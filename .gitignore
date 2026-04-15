@@ -1,0 +1,52 @@
+# Build output
+/build/
+/cmake-build-*/
+/out/
+
+# CMake / build system generated files
+/CMakeCache.txt
+/CMakeFiles/
+/Makefile
+/cmake_install.cmake
+/compile_commands.json
+/CTestTestfile.cmake
+/Testing/
+/.ninja_deps
+/.ninja_log
+/build.ninja
+
+# Local tool state
+/.cache/
+/.codex
+/.codex/
+
+# Generated binaries / libraries
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.lib
+*.exe
+
+# Debug / profiling artifacts
+*.dSYM/
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+*.gcov
+core
+vgcore.*
+
+# Editors / IDEs
+/.idea/
+/.vscode/
+.clangd
+.clang-tidy
+
+# OS cruft
+.DS_Store
+Thumbs.db

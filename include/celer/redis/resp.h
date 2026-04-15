@@ -1,0 +1,37 @@
+#pragma once
+
+#include <cstddef>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "celer/base/status.h"
+
+namespace celer::redis {
+
+struct RespCommand {
+  std::vector<std::string> args;
+};
+
+enum class RespParseState {
+  kOk,
+  kNeedMoreData,
+  kError,
+};
+
+struct RespParseResult {
+  RespParseState state = RespParseState::kNeedMoreData;
+  std::size_t consumed = 0;
+  Status status = Status::Ok();
+  RespCommand command;
+};
+
+RespParseResult ParseRespCommand(std::string_view input);
+
+std::string EncodeSimpleString(std::string_view value);
+std::string EncodeBulkString(std::string_view value);
+std::string EncodeNullBulkString();
+std::string EncodeInteger(long long value);
+std::string EncodeError(std::string_view message);
+
+}  // namespace celer::redis

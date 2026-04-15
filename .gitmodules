@@ -1,0 +1,3 @@
+[submodule "celer"]
+	path = celer
+	url = https://github.com/thweetkomputer/celer.git
