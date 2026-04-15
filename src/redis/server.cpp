@@ -221,7 +221,7 @@ Task<Status> RedisSession(Worker& worker, Connection* connection) {
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms) {
   constexpr RecvMode recv_mode = kDefaultRecvMode;
-  CELER_LOG_INFO << "celer redis listening on " << bind_ip << ':' << port
+  CELER_LOG_INFO << "keylane listening on " << bind_ip << ':' << port
                  << " threads=" << thread_count
                  << " idle_timeout_ms=" << idle_timeout_ms
                  << " recv_mode="
