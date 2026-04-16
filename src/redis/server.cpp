@@ -8,17 +8,17 @@
 #include <cerrno>
 #include <atomic>
 #include <chrono>
-#include <ctime>
 #include <span>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <memory>
-#include <pthread.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include <vector>
 
 #include "celer/base/log.h"
-#include "celer/net/tcp_listener.h"
+#include "celer/net/tcp_server.h"
 #include "celer/net/tcp_stream.h"
 #include "celer/redis/command.h"
 #include "celer/redis/db.h"
@@ -29,60 +29,94 @@ namespace celer::redis {
 namespace {
 
 std::atomic<bool> g_shutdown_requested = false;
-std::atomic<int> g_last_shutdown_signal = 0;
+volatile sig_atomic_t g_last_shutdown_signal = 0;
+int g_signal_event_fd = -1;
 
-sigset_t ShutdownSignalSet() {
-  sigset_t set;
-  sigemptyset(&set);
-  sigaddset(&set, SIGINT);
-  sigaddset(&set, SIGTERM);
-  return set;
+void ShutdownSignalHandler(int signal) {
+  g_last_shutdown_signal = signal;
+  if (g_signal_event_fd < 0) {
+    return;
+  }
+  const std::uint64_t wake = 1;
+  (void)write(g_signal_event_fd, &wake, sizeof(wake));
 }
 
-void BlockShutdownSignals() {
+Status InstallShutdownSignalHandler() {
   g_shutdown_requested.store(false, std::memory_order_release);
-  g_last_shutdown_signal.store(0, std::memory_order_relaxed);
-  const sigset_t set = ShutdownSignalSet();
-  pthread_sigmask(SIG_BLOCK, &set, nullptr);
+  g_last_shutdown_signal = 0;
+  g_signal_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (g_signal_event_fd < 0) {
+    return Status(StatusCode::kInternal, "eventfd setup failed");
+  }
+
+  struct sigaction action {};
+  sigemptyset(&action.sa_mask);
+  action.sa_handler = ShutdownSignalHandler;
+  if (sigaction(SIGINT, &action, nullptr) != 0 ||
+      sigaction(SIGTERM, &action, nullptr) != 0) {
+    close(g_signal_event_fd);
+    g_signal_event_fd = -1;
+    return Status(StatusCode::kInternal, "sigaction setup failed");
+  }
+  return Status::Ok();
 }
 
-void WaitForShutdownSignal(std::atomic<bool>* running) {
-  const sigset_t set = ShutdownSignalSet();
-  while (running->load(std::memory_order_acquire)) {
-    timespec timeout{
-        .tv_sec = 0,
-        .tv_nsec = 100 * 1000 * 1000,
-    };
-    const int signal = sigtimedwait(&set, nullptr, &timeout);
-    if (signal == SIGINT || signal == SIGTERM) {
-      g_last_shutdown_signal.store(signal, std::memory_order_relaxed);
-      g_shutdown_requested.store(true, std::memory_order_release);
-      return;
-    }
-    if (signal < 0 && errno != EAGAIN && errno != EINTR) {
-      CELER_LOG_WARN << "sigtimedwait failed errno=" << errno;
-    }
+void CleanupShutdownSignalHandler() noexcept {
+  struct sigaction action {};
+  sigemptyset(&action.sa_mask);
+  action.sa_handler = SIG_DFL;
+  (void)sigaction(SIGINT, &action, nullptr);
+  (void)sigaction(SIGTERM, &action, nullptr);
+  if (g_signal_event_fd >= 0) {
+    close(g_signal_event_fd);
+    g_signal_event_fd = -1;
   }
 }
 
-struct RedisWorkerRuntime {
-  Worker worker;
-  TcpListener listener;
-  std::atomic<bool> stop_requested = false;
-  std::atomic<bool> accept_loop_done = false;
-  std::atomic<bool> finished = false;
-  std::atomic<int> exit_code = 0;
-
-  void BeginShutdown() {
-    stop_requested.store(true, std::memory_order_release);
-    listener.Close();
-  }
-
-  void RequestStop() {
-    BeginShutdown();
-    worker.RequestStop();
-  }
+enum class WaitResult {
+  kSignal,
+  kStopped,
 };
+
+WaitResult WaitForSignalOrServerStop(const TcpServer& server) {
+  pollfd fds[2] = {
+      {.fd = g_signal_event_fd, .events = POLLIN, .revents = 0},
+      {.fd = server.completion_fd(), .events = POLLIN, .revents = 0},
+  };
+
+  while (true) {
+    const int rc = poll(fds, 2, -1);
+    if (rc < 0) [[unlikely]] {
+      if (errno == EINTR) {
+        continue;
+      }
+      CELER_LOG_WARN << "poll failed errno=" << errno;
+      return WaitResult::kStopped;
+    }
+
+    if ((fds[0].revents & POLLIN) != 0) {
+      std::uint64_t wake = 0;
+      (void)read(g_signal_event_fd, &wake, sizeof(wake));
+      g_shutdown_requested.store(true, std::memory_order_release);
+      return WaitResult::kSignal;
+    }
+    if ((fds[1].revents & POLLIN) != 0) {
+      std::uint64_t wake = 0;
+      (void)read(server.completion_fd(), &wake, sizeof(wake));
+      return WaitResult::kStopped;
+    }
+  }
+}
+
+class RedisHandler final : public TcpConnectionHandler {
+ public:
+  Task<Status> HandleRequests(TcpStream stream) override;
+
+ private:
+  static DbShard db_;
+};
+
+DbShard RedisHandler::db_{};
 
 Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
   std::array<std::byte, 4096> buffer{};
@@ -98,84 +132,31 @@ Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pend
     }
 
     auto read_result = co_await stream.ReadSome(buffer);
-    if (!read_result.ok()) {
+    if (!read_result.ok()) [[unlikely]] {
       co_return read_result.status();
     }
-    if (*read_result == 0) {
+    if (*read_result == 0) [[unlikely]] {
       co_return Status(StatusCode::kUnavailable, "peer closed connection");
     }
     pending->append(reinterpret_cast<const char*>(buffer.data()), *read_result);
   }
 }
 
-Task<Status> AcceptLoop(RedisWorkerRuntime& runtime) {
-  while (!runtime.stop_requested.load(std::memory_order_acquire)) {
-    auto accepted = co_await runtime.listener.Accept();
-    if (!accepted.ok()) {
-      const auto code = accepted.status().code();
-      if (runtime.stop_requested.load(std::memory_order_acquire) ||
-          code == StatusCode::kCancelled ||
-          code == StatusCode::kFailedPrecondition) {
-        runtime.accept_loop_done.store(true, std::memory_order_release);
-        co_return Status::Ok();
-      }
-      if (code != StatusCode::kUnavailable) {
-        CELER_LOG_WARN << "accept failed: " << accepted.status().message();
-      }
-      continue;
-    }
-
-    runtime.worker.Spawn(RedisSession(runtime.worker, *accepted));
-  }
-  runtime.accept_loop_done.store(true, std::memory_order_release);
-  co_return Status::Ok();
+bool ShutdownRequested() {
+  return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
-void RunRedisWorker(std::string bind_ip, std::uint16_t port, RecvMode recv_mode,
-                    int idle_timeout_ms, bool reuse_port, unsigned worker_index,
-                    RedisWorkerRuntime* runtime) {
-  WorkerOptions worker_options;
-  worker_options.recv_mode = recv_mode;
-  worker_options.idle_timeout_ms = idle_timeout_ms;
-
-  auto init_status = runtime->worker.Init(worker_options);
-  if (!init_status.ok()) {
-    CELER_LOG_ERROR << "worker[" << worker_index << "] init failed: " << init_status.message();
-    runtime->exit_code.store(1, std::memory_order_release);
-    runtime->finished.store(true, std::memory_order_release);
-    return;
-  }
-
-  auto bind_status = runtime->listener.Bind(&runtime->worker, bind_ip, port, 128, reuse_port);
-  if (!bind_status.ok()) {
-    CELER_LOG_ERROR << "worker[" << worker_index << "] bind failed: " << bind_status.message();
-    runtime->exit_code.store(1, std::memory_order_release);
-    runtime->finished.store(true, std::memory_order_release);
-    runtime->worker.RequestStop();
-    return;
-  }
-
-  runtime->worker.Spawn(AcceptLoop(*runtime));
-  runtime->worker.Run();
-  if (!runtime->stop_requested.load(std::memory_order_acquire) &&
-      !g_shutdown_requested.load(std::memory_order_acquire)) {
-    runtime->exit_code.store(1, std::memory_order_release);
-  }
-  runtime->finished.store(true, std::memory_order_release);
-}
-
-}  // namespace
-
-Task<Status> RedisSession(Worker& worker, Connection* connection) {
-  static DbShard db;
-  TcpStream stream(connection);
+Task<Status> RedisHandler::HandleRequests(TcpStream stream) {
   std::string pending;
 
   while (stream.IsOpen()) {
+    if (ShutdownRequested()) [[unlikely]] {
+      co_return Status::Ok();
+    }
+
     auto command_result = co_await ReadNextCommand(stream, &pending);
-    if (!command_result.ok()) {
-      if (command_result.status().code() == StatusCode::kUnavailable) {
-        worker.BeginClose(connection, Status::Ok(), CloseMode::kPeerClosed);
+    if (!command_result.ok()) [[unlikely]] {
+      if (command_result.status().code() == StatusCode::kUnavailable) [[unlikely]] {
         co_return Status::Ok();
       }
 
@@ -183,8 +164,7 @@ Task<Status> RedisSession(Worker& worker, Connection* connection) {
       auto write_status = co_await stream.WriteAll(
           std::span<const std::byte>(reinterpret_cast<const std::byte*>(encoded.data()),
                                      encoded.size()));
-      worker.BeginClose(connection, command_result.status(), CloseMode::kLocalError);
-      if (!write_status.ok()) {
+      if (!write_status.ok()) [[unlikely]] {
         co_return write_status;
       }
       co_return command_result.status();
@@ -193,10 +173,10 @@ Task<Status> RedisSession(Worker& worker, Connection* connection) {
     auto request_result = BuildCommandRequest(std::move(*command_result));
     std::string reply;
     bool close_connection = false;
-    if (!request_result.ok()) {
+    if (!request_result.ok()) [[unlikely]] {
       reply = EncodeError("ERR " + request_result.status().message());
     } else {
-      CommandReply executed = ExecuteCommand(&db, *request_result);
+      CommandReply executed = ExecuteCommand(&db_, *request_result);
       reply = std::move(executed.encoded);
       close_connection = executed.close_connection;
     }
@@ -204,19 +184,19 @@ Task<Status> RedisSession(Worker& worker, Connection* connection) {
     auto write_status = co_await stream.WriteAll(
         std::span<const std::byte>(reinterpret_cast<const std::byte*>(reply.data()),
                                    reply.size()));
-    if (!write_status.ok()) {
-      worker.BeginClose(connection, write_status, CloseMode::kLocalError);
+    if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }
-    if (close_connection) {
-      worker.BeginClose(connection, Status::Ok(), CloseMode::kLocalError);
+    if (close_connection || ShutdownRequested()) [[unlikely]] {
+      stream.Close();
       co_return Status::Ok();
     }
   }
 
-  worker.BeginClose(connection, Status::Ok(), CloseMode::kPeerClosed);
   co_return Status::Ok();
 }
+
+}  // namespace
 
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms) {
@@ -227,84 +207,39 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
                  << " recv_mode="
                  << (recv_mode == RecvMode::kMultishot ? "multishot" : "registered_buf");
 
-  const bool reuse_port = thread_count > 1;
-  BlockShutdownSignals();
-  std::atomic<bool> signal_wait_running = true;
-  std::thread signal_waiter(WaitForShutdownSignal, &signal_wait_running);
-
-  std::vector<std::unique_ptr<RedisWorkerRuntime>> runtimes;
-  runtimes.reserve(thread_count);
-  std::vector<std::thread> threads;
-  threads.reserve(thread_count);
-  for (unsigned i = 0; i < thread_count; ++i) {
-    runtimes.push_back(std::make_unique<RedisWorkerRuntime>());
-    threads.emplace_back(RunRedisWorker, std::string(bind_ip), port, recv_mode,
-                         idle_timeout_ms, reuse_port, i, runtimes.back().get());
+  const auto signal_status = InstallShutdownSignalHandler();
+  if (!signal_status.ok()) [[unlikely]] {
+    CELER_LOG_ERROR << "signal setup failed: " << signal_status.message();
+    return 1;
   }
 
-  bool failed = false;
-  while (true) {
-    bool all_finished = true;
-    for (const auto& runtime : runtimes) {
-      if (!runtime->finished.load(std::memory_order_acquire)) {
-        all_finished = false;
-      }
-      if (runtime->exit_code.load(std::memory_order_acquire) != 0) {
-        failed = true;
-      }
-    }
+  TcpServerOptions options;
+  options.bind_ip = std::string(bind_ip);
+  options.port = port;
+  options.thread_count = thread_count;
+  options.idle_timeout_ms = idle_timeout_ms;
+  options.recv_mode = recv_mode;
 
-    if (g_shutdown_requested.load(std::memory_order_acquire) || failed || all_finished) {
-      break;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  RedisHandler handler;
+  TcpServer server;
+  auto start_status = server.Start(options, &handler);
+  if (!start_status.ok()) [[unlikely]] {
+    CELER_LOG_ERROR << "server start failed: " << start_status.message();
+    CleanupShutdownSignalHandler();
+    return 1;
   }
 
-  signal_wait_running.store(false, std::memory_order_release);
-  signal_waiter.join();
-
-  if (g_shutdown_requested.load(std::memory_order_acquire)) {
-    const int signal = g_last_shutdown_signal.load(std::memory_order_relaxed);
+  const WaitResult wait_result = WaitForSignalOrServerStop(server);
+  if (wait_result == WaitResult::kSignal) {
+    const int signal = static_cast<int>(g_last_shutdown_signal);
     CELER_LOG_INFO << "shutdown requested by signal "
                    << (signal == 0 ? "unknown" : std::to_string(signal));
+    server.RequestStop();
   }
-
-  if (g_shutdown_requested.load(std::memory_order_acquire) || failed) {
-    for (const auto& runtime : runtimes) {
-      runtime->BeginShutdown();
-    }
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-    while (std::chrono::steady_clock::now() < deadline) {
-      bool all_accept_loops_done = true;
-      for (const auto& runtime : runtimes) {
-        if (!runtime->accept_loop_done.load(std::memory_order_acquire) &&
-            !runtime->finished.load(std::memory_order_acquire)) {
-          all_accept_loops_done = false;
-          break;
-        }
-      }
-      if (all_accept_loops_done) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    for (const auto& runtime : runtimes) {
-      runtime->worker.RequestStop();
-    }
-  }
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  for (const auto& runtime : runtimes) {
-    if (runtime->exit_code.load(std::memory_order_acquire) != 0) {
-      failed = true;
-    }
-  }
-  return failed ? 1 : 0;
+  server.WaitUntilStopped();
+  const int exit_code = server.exit_code();
+  CleanupShutdownSignalHandler();
+  return exit_code;
 }
 
 }  // namespace celer::redis
