@@ -13,7 +13,7 @@
 #include <unistd.h>
 
 #include "celer/base/log.h"
-#include "celer/net/tcp_server.h"
+#include "celer/net/tcp_server-inl.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
 #include "keylane/db.h"
@@ -74,7 +74,8 @@ enum class WaitResult {
   kStopped,
 };
 
-WaitResult WaitForSignalOrServerStop(const TcpServer& server) {
+template <typename Server>
+WaitResult WaitForSignalOrServerStop(const Server& server) {
   pollfd fds[2] = {
       {.fd = g_signal_event_fd, .events = POLLIN, .revents = 0},
       {.fd = server.completion_fd(), .events = POLLIN, .revents = 0},
@@ -104,9 +105,9 @@ WaitResult WaitForSignalOrServerStop(const TcpServer& server) {
   }
 }
 
-class RedisHandler final : public TcpConnectionHandler {
+class RedisHandler {
  public:
-  Task<Status> HandleRequests(TcpStream stream) override;
+  Task<Status> HandleRequests(TcpStream stream);
 };
 
 thread_local DbShard tls_db_;
@@ -214,8 +215,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   options.recv_mode = recv_mode;
 
   RedisHandler handler;
-  TcpServer server;
-  auto start_status = server.Start(options, &handler);
+  TcpServer<RedisHandler> server;
+  auto start_status = server.Start(options, std::move(handler));
   if (!start_status.ok()) [[unlikely]] {
     CELER_LOG_ERROR << "server start failed: " << start_status.message();
     CleanupShutdownSignalHandler();
@@ -236,3 +237,5 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
 }
 
 }  // namespace keylane
+
+template class celer::TcpServer<keylane::RedisHandler>;
