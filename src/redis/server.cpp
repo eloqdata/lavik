@@ -12,8 +12,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-#include "celer/base/log.h"
 #include "celer/net/tcp_server-inl.h"
+#include "spdlog/spdlog.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
 #include "keylane/db.h"
@@ -87,7 +87,7 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
       if (errno == EINTR) {
         continue;
       }
-      CELER_LOG_WARN << "poll failed errno=" << errno;
+      spdlog::warn("poll failed errno={}", errno);
       return WaitResult::kStopped;
     }
 
@@ -195,15 +195,13 @@ Task<Status> RedisHandler::HandleRequests(TcpStream stream) {
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms) {
   constexpr RecvMode recv_mode = kDefaultRecvMode;
-  CELER_LOG_INFO << "keylane listening on " << bind_ip << ':' << port
-                 << " threads=" << thread_count
-                 << " idle_timeout_ms=" << idle_timeout_ms
-                 << " recv_mode="
-                 << (recv_mode == RecvMode::kMultishot ? "multishot" : "registered_buf");
+  spdlog::info("keylane listening on {}:{} threads={} idle_timeout_ms={} recv_mode={}",
+               bind_ip, port, thread_count, idle_timeout_ms,
+               (recv_mode == RecvMode::kMultishot ? "multishot" : "registered_buf"));
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {
-    CELER_LOG_ERROR << "signal setup failed: " << signal_status.message();
+    spdlog::error("signal setup failed: {}", signal_status.message());
     return 1;
   }
 
@@ -218,7 +216,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   TcpServer<RedisHandler> server;
   auto start_status = server.Start(options, std::move(handler));
   if (!start_status.ok()) [[unlikely]] {
-    CELER_LOG_ERROR << "server start failed: " << start_status.message();
+    spdlog::error("server start failed: {}", start_status.message());
     CleanupShutdownSignalHandler();
     return 1;
   }
@@ -226,8 +224,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   const WaitResult wait_result = WaitForSignalOrServerStop(server);
   if (wait_result == WaitResult::kSignal) {
     const int signal = static_cast<int>(g_last_shutdown_signal);
-    CELER_LOG_INFO << "shutdown requested by signal "
-                   << (signal == 0 ? "unknown" : std::to_string(signal));
+    spdlog::info("shutdown requested by signal {}",
+                 (signal == 0 ? "unknown" : std::to_string(signal)));
     server.RequestStop();
   }
   server.WaitUntilStopped();

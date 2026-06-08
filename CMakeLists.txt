@@ -33,6 +33,10 @@ target_include_directories(keylane_module
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+target_precompile_headers(keylane_module PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/keylane/pch.h
+)
+
 target_compile_features(keylane_module PUBLIC cxx_std_23)
 target_link_libraries(keylane_module PUBLIC celer::core)
 
@@ -54,5 +58,6 @@ if (KEYLANE_BUILD_EXAMPLE)
     target_compile_options(keylane PRIVATE -O3 -march=native -flto)
     target_link_options(keylane PRIVATE -flto)
   endif()
+  target_precompile_headers(keylane REUSE_FROM keylane_module)
   target_link_libraries(keylane PRIVATE keylane::module)
 endif()
