@@ -1,21 +1,16 @@
 #include "celer/redis/server.h"
 
 #include <array>
-#include <cctype>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
-#include <cerrno>
 #include <atomic>
-#include <chrono>
+#include <poll.h>
 #include <span>
 #include <string>
 #include <string_view>
-#include <memory>
-#include <poll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
-#include <vector>
 
 #include "celer/base/log.h"
 #include "celer/net/tcp_server.h"

@@ -11,94 +11,78 @@ namespace {
 constexpr std::size_t kMaxArrayLen = 1024;
 constexpr std::size_t kMaxBulkLen = 1024 * 1024;
 
-bool ParseSignedNumber(std::string_view input, long long* value) {
-  const char* begin = input.data();
-  const char* end = input.data() + input.size();
-  auto [ptr, ec] = std::from_chars(begin, end, *value);
-  return ec == std::errc{} && ptr == end;
-}
-
-std::size_t FindCrlf(std::string_view input, std::size_t from) {
-  return input.find("\r\n", from);
-}
-
 }  // namespace
 
 RespParseResult ParseRespCommand(std::string_view input) {
   RespParseResult result;
 
-  if (input.empty()) {
-    return result;
-  }
-  if (input.front() != '*') {
-    result.state = RespParseState::kError;
-    result.status = Status(StatusCode::kInvalidArgument, "expected RESP array");
+  if (input.empty() || input.front() != '*') {
+    if (!input.empty()) {
+      result.state = RespParseState::kError;
+      result.status = Status(StatusCode::kInvalidArgument, "expected RESP array");
+    }
     return result;
   }
 
+  // Parse array length: *<N>\r\n
   std::size_t pos = 1;
-  const std::size_t array_end = FindCrlf(input, pos);
-  if (array_end == std::string_view::npos) {
-    return result;
-  }
+  std::size_t crlf = input.find("\r\n", pos);
+  if (crlf == std::string_view::npos) return result;
 
-  long long array_len_ll = 0;
-  if (!ParseSignedNumber(input.substr(pos, array_end - pos), &array_len_ll) || array_len_ll < 0) {
+  long long array_len = 0;
+  auto [ptr, ec] = std::from_chars(input.data() + pos, input.data() + crlf, array_len);
+  if (ec != std::errc{} || ptr != input.data() + crlf || array_len < 0) {
     result.state = RespParseState::kError;
     result.status = Status(StatusCode::kInvalidArgument, "invalid RESP array length");
     return result;
   }
-  if (array_len_ll > static_cast<long long>(kMaxArrayLen)) {
+  if (array_len > static_cast<long long>(kMaxArrayLen)) {
     result.state = RespParseState::kError;
     result.status = Status(StatusCode::kOutOfRange, "too many RESP array elements");
     return result;
   }
 
-  const std::size_t array_len = static_cast<std::size_t>(array_len_ll);
-  pos = array_end + 2;
-  result.command.args.reserve(array_len);
+  const auto count = static_cast<std::size_t>(array_len);
+  pos = crlf + 2;
+  result.command.args.reserve(count);
 
-  for (std::size_t i = 0; i < array_len; ++i) {
-    if (pos >= input.size()) {
-      return result;
-    }
-    if (input[pos] != '$') {
+  // Parse each bulk string: $<N>\r\n<data>\r\n
+  for (std::size_t i = 0; i < count; ++i) {
+    if (pos >= input.size() || input[pos] != '$') {
       result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kInvalidArgument, "expected RESP bulk string");
+      result.status = Status(StatusCode::kInvalidArgument,
+          (pos >= input.size()) ? "incomplete RESP command" : "expected RESP bulk string");
       return result;
     }
     ++pos;
 
-    const std::size_t bulk_end = FindCrlf(input, pos);
-    if (bulk_end == std::string_view::npos) {
-      return result;
-    }
+    crlf = input.find("\r\n", pos);
+    if (crlf == std::string_view::npos) return result;
 
-    long long bulk_len_ll = 0;
-    if (!ParseSignedNumber(input.substr(pos, bulk_end - pos), &bulk_len_ll) || bulk_len_ll < 0) {
+    long long bulk_len = 0;
+    auto [p2, ec2] = std::from_chars(input.data() + pos, input.data() + crlf, bulk_len);
+    if (ec2 != std::errc{} || p2 != input.data() + crlf || bulk_len < 0) {
       result.state = RespParseState::kError;
       result.status = Status(StatusCode::kInvalidArgument, "invalid RESP bulk string length");
       return result;
     }
-    if (bulk_len_ll > static_cast<long long>(kMaxBulkLen)) {
+    if (bulk_len > static_cast<long long>(kMaxBulkLen)) {
       result.state = RespParseState::kError;
       result.status = Status(StatusCode::kOutOfRange, "RESP bulk string too large");
       return result;
     }
 
-    const std::size_t bulk_len = static_cast<std::size_t>(bulk_len_ll);
-    pos = bulk_end + 2;
-    if (input.size() < pos + bulk_len + 2) {
-      return result;
-    }
-    if (input[pos + bulk_len] != '\r' || input[pos + bulk_len + 1] != '\n') {
+    const auto data_len = static_cast<std::size_t>(bulk_len);
+    pos = crlf + 2;
+    if (input.size() < pos + data_len + 2) return result;
+    if (input[pos + data_len] != '\r' || input[pos + data_len + 1] != '\n') {
       result.state = RespParseState::kError;
       result.status = Status(StatusCode::kInvalidArgument, "malformed RESP bulk string terminator");
       return result;
     }
 
-    result.command.args.emplace_back(input.substr(pos, bulk_len));
-    pos += bulk_len + 2;
+    result.command.args.emplace_back(input.substr(pos, data_len));
+    pos += data_len + 2;
   }
 
   result.state = RespParseState::kOk;
@@ -126,9 +110,7 @@ std::string EncodeBulkString(std::string_view value) {
   return out;
 }
 
-std::string EncodeNullBulkString() {
-  return "$-1\r\n";
-}
+std::string EncodeNullBulkString() { return "$-1\r\n"; }
 
 std::string EncodeInteger(long long value) {
   std::string out;

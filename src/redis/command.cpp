@@ -4,15 +4,16 @@
 #include <string>
 #include <string_view>
 
+#include "celer/redis/db.h"
+#include "celer/redis/resp.h"
+
 namespace keylane {
 using namespace celer;
 
 namespace {
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b) {
-  if (a.size() != b.size()) {
-    return false;
-  }
+  if (a.size() != b.size()) return false;
   for (std::size_t i = 0; i < a.size(); ++i) {
     unsigned char ca = static_cast<unsigned char>(a[i]);
     unsigned char cb = static_cast<unsigned char>(b[i]);
@@ -51,58 +52,58 @@ StatusOr<CommandRequest> BuildCommandRequest(RespCommand command) {
   CommandRequest request;
   request.kind = MatchCommandKind(command.args.front());
   request.args = std::move(command.args);
-
   return request;
 }
 
 CommandReply ExecuteCommand(DbShard* db, const CommandRequest& request) {
   CommandReply reply;
+  const auto& args = request.args;
 
   switch (request.kind) {
     case CommandKind::kPing:
-      if (request.args.size() == 1) {
+      if (args.size() == 1) {
         reply.encoded = EncodeSimpleString("PONG");
-      } else if (request.args.size() == 2) {
-        reply.encoded = EncodeBulkString(request.args[1]);
+      } else if (args.size() == 2) {
+        reply.encoded = EncodeBulkString(args[1]);
       } else {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'ping' command");
       }
       return reply;
 
     case CommandKind::kDel:
-      if (request.args.size() < 2) {
+      if (args.size() < 2) {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'del' command");
         return reply;
       }
       {
         long long deleted = 0;
-        for (std::size_t i = 1; i < request.args.size(); ++i) {
-          deleted += db->Delete(request.args[i]) ? 1 : 0;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+          deleted += db->Delete(args[i]) ? 1 : 0;
         }
         reply.encoded = EncodeInteger(deleted);
       }
       return reply;
 
     case CommandKind::kExists:
-      if (request.args.size() < 2) {
+      if (args.size() < 2) {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'exists' command");
         return reply;
       }
       {
-        long long exists = 0;
-        for (std::size_t i = 1; i < request.args.size(); ++i) {
-          exists += db->Exists(request.args[i]) ? 1 : 0;
+        long long count = 0;
+        for (std::size_t i = 1; i < args.size(); ++i) {
+          count += db->Exists(args[i]) ? 1 : 0;
         }
-        reply.encoded = EncodeInteger(exists);
+        reply.encoded = EncodeInteger(count);
       }
       return reply;
 
     case CommandKind::kGet:
-      if (request.args.size() != 2) {
+      if (args.size() != 2) {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'get' command");
         return reply;
       }
-      if (const StringValue* value = db->Get(request.args[1]); value != nullptr) {
+      if (const StringValue* value = db->Get(args[1]); value != nullptr) {
         reply.encoded = EncodeBulkString(value->data);
       } else {
         reply.encoded = EncodeNullBulkString();
@@ -110,13 +111,13 @@ CommandReply ExecuteCommand(DbShard* db, const CommandRequest& request) {
       return reply;
 
     case CommandKind::kIncr:
-      if (request.args.size() != 2) {
+      if (args.size() != 2) {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'incr' command");
         return reply;
       }
       {
         std::int64_t value = 0;
-        if (!db->Increment(request.args[1], &value)) {
+        if (!db->Increment(args[1], &value)) {
           reply.encoded = EncodeError("ERR value is not an integer or out of range");
         } else {
           reply.encoded = EncodeInteger(value);
@@ -125,17 +126,17 @@ CommandReply ExecuteCommand(DbShard* db, const CommandRequest& request) {
       return reply;
 
     case CommandKind::kSet:
-      if (request.args.size() != 3) {
+      if (args.size() != 3) {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'set' command");
         return reply;
       }
-      db->Set(request.args[1], request.args[2]);
+      db->Set(args[1], args[2]);
       reply.encoded = EncodeSimpleString("OK");
       return reply;
 
     case CommandKind::kUnknown:
     default:
-      reply.encoded = EncodeError("ERR unknown command '" + request.args.front() + "'");
+      reply.encoded = EncodeError("ERR unknown command '" + args.front() + "'");
       return reply;
   }
 }
