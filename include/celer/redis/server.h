@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <string_view>
 
-namespace celer::redis {
+namespace keylane {
 
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms);
 
-}  // namespace celer::redis
+}  // namespace keylane

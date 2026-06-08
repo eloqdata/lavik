@@ -1,14 +1,14 @@
 #pragma once
 
 #include <string>
-#include <string_view>
 #include <vector>
 
 #include "celer/base/status.h"
 #include "celer/redis/db.h"
 #include "celer/redis/resp.h"
 
-namespace celer::redis {
+namespace keylane {
+using namespace celer;
 
 enum class CommandKind {
   kPing,
@@ -22,7 +22,6 @@ enum class CommandKind {
 
 struct CommandRequest {
   CommandKind kind = CommandKind::kUnknown;
-  std::string name;
   std::vector<std::string> args;
 };
 
@@ -34,4 +33,4 @@ struct CommandReply {
 StatusOr<CommandRequest> BuildCommandRequest(RespCommand command);
 CommandReply ExecuteCommand(DbShard* db, const CommandRequest& request);
 
-}  // namespace celer::redis
+}  // namespace keylane

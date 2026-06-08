@@ -29,5 +29,5 @@ int main(int argc, char** argv) {
     idle_timeout_ms = std::stoi(argv[4]);
   }
 
-  return celer::redis::RunServer(bind_ip, port, thread_count, idle_timeout_ms);
+  return keylane::RunServer(bind_ip, port, thread_count, idle_timeout_ms);
 }

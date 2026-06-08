@@ -1,20 +1,44 @@
 #include "celer/redis/command.h"
 
-#include <cctype>
 #include <cstdint>
 #include <string>
 #include <string_view>
 
-namespace celer::redis {
+namespace keylane {
+using namespace celer;
 
 namespace {
 
-std::string ToUpperAscii(std::string_view input) {
-  std::string out(input);
-  for (char& ch : out) {
-    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+bool CmpCaseInsensitive(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) {
+    return false;
   }
-  return out;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    unsigned char ca = static_cast<unsigned char>(a[i]);
+    unsigned char cb = static_cast<unsigned char>(b[i]);
+    if (ca >= 'A' && ca <= 'Z') ca += 'a' - 'A';
+    if (cb >= 'A' && cb <= 'Z') cb += 'a' - 'A';
+    if (ca != cb) return false;
+  }
+  return true;
+}
+
+CommandKind MatchCommandKind(std::string_view name) {
+  switch (name.size()) {
+    case 3:
+      if (CmpCaseInsensitive(name, "GET")) return CommandKind::kGet;
+      if (CmpCaseInsensitive(name, "SET")) return CommandKind::kSet;
+      if (CmpCaseInsensitive(name, "DEL")) return CommandKind::kDel;
+      break;
+    case 4:
+      if (CmpCaseInsensitive(name, "PING")) return CommandKind::kPing;
+      if (CmpCaseInsensitive(name, "INCR")) return CommandKind::kIncr;
+      break;
+    case 6:
+      if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
+      break;
+  }
+  return CommandKind::kUnknown;
 }
 
 }  // namespace
@@ -25,24 +49,8 @@ StatusOr<CommandRequest> BuildCommandRequest(RespCommand command) {
   }
 
   CommandRequest request;
-  request.name = ToUpperAscii(command.args.front());
+  request.kind = MatchCommandKind(command.args.front());
   request.args = std::move(command.args);
-
-  if (request.name == "PING") {
-    request.kind = CommandKind::kPing;
-  } else if (request.name == "DEL") {
-    request.kind = CommandKind::kDel;
-  } else if (request.name == "EXISTS") {
-    request.kind = CommandKind::kExists;
-  } else if (request.name == "GET") {
-    request.kind = CommandKind::kGet;
-  } else if (request.name == "INCR") {
-    request.kind = CommandKind::kIncr;
-  } else if (request.name == "SET") {
-    request.kind = CommandKind::kSet;
-  } else {
-    request.kind = CommandKind::kUnknown;
-  }
 
   return request;
 }
@@ -132,4 +140,4 @@ CommandReply ExecuteCommand(DbShard* db, const CommandRequest& request) {
   }
 }
 
-}  // namespace celer::redis
+}  // namespace keylane

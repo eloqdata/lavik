@@ -4,14 +4,14 @@
 #include <limits>
 #include <string>
 
-namespace celer::redis {
+namespace keylane {
 
-void DbShard::Set(std::string key, std::string value) {
-  strings_.insert_or_assign(std::move(key), StringValue{std::move(value), std::nullopt});
+void DbShard::Set(std::string_view key, std::string_view value) {
+  strings_.insert_or_assign(std::string(key), StringValue{std::string(value), std::nullopt});
 }
 
 const StringValue* DbShard::Get(std::string_view key) const {
-  auto it = strings_.find(std::string(key));
+  auto it = strings_.find(key);
   if (it == strings_.end()) {
     return nullptr;
   }
@@ -19,17 +19,26 @@ const StringValue* DbShard::Get(std::string_view key) const {
 }
 
 bool DbShard::Delete(std::string_view key) {
-  return strings_.erase(std::string(key)) > 0;
+  auto it = strings_.find(key);
+  if (it == strings_.end()) {
+    return false;
+  }
+  strings_.erase(it);
+  return true;
 }
 
 bool DbShard::Exists(std::string_view key) const {
-  return strings_.find(std::string(key)) != strings_.end();
+  return strings_.find(key) != strings_.end();
 }
 
 bool DbShard::Increment(std::string_view key, std::int64_t* value) {
-  auto [it, inserted] =
-      strings_.try_emplace(std::string(key), StringValue{"0", std::nullopt});
-  (void)inserted;
+  auto it = strings_.find(key);
+  if (it == strings_.end()) {
+    auto [new_it, inserted] =
+        strings_.try_emplace(std::string(key), StringValue{"0", std::nullopt});
+    (void)inserted;
+    it = new_it;
+  }
 
   std::int64_t current = 0;
   const std::string_view current_view = it->second.data;
@@ -50,4 +59,4 @@ bool DbShard::Increment(std::string_view key, std::int64_t* value) {
   return true;
 }
 
-}  // namespace celer::redis
+}  // namespace keylane
