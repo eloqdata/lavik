@@ -1,4 +1,4 @@
-#include "keylane/redis/db.h"
+#include "keylane/db.h"
 
 #include <charconv>
 #include <limits>

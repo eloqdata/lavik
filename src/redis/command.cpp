@@ -1,11 +1,11 @@
-#include "keylane/redis/command.h"
+#include "keylane/command.h"
 
 #include <cstdint>
 #include <string>
 #include <string_view>
 
-#include "keylane/redis/db.h"
-#include "keylane/redis/resp.h"
+#include "keylane/db.h"
+#include "keylane/resp.h"
 
 namespace keylane {
 using namespace celer;
