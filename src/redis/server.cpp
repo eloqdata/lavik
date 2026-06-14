@@ -16,7 +16,6 @@
 #include "spdlog/spdlog.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
-#include "keylane/db.h"
 #include "keylane/resp.h"
 
 namespace keylane {
@@ -110,8 +109,6 @@ class RedisHandler {
   Task<Status> HandleRequests(TcpStream stream);
 };
 
-thread_local DbShard tls_db_;
-
 Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
   std::array<std::byte, 4096> buffer{};
   while (true) {
@@ -170,7 +167,7 @@ Task<Status> RedisHandler::HandleRequests(TcpStream stream) {
     if (!request_result.ok()) [[unlikely]] {
       reply = EncodeError("ERR " + request_result.status().message());
     } else {
-      CommandReply executed = ExecuteCommand(&tls_db_, *request_result);
+      CommandReply executed = co_await ExecuteCommand(*request_result);
       reply = std::move(executed.encoded);
       close_connection = executed.close_connection;
     }
@@ -204,6 +201,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
     spdlog::error("signal setup failed: {}", signal_status.message());
     return 1;
   }
+
+  InitShards(thread_count);
 
   TcpServerOptions options;
   options.bind_ip = std::string(bind_ip);
