@@ -190,7 +190,7 @@ Task<Status> RedisHandler::HandleRequests(TcpStream stream) {
 }  // namespace
 
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
-              int idle_timeout_ms) {
+              int idle_timeout_ms, unsigned recv_buffer_count) {
   constexpr RecvMode recv_mode = kDefaultRecvMode;
   spdlog::info("keylane listening on {}:{} threads={} idle_timeout_ms={} recv_mode={}",
                bind_ip, port, thread_count, idle_timeout_ms,
@@ -209,6 +209,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   options.port = port;
   options.thread_count = thread_count;
   options.idle_timeout_ms = idle_timeout_ms;
+  options.recv_buffer_count = recv_buffer_count;
   options.recv_mode = recv_mode;
 
   RedisHandler handler;
