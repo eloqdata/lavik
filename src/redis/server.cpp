@@ -12,7 +12,8 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
-#include "celer/net/tcp_server-inl.h"
+#include "celer/net/server.h"
+#include "celer/net/tcp_service.h"
 #include "spdlog/spdlog.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
@@ -104,9 +105,12 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
   }
 }
 
-class RedisHandler {
+class RedisService final : public TcpService {
  public:
-  Task<Status> HandleRequests(TcpStream stream);
+  explicit RedisService(std::uint16_t port) : TcpService(port) {}
+
+ protected:
+  Task<Status> Serve(TcpStream stream) override;
 };
 
 Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
@@ -137,7 +141,7 @@ bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
-Task<Status> RedisHandler::HandleRequests(TcpStream stream) {
+Task<Status> RedisService::Serve(TcpStream stream) {
   std::string pending;
 
   while (stream.IsOpen()) {
@@ -202,16 +206,16 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
 
   InitShards(thread_count);
 
-  TcpServerOptions options;
+  ServerOptions options;
   options.bind_ip = std::string(bind_ip);
-  options.port = port;
   options.thread_count = thread_count;
   options.idle_timeout_ms = idle_timeout_ms;
   options.recv_buffer_count = recv_buffer_count;
 
-  RedisHandler handler;
-  TcpServer<RedisHandler> server;
-  auto start_status = server.Start(options, std::move(handler));
+  RedisService redis(port);
+  Server server;
+  server.AddService(&redis);
+  auto start_status = server.Start(options);
   if (!start_status.ok()) [[unlikely]] {
     spdlog::error("server start failed: {}", start_status.message());
     CleanupShutdownSignalHandler();
@@ -232,5 +236,3 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
 }
 
 }  // namespace keylane
-
-template class celer::TcpServer<keylane::RedisHandler>;
