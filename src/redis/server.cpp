@@ -118,17 +118,66 @@ class RedisService final : public TcpService {
   bool startup_failed() const noexcept {
     return startup_failed_.load(std::memory_order_acquire);
   }
+  void StopAcceptingRequests() noexcept;
+  void WaitForRequestsDrained() const noexcept;
 
  protected:
   Task<Status> Serve(TcpStream stream) override;
 
  private:
+  class RequestGuard {
+   public:
+    explicit RequestGuard(RedisService* service) : service_(service) {}
+    RequestGuard(const RequestGuard&) = delete;
+    RequestGuard& operator=(const RequestGuard&) = delete;
+    ~RequestGuard() { service_->EndRequest(); }
+
+   private:
+    RedisService* service_;
+  };
+
+  bool TryBeginRequest() noexcept;
+  void EndRequest() noexcept;
+
+  static constexpr std::uint64_t kRequestsClosed = 1ULL << 63;
+  static constexpr std::uint64_t kRequestCountMask = ~kRequestsClosed;
   storage::StorageEngine* storage_;
   std::atomic<bool> startup_failed_{false};
+  std::atomic<std::uint64_t> request_gate_{0};
 };
 
 void RedisService::Prepare(unsigned thread_count) {
   TcpService::Prepare(thread_count);
+}
+
+void RedisService::StopAcceptingRequests() noexcept {
+  request_gate_.fetch_or(kRequestsClosed, std::memory_order_acq_rel);
+  request_gate_.notify_all();
+}
+
+void RedisService::WaitForRequestsDrained() const noexcept {
+  std::uint64_t state = request_gate_.load(std::memory_order_acquire);
+  while ((state & kRequestCountMask) != 0) {
+    request_gate_.wait(state, std::memory_order_acquire);
+    state = request_gate_.load(std::memory_order_acquire);
+  }
+}
+
+bool RedisService::TryBeginRequest() noexcept {
+  std::uint64_t state = request_gate_.load(std::memory_order_acquire);
+  while ((state & kRequestsClosed) == 0) {
+    if (request_gate_.compare_exchange_weak(
+            state, state + 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void RedisService::EndRequest() noexcept {
+  request_gate_.fetch_sub(1, std::memory_order_acq_rel);
+  request_gate_.notify_all();
 }
 
 Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
@@ -197,6 +246,15 @@ Task<Status> RedisService::Serve(TcpStream stream) {
       co_return command_result.status();
     }
 
+    if (!TryBeginRequest()) [[unlikely]] {
+      std::string encoded = EncodeError("ERR server is shutting down");
+      auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
+      stream.Close();
+      co_return write_status;
+    }
+    RequestGuard request_guard(this);
+
     auto request_result = BuildCommandRequest(std::move(*command_result));
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
@@ -231,11 +289,13 @@ Task<Status> RedisService::Serve(TcpStream stream) {
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms, unsigned recv_buffer_count,
               std::size_t registered_buffer_bytes,
+              std::uint32_t flush_max_ms,
               const std::vector<std::string>& data_files,
               std::uint64_t data_file_size_bytes) {
   spdlog::info(
-      "keylane listening on {}:{} threads={} idle_timeout_ms={} registered_buffer_bytes={} per worker",
-      bind_ip, port, thread_count, idle_timeout_ms, registered_buffer_bytes);
+      "keylane listening on {}:{} threads={} idle_timeout_ms={} registered_buffer_bytes={} per worker flush_max_ms={}",
+      bind_ip, port, thread_count, idle_timeout_ms, registered_buffer_bytes,
+      flush_max_ms);
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {
@@ -246,6 +306,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   storage::StorageEngineOptions storage_options;
   storage_options.data_files = data_files;
   storage_options.file_size_bytes = data_file_size_bytes;
+  storage_options.flush_max_ms = flush_max_ms;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
   Status storage_status = storage.Prepare(thread_count);
@@ -273,14 +334,30 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   }
 
   const WaitResult wait_result = WaitForSignalOrServerStop(server);
+  int shutdown_exit_code = 0;
   if (wait_result == WaitResult::kSignal) {
     const int signal = static_cast<int>(g_last_shutdown_signal);
     spdlog::info("shutdown requested by signal {}",
                  (signal == 0 ? "unknown" : std::to_string(signal)));
+
+    redis.StopAcceptingRequests();
+    server.StopAccepting();
+    redis.WaitForRequestsDrained();
+    spdlog::info("all active requests drained; flushing storage buffers");
+    Status flush_status = storage.FlushForShutdown();
+    if (!flush_status.ok()) {
+      spdlog::error("shutdown storage flush failed: {}",
+                    flush_status.message());
+      shutdown_exit_code = 1;
+    } else {
+      spdlog::info("all storage buffers durably flushed");
+    }
     server.RequestStop();
   }
   server.WaitUntilStopped();
-  const int exit_code = redis.startup_failed() ? 1 : server.exit_code();
+  const int exit_code = redis.startup_failed() || shutdown_exit_code != 0
+                            ? 1
+                            : server.exit_code();
   CleanupShutdownSignalHandler();
   return exit_code;
 }

@@ -21,6 +21,7 @@ namespace keylane::storage {
 struct StorageEngineOptions {
   std::vector<std::string> data_files{"keylane.data"};
   std::uint64_t file_size_bytes = 1024ULL * 1024 * 1024;
+  std::uint32_t flush_max_ms = 1000;
   RegisteredBufferPoolOptions buffers{};
 };
 
@@ -67,6 +68,7 @@ class StorageEngine {
   // complete fixed-file table, opens every file with O_DIRECT into its fixed
   // slot, and performs parallel recovery.
   celer::Task<celer::Status> InitializeWorker(celer::Worker& worker);
+  celer::Status FlushForShutdown();
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;

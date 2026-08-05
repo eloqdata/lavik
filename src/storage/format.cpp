@@ -184,8 +184,7 @@ bool DecodeBlockHeader(
       decoded.block_bytes != kStorageBlockBytes ||
       decoded.storage_shard_id >= kLogicalStorageShards ||
       decoded.committed_bytes < kBlockHeaderBytes ||
-      decoded.committed_bytes > kStorageBlockBytes ||
-      (decoded.committed_bytes % kDirectIoAlignment) != 0) {
+      decoded.committed_bytes > kStorageBlockBytes) {
     return false;
   }
   const std::uint32_t expected = decoded.checksum;
@@ -202,8 +201,10 @@ bool DecodeBlockHeader(
 
 bool EncodeRecordHeader(
     const RecordHeader& header, std::string_view key,
-    std::span<std::byte, kRecordHeaderBytes> output) noexcept {
-  if (key.size() > MaxKeyBytes() || key.size() != header.key_bytes) {
+    std::span<std::byte> output) noexcept {
+  const std::size_t header_bytes = RecordHeaderBytes(key.size());
+  if (key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
+      header.header_bytes != header_bytes || output.size() != header_bytes) {
     return false;
   }
   std::fill(output.begin(), output.end(), std::byte{0});
@@ -217,22 +218,24 @@ bool EncodeRecordHeader(
 }
 
 bool DecodeRecordHeader(
-    std::span<const std::byte, kRecordHeaderBytes> input,
+    std::span<const std::byte> input,
     RecordHeader* header, std::string_view* key) noexcept {
-  if (header == nullptr || key == nullptr) {
+  if (header == nullptr || key == nullptr || input.size() < sizeof(RecordHeader)) {
     return false;
   }
   RecordHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic != kRecordMagic ||
       decoded.version != kStorageFormatVersion ||
-      decoded.header_bytes != kRecordHeaderBytes ||
       (decoded.kind != RecordKind::kValue &&
        decoded.kind != RecordKind::kTombstone) ||
       decoded.key_bytes > MaxKeyBytes() ||
-      decoded.value_disk_bytes != AlignDirect(decoded.value_bytes) ||
-      decoded.total_disk_bytes !=
-          kRecordHeaderBytes + decoded.value_disk_bytes ||
+      decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
+      decoded.header_bytes > input.size() ||
+      decoded.value_disk_bytes != decoded.value_bytes ||
+      decoded.total_disk_bytes != AlignRecord(
+          static_cast<std::size_t>(decoded.header_bytes) +
+          decoded.value_disk_bytes) ||
       decoded.total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
     return false;
   }
@@ -240,11 +243,12 @@ bool DecodeRecordHeader(
     return false;
   }
   const std::uint32_t expected = decoded.header_checksum;
-  std::array<std::byte, kRecordHeaderBytes> copy{};
-  std::memcpy(copy.data(), input.data(), copy.size());
+  std::array<std::byte, kMaxRecordHeaderBytes> copy{};
+  std::memcpy(copy.data(), input.data(), decoded.header_bytes);
   decoded.header_checksum = 0;
   std::memcpy(copy.data(), &decoded, sizeof(decoded));
-  if (Crc32c(copy) != expected) {
+  if (Crc32c(std::span<const std::byte>(copy.data(), decoded.header_bytes)) !=
+      expected) {
     return false;
   }
   *header = decoded;

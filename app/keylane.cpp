@@ -16,6 +16,7 @@ int main(int argc, char** argv) {
   int idle_timeout_ms = -1;
   unsigned recv_buffer_count = 1024;
   unsigned registered_buffer_mb = 16;
+  std::uint32_t flush_max_ms = 1000;
   std::vector<std::string> data_files{"keylane.data"};
   std::uint64_t data_file_size_mb = 1024;
 
@@ -32,6 +33,10 @@ int main(int argc, char** argv) {
       ->check(CLI::NonNegativeNumber);
   app.add_option("--registered-buffer-mb", registered_buffer_mb,
                  "Registered storage buffer budget in MiB per worker")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--flush-max-ms", flush_max_ms,
+                 "Maximum age of a partial write block before flush")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("--data-file", data_files,
@@ -57,5 +62,6 @@ int main(int argc, char** argv) {
   return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms,
                             recv_buffer_count,
                             static_cast<std::size_t>(registered_buffer_mb) * kMiB,
+                            flush_max_ms,
                             data_files, data_file_size_mb * kMiB);
 }

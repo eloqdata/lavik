@@ -1,21 +1,25 @@
 #include "keylane/storage/engine.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <charconv>
 #include <cerrno>
 #include <coroutine>
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <new>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "celer/io/storage.h"
@@ -46,6 +50,7 @@ struct RecordLocation {
   std::uint64_t relocation_sequence = 0;
   std::uint64_t lsn = 0;
   std::uint64_t allocation_epoch = 0;
+  bool in_memory = false;
   RecordKind kind = RecordKind::kValue;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
@@ -73,6 +78,9 @@ struct ActiveBlock {
   std::uint32_t committed_bytes = kBlockHeaderBytes;
   std::uint32_t record_count = 0;
   std::uint64_t max_lsn = 0;
+  std::uint16_t write_buffer_id = 0;
+  std::byte* heap_buffer = nullptr;
+  std::size_t heap_buffer_size = 0;
 };
 
 struct BlockState {
@@ -83,6 +91,13 @@ struct BlockState {
   std::uint32_t pins = 0;
   bool allocated = false;
   bool defragging = false;
+  bool in_memory = false;
+  bool flush_queued = false;
+  bool flush_in_progress = false;
+  std::uint16_t write_buffer_id = 0;
+  std::byte* heap_data = nullptr;
+  std::size_t heap_data_size = 0;
+  bool release_pending = false;
 };
 
 struct RecoveryRecord {
@@ -300,6 +315,26 @@ Task<StatusOr<std::size_t>> ReadStorageBuffer(
       worker, file, std::span<std::byte>(buffer.data, buffer.size), offset);
 }
 
+Task<StatusOr<std::size_t>> WriteStorageBuffer(
+    Worker& worker, FixedFile file,
+    std::span<const std::byte> buffer, bool registered,
+    FixedBuffer registered_buffer, std::uint64_t offset) {
+  if (registered) {
+    celer::FixedBuffer target = {
+        .data = const_cast<std::byte*>(buffer.data()),
+        .size = buffer.size(),
+        .index = registered_buffer.index,
+    };
+    if (target.index == 0 || target.data == nullptr ||
+        target.size > registered_buffer.size) {
+      co_return Status(StatusCode::kInternal,
+                       "invalid registered write buffer");
+    }
+    co_return co_await celer::WriteFixed(worker, file, target, offset);
+  }
+  co_return co_await celer::Write(worker, file, buffer, offset);
+}
+
 }  // namespace
 
 class StorageEngine::Impl {
@@ -314,11 +349,14 @@ class StorageEngine::Impl {
     RegisteredBufferPool buffers;
     std::vector<FixedFile> files;
     absl::flat_hash_map<Digest, RecordLocation, DigestHash> index;
+  absl::flat_hash_map<std::uint64_t, std::vector<Digest>> staged_records;
     std::size_t live_key_count = 0;
     IntentLockTable key_locks;
     std::array<std::optional<ActiveBlock>, kLogicalStorageShards> active_blocks;
     std::vector<BlockState> block_states;
     AsyncMutex writer_mutex;
+    std::deque<std::uint64_t> flush_queue;
+    bool flush_running = false;
     bool write_failed = false;
     bool defrag_running = false;
   };
@@ -339,6 +377,14 @@ class StorageEngine::Impl {
     }
 
     for (const std::string& path : options_.data_files) {
+      struct stat file_info {};
+      if (::stat(path.c_str(), &file_info) == 0 &&
+          S_ISBLK(file_info.st_mode)) {
+        spdlog::info(
+            "using raw block device {} from offset 0 (configured bytes={})",
+            path, options_.file_size_bytes);
+        continue;
+      }
       Status status = PrepareDataFile(path, options_.file_size_bytes);
       if (!status.ok()) {
         return status;
@@ -437,7 +483,12 @@ class StorageEngine::Impl {
         free_block_count_.fetch_add(1, std::memory_order_release);
       }
     }
-    co_return co_await free_list_barrier_->Wait(worker);
+    status = co_await free_list_barrier_->Wait(worker);
+    if (!status.ok()) {
+      co_return status;
+    }
+    worker.Spawn(PeriodicFlush(&store));
+    co_return Status::Ok();
   }
 
   unsigned OwnerForKey(std::string_view key) const noexcept {
@@ -568,7 +619,45 @@ class StorageEngine::Impl {
     return CurrentStore().live_key_count;
   }
 
+  Status FlushForShutdown() {
+    shutdown_flush_requested_.store(true, std::memory_order_release);
+    unsigned completed =
+        shutdown_flush_completed_.load(std::memory_order_acquire);
+    while (completed < worker_count_) {
+      shutdown_flush_completed_.wait(completed, std::memory_order_acquire);
+      completed = shutdown_flush_completed_.load(std::memory_order_acquire);
+    }
+    if (shutdown_flush_failed_.load(std::memory_order_acquire)) {
+      return Status(StatusCode::kInternal,
+                    "one or more workers failed to flush during shutdown");
+    }
+    return Status::Ok();
+  }
+
  private:
+  FixedBuffer StagingBufferFor(const BlockState& state,
+                              const RegisteredBufferPool& buffers) const {
+    if (state.write_buffer_id != 0) {
+      return buffers.write_buffer(state.write_buffer_id);
+    }
+    return FixedBuffer{.data = state.heap_data,
+                      .size = state.heap_data_size,
+                      .index = 0};
+  }
+
+  void ReleaseStagingBuffer(WorkerStore& store, BlockState& state) {
+    if (state.write_buffer_id != 0) {
+      store.buffers.ReleaseWriteBuffer(state.write_buffer_id);
+    } else if (state.heap_data != nullptr) {
+      store.buffers.ReleaseHeapWriteBuffer(state.heap_data);
+    }
+    state.write_buffer_id = 0;
+    state.heap_data = nullptr;
+    state.heap_data_size = 0;
+    state.release_pending = false;
+    state.in_memory = false;
+  }
+
   struct LoadedValue {
     ReadBufferLease lease;
     std::size_t value_bytes = 0;
@@ -607,6 +696,40 @@ class StorageEngine::Impl {
     FixedBuffer header_buffer = lease.io_buffer();
     header_buffer.size = kDirectIoAlignment;
 
+    struct RecoveryBuffer {
+      RegisteredBufferPool* pool = nullptr;
+      std::uint16_t buffer_id = 0;
+      std::byte* heap_data = nullptr;
+      FixedBuffer buffer{};
+
+      ~RecoveryBuffer() {
+        if (buffer_id != 0) {
+          pool->ReleaseWriteBuffer(buffer_id);
+        } else if (heap_data != nullptr) {
+          pool->ReleaseHeapWriteBuffer(heap_data);
+        }
+      }
+
+      bool registered() const noexcept { return buffer_id != 0; }
+    } recovery{.pool = &store.buffers};
+    if (store.buffers.TryAcquireWriteBuffer(&recovery.buffer_id)) {
+      recovery.buffer = store.buffers.write_buffer(recovery.buffer_id);
+    } else if (store.buffers.TryAcquireHeapWriteBuffer(&recovery.heap_data)) {
+      recovery.buffer = FixedBuffer{
+          .data = recovery.heap_data,
+          .size = options_.buffers.write_buffer_bytes,
+          .index = 0,
+      };
+    } else {
+      co_return Status(StatusCode::kResourceExhausted,
+                       "failed to allocate recovery block buffer");
+    }
+    if (recovery.buffer.size < kStorageBlockBytes) {
+      co_return Status(StatusCode::kResourceExhausted,
+                       "recovery block buffer is smaller than a storage block");
+    }
+    recovery.buffer.size = kStorageBlockBytes;
+
     for (std::uint64_t block_id = store.worker->id(); block_id < total_blocks_;
          block_id += worker_count_) {
       const auto [file_id, block_offset] = FileOffset(block_id);
@@ -627,8 +750,21 @@ class StorageEngine::Impl {
         continue;
       }
 
+      read = co_await ReadStorageBuffer(
+          *store.worker, store.files[file_id], recovery.buffer,
+          recovery.registered(), block_offset);
+      if (!read.ok()) {
+        co_return read.status();
+      }
+      if (*read != kStorageBlockBytes) {
+        co_return Status(StatusCode::kInternal,
+                         "short read while scanning committed block");
+      }
+
       BlockHeader block{};
-      if (!DecodeBlockHeader(block_bytes, &block)) {
+      std::span<const std::byte, kBlockHeaderBytes> recovered_block_header(
+          recovery.buffer.data, kBlockHeaderBytes);
+      if (!DecodeBlockHeader(recovered_block_header, &block)) {
         co_return Status(StatusCode::kInternal,
                          "invalid or corrupt block header");
       }
@@ -650,24 +786,15 @@ class StorageEngine::Impl {
       std::uint32_t record_offset = kBlockHeaderBytes;
       std::uint32_t records = 0;
       while (record_offset < block.committed_bytes) {
-        read = co_await ReadStorageBuffer(
-            *store.worker, store.files[file_id], header_buffer,
-            lease.registered(), block_offset + record_offset);
-        if (!read.ok()) {
-          co_return read.status();
-        }
-        if (*read != kRecordHeaderBytes) {
-          co_return Status(StatusCode::kInternal,
-                           "short read while scanning record header");
-        }
-
         RecordHeader record{};
         std::string_view key;
-        std::span<const std::byte, kRecordHeaderBytes> record_bytes(
-            header_buffer.data, kRecordHeaderBytes);
+        std::span<const std::byte> record_bytes(
+            recovery.buffer.data + record_offset,
+            block.committed_bytes - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
             record.allocation_epoch != block.allocation_epoch ||
-            StorageShardForKey(key) != block.storage_shard_id ||
+            StorageShardForKey(key) % worker_count_ !=
+                block.storage_shard_id % worker_count_ ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt committed record header");
@@ -709,21 +836,19 @@ class StorageEngine::Impl {
       state.committed_bytes = block.committed_bytes;
       state.allocated = true;
 
-      auto& active = store.active_blocks[block.storage_shard_id];
-      if (block.committed_bytes < kStorageBlockBytes &&
-          (!active.has_value() ||
-           block.allocation_epoch > active->allocation_epoch)) {
-        active = block;
-      }
+      // Recovered blocks have no staging buffer. Keep partial blocks sealed;
+      // appending to one would otherwise dereference an absent in-memory copy.
     }
 
     for (const RecoveryRecord& recovered : batch.records) {
       auto found = store.index.find(recovered.digest);
       if (found == store.index.end() ||
           IsNewer(recovered.location, found->second)) {
+        // TODO: add large-record reconstruction on recovery:
+        // gather all chunks for a digest and coalesce into a logical key value.
         const bool was_live =
-            found != store.index.end() &&
-            found->second.kind == RecordKind::kValue;
+          found != store.index.end() &&
+          found->second.kind == RecordKind::kValue;
         const bool is_live = recovered.location.kind == RecordKind::kValue;
         if (found != store.index.end()) {
           BlockState& old_state =
@@ -743,6 +868,13 @@ class StorageEngine::Impl {
         BlockState& new_state =
             store.block_states[recovered.location.block_id];
         new_state.live_bytes += recovered.location.total_disk_bytes;
+        new_state.in_memory = false;
+        new_state.heap_data = nullptr;
+        new_state.heap_data_size = 0;
+        new_state.write_buffer_id = 0;
+        new_state.release_pending = false;
+        new_state.flush_queued = false;
+        new_state.flush_in_progress = false;
       }
     }
   }
@@ -764,11 +896,75 @@ class StorageEngine::Impl {
         state.allocation_epoch != location.allocation_epoch) {
       co_return Status(StatusCode::kInternal, "stale index block epoch");
     }
-    ++state.pins;
-    struct PinGuard {
-      BlockState* state;
-      ~PinGuard() { --state->pins; }
-    } pin{&state};
+    if (location.in_memory && state.in_memory) {
+      ++state.pins;
+      struct PinGuard {
+        WorkerStore* store = nullptr;
+        BlockState* state = nullptr;
+        ~PinGuard() {
+          if (state == nullptr) {
+            return;
+          }
+          --state->pins;
+          if (state->pins == 0 && state->release_pending) {
+            if (state->write_buffer_id != 0) {
+              store->buffers.ReleaseWriteBuffer(state->write_buffer_id);
+            } else if (state->heap_data != nullptr) {
+              store->buffers.ReleaseHeapWriteBuffer(state->heap_data);
+            }
+            state->write_buffer_id = 0;
+            state->heap_data = nullptr;
+            state->heap_data_size = 0;
+            state->release_pending = false;
+            state->in_memory = false;
+          }
+        }
+      } pin{&store, &state};
+
+      auto in_mem_buffer =
+          StagingBufferFor(state, store.buffers);
+      if (!in_mem_buffer.data || in_mem_buffer.size == 0 ||
+          location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
+        co_return Status(StatusCode::kInternal, "invalid in-memory location");
+      }
+      auto acquired = co_await store.buffers.AcquireReadBuffer();
+      if (!acquired.ok()) {
+        co_return acquired.status();
+      }
+      ReadBufferLease lease = std::move(*acquired);
+      FixedBuffer io = lease.io_buffer();
+      if (location.value_bytes > io.size) {
+        co_return Status(StatusCode::kOutOfRange,
+                         "value exceeds registered read buffer capacity");
+      }
+
+      const std::byte* record_bytes =
+          in_mem_buffer.data + location.record_offset;
+      RecordHeader record{};
+      std::string_view disk_key;
+      if (!DecodeRecordHeader(
+              std::span<const std::byte>(record_bytes,
+                                         location.total_disk_bytes),
+              &record, &disk_key) ||
+          record.digest != digest || disk_key != key ||
+          record.kind != RecordKind::kValue ||
+          record.generation != location.generation ||
+          record.relocation_sequence != location.relocation_sequence ||
+          record.allocation_epoch != location.allocation_epoch ||
+          location.value_bytes != record.value_bytes ||
+          location.total_disk_bytes != record.total_disk_bytes) {
+        co_return Status(StatusCode::kInternal,
+                         "record does not match in-memory location");
+      }
+      std::memcpy(io.data, record_bytes + record.header_bytes,
+                  location.value_bytes);
+      if (Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
+          record.payload_checksum) {
+        co_return Status(StatusCode::kInternal,
+                         "record value checksum mismatch");
+      }
+      co_return LoadedValue{std::move(lease), record.value_bytes};
+    }
 
     auto acquired = co_await store.buffers.AcquireReadBuffer();
     if (!acquired.ok()) {
@@ -776,55 +972,54 @@ class StorageEngine::Impl {
     }
     ReadBufferLease lease = std::move(*acquired);
     FixedBuffer io = lease.io_buffer();
-    FixedBuffer header = io;
-    header.size = kRecordHeaderBytes;
 
     const auto [file_id, block_offset] = FileOffset(location.block_id);
+    const std::uint64_t absolute_offset =
+        block_offset + location.record_offset;
+    const std::uint64_t aligned_offset =
+        absolute_offset & ~(static_cast<std::uint64_t>(kDirectIoAlignment) - 1);
+    const std::size_t record_headroom =
+        static_cast<std::size_t>(absolute_offset - aligned_offset);
+    const std::size_t read_bytes =
+        AlignDirect(record_headroom + location.total_disk_bytes);
+    if (read_bytes > io.size) {
+      co_return Status(StatusCode::kOutOfRange,
+                       "record exceeds registered read buffer capacity");
+    }
+    FixedBuffer record_buffer = io;
+    record_buffer.size = read_bytes;
     auto read = co_await ReadStorageBuffer(
-        *store.worker, store.files[file_id], header, lease.registered(),
-        block_offset + location.record_offset);
+        *store.worker, store.files[file_id], record_buffer,
+        lease.registered(), aligned_offset);
     if (!read.ok()) {
       co_return read.status();
     }
-    if (*read != kRecordHeaderBytes) {
-      co_return Status(StatusCode::kInternal, "short record header read");
+    if (*read != read_bytes) {
+      co_return Status(StatusCode::kInternal, "short compact record read");
     }
 
     RecordHeader record{};
     std::string_view disk_key;
-    std::span<const std::byte, kRecordHeaderBytes> record_bytes(
-        header.data, kRecordHeaderBytes);
+    const std::byte* record_data = io.data + record_headroom;
+    std::span<const std::byte> record_bytes(record_data,
+                                           location.total_disk_bytes);
     if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
         record.digest != digest || disk_key != key ||
         record.kind != RecordKind::kValue ||
         record.generation != location.generation ||
         record.relocation_sequence != location.relocation_sequence ||
-        record.allocation_epoch != location.allocation_epoch) {
+        record.allocation_epoch != location.allocation_epoch ||
+        record.value_bytes != location.value_bytes ||
+        record.total_disk_bytes != location.total_disk_bytes) {
       co_return Status(StatusCode::kInternal,
                        "record does not match in-memory location");
     }
-    if (record.value_disk_bytes > io.size) {
-      co_return Status(StatusCode::kOutOfRange,
-                       "value exceeds registered read buffer capacity");
-    }
-    if (record.value_disk_bytes != 0) {
-      FixedBuffer value_buffer = io;
-      value_buffer.size = record.value_disk_bytes;
-      read = co_await ReadStorageBuffer(
-          *store.worker, store.files[file_id], value_buffer,
-          lease.registered(),
-          block_offset + location.record_offset + kRecordHeaderBytes);
-      if (!read.ok()) {
-        co_return read.status();
-      }
-      if (*read != record.value_disk_bytes) {
-        co_return Status(StatusCode::kInternal, "short record value read");
-      }
-    }
-    if (Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
+    const std::byte* value_data = record_data + record.header_bytes;
+    if (Crc32c(std::span<const std::byte>(value_data, record.value_bytes)) !=
         record.payload_checksum) {
       co_return Status(StatusCode::kInternal, "record value checksum mismatch");
     }
+    std::memmove(io.data, value_data, record.value_bytes);
     co_return LoadedValue{std::move(lease), record.value_bytes};
   }
 
@@ -880,16 +1075,24 @@ class StorageEngine::Impl {
       co_return Status(StatusCode::kOutOfRange,
                        "key is too large for the on-disk record header");
     }
-    const std::size_t value_disk_bytes = AlignDirect(value.size());
-    const std::size_t total_disk_bytes =
-        kRecordHeaderBytes + value_disk_bytes;
+    const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
+    const std::size_t value_disk_bytes = value.size();
+    const std::size_t total_disk_bytes = AlignRecord(
+        record_header_bytes + value_disk_bytes);
     if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
-        total_disk_bytes > store.buffers.write_buffer().size) {
+        total_disk_bytes > options_.buffers.write_buffer_bytes) {
+      // TODO: large-value chunking: persist value as manifest+segments so
+      // restart can rebuild one logical value from ordered chunks.
       co_return Status(StatusCode::kOutOfRange,
                        "value requires dedicated multi-block storage");
     }
 
-    const std::uint32_t shard = StorageShardForKey(key);
+    // A worker owns one append stream. Records for different logical key
+    // shards can share the same block because they are all routed to this
+    // worker. The remaining registered write buffers cover blocks being
+    // flushed; heap buffers are the fallback when those are all busy.
+    const std::uint32_t shard =
+        static_cast<std::uint32_t>(store.worker->id());
     auto previous_it = store.index.find(digest);
     const std::optional<RecordLocation> previous =
         previous_it == store.index.end()
@@ -901,12 +1104,41 @@ class StorageEngine::Impl {
     auto& active = store.active_blocks[shard];
     if (!active.has_value() ||
         active->committed_bytes + total_disk_bytes > kStorageBlockBytes) {
+      if (active.has_value()) {
+        RequestFlush(store, active->block_id);
+        active.reset();
+      }
       const std::optional<std::uint64_t> allocated = AllocateBlock(for_defrag);
       if (!allocated.has_value()) {
         co_return Status(StatusCode::kResourceExhausted,
                          "no foreground blocks remain; defrag reserve is protected");
       }
       const std::uint64_t block_id = *allocated;
+      std::uint16_t write_buffer_id = 0;
+      std::byte* heap_buffer = nullptr;
+      if (!store.buffers.TryAcquireWriteBuffer(&write_buffer_id)) {
+        if (!store.buffers.TryAcquireHeapWriteBuffer(&heap_buffer)) {
+          co_return Status(StatusCode::kResourceExhausted,
+                           "no registered or fallback write buffers");
+        }
+      }
+      FixedBuffer staging_buffer = write_buffer_id != 0
+                                      ? store.buffers.write_buffer(write_buffer_id)
+                                      : FixedBuffer{.data = heap_buffer,
+                                                   .size = options_.buffers.write_buffer_bytes,
+                                                   .index = 0};
+      if (staging_buffer.data == nullptr ||
+          staging_buffer.size == 0) {
+        if (write_buffer_id != 0) {
+          store.buffers.ReleaseWriteBuffer(write_buffer_id);
+        } else {
+          store.buffers.ReleaseHeapWriteBuffer(heap_buffer);
+        }
+        co_return Status(StatusCode::kInternal,
+                         "active write staging allocation is invalid");
+      }
+      std::fill_n(staging_buffer.data, staging_buffer.size,
+                  std::byte{0});
       active = ActiveBlock{
           .block_id = block_id,
           .storage_shard_id = shard,
@@ -915,13 +1147,43 @@ class StorageEngine::Impl {
           .committed_bytes = kBlockHeaderBytes,
           .record_count = 0,
           .max_lsn = 0,
+          .write_buffer_id = write_buffer_id,
+          .heap_buffer = heap_buffer,
+          .heap_buffer_size = options_.buffers.write_buffer_bytes,
       };
       BlockState& state = store.block_states[block_id];
+      state = BlockState{};
       state.storage_shard_id = shard;
       state.allocation_epoch = active->allocation_epoch;
       state.committed_bytes = kBlockHeaderBytes;
       state.live_bytes = 0;
+      state.pins = 0;
       state.allocated = true;
+      state.defragging = false;
+      state.in_memory = true;
+      state.flush_queued = false;
+      state.flush_in_progress = false;
+      state.write_buffer_id = write_buffer_id;
+      state.heap_data = heap_buffer;
+      state.heap_data_size = options_.buffers.write_buffer_bytes;
+      store.staged_records.erase(block_id);
+
+      BlockHeader block{
+          .magic = kBlockMagic,
+          .version = kStorageFormatVersion,
+          .header_bytes = kBlockHeaderBytes,
+          .block_bytes = kStorageBlockBytes,
+          .storage_shard_id = shard,
+          .allocation_epoch = active->allocation_epoch,
+          .committed_bytes = kBlockHeaderBytes,
+          .record_count = 0,
+          .max_lsn = 0,
+          .checksum = 0,
+          .reserved = 0,
+      };
+      std::span<std::byte, kBlockHeaderBytes> block_output(
+          staging_buffer.data, kBlockHeaderBytes);
+      EncodeBlockHeader(block, block_output);
     }
 
     ActiveBlock updated = *active;
@@ -930,12 +1192,21 @@ class StorageEngine::Impl {
     ++updated.record_count;
     updated.max_lsn = std::max(updated.max_lsn, lsn);
 
-    FixedBuffer write_buffer = store.buffers.write_buffer();
-    std::fill_n(write_buffer.data, total_disk_bytes, std::byte{0});
+    BlockState& state = store.block_states[updated.block_id];
+    FixedBuffer staging = updated.write_buffer_id != 0
+                              ? store.buffers.write_buffer(updated.write_buffer_id)
+                              : FixedBuffer{.data = updated.heap_buffer,
+                                           .size = state.heap_data_size,
+                                           .index = 0};
+    if (staging.data == nullptr ||
+        record_offset + total_disk_bytes > staging.size) {
+      co_return Status(StatusCode::kInternal, "invalid active staging block");
+    }
+    std::fill_n(staging.data + record_offset, total_disk_bytes, std::byte{0});
     RecordHeader record{
         .magic = kRecordMagic,
         .version = kStorageFormatVersion,
-        .header_bytes = kRecordHeaderBytes,
+        .header_bytes = static_cast<std::uint16_t>(record_header_bytes),
         .kind = kind,
         .flags = 0,
         .digest = digest,
@@ -951,27 +1222,14 @@ class StorageEngine::Impl {
             reinterpret_cast<const std::byte*>(value.data()), value.size())),
         .header_checksum = 0,
     };
-    std::span<std::byte, kRecordHeaderBytes> record_output(
-        write_buffer.data, kRecordHeaderBytes);
+    std::span<std::byte> record_output(staging.data + record_offset,
+                                      record_header_bytes);
     if (!EncodeRecordHeader(record, key, record_output)) {
       co_return Status(StatusCode::kInternal, "record header encoding failed");
     }
     if (!value.empty()) {
-      std::memcpy(write_buffer.data + kRecordHeaderBytes, value.data(),
-                  value.size());
-    }
-
-    const auto [file_id, block_offset] = FileOffset(updated.block_id);
-    FixedBuffer record_buffer = write_buffer;
-    record_buffer.size = total_disk_bytes;
-    auto written = co_await celer::WriteFixed(
-        *store.worker, store.files[file_id], record_buffer,
-        block_offset + record_offset);
-    if (!written.ok() || *written != total_disk_bytes) {
-      store.write_failed = true;
-      co_return written.ok()
-                    ? Status(StatusCode::kInternal, "short record write")
-                    : written.status();
+      std::memcpy(staging.data + record_offset + record_header_bytes,
+                  value.data(), value.size());
     }
 
     BlockHeader block{
@@ -988,23 +1246,19 @@ class StorageEngine::Impl {
         .reserved = 0,
     };
     std::span<std::byte, kBlockHeaderBytes> block_output(
-        write_buffer.data, kBlockHeaderBytes);
+        staging.data, kBlockHeaderBytes);
     EncodeBlockHeader(block, block_output);
-    FixedBuffer block_buffer = write_buffer;
-    block_buffer.size = kBlockHeaderBytes;
-    written = co_await celer::WriteFixed(
-        *store.worker, store.files[file_id], block_buffer, block_offset);
-    if (!written.ok() || *written != kBlockHeaderBytes) {
-      store.write_failed = true;
-      co_return written.ok()
-                    ? Status(StatusCode::kInternal, "short block header write")
-                    : written.status();
-    }
-
-    Status sync = co_await celer::Fdatasync(*store.worker, store.files[file_id]);
-    if (!sync.ok()) {
-      store.write_failed = true;
-      co_return sync;
+    if (updated.committed_bytes == kStorageBlockBytes) {
+      state.in_memory = true;
+      state.write_buffer_id = updated.write_buffer_id;
+      state.heap_data = updated.heap_buffer;
+      state.heap_data_size = updated.heap_buffer_size;
+      RequestFlush(store, updated.block_id);
+      active.reset();
+    } else {
+      state.heap_data = updated.heap_buffer;
+      state.heap_data_size = updated.heap_buffer_size;
+      *active = updated;
     }
 
     const RecordLocation location{
@@ -1016,6 +1270,7 @@ class StorageEngine::Impl {
         .relocation_sequence = relocation_sequence,
         .lsn = lsn,
         .allocation_epoch = updated.allocation_epoch,
+        .in_memory = true,
         .kind = kind,
     };
     const bool was_live =
@@ -1027,6 +1282,7 @@ class StorageEngine::Impl {
                                        previous->total_disk_bytes);
     }
     store.index.insert_or_assign(digest, location);
+    store.staged_records[updated.block_id].push_back(digest);
     if (was_live != is_live) {
       if (is_live) {
         ++store.live_key_count;
@@ -1034,14 +1290,284 @@ class StorageEngine::Impl {
         --store.live_key_count;
       }
     }
-    BlockState& state = store.block_states[updated.block_id];
     state.committed_bytes = updated.committed_bytes;
+    state.in_memory = true;
+    state.write_buffer_id = updated.write_buffer_id;
+    state.heap_data = updated.heap_buffer;
+    state.heap_data_size = updated.heap_buffer_size;
     state.live_bytes += location.total_disk_bytes;
-    *active = updated;
+    state.flush_queued = updated.committed_bytes == kStorageBlockBytes;
     if (!for_defrag) {
       RequestDefrag(store);
     }
     co_return Status::Ok();
+  }
+
+  void SealActiveBlocks(WorkerStore& store) {
+    for (auto& active : store.active_blocks) {
+      if (!active.has_value() ||
+          active->committed_bytes <= kBlockHeaderBytes) {
+        continue;
+      }
+      RequestFlush(store, active->block_id);
+      active.reset();
+    }
+  }
+
+  Task<Status> FlushWorkerForShutdown(WorkerStore* store) {
+    while (store->defrag_running) {
+      Status status = co_await celer::SleepFor(
+          *store->worker, std::chrono::milliseconds(1));
+      if (!status.ok()) {
+        co_return status;
+      }
+    }
+
+    co_await store->writer_mutex.Lock();
+    {
+      UnlockGuard guard(&store->writer_mutex, store->worker);
+      SealActiveBlocks(*store);
+    }
+
+    while (true) {
+      co_await store->writer_mutex.Lock();
+      bool done = false;
+      bool failed = false;
+      {
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+        done = !store->flush_running && store->flush_queue.empty();
+        failed = store->write_failed;
+      }
+      if (failed) {
+        co_return Status(StatusCode::kInternal,
+                         "storage write failed while draining shutdown buffers");
+      }
+      if (done) {
+        co_return Status::Ok();
+      }
+      Status status = co_await celer::SleepFor(
+          *store->worker, std::chrono::milliseconds(1));
+      if (!status.ok()) {
+        co_return status;
+      }
+    }
+  }
+
+  void CompleteShutdownFlush(const Status& status) {
+    if (!status.ok()) {
+      shutdown_flush_failed_.store(true, std::memory_order_release);
+    }
+    shutdown_flush_completed_.fetch_add(1, std::memory_order_acq_rel);
+    shutdown_flush_completed_.notify_all();
+  }
+
+  Task<Status> PeriodicFlush(WorkerStore* store) {
+    const auto interval =
+        std::chrono::milliseconds(options_.flush_max_ms);
+    while (!store->worker->stop_requested()) {
+      Status status = co_await celer::SleepFor(*store->worker, interval);
+      if (!status.ok()) {
+        CompleteShutdownFlush(status);
+        co_return status;
+      }
+      if (store->worker->stop_requested()) {
+        break;
+      }
+
+      if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+        status = co_await FlushWorkerForShutdown(store);
+        CompleteShutdownFlush(status);
+        co_return status;
+      }
+
+      co_await store->writer_mutex.Lock();
+      UnlockGuard guard(&store->writer_mutex, store->worker);
+      SealActiveBlocks(*store);
+    }
+    co_return Status::Ok();
+  }
+
+  void RequestFlush(WorkerStore& store, std::uint64_t block_id) {
+    BlockState& state = store.block_states[block_id];
+    if (!state.allocated || !state.in_memory ||
+        (state.write_buffer_id == 0 && state.heap_data == nullptr)) {
+      return;
+    }
+    if (state.flush_queued || state.flush_in_progress) {
+      return;
+    }
+    state.flush_queued = true;
+    store.flush_queue.push_back(block_id);
+    if (store.flush_running) {
+      return;
+    }
+    store.flush_running = true;
+    store.worker->Spawn(FlushPendingBlocks(&store));
+  }
+
+  Task<Status> FlushPendingBlocks(WorkerStore* store) {
+    struct PendingFlush {
+      std::uint64_t block_id = 0;
+      std::uint32_t committed_bytes = 0;
+      std::uint64_t allocation_epoch = 0;
+      std::uint16_t write_buffer_id = 0;
+      std::byte* heap_data = nullptr;
+      std::size_t heap_data_size = 0;
+      std::vector<Digest> staged_records;
+    };
+
+    while (true) {
+      std::optional<PendingFlush> pending;
+      auto release_pending = [&](const PendingFlush& block) {
+        if (block.write_buffer_id != 0) {
+          store->buffers.ReleaseWriteBuffer(block.write_buffer_id);
+        } else if (block.heap_data != nullptr) {
+          store->buffers.ReleaseHeapWriteBuffer(block.heap_data);
+        }
+      };
+
+      {
+        co_await store->writer_mutex.Lock();
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+
+        if (store->flush_queue.empty()) {
+          store->flush_running = false;
+          co_return Status::Ok();
+        }
+
+        const std::uint64_t block_id = store->flush_queue.front();
+        store->flush_queue.pop_front();
+        if (block_id >= store->block_states.size()) {
+          continue;
+        }
+        BlockState& state = store->block_states[block_id];
+        if (!state.allocated || !state.in_memory ||
+            (state.write_buffer_id == 0 && state.heap_data == nullptr) ||
+            state.flush_in_progress) {
+          state.flush_queued = false;
+          continue;
+        }
+        if (state.pins > 0) {
+          store->flush_queue.push_back(block_id);
+          state.flush_queued = true;
+          continue;
+        }
+
+        pending.emplace(PendingFlush{
+            .block_id = block_id,
+            .committed_bytes = state.committed_bytes,
+            .allocation_epoch = state.allocation_epoch,
+            .write_buffer_id = state.write_buffer_id,
+            .heap_data = state.heap_data,
+            .heap_data_size = state.heap_data_size,
+        });
+        if (auto found = store->staged_records.find(block_id);
+            found != store->staged_records.end()) {
+          pending->staged_records = std::move(found->second);
+          store->staged_records.erase(found);
+        }
+        state.flush_queued = false;
+        state.flush_in_progress = true;
+      }
+
+      const auto [file_id, block_offset] =
+          FileOffset(pending->block_id);
+      FixedBuffer staging = pending->write_buffer_id != 0
+                               ? store->buffers.write_buffer(
+                                     pending->write_buffer_id)
+                               : FixedBuffer{.data = pending->heap_data,
+                                            .size = pending->heap_data_size,
+                                            .index = 0};
+      const std::size_t write_bytes = AlignDirect(pending->committed_bytes);
+      if (staging.data == nullptr || staging.size < write_bytes) {
+        co_await store->writer_mutex.Lock();
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+        BlockState& state = store->block_states[pending->block_id];
+        state.flush_in_progress = false;
+        state.flush_queued = false;
+        store->write_failed = true;
+        store->flush_running = false;
+        release_pending(*pending);
+        co_return Status(StatusCode::kInternal,
+                         "invalid pending flush staging buffer");
+      }
+
+      auto written = co_await WriteStorageBuffer(
+          *store->worker, store->files[file_id],
+          std::span<const std::byte>(staging.data, write_bytes),
+          pending->write_buffer_id != 0, staging,
+          block_offset);
+      if (!written.ok()) {
+        co_await store->writer_mutex.Lock();
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+        BlockState& state = store->block_states[pending->block_id];
+        state.flush_in_progress = false;
+        state.flush_queued = false;
+        store->write_failed = true;
+        store->flush_running = false;
+        release_pending(*pending);
+        co_return written.status();
+      }
+      if (*written != write_bytes) {
+        co_await store->writer_mutex.Lock();
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+        BlockState& state = store->block_states[pending->block_id];
+        state.flush_in_progress = false;
+        state.flush_queued = false;
+        store->write_failed = true;
+        store->flush_running = false;
+        release_pending(*pending);
+        co_return Status(StatusCode::kInternal,
+                         "short block flush write");
+      }
+      auto synced = co_await celer::Fdatasync(*store->worker,
+                                              store->files[file_id]);
+      if (!synced.ok()) {
+        co_await store->writer_mutex.Lock();
+        UnlockGuard guard(&store->writer_mutex, store->worker);
+        BlockState& state = store->block_states[pending->block_id];
+        state.flush_in_progress = false;
+        state.flush_queued = false;
+        store->write_failed = true;
+        store->flush_running = false;
+        release_pending(*pending);
+        co_return synced;
+      }
+
+      co_await store->writer_mutex.Lock();
+      UnlockGuard write_guard(&store->writer_mutex, store->worker);
+      if (pending->block_id >= store->block_states.size()) {
+        store->flush_running = false;
+        co_return Status::Ok();
+      }
+      BlockState& state = store->block_states[pending->block_id];
+      if (!state.allocated || state.flush_in_progress == false ||
+          state.allocation_epoch != pending->allocation_epoch) {
+        state.flush_in_progress = false;
+        state.flush_queued = false;
+        release_pending(*pending);
+        store->flush_running = false;
+        co_return Status::Ok();
+      }
+
+      for (const Digest& digest : pending->staged_records) {
+        auto current = store->index.find(digest);
+        if (current != store->index.end() &&
+            current->second.block_id == pending->block_id &&
+            current->second.allocation_epoch == pending->allocation_epoch) {
+          current->second.in_memory = false;
+        }
+      }
+
+      state.flush_in_progress = false;
+      state.flush_queued = false;
+      state.in_memory = false;
+      if (state.pins > 0) {
+        state.release_pending = true;
+        continue;
+      }
+      ReleaseStagingBuffer(*store, state);
+    }
   }
 
   bool IsActiveBlock(const WorkerStore& store,
@@ -1062,6 +1588,7 @@ class StorageEngine::Impl {
          ++block_id) {
       const BlockState& state = store.block_states[block_id];
       if (!state.allocated || state.defragging || state.pins != 0 ||
+          state.in_memory || state.flush_queued || state.flush_in_progress ||
           IsActiveBlock(store, block_id) ||
           state.committed_bytes <= kBlockHeaderBytes) {
         continue;
@@ -1079,7 +1606,8 @@ class StorageEngine::Impl {
   }
 
   void RequestDefrag(WorkerStore& store) {
-    if (store.defrag_running || !SelectDefragCandidate(store).has_value()) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        store.defrag_running || !SelectDefragCandidate(store).has_value()) {
       return;
     }
     store.defrag_running = true;
@@ -1104,41 +1632,68 @@ class StorageEngine::Impl {
   Task<Status> CleanBlockLocked(WorkerStore& store,
                                 std::uint64_t block_id) {
     BlockState& source = store.block_states[block_id];
-    if (!source.allocated || source.pins != 0 ||
+    if (!source.allocated || source.in_memory || source.pins != 0 ||
+        source.flush_queued || source.flush_in_progress ||
         IsActiveBlock(store, block_id)) {
       co_return Status::Ok();
     }
     source.defragging = true;
 
-    auto acquired = co_await store.buffers.AcquireReadBuffer();
-    if (!acquired.ok()) {
+    struct DefragBuffer {
+      RegisteredBufferPool* pool = nullptr;
+      std::uint16_t buffer_id = 0;
+      std::byte* heap_data = nullptr;
+      FixedBuffer buffer{};
+
+      ~DefragBuffer() {
+        if (buffer_id != 0) {
+          pool->ReleaseWriteBuffer(buffer_id);
+        } else if (heap_data != nullptr) {
+          pool->ReleaseHeapWriteBuffer(heap_data);
+        }
+      }
+
+      bool registered() const noexcept { return buffer_id != 0; }
+    } block_data{.pool = &store.buffers};
+    if (store.buffers.TryAcquireWriteBuffer(&block_data.buffer_id)) {
+      block_data.buffer = store.buffers.write_buffer(block_data.buffer_id);
+    } else if (store.buffers.TryAcquireHeapWriteBuffer(&block_data.heap_data)) {
+      block_data.buffer = FixedBuffer{
+          .data = block_data.heap_data,
+          .size = options_.buffers.write_buffer_bytes,
+          .index = 0,
+      };
+    } else {
       source.defragging = false;
-      co_return acquired.status();
+      co_return Status(StatusCode::kResourceExhausted,
+                       "failed to allocate defrag block buffer");
     }
-    ReadBufferLease lease = std::move(*acquired);
-    FixedBuffer io = lease.io_buffer();
-    FixedBuffer header_buffer = io;
-    header_buffer.size = kRecordHeaderBytes;
+    if (block_data.buffer.size < kStorageBlockBytes) {
+      source.defragging = false;
+      co_return Status(StatusCode::kResourceExhausted,
+                       "defrag block buffer is smaller than a storage block");
+    }
+    block_data.buffer.size = kStorageBlockBytes;
     const auto [source_file_id, source_block_offset] = FileOffset(block_id);
+    auto read = co_await ReadStorageBuffer(
+        *store.worker, store.files[source_file_id], block_data.buffer,
+        block_data.registered(), source_block_offset);
+    if (!read.ok() || *read != kStorageBlockBytes) {
+      source.defragging = false;
+      co_return read.ok()
+                    ? Status(StatusCode::kInternal,
+                             "short block read during defrag")
+                    : read.status();
+    }
 
     std::uint32_t record_offset = kBlockHeaderBytes;
     while (record_offset < source.committed_bytes) {
-      auto read = co_await ReadStorageBuffer(
-          *store.worker, store.files[source_file_id], header_buffer,
-          lease.registered(), source_block_offset + record_offset);
-      if (!read.ok() || *read != kRecordHeaderBytes) {
-        source.defragging = false;
-        co_return read.ok()
-                      ? Status(StatusCode::kInternal,
-                               "short record header read during defrag")
-                      : read.status();
-      }
-
       RecordHeader record{};
       std::string_view disk_key;
-      std::span<const std::byte, kRecordHeaderBytes> header_bytes(
-          header_buffer.data, kRecordHeaderBytes);
-      if (!DecodeRecordHeader(header_bytes, &record, &disk_key) ||
+      std::span<const std::byte> record_bytes(
+          block_data.buffer.data + record_offset,
+          source.committed_bytes - record_offset);
+      if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
           record.allocation_epoch != source.allocation_epoch ||
           record_offset + record.total_disk_bytes > source.committed_bytes) {
         source.defragging = false;
@@ -1175,30 +1730,12 @@ class StorageEngine::Impl {
         }
 
         const std::string key(disk_key);
-        std::string_view value;
-        if (record.value_disk_bytes != 0) {
-          if (record.value_disk_bytes > io.size) {
-            source.defragging = false;
-            co_return Status(StatusCode::kOutOfRange,
-                             "defrag value exceeds registered read buffer");
-          }
-          FixedBuffer value_buffer = io;
-          value_buffer.size = record.value_disk_bytes;
-          read = co_await ReadStorageBuffer(
-              *store.worker, store.files[source_file_id], value_buffer,
-              lease.registered(),
-              source_block_offset + record_offset + kRecordHeaderBytes);
-          if (!read.ok() || *read != record.value_disk_bytes) {
-            source.defragging = false;
-            co_return read.ok()
-                          ? Status(StatusCode::kInternal,
-                                   "short value read during defrag")
-                          : read.status();
-          }
-          value = std::string_view(reinterpret_cast<const char*>(io.data),
-                                   record.value_bytes);
-        }
-        if (Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
+        const std::byte* value_data =
+            block_data.buffer.data + record_offset + record.header_bytes;
+        const std::string_view value(
+            reinterpret_cast<const char*>(value_data), record.value_bytes);
+        if (Crc32c(std::span<const std::byte>(value_data,
+                                             record.value_bytes)) !=
             record.payload_checksum) {
           source.defragging = false;
           co_return Status(StatusCode::kInternal,
@@ -1223,12 +1760,25 @@ class StorageEngine::Impl {
       co_return Status::Ok();
     }
 
-    FixedBuffer zero = store.buffers.write_buffer();
-    zero.size = kBlockHeaderBytes;
+    auto* zero_buffer = static_cast<std::byte*>(::operator new[](
+        kBlockHeaderBytes, std::align_val_t(options_.buffers.alignment),
+        std::nothrow));
+    if (zero_buffer == nullptr) {
+      source.defragging = false;
+      store.write_failed = true;
+      co_return Status(StatusCode::kResourceExhausted,
+                       "failed to allocate temporary zero header buffer");
+    }
+    std::fill_n(zero_buffer, kBlockHeaderBytes, std::byte{0});
+    FixedBuffer zero{.data = zero_buffer, .size = kBlockHeaderBytes, .index = 0};
     std::fill_n(zero.data, zero.size, std::byte{0});
-    auto written = co_await celer::WriteFixed(
-        *store.worker, store.files[source_file_id], zero, source_block_offset);
+    auto written = co_await WriteStorageBuffer(
+        *store.worker, store.files[source_file_id],
+        std::span<const std::byte>(zero.data, zero.size),
+        false, {}, source_block_offset);
     if (!written.ok() || *written != kBlockHeaderBytes) {
+      ::operator delete[](zero_buffer,
+                          std::align_val_t(options_.buffers.alignment));
       source.defragging = false;
       store.write_failed = true;
       co_return written.ok()
@@ -1239,10 +1789,15 @@ class StorageEngine::Impl {
     Status sync =
         co_await celer::Fdatasync(*store.worker, store.files[source_file_id]);
     if (!sync.ok()) {
+      ::operator delete[](zero_buffer,
+                          std::align_val_t(options_.buffers.alignment));
       source.defragging = false;
       store.write_failed = true;
       co_return sync;
     }
+
+    ::operator delete[](zero_buffer,
+                        std::align_val_t(options_.buffers.alignment));
 
     source = BlockState{};
     if (!free_blocks_.enqueue(block_id)) {
@@ -1267,6 +1822,9 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> next_block_id_{0};
   std::atomic<std::uint64_t> next_allocation_epoch_{1};
   std::atomic<std::uint64_t> next_lsn_{1};
+  std::atomic<bool> shutdown_flush_requested_{false};
+  std::atomic<unsigned> shutdown_flush_completed_{0};
+  std::atomic<bool> shutdown_flush_failed_{false};
 };
 
 StorageEngine::StorageEngine(StorageEngineOptions options)
@@ -1280,6 +1838,10 @@ Status StorageEngine::Prepare(unsigned worker_count) {
 
 Task<Status> StorageEngine::InitializeWorker(Worker& worker) {
   co_return co_await impl_->InitializeWorker(worker);
+}
+
+Status StorageEngine::FlushForShutdown() {
+  return impl_->FlushForShutdown();
 }
 
 unsigned StorageEngine::OwnerForKey(std::string_view key) const noexcept {
