@@ -1,10 +1,12 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "celer/base/status.h"
 #include "celer/runtime/task.h"
+#include "keylane/storage/engine.h"
 
 namespace keylane {
 
@@ -15,6 +17,7 @@ using celer::Task;
 
 enum class CommandKind {
   kPing,
+  kDbSize,
   kDel,
   kExists,
   kGet,
@@ -30,16 +33,17 @@ struct CommandRequest {
 
 struct CommandReply {
   std::string encoded;
+  std::optional<storage::DiskValue> disk_value;
   bool close_connection = false;
 };
 
 StatusOr<CommandRequest> BuildCommandRequest(RespCommand command);
 
-// Create one shard (DbShard) per worker. Call once before the server starts.
-void InitShards(unsigned num_shards);
+// Bind command routing to the disk engine. Call once before the server starts.
+void InitStorage(storage::StorageEngine* engine);
 
-// Route `request` to the shard that owns its key (hash(key) % num_shards),
-// running it locally or via cross-core SubmitTo, and return the encoded reply.
+// Route `request` to the worker owning its 64-slot storage shard. Async disk
+// operations use SubmitTaskTo and return on the connection's original worker.
 Task<CommandReply> ExecuteCommand(const CommandRequest& request);
 
 }  // namespace keylane

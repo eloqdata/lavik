@@ -4,3 +4,6 @@
 [submodule "celer-raft"]
 	path = celer-raft
 	url = https://github.com/thweetkomputer/celer-raft.git
+[submodule "third_party/abseil"]
+	path = third_party/abseil
+	url = https://github.com/abseil/abseil-cpp.git

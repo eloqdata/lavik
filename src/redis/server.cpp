@@ -1,12 +1,14 @@
 #include "keylane/server.h"
 
 #include <array>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
 #include <poll.h>
 #include <span>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <sys/eventfd.h>
@@ -18,6 +20,7 @@
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
 #include "keylane/resp.h"
+#include "keylane/storage/engine.h"
 
 namespace keylane {
 using namespace celer;
@@ -107,11 +110,40 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 
 class RedisService final : public TcpService {
  public:
-  explicit RedisService(std::uint16_t port) : TcpService(port) {}
+  RedisService(std::uint16_t port, storage::StorageEngine* storage)
+      : TcpService(port), storage_(storage) {}
+
+  void Prepare(unsigned thread_count) override;
+  Task<Status> Run(Worker& worker, ServiceContext ctx) override;
+  bool startup_failed() const noexcept {
+    return startup_failed_.load(std::memory_order_acquire);
+  }
 
  protected:
   Task<Status> Serve(TcpStream stream) override;
+
+ private:
+  storage::StorageEngine* storage_;
+  std::atomic<bool> startup_failed_{false};
 };
+
+void RedisService::Prepare(unsigned thread_count) {
+  TcpService::Prepare(thread_count);
+}
+
+Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
+  Status status = co_await storage_->InitializeWorker(worker);
+  if (!status.ok()) [[unlikely]] {
+    startup_failed_.store(true, std::memory_order_release);
+    spdlog::error("worker[{}] storage initialization failed: {}", worker.id(),
+                  status.message());
+    worker.RequestStop();
+    co_return status;
+  }
+
+  spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
+  co_return co_await TcpService::Run(worker, ctx);
+}
 
 Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
   std::array<std::byte, 4096> buffer{};
@@ -166,23 +198,26 @@ Task<Status> RedisService::Serve(TcpStream stream) {
     }
 
     auto request_result = BuildCommandRequest(std::move(*command_result));
-    std::string reply;
-    bool close_connection = false;
+    CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
-      reply = EncodeError("ERR " + request_result.status().message());
+      reply.encoded = EncodeError("ERR " + request_result.status().message());
     } else {
-      CommandReply executed = co_await ExecuteCommand(*request_result);
-      reply = std::move(executed.encoded);
-      close_connection = executed.close_connection;
+      reply = co_await ExecuteCommand(*request_result);
     }
 
-    auto write_status = co_await stream.WriteAll(
-        std::span<const std::byte>(reinterpret_cast<const std::byte*>(reply.data()),
-                                   reply.size()));
+    Status write_status;
+    if (reply.disk_value.has_value()) {
+      write_status =
+          co_await stream.WriteAll(reply.disk_value->network_bytes());
+    } else {
+      write_status = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(reply.encoded.data()),
+          reply.encoded.size()));
+    }
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }
-    if (close_connection || ShutdownRequested()) [[unlikely]] {
+    if (reply.close_connection || ShutdownRequested()) [[unlikely]] {
       stream.Close();
       co_return Status::Ok();
     }
@@ -194,9 +229,13 @@ Task<Status> RedisService::Serve(TcpStream stream) {
 }  // namespace
 
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
-              int idle_timeout_ms, unsigned recv_buffer_count) {
-  spdlog::info("keylane listening on {}:{} threads={} idle_timeout_ms={}",
-               bind_ip, port, thread_count, idle_timeout_ms);
+              int idle_timeout_ms, unsigned recv_buffer_count,
+              std::size_t registered_buffer_bytes,
+              const std::vector<std::string>& data_files,
+              std::uint64_t data_file_size_bytes) {
+  spdlog::info(
+      "keylane listening on {}:{} threads={} idle_timeout_ms={} registered_buffer_bytes={} per worker",
+      bind_ip, port, thread_count, idle_timeout_ms, registered_buffer_bytes);
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {
@@ -204,7 +243,18 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
     return 1;
   }
 
-  InitShards(thread_count);
+  storage::StorageEngineOptions storage_options;
+  storage_options.data_files = data_files;
+  storage_options.file_size_bytes = data_file_size_bytes;
+  storage_options.buffers.registered_bytes = registered_buffer_bytes;
+  storage::StorageEngine storage(std::move(storage_options));
+  Status storage_status = storage.Prepare(thread_count);
+  if (!storage_status.ok()) [[unlikely]] {
+    spdlog::error("storage prepare failed: {}", storage_status.message());
+    CleanupShutdownSignalHandler();
+    return 1;
+  }
+  InitStorage(&storage);
 
   ServerOptions options;
   options.bind_ip = std::string(bind_ip);
@@ -212,7 +262,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   options.idle_timeout_ms = idle_timeout_ms;
   options.recv_buffer_count = recv_buffer_count;
 
-  RedisService redis(port);
+  RedisService redis(port, &storage);
   Server server;
   server.AddService(&redis);
   auto start_status = server.Start(options);
@@ -230,7 +280,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
     server.RequestStop();
   }
   server.WaitUntilStopped();
-  const int exit_code = server.exit_code();
+  const int exit_code = redis.startup_failed() ? 1 : server.exit_code();
   CleanupShutdownSignalHandler();
   return exit_code;
 }

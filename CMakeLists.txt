@@ -13,6 +13,14 @@ option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
+set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory(
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil"
+  "${CMAKE_CURRENT_BINARY_DIR}/third_party/abseil"
+  EXCLUDE_FROM_ALL
+)
+
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
 else()
@@ -20,8 +28,10 @@ else()
 endif()
 
 add_library(keylane_module
+  src/storage/buffer_pool.cpp
+  src/storage/engine.cpp
+  src/storage/format.cpp
   src/redis/resp.cpp
-  src/redis/db.cpp
   src/redis/command.cpp
   src/redis/server.cpp
 )
@@ -31,6 +41,8 @@ add_library(keylane::module ALIAS keylane_module)
 target_include_directories(keylane_module
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+  SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil
 )
 
 target_precompile_headers(keylane_module PRIVATE
@@ -38,7 +50,7 @@ target_precompile_headers(keylane_module PRIVATE
 )
 
 target_compile_features(keylane_module PUBLIC cxx_std_23)
-target_link_libraries(keylane_module PUBLIC celer::core)
+target_link_libraries(keylane_module PUBLIC celer::core absl::flat_hash_map)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(keylane_module PRIVATE -Wall -Wextra -Wpedantic)

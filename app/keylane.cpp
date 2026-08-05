@@ -1,5 +1,8 @@
+#include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <vector>
 
 #include "keylane/CLI11.hpp"
 #include "keylane/server.h"
@@ -12,6 +15,9 @@ int main(int argc, char** argv) {
   unsigned threads = 1;
   int idle_timeout_ms = -1;
   unsigned recv_buffer_count = 1024;
+  unsigned registered_buffer_mb = 16;
+  std::vector<std::string> data_files{"keylane.data"};
+  std::uint64_t data_file_size_mb = 1024;
 
   app.add_option("-b,--bind", bind_ip, "Bind address")->capture_default_str();
   app.add_option("-p,--port", port, "Listen port")->capture_default_str();
@@ -21,7 +27,18 @@ int main(int argc, char** argv) {
   app.add_option("-i,--idle-timeout", idle_timeout_ms, "Idle timeout in ms (-1 = disabled)")
       ->capture_default_str();
   app.add_option("--recv-buffers", recv_buffer_count,
-                 "Multishot recv buffer-ring entries per worker")
+                 "Multishot recv buffer-ring entries per worker (0 disables)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--registered-buffer-mb", registered_buffer_mb,
+                 "Registered storage buffer budget in MiB per worker")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--data-file", data_files,
+                 "Data file path; repeat for multiple files")
+      ->capture_default_str();
+  app.add_option("--data-file-size-mb", data_file_size_mb,
+                 "Preallocated size of each data file in MiB")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
 
@@ -31,5 +48,14 @@ int main(int argc, char** argv) {
     return app.exit(e);
   }
 
-  return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms, recv_buffer_count);
+  constexpr std::size_t kMiB = 1024 * 1024;
+  if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
+      data_file_size_mb >
+          std::numeric_limits<std::uint64_t>::max() / kMiB) {
+    return 2;
+  }
+  return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms,
+                            recv_buffer_count,
+                            static_cast<std::size_t>(registered_buffer_mb) * kMiB,
+                            data_files, data_file_size_mb * kMiB);
 }
