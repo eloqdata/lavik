@@ -6,6 +6,7 @@
 
 #include "celer/base/status.h"
 #include "celer/runtime/task.h"
+#include "keylane/read_trace.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
@@ -35,6 +36,7 @@ struct CommandReply {
   std::string encoded;
   std::optional<storage::DiskValue> disk_value;
   bool close_connection = false;
+  ReadLatencyTrace read_trace;
 };
 
 StatusOr<CommandRequest> BuildCommandRequest(RespCommand command);

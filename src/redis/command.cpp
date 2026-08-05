@@ -122,7 +122,8 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request) {
                          std::nullopt, false};
 }
 
-Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request) {
+Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
+                                         ReadLatencyTrace* read_trace = nullptr) {
   CommandReply reply;
   const auto& args = request.args;
   switch (request.kind) {
@@ -132,7 +133,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request) {
             EncodeError("ERR wrong number of arguments for 'get' command");
         co_return reply;
       }
-      auto value = co_await g_storage->Get(args[1]);
+      auto value = co_await g_storage->Get(args[1], read_trace);
       if (!value.ok()) {
         if (value.status().code() == StatusCode::kNotFound) {
           reply.encoded = EncodeNullBulkString();
@@ -254,6 +255,31 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
     case CommandKind::kIncr:
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);
+#if KEYLANE_ENABLE_READ_LATENCY_TRACE
+        if (request.kind == CommandKind::kGet) {
+          ReadLatencyTrace trace;
+          trace.request_start_ns = ReadTraceNowNanos();
+          trace.remote = target != ThisWorker().id;
+          CommandReply reply;
+          if (trace.remote) {
+            reply = co_await SubmitTaskTo(
+                target, [&request, &trace]() -> Task<CommandReply> {
+                  trace.owner_start_ns = ReadTraceNowNanos();
+                  CommandReply result =
+                      co_await ExecuteStorageCommand(request, &trace);
+                  trace.owner_done_ns = ReadTraceNowNanos();
+                  co_return result;
+                });
+          } else {
+            trace.owner_start_ns = trace.request_start_ns;
+            reply = co_await ExecuteStorageCommand(request, &trace);
+            trace.owner_done_ns = ReadTraceNowNanos();
+          }
+          trace.origin_resume_ns = ReadTraceNowNanos();
+          reply.read_trace = trace;
+          co_return reply;
+        }
+#endif
         if (target != ThisWorker().id) {
           co_return co_await SubmitTaskTo(
               target, [&request]() -> Task<CommandReply> {

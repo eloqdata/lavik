@@ -1,6 +1,7 @@
 #include "keylane/server.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <csignal>
 #include <cstdint>
@@ -26,6 +27,129 @@ namespace keylane {
 using namespace celer;
 
 namespace {
+
+constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
+    1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 40, 50, 75, 100,
+    150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000,
+    8000, 10000, 20000, 50000};
+
+struct LatencyDistribution {
+  std::uint64_t sum_ns = 0;
+  std::array<std::uint64_t, kLatencyBucketUpperUs.size()> buckets{};
+
+  void Add(std::uint64_t ns) noexcept {
+    sum_ns += ns;
+    const std::uint64_t us = (ns + 999) / 1000;
+    const auto it = std::lower_bound(kLatencyBucketUpperUs.begin(),
+                                     kLatencyBucketUpperUs.end(), us);
+    const std::size_t index =
+        it == kLatencyBucketUpperUs.end()
+            ? kLatencyBucketUpperUs.size() - 1
+            : static_cast<std::size_t>(it - kLatencyBucketUpperUs.begin());
+    ++buckets[index];
+  }
+
+  double AverageUs(std::uint64_t count) const noexcept {
+    return count == 0 ? 0.0
+                      : static_cast<double>(sum_ns) /
+                            (1000.0 * static_cast<double>(count));
+  }
+
+  std::uint64_t PercentileUpperUs(std::uint64_t count,
+                                  double percentile) const noexcept {
+    if (count == 0) {
+      return 0;
+    }
+    const std::uint64_t target = static_cast<std::uint64_t>(
+        static_cast<double>(count) * percentile + 0.999999);
+    std::uint64_t cumulative = 0;
+    for (std::size_t i = 0; i < buckets.size(); ++i) {
+      cumulative += buckets[i];
+      if (cumulative >= target) {
+        return kLatencyBucketUpperUs[i];
+      }
+    }
+    return kLatencyBucketUpperUs.back();
+  }
+};
+
+struct ReadLatencyStats {
+  std::uint64_t count = 0;
+  std::uint64_t remote = 0;
+  std::uint64_t hits = 0;
+  std::uint64_t disk_reads = 0;
+  std::uint64_t heap_buffers = 0;
+  std::uint64_t next_report_ns = 0;
+  LatencyDistribution total;
+  LatencyDistribution route_out;
+  LatencyDistribution lookup;
+  LatencyDistribution buffer;
+  LatencyDistribution io;
+  LatencyDistribution decode;
+  LatencyDistribution route_back;
+  LatencyDistribution send;
+};
+
+std::uint64_t Elapsed(std::uint64_t end, std::uint64_t start) noexcept {
+  return end >= start && start != 0 ? end - start : 0;
+}
+
+void RecordReadLatency(const ReadLatencyTrace& trace) {
+  static thread_local ReadLatencyStats stats;
+  if (trace.request_start_ns == 0 || trace.send_complete_ns == 0) {
+    return;
+  }
+  ++stats.count;
+  stats.remote += trace.remote;
+  stats.hits += trace.hit;
+  stats.disk_reads += trace.disk_read;
+  stats.heap_buffers += trace.heap_read_buffer;
+  stats.total.Add(Elapsed(trace.send_complete_ns, trace.request_start_ns));
+  stats.route_out.Add(Elapsed(trace.owner_start_ns, trace.request_start_ns));
+  stats.lookup.Add(Elapsed(trace.lookup_done_ns, trace.owner_start_ns));
+  stats.buffer.Add(
+      Elapsed(trace.buffer_acquired_ns, trace.buffer_acquire_start_ns));
+  stats.io.Add(Elapsed(trace.io_complete_ns, trace.io_submit_ns));
+  stats.decode.Add(Elapsed(trace.decode_done_ns, trace.io_complete_ns));
+  stats.route_back.Add(Elapsed(trace.origin_resume_ns, trace.owner_done_ns));
+  stats.send.Add(Elapsed(trace.send_complete_ns, trace.send_start_ns));
+
+  const std::uint64_t now = trace.send_complete_ns;
+  if (stats.next_report_ns == 0) {
+    stats.next_report_ns = now + 10'000'000'000ULL;
+    return;
+  }
+  if (now < stats.next_report_ns) {
+    return;
+  }
+
+  const auto avg = [&](const LatencyDistribution& value) {
+    return value.AverageUs(stats.count);
+  };
+  const auto p999 = [&](const LatencyDistribution& value) {
+    return value.PercentileUpperUs(stats.count, 0.999);
+  };
+  const auto wake_stats = ThisWorker().self->TakeWakeStats();
+  spdlog::info(
+      "read-latency worker={} n={} remote={:.1f}% hit={:.1f}% disk={:.1f}% "
+      "heap-buffer={:.1f}% avg-us total={:.1f} route-out={:.1f} lookup={:.1f} "
+      "buffer={:.1f} io={:.1f} decode={:.1f} route-back={:.1f} send={:.1f} "
+      "p99.9-us total<={} route-out<={} lookup<={} buffer<={} io<={} "
+      "decode<={} route-back<={} send<={} wake-sent={}/{}",
+      ThisWorker().id, stats.count,
+      100.0 * static_cast<double>(stats.remote) / stats.count,
+      100.0 * static_cast<double>(stats.hits) / stats.count,
+      100.0 * static_cast<double>(stats.disk_reads) / stats.count,
+      100.0 * static_cast<double>(stats.heap_buffers) / stats.count,
+      avg(stats.total), avg(stats.route_out), avg(stats.lookup), avg(stats.buffer),
+      avg(stats.io), avg(stats.decode), avg(stats.route_back), avg(stats.send),
+      p999(stats.total), p999(stats.route_out), p999(stats.lookup),
+      p999(stats.buffer), p999(stats.io), p999(stats.decode),
+      p999(stats.route_back), p999(stats.send),
+      wake_stats.sent, wake_stats.checks);
+  stats = ReadLatencyStats{};
+  stats.next_report_ns = now + 10'000'000'000ULL;
+}
 
 std::atomic<bool> g_shutdown_requested = false;
 volatile sig_atomic_t g_last_shutdown_signal = 0;
@@ -264,6 +388,9 @@ Task<Status> RedisService::Serve(TcpStream stream) {
     }
 
     Status write_status;
+    if (reply.read_trace.request_start_ns != 0) {
+      reply.read_trace.send_start_ns = ReadTraceNowNanos();
+    }
     if (reply.disk_value.has_value()) {
       write_status =
           co_await stream.WriteAll(reply.disk_value->network_bytes());
@@ -271,6 +398,10 @@ Task<Status> RedisService::Serve(TcpStream stream) {
       write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(reply.encoded.data()),
           reply.encoded.size()));
+    }
+    if (reply.read_trace.request_start_ns != 0) {
+      reply.read_trace.send_complete_ns = ReadTraceNowNanos();
+      RecordReadLatency(reply.read_trace);
     }
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
@@ -288,14 +419,16 @@ Task<Status> RedisService::Serve(TcpStream stream) {
 
 int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
               int idle_timeout_ms, unsigned recv_buffer_count,
+              unsigned busy_poll_us,
               std::size_t registered_buffer_bytes,
-              std::uint32_t flush_max_ms,
+              std::uint32_t flush_max_ms, bool verify_read_crc,
               const std::vector<std::string>& data_files,
               std::uint64_t data_file_size_bytes) {
   spdlog::info(
-      "keylane listening on {}:{} threads={} idle_timeout_ms={} registered_buffer_bytes={} per worker flush_max_ms={}",
-      bind_ip, port, thread_count, idle_timeout_ms, registered_buffer_bytes,
-      flush_max_ms);
+      "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
+      "registered_buffer_bytes={} per worker flush_max_ms={} verify_read_crc={}",
+      bind_ip, port, thread_count, idle_timeout_ms, busy_poll_us,
+      registered_buffer_bytes, flush_max_ms, verify_read_crc);
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {
@@ -307,6 +440,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   storage_options.data_files = data_files;
   storage_options.file_size_bytes = data_file_size_bytes;
   storage_options.flush_max_ms = flush_max_ms;
+  storage_options.verify_read_crc = verify_read_crc;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
   Status storage_status = storage.Prepare(thread_count);
@@ -322,6 +456,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   options.thread_count = thread_count;
   options.idle_timeout_ms = idle_timeout_ms;
   options.recv_buffer_count = recv_buffer_count;
+  options.busy_poll_us = busy_poll_us;
 
   RedisService redis(port, &storage);
   Server server;

@@ -396,6 +396,13 @@ class StorageEngine::Impl {
     worker_count_ = worker_count;
     blocks_per_file_ = options_.file_size_bytes / kStorageBlockBytes;
     total_blocks_ = blocks_per_file_ * options_.data_files.size();
+    const auto recovery_start = std::chrono::steady_clock::now();
+    recovery_started_ms_ =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            recovery_start.time_since_epoch())
+            .count();
+    recovery_next_log_ms_.store(recovery_started_ms_ + 5000,
+                                std::memory_order_relaxed);
     stores_.reserve(worker_count);
     for (unsigned i = 0; i < worker_count; ++i) {
       stores_.push_back(std::make_unique<WorkerStore>(total_blocks_));
@@ -497,7 +504,8 @@ class StorageEngine::Impl {
     return StorageShardForKey(key) % worker_count_;
   }
 
-  Task<StatusOr<DiskValue>> Get(std::string_view key) {
+  Task<StatusOr<DiskValue>> Get(std::string_view key,
+                                ReadLatencyTrace* trace) {
     WorkerStore& store = CurrentStore();
     const Digest digest = ComputeDigest(key);
     auto key_lock =
@@ -505,10 +513,17 @@ class StorageEngine::Impl {
     auto found = store.index.find(digest);
     if (found == store.index.end() ||
         found->second.kind == RecordKind::kTombstone) {
+      if (trace != nullptr) {
+        trace->lookup_done_ns = ReadTraceNowNanos();
+      }
       co_return Status(StatusCode::kNotFound, "key not found");
     }
+    if (trace != nullptr) {
+      trace->hit = true;
+      trace->lookup_done_ns = ReadTraceNowNanos();
+    }
 
-    auto loaded = co_await LoadValue(store, key, digest, found->second);
+    auto loaded = co_await LoadValue(store, key, digest, found->second, trace);
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -687,6 +702,55 @@ class StorageEngine::Impl {
     free_list_barrier_->Abort(status);
   }
 
+
+  void ReportRecoveryProgress(std::uint64_t records) {
+    const std::uint64_t scanned =
+        recovery_scanned_blocks_.fetch_add(1, std::memory_order_relaxed) + 1;
+    const std::uint64_t scanned_records =
+        recovery_scanned_records_.fetch_add(records, std::memory_order_relaxed) +
+        records;
+    const auto now = std::chrono::steady_clock::now();
+    const std::int64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            now.time_since_epoch())
+            .count();
+    const bool complete = scanned == total_blocks_;
+    if (complete) {
+      if (recovery_complete_logged_.exchange(true, std::memory_order_relaxed)) {
+        return;
+      }
+    } else {
+      std::int64_t next =
+          recovery_next_log_ms_.load(std::memory_order_relaxed);
+      if (now_ms < next ||
+          !recovery_next_log_ms_.compare_exchange_strong(
+              next, now_ms + 5000, std::memory_order_relaxed)) {
+        return;
+      }
+    }
+
+    const double elapsed_seconds =
+        std::max(0.001, static_cast<double>(now_ms - recovery_started_ms_) /
+                            1000.0);
+    const double block_rate =
+        static_cast<double>(scanned) / elapsed_seconds;
+    const double record_rate =
+        static_cast<double>(scanned_records) / elapsed_seconds;
+    const double percent =
+        total_blocks_ == 0
+            ? 100.0
+            : (static_cast<double>(scanned) * 100.0) /
+                  static_cast<double>(total_blocks_);
+    const double eta_seconds =
+        block_rate == 0.0
+            ? 0.0
+            : static_cast<double>(total_blocks_ - scanned) / block_rate;
+    spdlog::info(
+        "storage recovery: blocks={}/{} ({:.1f}%) records={} "
+        "rate={:.0f} blocks/s {:.2f}M records/s eta={:.1f}s",
+        scanned, total_blocks_, percent, scanned_records, block_rate,
+        record_rate / 1000000.0, eta_seconds);
+  }
   Task<Status> ScanAssignedBlocks(WorkerStore& store,
                                   std::vector<RecoveryBatch>* batches,
                                   std::vector<std::uint64_t>* zero_blocks) {
@@ -749,6 +813,7 @@ class StorageEngine::Impl {
           header_buffer.data, kBlockHeaderBytes);
       if (IsZero(block_bytes)) {
         zero_blocks->push_back(block_id);
+        ReportRecoveryProgress(0);
         continue;
       }
 
@@ -824,6 +889,7 @@ class StorageEngine::Impl {
         co_return Status(StatusCode::kInternal,
                          "block committed boundary does not match records");
       }
+      ReportRecoveryProgress(records);
     }
     co_return Status::Ok();
   }
@@ -884,7 +950,8 @@ class StorageEngine::Impl {
   Task<StatusOr<LoadedValue>> LoadValue(WorkerStore& store,
                                         std::string_view key,
                                         const Digest& digest,
-                                        RecordLocation location) {
+                                        RecordLocation location,
+                                        ReadLatencyTrace* trace = nullptr) {
     // TODO: Coalesce concurrent reads of the same aligned disk page, like
     // the reference engine tiering::OpManager::pending_reads_. Key the in-flight table by
     // (file_id, aligned offset, aligned length), submit one read, and fan the
@@ -929,11 +996,20 @@ class StorageEngine::Impl {
           location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
         co_return Status(StatusCode::kInternal, "invalid in-memory location");
       }
+      if (trace != nullptr) {
+        trace->buffer_acquire_start_ns = ReadTraceNowNanos();
+      }
       auto acquired = co_await store.buffers.AcquireReadBuffer();
       if (!acquired.ok()) {
         co_return acquired.status();
       }
       ReadBufferLease lease = std::move(*acquired);
+      if (trace != nullptr) {
+        trace->buffer_acquired_ns = ReadTraceNowNanos();
+        trace->heap_read_buffer = !lease.registered();
+        trace->io_submit_ns = trace->buffer_acquired_ns;
+        trace->io_complete_ns = trace->buffer_acquired_ns;
+      }
       FixedBuffer io = lease.io_buffer();
       if (location.value_bytes > io.size) {
         co_return Status(StatusCode::kOutOfRange,
@@ -960,19 +1036,31 @@ class StorageEngine::Impl {
       }
       std::memcpy(io.data, record_bytes + record.header_bytes,
                   location.value_bytes);
-      if (Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
-          record.payload_checksum) {
+      if (options_.verify_read_crc &&
+          Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
+              record.payload_checksum) {
         co_return Status(StatusCode::kInternal,
                          "record value checksum mismatch");
+      }
+      if (trace != nullptr) {
+        trace->decode_done_ns = ReadTraceNowNanos();
       }
       co_return LoadedValue{std::move(lease), record.value_bytes};
     }
 
+    if (trace != nullptr) {
+      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
+    }
     auto acquired = co_await store.buffers.AcquireReadBuffer();
     if (!acquired.ok()) {
       co_return acquired.status();
     }
     ReadBufferLease lease = std::move(*acquired);
+    if (trace != nullptr) {
+      trace->buffer_acquired_ns = ReadTraceNowNanos();
+      trace->heap_read_buffer = !lease.registered();
+      trace->disk_read = true;
+    }
     FixedBuffer io = lease.io_buffer();
 
     const auto [file_id, block_offset] = FileOffset(location.block_id);
@@ -990,9 +1078,15 @@ class StorageEngine::Impl {
     }
     FixedBuffer record_buffer = io;
     record_buffer.size = read_bytes;
+    if (trace != nullptr) {
+      trace->io_submit_ns = ReadTraceNowNanos();
+    }
     auto read = co_await ReadStorageBuffer(
         *store.worker, store.files[file_id], record_buffer,
         lease.registered(), aligned_offset);
+    if (trace != nullptr) {
+      trace->io_complete_ns = ReadTraceNowNanos();
+    }
     if (!read.ok()) {
       co_return read.status();
     }
@@ -1017,11 +1111,15 @@ class StorageEngine::Impl {
                        "record does not match in-memory location");
     }
     const std::byte* value_data = record_data + record.header_bytes;
-    if (Crc32c(std::span<const std::byte>(value_data, record.value_bytes)) !=
-        record.payload_checksum) {
+    if (options_.verify_read_crc &&
+        Crc32c(std::span<const std::byte>(value_data, record.value_bytes)) !=
+            record.payload_checksum) {
       co_return Status(StatusCode::kInternal, "record value checksum mismatch");
     }
     std::memmove(io.data, value_data, record.value_bytes);
+    if (trace != nullptr) {
+      trace->decode_done_ns = ReadTraceNowNanos();
+    }
     co_return LoadedValue{std::move(lease), record.value_bytes};
   }
 
@@ -1829,6 +1927,11 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
+  std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
+  std::atomic<std::uint64_t> recovery_scanned_records_{0};
+  std::atomic<std::int64_t> recovery_next_log_ms_{0};
+  std::atomic<bool> recovery_complete_logged_{false};
+  std::int64_t recovery_started_ms_ = 0;
   moodycamel::ConcurrentQueue<std::uint64_t> free_blocks_;
   std::atomic<std::size_t> free_block_count_{0};
   static constexpr std::size_t kDefragReserveBlocks = 8;
@@ -1869,8 +1972,9 @@ std::size_t StorageEngine::LocalSize() const noexcept {
   return impl_->LocalSize();
 }
 
-Task<StatusOr<DiskValue>> StorageEngine::Get(std::string_view key) {
-  co_return co_await impl_->Get(key);
+Task<StatusOr<DiskValue>> StorageEngine::Get(std::string_view key,
+                                             ReadLatencyTrace* trace) {
+  co_return co_await impl_->Get(key, trace);
 }
 
 Task<Status> StorageEngine::Set(std::string_view key, std::string_view value) {

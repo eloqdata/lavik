@@ -10,6 +10,7 @@
 
 #include "celer/base/status.h"
 #include "celer/runtime/task.h"
+#include "keylane/read_trace.h"
 #include "keylane/storage/buffer_pool.h"
 
 namespace celer {
@@ -22,6 +23,7 @@ struct StorageEngineOptions {
   std::vector<std::string> data_files{"keylane.data"};
   std::uint64_t file_size_bytes = 1024ULL * 1024 * 1024;
   std::uint32_t flush_max_ms = 1000;
+  bool verify_read_crc = true;
   RegisteredBufferPoolOptions buffers{};
 };
 
@@ -76,7 +78,8 @@ class StorageEngine {
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
-  celer::Task<celer::StatusOr<DiskValue>> Get(std::string_view key);
+  celer::Task<celer::StatusOr<DiskValue>> Get(std::string_view key,
+                                               ReadLatencyTrace* trace = nullptr);
   celer::Task<celer::Status> Set(std::string_view key, std::string_view value);
   celer::Task<celer::StatusOr<bool>> Delete(std::string_view key);
   celer::Task<bool> Exists(std::string_view key);
