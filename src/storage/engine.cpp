@@ -90,6 +90,7 @@ struct BlockState {
   std::uint32_t live_bytes = 0;
   std::uint32_t pins = 0;
   bool allocated = false;
+  bool defrag_queued = false;
   bool defragging = false;
   bool in_memory = false;
   bool flush_queued = false;
@@ -356,6 +357,7 @@ class StorageEngine::Impl {
     std::vector<BlockState> block_states;
     AsyncMutex writer_mutex;
     std::deque<std::uint64_t> flush_queue;
+    std::deque<std::uint64_t> defrag_queue;
     bool flush_running = false;
     bool write_failed = false;
     bool defrag_running = false;
@@ -1276,12 +1278,17 @@ class StorageEngine::Impl {
     const bool was_live =
         previous.has_value() && previous->kind == RecordKind::kValue;
     const bool is_live = kind == RecordKind::kValue;
+    std::optional<std::uint64_t> dirtied_block;
     if (previous.has_value()) {
       BlockState& old_state = store.block_states[previous->block_id];
       old_state.live_bytes -= std::min(old_state.live_bytes,
                                        previous->total_disk_bytes);
+      dirtied_block = previous->block_id;
     }
     store.index.insert_or_assign(digest, location);
+    if (!for_defrag && dirtied_block.has_value()) {
+      MaybeQueueDefrag(store, *dirtied_block);
+    }
     store.staged_records[updated.block_id].push_back(digest);
     if (was_live != is_live) {
       if (is_live) {
@@ -1297,9 +1304,6 @@ class StorageEngine::Impl {
     state.heap_data_size = updated.heap_buffer_size;
     state.live_bytes += location.total_disk_bytes;
     state.flush_queued = updated.committed_bytes == kStorageBlockBytes;
-    if (!for_defrag) {
-      RequestDefrag(store);
-    }
     co_return Status::Ok();
   }
 
@@ -1567,6 +1571,7 @@ class StorageEngine::Impl {
         continue;
       }
       ReleaseStagingBuffer(*store, state);
+      MaybeQueueDefrag(*store, pending->block_id);
     }
   }
 
@@ -1580,34 +1585,36 @@ class StorageEngine::Impl {
     return false;
   }
 
-  std::optional<std::uint64_t> SelectDefragCandidate(
-      const WorkerStore& store) const noexcept {
-    std::optional<std::uint64_t> best;
-    std::uint64_t best_live_ratio = std::numeric_limits<std::uint64_t>::max();
-    for (std::uint64_t block_id = 0; block_id < store.block_states.size();
-         ++block_id) {
-      const BlockState& state = store.block_states[block_id];
-      if (!state.allocated || state.defragging || state.pins != 0 ||
-          state.in_memory || state.flush_queued || state.flush_in_progress ||
-          IsActiveBlock(store, block_id) ||
-          state.committed_bytes <= kBlockHeaderBytes) {
-        continue;
-      }
-      const std::uint64_t used = state.committed_bytes - kBlockHeaderBytes;
-      const std::uint64_t ratio =
-          used == 0 ? 0 : (static_cast<std::uint64_t>(state.live_bytes) * 1000) / used;
-      if (ratio > 500 || ratio >= best_live_ratio) {
-        continue;
-      }
-      best = block_id;
-      best_live_ratio = ratio;
+  bool IsDefragCandidate(const WorkerStore& store,
+                         std::uint64_t block_id) const noexcept {
+    const BlockState& state = store.block_states[block_id];
+    if (!state.allocated || state.defrag_queued || state.defragging ||
+        state.pins != 0 || state.in_memory || state.flush_queued ||
+        state.flush_in_progress || IsActiveBlock(store, block_id) ||
+        state.committed_bytes <= kBlockHeaderBytes) {
+      return false;
     }
-    return best;
+    const std::uint64_t used = state.committed_bytes - kBlockHeaderBytes;
+    const std::uint64_t live_ratio =
+        used == 0
+            ? 0
+            : (static_cast<std::uint64_t>(state.live_bytes) * 1000) / used;
+    return live_ratio <= 500;
+  }
+
+  void MaybeQueueDefrag(WorkerStore& store, std::uint64_t block_id) {
+    if (block_id >= store.block_states.size() ||
+        !IsDefragCandidate(store, block_id)) {
+      return;
+    }
+    store.block_states[block_id].defrag_queued = true;
+    store.defrag_queue.push_back(block_id);
+    RequestDefrag(store);
   }
 
   void RequestDefrag(WorkerStore& store) {
     if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
-        store.defrag_running || !SelectDefragCandidate(store).has_value()) {
+        store.defrag_running || store.defrag_queue.empty()) {
       return;
     }
     store.defrag_running = true;
@@ -1615,17 +1622,23 @@ class StorageEngine::Impl {
   }
 
   Task<Status> DefragOne(WorkerStore* store) {
-    const std::optional<std::uint64_t> candidate =
-        SelectDefragCandidate(*store);
-    Status status = Status::Ok();
-    if (candidate.has_value()) {
-      status = co_await CleanBlockLocked(*store, *candidate);
-      if (!status.ok()) {
-        spdlog::error("worker[{}] defrag block {} failed: {}",
-                      store->worker->id(), *candidate, status.message());
-      }
+    if (store->defrag_queue.empty()) {
+      store->defrag_running = false;
+      co_return Status::Ok();
+    }
+    const std::uint64_t candidate = store->defrag_queue.front();
+    store->defrag_queue.pop_front();
+    store->block_states[candidate].defrag_queued = false;
+
+    Status status = co_await CleanBlockLocked(*store, candidate);
+    if (!status.ok()) {
+      spdlog::error("worker[{}] defrag block {} failed: {}",
+                    store->worker->id(), candidate, status.message());
     }
     store->defrag_running = false;
+    if (status.ok()) {
+      RequestDefrag(*store);
+    }
     co_return status;
   }
 

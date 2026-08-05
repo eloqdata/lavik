@@ -50,7 +50,11 @@ target_precompile_headers(keylane_module PRIVATE
 )
 
 target_compile_features(keylane_module PUBLIC cxx_std_23)
-target_link_libraries(keylane_module PUBLIC celer::core absl::flat_hash_map)
+target_link_libraries(keylane_module PUBLIC
+  celer::core
+  absl::crc32c
+  absl::flat_hash_map
+)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(keylane_module PRIVATE -Wall -Wextra -Wpedantic)

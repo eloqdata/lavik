@@ -1,5 +1,7 @@
 #include "keylane/storage/format.h"
 
+#include "absl/crc/crc32c.h"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -148,15 +150,9 @@ std::uint32_t StorageShardForKey(std::string_view key) noexcept {
 }
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
-  std::uint32_t crc = 0xffffffffU;
-  for (std::byte value : bytes) {
-    crc ^= static_cast<std::uint8_t>(value);
-    for (unsigned bit = 0; bit < 8; ++bit) {
-      const std::uint32_t mask = 0U - (crc & 1U);
-      crc = (crc >> 1) ^ (0x82f63b78U & mask);
-    }
-  }
-  return ~crc;
+  const absl::string_view input(
+      reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  return static_cast<std::uint32_t>(absl::ComputeCrc32c(input));
 }
 
 void EncodeBlockHeader(
