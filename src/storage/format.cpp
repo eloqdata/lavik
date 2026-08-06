@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <bit>
 #include <cstring>
 
@@ -197,6 +198,62 @@ bool DecodeDeviceLabel(
   return true;
 }
 
+void EncodeMetadataPage(
+    MetadataPageKind kind, std::uint32_t page_index,
+    std::uint64_t generation, std::span<const std::byte> payload,
+    std::span<std::byte, kDirectIoAlignment> output) noexcept {
+  assert(payload.size() <= kMetadataPagePayloadBytes);
+  std::fill(output.begin(), output.end(), std::byte{0});
+  MetadataPageHeader header{
+      .magic = kMetadataPageMagic,
+      .version = kStorageFormatVersion,
+      .kind = kind,
+      .header_bytes = sizeof(MetadataPageHeader),
+      .page_index = page_index,
+      .payload_bytes = static_cast<std::uint32_t>(payload.size()),
+      .generation = generation,
+      .checksum = 0,
+  };
+  std::memcpy(output.data(), &header, sizeof(header));
+  std::memcpy(output.data() + sizeof(header), payload.data(), payload.size());
+  header.checksum = Crc32c(output);
+  std::memcpy(output.data(), &header, sizeof(header));
+}
+
+bool DecodeMetadataPage(
+    std::span<const std::byte, kDirectIoAlignment> input,
+    MetadataPageKind expected_kind, std::uint32_t expected_page_index,
+    std::uint64_t* generation, std::span<std::byte> payload) noexcept {
+  if (generation == nullptr) {
+    return false;
+  }
+  MetadataPageHeader header{};
+  std::memcpy(&header, input.data(), sizeof(header));
+  if (header.magic != kMetadataPageMagic ||
+      header.version != kStorageFormatVersion ||
+      header.kind != expected_kind ||
+      header.header_bytes != sizeof(MetadataPageHeader) ||
+      header.page_index != expected_page_index || header.generation == 0 ||
+      header.payload_bytes > kMetadataPagePayloadBytes ||
+      header.payload_bytes > payload.size()) {
+    return false;
+  }
+  const std::uint32_t expected_checksum = header.checksum;
+  std::array<std::byte, kDirectIoAlignment> copy{};
+  std::memcpy(copy.data(), input.data(), copy.size());
+  header.checksum = 0;
+  std::memcpy(copy.data(), &header, sizeof(header));
+  if (Crc32c(copy) != expected_checksum) {
+    return false;
+  }
+  std::fill(payload.begin(), payload.end(), std::byte{0});
+  std::memcpy(payload.data(),
+              input.data() + sizeof(MetadataPageHeader),
+              header.payload_bytes);
+  *generation = header.generation;
+  return true;
+}
+
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderBytes> output) noexcept {
@@ -238,47 +295,6 @@ bool DecodeBlockHeader(
     return false;
   }
   *header = decoded;
-  return true;
-}
-
-void EncodeStorageMetadata(
-    const StorageMetadata& metadata,
-    std::span<std::byte, kDirectIoAlignment> output) noexcept {
-  std::fill(output.begin(), output.end(), std::byte{0});
-  StorageMetadata encoded = metadata;
-  encoded.checksum = 0;
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-  encoded.checksum = Crc32c(output);
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-}
-
-bool DecodeStorageMetadata(
-    std::span<const std::byte, kDirectIoAlignment> input,
-    StorageMetadata* metadata) noexcept {
-  if (metadata == nullptr) {
-    return false;
-  }
-  StorageMetadata decoded{};
-  std::memcpy(&decoded, input.data(), sizeof(decoded));
-  if (decoded.magic != kMetadataMagic ||
-      decoded.version != kStorageFormatVersion ||
-      decoded.header_bytes != kDirectIoAlignment) {
-    return false;
-  }
-  for (std::uint64_t epoch : decoded.db_epochs) {
-    if (epoch == 0) {
-      return false;
-    }
-  }
-  const std::uint32_t expected = decoded.checksum;
-  std::array<std::byte, kDirectIoAlignment> copy{};
-  std::memcpy(copy.data(), input.data(), copy.size());
-  decoded.checksum = 0;
-  std::memcpy(copy.data(), &decoded, sizeof(decoded));
-  if (Crc32c(copy) != expected) {
-    return false;
-  }
-  *metadata = decoded;
   return true;
 }
 

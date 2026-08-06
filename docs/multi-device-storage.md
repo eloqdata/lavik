@@ -1,13 +1,13 @@
 # Multi-Device Storage
 
-Keylane can use multiple local files or raw block devices for its online data
-path. Object storage is outside this path and is intended for backup and
-restore.
+Keylane can use multiple local files or raw block devices for online data.
+Object storage remains a backup/restore target rather than part of the active
+write path.
 
 ## Configuration
 
 Repeat `--data-file` once per file or block device. Every configured device
-currently uses the same `--data-file-size-mb` capacity.
+currently uses the same fixed `--data-file-size-mb` capacity.
 
 ```text
 keylane \
@@ -16,16 +16,14 @@ keylane \
   --data-file-size-mb 1048576
 ```
 
-The configured size must be a multiple of 8 MiB and must not exceed 1 PiB per
-device. For a raw block device, Keylane verifies that its actual capacity is at
-least the configured size.
+Capacity must be an 8 MiB multiple and cannot exceed 1 PiB per device. For a
+raw block device, Keylane verifies that its actual size is sufficient.
 
 ## Persistent identity and block IDs
 
-The first 4 KiB page of local block zero contains a checksummed device label.
-The label records the storage-set ID, persistent device ID, expected number of
-devices, capacity, and block size. The remaining metadata in local block zero
-includes a mirrored copy of database epochs. Data starts at local block one.
+The first 4 KiB page contains a checksummed device label: storage-set ID,
+persistent device ID, device count, capacity, and block size. Device IDs are
+dense in `[0, device_count)`.
 
 A 64-bit block ID is encoded as:
 
@@ -36,43 +34,58 @@ A 64-bit block ID is encoded as:
 +----------------------------+----------------------------+
 ```
 
-Device IDs are dense in the range `[0, device_count)`. Consequently, changing
-the order of `--data-file` arguments does not change block identity, and block
-lookup uses a direct array index rather than a hash-table lookup.
+Changing `--data-file` argument order does not change identity. Startup requires
+the complete persisted set and rejects a missing, duplicate, foreign, or empty
+device.
 
-At startup Keylane requires the complete persisted device set. A missing,
-duplicate, foreign, or empty device causes startup to fail before recovery.
-Online device addition and removal are not implemented yet; initialize a new
-set after clearing data when changing device membership during development.
+The label is followed by capacity-derived fixed A/B metadata pages for database
+epochs, partition epochs, and the recovery scan bitmap. Data begins at the next
+8 MiB boundary; it is not hard-coded to local block one. See
+[Recovery Metadata Layout](recovery-metadata-design.md).
 
-## Block allocation
+## Per-device allocator ownership
 
-Each worker has a sticky home device:
+Each device has one allocator owner chosen from the current workers:
 
-- With at least as many workers as devices, worker `w` uses
+```text
+allocator_owner = device_id % worker_count
+```
+
+The owner exclusively maintains the device's ready/cold vectors, pristine
+cursor, allocation epoch, bitmap, epoch-page image, and metadata generations.
+These are ordinary owner-local structures. A non-owner requests an ID or epoch
+page update through a cross-worker task; there is no shared MPMC free queue,
+bitmap CAS, global metadata-page owner, or special worker-zero writer.
+
+Fresh block IDs are activated in batches of 256. The owner makes their bitmap
+bits durable before adding them to its ready pool. Defrag returns a durably
+zeroed block to the same owner and keeps its bit set for cheap warm reuse.
+
+## Worker write affinity
+
+Each worker has at most one active block plus one prefetched standby ID.
+
+- With at least as many workers as devices, worker `w` first tries
   `w % device_count`.
-- With more devices than workers, each worker round-robins only among its own
-  interleaved subset (`w`, `w + worker_count`, ...).
-- If that subset is full, allocation falls back to the other devices.
+- With more devices than workers, a worker round-robins its interleaved subset
+  (`w`, `w + worker_count`, ...).
+- Allocation falls back to other devices when the preferred device is full.
 
-This keeps the common write path on one device per worker while retaining the
-capacity of the whole set. It can improve NUMA, page-cache metadata, and block
-queue locality. Changing a registered-file index in io_uring is already cheap,
-so it is not the main source of the expected gain.
+The standby request starts when an active block reaches 75% occupancy. This
+keeps the usual rollover off the latency-critical path without reserving an
+8 MiB memory buffer per standby or per device.
 
-Fresh blocks have per-device atomic allocation cursors. Reclaimed blocks return
-to a per-device MPMC free queue and are retried in the same home-device order as
-fresh blocks. The small defrag reserve is distributed across those queues, so
-the steady-state reuse path preserves device affinity without a global free-list
-counter or queue.
+## Recovery and worker-count changes
 
-## Recovery and metadata
+DB epochs and all 16,384 partition epochs are mirrored on every device. Recovery
+loads them before it considers data records. The scan bitmap skips pristine
+blocks, while set bits lead to a header check and, for valid headers, a full
+block read.
 
-Recovery scans every data block on every device and validates that the block ID
-stored in its header matches its physical device and local offset. Recovery is
-independent of the current worker count.
+Physical scan work is redistributed across the current workers. Recovered
+blocks keep their old writer provenance only for validation and are assigned a
+current runtime owner when necessary. New writes use the current worker/device
+affinity. No data rewrite is required when worker count changes.
 
-Database epochs are mirrored on every device. Startup takes the component-wise
-maximum valid epoch and rewrites that canonical metadata to all devices. This
-keeps `FLUSHDB` monotonic across a partial mirrored update, while the persisted
-device-count check prevents an omitted device from being silently ignored.
+Online device addition/removal is not implemented. During development, changing
+device membership requires clearing and reinitializing the storage set.

@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "keylane/storage/format.h"
 
@@ -37,6 +38,43 @@ int main() {
   assert(decoded_label.device_count == label.device_count);
   label_page.back() ^= std::byte{1};
   assert(!DecodeDeviceLabel(label_page, &decoded_label));
+
+  std::array<std::byte, 37> metadata_payload{};
+  for (std::size_t i = 0; i < metadata_payload.size(); ++i) {
+    metadata_payload[i] = static_cast<std::byte>(i + 1);
+  }
+  std::array<std::byte, kDirectIoAlignment> metadata_page{};
+  EncodeMetadataPage(MetadataPageKind::kEpochs, 11, 23,
+                     metadata_payload, metadata_page);
+  std::array<std::byte, 64> decoded_payload{};
+  std::uint64_t metadata_generation = 0;
+  assert(DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 11,
+                            &metadata_generation, decoded_payload));
+  assert(metadata_generation == 23);
+  assert(std::memcmp(metadata_payload.data(), decoded_payload.data(),
+                     metadata_payload.size()) == 0);
+  for (std::size_t i = metadata_payload.size(); i < decoded_payload.size();
+       ++i) {
+    assert(decoded_payload[i] == std::byte{0});
+  }
+  assert(!DecodeMetadataPage(metadata_page,
+                             MetadataPageKind::kScanBitmap, 11,
+                             &metadata_generation, decoded_payload));
+  assert(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 12,
+                             &metadata_generation, decoded_payload));
+  metadata_page.back() ^= std::byte{1};
+  assert(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 11,
+                             &metadata_generation, decoded_payload));
+
+  constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;
+  static_assert(ScanBitmapBytes(one_pib_blocks) == 16 * 1024 * 1024);
+  static_assert(DataBlockBegin(one_pib_blocks) >= 3);
+  static_assert(FixedMetadataBytes(one_pib_blocks) <=
+                static_cast<std::uint64_t>(DataBlockBegin(one_pib_blocks)) *
+                    kStorageBlockBytes);
+  static_assert(MetadataPageSlotOffset(kEpochMetadataOffset, 1, 0) +
+                    kDirectIoAlignment ==
+                MetadataPageSlotOffset(kEpochMetadataOffset, 1, 1));
 
   BlockHeader header{
       .magic = kBlockMagic,
