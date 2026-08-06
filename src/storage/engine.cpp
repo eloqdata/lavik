@@ -50,17 +50,16 @@ using celer::Worker;
 
 struct RecordLocation {
   std::uint64_t block_id = 0;
-  std::uint64_t generation = 0;
-  std::uint64_t relocation_sequence = 0;
-  std::uint64_t lsn = 0;
+  std::uint64_t replication_epoch = 1;
+  std::uint64_t mutation_sequence = 0;
   std::uint64_t allocation_epoch = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
-  std::uint32_t block_owner = 0;
+  std::uint16_t block_owner = 0;
   std::uint32_t record_offset = 0;
   std::uint32_t total_disk_bytes = 0;
   std::uint32_t value_bytes = 0;
-  std::uint8_t db_id = 0;
+  std::uint32_t relocation_sequence = 0;
   bool in_memory = false;
   RecordKind kind = RecordKind::kValue;
 
@@ -71,19 +70,22 @@ struct RecordLocation {
   }
 };
 
-static_assert(sizeof(RecordLocation) == 64);
+static_assert(sizeof(RecordLocation) == 56);
 
 using RecordIndex = ScanHashMap<RecordLocation>;
 
 bool IsNewer(const RecordLocation& candidate,
              const RecordLocation& current) noexcept {
-  if (candidate.generation != current.generation) {
-    return candidate.generation > current.generation;
+  if (candidate.replication_epoch != current.replication_epoch) {
+    return candidate.replication_epoch > current.replication_epoch;
+  }
+  if (candidate.mutation_sequence != current.mutation_sequence) {
+    return candidate.mutation_sequence > current.mutation_sequence;
   }
   if (candidate.relocation_sequence != current.relocation_sequence) {
     return candidate.relocation_sequence > current.relocation_sequence;
   }
-  return candidate.lsn > current.lsn;
+  return false;
 }
 
 struct ActiveBlock {
@@ -122,6 +124,7 @@ struct BlockState {
 struct RecoveryRecord {
   Digest digest{};
   std::string key;
+  std::uint8_t db_id = 0;
   RecordLocation location{};
 };
 
@@ -407,11 +410,22 @@ class StorageEngine::Impl {
 
  public:
   struct WorkerStore {
+    struct PartitionStore {
+      std::uint16_t id = 0;
+      std::array<RecordIndex, kLogicalDatabaseCount> indexes;
+      std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
+      std::uint64_t mutation_sequence = 0;
+      std::uint64_t replication_epoch = 1;
+      std::uint64_t delta_floor = 0;
+      bool capture_deltas = false;
+      bool delta_queued = false;
+      std::deque<SnapshotRecord> deltas;
+    };
+
     Worker* worker = nullptr;
     RegisteredBufferPool buffers;
     std::vector<FixedFile> files;
-    using Index = RecordIndex;
-    std::array<Index, kLogicalDatabaseCount> indexes;
+    std::vector<PartitionStore> partitions;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records;
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
@@ -439,10 +453,10 @@ class StorageEngine::Impl {
         std::numeric_limits<std::uint16_t>::max()) {
       return Status(StatusCode::kOutOfRange, "too many data files");
     }
-    if (options_.file_size_bytes < kStorageBlockBytes ||
+    if (options_.file_size_bytes < 2 * kStorageBlockBytes ||
         options_.file_size_bytes % kStorageBlockBytes != 0) {
       return Status(StatusCode::kInvalidArgument,
-                    "data file size must be a positive multiple of 8 MiB");
+                    "data file size must be at least 16 MiB and a multiple of 8 MiB");
     }
 
     std::size_t direct_io_alignment = 1;
@@ -496,8 +510,17 @@ class StorageEngine::Impl {
     stores_.reserve(worker_count);
     for (unsigned i = 0; i < worker_count; ++i) {
       stores_.push_back(std::make_unique<WorkerStore>());
+      WorkerStore& store = *stores_.back();
+      store.partitions.reserve(
+          (kLogicalStorageShards + worker_count - 1 - i) / worker_count);
+      for (std::uint32_t partition = i;
+           partition < kLogicalStorageShards; partition += worker_count) {
+        store.partitions.emplace_back();
+        store.partitions.back().id = static_cast<std::uint16_t>(partition);
+      }
     }
     open_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+    metadata_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
     recovery_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
     recovery_accounting_barrier_ =
         std::make_unique<CoroutineBarrier>(worker_count);
@@ -540,6 +563,18 @@ class StorageEngine::Impl {
       co_return status;
     }
 
+    if (worker.id() == 0) {
+      status = co_await InitializeMetadata(store);
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
+    }
+    status = co_await metadata_barrier_->Wait(worker);
+    if (!status.ok()) {
+      co_return status;
+    }
+
     std::vector<RecoveryBatch> batches(worker_count_);
     std::vector<std::uint64_t> zero_blocks;
     status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks);
@@ -575,17 +610,20 @@ class StorageEngine::Impl {
 
     std::vector<std::vector<RecoveryLiveReference>> live_by_owner(
         worker_count_);
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      store.indexes[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-        const RecordLocation& location = entry.value;
-        assert(location.db_id == db_id);
-        assert(location.block_owner < worker_count_);
-        live_by_owner[location.block_owner].push_back(RecoveryLiveReference{
-            .block_id = location.block_id,
-            .allocation_epoch = location.allocation_epoch,
-            .bytes = location.total_disk_bytes,
-        });
-      });
+    for (auto& partition : store.partitions) {
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        partition.indexes[db_id].ForEach(
+            [&](const RecordIndex::Entry& entry) {
+              const RecordLocation& location = entry.value;
+              assert(location.block_owner < worker_count_);
+              live_by_owner[location.block_owner].push_back(
+                  RecoveryLiveReference{
+                      .block_id = location.block_id,
+                      .allocation_epoch = location.allocation_epoch,
+                      .bytes = location.total_disk_bytes,
+                  });
+            });
+      }
     }
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       if (live_by_owner[owner].empty()) {
@@ -656,11 +694,12 @@ class StorageEngine::Impl {
                                 ReadLatencyTrace* trace) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
     const Digest digest = ComputeDigest(key);
     auto key_lock =
         co_await store.key_locks[db_id].Acquire(digest,
                                                 IntentLockMode::kShared);
-    auto& index = store.indexes[db_id];
+    auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
     if (found == nullptr || found->value.kind == RecordKind::kTombstone) {
       if (trace != nullptr) {
@@ -707,19 +746,21 @@ class StorageEngine::Impl {
                    std::string_view value) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
     const Digest digest = ComputeDigest(key);
     auto key_lock =
         co_await store.key_locks[db_id].Acquire(digest,
                                                 IntentLockMode::kExclusive);
     co_await store.writer_mutex.Lock();
     UnlockGuard unlock(&store.writer_mutex, store.worker);
-    co_return co_await AppendLocked(store, db_id, key, value,
+    co_return co_await AppendLocked(store, partition, db_id, key, value,
                                     RecordKind::kValue);
   }
 
   Task<StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
     const Digest digest = ComputeDigest(key);
     auto key_lock =
         co_await store.key_locks[db_id].Acquire(digest,
@@ -727,13 +768,14 @@ class StorageEngine::Impl {
     co_await store.writer_mutex.Lock();
     UnlockGuard unlock(&store.writer_mutex, store.worker);
 
-    auto& index = store.indexes[db_id];
+    auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
     if (found == nullptr || found->value.kind == RecordKind::kTombstone) {
       co_return false;
     }
     Status status =
-        co_await AppendLocked(store, db_id, key, {}, RecordKind::kTombstone);
+        co_await AppendLocked(store, partition, db_id, key, {},
+                              RecordKind::kTombstone);
     if (!status.ok()) {
       co_return status;
     }
@@ -743,11 +785,12 @@ class StorageEngine::Impl {
   Task<bool> Exists(std::uint8_t db_id, std::string_view key) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
     const Digest digest = ComputeDigest(key);
     auto key_lock =
         co_await store.key_locks[db_id].Acquire(digest,
                                                 IntentLockMode::kShared);
-    auto& index = store.indexes[db_id];
+    auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
     co_return found != nullptr && found->value.kind == RecordKind::kValue;
   }
@@ -756,6 +799,7 @@ class StorageEngine::Impl {
                                          std::string_view key) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
     const Digest digest = ComputeDigest(key);
     auto key_lock =
         co_await store.key_locks[db_id].Acquire(digest,
@@ -764,7 +808,7 @@ class StorageEngine::Impl {
     UnlockGuard unlock(&store.writer_mutex, store.worker);
 
     std::int64_t value = 0;
-    auto& index = store.indexes[db_id];
+    auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
     if (found != nullptr && found->value.kind == RecordKind::kValue) {
       auto loaded =
@@ -786,7 +830,8 @@ class StorageEngine::Impl {
     ++value;
     const std::string encoded = std::to_string(value);
     Status status =
-        co_await AppendLocked(store, db_id, key, encoded, RecordKind::kValue);
+        co_await AppendLocked(store, partition, db_id, key, encoded,
+                              RecordKind::kValue);
     if (!status.ok()) {
       co_return status;
     }
@@ -800,11 +845,70 @@ class StorageEngine::Impl {
     return CurrentStore().live_key_count[db_id];
   }
 
-  ScanBatch ScanLocal(std::uint8_t db_id, std::uint64_t cursor,
-                      std::size_t count) const {
+  std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept {
+    assert(db_id < kLogicalDatabaseCount);
+    return db_epochs_[db_id].load(std::memory_order_acquire);
+  }
+
+  Task<Status> FlushDb(std::uint8_t db_id) {
+    assert(db_id < kLogicalDatabaseCount);
+    if (celer::ThisWorker().id != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, db_id]() -> Task<Status> {
+            co_return co_await FlushDb(db_id);
+          });
+    }
+
+    const std::uint64_t current = DbEpoch(db_id);
+    if (current == std::numeric_limits<std::uint64_t>::max()) {
+      co_return Status(StatusCode::kOutOfRange, "database epoch exhausted");
+    }
+    co_return co_await AdvanceDbEpoch(db_id, current + 1);
+  }
+
+  Task<Status> AdvanceDbEpoch(std::uint8_t db_id, std::uint64_t next) {
+    if (celer::ThisWorker().id != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, db_id, next]() -> Task<Status> {
+            co_return co_await AdvanceDbEpoch(db_id, next);
+          });
+    }
+    const std::uint64_t current = DbEpoch(db_id);
+    if (next < current) {
+      co_return Status(StatusCode::kFailedPrecondition,
+                       "replica database epoch is ahead of primary");
+    }
+    if (next == current) {
+      co_return Status::Ok();
+    }
+    Status status = co_await PersistMetadata(db_id, next);
+    if (!status.ok()) {
+      co_return status;
+    }
+    db_epochs_[db_id].store(next, std::memory_order_release);
+
+    for (unsigned target = 0; target < worker_count_; ++target) {
+      Status cleared = target == 0
+                           ? co_await ClearDbLocal(*stores_[target], db_id)
+                           : co_await celer::SubmitTaskTo(
+                                 target,
+                                 [this, target, db_id]() -> Task<Status> {
+                                   co_return co_await ClearDbLocal(
+                                       *stores_[target], db_id);
+                                 });
+      if (!cleared.ok()) {
+        co_return cleared;
+      }
+    }
+    co_return Status::Ok();
+  }
+
+  ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
+                          std::uint64_t cursor, std::size_t count) const {
     assert(db_id < kLogicalDatabaseCount);
     assert(count > 0);
-    const auto& index = CurrentStore().indexes[db_id];
+    const auto& index =
+        PartitionFor(CurrentStore(), partition_id).indexes[db_id];
     ScanBatch result;
     result.cursor = cursor;
     const std::size_t max_iterations =
@@ -823,6 +927,236 @@ class StorageEngine::Impl {
     } while (result.cursor != 0 && result.keys.size() < count &&
              iterations < max_iterations);
     return result;
+  }
+
+  PartitionReplicationStart BeginPartitionReplication(
+      std::uint16_t partition_id) {
+    auto& partition = PartitionFor(CurrentStore(), partition_id);
+    partition.capture_deltas = true;
+    partition.deltas.clear();
+    partition.delta_floor = partition.mutation_sequence;
+    partition.delta_queued = false;
+    PartitionReplicationStart result;
+    result.snapshot_sequence = partition.mutation_sequence;
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      result.db_epochs[db_id] = DbEpoch(db_id);
+      if (partition.live_key_count[db_id] != 0) {
+        result.nonempty_db_mask |= static_cast<std::uint16_t>(1U << db_id);
+      }
+    }
+    return result;
+  }
+
+  Task<StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
+      std::uint16_t partition_id, std::uint8_t db_id,
+      std::uint64_t cursor, std::size_t count) {
+    if (db_id >= kLogicalDatabaseCount || count == 0) {
+      co_return Status(StatusCode::kInvalidArgument,
+                       "invalid partition snapshot request");
+    }
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionFor(store, partition_id);
+    auto& index = partition.indexes[db_id];
+    std::vector<std::string> keys;
+    std::uint64_t next = cursor;
+    const std::size_t max_iterations =
+        count > std::numeric_limits<std::size_t>::max() / 10
+            ? std::numeric_limits<std::size_t>::max()
+            : count * 10;
+    std::size_t iterations = 0;
+    do {
+      next = index.Scan(next, [&](const RecordIndex::Entry& entry) {
+        if (entry.value.kind == RecordKind::kValue) {
+          keys.push_back(entry.key);
+        }
+      });
+      ++iterations;
+    } while (next != 0 && keys.size() < count &&
+             iterations < max_iterations);
+
+    PartitionSnapshotBatch batch;
+    batch.cursor = next;
+    batch.records.reserve(keys.size());
+    for (const std::string& key : keys) {
+      const Digest digest = ComputeDigest(key);
+      auto key_lock = co_await store.key_locks[db_id].Acquire(
+          digest, IntentLockMode::kShared);
+      auto* current = index.Find(digest, key);
+      if (current == nullptr || current->value.kind != RecordKind::kValue) {
+        continue;
+      }
+      const RecordLocation location = current->value;
+      auto loaded = co_await LoadValue(store, db_id, key, digest, location);
+      if (!loaded.ok()) {
+        if (loaded.status().code() == StatusCode::kNotFound) {
+          continue;
+        }
+        co_return loaded.status();
+      }
+      const FixedBuffer value = loaded->lease.io_buffer();
+      batch.records.push_back(SnapshotRecord{
+          .kind = SnapshotRecord::Kind::kValue,
+          .db_id = db_id,
+          .db_epoch = DbEpoch(db_id),
+          .mutation_sequence = location.mutation_sequence,
+          .key = key,
+          .value = std::string(reinterpret_cast<const char*>(value.data),
+                               loaded->value_bytes),
+      });
+    }
+    co_return batch;
+  }
+
+  PartitionDeltaBatch ReadPartitionDeltas(
+      std::uint16_t partition_id, std::uint64_t after_sequence,
+      std::size_t count) {
+    auto& partition = PartitionFor(CurrentStore(), partition_id);
+    partition.delta_queued = false;
+    PartitionDeltaBatch batch;
+    batch.watermark = partition.mutation_sequence;
+    batch.overflow = after_sequence < partition.delta_floor;
+    if (batch.overflow || count == 0) {
+      return batch;
+    }
+    batch.records.reserve(std::min(count, partition.deltas.size()));
+    for (const SnapshotRecord& mutation : partition.deltas) {
+      if (mutation.mutation_sequence > after_sequence) {
+        batch.records.push_back(mutation);
+        if (batch.records.size() == count) {
+          break;
+        }
+      }
+    }
+    return batch;
+  }
+
+  void AcknowledgePartitionDeltas(std::uint16_t partition_id,
+                                  std::uint64_t through_sequence) {
+    auto& partition = PartitionFor(CurrentStore(), partition_id);
+    while (!partition.deltas.empty() &&
+           partition.deltas.front().mutation_sequence <= through_sequence) {
+      partition.delta_floor = std::max(
+          partition.delta_floor,
+          partition.deltas.front().mutation_sequence);
+      partition.deltas.pop_front();
+    }
+    if (!partition.deltas.empty() && !partition.delta_queued) {
+      partition.delta_queued = true;
+      (void)replication_ready_.enqueue(partition.id);
+    }
+  }
+
+  bool TryTakeReplicationReady(std::uint16_t* partition_id) {
+    return partition_id != nullptr &&
+           replication_ready_.try_dequeue(*partition_id);
+  }
+
+  Task<StatusOr<std::uint64_t>> ResetReplicaPartition(
+      std::uint16_t partition_id,
+      std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs) {
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      Status advanced = co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
+      if (!advanced.ok()) {
+        co_return advanced;
+      }
+    }
+
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionFor(store, partition_id);
+    if (partition.replication_epoch ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      co_return Status(StatusCode::kOutOfRange,
+                       "partition replication epoch exhausted");
+    }
+    const std::uint64_t next_epoch = partition.replication_epoch + 1;
+
+    co_await store.writer_mutex.Lock();
+    UnlockGuard unlock(&store.writer_mutex, store.worker);
+    std::vector<std::pair<std::uint8_t, std::string>> old_keys;
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      partition.indexes[db_id].ForEach(
+          [&](const RecordIndex::Entry& entry) {
+            old_keys.emplace_back(db_id, entry.key);
+          });
+    }
+    partition.replication_epoch = next_epoch;
+    partition.mutation_sequence = 0;
+    partition.capture_deltas = false;
+    partition.deltas.clear();
+    partition.delta_floor = 0;
+    partition.delta_queued = false;
+    for (const auto& [db_id, key] : old_keys) {
+      const Digest digest = ComputeDigest(key);
+      Status tombstone = co_await WriteRecordLocked(
+          store, db_id, key, {}, RecordKind::kTombstone, digest,
+          0, 0, 0, false);
+      if (!tombstone.ok()) {
+        co_return tombstone;
+      }
+    }
+    co_return next_epoch;
+  }
+
+  Task<Status> ApplyReplicaRecords(
+      std::uint16_t partition_id, std::uint64_t replication_epoch,
+      std::span<const SnapshotRecord> records) {
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionFor(store, partition_id);
+    if (replication_epoch != partition.replication_epoch) {
+      co_return Status(StatusCode::kFailedPrecondition,
+                       "stale partition replication epoch");
+    }
+    for (const SnapshotRecord& record : records) {
+      if (record.db_id >= kLogicalDatabaseCount ||
+          RedisSlot(record.key) != partition_id) {
+        if (record.kind != SnapshotRecord::Kind::kFlushDb) {
+          co_return Status(StatusCode::kInvalidArgument,
+                           "replica record belongs to another partition");
+        }
+      }
+      if (record.kind == SnapshotRecord::Kind::kFlushDb) {
+        Status advanced = co_await AdvanceDbEpoch(record.db_id,
+                                                  record.db_epoch);
+        if (!advanced.ok()) {
+          co_return advanced;
+        }
+        partition.mutation_sequence = std::max(
+            partition.mutation_sequence, record.mutation_sequence);
+        continue;
+      }
+      if (record.db_epoch != DbEpoch(record.db_id)) {
+        if (record.db_epoch < DbEpoch(record.db_id)) {
+          continue;
+        }
+        co_return Status(StatusCode::kFailedPrecondition,
+                         "replica record database epoch is not installed");
+      }
+
+      const Digest digest = ComputeDigest(record.key);
+      auto key_lock = co_await store.key_locks[record.db_id].Acquire(
+          digest, IntentLockMode::kExclusive);
+      co_await store.writer_mutex.Lock();
+      UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+      auto& index = partition.indexes[record.db_id];
+      auto* current = index.Find(digest, record.key);
+      if (current != nullptr &&
+          current->value.replication_epoch == replication_epoch &&
+          current->value.mutation_sequence >= record.mutation_sequence) {
+        continue;
+      }
+      const RecordKind kind = record.kind == SnapshotRecord::Kind::kValue
+                                  ? RecordKind::kValue
+                                  : RecordKind::kTombstone;
+      Status written = co_await WriteRecordLocked(
+          store, record.db_id, record.key, record.value, kind, digest,
+          record.mutation_sequence, record.mutation_sequence, 0, false);
+      if (!written.ok()) {
+        co_return written;
+      }
+      partition.mutation_sequence = std::max(
+          partition.mutation_sequence, record.mutation_sequence);
+    }
+    co_return Status::Ok();
   }
 
   Status FlushForShutdown() {
@@ -877,6 +1211,34 @@ class StorageEngine::Impl {
     return *stores_[celer::ThisWorker().id];
   }
 
+  WorkerStore::PartitionStore& PartitionFor(
+      WorkerStore& store, std::uint16_t partition_id) const {
+    assert(partition_id < kLogicalStorageShards);
+    assert(partition_id % worker_count_ == store.worker->id());
+    auto& partition = store.partitions[partition_id / worker_count_];
+    assert(partition.id == partition_id);
+    return partition;
+  }
+
+  const WorkerStore::PartitionStore& PartitionFor(
+      const WorkerStore& store, std::uint16_t partition_id) const {
+    assert(partition_id < kLogicalStorageShards);
+    assert(partition_id % worker_count_ == store.worker->id());
+    const auto& partition = store.partitions[partition_id / worker_count_];
+    assert(partition.id == partition_id);
+    return partition;
+  }
+
+  WorkerStore::PartitionStore& PartitionForKey(
+      WorkerStore& store, std::string_view key) const {
+    return PartitionFor(store, RedisSlot(key));
+  }
+
+  const WorkerStore::PartitionStore& PartitionForKey(
+      const WorkerStore& store, std::string_view key) const {
+    return PartitionFor(store, RedisSlot(key));
+  }
+
   static BlockState* FindBlockState(WorkerStore& store,
                                     std::uint64_t block_id) noexcept {
     auto found = store.block_states.find(block_id);
@@ -906,8 +1268,121 @@ class StorageEngine::Impl {
     return {file_id, local_block * kStorageBlockBytes};
   }
 
+  Task<Status> InitializeMetadata(WorkerStore& store) {
+    auto acquired = co_await store.buffers.AcquireReadBuffer();
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease lease = std::move(*acquired);
+    FixedBuffer buffer = lease.io_buffer();
+    buffer.size = kDirectIoAlignment;
+    auto read = co_await ReadStorageBuffer(*store.worker, store.files[0],
+                                           buffer, lease.registered(), 0);
+    if (!read.ok()) {
+      co_return read.status();
+    }
+    if (*read != kDirectIoAlignment) {
+      co_return Status(StatusCode::kInternal,
+                       "short read of storage metadata");
+    }
+
+    StorageMetadata metadata{};
+    std::span<const std::byte, kDirectIoAlignment> input(buffer.data,
+                                                         kDirectIoAlignment);
+    if (IsZero(input)) {
+      metadata.db_epochs.fill(1);
+      std::span<std::byte, kDirectIoAlignment> output(buffer.data,
+                                                      kDirectIoAlignment);
+      EncodeStorageMetadata(metadata, output);
+      auto written = co_await WriteStorageBuffer(
+          *store.worker, store.files[0], output, lease.registered(), buffer, 0);
+      if (!written.ok() || *written != kDirectIoAlignment) {
+        co_return written.ok()
+                      ? Status(StatusCode::kInternal,
+                               "short write of storage metadata")
+                      : written.status();
+      }
+      Status synced = co_await celer::Fdatasync(*store.worker, store.files[0]);
+      if (!synced.ok()) {
+        co_return synced;
+      }
+    } else if (!DecodeStorageMetadata(input, &metadata)) {
+      co_return Status(StatusCode::kInternal,
+                       "invalid or corrupt storage metadata");
+    }
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      db_epochs_[db_id].store(metadata.db_epochs[db_id],
+                              std::memory_order_release);
+    }
+    next_block_id_.store(1, std::memory_order_release);
+    co_return Status::Ok();
+  }
+
+  Task<Status> PersistMetadata(std::uint8_t db_id, std::uint64_t epoch) {
+    WorkerStore& store = *stores_[0];
+    auto acquired = co_await store.buffers.AcquireReadBuffer();
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease lease = std::move(*acquired);
+    FixedBuffer buffer = lease.io_buffer();
+    buffer.size = kDirectIoAlignment;
+    StorageMetadata metadata{};
+    for (std::uint8_t id = 0; id < kLogicalDatabaseCount; ++id) {
+      metadata.db_epochs[id] = id == db_id ? epoch : DbEpoch(id);
+    }
+    std::span<std::byte, kDirectIoAlignment> output(buffer.data,
+                                                    kDirectIoAlignment);
+    EncodeStorageMetadata(metadata, output);
+    auto written = co_await WriteStorageBuffer(
+        *store.worker, store.files[0], output, lease.registered(), buffer, 0);
+    if (!written.ok() || *written != kDirectIoAlignment) {
+      co_return written.ok()
+                    ? Status(StatusCode::kInternal,
+                             "short write of storage metadata")
+                    : written.status();
+    }
+    co_return co_await celer::Fdatasync(*store.worker, store.files[0]);
+  }
+
+  Task<Status> ClearDbLocal(WorkerStore& store, std::uint8_t db_id) {
+    co_await store.writer_mutex.Lock();
+    UnlockGuard unlock(&store.writer_mutex, store.worker);
+    std::vector<RecordLocation> old_locations;
+    old_locations.reserve(store.live_key_count[db_id]);
+    for (auto& partition : store.partitions) {
+      auto& index = partition.indexes[db_id];
+      index.ForEach([&](const RecordIndex::Entry& entry) {
+        old_locations.push_back(entry.value);
+      });
+      index.Clear();
+      partition.live_key_count[db_id] = 0;
+      const std::uint64_t sequence = ++partition.mutation_sequence;
+      if (partition.capture_deltas) {
+        AppendDelta(partition, SnapshotRecord{
+                                   .kind = SnapshotRecord::Kind::kFlushDb,
+                                   .db_id = db_id,
+                                   .db_epoch = DbEpoch(db_id),
+                                   .mutation_sequence = sequence,
+                                   .key = {},
+                                   .value = {},
+                               });
+      }
+    }
+    store.live_key_count[db_id] = 0;
+    for (const RecordLocation& location : old_locations) {
+      Status dead = co_await MarkRecordDead(location);
+      if (!dead.ok()) {
+        store.write_failed = true;
+        co_return dead;
+      }
+    }
+    co_return Status::Ok();
+  }
+
   void Fail(const Status& status) {
     open_barrier_->Abort(status);
+    metadata_barrier_->Abort(status);
     recovery_barrier_->Abort(status);
     recovery_accounting_barrier_->Abort(status);
     free_list_barrier_->Abort(status);
@@ -941,7 +1416,8 @@ class StorageEngine::Impl {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch())
             .count();
-    const bool complete = scanned == total_blocks_;
+    const std::uint64_t data_blocks = total_blocks_ - 1;
+    const bool complete = scanned == data_blocks;
     if (complete) {
       if (recovery_complete_logged_.exchange(true, std::memory_order_relaxed)) {
         return;
@@ -964,18 +1440,18 @@ class StorageEngine::Impl {
     const double record_rate =
         static_cast<double>(scanned_records) / elapsed_seconds;
     const double percent =
-        total_blocks_ == 0
+        data_blocks == 0
             ? 100.0
             : (static_cast<double>(scanned) * 100.0) /
-                  static_cast<double>(total_blocks_);
+                  static_cast<double>(data_blocks);
     const double eta_seconds =
         block_rate == 0.0
             ? 0.0
-            : static_cast<double>(total_blocks_ - scanned) / block_rate;
+            : static_cast<double>(data_blocks - scanned) / block_rate;
     spdlog::info(
         "storage recovery: blocks={}/{} ({:.1f}%) records={} "
         "rate={:.0f} blocks/s {:.2f}M records/s eta={:.1f}s",
-        scanned, total_blocks_, percent, scanned_records, block_rate,
+        scanned, data_blocks, percent, scanned_records, block_rate,
         record_rate / 1000000.0, eta_seconds);
   }
   Task<Status> ScanAssignedBlocks(WorkerStore& store,
@@ -1025,6 +1501,9 @@ class StorageEngine::Impl {
 
     for (std::uint64_t block_id = store.worker->id(); block_id < total_blocks_;
          block_id += worker_count_) {
+      if (block_id == 0) {
+        continue;
+      }
       const auto [file_id, block_offset] = FileOffset(block_id);
       auto read = co_await ReadStorageBuffer(
           *store.worker, store.files[file_id], header_buffer,
@@ -1090,26 +1569,34 @@ class StorageEngine::Impl {
             record.digest != ComputeDigest(key) ||
             StorageShardForKey(key) % block.layout_worker_count !=
                 block.writer_id ||
+            record.relocation_sequence >
+                std::numeric_limits<std::uint32_t>::max() ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt committed record header");
         }
         AtomicMax(&next_lsn_, record.lsn + 1);
+        if (record.db_epoch != DbEpoch(record.db_id)) {
+          record_offset += record.total_disk_bytes;
+          ++records;
+          continue;
+        }
         const unsigned key_owner = OwnerForKey(key);
         batches->at(key_owner).records.push_back(RecoveryRecord{
             .digest = record.digest,
             .key = std::string(key),
+            .db_id = record.db_id,
             .location = RecordLocation{
                 .block_id = block_id,
-                .generation = record.generation,
-                .relocation_sequence = record.relocation_sequence,
-                .lsn = record.lsn,
+                .replication_epoch = record.replication_epoch,
+                .mutation_sequence = record.mutation_sequence,
                 .allocation_epoch = record.allocation_epoch,
-                .block_owner = block_owner,
+                .block_owner = static_cast<std::uint16_t>(block_owner),
                 .record_offset = record_offset,
                 .total_disk_bytes = record.total_disk_bytes,
                 .value_bytes = record.value_bytes,
-                .db_id = record.db_id,
+                .relocation_sequence = static_cast<std::uint32_t>(
+                    record.relocation_sequence),
                 .kind = record.kind,
             },
         });
@@ -1142,7 +1629,26 @@ class StorageEngine::Impl {
     }
 
     for (const RecoveryRecord& recovered : batch.records) {
-      auto& index = store.indexes[recovered.location.db_id];
+      auto& partition = PartitionForKey(store, recovered.key);
+      if (recovered.location.replication_epoch <
+          partition.replication_epoch) {
+        continue;
+      }
+      if (recovered.location.replication_epoch >
+          partition.replication_epoch) {
+        for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+          store.live_key_count[db_id] -=
+              partition.live_key_count[db_id];
+          partition.live_key_count[db_id] = 0;
+          partition.indexes[db_id].Clear();
+        }
+        partition.replication_epoch =
+            recovered.location.replication_epoch;
+        partition.mutation_sequence = 0;
+      }
+      partition.mutation_sequence = std::max(
+          partition.mutation_sequence, recovered.location.mutation_sequence);
+      auto& index = partition.indexes[recovered.db_id];
       auto* found = index.Find(recovered.digest, recovered.key);
       if (found == nullptr ||
           IsNewer(recovered.location, found->value)) {
@@ -1155,9 +1661,11 @@ class StorageEngine::Impl {
                              recovered.location);
         if (was_live != is_live) {
           if (is_live) {
-            ++store.live_key_count[recovered.location.db_id];
+            ++partition.live_key_count[recovered.db_id];
+            ++store.live_key_count[recovered.db_id];
           } else {
-            --store.live_key_count[recovered.location.db_id];
+            --partition.live_key_count[recovered.db_id];
+            --store.live_key_count[recovered.db_id];
           }
         }
       }
@@ -1171,7 +1679,6 @@ class StorageEngine::Impl {
                                         RecordLocation location,
                                         ReadLatencyTrace* trace = nullptr) {
     assert(location.block_owner < worker_count_);
-    assert(location.db_id == db_id);
     if (location.block_owner == key_store.worker->id()) {
       co_return co_await LoadValueLocal(key_store, db_id, key, digest, location,
                                         trace);
@@ -1263,7 +1770,9 @@ class StorageEngine::Impl {
               &record, &disk_key) ||
           record.db_id != db_id || record.digest != digest || disk_key != key ||
           record.kind != RecordKind::kValue ||
-          record.generation != location.generation ||
+          record.db_epoch != DbEpoch(db_id) ||
+          record.mutation_sequence != location.mutation_sequence ||
+          record.replication_epoch != location.replication_epoch ||
           record.relocation_sequence != location.relocation_sequence ||
           record.allocation_epoch != location.allocation_epoch ||
           location.value_bytes != record.value_bytes ||
@@ -1342,7 +1851,9 @@ class StorageEngine::Impl {
     if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
         record.db_id != db_id || record.digest != digest || disk_key != key ||
         record.kind != RecordKind::kValue ||
-        record.generation != location.generation ||
+        record.db_epoch != DbEpoch(db_id) ||
+        record.mutation_sequence != location.mutation_sequence ||
+        record.replication_epoch != location.replication_epoch ||
         record.relocation_sequence != location.relocation_sequence ||
         record.allocation_epoch != location.allocation_epoch ||
         record.value_bytes != location.value_bytes ||
@@ -1418,16 +1929,45 @@ class StorageEngine::Impl {
         });
   }
 
-  Task<Status> AppendLocked(WorkerStore& store, std::uint8_t db_id,
+  Task<Status> AppendLocked(WorkerStore& store,
+                            WorkerStore::PartitionStore& partition,
+                            std::uint8_t db_id,
                             std::string_view key, std::string_view value,
                             RecordKind kind) {
     const Digest digest = ComputeDigest(key);
-    auto& index = store.indexes[db_id];
-    auto* previous = index.Find(digest, key);
-    const std::uint64_t generation =
-        previous == nullptr ? 1 : previous->value.generation + 1;
-    co_return co_await WriteRecordLocked(store, db_id, key, value, kind,
-                                         digest, generation, 0, false);
+    const std::uint64_t mutation_sequence = ++partition.mutation_sequence;
+    Status status = co_await WriteRecordLocked(
+        store, db_id, key, value, kind, digest, mutation_sequence,
+        mutation_sequence, 0, false);
+    if (status.ok() && partition.capture_deltas) {
+      AppendDelta(partition, SnapshotRecord{
+                                 .kind = kind == RecordKind::kValue
+                                             ? SnapshotRecord::Kind::kValue
+                                             : SnapshotRecord::Kind::kDelete,
+                                 .db_id = db_id,
+                                 .db_epoch = DbEpoch(db_id),
+                                 .mutation_sequence = mutation_sequence,
+                                 .key = std::string(key),
+                                 .value = std::string(value),
+                             });
+    }
+    co_return status;
+  }
+
+  void AppendDelta(WorkerStore::PartitionStore& partition,
+                   SnapshotRecord record) {
+    constexpr std::size_t kMaxRetainedMutations = 65536;
+    partition.deltas.push_back(std::move(record));
+    if (!partition.delta_queued) {
+      partition.delta_queued = true;
+      (void)replication_ready_.enqueue(partition.id);
+    }
+    while (partition.deltas.size() > kMaxRetainedMutations) {
+      partition.delta_floor = std::max(
+          partition.delta_floor,
+          partition.deltas.front().mutation_sequence);
+      partition.deltas.pop_front();
+    }
   }
 
   Task<Status> WriteRecordLocked(WorkerStore& store, std::uint8_t db_id,
@@ -1435,6 +1975,7 @@ class StorageEngine::Impl {
                                  RecordKind kind,
                                  const Digest& digest,
                                  std::uint64_t generation,
+                                 std::uint64_t mutation_sequence,
                                  std::uint64_t relocation_sequence,
                                  bool for_defrag) {
     if (store.write_failed) {
@@ -1461,7 +2002,8 @@ class StorageEngine::Impl {
     // worker. This keeps foreground writes local and bounds active 8 MiB
     // buffers by worker count rather than logical partition count.
     const std::uint32_t writer_id = store.worker->id();
-    auto& index = store.indexes[db_id];
+    auto& partition = PartitionForKey(store, key);
+    auto& index = partition.indexes[db_id];
     auto* previous_entry = index.Find(digest, key);
     const std::optional<RecordLocation> previous =
         previous_entry == nullptr
@@ -1591,6 +2133,9 @@ class StorageEngine::Impl {
         .value_disk_bytes = static_cast<std::uint32_t>(value_disk_bytes),
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
         .generation = generation,
+        .replication_epoch = partition.replication_epoch,
+        .db_epoch = DbEpoch(db_id),
+        .mutation_sequence = mutation_sequence,
         .relocation_sequence = relocation_sequence,
         .lsn = lsn,
         .allocation_epoch = updated.allocation_epoch,
@@ -1639,15 +2184,15 @@ class StorageEngine::Impl {
 
     const RecordLocation location{
         .block_id = updated.block_id,
-        .generation = generation,
-        .relocation_sequence = relocation_sequence,
-        .lsn = lsn,
+        .replication_epoch = partition.replication_epoch,
+        .mutation_sequence = mutation_sequence,
         .allocation_epoch = updated.allocation_epoch,
-        .block_owner = writer_id,
+        .block_owner = static_cast<std::uint16_t>(writer_id),
         .record_offset = record_offset,
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
         .value_bytes = static_cast<std::uint32_t>(value.size()),
-        .db_id = db_id,
+        .relocation_sequence = static_cast<std::uint32_t>(
+            relocation_sequence),
         .in_memory = true,
         .kind = kind,
     };
@@ -1660,8 +2205,10 @@ class StorageEngine::Impl {
     });
     if (was_live != is_live) {
       if (is_live) {
+        ++partition.live_key_count[db_id];
         ++store.live_key_count[db_id];
       } else {
+        --partition.live_key_count[db_id];
         --store.live_key_count[db_id];
       }
     }
@@ -2034,7 +2581,8 @@ class StorageEngine::Impl {
     co_await key_store.writer_mutex.Lock();
     UnlockGuard write_unlock(&key_store.writer_mutex, key_store.worker);
 
-    auto& index = key_store.indexes[record.db_id];
+    auto& partition = PartitionForKey(key_store, key);
+    auto& index = partition.indexes[record.db_id];
     auto* current = index.Find(record.digest, key);
     if (current == nullptr ||
         !current->value.SamePhysicalRecord(source_location)) {
@@ -2043,7 +2591,8 @@ class StorageEngine::Impl {
 
     co_return co_await WriteRecordLocked(
         key_store, record.db_id, key, value, record.kind, record.digest,
-        record.generation, record.relocation_sequence + 1, true);
+        record.generation, record.mutation_sequence,
+        record.relocation_sequence + 1, true);
   }
 
   Task<Status> CleanBlockLocked(WorkerStore& store,
@@ -2124,15 +2673,15 @@ class StorageEngine::Impl {
 
       const RecordLocation source_location{
           .block_id = block_id,
-          .generation = record.generation,
-          .relocation_sequence = record.relocation_sequence,
-          .lsn = record.lsn,
+          .replication_epoch = record.replication_epoch,
+          .mutation_sequence = record.mutation_sequence,
           .allocation_epoch = record.allocation_epoch,
-          .block_owner = store.worker->id(),
+          .block_owner = static_cast<std::uint16_t>(store.worker->id()),
           .record_offset = record_offset,
           .total_disk_bytes = record.total_disk_bytes,
           .value_bytes = record.value_bytes,
-          .db_id = record.db_id,
+          .relocation_sequence = static_cast<std::uint32_t>(
+              record.relocation_sequence),
           .kind = record.kind,
       };
       const std::byte* value_data =
@@ -2245,6 +2794,7 @@ class StorageEngine::Impl {
   std::uint64_t total_blocks_ = 0;
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
+  std::unique_ptr<CoroutineBarrier> metadata_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_accounting_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
@@ -2259,10 +2809,12 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> next_block_id_{0};
   std::atomic<std::uint64_t> next_allocation_epoch_{1};
   std::atomic<std::uint64_t> next_lsn_{1};
+  std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
   std::atomic<unsigned> active_defrags_{0};
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};
   std::atomic<bool> shutdown_flush_failed_{false};
+  moodycamel::ConcurrentQueue<std::uint16_t> replication_ready_;
 };
 
 StorageEngine::StorageEngine(StorageEngineOptions options)
@@ -2294,10 +2846,60 @@ std::size_t StorageEngine::LocalSize(std::uint8_t db_id) const noexcept {
   return impl_->LocalSize(db_id);
 }
 
-ScanBatch StorageEngine::ScanLocal(std::uint8_t db_id,
-                                   std::uint64_t cursor,
-                                   std::size_t count) const {
-  return impl_->ScanLocal(db_id, cursor, count);
+ScanBatch StorageEngine::ScanPartition(std::uint16_t partition_id,
+                                       std::uint8_t db_id,
+                                       std::uint64_t cursor,
+                                       std::size_t count) const {
+  return impl_->ScanPartition(partition_id, db_id, cursor, count);
+}
+
+Task<Status> StorageEngine::FlushDb(std::uint8_t db_id) {
+  co_return co_await impl_->FlushDb(db_id);
+}
+
+std::uint64_t StorageEngine::DbEpoch(std::uint8_t db_id) const noexcept {
+  return impl_->DbEpoch(db_id);
+}
+
+PartitionReplicationStart StorageEngine::BeginPartitionReplication(
+    std::uint16_t partition_id) {
+  return impl_->BeginPartitionReplication(partition_id);
+}
+
+Task<StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
+    std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
+    std::size_t count) {
+  co_return co_await impl_->SnapshotPartition(partition_id, db_id, cursor,
+                                              count);
+}
+
+PartitionDeltaBatch StorageEngine::ReadPartitionDeltas(
+    std::uint16_t partition_id, std::uint64_t after_sequence,
+    std::size_t count) {
+  return impl_->ReadPartitionDeltas(partition_id, after_sequence, count);
+}
+
+bool StorageEngine::TryTakeReplicationReady(std::uint16_t* partition_id) {
+  return impl_->TryTakeReplicationReady(partition_id);
+}
+
+void StorageEngine::AcknowledgePartitionDeltas(
+    std::uint16_t partition_id, std::uint64_t through_sequence) {
+  impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
+}
+
+Task<StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
+    std::uint16_t partition_id,
+    std::span<const std::uint64_t, 16> source_db_epochs) {
+  co_return co_await impl_->ResetReplicaPartition(partition_id,
+                                                  source_db_epochs);
+}
+
+Task<Status> StorageEngine::ApplyReplicaRecords(
+    std::uint16_t partition_id, std::uint64_t replication_epoch,
+    std::span<const SnapshotRecord> records) {
+  co_return co_await impl_->ApplyReplicaRecords(partition_id,
+                                                replication_epoch, records);
 }
 
 Task<StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,

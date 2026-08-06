@@ -22,6 +22,7 @@ enum class CommandKind {
   kDbSize,
   kDel,
   kExists,
+  kFlushDb,
   kGet,
   kIncr,
   kScan,
@@ -48,9 +49,9 @@ StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                              std::uint8_t db_id);
 
 // Bind command routing to the disk engine. Call once before the server starts.
-void InitStorage(storage::StorageEngine* engine);
+void InitStorage(storage::StorageEngine* engine, bool replica_read_only = false);
 
-// Route `request` to the worker owning its 16-slot storage shard. Async disk
+// Route `request` to the worker owning its Redis hash-slot partition. Async disk
 // operations use SubmitTaskTo and return on the connection's original worker.
 Task<CommandReply> ExecuteCommand(const CommandRequest& request);
 

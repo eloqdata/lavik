@@ -14,10 +14,10 @@ key_owner   = StorageShardForKey(key) % current_worker_count
 block_owner = the current worker that exclusively manages one physical block
 ```
 
-There are 1024 logical storage shards over Redis' 16384 slots (16 slots per
-shard). Logical shards are used for key routing and future scan partitioning.
+There are 16384 logical storage partitions, exactly matching Redis hash slots.
+Partitions are used for key routing, independent indexes, SCAN, and replication.
 They are not physical append streams. Each worker has one active 8 MiB append
-block, so active write-buffer count scales with workers rather than with 1024.
+block, so active write-buffer count scales with workers rather than with 16384.
 
 ## Persistent provenance
 
@@ -29,7 +29,7 @@ Every block header stores:
 - committed length, record count, and maximum LSN.
 
 `layout_worker_count` is provenance, not a startup constraint. Any current
-worker count from 1 through 1024 is accepted. The format version intentionally
+worker count from 1 through 16384 is accepted. The format version intentionally
 remains 1 during development; data must be cleared when incompatible layouts
 are introduced.
 
@@ -71,7 +71,7 @@ Each worker has a sparse map containing only the blocks it currently owns:
 
 ```text
 WorkerStore
-  16 logical-DB key indexes  keys routed to this worker, isolated by DB
+  owned partitions          each has 16 logical-DB key indexes
   active append block       new physical writes owned by this worker
   owned BlockState map      blocks whose lifecycle this worker manages
   flush queue

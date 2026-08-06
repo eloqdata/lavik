@@ -21,6 +21,7 @@
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
 #include "keylane/resp.h"
+#include "keylane/replication.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
@@ -247,8 +248,9 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 
 class RedisService final : public TcpService {
  public:
-  RedisService(std::uint16_t port, storage::StorageEngine* storage)
-      : TcpService(port), storage_(storage) {}
+  RedisService(std::uint16_t port, storage::StorageEngine* storage,
+               ReplicationManager* replication)
+      : TcpService(port), storage_(storage), replication_(replication) {}
 
   void Prepare(unsigned thread_count) override;
   Task<Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -279,6 +281,7 @@ class RedisService final : public TcpService {
   static constexpr std::uint64_t kRequestsClosed = 1ULL << 63;
   static constexpr std::uint64_t kRequestCountMask = ~kRequestsClosed;
   storage::StorageEngine* storage_;
+  ReplicationManager* replication_;
   std::atomic<bool> startup_failed_{false};
   std::atomic<std::uint64_t> request_gate_{0};
 };
@@ -328,6 +331,7 @@ Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   }
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
+  replication_->StorageReady(worker);
   co_return co_await TcpService::Run(worker, ctx);
 }
 
@@ -442,7 +446,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
               std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
               bool verify_read_crc,
               const std::vector<std::string>& data_files,
-              std::uint64_t data_file_size_bytes) {
+              std::uint64_t data_file_size_bytes,
+              ReplicationOptions replication_options) {
   spdlog::info(
       "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
       "registered_buffer_bytes={} per worker flush_max_ms={} flush_size_bytes={} "
@@ -470,7 +475,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
     CleanupShutdownSignalHandler();
     return 1;
   }
-  InitStorage(&storage);
+  ReplicationManager replication(&storage, replication_options);
+  InitStorage(&storage, replication.replica_read_only());
 
   ServerOptions options;
   options.bind_ip = std::string(bind_ip);
@@ -479,9 +485,13 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   options.recv_buffer_count = recv_buffer_count;
   options.busy_poll_us = busy_poll_us;
 
-  RedisService redis(port, &storage);
+  RedisService redis(port, &storage, &replication);
   Server server;
   server.AddService(&redis);
+  if (celer::Service* replication_service = replication.service();
+      replication_service != nullptr) {
+    server.AddService(replication_service);
+  }
   auto start_status = server.Start(options);
   if (!start_status.ok()) [[unlikely]] {
     spdlog::error("server start failed: {}", start_status.message());

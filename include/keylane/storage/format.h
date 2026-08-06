@@ -16,7 +16,8 @@ inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
 inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;   // KCOLBLK1
 inline constexpr std::uint64_t kRecordMagic = 0x314b4c5245434f52ULL;  // ROCERLK1
-inline constexpr std::uint32_t kLogicalStorageShards = 1024;
+inline constexpr std::uint64_t kMetadataMagic = 0x314154454d4c4bULL;  // KLMETA1
+inline constexpr std::uint32_t kLogicalStorageShards = 16384;
 inline constexpr std::uint8_t kLogicalDatabaseCount = 16;
 
 struct Digest {
@@ -64,6 +65,9 @@ struct RecordHeader {
   std::uint32_t value_disk_bytes = 0;
   std::uint32_t total_disk_bytes = 0;
   std::uint64_t generation = 0;
+  std::uint64_t replication_epoch = 1;
+  std::uint64_t db_epoch = 1;
+  std::uint64_t mutation_sequence = 0;
   std::uint64_t relocation_sequence = 0;
   std::uint64_t lsn = 0;
   std::uint64_t allocation_epoch = 0;
@@ -71,8 +75,20 @@ struct RecordHeader {
   std::uint32_t header_checksum = 0;
 };
 
+// Block zero is reserved for this metadata page. Data blocks start at block
+// one. A FLUSHDB first advances and persists the selected database epoch; old
+// records can then be forgotten from memory without writing per-key tombstones.
+struct StorageMetadata {
+  std::uint64_t magic = kMetadataMagic;
+  std::uint32_t version = kStorageFormatVersion;
+  std::uint32_t header_bytes = kDirectIoAlignment;
+  std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs{};
+  std::uint32_t checksum = 0;
+};
+
 static_assert(sizeof(BlockHeader) <= kBlockHeaderBytes);
 static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
+static_assert(sizeof(StorageMetadata) <= kDirectIoAlignment);
 
 constexpr std::size_t AlignDirect(std::size_t size) noexcept {
   return (size + kDirectIoAlignment - 1) & ~(kDirectIoAlignment - 1);
@@ -96,6 +112,13 @@ void EncodeBlockHeader(const BlockHeader& header,
                        std::span<std::byte, kBlockHeaderBytes> output) noexcept;
 bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderBytes> input,
                        BlockHeader* header) noexcept;
+
+void EncodeStorageMetadata(
+    const StorageMetadata& metadata,
+    std::span<std::byte, kDirectIoAlignment> output) noexcept;
+bool DecodeStorageMetadata(
+    std::span<const std::byte, kDirectIoAlignment> input,
+    StorageMetadata* metadata) noexcept;
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;

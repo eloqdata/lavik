@@ -1,7 +1,10 @@
 #include "keylane/command.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -11,6 +14,7 @@
 #include <vector>
 
 #include "celer/runtime/cross_core.h"
+#include "celer/io/storage.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
@@ -21,6 +25,7 @@ using namespace celer;
 namespace {
 
 storage::StorageEngine* g_storage = nullptr;
+bool g_replica_read_only = false;
 
 CommandReply EncodedReply(std::string encoded) {
   CommandReply reply;
@@ -60,6 +65,9 @@ CommandKind MatchCommandKind(std::string_view name) {
       if (CmpCaseInsensitive(name, "DBSIZE")) return CommandKind::kDbSize;
       if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
       if (CmpCaseInsensitive(name, "SELECT")) return CommandKind::kSelect;
+      break;
+    case 7:
+      if (CmpCaseInsensitive(name, "FLUSHDB")) return CommandKind::kFlushDb;
       break;
   }
   return CommandKind::kUnknown;
@@ -118,6 +126,7 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
     }
 
     case CommandKind::kDbSize:
+    case CommandKind::kFlushDb:
     case CommandKind::kScan:
     case CommandKind::kGet:
     case CommandKind::kIncr:
@@ -153,6 +162,90 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request) {
         EncodeError("ERR db size exceeds RESP integer range"));
   }
   co_return EncodedReply(EncodeInteger(static_cast<long long>(total)));
+}
+
+constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
+constexpr std::uint64_t kDbGateCountMask = ~kDbGateClosed;
+std::array<std::atomic<std::uint64_t>, storage::kLogicalDatabaseCount>
+    g_db_gates{};
+
+bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
+  auto& gate = g_db_gates[db_id];
+  std::uint64_t state = gate.load(std::memory_order_acquire);
+  while ((state & kDbGateClosed) == 0) {
+    if (gate.compare_exchange_weak(state, state + 1,
+                                   std::memory_order_acq_rel,
+                                   std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void EndDbOperation(std::uint8_t db_id) noexcept {
+  g_db_gates[db_id].fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool CloseDbGate(std::uint8_t db_id) noexcept {
+  auto& gate = g_db_gates[db_id];
+  std::uint64_t expected = gate.load(std::memory_order_acquire);
+  while ((expected & kDbGateClosed) == 0) {
+    if (gate.compare_exchange_weak(expected, expected | kDbGateClosed,
+                                   std::memory_order_acq_rel,
+                                   std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void OpenDbGate(std::uint8_t db_id) noexcept {
+  g_db_gates[db_id].store(0, std::memory_order_release);
+}
+
+class DbOperationGuard {
+ public:
+  explicit DbOperationGuard(std::uint8_t db_id) : db_id_(db_id) {}
+  DbOperationGuard(const DbOperationGuard&) = delete;
+  DbOperationGuard& operator=(const DbOperationGuard&) = delete;
+  ~DbOperationGuard() { EndDbOperation(db_id_); }
+
+ private:
+  std::uint8_t db_id_;
+};
+
+class DbCloseGuard {
+ public:
+  explicit DbCloseGuard(std::uint8_t db_id) : db_id_(db_id) {}
+  DbCloseGuard(const DbCloseGuard&) = delete;
+  DbCloseGuard& operator=(const DbCloseGuard&) = delete;
+  ~DbCloseGuard() { OpenDbGate(db_id_); }
+
+ private:
+  std::uint8_t db_id_;
+};
+
+Task<CommandReply> ExecuteFlushDb(const CommandRequest& request) {
+  if (request.args.size() != 1) {
+    co_return EncodedReply(
+        EncodeError("ERR wrong number of arguments for 'flushdb' command"));
+  }
+  if (!CloseDbGate(request.db_id)) {
+    co_return EncodedReply(
+        EncodeError("BUSY another FLUSHDB is already running"));
+  }
+  DbCloseGuard reopen(request.db_id);
+  while ((g_db_gates[request.db_id].load(std::memory_order_acquire) &
+          kDbGateCountMask) != 0) {
+    Status waited = co_await celer::SleepFor(
+        *ThisWorker().self, std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_return EncodedReply(EncodeError("ERR " + waited.message()));
+    }
+  }
+  Status status = co_await g_storage->FlushDb(request.db_id);
+  co_return EncodedReply(status.ok() ? EncodeSimpleString("OK")
+                                     : EncodeError("ERR " + status.message()));
 }
 
 struct ScanOptions {
@@ -294,33 +387,49 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
     co_return EncodedReply(EncodeError("ERR " + parsed.status().message()));
   }
 
-  constexpr unsigned kWorkerBits = 10;
-  constexpr unsigned kLocalBits = 64 - kWorkerBits;
-  constexpr std::uint64_t kLocalMask =
+  constexpr unsigned kPartitionBits = 14;
+  constexpr unsigned kLocalBits = 64 - kPartitionBits;
+  constexpr std::uint64_t kPackedLocalMask =
       (std::uint64_t{1} << kLocalBits) - 1;
-  static_assert(storage::kLogicalStorageShards <=
-                (std::uint64_t{1} << kWorkerBits));
+  constexpr std::uint64_t kDroppedLocalMask =
+      (std::uint64_t{1} << kPartitionBits) - 1;
+  constexpr std::size_t kMaxPartitionsPerCall = 64;
+  static_assert(storage::kLogicalStorageShards ==
+                (std::uint64_t{1} << kPartitionBits));
 
   const ScanOptions& options = *parsed;
-  unsigned worker_id =
+  unsigned partition_id =
       static_cast<unsigned>(options.cursor >> kLocalBits);
-  std::uint64_t local_cursor = options.cursor & kLocalMask;
-  if (options.cursor != 0 && worker_id >= g_storage->worker_count()) {
+  // ScanHashMap's reverse-bit cursor for a table with at most 2^50 buckets
+  // always has 14 zero low bits. Pack its significant high 50 bits below the
+  // 14-bit partition id and restore the zeros before scanning the local map.
+  std::uint64_t local_cursor =
+      (options.cursor & kPackedLocalMask) << kPartitionBits;
+  if (options.cursor != 0 &&
+      partition_id >= storage::kLogicalStorageShards) {
     co_return EncodedReply(EncodeError("ERR invalid cursor"));
   }
 
   std::size_t remaining = options.count;
+  std::size_t partitions_examined = 0;
   std::vector<std::string> keys;
-  while (worker_id < g_storage->worker_count()) {
+  while (partition_id < storage::kLogicalStorageShards) {
+    const unsigned worker_id = partition_id % g_storage->worker_count();
     storage::ScanBatch batch;
     if (worker_id == ThisWorker().id) {
-      batch = g_storage->ScanLocal(request.db_id, local_cursor, remaining);
+      batch = g_storage->ScanPartition(
+          static_cast<std::uint16_t>(partition_id), request.db_id,
+          local_cursor, remaining);
     } else {
       batch = co_await SubmitTo(
-          worker_id, [db_id = request.db_id, local_cursor, remaining] {
-            return g_storage->ScanLocal(db_id, local_cursor, remaining);
+          worker_id,
+          [partition_id, db_id = request.db_id, local_cursor, remaining] {
+            return g_storage->ScanPartition(
+                static_cast<std::uint16_t>(partition_id), db_id,
+                local_cursor, remaining);
           });
     }
+    ++partitions_examined;
 
     const std::size_t examined = batch.keys.size();
     for (std::string& key : batch.keys) {
@@ -331,24 +440,25 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
     }
 
     if (batch.cursor != 0) {
-      if (batch.cursor > kLocalMask) {
+      if ((batch.cursor & kDroppedLocalMask) != 0) {
         co_return EncodedReply(
             EncodeError("ERR local scan cursor overflow"));
       }
       const std::uint64_t cursor =
-          (static_cast<std::uint64_t>(worker_id) << kLocalBits) |
-          batch.cursor;
+          (static_cast<std::uint64_t>(partition_id) << kLocalBits) |
+          (batch.cursor >> kPartitionBits);
       co_return EncodedReply(EncodeScanReply(cursor, keys));
     }
 
-    ++worker_id;
+    ++partition_id;
     local_cursor = 0;
-    if (worker_id >= g_storage->worker_count()) {
+    if (partition_id >= storage::kLogicalStorageShards) {
       co_return EncodedReply(EncodeScanReply(0, keys));
     }
-    if (examined >= remaining) {
+    if (examined >= remaining ||
+        partitions_examined >= kMaxPartitionsPerCall) {
       const std::uint64_t cursor =
-          static_cast<std::uint64_t>(worker_id) << kLocalBits;
+          static_cast<std::uint64_t>(partition_id) << kLocalBits;
       co_return EncodedReply(EncodeScanReply(cursor, keys));
     }
     remaining -= examined;
@@ -471,12 +581,41 @@ Task<CommandReply> RouteMultiKey(const CommandRequest& request) {
 
 }  // namespace
 
-void InitStorage(storage::StorageEngine* engine) {
+void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_storage = engine;
+  g_replica_read_only = replica_read_only;
 }
 
 Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   const auto& args = request.args;
+  const bool mutating = request.kind == CommandKind::kSet ||
+                        request.kind == CommandKind::kIncr ||
+                        request.kind == CommandKind::kDel ||
+                        request.kind == CommandKind::kFlushDb;
+  if (g_replica_read_only && mutating) {
+    co_return EncodedReply(EncodeError(
+        "READONLY You can't write against a read only replica."));
+  }
+  if (request.kind == CommandKind::kFlushDb) {
+    co_return co_await ExecuteFlushDb(request);
+  }
+
+  const bool uses_db = request.kind == CommandKind::kDbSize ||
+                       request.kind == CommandKind::kScan ||
+                       request.kind == CommandKind::kDel ||
+                       request.kind == CommandKind::kExists ||
+                       request.kind == CommandKind::kGet ||
+                       request.kind == CommandKind::kSet ||
+                       request.kind == CommandKind::kIncr;
+  if (uses_db && !TryBeginDbOperation(request.db_id)) {
+    co_return EncodedReply(
+        EncodeError("TRYAGAIN FLUSHDB is in progress"));
+  }
+  std::optional<DbOperationGuard> db_guard;
+  if (uses_db) {
+    db_guard.emplace(request.db_id);
+  }
+
   switch (request.kind) {
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request);
@@ -526,6 +665,10 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
         }
       }
       co_return co_await ExecuteStorageCommand(request);
+
+    case CommandKind::kFlushDb:
+      // Handled before the DB operation gate above.
+      co_return EncodedReply(EncodeError("ERR internal FLUSHDB routing error"));
 
     default:  // PING, SELECT, local single-key path, unknown
       co_return ExecuteLocalCommand(request);

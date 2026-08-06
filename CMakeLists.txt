@@ -34,6 +34,7 @@ add_library(keylane_module
   src/storage/buffer_pool.cpp
   src/storage/engine.cpp
   src/storage/format.cpp
+  src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/command.cpp
   src/redis/server.cpp
@@ -58,6 +59,7 @@ target_compile_definitions(keylane_module PRIVATE
 )
 target_link_libraries(keylane_module PUBLIC
   celer::core
+  celer::rpc
   absl::crc32c
   absl::flat_hash_map
 )

@@ -146,7 +146,7 @@ std::uint16_t RedisSlot(std::string_view key) noexcept {
 }
 
 std::uint32_t StorageShardForKey(std::string_view key) noexcept {
-  return RedisSlot(key) >> 4;
+  return RedisSlot(key);
 }
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
@@ -197,6 +197,47 @@ bool DecodeBlockHeader(
   return true;
 }
 
+void EncodeStorageMetadata(
+    const StorageMetadata& metadata,
+    std::span<std::byte, kDirectIoAlignment> output) noexcept {
+  std::fill(output.begin(), output.end(), std::byte{0});
+  StorageMetadata encoded = metadata;
+  encoded.checksum = 0;
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  encoded.checksum = Crc32c(output);
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+}
+
+bool DecodeStorageMetadata(
+    std::span<const std::byte, kDirectIoAlignment> input,
+    StorageMetadata* metadata) noexcept {
+  if (metadata == nullptr) {
+    return false;
+  }
+  StorageMetadata decoded{};
+  std::memcpy(&decoded, input.data(), sizeof(decoded));
+  if (decoded.magic != kMetadataMagic ||
+      decoded.version != kStorageFormatVersion ||
+      decoded.header_bytes != kDirectIoAlignment) {
+    return false;
+  }
+  for (std::uint64_t epoch : decoded.db_epochs) {
+    if (epoch == 0) {
+      return false;
+    }
+  }
+  const std::uint32_t expected = decoded.checksum;
+  std::array<std::byte, kDirectIoAlignment> copy{};
+  std::memcpy(copy.data(), input.data(), copy.size());
+  decoded.checksum = 0;
+  std::memcpy(copy.data(), &decoded, sizeof(decoded));
+  if (Crc32c(copy) != expected) {
+    return false;
+  }
+  *metadata = decoded;
+  return true;
+}
+
 bool EncodeRecordHeader(
     const RecordHeader& header, std::string_view key,
     std::span<std::byte> output) noexcept {
@@ -229,6 +270,7 @@ bool DecodeRecordHeader(
       (decoded.kind != RecordKind::kValue &&
        decoded.kind != RecordKind::kTombstone) ||
       decoded.db_id >= kLogicalDatabaseCount ||
+      decoded.replication_epoch == 0 || decoded.db_epoch == 0 ||
       decoded.key_bytes > MaxKeyBytes() ||
       decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
       decoded.header_bytes > input.size() ||

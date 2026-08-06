@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -31,6 +32,38 @@ struct StorageEngineOptions {
 struct ScanBatch {
   std::uint64_t cursor = 0;
   std::vector<std::string> keys;
+};
+
+struct SnapshotRecord {
+  enum class Kind : std::uint8_t {
+    kValue = 1,
+    kDelete = 2,
+    kFlushDb = 3,
+  };
+
+  Kind kind = Kind::kValue;
+  std::uint8_t db_id = 0;
+  std::uint64_t db_epoch = 0;
+  std::uint64_t mutation_sequence = 0;
+  std::string key;
+  std::string value;
+};
+
+struct PartitionReplicationStart {
+  std::uint64_t snapshot_sequence = 0;
+  std::uint16_t nonempty_db_mask = 0;
+  std::array<std::uint64_t, 16> db_epochs{};
+};
+
+struct PartitionSnapshotBatch {
+  std::uint64_t cursor = 0;
+  std::vector<SnapshotRecord> records;
+};
+
+struct PartitionDeltaBatch {
+  std::uint64_t watermark = 0;
+  bool overflow = false;
+  std::vector<SnapshotRecord> records;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -81,10 +114,40 @@ class StorageEngine {
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
   std::size_t LocalSize(std::uint8_t db_id) const noexcept;
-  // Must run on the worker whose local index is being scanned. The cursor is
-  // stateless and may return duplicate keys while the index is changing.
-  ScanBatch ScanLocal(std::uint8_t db_id, std::uint64_t cursor,
-                      std::size_t count) const;
+  // Must run on the worker owning partition_id. The cursor is stateless and
+  // may return duplicate keys while the partition index is changing.
+  ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
+                          std::uint64_t cursor, std::size_t count) const;
+
+  // Atomically invalidates one logical DB by advancing its durable epoch.
+  // The command layer must prevent concurrent operations in that DB while this
+  // coroutine runs.
+  celer::Task<celer::Status> FlushDb(std::uint8_t db_id);
+  std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
+
+  // Source-side partition migration primitives. Begin captures
+  // a sequence fence, Snapshot reads the baseline tree, and ReadDeltas returns
+  // every mutation after that fence until acknowledged.
+  PartitionReplicationStart BeginPartitionReplication(
+      std::uint16_t partition_id);
+  celer::Task<celer::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
+      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
+      std::size_t count);
+  PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
+                                          std::uint64_t after_sequence,
+                                          std::size_t count);
+  void AcknowledgePartitionDeltas(std::uint16_t partition_id,
+                                  std::uint64_t through_sequence);
+  bool TryTakeReplicationReady(std::uint16_t* partition_id);
+
+  // Replica-side primitives. Reset returns a new local replication epoch that
+  // fences every record from an earlier copy of this partition.
+  celer::Task<celer::StatusOr<std::uint64_t>> ResetReplicaPartition(
+      std::uint16_t partition_id,
+      std::span<const std::uint64_t, 16> source_db_epochs);
+  celer::Task<celer::Status> ApplyReplicaRecords(
+      std::uint16_t partition_id, std::uint64_t replication_epoch,
+      std::span<const SnapshotRecord> records);
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.

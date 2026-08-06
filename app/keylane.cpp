@@ -1,3 +1,4 @@
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -22,6 +23,9 @@ int main(int argc, char** argv) {
   bool disable_read_crc = false;
   std::vector<std::string> data_files{"keylane.data"};
   std::uint64_t data_file_size_mb = 1024;
+  std::uint16_t replication_port = 0;
+  std::string replicate_to;
+  bool replica_read_only = false;
 
   app.add_option("-b,--bind", bind_ip, "Bind address")->capture_default_str();
   app.add_option("-p,--port", port, "Listen port")->capture_default_str();
@@ -59,6 +63,14 @@ int main(int argc, char** argv) {
                  "Preallocated size of each data file in MiB")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_option("--replication-port", replication_port,
+                 "Internal replication listen port (0 disables receiver)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--replicate-to", replicate_to,
+                 "Static replica endpoint as IPv4:port");
+  app.add_flag("--replica-read-only", replica_read_only,
+               "Reject mutating Redis commands on this replica");
 
   try {
     app.parse(argc, argv);
@@ -74,11 +86,33 @@ int main(int argc, char** argv) {
           std::numeric_limits<std::uint64_t>::max() / kMiB) {
     return 2;
   }
+  keylane::ReplicationOptions replication_options;
+  replication_options.listen_port = replication_port;
+  replication_options.replica_read_only = replica_read_only;
+  if (!replicate_to.empty()) {
+    const std::size_t separator = replicate_to.rfind(':');
+    unsigned parsed_port = 0;
+    if (separator == std::string::npos || separator == 0 ||
+        separator + 1 == replicate_to.size()) {
+      return 2;
+    }
+    const char* begin = replicate_to.data() + separator + 1;
+    const char* end = replicate_to.data() + replicate_to.size();
+    auto [parsed_end, error] =
+        std::from_chars(begin, end, parsed_port);
+    if (error != std::errc{} || parsed_end != end || parsed_port == 0 ||
+        parsed_port > std::numeric_limits<std::uint16_t>::max()) {
+      return 2;
+    }
+    replication_options.target_ip = replicate_to.substr(0, separator);
+    replication_options.target_port = static_cast<std::uint16_t>(parsed_port);
+  }
   return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms,
                             recv_buffer_count, busy_poll_us,
                             static_cast<std::size_t>(registered_buffer_mb) * kMiB,
                             flush_max_ms,
                             static_cast<std::size_t>(flush_size_kb) * kKiB,
                             !disable_read_crc,
-                            data_files, data_file_size_mb * kMiB);
+                            data_files, data_file_size_mb * kMiB,
+                            std::move(replication_options));
 }

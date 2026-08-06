@@ -22,21 +22,23 @@ affects another connection.
 
 ## Indexing and partitioning
 
-Logical databases are orthogonal to the 1024 storage partitions:
+Logical databases are orthogonal to the 16384 Redis hash-slot partitions:
 
 ```text
-key_owner = StorageShardForKey(user_key) % current_worker_count
-index[db_id][(SHA1(user_key), user_key)]
+partition = RedisSlot(user_key)
+key_owner = partition % current_worker_count
+partition_index[partition][db_id][(SHA1(user_key), user_key)]
 ```
 
 The same user key in two databases routes to the same worker but has a
-different hash table, intent-lock table, generation history, and value. A DB's
-rehash, scan, or flush does not traverse or resize another DB's index. The 16
-maps allocate buckets only when used; they still share the worker's one physical
-append stream, so this does not multiply write buffers or storage IOPS. Keeping
-DB out of the partition calculation also means changing DB does not alter key
-distribution. The complete key participates in equality, so two distinct keys
-with the same SHA-1 digest remain separate records.
+different hash table, generation history, and value. Each worker stores only
+the partitions it owns; every partition has 16 lazily allocated maps. These
+maps still share the worker's one physical append stream, so 16384 partitions
+do not create 16384 write buffers or physical storage streams. Intent locks
+remain per worker and DB. Keeping DB out of the partition calculation means
+changing DB does not alter key distribution. The complete key participates in
+equality, so two distinct keys with the same SHA-1 digest remain separate
+records.
 
 The primary index uses `ScanHashMap`, a Keylane-specific C++ adaptation of
 Valkey's cache-line bucket hash table. Entries have stable addresses, expansion
@@ -60,15 +62,19 @@ workers. `SCAN cursor [MATCH pattern] [COUNT count]` scans only the selected
 database. Its unsigned 64-bit cursor is composed as follows:
 
 ```text
-bits 63..54: worker id (10 bits, up to 1024 workers)
-bits 53..0:  owner-local reverse-bit hash-table cursor
+bits 63..50: Redis partition id (14 bits)
+bits 49..0:  local reverse-bit cursor bits 63..14
 ```
 
-A cursor of 0 begins and ends an iteration. Workers are visited in ascending
-order, so a request contacts only the worker represented by its cursor unless
-that worker's local scan finishes before the COUNT hint is satisfied. No global
-merge, cursor registry, or per-client scan state is required, and any number of
-clients may hold cursors concurrently.
+A cursor of 0 begins and ends an iteration. Partitions are visited in ascending
+order and each partition's map is scanned independently. The local cursor's low
+14 bits are omitted from the external cursor and restored as zero on decode;
+this is lossless while a partition map has at most 2^50 buckets because the
+reverse-bit algorithm leaves those bits zero. A request visits at most 64
+partitions, so a sparse database may legally return an empty key array with a
+nonzero cursor instead of traversing all 16384 empty maps in one latency spike.
+No global merge, cursor registry, or per-client scan state is required, and any
+number of clients may hold cursors concurrently.
 
 As in Redis/Valkey, SCAN is weakly consistent while writes are concurrent. It
 may return duplicates; a key inserted after its bucket has passed may not be
@@ -80,11 +86,9 @@ and limits empty/tombstone bucket work per call to keep latency bounded. Shrink
 and tombstone reclamation are intentionally deferred until an epoch-aware
 reclamation policy exists.
 
-Future database-wide invalidation commands must use the `db_id` carried by the
-request:
-
-- `FLUSHDB` invalidates only that DB, preferably through a per-DB epoch;
-- `FLUSHALL` advances every DB epoch or the node-wide epoch.
+`FLUSHDB` invalidates only the selected DB by durably advancing its per-DB
+epoch before clearing its in-memory partition indexes. `FLUSHALL` is not yet
+implemented; it should advance all DB epochs.
 
 The selected DB must never be inferred from the worker executing one of these
 operations.
