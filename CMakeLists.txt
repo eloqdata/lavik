@@ -92,4 +92,10 @@ if (BUILD_TESTING)
   )
   target_link_libraries(keylane_scan_hash_map_test PRIVATE keylane::module)
   add_test(NAME keylane_scan_hash_map COMMAND keylane_scan_hash_map_test)
+
+  add_executable(keylane_storage_format_test
+    tests/storage_format_test.cpp
+  )
+  target_link_libraries(keylane_storage_format_test PRIVATE keylane::module)
+  add_test(NAME keylane_storage_format COMMAND keylane_storage_format_test)
 endif()

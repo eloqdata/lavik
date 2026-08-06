@@ -155,6 +155,48 @@ std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
   return static_cast<std::uint32_t>(absl::ComputeCrc32c(input));
 }
 
+void EncodeDeviceLabel(
+    const DeviceLabel& label,
+    std::span<std::byte, kDirectIoAlignment> output) noexcept {
+  std::fill(output.begin(), output.end(), std::byte{0});
+  DeviceLabel encoded = label;
+  encoded.checksum = 0;
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  encoded.checksum = Crc32c(output);
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+}
+
+bool DecodeDeviceLabel(
+    std::span<const std::byte, kDirectIoAlignment> input,
+    DeviceLabel* label) noexcept {
+  if (label == nullptr) {
+    return false;
+  }
+  DeviceLabel decoded{};
+  std::memcpy(&decoded, input.data(), sizeof(decoded));
+  if (decoded.magic != kDeviceLabelMagic ||
+      decoded.version != kStorageFormatVersion ||
+      decoded.header_bytes != kDirectIoAlignment ||
+      decoded.storage_set_id == 0 || decoded.device_id >= kDeviceIdLimit ||
+      decoded.capacity_blocks < 2 ||
+      decoded.capacity_blocks > kLocalBlockIdLimit ||
+      decoded.device_count == 0 ||
+      decoded.device_count > std::numeric_limits<std::uint16_t>::max() ||
+      decoded.block_bytes != kStorageBlockBytes) {
+    return false;
+  }
+  const std::uint32_t expected = decoded.checksum;
+  std::array<std::byte, kDirectIoAlignment> copy{};
+  std::memcpy(copy.data(), input.data(), copy.size());
+  decoded.checksum = 0;
+  std::memcpy(copy.data(), &decoded, sizeof(decoded));
+  if (Crc32c(copy) != expected) {
+    return false;
+  }
+  *label = decoded;
+  return true;
+}
+
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderBytes> output) noexcept {
@@ -175,6 +217,8 @@ bool DecodeBlockHeader(
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
   if (decoded.magic != kBlockMagic ||
+      decoded.block_id == kInvalidBlockId ||
+      LocalBlockId(decoded.block_id) == 0 ||
       decoded.version != kStorageFormatVersion ||
       decoded.header_bytes != kBlockHeaderBytes ||
       decoded.block_bytes != kStorageBlockBytes ||
