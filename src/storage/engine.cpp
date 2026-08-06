@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <charconv>
 #include <cerrno>
@@ -48,6 +49,9 @@ using celer::Worker;
 
 struct RecordLocation {
   std::uint64_t block_id = 0;
+  // Owner in the current process topology. Unlike the persisted writer_id,
+  // this must always be in [0, worker_count).
+  std::uint32_t block_owner = 0;
   std::uint32_t record_offset = 0;
   std::uint32_t total_disk_bytes = 0;
   std::uint32_t value_bytes = 0;
@@ -78,7 +82,8 @@ bool IsNewer(const RecordLocation& candidate,
 
 struct ActiveBlock {
   std::uint64_t block_id = 0;
-  std::uint32_t storage_shard_id = 0;
+  std::uint32_t writer_id = 0;
+  std::uint32_t layout_worker_count = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = kBlockHeaderBytes;
   std::uint32_t record_count = 0;
@@ -89,7 +94,8 @@ struct ActiveBlock {
 };
 
 struct BlockState {
-  std::uint32_t storage_shard_id = 0;
+  std::uint32_t writer_id = 0;
+  std::uint32_t layout_worker_count = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = 0;
   std::uint32_t live_bytes = 0;
@@ -97,6 +103,7 @@ struct BlockState {
   bool allocated = false;
   bool defrag_queued = false;
   bool defragging = false;
+  bool freeing = false;
   bool in_memory = false;
   bool flush_queued = false;
   bool flush_in_progress = false;
@@ -118,6 +125,12 @@ struct RecoveryBlock {
 struct RecoveryBatch {
   std::vector<RecoveryRecord> records;
   std::vector<RecoveryBlock> blocks;
+};
+
+struct RecoveryLiveReference {
+  std::uint64_t block_id = 0;
+  std::uint64_t allocation_epoch = 0;
+  std::uint32_t bytes = 0;
 };
 
 class AsyncMutex {
@@ -383,18 +396,15 @@ class StorageEngine::Impl {
 
  public:
   struct WorkerStore {
-    explicit WorkerStore(std::size_t total_blocks)
-        : block_states(total_blocks) {}
-
     Worker* worker = nullptr;
     RegisteredBufferPool buffers;
     std::vector<FixedFile> files;
     absl::flat_hash_map<Digest, RecordLocation, DigestHash> index;
-  absl::flat_hash_map<std::uint64_t, std::vector<Digest>> staged_records;
+    absl::flat_hash_map<std::uint64_t, std::vector<Digest>> staged_records;
     std::size_t live_key_count = 0;
     IntentLockTable key_locks;
-    std::array<std::optional<ActiveBlock>, kLogicalStorageShards> active_blocks;
-    std::vector<BlockState> block_states;
+    std::optional<ActiveBlock> active_block;
+    absl::flat_hash_map<std::uint64_t, std::unique_ptr<BlockState>> block_states;
     AsyncMutex writer_mutex;
     std::deque<std::uint64_t> flush_queue;
     std::deque<std::uint64_t> defrag_queue;
@@ -407,6 +417,10 @@ class StorageEngine::Impl {
     if (worker_count == 0 || options_.data_files.empty()) {
       return Status(StatusCode::kInvalidArgument,
                     "storage requires workers and at least one data file");
+    }
+    if (worker_count > kLogicalStorageShards) {
+      return Status(StatusCode::kInvalidArgument,
+                    "storage worker count exceeds logical storage shards");
     }
     if (options_.data_files.size() >
         std::numeric_limits<std::uint16_t>::max()) {
@@ -468,10 +482,12 @@ class StorageEngine::Impl {
                                 std::memory_order_relaxed);
     stores_.reserve(worker_count);
     for (unsigned i = 0; i < worker_count; ++i) {
-      stores_.push_back(std::make_unique<WorkerStore>(total_blocks_));
+      stores_.push_back(std::make_unique<WorkerStore>());
     }
     open_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
     recovery_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+    recovery_accounting_barrier_ =
+        std::make_unique<CoroutineBarrier>(worker_count);
     free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
     return Status::Ok();
   }
@@ -542,6 +558,52 @@ class StorageEngine::Impl {
       co_return status;
     }
 
+    std::vector<std::vector<RecoveryLiveReference>> live_by_owner(
+        worker_count_);
+    for (const auto& [digest, location] : store.index) {
+      (void)digest;
+      assert(location.block_owner < worker_count_);
+      live_by_owner[location.block_owner].push_back(RecoveryLiveReference{
+          .block_id = location.block_id,
+          .allocation_epoch = location.allocation_epoch,
+          .bytes = location.total_disk_bytes,
+      });
+    }
+    for (unsigned owner = 0; owner < worker_count_; ++owner) {
+      if (live_by_owner[owner].empty()) {
+        continue;
+      }
+      auto apply_live =
+          [this, owner,
+           references = std::move(live_by_owner[owner])]() mutable {
+            WorkerStore& owner_store = *stores_[owner];
+            for (const RecoveryLiveReference& reference : references) {
+              BlockState* state =
+                  FindBlockState(owner_store, reference.block_id);
+              if (state == nullptr || !state->allocated ||
+                  state->allocation_epoch != reference.allocation_epoch) {
+                return Status(StatusCode::kInternal,
+                              "recovery live reference has no owning block");
+              }
+              state->live_bytes += reference.bytes;
+            }
+            return Status::Ok();
+          };
+      Status applied = owner == worker.id()
+                           ? apply_live()
+                           : co_await celer::SubmitTo(owner,
+                                                      std::move(apply_live));
+      if (!applied.ok()) {
+        Fail(applied);
+        co_return applied;
+      }
+    }
+
+    status = co_await recovery_accounting_barrier_->Wait(worker);
+    if (!status.ok()) {
+      co_return status;
+    }
+
     const std::uint64_t pristine =
         next_block_id_.load(std::memory_order_acquire);
     for (std::uint64_t block_id : zero_blocks) {
@@ -558,6 +620,11 @@ class StorageEngine::Impl {
     status = co_await free_list_barrier_->Wait(worker);
     if (!status.ok()) {
       co_return status;
+    }
+    for (const auto& [block_id, state] : store.block_states) {
+      if (state != nullptr) {
+        MaybeQueueDefrag(store, block_id);
+      }
     }
     worker.Spawn(PeriodicFlush(&store));
     co_return Status::Ok();
@@ -751,6 +818,27 @@ class StorageEngine::Impl {
     return *stores_[celer::ThisWorker().id];
   }
 
+  static BlockState* FindBlockState(WorkerStore& store,
+                                    std::uint64_t block_id) noexcept {
+    auto found = store.block_states.find(block_id);
+    return found == store.block_states.end() ? nullptr : found->second.get();
+  }
+
+  static const BlockState* FindBlockState(
+      const WorkerStore& store, std::uint64_t block_id) noexcept {
+    auto found = store.block_states.find(block_id);
+    return found == store.block_states.end() ? nullptr : found->second.get();
+  }
+
+  static BlockState& CreateBlockState(WorkerStore& store,
+                                      std::uint64_t block_id) {
+    auto [found, inserted] = store.block_states.try_emplace(block_id, nullptr);
+    if (inserted || found->second == nullptr) {
+      found->second = std::make_unique<BlockState>();
+    }
+    return *found->second;
+  }
+
   std::pair<std::uint32_t, std::uint64_t> FileOffset(
       std::uint64_t block_id) const noexcept {
     const std::uint32_t file_id =
@@ -762,7 +850,24 @@ class StorageEngine::Impl {
   void Fail(const Status& status) {
     open_barrier_->Abort(status);
     recovery_barrier_->Abort(status);
+    recovery_accounting_barrier_->Abort(status);
     free_list_barrier_->Abort(status);
+  }
+
+  unsigned RecoveredBlockOwner(const BlockHeader& block,
+                               std::uint64_t block_id) const noexcept {
+    // writer_id belongs to the topology that wrote the block and may be
+    // greater than the current worker count after a scale-down.
+    if (block.layout_worker_count == worker_count_ &&
+        block.writer_id < worker_count_) {
+      return block.writer_id;
+    }
+    std::uint64_t mixed = block_id ^
+                          (block.allocation_epoch + 0x9e3779b97f4a7c15ULL);
+    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+    mixed ^= mixed >> 31;
+    return static_cast<unsigned>(mixed % worker_count_);
   }
 
 
@@ -902,11 +1007,11 @@ class StorageEngine::Impl {
       AtomicMax(&next_allocation_epoch_, block.allocation_epoch + 1);
       AtomicMax(&next_lsn_, block.max_lsn + 1);
 
-      const unsigned target =
-          block.storage_shard_id % worker_count_;
-      batches->at(target).blocks.push_back(RecoveryBlock{ActiveBlock{
+      const unsigned block_owner = RecoveredBlockOwner(block, block_id);
+      batches->at(block_owner).blocks.push_back(RecoveryBlock{ActiveBlock{
           .block_id = block_id,
-          .storage_shard_id = block.storage_shard_id,
+          .writer_id = block.writer_id,
+          .layout_worker_count = block.layout_worker_count,
           .allocation_epoch = block.allocation_epoch,
           .committed_bytes = block.committed_bytes,
           .record_count = block.record_count,
@@ -923,17 +1028,19 @@ class StorageEngine::Impl {
             block.committed_bytes - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
             record.allocation_epoch != block.allocation_epoch ||
-            StorageShardForKey(key) % worker_count_ !=
-                block.storage_shard_id % worker_count_ ||
+            StorageShardForKey(key) % block.layout_worker_count !=
+                block.writer_id ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt committed record header");
         }
         AtomicMax(&next_lsn_, record.lsn + 1);
-        batches->at(target).records.push_back(RecoveryRecord{
+        const unsigned key_owner = OwnerForKey(key);
+        batches->at(key_owner).records.push_back(RecoveryRecord{
             .digest = record.digest,
             .location = RecordLocation{
                 .block_id = block_id,
+                .block_owner = block_owner,
                 .record_offset = record_offset,
                 .total_disk_bytes = record.total_disk_bytes,
                 .value_bytes = record.value_bytes,
@@ -961,8 +1068,9 @@ class StorageEngine::Impl {
     WorkerStore& store = *stores_[target];
     for (const RecoveryBlock& recovered : batch.blocks) {
       const ActiveBlock& block = recovered.block;
-      BlockState& state = store.block_states[block.block_id];
-      state.storage_shard_id = block.storage_shard_id;
+      BlockState& state = CreateBlockState(store, block.block_id);
+      state.writer_id = block.writer_id;
+      state.layout_worker_count = block.layout_worker_count;
       state.allocation_epoch = block.allocation_epoch;
       state.committed_bytes = block.committed_bytes;
       state.allocated = true;
@@ -981,13 +1089,6 @@ class StorageEngine::Impl {
           found != store.index.end() &&
           found->second.kind == RecordKind::kValue;
         const bool is_live = recovered.location.kind == RecordKind::kValue;
-        if (found != store.index.end()) {
-          BlockState& old_state =
-              store.block_states[found->second.block_id];
-          old_state.live_bytes -=
-              std::min(old_state.live_bytes,
-                       found->second.total_disk_bytes);
-        }
         store.index.insert_or_assign(recovered.digest, recovered.location);
         if (was_live != is_live) {
           if (is_live) {
@@ -996,65 +1097,72 @@ class StorageEngine::Impl {
             --store.live_key_count;
           }
         }
-        BlockState& new_state =
-            store.block_states[recovered.location.block_id];
-        new_state.live_bytes += recovered.location.total_disk_bytes;
-        new_state.in_memory = false;
-        new_state.heap_data = nullptr;
-        new_state.heap_data_size = 0;
-        new_state.write_buffer_id = 0;
-        new_state.release_pending = false;
-        new_state.flush_queued = false;
-        new_state.flush_in_progress = false;
       }
     }
   }
 
-  Task<StatusOr<LoadedValue>> LoadValue(WorkerStore& store,
+  Task<StatusOr<LoadedValue>> LoadValue(WorkerStore& key_store,
                                         std::string_view key,
                                         const Digest& digest,
                                         RecordLocation location,
                                         ReadLatencyTrace* trace = nullptr) {
+    assert(location.block_owner < worker_count_);
+    if (location.block_owner == key_store.worker->id()) {
+      co_return co_await LoadValueLocal(key_store, key, digest, location,
+                                        trace);
+    }
+    const unsigned owner = location.block_owner;
+    std::string owned_key(key);
+    co_return co_await celer::SubmitTaskTo(
+        owner,
+        [this, owner, key = std::move(owned_key), digest, location,
+         trace]() mutable -> Task<StatusOr<LoadedValue>> {
+          co_return co_await LoadValueLocal(*stores_[owner], key, digest,
+                                            location, trace);
+        });
+  }
+
+  Task<StatusOr<LoadedValue>> LoadValueLocal(
+      WorkerStore& store, std::string_view key, const Digest& digest,
+      RecordLocation location, ReadLatencyTrace* trace = nullptr) {
     // TODO: Coalesce concurrent reads of the same aligned disk page, like
     // the reference engine tiering::OpManager::pending_reads_. Key the in-flight table by
     // (file_id, aligned offset, aligned length), submit one read, and fan the
     // decoded result out to all waiting coroutines. In-flight operations must
     // retain values/leases, never flat_hash_map iterators or element pointers.
-    if (location.block_id >= store.block_states.size()) {
-      co_return Status(StatusCode::kInternal, "index block is out of range");
-    }
-    BlockState& state = store.block_states[location.block_id];
-    if (!state.allocated ||
-        state.allocation_epoch != location.allocation_epoch) {
+    BlockState* state = FindBlockState(store, location.block_id);
+    if (state == nullptr || !state->allocated || state->freeing ||
+        state->allocation_epoch != location.allocation_epoch) {
       co_return Status(StatusCode::kInternal, "stale index block epoch");
     }
-    if (location.in_memory && state.in_memory) {
-      ++state.pins;
-      struct PinGuard {
-        WorkerStore* store = nullptr;
-        BlockState* state = nullptr;
-        ~PinGuard() {
-          if (state == nullptr) {
-            return;
-          }
-          --state->pins;
-          if (state->pins == 0 && state->release_pending) {
-            if (state->write_buffer_id != 0) {
-              store->buffers.ReleaseWriteBuffer(state->write_buffer_id);
-            } else if (state->heap_data != nullptr) {
-              store->buffers.ReleaseHeapWriteBuffer(state->heap_data);
-            }
-            state->write_buffer_id = 0;
-            state->heap_data = nullptr;
-            state->heap_data_size = 0;
-            state->release_pending = false;
-            state->in_memory = false;
-          }
+    ++state->pins;
+    struct PinGuard {
+      WorkerStore* store = nullptr;
+      BlockState* state = nullptr;
+      ~PinGuard() {
+        if (state == nullptr) {
+          return;
         }
-      } pin{&store, &state};
+        --state->pins;
+        if (state->pins == 0 && state->release_pending) {
+          if (state->write_buffer_id != 0) {
+            store->buffers.ReleaseWriteBuffer(state->write_buffer_id);
+          } else if (state->heap_data != nullptr) {
+            store->buffers.ReleaseHeapWriteBuffer(state->heap_data);
+          }
+          state->write_buffer_id = 0;
+          state->heap_data = nullptr;
+          state->heap_data_size = 0;
+          state->release_pending = false;
+          state->in_memory = false;
+        }
+      }
+    } pin{&store, state};
+
+    if (location.in_memory && state->in_memory) {
 
       auto in_mem_buffer =
-          StagingBufferFor(state, store.buffers);
+          StagingBufferFor(*state, store.buffers);
       if (!in_mem_buffer.data || in_mem_buffer.size == 0 ||
           location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
         co_return Status(StatusCode::kInternal, "invalid in-memory location");
@@ -1217,6 +1325,33 @@ class StorageEngine::Impl {
     return std::nullopt;
   }
 
+  Status MarkRecordDeadLocal(unsigned owner,
+                             const RecordLocation& location) {
+    WorkerStore& store = *stores_[owner];
+    BlockState* state = FindBlockState(store, location.block_id);
+    if (state == nullptr || !state->allocated ||
+        state->allocation_epoch != location.allocation_epoch) {
+      return Status(StatusCode::kInternal,
+                    "stale block owner while invalidating record");
+    }
+    state->live_bytes -=
+        std::min(state->live_bytes, location.total_disk_bytes);
+    MaybeQueueDefrag(store, location.block_id);
+    return Status::Ok();
+  }
+
+  Task<Status> MarkRecordDead(const RecordLocation& location) {
+    assert(location.block_owner < worker_count_);
+    const unsigned owner = location.block_owner;
+    if (owner == celer::ThisWorker().id) {
+      co_return MarkRecordDeadLocal(owner, location);
+    }
+    co_return co_await celer::SubmitTo(
+        owner, [this, owner, location] {
+          return MarkRecordDeadLocal(owner, location);
+        });
+  }
+
   Task<Status> AppendLocked(WorkerStore& store, std::string_view key,
                             std::string_view value, RecordKind kind) {
     const Digest digest = ComputeDigest(key);
@@ -1253,12 +1388,10 @@ class StorageEngine::Impl {
                        "value requires dedicated multi-block storage");
     }
 
-    // A worker owns one append stream. Records for different logical key
-    // shards can share the same block because they are all routed to this
-    // worker. The remaining registered write buffers cover blocks being
-    // flushed; heap buffers are the fallback when those are all busy.
-    const std::uint32_t shard =
-        static_cast<std::uint32_t>(store.worker->id());
+    // Logical partitions route keys, but physical append streams are per
+    // worker. This keeps foreground writes local and bounds active 8 MiB
+    // buffers by worker count rather than logical partition count.
+    const std::uint32_t writer_id = store.worker->id();
     auto previous_it = store.index.find(digest);
     const std::optional<RecordLocation> previous =
         previous_it == store.index.end()
@@ -1267,7 +1400,7 @@ class StorageEngine::Impl {
     const std::uint64_t lsn =
         next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
-    auto& active = store.active_blocks[shard];
+    auto& active = store.active_block;
     if (!active.has_value() ||
         active->committed_bytes + total_disk_bytes > kStorageBlockBytes) {
       if (active.has_value()) {
@@ -1307,7 +1440,8 @@ class StorageEngine::Impl {
                   std::byte{0});
       active = ActiveBlock{
           .block_id = block_id,
-          .storage_shard_id = shard,
+          .writer_id = writer_id,
+          .layout_worker_count = worker_count_,
           .allocation_epoch = next_allocation_epoch_.fetch_add(
               1, std::memory_order_relaxed),
           .committed_bytes = kBlockHeaderBytes,
@@ -1317,9 +1451,10 @@ class StorageEngine::Impl {
           .heap_buffer = heap_buffer,
           .heap_buffer_size = options_.buffers.write_buffer_bytes,
       };
-      BlockState& state = store.block_states[block_id];
+      BlockState& state = CreateBlockState(store, block_id);
       state = BlockState{};
-      state.storage_shard_id = shard;
+      state.writer_id = writer_id;
+      state.layout_worker_count = worker_count_;
       state.allocation_epoch = active->allocation_epoch;
       state.committed_bytes = kBlockHeaderBytes;
       state.live_bytes = 0;
@@ -1339,13 +1474,13 @@ class StorageEngine::Impl {
           .version = kStorageFormatVersion,
           .header_bytes = kBlockHeaderBytes,
           .block_bytes = kStorageBlockBytes,
-          .storage_shard_id = shard,
+          .writer_id = writer_id,
           .allocation_epoch = active->allocation_epoch,
           .committed_bytes = kBlockHeaderBytes,
           .record_count = 0,
           .max_lsn = 0,
           .checksum = 0,
-          .reserved = 0,
+          .layout_worker_count = worker_count_,
       };
       std::span<std::byte, kBlockHeaderBytes> block_output(
           staging_buffer.data, kBlockHeaderBytes);
@@ -1358,7 +1493,12 @@ class StorageEngine::Impl {
     ++updated.record_count;
     updated.max_lsn = std::max(updated.max_lsn, lsn);
 
-    BlockState& state = store.block_states[updated.block_id];
+    BlockState* state_ptr = FindBlockState(store, updated.block_id);
+    if (state_ptr == nullptr) {
+      co_return Status(StatusCode::kInternal,
+                       "active block has no owner state");
+    }
+    BlockState& state = *state_ptr;
     FixedBuffer staging = updated.write_buffer_id != 0
                               ? store.buffers.write_buffer(updated.write_buffer_id)
                               : FixedBuffer{.data = updated.heap_buffer,
@@ -1403,13 +1543,13 @@ class StorageEngine::Impl {
         .version = kStorageFormatVersion,
         .header_bytes = kBlockHeaderBytes,
         .block_bytes = kStorageBlockBytes,
-        .storage_shard_id = shard,
+        .writer_id = updated.writer_id,
         .allocation_epoch = updated.allocation_epoch,
         .committed_bytes = updated.committed_bytes,
         .record_count = updated.record_count,
         .max_lsn = updated.max_lsn,
         .checksum = 0,
-        .reserved = 0,
+        .layout_worker_count = updated.layout_worker_count,
     };
     std::span<std::byte, kBlockHeaderBytes> block_output(
         staging.data, kBlockHeaderBytes);
@@ -1429,6 +1569,7 @@ class StorageEngine::Impl {
 
     const RecordLocation location{
         .block_id = updated.block_id,
+        .block_owner = writer_id,
         .record_offset = record_offset,
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
         .value_bytes = static_cast<std::uint32_t>(value.size()),
@@ -1442,17 +1583,7 @@ class StorageEngine::Impl {
     const bool was_live =
         previous.has_value() && previous->kind == RecordKind::kValue;
     const bool is_live = kind == RecordKind::kValue;
-    std::optional<std::uint64_t> dirtied_block;
-    if (previous.has_value()) {
-      BlockState& old_state = store.block_states[previous->block_id];
-      old_state.live_bytes -= std::min(old_state.live_bytes,
-                                       previous->total_disk_bytes);
-      dirtied_block = previous->block_id;
-    }
     store.index.insert_or_assign(digest, location);
-    if (!for_defrag && dirtied_block.has_value()) {
-      MaybeQueueDefrag(store, *dirtied_block);
-    }
     store.staged_records[updated.block_id].push_back(digest);
     if (was_live != is_live) {
       if (is_live) {
@@ -1468,22 +1599,26 @@ class StorageEngine::Impl {
     state.heap_data_size = updated.heap_buffer_size;
     state.live_bytes += location.total_disk_bytes;
     state.flush_queued = updated.committed_bytes == kStorageBlockBytes;
+    if (previous.has_value()) {
+      Status dead = co_await MarkRecordDead(*previous);
+      if (!dead.ok()) {
+        store.write_failed = true;
+        co_return dead;
+      }
+    }
     co_return Status::Ok();
   }
 
   void SealActiveBlocks(WorkerStore& store) {
-    for (auto& active : store.active_blocks) {
-      if (!active.has_value() ||
-          active->committed_bytes <= kBlockHeaderBytes) {
-        continue;
-      }
-      RequestFlush(store, active->block_id);
-      active.reset();
+    if (store.active_block.has_value() &&
+        store.active_block->committed_bytes > kBlockHeaderBytes) {
+      RequestFlush(store, store.active_block->block_id);
+      store.active_block.reset();
     }
   }
 
   Task<Status> FlushWorkerForShutdown(WorkerStore* store) {
-    while (store->defrag_running) {
+    while (active_defrags_.load(std::memory_order_acquire) != 0) {
       Status status = co_await celer::SleepFor(
           *store->worker, std::chrono::milliseconds(1));
       if (!status.ok()) {
@@ -1556,15 +1691,15 @@ class StorageEngine::Impl {
   }
 
   void RequestFlush(WorkerStore& store, std::uint64_t block_id) {
-    BlockState& state = store.block_states[block_id];
-    if (!state.allocated || !state.in_memory ||
-        (state.write_buffer_id == 0 && state.heap_data == nullptr)) {
+    BlockState* state = FindBlockState(store, block_id);
+    if (state == nullptr || !state->allocated || !state->in_memory ||
+        (state->write_buffer_id == 0 && state->heap_data == nullptr)) {
       return;
     }
-    if (state.flush_queued || state.flush_in_progress) {
+    if (state->flush_queued || state->flush_in_progress) {
       return;
     }
-    state.flush_queued = true;
+    state->flush_queued = true;
     store.flush_queue.push_back(block_id);
     if (store.flush_running) {
       return;
@@ -1605,37 +1740,37 @@ class StorageEngine::Impl {
 
         const std::uint64_t block_id = store->flush_queue.front();
         store->flush_queue.pop_front();
-        if (block_id >= store->block_states.size()) {
+        BlockState* state = FindBlockState(*store, block_id);
+        if (state == nullptr) {
           continue;
         }
-        BlockState& state = store->block_states[block_id];
-        if (!state.allocated || !state.in_memory ||
-            (state.write_buffer_id == 0 && state.heap_data == nullptr) ||
-            state.flush_in_progress) {
-          state.flush_queued = false;
+        if (!state->allocated || !state->in_memory ||
+            (state->write_buffer_id == 0 && state->heap_data == nullptr) ||
+            state->flush_in_progress) {
+          state->flush_queued = false;
           continue;
         }
-        if (state.pins > 0) {
+        if (state->pins > 0) {
           store->flush_queue.push_back(block_id);
-          state.flush_queued = true;
+          state->flush_queued = true;
           continue;
         }
 
         pending.emplace(PendingFlush{
             .block_id = block_id,
-            .committed_bytes = state.committed_bytes,
-            .allocation_epoch = state.allocation_epoch,
-            .write_buffer_id = state.write_buffer_id,
-            .heap_data = state.heap_data,
-            .heap_data_size = state.heap_data_size,
+            .committed_bytes = state->committed_bytes,
+            .allocation_epoch = state->allocation_epoch,
+            .write_buffer_id = state->write_buffer_id,
+            .heap_data = state->heap_data,
+            .heap_data_size = state->heap_data_size,
         });
         if (auto found = store->staged_records.find(block_id);
             found != store->staged_records.end()) {
           pending->staged_records = std::move(found->second);
           store->staged_records.erase(found);
         }
-        state.flush_queued = false;
-        state.flush_in_progress = true;
+        state->flush_queued = false;
+        state->flush_in_progress = true;
       }
 
       const auto [file_id, block_offset] =
@@ -1650,9 +1785,11 @@ class StorageEngine::Impl {
       if (staging.data == nullptr || staging.size < write_bytes) {
         co_await store->writer_mutex.Lock();
         UnlockGuard guard(&store->writer_mutex, store->worker);
-        BlockState& state = store->block_states[pending->block_id];
-        state.flush_in_progress = false;
-        state.flush_queued = false;
+        BlockState* state = FindBlockState(*store, pending->block_id);
+        if (state != nullptr) {
+          state->flush_in_progress = false;
+          state->flush_queued = false;
+        }
         store->write_failed = true;
         store->flush_running = false;
         release_pending(*pending);
@@ -1671,9 +1808,11 @@ class StorageEngine::Impl {
         if (!written.ok() || *written != chunk_bytes) {
           co_await store->writer_mutex.Lock();
           UnlockGuard guard(&store->writer_mutex, store->worker);
-          BlockState& state = store->block_states[pending->block_id];
-          state.flush_in_progress = false;
-          state.flush_queued = false;
+          BlockState* state = FindBlockState(*store, pending->block_id);
+          if (state != nullptr) {
+            state->flush_in_progress = false;
+            state->flush_queued = false;
+          }
           store->write_failed = true;
           store->flush_running = false;
           release_pending(*pending);
@@ -1690,9 +1829,11 @@ class StorageEngine::Impl {
       if (!synced.ok()) {
         co_await store->writer_mutex.Lock();
         UnlockGuard guard(&store->writer_mutex, store->worker);
-        BlockState& state = store->block_states[pending->block_id];
-        state.flush_in_progress = false;
-        state.flush_queued = false;
+        BlockState* state = FindBlockState(*store, pending->block_id);
+        if (state != nullptr) {
+          state->flush_in_progress = false;
+          state->flush_queued = false;
+        }
         store->write_failed = true;
         store->flush_running = false;
         release_pending(*pending);
@@ -1701,15 +1842,15 @@ class StorageEngine::Impl {
 
       co_await store->writer_mutex.Lock();
       UnlockGuard write_guard(&store->writer_mutex, store->worker);
-      if (pending->block_id >= store->block_states.size()) {
+      BlockState* state = FindBlockState(*store, pending->block_id);
+      if (state == nullptr) {
         store->flush_running = false;
         co_return Status::Ok();
       }
-      BlockState& state = store->block_states[pending->block_id];
-      if (!state.allocated || state.flush_in_progress == false ||
-          state.allocation_epoch != pending->allocation_epoch) {
-        state.flush_in_progress = false;
-        state.flush_queued = false;
+      if (!state->allocated || state->flush_in_progress == false ||
+          state->allocation_epoch != pending->allocation_epoch) {
+        state->flush_in_progress = false;
+        state->flush_queued = false;
         release_pending(*pending);
         store->flush_running = false;
         co_return Status::Ok();
@@ -1724,51 +1865,48 @@ class StorageEngine::Impl {
         }
       }
 
-      state.flush_in_progress = false;
-      state.flush_queued = false;
-      state.in_memory = false;
-      if (state.pins > 0) {
-        state.release_pending = true;
+      state->flush_in_progress = false;
+      state->flush_queued = false;
+      state->in_memory = false;
+      if (state->pins > 0) {
+        state->release_pending = true;
         continue;
       }
-      ReleaseStagingBuffer(*store, state);
+      ReleaseStagingBuffer(*store, *state);
       MaybeQueueDefrag(*store, pending->block_id);
     }
   }
 
   bool IsActiveBlock(const WorkerStore& store,
                      std::uint64_t block_id) const noexcept {
-    for (const auto& active : store.active_blocks) {
-      if (active.has_value() && active->block_id == block_id) {
-        return true;
-      }
-    }
-    return false;
+    return store.active_block.has_value() &&
+           store.active_block->block_id == block_id;
   }
 
   bool IsDefragCandidate(const WorkerStore& store,
                          std::uint64_t block_id) const noexcept {
-    const BlockState& state = store.block_states[block_id];
-    if (!state.allocated || state.defrag_queued || state.defragging ||
-        state.pins != 0 || state.in_memory || state.flush_queued ||
-        state.flush_in_progress || IsActiveBlock(store, block_id) ||
-        state.committed_bytes <= kBlockHeaderBytes) {
+    const BlockState* state = FindBlockState(store, block_id);
+    if (state == nullptr || !state->allocated || state->defrag_queued ||
+        state->defragging || state->pins != 0 || state->in_memory ||
+        state->flush_queued || state->flush_in_progress ||
+        IsActiveBlock(store, block_id) ||
+        state->committed_bytes <= kBlockHeaderBytes) {
       return false;
     }
-    const std::uint64_t used = state.committed_bytes - kBlockHeaderBytes;
+    const std::uint64_t used = state->committed_bytes - kBlockHeaderBytes;
     const std::uint64_t live_ratio =
         used == 0
             ? 0
-            : (static_cast<std::uint64_t>(state.live_bytes) * 1000) / used;
+            : (static_cast<std::uint64_t>(state->live_bytes) * 1000) / used;
     return live_ratio <= 500;
   }
 
   void MaybeQueueDefrag(WorkerStore& store, std::uint64_t block_id) {
-    if (block_id >= store.block_states.size() ||
-        !IsDefragCandidate(store, block_id)) {
+    BlockState* state = FindBlockState(store, block_id);
+    if (state == nullptr || !IsDefragCandidate(store, block_id)) {
       return;
     }
-    store.block_states[block_id].defrag_queued = true;
+    state->defrag_queued = true;
     store.defrag_queue.push_back(block_id);
     RequestDefrag(store);
   }
@@ -1779,17 +1917,26 @@ class StorageEngine::Impl {
       return;
     }
     store.defrag_running = true;
+    active_defrags_.fetch_add(1, std::memory_order_acq_rel);
     store.worker->Spawn(DefragOne(&store));
   }
 
   Task<Status> DefragOne(WorkerStore* store) {
     if (store->defrag_queue.empty()) {
       store->defrag_running = false;
+      active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
       co_return Status::Ok();
     }
     const std::uint64_t candidate = store->defrag_queue.front();
     store->defrag_queue.pop_front();
-    store->block_states[candidate].defrag_queued = false;
+    BlockState* candidate_state = FindBlockState(*store, candidate);
+    if (candidate_state == nullptr) {
+      store->defrag_running = false;
+      active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
+      RequestDefrag(*store);
+      co_return Status::Ok();
+    }
+    candidate_state->defrag_queued = false;
 
     Status status = co_await CleanBlockLocked(*store, candidate);
     if (!status.ok()) {
@@ -1797,15 +1944,41 @@ class StorageEngine::Impl {
                     store->worker->id(), candidate, status.message());
     }
     store->defrag_running = false;
+    active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
     if (status.ok()) {
       RequestDefrag(*store);
     }
     co_return status;
   }
 
+  Task<Status> RelocateIfCurrent(unsigned key_owner, std::string_view key,
+                                 std::string_view value,
+                                 const RecordHeader& record,
+                                 const RecordLocation& source_location) {
+    WorkerStore& key_store = *stores_[key_owner];
+    auto key_lock = co_await key_store.key_locks.Acquire(
+        record.digest, IntentLockMode::kExclusive);
+    co_await key_store.writer_mutex.Lock();
+    UnlockGuard write_unlock(&key_store.writer_mutex, key_store.worker);
+
+    auto current = key_store.index.find(record.digest);
+    if (current == key_store.index.end() ||
+        !current->second.SamePhysicalRecord(source_location)) {
+      co_return Status::Ok();
+    }
+
+    co_return co_await WriteRecordLocked(
+        key_store, key, value, record.kind, record.digest, record.generation,
+        record.relocation_sequence + 1, true);
+  }
+
   Task<Status> CleanBlockLocked(WorkerStore& store,
                                 std::uint64_t block_id) {
-    BlockState& source = store.block_states[block_id];
+    BlockState* source_ptr = FindBlockState(store, block_id);
+    if (source_ptr == nullptr) {
+      co_return Status::Ok();
+    }
+    BlockState& source = *source_ptr;
     if (!source.allocated || source.in_memory || source.pins != 0 ||
         source.flush_queued || source.flush_in_progress ||
         IsActiveBlock(store, block_id)) {
@@ -1877,6 +2050,7 @@ class StorageEngine::Impl {
 
       const RecordLocation source_location{
           .block_id = block_id,
+          .block_owner = store.worker->id(),
           .record_offset = record_offset,
           .total_disk_bytes = record.total_disk_bytes,
           .value_bytes = record.value_bytes,
@@ -1886,58 +2060,64 @@ class StorageEngine::Impl {
           .allocation_epoch = record.allocation_epoch,
           .kind = record.kind,
       };
-      auto current = store.index.find(record.digest);
-      if (current != store.index.end() &&
-          current->second.SamePhysicalRecord(source_location)) {
-        auto key_lock = co_await store.key_locks.Acquire(
-            record.digest, IntentLockMode::kExclusive);
-        co_await store.writer_mutex.Lock();
-        UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+      const std::byte* value_data =
+          block_data.buffer.data + record_offset + record.header_bytes;
+      if (Crc32c(std::span<const std::byte>(value_data,
+                                           record.value_bytes)) !=
+          record.payload_checksum) {
+        source.defragging = false;
+        co_return Status(StatusCode::kInternal,
+                         "value checksum mismatch during defrag");
+      }
 
-        // Both foreground writes and earlier defrag work may have replaced the
-        // location while this cleaner was waiting. Never relocate a stale copy.
-        current = store.index.find(record.digest);
-        if (current == store.index.end() ||
-            !current->second.SamePhysicalRecord(source_location)) {
-          record_offset += record.total_disk_bytes;
-          continue;
-        }
-
-        const std::string key(disk_key);
-        const std::byte* value_data =
-            block_data.buffer.data + record_offset + record.header_bytes;
-        const std::string_view value(
-            reinterpret_cast<const char*>(value_data), record.value_bytes);
-        if (Crc32c(std::span<const std::byte>(value_data,
-                                             record.value_bytes)) !=
-            record.payload_checksum) {
-          source.defragging = false;
-          co_return Status(StatusCode::kInternal,
-                           "value checksum mismatch during defrag");
-        }
-
-        Status relocated = co_await WriteRecordLocked(
-            store, key, value, record.kind, record.digest, record.generation,
-            record.relocation_sequence + 1, true);
-        if (!relocated.ok()) {
-          source.defragging = false;
-          co_return relocated;
-        }
+      const unsigned key_owner = OwnerForKey(disk_key);
+      const std::string key(disk_key);
+      const std::string value(reinterpret_cast<const char*>(value_data),
+                              record.value_bytes);
+      Status relocated;
+      if (key_owner == store.worker->id()) {
+        relocated = co_await RelocateIfCurrent(
+            key_owner, key, value, record, source_location);
+      } else {
+        relocated = co_await celer::SubmitTaskTo(
+            key_owner,
+            [this, key_owner, key, value, record,
+             source_location]() mutable -> Task<Status> {
+              co_return co_await RelocateIfCurrent(
+                  key_owner, key, value, record, source_location);
+            });
+      }
+      if (!relocated.ok()) {
+        source.defragging = false;
+        co_return relocated;
       }
       record_offset += record.total_disk_bytes;
     }
 
-    co_await store.writer_mutex.Lock();
-    UnlockGuard write_unlock(&store.writer_mutex, store.worker);
-    if (source.live_bytes != 0 || source.pins != 0) {
-      source.defragging = false;
-      co_return Status::Ok();
+    {
+      co_await store.writer_mutex.Lock();
+      UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+      if (source.live_bytes != 0) {
+        source.defragging = false;
+        co_return Status::Ok();
+      }
+      source.freeing = true;
+    }
+    while (source.pins != 0) {
+      Status waited = co_await celer::SleepFor(
+          *store.worker, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        source.freeing = false;
+        source.defragging = false;
+        co_return waited;
+      }
     }
 
     auto* zero_buffer = static_cast<std::byte*>(::operator new[](
         kBlockHeaderBytes, std::align_val_t(options_.buffers.alignment),
         std::nothrow));
     if (zero_buffer == nullptr) {
+      source.freeing = false;
       source.defragging = false;
       store.write_failed = true;
       co_return Status(StatusCode::kResourceExhausted,
@@ -1953,6 +2133,7 @@ class StorageEngine::Impl {
     if (!written.ok() || *written != kBlockHeaderBytes) {
       ::operator delete[](zero_buffer,
                           std::align_val_t(options_.buffers.alignment));
+      source.freeing = false;
       source.defragging = false;
       store.write_failed = true;
       co_return written.ok()
@@ -1965,6 +2146,7 @@ class StorageEngine::Impl {
     if (!sync.ok()) {
       ::operator delete[](zero_buffer,
                           std::align_val_t(options_.buffers.alignment));
+      source.freeing = false;
       source.defragging = false;
       store.write_failed = true;
       co_return sync;
@@ -1973,7 +2155,7 @@ class StorageEngine::Impl {
     ::operator delete[](zero_buffer,
                         std::align_val_t(options_.buffers.alignment));
 
-    source = BlockState{};
+    store.block_states.erase(block_id);
     if (!free_blocks_.enqueue(block_id)) {
       co_return Status(StatusCode::kResourceExhausted,
                        "failed to return block to free MPMC queue");
@@ -1989,6 +2171,7 @@ class StorageEngine::Impl {
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;
+  std::unique_ptr<CoroutineBarrier> recovery_accounting_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
   std::atomic<std::uint64_t> recovery_scanned_records_{0};
@@ -2001,6 +2184,7 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> next_block_id_{0};
   std::atomic<std::uint64_t> next_allocation_epoch_{1};
   std::atomic<std::uint64_t> next_lsn_{1};
+  std::atomic<unsigned> active_defrags_{0};
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};
   std::atomic<bool> shutdown_flush_failed_{false};

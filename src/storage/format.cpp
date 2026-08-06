@@ -146,7 +146,7 @@ std::uint16_t RedisSlot(std::string_view key) noexcept {
 }
 
 std::uint32_t StorageShardForKey(std::string_view key) noexcept {
-  return RedisSlot(key) >> 6;
+  return RedisSlot(key) >> 4;
 }
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
@@ -178,7 +178,9 @@ bool DecodeBlockHeader(
       decoded.version != kStorageFormatVersion ||
       decoded.header_bytes != kBlockHeaderBytes ||
       decoded.block_bytes != kStorageBlockBytes ||
-      decoded.storage_shard_id >= kLogicalStorageShards ||
+      decoded.layout_worker_count == 0 ||
+      decoded.layout_worker_count > kLogicalStorageShards ||
+      decoded.writer_id >= decoded.layout_worker_count ||
       decoded.committed_bytes < kBlockHeaderBytes ||
       decoded.committed_bytes > kStorageBlockBytes) {
     return false;

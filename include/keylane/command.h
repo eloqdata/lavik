@@ -44,7 +44,7 @@ StatusOr<CommandRequest> BuildCommandRequest(RespCommand command);
 // Bind command routing to the disk engine. Call once before the server starts.
 void InitStorage(storage::StorageEngine* engine);
 
-// Route `request` to the worker owning its 64-slot storage shard. Async disk
+// Route `request` to the worker owning its 16-slot storage shard. Async disk
 // operations use SubmitTaskTo and return on the connection's original worker.
 Task<CommandReply> ExecuteCommand(const CommandRequest& request);
 

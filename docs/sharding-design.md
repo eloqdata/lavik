@@ -1,5 +1,9 @@
 # Cross-Shard Architecture Design
 
+> Storage ownership has evolved beyond the original worker-equals-shard model
+> described here. See [Worker-Count-Independent Storage Ownership](storage-block-ownership.md)
+> for the current persistent block, recovery, read, and defrag design.
+
 ## Problem
 
 Current `thread_local DbShard tls_db_` is a correctness bug: a key written on

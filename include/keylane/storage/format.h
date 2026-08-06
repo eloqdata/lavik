@@ -13,10 +13,10 @@ inline constexpr std::size_t kBlockHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-inline constexpr std::uint32_t kStorageFormatVersion = 2;
+inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;   // KCOLBLK1
 inline constexpr std::uint64_t kRecordMagic = 0x314b4c5245434f52ULL;  // ROCERLK1
-inline constexpr std::uint32_t kLogicalStorageShards = 256;
+inline constexpr std::uint32_t kLogicalStorageShards = 1024;
 
 struct Digest {
   std::array<std::uint8_t, 20> bytes{};
@@ -42,13 +42,13 @@ struct BlockHeader {
   std::uint32_t version = kStorageFormatVersion;
   std::uint32_t header_bytes = kBlockHeaderBytes;
   std::uint32_t block_bytes = kStorageBlockBytes;
-  std::uint32_t storage_shard_id = 0;
+  std::uint32_t writer_id = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = kBlockHeaderBytes;
   std::uint32_t record_count = 0;
   std::uint64_t max_lsn = 0;
   std::uint32_t checksum = 0;
-  std::uint32_t reserved = 0;
+  std::uint32_t layout_worker_count = 0;
 };
 
 struct RecordHeader {
