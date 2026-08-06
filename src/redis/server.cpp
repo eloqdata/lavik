@@ -361,6 +361,7 @@ bool ShutdownRequested() {
 
 Task<Status> RedisService::Serve(TcpStream stream) {
   std::string pending;
+  std::uint8_t selected_db = 0;
 
   while (stream.IsOpen()) {
     if (ShutdownRequested()) [[unlikely]] {
@@ -392,12 +393,16 @@ Task<Status> RedisService::Serve(TcpStream stream) {
     }
     RequestGuard request_guard(this);
 
-    auto request_result = BuildCommandRequest(std::move(*command_result));
+    auto request_result =
+        BuildCommandRequest(std::move(*command_result), selected_db);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
       reply.encoded = EncodeError("ERR " + request_result.status().message());
     } else {
       reply = co_await ExecuteCommand(*request_result);
+    }
+    if (reply.selected_db.has_value()) {
+      selected_db = *reply.selected_db;
     }
 
     Status write_status;

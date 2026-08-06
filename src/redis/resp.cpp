@@ -130,4 +130,27 @@ std::string EncodeError(std::string_view message) {
   return out;
 }
 
+std::string EncodeScanReply(std::uint64_t cursor,
+                            const std::vector<std::string>& keys) {
+  std::string out;
+  out.reserve(64 + keys.size() * 16);
+  out.append("*2\r\n");
+  const std::string encoded_cursor = std::to_string(cursor);
+  out.push_back('$');
+  out.append(std::to_string(encoded_cursor.size()));
+  out.append("\r\n");
+  out.append(encoded_cursor);
+  out.append("\r\n*");
+  out.append(std::to_string(keys.size()));
+  out.append("\r\n");
+  for (const std::string& key : keys) {
+    out.push_back('$');
+    out.append(std::to_string(key.size()));
+    out.append("\r\n");
+    out.append(key);
+    out.append("\r\n");
+  }
+  return out;
+}
+
 }  // namespace keylane

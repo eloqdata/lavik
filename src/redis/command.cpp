@@ -1,8 +1,11 @@
 #include "keylane/command.h"
 
+#include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -10,6 +13,7 @@
 #include "celer/runtime/cross_core.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
+#include "keylane/storage/format.h"
 
 namespace keylane {
 using namespace celer;
@@ -17,6 +21,12 @@ using namespace celer;
 namespace {
 
 storage::StorageEngine* g_storage = nullptr;
+
+CommandReply EncodedReply(std::string encoded) {
+  CommandReply reply;
+  reply.encoded = std::move(encoded);
+  return reply;
+}
 
 unsigned ShardForKey(std::string_view key) {
   return g_storage->OwnerForKey(key);
@@ -44,10 +54,12 @@ CommandKind MatchCommandKind(std::string_view name) {
     case 4:
       if (CmpCaseInsensitive(name, "PING")) return CommandKind::kPing;
       if (CmpCaseInsensitive(name, "INCR")) return CommandKind::kIncr;
+      if (CmpCaseInsensitive(name, "SCAN")) return CommandKind::kScan;
       break;
     case 6:
       if (CmpCaseInsensitive(name, "DBSIZE")) return CommandKind::kDbSize;
       if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
+      if (CmpCaseInsensitive(name, "SELECT")) return CommandKind::kSelect;
       break;
   }
   return CommandKind::kUnknown;
@@ -55,13 +67,15 @@ CommandKind MatchCommandKind(std::string_view name) {
 
 }  // namespace
 
-StatusOr<CommandRequest> BuildCommandRequest(RespCommand command) {
+StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
+                                             std::uint8_t db_id) {
   if (command.args.empty()) {
     return Status(StatusCode::kInvalidArgument, "empty command");
   }
 
   CommandRequest request;
   request.kind = MatchCommandKind(command.args.front());
+  request.db_id = db_id;
   request.args = std::move(command.args);
   return request;
 }
@@ -83,7 +97,28 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
       }
       return reply;
 
+    case CommandKind::kSelect: {
+      if (args.size() != 2) {
+        reply.encoded =
+            EncodeError("ERR wrong number of arguments for 'select' command");
+        return reply;
+      }
+      unsigned db_id = 0;
+      const char* begin = args[1].data();
+      const char* end = begin + args[1].size();
+      const auto [parsed_end, error] = std::from_chars(begin, end, db_id);
+      if (error != std::errc{} || parsed_end != end ||
+          db_id >= storage::kLogicalDatabaseCount) {
+        reply.encoded = EncodeError("ERR DB index is out of range");
+        return reply;
+      }
+      reply.encoded = EncodeSimpleString("OK");
+      reply.selected_db = static_cast<std::uint8_t>(db_id);
+      return reply;
+    }
+
     case CommandKind::kDbSize:
+    case CommandKind::kScan:
     case CommandKind::kGet:
     case CommandKind::kIncr:
     case CommandKind::kSet:
@@ -98,28 +133,227 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
 
 Task<CommandReply> ExecuteDbSize(const CommandRequest& request) {
   if (request.args.size() != 1) {
-    co_return CommandReply{
-        EncodeError("ERR wrong number of arguments for 'dbsize' command"),
-        std::nullopt, false};
+    co_return EncodedReply(
+        EncodeError("ERR wrong number of arguments for 'dbsize' command"));
   }
 
   std::uint64_t total = 0;
+  const std::uint8_t db_id = request.db_id;
   for (unsigned target = 0; target < g_storage->worker_count(); ++target) {
-    const std::size_t local_size = co_await SubmitTo(target, [] {
-      return g_storage->LocalSize();
+    const std::size_t local_size = co_await SubmitTo(target, [db_id] {
+      return g_storage->LocalSize(db_id);
     });
     if (local_size > std::numeric_limits<std::uint64_t>::max() - total) {
-      co_return CommandReply{EncodeError("ERR db size overflow"),
-                             std::nullopt, false};
+      co_return EncodedReply(EncodeError("ERR db size overflow"));
     }
     total += local_size;
   }
   if (total > static_cast<std::uint64_t>(std::numeric_limits<long long>::max())) {
-    co_return CommandReply{EncodeError("ERR db size exceeds RESP integer range"),
-                           std::nullopt, false};
+    co_return EncodedReply(
+        EncodeError("ERR db size exceeds RESP integer range"));
   }
-  co_return CommandReply{EncodeInteger(static_cast<long long>(total)),
-                         std::nullopt, false};
+  co_return EncodedReply(EncodeInteger(static_cast<long long>(total)));
+}
+
+struct ScanOptions {
+  std::uint64_t cursor = 0;
+  std::size_t count = 10;
+  std::optional<std::string_view> pattern;
+};
+
+StatusOr<ScanOptions> ParseScanOptions(const std::vector<std::string>& args) {
+  if (args.size() < 2) {
+    return Status(StatusCode::kInvalidArgument,
+                  "wrong number of arguments for 'scan' command");
+  }
+  ScanOptions options;
+  const char* cursor_begin = args[1].data();
+  const char* cursor_end = cursor_begin + args[1].size();
+  auto [parsed_cursor, cursor_error] =
+      std::from_chars(cursor_begin, cursor_end, options.cursor);
+  if (cursor_error != std::errc{} || parsed_cursor != cursor_end) {
+    return Status(StatusCode::kInvalidArgument, "invalid cursor");
+  }
+
+  for (std::size_t i = 2; i < args.size();) {
+    if (CmpCaseInsensitive(args[i], "COUNT") && i + 1 < args.size()) {
+      std::uint64_t count = 0;
+      const char* begin = args[i + 1].data();
+      const char* end = begin + args[i + 1].size();
+      auto [parsed, error] = std::from_chars(begin, end, count);
+      if (error != std::errc{} || parsed != end || count == 0 ||
+          count > std::numeric_limits<std::size_t>::max()) {
+        return Status(StatusCode::kInvalidArgument,
+                      "value is not an integer or out of range");
+      }
+      options.count = static_cast<std::size_t>(count);
+      i += 2;
+      continue;
+    }
+    if (CmpCaseInsensitive(args[i], "MATCH") && i + 1 < args.size()) {
+      options.pattern = args[i + 1];
+      i += 2;
+      continue;
+    }
+    return Status(StatusCode::kInvalidArgument, "syntax error");
+  }
+  return options;
+}
+
+bool MatchCharacterClass(std::string_view pattern, std::size_t open,
+                         unsigned char value, std::size_t* next,
+                         bool* valid) {
+  std::size_t i = open + 1;
+  bool negate = false;
+  if (i < pattern.size() && (pattern[i] == '^' || pattern[i] == '!')) {
+    negate = true;
+    ++i;
+  }
+  bool matched = false;
+  bool any = false;
+  while (i < pattern.size() && pattern[i] != ']') {
+    unsigned char first = static_cast<unsigned char>(pattern[i++]);
+    if (first == '\\' && i < pattern.size()) {
+      first = static_cast<unsigned char>(pattern[i++]);
+    }
+    any = true;
+    if (i + 1 < pattern.size() && pattern[i] == '-' &&
+        pattern[i + 1] != ']') {
+      ++i;
+      unsigned char last = static_cast<unsigned char>(pattern[i++]);
+      if (last == '\\' && i < pattern.size()) {
+        last = static_cast<unsigned char>(pattern[i++]);
+      }
+      if (first > last) std::swap(first, last);
+      matched = matched || (value >= first && value <= last);
+    } else {
+      matched = matched || value == first;
+    }
+  }
+  if (i >= pattern.size() || pattern[i] != ']' || !any) {
+    *valid = false;
+    *next = open + 1;
+    return value == static_cast<unsigned char>('[');
+  }
+  *valid = true;
+  *next = i + 1;
+  return negate ? !matched : matched;
+}
+
+bool GlobMatch(std::string_view pattern, std::string_view text) {
+  std::size_t p = 0;
+  std::size_t t = 0;
+  std::size_t star_pattern = std::string_view::npos;
+  std::size_t star_text = 0;
+  while (t < text.size()) {
+    if (p < pattern.size() && pattern[p] == '*') {
+      while (p < pattern.size() && pattern[p] == '*') ++p;
+      if (p == pattern.size()) return true;
+      star_pattern = p;
+      star_text = t;
+      continue;
+    }
+
+    bool matched = false;
+    std::size_t next = p;
+    if (p < pattern.size()) {
+      if (pattern[p] == '?') {
+        matched = true;
+        next = p + 1;
+      } else if (pattern[p] == '[') {
+        bool valid = false;
+        matched = MatchCharacterClass(
+            pattern, p, static_cast<unsigned char>(text[t]), &next, &valid);
+        if (!valid) next = p + 1;
+      } else {
+        if (pattern[p] == '\\' && p + 1 < pattern.size()) ++p;
+        matched = static_cast<unsigned char>(pattern[p]) ==
+                  static_cast<unsigned char>(text[t]);
+        next = p + 1;
+      }
+    }
+    if (matched) {
+      p = next;
+      ++t;
+      continue;
+    }
+    if (star_pattern != std::string_view::npos && star_text < text.size()) {
+      p = star_pattern;
+      t = ++star_text;
+      continue;
+    }
+    return false;
+  }
+  while (p < pattern.size() && pattern[p] == '*') ++p;
+  return p == pattern.size();
+}
+
+Task<CommandReply> ExecuteScan(const CommandRequest& request) {
+  auto parsed = ParseScanOptions(request.args);
+  if (!parsed.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + parsed.status().message()));
+  }
+
+  constexpr unsigned kWorkerBits = 10;
+  constexpr unsigned kLocalBits = 64 - kWorkerBits;
+  constexpr std::uint64_t kLocalMask =
+      (std::uint64_t{1} << kLocalBits) - 1;
+  static_assert(storage::kLogicalStorageShards <=
+                (std::uint64_t{1} << kWorkerBits));
+
+  const ScanOptions& options = *parsed;
+  unsigned worker_id =
+      static_cast<unsigned>(options.cursor >> kLocalBits);
+  std::uint64_t local_cursor = options.cursor & kLocalMask;
+  if (options.cursor != 0 && worker_id >= g_storage->worker_count()) {
+    co_return EncodedReply(EncodeError("ERR invalid cursor"));
+  }
+
+  std::size_t remaining = options.count;
+  std::vector<std::string> keys;
+  while (worker_id < g_storage->worker_count()) {
+    storage::ScanBatch batch;
+    if (worker_id == ThisWorker().id) {
+      batch = g_storage->ScanLocal(request.db_id, local_cursor, remaining);
+    } else {
+      batch = co_await SubmitTo(
+          worker_id, [db_id = request.db_id, local_cursor, remaining] {
+            return g_storage->ScanLocal(db_id, local_cursor, remaining);
+          });
+    }
+
+    const std::size_t examined = batch.keys.size();
+    for (std::string& key : batch.keys) {
+      if (!options.pattern.has_value() ||
+          GlobMatch(*options.pattern, key)) {
+        keys.push_back(std::move(key));
+      }
+    }
+
+    if (batch.cursor != 0) {
+      if (batch.cursor > kLocalMask) {
+        co_return EncodedReply(
+            EncodeError("ERR local scan cursor overflow"));
+      }
+      const std::uint64_t cursor =
+          (static_cast<std::uint64_t>(worker_id) << kLocalBits) |
+          batch.cursor;
+      co_return EncodedReply(EncodeScanReply(cursor, keys));
+    }
+
+    ++worker_id;
+    local_cursor = 0;
+    if (worker_id >= g_storage->worker_count()) {
+      co_return EncodedReply(EncodeScanReply(0, keys));
+    }
+    if (examined >= remaining) {
+      const std::uint64_t cursor =
+          static_cast<std::uint64_t>(worker_id) << kLocalBits;
+      co_return EncodedReply(EncodeScanReply(cursor, keys));
+    }
+    remaining -= examined;
+  }
+  co_return EncodedReply(EncodeScanReply(0, keys));
 }
 
 Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
@@ -133,7 +367,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             EncodeError("ERR wrong number of arguments for 'get' command");
         co_return reply;
       }
-      auto value = co_await g_storage->Get(args[1], read_trace);
+      auto value =
+          co_await g_storage->Get(request.db_id, args[1], read_trace);
       if (!value.ok()) {
         if (value.status().code() == StatusCode::kNotFound) {
           reply.encoded = EncodeNullBulkString();
@@ -152,7 +387,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             EncodeError("ERR wrong number of arguments for 'set' command");
         co_return reply;
       }
-      Status status = co_await g_storage->Set(args[1], args[2]);
+      Status status =
+          co_await g_storage->Set(request.db_id, args[1], args[2]);
       reply.encoded = status.ok()
                           ? EncodeSimpleString("OK")
                           : EncodeError("ERR " + status.message());
@@ -165,7 +401,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             EncodeError("ERR wrong number of arguments for 'incr' command");
         co_return reply;
       }
-      auto value = co_await g_storage->Increment(args[1]);
+      auto value = co_await g_storage->Increment(request.db_id, args[1]);
       if (!value.ok()) {
         reply.encoded = value.status().code() == StatusCode::kInvalidArgument
                             ? EncodeError(
@@ -187,10 +423,9 @@ Task<CommandReply> RouteMultiKey(const CommandRequest& request) {
   const auto& args = request.args;
   const bool is_del = request.kind == CommandKind::kDel;
   if (args.size() < 2) {
-    co_return CommandReply{
-        EncodeError(is_del ? "ERR wrong number of arguments for 'del' command"
-                           : "ERR wrong number of arguments for 'exists' command"),
-        std::nullopt, false};
+    co_return EncodedReply(EncodeError(
+        is_del ? "ERR wrong number of arguments for 'del' command"
+               : "ERR wrong number of arguments for 'exists' command"));
   }
 
   long long count = 0;
@@ -200,30 +435,30 @@ Task<CommandReply> RouteMultiKey(const CommandRequest& request) {
     bool hit = false;
     if (target == ThisWorker().id) {
       if (is_del) {
-        auto deleted = co_await g_storage->Delete(key);
+        auto deleted = co_await g_storage->Delete(request.db_id, key);
         if (!deleted.ok()) {
-          co_return CommandReply{EncodeError("ERR " + deleted.status().message()),
-                                 std::nullopt, false};
+          co_return EncodedReply(
+              EncodeError("ERR " + deleted.status().message()));
         }
         hit = *deleted;
       } else {
-        hit = co_await g_storage->Exists(key);
+        hit = co_await g_storage->Exists(request.db_id, key);
       }
     } else {
       if (is_del) {
         auto deleted = co_await SubmitTaskTo(
-            target, [key]() -> Task<StatusOr<bool>> {
-              co_return co_await g_storage->Delete(key);
+            target, [db_id = request.db_id, key]() -> Task<StatusOr<bool>> {
+              co_return co_await g_storage->Delete(db_id, key);
             });
         if (!deleted.ok()) {
-          co_return CommandReply{EncodeError("ERR " + deleted.status().message()),
-                                 std::nullopt, false};
+          co_return EncodedReply(
+              EncodeError("ERR " + deleted.status().message()));
         }
         hit = *deleted;
       } else {
         hit = co_await SubmitTaskTo(
-            target, [key]() -> Task<bool> {
-              co_return co_await g_storage->Exists(key);
+            target, [db_id = request.db_id, key]() -> Task<bool> {
+              co_return co_await g_storage->Exists(db_id, key);
             });
       }
     }
@@ -231,7 +466,7 @@ Task<CommandReply> RouteMultiKey(const CommandRequest& request) {
       ++count;
     }
   }
-  co_return CommandReply{EncodeInteger(count), std::nullopt, false};
+  co_return EncodedReply(EncodeInteger(count));
 }
 
 }  // namespace
@@ -245,6 +480,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   switch (request.kind) {
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request);
+
+    case CommandKind::kScan:
+      co_return co_await ExecuteScan(request);
 
     case CommandKind::kDel:
     case CommandKind::kExists:
@@ -289,7 +527,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
       }
       co_return co_await ExecuteStorageCommand(request);
 
-    default:  // PING, local single-key path, unknown
+    default:  // PING, SELECT, local single-key path, unknown
       co_return ExecuteLocalCommand(request);
   }
 }

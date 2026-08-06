@@ -28,6 +28,11 @@ struct StorageEngineOptions {
   RegisteredBufferPoolOptions buffers{};
 };
 
+struct ScanBatch {
+  std::uint64_t cursor = 0;
+  std::vector<std::string> keys;
+};
+
 // A value read directly into a registered storage buffer. network_bytes()
 // contains a complete RESP bulk-string frame and remains valid until this
 // move-only object is destroyed after the network send CQE.
@@ -75,16 +80,24 @@ class StorageEngine {
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
-  std::size_t LocalSize() const noexcept;
+  std::size_t LocalSize(std::uint8_t db_id) const noexcept;
+  // Must run on the worker whose local index is being scanned. The cursor is
+  // stateless and may return duplicate keys while the index is changing.
+  ScanBatch ScanLocal(std::uint8_t db_id, std::uint64_t cursor,
+                      std::size_t count) const;
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
-  celer::Task<celer::StatusOr<DiskValue>> Get(std::string_view key,
-                                               ReadLatencyTrace* trace = nullptr);
-  celer::Task<celer::Status> Set(std::string_view key, std::string_view value);
-  celer::Task<celer::StatusOr<bool>> Delete(std::string_view key);
-  celer::Task<bool> Exists(std::string_view key);
-  celer::Task<celer::StatusOr<std::int64_t>> Increment(std::string_view key);
+  celer::Task<celer::StatusOr<DiskValue>> Get(
+      std::uint8_t db_id, std::string_view key,
+      ReadLatencyTrace* trace = nullptr);
+  celer::Task<celer::Status> Set(std::uint8_t db_id, std::string_view key,
+                                 std::string_view value);
+  celer::Task<celer::StatusOr<bool>> Delete(std::uint8_t db_id,
+                                             std::string_view key);
+  celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
+  celer::Task<celer::StatusOr<std::int64_t>> Increment(
+      std::uint8_t db_id, std::string_view key);
 
  private:
   class Impl;

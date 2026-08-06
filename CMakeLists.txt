@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(keylane VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -80,4 +82,12 @@ if (KEYLANE_BUILD_EXAMPLE)
   endif()
   target_precompile_headers(keylane REUSE_FROM keylane_module)
   target_link_libraries(keylane PRIVATE keylane::module)
+endif()
+
+if (BUILD_TESTING)
+  add_executable(keylane_scan_hash_map_test
+    tests/scan_hash_map_test.cpp
+  )
+  target_link_libraries(keylane_scan_hash_map_test PRIVATE keylane::module)
+  add_test(NAME keylane_scan_hash_map COMMAND keylane_scan_hash_map_test)
 endif()

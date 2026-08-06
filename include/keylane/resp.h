@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,5 +35,7 @@ std::string EncodeBulkString(std::string_view value);
 std::string EncodeNullBulkString();
 std::string EncodeInteger(long long value);
 std::string EncodeError(std::string_view message);
+std::string EncodeScanReply(std::uint64_t cursor,
+                            const std::vector<std::string>& keys);
 
 }  // namespace keylane

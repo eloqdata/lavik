@@ -1,0 +1,461 @@
+#pragma once
+
+/*
+ * ScanHashMap is derived from Valkey's src/hashtable.c at commit
+ * 21c0d49a0 (Valkey 8.0.8-180-g21c0d49a0).
+ *
+ * Copyright (c) 2024-present, Valkey contributors
+ * Copyright (c) 2006-2020, Redis Ltd.
+ * Copyright (c) 2026, Keylane contributors
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * The complete license text is in third_party/valkey/COPYING. This C++
+ * specialization retains Valkey's cache-line bucket layout, incremental
+ * two-table expansion, and stateless reverse-bit scan algorithm. It replaces
+ * Valkey runtime dependencies and generic callbacks with Keylane-owned entries.
+ */
+
+#include <array>
+#include <bit>
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+
+#include "keylane/storage/format.h"
+
+namespace keylane::storage {
+
+template <typename Value>
+class ScanHashMap {
+ public:
+  struct Entry {
+    Digest digest{};
+    std::string key;
+    Value value{};
+
+    Entry(const Digest& digest_arg, std::string_view key_arg,
+          const Value& value_arg)
+        : digest(digest_arg), key(key_arg), value(value_arg) {}
+  };
+
+  struct InsertResult {
+    Entry* entry = nullptr;
+    bool inserted = false;
+  };
+
+  ScanHashMap() = default;
+  ScanHashMap(const ScanHashMap&) = delete;
+  ScanHashMap& operator=(const ScanHashMap&) = delete;
+
+  ScanHashMap(ScanHashMap&& other) noexcept { MoveFrom(std::move(other)); }
+
+  ScanHashMap& operator=(ScanHashMap&& other) noexcept {
+    if (this != &other) {
+      Clear();
+      MoveFrom(std::move(other));
+    }
+    return *this;
+  }
+
+  ~ScanHashMap() { Clear(); }
+
+  std::size_t size() const noexcept {
+    return tables_[0].used + tables_[1].used;
+  }
+
+  bool empty() const noexcept { return size() == 0; }
+
+  Entry* Find(const Digest& digest, std::string_view key) {
+    RehashStep();
+    return FindWithoutStep(digest, key);
+  }
+
+  const Entry* Find(const Digest& digest, std::string_view key) const {
+    return FindWithoutStep(digest, key);
+  }
+
+  InsertResult InsertOrAssign(const Digest& digest, std::string_view key,
+                              const Value& value) {
+    if (Entry* existing = Find(digest, key); existing != nullptr) {
+      existing->value = value;
+      return {existing, false};
+    }
+
+    EnsureTable();
+    MaybeStartExpansion();
+    auto entry = std::make_unique<Entry>(digest, key, value);
+    Entry* raw = entry.get();
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
+    entry.release();
+    return {raw, true};
+  }
+
+  template <typename Fn>
+  void ForEach(Fn&& fn) {
+    ForEachTable(tables_[0], fn);
+    ForEachTable(tables_[1], fn);
+  }
+
+  // A cursor of zero starts and completes a full scan. The callback may be
+  // invoked more than once for an entry if the table changes between calls.
+  template <typename Fn>
+  std::uint64_t Scan(std::uint64_t cursor, Fn&& fn) const {
+    if (empty()) {
+      return 0;
+    }
+
+    if (!Rehashing()) {
+      const std::uint64_t mask = BucketMask(tables_[0]);
+      EmitBucket(tables_[0], cursor & mask, fn);
+      return NextCursor(cursor, mask);
+    }
+
+    const Table& small = tables_[0];
+    const Table& large = tables_[1];
+    const std::uint64_t small_mask = BucketMask(small);
+    const std::uint64_t large_mask = BucketMask(large);
+
+    const std::uint64_t small_index = cursor & small_mask;
+    if (small_index >= rehash_index_) {
+      EmitBucket(small, small_index, fn);
+    }
+
+    do {
+      EmitBucket(large, cursor & large_mask, fn);
+      cursor = NextCursor(cursor, large_mask);
+    } while ((cursor & (small_mask ^ large_mask)) != 0);
+
+    return cursor;
+  }
+
+  void Clear() noexcept {
+    DestroyTable(tables_[0], true);
+    DestroyTable(tables_[1], true);
+    rehash_index_ = kNotRehashing;
+  }
+
+ private:
+  static constexpr std::size_t kEntriesPerBucket = 7;
+  static constexpr std::uint8_t kChainedBit = 0x80;
+  static constexpr std::size_t kChildSlot = kEntriesPerBucket - 1;
+  static constexpr std::size_t kTargetEntriesPerBucket = 6;
+  static constexpr std::size_t kNotRehashing =
+      std::numeric_limits<std::size_t>::max();
+
+  struct alignas(64) Bucket {
+    std::uint8_t presence = 0;
+    std::array<std::uint8_t, kEntriesPerBucket> hashes{};
+    std::array<Entry*, kEntriesPerBucket> entries{};
+  };
+
+  static_assert(sizeof(Bucket) == 64);
+
+  struct Table {
+    std::unique_ptr<Bucket[]> buckets;
+    std::uint8_t exponent = 0;
+    std::size_t used = 0;
+  };
+
+  static bool Chained(const Bucket& bucket) noexcept {
+    return (bucket.presence & kChainedBit) != 0;
+  }
+
+  static bool Occupied(const Bucket& bucket, std::size_t slot) noexcept {
+    return (bucket.presence & (std::uint8_t{1} << slot)) != 0;
+  }
+
+  static void SetOccupied(Bucket* bucket, std::size_t slot) noexcept {
+    bucket->presence |= std::uint8_t{1} << slot;
+  }
+
+  static void ClearOccupied(Bucket* bucket, std::size_t slot) noexcept {
+    bucket->presence &= ~(std::uint8_t{1} << slot);
+  }
+
+  static Bucket* Child(Bucket* bucket) noexcept {
+    assert(Chained(*bucket));
+    return reinterpret_cast<Bucket*>(bucket->entries[kChildSlot]);
+  }
+
+  static const Bucket* Child(const Bucket* bucket) noexcept {
+    assert(Chained(*bucket));
+    return reinterpret_cast<const Bucket*>(bucket->entries[kChildSlot]);
+  }
+
+  static void SetChild(Bucket* bucket, Bucket* child) noexcept {
+    bucket->presence |= kChainedBit;
+    bucket->entries[kChildSlot] = reinterpret_cast<Entry*>(child);
+  }
+
+  static std::size_t BucketCount(const Table& table) noexcept {
+    return table.buckets == nullptr ? 0 : std::size_t{1} << table.exponent;
+  }
+
+  static std::uint64_t BucketMask(const Table& table) noexcept {
+    return static_cast<std::uint64_t>(BucketCount(table) - 1);
+  }
+
+  static std::uint64_t Hash(const Digest& digest) noexcept {
+    std::uint64_t first = 0;
+    std::uint64_t second = 0;
+    std::uint32_t tail = 0;
+    std::memcpy(&first, digest.bytes.data(), sizeof(first));
+    std::memcpy(&second, digest.bytes.data() + sizeof(first), sizeof(second));
+    std::memcpy(&tail, digest.bytes.data() + 2 * sizeof(first), sizeof(tail));
+    first ^= second + 0x9e3779b97f4a7c15ULL + (first << 6) + (first >> 2);
+    first ^= static_cast<std::uint64_t>(tail) * 0xbf58476d1ce4e5b9ULL;
+    first ^= first >> 30;
+    first *= 0xbf58476d1ce4e5b9ULL;
+    first ^= first >> 27;
+    first *= 0x94d049bb133111ebULL;
+    return first ^ (first >> 31);
+  }
+
+  static std::uint8_t HashTag(std::uint64_t hash) noexcept {
+    return static_cast<std::uint8_t>(hash >> 56);
+  }
+
+  static bool KeyEquals(const Entry& entry, const Digest& digest,
+                        std::string_view key) noexcept {
+    return entry.digest == digest && entry.key == key;
+  }
+
+  static std::uint64_t ReverseBits(std::uint64_t value) noexcept {
+    value = ((value >> 1) & 0x5555555555555555ULL) |
+            ((value & 0x5555555555555555ULL) << 1);
+    value = ((value >> 2) & 0x3333333333333333ULL) |
+            ((value & 0x3333333333333333ULL) << 2);
+    value = ((value >> 4) & 0x0f0f0f0f0f0f0f0fULL) |
+            ((value & 0x0f0f0f0f0f0f0f0fULL) << 4);
+    return std::byteswap(value);
+  }
+
+  // Pieter Noordhuis' stateless scan cursor algorithm, as used by Valkey.
+  static std::uint64_t NextCursor(std::uint64_t cursor,
+                                  std::uint64_t mask) noexcept {
+    cursor |= ~mask;
+    cursor = ReverseBits(cursor);
+    ++cursor;
+    return ReverseBits(cursor);
+  }
+
+  bool Rehashing() const noexcept { return rehash_index_ != kNotRehashing; }
+
+  void EnsureTable() {
+    if (tables_[0].buckets == nullptr) {
+      tables_[0].buckets = std::make_unique<Bucket[]>(1);
+      tables_[0].exponent = 0;
+    }
+  }
+
+  void MaybeStartExpansion() {
+    if (Rehashing()) {
+      return;
+    }
+    const std::size_t buckets = BucketCount(tables_[0]);
+    if (tables_[0].used + 1 <= buckets * kTargetEntriesPerBucket) {
+      return;
+    }
+    assert(tables_[0].exponent < 63);
+    tables_[1].exponent = tables_[0].exponent + 1;
+    tables_[1].buckets =
+        std::make_unique<Bucket[]>(std::size_t{1} << tables_[1].exponent);
+    tables_[1].used = 0;
+    rehash_index_ = 0;
+  }
+
+  void RehashStep() {
+    if (!Rehashing()) {
+      return;
+    }
+
+    MoveBucket(&tables_[0].buckets[rehash_index_], &tables_[1]);
+    ++rehash_index_;
+    if (rehash_index_ == BucketCount(tables_[0])) {
+      assert(tables_[0].used == 0);
+      tables_[0] = std::move(tables_[1]);
+      tables_[1] = Table{};
+      rehash_index_ = kNotRehashing;
+    }
+  }
+
+  static Entry* FindInTable(Table& table, const Digest& digest,
+                            std::string_view key, std::uint64_t hash) {
+    if (table.buckets == nullptr) {
+      return nullptr;
+    }
+    Bucket* bucket = &table.buckets[hash & BucketMask(table)];
+    const std::uint8_t tag = HashTag(hash);
+    while (bucket != nullptr) {
+      const std::size_t slots = Chained(*bucket) ? kChildSlot
+                                                  : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
+            KeyEquals(*bucket->entries[slot], digest, key)) {
+          return bucket->entries[slot];
+        }
+      }
+      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+    }
+    return nullptr;
+  }
+
+  static const Entry* FindInTable(const Table& table, const Digest& digest,
+                                  std::string_view key,
+                                  std::uint64_t hash) {
+    return FindInTable(const_cast<Table&>(table), digest, key, hash);
+  }
+
+  Entry* FindWithoutStep(const Digest& digest, std::string_view key) {
+    const std::uint64_t hash = Hash(digest);
+    if (Entry* found = FindInTable(tables_[0], digest, key, hash);
+        found != nullptr) {
+      return found;
+    }
+    return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
+  }
+
+  const Entry* FindWithoutStep(const Digest& digest,
+                               std::string_view key) const {
+    const std::uint64_t hash = Hash(digest);
+    if (const Entry* found = FindInTable(tables_[0], digest, key, hash);
+        found != nullptr) {
+      return found;
+    }
+    return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
+  }
+
+  static void AddToTable(Table& table, Entry* entry) {
+    const std::uint64_t hash = Hash(entry->digest);
+    const std::uint8_t tag = HashTag(hash);
+    Bucket* bucket = &table.buckets[hash & BucketMask(table)];
+    while (true) {
+      const std::size_t slots = Chained(*bucket) ? kChildSlot
+                                                  : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (!Occupied(*bucket, slot)) {
+          bucket->entries[slot] = entry;
+          bucket->hashes[slot] = tag;
+          SetOccupied(bucket, slot);
+          ++table.used;
+          return;
+        }
+      }
+      if (Chained(*bucket)) {
+        bucket = Child(bucket);
+        continue;
+      }
+
+      auto* child = new Bucket();
+      Entry* displaced = bucket->entries[kChildSlot];
+      const std::uint8_t displaced_hash = bucket->hashes[kChildSlot];
+      assert(Occupied(*bucket, kChildSlot));
+      ClearOccupied(bucket, kChildSlot);
+      SetChild(bucket, child);
+      child->entries[0] = displaced;
+      child->hashes[0] = displaced_hash;
+      SetOccupied(child, 0);
+      bucket = child;
+    }
+  }
+
+  static void MoveBucketEntries(Bucket* top, Table* target) {
+    Bucket* bucket = top;
+    while (bucket != nullptr) {
+      const bool chained = Chained(*bucket);
+      Bucket* next = chained ? Child(bucket) : nullptr;
+      const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (Occupied(*bucket, slot)) {
+          AddToTable(*target, bucket->entries[slot]);
+          ClearOccupied(bucket, slot);
+        }
+      }
+      if (bucket != top) {
+        delete bucket;
+      }
+      bucket = next;
+    }
+    top->presence = 0;
+    top->entries.fill(nullptr);
+    top->hashes.fill(0);
+  }
+
+  void MoveBucket(Bucket* top, Table* target) {
+    const std::size_t before = target->used;
+    MoveBucketEntries(top, target);
+    const std::size_t moved = target->used - before;
+    assert(tables_[0].used >= moved);
+    tables_[0].used -= moved;
+  }
+
+  template <typename Fn>
+  static void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) {
+    if (table.buckets == nullptr) {
+      return;
+    }
+    const Bucket* bucket = &table.buckets[index];
+    while (bucket != nullptr) {
+      const std::size_t slots = Chained(*bucket) ? kChildSlot
+                                                  : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (Occupied(*bucket, slot)) {
+          fn(*bucket->entries[slot]);
+        }
+      }
+      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+    }
+  }
+
+  template <typename Fn>
+  static void ForEachTable(Table& table, Fn& fn) {
+    const std::size_t count = BucketCount(table);
+    for (std::size_t index = 0; index < count; ++index) {
+      EmitBucket(table, index, fn);
+    }
+  }
+
+  static void DestroyTable(Table& table, bool destroy_entries) noexcept {
+    const std::size_t count = BucketCount(table);
+    for (std::size_t index = 0; index < count; ++index) {
+      Bucket* top = &table.buckets[index];
+      Bucket* bucket = top;
+      while (bucket != nullptr) {
+        const bool chained = Chained(*bucket);
+        Bucket* next = chained ? Child(bucket) : nullptr;
+        const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
+        if (destroy_entries) {
+          for (std::size_t slot = 0; slot < slots; ++slot) {
+            if (Occupied(*bucket, slot)) {
+              delete bucket->entries[slot];
+            }
+          }
+        }
+        if (bucket != top) {
+          delete bucket;
+        }
+        bucket = next;
+      }
+    }
+    table = Table{};
+  }
+
+  void MoveFrom(ScanHashMap&& other) noexcept {
+    tables_ = std::move(other.tables_);
+    rehash_index_ = std::exchange(other.rehash_index_, kNotRehashing);
+    other.tables_ = {};
+  }
+
+  std::array<Table, 2> tables_{};
+  std::size_t rehash_index_ = kNotRehashing;
+};
+
+}  // namespace keylane::storage

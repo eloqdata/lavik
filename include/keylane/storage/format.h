@@ -17,6 +17,7 @@ inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;   // KCOLBLK1
 inline constexpr std::uint64_t kRecordMagic = 0x314b4c5245434f52ULL;  // ROCERLK1
 inline constexpr std::uint32_t kLogicalStorageShards = 1024;
+inline constexpr std::uint8_t kLogicalDatabaseCount = 16;
 
 struct Digest {
   std::array<std::uint8_t, 20> bytes{};
@@ -56,7 +57,7 @@ struct RecordHeader {
   std::uint32_t version = kStorageFormatVersion;
   std::uint16_t header_bytes = 0;
   RecordKind kind = RecordKind::kValue;
-  std::uint8_t flags = 0;
+  std::uint8_t db_id = 0;
   Digest digest{};
   std::uint32_t key_bytes = 0;
   std::uint32_t value_bytes = 0;

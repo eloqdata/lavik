@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,12 +24,15 @@ enum class CommandKind {
   kExists,
   kGet,
   kIncr,
+  kScan,
+  kSelect,
   kSet,
   kUnknown,
 };
 
 struct CommandRequest {
   CommandKind kind = CommandKind::kUnknown;
+  std::uint8_t db_id = 0;
   std::vector<std::string> args;
 };
 
@@ -37,9 +41,11 @@ struct CommandReply {
   std::optional<storage::DiskValue> disk_value;
   bool close_connection = false;
   ReadLatencyTrace read_trace;
+  std::optional<std::uint8_t> selected_db;
 };
 
-StatusOr<CommandRequest> BuildCommandRequest(RespCommand command);
+StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
+                                             std::uint8_t db_id);
 
 // Bind command routing to the disk engine. Call once before the server starts.
 void InitStorage(storage::StorageEngine* engine);

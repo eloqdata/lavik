@@ -71,7 +71,7 @@ Each worker has a sparse map containing only the blocks it currently owns:
 
 ```text
 WorkerStore
-  key index                  keys routed to this worker
+  16 logical-DB key indexes  keys routed to this worker, isolated by DB
   active append block       new physical writes owned by this worker
   owned BlockState map      blocks whose lifecycle this worker manages
   flush queue

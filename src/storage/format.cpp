@@ -202,6 +202,7 @@ bool EncodeRecordHeader(
     std::span<std::byte> output) noexcept {
   const std::size_t header_bytes = RecordHeaderBytes(key.size());
   if (key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
+      header.db_id >= kLogicalDatabaseCount ||
       header.header_bytes != header_bytes || output.size() != header_bytes) {
     return false;
   }
@@ -227,6 +228,7 @@ bool DecodeRecordHeader(
       decoded.version != kStorageFormatVersion ||
       (decoded.kind != RecordKind::kValue &&
        decoded.kind != RecordKind::kTombstone) ||
+      decoded.db_id >= kLogicalDatabaseCount ||
       decoded.key_bytes > MaxKeyBytes() ||
       decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
       decoded.header_bytes > input.size() ||
