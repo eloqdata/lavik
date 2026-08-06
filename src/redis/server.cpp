@@ -81,6 +81,7 @@ struct ReadLatencyStats {
   std::uint64_t heap_buffers = 0;
   std::uint64_t next_report_ns = 0;
   LatencyDistribution total;
+  LatencyDistribution non_network;
   LatencyDistribution route_out;
   LatencyDistribution lookup;
   LatencyDistribution buffer;
@@ -105,6 +106,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
   stats.disk_reads += trace.disk_read;
   stats.heap_buffers += trace.heap_read_buffer;
   stats.total.Add(Elapsed(trace.send_complete_ns, trace.request_start_ns));
+  stats.non_network.Add(Elapsed(trace.send_start_ns, trace.request_start_ns));
   stats.route_out.Add(Elapsed(trace.owner_start_ns, trace.request_start_ns));
   stats.lookup.Add(Elapsed(trace.lookup_done_ns, trace.owner_start_ns));
   stats.buffer.Add(
@@ -129,6 +131,9 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
   const auto p999 = [&](const LatencyDistribution& value) {
     return value.PercentileUpperUs(stats.count, 0.999);
   };
+  const auto p9999 = [&](const LatencyDistribution& value) {
+    return value.PercentileUpperUs(stats.count, 0.9999);
+  };
   const auto wake_stats = ThisWorker().self->TakeWakeStats();
   spdlog::info(
       "read-latency worker={} n={} remote={:.1f}% hit={:.1f}% disk={:.1f}% "
@@ -147,6 +152,14 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p999(stats.buffer), p999(stats.io), p999(stats.decode),
       p999(stats.route_back), p999(stats.send),
       wake_stats.sent, wake_stats.checks);
+  spdlog::info(
+      "read-latency-p99.99 worker={} n={} non-network-us<={} total-us<={} "
+      "storage-io-us<={} route-out-us<={} lookup-us<={} buffer-us<={} "
+      "decode-us<={} route-back-us<={} send-us<={}",
+      ThisWorker().id, stats.count, p9999(stats.non_network),
+      p9999(stats.total), p9999(stats.io), p9999(stats.route_out),
+      p9999(stats.lookup), p9999(stats.buffer), p9999(stats.decode),
+      p9999(stats.route_back), p9999(stats.send));
   stats = ReadLatencyStats{};
   stats.next_report_ns = now + 10'000'000'000ULL;
 }
@@ -421,14 +434,16 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
               int idle_timeout_ms, unsigned recv_buffer_count,
               unsigned busy_poll_us,
               std::size_t registered_buffer_bytes,
-              std::uint32_t flush_max_ms, bool verify_read_crc,
+              std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
+              bool verify_read_crc,
               const std::vector<std::string>& data_files,
               std::uint64_t data_file_size_bytes) {
   spdlog::info(
       "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
-      "registered_buffer_bytes={} per worker flush_max_ms={} verify_read_crc={}",
+      "registered_buffer_bytes={} per worker flush_max_ms={} flush_size_bytes={} "
+      "verify_read_crc={}",
       bind_ip, port, thread_count, idle_timeout_ms, busy_poll_us,
-      registered_buffer_bytes, flush_max_ms, verify_read_crc);
+      registered_buffer_bytes, flush_max_ms, flush_size_bytes, verify_read_crc);
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {
@@ -440,6 +455,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   storage_options.data_files = data_files;
   storage_options.file_size_bytes = data_file_size_bytes;
   storage_options.flush_max_ms = flush_max_ms;
+  storage_options.flush_size_bytes = flush_size_bytes;
   storage_options.verify_read_crc = verify_read_crc;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));

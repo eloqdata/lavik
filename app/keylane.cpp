@@ -18,6 +18,7 @@ int main(int argc, char** argv) {
   unsigned busy_poll_us = 0;
   unsigned registered_buffer_mb = 16;
   std::uint32_t flush_max_ms = 1000;
+  unsigned flush_size_kb = 8192;
   bool disable_read_crc = false;
   std::vector<std::string> data_files{"keylane.data"};
   std::uint64_t data_file_size_mb = 1024;
@@ -45,6 +46,10 @@ int main(int argc, char** argv) {
                  "Maximum age of a partial write block before flush")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_option("--flush-size-kb", flush_size_kb,
+                 "Maximum size of each storage write submission in KiB")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
   app.add_flag("--disable-read-crc", disable_read_crc,
                "Skip payload CRC32C verification on GET reads");
   app.add_option("--data-file", data_files,
@@ -62,7 +67,9 @@ int main(int argc, char** argv) {
   }
 
   constexpr std::size_t kMiB = 1024 * 1024;
+  constexpr std::size_t kKiB = 1024;
   if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
+      flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB ||
       data_file_size_mb >
           std::numeric_limits<std::uint64_t>::max() / kMiB) {
     return 2;
@@ -70,6 +77,8 @@ int main(int argc, char** argv) {
   return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms,
                             recv_buffer_count, busy_poll_us,
                             static_cast<std::size_t>(registered_buffer_mb) * kMiB,
-                            flush_max_ms, !disable_read_crc,
+                            flush_max_ms,
+                            static_cast<std::size_t>(flush_size_kb) * kKiB,
+                            !disable_read_crc,
                             data_files, data_file_size_mb * kMiB);
 }

@@ -1,6 +1,11 @@
 #include "keylane/storage/engine.h"
 
 #include <fcntl.h>
+#include <linux/fs.h>
+#ifdef BLOCK_SIZE
+#undef BLOCK_SIZE
+#endif
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -306,6 +311,37 @@ Status PrepareDataFile(const std::string& path, std::uint64_t size) {
   return Status::Ok();
 }
 
+StatusOr<std::size_t> BlockDeviceIoAlignment(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return Status(StatusCode::kInternal,
+                  "open block device for alignment probe failed: " + path +
+                      ": " + std::strerror(errno));
+  }
+
+  int logical_block_bytes = 0;
+  const int ioctl_error = ::ioctl(fd, BLKSSZGET, &logical_block_bytes);
+  const int saved_errno = errno;
+  const int close_error = ::close(fd);
+  if (ioctl_error != 0) {
+    return Status(StatusCode::kInternal,
+                  "BLKSSZGET failed: " + path + ": " +
+                      std::strerror(saved_errno));
+  }
+  if (close_error != 0) {
+    return Status(StatusCode::kInternal,
+                  "close block device after alignment probe failed: " + path);
+  }
+
+  const auto alignment = static_cast<std::size_t>(logical_block_bytes);
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+    return Status(StatusCode::kInternal,
+                  "block device logical sector size is not a power of two: " +
+                      path);
+  }
+  return alignment;
+}
+
 Task<StatusOr<std::size_t>> ReadStorageBuffer(
     Worker& worker, FixedFile file, FixedBuffer buffer, bool registered,
     std::uint64_t offset) {
@@ -342,6 +378,10 @@ class StorageEngine::Impl {
  public:
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {}
 
+ private:
+  std::size_t direct_io_alignment_ = kDirectIoAlignment;
+
+ public:
   struct WorkerStore {
     explicit WorkerStore(std::size_t total_blocks)
         : block_states(total_blocks) {}
@@ -378,20 +418,43 @@ class StorageEngine::Impl {
                     "data file size must be a positive multiple of 8 MiB");
     }
 
+    std::size_t direct_io_alignment = 1;
     for (const std::string& path : options_.data_files) {
       struct stat file_info {};
       if (::stat(path.c_str(), &file_info) == 0 &&
           S_ISBLK(file_info.st_mode)) {
+        auto alignment = BlockDeviceIoAlignment(path);
+        if (!alignment.ok()) {
+          return alignment.status();
+        }
+        direct_io_alignment = std::max(direct_io_alignment, *alignment);
         spdlog::info(
-            "using raw block device {} from offset 0 (configured bytes={})",
-            path, options_.file_size_bytes);
+            "using raw block device {} from offset 0 (configured bytes={} "
+            "logical-sector-bytes={})",
+            path, options_.file_size_bytes, *alignment);
         continue;
       }
       Status status = PrepareDataFile(path, options_.file_size_bytes);
       if (!status.ok()) {
         return status;
       }
+      direct_io_alignment =
+          std::max(direct_io_alignment, kDirectIoAlignment);
     }
+    direct_io_alignment_ = direct_io_alignment;
+    if (options_.flush_size_bytes < direct_io_alignment_ ||
+        options_.flush_size_bytes > kStorageBlockBytes ||
+        (options_.flush_size_bytes & (options_.flush_size_bytes - 1)) != 0 ||
+        options_.flush_size_bytes % direct_io_alignment_ != 0) {
+      return Status(
+          StatusCode::kInvalidArgument,
+          "flush size must be a power of two between the direct-I/O alignment "
+          "and the 8 MiB storage block size");
+    }
+    spdlog::info("storage direct-I/O alignment={} bytes",
+                 direct_io_alignment_);
+    spdlog::info("storage flush submission size={} bytes",
+                 options_.flush_size_bytes);
 
     worker_count_ = worker_count;
     blocks_per_file_ = options_.file_size_bytes / kStorageBlockBytes;
@@ -1066,12 +1129,15 @@ class StorageEngine::Impl {
     const auto [file_id, block_offset] = FileOffset(location.block_id);
     const std::uint64_t absolute_offset =
         block_offset + location.record_offset;
-    const std::uint64_t aligned_offset =
-        absolute_offset & ~(static_cast<std::uint64_t>(kDirectIoAlignment) - 1);
+    const std::uint64_t direct_io_mask =
+        static_cast<std::uint64_t>(direct_io_alignment_ - 1);
+    const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
     const std::size_t record_headroom =
         static_cast<std::size_t>(absolute_offset - aligned_offset);
+    const std::size_t record_span =
+        record_headroom + location.total_disk_bytes;
     const std::size_t read_bytes =
-        AlignDirect(record_headroom + location.total_disk_bytes);
+        (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
     if (read_bytes > io.size) {
       co_return Status(StatusCode::kOutOfRange,
                        "record exceeds registered read buffer capacity");
@@ -1594,33 +1660,30 @@ class StorageEngine::Impl {
                          "invalid pending flush staging buffer");
       }
 
-      auto written = co_await WriteStorageBuffer(
-          *store->worker, store->files[file_id],
-          std::span<const std::byte>(staging.data, write_bytes),
-          pending->write_buffer_id != 0, staging,
-          block_offset);
-      if (!written.ok()) {
-        co_await store->writer_mutex.Lock();
-        UnlockGuard guard(&store->writer_mutex, store->worker);
-        BlockState& state = store->block_states[pending->block_id];
-        state.flush_in_progress = false;
-        state.flush_queued = false;
-        store->write_failed = true;
-        store->flush_running = false;
-        release_pending(*pending);
-        co_return written.status();
-      }
-      if (*written != write_bytes) {
-        co_await store->writer_mutex.Lock();
-        UnlockGuard guard(&store->writer_mutex, store->worker);
-        BlockState& state = store->block_states[pending->block_id];
-        state.flush_in_progress = false;
-        state.flush_queued = false;
-        store->write_failed = true;
-        store->flush_running = false;
-        release_pending(*pending);
-        co_return Status(StatusCode::kInternal,
-                         "short block flush write");
+      for (std::size_t write_offset = 0; write_offset < write_bytes;) {
+        const std::size_t chunk_bytes =
+            std::min(options_.flush_size_bytes, write_bytes - write_offset);
+        auto written = co_await WriteStorageBuffer(
+            *store->worker, store->files[file_id],
+            std::span<const std::byte>(staging.data + write_offset, chunk_bytes),
+            pending->write_buffer_id != 0, staging,
+            block_offset + write_offset);
+        if (!written.ok() || *written != chunk_bytes) {
+          co_await store->writer_mutex.Lock();
+          UnlockGuard guard(&store->writer_mutex, store->worker);
+          BlockState& state = store->block_states[pending->block_id];
+          state.flush_in_progress = false;
+          state.flush_queued = false;
+          store->write_failed = true;
+          store->flush_running = false;
+          release_pending(*pending);
+          if (!written.ok()) {
+            co_return written.status();
+          }
+          co_return Status(StatusCode::kInternal,
+                           "short block flush write");
+        }
+        write_offset += chunk_bytes;
       }
       auto synced = co_await celer::Fdatasync(*store->worker,
                                               store->files[file_id]);
