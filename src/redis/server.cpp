@@ -455,7 +455,7 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
     if (!request_result.ok()) [[unlikely]] {
       reply.encoded = EncodeError("ERR " + request_result.status().message());
     } else {
-      reply = co_await ExecuteCommand(*request_result);
+      reply = co_await DispatchCommand(ctx, std::move(*request_result));
     }
     if (reply.selected_db.has_value()) {
       ctx.selected_db = *reply.selected_db;

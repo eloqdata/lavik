@@ -84,6 +84,9 @@ class Transaction {
   celer::Task<celer::Status> Execute(ShardCallback cb, void* ctx,
                                      bool conclude);
 
+  // Final no-op hop that releases every shard's locks and queue position.
+  celer::Task<celer::Status> Conclude();
+
   bool concluding() const { return concluding_; }
 
   // Shard-side entry points (shard thread only).

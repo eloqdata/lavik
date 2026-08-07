@@ -272,6 +272,18 @@ Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool conclude) {
 
 namespace {
 
+Task<Status> NoopShardCallback(void*, const ShardSlice&) {
+  co_return Status::Ok();
+}
+
+}  // namespace
+
+Task<Status> Transaction::Conclude() {
+  co_return co_await Execute(&NoopShardCallback, nullptr, true);
+}
+
+namespace {
+
 Task<Status> RunShardHop(TxShard* shard, TxWaiter* node) {
   Transaction* tx = node->tx;
   Status status = co_await tx->InvokeCallback(node->shard_slot);

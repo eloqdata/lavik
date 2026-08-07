@@ -1,0 +1,415 @@
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <charconv>
+#include <chrono>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using namespace std::chrono_literals;
+
+[[noreturn]] void Fail(std::string message) {
+  throw std::runtime_error(std::move(message));
+}
+
+class RespClient {
+ public:
+  explicit RespClient(int fd) : fd_(fd) {}
+  RespClient(const RespClient&) = delete;
+  RespClient& operator=(const RespClient&) = delete;
+  RespClient(RespClient&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+  RespClient& operator=(RespClient&&) = delete;
+  ~RespClient() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  std::string Command(const std::vector<std::string_view>& args) {
+    std::string request = "*" + std::to_string(args.size()) + "\r\n";
+    for (std::string_view arg : args) {
+      request += "$" + std::to_string(arg.size()) + "\r\n";
+      request.append(arg);
+      request += "\r\n";
+    }
+    SendAll(request);
+    return ReadReply();
+  }
+
+ private:
+  std::string ReadReply() {
+    const std::string line = ReadLine();
+    switch (line.empty() ? '\0' : line.front()) {
+      case '+':
+      case '-':
+      case ':':
+        return line;
+      case '$': {
+        if (line == "$-1") {
+          return line;
+        }
+        const std::size_t size = ParseLength(line);
+        std::string payload(size + 2, '\0');
+        ReadExact(payload.data(), payload.size());
+        if (!payload.ends_with("\r\n")) {
+          Fail("malformed bulk terminator");
+        }
+        payload.resize(size);
+        return line + "\r\n" + payload;
+      }
+      case '*': {
+        if (line == "*-1") {
+          return line;
+        }
+        const std::size_t count = ParseLength(line);
+        std::string reply = line;
+        for (std::size_t i = 0; i < count; ++i) {
+          reply += "\r\n" + ReadReply();
+        }
+        return reply;
+      }
+      default:
+        Fail("unexpected RESP type: " + line);
+    }
+  }
+
+  static std::size_t ParseLength(const std::string& line) {
+    std::size_t size = 0;
+    const char* begin = line.data() + 1;
+    const char* end = line.data() + line.size();
+    const auto [parsed, error] = std::from_chars(begin, end, size);
+    if (error != std::errc{} || parsed != end) {
+      Fail("malformed RESP length: " + line);
+    }
+    return size;
+  }
+
+  void SendAll(std::string_view bytes) {
+    while (!bytes.empty()) {
+      const ssize_t sent =
+          ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+      if (sent < 0) {
+        if (errno == EINTR) continue;
+        Fail("send failed: " + std::string(std::strerror(errno)));
+      }
+      if (sent == 0) Fail("send returned zero bytes");
+      bytes.remove_prefix(static_cast<std::size_t>(sent));
+    }
+  }
+
+  void ReadExact(char* output, std::size_t size) {
+    while (size != 0) {
+      const ssize_t received = ::recv(fd_, output, size, 0);
+      if (received < 0) {
+        if (errno == EINTR) continue;
+        Fail("recv failed: " + std::string(std::strerror(errno)));
+      }
+      if (received == 0) Fail("server closed the connection");
+      output += received;
+      size -= static_cast<std::size_t>(received);
+    }
+  }
+
+  std::string ReadLine() {
+    std::string response;
+    while (!response.ends_with("\r\n")) {
+      char byte = 0;
+      ReadExact(&byte, 1);
+      response.push_back(byte);
+      if (response.size() > 4096) Fail("unexpectedly long RESP line");
+    }
+    response.resize(response.size() - 2);
+    return response;
+  }
+
+  int fd_ = -1;
+};
+
+std::uint16_t FindFreePort() {
+  const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) Fail("socket failed while selecting a port");
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  address.sin_port = 0;
+  if (::bind(fd, reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) != 0) {
+    ::close(fd);
+    Fail("bind failed while selecting a port");
+  }
+  socklen_t bytes = sizeof(address);
+  if (::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &bytes) != 0) {
+    ::close(fd);
+    Fail("getsockname failed while selecting a port");
+  }
+  ::close(fd);
+  return ntohs(address.sin_port);
+}
+
+void CreateDataFile(const std::string& path, std::uint64_t bytes) {
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) Fail("failed to create test data file");
+  const int allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
+  const int close_error = ::close(fd);
+  if (allocated != 0 || close_error != 0) Fail("failed to size data file");
+}
+
+RespClient Connect(std::uint16_t port) {
+  const auto deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) Fail("client socket failed");
+    timeval timeout{.tv_sec = 30, .tv_usec = 0};
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = htons(port);
+    if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                  sizeof(address)) == 0) {
+      return RespClient(fd);
+    }
+    ::close(fd);
+    std::this_thread::sleep_for(10ms);
+  }
+  Fail("timed out connecting to Keylane");
+}
+
+class ServerProcess {
+ public:
+  ServerProcess(const std::string& binary, std::uint16_t port,
+                const std::string& data_path, const std::string& log_path) {
+    pid_ = ::fork();
+    if (pid_ < 0) Fail("fork failed");
+    if (pid_ == 0) {
+      const int log_fd = ::open(
+          log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+      if (log_fd >= 0) {
+        (void)::dup2(log_fd, STDOUT_FILENO);
+        (void)::dup2(log_fd, STDERR_FILENO);
+        ::close(log_fd);
+      }
+      std::vector<std::string> arguments{
+          binary,        "--port",         std::to_string(port),
+          "--threads",   "4",              "--recv-buffers",
+          "0",           "--flush-max-ms", "20",
+          "--data-file", data_path,
+      };
+      std::vector<char*> child_argv;
+      for (std::string& argument : arguments) {
+        child_argv.push_back(argument.data());
+      }
+      child_argv.push_back(nullptr);
+      ::execv(binary.c_str(), child_argv.data());
+      _exit(127);
+    }
+  }
+
+  ServerProcess(const ServerProcess&) = delete;
+  ServerProcess& operator=(const ServerProcess&) = delete;
+  ~ServerProcess() {
+    if (pid_ > 0) {
+      (void)::kill(pid_, SIGKILL);
+      (void)::waitpid(pid_, nullptr, 0);
+    }
+  }
+
+  void Stop() {
+    if (pid_ <= 0) return;
+    if (::kill(pid_, SIGINT) != 0 && errno != ESRCH) Fail("signal failed");
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+      if (result == pid_) {
+        pid_ = -1;
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+          Fail("Keylane exited unsuccessfully");
+        }
+        return;
+      }
+      if (result < 0) Fail("waitpid failed");
+      std::this_thread::sleep_for(10ms);
+    }
+    Fail("Keylane did not stop");
+  }
+
+ private:
+  pid_t pid_ = -1;
+};
+
+void Expect(std::string_view actual, std::string_view expected,
+            std::string_view operation) {
+  if (actual != expected) {
+    Fail(std::string(operation) + " returned '" + std::string(actual) +
+         "', expected '" + std::string(expected) + "'");
+  }
+}
+
+std::string Bulk(std::string_view value) {
+  return "$" + std::to_string(value.size()) + "\r\n" + std::string(value);
+}
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream input(path);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc != 2) {
+    std::cerr << "usage: multi_exec_e2e_test /path/to/keylane\n";
+    return 1;
+  }
+  const std::string suffix = std::to_string(::getpid());
+  const std::string data_path = "/tmp/keylane-multiexec-" + suffix + ".data";
+  const std::string log_path = "/tmp/keylane-multiexec-" + suffix + ".log";
+  (void)::unlink(data_path.c_str());
+  (void)::unlink(log_path.c_str());
+
+  int exit_code = 0;
+  try {
+    const std::uint16_t port = FindFreePort();
+    CreateDataFile(data_path, 256ULL * 1024 * 1024);
+    ServerProcess server(argv[1], port, data_path, log_path);
+    RespClient client = Connect(port);
+    Expect(client.Command({"PING"}), "+PONG", "PING");
+
+    // Basic transaction: replies in queue order, later commands see earlier
+    // effects.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI");
+    Expect(client.Command({"SET", "k", "1"}), "+QUEUED", "queue SET");
+    Expect(client.Command({"INCR", "k"}), "+QUEUED", "queue INCR");
+    Expect(client.Command({"GET", "k"}), "+QUEUED", "queue GET");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue PING");
+    Expect(client.Command({"EXEC"}),
+           "*4\r\n+OK\r\n:2\r\n" + Bulk("2") + "\r\n+PONG", "EXEC basic");
+    Expect(client.Command({"GET", "k"}), Bulk("2"), "state after EXEC");
+
+    // Cross-shard transaction with multi-key commands inside.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI cross");
+    Expect(client.Command({"SET", "xa", "av"}), "+QUEUED", "queue xa");
+    Expect(client.Command({"SET", "xb", "bv"}), "+QUEUED", "queue xb");
+    Expect(client.Command({"SET", "xc", "cv"}), "+QUEUED", "queue xc");
+    Expect(client.Command({"MGET", "xc", "xa", "nope", "xb"}), "+QUEUED",
+           "queue MGET");
+    Expect(client.Command({"EXISTS", "xa", "xa", "nope"}), "+QUEUED",
+           "queue EXISTS");
+    Expect(client.Command({"DEL", "xa", "xb", "nope"}), "+QUEUED",
+           "queue DEL");
+    Expect(client.Command({"EXEC"}),
+           "*6\r\n+OK\r\n+OK\r\n+OK\r\n*4\r\n" + Bulk("cv") + "\r\n" +
+               Bulk("av") + "\r\n$-1\r\n" + Bulk("bv") + "\r\n:2\r\n:2",
+           "EXEC cross-shard");
+    Expect(client.Command({"MGET", "xa", "xb", "xc"}),
+           "*3\r\n$-1\r\n$-1\r\n" + Bulk("cv"), "state after cross EXEC");
+
+    // Nested MULTI errors without dooming the transaction.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI nested");
+    Expect(client.Command({"MULTI"}), "-ERR MULTI calls can not be nested",
+           "nested MULTI");
+    Expect(client.Command({"SET", "n", "v"}), "+QUEUED", "queue after nested");
+    Expect(client.Command({"EXEC"}), "*1\r\n+OK", "EXEC after nested");
+
+    // Queue-time errors doom EXEC.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI unknown");
+    Expect(client.Command({"BOGUS", "x"}), "-ERR unknown command 'BOGUS'",
+           "unknown queued");
+    Expect(client.Command({"SET", "u", "v"}), "+QUEUED", "queue after bogus");
+    Expect(client.Command({"EXEC"}),
+           "-EXECABORT Transaction discarded because of previous errors.",
+           "EXECABORT unknown");
+    Expect(client.Command({"GET", "u"}), "$-1", "doomed EXEC ran nothing");
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI arity");
+    Expect(client.Command({"GET"}),
+           "-ERR wrong number of arguments for 'get' command",
+           "arity queued");
+    Expect(client.Command({"EXEC"}),
+           "-EXECABORT Transaction discarded because of previous errors.",
+           "EXECABORT arity");
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI flushdb");
+    Expect(client.Command({"FLUSHDB"}),
+           "-ERR flushdb is not allowed in transactions", "queue FLUSHDB");
+    Expect(client.Command({"EXEC"}),
+           "-EXECABORT Transaction discarded because of previous errors.",
+           "EXECABORT flushdb");
+
+    // DISCARD clears everything.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI discard");
+    Expect(client.Command({"SET", "d", "1"}), "+QUEUED", "queue discard SET");
+    Expect(client.Command({"DISCARD"}), "+OK", "DISCARD");
+    Expect(client.Command({"EXEC"}), "-ERR EXEC without MULTI",
+           "EXEC after DISCARD");
+    Expect(client.Command({"GET", "d"}), "$-1", "discarded write");
+    Expect(client.Command({"DISCARD"}), "-ERR DISCARD without MULTI",
+           "stray DISCARD");
+
+    // Runtime errors reply inline; later commands still run.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI runtime");
+    Expect(client.Command({"SET", "rx", "abc"}), "+QUEUED", "queue bad SET");
+    Expect(client.Command({"INCR", "rx"}), "+QUEUED", "queue bad INCR");
+    Expect(client.Command({"SET", "ry", "1"}), "+QUEUED", "queue good SET");
+    Expect(client.Command({"EXEC"}),
+           "*3\r\n+OK\r\n-ERR value is not an integer or out of range\r\n+OK",
+           "EXEC runtime error inline");
+    Expect(client.Command({"GET", "ry"}), Bulk("1"), "post-error write ran");
+
+    // Empty transaction.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI empty");
+    Expect(client.Command({"EXEC"}), "*0", "empty EXEC");
+
+    // SELECT inside MULTI moves later queued commands to the new database
+    // and sticks after EXEC.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI select");
+    Expect(client.Command({"SELECT", "1"}), "+QUEUED", "queue SELECT");
+    Expect(client.Command({"SET", "sk", "sv"}), "+QUEUED", "queue db1 SET");
+    Expect(client.Command({"EXEC"}), "*2\r\n+OK\r\n+OK", "EXEC select");
+    Expect(client.Command({"GET", "sk"}), Bulk("sv"), "db1 read after EXEC");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "back to db0");
+    Expect(client.Command({"GET", "sk"}), "$-1", "db0 unaffected");
+
+    // Transactions spanning databases are rejected.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI cross-db");
+    Expect(client.Command({"SET", "c0", "v"}), "+QUEUED", "queue db0 SET");
+    Expect(client.Command({"SELECT", "1"}), "+QUEUED", "queue SELECT 1");
+    Expect(client.Command({"SET", "c1", "v"}), "+QUEUED", "queue db1 SET");
+    Expect(client.Command({"EXEC"}),
+           "-ERR EXEC spanning multiple databases is not supported",
+           "cross-db EXEC");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "reset db");
+
+    server.Stop();
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << "\n--- Keylane log ---\n"
+              << ReadFile(log_path) << std::flush;
+    exit_code = 1;
+  }
+
+  (void)::unlink(data_path.c_str());
+  (void)::unlink(log_path.c_str());
+  std::cout << (exit_code == 0 ? "multi/exec e2e passed\n" : "")
+            << std::flush;
+  return exit_code;
+}

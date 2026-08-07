@@ -17,7 +17,9 @@
 #include "celer/io/storage.h"
 #include "keylane/command_table.h"
 #include "keylane/resp.h"
+#include "keylane/session.h"
 #include "keylane/tx/transaction.h"
+#include "keylane/tx/tx_shard.h"
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
 
@@ -800,6 +802,136 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
   }
 }
 
+// Runs one single-key command body against pre-acquired locks, returning the
+// encoded reply. Mirrors ExecuteStorageCommand's semantics; arity was already
+// validated when the command was queued.
+Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
+                                     const CommandRequest& request,
+                                     const storage::Digest& digest) {
+  const auto& args = request.args;
+  switch (request.kind) {
+    case CommandKind::kGet: {
+      auto value = co_await g_storage->GetLocked(db_id, args[1], digest);
+      if (value.ok()) {
+        const auto bytes = value->network_bytes();
+        co_return std::string(reinterpret_cast<const char*>(bytes.data()),
+                              bytes.size());
+      }
+      co_return value.status().code() == StatusCode::kNotFound
+          ? EncodeNullBulkString()
+          : EncodeError("ERR " + value.status().message());
+    }
+
+    case CommandKind::kSet: {
+      auto options = ParseSetOptions(args);
+      if (!options.ok()) {
+        co_return EncodeError("ERR " + options.status().message());
+      }
+      auto result = co_await g_storage->SetLocked(db_id, args[1], digest,
+                                                  args[2], *options);
+      if (!result.ok()) {
+        co_return EncodeStorageError(result.status());
+      }
+      if (options->return_old_value) {
+        if (result->old_value.has_value()) {
+          const auto bytes = result->old_value->network_bytes();
+          co_return std::string(reinterpret_cast<const char*>(bytes.data()),
+                                bytes.size());
+        }
+        co_return EncodeNullBulkString();
+      }
+      co_return result->applied ? EncodeSimpleString("OK")
+                                : EncodeNullBulkString();
+    }
+
+    case CommandKind::kStrlen: {
+      auto length =
+          co_await g_storage->StringLengthLocked(db_id, args[1], digest);
+      if (!length.ok()) {
+        co_return length.status().code() == StatusCode::kNotFound
+            ? EncodeInteger(0)
+            : EncodeStorageError(length.status());
+      }
+      if (*length > static_cast<std::uint64_t>(
+                        std::numeric_limits<long long>::max())) {
+        co_return EncodeError("ERR String length exceeds RESP range");
+      }
+      co_return EncodeInteger(static_cast<long long>(*length));
+    }
+
+    case CommandKind::kTtl:
+    case CommandKind::kPttl: {
+      const bool milliseconds = request.kind == CommandKind::kPttl;
+      const storage::ExpirationInfo info =
+          co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
+      if (!info.exists) {
+        co_return EncodeInteger(-2);
+      }
+      if (info.expire_at_ms == 0) {
+        co_return EncodeInteger(-1);
+      }
+      const std::uint64_t now_ms = CommandUnixTimeMillis();
+      const std::uint64_t remaining =
+          info.expire_at_ms > now_ms ? info.expire_at_ms - now_ms : 0;
+      co_return EncodeInteger(static_cast<long long>(
+          milliseconds ? remaining : remaining / 1000));
+    }
+
+    case CommandKind::kExpire:
+    case CommandKind::kPExpire: {
+      const bool milliseconds = request.kind == CommandKind::kPExpire;
+      std::int64_t duration = 0;
+      if (!ParseInt64(args[2], &duration)) {
+        co_return EncodeError("ERR value is not an integer or out of range");
+      }
+      auto condition = ParseExpirationCondition(args);
+      if (!condition.ok()) {
+        co_return EncodeError("ERR syntax error");
+      }
+      const std::uint64_t now_ms = CommandUnixTimeMillis();
+      constexpr std::uint64_t kMaxTimestamp =
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+      std::uint64_t expire_at_ms = 1;
+      if (duration > 0) {
+        const std::uint64_t amount = static_cast<std::uint64_t>(duration);
+        const std::uint64_t factor = milliseconds ? 1 : 1000;
+        if (amount > (kMaxTimestamp - now_ms) / factor) {
+          co_return EncodeError("ERR invalid expire time in 'expire' command");
+        }
+        expire_at_ms = now_ms + amount * factor;
+      }
+      auto updated = co_await g_storage->UpdateExpirationLocked(
+          db_id, args[1], digest, expire_at_ms, *condition);
+      co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
+                             : EncodeStorageError(updated.status());
+    }
+
+    case CommandKind::kPersist: {
+      auto updated = co_await g_storage->UpdateExpirationLocked(
+          db_id, args[1], digest, 0,
+          storage::ExpirationCondition::kIfHasExpiration);
+      co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
+                             : EncodeStorageError(updated.status());
+    }
+
+    case CommandKind::kIncr: {
+      auto value = co_await g_storage->IncrementLocked(db_id, args[1], digest);
+      if (value.ok()) {
+        co_return EncodeInteger(*value);
+      }
+      if (value.status().message().starts_with("WRONGTYPE ")) {
+        co_return EncodeError(value.status().message());
+      }
+      co_return value.status().code() == StatusCode::kInvalidArgument
+          ? EncodeError("ERR value is not an integer or out of range")
+          : EncodeError("ERR " + value.status().message());
+    }
+
+    default:
+      co_return EncodeError("ERR command is not allowed in transactions");
+  }
+}
+
 // Shared context of one multi-key command's transaction. Shard callbacks
 // write disjoint reply slots (MGET) or bump the shared counter (DEL/EXISTS)
 // before the hop barrier; the coordinator assembles the reply afterwards.
@@ -915,11 +1047,391 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   }
 }
 
+// One key of a queued EXEC command, with everything precomputed on the
+// coordinator: digest, owning shard, argument position, reply slot.
+struct ExecKey {
+  storage::Digest digest;
+  std::uint16_t owner = 0;
+  std::uint16_t arg = 0;
+  std::uint16_t slot = 0;
+  tx::LockMode mode = tx::LockMode::kShared;
+};
+
+struct ExecContext {
+  const std::vector<CommandRequest>* queued = nullptr;
+  const std::vector<std::vector<ExecKey>>* cmd_keys = nullptr;
+  std::vector<std::string>* replies = nullptr;
+  std::vector<std::optional<std::string>> mget;
+  std::atomic<long long> counter{0};
+  std::size_t current = 0;
+};
+
+std::string AssembleMultiKeyReply(CommandKind kind, const ExecContext& ctx,
+                                  const Status& ran) {
+  if (!ran.ok()) {
+    return EncodeStorageError(ran);
+  }
+  switch (kind) {
+    case CommandKind::kMSet:
+      return EncodeSimpleString("OK");
+    case CommandKind::kMGet: {
+      std::string reply = "*" + std::to_string(ctx.mget.size()) + "\r\n";
+      for (const auto& frame : ctx.mget) {
+        reply += frame.has_value() ? *frame : "$-1\r\n";
+      }
+      return reply;
+    }
+    default:
+      return EncodeInteger(ctx.counter.load(std::memory_order_relaxed));
+  }
+}
+
+// One EXEC hop = one queued command: every shard runs the slice of that
+// command it owns; shards that own none of its keys no-op.
+Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
+  auto* ctx = static_cast<ExecContext*>(context);
+  const CommandRequest& cmd = (*ctx->queued)[ctx->current];
+  const auto& args = cmd.args;
+  const unsigned self = ThisWorker().id;
+  for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
+    if (key.owner != self) {
+      continue;
+    }
+    switch (cmd.kind) {
+      case CommandKind::kMSet: {
+        auto result = co_await g_storage->SetLocked(
+            slice.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
+        if (!result.ok()) {
+          co_return result.status();
+        }
+        break;
+      }
+      case CommandKind::kMGet: {
+        auto value = co_await g_storage->GetLocked(slice.db_id, args[key.arg],
+                                                   key.digest);
+        if (value.ok()) {
+          const auto bytes = value->network_bytes();
+          ctx->mget[key.slot].emplace(
+              reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        } else if (value.status().code() != StatusCode::kNotFound) {
+          co_return value.status();
+        }
+        break;
+      }
+      case CommandKind::kDel: {
+        auto deleted = co_await g_storage->DeleteLocked(
+            slice.db_id, args[key.arg], key.digest);
+        if (!deleted.ok()) {
+          co_return deleted.status();
+        }
+        if (*deleted) {
+          ctx->counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+      }
+      case CommandKind::kExists: {
+        if (co_await g_storage->ExistsLocked(slice.db_id, args[key.arg],
+                                             key.digest)) {
+          ctx->counter.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+      }
+      default:
+        // Single-key command: the sole owner runs the full body and writes
+        // the reply slot directly.
+        (*ctx->replies)[ctx->current] =
+            co_await RunSingleKeyLocked(slice.db_id, cmd, key.digest);
+        break;
+    }
+  }
+  co_return Status::Ok();
+}
+
+// The union lock set of an EXEC, deduplicated per fingerprint with
+// exclusive-if-any-writer, as TxShard::AcquireKeys requires.
+std::vector<tx::KeyRef> DedupExecLocks(
+    const std::vector<std::vector<ExecKey>>& cmd_keys) {
+  std::vector<tx::KeyRef> refs;
+  for (const auto& keys : cmd_keys) {
+    for (const ExecKey& key : keys) {
+      const tx::LockFp fp = tx::FingerprintOf(key.digest);
+      bool merged = false;
+      for (tx::KeyRef& ref : refs) {
+        if (ref.fp == fp) {
+          if (key.mode == tx::LockMode::kExclusive) {
+            ref.mode = tx::LockMode::kExclusive;
+          }
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        refs.push_back(tx::KeyRef{fp, key.mode});
+      }
+    }
+  }
+  return refs;
+}
+
+Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
+  const std::vector<CommandRequest> queued = std::move(ctx.queued);
+  const bool dirty = ctx.multi_dirty;
+  ctx.ResetMulti();
+  if (dirty) {
+    co_return EncodedReply(EncodeError(
+        "EXECABORT Transaction discarded because of previous errors."));
+  }
+  if (queued.empty()) {
+    co_return EncodedReply("*0\r\n");
+  }
+
+  // Precompute every queued command's keys: digests, owners, slots, modes.
+  std::vector<std::vector<ExecKey>> cmd_keys(queued.size());
+  std::optional<std::uint8_t> tx_db;
+  bool cross_db = false;
+  for (std::size_t i = 0; i < queued.size(); ++i) {
+    const CommandRequest& cmd = queued[i];
+    if (cmd.spec == nullptr || cmd.spec->first_key == 0) {
+      continue;
+    }
+    auto keys = DetermineKeys(*cmd.spec, cmd.args.size());
+    if (!keys.ok()) {
+      co_return EncodedReply(EncodeError("ERR " + keys.status().message()));
+    }
+    const bool write = (cmd.spec->flags & kCmdWrite) != 0;
+    std::uint16_t slot = 0;
+    for (std::size_t a = keys->first; a <= keys->last; a += keys->step) {
+      cmd_keys[i].push_back(ExecKey{
+          .digest = storage::ComputeDigest(cmd.args[a]),
+          .owner = static_cast<std::uint16_t>(ShardForKey(cmd.args[a])),
+          .arg = static_cast<std::uint16_t>(a),
+          .slot = slot++,
+          .mode = write ? tx::LockMode::kExclusive : tx::LockMode::kShared,
+      });
+    }
+    if (tx_db.has_value() && *tx_db != cmd.db_id) {
+      cross_db = true;
+    }
+    tx_db = tx_db.value_or(cmd.db_id);
+  }
+  if (cross_db) {
+    co_return EncodedReply(EncodeError(
+        "ERR EXEC spanning multiple databases is not supported"));
+  }
+
+  std::vector<std::string> replies(queued.size());
+  std::optional<std::uint8_t> select_db;
+  auto run_keyless = [&](const CommandRequest& cmd) {
+    CommandReply local = ExecuteLocalCommand(cmd);
+    if (local.selected_db.has_value()) {
+      select_db = local.selected_db;
+    }
+    return std::move(local.encoded);
+  };
+
+  if (tx_db.has_value()) {
+    if (!TryBeginDbOperation(*tx_db)) {
+      co_return EncodedReply(EncodeError("TRYAGAIN FLUSHDB is in progress"));
+    }
+    DbOperationGuard db_guard(*tx_db);
+
+    // Distinct owners across the whole transaction.
+    std::vector<std::uint16_t> owners;
+    for (const auto& keys : cmd_keys) {
+      for (const ExecKey& key : keys) {
+        if (std::find(owners.begin(), owners.end(), key.owner) ==
+            owners.end()) {
+          owners.push_back(key.owner);
+        }
+      }
+    }
+
+    if (owners.size() == 1) {
+      // Whole transaction on one shard: hop once, take the fast-path guard
+      // over the union lock set, run every command inline.
+      const std::vector<tx::KeyRef> refs = DedupExecLocks(cmd_keys);
+      const std::uint8_t db = *tx_db;
+      Status status = co_await SubmitTaskTo(
+          owners.front(), [&]() -> Task<Status> {
+            auto guard = co_await tx::CurrentTxShard().AcquireKeys(
+                db, std::span<const tx::KeyRef>(refs));
+            for (std::size_t i = 0; i < queued.size(); ++i) {
+              const CommandRequest& cmd = queued[i];
+              if (cmd_keys[i].empty()) {
+                replies[i] = run_keyless(cmd);
+                continue;
+              }
+              switch (cmd.kind) {
+                case CommandKind::kMSet:
+                case CommandKind::kMGet:
+                case CommandKind::kDel:
+                case CommandKind::kExists: {
+                  ExecContext exec_ctx;
+                  exec_ctx.queued = &queued;
+                  exec_ctx.cmd_keys = &cmd_keys;
+                  exec_ctx.replies = &replies;
+                  exec_ctx.current = i;
+                  exec_ctx.mget.assign(
+                      cmd.kind == CommandKind::kMGet ? cmd_keys[i].size() : 0,
+                      std::nullopt);
+                  Status ran = co_await ExecShardCallback(
+                      &exec_ctx, tx::ShardSlice{.db_id = db, .keys = {}});
+                  replies[i] = AssembleMultiKeyReply(cmd.kind, exec_ctx, ran);
+                  break;
+                }
+                default:
+                  replies[i] = co_await RunSingleKeyLocked(
+                      db, cmd, cmd_keys[i].front().digest);
+                  break;
+              }
+            }
+            co_return Status::Ok();
+          });
+      if (!status.ok()) {
+        co_return EncodedReply(EncodeError("ERR " + status.message()));
+      }
+    } else {
+      tx::Transaction txn;
+      txn.Begin(*tx_db);
+      for (const auto& keys : cmd_keys) {
+        for (const ExecKey& key : keys) {
+          txn.AddKey(key.owner, key.digest, key.arg, key.mode);
+        }
+      }
+      txn.Seal();
+      Status scheduled = co_await txn.Schedule();
+      if (!scheduled.ok()) {
+        co_return EncodedReply(EncodeError("ERR " + scheduled.message()));
+      }
+      ExecContext exec_ctx;
+      exec_ctx.queued = &queued;
+      exec_ctx.cmd_keys = &cmd_keys;
+      exec_ctx.replies = &replies;
+      for (std::size_t i = 0; i < queued.size(); ++i) {
+        const CommandRequest& cmd = queued[i];
+        if (cmd_keys[i].empty()) {
+          replies[i] = run_keyless(cmd);
+          continue;
+        }
+        exec_ctx.current = i;
+        exec_ctx.counter.store(0, std::memory_order_relaxed);
+        exec_ctx.mget.assign(
+            cmd.kind == CommandKind::kMGet ? cmd_keys[i].size() : 0,
+            std::nullopt);
+        Status ran = co_await txn.Execute(&ExecShardCallback, &exec_ctx,
+                                         /*conclude=*/false);
+        switch (cmd.kind) {
+          case CommandKind::kMSet:
+          case CommandKind::kMGet:
+          case CommandKind::kDel:
+          case CommandKind::kExists:
+            replies[i] = AssembleMultiKeyReply(cmd.kind, exec_ctx, ran);
+            break;
+          default:
+            if (!ran.ok()) {
+              replies[i] = EncodeStorageError(ran);
+            }
+            break;
+        }
+      }
+      Status concluded = co_await txn.Conclude();
+      if (!concluded.ok()) {
+        co_return EncodedReply(EncodeError("ERR " + concluded.message()));
+      }
+    }
+  } else {
+    // Keyless-only transaction.
+    for (std::size_t i = 0; i < queued.size(); ++i) {
+      replies[i] = run_keyless(queued[i]);
+    }
+  }
+
+  std::string encoded = "*" + std::to_string(replies.size()) + "\r\n";
+  for (const std::string& reply : replies) {
+    encoded += reply;
+  }
+  CommandReply reply = EncodedReply(std::move(encoded));
+  reply.selected_db = select_db;
+  co_return reply;
+}
+
 }  // namespace
 
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_storage = engine;
   g_replica_read_only = replica_read_only;
+}
+
+Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
+                                   CommandRequest request) {
+  const CommandKind kind = request.kind;
+  if (ctx.in_multi) {
+    switch (kind) {
+      case CommandKind::kMulti:
+        co_return EncodedReply(
+            EncodeError("ERR MULTI calls can not be nested"));
+      case CommandKind::kDiscard:
+        ctx.ResetMulti();
+        co_return EncodedReply(EncodeSimpleString("OK"));
+      case CommandKind::kExec:
+        co_return co_await ExecuteExec(ctx);
+      default:
+        break;
+    }
+    // Queue-time validation: errors reply immediately and doom the EXEC.
+    if (request.spec == nullptr) {
+      ctx.multi_dirty = true;
+      co_return EncodedReply(
+          EncodeError("ERR unknown command '" + request.args.front() + "'"));
+    }
+    const CommandSpec& spec = *request.spec;
+    auto keys = DetermineKeys(spec, request.args.size());
+    if (!keys.ok() ||
+        (kind == CommandKind::kMSet && request.args.size() % 2 != 1)) {
+      ctx.multi_dirty = true;
+      co_return EncodedReply(EncodeError(
+          "ERR wrong number of arguments for '" + std::string(spec.name) +
+          "' command"));
+    }
+    if (g_replica_read_only && (spec.flags & kCmdWrite) != 0) {
+      ctx.multi_dirty = true;
+      co_return EncodedReply(EncodeError(
+          "READONLY You can't write against a read only replica."));
+    }
+    if ((spec.flags & kCmdGlobal) != 0) {
+      ctx.multi_dirty = true;
+      co_return EncodedReply(
+          EncodeError("ERR " + std::string(spec.name) +
+                      " is not allowed in transactions"));
+    }
+    if (kind == CommandKind::kSelect) {
+      // Validated by running it: SELECT inside MULTI moves the database for
+      // the commands queued after it.
+      CommandReply local = ExecuteLocalCommand(request);
+      if (!local.selected_db.has_value()) {
+        ctx.multi_dirty = true;
+        co_return local;
+      }
+      ctx.multi_db = *local.selected_db;
+    }
+    request.db_id = ctx.multi_db;
+    ctx.queued.push_back(std::move(request));
+    co_return EncodedReply(EncodeSimpleString("QUEUED"));
+  }
+
+  switch (kind) {
+    case CommandKind::kMulti:
+      ctx.in_multi = true;
+      ctx.multi_dirty = false;
+      ctx.multi_db = ctx.selected_db;
+      co_return EncodedReply(EncodeSimpleString("OK"));
+    case CommandKind::kExec:
+      co_return EncodedReply(EncodeError("ERR EXEC without MULTI"));
+    case CommandKind::kDiscard:
+      co_return EncodedReply(EncodeError("ERR DISCARD without MULTI"));
+    default:
+      co_return co_await ExecuteCommand(request);
+  }
 }
 
 Task<CommandReply> ExecuteCommand(const CommandRequest& request) {

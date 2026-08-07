@@ -37,6 +37,9 @@ enum class CommandKind {
   kSet,
   kMSet,
   kMGet,
+  kMulti,
+  kExec,
+  kDiscard,
   kUnknown,
 };
 
@@ -62,6 +65,13 @@ struct CommandReply {
 
 StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                              std::uint8_t db_id);
+
+struct ConnectionContext;
+
+// Connection-level dispatch: intercepts MULTI/EXEC/DISCARD and queueing;
+// everything else falls through to ExecuteCommand.
+Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
+                                   CommandRequest request);
 
 // Bind command routing to the disk engine. Call once before the server starts.
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only = false);
