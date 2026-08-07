@@ -188,7 +188,12 @@ struct StagingSlot {
   std::uint16_t next_free = 0;
 };
 
-struct BlockState {
+// Aligned, not just sized: natural alignment is 8, so at malloc's 16-byte
+// granularity roughly a quarter of these would start 48 bytes into a cache
+// line and straddle two. Aligning to 32 pins every one inside a single line
+// without growing the struct, and keeps that true if these ever move into a
+// dense array.
+struct alignas(32) BlockState {
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = 0;
   std::uint32_t live_bytes = 0;
@@ -215,7 +220,8 @@ struct BlockState {
 // paths scan them in bulk, so keep two per cache line. Anything that only
 // matters while a block is staged in memory belongs in StagingSlot, and
 // anything only an extent block needs belongs in the recovery-scoped map.
-static_assert(sizeof(BlockState) <= 32);
+static_assert(sizeof(BlockState) == 32);
+static_assert(alignof(BlockState) == 32);
 
 struct ExtentIdentity {
   std::uint32_t extent_index = 0;
