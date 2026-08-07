@@ -294,8 +294,7 @@ int main(int argc, char** argv) {
           continue;
         }
         if (response.starts_with("-ERR ") &&
-            response.find("no foreground blocks remain") !=
-                std::string::npos) {
+            response.find("out of disk space") != std::string::npos) {
           observed_full = true;
           break;
         }
