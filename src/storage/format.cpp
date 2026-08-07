@@ -256,7 +256,7 @@ bool DecodeMetadataPage(
 
 void EncodeBlockHeader(
     const BlockHeader& header,
-    std::span<std::byte, kBlockHeaderBytes> output) noexcept {
+    std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept {
   std::fill(output.begin(), output.end(), std::byte{0});
   BlockHeader encoded = header;
   encoded.checksum = 0;
@@ -265,8 +265,43 @@ void EncodeBlockHeader(
   std::memcpy(output.data(), &encoded, sizeof(encoded));
 }
 
+bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+                            BlockHeader* header,
+                            std::uint8_t* active_slot) noexcept {
+  BlockHeader best{};
+  std::uint8_t best_slot = 0;
+  bool found = false;
+  for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
+    BlockHeader decoded{};
+    if (!DecodeBlockHeader(
+            std::span<const std::byte, kBlockHeaderSlotBytes>(
+                input.data() + slot * kBlockHeaderSlotBytes,
+                kBlockHeaderSlotBytes),
+            &decoded)) {
+      continue;
+    }
+    if (!found || decoded.allocation_epoch > best.allocation_epoch ||
+        (decoded.allocation_epoch == best.allocation_epoch &&
+         decoded.committed_bytes > best.committed_bytes)) {
+      best = decoded;
+      best_slot = slot;
+      found = true;
+    }
+  }
+  if (!found) {
+    return false;
+  }
+  if (header != nullptr) {
+    *header = best;
+  }
+  if (active_slot != nullptr) {
+    *active_slot = best_slot;
+  }
+  return true;
+}
+
 bool DecodeBlockHeader(
-    std::span<const std::byte, kBlockHeaderBytes> input,
+    std::span<const std::byte, kBlockHeaderSlotBytes> input,
     BlockHeader* header) noexcept {
   if (header == nullptr) {
     return false;
@@ -304,7 +339,7 @@ bool DecodeBlockHeader(
     return false;
   }
   const std::uint32_t expected = decoded.checksum;
-  std::array<std::byte, kBlockHeaderBytes> copy{};
+  std::array<std::byte, kBlockHeaderSlotBytes> copy{};
   std::memcpy(copy.data(), input.data(), copy.size());
   decoded.checksum = 0;
   std::memcpy(copy.data(), &decoded, sizeof(decoded));

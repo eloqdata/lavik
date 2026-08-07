@@ -3144,7 +3144,7 @@ class StorageEngine::Impl {
     }
     ReadBufferLease lease = std::move(*acquired);
     FixedBuffer header_buffer = lease.io_buffer();
-    header_buffer.size = kDirectIoAlignment;
+    header_buffer.size = kBlockHeaderBytes;
 
     struct RecoveryBuffer {
       RegisteredBufferPool* pool = nullptr;
@@ -3224,7 +3224,7 @@ class StorageEngine::Impl {
         }
 
         BlockHeader block{};
-        if (!DecodeBlockHeader(block_bytes, &block) ||
+        if (!DecodeBlockHeaderPages(block_bytes, &block) ||
             block.block_id != block_id) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt block header");
@@ -3507,7 +3507,7 @@ class StorageEngine::Impl {
         co_return Status(StatusCode::kInternal, "short extent block read");
       }
       BlockHeader header{};
-      if (!DecodeBlockHeader(
+      if (!DecodeBlockHeaderPages(
               std::span<const std::byte, kBlockHeaderBytes>(
                   io.data, kBlockHeaderBytes),
               &header) ||
@@ -4120,8 +4120,10 @@ class StorageEngine::Impl {
           .extent_payload_checksum = payload_checksum,
       };
       EncodeBlockHeader(
-          header, std::span<std::byte, kBlockHeaderBytes>(staging.data,
-                                                         kBlockHeaderBytes));
+          header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                      staging.data, kBlockHeaderSlotBytes));
+      std::memset(staging.data + kBlockHeaderSlotBytes, 0,
+                  kBlockHeaderBytes - kBlockHeaderSlotBytes);
       std::memcpy(staging.data + kBlockHeaderBytes, payload.data(),
                   payload.size());
       const auto [file_id, block_offset] = FileOffset(reserved->block_id);
@@ -4471,9 +4473,11 @@ class StorageEngine::Impl {
             .checksum = 0,
             .layout_worker_count = worker_count_,
         };
-        std::span<std::byte, kBlockHeaderBytes> block_output(
-            staging_buffer.data, kBlockHeaderBytes);
-        EncodeBlockHeader(block, block_output);
+        EncodeBlockHeader(block,
+                          std::span<std::byte, kBlockHeaderSlotBytes>(
+                              staging_buffer.data, kBlockHeaderSlotBytes));
+        std::memset(staging_buffer.data + kBlockHeaderSlotBytes, 0,
+                    kBlockHeaderBytes - kBlockHeaderSlotBytes);
       }
     }
 
@@ -4557,9 +4561,8 @@ class StorageEngine::Impl {
         .checksum = 0,
         .layout_worker_count = updated.layout_worker_count,
     };
-    std::span<std::byte, kBlockHeaderBytes> block_output(
-        staging.data, kBlockHeaderBytes);
-    EncodeBlockHeader(block, block_output);
+    EncodeBlockHeader(block, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                 staging.data, kBlockHeaderSlotBytes));
     if (updated.committed_bytes == kStorageBlockBytes) {
       state.in_memory = true;
       state.write_buffer_id = updated.write_buffer_id;

@@ -10,7 +10,12 @@
 namespace keylane::storage {
 
 inline constexpr std::size_t kDirectIoAlignment = 4096;
-inline constexpr std::size_t kBlockHeaderBytes = kDirectIoAlignment;
+// Two header slot pages per block, written alternately so a torn header
+// write can never destroy the last valid header. Records start after both.
+inline constexpr std::size_t kBlockHeaderSlotBytes = kDirectIoAlignment;
+inline constexpr std::size_t kBlockHeaderSlots = 2;
+inline constexpr std::size_t kBlockHeaderBytes =
+    kBlockHeaderSlotBytes * kBlockHeaderSlots;
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
@@ -278,10 +283,20 @@ bool DecodeMetadataPage(
     MetadataPageKind expected_kind, std::uint32_t expected_page_index,
     std::uint64_t* generation, std::span<std::byte> payload) noexcept;
 
-void EncodeBlockHeader(const BlockHeader& header,
-                       std::span<std::byte, kBlockHeaderBytes> output) noexcept;
-bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderBytes> input,
-                       BlockHeader* header) noexcept;
+// Encode into / decode from a single header slot page.
+void EncodeBlockHeader(
+    const BlockHeader& header,
+    std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
+bool DecodeBlockHeader(
+    std::span<const std::byte, kBlockHeaderSlotBytes> input,
+    BlockHeader* header) noexcept;
+
+// Decode the winning slot from a block's full header region: the valid slot
+// with the larger (allocation_epoch, committed_bytes). Returns the winning
+// slot index in `active_slot`, or false when neither slot is valid.
+bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
+                            BlockHeader* header,
+                            std::uint8_t* active_slot = nullptr) noexcept;
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;

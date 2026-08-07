@@ -90,12 +90,36 @@ int main() {
       .checksum = 0,
       .layout_worker_count = 4,
   };
-  std::array<std::byte, kBlockHeaderBytes> block_page{};
+  std::array<std::byte, kBlockHeaderSlotBytes> block_page{};
   EncodeBlockHeader(header, block_page);
   BlockHeader decoded_header{};
   assert(DecodeBlockHeader(block_page, &decoded_header));
   assert(decoded_header.block_id == block_id);
   assert(decoded_header.allocation_epoch == header.allocation_epoch);
+
+  // Double-slot resolution: the valid slot with the larger
+  // (allocation_epoch, committed_bytes) wins; torn/zero slots are skipped.
+  {
+    std::array<std::byte, kBlockHeaderBytes> pages{};
+    BlockHeader winner{};
+    std::uint8_t active_slot = 9;
+    assert(!DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    std::memcpy(pages.data(), block_page.data(), block_page.size());
+    assert(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    assert(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
+    BlockHeader newer = header;
+    newer.committed_bytes = kBlockHeaderBytes + 4096;
+    std::array<std::byte, kBlockHeaderSlotBytes> newer_page{};
+    EncodeBlockHeader(newer, newer_page);
+    std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
+                newer_page.size());
+    assert(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    assert(active_slot == 1 &&
+           winner.committed_bytes == kBlockHeaderBytes + 4096);
+    pages[kBlockHeaderSlotBytes + 8] ^= std::byte{0xff};  // tear slot 1
+    assert(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    assert(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
+  }
 
   BlockHeader extent_header = header;
   extent_header.kind = BlockKind::kValueExtent;
