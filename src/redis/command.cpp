@@ -59,6 +59,7 @@ CommandKind MatchCommandKind(std::string_view name) {
       break;
     case 4:
       if (CmpCaseInsensitive(name, "PING")) return CommandKind::kPing;
+      if (CmpCaseInsensitive(name, "ECHO")) return CommandKind::kEcho;
       if (CmpCaseInsensitive(name, "INCR")) return CommandKind::kIncr;
       if (CmpCaseInsensitive(name, "SCAN")) return CommandKind::kScan;
       if (CmpCaseInsensitive(name, "PTTL")) return CommandKind::kPttl;
@@ -108,6 +109,15 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
         reply.encoded = EncodeBulkString(args[1]);
       } else {
         reply.encoded = EncodeError("ERR wrong number of arguments for 'ping' command");
+      }
+      return reply;
+
+    case CommandKind::kEcho:
+      if (args.size() != 2) {
+        reply.encoded =
+            EncodeError("ERR wrong number of arguments for 'echo' command");
+      } else {
+        reply.encoded = EncodeBulkString(args[1]);
       }
       return reply;
 
