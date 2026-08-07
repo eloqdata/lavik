@@ -142,7 +142,12 @@ class TxShard {
   void Poll();
 
   LockTable& locks(std::uint8_t db_id) { return locks_[db_id]; }
+  TxQueue& queue() noexcept { return queue_; }
+  celer::Worker* worker() const noexcept { return worker_; }
   std::uint64_t committed_txid() const noexcept { return committed_txid_; }
+  void PublishCommitted(std::uint64_t txid) noexcept {
+    committed_txid_ = std::max(committed_txid_, txid);
+  }
   std::uint64_t fastpath_runs() const noexcept { return fastpath_runs_; }
   std::uint64_t queued_runs() const noexcept { return queued_runs_; }
 

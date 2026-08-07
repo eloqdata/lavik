@@ -17,6 +17,7 @@
 #include "celer/io/storage.h"
 #include "keylane/command_table.h"
 #include "keylane/resp.h"
+#include "keylane/tx/transaction.h"
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
 
@@ -799,55 +800,119 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
   }
 }
 
-// DEL / EXISTS may span shards, so route each key to its owner and combine.
-Task<CommandReply> RouteMultiKey(const CommandRequest& request) {
+// Shared context of one multi-key command's transaction. Shard callbacks
+// write disjoint reply slots (MGET) or bump the shared counter (DEL/EXISTS)
+// before the hop barrier; the coordinator assembles the reply afterwards.
+struct MultiKeyContext {
+  const CommandRequest* request = nullptr;
+  std::vector<std::optional<std::string>> frames;  // MGET: encoded bulk per slot
+  std::atomic<long long> hits{0};                  // DEL / EXISTS
+};
+
+Task<Status> MultiKeyShardCallback(void* context,
+                                   const tx::ShardSlice& slice) {
+  auto* ctx = static_cast<MultiKeyContext*>(context);
+  const auto& args = ctx->request->args;
+  for (const tx::TxKey& key : slice.keys) {
+    const std::string& name = args[key.arg_index];
+    switch (ctx->request->kind) {
+      case CommandKind::kMSet: {
+        auto result = co_await g_storage->SetLocked(
+            slice.db_id, name, key.digest, args[key.arg_index + 1], {});
+        if (!result.ok()) {
+          co_return result.status();
+        }
+        break;
+      }
+      case CommandKind::kMGet: {
+        auto value = co_await g_storage->GetLocked(slice.db_id, name,
+                                                   key.digest);
+        if (value.ok()) {
+          const auto bytes = value->network_bytes();
+          ctx->frames[key.arg_index - 1].emplace(
+              reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        } else if (value.status().code() != StatusCode::kNotFound) {
+          co_return value.status();
+        }
+        break;
+      }
+      case CommandKind::kDel: {
+        auto deleted =
+            co_await g_storage->DeleteLocked(slice.db_id, name, key.digest);
+        if (!deleted.ok()) {
+          co_return deleted.status();
+        }
+        if (*deleted) {
+          ctx->hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+      }
+      case CommandKind::kExists:
+      default: {
+        if (co_await g_storage->ExistsLocked(slice.db_id, name, key.digest)) {
+          ctx->hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+      }
+    }
+  }
+  co_return Status::Ok();
+}
+
+// DEL / EXISTS / MSET / MGET run as one transaction: every key locked up
+// front (across all owning shards), one hop where each shard works its
+// slice, locks released when the hop concludes.
+Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   const auto& args = request.args;
-  const bool is_del = request.kind == CommandKind::kDel;
-  if (args.size() < 2) {
-    co_return EncodedReply(EncodeError(
-        is_del ? "ERR wrong number of arguments for 'del' command"
-               : "ERR wrong number of arguments for 'exists' command"));
+  auto keys = DetermineKeys(*request.spec, args.size());
+  if (!keys.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + keys.status().message()));
+  }
+  if (request.kind == CommandKind::kMSet && args.size() % 2 != 1) {
+    co_return EncodedReply(
+        EncodeError("ERR wrong number of arguments for 'mset' command"));
   }
 
-  long long count = 0;
-  for (std::size_t i = 1; i < args.size(); ++i) {
-    const std::string_view key = args[i];
-    const unsigned target = ShardForKey(key);
-    bool hit = false;
-    if (target == ThisWorker().id) {
-      if (is_del) {
-        auto deleted = co_await g_storage->Delete(request.db_id, key);
-        if (!deleted.ok()) {
-          co_return EncodedReply(
-              EncodeError("ERR " + deleted.status().message()));
-        }
-        hit = *deleted;
-      } else {
-        hit = co_await g_storage->Exists(request.db_id, key);
-      }
-    } else {
-      if (is_del) {
-        auto deleted = co_await SubmitTaskTo(
-            target, [db_id = request.db_id, key]() -> Task<StatusOr<bool>> {
-              co_return co_await g_storage->Delete(db_id, key);
-            });
-        if (!deleted.ok()) {
-          co_return EncodedReply(
-              EncodeError("ERR " + deleted.status().message()));
-        }
-        hit = *deleted;
-      } else {
-        hit = co_await SubmitTaskTo(
-            target, [db_id = request.db_id, key]() -> Task<bool> {
-              co_return co_await g_storage->Exists(db_id, key);
-            });
-      }
-    }
-    if (hit) {
-      ++count;
-    }
+  const bool write = (request.spec->flags & kCmdWrite) != 0;
+  tx::Transaction txn;
+  txn.Begin(request.db_id);
+  for (std::size_t i = keys->first; i <= keys->last; i += keys->step) {
+    txn.AddKey(ShardForKey(args[i]), storage::ComputeDigest(args[i]),
+               static_cast<std::uint32_t>(i),
+               write ? tx::LockMode::kExclusive : tx::LockMode::kShared);
   }
-  co_return EncodedReply(EncodeInteger(count));
+  txn.Seal();
+
+  MultiKeyContext ctx;
+  ctx.request = &request;
+  if (request.kind == CommandKind::kMGet) {
+    ctx.frames.resize(keys->count());
+  }
+
+  Status scheduled = co_await txn.Schedule();
+  if (!scheduled.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + scheduled.message()));
+  }
+  Status status = co_await txn.Execute(&MultiKeyShardCallback, &ctx, true);
+  if (!status.ok()) {
+    co_return EncodedReply(EncodeStorageError(status));
+  }
+
+  switch (request.kind) {
+    case CommandKind::kMSet:
+      co_return EncodedReply(EncodeSimpleString("OK"));
+    case CommandKind::kMGet: {
+      std::string reply =
+          "*" + std::to_string(ctx.frames.size()) + "\r\n";
+      for (const auto& frame : ctx.frames) {
+        reply += frame.has_value() ? *frame : "$-1\r\n";
+      }
+      co_return EncodedReply(std::move(reply));
+    }
+    default:
+      co_return EncodedReply(
+          EncodeInteger(ctx.hits.load(std::memory_order_relaxed)));
+  }
 }
 
 }  // namespace
@@ -888,7 +953,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
 
     case CommandKind::kDel:
     case CommandKind::kExists:
-      co_return co_await RouteMultiKey(request);
+    case CommandKind::kMSet:
+    case CommandKind::kMGet:
+      co_return co_await ExecuteMultiKey(request);
 
     case CommandKind::kGet:
     case CommandKind::kStrlen:

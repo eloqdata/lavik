@@ -34,6 +34,10 @@ constexpr CommandSpec kCommandTable[] = {
     {"del", CommandKind::kDel, 2, 0, 1, -1, 1, kKeyedWrite | kCmdMultiShard},
     {"exists", CommandKind::kExists, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
+    {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2,
+     kKeyedWrite | kCmdMultiShard},
+    {"mget", CommandKind::kMGet, 2, 0, 1, -1, 1,
+     kKeyedRead | kCmdMultiShard},
 };
 
 bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {

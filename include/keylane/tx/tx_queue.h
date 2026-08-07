@@ -10,15 +10,27 @@
 
 namespace keylane::tx {
 
-// One queued acquisition waiting for its turn on a shard. Lives in the
-// awaiter inside the waiting coroutine's frame; it is only referenced by the
-// queue while the coroutine is suspended, and Poll removes it from the queue
-// before resuming.
+class Transaction;
+
+// One queued acquisition waiting for its turn on a shard.
+//
+// Two flavors share the queue so ordering is uniform:
+//  - plain waiters (tx == nullptr): live in the awaiter inside the waiting
+//    coroutine's frame; Poll removes them from the queue before resuming, and
+//    the resumed coroutine owns holds via its Guard.
+//  - transaction entries (tx != nullptr): live in the Transaction's per-shard
+//    data; they stay queued (holding their position) until the transaction
+//    concludes, running one armed hop at a time.
 struct TxWaiter {
   std::uint64_t txid = 0;
-  std::uint8_t db_id = 0;
   std::span<const KeyRef> keys;
   std::coroutine_handle<> resume;
+  Transaction* tx = nullptr;
+  std::uint16_t shard_slot = 0;
+  std::uint8_t db_id = 0;
+  bool armed = false;
+  bool running = false;
+  bool holds_acquired = false;
 };
 
 // Per-shard transaction queue, sorted ascending by txid. Single-threaded.

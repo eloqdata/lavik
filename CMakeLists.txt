@@ -32,6 +32,7 @@ add_library(keylane_module
   src/redis/command_table.cpp
   src/redis/server.cpp
   src/tx/tx_shard.cpp
+  src/tx/transaction.cpp
 )
 
 add_library(keylane::module ALIAS keylane_module)
@@ -119,6 +120,15 @@ if (BUILD_TESTING)
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 150)
+
+    add_executable(keylane_multikey_e2e_test
+      tests/multikey_e2e_test.cpp
+    )
+    add_test(
+      NAME keylane_multikey_e2e
+      COMMAND keylane_multikey_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_multikey_e2e PROPERTIES TIMEOUT 120)
 
     add_executable(keylane_ttl_e2e_test
       tests/ttl_e2e_test.cpp

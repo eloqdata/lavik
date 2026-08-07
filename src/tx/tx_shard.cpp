@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "celer/runtime/worker.h"
+#include "keylane/tx/transaction.h"
 
 namespace keylane::tx {
 
@@ -20,6 +21,28 @@ void TxShard::Poll() {
   while (true) {
     TxWaiter* head = queue_.Front();
     if (head == nullptr) {
+      break;
+    }
+    if (head->tx != nullptr) {
+      // Transaction entry: stays queued (holding its position) until the
+      // transaction concludes; runs one armed hop at a time. Holds are
+      // acquired once and retained across hops.
+      if (head->running || !head->armed) {
+        break;
+      }
+      if (!head->holds_acquired &&
+          !locks_[head->db_id].CanHoldAll(head->keys)) {
+        break;
+      }
+      committed_txid_ = std::max(committed_txid_, head->txid);
+      if (!head->holds_acquired) {
+        locks_[head->db_id].AcquireHolds(head->keys);
+        head->holds_acquired = true;
+      }
+      head->armed = false;
+      head->running = true;
+      ++queued_runs_;
+      StartTransactionHop(*this, head);
       break;
     }
     if (!locks_[head->db_id].CanHoldAll(head->keys)) {

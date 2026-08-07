@@ -35,6 +35,8 @@ enum class CommandKind {
   kScan,
   kSelect,
   kSet,
+  kMSet,
+  kMGet,
   kUnknown,
 };
 
