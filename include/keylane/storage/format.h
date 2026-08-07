@@ -132,6 +132,19 @@ enum class RecordKind : std::uint8_t {
   kTombstone = 2,
 };
 
+// Stable on-disk Redis value type identifiers. Only strings are implemented
+// today; reserving the remaining top-level types keeps expiration and recovery
+// metadata generic as their command implementations are added.
+enum class ValueType : std::uint8_t {
+  kNone = 0,
+  kString = 1,
+  kList = 2,
+  kSet = 3,
+  kSortedSet = 4,
+  kHash = 5,
+  kStream = 6,
+};
+
 struct BlockHeader {
   std::uint64_t magic = kBlockMagic;
   std::uint64_t block_id = kInvalidBlockId;
@@ -167,6 +180,8 @@ struct RecordHeader {
   std::uint16_t header_bytes = 0;
   RecordKind kind = RecordKind::kValue;
   std::uint8_t db_id = 0;
+  ValueType value_type = ValueType::kNone;
+  std::uint8_t reserved = 0;
   Digest digest{};
   std::uint32_t key_bytes = 0;
   std::uint32_t value_bytes = 0;
@@ -177,6 +192,8 @@ struct RecordHeader {
   std::uint64_t db_epoch = 1;
   std::uint64_t mutation_sequence = 0;
   std::uint64_t relocation_sequence = 0;
+  // Absolute Unix time in milliseconds. Zero means the value does not expire.
+  std::uint64_t expire_at_ms = 0;
   std::uint64_t lsn = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t payload_checksum = 0;

@@ -55,6 +55,7 @@ struct RecordLocation {
   std::uint64_t replication_epoch = 1;
   std::uint64_t mutation_sequence = 0;
   std::uint64_t allocation_epoch = 0;
+  std::uint64_t expire_at_ms = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
   std::uint16_t block_owner = 0;
@@ -64,6 +65,7 @@ struct RecordLocation {
   std::uint32_t relocation_sequence = 0;
   bool in_memory = false;
   RecordKind kind = RecordKind::kValue;
+  ValueType value_type = ValueType::kNone;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
     return block_id == other.block_id &&
@@ -72,7 +74,7 @@ struct RecordLocation {
   }
 };
 
-static_assert(sizeof(RecordLocation) == 56);
+static_assert(sizeof(RecordLocation) == 64);
 
 using RecordIndex = ScanHashMap<RecordLocation>;
 
@@ -88,6 +90,19 @@ bool IsNewer(const RecordLocation& candidate,
     return candidate.relocation_sequence > current.relocation_sequence;
   }
   return false;
+}
+
+std::uint64_t UnixTimeMillis() noexcept {
+  const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+}
+
+bool IsExpired(const RecordLocation& location,
+               std::uint64_t now_ms) noexcept {
+  return location.kind == RecordKind::kValue &&
+         location.expire_at_ms != 0 && location.expire_at_ms <= now_ms;
 }
 
 struct ActiveBlock {
@@ -676,12 +691,22 @@ class StorageEngine::Impl {
       std::uint16_t id = 0;
       std::array<RecordIndex, kLogicalDatabaseCount> indexes;
       std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
+      std::array<std::size_t, kLogicalDatabaseCount> expiring_key_count{};
       std::uint64_t mutation_sequence = 0;
       std::uint64_t replication_epoch = 1;
       std::uint64_t delta_floor = 0;
       bool capture_deltas = false;
       bool delta_queued = false;
       std::deque<SnapshotRecord> deltas;
+    };
+
+    struct ExpireCandidate {
+      std::uint16_t partition_id = 0;
+      std::uint8_t db_id = 0;
+      Digest digest{};
+      std::uint64_t mutation_sequence = 0;
+      std::uint64_t expire_at_ms = 0;
+      std::string key;
     };
 
     Worker* worker = nullptr;
@@ -709,6 +734,10 @@ class StorageEngine::Impl {
     std::size_t defrag_waiting_device = 0;
     std::size_t active_defrag_device = 0;
     bool standby_request_pending = false;
+    std::size_t expiry_partition_cursor = 0;
+    std::uint8_t expiry_db_cursor = 0;
+    std::uint64_t expiry_scan_cursor = 0;
+    std::deque<ExpireCandidate> expired_candidates;
   };
 
   Status Prepare(unsigned worker_count) {
@@ -1305,6 +1334,9 @@ class StorageEngine::Impl {
       }
     }
     worker.Spawn(PeriodicFlush(&store));
+    if (options_.expiration_authority) {
+      worker.Spawn(ActiveExpiration(&store));
+    }
     co_return Status::Ok();
   }
 
@@ -1329,6 +1361,14 @@ class StorageEngine::Impl {
       }
       co_return Status(StatusCode::kNotFound, "key not found");
     }
+    const std::uint64_t now_ms = UnixTimeMillis();
+    if (IsExpired(found->value, now_ms)) {
+      QueueExpiredCandidate(store, partition.id, db_id, *found);
+      if (trace != nullptr) {
+        trace->lookup_done_ns = ReadTraceNowNanos();
+      }
+      co_return Status(StatusCode::kNotFound, "key not found");
+    }
     if (trace != nullptr) {
       trace->hit = true;
       trace->lookup_done_ns = ReadTraceNowNanos();
@@ -1340,38 +1380,12 @@ class StorageEngine::Impl {
       co_return loaded.status();
     }
 
-    ReadBufferLease lease = std::move(loaded->lease);
-    const std::size_t value_offset = loaded->value_offset;
-    const std::size_t value_bytes = loaded->value_bytes;
-    std::span<std::byte> buffer = lease.bytes();
-    char length[32];
-    auto [end, error] = std::to_chars(length, length + sizeof(length), value_bytes);
-    if (error != std::errc{}) {
-      co_return Status(StatusCode::kInternal, "bulk length formatting failed");
-    }
-    const std::size_t digits = static_cast<std::size_t>(end - length);
-    const std::size_t prefix_bytes = digits + 3;
-    if (value_offset < prefix_bytes || value_offset > buffer.size() ||
-        value_bytes > buffer.size() - value_offset ||
-        buffer.size() - value_offset - value_bytes < 2) {
-      co_return Status(StatusCode::kInternal,
-                       "value lacks RESP framing headroom or tailroom");
-    }
-    std::byte* prefix = buffer.data() + value_offset - prefix_bytes;
-    prefix[0] = std::byte{'$'};
-    std::memcpy(prefix + 1, length, digits);
-    prefix[digits + 1] = std::byte{'\r'};
-    prefix[digits + 2] = std::byte{'\n'};
-    buffer[value_offset + value_bytes] = std::byte{'\r'};
-    buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
-
-    const std::size_t network_offset = value_offset - prefix_bytes;
-    co_return DiskValue(std::move(lease), network_offset,
-                        prefix_bytes + value_bytes + 2);
+    co_return EncodeDiskValue(std::move(*loaded));
   }
 
-  Task<Status> Set(std::uint8_t db_id, std::string_view key,
-                   std::string_view value) {
+  Task<StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
+                                std::string_view value,
+                                SetOptions options) {
     assert(db_id < kLogicalDatabaseCount);
     WorkerStore& store = CurrentStore();
     auto& partition = PartitionForKey(store, key);
@@ -1381,8 +1395,139 @@ class StorageEngine::Impl {
                                                 IntentLockMode::kExclusive);
     co_await store.writer_mutex.Lock();
     UnlockGuard unlock(&store.writer_mutex, store.worker);
-    co_return co_await AppendLocked(store, partition, db_id, key, value,
-                                    RecordKind::kValue);
+
+    auto& index = partition.indexes[db_id];
+    auto* found = index.Find(digest, key);
+    const std::uint64_t now_ms = UnixTimeMillis();
+    const bool exists = found != nullptr &&
+                        found->value.kind == RecordKind::kValue &&
+                        !IsExpired(found->value, now_ms);
+    SetResult result;
+    if (options.return_old_value && exists) {
+      if (found->value.value_type != ValueType::kString) {
+        co_return Status(StatusCode::kInvalidArgument,
+                         "WRONGTYPE Operation against a key holding the wrong kind of value");
+      }
+      auto loaded = co_await LoadValue(store, db_id, key, digest, found->value);
+      if (!loaded.ok()) {
+        co_return loaded.status();
+      }
+      auto encoded = EncodeDiskValue(std::move(*loaded));
+      if (!encoded.ok()) {
+        co_return encoded.status();
+      }
+      result.old_value.emplace(std::move(*encoded));
+    }
+
+    const bool condition_met =
+        options.condition == SetCondition::kNone ||
+        (options.condition == SetCondition::kIfAbsent && !exists) ||
+        (options.condition == SetCondition::kIfPresent && exists);
+    if (!condition_met) {
+      co_return result;
+    }
+
+    const std::uint64_t expire_at_ms =
+        options.keep_ttl && exists ? found->value.expire_at_ms
+                                   : options.expire_at_ms;
+    Status status = co_await AppendLocked(
+        store, partition, db_id, key, value, RecordKind::kValue,
+        ValueType::kString, expire_at_ms);
+    if (!status.ok()) {
+      co_return status;
+    }
+    result.applied = true;
+    co_return result;
+  }
+
+  Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
+                                     std::string_view key) {
+    assert(db_id < kLogicalDatabaseCount);
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
+    const Digest digest = ComputeDigest(key);
+    auto key_lock = co_await store.key_locks[db_id].Acquire(
+        digest, IntentLockMode::kShared);
+    auto* found = partition.indexes[db_id].Find(digest, key);
+    if (found == nullptr || found->value.kind != RecordKind::kValue) {
+      co_return ExpirationInfo{};
+    }
+    if (IsExpired(found->value, UnixTimeMillis())) {
+      QueueExpiredCandidate(store, partition.id, db_id, *found);
+      co_return ExpirationInfo{};
+    }
+    co_return ExpirationInfo{
+        .exists = true,
+        .expire_at_ms = found->value.expire_at_ms,
+    };
+  }
+
+  Task<StatusOr<bool>> UpdateExpiration(
+      std::uint8_t db_id, std::string_view key,
+      std::uint64_t expire_at_ms, ExpirationCondition condition) {
+    assert(db_id < kLogicalDatabaseCount);
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
+    const Digest digest = ComputeDigest(key);
+    auto key_lock = co_await store.key_locks[db_id].Acquire(
+        digest, IntentLockMode::kExclusive);
+    co_await store.writer_mutex.Lock();
+    UnlockGuard unlock(&store.writer_mutex, store.worker);
+
+    auto& index = partition.indexes[db_id];
+    auto* found = index.Find(digest, key);
+    const std::uint64_t now_ms = UnixTimeMillis();
+    if (found == nullptr || found->value.kind != RecordKind::kValue ||
+        IsExpired(found->value, now_ms)) {
+      co_return false;
+    }
+    const std::uint64_t current = found->value.expire_at_ms;
+    bool condition_met = true;
+    switch (condition) {
+      case ExpirationCondition::kNone:
+        break;
+      case ExpirationCondition::kIfNoExpiration:
+        condition_met = current == 0;
+        break;
+      case ExpirationCondition::kIfHasExpiration:
+        condition_met = current != 0;
+        break;
+      case ExpirationCondition::kIfGreater:
+        condition_met = current != 0 && expire_at_ms > current;
+        break;
+      case ExpirationCondition::kIfLess:
+        condition_met = current == 0 || expire_at_ms < current;
+        break;
+    }
+    if (!condition_met) {
+      co_return false;
+    }
+
+    if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
+      Status status = co_await AppendLocked(
+          store, partition, db_id, key, {}, RecordKind::kTombstone,
+          ValueType::kNone, 0);
+      if (!status.ok()) {
+        co_return status;
+      }
+      co_return true;
+    }
+
+    const RecordLocation previous = found->value;
+    auto loaded = co_await LoadValue(store, db_id, key, digest, previous);
+    if (!loaded.ok()) {
+      co_return loaded.status();
+    }
+    FixedBuffer value_buffer = loaded->lease.io_buffer();
+    std::string_view value(reinterpret_cast<const char*>(value_buffer.data),
+                           loaded->value_bytes);
+    Status status = co_await AppendLocked(
+        store, partition, db_id, key, value, RecordKind::kValue,
+        previous.value_type, expire_at_ms);
+    if (!status.ok()) {
+      co_return status;
+    }
+    co_return true;
   }
 
   Task<StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key) {
@@ -1401,13 +1546,14 @@ class StorageEngine::Impl {
     if (found == nullptr || found->value.kind == RecordKind::kTombstone) {
       co_return false;
     }
+    const bool expired = IsExpired(found->value, UnixTimeMillis());
     Status status =
         co_await AppendLocked(store, partition, db_id, key, {},
-                              RecordKind::kTombstone);
+                              RecordKind::kTombstone, ValueType::kNone, 0);
     if (!status.ok()) {
       co_return status;
     }
-    co_return true;
+    co_return !expired;
   }
 
   Task<bool> Exists(std::uint8_t db_id, std::string_view key) {
@@ -1420,7 +1566,14 @@ class StorageEngine::Impl {
                                                 IntentLockMode::kShared);
     auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
-    co_return found != nullptr && found->value.kind == RecordKind::kValue;
+    if (found == nullptr || found->value.kind != RecordKind::kValue) {
+      co_return false;
+    }
+    if (IsExpired(found->value, UnixTimeMillis())) {
+      QueueExpiredCandidate(store, partition.id, db_id, *found);
+      co_return false;
+    }
+    co_return true;
   }
 
   Task<StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
@@ -1436,9 +1589,18 @@ class StorageEngine::Impl {
     UnlockGuard unlock(&store.writer_mutex, store.worker);
 
     std::int64_t value = 0;
+    std::uint64_t expire_at_ms = 0;
     auto& index = partition.indexes[db_id];
     auto* found = index.Find(digest, key);
-    if (found != nullptr && found->value.kind == RecordKind::kValue) {
+    const bool exists = found != nullptr &&
+                        found->value.kind == RecordKind::kValue &&
+                        !IsExpired(found->value, UnixTimeMillis());
+    if (exists) {
+      if (found->value.value_type != ValueType::kString) {
+        co_return Status(StatusCode::kInvalidArgument,
+                         "WRONGTYPE Operation against a key holding the wrong kind of value");
+      }
+      expire_at_ms = found->value.expire_at_ms;
       auto loaded =
           co_await LoadValue(store, db_id, key, digest, found->value);
       if (!loaded.ok()) {
@@ -1459,7 +1621,8 @@ class StorageEngine::Impl {
     const std::string encoded = std::to_string(value);
     Status status =
         co_await AppendLocked(store, partition, db_id, key, encoded,
-                              RecordKind::kValue);
+                              RecordKind::kValue, ValueType::kString,
+                              expire_at_ms);
     if (!status.ok()) {
       co_return status;
     }
@@ -1539,6 +1702,7 @@ class StorageEngine::Impl {
         PartitionFor(CurrentStore(), partition_id).indexes[db_id];
     ScanBatch result;
     result.cursor = cursor;
+    const std::uint64_t now_ms = UnixTimeMillis();
     const std::size_t max_iterations =
         count > std::numeric_limits<std::size_t>::max() / 10
             ? std::numeric_limits<std::size_t>::max()
@@ -1547,7 +1711,8 @@ class StorageEngine::Impl {
     do {
       result.cursor = index.Scan(
           result.cursor, [&](const RecordIndex::Entry& entry) {
-            if (entry.value.kind == RecordKind::kValue) {
+            if (entry.value.kind == RecordKind::kValue &&
+                !IsExpired(entry.value, now_ms)) {
               result.keys.push_back(entry.key);
             }
           });
@@ -1586,6 +1751,7 @@ class StorageEngine::Impl {
     auto& partition = PartitionFor(store, partition_id);
     auto& index = partition.indexes[db_id];
     std::vector<std::string> keys;
+    const std::uint64_t now_ms = UnixTimeMillis();
     std::uint64_t next = cursor;
     const std::size_t max_iterations =
         count > std::numeric_limits<std::size_t>::max() / 10
@@ -1594,7 +1760,8 @@ class StorageEngine::Impl {
     std::size_t iterations = 0;
     do {
       next = index.Scan(next, [&](const RecordIndex::Entry& entry) {
-        if (entry.value.kind == RecordKind::kValue) {
+        if (entry.value.kind == RecordKind::kValue &&
+            !IsExpired(entry.value, now_ms)) {
           keys.push_back(entry.key);
         }
       });
@@ -1614,6 +1781,10 @@ class StorageEngine::Impl {
         continue;
       }
       const RecordLocation location = current->value;
+      if (IsExpired(location, UnixTimeMillis())) {
+        QueueExpiredCandidate(store, partition.id, db_id, *current);
+        continue;
+      }
       auto loaded = co_await LoadValue(store, db_id, key, digest, location);
       if (!loaded.ok()) {
         if (loaded.status().code() == StatusCode::kNotFound) {
@@ -1627,6 +1798,8 @@ class StorageEngine::Impl {
           .db_id = db_id,
           .db_epoch = DbEpoch(db_id),
           .mutation_sequence = location.mutation_sequence,
+          .expire_at_ms = location.expire_at_ms,
+          .value_type = location.value_type,
           .key = key,
           .value = std::string(reinterpret_cast<const char*>(value.data()),
                                value.size()),
@@ -1724,8 +1897,8 @@ class StorageEngine::Impl {
     for (const auto& [db_id, key] : old_keys) {
       const Digest digest = ComputeDigest(key);
       Status tombstone = co_await WriteRecordLocked(
-          store, db_id, key, {}, RecordKind::kTombstone, digest,
-          0, 0, 0, false, false);
+          store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone,
+          0, digest, 0, 0, 0, false, false);
       if (!tombstone.ok()) {
         co_return tombstone;
       }
@@ -1783,8 +1956,16 @@ class StorageEngine::Impl {
       const RecordKind kind = record.kind == SnapshotRecord::Kind::kValue
                                   ? RecordKind::kValue
                                   : RecordKind::kTombstone;
+      const ValueType value_type = kind == RecordKind::kValue
+                                       ? record.value_type
+                                       : ValueType::kNone;
+      if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
+        co_return Status(StatusCode::kInvalidArgument,
+                         "replicated value has no Redis type");
+      }
       Status written = co_await WriteRecordLocked(
-          store, record.db_id, record.key, record.value, kind, digest,
+          store, record.db_id, record.key, record.value, kind, value_type,
+          kind == RecordKind::kValue ? record.expire_at_ms : 0, digest,
           record.mutation_sequence, record.mutation_sequence, 0, false);
       if (!written.ok()) {
         co_return written;
@@ -1859,6 +2040,57 @@ class StorageEngine::Impl {
     return buffers.read_payload_bytes > framing_reserve
                ? buffers.read_payload_bytes - framing_reserve
                : 0;
+  }
+
+  StatusOr<DiskValue> EncodeDiskValue(LoadedValue loaded) {
+    ReadBufferLease lease = std::move(loaded.lease);
+    const std::size_t value_offset = loaded.value_offset;
+    const std::size_t value_bytes = loaded.value_bytes;
+    std::span<std::byte> buffer = lease.bytes();
+    char length[32];
+    auto [end, error] =
+        std::to_chars(length, length + sizeof(length), value_bytes);
+    if (error != std::errc{}) {
+      return Status(StatusCode::kInternal, "bulk length formatting failed");
+    }
+    const std::size_t digits = static_cast<std::size_t>(end - length);
+    const std::size_t prefix_bytes = digits + 3;
+    if (value_offset < prefix_bytes || value_offset > buffer.size() ||
+        value_bytes > buffer.size() - value_offset ||
+        buffer.size() - value_offset - value_bytes < 2) {
+      return Status(StatusCode::kInternal,
+                    "value lacks RESP framing headroom or tailroom");
+    }
+    std::byte* prefix = buffer.data() + value_offset - prefix_bytes;
+    prefix[0] = std::byte{'$'};
+    std::memcpy(prefix + 1, length, digits);
+    prefix[digits + 1] = std::byte{'\r'};
+    prefix[digits + 2] = std::byte{'\n'};
+    buffer[value_offset + value_bytes] = std::byte{'\r'};
+    buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
+    const std::size_t network_offset = value_offset - prefix_bytes;
+    return DiskValue(std::move(lease), network_offset,
+                     prefix_bytes + value_bytes + 2);
+  }
+
+  void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
+                             std::uint8_t db_id,
+                             const RecordIndex::Entry& entry) {
+    constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
+    if (!options_.expiration_authority ||
+        store.expired_candidates.size() >= kMaxQueuedExpiredCandidates ||
+        entry.value.kind != RecordKind::kValue ||
+        entry.value.expire_at_ms == 0) {
+      return;
+    }
+    store.expired_candidates.push_back(WorkerStore::ExpireCandidate{
+        .partition_id = partition_id,
+        .db_id = db_id,
+        .digest = entry.digest,
+        .mutation_sequence = entry.value.mutation_sequence,
+        .expire_at_ms = entry.value.expire_at_ms,
+        .key = entry.key,
+    });
   }
 
   WorkerStore& CurrentStore() {
@@ -2289,6 +2521,7 @@ class StorageEngine::Impl {
     for (auto& partition : store.partitions) {
       partition.indexes[db_id].Clear();
       partition.live_key_count[db_id] = 0;
+      partition.expiring_key_count[db_id] = 0;
       const std::uint64_t sequence = ++partition.mutation_sequence;
       if (partition.capture_deltas) {
         AppendDelta(partition, SnapshotRecord{
@@ -2555,6 +2788,7 @@ class StorageEngine::Impl {
                   .replication_epoch = record.replication_epoch,
                   .mutation_sequence = record.mutation_sequence,
                   .allocation_epoch = record.allocation_epoch,
+                  .expire_at_ms = record.expire_at_ms,
                   .block_owner = block_owner,
                   .record_offset = record_offset,
                   .total_disk_bytes = record.total_disk_bytes,
@@ -2562,6 +2796,7 @@ class StorageEngine::Impl {
                   .relocation_sequence = static_cast<std::uint32_t>(
                       record.relocation_sequence),
                   .kind = record.kind,
+                  .value_type = record.value_type,
               },
           });
           record_offset += record.total_disk_bytes;
@@ -2611,6 +2846,10 @@ class StorageEngine::Impl {
         const bool was_live =
           found != nullptr && found->value.kind == RecordKind::kValue;
         const bool is_live = recovered.location.kind == RecordKind::kValue;
+        const bool was_expiring =
+            was_live && found->value.expire_at_ms != 0;
+        const bool is_expiring =
+            is_live && recovered.location.expire_at_ms != 0;
         index.InsertOrAssign(recovered.digest, recovered.key,
                              recovered.location);
         if (was_live != is_live) {
@@ -2620,6 +2859,13 @@ class StorageEngine::Impl {
           } else {
             --partition.live_key_count[recovered.db_id];
             --store.live_key_count[recovered.db_id];
+          }
+        }
+        if (was_expiring != is_expiring) {
+          if (is_expiring) {
+            ++partition.expiring_key_count[recovered.db_id];
+          } else {
+            --partition.expiring_key_count[recovered.db_id];
           }
         }
       }
@@ -2729,6 +2975,8 @@ class StorageEngine::Impl {
           record.replication_epoch != location.replication_epoch ||
           record.relocation_sequence != location.relocation_sequence ||
           record.allocation_epoch != location.allocation_epoch ||
+          record.expire_at_ms != location.expire_at_ms ||
+          record.value_type != location.value_type ||
           location.value_bytes != record.value_bytes ||
           location.total_disk_bytes != record.total_disk_bytes) {
         co_return Status(StatusCode::kInternal,
@@ -2812,6 +3060,8 @@ class StorageEngine::Impl {
         record.replication_epoch != location.replication_epoch ||
         record.relocation_sequence != location.relocation_sequence ||
         record.allocation_epoch != location.allocation_epoch ||
+        record.expire_at_ms != location.expire_at_ms ||
+        record.value_type != location.value_type ||
         record.value_bytes != location.value_bytes ||
         record.total_disk_bytes != location.total_disk_bytes) {
       co_return Status(StatusCode::kInternal,
@@ -3080,12 +3330,13 @@ class StorageEngine::Impl {
                             WorkerStore::PartitionStore& partition,
                             std::uint8_t db_id,
                             std::string_view key, std::string_view value,
-                            RecordKind kind) {
+                            RecordKind kind, ValueType value_type,
+                            std::uint64_t expire_at_ms) {
     const Digest digest = ComputeDigest(key);
     const std::uint64_t mutation_sequence = ++partition.mutation_sequence;
     Status status = co_await WriteRecordLocked(
-        store, db_id, key, value, kind, digest, mutation_sequence,
-        mutation_sequence, 0, false);
+        store, db_id, key, value, kind, value_type, expire_at_ms, digest,
+        mutation_sequence, mutation_sequence, 0, false);
     if (status.ok() && partition.capture_deltas) {
       AppendDelta(partition, SnapshotRecord{
                                  .kind = kind == RecordKind::kValue
@@ -3094,6 +3345,8 @@ class StorageEngine::Impl {
                                  .db_id = db_id,
                                  .db_epoch = DbEpoch(db_id),
                                  .mutation_sequence = mutation_sequence,
+                                 .expire_at_ms = expire_at_ms,
+                                 .value_type = value_type,
                                  .key = std::string(key),
                                  .value = std::string(value),
                              });
@@ -3183,7 +3436,8 @@ class StorageEngine::Impl {
 
   Task<Status> WriteRecordLocked(WorkerStore& store, std::uint8_t db_id,
                                  std::string_view key, std::string_view value,
-                                 RecordKind kind,
+                                 RecordKind kind, ValueType value_type,
+                                 std::uint64_t expire_at_ms,
                                  const Digest& digest,
                                  std::uint64_t generation,
                                  std::uint64_t mutation_sequence,
@@ -3194,6 +3448,13 @@ class StorageEngine::Impl {
         epoch_metadata_failed_.load(std::memory_order_acquire)) {
       co_return Status(StatusCode::kFailedPrecondition,
                        "storage writer is stopped after an IO failure");
+    }
+    if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
+        (kind == RecordKind::kTombstone &&
+         (value_type != ValueType::kNone || expire_at_ms != 0 ||
+          !value.empty()))) {
+      co_return Status(StatusCode::kInvalidArgument,
+                       "invalid value type or expiration metadata");
     }
     if (key.size() > MaxKeyBytes()) {
       co_return Status(StatusCode::kOutOfRange,
@@ -3368,6 +3629,8 @@ class StorageEngine::Impl {
         .header_bytes = static_cast<std::uint16_t>(record_header_bytes),
         .kind = kind,
         .db_id = db_id,
+        .value_type = value_type,
+        .reserved = 0,
         .digest = digest,
         .key_bytes = static_cast<std::uint32_t>(key.size()),
         .value_bytes = static_cast<std::uint32_t>(value.size()),
@@ -3378,6 +3641,7 @@ class StorageEngine::Impl {
         .db_epoch = DbEpoch(db_id),
         .mutation_sequence = mutation_sequence,
         .relocation_sequence = relocation_sequence,
+        .expire_at_ms = expire_at_ms,
         .lsn = lsn,
         .allocation_epoch = updated.allocation_epoch,
         .payload_checksum = Crc32c(std::span<const std::byte>(
@@ -3429,6 +3693,7 @@ class StorageEngine::Impl {
         .replication_epoch = partition.replication_epoch,
         .mutation_sequence = mutation_sequence,
         .allocation_epoch = updated.allocation_epoch,
+        .expire_at_ms = expire_at_ms,
         .block_owner = writer_id,
         .record_offset = record_offset,
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
@@ -3437,10 +3702,14 @@ class StorageEngine::Impl {
             relocation_sequence),
         .in_memory = true,
         .kind = kind,
+        .value_type = value_type,
     };
     const bool was_live =
         previous.has_value() && previous->kind == RecordKind::kValue;
     const bool is_live = kind == RecordKind::kValue;
+    const bool was_expiring =
+        was_live && previous->expire_at_ms != 0;
+    const bool is_expiring = is_live && expire_at_ms != 0;
     auto inserted = index.InsertOrAssign(digest, key, location);
     store.staged_records[updated.block_id].push_back(RecordIdentity{
         .entry = inserted.entry,
@@ -3452,6 +3721,13 @@ class StorageEngine::Impl {
       } else {
         --partition.live_key_count[db_id];
         --store.live_key_count[db_id];
+      }
+    }
+    if (was_expiring != is_expiring) {
+      if (is_expiring) {
+        ++partition.expiring_key_count[db_id];
+      } else {
+        --partition.expiring_key_count[db_id];
       }
     }
     state.committed_bytes = updated.committed_bytes;
@@ -3537,6 +3813,96 @@ class StorageEngine::Impl {
     }
     shutdown_flush_completed_.fetch_add(1, std::memory_order_acq_rel);
     shutdown_flush_completed_.notify_all();
+  }
+
+  void AdvanceExpiryMap(WorkerStore& store) {
+    store.expiry_scan_cursor = 0;
+    ++store.expiry_db_cursor;
+    if (store.expiry_db_cursor == kLogicalDatabaseCount) {
+      store.expiry_db_cursor = 0;
+      ++store.expiry_partition_cursor;
+      if (store.expiry_partition_cursor == store.partitions.size()) {
+        store.expiry_partition_cursor = 0;
+      }
+    }
+  }
+
+  Task<Status> ExpireCandidate(WorkerStore& store,
+                               WorkerStore::ExpireCandidate candidate) {
+    if (candidate.partition_id >= kLogicalStorageShards ||
+        candidate.db_id >= kLogicalDatabaseCount) {
+      co_return Status::Ok();
+    }
+    auto& partition = PartitionFor(store, candidate.partition_id);
+    auto key_lock = co_await store.key_locks[candidate.db_id].Acquire(
+        candidate.digest, IntentLockMode::kExclusive);
+    co_await store.writer_mutex.Lock();
+    UnlockGuard unlock(&store.writer_mutex, store.worker);
+    auto* current = partition.indexes[candidate.db_id].Find(
+        candidate.digest, candidate.key);
+    if (current == nullptr || current->value.kind != RecordKind::kValue ||
+        current->value.mutation_sequence != candidate.mutation_sequence ||
+        current->value.expire_at_ms != candidate.expire_at_ms ||
+        !IsExpired(current->value, UnixTimeMillis())) {
+      co_return Status::Ok();
+    }
+    co_return co_await AppendLocked(
+        store, partition, candidate.db_id, candidate.key, {},
+        RecordKind::kTombstone, ValueType::kNone, 0);
+  }
+
+  Task<Status> ActiveExpiration(WorkerStore* store) {
+    constexpr auto kInterval = std::chrono::milliseconds(10);
+    constexpr std::size_t kMapStepsPerCycle = 256;
+    constexpr std::size_t kDeletesPerCycle = 64;
+    while (!store->worker->stop_requested()) {
+      Status waited = co_await celer::SleepFor(*store->worker, kInterval);
+      if (!waited.ok()) {
+        co_return waited;
+      }
+      if (store->worker->stop_requested() ||
+          shutdown_flush_requested_.load(std::memory_order_acquire)) {
+        break;
+      }
+
+      const std::uint64_t now_ms = UnixTimeMillis();
+      for (std::size_t step = 0;
+           step < kMapStepsPerCycle && !store->partitions.empty(); ++step) {
+        auto& partition =
+            store->partitions[store->expiry_partition_cursor];
+        const std::uint8_t db_id = store->expiry_db_cursor;
+        if (partition.expiring_key_count[db_id] == 0) {
+          AdvanceExpiryMap(*store);
+          continue;
+        }
+        auto& index = partition.indexes[db_id];
+        store->expiry_scan_cursor = index.Scan(
+            store->expiry_scan_cursor,
+            [&](const RecordIndex::Entry& entry) {
+              if (IsExpired(entry.value, now_ms)) {
+                QueueExpiredCandidate(*store, partition.id, db_id, entry);
+              }
+            });
+        if (store->expiry_scan_cursor == 0) {
+          AdvanceExpiryMap(*store);
+        }
+      }
+
+      std::size_t deleted = 0;
+      while (deleted < kDeletesPerCycle &&
+             !store->expired_candidates.empty()) {
+        WorkerStore::ExpireCandidate candidate =
+            std::move(store->expired_candidates.front());
+        store->expired_candidates.pop_front();
+        Status expired = co_await ExpireCandidate(*store,
+                                                  std::move(candidate));
+        if (!expired.ok()) {
+          co_return expired;
+        }
+        ++deleted;
+      }
+    }
+    co_return Status::Ok();
   }
 
   Task<Status> PeriodicFlush(WorkerStore* store) {
@@ -3945,8 +4311,9 @@ class StorageEngine::Impl {
     }
 
     co_return co_await WriteRecordLocked(
-        key_store, record.db_id, key, value, record.kind, record.digest,
-        record.generation, record.mutation_sequence,
+        key_store, record.db_id, key, value, record.kind, record.value_type,
+        record.expire_at_ms, record.digest, record.generation,
+        record.mutation_sequence,
         record.relocation_sequence + 1, true);
   }
 
@@ -4031,6 +4398,7 @@ class StorageEngine::Impl {
           .replication_epoch = record.replication_epoch,
           .mutation_sequence = record.mutation_sequence,
           .allocation_epoch = record.allocation_epoch,
+          .expire_at_ms = record.expire_at_ms,
           .block_owner = store.worker->id(),
           .record_offset = record_offset,
           .total_disk_bytes = record.total_disk_bytes,
@@ -4038,6 +4406,7 @@ class StorageEngine::Impl {
           .relocation_sequence = static_cast<std::uint32_t>(
               record.relocation_sequence),
           .kind = record.kind,
+          .value_type = record.value_type,
       };
       const std::byte* value_data =
           block_data.buffer.data + record_offset + record.header_bytes;
@@ -4266,9 +4635,23 @@ Task<StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
   co_return co_await impl_->Get(db_id, key, trace);
 }
 
-Task<Status> StorageEngine::Set(std::uint8_t db_id, std::string_view key,
-                                std::string_view value) {
-  co_return co_await impl_->Set(db_id, key, value);
+Task<StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
+                                             std::string_view key,
+                                             std::string_view value,
+                                             SetOptions options) {
+  co_return co_await impl_->Set(db_id, key, value, options);
+}
+
+Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
+                                                   std::string_view key) {
+  co_return co_await impl_->GetExpiration(db_id, key);
+}
+
+Task<StatusOr<bool>> StorageEngine::UpdateExpiration(
+    std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
+    ExpirationCondition condition) {
+  co_return co_await impl_->UpdateExpiration(db_id, key, expire_at_ms,
+                                             condition);
 }
 
 Task<StatusOr<bool>> StorageEngine::Delete(std::uint8_t db_id,

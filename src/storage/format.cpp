@@ -302,8 +302,18 @@ bool EncodeRecordHeader(
     const RecordHeader& header, std::string_view key,
     std::span<std::byte> output) noexcept {
   const std::size_t header_bytes = RecordHeaderBytes(key.size());
-  if (key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
+  if (header.magic != kRecordMagic ||
+      header.version != kStorageFormatVersion ||
+      key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
       header.db_id >= kLogicalDatabaseCount ||
+      header.reserved != 0 ||
+      static_cast<std::uint8_t>(header.value_type) >
+          static_cast<std::uint8_t>(ValueType::kStream) ||
+      (header.kind == RecordKind::kValue &&
+       header.value_type == ValueType::kNone) ||
+      (header.kind == RecordKind::kTombstone &&
+       (header.value_bytes != 0 || header.expire_at_ms != 0 ||
+        header.value_type != ValueType::kNone)) ||
       header.header_bytes != header_bytes || output.size() != header_bytes) {
     return false;
   }
@@ -320,7 +330,8 @@ bool EncodeRecordHeader(
 bool DecodeRecordHeader(
     std::span<const std::byte> input,
     RecordHeader* header, std::string_view* key) noexcept {
-  if (header == nullptr || key == nullptr || input.size() < sizeof(RecordHeader)) {
+  if (header == nullptr || key == nullptr ||
+      input.size() < sizeof(RecordHeader)) {
     return false;
   }
   RecordHeader decoded{};
@@ -330,6 +341,11 @@ bool DecodeRecordHeader(
       (decoded.kind != RecordKind::kValue &&
        decoded.kind != RecordKind::kTombstone) ||
       decoded.db_id >= kLogicalDatabaseCount ||
+      decoded.reserved != 0 ||
+      static_cast<std::uint8_t>(decoded.value_type) >
+          static_cast<std::uint8_t>(ValueType::kStream) ||
+      (decoded.kind == RecordKind::kValue &&
+       decoded.value_type == ValueType::kNone) ||
       decoded.replication_epoch == 0 || decoded.db_epoch == 0 ||
       decoded.key_bytes > MaxKeyBytes() ||
       decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
@@ -341,7 +357,9 @@ bool DecodeRecordHeader(
       decoded.total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
     return false;
   }
-  if (decoded.kind == RecordKind::kTombstone && decoded.value_bytes != 0) {
+  if (decoded.kind == RecordKind::kTombstone &&
+      (decoded.value_bytes != 0 || decoded.expire_at_ms != 0 ||
+       decoded.value_type != ValueType::kNone)) {
     return false;
   }
   const std::uint32_t expected = decoded.header_checksum;

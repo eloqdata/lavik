@@ -465,6 +465,10 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   storage_options.flush_max_ms = flush_max_ms;
   storage_options.flush_size_bytes = flush_size_bytes;
   storage_options.verify_read_crc = verify_read_crc;
+  // A node accepting an upstream replication stream must not create local
+  // expiration mutation sequences. It still hides expired values by their
+  // absolute deadline and applies the primary's replicated tombstone.
+  storage_options.expiration_authority = replication_options.listen_port == 0;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
   Status storage_status = storage.Prepare(thread_count);

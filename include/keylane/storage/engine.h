@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,7 @@
 #include "celer/runtime/task.h"
 #include "keylane/read_trace.h"
 #include "keylane/storage/buffer_pool.h"
+#include "keylane/storage/format.h"
 
 namespace celer {
 class Worker;
@@ -25,6 +27,7 @@ struct StorageEngineOptions {
   std::uint32_t flush_max_ms = 1000;
   std::size_t flush_size_bytes = 8 * 1024 * 1024;
   bool verify_read_crc = true;
+  bool expiration_authority = true;
   RegisteredBufferPoolOptions buffers{};
 };
 
@@ -44,6 +47,8 @@ struct SnapshotRecord {
   std::uint8_t db_id = 0;
   std::uint64_t db_epoch = 0;
   std::uint64_t mutation_sequence = 0;
+  std::uint64_t expire_at_ms = 0;
+  ValueType value_type = ValueType::kNone;
   std::string key;
   std::string value;
 };
@@ -91,6 +96,39 @@ class DiskValue {
   ReadBufferLease lease_;
   std::size_t network_offset_ = 0;
   std::size_t network_size_ = 0;
+};
+
+enum class SetCondition : std::uint8_t {
+  kNone,
+  kIfAbsent,
+  kIfPresent,
+};
+
+struct SetOptions {
+  SetCondition condition = SetCondition::kNone;
+  // Absolute Unix time in milliseconds. Zero clears the TTL unless
+  // keep_ttl is set.
+  std::uint64_t expire_at_ms = 0;
+  bool keep_ttl = false;
+  bool return_old_value = false;
+};
+
+struct SetResult {
+  bool applied = false;
+  std::optional<DiskValue> old_value;
+};
+
+enum class ExpirationCondition : std::uint8_t {
+  kNone,
+  kIfNoExpiration,
+  kIfHasExpiration,
+  kIfGreater,
+  kIfLess,
+};
+
+struct ExpirationInfo {
+  bool exists = false;
+  std::uint64_t expire_at_ms = 0;
 };
 
 class StorageEngine {
@@ -153,8 +191,14 @@ class StorageEngine {
   celer::Task<celer::StatusOr<DiskValue>> Get(
       std::uint8_t db_id, std::string_view key,
       ReadLatencyTrace* trace = nullptr);
-  celer::Task<celer::Status> Set(std::uint8_t db_id, std::string_view key,
-                                 std::string_view value);
+  celer::Task<celer::StatusOr<SetResult>> Set(
+      std::uint8_t db_id, std::string_view key, std::string_view value,
+      SetOptions options = {});
+  celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
+                                            std::string_view key);
+  celer::Task<celer::StatusOr<bool>> UpdateExpiration(
+      std::uint8_t db_id, std::string_view key,
+      std::uint64_t expire_at_ms, ExpirationCondition condition);
   celer::Task<celer::StatusOr<bool>> Delete(std::uint8_t db_id,
                                              std::string_view key);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);

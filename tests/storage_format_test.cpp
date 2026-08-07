@@ -97,5 +97,50 @@ int main() {
   assert(decoded_header.block_id == block_id);
   assert(decoded_header.allocation_epoch == header.allocation_epoch);
 
+  constexpr std::string_view key = "typed-expiring-key";
+  constexpr std::string_view value = "value";
+  const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
+  RecordHeader record{
+      .magic = kRecordMagic,
+      .version = kStorageFormatVersion,
+      .header_bytes = static_cast<std::uint16_t>(record_header_bytes),
+      .kind = RecordKind::kValue,
+      .db_id = 3,
+      .value_type = ValueType::kString,
+      .reserved = 0,
+      .digest = ComputeDigest(key),
+      .key_bytes = static_cast<std::uint32_t>(key.size()),
+      .value_bytes = static_cast<std::uint32_t>(value.size()),
+      .value_disk_bytes = static_cast<std::uint32_t>(value.size()),
+      .total_disk_bytes = static_cast<std::uint32_t>(
+          AlignRecord(record_header_bytes + value.size())),
+      .generation = 4,
+      .replication_epoch = 5,
+      .db_epoch = 6,
+      .mutation_sequence = 7,
+      .relocation_sequence = 8,
+      .expire_at_ms = 1'900'000'000'123ULL,
+      .lsn = 9,
+      .allocation_epoch = 10,
+      .payload_checksum = Crc32c(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(value.data()), value.size())),
+  };
+  std::array<std::byte, kMaxRecordHeaderBytes> record_page{};
+  assert(EncodeRecordHeader(
+      record, key,
+      std::span<std::byte>(record_page.data(), record_header_bytes)));
+  RecordHeader decoded_record{};
+  std::string_view decoded_key;
+  assert(DecodeRecordHeader(
+      std::span<const std::byte>(record_page.data(), record_header_bytes),
+      &decoded_record, &decoded_key));
+  assert(decoded_key == key);
+  assert(decoded_record.value_type == ValueType::kString);
+  assert(decoded_record.expire_at_ms == record.expire_at_ms);
+  record_page[record_header_bytes - 1] ^= std::byte{1};
+  assert(!DecodeRecordHeader(
+      std::span<const std::byte>(record_page.data(), record_header_bytes),
+      &decoded_record, &decoded_key));
+
   return 0;
 }

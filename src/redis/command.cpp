@@ -55,19 +55,24 @@ CommandKind MatchCommandKind(std::string_view name) {
       if (CmpCaseInsensitive(name, "GET")) return CommandKind::kGet;
       if (CmpCaseInsensitive(name, "SET")) return CommandKind::kSet;
       if (CmpCaseInsensitive(name, "DEL")) return CommandKind::kDel;
+      if (CmpCaseInsensitive(name, "TTL")) return CommandKind::kTtl;
       break;
     case 4:
       if (CmpCaseInsensitive(name, "PING")) return CommandKind::kPing;
       if (CmpCaseInsensitive(name, "INCR")) return CommandKind::kIncr;
       if (CmpCaseInsensitive(name, "SCAN")) return CommandKind::kScan;
+      if (CmpCaseInsensitive(name, "PTTL")) return CommandKind::kPttl;
       break;
     case 6:
       if (CmpCaseInsensitive(name, "DBSIZE")) return CommandKind::kDbSize;
       if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
       if (CmpCaseInsensitive(name, "SELECT")) return CommandKind::kSelect;
+      if (CmpCaseInsensitive(name, "EXPIRE")) return CommandKind::kExpire;
       break;
     case 7:
       if (CmpCaseInsensitive(name, "FLUSHDB")) return CommandKind::kFlushDb;
+      if (CmpCaseInsensitive(name, "PEXPIRE")) return CommandKind::kPExpire;
+      if (CmpCaseInsensitive(name, "PERSIST")) return CommandKind::kPersist;
       break;
   }
   return CommandKind::kUnknown;
@@ -131,6 +136,11 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
     case CommandKind::kGet:
     case CommandKind::kIncr:
     case CommandKind::kSet:
+    case CommandKind::kExpire:
+    case CommandKind::kPExpire:
+    case CommandKind::kPersist:
+    case CommandKind::kTtl:
+    case CommandKind::kPttl:
     case CommandKind::kDel:
     case CommandKind::kExists:
     case CommandKind::kUnknown:
@@ -466,6 +476,134 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
   co_return EncodedReply(EncodeScanReply(0, keys));
 }
 
+std::uint64_t CommandUnixTimeMillis() noexcept {
+  const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                         .count();
+  return value > 0 ? static_cast<std::uint64_t>(value) : 0;
+}
+
+bool ParseInt64(std::string_view text, std::int64_t* value) {
+  if (value == nullptr || text.empty()) {
+    return false;
+  }
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [parsed_end, error] = std::from_chars(begin, end, *value);
+  return error == std::errc{} && parsed_end == end;
+}
+
+std::string EncodeStorageError(const Status& status) {
+  if (status.message().starts_with("WRONGTYPE ")) {
+    return EncodeError(status.message());
+  }
+  return EncodeError("ERR " + status.message());
+}
+
+StatusOr<storage::SetOptions> ParseSetOptions(
+    const std::vector<std::string>& args) {
+  storage::SetOptions options;
+  bool condition_seen = false;
+  bool expiration_seen = false;
+  bool get_seen = false;
+  const std::uint64_t now_ms = CommandUnixTimeMillis();
+  constexpr std::uint64_t kMaxTimestamp =
+      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+
+  for (std::size_t i = 3; i < args.size(); ++i) {
+    const std::string_view option = args[i];
+    if (CmpCaseInsensitive(option, "NX") ||
+        CmpCaseInsensitive(option, "XX")) {
+      if (condition_seen) {
+        return Status(StatusCode::kInvalidArgument, "syntax error");
+      }
+      condition_seen = true;
+      options.condition = CmpCaseInsensitive(option, "NX")
+                              ? storage::SetCondition::kIfAbsent
+                              : storage::SetCondition::kIfPresent;
+      continue;
+    }
+    if (CmpCaseInsensitive(option, "GET")) {
+      if (get_seen) {
+        return Status(StatusCode::kInvalidArgument, "syntax error");
+      }
+      get_seen = true;
+      options.return_old_value = true;
+      continue;
+    }
+    if (CmpCaseInsensitive(option, "KEEPTTL")) {
+      if (expiration_seen) {
+        return Status(StatusCode::kInvalidArgument, "syntax error");
+      }
+      expiration_seen = true;
+      options.keep_ttl = true;
+      continue;
+    }
+
+    const bool ex = CmpCaseInsensitive(option, "EX");
+    const bool px = CmpCaseInsensitive(option, "PX");
+    const bool exat = CmpCaseInsensitive(option, "EXAT");
+    const bool pxat = CmpCaseInsensitive(option, "PXAT");
+    if (!ex && !px && !exat && !pxat) {
+      return Status(StatusCode::kInvalidArgument, "syntax error");
+    }
+    if (expiration_seen || i + 1 >= args.size()) {
+      return Status(StatusCode::kInvalidArgument, "syntax error");
+    }
+    expiration_seen = true;
+    std::int64_t parsed = 0;
+    if (!ParseInt64(args[++i], &parsed)) {
+      return Status(StatusCode::kInvalidArgument,
+                    "value is not an integer or out of range");
+    }
+    if (parsed <= 0) {
+      return Status(StatusCode::kInvalidArgument,
+                    "invalid expire time in 'set' command");
+    }
+    const std::uint64_t amount = static_cast<std::uint64_t>(parsed);
+    if (ex || exat) {
+      if (amount > kMaxTimestamp / 1000) {
+        return Status(StatusCode::kInvalidArgument,
+                      "invalid expire time in 'set' command");
+      }
+    }
+    const std::uint64_t millis = (ex || exat) ? amount * 1000 : amount;
+    if (ex || px) {
+      if (millis > kMaxTimestamp - now_ms) {
+        return Status(StatusCode::kInvalidArgument,
+                      "invalid expire time in 'set' command");
+      }
+      options.expire_at_ms = now_ms + millis;
+    } else {
+      options.expire_at_ms = millis;
+    }
+  }
+  return options;
+}
+
+StatusOr<storage::ExpirationCondition> ParseExpirationCondition(
+    const std::vector<std::string>& args) {
+  if (args.size() == 3) {
+    return storage::ExpirationCondition::kNone;
+  }
+  if (args.size() != 4) {
+    return Status(StatusCode::kInvalidArgument, "syntax error");
+  }
+  if (CmpCaseInsensitive(args[3], "NX")) {
+    return storage::ExpirationCondition::kIfNoExpiration;
+  }
+  if (CmpCaseInsensitive(args[3], "XX")) {
+    return storage::ExpirationCondition::kIfHasExpiration;
+  }
+  if (CmpCaseInsensitive(args[3], "GT")) {
+    return storage::ExpirationCondition::kIfGreater;
+  }
+  if (CmpCaseInsensitive(args[3], "LT")) {
+    return storage::ExpirationCondition::kIfLess;
+  }
+  return Status(StatusCode::kInvalidArgument, "syntax error");
+}
+
 Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
                                          ReadLatencyTrace* read_trace = nullptr) {
   CommandReply reply;
@@ -492,16 +630,116 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
     }
 
     case CommandKind::kSet: {
-      if (args.size() != 3) {
+      if (args.size() < 3) {
         reply.encoded =
             EncodeError("ERR wrong number of arguments for 'set' command");
         co_return reply;
       }
-      Status status =
-          co_await g_storage->Set(request.db_id, args[1], args[2]);
-      reply.encoded = status.ok()
-                          ? EncodeSimpleString("OK")
-                          : EncodeError("ERR " + status.message());
+      auto options = ParseSetOptions(args);
+      if (!options.ok()) {
+        reply.encoded = EncodeError("ERR " + options.status().message());
+        co_return reply;
+      }
+      auto result = co_await g_storage->Set(request.db_id, args[1], args[2],
+                                            *options);
+      if (!result.ok()) {
+        reply.encoded = EncodeStorageError(result.status());
+        co_return reply;
+      }
+      if (options->return_old_value) {
+        if (result->old_value.has_value()) {
+          reply.disk_value.emplace(std::move(*result->old_value));
+        } else {
+          reply.encoded = EncodeNullBulkString();
+        }
+      } else {
+        reply.encoded = result->applied ? EncodeSimpleString("OK")
+                                        : EncodeNullBulkString();
+      }
+      co_return reply;
+    }
+
+    case CommandKind::kTtl:
+    case CommandKind::kPttl: {
+      const bool milliseconds = request.kind == CommandKind::kPttl;
+      if (args.size() != 2) {
+        reply.encoded = EncodeError(
+            std::string("ERR wrong number of arguments for '") +
+            (milliseconds ? "pttl" : "ttl") + "' command");
+        co_return reply;
+      }
+      const storage::ExpirationInfo info =
+          co_await g_storage->GetExpiration(request.db_id, args[1]);
+      if (!info.exists) {
+        reply.encoded = EncodeInteger(-2);
+      } else if (info.expire_at_ms == 0) {
+        reply.encoded = EncodeInteger(-1);
+      } else {
+        const std::uint64_t now_ms = CommandUnixTimeMillis();
+        const std::uint64_t remaining =
+            info.expire_at_ms > now_ms ? info.expire_at_ms - now_ms : 0;
+        const std::uint64_t output = milliseconds ? remaining
+                                                   : remaining / 1000;
+        reply.encoded = EncodeInteger(static_cast<long long>(output));
+      }
+      co_return reply;
+    }
+
+    case CommandKind::kExpire:
+    case CommandKind::kPExpire: {
+      const bool milliseconds = request.kind == CommandKind::kPExpire;
+      if (args.size() < 3 || args.size() > 4) {
+        reply.encoded = EncodeError(
+            std::string("ERR wrong number of arguments for '") +
+            (milliseconds ? "pexpire" : "expire") + "' command");
+        co_return reply;
+      }
+      std::int64_t duration = 0;
+      if (!ParseInt64(args[2], &duration)) {
+        reply.encoded =
+            EncodeError("ERR value is not an integer or out of range");
+        co_return reply;
+      }
+      auto condition = ParseExpirationCondition(args);
+      if (!condition.ok()) {
+        reply.encoded = EncodeError("ERR syntax error");
+        co_return reply;
+      }
+      const std::uint64_t now_ms = CommandUnixTimeMillis();
+      constexpr std::uint64_t kMaxTimestamp =
+          static_cast<std::uint64_t>(
+              std::numeric_limits<std::int64_t>::max());
+      std::uint64_t expire_at_ms = 1;
+      if (duration > 0) {
+        const std::uint64_t amount = static_cast<std::uint64_t>(duration);
+        const std::uint64_t factor = milliseconds ? 1 : 1000;
+        if (amount > (kMaxTimestamp - now_ms) / factor) {
+          reply.encoded =
+              EncodeError("ERR invalid expire time in 'expire' command");
+          co_return reply;
+        }
+        expire_at_ms = now_ms + amount * factor;
+      }
+      auto updated = co_await g_storage->UpdateExpiration(
+          request.db_id, args[1], expire_at_ms, *condition);
+      reply.encoded = updated.ok()
+                          ? EncodeInteger(*updated ? 1 : 0)
+                          : EncodeStorageError(updated.status());
+      co_return reply;
+    }
+
+    case CommandKind::kPersist: {
+      if (args.size() != 2) {
+        reply.encoded =
+            EncodeError("ERR wrong number of arguments for 'persist' command");
+        co_return reply;
+      }
+      auto updated = co_await g_storage->UpdateExpiration(
+          request.db_id, args[1], 0,
+          storage::ExpirationCondition::kIfHasExpiration);
+      reply.encoded = updated.ok()
+                          ? EncodeInteger(*updated ? 1 : 0)
+                          : EncodeStorageError(updated.status());
       co_return reply;
     }
 
@@ -513,10 +751,15 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       }
       auto value = co_await g_storage->Increment(request.db_id, args[1]);
       if (!value.ok()) {
-        reply.encoded = value.status().code() == StatusCode::kInvalidArgument
-                            ? EncodeError(
-                                  "ERR value is not an integer or out of range")
-                            : EncodeError("ERR " + value.status().message());
+        if (value.status().message().starts_with("WRONGTYPE ")) {
+          reply.encoded = EncodeError(value.status().message());
+        } else {
+          reply.encoded =
+              value.status().code() == StatusCode::kInvalidArgument
+                  ? EncodeError(
+                        "ERR value is not an integer or out of range")
+                  : EncodeError("ERR " + value.status().message());
+        }
       } else {
         reply.encoded = EncodeInteger(*value);
       }
@@ -591,6 +834,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   const bool mutating = request.kind == CommandKind::kSet ||
                         request.kind == CommandKind::kIncr ||
                         request.kind == CommandKind::kDel ||
+                        request.kind == CommandKind::kExpire ||
+                        request.kind == CommandKind::kPExpire ||
+                        request.kind == CommandKind::kPersist ||
                         request.kind == CommandKind::kFlushDb;
   if (g_replica_read_only && mutating) {
     co_return EncodedReply(EncodeError(
@@ -606,7 +852,12 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
                        request.kind == CommandKind::kExists ||
                        request.kind == CommandKind::kGet ||
                        request.kind == CommandKind::kSet ||
-                       request.kind == CommandKind::kIncr;
+                       request.kind == CommandKind::kIncr ||
+                       request.kind == CommandKind::kExpire ||
+                       request.kind == CommandKind::kPExpire ||
+                       request.kind == CommandKind::kPersist ||
+                       request.kind == CommandKind::kTtl ||
+                       request.kind == CommandKind::kPttl;
   if (uses_db && !TryBeginDbOperation(request.db_id)) {
     co_return EncodedReply(
         EncodeError("TRYAGAIN FLUSHDB is in progress"));
@@ -630,6 +881,11 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
     case CommandKind::kGet:
     case CommandKind::kSet:
     case CommandKind::kIncr:
+    case CommandKind::kExpire:
+    case CommandKind::kPExpire:
+    case CommandKind::kPersist:
+    case CommandKind::kTtl:
+    case CommandKind::kPttl:
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE

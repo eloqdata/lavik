@@ -168,7 +168,8 @@ Status DecodeStatus(BytesView response, Reader* reader) {
 }
 
 std::size_t EncodedRecordBytes(const SnapshotRecord& record) {
-  return 1 + 1 + 8 + 8 + 4 + 4 + record.key.size() + record.value.size();
+  return 1 + 1 + 1 + 8 + 8 + 8 + 4 + 4 + record.key.size() +
+         record.value.size();
 }
 
 bool EncodeRecords(std::uint16_t partition_id, std::uint64_t epoch,
@@ -190,8 +191,10 @@ bool EncodeRecords(std::uint16_t partition_id, std::uint64_t epoch,
   for (const SnapshotRecord& record : records) {
     PutU8(*output, static_cast<std::uint8_t>(record.kind));
     PutU8(*output, record.db_id);
+    PutU8(*output, static_cast<std::uint8_t>(record.value_type));
     PutU64(*output, record.db_epoch);
     PutU64(*output, record.mutation_sequence);
+    PutU64(*output, record.expire_at_ms);
     PutU32(*output, static_cast<std::uint32_t>(record.key.size()));
     PutU32(*output, static_cast<std::uint32_t>(record.value.size()));
     PutString(*output, record.key);
@@ -217,22 +220,36 @@ DecodeRecords(BytesView payload) {
   records.reserve(count);
   for (std::uint32_t i = 0; i < count; ++i) {
     std::uint8_t kind = 0;
+    std::uint8_t value_type = 0;
     SnapshotRecord record;
     std::uint32_t key_size = 0;
     std::uint32_t value_size = 0;
     if (!reader.U8(&kind) || !reader.U8(&record.db_id) ||
+        !reader.U8(&value_type) ||
         !reader.U64(&record.db_epoch) ||
         !reader.U64(&record.mutation_sequence) ||
+        !reader.U64(&record.expire_at_ms) ||
         !reader.U32(&key_size) || !reader.U32(&value_size) ||
         kind < static_cast<std::uint8_t>(SnapshotRecord::Kind::kValue) ||
         kind > static_cast<std::uint8_t>(SnapshotRecord::Kind::kFlushDb) ||
         record.db_id >= storage::kLogicalDatabaseCount ||
+        value_type >
+            static_cast<std::uint8_t>(storage::ValueType::kStream) ||
         !reader.String(key_size, &record.key) ||
         !reader.String(value_size, &record.value)) {
       return Status(StatusCode::kInvalidArgument,
                     "malformed replicated record");
     }
     record.kind = static_cast<SnapshotRecord::Kind>(kind);
+    record.value_type = static_cast<storage::ValueType>(value_type);
+    if ((record.kind == SnapshotRecord::Kind::kValue &&
+         record.value_type == storage::ValueType::kNone) ||
+        (record.kind != SnapshotRecord::Kind::kValue &&
+         (record.value_type != storage::ValueType::kNone ||
+          record.expire_at_ms != 0))) {
+      return Status(StatusCode::kInvalidArgument,
+                    "invalid replicated value metadata");
+    }
     records.push_back(std::move(record));
   }
   if (reader.remaining() != 0) {

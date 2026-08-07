@@ -114,5 +114,14 @@ if (BUILD_TESTING)
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 150)
+
+    add_executable(keylane_ttl_e2e_test
+      tests/ttl_e2e_test.cpp
+    )
+    add_test(
+      NAME keylane_ttl_e2e
+      COMMAND keylane_ttl_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_ttl_e2e PROPERTIES TIMEOUT 90)
   endif()
 endif()
