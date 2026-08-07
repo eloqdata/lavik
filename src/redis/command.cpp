@@ -1532,6 +1532,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         co_await DropWatches(ctx);
         co_return EncodedReply("*-1\r\n");
       }
+      // TODO(squashing): batch runs of squashable commands by shard into one
+      // hop instead of one hop per command. Safe because queued commands
+      // cannot reference earlier replies, same-key commands land on the same
+      // shard (preserving order inside its sub-list), and replies fill
+      // position slots; segment at commands with intra-command cross-shard
+      // data flow. Conditions worked out in docs/vll-design.md.
       ExecContext exec_ctx;
       exec_ctx.queued = &queued;
       exec_ctx.cmd_keys = &cmd_keys;
