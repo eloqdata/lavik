@@ -446,7 +446,6 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
               std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
               bool verify_read_crc,
               const std::vector<std::string>& data_files,
-              std::uint64_t data_file_size_bytes,
               ReplicationOptions replication_options) {
   spdlog::info(
       "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
@@ -463,7 +462,6 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
 
   storage::StorageEngineOptions storage_options;
   storage_options.data_files = data_files;
-  storage_options.file_size_bytes = data_file_size_bytes;
   storage_options.flush_max_ms = flush_max_ms;
   storage_options.flush_size_bytes = flush_size_bytes;
   storage_options.verify_read_crc = verify_read_crc;

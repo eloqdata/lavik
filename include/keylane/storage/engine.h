@@ -22,7 +22,6 @@ namespace keylane::storage {
 
 struct StorageEngineOptions {
   std::vector<std::string> data_files{"keylane.data"};
-  std::uint64_t file_size_bytes = 1024ULL * 1024 * 1024;
   std::uint32_t flush_max_ms = 1000;
   std::size_t flush_size_bytes = 8 * 1024 * 1024;
   bool verify_read_crc = true;

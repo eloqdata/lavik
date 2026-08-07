@@ -12,8 +12,10 @@ block device. The prefix contains:
 
 The epoch and bitmap pages use independent A/B slots. There is no metadata
 journal, tree, checkpoint, or persistent worker table in this implementation.
-The configured file size is fixed after initialization, so the complete bitmap
-size is known before data allocation starts.
+Each path's persisted capacity is fixed after initialization, so its complete
+bitmap size is known before data allocation starts. Different devices may have
+different capacities and therefore different bitmap lengths and data-prefix
+boundaries.
 
 The format version remains 1 during development. Existing files must be
 cleared when this layout changes.
@@ -92,7 +94,11 @@ and startup requires the complete device set.
 
 `FLUSHDB` persists the new DB epoch before dropping the in-memory DB indexes.
 Recovery ignores records with an older DB epoch, so no per-key disk rewrite is
-required.
+required. After the indexes are cleared, Keylane marks their old locations dead.
+If this makes the worker's active append block completely dead, `FLUSHDB` seals
+that block immediately and queues it for flush; a mixed active block remains
+open so live records from other logical databases are not disturbed. Once the
+sealed block is durable, the normal defrag path can return it to the ready pool.
 
 `ResetReplicaPartition` locks the owning worker's append stream, persists the
 new partition epoch, publishes it to the partition, and then removes the old
@@ -187,7 +193,25 @@ waiting because its epoch transition must remain serialized.
 
 The foreground allocator preserves a small per-device defrag reserve. Device
 selection retains worker affinity where possible and falls back to other
-devices when needed.
+devices when needed. If no foreground block is immediately available, an
+ordinary write waits in its coroutine while a flush or defrag pass is active,
+then retries every device. A monotonically increasing reclaim generation closes
+the completion race: `ResourceExhausted` is returned only after a stable
+observation with no flush/defrag in progress and no newly returned block.
+Defrag's own reserve allocation never waits for another defrag, avoiding a
+self-deadlock when the protected reserve is genuinely exhausted. An I/O failure
+still stops the writer and is reported as `FailedPrecondition`, rather than
+being mistaken for capacity exhaustion.
+
+The reserve and scheduler are per device, not per worker. Every device protects
+eight ready blocks from foreground allocation and has an independent ready
+queue with at most eight active defrag permits. A candidate is queued according
+to its source block's device. Releasing a permit wakes work only for that
+device, so workers do not continuously contend for reserved block IDs and one
+device cannot consume another device's recovery capacity. Actual concurrency
+is also naturally capped by the worker count because a worker runs at most one
+defrag pass at a time. A candidate that temporarily encounters
+`ResourceExhausted` is returned to the queue instead of being lost.
 
 ## Startup sequence
 
@@ -198,7 +222,8 @@ Recovery runs in this order:
 3. Load A/B epoch pages from every device and install canonical DB/partition
    epochs.
 4. Load each device's A/B scan bitmap.
-5. Distribute physical data-block ranges across the current workers.
+5. Distribute each device's physical data-block range across the current
+   workers using a global linear ordinal; device capacities need not match.
 6. Skip bit-0 blocks; inspect bit-1 headers; fully read valid committed blocks.
 7. Reject records with stale DB or partition epochs and rebuild partition
    indexes using record version ordering.

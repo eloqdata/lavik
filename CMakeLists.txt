@@ -98,4 +98,21 @@ if (BUILD_TESTING)
   )
   target_link_libraries(keylane_storage_format_test PRIVATE keylane::module)
   add_test(NAME keylane_storage_format COMMAND keylane_storage_format_test)
+
+  add_executable(keylane_storage_capacity_test
+    tests/storage_capacity_test.cpp
+  )
+  target_link_libraries(keylane_storage_capacity_test PRIVATE keylane::module)
+  add_test(NAME keylane_storage_capacity COMMAND keylane_storage_capacity_test)
+
+  if (KEYLANE_BUILD_EXAMPLE AND UNIX)
+    add_executable(keylane_flushdb_reclaim_e2e_test
+      tests/flushdb_reclaim_e2e_test.cpp
+    )
+    add_test(
+      NAME keylane_flushdb_reclaim_e2e
+      COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 150)
+  endif()
 endif()

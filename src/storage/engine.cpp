@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/concurrentqueue.h"
 #include "celer/runtime/cross_core.h"
@@ -348,29 +349,6 @@ void AtomicMax(std::atomic<std::uint64_t>* target,
   }
 }
 
-Status PrepareDataFile(const std::string& path, std::uint64_t size) {
-  const int fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
-  if (fd < 0) {
-    return Status(StatusCode::kInternal,
-                  "open data file failed: " + path + ": " +
-                      std::strerror(errno));
-  }
-
-  const int allocation_error =
-      ::posix_fallocate(fd, 0, static_cast<off_t>(size));
-  const int close_error = ::close(fd);
-  if (allocation_error != 0) {
-    return Status(StatusCode::kResourceExhausted,
-                  "preallocate data file failed: " + path + ": " +
-                      std::strerror(allocation_error));
-  }
-  if (close_error != 0) {
-    return Status(StatusCode::kInternal,
-                  "close data file failed: " + path);
-  }
-  return Status::Ok();
-}
-
 Status ReadExactlyAt(int fd, std::span<std::byte> output,
                      std::uint64_t offset) {
   std::size_t done = 0;
@@ -534,6 +512,8 @@ struct StorageDevice {
   std::string path;
   std::uint64_t id = 0;
   std::uint64_t capacity_blocks = 0;
+  std::uint32_t data_block_begin = 1;
+  std::uint64_t data_block_count = 0;
   std::uint32_t file_index = 0;
 };
 
@@ -569,6 +549,12 @@ struct DeviceAllocator {
 
 struct BlockDeviceInfo {
   std::size_t io_alignment = 0;
+  std::uint64_t size_bytes = 0;
+};
+
+struct StoragePathInfo {
+  bool is_block_device = false;
+  std::size_t io_alignment = kDirectIoAlignment;
   std::uint64_t size_bytes = 0;
 };
 
@@ -609,6 +595,40 @@ StatusOr<BlockDeviceInfo> ProbeBlockDevice(const std::string& path) {
                       path);
   }
   return BlockDeviceInfo{.io_alignment = alignment, .size_bytes = size_bytes};
+}
+
+StatusOr<StoragePathInfo> ProbeStoragePath(const std::string& path) {
+  struct stat file_info {};
+  if (::stat(path.c_str(), &file_info) != 0) {
+    return Status(StatusCode::kInternal,
+                  "stat storage path failed: " + path + ": " +
+                      std::strerror(errno));
+  }
+  if (S_ISBLK(file_info.st_mode)) {
+    auto device = ProbeBlockDevice(path);
+    if (!device.ok()) {
+      return device.status();
+    }
+    return StoragePathInfo{
+        .is_block_device = true,
+        .io_alignment = device->io_alignment,
+        .size_bytes = device->size_bytes,
+    };
+  }
+  if (!S_ISREG(file_info.st_mode)) {
+    return Status(StatusCode::kInvalidArgument,
+                  "storage path is neither a regular file nor a block device: " +
+                      path);
+  }
+  if (file_info.st_size < 0) {
+    return Status(StatusCode::kOutOfRange,
+                  "storage file reports a negative size: " + path);
+  }
+  return StoragePathInfo{
+      .is_block_device = false,
+      .io_alignment = kDirectIoAlignment,
+      .size_bytes = static_cast<std::uint64_t>(file_info.st_size),
+  };
 }
 
 Task<StatusOr<std::size_t>> ReadStorageBuffer(
@@ -680,10 +700,14 @@ class StorageEngine::Impl {
     AsyncMutex writer_mutex;
     std::deque<std::uint64_t> flush_queue;
     std::deque<std::uint64_t> defrag_queue;
-    std::uint64_t next_device_choice = 0;
+    std::vector<std::size_t> home_devices;
+    std::vector<std::uint64_t> home_device_allocations;
     bool flush_running = false;
     bool write_failed = false;
     bool defrag_running = false;
+    bool defrag_waiting = false;
+    std::size_t defrag_waiting_device = 0;
+    std::size_t active_defrag_device = 0;
     bool standby_request_pending = false;
   };
 
@@ -700,50 +724,25 @@ class StorageEngine::Impl {
         std::numeric_limits<std::uint16_t>::max()) {
       return Status(StatusCode::kOutOfRange, "too many data files");
     }
-    if (options_.file_size_bytes < 2 * kStorageBlockBytes ||
-        options_.file_size_bytes % kStorageBlockBytes != 0) {
-      return Status(StatusCode::kInvalidArgument,
-                    "data file size must be at least 16 MiB and a multiple of 8 MiB");
-    }
-
-    const std::uint64_t capacity_blocks =
-        options_.file_size_bytes / kStorageBlockBytes;
-    if (capacity_blocks > kLocalBlockIdLimit) {
-      return Status(StatusCode::kOutOfRange,
-                    "each data file or device is limited to 1 PiB");
-    }
 
     std::size_t direct_io_alignment = 1;
+    std::vector<StoragePathInfo> path_info;
+    path_info.reserve(options_.data_files.size());
     std::vector<std::optional<DeviceLabel>> labels;
     labels.reserve(options_.data_files.size());
     for (const std::string& path : options_.data_files) {
-      struct stat file_info {};
-      if (::stat(path.c_str(), &file_info) == 0 &&
-          S_ISBLK(file_info.st_mode)) {
-        auto device_info = ProbeBlockDevice(path);
-        if (!device_info.ok()) {
-          return device_info.status();
-        }
-        if (device_info->size_bytes < options_.file_size_bytes) {
-          return Status(StatusCode::kOutOfRange,
-                        "configured data size exceeds block device capacity: " +
-                            path);
-        }
-        direct_io_alignment =
-            std::max(direct_io_alignment, device_info->io_alignment);
-        spdlog::info(
-            "using raw block device {} from offset 0 (configured bytes={} "
-            "device-bytes={} logical-sector-bytes={})",
-            path, options_.file_size_bytes, device_info->size_bytes,
-            device_info->io_alignment);
-      } else {
-        Status status = PrepareDataFile(path, options_.file_size_bytes);
-        if (!status.ok()) {
-          return status;
-        }
-        direct_io_alignment =
-            std::max(direct_io_alignment, kDirectIoAlignment);
+      auto probed = ProbeStoragePath(path);
+      if (!probed.ok()) {
+        return probed.status();
       }
+      if (probed->size_bytes < 2 * kStorageBlockBytes) {
+        return Status(StatusCode::kOutOfRange,
+                      "storage path is too small to hold metadata and data: " +
+                          path);
+      }
+      direct_io_alignment =
+          std::max(direct_io_alignment, probed->io_alignment);
+      path_info.push_back(*probed);
 
       auto label = ReadDeviceLabel(path);
       if (!label.ok()) {
@@ -764,11 +763,6 @@ class StorageEngine::Impl {
       }
       has_existing_device = true;
       const DeviceLabel& label = *labels[i];
-      if (label.capacity_blocks != capacity_blocks) {
-        return Status(StatusCode::kFailedPrecondition,
-                      "configured size does not match device label: " +
-                          options_.data_files[i]);
-      }
       if (storage_set_id == 0) {
         storage_set_id = label.storage_set_id;
       } else if (storage_set_id != label.storage_set_id) {
@@ -817,6 +811,114 @@ class StorageEngine::Impl {
 
     devices_.clear();
     devices_.reserve(options_.data_files.size());
+    std::vector<std::uint64_t> capacity_by_path(labels.size(), 0);
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      const StoragePathInfo& probed = path_info[i];
+      std::uint64_t capacity_blocks = 0;
+      std::uint64_t device_id = i;
+      if (labels[i].has_value()) {
+        const DeviceLabel& label = *labels[i];
+        capacity_blocks = label.capacity_blocks;
+        device_id = label.device_id;
+        const std::uint64_t required_bytes =
+            capacity_blocks * kStorageBlockBytes;
+        if (probed.size_bytes < required_bytes) {
+          return Status(StatusCode::kFailedPrecondition,
+                        "storage path is smaller than its persisted capacity: " +
+                            options_.data_files[i]);
+        }
+        if (probed.size_bytes > required_bytes) {
+          spdlog::info(
+              "storage path {} has {} trailing bytes beyond its persisted "
+              "capacity; ignoring them",
+              options_.data_files[i], probed.size_bytes - required_bytes);
+        }
+      } else {
+        if (!probed.is_block_device &&
+            probed.size_bytes % kStorageBlockBytes != 0) {
+          return Status(
+              StatusCode::kInvalidArgument,
+              "new regular storage file size must be a multiple of 8 MiB: " +
+                  options_.data_files[i]);
+        }
+        capacity_blocks = probed.size_bytes / kStorageBlockBytes;
+        if (capacity_blocks > kLocalBlockIdLimit) {
+          return Status(StatusCode::kOutOfRange,
+                        "each data file or device is limited to 1 PiB: " +
+                            options_.data_files[i]);
+        }
+        const std::uint64_t ignored_bytes =
+            probed.size_bytes - capacity_blocks * kStorageBlockBytes;
+        if (ignored_bytes != 0) {
+          spdlog::info(
+              "block device {} has {} tail bytes outside a complete 8 MiB "
+              "block; ignoring them",
+              options_.data_files[i], ignored_bytes);
+        }
+      }
+      const std::uint32_t data_block_begin =
+          DataBlockBegin(capacity_blocks);
+      if (capacity_blocks > kLocalBlockIdLimit) {
+        return Status(StatusCode::kOutOfRange,
+                      "persisted device capacity exceeds the 1 PiB limit: " +
+                          options_.data_files[i]);
+      }
+      if (data_block_begin >= capacity_blocks) {
+        return Status(StatusCode::kOutOfRange,
+                      "fixed metadata leaves no data blocks: " +
+                          options_.data_files[i]);
+      }
+      if (capacity_blocks - data_block_begin <=
+          kDefragReserveBlocksPerDevice) {
+        return Status(
+            StatusCode::kOutOfRange,
+            "storage path has no foreground block after its per-device "
+            "defrag reserve; each device must be at least 80 MiB: " +
+                options_.data_files[i]);
+      }
+      capacity_by_path[i] = capacity_blocks;
+      devices_.push_back(StorageDevice{
+          .path = options_.data_files[i],
+          .id = device_id,
+          .capacity_blocks = capacity_blocks,
+          .data_block_begin = data_block_begin,
+          .data_block_count = capacity_blocks - data_block_begin,
+          .file_index = static_cast<std::uint32_t>(i),
+      });
+    }
+    std::sort(devices_.begin(), devices_.end(),
+              [](const StorageDevice& left, const StorageDevice& right) {
+                return left.id < right.id;
+              });
+
+    ConfigureDefragReserves();
+    active_defrags_by_device_ =
+        std::make_unique<std::atomic<unsigned>[]>(devices_.size());
+    defrag_ready_by_device_ = std::make_unique<
+        moodycamel::ConcurrentQueue<std::uint16_t>[]>(devices_.size());
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      active_defrags_by_device_[device_index].store(
+          0, std::memory_order_relaxed);
+    }
+    total_data_blocks_ = 0;
+    std::uint64_t foreground_blocks = 0;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      total_data_blocks_ += device.data_block_count;
+      const std::size_t reserve = DefragReserveForDevice(device_index);
+      if (device.data_block_count > reserve) {
+        foreground_blocks += device.data_block_count - reserve;
+      }
+    }
+    if (foreground_blocks == 0) {
+      return Status(
+          StatusCode::kOutOfRange,
+          "storage set has no foreground blocks after the defrag reserve; "
+          "a single-device storage set must be at least 80 MiB");
+    }
+
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (!labels[i].has_value()) {
         DeviceLabel label{
@@ -825,7 +927,7 @@ class StorageEngine::Impl {
             .header_bytes = kDirectIoAlignment,
             .storage_set_id = storage_set_id,
             .device_id = i,
-            .capacity_blocks = capacity_blocks,
+            .capacity_blocks = capacity_by_path[i],
             .device_count = expected_device_count,
             .block_bytes = kStorageBlockBytes,
         };
@@ -835,24 +937,24 @@ class StorageEngine::Impl {
         }
         labels[i] = label;
       }
-      const DeviceLabel& label = *labels[i];
-      devices_.push_back(StorageDevice{
-          .path = options_.data_files[i],
-          .id = label.device_id,
-          .capacity_blocks = label.capacity_blocks,
-          .file_index = static_cast<std::uint32_t>(i),
-      });
-      spdlog::info(
-          "storage device id={} path={} blocks={} data-bytes={}",
-          label.device_id, options_.data_files[i],
-          capacity_blocks - DataBlockBegin(capacity_blocks),
-          (capacity_blocks - DataBlockBegin(capacity_blocks)) *
-              kStorageBlockBytes);
     }
-    std::sort(devices_.begin(), devices_.end(),
-              [](const StorageDevice& left, const StorageDevice& right) {
-                return left.id < right.id;
-              });
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      const std::size_t reserve = DefragReserveForDevice(device_index);
+      spdlog::info(
+          "storage device id={} path={} capacity-bytes={} data-blocks={} "
+          "foreground-blocks={} defrag-reserve-blocks={} data-bytes={}",
+          device.id, device.path,
+          device.capacity_blocks * kStorageBlockBytes,
+          device.data_block_count, device.data_block_count - reserve, reserve,
+          device.data_block_count * kStorageBlockBytes);
+    }
+    spdlog::info(
+        "storage capacity: data-blocks={} foreground-blocks={} "
+        "defrag-reserve-blocks={}",
+        total_data_blocks_, foreground_blocks,
+        total_data_blocks_ - foreground_blocks);
     direct_io_alignment_ = direct_io_alignment;
     if (options_.flush_size_bytes < direct_io_alignment_ ||
         options_.flush_size_bytes > kStorageBlockBytes ||
@@ -869,28 +971,21 @@ class StorageEngine::Impl {
                  options_.flush_size_bytes);
 
     worker_count_ = worker_count;
-    data_block_begin_ = DataBlockBegin(capacity_blocks);
-    if (data_block_begin_ >= capacity_blocks) {
-      return Status(StatusCode::kOutOfRange,
-                    "fixed metadata leaves no data blocks");
-    }
-    data_blocks_per_device_ = capacity_blocks - data_block_begin_;
-    total_data_blocks_ =
-        data_blocks_per_device_ * static_cast<std::uint64_t>(devices_.size());
     epoch_values_.assign(kEpochValueCount, 1);
     device_allocators_.clear();
     device_allocators_.reserve(devices_.size());
-    const std::size_t bitmap_bytes = ScanBitmapBytes(capacity_blocks);
-    const std::size_t bitmap_page_count =
-        ScanBitmapPageCount(capacity_blocks);
     for (std::size_t device_index = 0; device_index < devices_.size();
          ++device_index) {
       const StorageDevice& device = devices_[device_index];
+      const std::size_t bitmap_bytes =
+          ScanBitmapBytes(device.capacity_blocks);
+      const std::size_t bitmap_page_count =
+          ScanBitmapPageCount(device.capacity_blocks);
       auto allocator = std::make_unique<DeviceAllocator>();
       allocator->owner = static_cast<celer::WorkerId>(device_index %
                                                        worker_count_);
-      allocator->data_block_begin = data_block_begin_;
-      allocator->next_pristine = data_block_begin_;
+      allocator->data_block_begin = device.data_block_begin;
+      allocator->next_pristine = device.data_block_begin;
       allocator->scan_bitmap.resize(bitmap_bytes, std::byte{0});
       allocator->bitmap_pages.resize(bitmap_page_count);
       allocator->epoch_pages.resize(kEpochMetadataPageCount);
@@ -961,8 +1056,8 @@ class StorageEngine::Impl {
                       "close fixed metadata failed: " + device.path);
       }
 
-      for (std::uint64_t local = capacity_blocks;
-           local-- > data_block_begin_;) {
+      for (std::uint64_t local = device.capacity_blocks;
+           local-- > device.data_block_begin;) {
         const std::size_t byte_index = static_cast<std::size_t>(local / 8);
         const unsigned bit_index = static_cast<unsigned>(local % 8);
         if ((std::to_integer<unsigned>(
@@ -972,7 +1067,7 @@ class StorageEngine::Impl {
           break;
         }
       }
-      for (std::uint64_t local = data_block_begin_;
+      for (std::uint64_t local = device.data_block_begin;
            local < allocator->next_pristine; ++local) {
         const std::size_t byte_index = static_cast<std::size_t>(local / 8);
         const unsigned bit_index = static_cast<unsigned>(local % 8);
@@ -1020,6 +1115,7 @@ class StorageEngine::Impl {
             epoch_values_[kLogicalDatabaseCount + partition];
       }
     }
+    ConfigureWorkerDeviceAffinity();
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       db_epochs_[db_id].store(epoch_values_[db_id],
                               std::memory_order_relaxed);
@@ -1832,7 +1928,7 @@ class StorageEngine::Impl {
   std::pair<std::uint32_t, std::uint64_t> FileOffset(
       std::uint64_t block_id) const noexcept {
     const StorageDevice& device = devices_[DeviceIndexForBlock(block_id)];
-    assert(LocalBlockId(block_id) >= data_block_begin_);
+    assert(LocalBlockId(block_id) >= device.data_block_begin);
     assert(LocalBlockId(block_id) < device.capacity_blocks);
     return {device.file_index, LocalBlockOffset(block_id)};
   }
@@ -2155,12 +2251,43 @@ class StorageEngine::Impl {
     UnlockGuard unlock(&store.writer_mutex, store.worker);
     std::vector<RecordLocation> old_locations;
     old_locations.reserve(store.live_key_count[db_id]);
+    std::size_t staged_record_count = 0;
+    for (const auto& [block_id, records] : store.staged_records) {
+      (void)block_id;
+      staged_record_count += records.size();
+    }
+    absl::flat_hash_set<const RecordIndex::Entry*> retained_staged_entries;
+    retained_staged_entries.reserve(staged_record_count);
+    for (const auto& [block_id, records] : store.staged_records) {
+      (void)block_id;
+      for (const RecordIdentity& identity : records) {
+        if (identity.entry != nullptr) {
+          retained_staged_entries.insert(identity.entry);
+        }
+      }
+    }
     for (auto& partition : store.partitions) {
       auto& index = partition.indexes[db_id];
       index.ForEach([&](const RecordIndex::Entry& entry) {
         old_locations.push_back(entry.value);
+        retained_staged_entries.erase(&entry);
       });
-      index.Clear();
+    }
+    // A staged flush retains raw Entry pointers. Null affected pointers while
+    // the entries are still alive, before Clear destroys the index storage.
+    // Track only staged pointers here instead of building a set for every key
+    // in a potentially very large logical database.
+    for (auto& [block_id, records] : store.staged_records) {
+      (void)block_id;
+      for (RecordIdentity& identity : records) {
+        if (identity.entry != nullptr &&
+            !retained_staged_entries.contains(identity.entry)) {
+          identity.entry = nullptr;
+        }
+      }
+    }
+    for (auto& partition : store.partitions) {
+      partition.indexes[db_id].Clear();
       partition.live_key_count[db_id] = 0;
       const std::uint64_t sequence = ++partition.mutation_sequence;
       if (partition.capture_deltas) {
@@ -2182,6 +2309,7 @@ class StorageEngine::Impl {
         co_return dead;
       }
     }
+    SealDeadActiveBlock(store);
     co_return Status::Ok();
   }
 
@@ -2304,141 +2432,149 @@ class StorageEngine::Impl {
     }
     recovery.buffer.size = kStorageBlockBytes;
 
-    for (std::uint64_t linear = store.worker->id();
-         linear < total_data_blocks_; linear += worker_count_) {
-      const std::size_t device_index =
-          static_cast<std::size_t>(linear / data_blocks_per_device_);
-      const std::uint32_t local_block = static_cast<std::uint32_t>(
-          linear % data_blocks_per_device_ + data_block_begin_);
+    std::uint64_t device_linear_begin = 0;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
       const StorageDevice& device = devices_[device_index];
-      const std::uint64_t block_id = MakeBlockId(device.id, local_block);
-      const DeviceAllocator& allocator = *device_allocators_[device_index];
-      const std::size_t bitmap_byte = local_block / 8;
-      const unsigned bitmap_bit = local_block % 8;
-      if ((std::to_integer<unsigned>(allocator.scan_bitmap[bitmap_byte]) &
-           (1U << bitmap_bit)) == 0) {
-        ReportRecoveryProgress(0);
-        continue;
-      }
-      const std::uint32_t file_id = device.file_index;
-      const std::uint64_t block_offset =
-          static_cast<std::uint64_t>(local_block) * kStorageBlockBytes;
-      auto read = co_await ReadStorageBuffer(
-          *store.worker, store.files[file_id], header_buffer,
-          lease.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
-      if (*read != kBlockHeaderBytes) {
-        co_return Status(StatusCode::kInternal,
-                         "short read while scanning block header");
-      }
-      std::span<const std::byte, kBlockHeaderBytes> block_bytes(
-          header_buffer.data, kBlockHeaderBytes);
-      if (IsZero(block_bytes)) {
-        zero_blocks->push_back(block_id);
-        ReportRecoveryProgress(0);
-        continue;
-      }
-
-      read = co_await ReadStorageBuffer(
-          *store.worker, store.files[file_id], recovery.buffer,
-          recovery.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
-      if (*read != kStorageBlockBytes) {
-        co_return Status(StatusCode::kInternal,
-                         "short read while scanning committed block");
-      }
-
-      BlockHeader block{};
-      std::span<const std::byte, kBlockHeaderBytes> recovered_block_header(
-          recovery.buffer.data, kBlockHeaderBytes);
-      if (!DecodeBlockHeader(recovered_block_header, &block) ||
-          block.block_id != block_id) {
-        co_return Status(StatusCode::kInternal,
-                         "invalid or corrupt block header");
-      }
-      AtomicMax(&recovery_device_cursors_[device_index].next_local,
-                static_cast<std::uint64_t>(local_block) + 1);
-      AtomicMax(
-          &recovery_device_cursors_[device_index].next_allocation_epoch,
-          block.allocation_epoch + 1);
-      AtomicMax(&next_lsn_, block.max_lsn + 1);
-
-      const std::uint16_t block_owner =
-          RecoveredBlockOwner(block, block_id);
-      batches->at(block_owner).blocks.push_back(RecoveryBlock{ActiveBlock{
-          .block_id = block_id,
-          .writer_id = block.writer_id,
-          .layout_worker_count = block.layout_worker_count,
-          .allocation_epoch = block.allocation_epoch,
-          .committed_bytes = block.committed_bytes,
-          .record_count = block.record_count,
-          .max_lsn = block.max_lsn,
-      }});
-
-      std::uint32_t record_offset = kBlockHeaderBytes;
-      std::uint32_t records = 0;
-      while (record_offset < block.committed_bytes) {
-        RecordHeader record{};
-        std::string_view key;
-        std::span<const std::byte> record_bytes(
-            recovery.buffer.data + record_offset,
-            block.committed_bytes - record_offset);
-        if (!DecodeRecordHeader(record_bytes, &record, &key) ||
-            record.allocation_epoch != block.allocation_epoch ||
-            record.digest != ComputeDigest(key) ||
-            StorageShardForKey(key) % block.layout_worker_count !=
-                block.writer_id ||
-            record.relocation_sequence >
-                std::numeric_limits<std::uint32_t>::max() ||
-            record_offset + record.total_disk_bytes > block.committed_bytes) {
+      const std::uint64_t first_device_offset =
+          (store.worker->id() + worker_count_ -
+           device_linear_begin % worker_count_) %
+          worker_count_;
+      for (std::uint64_t device_offset = first_device_offset;
+           device_offset < device.data_block_count;
+           device_offset += worker_count_) {
+        const std::uint32_t local_block = static_cast<std::uint32_t>(
+            device.data_block_begin + device_offset);
+        const std::uint64_t block_id = MakeBlockId(device.id, local_block);
+        const DeviceAllocator& allocator = *device_allocators_[device_index];
+        const std::size_t bitmap_byte = local_block / 8;
+        const unsigned bitmap_bit = local_block % 8;
+        if ((std::to_integer<unsigned>(allocator.scan_bitmap[bitmap_byte]) &
+             (1U << bitmap_bit)) == 0) {
+          ReportRecoveryProgress(0);
+          continue;
+        }
+        const std::uint32_t file_id = device.file_index;
+        const std::uint64_t block_offset =
+            static_cast<std::uint64_t>(local_block) * kStorageBlockBytes;
+        auto read = co_await ReadStorageBuffer(
+            *store.worker, store.files[file_id], header_buffer,
+            lease.registered(), block_offset);
+        if (!read.ok()) {
+          co_return read.status();
+        }
+        if (*read != kBlockHeaderBytes) {
           co_return Status(StatusCode::kInternal,
-                           "invalid or corrupt committed record header");
+                           "short read while scanning block header");
         }
-        AtomicMax(&next_lsn_, record.lsn + 1);
-        if (record.db_epoch != DbEpoch(record.db_id)) {
-          record_offset += record.total_disk_bytes;
-          ++records;
+        std::span<const std::byte, kBlockHeaderBytes> block_bytes(
+            header_buffer.data, kBlockHeaderBytes);
+        if (IsZero(block_bytes)) {
+          zero_blocks->push_back(block_id);
+          ReportRecoveryProgress(0);
           continue;
         }
-        const std::uint16_t partition_id = RedisSlot(key);
-        if (record.replication_epoch !=
-            epoch_values_[kLogicalDatabaseCount + partition_id]) {
+
+        read = co_await ReadStorageBuffer(
+            *store.worker, store.files[file_id], recovery.buffer,
+            recovery.registered(), block_offset);
+        if (!read.ok()) {
+          co_return read.status();
+        }
+        if (*read != kStorageBlockBytes) {
+          co_return Status(StatusCode::kInternal,
+                           "short read while scanning committed block");
+        }
+
+        BlockHeader block{};
+        std::span<const std::byte, kBlockHeaderBytes> recovered_block_header(
+            recovery.buffer.data, kBlockHeaderBytes);
+        if (!DecodeBlockHeader(recovered_block_header, &block) ||
+            block.block_id != block_id) {
+          co_return Status(StatusCode::kInternal,
+                           "invalid or corrupt block header");
+        }
+        AtomicMax(&recovery_device_cursors_[device_index].next_local,
+                  static_cast<std::uint64_t>(local_block) + 1);
+        AtomicMax(
+            &recovery_device_cursors_[device_index].next_allocation_epoch,
+            block.allocation_epoch + 1);
+        AtomicMax(&next_lsn_, block.max_lsn + 1);
+
+        const std::uint16_t block_owner =
+            RecoveredBlockOwner(block, block_id);
+        batches->at(block_owner).blocks.push_back(RecoveryBlock{ActiveBlock{
+            .block_id = block_id,
+            .writer_id = block.writer_id,
+            .layout_worker_count = block.layout_worker_count,
+            .allocation_epoch = block.allocation_epoch,
+            .committed_bytes = block.committed_bytes,
+            .record_count = block.record_count,
+            .max_lsn = block.max_lsn,
+        }});
+
+        std::uint32_t record_offset = kBlockHeaderBytes;
+        std::uint32_t records = 0;
+        while (record_offset < block.committed_bytes) {
+          RecordHeader record{};
+          std::string_view key;
+          std::span<const std::byte> record_bytes(
+              recovery.buffer.data + record_offset,
+              block.committed_bytes - record_offset);
+          if (!DecodeRecordHeader(record_bytes, &record, &key) ||
+              record.allocation_epoch != block.allocation_epoch ||
+              record.digest != ComputeDigest(key) ||
+              StorageShardForKey(key) % block.layout_worker_count !=
+                  block.writer_id ||
+              record.relocation_sequence >
+                  std::numeric_limits<std::uint32_t>::max() ||
+              record_offset + record.total_disk_bytes > block.committed_bytes) {
+            co_return Status(StatusCode::kInternal,
+                             "invalid or corrupt committed record header");
+          }
+          AtomicMax(&next_lsn_, record.lsn + 1);
+          if (record.db_epoch != DbEpoch(record.db_id)) {
+            record_offset += record.total_disk_bytes;
+            ++records;
+            continue;
+          }
+          const std::uint16_t partition_id = RedisSlot(key);
+          if (record.replication_epoch !=
+              epoch_values_[kLogicalDatabaseCount + partition_id]) {
+            record_offset += record.total_disk_bytes;
+            ++records;
+            continue;
+          }
+          const unsigned key_owner = OwnerForKey(key);
+          batches->at(key_owner).records.push_back(RecoveryRecord{
+              .digest = record.digest,
+              .key = std::string(key),
+              .db_id = record.db_id,
+              .location = RecordLocation{
+                  .block_id = block_id,
+                  .replication_epoch = record.replication_epoch,
+                  .mutation_sequence = record.mutation_sequence,
+                  .allocation_epoch = record.allocation_epoch,
+                  .block_owner = block_owner,
+                  .record_offset = record_offset,
+                  .total_disk_bytes = record.total_disk_bytes,
+                  .value_bytes = record.value_bytes,
+                  .relocation_sequence = static_cast<std::uint32_t>(
+                      record.relocation_sequence),
+                  .kind = record.kind,
+              },
+          });
           record_offset += record.total_disk_bytes;
           ++records;
-          continue;
         }
-        const unsigned key_owner = OwnerForKey(key);
-        batches->at(key_owner).records.push_back(RecoveryRecord{
-            .digest = record.digest,
-            .key = std::string(key),
-            .db_id = record.db_id,
-            .location = RecordLocation{
-                .block_id = block_id,
-                .replication_epoch = record.replication_epoch,
-                .mutation_sequence = record.mutation_sequence,
-                .allocation_epoch = record.allocation_epoch,
-                .block_owner = block_owner,
-                .record_offset = record_offset,
-                .total_disk_bytes = record.total_disk_bytes,
-                .value_bytes = record.value_bytes,
-                .relocation_sequence = static_cast<std::uint32_t>(
-                    record.relocation_sequence),
-                .kind = record.kind,
-            },
-        });
-        record_offset += record.total_disk_bytes;
-        ++records;
+        if (record_offset != block.committed_bytes ||
+            records != block.record_count) {
+          co_return Status(StatusCode::kInternal,
+                           "block committed boundary does not match records");
+        }
+        ReportRecoveryProgress(records);
       }
-      if (record_offset != block.committed_bytes ||
-          records != block.record_count) {
-        co_return Status(StatusCode::kInternal,
-                         "block committed boundary does not match records");
-      }
-      ReportRecoveryProgress(records);
+      device_linear_begin += device.data_block_count;
     }
     co_return Status::Ok();
   }
@@ -2701,36 +2837,216 @@ class StorageEngine::Impl {
                           record.value_bytes};
   }
 
+  std::uint64_t ForegroundBlocksForDevice(
+      std::size_t device_index) const noexcept {
+    const std::uint64_t data_blocks = devices_[device_index].data_block_count;
+    const std::size_t reserve = DefragReserveForDevice(device_index);
+    return data_blocks > reserve ? data_blocks - reserve : 0;
+  }
+
+  void ConfigureDefragReserves() {
+    defrag_reserve_blocks_.assign(devices_.size(),
+                                  kDefragReserveBlocksPerDevice);
+  }
+
+  void ConfigureWorkerDeviceAffinity() {
+    std::vector<std::size_t> usable_devices;
+    std::uint64_t total_weight = 0;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const std::uint64_t weight =
+          ForegroundBlocksForDevice(device_index);
+      if (weight != 0) {
+        usable_devices.push_back(device_index);
+        total_weight += weight;
+      }
+    }
+    assert(!usable_devices.empty());
+
+    if (worker_count_ >= usable_devices.size()) {
+      std::vector<unsigned> quotas(devices_.size(), 0);
+      for (const std::size_t device_index : usable_devices) {
+        quotas[device_index] = 1;
+      }
+      const unsigned remaining_workers =
+          worker_count_ - static_cast<unsigned>(usable_devices.size());
+      std::vector<std::pair<std::uint64_t, std::size_t>> remainders;
+      remainders.reserve(usable_devices.size());
+      unsigned assigned_workers =
+          static_cast<unsigned>(usable_devices.size());
+      for (const std::size_t device_index : usable_devices) {
+        const std::uint64_t weighted =
+            remaining_workers * ForegroundBlocksForDevice(device_index);
+        quotas[device_index] +=
+            static_cast<unsigned>(weighted / total_weight);
+        assigned_workers +=
+            static_cast<unsigned>(weighted / total_weight);
+        remainders.emplace_back(weighted % total_weight, device_index);
+      }
+      std::sort(remainders.begin(), remainders.end(),
+                [](const auto& left, const auto& right) {
+                  if (left.first != right.first) {
+                    return left.first > right.first;
+                  }
+                  return left.second < right.second;
+                });
+      for (unsigned i = assigned_workers; i < worker_count_; ++i) {
+        ++quotas[remainders[i - assigned_workers].second];
+      }
+
+      std::vector<unsigned> quota_remaining = quotas;
+      std::vector<std::int64_t> smooth_current(devices_.size(), 0);
+      for (unsigned worker = 0; worker < worker_count_; ++worker) {
+        std::size_t selected = usable_devices.front();
+        bool selected_valid = false;
+        for (const std::size_t device_index : usable_devices) {
+          smooth_current[device_index] += quotas[device_index];
+          if (quota_remaining[device_index] != 0 &&
+              (!selected_valid || smooth_current[device_index] >
+                                      smooth_current[selected])) {
+            selected = device_index;
+            selected_valid = true;
+          }
+        }
+        assert(selected_valid);
+        smooth_current[selected] -= worker_count_;
+        --quota_remaining[selected];
+        stores_[worker]->home_devices.push_back(selected);
+      }
+    } else {
+      std::sort(usable_devices.begin(), usable_devices.end(),
+                [this](std::size_t left, std::size_t right) {
+                  return ForegroundBlocksForDevice(left) >
+                         ForegroundBlocksForDevice(right);
+                });
+      std::vector<std::uint64_t> worker_weights(worker_count_, 0);
+      for (const std::size_t device_index : usable_devices) {
+        const auto lightest = std::min_element(worker_weights.begin(),
+                                               worker_weights.end());
+        const unsigned worker =
+            static_cast<unsigned>(lightest - worker_weights.begin());
+        stores_[worker]->home_devices.push_back(device_index);
+        *lightest += ForegroundBlocksForDevice(device_index);
+      }
+    }
+
+    std::vector<unsigned> home_workers(devices_.size(), 0);
+    for (auto& store : stores_) {
+      assert(!store->home_devices.empty());
+      store->home_device_allocations.assign(store->home_devices.size(), 0);
+      for (const std::size_t device_index : store->home_devices) {
+        ++home_workers[device_index];
+      }
+    }
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      spdlog::info(
+          "storage device id={} foreground-weight={} home-workers={}",
+          devices_[device_index].id,
+          ForegroundBlocksForDevice(device_index),
+          home_workers[device_index]);
+    }
+  }
+
   Task<StatusOr<ReservedBlock>> AllocateBlock(WorkerStore& store,
                                               bool for_defrag) {
     const std::size_t device_count = devices_.size();
-    const celer::WorkerId worker_id = store.worker->id();
-    std::size_t first = worker_id % device_count;
-    if (device_count > worker_count_) {
-      const std::size_t home_device_count =
-          (device_count - 1 - worker_id) / worker_count_ + 1;
-      const std::size_t home = static_cast<std::size_t>(
-          store.next_device_choice++ % home_device_count);
-      first = worker_id + home * worker_count_;
+    std::vector<std::size_t> home_order(store.home_devices.size());
+    for (std::size_t i = 0; i < home_order.size(); ++i) {
+      home_order[i] = i;
     }
-    for (std::size_t attempt = 0; attempt < device_count; ++attempt) {
-      const std::size_t device_index = (first + attempt) % device_count;
-      auto allocated = co_await AllocateFromDevice(device_index, for_defrag);
-      if (allocated.ok()) {
-        co_return *allocated;
-      }
-      if (allocated.status().code() != StatusCode::kResourceExhausted) {
-        co_return allocated.status();
+    std::sort(home_order.begin(), home_order.end(),
+              [this, &store](std::size_t left, std::size_t right) {
+                const long double left_score =
+                    static_cast<long double>(
+                        store.home_device_allocations[left] + 1) /
+                    static_cast<long double>(ForegroundBlocksForDevice(
+                        store.home_devices[left]));
+                const long double right_score =
+                    static_cast<long double>(
+                        store.home_device_allocations[right] + 1) /
+                    static_cast<long double>(ForegroundBlocksForDevice(
+                        store.home_devices[right]));
+                return left_score < right_score;
+              });
+    std::vector<std::size_t> attempt_order;
+    attempt_order.reserve(device_count);
+    std::vector<bool> included(device_count, false);
+    for (const std::size_t home_index : home_order) {
+      const std::size_t device_index = store.home_devices[home_index];
+      attempt_order.push_back(device_index);
+      included[device_index] = true;
+    }
+    for (std::size_t device_index = 0; device_index < device_count;
+         ++device_index) {
+      if (!included[device_index]) {
+        attempt_order.push_back(device_index);
       }
     }
-    co_return Status(StatusCode::kResourceExhausted,
-                     "no foreground blocks remain; defrag reserve is protected");
+    while (true) {
+      if (store.write_failed ||
+          epoch_metadata_failed_.load(std::memory_order_acquire)) {
+        co_return Status(StatusCode::kFailedPrecondition,
+                         "storage writer is stopped after an IO failure");
+      }
+      const std::uint64_t generation_before =
+          space_reclaim_generation_.load(std::memory_order_acquire);
+      for (const std::size_t device_index : attempt_order) {
+        auto allocated = co_await AllocateFromDevice(device_index, for_defrag);
+        if (allocated.ok()) {
+          auto home = std::find(store.home_devices.begin(),
+                                store.home_devices.end(), device_index);
+          if (home != store.home_devices.end()) {
+            const std::size_t home_index =
+                static_cast<std::size_t>(home - store.home_devices.begin());
+            ++store.home_device_allocations[home_index];
+          }
+          co_return *allocated;
+        }
+        if (allocated.status().code() != StatusCode::kResourceExhausted) {
+          co_return allocated.status();
+        }
+      }
+
+      // Defrag allocations consume the protected reserve. Waiting for another
+      // defrag from inside DefragOne would deadlock when the reserve is truly
+      // exhausted, so only foreground allocation waits for reclaim progress.
+      if (for_defrag) {
+        co_return Status(StatusCode::kResourceExhausted,
+                         "defrag reserve is exhausted");
+      }
+
+      const std::uint64_t generation_after =
+          space_reclaim_generation_.load(std::memory_order_acquire);
+      if (generation_after != generation_before) {
+        continue;
+      }
+      if (active_defrags_.load(std::memory_order_acquire) != 0 ||
+          pending_defrags_.load(std::memory_order_acquire) != 0 ||
+          active_flushes_.load(std::memory_order_acquire) != 0) {
+        Status waited = co_await celer::SleepFor(
+            *store.worker, std::chrono::milliseconds(1));
+        if (!waited.ok()) {
+          co_return waited;
+        }
+        continue;
+      }
+      // Close the race where the final defrag completed between the active
+      // count and generation observations. Return FULL only from a stable
+      // snapshot with no reclaim work in progress.
+      if (space_reclaim_generation_.load(std::memory_order_acquire) !=
+          generation_after) {
+        continue;
+      }
+      co_return Status(
+          StatusCode::kResourceExhausted,
+          "no foreground blocks remain and no flush or defrag can reclaim space");
+    }
   }
 
   std::size_t DefragReserveForDevice(std::size_t device_index) const noexcept {
-    const std::size_t device_count = devices_.size();
-    return kDefragReserveBlocks / device_count +
-           (device_index < kDefragReserveBlocks % device_count ? 1 : 0);
+    assert(device_index < defrag_reserve_blocks_.size());
+    return defrag_reserve_blocks_[device_index];
   }
 
   Status MarkRecordDeadLocal(unsigned owner,
@@ -3164,6 +3480,18 @@ class StorageEngine::Impl {
     }
   }
 
+  void SealDeadActiveBlock(WorkerStore& store) {
+    if (!store.active_block.has_value()) {
+      return;
+    }
+    BlockState* state = FindBlockState(store, store.active_block->block_id);
+    if (state == nullptr || state->live_bytes != 0) {
+      return;
+    }
+    RequestFlush(store, store.active_block->block_id);
+    store.active_block.reset();
+  }
+
   Task<Status> FlushWorkerForShutdown(WorkerStore* store) {
     while (active_defrags_.load(std::memory_order_acquire) != 0) {
       Status status = co_await celer::SleepFor(
@@ -3252,10 +3580,20 @@ class StorageEngine::Impl {
       return;
     }
     store.flush_running = true;
+    active_flushes_.fetch_add(1, std::memory_order_acq_rel);
     store.worker->Spawn(FlushPendingBlocks(&store));
   }
 
   Task<Status> FlushPendingBlocks(WorkerStore* store) {
+    struct FlushRunGuard {
+      Impl* engine = nullptr;
+      ~FlushRunGuard() {
+        engine->space_reclaim_generation_.fetch_add(
+            1, std::memory_order_release);
+        engine->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
+      }
+    } flush_run_guard{this};
+
     struct PendingFlush {
       std::uint64_t block_id = 0;
       std::uint32_t committed_bytes = 0;
@@ -3404,7 +3742,9 @@ class StorageEngine::Impl {
       }
 
       for (const RecordIdentity& identity : pending->staged_records) {
-        assert(identity.entry != nullptr);
+        if (identity.entry == nullptr) {
+          continue;
+        }
         RecordLocation& current = identity.entry->value;
         if (current.block_id == pending->block_id &&
             current.allocation_epoch == pending->allocation_epoch) {
@@ -3458,29 +3798,118 @@ class StorageEngine::Impl {
     RequestDefrag(store);
   }
 
-  void RequestDefrag(WorkerStore& store) {
+  bool TryAcquireDefragPermit(std::size_t device_index) {
+    std::atomic<unsigned>& device_active =
+        active_defrags_by_device_[device_index];
+    unsigned active = device_active.load(std::memory_order_acquire);
+    while (active < kDefragPermitsPerDevice) {
+      if (device_active.compare_exchange_weak(
+              active, active + 1, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        active_defrags_.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void ReleaseDefragPermit(std::size_t device_index) {
+    active_defrags_by_device_[device_index].fetch_sub(
+        1, std::memory_order_acq_rel);
+    active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  Task<Status> StartQueuedDefrag(unsigned worker_id,
+                                 std::size_t device_index) {
+    WorkerStore& store = *stores_[worker_id];
+    if (!store.defrag_waiting ||
+        store.defrag_waiting_device != device_index) {
+      ReleaseDefragPermit(device_index);
+      co_return Status::Ok();
+    }
+    store.defrag_waiting = false;
     if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
-        store.defrag_running || store.defrag_queue.empty()) {
-      return;
+        store.defrag_running || store.defrag_queue.empty() ||
+        DeviceIndexForBlock(store.defrag_queue.front()) != device_index) {
+      ReleaseDefragPermit(device_index);
+      RequestDefrag(store);
+      co_return Status::Ok();
     }
     store.defrag_running = true;
-    active_defrags_.fetch_add(1, std::memory_order_acq_rel);
+    store.active_defrag_device = device_index;
     store.worker->Spawn(DefragOne(&store));
+    co_return Status::Ok();
+  }
+
+  Task<Status> WakeQueuedDefrags(std::size_t device_index) {
+    while (TryAcquireDefragPermit(device_index)) {
+      std::uint16_t worker_id = 0;
+      if (!defrag_ready_by_device_[device_index].try_dequeue(worker_id)) {
+        ReleaseDefragPermit(device_index);
+        co_return Status::Ok();
+      }
+      pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
+      Status started = worker_id == celer::ThisWorker().id
+                           ? co_await StartQueuedDefrag(worker_id,
+                                                        device_index)
+                           : co_await celer::SubmitTaskTo(
+                                 worker_id,
+                                 [this, worker_id,
+                                  device_index]() -> Task<Status> {
+                                   co_return co_await StartQueuedDefrag(
+                                       worker_id, device_index);
+                                 });
+      if (!started.ok()) {
+        ReleaseDefragPermit(device_index);
+        co_return started;
+      }
+    }
+    co_return Status::Ok();
+  }
+
+  void RequestDefrag(WorkerStore& store) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
+        store.defrag_running || store.defrag_waiting ||
+        store.defrag_queue.empty()) {
+      return;
+    }
+    const std::size_t device_index =
+        DeviceIndexForBlock(store.defrag_queue.front());
+    store.defrag_waiting = true;
+    store.defrag_waiting_device = device_index;
+    pending_defrags_.fetch_add(1, std::memory_order_acq_rel);
+    if (!defrag_ready_by_device_[device_index].enqueue(store.worker->id())) {
+      pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
+      store.defrag_waiting = false;
+      spdlog::error(
+          "worker[{}] failed to enqueue defrag request for device {}",
+          store.worker->id(), devices_[device_index].id);
+      return;
+    }
+    store.worker->Spawn(WakeQueuedDefrags(device_index));
+  }
+
+  void FinishDefragPass(WorkerStore& store) {
+    const std::size_t completed_device = store.active_defrag_device;
+    store.defrag_running = false;
+    // Queue this worker's next candidate before releasing the active permit,
+    // so foreground allocation never observes a false no-reclaim gap.
+    RequestDefrag(store);
+    space_reclaim_generation_.fetch_add(1, std::memory_order_release);
+    ReleaseDefragPermit(completed_device);
+    store.worker->Spawn(WakeQueuedDefrags(completed_device));
   }
 
   Task<Status> DefragOne(WorkerStore* store) {
     if (store->defrag_queue.empty()) {
-      store->defrag_running = false;
-      active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
+      FinishDefragPass(*store);
       co_return Status::Ok();
     }
     const std::uint64_t candidate = store->defrag_queue.front();
     store->defrag_queue.pop_front();
     BlockState* candidate_state = FindBlockState(*store, candidate);
     if (candidate_state == nullptr) {
-      store->defrag_running = false;
-      active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
-      RequestDefrag(*store);
+      FinishDefragPass(*store);
       co_return Status::Ok();
     }
     candidate_state->defrag_queued = false;
@@ -3490,11 +3919,10 @@ class StorageEngine::Impl {
       spdlog::error("worker[{}] defrag block {} failed: {}",
                     store->worker->id(), candidate, status.message());
     }
-    store->defrag_running = false;
-    active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
-    if (status.ok()) {
-      RequestDefrag(*store);
+    if (status.code() == StatusCode::kResourceExhausted) {
+      MaybeQueueDefrag(*store, candidate);
     }
+    FinishDefragPass(*store);
     co_return status;
   }
 
@@ -3712,11 +4140,13 @@ class StorageEngine::Impl {
 
   StorageEngineOptions options_;
   unsigned worker_count_ = 0;
-  std::uint32_t data_block_begin_ = 1;
-  std::uint64_t data_blocks_per_device_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
   std::vector<std::unique_ptr<DeviceAllocator>> device_allocators_;
+  std::vector<std::size_t> defrag_reserve_blocks_;
+  std::unique_ptr<std::atomic<unsigned>[]> active_defrags_by_device_;
+  std::unique_ptr<moodycamel::ConcurrentQueue<std::uint16_t>[]>
+      defrag_ready_by_device_;
   std::unique_ptr<RecoveryDeviceCursor[]> recovery_device_cursors_;
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
@@ -3731,10 +4161,14 @@ class StorageEngine::Impl {
   std::atomic<std::int64_t> recovery_next_log_ms_{0};
   std::atomic<bool> recovery_complete_logged_{false};
   std::int64_t recovery_started_ms_ = 0;
-  static constexpr std::size_t kDefragReserveBlocks = 8;
+  static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
+  static constexpr unsigned kDefragPermitsPerDevice = 8;
   std::atomic<std::uint64_t> next_lsn_{1};
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
   std::atomic<unsigned> active_defrags_{0};
+  std::atomic<unsigned> pending_defrags_{0};
+  std::atomic<unsigned> active_flushes_{0};
+  std::atomic<std::uint64_t> space_reclaim_generation_{0};
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};
   std::atomic<bool> shutdown_flush_failed_{false};

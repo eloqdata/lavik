@@ -22,7 +22,6 @@ int main(int argc, char** argv) {
   unsigned flush_size_kb = 8192;
   bool disable_read_crc = false;
   std::vector<std::string> data_files{"keylane.data"};
-  std::uint64_t data_file_size_mb = 1024;
   std::uint16_t replication_port = 0;
   std::string replicate_to;
   bool replica_read_only = false;
@@ -57,12 +56,8 @@ int main(int argc, char** argv) {
   app.add_flag("--disable-read-crc", disable_read_crc,
                "Skip payload CRC32C verification on GET reads");
   app.add_option("--data-file", data_files,
-                 "Data file path; repeat for multiple files")
+                 "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
-  app.add_option("--data-file-size-mb", data_file_size_mb,
-                 "Preallocated size of each data file in MiB")
-      ->capture_default_str()
-      ->check(CLI::PositiveNumber);
   app.add_option("--replication-port", replication_port,
                  "Internal replication listen port (0 disables receiver)")
       ->capture_default_str()
@@ -81,9 +76,7 @@ int main(int argc, char** argv) {
   constexpr std::size_t kMiB = 1024 * 1024;
   constexpr std::size_t kKiB = 1024;
   if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
-      flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB ||
-      data_file_size_mb >
-          std::numeric_limits<std::uint64_t>::max() / kMiB) {
+      flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB) {
     return 2;
   }
   keylane::ReplicationOptions replication_options;
@@ -113,6 +106,6 @@ int main(int argc, char** argv) {
                             flush_max_ms,
                             static_cast<std::size_t>(flush_size_kb) * kKiB,
                             !disable_read_crc,
-                            data_files, data_file_size_mb * kMiB,
+                            data_files,
                             std::move(replication_options));
 }

@@ -6,18 +6,28 @@ write path.
 
 ## Configuration
 
-Repeat `--data-file` once per file or block device. Every configured device
-currently uses the same fixed `--data-file-size-mb` capacity.
+Repeat `--data-file` once per existing regular file or block device. Keylane
+does not create, extend, truncate, or preallocate storage paths during startup.
+Regular files should be provisioned explicitly by the deployment layer, for
+example with `fallocate`.
 
 ```text
+fallocate -l 1T /var/lib/keylane/data-0
+fallocate -l 2T /var/lib/keylane/data-1
 keylane \
-  --data-file /dev/nvme0n1 \
-  --data-file /dev/nvme1n1 \
-  --data-file-size-mb 1048576
+  --data-file /var/lib/keylane/data-0 \
+  --data-file /var/lib/keylane/data-1
 ```
 
-Capacity must be an 8 MiB multiple and cannot exceed 1 PiB per device. For a
-raw block device, Keylane verifies that its actual size is sufficient.
+A fresh regular file must be an 8 MiB multiple. A fresh raw block device uses
+all complete 8 MiB blocks and ignores a tail smaller than one block. Capacity
+cannot exceed 1 PiB per device. Initialized paths use the capacity persisted in
+their device label: a smaller backing object is rejected, while newly added
+tail capacity is ignored until online expansion has an explicit design.
+
+Every device must have room for fixed metadata, an eight-block defrag reserve,
+and at least one foreground data block. With the current metadata layout this
+makes 80 MiB the minimum size of every device.
 
 ## Persistent identity and block IDs
 
@@ -65,15 +75,27 @@ zeroed block to the same owner and keeps its bit set for cheap warm reuse.
 
 Each worker has at most one active block plus one prefetched standby ID.
 
-- With at least as many workers as devices, worker `w` first tries
-  `w % device_count`.
-- With more devices than workers, a worker round-robins its interleaved subset
-  (`w`, `w + worker_count`, ...).
+- Every device protects its last eight allocatable blocks for defrag. Device
+  weight is its remaining foreground data-block count after that reserve.
+- With at least as many workers as usable devices, every device gets one home
+  worker and remaining workers are apportioned by weight.
+- With more usable devices than workers, devices are greedily grouped to keep
+  aggregate group weights balanced. A worker chooses within its group by the
+  lowest allocated-blocks/weight ratio.
 - Allocation falls back to other devices when the preferred device is full.
 
 The standby request starts when an active block reaches 75% occupancy. This
 keeps the usual rollover off the latency-critical path without reserving an
-8 MiB memory buffer per standby or per device.
+8 MiB memory buffer per standby or per device. Weighting is computed at startup
+and allocation counters are worker-local; the hot path does not read a shared
+global free-space counter.
+
+Defrag scheduling is also per device. A device has its own ready queue and up
+to eight active defrag permits, matching its eight-block reserve. A source
+block is queued on the device that contains it, so a busy or full device does
+not consume another device's permits. The reserve is capacity, not eight fixed
+block identities: defrag consumes a ready destination, returns the cleaned
+source, and the protected free space rotates over time.
 
 ## Recovery and worker-count changes
 
