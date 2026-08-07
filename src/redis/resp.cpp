@@ -9,7 +9,7 @@ using namespace celer;
 namespace {
 
 constexpr std::size_t kMaxArrayLen = 1024;
-constexpr std::size_t kMaxBulkLen = 1024 * 1024;
+constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 
 }  // namespace
 

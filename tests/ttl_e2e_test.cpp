@@ -278,7 +278,7 @@ int main(int argc, char** argv) {
 
   try {
     const std::uint16_t port = FindFreePort();
-    CreateDataFile(data_path, 96ULL * 1024 * 1024);
+    CreateDataFile(data_path, 192ULL * 1024 * 1024);
     {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
@@ -392,6 +392,13 @@ int main(int argc, char** argv) {
              "+OK", "restart-live SET");
       Expect(client.Command({"SET", "restart-dead", "v", "PX", "50"}),
              "+OK", "restart-dead SET");
+      const std::string large_value(9ULL * 1024 * 1024, 'L');
+      Expect(client.Command({"SET", "restart-large", large_value}), "+OK",
+             "large SET");
+      Expect(client.Command({"STRLEN", "restart-large"}), ":9437184",
+             "large STRLEN");
+      Expect(client.Command({"GET", "restart-large"}),
+             "$9437184\r\n" + large_value, "large GET");
       server.Stop();
     }
 
@@ -408,6 +415,20 @@ int main(int argc, char** argv) {
       ExpectRange(IntegerReply(client.Command({"PTTL", "restart-live"}),
                                "restart-live PTTL"),
                   1, 5000, "restart live TTL");
+      Expect(client.Command({"STRLEN", "restart-large"}), ":9437184",
+             "recovered large STRLEN");
+      Expect(client.Command({"SET", "restart-large", "small"}), "+OK",
+             "large to small overwrite");
+      Expect(client.Command({"GET", "restart-large"}), "$5\r\nsmall",
+             "large to small GET");
+      server.Stop();
+    }
+
+    {
+      ServerProcess server(argv[1], port, data_path, log_path);
+      RespClient client = Connect(port);
+      Expect(client.Command({"GET", "restart-large"}), "$5\r\nsmall",
+             "large extent reclaim restart");
       server.Stop();
     }
 

@@ -68,6 +68,7 @@ CommandKind MatchCommandKind(std::string_view name) {
       if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
       if (CmpCaseInsensitive(name, "SELECT")) return CommandKind::kSelect;
       if (CmpCaseInsensitive(name, "EXPIRE")) return CommandKind::kExpire;
+      if (CmpCaseInsensitive(name, "STRLEN")) return CommandKind::kStrlen;
       break;
     case 7:
       if (CmpCaseInsensitive(name, "FLUSHDB")) return CommandKind::kFlushDb;
@@ -134,6 +135,7 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
     case CommandKind::kFlushDb:
     case CommandKind::kScan:
     case CommandKind::kGet:
+    case CommandKind::kStrlen:
     case CommandKind::kIncr:
     case CommandKind::kSet:
     case CommandKind::kExpire:
@@ -659,6 +661,29 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       co_return reply;
     }
 
+    case CommandKind::kStrlen: {
+      if (args.size() != 2) {
+        reply.encoded =
+            EncodeError("ERR wrong number of arguments for 'strlen' command");
+        co_return reply;
+      }
+      auto length =
+          co_await g_storage->StringLength(request.db_id, args[1]);
+      if (!length.ok()) {
+        if (length.status().code() == StatusCode::kNotFound) {
+          reply.encoded = EncodeInteger(0);
+        } else {
+          reply.encoded = EncodeStorageError(length.status());
+        }
+      } else if (*length > static_cast<std::uint64_t>(
+                                std::numeric_limits<long long>::max())) {
+        reply.encoded = EncodeError("ERR String length exceeds RESP range");
+      } else {
+        reply.encoded = EncodeInteger(static_cast<long long>(*length));
+      }
+      co_return reply;
+    }
+
     case CommandKind::kTtl:
     case CommandKind::kPttl: {
       const bool milliseconds = request.kind == CommandKind::kPttl;
@@ -851,6 +876,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
                        request.kind == CommandKind::kDel ||
                        request.kind == CommandKind::kExists ||
                        request.kind == CommandKind::kGet ||
+                       request.kind == CommandKind::kStrlen ||
                        request.kind == CommandKind::kSet ||
                        request.kind == CommandKind::kIncr ||
                        request.kind == CommandKind::kExpire ||
@@ -879,6 +905,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
       co_return co_await RouteMultiKey(request);
 
     case CommandKind::kGet:
+    case CommandKind::kStrlen:
     case CommandKind::kSet:
     case CommandKind::kIncr:
     case CommandKind::kExpire:

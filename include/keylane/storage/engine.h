@@ -41,6 +41,9 @@ struct SnapshotRecord {
     kValue = 1,
     kDelete = 2,
     kFlushDb = 3,
+    kValueBegin = 4,
+    kValueChunk = 5,
+    kValueCommit = 6,
   };
 
   Kind kind = Kind::kValue;
@@ -49,6 +52,9 @@ struct SnapshotRecord {
   std::uint64_t mutation_sequence = 0;
   std::uint64_t expire_at_ms = 0;
   ValueType value_type = ValueType::kNone;
+  std::uint64_t logical_size = 0;
+  std::uint32_t chunk_index = 0;
+  std::uint32_t chunk_count = 0;
   std::string key;
   std::string value;
 };
@@ -191,6 +197,8 @@ class StorageEngine {
   celer::Task<celer::StatusOr<DiskValue>> Get(
       std::uint8_t db_id, std::string_view key,
       ReadLatencyTrace* trace = nullptr);
+  celer::Task<celer::StatusOr<std::uint64_t>> StringLength(
+      std::uint8_t db_id, std::string_view key);
   celer::Task<celer::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {});

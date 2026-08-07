@@ -97,6 +97,21 @@ int main() {
   assert(decoded_header.block_id == block_id);
   assert(decoded_header.allocation_epoch == header.allocation_epoch);
 
+  BlockHeader extent_header = header;
+  extent_header.kind = BlockKind::kValueExtent;
+  extent_header.committed_bytes = kBlockHeaderBytes + 1234;
+  extent_header.extent_index = 2;
+  extent_header.extent_payload_bytes = 1234;
+  extent_header.extent_payload_checksum = 0x12345678U;
+  EncodeBlockHeader(extent_header, block_page);
+  assert(DecodeBlockHeader(block_page, &decoded_header));
+  assert(decoded_header.kind == BlockKind::kValueExtent);
+  assert(decoded_header.extent_index == extent_header.extent_index);
+  assert(decoded_header.extent_payload_bytes ==
+         extent_header.extent_payload_bytes);
+  assert(decoded_header.extent_payload_checksum ==
+         extent_header.extent_payload_checksum);
+
   constexpr std::string_view key = "typed-expiring-key";
   constexpr std::string_view value = "value";
   const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
@@ -107,11 +122,11 @@ int main() {
       .kind = RecordKind::kValue,
       .db_id = 3,
       .value_type = ValueType::kString,
-      .reserved = 0,
+      .external = false,
       .digest = ComputeDigest(key),
       .key_bytes = static_cast<std::uint32_t>(key.size()),
-      .value_bytes = static_cast<std::uint32_t>(value.size()),
-      .value_disk_bytes = static_cast<std::uint32_t>(value.size()),
+      .logical_size = value.size(),
+      .payload_bytes = static_cast<std::uint32_t>(value.size()),
       .total_disk_bytes = static_cast<std::uint32_t>(
           AlignRecord(record_header_bytes + value.size())),
       .generation = 4,
@@ -136,11 +151,31 @@ int main() {
       &decoded_record, &decoded_key));
   assert(decoded_key == key);
   assert(decoded_record.value_type == ValueType::kString);
+  assert(!decoded_record.external);
   assert(decoded_record.expire_at_ms == record.expire_at_ms);
   record_page[record_header_bytes - 1] ^= std::byte{1};
   assert(!DecodeRecordHeader(
       std::span<const std::byte>(record_page.data(), record_header_bytes),
       &decoded_record, &decoded_key));
+
+  RecordHeader external_record = record;
+  external_record.external = true;
+  external_record.logical_size = 9ULL * 1024 * 1024;
+  external_record.payload_bytes = sizeof(ExtentManifestHeader) +
+                                  2 * sizeof(ExtentRef);
+  external_record.total_disk_bytes = static_cast<std::uint32_t>(AlignRecord(
+      record_header_bytes + external_record.payload_bytes));
+  std::fill(record_page.begin(), record_page.end(), std::byte{0});
+  assert(EncodeRecordHeader(
+      external_record, key,
+      std::span<std::byte>(record_page.data(), record_header_bytes)));
+  assert(DecodeRecordHeader(
+      std::span<const std::byte>(record_page.data(), record_header_bytes),
+      &decoded_record, &decoded_key));
+  assert(decoded_record.external);
+  assert(decoded_record.value_type == ValueType::kString);
+  assert(decoded_record.logical_size == external_record.logical_size);
+  assert(decoded_record.payload_bytes == external_record.payload_bytes);
 
   return 0;
 }

@@ -168,7 +168,7 @@ Status DecodeStatus(BytesView response, Reader* reader) {
 }
 
 std::size_t EncodedRecordBytes(const SnapshotRecord& record) {
-  return 1 + 1 + 1 + 8 + 8 + 8 + 4 + 4 + record.key.size() +
+  return 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + record.key.size() +
          record.value.size();
 }
 
@@ -195,6 +195,9 @@ bool EncodeRecords(std::uint16_t partition_id, std::uint64_t epoch,
     PutU64(*output, record.db_epoch);
     PutU64(*output, record.mutation_sequence);
     PutU64(*output, record.expire_at_ms);
+    PutU64(*output, record.logical_size);
+    PutU32(*output, record.chunk_index);
+    PutU32(*output, record.chunk_count);
     PutU32(*output, static_cast<std::uint32_t>(record.key.size()));
     PutU32(*output, static_cast<std::uint32_t>(record.value.size()));
     PutString(*output, record.key);
@@ -229,9 +232,12 @@ DecodeRecords(BytesView payload) {
         !reader.U64(&record.db_epoch) ||
         !reader.U64(&record.mutation_sequence) ||
         !reader.U64(&record.expire_at_ms) ||
+        !reader.U64(&record.logical_size) ||
+        !reader.U32(&record.chunk_index) ||
+        !reader.U32(&record.chunk_count) ||
         !reader.U32(&key_size) || !reader.U32(&value_size) ||
         kind < static_cast<std::uint8_t>(SnapshotRecord::Kind::kValue) ||
-        kind > static_cast<std::uint8_t>(SnapshotRecord::Kind::kFlushDb) ||
+        kind > static_cast<std::uint8_t>(SnapshotRecord::Kind::kValueCommit) ||
         record.db_id >= storage::kLogicalDatabaseCount ||
         value_type >
             static_cast<std::uint8_t>(storage::ValueType::kStream) ||
@@ -242,9 +248,13 @@ DecodeRecords(BytesView payload) {
     }
     record.kind = static_cast<SnapshotRecord::Kind>(kind);
     record.value_type = static_cast<storage::ValueType>(value_type);
-    if ((record.kind == SnapshotRecord::Kind::kValue &&
-         record.value_type == storage::ValueType::kNone) ||
-        (record.kind != SnapshotRecord::Kind::kValue &&
+    const bool value_frame =
+        record.kind == SnapshotRecord::Kind::kValue ||
+        record.kind == SnapshotRecord::Kind::kValueBegin ||
+        record.kind == SnapshotRecord::Kind::kValueChunk ||
+        record.kind == SnapshotRecord::Kind::kValueCommit;
+    if ((value_frame && record.value_type == storage::ValueType::kNone) ||
+        (!value_frame &&
          (record.value_type != storage::ValueType::kNone ||
           record.expire_at_ms != 0))) {
       return Status(StatusCode::kInvalidArgument,
@@ -398,6 +408,50 @@ class ReplicationManager::Impl {
     if (records.empty()) co_return Status::Ok();
     std::size_t begin = 0;
     while (begin < records.size()) {
+      if (EncodedRecordBytes(records[begin]) + 2 + 8 + 4 >
+          kMaxApplyPayload) {
+        const SnapshotRecord& large = records[begin];
+        if (large.kind != SnapshotRecord::Kind::kValue ||
+            large.value.size() > storage::kMaxStringBytes) {
+          co_return Status(StatusCode::kOutOfRange,
+                           "replicated record exceeds RPC payload limit");
+        }
+        const std::uint32_t chunk_count = static_cast<std::uint32_t>(
+            (large.value.size() + storage::kExtentPayloadBytes - 1) /
+            storage::kExtentPayloadBytes);
+        SnapshotRecord frame = large;
+        frame.kind = SnapshotRecord::Kind::kValueBegin;
+        frame.logical_size = large.value.size();
+        frame.chunk_index = 0;
+        frame.chunk_count = chunk_count;
+        frame.value.clear();
+        Status sent = co_await ApplyRemote(
+            client, partition_id, epoch,
+            std::span<const SnapshotRecord>(&frame, 1));
+        if (!sent.ok()) co_return sent;
+        for (std::uint32_t index = 0; index < chunk_count; ++index) {
+          const std::size_t offset =
+              static_cast<std::size_t>(index) * storage::kExtentPayloadBytes;
+          const std::size_t bytes = std::min(
+              storage::kExtentPayloadBytes, large.value.size() - offset);
+          frame.kind = SnapshotRecord::Kind::kValueChunk;
+          frame.chunk_index = index;
+          frame.value.assign(large.value.data() + offset, bytes);
+          sent = co_await ApplyRemote(
+              client, partition_id, epoch,
+              std::span<const SnapshotRecord>(&frame, 1));
+          if (!sent.ok()) co_return sent;
+        }
+        frame.kind = SnapshotRecord::Kind::kValueCommit;
+        frame.chunk_index = chunk_count;
+        frame.value.clear();
+        sent = co_await ApplyRemote(
+            client, partition_id, epoch,
+            std::span<const SnapshotRecord>(&frame, 1));
+        if (!sent.ok()) co_return sent;
+        ++begin;
+        continue;
+      }
       std::size_t end = begin;
       std::size_t bytes = 2 + 8 + 4;
       while (end < records.size()) {

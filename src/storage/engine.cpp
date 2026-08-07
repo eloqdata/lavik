@@ -61,11 +61,14 @@ struct RecordLocation {
   std::uint16_t block_owner = 0;
   std::uint32_t record_offset = 0;
   std::uint32_t total_disk_bytes = 0;
-  std::uint32_t value_bytes = 0;
+  std::uint64_t logical_size = 0;
+  std::uint32_t payload_bytes = 0;
   std::uint32_t relocation_sequence = 0;
   bool in_memory = false;
+  bool external = false;
   RecordKind kind = RecordKind::kValue;
   ValueType value_type = ValueType::kNone;
+  std::shared_ptr<const std::vector<ExtentRef>> extents;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
     return block_id == other.block_id &&
@@ -74,7 +77,6 @@ struct RecordLocation {
   }
 };
 
-static_assert(sizeof(RecordLocation) == 64);
 
 using RecordIndex = ScanHashMap<RecordLocation>;
 
@@ -105,6 +107,51 @@ bool IsExpired(const RecordLocation& location,
          location.expire_at_ms != 0 && location.expire_at_ms <= now_ms;
 }
 
+StatusOr<std::shared_ptr<const std::vector<ExtentRef>>> DecodeManifest(
+    std::span<const std::byte> payload, std::uint64_t logical_size) {
+  if (payload.size() < sizeof(ExtentManifestHeader)) {
+    return Status(StatusCode::kInternal, "external value manifest is truncated");
+  }
+  ExtentManifestHeader header{};
+  std::memcpy(&header, payload.data(), sizeof(header));
+  if (header.magic != kExtentManifestMagic ||
+      header.version != kStorageFormatVersion || header.extent_count == 0 ||
+      header.extent_count > kMaxStringExtents ||
+      payload.size() != sizeof(header) +
+                            static_cast<std::size_t>(header.extent_count) *
+                                sizeof(ExtentRef)) {
+    return Status(StatusCode::kInternal, "invalid external value manifest");
+  }
+  auto refs = std::make_shared<std::vector<ExtentRef>>(header.extent_count);
+  std::memcpy(refs->data(), payload.data() + sizeof(header),
+              refs->size() * sizeof(ExtentRef));
+  std::uint64_t total = 0;
+  for (const ExtentRef& ref : *refs) {
+    if (ref.block_id == kInvalidBlockId || ref.allocation_epoch == 0 ||
+        ref.payload_bytes == 0 || ref.payload_bytes > kExtentPayloadBytes ||
+        total > kMaxStringBytes - ref.payload_bytes) {
+      return Status(StatusCode::kInternal, "invalid extent reference");
+    }
+    total += ref.payload_bytes;
+  }
+  if (total != logical_size || total > kMaxStringBytes) {
+    return Status(StatusCode::kInternal,
+                  "extent manifest logical size mismatch");
+  }
+  return std::shared_ptr<const std::vector<ExtentRef>>(std::move(refs));
+}
+
+std::string EncodeManifest(std::span<const ExtentRef> refs) {
+  ExtentManifestHeader header{.magic = kExtentManifestMagic,
+                              .version = kStorageFormatVersion,
+                              .extent_count =
+                                  static_cast<std::uint32_t>(refs.size())};
+  std::string output(sizeof(header) + refs.size_bytes(), '\0');
+  std::memcpy(output.data(), &header, sizeof(header));
+  std::memcpy(output.data() + sizeof(header), refs.data(), refs.size_bytes());
+  return output;
+}
+
 struct ActiveBlock {
   std::uint64_t block_id = 0;
   std::uint32_t writer_id = 0;
@@ -116,6 +163,9 @@ struct ActiveBlock {
   std::uint16_t write_buffer_id = 0;
   std::byte* heap_buffer = nullptr;
   std::size_t heap_buffer_size = 0;
+  BlockKind kind = BlockKind::kRecords;
+  std::uint32_t extent_index = 0;
+  std::uint32_t extent_payload_checksum = 0;
 };
 
 struct BlockState {
@@ -136,6 +186,9 @@ struct BlockState {
   std::byte* heap_data = nullptr;
   std::size_t heap_data_size = 0;
   bool release_pending = false;
+  BlockKind kind = BlockKind::kRecords;
+  std::uint32_t extent_index = 0;
+  std::uint32_t extent_payload_checksum = 0;
 };
 
 struct RecoveryRecord {
@@ -158,10 +211,27 @@ struct RecoveryLiveReference {
   std::uint64_t block_id = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t bytes = 0;
+  bool extent = false;
+  std::uint32_t extent_index = 0;
+  std::uint32_t extent_payload_checksum = 0;
 };
 
 struct RecordIdentity {
   RecordIndex::Entry* entry = nullptr;
+  std::shared_ptr<const std::vector<ExtentRef>> retired_extents;
+};
+
+struct ReplicaValueStage {
+  std::uint8_t db_id = 0;
+  std::uint64_t db_epoch = 0;
+  std::uint64_t mutation_sequence = 0;
+  std::uint64_t expire_at_ms = 0;
+  std::uint64_t logical_size = 0;
+  std::uint32_t next_chunk = 0;
+  std::uint32_t chunk_count = 0;
+  ValueType value_type = ValueType::kNone;
+  std::string key;
+  std::string value;
 };
 
 class AsyncMutex {
@@ -698,6 +768,7 @@ class StorageEngine::Impl {
       bool capture_deltas = false;
       bool delta_queued = false;
       std::deque<SnapshotRecord> deltas;
+      std::optional<ReplicaValueStage> replica_value_stage;
     };
 
     struct ExpireCandidate {
@@ -1245,6 +1316,25 @@ class StorageEngine::Impl {
                       .allocation_epoch = location.allocation_epoch,
                       .bytes = location.total_disk_bytes,
                   });
+              if (location.external && location.extents != nullptr) {
+                for (std::size_t extent_index = 0;
+                     extent_index < location.extents->size();
+                     ++extent_index) {
+                  const ExtentRef& extent =
+                      location.extents->at(extent_index);
+                  live_by_owner[location.block_owner].push_back(
+                      RecoveryLiveReference{
+                          .block_id = extent.block_id,
+                          .allocation_epoch = extent.allocation_epoch,
+                          .bytes = extent.payload_bytes,
+                          .extent = true,
+                          .extent_index = static_cast<std::uint32_t>(
+                              extent_index),
+                          .extent_payload_checksum =
+                              extent.payload_checksum,
+                      });
+                }
+              }
             });
       }
     }
@@ -1263,6 +1353,16 @@ class StorageEngine::Impl {
                   state->allocation_epoch != reference.allocation_epoch) {
                 return Status(StatusCode::kInternal,
                               "recovery live reference has no owning block");
+              }
+              if (reference.extent &&
+                  (state->kind != BlockKind::kValueExtent ||
+                   state->committed_bytes !=
+                       kBlockHeaderBytes + reference.bytes ||
+                   state->extent_index != reference.extent_index ||
+                   state->extent_payload_checksum !=
+                       reference.extent_payload_checksum)) {
+                return Status(StatusCode::kInternal,
+                              "live extent header does not match manifest");
               }
               state->live_bytes += reference.bytes;
             }
@@ -1328,10 +1428,27 @@ class StorageEngine::Impl {
     if (!status.ok()) {
       co_return status;
     }
+    auto orphan_extents = std::make_shared<std::vector<ExtentRef>>();
     for (const auto& [block_id, state] : store.block_states) {
       if (state != nullptr) {
-        MaybeQueueDefrag(store, block_id);
+        if (state->kind == BlockKind::kValueExtent &&
+            state->live_bytes == 0) {
+          orphan_extents->push_back(ExtentRef{
+              .block_id = block_id,
+              .allocation_epoch = state->allocation_epoch,
+              .payload_bytes = static_cast<std::uint32_t>(
+                  state->committed_bytes - kBlockHeaderBytes),
+              .payload_checksum = 0,
+          });
+        } else {
+          MaybeQueueDefrag(store, block_id);
+        }
       }
+    }
+    if (!orphan_extents->empty()) {
+      worker.Spawn(ReclaimExtents(
+          &store, std::shared_ptr<const std::vector<ExtentRef>>(
+                      std::move(orphan_extents))));
     }
     worker.Spawn(PeriodicFlush(&store));
     if (options_.expiration_authority) {
@@ -1381,6 +1498,29 @@ class StorageEngine::Impl {
     }
 
     co_return EncodeDiskValue(std::move(*loaded));
+  }
+
+  Task<StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
+                                             std::string_view key) {
+    assert(db_id < kLogicalDatabaseCount);
+    WorkerStore& store = CurrentStore();
+    auto& partition = PartitionForKey(store, key);
+    const Digest digest = ComputeDigest(key);
+    auto key_lock = co_await store.key_locks[db_id].Acquire(
+        digest, IntentLockMode::kShared);
+    auto* found = partition.indexes[db_id].Find(digest, key);
+    if (found == nullptr || found->value.kind != RecordKind::kValue ||
+        IsExpired(found->value, UnixTimeMillis())) {
+      if (found != nullptr && IsExpired(found->value, UnixTimeMillis())) {
+        QueueExpiredCandidate(store, partition.id, db_id, *found);
+      }
+      co_return Status(StatusCode::kNotFound, "key not found");
+    }
+    if (found->value.value_type != ValueType::kString) {
+      co_return Status(StatusCode::kInvalidArgument,
+                       "WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    co_return found->value.logical_size;
   }
 
   Task<StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
@@ -1892,6 +2032,7 @@ class StorageEngine::Impl {
     partition.mutation_sequence = 0;
     partition.capture_deltas = false;
     partition.deltas.clear();
+    partition.replica_value_stage.reset();
     partition.delta_floor = 0;
     partition.delta_queued = false;
     for (const auto& [db_id, key] : old_keys) {
@@ -1916,6 +2057,8 @@ class StorageEngine::Impl {
                        "stale partition replication epoch");
     }
     for (const SnapshotRecord& record : records) {
+      std::optional<SnapshotRecord> materialized;
+      const SnapshotRecord* effective = &record;
       if (record.db_id >= kLogicalDatabaseCount ||
           RedisSlot(record.key) != partition_id) {
         if (record.kind != SnapshotRecord::Kind::kFlushDb) {
@@ -1941,37 +2084,135 @@ class StorageEngine::Impl {
                          "replica record database epoch is not installed");
       }
 
-      const Digest digest = ComputeDigest(record.key);
-      auto key_lock = co_await store.key_locks[record.db_id].Acquire(
+      if (record.kind == SnapshotRecord::Kind::kValueBegin) {
+        if (partition.replica_value_stage.has_value() ||
+            record.value_type != ValueType::kString || !record.value.empty() ||
+            record.logical_size == 0 ||
+            record.logical_size > kMaxStringBytes ||
+            record.chunk_count == 0 ||
+            record.chunk_count !=
+                (record.logical_size + kExtentPayloadBytes - 1) /
+                    kExtentPayloadBytes) {
+          co_return Status(StatusCode::kInvalidArgument,
+                           "invalid replicated large value begin frame");
+        }
+        partition.replica_value_stage = ReplicaValueStage{
+            .db_id = record.db_id,
+            .db_epoch = record.db_epoch,
+            .mutation_sequence = record.mutation_sequence,
+            .expire_at_ms = record.expire_at_ms,
+            .logical_size = record.logical_size,
+            .next_chunk = 0,
+            .chunk_count = record.chunk_count,
+            .value_type = record.value_type,
+            .key = record.key,
+            .value = {},
+        };
+        partition.replica_value_stage->value.reserve(
+            static_cast<std::size_t>(record.logical_size));
+        continue;
+      }
+      if (record.kind == SnapshotRecord::Kind::kValueChunk) {
+        auto& stage = partition.replica_value_stage;
+        if (!stage.has_value() || stage->db_id != record.db_id ||
+            stage->db_epoch != record.db_epoch ||
+            stage->mutation_sequence != record.mutation_sequence ||
+            stage->key != record.key ||
+            stage->next_chunk != record.chunk_index ||
+            stage->chunk_count != record.chunk_count ||
+            record.value.empty() ||
+            record.value.size() > kExtentPayloadBytes ||
+            record.value.size() > stage->logical_size ||
+            stage->value.size() > stage->logical_size - record.value.size()) {
+          co_return Status(StatusCode::kInvalidArgument,
+                           "invalid replicated large value chunk frame");
+        }
+        stage->value.append(record.value);
+        ++stage->next_chunk;
+        continue;
+      }
+      if (record.kind == SnapshotRecord::Kind::kValueCommit) {
+        auto& stage = partition.replica_value_stage;
+        if (!stage.has_value() || stage->db_id != record.db_id ||
+            stage->db_epoch != record.db_epoch ||
+            stage->mutation_sequence != record.mutation_sequence ||
+            stage->key != record.key || !record.value.empty() ||
+            stage->next_chunk != stage->chunk_count ||
+            record.chunk_index != stage->chunk_count ||
+            stage->value.size() != stage->logical_size) {
+          co_return Status(StatusCode::kInvalidArgument,
+                           "invalid replicated large value commit frame");
+        }
+        materialized.emplace(SnapshotRecord{
+            .kind = SnapshotRecord::Kind::kValue,
+            .db_id = stage->db_id,
+            .db_epoch = stage->db_epoch,
+            .mutation_sequence = stage->mutation_sequence,
+            .expire_at_ms = stage->expire_at_ms,
+            .value_type = stage->value_type,
+            .logical_size = stage->logical_size,
+            .key = std::move(stage->key),
+            .value = std::move(stage->value),
+        });
+        stage.reset();
+        effective = &*materialized;
+      } else if (partition.replica_value_stage.has_value()) {
+        co_return Status(StatusCode::kInvalidArgument,
+                         "replicated large value frame sequence interrupted");
+      }
+
+      const SnapshotRecord& applied = *effective;
+      const Digest digest = ComputeDigest(applied.key);
+      auto key_lock = co_await store.key_locks[applied.db_id].Acquire(
           digest, IntentLockMode::kExclusive);
       co_await store.writer_mutex.Lock();
       UnlockGuard write_unlock(&store.writer_mutex, store.worker);
-      auto& index = partition.indexes[record.db_id];
-      auto* current = index.Find(digest, record.key);
+      auto& index = partition.indexes[applied.db_id];
+      auto* current = index.Find(digest, applied.key);
       if (current != nullptr &&
           current->value.replication_epoch == replication_epoch &&
-          current->value.mutation_sequence >= record.mutation_sequence) {
+          current->value.mutation_sequence >= applied.mutation_sequence) {
         continue;
       }
-      const RecordKind kind = record.kind == SnapshotRecord::Kind::kValue
+      const RecordKind kind = applied.kind == SnapshotRecord::Kind::kValue
                                   ? RecordKind::kValue
                                   : RecordKind::kTombstone;
       const ValueType value_type = kind == RecordKind::kValue
-                                       ? record.value_type
+                                       ? applied.value_type
                                        : ValueType::kNone;
       if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
         co_return Status(StatusCode::kInvalidArgument,
                          "replicated value has no Redis type");
       }
-      Status written = co_await WriteRecordLocked(
-          store, record.db_id, record.key, record.value, kind, value_type,
-          kind == RecordKind::kValue ? record.expire_at_ms : 0, digest,
-          record.mutation_sequence, record.mutation_sequence, 0, false);
+      Status written;
+      const std::size_t inline_bytes = AlignRecord(
+          RecordHeaderBytes(applied.key.size()) + applied.value.size());
+      if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+          inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
+        auto extents = co_await WriteExtentValueLocked(store, applied.value);
+        if (!extents.ok()) {
+          co_return extents.status();
+        }
+        const std::string manifest = EncodeManifest(**extents);
+        written = co_await WriteRecordLocked(
+            store, applied.db_id, applied.key, manifest, kind, value_type,
+            applied.expire_at_ms, digest, applied.mutation_sequence,
+            applied.mutation_sequence, 0, false, true, true,
+            applied.value.size(), *extents);
+        if (!written.ok()) {
+          store.worker->Spawn(ReclaimExtents(&store, *extents));
+        }
+      } else {
+        written = co_await WriteRecordLocked(
+            store, applied.db_id, applied.key, applied.value, kind, value_type,
+            kind == RecordKind::kValue ? applied.expire_at_ms : 0, digest,
+            applied.mutation_sequence, applied.mutation_sequence, 0, false);
+      }
       if (!written.ok()) {
         co_return written;
       }
       partition.mutation_sequence = std::max(
-          partition.mutation_sequence, record.mutation_sequence);
+          partition.mutation_sequence, applied.mutation_sequence);
     }
     co_return Status::Ok();
   }
@@ -2181,6 +2422,14 @@ class StorageEngine::Impl {
         static_cast<std::byte>(1U << bit_index);
   }
 
+  static void ClearBitmapBit(DeviceAllocator& allocator,
+                             std::uint32_t local_block) noexcept {
+    const std::size_t byte_index = local_block / 8;
+    const unsigned bit_index = local_block % 8;
+    allocator.scan_bitmap[byte_index] &=
+        static_cast<std::byte>(~(1U << bit_index));
+  }
+
   Task<Status> PersistBitmapPages(
       std::size_t device_index, DeviceAllocator& allocator,
       std::vector<std::size_t> page_indexes) {
@@ -2363,6 +2612,66 @@ class StorageEngine::Impl {
         });
   }
 
+  Task<Status> ReturnColdBlocksLocal(
+      std::size_t device_index, std::vector<std::uint64_t> block_ids) {
+    DeviceAllocator& allocator = *device_allocators_[device_index];
+    assert(celer::ThisWorker().id == allocator.owner);
+    co_await allocator.mutex.Lock();
+    UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
+    if (allocator.failed.has_value()) {
+      co_return *allocator.failed;
+    }
+    std::vector<std::size_t> dirty_pages;
+    dirty_pages.reserve(block_ids.size());
+    for (const std::uint64_t block_id : block_ids) {
+      assert(DeviceIndexForBlock(block_id) == device_index);
+      const std::uint32_t local = LocalBlockId(block_id);
+      if (BitmapBit(allocator, local)) {
+        ClearBitmapBit(allocator, local);
+        dirty_pages.push_back((local / 8) / kMetadataPagePayloadBytes);
+      }
+    }
+    Status persisted = co_await PersistBitmapPages(
+        device_index, allocator, std::move(dirty_pages));
+    if (!persisted.ok()) {
+      allocator.failed = persisted;
+      co_return persisted;
+    }
+    allocator.cold_free.insert(allocator.cold_free.end(), block_ids.begin(),
+                               block_ids.end());
+    co_return Status::Ok();
+  }
+
+  Task<Status> ReturnColdBlocks(std::vector<std::uint64_t> block_ids) {
+    std::vector<std::vector<std::uint64_t>> by_device(devices_.size());
+    for (const std::uint64_t block_id : block_ids) {
+      by_device[DeviceIndexForBlock(block_id)].push_back(block_id);
+    }
+    for (std::size_t device_index = 0; device_index < by_device.size();
+         ++device_index) {
+      if (by_device[device_index].empty()) {
+        continue;
+      }
+      const celer::WorkerId owner = device_allocators_[device_index]->owner;
+      Status returned =
+          owner == celer::ThisWorker().id
+              ? co_await ReturnColdBlocksLocal(
+                    device_index, std::move(by_device[device_index]))
+              : co_await celer::SubmitTaskTo(
+                    owner,
+                    [this, device_index,
+                     blocks = std::move(by_device[device_index])]() mutable
+                        -> Task<Status> {
+                      co_return co_await ReturnColdBlocksLocal(
+                          device_index, std::move(blocks));
+                    });
+      if (!returned.ok()) {
+        co_return returned;
+      }
+    }
+    co_return Status::Ok();
+  }
+
   Task<Status> PersistEpochValueOnDeviceLocal(std::size_t device_index,
                                               std::size_t value_index,
                                               std::uint64_t epoch) {
@@ -2541,6 +2850,9 @@ class StorageEngine::Impl {
         store.write_failed = true;
         co_return dead;
       }
+      if (location.external && location.extents != nullptr) {
+        store.worker->Spawn(ReclaimExtents(&store, location.extents));
+      }
     }
     SealDeadActiveBlock(store);
     co_return Status::Ok();
@@ -2708,21 +3020,8 @@ class StorageEngine::Impl {
           continue;
         }
 
-        read = co_await ReadStorageBuffer(
-            *store.worker, store.files[file_id], recovery.buffer,
-            recovery.registered(), block_offset);
-        if (!read.ok()) {
-          co_return read.status();
-        }
-        if (*read != kStorageBlockBytes) {
-          co_return Status(StatusCode::kInternal,
-                           "short read while scanning committed block");
-        }
-
         BlockHeader block{};
-        std::span<const std::byte, kBlockHeaderBytes> recovered_block_header(
-            recovery.buffer.data, kBlockHeaderBytes);
-        if (!DecodeBlockHeader(recovered_block_header, &block) ||
+        if (!DecodeBlockHeader(block_bytes, &block) ||
             block.block_id != block_id) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt block header");
@@ -2744,7 +3043,26 @@ class StorageEngine::Impl {
             .committed_bytes = block.committed_bytes,
             .record_count = block.record_count,
             .max_lsn = block.max_lsn,
+            .kind = block.kind,
+            .extent_index = block.extent_index,
+            .extent_payload_checksum = block.extent_payload_checksum,
         }});
+
+        if (block.kind == BlockKind::kValueExtent) {
+          ReportRecoveryProgress(0);
+          continue;
+        }
+
+        read = co_await ReadStorageBuffer(
+            *store.worker, store.files[file_id], recovery.buffer,
+            recovery.registered(), block_offset);
+        if (!read.ok()) {
+          co_return read.status();
+        }
+        if (*read != kStorageBlockBytes) {
+          co_return Status(StatusCode::kInternal,
+                           "short read while scanning committed block");
+        }
 
         std::uint32_t record_offset = kBlockHeaderBytes;
         std::uint32_t records = 0;
@@ -2779,6 +3097,29 @@ class StorageEngine::Impl {
             continue;
           }
           const unsigned key_owner = OwnerForKey(key);
+          std::shared_ptr<const std::vector<ExtentRef>> extents;
+          if (record.external) {
+            if (record.kind != RecordKind::kValue ||
+                record.value_type != ValueType::kString) {
+              co_return Status(StatusCode::kInternal,
+                               "unsupported external record type");
+            }
+            const std::byte* payload =
+                recovery.buffer.data + record_offset + record.header_bytes;
+            if (Crc32c(std::span<const std::byte>(payload,
+                                                  record.payload_bytes)) !=
+                record.payload_checksum) {
+              co_return Status(StatusCode::kInternal,
+                               "external manifest checksum mismatch");
+            }
+            auto decoded = DecodeManifest(
+                std::span<const std::byte>(payload, record.payload_bytes),
+                record.logical_size);
+            if (!decoded.ok()) {
+              co_return decoded.status();
+            }
+            extents = std::move(*decoded);
+          }
           batches->at(key_owner).records.push_back(RecoveryRecord{
               .digest = record.digest,
               .key = std::string(key),
@@ -2792,11 +3133,14 @@ class StorageEngine::Impl {
                   .block_owner = block_owner,
                   .record_offset = record_offset,
                   .total_disk_bytes = record.total_disk_bytes,
-                  .value_bytes = record.value_bytes,
+                  .logical_size = record.logical_size,
+                  .payload_bytes = record.payload_bytes,
                   .relocation_sequence = static_cast<std::uint32_t>(
                       record.relocation_sequence),
+                  .external = record.external,
                   .kind = record.kind,
                   .value_type = record.value_type,
+                  .extents = std::move(extents),
               },
           });
           record_offset += record.total_disk_bytes;
@@ -2824,6 +3168,9 @@ class StorageEngine::Impl {
       state.allocation_epoch = block.allocation_epoch;
       state.committed_bytes = block.committed_bytes;
       state.allocated = true;
+      state.kind = block.kind;
+      state.extent_index = block.extent_index;
+      state.extent_payload_checksum = block.extent_payload_checksum;
 
       // Recovered blocks have no staging buffer. Keep partial blocks sealed;
       // appending to one would otherwise dereference an absent in-memory copy.
@@ -2841,8 +3188,6 @@ class StorageEngine::Impl {
       auto* found = index.Find(recovered.digest, recovered.key);
       if (found == nullptr ||
           IsNewer(recovered.location, found->value)) {
-        // TODO: add large-record reconstruction on recovery:
-        // gather all chunks for a digest and coalesce into a logical key value.
         const bool was_live =
           found != nullptr && found->value.kind == RecordKind::kValue;
         const bool is_live = recovered.location.kind == RecordKind::kValue;
@@ -2894,10 +3239,115 @@ class StorageEngine::Impl {
         });
   }
 
+  Task<StatusOr<LoadedValue>> LoadExternalValueLocal(
+      WorkerStore& store, const RecordLocation& location,
+      ReadLatencyTrace* trace) {
+    if (!location.external || location.extents == nullptr ||
+        location.logical_size > kMaxStringBytes) {
+      co_return Status(StatusCode::kInternal,
+                       "external value has no valid extent manifest");
+    }
+    if (trace != nullptr) {
+      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
+    }
+    auto acquired = co_await store.buffers.AcquireReadBuffer(
+        static_cast<std::size_t>(location.logical_size));
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease output = std::move(*acquired);
+    FixedBuffer destination = output.io_buffer();
+    if (destination.size < location.logical_size) {
+      co_return Status(StatusCode::kOutOfRange,
+                       "external value exceeds read buffer capacity");
+    }
+    if (trace != nullptr) {
+      trace->buffer_acquired_ns = ReadTraceNowNanos();
+      trace->heap_read_buffer = !output.registered();
+      trace->disk_read = true;
+    }
+    std::size_t output_offset = 0;
+    for (std::size_t index = 0; index < location.extents->size(); ++index) {
+      const ExtentRef& ref = location.extents->at(index);
+      BlockState* state = FindBlockState(store, ref.block_id);
+      if (state == nullptr || !state->allocated || state->freeing ||
+          state->kind != BlockKind::kValueExtent ||
+          state->allocation_epoch != ref.allocation_epoch) {
+        co_return Status(StatusCode::kInternal,
+                         "stale or missing external extent");
+      }
+      ++state->pins;
+      struct ExtentPin {
+        BlockState* state;
+        ~ExtentPin() { --state->pins; }
+      } pin{state};
+      const std::size_t read_bytes =
+          AlignDirect(kBlockHeaderBytes + ref.payload_bytes);
+      auto temp_acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
+      if (!temp_acquired.ok()) {
+        co_return temp_acquired.status();
+      }
+      ReadBufferLease temp = std::move(*temp_acquired);
+      FixedBuffer io = temp.io_buffer();
+      io.size = read_bytes;
+      const auto [file_id, block_offset] = FileOffset(ref.block_id);
+      if (trace != nullptr && index == 0) {
+        trace->io_submit_ns = ReadTraceNowNanos();
+      }
+      auto read = co_await ReadStorageBuffer(*store.worker,
+                                             store.files[file_id], io,
+                                             temp.registered(), block_offset);
+      if (!read.ok()) {
+        co_return read.status();
+      }
+      if (*read != read_bytes) {
+        co_return Status(StatusCode::kInternal, "short extent block read");
+      }
+      BlockHeader header{};
+      if (!DecodeBlockHeader(
+              std::span<const std::byte, kBlockHeaderBytes>(
+                  io.data, kBlockHeaderBytes),
+              &header) ||
+          header.kind != BlockKind::kValueExtent ||
+          header.block_id != ref.block_id ||
+          header.allocation_epoch != ref.allocation_epoch ||
+          header.extent_index != index ||
+          header.extent_payload_bytes != ref.payload_bytes ||
+          header.extent_payload_checksum != ref.payload_checksum ||
+          output_offset + ref.payload_bytes > location.logical_size) {
+        co_return Status(StatusCode::kInternal,
+                         "extent header does not match manifest");
+      }
+      const auto payload = std::span<const std::byte>(
+          io.data + kBlockHeaderBytes, ref.payload_bytes);
+      if (options_.verify_read_crc && Crc32c(payload) != ref.payload_checksum) {
+        co_return Status(StatusCode::kInternal,
+                         "extent payload checksum mismatch");
+      }
+      std::memcpy(destination.data + output_offset, payload.data(),
+                  payload.size());
+      output_offset += payload.size();
+    }
+    if (output_offset != location.logical_size) {
+      co_return Status(StatusCode::kInternal,
+                       "external value length does not match manifest");
+    }
+    if (trace != nullptr) {
+      trace->io_complete_ns = ReadTraceNowNanos();
+      trace->decode_done_ns = trace->io_complete_ns;
+    }
+    const std::size_t value_offset = static_cast<std::size_t>(
+        destination.data - output.bytes().data());
+    co_return LoadedValue{std::move(output), value_offset, output_offset};
+  }
+
   Task<StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       const Digest& digest, RecordLocation location,
       ReadLatencyTrace* trace = nullptr) {
+    if (location.external) {
+      co_return co_await LoadExternalValueLocal(store, location, trace);
+    }
     // TODO: Coalesce concurrent reads of the same aligned disk page, like
     // the reference engine tiering::OpManager::pending_reads_. Key the in-flight table by
     // (file_id, aligned offset, aligned length), submit one read, and fan the
@@ -2955,7 +3405,11 @@ class StorageEngine::Impl {
         trace->io_complete_ns = trace->buffer_acquired_ns;
       }
       FixedBuffer io = lease.io_buffer();
-      if (location.value_bytes > io.size) {
+      if (location.external) {
+        co_return Status(StatusCode::kInternal,
+                         "external value requires extent loading");
+      }
+      if (location.payload_bytes > io.size) {
         co_return Status(StatusCode::kOutOfRange,
                          "value exceeds registered read buffer capacity");
       }
@@ -2977,15 +3431,17 @@ class StorageEngine::Impl {
           record.allocation_epoch != location.allocation_epoch ||
           record.expire_at_ms != location.expire_at_ms ||
           record.value_type != location.value_type ||
-          location.value_bytes != record.value_bytes ||
+          record.external != location.external ||
+          location.logical_size != record.logical_size ||
+          location.payload_bytes != record.payload_bytes ||
           location.total_disk_bytes != record.total_disk_bytes) {
         co_return Status(StatusCode::kInternal,
                          "record does not match in-memory location");
       }
       std::memcpy(io.data, record_bytes + record.header_bytes,
-                  location.value_bytes);
+                  location.payload_bytes);
       if (options_.verify_read_crc &&
-          Crc32c(std::span<const std::byte>(io.data, record.value_bytes)) !=
+          Crc32c(std::span<const std::byte>(io.data, record.payload_bytes)) !=
               record.payload_checksum) {
         co_return Status(StatusCode::kInternal,
                          "record value checksum mismatch");
@@ -2996,7 +3452,7 @@ class StorageEngine::Impl {
       const std::size_t value_offset = static_cast<std::size_t>(
           io.data - lease.bytes().data());
       co_return LoadedValue{std::move(lease), value_offset,
-                            record.value_bytes};
+                            record.payload_bytes};
     }
 
     const auto [file_id, block_offset] = FileOffset(location.block_id);
@@ -3062,20 +3518,22 @@ class StorageEngine::Impl {
         record.allocation_epoch != location.allocation_epoch ||
         record.expire_at_ms != location.expire_at_ms ||
         record.value_type != location.value_type ||
-        record.value_bytes != location.value_bytes ||
+        record.external != location.external ||
+        record.logical_size != location.logical_size ||
+        record.payload_bytes != location.payload_bytes ||
         record.total_disk_bytes != location.total_disk_bytes) {
       co_return Status(StatusCode::kInternal,
                        "record does not match in-memory location");
     }
     const std::byte* value_data = record_data + record.header_bytes;
     if (options_.verify_read_crc &&
-        Crc32c(std::span<const std::byte>(value_data, record.value_bytes)) !=
+        Crc32c(std::span<const std::byte>(value_data, record.payload_bytes)) !=
             record.payload_checksum) {
       co_return Status(StatusCode::kInternal, "record value checksum mismatch");
     }
     const std::byte* framed_value = value_data;
-    if (record.value_bytes > DirectGetValueLimit()) {
-      std::memmove(io.data, value_data, record.value_bytes);
+    if (record.payload_bytes > DirectGetValueLimit()) {
+      std::memmove(io.data, value_data, record.payload_bytes);
       framed_value = io.data;
     }
     if (trace != nullptr) {
@@ -3084,7 +3542,7 @@ class StorageEngine::Impl {
     const std::size_t value_offset = static_cast<std::size_t>(
         framed_value - lease.bytes().data());
     co_return LoadedValue{std::move(lease), value_offset,
-                          record.value_bytes};
+                          record.payload_bytes};
   }
 
   std::uint64_t ForegroundBlocksForDevice(
@@ -3326,6 +3784,176 @@ class StorageEngine::Impl {
         });
   }
 
+  Task<StatusOr<ReservedBlock>> TakeStandaloneBlockLocked(
+      WorkerStore& store) {
+    while (!store.standby_block.has_value()) {
+      Status waited = co_await WaitForStandbyWithWriterUnlocked(store, false);
+      if (!waited.ok()) {
+        co_return waited;
+      }
+    }
+    const ReservedBlock block = *store.standby_block;
+    store.standby_block.reset();
+    RequestStandbyBlock(store, false);
+    co_return block;
+  }
+
+  Task<StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
+  WriteExtentValueLocked(WorkerStore& store, std::string_view value) {
+    if (value.empty() || value.size() > kMaxStringBytes) {
+      co_return Status(StatusCode::kOutOfRange,
+                       "String exceeds the 512 MiB limit");
+    }
+    auto refs = std::make_shared<std::vector<ExtentRef>>();
+    refs->reserve((value.size() + kExtentPayloadBytes - 1) /
+                  kExtentPayloadBytes);
+    auto reclaim_allocated = [&]() {
+      if (!refs->empty()) {
+        store.worker->Spawn(ReclaimExtents(
+            &store,
+            std::shared_ptr<const std::vector<ExtentRef>>(refs)));
+      }
+    };
+    std::size_t value_offset = 0;
+    std::uint32_t extent_index = 0;
+    while (value_offset < value.size()) {
+      auto reserved = co_await TakeStandaloneBlockLocked(store);
+      if (!reserved.ok()) {
+        reclaim_allocated();
+        co_return reserved.status();
+      }
+      const std::size_t payload_bytes =
+          std::min(kExtentPayloadBytes, value.size() - value_offset);
+      const auto payload = std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(value.data() + value_offset),
+          payload_bytes);
+      const std::uint32_t payload_checksum = Crc32c(payload);
+      BlockState& state = CreateBlockState(store, reserved->block_id);
+      state = BlockState{};
+      state.writer_id = store.worker->id();
+      state.layout_worker_count = worker_count_;
+      state.allocation_epoch = reserved->allocation_epoch;
+      state.committed_bytes = static_cast<std::uint32_t>(
+          kBlockHeaderBytes + payload_bytes);
+      state.live_bytes = static_cast<std::uint32_t>(payload_bytes);
+      state.allocated = true;
+      state.kind = BlockKind::kValueExtent;
+      state.extent_index = extent_index;
+      state.extent_payload_checksum = payload_checksum;
+      refs->push_back(ExtentRef{
+          .block_id = reserved->block_id,
+          .allocation_epoch = reserved->allocation_epoch,
+          .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
+          .payload_checksum = payload_checksum,
+      });
+      std::uint16_t write_buffer_id = 0;
+      std::byte* heap_buffer = nullptr;
+      if (!store.buffers.TryAcquireWriteBuffer(&write_buffer_id) &&
+          !store.buffers.TryAcquireHeapWriteBuffer(&heap_buffer)) {
+        reclaim_allocated();
+        co_return Status(StatusCode::kResourceExhausted,
+                         "no extent write buffer is available");
+      }
+      auto release_buffer = [&]() {
+        if (write_buffer_id != 0) {
+          store.buffers.ReleaseWriteBuffer(write_buffer_id);
+        } else {
+          store.buffers.ReleaseHeapWriteBuffer(heap_buffer);
+        }
+      };
+      FixedBuffer staging =
+          write_buffer_id != 0
+              ? store.buffers.write_buffer(write_buffer_id)
+              : FixedBuffer{.data = heap_buffer,
+                            .size = options_.buffers.write_buffer_bytes,
+                            .index = 0};
+      if (staging.data == nullptr || staging.size < kStorageBlockBytes) {
+        release_buffer();
+        reclaim_allocated();
+        co_return Status(StatusCode::kInternal,
+                         "extent staging buffer is smaller than a block");
+      }
+      std::fill_n(staging.data, kStorageBlockBytes, std::byte{0});
+      BlockHeader header{
+          .magic = kBlockMagic,
+          .block_id = reserved->block_id,
+          .version = kStorageFormatVersion,
+          .header_bytes = kBlockHeaderBytes,
+          .block_bytes = kStorageBlockBytes,
+          .writer_id = store.worker->id(),
+          .allocation_epoch = reserved->allocation_epoch,
+          .committed_bytes = static_cast<std::uint32_t>(
+              kBlockHeaderBytes + payload_bytes),
+          .record_count = 0,
+          .max_lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed),
+          .checksum = 0,
+          .layout_worker_count = worker_count_,
+          .kind = BlockKind::kValueExtent,
+          .reserved = {},
+          .extent_index = extent_index,
+          .extent_payload_bytes = static_cast<std::uint32_t>(payload_bytes),
+          .extent_payload_checksum = payload_checksum,
+      };
+      EncodeBlockHeader(
+          header, std::span<std::byte, kBlockHeaderBytes>(staging.data,
+                                                         kBlockHeaderBytes));
+      std::memcpy(staging.data + kBlockHeaderBytes, payload.data(),
+                  payload.size());
+      const auto [file_id, block_offset] = FileOffset(reserved->block_id);
+      const std::size_t write_bytes = AlignDirect(payload_bytes);
+      bool write_ok = true;
+      Status write_status = Status::Ok();
+      for (std::size_t offset = 0; offset < write_bytes;) {
+        const std::size_t chunk =
+            std::min(options_.flush_size_bytes, write_bytes - offset);
+        auto written = co_await WriteStorageBuffer(
+            *store.worker, store.files[file_id],
+            std::span<const std::byte>(
+                staging.data + kBlockHeaderBytes + offset, chunk),
+            write_buffer_id != 0, staging,
+            block_offset + kBlockHeaderBytes + offset);
+        if (!written.ok() || *written != chunk) {
+          write_ok = false;
+          write_status = written.ok()
+                             ? Status(StatusCode::kInternal,
+                                      "short extent block write")
+                             : written.status();
+          break;
+        }
+        offset += chunk;
+      }
+      if (write_ok) {
+        write_status =
+            co_await celer::Fdatasync(*store.worker, store.files[file_id]);
+      }
+      if (write_status.ok()) {
+        auto written = co_await WriteStorageBuffer(
+            *store.worker, store.files[file_id],
+            std::span<const std::byte>(staging.data, kBlockHeaderBytes),
+            write_buffer_id != 0, staging, block_offset);
+        if (!written.ok() || *written != kBlockHeaderBytes) {
+          write_status = written.ok()
+                             ? Status(StatusCode::kInternal,
+                                      "short extent header write")
+                             : written.status();
+        }
+      }
+      if (write_status.ok()) {
+        write_status =
+            co_await celer::Fdatasync(*store.worker, store.files[file_id]);
+      }
+      release_buffer();
+      if (!write_status.ok()) {
+        store.write_failed = true;
+        reclaim_allocated();
+        co_return write_status;
+      }
+      value_offset += payload_bytes;
+      ++extent_index;
+    }
+    co_return std::shared_ptr<const std::vector<ExtentRef>>(std::move(refs));
+  }
+
   Task<Status> AppendLocked(WorkerStore& store,
                             WorkerStore::PartitionStore& partition,
                             std::uint8_t db_id,
@@ -3334,9 +3962,28 @@ class StorageEngine::Impl {
                             std::uint64_t expire_at_ms) {
     const Digest digest = ComputeDigest(key);
     const std::uint64_t mutation_sequence = ++partition.mutation_sequence;
-    Status status = co_await WriteRecordLocked(
-        store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        mutation_sequence, mutation_sequence, 0, false);
+    Status status = Status::Ok();
+    const std::size_t inline_bytes =
+        AlignRecord(RecordHeaderBytes(key.size()) + value.size());
+    if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+        inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
+      auto extents = co_await WriteExtentValueLocked(store, value);
+      if (!extents.ok()) {
+        co_return extents.status();
+      }
+      const std::string manifest = EncodeManifest(**extents);
+      status = co_await WriteRecordLocked(
+          store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
+          mutation_sequence, mutation_sequence, 0, false, true, true,
+          value.size(), *extents);
+      if (!status.ok()) {
+        store.worker->Spawn(ReclaimExtents(&store, *extents));
+      }
+    } else {
+      status = co_await WriteRecordLocked(
+          store, db_id, key, value, kind, value_type, expire_at_ms, digest,
+          mutation_sequence, mutation_sequence, 0, false);
+    }
     if (status.ok() && partition.capture_deltas) {
       AppendDelta(partition, SnapshotRecord{
                                  .kind = kind == RecordKind::kValue
@@ -3447,16 +4094,27 @@ class StorageEngine::Impl {
                                  std::uint64_t mutation_sequence,
                                  std::uint64_t relocation_sequence,
                                  bool for_defrag,
-                                 bool unlock_writer_while_waiting = true) {
+                                 bool unlock_writer_while_waiting = true,
+                                 bool external = false,
+                                 std::uint64_t logical_size =
+                                     std::numeric_limits<std::uint64_t>::max(),
+                                 std::shared_ptr<const std::vector<ExtentRef>>
+                                     extents = nullptr) {
     if (store.write_failed ||
         epoch_metadata_failed_.load(std::memory_order_acquire)) {
       co_return Status(StatusCode::kFailedPrecondition,
                        "storage writer is stopped after an IO failure");
     }
+    if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
+      logical_size = value.size();
+    }
     if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
         (kind == RecordKind::kTombstone &&
          (value_type != ValueType::kNone || expire_at_ms != 0 ||
-          !value.empty()))) {
+          !value.empty() || logical_size != 0 || external)) ||
+        (external &&
+         (kind != RecordKind::kValue || value_type != ValueType::kString ||
+          extents == nullptr || extents->empty()))) {
       co_return Status(StatusCode::kInvalidArgument,
                        "invalid value type or expiration metadata");
     }
@@ -3465,15 +4123,13 @@ class StorageEngine::Impl {
                        "key is too large for the on-disk record header");
     }
     const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
-    const std::size_t value_disk_bytes = value.size();
+    const std::size_t payload_bytes = value.size();
     const std::size_t total_disk_bytes = AlignRecord(
-        record_header_bytes + value_disk_bytes);
+        record_header_bytes + payload_bytes);
     if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
         total_disk_bytes > options_.buffers.write_buffer_bytes) {
-      // TODO: large-value chunking: persist value as manifest+segments so
-      // restart can rebuild one logical value from ordered chunks.
       co_return Status(StatusCode::kOutOfRange,
-                       "value requires dedicated multi-block storage");
+                       "record payload does not fit an inline block");
     }
 
     // Logical partitions route keys, but physical append streams are per
@@ -3634,11 +4290,11 @@ class StorageEngine::Impl {
         .kind = kind,
         .db_id = db_id,
         .value_type = value_type,
-        .reserved = 0,
+        .external = external,
         .digest = digest,
         .key_bytes = static_cast<std::uint32_t>(key.size()),
-        .value_bytes = static_cast<std::uint32_t>(value.size()),
-        .value_disk_bytes = static_cast<std::uint32_t>(value_disk_bytes),
+        .logical_size = logical_size,
+        .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
         .generation = generation,
         .replication_epoch = partition.replication_epoch,
@@ -3701,12 +4357,15 @@ class StorageEngine::Impl {
         .block_owner = writer_id,
         .record_offset = record_offset,
         .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
-        .value_bytes = static_cast<std::uint32_t>(value.size()),
+        .logical_size = logical_size,
+        .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
         .relocation_sequence = static_cast<std::uint32_t>(
             relocation_sequence),
         .in_memory = true,
+        .external = external,
         .kind = kind,
         .value_type = value_type,
+        .extents = std::move(extents),
     };
     const bool was_live =
         previous.has_value() && previous->kind == RecordKind::kValue;
@@ -3717,6 +4376,10 @@ class StorageEngine::Impl {
     auto inserted = index.InsertOrAssign(digest, key, location);
     store.staged_records[updated.block_id].push_back(RecordIdentity{
         .entry = inserted.entry,
+        .retired_extents =
+            !for_defrag && previous.has_value() && previous->external
+                ? previous->extents
+                : nullptr,
     });
     if (was_live != is_live) {
       if (is_live) {
@@ -3746,6 +4409,13 @@ class StorageEngine::Impl {
       if (!dead.ok()) {
         store.write_failed = true;
         co_return dead;
+      }
+    }
+    if (!for_defrag && previous.has_value() && previous->external) {
+      RequestFlush(store, updated.block_id);
+      if (store.active_block.has_value() &&
+          store.active_block->block_id == updated.block_id) {
+        store.active_block.reset();
       }
     }
     MaybePrefetchStandby(store);
@@ -3937,6 +4607,60 @@ class StorageEngine::Impl {
     co_return Status::Ok();
   }
 
+  Task<Status> ReclaimExtents(
+      WorkerStore* store,
+      std::shared_ptr<const std::vector<ExtentRef>> extents) {
+    if (extents == nullptr) {
+      co_return Status::Ok();
+    }
+    std::vector<std::uint64_t> released;
+    released.reserve(extents->size());
+    for (const ExtentRef& ref : *extents) {
+      while (true) {
+        co_await store->writer_mutex.Lock();
+        BlockState* state = FindBlockState(*store, ref.block_id);
+        if (state == nullptr || !state->allocated ||
+            state->allocation_epoch != ref.allocation_epoch) {
+          store->writer_mutex.Unlock(*store->worker);
+          break;
+        }
+        if (state->kind != BlockKind::kValueExtent) {
+          store->writer_mutex.Unlock(*store->worker);
+          co_return Status(StatusCode::kInternal,
+                           "extent reclaim found a record block");
+        }
+        state->live_bytes = 0;
+        if (state->pins != 0 || state->freeing) {
+          store->writer_mutex.Unlock(*store->worker);
+          Status waited = co_await celer::SleepFor(
+              *store->worker, std::chrono::milliseconds(1));
+          if (!waited.ok()) {
+            co_return waited;
+          }
+          continue;
+        }
+        state->freeing = true;
+        store->writer_mutex.Unlock(*store->worker);
+
+        co_await store->writer_mutex.Lock();
+        BlockState* current = FindBlockState(*store, ref.block_id);
+        if (current != nullptr && current->allocation_epoch ==
+                                      ref.allocation_epoch) {
+          store->block_states.erase(ref.block_id);
+          released.push_back(ref.block_id);
+        }
+        store->writer_mutex.Unlock(*store->worker);
+        break;
+      }
+    }
+    Status returned = co_await ReturnColdBlocks(std::move(released));
+    if (!returned.ok()) {
+      co_return returned;
+    }
+    space_reclaim_generation_.fetch_add(1, std::memory_order_release);
+    co_return Status::Ok();
+  }
+
   void RequestFlush(WorkerStore& store, std::uint64_t block_id) {
     BlockState* state = FindBlockState(store, block_id);
     if (state == nullptr || !state->allocated || !state->in_memory ||
@@ -4115,6 +4839,10 @@ class StorageEngine::Impl {
       }
 
       for (const RecordIdentity& identity : pending->staged_records) {
+        if (identity.retired_extents != nullptr) {
+          store->worker->Spawn(
+              ReclaimExtents(store, identity.retired_extents));
+        }
         if (identity.entry == nullptr) {
           continue;
         }
@@ -4148,6 +4876,7 @@ class StorageEngine::Impl {
     const BlockState* state = FindBlockState(store, block_id);
     if (state == nullptr || !state->allocated || state->defrag_queued ||
         state->defragging || state->pins != 0 || state->in_memory ||
+        state->kind != BlockKind::kRecords ||
         state->flush_queued || state->flush_in_progress ||
         IsActiveBlock(store, block_id) ||
         state->committed_bytes <= kBlockHeaderBytes) {
@@ -4321,7 +5050,8 @@ class StorageEngine::Impl {
         key_store, record.db_id, key, value, record.kind, record.value_type,
         record.expire_at_ms, record.digest, record.generation,
         record.mutation_sequence,
-        record.relocation_sequence + 1, true);
+        record.relocation_sequence + 1, true, true, record.external,
+        record.logical_size, source_location.extents);
   }
 
   Task<Status> CleanBlockLocked(WorkerStore& store,
@@ -4400,7 +5130,7 @@ class StorageEngine::Impl {
                          "corrupt committed record during defrag");
       }
 
-      const RecordLocation source_location{
+      RecordLocation source_location{
           .block_id = block_id,
           .replication_epoch = record.replication_epoch,
           .mutation_sequence = record.mutation_sequence,
@@ -4409,26 +5139,39 @@ class StorageEngine::Impl {
           .block_owner = store.worker->id(),
           .record_offset = record_offset,
           .total_disk_bytes = record.total_disk_bytes,
-          .value_bytes = record.value_bytes,
+          .logical_size = record.logical_size,
+          .payload_bytes = record.payload_bytes,
           .relocation_sequence = static_cast<std::uint32_t>(
               record.relocation_sequence),
+          .external = record.external,
           .kind = record.kind,
           .value_type = record.value_type,
+          .extents = {},
       };
       const std::byte* value_data =
           block_data.buffer.data + record_offset + record.header_bytes;
       if (Crc32c(std::span<const std::byte>(value_data,
-                                           record.value_bytes)) !=
+                                           record.payload_bytes)) !=
           record.payload_checksum) {
         source.defragging = false;
         co_return Status(StatusCode::kInternal,
                          "value checksum mismatch during defrag");
       }
+      if (record.external) {
+        auto decoded = DecodeManifest(
+            std::span<const std::byte>(value_data, record.payload_bytes),
+            record.logical_size);
+        if (!decoded.ok()) {
+          source.defragging = false;
+          co_return decoded.status();
+        }
+        source_location.extents = std::move(*decoded);
+      }
 
       const unsigned key_owner = OwnerForKey(disk_key);
       const std::string key(disk_key);
       const std::string value(reinterpret_cast<const char*>(value_data),
-                              record.value_bytes);
+                              record.payload_bytes);
       Status relocated;
       if (key_owner == store.worker->id()) {
         relocated = co_await RelocateIfCurrent(
@@ -4644,6 +5387,11 @@ Task<StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
                                              std::string_view key,
                                              ReadLatencyTrace* trace) {
   co_return co_await impl_->Get(db_id, key, trace);
+}
+
+Task<StatusOr<std::uint64_t>> StorageEngine::StringLength(
+    std::uint8_t db_id, std::string_view key) {
+  co_return co_await impl_->StringLength(db_id, key);
 }
 
 Task<StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,

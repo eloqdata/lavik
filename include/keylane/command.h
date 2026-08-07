@@ -24,6 +24,7 @@ enum class CommandKind {
   kExists,
   kFlushDb,
   kGet,
+  kStrlen,
   kIncr,
   kExpire,
   kPExpire,

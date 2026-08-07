@@ -286,6 +286,23 @@ bool DecodeBlockHeader(
       decoded.committed_bytes > kStorageBlockBytes) {
     return false;
   }
+  if ((decoded.kind != BlockKind::kRecords &&
+       decoded.kind != BlockKind::kValueExtent) ||
+      decoded.reserved != std::array<std::uint8_t, 3>{}) {
+    return false;
+  }
+  if (decoded.kind == BlockKind::kRecords) {
+    if (decoded.extent_index != 0 || decoded.extent_payload_bytes != 0 ||
+        decoded.extent_payload_checksum != 0) {
+      return false;
+    }
+  } else if (decoded.record_count != 0 ||
+             decoded.extent_payload_bytes == 0 ||
+             decoded.extent_payload_bytes > kExtentPayloadBytes ||
+             decoded.committed_bytes !=
+                 kBlockHeaderBytes + decoded.extent_payload_bytes) {
+    return false;
+  }
   const std::uint32_t expected = decoded.checksum;
   std::array<std::byte, kBlockHeaderBytes> copy{};
   std::memcpy(copy.data(), input.data(), copy.size());
@@ -306,19 +323,23 @@ bool EncodeRecordHeader(
       header.version != kStorageFormatVersion ||
       key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
       header.db_id >= kLogicalDatabaseCount ||
-      header.reserved != 0 ||
       static_cast<std::uint8_t>(header.value_type) >
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (header.kind == RecordKind::kValue &&
        header.value_type == ValueType::kNone) ||
       (header.kind == RecordKind::kTombstone &&
-       (header.value_bytes != 0 || header.expire_at_ms != 0 ||
+       (header.logical_size != 0 || header.payload_bytes != 0 ||
+        header.external || header.expire_at_ms != 0 ||
         header.value_type != ValueType::kNone)) ||
       header.header_bytes != header_bytes || output.size() != header_bytes) {
     return false;
   }
   std::fill(output.begin(), output.end(), std::byte{0});
   RecordHeader encoded = header;
+  encoded.value_type = static_cast<ValueType>(
+      static_cast<std::uint8_t>(encoded.value_type) |
+      (encoded.external ? kExternalValueMask : 0));
+  encoded.external = false;
   encoded.header_checksum = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
   std::memcpy(output.data() + sizeof(encoded), key.data(), key.size());
@@ -336,12 +357,16 @@ bool DecodeRecordHeader(
   }
   RecordHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
+  const std::uint8_t encoded_type =
+      static_cast<std::uint8_t>(decoded.value_type);
+  decoded.external = (encoded_type & kExternalValueMask) != 0;
+  decoded.value_type =
+      static_cast<ValueType>(encoded_type & ~kExternalValueMask);
   if (decoded.magic != kRecordMagic ||
       decoded.version != kStorageFormatVersion ||
       (decoded.kind != RecordKind::kValue &&
        decoded.kind != RecordKind::kTombstone) ||
       decoded.db_id >= kLogicalDatabaseCount ||
-      decoded.reserved != 0 ||
       static_cast<std::uint8_t>(decoded.value_type) >
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (decoded.kind == RecordKind::kValue &&
@@ -350,23 +375,26 @@ bool DecodeRecordHeader(
       decoded.key_bytes > MaxKeyBytes() ||
       decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
       decoded.header_bytes > input.size() ||
-      decoded.value_disk_bytes != decoded.value_bytes ||
       decoded.total_disk_bytes != AlignRecord(
           static_cast<std::size_t>(decoded.header_bytes) +
-          decoded.value_disk_bytes) ||
+          decoded.payload_bytes) ||
       decoded.total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
     return false;
   }
   if (decoded.kind == RecordKind::kTombstone &&
-      (decoded.value_bytes != 0 || decoded.expire_at_ms != 0 ||
+      (decoded.logical_size != 0 || decoded.payload_bytes != 0 ||
+       decoded.external || decoded.expire_at_ms != 0 ||
        decoded.value_type != ValueType::kNone)) {
     return false;
   }
   const std::uint32_t expected = decoded.header_checksum;
   std::array<std::byte, kMaxRecordHeaderBytes> copy{};
   std::memcpy(copy.data(), input.data(), decoded.header_bytes);
-  decoded.header_checksum = 0;
-  std::memcpy(copy.data(), &decoded, sizeof(decoded));
+  RecordHeader checksum_header = decoded;
+  checksum_header.value_type = static_cast<ValueType>(encoded_type);
+  checksum_header.external = false;
+  checksum_header.header_checksum = 0;
+  std::memcpy(copy.data(), &checksum_header, sizeof(checksum_header));
   if (Crc32c(std::span<const std::byte>(copy.data(), decoded.header_bytes)) !=
       expected) {
     return false;

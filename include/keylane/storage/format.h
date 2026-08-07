@@ -27,6 +27,10 @@ inline constexpr std::uint64_t kDeviceLabelMagic =
     0x314c42414c4c4bULL;  // KLLABL1
 inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;   // KCOLBLK1
 inline constexpr std::uint64_t kRecordMagic = 0x314b4c5245434f52ULL;  // ROCERLK1
+inline constexpr std::uint64_t kExtentManifestMagic =
+    0x3154464e4d4c4bULL;  // KLMNFT1
+inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
+inline constexpr std::uint8_t kExternalValueMask = 0x80;
 inline constexpr std::uint64_t kMetadataPageMagic =
     0x31475041544d4c4bULL;  // KLMETAP1
 inline constexpr std::uint32_t kLogicalStorageShards = 16384;
@@ -132,6 +136,11 @@ enum class RecordKind : std::uint8_t {
   kTombstone = 2,
 };
 
+enum class BlockKind : std::uint8_t {
+  kRecords = 1,
+  kValueExtent = 2,
+};
+
 // Stable on-disk Redis value type identifiers. Only strings are implemented
 // today; reserving the remaining top-level types keeps expiration and recovery
 // metadata generic as their command implementations are added.
@@ -158,6 +167,11 @@ struct BlockHeader {
   std::uint64_t max_lsn = 0;
   std::uint32_t checksum = 0;
   std::uint32_t layout_worker_count = 0;
+  BlockKind kind = BlockKind::kRecords;
+  std::array<std::uint8_t, 3> reserved{};
+  std::uint32_t extent_index = 0;
+  std::uint32_t extent_payload_bytes = 0;
+  std::uint32_t extent_payload_checksum = 0;
 };
 
 // Every configured file or raw block device has an immutable identity. Fixed
@@ -181,11 +195,15 @@ struct RecordHeader {
   RecordKind kind = RecordKind::kValue;
   std::uint8_t db_id = 0;
   ValueType value_type = ValueType::kNone;
-  std::uint8_t reserved = 0;
+  // Transient decoded form. This byte is zero on disk; external is encoded in
+  // the high bit of value_type.
+  bool external = false;
   Digest digest{};
   std::uint32_t key_bytes = 0;
-  std::uint32_t value_bytes = 0;
-  std::uint32_t value_disk_bytes = 0;
+  // Redis-visible size: bytes for String and cardinality for collections.
+  std::uint64_t logical_size = 0;
+  // Physical payload following this header. External roots store a manifest.
+  std::uint32_t payload_bytes = 0;
   std::uint32_t total_disk_bytes = 0;
   std::uint64_t generation = 0;
   std::uint64_t replication_epoch = 1;
@@ -200,11 +218,31 @@ struct RecordHeader {
   std::uint32_t header_checksum = 0;
 };
 
+struct ExtentManifestHeader {
+  std::uint64_t magic = kExtentManifestMagic;
+  std::uint32_t version = kStorageFormatVersion;
+  std::uint32_t extent_count = 0;
+};
+
+struct ExtentRef {
+  std::uint64_t block_id = kInvalidBlockId;
+  std::uint64_t allocation_epoch = 0;
+  std::uint32_t payload_bytes = 0;
+  std::uint32_t payload_checksum = 0;
+};
+
+inline constexpr std::size_t kExtentPayloadBytes =
+    kStorageBlockBytes - kBlockHeaderBytes;
+inline constexpr std::size_t kMaxStringExtents =
+    (kMaxStringBytes + kExtentPayloadBytes - 1) / kExtentPayloadBytes;
+
 static_assert(sizeof(BlockHeader) <= kBlockHeaderBytes);
 static_assert(sizeof(DeviceLabel) <= kDirectIoAlignment);
 static_assert(sizeof(MetadataPageHeader) < kDirectIoAlignment);
 static_assert(kMetadataPagePayloadBytes % sizeof(std::uint64_t) == 0);
 static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
+static_assert(sizeof(ExtentManifestHeader) == 16);
+static_assert(sizeof(ExtentRef) == 24);
 
 constexpr std::size_t AlignDirect(std::size_t size) noexcept {
   return (size + kDirectIoAlignment - 1) & ~(kDirectIoAlignment - 1);
