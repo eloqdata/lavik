@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "celer/runtime/cross_core.h"
+#include "celer/runtime/worker.h"
 #include "celer/io/storage.h"
 #include "keylane/command_table.h"
 #include "keylane/resp.h"
@@ -1061,6 +1062,57 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
   }
 }
 
+// Joins per-key reader coroutines spawned on one shard. Everything runs on
+// the owning worker thread, so plain counters suffice; the waiter resumes
+// via its own worker's ready queue once the last read lands.
+struct ShardReadJoin {
+  std::size_t pending = 0;
+  std::coroutine_handle<> waiter;
+  Status error;
+
+  void Complete(Status status) {
+    if (!status.ok() && error.ok()) {
+      error = std::move(status);
+    }
+    if (--pending == 0 && waiter) {
+      auto handle = waiter;
+      waiter = {};
+      ThisWorker().self->Enqueue(handle);
+    }
+  }
+
+  auto Join() {
+    struct Awaiter {
+      ShardReadJoin* join;
+      bool await_ready() const { return join->pending == 0; }
+      void await_suspend(std::coroutine_handle<> handle) {
+        join->waiter = handle;
+      }
+      void await_resume() const {}
+    };
+    return Awaiter{this};
+  }
+};
+
+// One concurrent MGET read: locks are already held for the whole hop, and
+// distinct keys live in distinct blocks, so per-key disk reads overlap
+// instead of accumulating latency serially.
+Task<Status> ReadFrameIntoSlot(std::uint8_t db, const std::string* key,
+                               storage::Digest digest,
+                               std::optional<std::string>* slot,
+                               ShardReadJoin* join) {
+  auto value = co_await g_storage->GetLocked(db, *key, digest);
+  Status status = Status::Ok();
+  if (value.ok()) {
+    const auto bytes = value->network_bytes();
+    slot->emplace(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  } else if (value.status().code() != StatusCode::kNotFound) {
+    status = value.status();
+  }
+  join->Complete(std::move(status));
+  co_return Status::Ok();
+}
+
 // Shared context of one multi-key command's transaction. Shard callbacks
 // write disjoint reply slots (MGET) or bump the shared counter (DEL/EXISTS)
 // before the hop barrier; the coordinator assembles the reply afterwards.
@@ -1074,6 +1126,18 @@ Task<Status> MultiKeyShardCallback(void* context,
                                    const tx::ShardSlice& slice) {
   auto* ctx = static_cast<MultiKeyContext*>(context);
   const auto& args = ctx->request->args;
+  if (ctx->request->kind == CommandKind::kMGet && slice.keys.size() > 1) {
+    // Overlap this shard's disk reads instead of awaiting them one by one.
+    ShardReadJoin join;
+    join.pending = slice.keys.size();
+    for (const tx::TxKey& key : slice.keys) {
+      SpawnOnCurrentWorker(ReadFrameIntoSlot(
+          ctx->request->db_id, &args[key.arg_index], key.digest,
+          &ctx->frames[key.arg_index - 1], &join));
+    }
+    co_await join.Join();
+    co_return join.error;
+  }
   for (const tx::TxKey& key : slice.keys) {
     const std::string& name = args[key.arg_index];
     switch (ctx->request->kind) {
@@ -1226,6 +1290,25 @@ Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
   const CommandRequest& cmd = (*ctx->queued)[ctx->current];
   const auto& args = cmd.args;
   const unsigned self = ThisWorker().id;
+  if (cmd.kind == CommandKind::kMGet) {
+    std::size_t mine = 0;
+    for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
+      mine += key.owner == self ? 1 : 0;
+    }
+    if (mine > 1) {
+      ShardReadJoin join;
+      join.pending = mine;
+      for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
+        if (key.owner == self) {
+          SpawnOnCurrentWorker(ReadFrameIntoSlot(cmd.db_id, &args[key.arg],
+                                                 key.digest,
+                                                 &ctx->mget[key.slot], &join));
+        }
+      }
+      co_await join.Join();
+      co_return join.error;
+    }
+  }
   for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
     if (key.owner != self) {
       continue;
