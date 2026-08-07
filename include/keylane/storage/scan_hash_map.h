@@ -142,6 +142,23 @@ class ScanHashMap {
     rehash_index_ = kNotRehashing;
   }
 
+  // Moves every entry out into the returned map and leaves *this empty and
+  // immediately usable. Destroying the returned map is what actually frees the
+  // entries, so a caller can hand it to a background task and keep serving
+  // reads from *this. O(1) — no entry is touched here.
+  //
+  // Entry addresses are stable for as long as their map lives (expansion moves
+  // bucket pointers, never entries), so callers may cache a raw Entry*. Such a
+  // caller must be able to tell that a detach happened before dereferencing;
+  // this class does not track that, since the useful granularity is whatever
+  // set of maps the caller detaches together.
+  ScanHashMap Detach() noexcept {
+    ScanHashMap detached;
+    detached.tables_ = std::exchange(tables_, {});
+    detached.rehash_index_ = std::exchange(rehash_index_, kNotRehashing);
+    return detached;
+  }
+
  private:
   static constexpr std::size_t kEntriesPerBucket = 7;
   static constexpr std::uint8_t kChainedBit = 0x80;

@@ -248,26 +248,47 @@ class DbCloseGuard {
 };
 
 Task<CommandReply> ExecuteFlushDb(const CommandRequest& request) {
-  if (request.args.size() != 1) {
+  bool wait_for_reclaim = true;
+  if (request.args.size() == 2) {
+    if (CmpCaseInsensitive(request.args[1], "ASYNC")) {
+      wait_for_reclaim = false;
+    } else if (!CmpCaseInsensitive(request.args[1], "SYNC")) {
+      co_return EncodedReply(EncodeError("ERR syntax error"));
+    }
+  } else if (request.args.size() != 1) {
     co_return EncodedReply(
         EncodeError("ERR wrong number of arguments for 'flushdb' command"));
   }
-  if (!CloseDbGate(request.db_id)) {
-    co_return EncodedReply(
-        EncodeError("BUSY another FLUSHDB is already running"));
-  }
-  DbCloseGuard reopen(request.db_id);
-  while ((g_db_gates[request.db_id].load(std::memory_order_acquire) &
-          kDbGateCountMask) != 0) {
-    Status waited = co_await celer::SleepFor(
-        *ThisWorker().self, std::chrono::milliseconds(1));
-    if (!waited.ok()) {
-      co_return EncodedReply(EncodeError("ERR " + waited.message()));
+
+  Status detached = Status::Ok();
+  {
+    // The gate closes the database to every other command, so it covers only
+    // the phase that has to be exclusive: draining commands already in flight,
+    // and swapping the indexes out. Reclaiming what was swapped out runs below
+    // with the database open again, since nothing can reach it any more.
+    if (!CloseDbGate(request.db_id)) {
+      co_return EncodedReply(
+          EncodeError("BUSY another FLUSHDB is already running"));
     }
+    DbCloseGuard reopen(request.db_id);
+    while ((g_db_gates[request.db_id].load(std::memory_order_acquire) &
+            kDbGateCountMask) != 0) {
+      Status waited = co_await celer::SleepFor(
+          *ThisWorker().self, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        co_return EncodedReply(EncodeError("ERR " + waited.message()));
+      }
+    }
+    detached = co_await g_storage->FlushDbDetach(request.db_id);
   }
-  Status status = co_await g_storage->FlushDb(request.db_id);
-  co_return EncodedReply(status.ok() ? EncodeSimpleString("OK")
-                                     : EncodeError("ERR " + status.message()));
+  if (!detached.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + detached.message()));
+  }
+
+  Status reclaimed = co_await g_storage->FlushDbReclaim(wait_for_reclaim);
+  co_return EncodedReply(reclaimed.ok()
+                             ? EncodeSimpleString("OK")
+                             : EncodeError("ERR " + reclaimed.message()));
 }
 
 struct ScanOptions {

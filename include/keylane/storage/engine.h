@@ -162,10 +162,18 @@ class StorageEngine {
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
                           std::uint64_t cursor, std::size_t count) const;
 
-  // Atomically invalidates one logical DB by advancing its durable epoch.
-  // The command layer must prevent concurrent operations in that DB while this
-  // coroutine runs.
-  celer::Task<celer::Status> FlushDb(std::uint8_t db_id);
+  // Atomically invalidates one logical DB by advancing its durable epoch and
+  // taking its indexes out of service. The command layer must prevent
+  // concurrent operations in that DB while this coroutine runs, and may allow
+  // them again as soon as it returns: the DB is observably empty from here on.
+  // Cost is bounded by the partition count, not by the number of keys.
+  celer::Task<celer::Status> FlushDbDetach(std::uint8_t db_id);
+
+  // Retires what FlushDbDetach took out of service, subtracting it from the
+  // block accounting and freeing it. Safe to run with the DB open and serving.
+  // `wait` distinguishes FLUSHDB SYNC from FLUSHDB ASYNC: a reclaimer runs
+  // either way, and only the caller's completion differs.
+  celer::Task<celer::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
 
   // Source-side partition migration primitives. Begin captures

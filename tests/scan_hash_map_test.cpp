@@ -112,5 +112,36 @@ int main() {
     return 1;
   }
 
+  // Detach hands the whole population to the caller and leaves the source empty
+  // and immediately usable. Entry addresses survive the move, which is what
+  // lets callers keep raw Entry pointers into a detached population.
+  const std::size_t detached_size = moved.size();
+  auto* before_detach = moved.Find(ComputeDigest("key-0"), "key-0");
+  ScanHashMap<std::uint64_t> detached = moved.Detach();
+  if (!Check(moved.empty() && moved.size() == 0,
+             "detach left entries in the source")) {
+    return 1;
+  }
+  if (!Check(moved.Find(ComputeDigest("key-0"), "key-0") == nullptr,
+             "detached entry is still reachable from the source")) {
+    return 1;
+  }
+  if (!Check(detached.size() == detached_size &&
+                 detached.Find(ComputeDigest("key-0"), "key-0") ==
+                     before_detach,
+             "detach did not carry the population over unchanged")) {
+    return 1;
+  }
+
+  // The source must accept a fresh population, including a key that the
+  // detached one still holds.
+  auto reinserted = moved.InsertOrAssign(ComputeDigest("key-0"), "key-0", 7);
+  if (!Check(reinserted.inserted && moved.size() == 1 &&
+                 moved.Find(ComputeDigest("key-0"), "key-0")->value == 7 &&
+                 detached.Find(ComputeDigest("key-0"), "key-0")->value == 42,
+             "source and detached populations are not independent")) {
+    return 1;
+  }
+
   return 0;
 }

@@ -216,9 +216,17 @@ struct RecoveryLiveReference {
   std::uint32_t extent_payload_checksum = 0;
 };
 
+// Back-pointer from a block to the index entries staged in its write buffer, so
+// the flush completion can flip them to on-disk reads without re-hashing every
+// key. The entry can outlive the index that owns it: FLUSHDB detaches every
+// partition index for one database while blocks are still in flight. Recording
+// which database generation produced the entry lets the completion detect that
+// and skip the entry instead of following a pointer into a freed population.
 struct RecordIdentity {
   RecordIndex::Entry* entry = nullptr;
   std::shared_ptr<const std::vector<ExtentRef>> retired_extents;
+  std::uint64_t index_generation = 0;
+  std::uint8_t db_id = 0;
 };
 
 struct ReplicaValueStage {
@@ -232,6 +240,14 @@ struct ReplicaValueStage {
   ValueType value_type = ValueType::kNone;
   std::string key;
   std::string value;
+};
+
+// One partition's worth of entries taken out of service by FLUSHDB. The entries
+// are unreachable to readers the moment the index is detached, but the blocks
+// they occupy still count them as live until the reclaimer subtracts them.
+struct DetachedIndex {
+  RecordIndex index;
+  std::uint8_t db_id = 0;
 };
 
 class AsyncMutex {
@@ -786,6 +802,14 @@ class StorageEngine::Impl {
     std::vector<PartitionStore> partitions;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records;
+    // Bumped every time FLUSHDB detaches this database's partition indexes.
+    // Every index for one database is detached together and without suspending,
+    // so one counter per database describes all of them.
+    std::array<std::uint64_t, kLogicalDatabaseCount> index_generations{};
+    // Populations detached by FLUSHDB, still holding their entries. Draining
+    // this is what actually frees them and settles the block accounting.
+    std::deque<DetachedIndex> detached_indexes;
+    bool detached_reclaim_running = false;
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
     std::array<IntentLockTable, kLogicalDatabaseCount> key_locks;
     std::optional<ActiveBlock> active_block;
@@ -1781,12 +1805,12 @@ class StorageEngine::Impl {
     return db_epochs_[db_id].load(std::memory_order_acquire);
   }
 
-  Task<Status> FlushDb(std::uint8_t db_id) {
+  Task<Status> FlushDbDetach(std::uint8_t db_id) {
     assert(db_id < kLogicalDatabaseCount);
     if (celer::ThisWorker().id != 0) {
       co_return co_await celer::SubmitTaskTo(
           0, [this, db_id]() -> Task<Status> {
-            co_return co_await FlushDb(db_id);
+            co_return co_await FlushDbDetach(db_id);
           });
     }
 
@@ -1794,14 +1818,26 @@ class StorageEngine::Impl {
     if (current == std::numeric_limits<std::uint64_t>::max()) {
       co_return Status(StatusCode::kOutOfRange, "database epoch exhausted");
     }
-    co_return co_await AdvanceDbEpoch(db_id, current + 1);
+    co_return co_await DetachDbEpoch(db_id, current + 1);
   }
 
-  Task<Status> AdvanceDbEpoch(std::uint8_t db_id, std::uint64_t next) {
+  Task<Status> FlushDbReclaim(bool wait) {
+    co_return co_await ReclaimDetachedAllWorkers(wait);
+  }
+
+  // Persists the new epoch, then takes the database out of service on every
+  // worker. Callers hold the database gate across this and can drop it as soon
+  // as it returns: the keyspace is empty and durably so, and what remains is
+  // reclamation that no reader can observe. Bounded by the partition count.
+  //
+  // The epoch has to reach the device before any index is detached. Crashing in
+  // the other order leaves records on disk whose epoch still matches, and
+  // recovery would resurrect the whole flushed database.
+  Task<Status> DetachDbEpoch(std::uint8_t db_id, std::uint64_t next) {
     if (celer::ThisWorker().id != 0) {
       co_return co_await celer::SubmitTaskTo(
           0, [this, db_id, next]() -> Task<Status> {
-            co_return co_await AdvanceDbEpoch(db_id, next);
+            co_return co_await DetachDbEpoch(db_id, next);
           });
     }
     const std::uint64_t current = DbEpoch(db_id);
@@ -1819,19 +1855,58 @@ class StorageEngine::Impl {
     db_epochs_[db_id].store(next, std::memory_order_release);
 
     for (unsigned target = 0; target < worker_count_; ++target) {
-      Status cleared = target == 0
-                           ? co_await ClearDbLocal(*stores_[target], db_id)
-                           : co_await celer::SubmitTaskTo(
-                                 target,
-                                 [this, target, db_id]() -> Task<Status> {
-                                   co_return co_await ClearDbLocal(
-                                       *stores_[target], db_id);
-                                 });
-      if (!cleared.ok()) {
-        co_return cleared;
+      auto detach = [this, target, db_id]() -> Task<Status> {
+        WorkerStore& store = *stores_[target];
+        co_await store.writer_mutex.Lock();
+        UnlockGuard unlock(&store.writer_mutex, store.worker);
+        DetachDbLocal(store, db_id);
+        co_return Status::Ok();
+      };
+      Status detached = target == 0
+                            ? co_await detach()
+                            : co_await celer::SubmitTaskTo(target, detach);
+      if (!detached.ok()) {
+        co_return detached;
       }
     }
     co_return Status::Ok();
+  }
+
+  // Retires what DetachDbEpoch took out of service. Runs with the gate open and
+  // ordinary traffic flowing. `wait` is the difference between FLUSHDB SYNC and
+  // FLUSHDB ASYNC: either way a reclaimer runs, only the reply waits or not.
+  Task<Status> ReclaimDetachedAllWorkers(bool wait) {
+    if (celer::ThisWorker().id != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, wait]() -> Task<Status> {
+            co_return co_await ReclaimDetachedAllWorkers(wait);
+          });
+    }
+    for (unsigned target = 0; target < worker_count_; ++target) {
+      auto reclaim = [this, target, wait]() -> Task<Status> {
+        WorkerStore& store = *stores_[target];
+        if (!wait) {
+          EnsureDetachedReclaim(store);
+          co_return Status::Ok();
+        }
+        co_return co_await AwaitDetachedReclaim(store);
+      };
+      Status reclaimed = target == 0
+                             ? co_await reclaim()
+                             : co_await celer::SubmitTaskTo(target, reclaim);
+      if (!reclaimed.ok()) {
+        co_return reclaimed;
+      }
+    }
+    co_return Status::Ok();
+  }
+
+  Task<Status> AdvanceDbEpoch(std::uint8_t db_id, std::uint64_t next) {
+    Status detached = co_await DetachDbEpoch(db_id, next);
+    if (!detached.ok()) {
+      co_return detached;
+    }
+    co_return co_await ReclaimDetachedAllWorkers(/*wait=*/true);
   }
 
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
@@ -2787,48 +2862,17 @@ class StorageEngine::Impl {
     co_return Status::Ok();
   }
 
-  Task<Status> ClearDbLocal(WorkerStore& store, std::uint8_t db_id) {
-    co_await store.writer_mutex.Lock();
-    UnlockGuard unlock(&store.writer_mutex, store.worker);
-    std::vector<RecordLocation> old_locations;
-    old_locations.reserve(store.live_key_count[db_id]);
-    std::size_t staged_record_count = 0;
-    for (const auto& [block_id, records] : store.staged_records) {
-      (void)block_id;
-      staged_record_count += records.size();
-    }
-    absl::flat_hash_set<const RecordIndex::Entry*> retained_staged_entries;
-    retained_staged_entries.reserve(staged_record_count);
-    for (const auto& [block_id, records] : store.staged_records) {
-      (void)block_id;
-      for (const RecordIdentity& identity : records) {
-        if (identity.entry != nullptr) {
-          retained_staged_entries.insert(identity.entry);
-        }
-      }
-    }
+  // Takes the database out of service on this worker. Everything here is O(the
+  // partition count) and runs without suspending, so the caller's FLUSHDB gate
+  // stays closed for a bounded time no matter how many keys the database holds.
+  // Retiring the detached entries is left to ReclaimDetachedIndexes.
+  void DetachDbLocal(WorkerStore& store, std::uint8_t db_id) {
+    ++store.index_generations[db_id];
     for (auto& partition : store.partitions) {
-      auto& index = partition.indexes[db_id];
-      index.ForEach([&](const RecordIndex::Entry& entry) {
-        old_locations.push_back(entry.value);
-        retained_staged_entries.erase(&entry);
+      store.detached_indexes.push_back(DetachedIndex{
+          .index = partition.indexes[db_id].Detach(),
+          .db_id = db_id,
       });
-    }
-    // A staged flush retains raw Entry pointers. Null affected pointers while
-    // the entries are still alive, before Clear destroys the index storage.
-    // Track only staged pointers here instead of building a set for every key
-    // in a potentially very large logical database.
-    for (auto& [block_id, records] : store.staged_records) {
-      (void)block_id;
-      for (RecordIdentity& identity : records) {
-        if (identity.entry != nullptr &&
-            !retained_staged_entries.contains(identity.entry)) {
-          identity.entry = nullptr;
-        }
-      }
-    }
-    for (auto& partition : store.partitions) {
-      partition.indexes[db_id].Clear();
       partition.live_key_count[db_id] = 0;
       partition.expiring_key_count[db_id] = 0;
       const std::uint64_t sequence = ++partition.mutation_sequence;
@@ -2844,17 +2888,120 @@ class StorageEngine::Impl {
       }
     }
     store.live_key_count[db_id] = 0;
-    for (const RecordLocation& location : old_locations) {
-      Status dead = co_await MarkRecordDead(location);
-      if (!dead.ok()) {
-        store.write_failed = true;
-        co_return dead;
+  }
+
+  // Retires the entries FLUSHDB detached: subtracts what they contributed to
+  // their blocks, then frees them. Readers can no longer reach any of it, so
+  // this may run long after the command replied.
+  //
+  // Each block is credited once for the whole population rather than once per
+  // record, which is the same total by construction and turns a per-record
+  // cross-core hop into a per-block one. A block cannot be recycled underneath
+  // an outstanding subtraction: whatever is still owed keeps its live_bytes
+  // above zero, so it cannot reach the empty-block path until this settles.
+  Task<Status> ReclaimDetachedIndexes(WorkerStore& store) {
+    while (!store.detached_indexes.empty()) {
+      DetachedIndex detached = std::move(store.detached_indexes.front());
+      store.detached_indexes.pop_front();
+
+      struct BlockDelta {
+        std::uint64_t bytes = 0;
+        std::uint16_t block_owner = 0;
+      };
+      // Keyed by allocation epoch as well as block id: entries naming the same
+      // block at different epochs are an accounting violation rather than
+      // something to sum, so they stay separate and MarkRecordDeadLocal's epoch
+      // check rejects the stale one instead of the total silently absorbing it.
+      // Bounded by the number of blocks the population touched, not by the
+      // number of records in it.
+      absl::flat_hash_map<std::pair<std::uint64_t, std::uint64_t>, BlockDelta>
+          dead_by_block;
+      // An external value's manifest is what the block accounting above sees;
+      // the extent blocks holding its payload are owned by the manifest and
+      // released as a unit, so they are collected per record rather than
+      // folded into the per-block totals.
+      std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
+      detached.index.ForEach([&](const RecordIndex::Entry& entry) {
+        BlockDelta& delta = dead_by_block[std::pair(
+            entry.value.block_id, entry.value.allocation_epoch)];
+        delta.block_owner = entry.value.block_owner;
+        delta.bytes += entry.value.total_disk_bytes;
+        if (entry.value.external && entry.value.extents != nullptr) {
+          dead_extents.push_back(entry.value.extents);
+        }
+      });
+
+      for (const auto& extents : dead_extents) {
+        store.worker->Spawn(ReclaimExtents(&store, extents));
       }
-      if (location.external && location.extents != nullptr) {
-        store.worker->Spawn(ReclaimExtents(&store, location.extents));
+
+      for (const auto& [block, delta] : dead_by_block) {
+        // A block holds at most kStorageBlockBytes, so the sum still fits the
+        // per-record width.
+        assert(delta.bytes <= kStorageBlockBytes);
+        RecordLocation aggregate{
+            .block_id = block.first,
+            .allocation_epoch = block.second,
+            .block_owner = delta.block_owner,
+            .total_disk_bytes = static_cast<std::uint32_t>(delta.bytes),
+        };
+        Status dead = co_await MarkRecordDead(aggregate);
+        if (!dead.ok()) {
+          store.write_failed = true;
+          co_return dead;
+        }
+      }
+
+      // Freeing the entries is the expensive part of this loop, and it happens
+      // as `detached` goes out of scope. Yield so online work is polled between
+      // populations.
+      co_await celer::Yield(*store.worker);
+    }
+
+    co_await store.writer_mutex.Lock();
+    UnlockGuard unlock(&store.writer_mutex, store.worker);
+    SealDeadActiveBlock(store);
+    co_return Status::Ok();
+  }
+
+  // At most one reclaimer per store, so the two ways in — a background one that
+  // FLUSHDB ASYNC leaves behind, and a caller waiting for SYNC — never split a
+  // population between them. Whichever runs picks up work queued after it
+  // started, so an arriving FLUSHDB only has to make sure one is alive.
+  void EnsureDetachedReclaim(WorkerStore& store) {
+    if (store.detached_reclaim_running || store.detached_indexes.empty()) {
+      return;
+    }
+    store.detached_reclaim_running = true;
+    store.worker->SpawnBackground(RunDetachedReclaim(&store));
+  }
+
+  Task<Status> RunDetachedReclaim(WorkerStore* store) {
+    Status status = co_await ReclaimDetachedIndexes(*store);
+    store->detached_reclaim_running = false;
+    if (!status.ok()) {
+      spdlog::error("worker[{}] detached index reclaim failed: {}",
+                    store->worker->id(), status.message());
+    }
+    co_return status;
+  }
+
+  // Waits for everything detached so far to be retired. The keyspace is already
+  // empty either way; this is what makes FLUSHDB SYNC mean the memory came back
+  // before the reply.
+  Task<Status> AwaitDetachedReclaim(WorkerStore& store) {
+    EnsureDetachedReclaim(store);
+    while (store.detached_reclaim_running || !store.detached_indexes.empty()) {
+      Status waited = co_await celer::SleepFor(
+          *store.worker, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        co_return waited;
       }
     }
-    SealDeadActiveBlock(store);
+    if (store.write_failed) {
+      co_return Status(StatusCode::kInternal,
+                       "storage writer stopped while reclaiming flushed keys");
+    }
     co_return Status::Ok();
   }
 
@@ -3766,8 +3913,17 @@ class StorageEngine::Impl {
       return Status(StatusCode::kInternal,
                     "stale block owner while invalidating record");
     }
-    state->live_bytes -=
-        std::min(state->live_bytes, location.total_disk_bytes);
+    // live_bytes is the byte sum over exactly the index entries naming this
+    // block at this allocation epoch, so the entry being retired here is one of
+    // the summands and the subtraction cannot underflow. Saturating instead of
+    // reporting would drive live_bytes to zero while records are still
+    // reachable, which CleanBlockLocked now reads as "nothing to salvage" and
+    // frees without inspecting the block. Fail loudly rather than lose data.
+    if (state->live_bytes < location.total_disk_bytes) {
+      return Status(StatusCode::kInternal,
+                    "block live-byte accounting underflow");
+    }
+    state->live_bytes -= location.total_disk_bytes;
     MaybeQueueDefrag(store, location.block_id);
     return Status::Ok();
   }
@@ -4380,6 +4536,8 @@ class StorageEngine::Impl {
             !for_defrag && previous.has_value() && previous->external
                 ? previous->extents
                 : nullptr,
+        .index_generation = store.index_generations[db_id],
+        .db_id = db_id,
     });
     if (was_live != is_live) {
       if (is_live) {
@@ -4846,6 +5004,13 @@ class StorageEngine::Impl {
         if (identity.entry == nullptr) {
           continue;
         }
+        // FLUSHDB detached the population this entry belongs to. The entry is
+        // either already freed or waiting to be, and nothing reaches it either
+        // way, so it must not be dereferenced.
+        if (identity.index_generation !=
+            store->index_generations[identity.db_id]) {
+          continue;
+        }
         RecordLocation& current = identity.entry->value;
         if (current.block_id == pending->block_id &&
             current.allocation_epoch == pending->allocation_epoch) {
@@ -5067,7 +5232,44 @@ class StorageEngine::Impl {
       co_return Status::Ok();
     }
     source.defragging = true;
+    const auto [source_file_id, source_block_offset] = FileOffset(block_id);
 
+    // live_bytes counts exactly the index entries naming this block, so zero
+    // means nothing here is reachable and the salvage pass is a provable no-op:
+    // every record it decoded would find its key either absent from the index
+    // or pointing at a different physical record, so RelocateIfCurrent would
+    // rewrite nothing and the live_bytes re-check below would still see zero.
+    // Skipping reaches the same free path under the same precondition, without
+    // reading 8 MiB and CRC-checking every record in it. FLUSHDB empties whole
+    // blocks at once, which is where this dominates.
+    if (source.live_bytes != 0) {
+      Status salvaged = co_await SalvageBlockRecords(
+          store, block_id, source, source_file_id, source_block_offset);
+      if (!salvaged.ok()) {
+        co_return salvaged;
+      }
+    }
+
+    {
+      co_await store.writer_mutex.Lock();
+      UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+      if (source.live_bytes != 0) {
+        source.defragging = false;
+        co_return Status::Ok();
+      }
+      source.freeing = true;
+    }
+    co_return co_await ReleaseEmptyBlock(store, block_id, source,
+                                         source_file_id, source_block_offset);
+  }
+
+  // Rewrites every record in the block that is still current, so the block ends
+  // up with no reachable data and the caller can free it. Clears `defragging`
+  // on each failure path so the block stays eligible for a later pass.
+  Task<Status> SalvageBlockRecords(WorkerStore& store, std::uint64_t block_id,
+                                   BlockState& source,
+                                   std::uint32_t source_file_id,
+                                   std::uint64_t source_block_offset) {
     struct DefragBuffer {
       RegisteredBufferPool* pool = nullptr;
       std::uint16_t buffer_id = 0;
@@ -5103,7 +5305,6 @@ class StorageEngine::Impl {
                        "defrag block buffer is smaller than a storage block");
     }
     block_data.buffer.size = kStorageBlockBytes;
-    const auto [source_file_id, source_block_offset] = FileOffset(block_id);
     auto read = co_await ReadStorageBuffer(
         *store.worker, store.files[source_file_id], block_data.buffer,
         block_data.registered(), source_block_offset);
@@ -5195,16 +5396,16 @@ class StorageEngine::Impl {
       // I/O and cross-core work are polled first.
       co_await celer::Yield(*store.worker);
     }
+    co_return Status::Ok();
+  }
 
-    {
-      co_await store.writer_mutex.Lock();
-      UnlockGuard write_unlock(&store.writer_mutex, store.worker);
-      if (source.live_bytes != 0) {
-        source.defragging = false;
-        co_return Status::Ok();
-      }
-      source.freeing = true;
-    }
+  // Drains readers and hands the block back to the allocator. The caller must
+  // have observed live_bytes == 0 under writer_mutex and set `freeing`, which
+  // stops LoadValueLocal from taking new pins.
+  Task<Status> ReleaseEmptyBlock(WorkerStore& store, std::uint64_t block_id,
+                                 BlockState& source,
+                                 std::uint32_t source_file_id,
+                                 std::uint64_t source_block_offset) {
     while (source.pins != 0) {
       Status waited = co_await celer::SleepFor(
           *store.worker, std::chrono::milliseconds(1));
@@ -5334,8 +5535,12 @@ ScanBatch StorageEngine::ScanPartition(std::uint16_t partition_id,
   return impl_->ScanPartition(partition_id, db_id, cursor, count);
 }
 
-Task<Status> StorageEngine::FlushDb(std::uint8_t db_id) {
-  co_return co_await impl_->FlushDb(db_id);
+Task<Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
+  co_return co_await impl_->FlushDbDetach(db_id);
+}
+
+Task<Status> StorageEngine::FlushDbReclaim(bool wait) {
+  co_return co_await impl_->FlushDbReclaim(wait);
 }
 
 std::uint64_t StorageEngine::DbEpoch(std::uint8_t db_id) const noexcept {
