@@ -38,9 +38,12 @@ enum class CommandKind {
   kUnknown,
 };
 
+struct CommandSpec;
+
 struct CommandRequest {
   CommandKind kind = CommandKind::kUnknown;
   std::uint8_t db_id = 0;
+  const CommandSpec* spec = nullptr;
   std::vector<std::string> args;
 };
 

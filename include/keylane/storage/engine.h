@@ -221,6 +221,33 @@ class StorageEngine {
   celer::Task<celer::StatusOr<std::int64_t>> Increment(
       std::uint8_t db_id, std::string_view key);
 
+  // Pre-locked variants for the transaction layer. The caller must already
+  // hold this worker's key lock for `digest` in the required mode (shared for
+  // reads, exclusive for writes), must run on OwnerForKey(key), and `digest`
+  // must equal ComputeDigest(key). Write variants take the worker's
+  // writer_mutex internally and release it before returning.
+  celer::Task<celer::StatusOr<DiskValue>> GetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ReadLatencyTrace* trace = nullptr);
+  celer::Task<celer::StatusOr<std::uint64_t>> StringLengthLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  celer::Task<celer::StatusOr<SetResult>> SetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::string_view value, SetOptions options = {});
+  celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
+                                                  std::string_view key,
+                                                  const Digest& digest);
+  celer::Task<celer::StatusOr<bool>> UpdateExpirationLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::uint64_t expire_at_ms, ExpirationCondition condition);
+  celer::Task<celer::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
+                                                  std::string_view key,
+                                                  const Digest& digest);
+  celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
+                                 const Digest& digest);
+  celer::Task<celer::StatusOr<std::int64_t>> IncrementLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;

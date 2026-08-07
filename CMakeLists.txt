@@ -29,7 +29,9 @@ add_library(keylane_module
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/command.cpp
+  src/redis/command_table.cpp
   src/redis/server.cpp
+  src/tx/tx_shard.cpp
 )
 
 add_library(keylane::module ALIAS keylane_module)
@@ -52,6 +54,7 @@ target_link_libraries(keylane_module PUBLIC
   celer::rpc
   absl::crc32c
   absl::flat_hash_map
+  absl::inlined_vector
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -82,6 +85,18 @@ if (BUILD_TESTING)
   )
   target_link_libraries(keylane_scan_hash_map_test PRIVATE keylane::module)
   add_test(NAME keylane_scan_hash_map COMMAND keylane_scan_hash_map_test)
+
+  add_executable(keylane_command_table_test
+    tests/command_table_test.cpp
+  )
+  target_link_libraries(keylane_command_table_test PRIVATE keylane::module)
+  add_test(NAME keylane_command_table COMMAND keylane_command_table_test)
+
+  add_executable(keylane_tx_lock_test
+    tests/tx_lock_test.cpp
+  )
+  target_link_libraries(keylane_tx_lock_test PRIVATE keylane::module)
+  add_test(NAME keylane_tx_lock COMMAND keylane_tx_lock_test)
 
   add_executable(keylane_storage_format_test
     tests/storage_format_test.cpp

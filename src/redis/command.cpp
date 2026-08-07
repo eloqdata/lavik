@@ -15,6 +15,7 @@
 
 #include "celer/runtime/cross_core.h"
 #include "celer/io/storage.h"
+#include "keylane/command_table.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
@@ -49,37 +50,6 @@ bool CmpCaseInsensitive(std::string_view a, std::string_view b) {
   return true;
 }
 
-CommandKind MatchCommandKind(std::string_view name) {
-  switch (name.size()) {
-    case 3:
-      if (CmpCaseInsensitive(name, "GET")) return CommandKind::kGet;
-      if (CmpCaseInsensitive(name, "SET")) return CommandKind::kSet;
-      if (CmpCaseInsensitive(name, "DEL")) return CommandKind::kDel;
-      if (CmpCaseInsensitive(name, "TTL")) return CommandKind::kTtl;
-      break;
-    case 4:
-      if (CmpCaseInsensitive(name, "PING")) return CommandKind::kPing;
-      if (CmpCaseInsensitive(name, "ECHO")) return CommandKind::kEcho;
-      if (CmpCaseInsensitive(name, "INCR")) return CommandKind::kIncr;
-      if (CmpCaseInsensitive(name, "SCAN")) return CommandKind::kScan;
-      if (CmpCaseInsensitive(name, "PTTL")) return CommandKind::kPttl;
-      break;
-    case 6:
-      if (CmpCaseInsensitive(name, "DBSIZE")) return CommandKind::kDbSize;
-      if (CmpCaseInsensitive(name, "EXISTS")) return CommandKind::kExists;
-      if (CmpCaseInsensitive(name, "SELECT")) return CommandKind::kSelect;
-      if (CmpCaseInsensitive(name, "EXPIRE")) return CommandKind::kExpire;
-      if (CmpCaseInsensitive(name, "STRLEN")) return CommandKind::kStrlen;
-      break;
-    case 7:
-      if (CmpCaseInsensitive(name, "FLUSHDB")) return CommandKind::kFlushDb;
-      if (CmpCaseInsensitive(name, "PEXPIRE")) return CommandKind::kPExpire;
-      if (CmpCaseInsensitive(name, "PERSIST")) return CommandKind::kPersist;
-      break;
-  }
-  return CommandKind::kUnknown;
-}
-
 }  // namespace
 
 StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
@@ -89,7 +59,9 @@ StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
   }
 
   CommandRequest request;
-  request.kind = MatchCommandKind(command.args.front());
+  request.spec = FindCommand(command.args.front());
+  request.kind =
+      request.spec != nullptr ? request.spec->kind : CommandKind::kUnknown;
   request.db_id = db_id;
   request.args = std::move(command.args);
   return request;
@@ -887,14 +859,9 @@ void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
 
 Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   const auto& args = request.args;
-  const bool mutating = request.kind == CommandKind::kSet ||
-                        request.kind == CommandKind::kIncr ||
-                        request.kind == CommandKind::kDel ||
-                        request.kind == CommandKind::kExpire ||
-                        request.kind == CommandKind::kPExpire ||
-                        request.kind == CommandKind::kPersist ||
-                        request.kind == CommandKind::kFlushDb;
-  if (g_replica_read_only && mutating) {
+  const std::uint32_t cmd_flags =
+      request.spec != nullptr ? request.spec->flags : 0u;
+  if (g_replica_read_only && (cmd_flags & kCmdWrite) != 0) {
     co_return EncodedReply(EncodeError(
         "READONLY You can't write against a read only replica."));
   }
@@ -902,19 +869,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
     co_return co_await ExecuteFlushDb(request);
   }
 
-  const bool uses_db = request.kind == CommandKind::kDbSize ||
-                       request.kind == CommandKind::kScan ||
-                       request.kind == CommandKind::kDel ||
-                       request.kind == CommandKind::kExists ||
-                       request.kind == CommandKind::kGet ||
-                       request.kind == CommandKind::kStrlen ||
-                       request.kind == CommandKind::kSet ||
-                       request.kind == CommandKind::kIncr ||
-                       request.kind == CommandKind::kExpire ||
-                       request.kind == CommandKind::kPExpire ||
-                       request.kind == CommandKind::kPersist ||
-                       request.kind == CommandKind::kTtl ||
-                       request.kind == CommandKind::kPttl;
+  const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
   if (uses_db && !TryBeginDbOperation(request.db_id)) {
     co_return EncodedReply(
         EncodeError("TRYAGAIN FLUSHDB is in progress"));

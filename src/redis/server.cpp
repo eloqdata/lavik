@@ -21,6 +21,8 @@
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
 #include "keylane/resp.h"
+#include "keylane/session.h"
+#include "keylane/tx/tx_shard.h"
 #include "keylane/replication.h"
 #include "keylane/storage/engine.h"
 
@@ -303,6 +305,8 @@ class RedisService final : public TcpService {
   Task<Status> Serve(TcpStream stream) override;
 
  private:
+  Task<Status> Serve(TcpStream& stream, ConnectionContext& ctx);
+
   class RequestGuard {
    public:
     explicit RequestGuard(RedisService* service) : service_(service) {}
@@ -360,6 +364,7 @@ void RedisService::EndRequest() noexcept {
 }
 
 Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
+  tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
   Status status = co_await storage_->InitializeWorker(worker);
   if (!status.ok()) [[unlikely]] {
     startup_failed_.store(true, std::memory_order_release);
@@ -403,8 +408,16 @@ bool ShutdownRequested() {
 }
 
 Task<Status> RedisService::Serve(TcpStream stream) {
+  ConnectionContext ctx;
+  const Status status = co_await Serve(stream, ctx);
+  // Single connection-scoped cleanup point: every disconnect path funnels
+  // through this co_return, so state that outlives the loop (MULTI queues,
+  // WATCH registrations) is released here in later milestones.
+  co_return status;
+}
+
+Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
   std::string pending;
-  std::uint8_t selected_db = 0;
 
   while (stream.IsOpen()) {
     if (ShutdownRequested()) [[unlikely]] {
@@ -437,7 +450,7 @@ Task<Status> RedisService::Serve(TcpStream stream) {
     RequestGuard request_guard(this);
 
     auto request_result =
-        BuildCommandRequest(std::move(*command_result), selected_db);
+        BuildCommandRequest(std::move(*command_result), ctx.selected_db);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
       reply.encoded = EncodeError("ERR " + request_result.status().message());
@@ -445,7 +458,7 @@ Task<Status> RedisService::Serve(TcpStream stream) {
       reply = co_await ExecuteCommand(*request_result);
     }
     if (reply.selected_db.has_value()) {
-      selected_db = *reply.selected_db;
+      ctx.selected_db = *reply.selected_db;
     }
 
     Status write_status;
@@ -518,6 +531,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   }
   ReplicationManager replication(&storage, replication_options);
   InitStorage(&storage, replication.replica_read_only());
+  tx::TxRuntime::Create(thread_count);
 
   ServerOptions options;
   options.bind_ip = std::string(bind_ip);
