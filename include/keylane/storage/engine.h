@@ -248,6 +248,11 @@ class StorageEngine {
   celer::Task<celer::StatusOr<std::int64_t>> IncrementLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
 
+  // Non-suspending index probe for WATCH: whether the key currently holds a
+  // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).
+  bool KeyLive(std::uint8_t db_id, std::string_view key,
+               const Digest& digest) const;
+
  private:
   class Impl;
   std::unique_ptr<Impl> impl_;

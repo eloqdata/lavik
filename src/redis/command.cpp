@@ -96,6 +96,12 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
       }
       return reply;
 
+    case CommandKind::kUnwatch:
+      // Inside EXEC this is a no-op: the transaction consumes the watches
+      // itself. Outside MULTI, DispatchCommand clears them before this runs.
+      reply.encoded = EncodeSimpleString("OK");
+      return reply;
+
     case CommandKind::kSelect: {
       if (args.size() != 2) {
         reply.encoded =
@@ -1173,16 +1179,94 @@ std::vector<tx::KeyRef> DedupExecLocks(
   return refs;
 }
 
+// Registers each key on its owning shard with a liveness snapshot taken
+// there; duplicates of an already-watched (db, fp) keep the first snapshot.
+Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
+                                const CommandRequest& request) {
+  auto keys = DetermineKeys(*request.spec, request.args.size());
+  if (!keys.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + keys.status().message()));
+  }
+  for (std::size_t i = keys->first; i <= keys->last; i += keys->step) {
+    const std::uint8_t db = ctx.selected_db;
+    const storage::Digest digest = storage::ComputeDigest(request.args[i]);
+    const tx::LockFp fp = tx::FingerprintOf(digest);
+    bool already = false;
+    for (const auto& watched : ctx.watched) {
+      if (watched.db == db && watched.fp == fp) {
+        already = true;
+        break;
+      }
+    }
+    if (already) {
+      continue;
+    }
+    const std::uint16_t owner =
+        static_cast<std::uint16_t>(ShardForKey(request.args[i]));
+    co_await SubmitTo(owner, [key = std::string(request.args[i]), db, digest,
+                              fp, conn = ctx.conn_id]() {
+      tx::CurrentTxShard().Watch(db, fp, conn,
+                                 g_storage->KeyLive(db, key, digest));
+      return true;
+    });
+    ctx.watched.push_back(ConnectionContext::WatchedKey{
+        .key = request.args[i],
+        .digest = digest,
+        .fp = fp,
+        .owner = owner,
+        .db = db,
+    });
+  }
+  co_return EncodedReply(EncodeSimpleString("OK"));
+}
+
+// True when every watched key is unmarked and still matches its WATCH-time
+// liveness. Runs on each key's owning shard; callers hold whatever locks the
+// transaction needs before asking.
+Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
+  for (const auto& watched : ctx.watched) {
+    const bool clean = co_await SubmitTo(
+        watched.owner,
+        [key = watched.key, db = watched.db, digest = watched.digest,
+         fp = watched.fp, conn = ctx.conn_id]() {
+          return tx::CurrentTxShard().WatchClean(
+              db, fp, conn, g_storage->KeyLive(db, key, digest));
+        });
+    if (!clean) {
+      co_return false;
+    }
+  }
+  co_return true;
+}
+
+// EXEC consumes the connection's watches whatever its outcome.
+Task<Status> DropWatches(ConnectionContext& ctx) {
+  for (const auto& watched : ctx.watched) {
+    co_await SubmitTo(watched.owner,
+                      [db = watched.db, fp = watched.fp,
+                       conn = ctx.conn_id]() {
+                        tx::CurrentTxShard().Unwatch(db, fp, conn);
+                        return true;
+                      });
+  }
+  ctx.watched.clear();
+  co_return Status::Ok();
+}
+
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
   const std::vector<CommandRequest> queued = std::move(ctx.queued);
   const bool dirty = ctx.multi_dirty;
   ctx.ResetMulti();
   if (dirty) {
+    co_await DropWatches(ctx);
     co_return EncodedReply(EncodeError(
         "EXECABORT Transaction discarded because of previous errors."));
   }
   if (queued.empty()) {
-    co_return EncodedReply("*0\r\n");
+    const bool clean =
+        ctx.watched.empty() || co_await CheckConnectionWatches(ctx);
+    co_await DropWatches(ctx);
+    co_return EncodedReply(clean ? "*0\r\n" : "*-1\r\n");
   }
 
   // Precompute every queued command's keys: digests, owners, slots, modes.
@@ -1215,6 +1299,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     tx_db = tx_db.value_or(cmd.db_id);
   }
   if (cross_db) {
+    co_await DropWatches(ctx);
     co_return EncodedReply(EncodeError(
         "ERR EXEC spanning multiple databases is not supported"));
   }
@@ -1251,10 +1336,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       // over the union lock set, run every command inline.
       const std::vector<tx::KeyRef> refs = DedupExecLocks(cmd_keys);
       const std::uint8_t db = *tx_db;
+      bool watch_aborted = false;
       Status status = co_await SubmitTaskTo(
           owners.front(), [&]() -> Task<Status> {
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
                 db, std::span<const tx::KeyRef>(refs));
+            if (!ctx.watched.empty() &&
+                !co_await CheckConnectionWatches(ctx)) {
+              watch_aborted = true;
+              co_return Status::Ok();
+            }
             for (std::size_t i = 0; i < queued.size(); ++i) {
               const CommandRequest& cmd = queued[i];
               if (cmd_keys[i].empty()) {
@@ -1288,7 +1379,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
             co_return Status::Ok();
           });
       if (!status.ok()) {
+        co_await DropWatches(ctx);
         co_return EncodedReply(EncodeError("ERR " + status.message()));
+      }
+      if (watch_aborted) {
+        co_await DropWatches(ctx);
+        co_return EncodedReply("*-1\r\n");
       }
     } else {
       tx::Transaction txn;
@@ -1301,7 +1397,13 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       txn.Seal();
       Status scheduled = co_await txn.Schedule();
       if (!scheduled.ok()) {
+        co_await DropWatches(ctx);
         co_return EncodedReply(EncodeError("ERR " + scheduled.message()));
+      }
+      if (!ctx.watched.empty() && !co_await CheckConnectionWatches(ctx)) {
+        (void)co_await txn.Conclude();
+        co_await DropWatches(ctx);
+        co_return EncodedReply("*-1\r\n");
       }
       ExecContext exec_ctx;
       exec_ctx.queued = &queued;
@@ -1341,11 +1443,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     }
   } else {
     // Keyless-only transaction.
+    if (!ctx.watched.empty() && !co_await CheckConnectionWatches(ctx)) {
+      co_await DropWatches(ctx);
+      co_return EncodedReply("*-1\r\n");
+    }
     for (std::size_t i = 0; i < queued.size(); ++i) {
       replies[i] = run_keyless(queued[i]);
     }
   }
 
+  co_await DropWatches(ctx);
   std::string encoded = "*" + std::to_string(replies.size()) + "\r\n";
   for (const std::string& reply : replies) {
     encoded += reply;
@@ -1370,8 +1477,12 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       case CommandKind::kMulti:
         co_return EncodedReply(
             EncodeError("ERR MULTI calls can not be nested"));
+      case CommandKind::kWatch:
+        co_return EncodedReply(
+            EncodeError("ERR WATCH inside MULTI is not allowed"));
       case CommandKind::kDiscard:
         ctx.ResetMulti();
+        co_await DropWatches(ctx);
         co_return EncodedReply(EncodeSimpleString("OK"));
       case CommandKind::kExec:
         co_return co_await ExecuteExec(ctx);
@@ -1429,9 +1540,22 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       co_return EncodedReply(EncodeError("ERR EXEC without MULTI"));
     case CommandKind::kDiscard:
       co_return EncodedReply(EncodeError("ERR DISCARD without MULTI"));
+    case CommandKind::kWatch:
+      if (request.spec == nullptr) {
+        break;
+      }
+      co_return co_await ExecuteWatch(ctx, request);
+    case CommandKind::kUnwatch:
+      co_await DropWatches(ctx);
+      co_return EncodedReply(EncodeSimpleString("OK"));
     default:
-      co_return co_await ExecuteCommand(request);
+      break;
   }
+  co_return co_await ExecuteCommand(request);
+}
+
+Task<celer::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
+  co_return co_await DropWatches(ctx);
 }
 
 Task<CommandReply> ExecuteCommand(const CommandRequest& request) {

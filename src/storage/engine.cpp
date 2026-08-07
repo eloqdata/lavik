@@ -1763,6 +1763,18 @@ class StorageEngine::Impl {
     co_return !expired;
   }
 
+  bool KeyLive(std::uint8_t db_id, std::string_view key,
+               const Digest& digest) const {
+    assert(db_id < kLogicalDatabaseCount);
+    const WorkerStore& store = CurrentStore();
+    auto& partition =
+        const_cast<Impl*>(this)->PartitionForKey(const_cast<WorkerStore&>(store),
+                                                 key);
+    const auto* found = partition.indexes[db_id].Find(digest, key);
+    return found != nullptr && found->value.kind == RecordKind::kValue &&
+           !IsExpired(found->value, UnixTimeMillis());
+  }
+
   Task<bool> Exists(std::uint8_t db_id, std::string_view key) {
     assert(db_id < kLogicalDatabaseCount);
     const Digest digest = ComputeDigest(key);
@@ -2304,6 +2316,9 @@ class StorageEngine::Impl {
       const Digest digest = ComputeDigest(applied.key);
       auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
           applied.db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+      // Replicated modifications invalidate local watchers too.
+      tx::CurrentTxShard().MarkWatched(applied.db_id,
+                                       tx::FingerprintOf(digest));
       co_await store.writer_mutex.Lock();
       UnlockGuard write_unlock(&store.writer_mutex, store.worker);
       auto& index = partition.indexes[applied.db_id];
@@ -2939,6 +2954,9 @@ class StorageEngine::Impl {
   // stays closed for a bounded time no matter how many keys the database holds.
   // Retiring the detached entries is left to ReclaimDetachedIndexes.
   void DetachDbLocal(WorkerStore& store, std::uint8_t db_id) {
+    // FLUSHDB invalidates every watcher of this database, including watches
+    // on keys that never existed (Redis semantics).
+    tx::CurrentTxShard().MarkAllWatched(db_id);
     ++store.index_generations[db_id];
     for (auto& partition : store.partitions) {
       store.detached_indexes.push_back(DetachedIndex{
@@ -4204,6 +4222,9 @@ class StorageEngine::Impl {
                             RecordKind kind, ValueType value_type,
                             std::uint64_t expire_at_ms) {
     const Digest digest = ComputeDigest(key);
+    // Every real keyspace modification funnels through here (client writes,
+    // deletes, expiration rewrites, active expiry): invalidate watchers.
+    tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
     const std::uint64_t mutation_sequence = ++partition.mutation_sequence;
     Status status = Status::Ok();
     const std::size_t inline_bytes =
@@ -5794,6 +5815,11 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id,
 Task<StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest) {
   co_return co_await impl_->IncrementLocked(db_id, key, digest);
+}
+
+bool StorageEngine::KeyLive(std::uint8_t db_id, std::string_view key,
+                            const Digest& digest) const {
+  return impl_->KeyLive(db_id, key, digest);
 }
 
 }  // namespace keylane::storage

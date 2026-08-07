@@ -408,11 +408,13 @@ bool ShutdownRequested() {
 }
 
 Task<Status> RedisService::Serve(TcpStream stream) {
+  static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
+  ctx.conn_id = next_connection_id.fetch_add(1, std::memory_order_relaxed);
   const Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
-  // through this co_return, so state that outlives the loop (MULTI queues,
-  // WATCH registrations) is released here in later milestones.
+  // through this co_return.
+  co_await ReleaseConnectionWatches(ctx);
   co_return status;
 }
 

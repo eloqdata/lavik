@@ -9,6 +9,7 @@
 #include <span>
 #include <utility>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/inlined_vector.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/intent_lock.h"
@@ -141,6 +142,79 @@ class TxShard {
   // release and by the queue machinery; safe to call at any time.
   void Poll();
 
+  // Shard-local WATCH registrations (push model): every real keyspace
+  // modification marks the watchers of that fingerprint; EXEC checks its own
+  // connection's entries after taking its locks. Marks are sticky until the
+  // entry is removed (UNWATCH / DISCARD / EXEC / connection close).
+  void Watch(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id,
+             bool live) {
+    auto& entries = watches_[db_id][fp];
+    for (const WatchEntry& entry : entries) {
+      if (entry.conn_id == conn_id) {
+        return;  // sticky: the first registration's snapshot wins
+      }
+    }
+    entries.push_back(WatchEntry{conn_id, live, false});
+  }
+
+  void MarkWatched(std::uint8_t db_id, LockFp fp) {
+    auto& table = watches_[db_id];
+    if (table.empty()) {
+      return;
+    }
+    auto it = table.find(fp);
+    if (it == table.end()) {
+      return;
+    }
+    for (WatchEntry& entry : it->second) {
+      entry.dirty = true;
+    }
+  }
+
+  void MarkAllWatched(std::uint8_t db_id) {
+    for (auto& [fp, entries] : watches_[db_id]) {
+      for (WatchEntry& entry : entries) {
+        entry.dirty = true;
+      }
+    }
+  }
+
+  // True when the connection's registration is untouched: not marked by any
+  // write and the key's liveness matches the WATCH-time snapshot (passive
+  // expiration invalidates like a write, mirroring Redis).
+  bool WatchClean(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id,
+                  bool now_live) const {
+    auto it = watches_[db_id].find(fp);
+    if (it == watches_[db_id].end()) {
+      return false;
+    }
+    for (const WatchEntry& entry : it->second) {
+      if (entry.conn_id == conn_id) {
+        return !entry.dirty && entry.live == now_live;
+      }
+    }
+    return false;
+  }
+
+  void Unwatch(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id) {
+    auto& table = watches_[db_id];
+    auto it = table.find(fp);
+    if (it == table.end()) {
+      return;
+    }
+    auto& entries = it->second;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+      if (entries[i].conn_id == conn_id) {
+        entries[i] = entries.back();
+        entries.pop_back();
+        break;
+      }
+    }
+    if (entries.empty()) {
+      table.erase(it);
+    }
+  }
+
   LockTable& locks(std::uint8_t db_id) { return locks_[db_id]; }
   TxQueue& queue() noexcept { return queue_; }
   celer::Worker* worker() const noexcept { return worker_; }
@@ -182,7 +256,17 @@ class TxShard {
     Poll();
   }
 
+  struct WatchEntry {
+    std::uint64_t conn_id = 0;
+    bool live = false;
+    bool dirty = false;
+  };
+
   std::array<LockTable, storage::kLogicalDatabaseCount> locks_;
+  std::array<absl::flat_hash_map<LockFp, absl::InlinedVector<WatchEntry, 1>,
+                                 LockFpIdentityHash>,
+             storage::kLogicalDatabaseCount>
+      watches_;
   TxQueue queue_;
   std::uint64_t committed_txid_ = 0;
   bool polling_ = false;

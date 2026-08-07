@@ -1,9 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "keylane/command.h"
+#include "keylane/storage/format.h"
+#include "keylane/tx/fingerprint.h"
 
 namespace keylane {
 
@@ -20,6 +23,19 @@ struct ConnectionContext {
   bool multi_dirty = false;
   std::uint8_t multi_db = 0;
   std::vector<CommandRequest> queued;
+
+  // WATCH registrations: enough to check and unregister on the owning
+  // shards. Deduplicated by (db, fp); the first registration's snapshot is
+  // authoritative (sticky, like Redis).
+  struct WatchedKey {
+    std::string key;
+    storage::Digest digest;
+    tx::LockFp fp = 0;
+    std::uint16_t owner = 0;
+    std::uint8_t db = 0;
+  };
+  std::uint64_t conn_id = 0;
+  std::vector<WatchedKey> watched;
 
   void ResetMulti() {
     in_multi = false;

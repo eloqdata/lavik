@@ -400,6 +400,95 @@ int main(int argc, char** argv) {
            "cross-db EXEC");
     Expect(client.Command({"SELECT", "0"}), "+OK", "reset db");
 
+    // ---- WATCH / UNWATCH ----
+    RespClient other = Connect(port);
+
+    // Unmodified watch: EXEC proceeds.
+    Expect(client.Command({"SET", "w1", "base"}), "+OK", "watch seed");
+    Expect(client.Command({"WATCH", "w1"}), "+OK", "WATCH clean");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI watch clean");
+    Expect(client.Command({"SET", "w1", "mine"}), "+QUEUED", "queue clean");
+    Expect(client.Command({"EXEC"}), "*1\r\n+OK", "EXEC clean watch");
+    Expect(client.Command({"GET", "w1"}), Bulk("mine"), "clean watch wrote");
+
+    // Another client's write aborts the transaction; nothing runs.
+    Expect(client.Command({"WATCH", "w1"}), "+OK", "WATCH conflicted");
+    Expect(other.Command({"SET", "w1", "theirs"}), "+OK", "outside write");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI conflicted");
+    Expect(client.Command({"SET", "w1", "mine2"}), "+QUEUED",
+           "queue conflicted");
+    Expect(client.Command({"EXEC"}), "*-1", "EXEC aborted by write");
+    Expect(client.Command({"GET", "w1"}), Bulk("theirs"),
+           "aborted EXEC ran nothing");
+
+    // Watches are consumed by EXEC: the next transaction is unaffected.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI after abort");
+    Expect(client.Command({"SET", "w1", "fresh"}), "+QUEUED",
+           "queue after abort");
+    Expect(client.Command({"EXEC"}), "*1\r\n+OK", "watches consumed");
+
+    // Setting the value back does not un-mark: version semantics.
+    Expect(client.Command({"WATCH", "w1"}), "+OK", "WATCH set-back");
+    Expect(other.Command({"SET", "w1", "detour"}), "+OK", "detour write");
+    Expect(other.Command({"SET", "w1", "fresh"}), "+OK", "restore write");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI set-back");
+    Expect(client.Command({"SET", "w1", "x"}), "+QUEUED", "queue set-back");
+    Expect(client.Command({"EXEC"}), "*-1", "set-back still aborts");
+
+    // Deleting a watched key aborts; creating a watched-missing key aborts.
+    Expect(client.Command({"WATCH", "w1"}), "+OK", "WATCH for DEL");
+    Expect(other.Command({"DEL", "w1"}), ":1", "outside DEL");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI del");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue del ping");
+    Expect(client.Command({"EXEC"}), "*-1", "DEL aborts watcher");
+
+    Expect(client.Command({"WATCH", "wmissing"}), "+OK", "WATCH missing");
+    Expect(other.Command({"SET", "wmissing", "born"}), "+OK",
+           "create watched-missing");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI created");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue created ping");
+    Expect(client.Command({"EXEC"}), "*-1", "creation aborts watcher");
+
+    // A write by this connection before MULTI also aborts.
+    Expect(client.Command({"WATCH", "wmissing"}), "+OK", "WATCH self");
+    Expect(client.Command({"SET", "wmissing", "self"}), "+OK", "self write");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI self");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue self ping");
+    Expect(client.Command({"EXEC"}), "*-1", "self write aborts");
+
+    // UNWATCH forgives earlier modifications.
+    Expect(client.Command({"WATCH", "w1"}), "+OK", "WATCH unwatch");
+    Expect(other.Command({"SET", "w1", "poke"}), "+OK", "poke");
+    Expect(client.Command({"UNWATCH"}), "+OK", "UNWATCH");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI unwatched");
+    Expect(client.Command({"SET", "w1", "won"}), "+QUEUED",
+           "queue unwatched");
+    Expect(client.Command({"EXEC"}), "*1\r\n+OK", "UNWATCH cleared");
+
+    // WATCH inside MULTI is refused without dooming the transaction.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI watch-inside");
+    Expect(client.Command({"WATCH", "w1"}),
+           "-ERR WATCH inside MULTI is not allowed", "WATCH inside MULTI");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue after watch error");
+    Expect(client.Command({"EXEC"}), "*1\r\n+PONG",
+           "EXEC after watch error");
+
+    // Passive expiration invalidates like a write.
+    Expect(client.Command({"SET", "wexp", "v", "PX", "80"}), "+OK",
+           "expiring seed");
+    Expect(client.Command({"WATCH", "wexp"}), "+OK", "WATCH expiring");
+    std::this_thread::sleep_for(300ms);
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI expired");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue expired ping");
+    Expect(client.Command({"EXEC"}), "*-1", "expiration aborts watcher");
+
+    // FLUSHDB invalidates every watcher, existing keys or not.
+    Expect(client.Command({"WATCH", "never-existed"}), "+OK", "WATCH flush");
+    Expect(other.Command({"FLUSHDB"}), "+OK", "outside FLUSHDB");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI flushed");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue flushed ping");
+    Expect(client.Command({"EXEC"}), "*-1", "FLUSHDB aborts watcher");
+
     server.Stop();
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
