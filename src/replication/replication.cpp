@@ -323,14 +323,19 @@ class ReplicationManager::Impl {
       co_return ErrorResponse("trailing reset-partition bytes");
     }
     const unsigned owner = partition_id % storage_->worker_count();
-    StatusOr<std::uint64_t> reset = owner == celer::ThisWorker().id
-        ? co_await storage_->ResetReplicaPartition(partition_id, epochs)
-        : co_await celer::SubmitTaskTo(
-              owner, [this, partition_id, epochs]() ->
-                         Task<StatusOr<std::uint64_t>> {
-                co_return co_await storage_->ResetReplicaPartition(
-                    partition_id, epochs);
-              });
+    // if/else, not ?:, to keep the two co_awaits in separate full
+    // expressions (GCC coroutine frame-slot aliasing).
+    StatusOr<std::uint64_t> reset = celer::Status::Ok();
+    if (owner == celer::ThisWorker().id) {
+      reset = co_await storage_->ResetReplicaPartition(partition_id, epochs);
+    } else {
+      reset = co_await celer::SubmitTaskTo(
+          owner, [this, partition_id, epochs]() ->
+                     Task<StatusOr<std::uint64_t>> {
+            co_return co_await storage_->ResetReplicaPartition(
+                partition_id, epochs);
+          });
+    }
     if (!reset.ok()) {
       co_return ErrorResponse(reset.status().message());
     }
@@ -349,14 +354,18 @@ class ReplicationManager::Impl {
     }
     auto [partition_id, epoch, records] = std::move(*decoded);
     const unsigned owner = partition_id % storage_->worker_count();
-    Status status = owner == celer::ThisWorker().id
-        ? co_await storage_->ApplyReplicaRecords(partition_id, epoch, records)
-        : co_await celer::SubmitTaskTo(
-              owner, [this, partition_id, epoch,
-                      records = std::move(records)]() mutable {
-                return ApplyReplicaRecordsOwned(partition_id, epoch,
-                                                std::move(records));
-              });
+    Status status;
+    if (owner == celer::ThisWorker().id) {
+      status = co_await storage_->ApplyReplicaRecords(partition_id, epoch,
+                                                      records);
+    } else {
+      status = co_await celer::SubmitTaskTo(
+          owner, [this, partition_id, epoch,
+                  records = std::move(records)]() mutable {
+            return ApplyReplicaRecordsOwned(partition_id, epoch,
+                                            std::move(records));
+          });
+    }
     co_return status.ok() ? OkResponse()
                           : ErrorResponse(status.message());
   }

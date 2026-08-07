@@ -1918,9 +1918,14 @@ class StorageEngine::Impl {
         DetachDbLocal(store, db_id);
         co_return Status::Ok();
       };
-      Status detached = target == 0
-                            ? co_await detach()
-                            : co_await celer::SubmitTaskTo(target, detach);
+      // if/else, not ?:, to keep the two co_awaits in separate full
+      // expressions (GCC coroutine frame-slot aliasing).
+      Status detached;
+      if (target == 0) {
+        detached = co_await detach();
+      } else {
+        detached = co_await celer::SubmitTaskTo(target, detach);
+      }
       if (!detached.ok()) {
         co_return detached;
       }
@@ -1947,9 +1952,12 @@ class StorageEngine::Impl {
         }
         co_return co_await AwaitDetachedReclaim(store);
       };
-      Status reclaimed = target == 0
-                             ? co_await reclaim()
-                             : co_await celer::SubmitTaskTo(target, reclaim);
+      Status reclaimed;
+      if (target == 0) {
+        reclaimed = co_await reclaim();
+      } else {
+        reclaimed = co_await celer::SubmitTaskTo(target, reclaim);
+      }
       if (!reclaimed.ok()) {
         co_return reclaimed;
       }
@@ -2784,18 +2792,24 @@ class StorageEngine::Impl {
         continue;
       }
       const celer::WorkerId owner = device_allocators_[device_index]->owner;
-      Status returned =
-          owner == celer::ThisWorker().id
-              ? co_await ReturnColdBlocksLocal(
-                    device_index, std::move(by_device[device_index]))
-              : co_await celer::SubmitTaskTo(
-                    owner,
-                    [this, device_index,
-                     blocks = std::move(by_device[device_index])]() mutable
-                        -> Task<Status> {
-                      co_return co_await ReturnColdBlocksLocal(
-                          device_index, std::move(blocks));
-                    });
+      // Deliberately if/else, not a conditional expression: two co_awaits in
+      // one full expression miscompile under GCC coroutines (branch awaiter
+      // temporaries alias frame slots; destroying the suspended frame then
+      // runs destructors on garbage).
+      Status returned;
+      if (owner == celer::ThisWorker().id) {
+        returned = co_await ReturnColdBlocksLocal(
+            device_index, std::move(by_device[device_index]));
+      } else {
+        returned = co_await celer::SubmitTaskTo(
+            owner,
+            [this, device_index,
+             blocks = std::move(by_device[device_index])]() mutable
+                -> Task<Status> {
+              co_return co_await ReturnColdBlocksLocal(device_index,
+                                                       std::move(blocks));
+            });
+      }
       if (!returned.ok()) {
         co_return returned;
       }
@@ -2902,15 +2916,17 @@ class StorageEngine::Impl {
          ++device_index) {
       const celer::WorkerId owner =
           device_allocators_[device_index]->owner;
-      Status persisted = owner == celer::ThisWorker().id
-          ? co_await PersistEpochValueOnDeviceLocal(
-                device_index, value_index, epoch)
-          : co_await celer::SubmitTaskTo(
-                owner,
-                [this, device_index, value_index, epoch]() -> Task<Status> {
-                  co_return co_await PersistEpochValueOnDeviceLocal(
-                      device_index, value_index, epoch);
-                });
+      Status persisted;
+      if (owner == celer::ThisWorker().id) {
+        persisted = co_await PersistEpochValueOnDeviceLocal(device_index,
+                                                           value_index, epoch);
+      } else {
+        persisted = co_await celer::SubmitTaskTo(
+            owner, [this, device_index, value_index, epoch]() -> Task<Status> {
+              co_return co_await PersistEpochValueOnDeviceLocal(
+                  device_index, value_index, epoch);
+            });
+      }
       if (!persisted.ok()) {
         co_return persisted;
       }
@@ -5209,16 +5225,15 @@ class StorageEngine::Impl {
         co_return Status::Ok();
       }
       pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
-      Status started = worker_id == celer::ThisWorker().id
-                           ? co_await StartQueuedDefrag(worker_id,
-                                                        device_index)
-                           : co_await celer::SubmitTaskTo(
-                                 worker_id,
-                                 [this, worker_id,
-                                  device_index]() -> Task<Status> {
-                                   co_return co_await StartQueuedDefrag(
-                                       worker_id, device_index);
-                                 });
+      Status started;
+      if (worker_id == celer::ThisWorker().id) {
+        started = co_await StartQueuedDefrag(worker_id, device_index);
+      } else {
+        started = co_await celer::SubmitTaskTo(
+            worker_id, [this, worker_id, device_index]() -> Task<Status> {
+              co_return co_await StartQueuedDefrag(worker_id, device_index);
+            });
+      }
       if (!started.ok()) {
         ReleaseDefragPermit(device_index);
         co_return started;
