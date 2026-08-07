@@ -168,21 +168,36 @@ struct ActiveBlock {
   std::uint32_t extent_payload_checksum = 0;
 };
 
-struct BlockState {
-  std::uint32_t writer_id = 0;
-  std::uint32_t layout_worker_count = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t committed_bytes = 0;
+// State that exists only while a block is held in memory behind a staging
+// buffer: the buffer itself and the bookkeeping the flusher needs. At most a
+// handful of blocks per worker are in that state at once, while every
+// allocated block carries a BlockState, so this lives in a side table instead
+// of costing all of them 38 bytes.
+struct StagingSlot {
+  std::uint16_t write_buffer_id = 0;
+  std::byte* heap_data = nullptr;
+  std::size_t heap_data_size = 0;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
-  std::uint32_t durable_bytes = 0;
+  std::uint32_t durable_bytes = kBlockHeaderBytes;
   std::uint32_t record_count = 0;
   std::uint64_t max_lsn = 0;
   // Sequence stamped into the last header write. Its parity picks the slot,
-  // so the slot needs no field of its own.
+  // so the header slot needs no field of its own.
   std::uint32_t header_sequence = 0;
+  std::uint16_t next_free = 0;
+};
+
+struct BlockState {
+  std::uint64_t allocation_epoch = 0;
+  std::uint32_t committed_bytes = 0;
   std::uint32_t live_bytes = 0;
   std::uint32_t pins = 0;
+  std::uint16_t writer_id = 0;
+  std::uint16_t layout_worker_count = 0;
+  // Index into WorkerStore::staging_slots, or 0 when the block has no staging
+  // buffer. Ids are 1-based so zero can mean "none".
+  std::uint16_t staging_slot = 0;
   bool allocated = false;
   bool defrag_queued = false;
   bool defragging = false;
@@ -190,14 +205,16 @@ struct BlockState {
   bool in_memory = false;
   bool flush_queued = false;
   bool flush_in_progress = false;
-  std::uint16_t write_buffer_id = 0;
-  std::byte* heap_data = nullptr;
-  std::size_t heap_data_size = 0;
   bool release_pending = false;
   BlockKind kind = BlockKind::kRecords;
   std::uint32_t extent_index = 0;
   std::uint32_t extent_payload_checksum = 0;
 };
+
+// Every allocated block carries one of these for its whole life, so keep it
+// inside a cache line. Anything that only matters while a block is staged in
+// memory belongs in StagingSlot instead.
+static_assert(sizeof(BlockState) <= 64);
 
 struct RecoveryRecord {
   Digest digest{};
@@ -853,6 +870,10 @@ class StorageEngine::Impl {
     std::optional<Status> standby_error;
     AsyncNotification standby_ready;
     absl::flat_hash_map<std::uint64_t, std::unique_ptr<BlockState>> block_states;
+    // Index 0 is the "no staging buffer" sentinel. A deque keeps references
+    // stable as the table grows, since heap fallback buffers are unbounded.
+    std::deque<StagingSlot> staging_slots{1};
+    std::uint16_t free_staging_slot = 0;
     AsyncMutex writer_mutex;
     std::deque<std::uint64_t> flush_queue;
     std::deque<std::uint64_t> defrag_queue;
@@ -2453,25 +2474,49 @@ class StorageEngine::Impl {
   }
 
  private:
-  FixedBuffer StagingBufferFor(const BlockState& state,
-                              const RegisteredBufferPool& buffers) const {
-    if (state.write_buffer_id != 0) {
-      return buffers.write_buffer(state.write_buffer_id);
+  static StagingSlot* StagingFor(WorkerStore& store, const BlockState& state) {
+    return state.staging_slot == 0
+               ? nullptr
+               : &store.staging_slots[state.staging_slot];
+  }
+
+  static std::uint16_t AcquireStagingSlot(WorkerStore& store) {
+    if (store.free_staging_slot != 0) {
+      const std::uint16_t id = store.free_staging_slot;
+      store.free_staging_slot = store.staging_slots[id].next_free;
+      store.staging_slots[id] = StagingSlot{};
+      return id;
     }
-    return FixedBuffer{.data = state.heap_data,
-                      .size = state.heap_data_size,
+    store.staging_slots.emplace_back();
+    return static_cast<std::uint16_t>(store.staging_slots.size() - 1);
+  }
+
+  FixedBuffer StagingBufferFor(WorkerStore& store,
+                               const BlockState& state) const {
+    const StagingSlot* slot = StagingFor(store, state);
+    if (slot == nullptr) {
+      return FixedBuffer{};
+    }
+    if (slot->write_buffer_id != 0) {
+      return store.buffers.write_buffer(slot->write_buffer_id);
+    }
+    return FixedBuffer{.data = slot->heap_data,
+                      .size = slot->heap_data_size,
                       .index = 0};
   }
 
-  void ReleaseStagingBuffer(WorkerStore& store, BlockState& state) {
-    if (state.write_buffer_id != 0) {
-      store.buffers.ReleaseWriteBuffer(state.write_buffer_id);
-    } else if (state.heap_data != nullptr) {
-      store.buffers.ReleaseHeapWriteBuffer(state.heap_data);
+  static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state) {
+    if (StagingSlot* slot = StagingFor(store, state); slot != nullptr) {
+      if (slot->write_buffer_id != 0) {
+        store.buffers.ReleaseWriteBuffer(slot->write_buffer_id);
+      } else if (slot->heap_data != nullptr) {
+        store.buffers.ReleaseHeapWriteBuffer(slot->heap_data);
+      }
+      *slot = StagingSlot{};
+      slot->next_free = store.free_staging_slot;
+      store.free_staging_slot = state.staging_slot;
+      state.staging_slot = 0;
     }
-    state.write_buffer_id = 0;
-    state.heap_data = nullptr;
-    state.heap_data_size = 0;
     state.release_pending = false;
     state.in_memory = false;
   }
@@ -3489,9 +3534,6 @@ class StorageEngine::Impl {
       state.layout_worker_count = block.layout_worker_count;
       state.allocation_epoch = block.allocation_epoch;
       state.committed_bytes = block.committed_bytes;
-      state.durable_bytes = block.committed_bytes;
-      state.record_count = block.record_count;
-      state.max_lsn = block.max_lsn;
       state.allocated = true;
       state.kind = block.kind;
       state.extent_index = block.extent_index;
@@ -3693,24 +3735,14 @@ class StorageEngine::Impl {
         }
         --state->pins;
         if (state->pins == 0 && state->release_pending) {
-          if (state->write_buffer_id != 0) {
-            store->buffers.ReleaseWriteBuffer(state->write_buffer_id);
-          } else if (state->heap_data != nullptr) {
-            store->buffers.ReleaseHeapWriteBuffer(state->heap_data);
-          }
-          state->write_buffer_id = 0;
-          state->heap_data = nullptr;
-          state->heap_data_size = 0;
-          state->release_pending = false;
-          state->in_memory = false;
+          ReleaseStagingBuffer(*store, *state);
         }
       }
     } pin{&store, state};
 
     if (location.in_memory && state->in_memory) {
 
-      auto in_mem_buffer =
-          StagingBufferFor(*state, store.buffers);
+      auto in_mem_buffer = StagingBufferFor(store, *state);
       if (!in_mem_buffer.data || in_mem_buffer.size == 0 ||
           location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
         co_return Status(StatusCode::kInternal, "invalid in-memory location");
@@ -4182,8 +4214,8 @@ class StorageEngine::Impl {
       state.allocation_epoch = reserved->allocation_epoch;
       state.committed_bytes = static_cast<std::uint32_t>(
           kBlockHeaderBytes + payload_bytes);
-      state.durable_bytes = state.committed_bytes;
-      state.header_sequence = 1;
+      // An extent block is written whole right here and never enters the flush
+      // queue, so it needs no staging slot.
       state.live_bytes = static_cast<std::uint32_t>(payload_bytes);
       state.allocated = true;
       state.kind = BlockKind::kValueExtent;
@@ -4578,10 +4610,6 @@ class StorageEngine::Impl {
         state.layout_worker_count = worker_count_;
         state.allocation_epoch = active->allocation_epoch;
         state.committed_bytes = kBlockHeaderBytes;
-        state.durable_bytes = kBlockHeaderBytes;
-        state.record_count = 0;
-        state.max_lsn = 0;
-        state.header_sequence = 0;
         state.live_bytes = 0;
         state.pins = 0;
         state.allocated = true;
@@ -4589,9 +4617,11 @@ class StorageEngine::Impl {
         state.in_memory = true;
         state.flush_queued = false;
         state.flush_in_progress = false;
-        state.write_buffer_id = write_buffer_id;
-        state.heap_data = heap_buffer;
-        state.heap_data_size = options_.buffers.write_buffer_bytes;
+        state.staging_slot = AcquireStagingSlot(store);
+        StagingSlot& staging_state = store.staging_slots[state.staging_slot];
+        staging_state.write_buffer_id = write_buffer_id;
+        staging_state.heap_data = heap_buffer;
+        staging_state.heap_data_size = options_.buffers.write_buffer_bytes;
         store.staged_records.erase(block_id);
 
         // The header region stays zero in staging until a flush encodes it
@@ -4621,10 +4651,15 @@ class StorageEngine::Impl {
                        "active block has no owner state");
     }
     BlockState& state = *state_ptr;
+    StagingSlot* staging_state = StagingFor(store, state);
+    if (staging_state == nullptr) {
+      co_return Status(StatusCode::kInternal,
+                       "active block has no staging slot");
+    }
     FixedBuffer staging = updated.write_buffer_id != 0
                               ? store.buffers.write_buffer(updated.write_buffer_id)
                               : FixedBuffer{.data = updated.heap_buffer,
-                                           .size = state.heap_data_size,
+                                           .size = updated.heap_buffer_size,
                                            .index = 0};
     if (staging.data == nullptr ||
         record_offset + total_disk_bytes > staging.size) {
@@ -4666,16 +4701,13 @@ class StorageEngine::Impl {
                   value.data(), value.size());
     }
 
+    // The staging slot already holds this block's buffer; it is fixed for the
+    // life of the allocation, so only the flush counters need syncing below.
     if (updated.committed_bytes == kStorageBlockBytes) {
       state.in_memory = true;
-      state.write_buffer_id = updated.write_buffer_id;
-      state.heap_data = updated.heap_buffer;
-      state.heap_data_size = updated.heap_buffer_size;
       RequestFlush(store, updated.block_id);
       active.reset();
     } else {
-      state.heap_data = updated.heap_buffer;
-      state.heap_data_size = updated.heap_buffer_size;
       *active = updated;
     }
 
@@ -4731,12 +4763,9 @@ class StorageEngine::Impl {
       }
     }
     state.committed_bytes = updated.committed_bytes;
-    state.record_count = updated.record_count;
-    state.max_lsn = updated.max_lsn;
     state.in_memory = true;
-    state.write_buffer_id = updated.write_buffer_id;
-    state.heap_data = updated.heap_buffer;
-    state.heap_data_size = updated.heap_buffer_size;
+    staging_state->record_count = updated.record_count;
+    staging_state->max_lsn = updated.max_lsn;
     state.live_bytes += location.total_disk_bytes;
     state.flush_queued = updated.committed_bytes == kStorageBlockBytes;
     if (previous.has_value()) {
@@ -5035,7 +5064,7 @@ class StorageEngine::Impl {
   void RequestFlush(WorkerStore& store, std::uint64_t block_id) {
     BlockState* state = FindBlockState(store, block_id);
     if (state == nullptr || !state->allocated || !state->in_memory ||
-        (state->write_buffer_id == 0 && state->heap_data == nullptr)) {
+        state->staging_slot == 0) {
       return;
     }
     if (state->flush_queued || state->flush_in_progress) {
@@ -5073,7 +5102,15 @@ class StorageEngine::Impl {
       std::vector<RecordIdentity> staged_records;
     };
 
+    bool yield_before_retry = false;
     while (true) {
+      // A pinned block goes back on the queue. The pin belongs to a read that
+      // is waiting on I/O this same worker has to complete, so retrying in a
+      // tight loop would livelock: give the worker a chance to run first.
+      if (yield_before_retry) {
+        yield_before_retry = false;
+        co_await celer::Yield(*store->worker);
+      }
       std::optional<PendingFlush> pending;
       auto release_pending = [&](const PendingFlush& block) {
         if (block.write_buffer_id != 0) {
@@ -5099,37 +5136,33 @@ class StorageEngine::Impl {
           continue;
         }
         if (!state->allocated || !state->in_memory ||
-            (state->write_buffer_id == 0 && state->heap_data == nullptr) ||
-            state->flush_in_progress) {
+            state->staging_slot == 0 || state->flush_in_progress) {
           state->flush_queued = false;
           continue;
         }
         if (state->pins > 0) {
           store->flush_queue.push_back(block_id);
           state->flush_queued = true;
+          yield_before_retry = true;
           continue;
         }
 
-        FixedBuffer buffer =
-            state->write_buffer_id != 0
-                ? store->buffers.write_buffer(state->write_buffer_id)
-                : FixedBuffer{.data = state->heap_data,
-                              .size = state->heap_data_size,
-                              .index = 0};
+        StagingSlot& staging_state = store->staging_slots[state->staging_slot];
+        const FixedBuffer buffer = StagingBufferFor(*store, *state);
         // Pad the tail out to a direct-I/O page and move the append cursor
         // past it. Every data page is then written exactly once, so a torn
         // write can never damage a record that is already durable.
         const std::uint32_t padded =
             static_cast<std::uint32_t>(AlignDirect(state->committed_bytes));
         if (buffer.data == nullptr || buffer.size < padded ||
-            state->durable_bytes > state->committed_bytes) {
+            staging_state.durable_bytes > state->committed_bytes) {
           state->flush_queued = false;
           store->write_failed = true;
           store->flush_running = false;
           co_return Status(StatusCode::kInternal,
                            "invalid pending flush staging buffer");
         }
-        if (padded == state->durable_bytes) {
+        if (padded == staging_state.durable_bytes) {
           // Nothing new since the last flush. Rewriting the header would only
           // burn a slot and two fdatasyncs.
           state->flush_queued = false;
@@ -5146,8 +5179,8 @@ class StorageEngine::Impl {
             store->active_block->block_id == block_id) {
           store->active_block->committed_bytes = padded;
         }
-        ++state->header_sequence;
-        const std::uint8_t slot = HeaderSlot(state->header_sequence);
+        ++staging_state.header_sequence;
+        const std::uint8_t slot = HeaderSlot(staging_state.header_sequence);
 
         const BlockHeader header{
             .magic = kBlockMagic,
@@ -5158,9 +5191,9 @@ class StorageEngine::Impl {
             .writer_id = state->writer_id,
             .allocation_epoch = state->allocation_epoch,
             .committed_bytes = padded,
-            .record_count = state->record_count,
-            .max_lsn = state->max_lsn,
-            .header_sequence = state->header_sequence,
+            .record_count = staging_state.record_count,
+            .max_lsn = staging_state.max_lsn,
+            .header_sequence = staging_state.header_sequence,
             .checksum = 0,
             .layout_worker_count = state->layout_worker_count,
         };
@@ -5172,11 +5205,11 @@ class StorageEngine::Impl {
         pending.emplace(PendingFlush{
             .block_id = block_id,
             .committed_bytes = padded,
-            .durable_bytes = state->durable_bytes,
+            .durable_bytes = staging_state.durable_bytes,
             .allocation_epoch = state->allocation_epoch,
-            .write_buffer_id = state->write_buffer_id,
-            .heap_data = state->heap_data,
-            .heap_data_size = state->heap_data_size,
+            .write_buffer_id = staging_state.write_buffer_id,
+            .heap_data = staging_state.heap_data,
+            .heap_data_size = staging_state.heap_data_size,
             .slot = slot,
             .staged_records = {},
         });
@@ -5328,7 +5361,9 @@ class StorageEngine::Impl {
         }
       }
 
-      state->durable_bytes = pending->committed_bytes;
+      if (StagingSlot* slot = StagingFor(*store, *state); slot != nullptr) {
+        slot->durable_bytes = pending->committed_bytes;
+      }
       state->flush_in_progress = false;
       state->flush_queued = false;
 
