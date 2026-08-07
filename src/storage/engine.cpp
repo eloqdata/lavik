@@ -198,23 +198,29 @@ struct BlockState {
   // Index into WorkerStore::staging_slots, or 0 when the block has no staging
   // buffer. Ids are 1-based so zero can mean "none".
   std::uint16_t staging_slot = 0;
-  bool allocated = false;
-  bool defrag_queued = false;
-  bool defragging = false;
-  bool freeing = false;
-  bool in_memory = false;
-  bool flush_queued = false;
-  bool flush_in_progress = false;
-  bool release_pending = false;
+  // Bitfields rather than bools: eight of these would otherwise cost a byte
+  // each and push the struct past a cache line.
+  bool allocated : 1 = false;
+  bool defrag_queued : 1 = false;
+  bool defragging : 1 = false;
+  bool freeing : 1 = false;
+  bool in_memory : 1 = false;
+  bool flush_queued : 1 = false;
+  bool flush_in_progress : 1 = false;
+  bool release_pending : 1 = false;
   BlockKind kind = BlockKind::kRecords;
-  std::uint32_t extent_index = 0;
-  std::uint32_t extent_payload_checksum = 0;
 };
 
-// Every allocated block carries one of these for its whole life, so keep it
-// inside a cache line. Anything that only matters while a block is staged in
-// memory belongs in StagingSlot instead.
-static_assert(sizeof(BlockState) <= 64);
+// Every allocated block carries one of these for its whole life, and cold
+// paths scan them in bulk, so keep two per cache line. Anything that only
+// matters while a block is staged in memory belongs in StagingSlot, and
+// anything only an extent block needs belongs in the recovery-scoped map.
+static_assert(sizeof(BlockState) <= 32);
+
+struct ExtentIdentity {
+  std::uint32_t extent_index = 0;
+  std::uint32_t payload_checksum = 0;
+};
 
 struct RecoveryRecord {
   Digest digest{};
@@ -870,6 +876,11 @@ class StorageEngine::Impl {
     std::optional<Status> standby_error;
     AsyncNotification standby_ready;
     absl::flat_hash_map<std::uint64_t, std::unique_ptr<BlockState>> block_states;
+    // Recovery only. A recovered extent block's identity has to be checked
+    // against the manifests that reference it, and the two arrive in separate
+    // passes, so they meet here instead of in every BlockState. Cleared once
+    // the live-reference pass has run.
+    absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};
@@ -1432,15 +1443,19 @@ class StorageEngine::Impl {
                 return Status(StatusCode::kInternal,
                               "recovery live reference has no owning block");
               }
-              if (reference.extent &&
-                  (state->kind != BlockKind::kValueExtent ||
-                   state->committed_bytes !=
-                       kBlockHeaderBytes + reference.bytes ||
-                   state->extent_index != reference.extent_index ||
-                   state->extent_payload_checksum !=
-                       reference.extent_payload_checksum)) {
-                return Status(StatusCode::kInternal,
-                              "live extent header does not match manifest");
+              if (reference.extent) {
+                const auto found =
+                    owner_store.recovered_extents.find(reference.block_id);
+                if (state->kind != BlockKind::kValueExtent ||
+                    state->committed_bytes !=
+                        kBlockHeaderBytes + reference.bytes ||
+                    found == owner_store.recovered_extents.end() ||
+                    found->second.extent_index != reference.extent_index ||
+                    found->second.payload_checksum !=
+                        reference.extent_payload_checksum) {
+                  return Status(StatusCode::kInternal,
+                                "live extent header does not match manifest");
+                }
               }
               state->live_bytes += reference.bytes;
             }
@@ -1460,6 +1475,9 @@ class StorageEngine::Impl {
     if (!status.ok()) {
       co_return status;
     }
+    // Every worker's live-reference pass has run, so no manifest still needs
+    // to be matched against a recovered extent header.
+    store.recovered_extents.clear();
 
     std::vector<std::vector<std::uint64_t>> free_by_device(devices_.size());
     for (std::uint64_t block_id : zero_blocks) {
@@ -3536,8 +3554,12 @@ class StorageEngine::Impl {
       state.committed_bytes = block.committed_bytes;
       state.allocated = true;
       state.kind = block.kind;
-      state.extent_index = block.extent_index;
-      state.extent_payload_checksum = block.extent_payload_checksum;
+      if (block.kind == BlockKind::kValueExtent) {
+        store.recovered_extents[block.block_id] = ExtentIdentity{
+            .extent_index = block.extent_index,
+            .payload_checksum = block.extent_payload_checksum,
+        };
+      }
 
       // Recovered blocks have no staging buffer. Keep partial blocks sealed;
       // appending to one would otherwise dereference an absent in-memory copy.
@@ -4226,8 +4248,6 @@ class StorageEngine::Impl {
       state.live_bytes = static_cast<std::uint32_t>(payload_bytes);
       state.allocated = true;
       state.kind = BlockKind::kValueExtent;
-      state.extent_index = extent_index;
-      state.extent_payload_checksum = payload_checksum;
       refs->push_back(ExtentRef{
           .block_id = reserved->block_id,
           .allocation_epoch = reserved->allocation_epoch,
