@@ -1245,8 +1245,9 @@ class StorageEngine::Impl {
     }
 
     ReadBufferLease lease = std::move(loaded->lease);
+    const std::size_t value_offset = loaded->value_offset;
     const std::size_t value_bytes = loaded->value_bytes;
-    FixedBuffer io = lease.io_buffer();
+    std::span<std::byte> buffer = lease.bytes();
     char length[32];
     auto [end, error] = std::to_chars(length, length + sizeof(length), value_bytes);
     if (error != std::errc{}) {
@@ -1254,16 +1255,21 @@ class StorageEngine::Impl {
     }
     const std::size_t digits = static_cast<std::size_t>(end - length);
     const std::size_t prefix_bytes = digits + 3;
-    std::byte* prefix = io.data - prefix_bytes;
+    if (value_offset < prefix_bytes || value_offset > buffer.size() ||
+        value_bytes > buffer.size() - value_offset ||
+        buffer.size() - value_offset - value_bytes < 2) {
+      co_return Status(StatusCode::kInternal,
+                       "value lacks RESP framing headroom or tailroom");
+    }
+    std::byte* prefix = buffer.data() + value_offset - prefix_bytes;
     prefix[0] = std::byte{'$'};
     std::memcpy(prefix + 1, length, digits);
     prefix[digits + 1] = std::byte{'\r'};
     prefix[digits + 2] = std::byte{'\n'};
-    io.data[value_bytes] = std::byte{'\r'};
-    io.data[value_bytes + 1] = std::byte{'\n'};
+    buffer[value_offset + value_bytes] = std::byte{'\r'};
+    buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
 
-    const std::size_t network_offset =
-        static_cast<std::size_t>(prefix - lease.bytes().data());
+    const std::size_t network_offset = value_offset - prefix_bytes;
     co_return DiskValue(std::move(lease), network_offset,
                         prefix_bytes + value_bytes + 2);
   }
@@ -1342,9 +1348,9 @@ class StorageEngine::Impl {
       if (!loaded.ok()) {
         co_return loaded.status();
       }
-      FixedBuffer io = loaded->lease.io_buffer();
-      std::string_view text(reinterpret_cast<const char*>(io.data),
-                            loaded->value_bytes);
+      const std::span<const std::byte> value_bytes = loaded->value();
+      std::string_view text(reinterpret_cast<const char*>(value_bytes.data()),
+                            value_bytes.size());
       auto [end, error] = std::from_chars(text.data(), text.data() + text.size(),
                                           value);
       if (error != std::errc{} || end != text.data() + text.size() ||
@@ -1519,15 +1525,15 @@ class StorageEngine::Impl {
         }
         co_return loaded.status();
       }
-      const FixedBuffer value = loaded->lease.io_buffer();
+      const std::span<const std::byte> value = loaded->value();
       batch.records.push_back(SnapshotRecord{
           .kind = SnapshotRecord::Kind::kValue,
           .db_id = db_id,
           .db_epoch = DbEpoch(db_id),
           .mutation_sequence = location.mutation_sequence,
           .key = key,
-          .value = std::string(reinterpret_cast<const char*>(value.data),
-                               loaded->value_bytes),
+          .value = std::string(reinterpret_cast<const char*>(value.data()),
+                               value.size()),
       });
     }
     co_return batch;
@@ -1734,8 +1740,30 @@ class StorageEngine::Impl {
 
   struct LoadedValue {
     ReadBufferLease lease;
+    std::size_t value_offset = 0;
     std::size_t value_bytes = 0;
+
+    std::span<const std::byte> value() const noexcept {
+      const std::span<std::byte> buffer = lease.bytes();
+      if (value_offset > buffer.size() ||
+          value_bytes > buffer.size() - value_offset) {
+        return {};
+      }
+      return buffer.subspan(value_offset, value_bytes);
+    }
   };
+
+  std::size_t DirectGetValueLimit() const noexcept {
+    const RegisteredBufferPoolOptions& buffers = options_.buffers;
+    // Keep the direct-from-disk framing path conservative: with the defaults,
+    // values through 1 MiB - 8 KiB avoid the value copy. Larger values retain
+    // the materializing memmove path below.
+    const std::size_t framing_reserve =
+        buffers.read_headroom_bytes + buffers.read_tailroom_bytes;
+    return buffers.read_payload_bytes > framing_reserve
+               ? buffers.read_payload_bytes - framing_reserve
+               : 0;
+  }
 
   WorkerStore& CurrentStore() {
     return *stores_[celer::ThisWorker().id];
@@ -2581,23 +2609,11 @@ class StorageEngine::Impl {
       if (trace != nullptr) {
         trace->decode_done_ns = ReadTraceNowNanos();
       }
-      co_return LoadedValue{std::move(lease), record.value_bytes};
+      const std::size_t value_offset = static_cast<std::size_t>(
+          io.data - lease.bytes().data());
+      co_return LoadedValue{std::move(lease), value_offset,
+                            record.value_bytes};
     }
-
-    if (trace != nullptr) {
-      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
-    }
-    auto acquired = co_await store.buffers.AcquireReadBuffer();
-    if (!acquired.ok()) {
-      co_return acquired.status();
-    }
-    ReadBufferLease lease = std::move(*acquired);
-    if (trace != nullptr) {
-      trace->buffer_acquired_ns = ReadTraceNowNanos();
-      trace->heap_read_buffer = !lease.registered();
-      trace->disk_read = true;
-    }
-    FixedBuffer io = lease.io_buffer();
 
     const auto [file_id, block_offset] = FileOffset(location.block_id);
     const std::uint64_t absolute_offset =
@@ -2611,6 +2627,20 @@ class StorageEngine::Impl {
         record_headroom + location.total_disk_bytes;
     const std::size_t read_bytes =
         (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
+    if (trace != nullptr) {
+      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
+    }
+    auto acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease lease = std::move(*acquired);
+    if (trace != nullptr) {
+      trace->buffer_acquired_ns = ReadTraceNowNanos();
+      trace->heap_read_buffer = !lease.registered();
+      trace->disk_read = true;
+    }
+    FixedBuffer io = lease.io_buffer();
     if (read_bytes > io.size) {
       co_return Status(StatusCode::kOutOfRange,
                        "record exceeds registered read buffer capacity");
@@ -2657,11 +2687,18 @@ class StorageEngine::Impl {
             record.payload_checksum) {
       co_return Status(StatusCode::kInternal, "record value checksum mismatch");
     }
-    std::memmove(io.data, value_data, record.value_bytes);
+    const std::byte* framed_value = value_data;
+    if (record.value_bytes > DirectGetValueLimit()) {
+      std::memmove(io.data, value_data, record.value_bytes);
+      framed_value = io.data;
+    }
     if (trace != nullptr) {
       trace->decode_done_ns = ReadTraceNowNanos();
     }
-    co_return LoadedValue{std::move(lease), record.value_bytes};
+    const std::size_t value_offset = static_cast<std::size_t>(
+        framed_value - lease.bytes().data());
+    co_return LoadedValue{std::move(lease), value_offset,
+                          record.value_bytes};
   }
 
   Task<StatusOr<ReservedBlock>> AllocateBlock(WorkerStore& store,

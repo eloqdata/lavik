@@ -120,7 +120,9 @@ class RegisteredBufferPool {
 
   class AcquireReadAwaiter {
    public:
-    explicit AcquireReadAwaiter(RegisteredBufferPool* pool) : pool_(pool) {}
+    AcquireReadAwaiter(RegisteredBufferPool* pool,
+                       std::size_t minimum_payload_bytes)
+        : pool_(pool), minimum_payload_bytes_(minimum_payload_bytes) {}
 
     bool await_ready() const noexcept;
     bool await_suspend(std::coroutine_handle<> awaiting);
@@ -128,17 +130,21 @@ class RegisteredBufferPool {
 
    private:
     RegisteredBufferPool* pool_ = nullptr;
+    std::size_t minimum_payload_bytes_ = 0;
   };
 
-  AcquireReadAwaiter AcquireReadBuffer() noexcept {
-    return AcquireReadAwaiter(this);
+  // Requests larger than a registered read slot use an aligned heap lease.
+  AcquireReadAwaiter AcquireReadBuffer(
+      std::size_t minimum_payload_bytes = 0) noexcept {
+    return AcquireReadAwaiter(this, minimum_payload_bytes);
   }
 
  private:
   friend class ReadBufferLease;
 
   ReadBufferLease TakeReadBuffer();
-  celer::StatusOr<ReadBufferLease> AllocateHeapReadBuffer();
+  celer::StatusOr<ReadBufferLease> AllocateHeapReadBuffer(
+      std::size_t minimum_payload_bytes);
   std::optional<std::uint16_t> TakeWriteBuffer();
   void ReleaseWriteBufferLocal(std::uint16_t buffer_id) noexcept;
   void Release(std::uint16_t buffer_id) noexcept;

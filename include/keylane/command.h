@@ -38,6 +38,9 @@ struct CommandRequest {
 };
 
 struct CommandReply {
+  // TODO: Add a connection-local RESP reply builder for composite and small
+  // replies. Keep DiskValue as the specialized direct-from-read-buffer GET
+  // path.
   std::string encoded;
   std::optional<storage::DiskValue> disk_value;
   bool close_connection = false;

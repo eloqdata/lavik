@@ -313,10 +313,11 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return celer::Status(celer::StatusCode::kFailedPrecondition,
                          "registered buffer pool is not initialized");
   }
-  if (!pool_->free_read_buffers_.empty()) {
+  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes &&
+      !pool_->free_read_buffers_.empty()) {
     return pool_->TakeReadBuffer();
   }
-  return pool_->AllocateHeapReadBuffer();
+  return pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
 }
 
 ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
@@ -331,9 +332,27 @@ ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
 }
 
 celer::StatusOr<ReadBufferLease>
-RegisteredBufferPool::AllocateHeapReadBuffer() {
+RegisteredBufferPool::AllocateHeapReadBuffer(
+    std::size_t minimum_payload_bytes) {
+  std::size_t payload_bytes =
+      std::max(options_.read_payload_bytes, minimum_payload_bytes);
+  if (payload_bytes > std::numeric_limits<std::size_t>::max() -
+                          (options_.alignment - 1)) {
+    return celer::Status(celer::StatusCode::kOutOfRange,
+                         "heap read buffer size overflow");
+  }
+  payload_bytes =
+      (payload_bytes + options_.alignment - 1) & ~(options_.alignment - 1);
+  if (payload_bytes > std::numeric_limits<std::size_t>::max() -
+                          options_.read_headroom_bytes ||
+      payload_bytes + options_.read_headroom_bytes >
+          std::numeric_limits<std::size_t>::max() -
+              options_.read_tailroom_bytes) {
+    return celer::Status(celer::StatusCode::kOutOfRange,
+                         "heap read buffer size overflow");
+  }
   const std::size_t bytes = options_.read_headroom_bytes +
-                            options_.read_payload_bytes +
+                            payload_bytes +
                             options_.read_tailroom_bytes;
   auto* data = static_cast<std::byte*>(::operator new[](
       bytes, std::align_val_t(options_.alignment), std::nothrow));
