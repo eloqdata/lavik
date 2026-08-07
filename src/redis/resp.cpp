@@ -16,6 +16,17 @@ constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 RespParseResult ParseRespCommand(std::string_view input) {
   RespParseResult result;
 
+  // An empty line is a command that does nothing, and clients rely on it:
+  // redis-cli --pipe sends a bare CRLF to terminate any half-written command
+  // before its final handshake. Consume it silently instead of failing the
+  // connection, which would strand every command the client sends afterwards.
+  std::size_t blank = 0;
+  while (blank < input.size() &&
+         (input[blank] == '\r' || input[blank] == '\n')) {
+    ++blank;
+  }
+  input.remove_prefix(blank);
+
   if (input.empty() || input.front() != '*') {
     if (!input.empty()) {
       result.state = RespParseState::kError;
@@ -48,10 +59,16 @@ RespParseResult ParseRespCommand(std::string_view input) {
 
   // Parse each bulk string: $<N>\r\n<data>\r\n
   for (std::size_t i = 0; i < count; ++i) {
-    if (pos >= input.size() || input[pos] != '$') {
+    // Running out of input between arguments is truncation, not corruption:
+    // a pipelined stream splits wherever the socket happens to split it, and
+    // landing exactly on an argument boundary is ordinary. Report it the same
+    // way as every other short read so the caller waits for the rest instead
+    // of failing the connection.
+    if (pos >= input.size()) return result;
+    if (input[pos] != '$') {
       result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kInvalidArgument,
-          (pos >= input.size()) ? "incomplete RESP command" : "expected RESP bulk string");
+      result.status =
+          Status(StatusCode::kInvalidArgument, "expected RESP bulk string");
       return result;
     }
     ++pos;
@@ -86,7 +103,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
   }
 
   result.state = RespParseState::kOk;
-  result.consumed = pos;
+  result.consumed = blank + pos;
   return result;
 }
 
