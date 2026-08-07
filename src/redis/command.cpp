@@ -217,6 +217,31 @@ class DbOperationGuard {
   std::uint8_t db_id_;
 };
 
+// Gates several databases at once (EXEC spanning databases via SELECT); the
+// destructor releases whatever was successfully begun.
+class MultiDbOperationGuard {
+ public:
+  MultiDbOperationGuard() = default;
+  MultiDbOperationGuard(const MultiDbOperationGuard&) = delete;
+  MultiDbOperationGuard& operator=(const MultiDbOperationGuard&) = delete;
+  ~MultiDbOperationGuard() {
+    for (const std::uint8_t db : dbs_) {
+      EndDbOperation(db);
+    }
+  }
+
+  bool Add(std::uint8_t db_id) {
+    if (!TryBeginDbOperation(db_id)) {
+      return false;
+    }
+    dbs_.push_back(db_id);
+    return true;
+  }
+
+ private:
+  std::vector<std::uint8_t> dbs_;
+};
+
 class DbCloseGuard {
  public:
   explicit DbCloseGuard(std::uint8_t db_id) : db_id_(db_id) {}
@@ -956,15 +981,16 @@ Task<Status> MultiKeyShardCallback(void* context,
     switch (ctx->request->kind) {
       case CommandKind::kMSet: {
         auto result = co_await g_storage->SetLocked(
-            slice.db_id, name, key.digest, args[key.arg_index + 1], {});
+            ctx->request->db_id, name, key.digest, args[key.arg_index + 1],
+            {});
         if (!result.ok()) {
           co_return result.status();
         }
         break;
       }
       case CommandKind::kMGet: {
-        auto value = co_await g_storage->GetLocked(slice.db_id, name,
-                                                   key.digest);
+        auto value = co_await g_storage->GetLocked(ctx->request->db_id,
+                                                   name, key.digest);
         if (value.ok()) {
           const auto bytes = value->network_bytes();
           ctx->frames[key.arg_index - 1].emplace(
@@ -976,7 +1002,8 @@ Task<Status> MultiKeyShardCallback(void* context,
       }
       case CommandKind::kDel: {
         auto deleted =
-            co_await g_storage->DeleteLocked(slice.db_id, name, key.digest);
+            co_await g_storage->DeleteLocked(ctx->request->db_id, name,
+                                             key.digest);
         if (!deleted.ok()) {
           co_return deleted.status();
         }
@@ -987,7 +1014,8 @@ Task<Status> MultiKeyShardCallback(void* context,
       }
       case CommandKind::kExists:
       default: {
-        if (co_await g_storage->ExistsLocked(slice.db_id, name, key.digest)) {
+        if (co_await g_storage->ExistsLocked(ctx->request->db_id, name,
+                                             key.digest)) {
           ctx->hits.fetch_add(1, std::memory_order_relaxed);
         }
         break;
@@ -1013,9 +1041,9 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
 
   const bool write = (request.spec->flags & kCmdWrite) != 0;
   tx::Transaction txn;
-  txn.Begin(request.db_id);
   for (std::size_t i = keys->first; i <= keys->last; i += keys->step) {
-    txn.AddKey(ShardForKey(args[i]), storage::ComputeDigest(args[i]),
+    txn.AddKey(ShardForKey(args[i]), request.db_id,
+               storage::ComputeDigest(args[i]),
                static_cast<std::uint32_t>(i),
                write ? tx::LockMode::kExclusive : tx::LockMode::kShared);
   }
@@ -1061,6 +1089,7 @@ struct ExecKey {
   std::uint16_t arg = 0;
   std::uint16_t slot = 0;
   tx::LockMode mode = tx::LockMode::kShared;
+  std::uint8_t db = 0;
 };
 
 struct ExecContext {
@@ -1106,14 +1135,14 @@ Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
     switch (cmd.kind) {
       case CommandKind::kMSet: {
         auto result = co_await g_storage->SetLocked(
-            slice.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
+            cmd.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
         if (!result.ok()) {
           co_return result.status();
         }
         break;
       }
       case CommandKind::kMGet: {
-        auto value = co_await g_storage->GetLocked(slice.db_id, args[key.arg],
+        auto value = co_await g_storage->GetLocked(cmd.db_id, args[key.arg],
                                                    key.digest);
         if (value.ok()) {
           const auto bytes = value->network_bytes();
@@ -1126,7 +1155,7 @@ Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
       }
       case CommandKind::kDel: {
         auto deleted = co_await g_storage->DeleteLocked(
-            slice.db_id, args[key.arg], key.digest);
+            cmd.db_id, args[key.arg], key.digest);
         if (!deleted.ok()) {
           co_return deleted.status();
         }
@@ -1136,7 +1165,7 @@ Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
         break;
       }
       case CommandKind::kExists: {
-        if (co_await g_storage->ExistsLocked(slice.db_id, args[key.arg],
+        if (co_await g_storage->ExistsLocked(cmd.db_id, args[key.arg],
                                              key.digest)) {
           ctx->counter.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1146,7 +1175,7 @@ Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
         // Single-key command: the sole owner runs the full body and writes
         // the reply slot directly.
         (*ctx->replies)[ctx->current] =
-            co_await RunSingleKeyLocked(slice.db_id, cmd, key.digest);
+            co_await RunSingleKeyLocked(cmd.db_id, cmd, key.digest);
         break;
     }
   }
@@ -1163,7 +1192,7 @@ std::vector<tx::KeyRef> DedupExecLocks(
       const tx::LockFp fp = tx::FingerprintOf(key.digest);
       bool merged = false;
       for (tx::KeyRef& ref : refs) {
-        if (ref.fp == fp) {
+        if (ref.fp == fp && ref.db == key.db) {
           if (key.mode == tx::LockMode::kExclusive) {
             ref.mode = tx::LockMode::kExclusive;
           }
@@ -1172,7 +1201,7 @@ std::vector<tx::KeyRef> DedupExecLocks(
         }
       }
       if (!merged) {
-        refs.push_back(tx::KeyRef{fp, key.mode});
+        refs.push_back(tx::KeyRef{fp, key.mode, key.db});
       }
     }
   }
@@ -1271,8 +1300,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
 
   // Precompute every queued command's keys: digests, owners, slots, modes.
   std::vector<std::vector<ExecKey>> cmd_keys(queued.size());
-  std::optional<std::uint8_t> tx_db;
-  bool cross_db = false;
+  std::vector<std::uint8_t> dbs;  // distinct databases with keyed commands
   for (std::size_t i = 0; i < queued.size(); ++i) {
     const CommandRequest& cmd = queued[i];
     if (cmd.spec == nullptr || cmd.spec->first_key == 0) {
@@ -1291,17 +1319,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
           .arg = static_cast<std::uint16_t>(a),
           .slot = slot++,
           .mode = write ? tx::LockMode::kExclusive : tx::LockMode::kShared,
+          .db = cmd.db_id,
       });
     }
-    if (tx_db.has_value() && *tx_db != cmd.db_id) {
-      cross_db = true;
+    if (std::find(dbs.begin(), dbs.end(), cmd.db_id) == dbs.end()) {
+      dbs.push_back(cmd.db_id);
     }
-    tx_db = tx_db.value_or(cmd.db_id);
-  }
-  if (cross_db) {
-    co_await DropWatches(ctx);
-    co_return EncodedReply(EncodeError(
-        "ERR EXEC spanning multiple databases is not supported"));
   }
 
   std::vector<std::string> replies(queued.size());
@@ -1314,11 +1337,15 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     return std::move(local.encoded);
   };
 
-  if (tx_db.has_value()) {
-    if (!TryBeginDbOperation(*tx_db)) {
-      co_return EncodedReply(EncodeError("TRYAGAIN FLUSHDB is in progress"));
+  if (!dbs.empty()) {
+    MultiDbOperationGuard db_guard;
+    for (const std::uint8_t db : dbs) {
+      if (!db_guard.Add(db)) {
+        co_await DropWatches(ctx);
+        co_return EncodedReply(
+            EncodeError("TRYAGAIN FLUSHDB is in progress"));
+      }
     }
-    DbOperationGuard db_guard(*tx_db);
 
     // Distinct owners across the whole transaction.
     std::vector<std::uint16_t> owners;
@@ -1335,12 +1362,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       // Whole transaction on one shard: hop once, take the fast-path guard
       // over the union lock set, run every command inline.
       const std::vector<tx::KeyRef> refs = DedupExecLocks(cmd_keys);
-      const std::uint8_t db = *tx_db;
       bool watch_aborted = false;
       Status status = co_await SubmitTaskTo(
           owners.front(), [&]() -> Task<Status> {
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
-                db, std::span<const tx::KeyRef>(refs));
+                std::span<const tx::KeyRef>(refs));
             if (!ctx.watched.empty() &&
                 !co_await CheckConnectionWatches(ctx)) {
               watch_aborted = true;
@@ -1366,13 +1392,13 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
                       cmd.kind == CommandKind::kMGet ? cmd_keys[i].size() : 0,
                       std::nullopt);
                   Status ran = co_await ExecShardCallback(
-                      &exec_ctx, tx::ShardSlice{.db_id = db, .keys = {}});
+                      &exec_ctx, tx::ShardSlice{.keys = {}});
                   replies[i] = AssembleMultiKeyReply(cmd.kind, exec_ctx, ran);
                   break;
                 }
                 default:
                   replies[i] = co_await RunSingleKeyLocked(
-                      db, cmd, cmd_keys[i].front().digest);
+                      cmd.db_id, cmd, cmd_keys[i].front().digest);
                   break;
               }
             }
@@ -1388,10 +1414,9 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       }
     } else {
       tx::Transaction txn;
-      txn.Begin(*tx_db);
       for (const auto& keys : cmd_keys) {
         for (const ExecKey& key : keys) {
-          txn.AddKey(key.owner, key.digest, key.arg, key.mode);
+          txn.AddKey(key.owner, key.db, key.digest, key.arg, key.mode);
         }
       }
       txn.Seal();

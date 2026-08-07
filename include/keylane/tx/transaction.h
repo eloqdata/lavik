@@ -19,19 +19,19 @@ namespace keylane::tx {
 class TxShard;
 
 // One key of a transaction: the full digest for engine access, the
-// fingerprint and mode for locking, and the argument index it came from so
-// shard callbacks can find paired values and reply slots.
+// fingerprint, database, and mode for locking, and the argument index it
+// came from so shard callbacks can find paired values and reply slots.
 struct TxKey {
   storage::Digest digest;
   LockFp fp = 0;
   std::uint32_t arg_index = 0;
   LockMode mode = LockMode::kShared;
+  std::uint8_t db = 0;
 };
 
 // The per-shard view handed to a shard callback: this shard's keys in
 // argument order, duplicates included (locking is deduplicated separately).
 struct ShardSlice {
-  std::uint8_t db_id = 0;
   std::span<const TxKey> keys;
 };
 
@@ -61,10 +61,8 @@ class Transaction {
   Transaction(const Transaction&) = delete;
   Transaction& operator=(const Transaction&) = delete;
 
-  void Begin(std::uint8_t db_id) { db_id_ = db_id; }
-
   // Owner is the key's home worker (StorageEngine::OwnerForKey).
-  void AddKey(unsigned owner, const storage::Digest& digest,
+  void AddKey(unsigned owner, std::uint8_t db, const storage::Digest& digest,
               std::uint32_t arg_index, LockMode mode);
 
   // Groups keys by shard and builds the deduplicated lock sets. No keys may
@@ -73,7 +71,6 @@ class Transaction {
 
   bool single_shard() const { return shards_.size() == 1; }
   std::size_t shard_count() const { return shards_.size(); }
-  std::uint8_t db_id() const { return db_id_; }
 
   // Multi-shard only; no-op for single-shard transactions.
   celer::Task<celer::Status> Schedule();
@@ -140,7 +137,6 @@ class Transaction {
   ShardSlice Slice(const ShardData& sd) const;
   celer::Task<celer::Status> ExecuteSingleShard();
 
-  std::uint8_t db_id_ = 0;
   bool concluding_ = false;
   bool scheduled_ = false;
   std::uint64_t txid_ = 0;

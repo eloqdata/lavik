@@ -10,7 +10,8 @@ namespace keylane::tx {
 using celer::Status;
 using celer::Task;
 
-void Transaction::AddKey(unsigned owner, const storage::Digest& digest,
+void Transaction::AddKey(unsigned owner, std::uint8_t db,
+                         const storage::Digest& digest,
                          std::uint32_t arg_index, LockMode mode) {
   assert(shards_.empty() && "AddKey after Seal");
   keys_.push_back(TxKey{
@@ -18,6 +19,7 @@ void Transaction::AddKey(unsigned owner, const storage::Digest& digest,
       .fp = FingerprintOf(digest),
       .arg_index = arg_index,
       .mode = mode,
+      .db = db,
   });
   owners_.push_back(static_cast<std::uint16_t>(owner));
 }
@@ -48,14 +50,14 @@ void Transaction::Seal() {
     }
     sd.key_count =
         static_cast<std::uint16_t>(grouped.size() - sd.key_begin);
-    // Deduplicate the lock set: one ref per fingerprint, exclusive if any
-    // occurrence writes.
+    // Deduplicate the lock set: one ref per (db, fingerprint), exclusive if
+    // any occurrence writes.
     sd.lock_begin = static_cast<std::uint16_t>(lock_refs_.size());
     for (std::size_t i = sd.key_begin; i < grouped.size(); ++i) {
       const TxKey& key = grouped[i];
       bool merged = false;
       for (std::size_t j = sd.lock_begin; j < lock_refs_.size(); ++j) {
-        if (lock_refs_[j].fp == key.fp) {
+        if (lock_refs_[j].fp == key.fp && lock_refs_[j].db == key.db) {
           if (key.mode == LockMode::kExclusive) {
             lock_refs_[j].mode = LockMode::kExclusive;
           }
@@ -64,7 +66,7 @@ void Transaction::Seal() {
         }
       }
       if (!merged) {
-        lock_refs_.push_back(KeyRef{key.fp, key.mode});
+        lock_refs_.push_back(KeyRef{key.fp, key.mode, key.db});
       }
     }
     sd.lock_count =
@@ -75,7 +77,6 @@ void Transaction::Seal() {
   for (std::size_t s = 0; s < shards_.size(); ++s) {
     ShardData& sd = shards_[s];
     sd.node.tx = this;
-    sd.node.db_id = db_id_;
     sd.node.shard_slot = static_cast<std::uint16_t>(s);
     sd.node.keys = std::span<const KeyRef>(lock_refs_.data() + sd.lock_begin,
                                            sd.lock_count);
@@ -84,7 +85,6 @@ void Transaction::Seal() {
 
 ShardSlice Transaction::Slice(const ShardData& sd) const {
   return ShardSlice{
-      .db_id = db_id_,
       .keys = std::span<const TxKey>(keys_.data() + sd.key_begin,
                                      sd.key_count),
   };
@@ -156,16 +156,15 @@ void Transaction::ScheduleInShard(ShardData* sd) {
     sd->schedule_failed = true;
     return;
   }
-  LockTable& table = shard.locks(tx->db_id_);
   sd->node.txid = tx->txid_;
-  sd->granted = table.AcquireIntents(sd->node.keys);
+  sd->granted = shard.AcquireIntents(sd->node.keys);
   const std::uint64_t tail = shard.queue().TailTxid();
   // Reorder rule: inserting before the tail while conflicting is unsound —
   // a later transaction may already have run out of order assuming nothing
   // precedes it. Fail the schedule; the coordinator retries with a fresh,
   // larger txid.
   if (!sd->granted && tail != 0 && tx->txid_ < tail) {
-    table.ReleaseIntents(sd->node.keys);
+    shard.ReleaseIntents(sd->node.keys);
     sd->schedule_failed = true;
     return;
   }
@@ -173,9 +172,8 @@ void Transaction::ScheduleInShard(ShardData* sd) {
 }
 
 void Transaction::CancelInShard(ShardData* sd) {
-  Transaction* tx = sd->tx;
   TxShard& shard = CurrentTxShard();
-  shard.locks(tx->db_id_).ReleaseIntents(sd->node.keys);
+  shard.ReleaseIntents(sd->node.keys);
   shard.queue().Remove(&sd->node);
   sd->granted = false;
   shard.Poll();
@@ -243,7 +241,7 @@ Task<Status> Transaction::ExecuteSingleShard() {
   const unsigned owner = shards_[0].shard_id;
   co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<Status> {
     ShardData& sd = shards_[0];
-    auto guard = co_await CurrentTxShard().AcquireKeys(db_id_, sd.node.keys);
+    auto guard = co_await CurrentTxShard().AcquireKeys(sd.node.keys);
     co_return co_await cb_(cb_ctx_, Slice(sd));
   });
 }
@@ -291,9 +289,8 @@ Task<Status> RunShardHop(TxShard* shard, TxWaiter* node) {
   // Non-suspending epilogue on the shard thread.
   node->running = false;
   if (tx->concluding()) {
-    LockTable& table = shard->locks(node->db_id);
-    table.ReleaseHolds(node->keys);
-    table.ReleaseIntents(node->keys);
+    shard->ReleaseHolds(node->keys);
+    shard->ReleaseIntents(node->keys);
     node->holds_acquired = false;
     shard->queue().Remove(node);
     shard->Poll();

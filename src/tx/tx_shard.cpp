@@ -30,13 +30,12 @@ void TxShard::Poll() {
       if (head->running || !head->armed) {
         break;
       }
-      if (!head->holds_acquired &&
-          !locks_[head->db_id].CanHoldAll(head->keys)) {
+      if (!head->holds_acquired && !CanHoldAll(head->keys)) {
         break;
       }
       committed_txid_ = std::max(committed_txid_, head->txid);
       if (!head->holds_acquired) {
-        locks_[head->db_id].AcquireHolds(head->keys);
+        AcquireHolds(head->keys);
         head->holds_acquired = true;
       }
       head->armed = false;
@@ -45,7 +44,7 @@ void TxShard::Poll() {
       StartTransactionHop(*this, head);
       break;
     }
-    if (!locks_[head->db_id].CanHoldAll(head->keys)) {
+    if (!CanHoldAll(head->keys)) {
       // A suspended runner still holds a conflicting key; its release will
       // re-poll. The head's recorded intents guarantee no new conflicting
       // holder can appear, so the wait set only drains.
@@ -54,7 +53,7 @@ void TxShard::Poll() {
     // Publish before the head can run (its callback may suspend at any
     // point after resumption).
     committed_txid_ = std::max(committed_txid_, head->txid);
-    locks_[head->db_id].AcquireHolds(head->keys);
+    AcquireHolds(head->keys);
     ++queued_runs_;
     // Remove before resuming: once resumed, the waiter (living in the
     // suspended coroutine's frame) is no longer referenced by the queue.

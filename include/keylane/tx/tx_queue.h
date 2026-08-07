@@ -23,11 +23,10 @@ class Transaction;
 //    concludes, running one armed hop at a time.
 struct TxWaiter {
   std::uint64_t txid = 0;
-  std::span<const KeyRef> keys;
+  std::span<const KeyRef> keys;  // each ref carries its database
   std::coroutine_handle<> resume;
   Transaction* tx = nullptr;
   std::uint16_t shard_slot = 0;
-  std::uint8_t db_id = 0;
   bool armed = false;
   bool running = false;
   bool holds_acquired = false;

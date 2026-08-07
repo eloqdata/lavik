@@ -390,15 +390,20 @@ int main(int argc, char** argv) {
     Expect(client.Command({"SELECT", "0"}), "+OK", "back to db0");
     Expect(client.Command({"GET", "sk"}), "$-1", "db0 unaffected");
 
-    // Transactions spanning databases are rejected.
+    // Transactions spanning databases: SELECT inside MULTI moves later
+    // commands to another database and everything commits atomically.
     Expect(client.Command({"MULTI"}), "+OK", "MULTI cross-db");
-    Expect(client.Command({"SET", "c0", "v"}), "+QUEUED", "queue db0 SET");
+    Expect(client.Command({"SET", "c0", "zero"}), "+QUEUED", "queue db0 SET");
     Expect(client.Command({"SELECT", "1"}), "+QUEUED", "queue SELECT 1");
-    Expect(client.Command({"SET", "c1", "v"}), "+QUEUED", "queue db1 SET");
+    Expect(client.Command({"SET", "c1", "one"}), "+QUEUED", "queue db1 SET");
+    Expect(client.Command({"GET", "c1"}), "+QUEUED", "queue db1 GET");
     Expect(client.Command({"EXEC"}),
-           "-ERR EXEC spanning multiple databases is not supported",
-           "cross-db EXEC");
-    Expect(client.Command({"SELECT", "0"}), "+OK", "reset db");
+           "*4\r\n+OK\r\n+OK\r\n+OK\r\n" + Bulk("one"), "cross-db EXEC");
+    Expect(client.Command({"GET", "c1"}), Bulk("one"), "db1 sticky read");
+    Expect(client.Command({"GET", "c0"}), "$-1", "c0 not in db1");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "back to db0");
+    Expect(client.Command({"GET", "c0"}), Bulk("zero"), "db0 read");
+    Expect(client.Command({"GET", "c1"}), "$-1", "c1 not in db0");
 
     // ---- WATCH / UNWATCH ----
     RespClient other = Connect(port);

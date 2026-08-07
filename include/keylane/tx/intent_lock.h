@@ -91,39 +91,6 @@ class LockTable {
     // trigger from ReleaseIntent.
   }
 
-  // Convenience over a whole key set. AcquireIntents records every intent even
-  // when the set is not granted (recorded intents block later barging).
-  bool AcquireIntents(std::span<const KeyRef> keys) {
-    bool granted = true;
-    for (const KeyRef& key : keys) {
-      granted &= AcquireIntent(key.fp, key.mode);
-    }
-    return granted;
-  }
-  void ReleaseIntents(std::span<const KeyRef> keys) {
-    for (const KeyRef& key : keys) {
-      ReleaseIntent(key.fp, key.mode);
-    }
-  }
-  bool CanHoldAll(std::span<const KeyRef> keys) const {
-    for (const KeyRef& key : keys) {
-      if (!CanHold(key.fp, key.mode)) {
-        return false;
-      }
-    }
-    return true;
-  }
-  void AcquireHolds(std::span<const KeyRef> keys) {
-    for (const KeyRef& key : keys) {
-      AcquireHold(key.fp, key.mode);
-    }
-  }
-  void ReleaseHolds(std::span<const KeyRef> keys) {
-    for (const KeyRef& key : keys) {
-      ReleaseHold(key.fp, key.mode);
-    }
-  }
-
   std::size_t size() const noexcept { return map_.size(); }
 
  private:

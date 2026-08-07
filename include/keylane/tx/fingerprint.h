@@ -32,10 +32,13 @@ enum class LockMode : std::uint8_t {
   kExclusive,
 };
 
-// One key of a transaction's lock set: fingerprint + requested mode.
+// One key of a transaction's lock set: fingerprint, requested mode, and the
+// logical database whose lock table arbitrates it. Carrying the database per
+// key lets one transaction span databases (SELECT inside MULTI).
 struct KeyRef {
   LockFp fp = 0;
   LockMode mode = LockMode::kShared;
+  std::uint8_t db = 0;
 };
 
 }  // namespace keylane::tx

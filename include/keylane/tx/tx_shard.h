@@ -35,22 +35,20 @@ class TxShard {
   class Guard {
    public:
     Guard() = default;
-    Guard(TxShard* shard, std::uint8_t db_id, std::span<const KeyRef> keys)
-        : shard_(shard), db_id_(db_id), keys_(keys.begin(), keys.end()) {}
+    Guard(TxShard* shard, std::span<const KeyRef> keys)
+        : shard_(shard), keys_(keys.begin(), keys.end()) {}
 
     Guard(const Guard&) = delete;
     Guard& operator=(const Guard&) = delete;
 
     Guard(Guard&& other) noexcept
         : shard_(std::exchange(other.shard_, nullptr)),
-          db_id_(other.db_id_),
           keys_(std::move(other.keys_)) {}
 
     Guard& operator=(Guard&& other) noexcept {
       if (this != &other) {
         Reset();
         shard_ = std::exchange(other.shard_, nullptr);
-        db_id_ = other.db_id_;
         keys_ = std::move(other.keys_);
       }
       return *this;
@@ -61,13 +59,12 @@ class TxShard {
     void Reset() noexcept {
       if (shard_ != nullptr) {
         TxShard* shard = std::exchange(shard_, nullptr);
-        shard->Release(db_id_, keys_);
+        shard->Release(keys_);
       }
     }
 
    private:
     TxShard* shard_ = nullptr;
-    std::uint8_t db_id_ = 0;
     absl::InlinedVector<KeyRef, 2> keys_;
   };
 
@@ -78,38 +75,33 @@ class TxShard {
   // Poll starts us as the hold-compatible head.
   class Awaiter {
    public:
-    Awaiter(TxShard* shard, std::uint8_t db_id, std::span<const KeyRef> keys)
-        : shard_(shard), db_id_(db_id), keys_(keys) {}
+    Awaiter(TxShard* shard, std::span<const KeyRef> keys)
+        : shard_(shard), keys_(keys) {}
 
     // Single-key form; the ref is stored inline so callers can pass
     // temporaries.
-    Awaiter(TxShard* shard, std::uint8_t db_id, KeyRef key)
-        : shard_(shard), db_id_(db_id), inline_key_(key),
-          keys_(&inline_key_, 1) {}
+    Awaiter(TxShard* shard, KeyRef key)
+        : shard_(shard), inline_key_(key), keys_(&inline_key_, 1) {}
 
     Awaiter(const Awaiter&) = delete;
     Awaiter& operator=(const Awaiter&) = delete;
 
     bool await_ready() {
-      granted_ = shard_->TryFastPath(db_id_, keys_);
+      granted_ = shard_->TryFastPath(keys_);
       return granted_;
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
       waiter_.txid = shard_->AllocateTxid();
-      waiter_.db_id = db_id_;
       waiter_.keys = keys_;
       waiter_.resume = handle;
       shard_->Enqueue(&waiter_);
     }
 
-    Guard await_resume() noexcept {
-      return Guard(shard_, db_id_, keys_);
-    }
+    Guard await_resume() noexcept { return Guard(shard_, keys_); }
 
    private:
     TxShard* shard_;
-    std::uint8_t db_id_;
     KeyRef inline_key_{};
     std::span<const KeyRef> keys_;
     TxWaiter waiter_;
@@ -128,14 +120,13 @@ class TxShard {
   }
 
   // The caller must keep the KeyRef storage alive across the co_await; the
-  // set must be duplicate-free.
-  Awaiter AcquireKeys(std::uint8_t db_id, std::span<const KeyRef> keys) {
-    assert(db_id < storage::kLogicalDatabaseCount);
-    return Awaiter(this, db_id, keys);
+  // set must be duplicate-free per (db, fp).
+  Awaiter AcquireKeys(std::span<const KeyRef> keys) {
+    return Awaiter(this, keys);
   }
   Awaiter AcquireKey(std::uint8_t db_id, LockFp fp, LockMode mode) {
     assert(db_id < storage::kLogicalDatabaseCount);
-    return Awaiter(this, db_id, KeyRef{fp, mode});
+    return Awaiter(this, KeyRef{fp, mode, db_id});
   }
 
   // Starts the queue head while it is hold-compatible. Called after every
@@ -215,6 +206,39 @@ class TxShard {
     }
   }
 
+  // Key-set lock operations dispatch each ref to its database's table, so a
+  // single set (and therefore a single transaction) may span databases.
+  bool AcquireIntents(std::span<const KeyRef> keys) {
+    bool granted = true;
+    for (const KeyRef& key : keys) {
+      granted &= locks_[key.db].AcquireIntent(key.fp, key.mode);
+    }
+    return granted;
+  }
+  void ReleaseIntents(std::span<const KeyRef> keys) {
+    for (const KeyRef& key : keys) {
+      locks_[key.db].ReleaseIntent(key.fp, key.mode);
+    }
+  }
+  bool CanHoldAll(std::span<const KeyRef> keys) const {
+    for (const KeyRef& key : keys) {
+      if (!locks_[key.db].CanHold(key.fp, key.mode)) {
+        return false;
+      }
+    }
+    return true;
+  }
+  void AcquireHolds(std::span<const KeyRef> keys) {
+    for (const KeyRef& key : keys) {
+      locks_[key.db].AcquireHold(key.fp, key.mode);
+    }
+  }
+  void ReleaseHolds(std::span<const KeyRef> keys) {
+    for (const KeyRef& key : keys) {
+      locks_[key.db].ReleaseHold(key.fp, key.mode);
+    }
+  }
+
   LockTable& locks(std::uint8_t db_id) { return locks_[db_id]; }
   TxQueue& queue() noexcept { return queue_; }
   celer::Worker* worker() const noexcept { return worker_; }
@@ -228,16 +252,15 @@ class TxShard {
  private:
   friend class Awaiter;
 
-  bool TryFastPath(std::uint8_t db_id, std::span<const KeyRef> keys) {
-    LockTable& table = locks_[db_id];
+  bool TryFastPath(std::span<const KeyRef> keys) {
     // Intents are recorded even when not granted: they block later barging
     // while this acquisition waits in the queue.
-    if (!table.AcquireIntents(keys)) {
+    if (!AcquireIntents(keys)) {
       return false;
     }
     // Granted => sole/compatible intent owner => (holds ⊆ intents) no
     // conflicting hold can exist.
-    table.AcquireHolds(keys);
+    AcquireHolds(keys);
     ++fastpath_runs_;
     return true;
   }
@@ -249,10 +272,9 @@ class TxShard {
 
   void Enqueue(TxWaiter* waiter) { queue_.Insert(waiter); }
 
-  void Release(std::uint8_t db_id, std::span<const KeyRef> keys) {
-    LockTable& table = locks_[db_id];
-    table.ReleaseHolds(keys);
-    table.ReleaseIntents(keys);
+  void Release(std::span<const KeyRef> keys) {
+    ReleaseHolds(keys);
+    ReleaseIntents(keys);
     Poll();
   }
 
