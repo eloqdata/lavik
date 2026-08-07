@@ -136,6 +136,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
     return value.PercentileUpperUs(stats.count, 0.9999);
   };
   const auto wake_stats = ThisWorker().self->TakeWakeStats();
+  const auto scheduler_stats = ThisWorker().self->TakeSchedulerStats();
   spdlog::info(
       "read-latency worker={} n={} remote={:.1f}% hit={:.1f}% disk={:.1f}% "
       "heap-buffer={:.1f}% avg-us total={:.1f} route-out={:.1f} lookup={:.1f} "
@@ -153,6 +154,36 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p999(stats.buffer), p999(stats.io), p999(stats.decode),
       p999(stats.route_back), p999(stats.send),
       wake_stats.sent, wake_stats.checks);
+  const auto cycles_to_us = [&](std::uint64_t cycles) {
+    return scheduler_stats.cycles_per_second == 0.0
+               ? 0.0
+               : static_cast<double>(cycles) * 1'000'000.0 /
+                     scheduler_stats.cycles_per_second;
+  };
+  const std::uint64_t scheduled_cycles =
+      scheduler_stats.foreground_cycles + scheduler_stats.background_cycles;
+  spdlog::info(
+      "scheduler worker={} rounds={} avg-round-us={:.2f} max-round-us={:.2f} "
+      "fg-resumes={} fg-us={:.1f} max-fg-us={:.1f} fg-overruns={} "
+      "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} bg-share={:.1f}%",
+      ThisWorker().id, scheduler_stats.rounds,
+      scheduler_stats.rounds == 0
+          ? 0.0
+          : cycles_to_us(scheduler_stats.round_cycles) /
+                static_cast<double>(scheduler_stats.rounds),
+      cycles_to_us(scheduler_stats.max_round_cycles),
+      scheduler_stats.foreground_resumes,
+      cycles_to_us(scheduler_stats.foreground_cycles),
+      cycles_to_us(scheduler_stats.max_foreground_cycles),
+      scheduler_stats.foreground_overruns,
+      scheduler_stats.background_resumes,
+      cycles_to_us(scheduler_stats.background_cycles),
+      cycles_to_us(scheduler_stats.max_background_cycles),
+      scheduler_stats.background_overruns,
+      scheduled_cycles == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(scheduler_stats.background_cycles) /
+                static_cast<double>(scheduled_cycles));
   spdlog::info(
       "read-latency-p99.99 worker={} n={} non-network-us<={} total-us<={} "
       "storage-io-us<={} route-out-us<={} lookup-us<={} buffer-us<={} "
@@ -175,7 +206,8 @@ void ShutdownSignalHandler(int signal) {
     return;
   }
   const std::uint64_t wake = 1;
-  (void)write(g_signal_event_fd, &wake, sizeof(wake));
+  const ssize_t result = write(g_signal_event_fd, &wake, sizeof(wake));
+  (void)result;
 }
 
 Status InstallShutdownSignalHandler() {
@@ -234,13 +266,20 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 
     if ((fds[0].revents & POLLIN) != 0) {
       std::uint64_t wake = 0;
-      (void)read(g_signal_event_fd, &wake, sizeof(wake));
+      const ssize_t result = read(g_signal_event_fd, &wake, sizeof(wake));
+      if (result < 0 && errno != EAGAIN) {
+        spdlog::warn("signal eventfd read failed errno={}", errno);
+      }
       g_shutdown_requested.store(true, std::memory_order_release);
       return WaitResult::kSignal;
     }
     if ((fds[1].revents & POLLIN) != 0) {
       std::uint64_t wake = 0;
-      (void)read(server.completion_fd(), &wake, sizeof(wake));
+      const ssize_t result =
+          read(server.completion_fd(), &wake, sizeof(wake));
+      if (result < 0 && errno != EAGAIN) {
+        spdlog::warn("server completion eventfd read failed errno={}", errno);
+      }
       return WaitResult::kStopped;
     }
   }

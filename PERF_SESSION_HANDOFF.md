@@ -483,12 +483,215 @@ Artifacts:
     /tmp/keylane-c3488d9-w8-direct-frame-setget10-5m.{memtier,iostat,pidstat}
     /tmp/keylane-c3488d9-w8-direct-frame-setget1-5m.{memtier,iostat,pidstat}
 
+### 50 GiB regular-file online defrag impact
+
+This test used Keylane 767bb11 with Celer 0afbc77 and an isolated 50 GiB
+preallocated regular file at `/mnt/data0/keylane-defrag-50g.data` on the
+`/dev/nvme0n1` ext4 filesystem. It did not touch the 200-million-key raw-device
+dataset or Dragonfly's files. Keylane exposed 6,399 8 MiB blocks with 4 KiB
+direct-I/O alignment. The file was filled with 8,000,000 fixed 2000-byte values
+at 454,823.41 SET/s; the smaller live set deliberately left enough free space
+for relocation.
+
+The controlled foreground workload was split into two independent clients:
+50K random GET/s as the measured online business and 50K random SET/s as the
+fragmentation source. Both used 8 threads and 10 connections per thread on
+CPUs 8-15, while the 8 Keylane workers remained on CPUs 0-7. With 8 million
+keys, random replacement is expected to reduce the original-record live ratio
+to 50% after approximately `-ln(0.5) * 8M / 50K = 111` seconds. The observed
+SET slowdown began at seconds 107-110, matching the code's 50% threshold.
+
+The first 60-second window was before that threshold. The first active window
+started as the threshold was crossed. A later attempt to obtain an A/B/A clean
+window instead produced a second active reproduction: although defrag drained
+when SET traffic stopped, resuming SET immediately discovered more already-low
+live-ratio blocks and queued another burst.
+
+    Window               GET/s       Average       p99          p99.9        p99.99
+    Before defrag        49,923.70    0.25714 ms    0.807 ms     1.895 ms      3.087 ms
+    Defrag active #1     49,888.92    0.29965 ms    2.351 ms     7.167 ms     13.311 ms
+    Defrag active #2     47,556.15    0.70051 ms   11.391 ms    17.023 ms     23.423 ms
+
+Relative to the threshold-before baseline, the first active window retained
+the GET rate but increased average, p99, p99.9, and p99.99 by 16.5%, 191.3%,
+278.2%, and 331.2% respectively. The second burst was stronger: the GET client
+missed its 50K/s target by 4.9%, average latency was 2.72x baseline, and p99
+was 14.1x baseline. During the second active window, the concurrent SET client
+delivered 49,621.31 SET/s at 0.25655 ms average, 2.127 ms p99, 14.271 ms p99.9,
+and 20.223 ms p99.99.
+
+First-60-second server and device averages were:
+
+    Window               CPU       r/s         rMiB/s    rAwait     w/s       wMiB/s   wAwait
+    Before defrag        253.88%   49,833.3    296.06    0.144 ms     846.5    102.15   0.321 ms
+    Defrag active #1     285.50%   49,994.0    396.43    0.151 ms   1,252.7    152.44   0.076 ms
+    Defrag active #2     369.00%   48,008.8    558.67    0.239 ms   1,869.5    228.28   0.096 ms
+
+The first active window raised server CPU by 12.5%, read bandwidth by 33.9%,
+and write bandwidth by 49.2%. It did not exhaust either global resource:
+Keylane peaked at 303% of the 800% available CPU, while NVMe utilization
+averaged 33.1% and peaked at 37.9%. The server phase trace isolates the first
+window's added delay:
+
+    Phase              Before       Active #1     Change
+    total              213.75 us     244.94 us     +31.19 us
+    storage I/O        170.00 us     170.11 us      +0.11 us
+    route out           10.02 us      42.57 us     +32.55 us
+    route back           7.23 us       7.32 us      +0.09 us
+    send                22.28 us      20.75 us      -1.53 us
+
+Thus the clean first reproduction was dominated by worker/cross-core queueing,
+not storage latency or total CPU capacity. Defrag relocation shares the worker,
+key-lock, writer-mutex, and cross-core mailbox paths with foreground requests.
+
+The second reproduction raised CPU and I/O much further, but its most extreme
+interval also overlapped the known device/system slow plateau. NVMe utilization
+peaked at 91.7%, read await at 0.670 ms, process CPU at 689%, and system CPU at
+532%. Its 23.423 ms p99.99 must therefore be treated as defrag plus device
+saturation, not a defrag-only result. Even without that confounder, the first
+active window proves a material defrag tail effect.
+
+Baseline perf contained no `CleanBlockLocked` or
+`RelocateIfCurrent`; both active profiles sampled those functions. Their
+on-CPU shares were modest because block reads and writes spend significant time
+off CPU, but their presence together with the large extra I/O confirms that
+defrag was active rather than this being ordinary foreground SET cost.
+
+The result is that current defrag materially harms online tail latency in
+short bursts. It reads complete 8 MiB blocks, relocates live records through
+the normal write and key-lock path, and can run once per worker. Rate limiting,
+lower defrag concurrency, I/O budgeting, and yielding between relocations are
+appropriate follow-up experiments.
+
+After the experiment, DB 0 still contained exactly 8,000,000 live keys and the
+first, middle, and last sampled values were all 2000 bytes. All measured GETs
+were hits, no defrag/checksum errors were logged, and the defrag I/O drained to
+zero after foreground writes stopped. The 50 GiB test file was retained for
+follow-up tests.
+
+Artifacts:
+
+    /tmp/keylane-c3488d9-w8-defrag50g-server.log
+    /tmp/keylane-c3488d9-w8-defrag50g-fill.memtier
+    /tmp/keylane-c3488d9-w8-defrag50g-churn-set50k.memtier
+    /tmp/keylane-c3488d9-w8-defrag50g-nodefrag-read50k.memtier
+    /tmp/keylane-c3488d9-w8-defrag50g-nodefrag.{iostat,pidstat,perf.data}
+    /tmp/keylane-c3488d9-w8-defrag50g-active-read50k.memtier
+    /tmp/keylane-c3488d9-w8-defrag50g-active.{iostat,pidstat,perf.data}
+    /tmp/keylane-c3488d9-w8-defrag50g-post-{set50k,read50k}.memtier
+    /tmp/keylane-c3488d9-w8-defrag50g-post.{iostat,pidstat,perf.data}
+
+### Round-budget defrag correctness smoke test
+
+The local round-budget implementation was checked on an isolated 1 GiB ext4
+regular file after moving Abseil under Celer. Celer always used Abseil
+`CycleClock`; no package lookup, compile-time switch, or clock fallback was
+involved. The scheduler used a 1,000 us foreground budget, a 50 us background
+budget, and a 10% background warrant. Foreground coroutine and cross-core work
+were queued separately from background defrag work. Defrag and every nested
+task, I/O completion, and cross-core continuation inherited the background
+classification.
+
+The test first loaded 100,000 unique 2,000-byte values, then ran independent
+50K random SET/s and 50K random GET/s clients concurrently for 30 seconds on
+CPUs 8-15. Keylane used eight workers on CPUs 0-7. Repeated replacement
+triggered defrag quickly in the small file; scheduler logs reported thousands
+of background resumes on every worker throughout the measured interval.
+
+    Operation    Ops/s        Average       p99          p99.9        p99.99
+    SET           49,998.49    0.12326 ms    0.615 ms     1.591 ms      2.751 ms
+    GET           49,996.56    0.19125 ms    0.575 ms     1.367 ms      2.975 ms
+
+All 1,500,019 measured GETs were hits. `DBSIZE` remained exactly 100,000 and
+the first, arbitrary, middle, and last sampled values were all 2,000 bytes. No
+defrag, checksum, corruption, or storage errors were logged. The temporary
+1 GiB file was deleted after Keylane stopped; the retained 50 GiB defrag file
+and the raw-device dataset were not modified.
+
+In steady 10-second scheduler windows, average rounds were approximately
+5.5-5.6 us and maximum foreground slices were 1.07-1.45 ms. Background work
+was present on every worker. Although its configured slice is 50 us, maximum
+observed background slices were 0.79-0.94 ms because the budget is cooperative:
+a continuation can only stop when it reaches the next `Yield` or suspension.
+The measured background share was 26-28%, above the 10% warrant because a
+single defrag continuation commonly overran the small nominal slice. The
+online p99.99 nevertheless remained below 3 ms in this smoke workload. This is
+a functional and scheduling check, not a replacement for the retained 50 GiB
+before/active comparison.
+
+Artifacts:
+
+    /tmp/keylane-round-budget-smoke-v2-{fill,write,read}.txt
+    /tmp/keylane-round-budget-smoke-v2-server.log
+
+### Unlimited fixed-key overwrite with round-budget defrag
+
+The retained 50 GiB file was recovered with exactly 8,000,000 live
+`defragkey_` keys and 2,000-byte values. The measured workload never expanded
+that logical key range: four memtier threads with ten connections each randomly
+overwrote those keys without rate limiting for 180 seconds. A separate,
+identically configured GET client on the other four client CPUs attempted
+50K GET/s throughout. Keylane remained on CPUs 0-7. A matching read-only
+baseline and a 60-second read-only run after writes stopped used the exact same
+GET client configuration.
+
+    Phase                 GET/s       Average       p99          p99.9        p99.99
+    Read-only baseline     49,996.37    0.19478 ms    0.647 ms     1.063 ms      1.839 ms
+    Unlimited overwrite    47,559.80    0.66034 ms    3.199 ms     4.991 ms      6.719 ms
+    Writes stopped         49,998.60    0.19472 ms    0.655 ms     1.071 ms      1.919 ms
+
+During unlimited overwrite, GET missed its target by 4.9%, average latency was
+3.39x baseline, p99 was 4.94x, p99.9 was 4.70x, and p99.99 was 3.65x. All GETs
+still hit. The SET client delivered 232,429.17 SET/s at 0.17197 ms average,
+0.711 ms p99, 1.247 ms p99.9, and 1.767 ms p99.99. Its first partial-defrag
+ten-second window averaged about 268K SET/s, fell to 209K SET/s in seconds
+30-59 during stronger cleaning, and stabilized around 236K SET/s in the final
+60 seconds.
+
+    Phase                 CPU       r/s       rMiB/s    rAwait     w/s      wMiB/s   wAwait    NVMe util
+    Read-only baseline    193.8%    50,001      296.9    0.110 ms       0        0.0   0.000 ms     40.7%
+    Unlimited overwrite   789.0%    49,364    1,266.1    0.437 ms   7,733      949.6   0.146 ms     97.0%
+    Writes stopped        193.9%    50,001      297.1    0.110 ms       0        0.0   0.000 ms     40.8%
+
+Unlimited overwrite therefore makes the defrag effect unmistakable, but it is
+an intentional saturation test rather than an isolated defrag comparison:
+Keylane used essentially all eight server CPUs and NVMe utilization averaged
+97%, with a queue depth of 22.4. Defrag increased physical reads to 1.27 GiB/s
+because it scans whole blocks while foreground GETs continue.
+
+The scheduler trace revealed a more important policy problem. Once defrag was
+active, measured background share was normally 42-46% and sometimes 51-54%,
+despite the configured 10% warrant. Maximum background continuations were
+usually about 0.94-1.3 ms. The cooperative 50 us budget explains individual
+slice overruns, but not the whole policy failure: `ShouldRunBackground()` runs
+background unconditionally whenever the foreground ready queues are empty.
+With asynchronous foreground I/O those queues commonly drain every round even
+under full load, so this idle shortcut bypasses the rolling 10% share check.
+The warrant currently constrains background only when foreground work remains
+queued after its slice. A follow-up should base the idle exception on actual
+recent foreground activity or pending/in-flight online work, not merely an
+empty ready queue; defrag work should also reach a checkpoint at a finer unit
+than one relocation continuation.
+
+After writes stopped, background resumes returned to zero and the 60-second GET
+result, CPU, and device metrics returned almost exactly to the read-only
+baseline. `DBSIZE` remained 8,000,000, four sampled values were all 2,000 bytes,
+and no storage, defrag, checksum, space-exhaustion, or request errors were
+logged. Keylane was stopped cleanly and the 50 GiB file was retained.
+
+Artifacts:
+
+    /tmp/keylane-roundbudget-unlimited-server.log
+    /tmp/keylane-roundbudget-unlimited-baseline-match-{read.txt,read.realtime,iostat,pidstat}
+    /tmp/keylane-roundbudget-unlimited-active-{write.txt,write.realtime,read.txt,read.realtime,iostat,pidstat}
+    /tmp/keylane-roundbudget-unlimited-post-{read.txt,read.realtime,iostat,pidstat}
+
 ### Current Keylane versus Dragonfly comparison, 8 workers, 80 connections
 
 These results use the same 200-million-key range, fixed 2000-byte values,
-CPU split, memtier concurrency, and 100K operation/s limit. Keylane is c3488d9
-with celer a5cd07d plus the local accept-balancing and direct String GET
-changes. Dragonfly is v1.40.0, build e4ebd, and was launched as:
+CPU split, memtier concurrency, and 100K operation/s limit. Keylane is 767bb11
+with Celer 0afbc77, including accept balancing and direct String GET framing.
+Dragonfly is v1.40.0, build e4ebd, and was launched as:
 
     taskset -c 0-7 /mnt/dev/dragonfly-x86_64 \
       --bind=0.0.0.0 \

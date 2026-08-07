@@ -1335,7 +1335,7 @@ class StorageEngine::Impl {
     }
     worker.Spawn(PeriodicFlush(&store));
     if (options_.expiration_authority) {
-      worker.Spawn(ActiveExpiration(&store));
+      worker.SpawnBackground(ActiveExpiration(&store));
     }
     co_return Status::Ok();
   }
@@ -3391,7 +3391,11 @@ class StorageEngine::Impl {
     }
     store.standby_error.reset();
     store.standby_request_pending = true;
-    store.worker->Spawn(FetchStandbyBlock(&store, for_defrag));
+    if (for_defrag) {
+      store.worker->SpawnBackground(FetchStandbyBlock(&store, true));
+    } else {
+      store.worker->Spawn(FetchStandbyBlock(&store, false));
+    }
   }
 
   void MaybePrefetchStandby(WorkerStore& store) {
@@ -3873,19 +3877,20 @@ class StorageEngine::Impl {
         const std::uint8_t db_id = store->expiry_db_cursor;
         if (partition.expiring_key_count[db_id] == 0) {
           AdvanceExpiryMap(*store);
-          continue;
+        } else {
+          auto& index = partition.indexes[db_id];
+          store->expiry_scan_cursor = index.Scan(
+              store->expiry_scan_cursor,
+              [&](const RecordIndex::Entry& entry) {
+                if (IsExpired(entry.value, now_ms)) {
+                  QueueExpiredCandidate(*store, partition.id, db_id, entry);
+                }
+              });
+          if (store->expiry_scan_cursor == 0) {
+            AdvanceExpiryMap(*store);
+          }
         }
-        auto& index = partition.indexes[db_id];
-        store->expiry_scan_cursor = index.Scan(
-            store->expiry_scan_cursor,
-            [&](const RecordIndex::Entry& entry) {
-              if (IsExpired(entry.value, now_ms)) {
-                QueueExpiredCandidate(*store, partition.id, db_id, entry);
-              }
-            });
-        if (store->expiry_scan_cursor == 0) {
-          AdvanceExpiryMap(*store);
-        }
+        co_await celer::Yield(*store->worker);
       }
 
       std::size_t deleted = 0;
@@ -3900,6 +3905,7 @@ class StorageEngine::Impl {
           co_return expired;
         }
         ++deleted;
+        co_await celer::Yield(*store->worker);
       }
     }
     co_return Status::Ok();
@@ -4014,6 +4020,7 @@ class StorageEngine::Impl {
             .write_buffer_id = state->write_buffer_id,
             .heap_data = state->heap_data,
             .heap_data_size = state->heap_data_size,
+            .staged_records = {},
         });
         if (auto found = store->staged_records.find(block_id);
             found != store->staged_records.end()) {
@@ -4203,7 +4210,7 @@ class StorageEngine::Impl {
     }
     store.defrag_running = true;
     store.active_defrag_device = device_index;
-    store.worker->Spawn(DefragOne(&store));
+    store.worker->SpawnBackground(DefragOne(&store));
     co_return Status::Ok();
   }
 
@@ -4252,7 +4259,7 @@ class StorageEngine::Impl {
           store.worker->id(), devices_[device_index].id);
       return;
     }
-    store.worker->Spawn(WakeQueuedDefrags(device_index));
+    store.worker->SpawnBackground(WakeQueuedDefrags(device_index));
   }
 
   void FinishDefragPass(WorkerStore& store) {
@@ -4263,7 +4270,7 @@ class StorageEngine::Impl {
     RequestDefrag(store);
     space_reclaim_generation_.fetch_add(1, std::memory_order_release);
     ReleaseDefragPermit(completed_device);
-    store.worker->Spawn(WakeQueuedDefrags(completed_device));
+    store.worker->SpawnBackground(WakeQueuedDefrags(completed_device));
   }
 
   Task<Status> DefragOne(WorkerStore* store) {
@@ -4440,6 +4447,10 @@ class StorageEngine::Impl {
         co_return relocated;
       }
       record_offset += record.total_disk_bytes;
+      // Cheap while the 50 us background slice has budget remaining; once it
+      // expires this defers the cleaner to the next scheduler round so online
+      // I/O and cross-core work are polled first.
+      co_await celer::Yield(*store.worker);
     }
 
     {

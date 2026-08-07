@@ -16,14 +16,6 @@ option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" O
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
-set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(
-  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil"
-  "${CMAKE_CURRENT_BINARY_DIR}/third_party/abseil"
-  EXCLUDE_FROM_ALL
-)
-
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
 else()
@@ -45,8 +37,6 @@ add_library(keylane::module ALIAS keylane_module)
 target_include_directories(keylane_module
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-  SYSTEM PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/abseil
 )
 
 target_precompile_headers(keylane_module PRIVATE
@@ -54,7 +44,7 @@ target_precompile_headers(keylane_module PRIVATE
 )
 
 target_compile_features(keylane_module PUBLIC cxx_std_23)
-target_compile_definitions(keylane_module PRIVATE
+target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_READ_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_READ_LATENCY_TRACE}>
 )
 target_link_libraries(keylane_module PUBLIC
@@ -67,7 +57,7 @@ target_link_libraries(keylane_module PUBLIC
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(keylane_module PRIVATE -Wall -Wextra -Wpedantic)
   if (KEYLANE_ENABLE_OPT)
-    target_compile_options(keylane_module PRIVATE -O3 -march=native -flto)
+    target_compile_options(keylane_module PRIVATE -O3 -march=native -flto=auto)
   endif()
   if (KEYLANE_ENABLE_WERROR)
     target_compile_options(keylane_module PRIVATE -Werror)
@@ -79,8 +69,8 @@ if (KEYLANE_BUILD_EXAMPLE)
     app/keylane.cpp
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND KEYLANE_ENABLE_OPT)
-    target_compile_options(keylane PRIVATE -O3 -march=native -flto)
-    target_link_options(keylane PRIVATE -flto)
+    target_compile_options(keylane PRIVATE -O3 -march=native -flto=auto)
+    target_link_options(keylane PRIVATE -flto=auto)
   endif()
   target_precompile_headers(keylane REUSE_FROM keylane_module)
   target_link_libraries(keylane PRIVATE keylane::module)
