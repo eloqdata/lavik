@@ -3720,44 +3720,53 @@ class StorageEngine::Impl {
     // (file_id, aligned offset, aligned length), submit one read, and fan the
     // decoded result out to all waiting coroutines. In-flight operations must
     // retain values/leases, never flat_hash_map iterators or element pointers.
+    const auto [file_id, block_offset] = FileOffset(location.block_id);
+    const std::uint64_t absolute_offset =
+        block_offset + location.record_offset;
+    const std::uint64_t direct_io_mask =
+        static_cast<std::uint64_t>(direct_io_alignment_ - 1);
+    const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
+    const std::size_t record_headroom =
+        static_cast<std::size_t>(absolute_offset - aligned_offset);
+    const std::size_t record_span =
+        record_headroom + location.total_disk_bytes;
+    const std::size_t read_bytes =
+        (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
+
+    // Acquire the output buffer before resolving any block state. This is the
+    // only suspension the staged-copy path would otherwise have, and it used
+    // to sit between reading the staging pointer and using it, so that path
+    // needed a pin to stop a flush from handing the staging buffer back. With
+    // the acquisition hoisted, the staged copy runs straight through on a
+    // worker that cannot preempt it, and only the disk read below pins. The
+    // disk sizing covers the staged copy too: read_bytes is at least
+    // total_disk_bytes, which is header plus payload.
+    if (trace != nullptr) {
+      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
+    }
+    auto acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease lease = std::move(*acquired);
+    if (trace != nullptr) {
+      trace->buffer_acquired_ns = ReadTraceNowNanos();
+      trace->heap_read_buffer = !lease.registered();
+    }
+
     BlockState* state = FindBlockState(store, location.block_id);
     if (state == nullptr || !state->allocated || state->freeing ||
         state->allocation_epoch != location.allocation_epoch) {
       co_return Status(StatusCode::kInternal, "stale index block epoch");
     }
-    ++state->pins;
-    struct PinGuard {
-      WorkerStore* store = nullptr;
-      BlockState* state = nullptr;
-      ~PinGuard() {
-        if (state == nullptr) {
-          return;
-        }
-        --state->pins;
-        if (state->pins == 0 && state->release_pending) {
-          ReleaseStagingBuffer(*store, *state);
-        }
-      }
-    } pin{&store, state};
 
     if (location.in_memory && state->in_memory) {
-
       auto in_mem_buffer = StagingBufferFor(store, *state);
       if (!in_mem_buffer.data || in_mem_buffer.size == 0 ||
           location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
         co_return Status(StatusCode::kInternal, "invalid in-memory location");
       }
       if (trace != nullptr) {
-        trace->buffer_acquire_start_ns = ReadTraceNowNanos();
-      }
-      auto acquired = co_await store.buffers.AcquireReadBuffer();
-      if (!acquired.ok()) {
-        co_return acquired.status();
-      }
-      ReadBufferLease lease = std::move(*acquired);
-      if (trace != nullptr) {
-        trace->buffer_acquired_ns = ReadTraceNowNanos();
-        trace->heap_read_buffer = !lease.registered();
         trace->io_submit_ns = trace->buffer_acquired_ns;
         trace->io_complete_ns = trace->buffer_acquired_ns;
       }
@@ -3812,29 +3821,24 @@ class StorageEngine::Impl {
                             record.payload_bytes};
     }
 
-    const auto [file_id, block_offset] = FileOffset(location.block_id);
-    const std::uint64_t absolute_offset =
-        block_offset + location.record_offset;
-    const std::uint64_t direct_io_mask =
-        static_cast<std::uint64_t>(direct_io_alignment_ - 1);
-    const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
-    const std::size_t record_headroom =
-        static_cast<std::size_t>(absolute_offset - aligned_offset);
-    const std::size_t record_span =
-        record_headroom + location.total_disk_bytes;
-    const std::size_t read_bytes =
-        (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
+    // Only the disk read suspends while holding the BlockState pointer, so it
+    // is the only path that has to keep the state alive with a pin.
+    ++state->pins;
+    struct PinGuard {
+      WorkerStore* store = nullptr;
+      BlockState* state = nullptr;
+      ~PinGuard() {
+        if (state == nullptr) {
+          return;
+        }
+        --state->pins;
+        if (state->pins == 0 && state->release_pending) {
+          ReleaseStagingBuffer(*store, *state);
+        }
+      }
+    } pin{&store, state};
+
     if (trace != nullptr) {
-      trace->buffer_acquire_start_ns = ReadTraceNowNanos();
-    }
-    auto acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
-    if (!acquired.ok()) {
-      co_return acquired.status();
-    }
-    ReadBufferLease lease = std::move(*acquired);
-    if (trace != nullptr) {
-      trace->buffer_acquired_ns = ReadTraceNowNanos();
-      trace->heap_read_buffer = !lease.registered();
       trace->disk_read = true;
     }
     FixedBuffer io = lease.io_buffer();
