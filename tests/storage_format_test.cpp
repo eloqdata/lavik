@@ -87,6 +87,7 @@ int main() {
       .committed_bytes = kBlockHeaderBytes,
       .record_count = 0,
       .max_lsn = 0,
+      .header_sequence = 1,
       .checksum = 0,
       .layout_worker_count = 4,
   };
@@ -98,7 +99,7 @@ int main() {
   assert(decoded_header.allocation_epoch == header.allocation_epoch);
 
   // Double-slot resolution: the valid slot with the larger
-  // (allocation_epoch, committed_bytes) wins; torn/zero slots are skipped.
+  // (allocation_epoch, header_sequence) wins; torn/zero slots are skipped.
   {
     std::array<std::byte, kBlockHeaderBytes> pages{};
     BlockHeader winner{};
@@ -109,6 +110,7 @@ int main() {
     assert(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
     BlockHeader newer = header;
     newer.committed_bytes = kBlockHeaderBytes + 4096;
+    newer.header_sequence = 2;
     std::array<std::byte, kBlockHeaderSlotBytes> newer_page{};
     EncodeBlockHeader(newer, newer_page);
     std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
@@ -119,6 +121,17 @@ int main() {
     pages[kBlockHeaderSlotBytes + 8] ^= std::byte{0xff};  // tear slot 1
     assert(DecodeBlockHeaderPages(pages, &winner, &active_slot));
     assert(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
+
+    // A flush that adds no records still restamps the header, so equal
+    // committed_bytes must be broken by the sequence, not by slot order.
+    BlockHeader restamped = header;
+    restamped.header_sequence = 2;
+    restamped.max_lsn = 77;
+    EncodeBlockHeader(restamped, newer_page);
+    std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
+                newer_page.size());
+    assert(DecodeBlockHeaderPages(pages, &winner, &active_slot));
+    assert(active_slot == 1 && winner.max_lsn == 77);
   }
 
   BlockHeader extent_header = header;

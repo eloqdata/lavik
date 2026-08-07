@@ -282,7 +282,7 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
     }
     if (!found || decoded.allocation_epoch > best.allocation_epoch ||
         (decoded.allocation_epoch == best.allocation_epoch &&
-         decoded.committed_bytes > best.committed_bytes)) {
+         decoded.header_sequence > best.header_sequence)) {
       best = decoded;
       best_slot = slot;
       found = true;

@@ -170,6 +170,11 @@ struct BlockHeader {
   std::uint32_t committed_bytes = kBlockHeaderBytes;
   std::uint32_t record_count = 0;
   std::uint64_t max_lsn = 0;
+  // Incremented on every header write for this allocation, and the slot that
+  // write lands in is its parity. Slot resolution compares this rather than
+  // committed_bytes, which can tie. A flush advances committed_bytes by at
+  // least one page, so this cannot exceed kStorageBlockBytes / 4096.
+  std::uint32_t header_sequence = 0;
   std::uint32_t checksum = 0;
   std::uint32_t layout_worker_count = 0;
   BlockKind kind = BlockKind::kRecords;
@@ -292,7 +297,7 @@ bool DecodeBlockHeader(
     BlockHeader* header) noexcept;
 
 // Decode the winning slot from a block's full header region: the valid slot
-// with the larger (allocation_epoch, committed_bytes). Returns the winning
+// with the larger (allocation_epoch, header_sequence). Returns the winning
 // slot index in `active_slot`, or false when neither slot is valid.
 bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
                             BlockHeader* header,

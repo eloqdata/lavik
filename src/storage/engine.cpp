@@ -173,6 +173,14 @@ struct BlockState {
   std::uint32_t layout_worker_count = 0;
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = 0;
+  // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
+  // never land in a durable page and a flush only writes the new tail.
+  std::uint32_t durable_bytes = 0;
+  std::uint32_t record_count = 0;
+  std::uint64_t max_lsn = 0;
+  // Sequence stamped into the last header write. Its parity picks the slot,
+  // so the slot needs no field of its own.
+  std::uint32_t header_sequence = 0;
   std::uint32_t live_bytes = 0;
   std::uint32_t pins = 0;
   bool allocated = false;
@@ -439,6 +447,35 @@ class CoroutineBarrier {
 bool IsZero(std::span<const std::byte> bytes) noexcept {
   return std::all_of(bytes.begin(), bytes.end(),
                      [](std::byte value) { return value == std::byte{0}; });
+}
+
+// Header writes alternate between the two slots, so the sequence a write
+// stamps also names the slot it lands in. The first write of an allocation
+// carries sequence 1 and goes to slot 0.
+constexpr std::uint8_t HeaderSlot(std::uint32_t header_sequence) noexcept {
+  return static_cast<std::uint8_t>(1 - (header_sequence & 1));
+}
+
+// Every flush pads its tail out to a direct-I/O page and restarts the next
+// record on the following page, so committed data can contain zero-filled
+// holes. Returns where the next record starts, or nullopt when the bytes are
+// neither a record header nor valid padding.
+std::optional<std::uint32_t> NextRecordOffset(
+    const std::byte* block, std::uint32_t record_offset,
+    std::uint32_t committed_bytes) noexcept {
+  std::uint64_t magic = 0;
+  std::memcpy(&magic, block + record_offset, sizeof(magic));
+  if (magic == kRecordMagic) {
+    return record_offset;
+  }
+  const std::uint32_t next_page =
+      static_cast<std::uint32_t>(AlignDirect(record_offset + 1));
+  if (next_page > committed_bytes ||
+      !IsZero(std::span<const std::byte>(block + record_offset,
+                                         next_page - record_offset))) {
+    return std::nullopt;
+  }
+  return next_page;
 }
 
 void AtomicMax(std::atomic<std::uint64_t>* target,
@@ -3287,8 +3324,17 @@ class StorageEngine::Impl {
         }
 
         BlockHeader block{};
-        if (!DecodeBlockHeaderPages(block_bytes, &block) ||
-            block.block_id != block_id) {
+        if (!DecodeBlockHeaderPages(block_bytes, &block)) {
+          // Neither slot is valid. A block is allocated before it is ever
+          // flushed, and its first flush zeroes the slot it does not write, so
+          // this means no header ever committed here. Nothing in it was
+          // durable, and the free slot cannot hold a header from an earlier
+          // life, so the block is unused rather than corrupt.
+          zero_blocks->push_back(block_id);
+          ReportRecoveryProgress(0);
+          continue;
+        }
+        if (block.block_id != block_id) {
           co_return Status(StatusCode::kInternal,
                            "invalid or corrupt block header");
         }
@@ -3333,6 +3379,16 @@ class StorageEngine::Impl {
         std::uint32_t record_offset = kBlockHeaderBytes;
         std::uint32_t records = 0;
         while (record_offset < block.committed_bytes) {
+          const std::optional<std::uint32_t> next = NextRecordOffset(
+              recovery.buffer.data, record_offset, block.committed_bytes);
+          if (!next.has_value()) {
+            co_return Status(StatusCode::kInternal,
+                             "invalid or corrupt committed record header");
+          }
+          if (*next != record_offset) {
+            record_offset = *next;
+            continue;
+          }
           RecordHeader record{};
           std::string_view key;
           std::span<const std::byte> record_bytes(
@@ -3433,6 +3489,9 @@ class StorageEngine::Impl {
       state.layout_worker_count = block.layout_worker_count;
       state.allocation_epoch = block.allocation_epoch;
       state.committed_bytes = block.committed_bytes;
+      state.durable_bytes = block.committed_bytes;
+      state.record_count = block.record_count;
+      state.max_lsn = block.max_lsn;
       state.allocated = true;
       state.kind = block.kind;
       state.extent_index = block.extent_index;
@@ -4123,6 +4182,8 @@ class StorageEngine::Impl {
       state.allocation_epoch = reserved->allocation_epoch;
       state.committed_bytes = static_cast<std::uint32_t>(
           kBlockHeaderBytes + payload_bytes);
+      state.durable_bytes = state.committed_bytes;
+      state.header_sequence = 1;
       state.live_bytes = static_cast<std::uint32_t>(payload_bytes);
       state.allocated = true;
       state.kind = BlockKind::kValueExtent;
@@ -4174,6 +4235,7 @@ class StorageEngine::Impl {
               kBlockHeaderBytes + payload_bytes),
           .record_count = 0,
           .max_lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed),
+          .header_sequence = 1,
           .checksum = 0,
           .layout_worker_count = worker_count_,
           .kind = BlockKind::kValueExtent,
@@ -4190,18 +4252,21 @@ class StorageEngine::Impl {
       std::memcpy(staging.data + kBlockHeaderBytes, payload.data(),
                   payload.size());
       const auto [file_id, block_offset] = FileOffset(reserved->block_id);
-      const std::size_t write_bytes = AlignDirect(payload_bytes);
+      // Start at the second header slot, which staging left zero. An extent
+      // block only ever writes slot 0, so this durably clears whatever header
+      // the block carried in a previous life before the new one commits.
+      const std::size_t write_begin = kBlockHeaderSlotBytes;
+      const std::size_t write_bytes =
+          kBlockHeaderBytes + AlignDirect(payload_bytes);
       bool write_ok = true;
       Status write_status = Status::Ok();
-      for (std::size_t offset = 0; offset < write_bytes;) {
+      for (std::size_t offset = write_begin; offset < write_bytes;) {
         const std::size_t chunk =
             std::min(options_.flush_size_bytes, write_bytes - offset);
         auto written = co_await WriteStorageBuffer(
             *store.worker, store.files[file_id],
-            std::span<const std::byte>(
-                staging.data + kBlockHeaderBytes + offset, chunk),
-            write_buffer_id != 0, staging,
-            block_offset + kBlockHeaderBytes + offset);
+            std::span<const std::byte>(staging.data + offset, chunk),
+            write_buffer_id != 0, staging, block_offset + offset);
         if (!written.ok() || *written != chunk) {
           write_ok = false;
           write_status = written.ok()
@@ -4219,9 +4284,9 @@ class StorageEngine::Impl {
       if (write_status.ok()) {
         auto written = co_await WriteStorageBuffer(
             *store.worker, store.files[file_id],
-            std::span<const std::byte>(staging.data, kBlockHeaderBytes),
+            std::span<const std::byte>(staging.data, kBlockHeaderSlotBytes),
             write_buffer_id != 0, staging, block_offset);
-        if (!written.ok() || *written != kBlockHeaderBytes) {
+        if (!written.ok() || *written != kBlockHeaderSlotBytes) {
           write_status = written.ok()
                              ? Status(StatusCode::kInternal,
                                       "short extent header write")
@@ -4513,6 +4578,10 @@ class StorageEngine::Impl {
         state.layout_worker_count = worker_count_;
         state.allocation_epoch = active->allocation_epoch;
         state.committed_bytes = kBlockHeaderBytes;
+        state.durable_bytes = kBlockHeaderBytes;
+        state.record_count = 0;
+        state.max_lsn = 0;
+        state.header_sequence = 0;
         state.live_bytes = 0;
         state.pins = 0;
         state.allocated = true;
@@ -4525,25 +4594,9 @@ class StorageEngine::Impl {
         state.heap_data_size = options_.buffers.write_buffer_bytes;
         store.staged_records.erase(block_id);
 
-        BlockHeader block{
-            .magic = kBlockMagic,
-            .block_id = block_id,
-            .version = kStorageFormatVersion,
-            .header_bytes = kBlockHeaderBytes,
-            .block_bytes = kStorageBlockBytes,
-            .writer_id = writer_id,
-            .allocation_epoch = active->allocation_epoch,
-            .committed_bytes = kBlockHeaderBytes,
-            .record_count = 0,
-            .max_lsn = 0,
-            .checksum = 0,
-            .layout_worker_count = worker_count_,
-        };
-        EncodeBlockHeader(block,
-                          std::span<std::byte, kBlockHeaderSlotBytes>(
-                              staging_buffer.data, kBlockHeaderSlotBytes));
-        std::memset(staging_buffer.data + kBlockHeaderSlotBytes, 0,
-                    kBlockHeaderBytes - kBlockHeaderSlotBytes);
+        // The header region stays zero in staging until a flush encodes it
+        // into the slot it is about to write. Encoding it here, or on every
+        // append, would race the flush that is reading the same page.
       }
     }
 
@@ -4613,22 +4666,6 @@ class StorageEngine::Impl {
                   value.data(), value.size());
     }
 
-    BlockHeader block{
-        .magic = kBlockMagic,
-        .block_id = updated.block_id,
-        .version = kStorageFormatVersion,
-        .header_bytes = kBlockHeaderBytes,
-        .block_bytes = kStorageBlockBytes,
-        .writer_id = updated.writer_id,
-        .allocation_epoch = updated.allocation_epoch,
-        .committed_bytes = updated.committed_bytes,
-        .record_count = updated.record_count,
-        .max_lsn = updated.max_lsn,
-        .checksum = 0,
-        .layout_worker_count = updated.layout_worker_count,
-    };
-    EncodeBlockHeader(block, std::span<std::byte, kBlockHeaderSlotBytes>(
-                                 staging.data, kBlockHeaderSlotBytes));
     if (updated.committed_bytes == kStorageBlockBytes) {
       state.in_memory = true;
       state.write_buffer_id = updated.write_buffer_id;
@@ -4694,6 +4731,8 @@ class StorageEngine::Impl {
       }
     }
     state.committed_bytes = updated.committed_bytes;
+    state.record_count = updated.record_count;
+    state.max_lsn = updated.max_lsn;
     state.in_memory = true;
     state.write_buffer_id = updated.write_buffer_id;
     state.heap_data = updated.heap_buffer;
@@ -4723,6 +4762,16 @@ class StorageEngine::Impl {
         store.active_block->committed_bytes > kBlockHeaderBytes) {
       RequestFlush(store, store.active_block->block_id);
       store.active_block.reset();
+    }
+  }
+
+  // Make the active block's tail durable without retiring it. The block stays
+  // open for appends, so a slow writer no longer burns a whole 8 MiB block per
+  // flush interval; it pays at most one padding page instead.
+  void FlushActiveBlock(WorkerStore& store) {
+    if (store.active_block.has_value() &&
+        store.active_block->committed_bytes > kBlockHeaderBytes) {
+      RequestFlush(store, store.active_block->block_id);
     }
   }
 
@@ -4903,7 +4952,7 @@ class StorageEngine::Impl {
 
       co_await store->writer_mutex.Lock();
       UnlockGuard guard(&store->writer_mutex, store->worker);
-      SealActiveBlocks(*store);
+      FlushActiveBlock(*store);
     }
     co_return Status::Ok();
   }
@@ -5015,10 +5064,12 @@ class StorageEngine::Impl {
     struct PendingFlush {
       std::uint64_t block_id = 0;
       std::uint32_t committed_bytes = 0;
+      std::uint32_t durable_bytes = 0;
       std::uint64_t allocation_epoch = 0;
       std::uint16_t write_buffer_id = 0;
       std::byte* heap_data = nullptr;
       std::size_t heap_data_size = 0;
+      std::uint8_t slot = 0;
       std::vector<RecordIdentity> staged_records;
     };
 
@@ -5059,13 +5110,74 @@ class StorageEngine::Impl {
           continue;
         }
 
+        FixedBuffer buffer =
+            state->write_buffer_id != 0
+                ? store->buffers.write_buffer(state->write_buffer_id)
+                : FixedBuffer{.data = state->heap_data,
+                              .size = state->heap_data_size,
+                              .index = 0};
+        // Pad the tail out to a direct-I/O page and move the append cursor
+        // past it. Every data page is then written exactly once, so a torn
+        // write can never damage a record that is already durable.
+        const std::uint32_t padded =
+            static_cast<std::uint32_t>(AlignDirect(state->committed_bytes));
+        if (buffer.data == nullptr || buffer.size < padded ||
+            state->durable_bytes > state->committed_bytes) {
+          state->flush_queued = false;
+          store->write_failed = true;
+          store->flush_running = false;
+          co_return Status(StatusCode::kInternal,
+                           "invalid pending flush staging buffer");
+        }
+        if (padded == state->durable_bytes) {
+          // Nothing new since the last flush. Rewriting the header would only
+          // burn a slot and two fdatasyncs.
+          state->flush_queued = false;
+          if (!IsActiveBlock(*store, block_id)) {
+            ReleaseStagingBuffer(*store, *state);
+            MaybeQueueDefrag(*store, block_id);
+          }
+          continue;
+        }
+        std::fill_n(buffer.data + state->committed_bytes,
+                    padded - state->committed_bytes, std::byte{0});
+        state->committed_bytes = padded;
+        if (store->active_block.has_value() &&
+            store->active_block->block_id == block_id) {
+          store->active_block->committed_bytes = padded;
+        }
+        ++state->header_sequence;
+        const std::uint8_t slot = HeaderSlot(state->header_sequence);
+
+        const BlockHeader header{
+            .magic = kBlockMagic,
+            .block_id = block_id,
+            .version = kStorageFormatVersion,
+            .header_bytes = kBlockHeaderBytes,
+            .block_bytes = kStorageBlockBytes,
+            .writer_id = state->writer_id,
+            .allocation_epoch = state->allocation_epoch,
+            .committed_bytes = padded,
+            .record_count = state->record_count,
+            .max_lsn = state->max_lsn,
+            .header_sequence = state->header_sequence,
+            .checksum = 0,
+            .layout_worker_count = state->layout_worker_count,
+        };
+        EncodeBlockHeader(
+            header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                        buffer.data + slot * kBlockHeaderSlotBytes,
+                        kBlockHeaderSlotBytes));
+
         pending.emplace(PendingFlush{
             .block_id = block_id,
-            .committed_bytes = state->committed_bytes,
+            .committed_bytes = padded,
+            .durable_bytes = state->durable_bytes,
             .allocation_epoch = state->allocation_epoch,
             .write_buffer_id = state->write_buffer_id,
             .heap_data = state->heap_data,
             .heap_data_size = state->heap_data_size,
+            .slot = slot,
             .staged_records = {},
         });
         if (auto found = store->staged_records.find(block_id);
@@ -5085,7 +5197,15 @@ class StorageEngine::Impl {
                                : FixedBuffer{.data = pending->heap_data,
                                             .size = pending->heap_data_size,
                                             .index = 0};
-      const std::size_t write_bytes = AlignDirect(pending->committed_bytes);
+      // The first flush of a block starts at the unused header slot, which is
+      // still zero in staging. That makes the slot durably zero before the
+      // first header lands in the other one, so a torn first header cannot
+      // leave a stale header from this block's previous life as the winner.
+      const std::size_t write_begin =
+          pending->durable_bytes == kBlockHeaderBytes
+              ? kBlockHeaderSlotBytes * (1 - pending->slot)
+              : pending->durable_bytes;
+      const std::size_t write_bytes = pending->committed_bytes;
       if (staging.data == nullptr || staging.size < write_bytes) {
         co_await store->writer_mutex.Lock();
         UnlockGuard guard(&store->writer_mutex, store->worker);
@@ -5101,7 +5221,8 @@ class StorageEngine::Impl {
                          "invalid pending flush staging buffer");
       }
 
-      for (std::size_t write_offset = 0; write_offset < write_bytes;) {
+      for (std::size_t write_offset = write_begin;
+           write_offset < write_bytes;) {
         const std::size_t chunk_bytes =
             std::min(options_.flush_size_bytes, write_bytes - write_offset);
         auto written = co_await WriteStorageBuffer(
@@ -5128,9 +5249,10 @@ class StorageEngine::Impl {
         }
         write_offset += chunk_bytes;
       }
-      auto synced = co_await celer::Fdatasync(*store->worker,
-                                              store->files[file_id]);
-      if (!synced.ok()) {
+      // The header is the block's commit record, so it must land strictly
+      // after the data it describes is durable. Otherwise a crash between the
+      // two can leave a header advertising records that were never written.
+      auto fail_flush = [&](Status status) -> Task<Status> {
         co_await store->writer_mutex.Lock();
         UnlockGuard guard(&store->writer_mutex, store->worker);
         BlockState* state = FindBlockState(*store, pending->block_id);
@@ -5141,7 +5263,32 @@ class StorageEngine::Impl {
         store->write_failed = true;
         store->flush_running = false;
         release_pending(*pending);
-        co_return synced;
+        co_return status;
+      };
+
+      auto synced = co_await celer::Fdatasync(*store->worker,
+                                              store->files[file_id]);
+      if (!synced.ok()) {
+        co_return co_await fail_flush(synced);
+      }
+
+      const std::uint64_t slot_offset =
+          block_offset + pending->slot * kBlockHeaderSlotBytes;
+      auto header_written = co_await WriteStorageBuffer(
+          *store->worker, store->files[file_id],
+          std::span<const std::byte>(
+              staging.data + pending->slot * kBlockHeaderSlotBytes,
+              kBlockHeaderSlotBytes),
+          pending->write_buffer_id != 0, staging, slot_offset);
+      if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
+        co_return co_await fail_flush(
+            header_written.ok()
+                ? Status(StatusCode::kInternal, "short block header write")
+                : header_written.status());
+      }
+      synced = co_await celer::Fdatasync(*store->worker, store->files[file_id]);
+      if (!synced.ok()) {
+        co_return co_await fail_flush(synced);
       }
 
       co_await store->writer_mutex.Lock();
@@ -5181,8 +5328,18 @@ class StorageEngine::Impl {
         }
       }
 
+      state->durable_bytes = pending->committed_bytes;
       state->flush_in_progress = false;
       state->flush_queued = false;
+
+      // A block that is still the append stream's active block keeps its
+      // staging buffer and stays in memory: the periodic flush only makes the
+      // tail durable, it no longer retires the block. Sealing is what frees
+      // the buffer, and sealing already cleared active_block by this point.
+      if (IsActiveBlock(*store, pending->block_id)) {
+        continue;
+      }
+
       state->in_memory = false;
       if (state->pins > 0) {
         state->release_pending = true;
@@ -5483,6 +5640,17 @@ class StorageEngine::Impl {
 
     std::uint32_t record_offset = kBlockHeaderBytes;
     while (record_offset < source.committed_bytes) {
+      const std::optional<std::uint32_t> next = NextRecordOffset(
+          block_data.buffer.data, record_offset, source.committed_bytes);
+      if (!next.has_value()) {
+        source.defragging = false;
+        co_return Status(StatusCode::kInternal,
+                         "corrupt committed record during defrag");
+      }
+      if (*next != record_offset) {
+        record_offset = *next;
+        continue;
+      }
       RecordHeader record{};
       std::string_view disk_key;
       std::span<const std::byte> record_bytes(
