@@ -1470,7 +1470,7 @@ class StorageEngine::Impl {
           &store, std::shared_ptr<const std::vector<ExtentRef>>(
                       std::move(orphan_extents))));
     }
-    worker.Spawn(PeriodicFlush(&store));
+    worker.SpawnRoot(PeriodicFlush(&store));
     if (options_.expiration_authority) {
       worker.SpawnBackground(ActiveExpiration(&store));
     }

@@ -388,7 +388,9 @@ int main(int argc, char** argv) {
              "-ERR invalid expire time in 'set' command",
              "invalid SET expiration");
 
-      Expect(client.Command({"SET", "restart-live", "v", "PX", "5000"}),
+      // Generous TTL: the restart below includes full recovery, which takes
+      // several seconds under sanitizer builds; the key must outlive it.
+      Expect(client.Command({"SET", "restart-live", "v", "PX", "60000"}),
              "+OK", "restart-live SET");
       Expect(client.Command({"SET", "restart-dead", "v", "PX", "50"}),
              "+OK", "restart-dead SET");
@@ -414,7 +416,7 @@ int main(int argc, char** argv) {
              "restart live value");
       ExpectRange(IntegerReply(client.Command({"PTTL", "restart-live"}),
                                "restart-live PTTL"),
-                  1, 5000, "restart live TTL");
+                  1, 60000, "restart live TTL");
       Expect(client.Command({"STRLEN", "restart-large"}), ":9437184",
              "recovered large STRLEN");
       Expect(client.Command({"SET", "restart-large", "small"}), "+OK",
