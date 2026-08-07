@@ -494,6 +494,38 @@ int main(int argc, char** argv) {
     Expect(client.Command({"PING"}), "+QUEUED", "queue flushed ping");
     Expect(client.Command({"EXEC"}), "*-1", "FLUSHDB aborts watcher");
 
+    // ---- INFO ----
+    const std::string info = client.Command({"INFO"});
+    auto contains = [&](const std::string& haystack, std::string_view needle,
+                        const char* what) {
+      if (haystack.find(needle) == std::string::npos) {
+        Fail(std::string(what) + " missing from INFO reply: " +
+             haystack.substr(0, 300));
+      }
+    };
+    contains(info, "# Server", "server section");
+    contains(info, "keylane_version:", "version field");
+    contains(info, "worker_threads:4", "threads field");
+    contains(info, "# Clients", "clients section");
+    contains(info, "connected_clients:", "clients field");
+    contains(info, "# Transactions", "transactions section");
+    contains(info, "tx_fastpath_runs:", "fastpath counter");
+    contains(info, "tx_queued_runs:", "queued counter");
+    contains(info, "tx_schedule_retries:", "retry counter");
+    contains(info, "# Keyspace", "keyspace section");
+    contains(info, "db1:keys=", "db1 keyspace line");
+
+    const std::string tx_only = client.Command({"INFO", "transactions"});
+    contains(tx_only, "# Transactions", "filtered section");
+    if (tx_only.find("# Server") != std::string::npos) {
+      Fail("INFO section filter returned other sections");
+    }
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI info");
+    Expect(client.Command({"INFO", "server"}), "+QUEUED", "queue INFO");
+    const std::string exec_info = client.Command({"EXEC"});
+    contains(exec_info, "# Server", "INFO inside EXEC");
+
     server.Stop();
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"

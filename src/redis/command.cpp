@@ -30,6 +30,11 @@ namespace {
 
 storage::StorageEngine* g_storage = nullptr;
 bool g_replica_read_only = false;
+std::uint16_t g_server_port = 0;
+unsigned g_server_threads = 0;
+std::chrono::steady_clock::time_point g_server_start;
+std::atomic<std::uint64_t> g_connected_clients{0};
+std::atomic<std::uint64_t> g_commands_processed{0};
 
 CommandReply EncodedReply(std::string encoded) {
   CommandReply reply;
@@ -833,6 +838,99 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
   }
 }
 
+// INFO: Redis-shaped sections built from what keylane actually tracks. The
+// Transactions section surfaces the VLL scheduler counters.
+Task<CommandReply> ExecuteInfo(const CommandRequest& request) {
+  std::string section = "default";
+  if (request.args.size() == 2) {
+    section = request.args[1];
+    for (char& c : section) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+  const bool all = section == "default" || section == "all" ||
+                   section == "everything";
+  auto wants = [&](std::string_view name) { return all || section == name; };
+
+  std::string info;
+  if (wants("server")) {
+    const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - g_server_start)
+                            .count();
+    info += "# Server\r\n";
+    info += "keylane_version:0.1.0\r\n";
+    info += "process_id:" + std::to_string(::getpid()) + "\r\n";
+    info += "tcp_port:" + std::to_string(g_server_port) + "\r\n";
+    info += "worker_threads:" + std::to_string(g_server_threads) + "\r\n";
+    info += "uptime_in_seconds:" + std::to_string(uptime) + "\r\n\r\n";
+  }
+  if (wants("clients")) {
+    info += "# Clients\r\n";
+    info += "connected_clients:" +
+            std::to_string(
+                g_connected_clients.load(std::memory_order_relaxed)) +
+            "\r\n\r\n";
+  }
+  if (wants("stats")) {
+    info += "# Stats\r\n";
+    info += "total_commands_processed:" +
+            std::to_string(
+                g_commands_processed.load(std::memory_order_relaxed)) +
+            "\r\n\r\n";
+  }
+  if (wants("replication")) {
+    info += "# Replication\r\n";
+    info += std::string("role:") +
+            (g_replica_read_only ? "slave" : "master") + "\r\n\r\n";
+  }
+  if (wants("transactions")) {
+    struct ShardStats {
+      std::uint64_t fastpath = 0;
+      std::uint64_t queued = 0;
+    };
+    std::uint64_t fastpath = 0;
+    std::uint64_t queued = 0;
+    tx::TxRuntime* runtime = tx::TxRuntime::Get();
+    for (unsigned target = 0; target < runtime->shard_count(); ++target) {
+      const ShardStats stats = co_await SubmitTo(target, [] {
+        tx::TxShard& shard = tx::CurrentTxShard();
+        return ShardStats{shard.fastpath_runs(), shard.queued_runs()};
+      });
+      fastpath += stats.fastpath;
+      queued += stats.queued;
+    }
+    info += "# Transactions\r\n";
+    info += "tx_fastpath_runs:" + std::to_string(fastpath) + "\r\n";
+    info += "tx_queued_runs:" + std::to_string(queued) + "\r\n";
+    info += "tx_schedule_retries:" +
+            std::to_string(
+                runtime->schedule_retries.load(std::memory_order_relaxed)) +
+            "\r\n";
+    info += "tx_ids_allocated:" +
+            std::to_string(
+                runtime->next_txid.load(std::memory_order_relaxed) - 1) +
+            "\r\n\r\n";
+  }
+  if (wants("keyspace")) {
+    info += "# Keyspace\r\n";
+    for (unsigned db = 0; db < storage::kLogicalDatabaseCount; ++db) {
+      std::uint64_t keys = 0;
+      for (unsigned target = 0; target < g_storage->worker_count();
+           ++target) {
+        keys += co_await SubmitTo(
+            target, [db] { return g_storage->LocalSize(
+                               static_cast<std::uint8_t>(db)); });
+      }
+      if (keys != 0) {
+        info += "db" + std::to_string(db) + ":keys=" + std::to_string(keys) +
+                "\r\n";
+      }
+    }
+    info += "\r\n";
+  }
+  co_return EncodedReply(EncodeBulkString(info));
+}
+
 // Runs one single-key command body against pre-acquired locks, returning the
 // encoded reply. Mirrors ExecuteStorageCommand's semantics; arity was already
 // validated when the command was queued.
@@ -1375,7 +1473,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
             for (std::size_t i = 0; i < queued.size(); ++i) {
               const CommandRequest& cmd = queued[i];
               if (cmd_keys[i].empty()) {
-                replies[i] = run_keyless(cmd);
+                if (cmd.kind == CommandKind::kInfo) {
+                  replies[i] = (co_await ExecuteInfo(cmd)).encoded;
+                } else {
+                  replies[i] = run_keyless(cmd);
+                }
                 continue;
               }
               switch (cmd.kind) {
@@ -1437,7 +1539,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       for (std::size_t i = 0; i < queued.size(); ++i) {
         const CommandRequest& cmd = queued[i];
         if (cmd_keys[i].empty()) {
-          replies[i] = run_keyless(cmd);
+          if (cmd.kind == CommandKind::kInfo) {
+            replies[i] = (co_await ExecuteInfo(cmd)).encoded;
+          } else {
+            replies[i] = run_keyless(cmd);
+          }
           continue;
         }
         exec_ctx.current = i;
@@ -1473,7 +1579,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       co_return EncodedReply("*-1\r\n");
     }
     for (std::size_t i = 0; i < queued.size(); ++i) {
-      replies[i] = run_keyless(queued[i]);
+      if (queued[i].kind == CommandKind::kInfo) {
+        replies[i] = (co_await ExecuteInfo(queued[i])).encoded;
+      } else {
+        replies[i] = run_keyless(queued[i]);
+      }
     }
   }
 
@@ -1494,8 +1604,23 @@ void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_replica_read_only = replica_read_only;
 }
 
+void SetServerInfo(std::uint16_t port, unsigned thread_count) {
+  g_server_port = port;
+  g_server_threads = thread_count;
+  g_server_start = std::chrono::steady_clock::now();
+}
+
+void ConnectionOpened() noexcept {
+  g_connected_clients.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ConnectionClosed() noexcept {
+  g_connected_clients.fetch_sub(1, std::memory_order_relaxed);
+}
+
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest request) {
+  g_commands_processed.fetch_add(1, std::memory_order_relaxed);
   const CommandKind kind = request.kind;
   if (ctx.in_multi) {
     switch (kind) {
@@ -1606,6 +1731,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   }
 
   switch (request.kind) {
+    case CommandKind::kInfo:
+      co_return co_await ExecuteInfo(request);
+
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request);
 

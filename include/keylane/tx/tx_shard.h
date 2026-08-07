@@ -314,6 +314,9 @@ class TxRuntime {
   }
 
   std::atomic<std::uint64_t> next_txid{1};
+  // Multi-shard schedule rounds that failed the reorder rule and retried
+  // with a fresh txid.
+  std::atomic<std::uint64_t> schedule_retries{0};
 
  private:
   std::vector<std::unique_ptr<TxShard>> shards_;

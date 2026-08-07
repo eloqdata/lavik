@@ -411,10 +411,12 @@ Task<Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
   ctx.conn_id = next_connection_id.fetch_add(1, std::memory_order_relaxed);
+  ConnectionOpened();
   const Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
   co_await ReleaseConnectionWatches(ctx);
+  ConnectionClosed();
   co_return status;
 }
 
@@ -533,6 +535,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   }
   ReplicationManager replication(&storage, replication_options);
   InitStorage(&storage, replication.replica_read_only());
+  SetServerInfo(port, thread_count);
   tx::TxRuntime::Create(thread_count);
 
   ServerOptions options;

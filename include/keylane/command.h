@@ -42,6 +42,7 @@ enum class CommandKind {
   kDiscard,
   kWatch,
   kUnwatch,
+  kInfo,
   kUnknown,
 };
 
@@ -81,6 +82,13 @@ Task<celer::Status> ReleaseConnectionWatches(ConnectionContext& ctx);
 
 // Bind command routing to the disk engine. Call once before the server starts.
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only = false);
+
+// Static facts INFO reports. Call once before the server starts.
+void SetServerInfo(std::uint16_t port, unsigned thread_count);
+
+// Connection accounting for INFO's Clients section.
+void ConnectionOpened() noexcept;
+void ConnectionClosed() noexcept;
 
 // Route `request` to the worker owning its Redis hash-slot partition. Async disk
 // operations use SubmitTaskTo and return on the connection's original worker.

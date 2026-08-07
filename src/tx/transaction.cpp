@@ -232,6 +232,8 @@ Task<Status> Transaction::Schedule() {
     }
     co_await RoundAwaiter{this, Phase::kCancel};
     ++schedule_retries_;
+    TxRuntime::Get()->schedule_retries.fetch_add(1,
+                                                 std::memory_order_relaxed);
   }
 }
 
