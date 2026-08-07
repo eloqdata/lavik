@@ -348,6 +348,21 @@ int main(int argc, char** argv) {
     Expect(client.Command({"DEL", "{tag}a", "{tag}b", "{tag}c", "{tag}d"}),
            ":3", "hashtag DEL");
 
+    // Binary safety: RESP is length-prefixed, so keys and values may carry
+    // CRLF, NUL, and arbitrary bytes with no escaping anywhere in the chain.
+    {
+      const std::string bin_key("k\r\n\x00\xff\x01", 6);
+      const std::string bin_value("v\x00\r\n\xfe\\x41", 8);
+      Expect(client.Command({"SET", bin_key, bin_value}), "+OK",
+             "binary SET");
+      Expect(client.Command({"GET", bin_key}), Bulk(bin_value),
+             "binary GET");
+      Expect(client.Command({"MGET", bin_key, "missing"}),
+             "*2\r\n" + Bulk(bin_value) + "\r\n$-1", "binary MGET");
+      Expect(client.Command({"EXISTS", bin_key}), ":1", "binary EXISTS");
+      Expect(client.Command({"DEL", bin_key}), ":1", "binary DEL");
+    }
+
     // Mixed sizes across shards, including a value above the inline limit.
     const std::string large(9ULL * 1024 * 1024, 'L');
     Expect(client.Command({"MSET", "small", "s", "large", large}), "+OK",
