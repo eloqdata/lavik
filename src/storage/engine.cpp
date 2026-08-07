@@ -3760,7 +3760,10 @@ class StorageEngine::Impl {
       co_return Status(StatusCode::kInternal, "stale index block epoch");
     }
 
-    if (location.in_memory && state->in_memory) {
+    // Only records appended since the last flush live in a staging buffer, so
+    // on a read-mostly workload this branch is rare. Keep the disk read on the
+    // straight-line path.
+    if (location.in_memory && state->in_memory) [[unlikely]] {
       auto in_mem_buffer = StagingBufferFor(store, *state);
       if (!in_mem_buffer.data || in_mem_buffer.size == 0 ||
           location.record_offset + location.total_disk_bytes > in_mem_buffer.size) {
