@@ -139,6 +139,15 @@ if (BUILD_TESTING)
     )
     set_tests_properties(keylane_multi_exec_e2e PROPERTIES TIMEOUT 120)
 
+    add_executable(keylane_atomicity_stress_e2e_test
+      tests/atomicity_stress_e2e_test.cpp
+    )
+    add_test(
+      NAME keylane_atomicity_stress_e2e
+      COMMAND keylane_atomicity_stress_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_atomicity_stress_e2e PROPERTIES TIMEOUT 150)
+
     add_executable(keylane_ttl_e2e_test
       tests/ttl_e2e_test.cpp
     )
