@@ -159,8 +159,11 @@ class StorageEngine {
   std::size_t LocalSize(std::uint8_t db_id) const noexcept;
   // Must run on the worker owning partition_id. The cursor is stateless and
   // may return duplicate keys while the partition index is changing.
+  // now_ms fixes the expiration filter timestamp (0 = current time), so a
+  // multi-pass scan can see a stable notion of liveness.
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
-                          std::uint64_t cursor, std::size_t count) const;
+                          std::uint64_t cursor, std::size_t count,
+                          std::uint64_t now_ms = 0) const;
 
   // Atomically invalidates one logical DB by advancing its durable epoch and
   // taking its indexes out of service. The command layer must prevent
@@ -247,6 +250,11 @@ class StorageEngine {
                                  const Digest& digest);
   celer::Task<celer::StatusOr<std::int64_t>> IncrementLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
+
+  // Freeze/unfreeze expiration writes for stable-count scans (KEYS). The
+  // caller must already exclude client writes (closed database gate).
+  celer::Task<celer::Status> QuiesceExpiration();
+  void ResumeExpiration() noexcept;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
   // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).

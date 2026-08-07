@@ -1763,6 +1763,32 @@ class StorageEngine::Impl {
     co_return !expired;
   }
 
+  // Freezes the keyspace against expiration writes for stable-count scans
+  // (KEYS): client writes are already excluded by the closed database gate;
+  // this stops the active-expiry loop and drains any in-flight append by
+  // bouncing off every worker's writer mutex.
+  Task<Status> QuiesceExpiration() {
+    expiration_paused_.store(true, std::memory_order_release);
+    for (unsigned target = 0; target < worker_count_; ++target) {
+      Status drained = co_await celer::SubmitTaskTo(
+          target, [this, target]() -> Task<Status> {
+            WorkerStore& store = *stores_[target];
+            co_await store.writer_mutex.Lock();
+            store.writer_mutex.Unlock(*store.worker);
+            co_return Status::Ok();
+          });
+      if (!drained.ok()) {
+        expiration_paused_.store(false, std::memory_order_release);
+        co_return drained;
+      }
+    }
+    co_return Status::Ok();
+  }
+
+  void ResumeExpiration() noexcept {
+    expiration_paused_.store(false, std::memory_order_release);
+  }
+
   bool KeyLive(std::uint8_t db_id, std::string_view key,
                const Digest& digest) const {
     assert(db_id < kLogicalDatabaseCount);
@@ -1986,14 +2012,17 @@ class StorageEngine::Impl {
   }
 
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
-                          std::uint64_t cursor, std::size_t count) const {
+                          std::uint64_t cursor, std::size_t count,
+                          std::uint64_t now_ms) const {
     assert(db_id < kLogicalDatabaseCount);
     assert(count > 0);
     const auto& index =
         PartitionFor(CurrentStore(), partition_id).indexes[db_id];
     ScanBatch result;
     result.cursor = cursor;
-    const std::uint64_t now_ms = UnixTimeMillis();
+    if (now_ms == 0) {
+      now_ms = UnixTimeMillis();
+    }
     const std::size_t max_iterations =
         count > std::numeric_limits<std::size_t>::max() / 10
             ? std::numeric_limits<std::size_t>::max()
@@ -4771,7 +4800,8 @@ class StorageEngine::Impl {
   Task<Status> ExpireCandidate(WorkerStore& store,
                                WorkerStore::ExpireCandidate candidate) {
     if (candidate.partition_id >= kLogicalStorageShards ||
-        candidate.db_id >= kLogicalDatabaseCount) {
+        candidate.db_id >= kLogicalDatabaseCount ||
+        expiration_paused_.load(std::memory_order_acquire)) {
       co_return Status::Ok();
     }
     auto& partition = PartitionFor(store, candidate.partition_id);
@@ -4801,6 +4831,9 @@ class StorageEngine::Impl {
       Status waited = co_await celer::SleepFor(*store->worker, kInterval);
       if (!waited.ok()) {
         co_return waited;
+      }
+      if (expiration_paused_.load(std::memory_order_acquire)) {
+        continue;  // a stable-keyspace scan (KEYS) is in flight
       }
       if (store->worker->stop_requested() ||
           shutdown_flush_requested_.load(std::memory_order_acquire)) {
@@ -5606,6 +5639,7 @@ class StorageEngine::Impl {
   std::unique_ptr<RecoveryDeviceCursor[]> recovery_device_cursors_;
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
+  std::atomic<bool> expiration_paused_{false};
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;
@@ -5666,8 +5700,17 @@ std::size_t StorageEngine::LocalSize(std::uint8_t db_id) const noexcept {
 ScanBatch StorageEngine::ScanPartition(std::uint16_t partition_id,
                                        std::uint8_t db_id,
                                        std::uint64_t cursor,
-                                       std::size_t count) const {
-  return impl_->ScanPartition(partition_id, db_id, cursor, count);
+                                       std::size_t count,
+                                       std::uint64_t now_ms) const {
+  return impl_->ScanPartition(partition_id, db_id, cursor, count, now_ms);
+}
+
+Task<Status> StorageEngine::QuiesceExpiration() {
+  co_return co_await impl_->QuiesceExpiration();
+}
+
+void StorageEngine::ResumeExpiration() noexcept {
+  impl_->ResumeExpiration();
 }
 
 Task<Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {

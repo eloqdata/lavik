@@ -307,6 +307,7 @@ struct ScanOptions {
   std::uint64_t cursor = 0;
   std::size_t count = 10;
   std::optional<std::string_view> pattern;
+  std::optional<std::string_view> type;
 };
 
 StatusOr<ScanOptions> ParseScanOptions(const std::vector<std::string>& args) {
@@ -340,6 +341,11 @@ StatusOr<ScanOptions> ParseScanOptions(const std::vector<std::string>& args) {
     }
     if (CmpCaseInsensitive(args[i], "MATCH") && i + 1 < args.size()) {
       options.pattern = args[i + 1];
+      i += 2;
+      continue;
+    }
+    if (CmpCaseInsensitive(args[i], "TYPE") && i + 1 < args.size()) {
+      options.type = args[i + 1];
       i += 2;
       continue;
     }
@@ -448,7 +454,12 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
       (std::uint64_t{1} << kLocalBits) - 1;
   constexpr std::uint64_t kDroppedLocalMask =
       (std::uint64_t{1} << kPartitionBits) - 1;
-  constexpr std::size_t kMaxPartitionsPerCall = 64;
+  // COUNT is the per-call work hint: it also bounds how many (mostly
+  // empty) partitions one call may examine, so large COUNTs sweep the
+  // keyspace in few round trips.
+  const std::size_t max_partitions_per_call =
+      std::clamp<std::size_t>(parsed->count, 64,
+                              storage::kLogicalStorageShards);
   static_assert(storage::kLogicalStorageShards ==
                 (std::uint64_t{1} << kPartitionBits));
 
@@ -487,9 +498,13 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
     ++partitions_examined;
 
     const std::size_t examined = batch.keys.size();
+    const bool type_matches =
+        !options.type.has_value() ||
+        CmpCaseInsensitive(*options.type, "string");
     for (std::string& key : batch.keys) {
-      if (!options.pattern.has_value() ||
-          GlobMatch(*options.pattern, key)) {
+      if (type_matches &&
+          (!options.pattern.has_value() ||
+           GlobMatch(*options.pattern, key))) {
         keys.push_back(std::move(key));
       }
     }
@@ -511,7 +526,7 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
       co_return EncodedReply(EncodeScanReply(0, keys));
     }
     if (examined >= remaining ||
-        partitions_examined >= kMaxPartitionsPerCall) {
+        partitions_examined >= max_partitions_per_call) {
       const std::uint64_t cursor =
           static_cast<std::uint64_t>(partition_id) << kLocalBits;
       co_return EncodedReply(EncodeScanReply(cursor, keys));
@@ -519,6 +534,153 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
     remaining -= examined;
   }
   co_return EncodedReply(EncodeScanReply(0, keys));
+}
+
+std::uint64_t CommandUnixTimeMillis() noexcept;
+
+// KEYS streams its reply in bounded memory. RESP2 arrays announce their
+// element count first, so the keyspace must hold still between the counting
+// pass and the emitting pass: the database gate is closed (like FLUSHDB) and
+// expiration writes are quiesced, with a fixed liveness timestamp shared by
+// both passes. State is dropped when the reply finishes or the connection
+// dies, reopening the gate either way.
+struct KeysStreamState {
+  explicit KeysStreamState(std::uint8_t db_id) : db(db_id), guard(db_id) {}
+  ~KeysStreamState() { g_storage->ResumeExpiration(); }
+
+  std::uint8_t db;
+  DbCloseGuard guard;
+  std::string pattern;
+  std::uint64_t now_ms = 0;
+  unsigned worker = 0;        // worker currently being drained
+  unsigned partition = 0;     // absolute partition id owned by `worker`
+  std::uint64_t cursor = 0;
+};
+
+// One bounded batch on `worker`: walks that worker's own partitions locally
+// (one cross-core round trip per batch, not per partition), encoding matches
+// or just counting them. Yields periodically so other databases' traffic on
+// the worker keeps flowing.
+struct KeysWorkerBatch {
+  std::string payload;
+  std::uint64_t matches = 0;
+  unsigned partition = 0;
+  std::uint64_t cursor = 0;
+  bool worker_done = false;
+};
+
+Task<KeysWorkerBatch> KeysBatchOnWorker(std::uint8_t db, unsigned worker,
+                                        unsigned partition,
+                                        std::uint64_t cursor,
+                                        std::uint64_t now_ms,
+                                        const std::string* pattern,
+                                        bool count_only) {
+  co_return co_await celer::SubmitTaskTo(
+      worker, [=]() -> Task<KeysWorkerBatch> {
+        constexpr std::size_t kChunkBytes = 64 * 1024;
+        const unsigned stride = g_storage->worker_count();
+        KeysWorkerBatch batch;
+        batch.partition = partition == 0 ? worker : partition;
+        batch.cursor = cursor;
+        unsigned scanned = 0;
+        while (batch.partition < storage::kLogicalStorageShards &&
+               batch.payload.size() < kChunkBytes) {
+          storage::ScanBatch step = g_storage->ScanPartition(
+              static_cast<std::uint16_t>(batch.partition), db, batch.cursor,
+              512, now_ms);
+          for (const std::string& key : step.keys) {
+            if (*pattern == "*" || GlobMatch(*pattern, key)) {
+              if (count_only) {
+                ++batch.matches;
+              } else {
+                batch.payload += "$" + std::to_string(key.size()) + "\r\n" +
+                                 key + "\r\n";
+              }
+            }
+          }
+          if (step.cursor == 0) {
+            batch.partition += stride;
+            batch.cursor = 0;
+          } else {
+            batch.cursor = step.cursor;
+          }
+          if (++scanned % 256 == 0) {
+            co_await celer::Yield(*ThisWorker().self);
+          }
+        }
+        batch.worker_done =
+            batch.partition >= storage::kLogicalStorageShards;
+        co_return batch;
+      });
+}
+
+Task<StatusOr<std::string>> NextKeysChunk(
+    std::shared_ptr<KeysStreamState> state) {
+  while (state->worker < g_storage->worker_count()) {
+    KeysWorkerBatch batch = co_await KeysBatchOnWorker(
+        state->db, state->worker, state->partition, state->cursor,
+        state->now_ms, &state->pattern, /*count_only=*/false);
+    if (batch.worker_done) {
+      ++state->worker;
+      state->partition = 0;
+      state->cursor = 0;
+    } else {
+      state->partition = batch.partition;
+      state->cursor = batch.cursor;
+    }
+    if (!batch.payload.empty()) {
+      co_return std::move(batch.payload);
+    }
+  }
+  co_return std::string();
+}
+
+Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
+  const std::uint8_t db = request.db_id;
+  if (!CloseDbGate(db)) {
+    co_return EncodedReply(
+        EncodeError("BUSY another operation is holding the database"));
+  }
+  auto state = std::make_shared<KeysStreamState>(db);
+  state->pattern = request.args[1];
+  state->now_ms = CommandUnixTimeMillis();
+  // Drain in-flight commands, then freeze expiration writes: from here to the
+  // end of the stream the keyspace cannot change, so the counted N is exact.
+  while ((g_db_gates[db].load(std::memory_order_acquire) &
+          kDbGateCountMask) != 0) {
+    Status waited = co_await celer::SleepFor(*ThisWorker().self,
+                                             std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_return EncodedReply(EncodeError("ERR " + waited.message()));
+    }
+  }
+  Status quiesced = co_await g_storage->QuiesceExpiration();
+  if (!quiesced.ok()) {
+    co_return EncodedReply(EncodeError("ERR " + quiesced.message()));
+  }
+
+  // Counting pass over the frozen keyspace: one batched walk per worker.
+  std::uint64_t matches = 0;
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    unsigned partition = 0;
+    std::uint64_t cursor = 0;
+    for (;;) {
+      KeysWorkerBatch batch = co_await KeysBatchOnWorker(
+          db, worker, partition, cursor, state->now_ms, &state->pattern,
+          /*count_only=*/true);
+      matches += batch.matches;
+      if (batch.worker_done) {
+        break;
+      }
+      partition = batch.partition;
+      cursor = batch.cursor;
+    }
+  }
+
+  CommandReply reply =
+      EncodedReply("*" + std::to_string(matches) + "\r\n");
+  reply.chunks = [state]() { return NextKeysChunk(state); };
+  co_return reply;
 }
 
 std::uint64_t CommandUnixTimeMillis() noexcept {
@@ -1822,6 +1984,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
   switch (request.kind) {
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request);
+
+    case CommandKind::kKeys:
+      co_return co_await ExecuteKeys(request);
 
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request);

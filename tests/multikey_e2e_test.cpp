@@ -371,6 +371,85 @@ int main(int argc, char** argv) {
            "*2\r\n" + Bulk(large) + "\r\n" + Bulk("s"), "MGET large");
     Expect(client.Command({"DEL", "large", "small"}), ":2", "DEL large");
 
+    // ---- KEYS / SCAN TYPE ----
+    Expect(client.Command({"MSET", "kx:1", "a", "kx:2", "b", "kx:3", "c",
+                           "other", "1"}),
+           "+OK", "KEYS seed");
+    auto expect_members = [&](const std::string& reply, std::size_t count,
+                              const std::vector<std::string>& members,
+                              const char* what) {
+      const std::string header = "*" + std::to_string(count) + "\r\n";
+      if (reply.compare(0, header.size(), header) != 0) {
+        Fail(std::string(what) + " count mismatch: " + reply.substr(0, 120));
+      }
+      for (const std::string& member : members) {
+        const std::string element =
+            "$" + std::to_string(member.size()) + "\r\n" + member;
+        if (reply.find(element) == std::string::npos) {
+          Fail(std::string(what) + " missing member '" + member + "'");
+        }
+      }
+    };
+    expect_members(client.Command({"KEYS", "kx:*"}), 3,
+                   {"kx:1", "kx:2", "kx:3"}, "KEYS glob");
+    expect_members(client.Command({"KEYS", "kx:?"}), 3,
+                   {"kx:1", "kx:2", "kx:3"}, "KEYS question mark");
+    Expect(client.Command({"KEYS", "nomatch:*"}), "*0", "KEYS no match");
+    expect_members(client.Command({"KEYS", "other"}), 1, {"other"},
+                   "KEYS exact");
+
+    // Streaming stays bounded: several hundred keys still arrive with an
+    // exact element count.
+    std::vector<std::string> volume_storage;
+    for (unsigned batch = 0; batch < 6; ++batch) {
+      std::vector<std::string_view> mset_args;
+      volume_storage.clear();
+      mset_args.push_back("MSET");
+      for (unsigned i = 0; i < 50; ++i) {
+        volume_storage.push_back("vol:" +
+                                 std::to_string(batch * 50 + i));
+        volume_storage.push_back("v");
+      }
+      for (const std::string& arg : volume_storage) {
+        mset_args.push_back(arg);
+      }
+      Expect(client.Command(mset_args), "+OK", "volume MSET");
+    }
+    {
+      const std::string reply = client.Command({"KEYS", "vol:*"});
+      if (reply.compare(0, 6, "*300\r\n") != 0) {
+        Fail("KEYS volume count mismatch: " + reply.substr(0, 60));
+      }
+      if (reply.find("$5\r\nvol:0\r\n") == std::string::npos ||
+          reply.find("$7\r\nvol:299") == std::string::npos) {
+        Fail("KEYS volume members missing");
+      }
+    }
+
+    // SCAN TYPE: strings match, other types match nothing. Follow the
+    // cursor to completion as any SCAN client must.
+    auto scan_all = [&](std::string_view type) {
+      std::string collected;
+      std::string cursor = "0";
+      do {
+        const std::string reply = client.Command(
+            {"SCAN", cursor, "MATCH", "kx:*", "COUNT", "1000", "TYPE",
+             type});
+        const std::size_t cursor_start = reply.find("\r\n") + 2;
+        const std::size_t digits = reply.find("\r\n", cursor_start) + 2;
+        const std::size_t digits_end = reply.find("\r\n", digits);
+        cursor = reply.substr(digits, digits_end - digits);
+        collected += reply.substr(digits_end);
+      } while (cursor != "0");
+      return collected;
+    };
+    if (scan_all("string").find("kx:1") == std::string::npos) {
+      Fail("SCAN TYPE string missing keys");
+    }
+    if (scan_all("hash").find("kx:") != std::string::npos) {
+      Fail("SCAN TYPE hash returned string keys");
+    }
+
     server.Stop();
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"

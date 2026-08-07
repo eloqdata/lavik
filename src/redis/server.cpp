@@ -477,6 +477,20 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
           reinterpret_cast<const std::byte*>(reply.encoded.data()),
           reply.encoded.size()));
     }
+    // Streamed continuation (KEYS): drain bounded chunks onto the socket.
+    // The reply header already committed the element count, so a chunk
+    // failure can only end the connection.
+    while (write_status.ok() && reply.chunks) {
+      auto chunk = co_await reply.chunks();
+      if (!chunk.ok()) {
+        co_return chunk.status();
+      }
+      if (chunk->empty()) {
+        break;
+      }
+      write_status = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(chunk->data()), chunk->size()));
+    }
     if (reply.read_trace.request_start_ns != 0) {
       reply.read_trace.send_complete_ns = ReadTraceNowNanos();
       RecordReadLatency(reply.read_trace);

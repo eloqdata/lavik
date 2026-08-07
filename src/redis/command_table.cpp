@@ -44,6 +44,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"watch", CommandKind::kWatch, 2, 0, 1, -1, 1, kCmdReadOnly},
     {"unwatch", CommandKind::kUnwatch, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
+    {"keys", CommandKind::kKeys, 2, 2, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
 };
 
 bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
