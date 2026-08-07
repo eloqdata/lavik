@@ -5102,15 +5102,7 @@ class StorageEngine::Impl {
       std::vector<RecordIdentity> staged_records;
     };
 
-    bool yield_before_retry = false;
     while (true) {
-      // A pinned block goes back on the queue. The pin belongs to a read that
-      // is waiting on I/O this same worker has to complete, so retrying in a
-      // tight loop would livelock: give the worker a chance to run first.
-      if (yield_before_retry) {
-        yield_before_retry = false;
-        co_await celer::Yield(*store->worker);
-      }
       std::optional<PendingFlush> pending;
       auto release_pending = [&](const PendingFlush& block) {
         if (block.write_buffer_id != 0) {
@@ -5140,13 +5132,14 @@ class StorageEngine::Impl {
           state->flush_queued = false;
           continue;
         }
-        if (state->pins > 0) {
-          store->flush_queue.push_back(block_id);
-          state->flush_queued = true;
-          yield_before_retry = true;
-          continue;
-        }
-
+        // Readers do not hold this flush up. It writes only the padding above
+        // committed_bytes and a header slot, neither of which a record read
+        // touches; it never frees the staging buffer, which the completion
+        // path below defers behind release_pending; and it never erases the
+        // BlockState, which is what pins actually keep alive. Waiting for
+        // pins here starved the flush instead: a block under steady read
+        // traffic never shows a zero pin count, so its tail stayed dirty
+        // indefinitely and shutdown could not drain the queue.
         StagingSlot& staging_state = store->staging_slots[state->staging_slot];
         const FixedBuffer buffer = StagingBufferFor(*store, *state);
         // Pad the tail out to a direct-I/O page and move the append cursor
