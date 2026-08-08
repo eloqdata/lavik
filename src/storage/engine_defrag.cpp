@@ -281,6 +281,19 @@ StorageEngine::Impl::RelocateIfCurrent(
       !current->value.SamePhysicalRecord(source_location)) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
+  // A source from a flushed database epoch is already condemned: FLUSHDB has
+  // published the new epoch and this worker's detach just has not run yet.
+  // Rewriting it would stamp the new epoch into the copy, turning a record
+  // recovery must drop into one it must keep. Skip it; the detach reclaim
+  // settles its accounting.
+  if (DbEpoch(record.db_id) != record.db_epoch) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+  const RelocationSource source{
+      .db_epoch = record.db_epoch,
+      .replication_epoch = partition.replication_epoch,
+      .index_generation = key_store.index_generations[record.db_id],
+  };
 
   RecordLocation relocated;
   Status written = co_await WriteRecordLocked(
@@ -288,7 +301,13 @@ StorageEngine::Impl::RelocateIfCurrent(
       record.expire_at_ms, record.digest, record.generation,
       record.mutation_sequence,
       record.relocation_sequence + 1, true, true, record.external,
-      record.logical_size, source_location.extents, &relocated);
+      record.logical_size, source_location.extents, &relocated, &source);
+  if (written.code() == StatusCode::kAborted) {
+    // FLUSHDB or a replica reset replaced the index while the write waited
+    // for a standby block. Nothing was written; the block stays uncleaned
+    // this pass rather than resurrecting a removed key.
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
   if (!written.ok()) {
     co_return written;
   }

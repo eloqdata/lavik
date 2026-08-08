@@ -332,6 +332,19 @@ struct RetiredRecord {
   std::uint16_t block_owner = 0;
 };
 
+// The index state a defrag relocation observed when it validated its source
+// record. WriteRecordLocked can release writer_mutex while waiting for a
+// standby block; if FLUSHDB detached the database or a replica reset rewrote
+// the partition in that gap, the relocation would insert its (stale) copy
+// into the successor index stamped with the successor's epochs — resurrecting
+// a key the flush or reset just removed. Re-checking these before the append
+// turns that into an aborted, retryable relocation instead.
+struct RelocationSource {
+  std::uint64_t db_epoch = 0;
+  std::uint64_t replication_epoch = 0;
+  std::uint64_t index_generation = 0;
+};
+
 // Back-pointer from a block to the index entries staged in its write buffer, so
 // the flush completion can flip them to on-disk reads without re-hashing every
 // key. The entry can outlive the index that owns it: FLUSHDB detaches every
@@ -1306,7 +1319,8 @@ class StorageEngine::Impl {
                                      std::numeric_limits<std::uint64_t>::max(),
                                  std::shared_ptr<const std::vector<ExtentRef>>
                                      extents = nullptr,
-                                 RecordLocation* written_location = nullptr);
+                                 RecordLocation* written_location = nullptr,
+                                 const RelocationSource* relocation = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 

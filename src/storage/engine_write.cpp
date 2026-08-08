@@ -658,7 +658,7 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     bool for_defrag, bool unlock_writer_while_waiting, bool external,
     std::uint64_t logical_size,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
-    RecordLocation* written_location) {
+    RecordLocation* written_location, const RelocationSource* relocation) {
   if (store.write_failed ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return Status(StatusCode::kFailedPrecondition,
@@ -802,6 +802,16 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   // FLUSHDB or partition reset can replace the index state during that gap,
   // so capture the previous location only after the append stream is locked
   // again and an active block is available.
+  if (relocation != nullptr &&
+      (DbEpoch(db_id) != relocation->db_epoch ||
+       partition.replication_epoch != relocation->replication_epoch ||
+       store.index_generations[db_id] != relocation->index_generation)) {
+    // The population the source record was validated against is gone — a
+    // record written now would carry the successor's epochs and resurrect a
+    // removed key. Abort; the source block simply is not cleaned this pass.
+    co_return Status(StatusCode::kAborted,
+                     "relocation target index changed while waiting");
+  }
   auto* previous_entry = index.Find(digest, key);
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
@@ -849,7 +859,12 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
       .generation = generation,
       .replication_epoch = partition.replication_epoch,
-      .db_epoch = DbEpoch(db_id),
+      // A relocation stamps the epoch its source was validated under, not a
+      // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
+      // fresh read here could adopt it mid-append — turning a record
+      // recovery must drop into one it must keep.
+      .db_epoch = relocation != nullptr ? relocation->db_epoch
+                                        : DbEpoch(db_id),
       .mutation_sequence = mutation_sequence,
       .relocation_sequence = relocation_sequence,
       .expire_at_ms = expire_at_ms,
