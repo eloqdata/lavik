@@ -638,6 +638,10 @@ Task<StatusOr<std::string>> NextKeysChunk(
 }
 
 Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
+  if (request.args.size() != 2) {
+    co_return EncodedReply(
+        EncodeError("ERR wrong number of arguments for 'keys' command"));
+  }
   const std::uint8_t db = request.db_id;
   if (!CloseDbGate(db)) {
     co_return EncodedReply(

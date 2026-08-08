@@ -588,10 +588,14 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           }
           return Status::Ok();
         };
-    Status applied = owner == worker.id()
-                         ? apply_live()
-                         : co_await celer::SubmitTo(owner,
-                                                    std::move(apply_live));
+    // if/else, not ?:, to keep the co_await out of a conditional
+    // expression (GCC coroutine frame-slot aliasing).
+    Status applied = Status::Ok();
+    if (owner == worker.id()) {
+      applied = apply_live();
+    } else {
+      applied = co_await celer::SubmitTo(owner, std::move(apply_live));
+    }
     if (!applied.ok()) {
       Fail(applied);
       co_return applied;
@@ -638,10 +642,14 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
               std::make_move_iterator(blocks.end()));
           return Status::Ok();
         };
-    status = allocator_owner == worker.id()
-                 ? apply_recovery_free()
-                 : co_await celer::SubmitTo(allocator_owner,
-                                             std::move(apply_recovery_free));
+    // if/else, not ?:, to keep the co_await out of a conditional
+    // expression (GCC coroutine frame-slot aliasing).
+    if (allocator_owner == worker.id()) {
+      status = apply_recovery_free();
+    } else {
+      status = co_await celer::SubmitTo(allocator_owner,
+                                        std::move(apply_recovery_free));
+    }
     if (!status.ok()) {
       Fail(status);
       co_return status;

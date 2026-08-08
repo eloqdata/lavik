@@ -388,6 +388,42 @@ int main(int argc, char** argv) {
              "-ERR invalid expire time in 'set' command",
              "invalid SET expiration");
 
+      // TTL updates rewrite the record with the value loaded back from
+      // storage. Wait out the periodic flush (20ms here) so the records are
+      // disk-resident, then verify EXPIRE/PERSIST preserve the payload
+      // byte-for-byte. Several back-to-back keys give the records non-zero
+      // offsets within their pages, so a mislocated value start (e.g. the
+      // raw aligned read buffer instead of the decoded value) surfaces as a
+      // mismatch here.
+      std::vector<std::string> flushed_values;
+      for (int i = 0; i < 4; ++i) {
+        flushed_values.emplace_back(200 + 17 * i, static_cast<char>('a' + i));
+        Expect(client.Command({"SET", "flushed-" + std::to_string(i),
+                               flushed_values[i]}),
+               "+OK", "flushed SET");
+      }
+      Expect(client.Command({"SET", "flushed-ttl", "keepme", "PX", "60000"}),
+             "+OK", "flushed-ttl SET");
+      std::this_thread::sleep_for(2s);
+      for (int i = 0; i < 4; ++i) {
+        const std::string key = "flushed-" + std::to_string(i);
+        Expect(client.Command({"EXPIRE", key, "1000"}), ":1",
+               "disk-resident EXPIRE");
+        Expect(client.Command({"GET", key}),
+               "$" + std::to_string(flushed_values[i].size()) + "\r\n" +
+                   flushed_values[i],
+               "value intact after disk-resident EXPIRE");
+        ExpectRange(IntegerReply(client.Command({"TTL", key}),
+                                 "disk-resident EXPIRE TTL"),
+                    1, 1000, "disk-resident EXPIRE TTL");
+      }
+      Expect(client.Command({"PERSIST", "flushed-ttl"}), ":1",
+             "disk-resident PERSIST");
+      Expect(client.Command({"GET", "flushed-ttl"}), "$6\r\nkeepme",
+             "value intact after disk-resident PERSIST");
+      Expect(client.Command({"TTL", "flushed-ttl"}), ":-1",
+             "disk-resident PERSIST TTL");
+
       // Generous TTL: the restart below includes full recovery, which takes
       // several seconds under sanitizer builds; the key must outlive it.
       Expect(client.Command({"SET", "restart-live", "v", "PX", "60000"}),

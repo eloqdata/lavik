@@ -132,9 +132,9 @@ Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (!loaded.ok()) {
     co_return loaded.status();
   }
-  FixedBuffer value_buffer = loaded->lease.io_buffer();
-  std::string_view value(reinterpret_cast<const char*>(value_buffer.data),
-                         loaded->value_bytes);
+  const std::span<const std::byte> value_bytes = loaded->value();
+  std::string_view value(reinterpret_cast<const char*>(value_bytes.data()),
+                         value_bytes.size());
   Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       previous.value_type, expire_at_ms);
