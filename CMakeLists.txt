@@ -164,13 +164,6 @@ if (BUILD_TESTING)
       NAME keylane_extent_recovery_e2e
       COMMAND keylane_extent_recovery_e2e_test $<TARGET_FILE:keylane>
     )
-    # Disabled, not passing. The bug it was written for is fixed: recovery and
-    # reads of external values now survive a worker-count change. It still ends
-    # in a heap corruption while the second server shuts down, inside the
-    # cross-worker dispatch in ReturnColdBlocks, which is not root-caused. That
-    # path is only reachable now that recovery gets that far. Re-enable with
-    # the fix; run it by hand meanwhile.
-    set_tests_properties(keylane_extent_recovery_e2e
-      PROPERTIES TIMEOUT 180 DISABLED TRUE)
+    set_tests_properties(keylane_extent_recovery_e2e PROPERTIES TIMEOUT 180)
   endif()
 endif()
