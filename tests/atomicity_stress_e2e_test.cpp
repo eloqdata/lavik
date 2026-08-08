@@ -237,9 +237,12 @@ class ServerProcess {
         ::close(log_fd);
       }
       std::vector<std::string> arguments{
-          binary,        "--port",         std::to_string(port),
-          "--threads",   "4",              "--recv-buffers",
-          "0",           "--flush-max-ms", "20",
+          binary,
+          "--port", std::to_string(port),
+          "--threads", "4",
+          "--recv-buffers", "0",
+          "--flush-max-ms", "1",
+          "--flush-size-kb", "4",
           "--data-file", data_path,
       };
       std::vector<char*> child_argv;
@@ -430,34 +433,54 @@ int main(int argc, char** argv) {
   try {
     const std::uint16_t port = FindFreePort();
     CreateDataFile(data_path, 512ULL * 1024 * 1024);
-    ServerProcess server(argv[1], port, data_path, log_path);
+    std::vector<std::string> final_values;
     {
-      RespClient seed = Connect(port);
-      if (seed.Command({"MSET", "sa", "W1:0", "sb", "W1:0", "ha", "H0",
-                        "hb", "H0"}) != "+OK") {
-        Fail("seed MSET failed");
+      ServerProcess server(argv[1], port, data_path, log_path);
+      {
+        RespClient seed = Connect(port);
+        if (seed.Command({"MSET", "sa", "W1:0", "sb", "W1:0", "ha", "H0",
+                          "hb", "H0"}) != "+OK") {
+          Fail("seed MSET failed");
+        }
+      }
+
+      std::vector<std::thread> threads;
+      threads.emplace_back(Writer, port, "W1:", "sa", "sb");
+      threads.emplace_back(Writer, port, "W2:", "sb", "sc");
+      threads.emplace_back(MgetReader, port);
+      threads.emplace_back(MgetReader, port);
+      threads.emplace_back(ExecReader, port);
+      threads.emplace_back(PairWriter, port, "P1:");
+      threads.emplace_back(PairWriter, port, "P2:");
+      threads.emplace_back(PairReader, port);
+
+      std::this_thread::sleep_for(5s);
+      stop_flag.store(true, std::memory_order_release);
+      for (std::thread& thread : threads) {
+        thread.join();
+      }
+      if (!failure_message.empty()) {
+        Fail(failure_message);
+      }
+
+      RespClient final = Connect(port);
+      final_values = RespClient::ParseFlatArray(
+          final.Command({"MGET", "sa", "sb", "sc", "ha", "hb"}));
+      if (final_values.size() != 5) {
+        Fail("final MGET did not return five values");
+      }
+      server.Stop();
+    }
+
+    {
+      ServerProcess server(argv[1], port, data_path, log_path);
+      RespClient recovered = Connect(port);
+      const auto recovered_values = RespClient::ParseFlatArray(
+          recovered.Command({"MGET", "sa", "sb", "sc", "ha", "hb"}));
+      if (recovered_values != final_values) {
+        Fail("graceful restart did not recover the last acknowledged values");
       }
     }
-
-    std::vector<std::thread> threads;
-    threads.emplace_back(Writer, port, "W1:", "sa", "sb");
-    threads.emplace_back(Writer, port, "W2:", "sb", "sc");
-    threads.emplace_back(MgetReader, port);
-    threads.emplace_back(MgetReader, port);
-    threads.emplace_back(ExecReader, port);
-    threads.emplace_back(PairWriter, port, "P1:");
-    threads.emplace_back(PairWriter, port, "P2:");
-    threads.emplace_back(PairReader, port);
-
-    std::this_thread::sleep_for(5s);
-    stop_flag.store(true, std::memory_order_release);
-    for (std::thread& thread : threads) {
-      thread.join();
-    }
-    if (!failure_message.empty()) {
-      Fail(failure_message);
-    }
-    server.Stop();
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
               << ReadFile(log_path) << std::flush;

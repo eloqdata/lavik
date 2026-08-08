@@ -346,6 +346,18 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     state->flush_in_progress = false;
     state->flush_queued = false;
 
+    // RequestFlush coalesces requests while an earlier snapshot is in
+    // flight. If rollover or shutdown sealed the block during that write,
+    // records may have been appended above the committed boundary before
+    // active_block was cleared. Queue that tail now, before releasing the
+    // staging buffer; otherwise shutdown can observe an empty queue and
+    // report success while acknowledged records remain only in memory.
+    if (!IsActiveBlock(*store, pending->block_id) &&
+        state->committed_bytes > pending->committed_bytes) {
+      RequestFlush(*store, pending->block_id);
+      continue;
+    }
+
     // A block that is still the append stream's active block keeps its
     // staging buffer and stays in memory: the periodic flush only makes the
     // tail durable, it no longer retires the block. Sealing is what frees
