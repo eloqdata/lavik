@@ -290,6 +290,18 @@ struct RecoveryLiveReference {
   std::uint32_t extent_payload_checksum = 0;
 };
 
+// A relocated record cannot make its source block reclaimable until the
+// destination block header durably covers this boundary. Keeping the fence
+// independent of the in-memory index also makes later overwrites harmless:
+// once this version is durable, recovery always has at least this copy or a
+// newer relocation to choose from.
+struct RelocationDurabilityFence {
+  std::uint64_t block_id = 0;
+  std::uint64_t allocation_epoch = 0;
+  std::uint16_t block_owner = 0;
+  std::uint32_t committed_bytes = 0;
+};
+
 // Back-pointer from a block to the index entries staged in its write buffer, so
 // the flush completion can flip them to on-disk reads without re-hashing every
 // key. The entry can outlive the index that owns it: FLUSHDB detaches every
@@ -1056,6 +1068,10 @@ class StorageEngine::Impl {
       std::size_t device_index, DeviceAllocator& allocator,
       std::vector<std::size_t> page_indexes);
 
+  Task<Status> InvalidateReactivatedBlockHeadersLocal(
+      std::size_t device_index,
+      std::span<const std::uint64_t> block_ids);
+
   Task<Status> RefillReadyBlocksLocal(std::size_t device_index,
                                       DeviceAllocator& allocator);
 
@@ -1064,11 +1080,6 @@ class StorageEngine::Impl {
 
   Task<StatusOr<ReservedBlock>> AllocateFromDevice(
       std::size_t device_index, bool for_defrag);
-
-  Task<Status> ReturnReadyBlockLocal(std::size_t device_index,
-                                     std::uint64_t block_id);
-
-  Task<Status> ReturnReadyBlock(std::uint64_t block_id);
 
   Task<Status> ReturnColdBlocksLocal(
       std::size_t device_index, std::vector<std::uint64_t> block_ids);
@@ -1247,7 +1258,8 @@ class StorageEngine::Impl {
                                  std::uint64_t logical_size =
                                      std::numeric_limits<std::uint64_t>::max(),
                                  std::shared_ptr<const std::vector<ExtentRef>>
-                                     extents = nullptr);
+                                     extents = nullptr,
+                                 RecordLocation* written_location = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 
@@ -1316,10 +1328,16 @@ class StorageEngine::Impl {
 
   Task<Status> DefragOne(WorkerStore* store);
 
-  Task<Status> RelocateIfCurrent(unsigned key_owner, std::string_view key,
-                                 std::string_view value,
-                                 const RecordHeader& record,
-                                 const RecordLocation& source_location);
+  Task<StatusOr<std::optional<RelocationDurabilityFence>>>
+  RelocateIfCurrent(unsigned key_owner, std::string_view key,
+                    std::string_view value, const RecordHeader& record,
+                    const RecordLocation& source_location);
+
+  Task<Status> AwaitRelocationDurableLocal(
+      WorkerStore& store, const RelocationDurabilityFence& fence);
+
+  Task<Status> AwaitRelocationDurable(
+      const RelocationDurabilityFence& fence);
 
   Task<Status> CleanBlockLocked(WorkerStore& store,
                                 std::uint64_t block_id);
@@ -1336,9 +1354,7 @@ class StorageEngine::Impl {
   // have observed live_bytes == 0 under writer_mutex and set `freeing`, which
   // stops LoadValueLocal from taking new pins.
   Task<Status> ReleaseEmptyBlock(WorkerStore& store, std::uint64_t block_id,
-                                 BlockState& source,
-                                 std::uint32_t source_file_id,
-                                 std::uint64_t source_block_offset);
+                                 BlockState& source);
 
   StorageEngineOptions options_;
   unsigned worker_count_ = 0;

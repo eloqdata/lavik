@@ -103,6 +103,48 @@ Task<Status> StorageEngine::Impl::PersistBitmapPages(
   co_return Status::Ok();
 }
 
+Task<Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
+    std::size_t device_index,
+    std::span<const std::uint64_t> block_ids) {
+  if (block_ids.empty()) {
+    co_return Status::Ok();
+  }
+  DeviceAllocator& allocator = *device_allocators_[device_index];
+  assert(celer::ThisWorker().id == allocator.owner);
+  WorkerStore& store = *stores_[allocator.owner];
+  const StorageDevice& device = devices_[device_index];
+  auto* zero_header = static_cast<std::byte*>(::operator new[](
+      kBlockHeaderBytes, std::align_val_t(options_.buffers.alignment),
+      std::nothrow));
+  if (zero_header == nullptr) {
+    co_return Status(StatusCode::kResourceExhausted,
+                     "failed to allocate recycled-block header buffer");
+  }
+  std::fill_n(zero_header, kBlockHeaderBytes, std::byte{0});
+  Status status = Status::Ok();
+  for (const std::uint64_t block_id : block_ids) {
+    assert(DeviceIndexForBlock(block_id) == device_index);
+    auto written = co_await WriteStorageBuffer(
+        *store.worker, store.files[device.file_index],
+        std::span<const std::byte>(zero_header, kBlockHeaderBytes), false, {},
+        LocalBlockOffset(block_id));
+    if (!written.ok() || *written != kBlockHeaderBytes) {
+      status = written.ok()
+                   ? Status(StatusCode::kInternal,
+                            "short recycled-block header invalidation")
+                   : written.status();
+      break;
+    }
+  }
+  if (status.ok()) {
+    status = co_await celer::Fdatasync(
+        *store.worker, store.files[device.file_index]);
+  }
+  ::operator delete[](zero_header,
+                      std::align_val_t(options_.buffers.alignment));
+  co_return status;
+}
+
 Task<Status> StorageEngine::Impl::RefillReadyBlocksLocal(std::size_t device_index,
                                                          DeviceAllocator& allocator) {
   assert(celer::ThisWorker().id == allocator.owner);
@@ -110,6 +152,8 @@ Task<Status> StorageEngine::Impl::RefillReadyBlocksLocal(std::size_t device_inde
   const StorageDevice& device = devices_[device_index];
   std::vector<std::uint64_t> activated;
   activated.reserve(kActivationBatchBlocks);
+  std::vector<std::uint64_t> reactivated;
+  reactivated.reserve(kActivationBatchBlocks);
   while (activated.size() < kActivationBatchBlocks &&
          allocator.next_pristine < device.capacity_blocks) {
     const std::uint32_t local =
@@ -118,11 +162,24 @@ Task<Status> StorageEngine::Impl::RefillReadyBlocksLocal(std::size_t device_inde
   }
   while (activated.size() < kActivationBatchBlocks &&
          !allocator.cold_free.empty()) {
-    activated.push_back(allocator.cold_free.back());
+    const std::uint64_t block_id = allocator.cold_free.back();
     allocator.cold_free.pop_back();
+    activated.push_back(block_id);
+    reactivated.push_back(block_id);
   }
   if (activated.empty()) {
     co_return Status::Ok();
+  }
+
+  // A cold block deliberately retains its old header while its bitmap bit is
+  // clear. Invalidate that stale header before making the bit durable again,
+  // otherwise a crash between activation and the writer's first flush could
+  // make recovery accept records from the block's previous allocation.
+  Status invalidated = co_await InvalidateReactivatedBlockHeadersLocal(
+      device_index, reactivated);
+  if (!invalidated.ok()) {
+    allocator.failed = invalidated;
+    co_return invalidated;
   }
 
   std::vector<std::size_t> dirty_pages;
@@ -190,29 +247,6 @@ Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
           -> Task<StatusOr<ReservedBlock>> {
         co_return co_await AllocateFromDeviceLocal(device_index,
                                                     for_defrag);
-      });
-}
-
-Task<Status> StorageEngine::Impl::ReturnReadyBlockLocal(std::size_t device_index,
-                                                        std::uint64_t block_id) {
-  DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id == allocator.owner);
-  co_await allocator.mutex.Lock();
-  UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
-  assert(BitmapBit(allocator, LocalBlockId(block_id)));
-  allocator.ready_blocks.push_back(block_id);
-  co_return Status::Ok();
-}
-
-Task<Status> StorageEngine::Impl::ReturnReadyBlock(std::uint64_t block_id) {
-  const std::size_t device_index = DeviceIndexForBlock(block_id);
-  const celer::WorkerId owner = device_allocators_[device_index]->owner;
-  if (celer::ThisWorker().id == owner) {
-    co_return co_await ReturnReadyBlockLocal(device_index, block_id);
-  }
-  co_return co_await celer::SubmitTaskTo(
-      owner, [this, device_index, block_id]() -> Task<Status> {
-        co_return co_await ReturnReadyBlockLocal(device_index, block_id);
       });
 }
 

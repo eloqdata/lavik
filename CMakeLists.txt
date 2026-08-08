@@ -125,6 +125,9 @@ if (BUILD_TESTING)
     add_executable(keylane_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp
     )
+    target_link_libraries(keylane_flushdb_reclaim_e2e_test
+      PRIVATE keylane::module
+    )
     add_test(
       NAME keylane_flushdb_reclaim_e2e
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>

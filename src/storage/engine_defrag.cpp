@@ -261,7 +261,8 @@ Task<Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
   co_return status;
 }
 
-Task<Status> StorageEngine::Impl::RelocateIfCurrent(
+Task<StatusOr<std::optional<RelocationDurabilityFence>>>
+StorageEngine::Impl::RelocateIfCurrent(
     unsigned key_owner, std::string_view key, std::string_view value,
     const RecordHeader& record, const RecordLocation& source_location) {
   WorkerStore& key_store = *stores_[key_owner];
@@ -278,15 +279,88 @@ Task<Status> StorageEngine::Impl::RelocateIfCurrent(
   auto* current = index.Find(record.digest, key);
   if (current == nullptr ||
       !current->value.SamePhysicalRecord(source_location)) {
-    co_return Status::Ok();
+    co_return std::optional<RelocationDurabilityFence>{};
   }
 
-  co_return co_await WriteRecordLocked(
+  RecordLocation relocated;
+  Status written = co_await WriteRecordLocked(
       key_store, record.db_id, key, value, record.kind, record.value_type,
       record.expire_at_ms, record.digest, record.generation,
       record.mutation_sequence,
       record.relocation_sequence + 1, true, true, record.external,
-      record.logical_size, source_location.extents);
+      record.logical_size, source_location.extents, &relocated);
+  if (!written.ok()) {
+    co_return written;
+  }
+  co_return std::optional<RelocationDurabilityFence>(
+      RelocationDurabilityFence{
+          .block_id = relocated.block_id,
+          .allocation_epoch = relocated.allocation_epoch,
+          .block_owner = relocated.block_owner,
+          .committed_bytes = static_cast<std::uint32_t>(
+              relocated.record_offset + relocated.total_disk_bytes),
+      });
+}
+
+Task<Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
+    WorkerStore& store, const RelocationDurabilityFence& fence) {
+  while (true) {
+    co_await store.writer_mutex.Lock();
+    bool durable = false;
+    bool failed = false;
+    {
+      UnlockGuard unlock(&store.writer_mutex, store.worker);
+      BlockState* state = FindBlockState(store, fence.block_id);
+      if (state == nullptr || !state->allocated ||
+          state->allocation_epoch != fence.allocation_epoch) {
+        // The only paths that destroy or reuse a committed block first make
+        // every record they retire durable elsewhere (or durably invalidate
+        // the whole DB/partition). That guarantee is transitive across a
+        // chain of defrag relocations.
+        durable = true;
+      } else if (StagingSlot* staging = StagingFor(store, *state);
+                 staging == nullptr) {
+        // A records block loses its staging buffer only after its committed
+        // header is durable.
+        durable = !state->in_memory && !state->flush_in_progress;
+      } else if (staging->durable_bytes >= fence.committed_bytes) {
+        durable = true;
+      } else {
+        RequestFlush(store, fence.block_id);
+      }
+      failed = store.write_failed;
+    }
+    if (failed) {
+      co_return Status(StatusCode::kInternal,
+                       "storage write failed while flushing defrag relocation");
+    }
+    if (durable) {
+      co_return Status::Ok();
+    }
+    Status waited = co_await celer::SleepFor(
+        *store.worker, std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_return waited;
+    }
+  }
+}
+
+Task<Status> StorageEngine::Impl::AwaitRelocationDurable(
+    const RelocationDurabilityFence& fence) {
+  if (fence.block_owner >= worker_count_) {
+    co_return Status(StatusCode::kInternal,
+                     "defrag relocation has an invalid block owner");
+  }
+  WorkerStore& owner = *stores_[fence.block_owner];
+  if (fence.block_owner == celer::ThisWorker().id) {
+    co_return co_await AwaitRelocationDurableLocal(owner, fence);
+  }
+  co_return co_await celer::SubmitTaskTo(
+      fence.block_owner,
+      [this, fence]() -> Task<Status> {
+        co_return co_await AwaitRelocationDurableLocal(
+            *stores_[fence.block_owner], fence);
+      });
 }
 
 Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
@@ -329,8 +403,7 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
     }
     source.freeing = true;
   }
-  co_return co_await ReleaseEmptyBlock(store, block_id, source,
-                                       source_file_id, source_block_offset);
+  co_return co_await ReleaseEmptyBlock(store, block_id, source);
 }
 
 Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
@@ -384,6 +457,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
                   : read.status();
   }
 
+  std::vector<RelocationDurabilityFence> durability_fences;
   std::uint32_t record_offset = kBlockHeaderBytes;
   while (record_offset < source.committed_bytes) {
     const std::optional<std::uint32_t> next = NextRecordOffset(
@@ -452,7 +526,8 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     const std::string key(disk_key);
     const std::string value(reinterpret_cast<const char*>(value_data),
                             record.payload_bytes);
-    Status relocated;
+    StatusOr<std::optional<RelocationDurabilityFence>> relocated(
+        std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker->id()) {
       relocated = co_await RelocateIfCurrent(
           key_owner, key, value, record, source_location);
@@ -460,14 +535,32 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
       relocated = co_await celer::SubmitTaskTo(
           key_owner,
           [this, key_owner, key, value, record,
-           source_location]() mutable -> Task<Status> {
+           source_location]() mutable
+              -> Task<StatusOr<std::optional<
+                  RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(
                 key_owner, key, value, record, source_location);
           });
     }
     if (!relocated.ok()) {
       source.defragging = false;
-      co_return relocated;
+      co_return relocated.status();
+    }
+    if (relocated->has_value()) {
+      const RelocationDurabilityFence& fence = **relocated;
+      auto existing = std::find_if(
+          durability_fences.begin(), durability_fences.end(),
+          [&](const RelocationDurabilityFence& candidate) {
+            return candidate.block_owner == fence.block_owner &&
+                   candidate.block_id == fence.block_id &&
+                   candidate.allocation_epoch == fence.allocation_epoch;
+          });
+      if (existing == durability_fences.end()) {
+        durability_fences.push_back(fence);
+      } else {
+        existing->committed_bytes =
+            std::max(existing->committed_bytes, fence.committed_bytes);
+      }
     }
     record_offset += record.total_disk_bytes;
     // Cheap while the 50 us background slice has budget remaining; once it
@@ -475,14 +568,24 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     // I/O and cross-core work are polled first.
     co_await celer::Yield(*store.worker);
   }
+  // Do not clear the source block's allocation bitmap bit until every newly
+  // written destination record is covered by a durable destination header.
+  // If the process dies while waiting, recovery still scans the source; if it
+  // dies afterwards, recovery skips it or selects the higher-sequence
+  // relocation if the bitmap update had not become durable yet.
+  for (const RelocationDurabilityFence& fence : durability_fences) {
+    Status durable = co_await AwaitRelocationDurable(fence);
+    if (!durable.ok()) {
+      source.defragging = false;
+      co_return durable;
+    }
+  }
   co_return Status::Ok();
 }
 
 Task<Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
                                                     std::uint64_t block_id,
-                                                    BlockState& source,
-                                                    std::uint32_t source_file_id,
-                                                    std::uint64_t source_block_offset) {
+                                                    BlockState& source) {
   while (source.pins != 0) {
     Status waited = co_await celer::SleepFor(
         *store.worker, std::chrono::milliseconds(1));
@@ -493,50 +596,13 @@ Task<Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
     }
   }
 
-  auto* zero_buffer = static_cast<std::byte*>(::operator new[](
-      kBlockHeaderBytes, std::align_val_t(options_.buffers.alignment),
-      std::nothrow));
-  if (zero_buffer == nullptr) {
-    source.freeing = false;
-    source.defragging = false;
-    store.write_failed = true;
-    co_return Status(StatusCode::kResourceExhausted,
-                     "failed to allocate temporary zero header buffer");
-  }
-  std::fill_n(zero_buffer, kBlockHeaderBytes, std::byte{0});
-  FixedBuffer zero{.data = zero_buffer, .size = kBlockHeaderBytes, .index = 0};
-  std::fill_n(zero.data, zero.size, std::byte{0});
-  auto written = co_await WriteStorageBuffer(
-      *store.worker, store.files[source_file_id],
-      std::span<const std::byte>(zero.data, zero.size),
-      false, {}, source_block_offset);
-  if (!written.ok() || *written != kBlockHeaderBytes) {
-    ::operator delete[](zero_buffer,
-                        std::align_val_t(options_.buffers.alignment));
-    source.freeing = false;
-    source.defragging = false;
-    store.write_failed = true;
-    co_return written.ok()
-                  ? Status(StatusCode::kInternal,
-                           "short free-header write during defrag")
-                  : written.status();
-  }
-  Status sync =
-      co_await celer::Fdatasync(*store.worker, store.files[source_file_id]);
-  if (!sync.ok()) {
-    ::operator delete[](zero_buffer,
-                        std::align_val_t(options_.buffers.alignment));
-    source.freeing = false;
-    source.defragging = false;
-    store.write_failed = true;
-    co_return sync;
-  }
-
-  ::operator delete[](zero_buffer,
-                      std::align_val_t(options_.buffers.alignment));
-
+  // The durable allocation bitmap is authoritative during recovery. Retire
+  // the runtime state before publishing the block to cold_free so another
+  // worker cannot allocate it while its old owner still names it. A bitmap
+  // write failure fail-stops the allocator, so this block cannot be reused
+  // in the ambiguous state.
   DestroyBlockState(store, block_id);
-  co_return co_await ReturnReadyBlock(block_id);
+  co_return co_await ReturnColdBlocks({block_id});
 }
 
 }  // namespace keylane::storage

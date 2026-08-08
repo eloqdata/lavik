@@ -7,19 +7,25 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "keylane/storage/format.h"
 
 namespace {
 
@@ -155,9 +161,19 @@ RespClient Connect(std::uint16_t port) {
     address.sin_port = htons(port);
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
                   sizeof(address)) == 0) {
-      return RespClient(fd);
+      try {
+        RespClient client(fd);
+        if (client.Command({"PING"}) == "+PONG") {
+          return client;
+        }
+      } catch (const std::exception&) {
+        // The listener is created before recovery finishes. A successful TCP
+        // connect is therefore not sufficient to prove that a worker is ready
+        // to serve requests; retry until PING completes too.
+      }
+    } else {
+      ::close(fd);
     }
-    ::close(fd);
     std::this_thread::sleep_for(10ms);
   }
   Fail("timed out connecting to Keylane");
@@ -166,7 +182,8 @@ RespClient Connect(std::uint16_t port) {
 class ServerProcess {
  public:
   ServerProcess(std::string binary, std::uint16_t port,
-                std::vector<std::string> data_paths, std::string log_path) {
+                std::vector<std::string> data_paths, std::string log_path,
+                unsigned flush_max_ms = 1000) {
     pid_ = ::fork();
     if (pid_ < 0) {
       Fail("fork failed");
@@ -185,7 +202,7 @@ class ServerProcess {
           "--port", std::to_string(port),
           "--threads", "1",
           "--recv-buffers", "0",
-          "--flush-max-ms", "1000",
+          "--flush-max-ms", std::to_string(flush_max_ms),
       };
       for (const std::string& data_path : data_paths) {
         arguments.emplace_back("--data-file");
@@ -237,6 +254,20 @@ class ServerProcess {
     Fail("Keylane did not stop after SIGINT");
   }
 
+  void Crash() {
+    if (pid_ <= 0) {
+      return;
+    }
+    if (::kill(pid_, SIGKILL) != 0 && errno != ESRCH) {
+      Fail("failed to kill Keylane");
+    }
+    int status = 0;
+    if (::waitpid(pid_, &status, 0) != pid_) {
+      Fail("waitpid failed after SIGKILL");
+    }
+    pid_ = -1;
+  }
+
  private:
   pid_t pid_ = -1;
 };
@@ -255,6 +286,107 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+std::vector<std::uint64_t> ReadAllocatedRecordBlocks(
+    const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    Fail("failed to open data file for block scan");
+  }
+  off_t bytes = ::lseek(fd, 0, SEEK_END);
+  if (bytes < 0) {
+    ::close(fd);
+    Fail("failed to size data file for block scan");
+  }
+  const std::uint64_t capacity_blocks =
+      static_cast<std::uint64_t>(bytes) / keylane::storage::kStorageBlockBytes;
+  const std::uint32_t begin =
+      keylane::storage::DataBlockBegin(capacity_blocks);
+  alignas(keylane::storage::kDirectIoAlignment)
+      std::array<std::byte, keylane::storage::kBlockHeaderBytes> header{};
+  std::vector<std::uint64_t> blocks;
+  for (std::uint32_t local = begin; local < capacity_blocks; ++local) {
+    const off_t offset = static_cast<off_t>(local) *
+                         keylane::storage::kStorageBlockBytes;
+    const ssize_t read = ::pread(fd, header.data(), header.size(), offset);
+    if (read != static_cast<ssize_t>(header.size())) {
+      ::close(fd);
+      Fail("failed to read block header during test scan");
+    }
+    keylane::storage::BlockHeader decoded{};
+    if (keylane::storage::DecodeBlockHeaderPages(header, &decoded) &&
+        decoded.kind == keylane::storage::BlockKind::kRecords) {
+      blocks.push_back(decoded.block_id);
+    }
+  }
+  ::close(fd);
+  return blocks;
+}
+
+bool BlockBitmapBitIsClear(const std::string& path,
+                           std::uint64_t block_id) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    Fail("failed to open data file while reading allocation bitmap");
+  }
+  const std::uint32_t local_block =
+      keylane::storage::LocalBlockId(block_id);
+  const std::size_t byte_index = local_block / 8;
+  const std::uint32_t page_index = static_cast<std::uint32_t>(
+      byte_index / keylane::storage::kMetadataPagePayloadBytes);
+  const std::size_t payload_byte =
+      byte_index % keylane::storage::kMetadataPagePayloadBytes;
+  alignas(keylane::storage::kDirectIoAlignment)
+      std::array<std::byte, keylane::storage::kDirectIoAlignment> page{};
+  std::array<std::byte, keylane::storage::kMetadataPagePayloadBytes>
+      selected_payload{};
+  std::uint64_t selected_generation = 0;
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    const off_t offset = static_cast<off_t>(
+        keylane::storage::MetadataPageSlotOffset(
+            keylane::storage::kScanBitmapMetadataOffset, page_index, slot));
+    const ssize_t read = ::pread(fd, page.data(), page.size(), offset);
+    if (read != static_cast<ssize_t>(page.size())) {
+      ::close(fd);
+      Fail("failed to read allocation bitmap page");
+    }
+    std::array<std::byte, keylane::storage::kMetadataPagePayloadBytes>
+        payload{};
+    std::uint64_t generation = 0;
+    if (keylane::storage::DecodeMetadataPage(
+            page, keylane::storage::MetadataPageKind::kScanBitmap,
+            page_index, &generation, payload) &&
+        generation > selected_generation) {
+      selected_generation = generation;
+      selected_payload = payload;
+    }
+  }
+  ::close(fd);
+  if (selected_generation == 0) {
+    Fail("allocation bitmap has no valid metadata page");
+  }
+  const unsigned bit = local_block % 8;
+  return (std::to_integer<unsigned>(selected_payload[payload_byte]) &
+          (1U << bit)) == 0;
+}
+
+bool BlockHeaderIsNonZero(const std::string& path, std::uint64_t block_id) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    Fail("failed to open data file while checking retired block header");
+  }
+  alignas(keylane::storage::kDirectIoAlignment)
+      std::array<std::byte, keylane::storage::kBlockHeaderBytes> header{};
+  const off_t offset = static_cast<off_t>(
+      keylane::storage::LocalBlockOffset(block_id));
+  const ssize_t read = ::pread(fd, header.data(), header.size(), offset);
+  ::close(fd);
+  if (read != static_cast<ssize_t>(header.size())) {
+    Fail("failed to read retired block header");
+  }
+  return std::any_of(header.begin(), header.end(),
+                     [](std::byte byte) { return byte != std::byte{0}; });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -268,10 +400,12 @@ int main(int argc, char** argv) {
   const std::string data_path = prefix + ".data";
   const std::string unequal_path_a = prefix + "-unequal-a.data";
   const std::string unequal_path_b = prefix + "-unequal-b.data";
+  const std::string defrag_crash_path = prefix + "-defrag-crash.data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
   (void)::unlink(unequal_path_a.c_str());
   (void)::unlink(unequal_path_b.c_str());
+  (void)::unlink(defrag_crash_path.c_str());
   (void)::unlink(log_path.c_str());
 
   try {
@@ -340,6 +474,87 @@ int main(int argc, char** argv) {
       Expect(client.Command({"DBSIZE"}), ":20", "unequal-device DBSIZE");
       server.Stop();
     }
+
+    // A defrag relocation updates the in-memory index before its destination
+    // block is necessarily flushed. Keep periodic flush far away, wait until
+    // defrag has durably cleared an original source allocation bit, then crash
+    // immediately. Recovery must skip that stale source header and find every
+    // key through relocation records committed before the bitmap update.
+    constexpr unsigned kDefragKeys = 12000;
+    CreateDataFile(defrag_crash_path, 128ULL * 1024 * 1024);
+    std::vector<std::uint64_t> original_blocks;
+    {
+      ServerProcess server(argv[1], port, {defrag_crash_path}, log_path,
+                           60000);
+      RespClient client = Connect(port);
+      const std::string small_value(2000, 'd');
+      for (unsigned i = 0; i < kDefragKeys; ++i) {
+        const std::string key = "defrag-crash-" + std::to_string(i);
+        Expect(client.Command({"SET", key, small_value}), "+OK",
+               "defrag crash initial SET");
+      }
+
+      const auto scan_deadline = std::chrono::steady_clock::now() + 20s;
+      while (std::chrono::steady_clock::now() < scan_deadline) {
+        original_blocks = ReadAllocatedRecordBlocks(defrag_crash_path);
+        if (original_blocks.size() >= 2) {
+          break;
+        }
+        std::this_thread::sleep_for(10ms);
+      }
+      if (original_blocks.size() < 2) {
+        Fail("initial record blocks did not become durable");
+      }
+
+      // Replace 80% of every original block's sequential key population. The
+      // original blocks fall well below the 50% live-ratio threshold, while
+      // the relocation destination remains partial with periodic flush
+      // disabled.
+      for (unsigned i = 0; i < kDefragKeys; ++i) {
+        if (i % 5 == 0) {
+          continue;
+        }
+        const std::string key = "defrag-crash-" + std::to_string(i);
+        Expect(client.Command({"SET", key, small_value}), "+OK",
+               "defrag crash overwrite SET");
+      }
+
+      std::optional<std::uint64_t> source_cleared;
+      const auto defrag_deadline = std::chrono::steady_clock::now() + 30s;
+      while (std::chrono::steady_clock::now() < defrag_deadline &&
+             !source_cleared.has_value()) {
+        for (const std::uint64_t block_id : original_blocks) {
+          if (BlockBitmapBitIsClear(defrag_crash_path, block_id)) {
+            source_cleared = block_id;
+            break;
+          }
+        }
+        if (!source_cleared.has_value()) {
+          std::this_thread::sleep_for(1ms);
+        }
+      }
+      if (!source_cleared.has_value()) {
+        Fail("defrag did not clear an original source bitmap bit");
+      }
+      if (!BlockHeaderIsNonZero(defrag_crash_path, *source_cleared)) {
+        Fail("defrag unexpectedly zeroed a retired source header");
+      }
+      server.Crash();
+    }
+    {
+      ServerProcess server(argv[1], port, {defrag_crash_path}, log_path);
+      RespClient client = Connect(port);
+      Expect(client.Command({"PING"}), "+PONG", "defrag crash restart PING");
+      Expect(client.Command({"DBSIZE"}),
+             ":" + std::to_string(kDefragKeys),
+             "defrag crash restart DBSIZE");
+      for (unsigned i : {0U, 1U, kDefragKeys / 2, kDefragKeys - 1}) {
+        const std::string key = "defrag-crash-" + std::to_string(i);
+        Expect(client.Command({"STRLEN", key}), ":2000",
+               "defrag crash restart STRLEN");
+      }
+      server.Stop();
+    }
     {
       ServerProcess server(argv[1], port,
                            {unequal_path_a, unequal_path_b}, log_path);
@@ -356,6 +571,7 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
+    (void)::unlink(defrag_crash_path.c_str());
     (void)::unlink(log_path.c_str());
     return 0;
   } catch (const std::exception& error) {
@@ -367,6 +583,7 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
+    (void)::unlink(defrag_crash_path.c_str());
     (void)::unlink(log_path.c_str());
     return 1;
   }

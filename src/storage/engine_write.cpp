@@ -581,7 +581,8 @@ void StorageEngine::Impl::RequestStandbyBlock(WorkerStore& store,
                                               bool for_defrag) {
   if (store.standby_block.has_value() || store.standby_request_pending ||
       store.write_failed ||
-      shutdown_flush_requested_.load(std::memory_order_acquire)) {
+      (shutdown_flush_requested_.load(std::memory_order_acquire) &&
+       !for_defrag)) {
     return;
   }
   store.standby_error.reset();
@@ -640,7 +641,8 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
     bool for_defrag, bool unlock_writer_while_waiting, bool external,
     std::uint64_t logical_size,
-    std::shared_ptr<const std::vector<ExtentRef>> extents) {
+    std::shared_ptr<const std::vector<ExtentRef>> extents,
+    RecordLocation* written_location) {
   if (store.write_failed ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return Status(StatusCode::kFailedPrecondition,
@@ -933,6 +935,9 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     }
   }
   MaybePrefetchStandby(store);
+  if (written_location != nullptr) {
+    *written_location = location;
+  }
   co_return Status::Ok();
 }
 
