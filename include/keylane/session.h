@@ -25,14 +25,19 @@ struct ConnectionContext {
   std::vector<CommandRequest> queued;
 
   // WATCH registrations: enough to check and unregister on the owning
-  // shards. Deduplicated by (db, fp); the first registration's snapshot is
-  // authoritative (sticky, like Redis).
+  // shards. Deduplicated by (db, key) — never by fingerprint, which can
+  // collide across distinct keys — and the first registration's liveness
+  // snapshot is authoritative (sticky, like Redis).
   struct WatchedKey {
     std::string key;
     storage::Digest digest;
     tx::LockFp fp = 0;
     std::uint16_t owner = 0;
     std::uint8_t db = 0;
+    // Liveness observed on the owning shard at WATCH time; EXEC compares it
+    // against the key's own current liveness, so fingerprint collisions can
+    // only ever cause false aborts, not missed ones.
+    bool live = false;
   };
   std::uint64_t conn_id = 0;
   std::vector<WatchedKey> watched;

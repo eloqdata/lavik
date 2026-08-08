@@ -136,16 +136,19 @@ class TxShard {
   // Shard-local WATCH registrations (push model): every real keyspace
   // modification marks the watchers of that fingerprint; EXEC checks its own
   // connection's entries after taking its locks. Marks are sticky until the
-  // entry is removed (UNWATCH / DISCARD / EXEC / connection close).
-  void Watch(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id,
-             bool live) {
+  // entry is removed (UNWATCH / DISCARD / EXEC / connection close). The
+  // liveness snapshot lives with the connection, not here: this entry is
+  // per (db, fingerprint), and two of a connection's watched keys may share
+  // a fingerprint — one snapshot slot would make the second key's passive
+  // expiration invisible.
+  void Watch(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id) {
     auto& entries = watches_[db_id][fp];
     for (const WatchEntry& entry : entries) {
       if (entry.conn_id == conn_id) {
-        return;  // sticky: the first registration's snapshot wins
+        return;  // already registered; the existing marks stay
       }
     }
-    entries.push_back(WatchEntry{conn_id, live, false});
+    entries.push_back(WatchEntry{conn_id, false});
   }
 
   void MarkWatched(std::uint8_t db_id, LockFp fp) {
@@ -170,18 +173,18 @@ class TxShard {
     }
   }
 
-  // True when the connection's registration is untouched: not marked by any
-  // write and the key's liveness matches the WATCH-time snapshot (passive
+  // True when the connection's registration exists and no write has marked
+  // it. The caller pairs this with its own liveness comparison (passive
   // expiration invalidates like a write, mirroring Redis).
-  bool WatchClean(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id,
-                  bool now_live) const {
+  bool WatchClean(std::uint8_t db_id, LockFp fp,
+                  std::uint64_t conn_id) const {
     auto it = watches_[db_id].find(fp);
     if (it == watches_[db_id].end()) {
       return false;
     }
     for (const WatchEntry& entry : it->second) {
       if (entry.conn_id == conn_id) {
-        return !entry.dirty && entry.live == now_live;
+        return !entry.dirty;
       }
     }
     return false;
@@ -280,7 +283,6 @@ class TxShard {
 
   struct WatchEntry {
     std::uint64_t conn_id = 0;
-    bool live = false;
     bool dirty = false;
   };
 

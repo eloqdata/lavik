@@ -1645,7 +1645,7 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
     const tx::LockFp fp = tx::FingerprintOf(digest);
     bool already = false;
     for (const auto& watched : ctx.watched) {
-      if (watched.db == db && watched.fp == fp) {
+      if (watched.db == db && watched.key == request.args[i]) {
         already = true;
         break;
       }
@@ -1655,18 +1655,19 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
     }
     const std::uint16_t owner =
         static_cast<std::uint16_t>(ShardForKey(request.args[i]));
-    co_await SubmitTo(owner, [key = std::string(request.args[i]), db, digest,
-                              fp, conn = ctx.conn_id]() {
-      tx::CurrentTxShard().Watch(db, fp, conn,
-                                 g_storage->KeyLive(db, key, digest));
-      return true;
-    });
+    const bool live = co_await SubmitTo(
+        owner, [key = std::string(request.args[i]), db, digest, fp,
+                conn = ctx.conn_id]() {
+          tx::CurrentTxShard().Watch(db, fp, conn);
+          return g_storage->KeyLive(db, key, digest);
+        });
     ctx.watched.push_back(ConnectionContext::WatchedKey{
         .key = request.args[i],
         .digest = digest,
         .fp = fp,
         .owner = owner,
         .db = db,
+        .live = live,
     });
   }
   co_return EncodedReply(EncodeSimpleString("OK"));
@@ -1674,15 +1675,17 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
 
 // True when every watched key is unmarked and still matches its WATCH-time
 // liveness. Runs on each key's owning shard; callers hold whatever locks the
-// transaction needs before asking.
+// transaction needs before asking. The liveness snapshot travels with the
+// key, not the shard entry, so keys sharing a fingerprint are each compared
+// against their own snapshot.
 Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
   for (const auto& watched : ctx.watched) {
     const bool clean = co_await SubmitTo(
         watched.owner,
         [key = watched.key, db = watched.db, digest = watched.digest,
-         fp = watched.fp, conn = ctx.conn_id]() {
-          return tx::CurrentTxShard().WatchClean(
-              db, fp, conn, g_storage->KeyLive(db, key, digest));
+         fp = watched.fp, live = watched.live, conn = ctx.conn_id]() {
+          return tx::CurrentTxShard().WatchClean(db, fp, conn) &&
+                 g_storage->KeyLive(db, key, digest) == live;
         });
     if (!clean) {
       co_return false;
