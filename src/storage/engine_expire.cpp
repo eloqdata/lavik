@@ -3,7 +3,7 @@
 namespace keylane::storage {
 
 Task<Status> StorageEngine::Impl::QuiesceExpiration() {
-  expiration_paused_.store(true, std::memory_order_release);
+  expiration_pause_count_.fetch_add(1, std::memory_order_acq_rel);
   for (unsigned target = 0; target < worker_count_; ++target) {
     Status drained = co_await celer::SubmitTaskTo(
         target, [this, target]() -> Task<Status> {
@@ -13,7 +13,7 @@ Task<Status> StorageEngine::Impl::QuiesceExpiration() {
           co_return Status::Ok();
         });
     if (!drained.ok()) {
-      expiration_paused_.store(false, std::memory_order_release);
+      ResumeExpiration();
       co_return drained;
     }
   }
@@ -57,7 +57,7 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
     WorkerStore& store, WorkerStore::ExpireCandidate candidate) {
   if (candidate.partition_id >= kLogicalStorageShards ||
       candidate.db_id >= kLogicalDatabaseCount ||
-      expiration_paused_.load(std::memory_order_acquire)) {
+      expiration_pause_count_.load(std::memory_order_acquire) != 0) {
     co_return Status::Ok();
   }
   auto& partition = PartitionFor(store, candidate.partition_id);
@@ -66,6 +66,14 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
       tx::LockMode::kExclusive);
   co_await store.writer_mutex.Lock();
   UnlockGuard unlock(&store.writer_mutex, store.worker);
+  // Re-check after the locks: the acquisitions above suspend, and a
+  // candidate parked on the key lock is invisible to QuiesceExpiration's
+  // writer-mutex drain — it must not delete mid-scan when it wakes. A
+  // candidate that instead beat the drain to the writer mutex finished
+  // before the drain returned, so either way the scan's count stays exact.
+  if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
+    co_return Status::Ok();
+  }
   auto* current = partition.indexes[candidate.db_id].Find(
       candidate.digest, candidate.key);
   if (current == nullptr || current->value.kind != RecordKind::kValue ||
@@ -88,7 +96,7 @@ Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     if (!waited.ok()) {
       co_return waited;
     }
-    if (expiration_paused_.load(std::memory_order_acquire)) {
+    if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
       continue;  // a stable-keyspace scan (KEYS) is in flight
     }
     if (store->worker->stop_requested() ||

@@ -880,11 +880,14 @@ class StorageEngine::Impl {
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
   // this stops the active-expiry loop and drains any in-flight append by
-  // bouncing off every worker's writer mutex.
+  // bouncing off every worker's writer mutex. Pauses nest — the database
+  // gates are per-db, so KEYS on two databases can overlap — and every
+  // successful QuiesceExpiration must be paired with exactly one
+  // ResumeExpiration.
   Task<Status> QuiesceExpiration();
 
   void ResumeExpiration() noexcept {
-    expiration_paused_.store(false, std::memory_order_release);
+    expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
 
   bool KeyLive(std::uint8_t db_id, std::string_view key,
@@ -1438,7 +1441,7 @@ class StorageEngine::Impl {
   std::unique_ptr<RecoveryDeviceCursor[]> recovery_device_cursors_;
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
-  std::atomic<bool> expiration_paused_{false};
+  std::atomic<std::uint32_t> expiration_pause_count_{0};
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;

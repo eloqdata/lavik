@@ -548,9 +548,17 @@ std::uint64_t CommandUnixTimeMillis() noexcept;
 // dies, reopening the gate either way.
 struct KeysStreamState {
   explicit KeysStreamState(std::uint8_t db_id) : db(db_id), guard(db_id) {}
-  ~KeysStreamState() { g_storage->ResumeExpiration(); }
+  ~KeysStreamState() {
+    // Resume only a pause this KEYS actually took: the pause nests across
+    // overlapping KEYS on other databases, and the early-error path drops
+    // the state before ever quiescing.
+    if (expiration_quiesced) {
+      g_storage->ResumeExpiration();
+    }
+  }
 
   std::uint8_t db;
+  bool expiration_quiesced = false;
   DbCloseGuard guard;
   std::string pattern;
   std::uint64_t now_ms = 0;
@@ -664,6 +672,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
   if (!quiesced.ok()) {
     co_return EncodedReply(EncodeError("ERR " + quiesced.message()));
   }
+  state->expiration_quiesced = true;
 
   // Counting pass over the frozen keyspace: one batched walk per worker.
   std::uint64_t matches = 0;
