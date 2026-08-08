@@ -188,16 +188,24 @@ struct StagingSlot {
   std::uint16_t next_free = 0;
 };
 
-// Aligned, not just sized: natural alignment is 8, so at malloc's 16-byte
-// granularity roughly a quarter of these would start 48 bytes into a cache
-// line and straddle two. Aligning to 32 pins every one inside a single line
-// without growing the struct, and keeps that true if these ever move into a
-// dense array.
+inline constexpr std::uint16_t kUnownedBlock =
+    std::numeric_limits<std::uint16_t>::max();
+
+// These live in a dense per-device array, so aligning to 32 keeps every entry
+// inside one cache line rather than letting some straddle two.
+//
+// The array is shared: any worker can address any entry. Only `owner` may be
+// read by a worker that does not own the block, which is why it alone is
+// atomic. Everything else is the owner's exclusive property, reached only
+// after FindBlockState has confirmed ownership.
 struct alignas(32) BlockState {
   std::uint64_t allocation_epoch = 0;
   std::uint32_t committed_bytes = 0;
   std::uint32_t live_bytes = 0;
   std::uint32_t pins = 0;
+  // Written only by the owner as it claims or releases the block; read by
+  // anyone that needs to know where to dispatch. kUnownedBlock means free.
+  std::atomic<std::uint16_t> owner{kUnownedBlock};
   std::uint16_t writer_id = 0;
   std::uint16_t layout_worker_count = 0;
   // Index into WorkerStore::staging_slots, or 0 when the block has no staging
@@ -214,6 +222,28 @@ struct alignas(32) BlockState {
   bool flush_in_progress : 1 = false;
   bool release_pending : 1 = false;
   BlockKind kind = BlockKind::kRecords;
+
+  // The atomic member makes this non-assignable, and clearing an entry has to
+  // publish the new owner last so no one observes a half-reset block.
+  void Reset(std::uint16_t new_owner) noexcept {
+    allocation_epoch = 0;
+    committed_bytes = 0;
+    live_bytes = 0;
+    pins = 0;
+    writer_id = 0;
+    layout_worker_count = 0;
+    staging_slot = 0;
+    allocated = false;
+    defrag_queued = false;
+    defragging = false;
+    freeing = false;
+    in_memory = false;
+    flush_queued = false;
+    flush_in_progress = false;
+    release_pending = false;
+    kind = BlockKind::kRecords;
+    owner.store(new_owner, std::memory_order_release);
+  }
 };
 
 // Every allocated block carries one of these for its whole life, and cold
@@ -881,7 +911,6 @@ class StorageEngine::Impl {
     std::optional<ReservedBlock> standby_block;
     std::optional<Status> standby_error;
     AsyncNotification standby_ready;
-    absl::flat_hash_map<std::uint64_t, std::unique_ptr<BlockState>> block_states;
     // Recovery only. A recovered extent block's identity has to be checked
     // against the manifests that reference it, and the two arrive in separate
     // passes, so they meet here instead of in every BlockState. Cleared once
@@ -1101,9 +1130,15 @@ class StorageEngine::Impl {
     }
     total_data_blocks_ = 0;
     std::uint64_t foreground_blocks = 0;
+    // Sized once and never resized: BlockState pointers are held across
+    // suspension points, so entries must not move.
+    device_block_states_.resize(devices_.size());
     for (std::size_t device_index = 0; device_index < devices_.size();
          ++device_index) {
       const StorageDevice& device = devices_[device_index];
+      device_block_states_[device_index] = std::vector<BlockState>(
+          static_cast<std::size_t>(device.capacity_blocks -
+                                   device.data_block_begin));
       total_data_blocks_ += device.data_block_count;
       const std::size_t reserve = DefragReserveForDevice(device_index);
       if (device.data_block_count > reserve) {
@@ -1417,7 +1452,19 @@ class StorageEngine::Impl {
                      ++extent_index) {
                   const ExtentRef& extent =
                       location.extents->at(extent_index);
-                  live_by_owner[location.block_owner].push_back(
+                  // An extent block's owner is derived from its own block id,
+                  // so it is unrelated to the owner of the block holding this
+                  // manifest. Charging the reference to the record's owner
+                  // sends it to a worker that has no state for the block,
+                  // which reads as corruption and fails recovery outright.
+                  const std::uint16_t extent_owner =
+                      BlockOwner(extent.block_id);
+                  if (extent_owner >= worker_count_) {
+                    Fail(Status(StatusCode::kInternal,
+                                "manifest references an unscanned extent"));
+                    return;
+                  }
+                  live_by_owner[extent_owner].push_back(
                       RecoveryLiveReference{
                           .block_id = extent.block_id,
                           .allocation_epoch = extent.allocation_epoch,
@@ -1531,22 +1578,19 @@ class StorageEngine::Impl {
       co_return status;
     }
     auto orphan_extents = std::make_shared<std::vector<ExtentRef>>();
-    for (const auto& [block_id, state] : store.block_states) {
-      if (state != nullptr) {
-        if (state->kind == BlockKind::kValueExtent &&
-            state->live_bytes == 0) {
-          orphan_extents->push_back(ExtentRef{
-              .block_id = block_id,
-              .allocation_epoch = state->allocation_epoch,
-              .payload_bytes = static_cast<std::uint32_t>(
-                  state->committed_bytes - kBlockHeaderBytes),
-              .payload_checksum = 0,
-          });
-        } else {
-          MaybeQueueDefrag(store, block_id);
-        }
+    ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
+      if (state.kind == BlockKind::kValueExtent && state.live_bytes == 0) {
+        orphan_extents->push_back(ExtentRef{
+            .block_id = block_id,
+            .allocation_epoch = state.allocation_epoch,
+            .payload_bytes = static_cast<std::uint32_t>(
+                state.committed_bytes - kBlockHeaderBytes),
+            .payload_checksum = 0,
+        });
+      } else {
+        MaybeQueueDefrag(store, block_id);
       }
-    }
+    });
     if (!orphan_extents->empty()) {
       SpawnExtentReclaim(store,
                          std::shared_ptr<const std::vector<ExtentRef>>(
@@ -2659,25 +2703,57 @@ class StorageEngine::Impl {
     return PartitionFor(store, RedisSlot(key));
   }
 
-  static BlockState* FindBlockState(WorkerStore& store,
-                                    std::uint64_t block_id) noexcept {
-    auto found = store.block_states.find(block_id);
-    return found == store.block_states.end() ? nullptr : found->second.get();
-  }
-
-  static const BlockState* FindBlockState(
-      const WorkerStore& store, std::uint64_t block_id) noexcept {
-    auto found = store.block_states.find(block_id);
-    return found == store.block_states.end() ? nullptr : found->second.get();
-  }
-
-  static BlockState& CreateBlockState(WorkerStore& store,
-                                      std::uint64_t block_id) {
-    auto [found, inserted] = store.block_states.try_emplace(block_id, nullptr);
-    if (inserted || found->second == nullptr) {
-      found->second = std::make_unique<BlockState>();
+  // Absent means unallocated or owned by another worker. Ownership is settled
+  // from the atomic first, so a foreign entry is never read past that field.
+  BlockState* FindBlockState(WorkerStore& store,
+                             std::uint64_t block_id) noexcept {
+    BlockState& state = BlockStateAt(block_id);
+    if (state.owner.load(std::memory_order_acquire) != store.worker->id()) {
+      return nullptr;
     }
-    return *found->second;
+    return state.allocated ? &state : nullptr;
+  }
+
+  const BlockState* FindBlockState(
+      const WorkerStore& store, std::uint64_t block_id) const noexcept {
+    const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
+    if (state.owner.load(std::memory_order_acquire) != store.worker->id()) {
+      return nullptr;
+    }
+    return state.allocated ? &state : nullptr;
+  }
+
+  BlockState& CreateBlockState(WorkerStore& store, std::uint64_t block_id) {
+    BlockState& state = BlockStateAt(block_id);
+    state.Reset(static_cast<std::uint16_t>(store.worker->id()));
+    return state;
+  }
+
+  void DestroyBlockState(WorkerStore& store, std::uint64_t block_id) {
+    (void)store;
+    BlockStateAt(block_id).Reset(kUnownedBlock);
+  }
+
+  // Walks this worker's blocks. The array is shared, so ownership is filtered
+  // from the atomic and no other worker's fields are touched.
+  template <typename Fn>
+  void ForEachOwnedBlock(WorkerStore& store, Fn&& fn) {
+    const std::uint16_t me = static_cast<std::uint16_t>(store.worker->id());
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      std::vector<BlockState>& states = device_block_states_[device_index];
+      for (std::size_t slot = 0; slot < states.size(); ++slot) {
+        BlockState& state = states[slot];
+        if (state.owner.load(std::memory_order_acquire) != me ||
+            !state.allocated) {
+          continue;
+        }
+        fn(MakeBlockId(device.id, static_cast<std::uint32_t>(
+                                      slot + device.data_block_begin)),
+           state);
+      }
+    }
   }
 
   std::size_t DeviceIndexForBlock(std::uint64_t block_id) const noexcept {
@@ -3238,6 +3314,32 @@ class StorageEngine::Impl {
     free_list_barrier_->Abort(status);
   }
 
+  // Block states live in one dense array per device, indexed by local block
+  // id. Each array is sized once at startup and never resized, so entries
+  // never move and a BlockState* stays valid across suspension points.
+  BlockState& BlockStateAt(std::uint64_t block_id) noexcept {
+    const std::size_t device_index = DeviceIndexForBlock(block_id);
+    const StorageDevice& device = devices_[device_index];
+    const std::uint32_t local = LocalBlockId(block_id);
+    assert(local >= device.data_block_begin);
+    assert(local < device.capacity_blocks);
+    return device_block_states_[device_index][local - device.data_block_begin];
+  }
+
+  // Which worker owns a block, or kUnownedBlock if it is free. This is the one
+  // field a non-owner may read, so it is the only one that is atomic.
+  std::uint16_t BlockOwner(std::uint64_t block_id) const noexcept {
+    const std::size_t device_index = DeviceIndexForBlock(block_id);
+    const StorageDevice& device = devices_[device_index];
+    const std::uint32_t local = LocalBlockId(block_id);
+    if (device_block_states_.empty() || local < device.data_block_begin ||
+        local >= device.capacity_blocks) {
+      return kUnownedBlock;
+    }
+    return device_block_states_[device_index][local - device.data_block_begin]
+        .owner.load(std::memory_order_acquire);
+  }
+
   std::uint16_t RecoveredBlockOwner(const BlockHeader& block,
                                     std::uint64_t block_id) const noexcept {
     // writer_id belongs to the topology that wrote the block and may be
@@ -3619,6 +3721,14 @@ class StorageEngine::Impl {
                                         RecordLocation location,
                                         ReadLatencyTrace* trace = nullptr) {
     assert(location.block_owner < worker_count_);
+    // An external value's manifest is already decoded in this index entry, so
+    // the record's own block holds nothing worth reading. Assemble here and
+    // let each extent go straight to its block's owner, rather than hopping to
+    // the record's owner first and having it acquire the output buffer from
+    // its pool and hand the lease back across workers.
+    if (location.external) {
+      co_return co_await LoadExternalValueLocal(key_store, location, trace);
+    }
     if (location.block_owner == key_store.worker->id()) {
       co_return co_await LoadValueLocal(key_store, db_id, key, digest, location,
                                         trace);
@@ -3632,6 +3742,67 @@ class StorageEngine::Impl {
           co_return co_await LoadValueLocal(*stores_[owner], db_id, key, digest,
                                             location, trace);
         });
+  }
+
+  // Reads one extent block's payload into `destination`. Runs on the worker
+  // that owns that block, which is not necessarily the one holding the
+  // manifest, so everything it needs is passed by value.
+  Task<Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
+                              std::uint32_t extent_index,
+                              std::byte* destination) {
+    BlockState* state = FindBlockState(store, ref.block_id);
+    if (state == nullptr || !state->allocated || state->freeing ||
+        state->kind != BlockKind::kValueExtent ||
+        state->allocation_epoch != ref.allocation_epoch) {
+      co_return Status(StatusCode::kInternal,
+                       "stale or missing external extent");
+    }
+    ++state->pins;
+    struct ExtentPin {
+      BlockState* state;
+      ~ExtentPin() { --state->pins; }
+    } pin{state};
+    const std::size_t read_bytes =
+        AlignDirect(kBlockHeaderBytes + ref.payload_bytes);
+    auto temp_acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
+    if (!temp_acquired.ok()) {
+      co_return temp_acquired.status();
+    }
+    ReadBufferLease temp = std::move(*temp_acquired);
+    FixedBuffer io = temp.io_buffer();
+    io.size = read_bytes;
+    const auto [file_id, block_offset] = FileOffset(ref.block_id);
+    auto read = co_await ReadStorageBuffer(*store.worker,
+                                           store.files[file_id], io,
+                                           temp.registered(), block_offset);
+    if (!read.ok()) {
+      co_return read.status();
+    }
+    if (*read != read_bytes) {
+      co_return Status(StatusCode::kInternal, "short extent block read");
+    }
+    BlockHeader header{};
+    if (!DecodeBlockHeaderPages(
+            std::span<const std::byte, kBlockHeaderBytes>(
+                io.data, kBlockHeaderBytes),
+            &header) ||
+        header.kind != BlockKind::kValueExtent ||
+        header.block_id != ref.block_id ||
+        header.allocation_epoch != ref.allocation_epoch ||
+        header.extent_index != extent_index ||
+        header.extent_payload_bytes != ref.payload_bytes ||
+        header.extent_payload_checksum != ref.payload_checksum) {
+      co_return Status(StatusCode::kInternal,
+                       "extent header does not match manifest");
+    }
+    const auto payload = std::span<const std::byte>(
+        io.data + kBlockHeaderBytes, ref.payload_bytes);
+    if (options_.verify_read_crc && Crc32c(payload) != ref.payload_checksum) {
+      co_return Status(StatusCode::kInternal,
+                       "extent payload checksum mismatch");
+    }
+    std::memcpy(destination, payload.data(), payload.size());
+    co_return Status::Ok();
   }
 
   Task<StatusOr<LoadedValue>> LoadExternalValueLocal(
@@ -3661,67 +3832,41 @@ class StorageEngine::Impl {
       trace->heap_read_buffer = !output.registered();
       trace->disk_read = true;
     }
+    if (trace != nullptr) {
+      trace->io_submit_ns = ReadTraceNowNanos();
+    }
     std::size_t output_offset = 0;
     for (std::size_t index = 0; index < location.extents->size(); ++index) {
       const ExtentRef& ref = location.extents->at(index);
-      BlockState* state = FindBlockState(store, ref.block_id);
-      if (state == nullptr || !state->allocated || state->freeing ||
-          state->kind != BlockKind::kValueExtent ||
-          state->allocation_epoch != ref.allocation_epoch) {
-        co_return Status(StatusCode::kInternal,
-                         "stale or missing external extent");
-      }
-      ++state->pins;
-      struct ExtentPin {
-        BlockState* state;
-        ~ExtentPin() { --state->pins; }
-      } pin{state};
-      const std::size_t read_bytes =
-          AlignDirect(kBlockHeaderBytes + ref.payload_bytes);
-      auto temp_acquired = co_await store.buffers.AcquireReadBuffer(read_bytes);
-      if (!temp_acquired.ok()) {
-        co_return temp_acquired.status();
-      }
-      ReadBufferLease temp = std::move(*temp_acquired);
-      FixedBuffer io = temp.io_buffer();
-      io.size = read_bytes;
-      const auto [file_id, block_offset] = FileOffset(ref.block_id);
-      if (trace != nullptr && index == 0) {
-        trace->io_submit_ns = ReadTraceNowNanos();
-      }
-      auto read = co_await ReadStorageBuffer(*store.worker,
-                                             store.files[file_id], io,
-                                             temp.registered(), block_offset);
-      if (!read.ok()) {
-        co_return read.status();
-      }
-      if (*read != read_bytes) {
-        co_return Status(StatusCode::kInternal, "short extent block read");
-      }
-      BlockHeader header{};
-      if (!DecodeBlockHeaderPages(
-              std::span<const std::byte, kBlockHeaderBytes>(
-                  io.data, kBlockHeaderBytes),
-              &header) ||
-          header.kind != BlockKind::kValueExtent ||
-          header.block_id != ref.block_id ||
-          header.allocation_epoch != ref.allocation_epoch ||
-          header.extent_index != index ||
-          header.extent_payload_bytes != ref.payload_bytes ||
-          header.extent_payload_checksum != ref.payload_checksum ||
-          output_offset + ref.payload_bytes > location.logical_size) {
+      if (output_offset + ref.payload_bytes > location.logical_size) {
         co_return Status(StatusCode::kInternal,
                          "extent header does not match manifest");
       }
-      const auto payload = std::span<const std::byte>(
-          io.data + kBlockHeaderBytes, ref.payload_bytes);
-      if (options_.verify_read_crc && Crc32c(payload) != ref.payload_checksum) {
+      // The manifest is held by the record's owner, but each extent block has
+      // its own owner, and after a worker-count change the two are unrelated.
+      // Hop to the block's owner exactly as LoadValue does for records.
+      const std::uint16_t owner = BlockOwner(ref.block_id);
+      if (owner >= worker_count_) {
         co_return Status(StatusCode::kInternal,
-                         "extent payload checksum mismatch");
+                         "stale or missing external extent");
       }
-      std::memcpy(destination.data + output_offset, payload.data(),
-                  payload.size());
-      output_offset += payload.size();
+      std::byte* target = destination.data + output_offset;
+      Status read =
+          owner == store.worker->id()
+              ? co_await ReadExtentInto(store, ref,
+                                        static_cast<std::uint32_t>(index),
+                                        target)
+              : co_await celer::SubmitTaskTo(
+                    owner,
+                    [this, owner, ref, index, target]() -> Task<Status> {
+                      co_return co_await ReadExtentInto(
+                          *stores_[owner], ref,
+                          static_cast<std::uint32_t>(index), target);
+                    });
+      if (!read.ok()) {
+        co_return read;
+      }
+      output_offset += ref.payload_bytes;
     }
     if (output_offset != location.logical_size) {
       co_return Status(StatusCode::kInternal,
@@ -4243,7 +4388,6 @@ class StorageEngine::Impl {
           payload_bytes);
       const std::uint32_t payload_checksum = Crc32c(payload);
       BlockState& state = CreateBlockState(store, reserved->block_id);
-      state = BlockState{};
       state.writer_id = store.worker->id();
       state.layout_worker_count = worker_count_;
       state.allocation_epoch = reserved->allocation_epoch;
@@ -4638,7 +4782,6 @@ class StorageEngine::Impl {
             .heap_buffer_size = options_.buffers.write_buffer_bytes,
         };
         BlockState& state = CreateBlockState(store, block_id);
-        state = BlockState{};
         state.writer_id = writer_id;
         state.layout_worker_count = worker_count_;
         state.allocation_epoch = active->allocation_epoch;
@@ -4870,7 +5013,13 @@ class StorageEngine::Impl {
       bool failed = false;
       {
         UnlockGuard guard(&store->writer_mutex, store->worker);
-        done = !store->flush_running && store->flush_queue.empty();
+        // Extent reclaims are detached and hop to whichever worker owns the
+        // device allocator, so one can still be mid-flight across workers
+        // here. Draining the flush queue is not enough: flush completion is
+        // itself what spawns them, and letting a worker tear down under one
+        // frees the coroutine frame it is running on.
+        done = !store->flush_running && store->flush_queue.empty() &&
+               active_extent_reclaims_.load(std::memory_order_acquire) == 0;
         failed = store->write_failed;
       }
       if (failed) {
@@ -5040,6 +5189,49 @@ class StorageEngine::Impl {
     co_return co_await ReclaimExtents(store, std::move(extents));
   }
 
+  // Retires one extent block. Runs on that block's owner, which after a
+  // worker-count change is unrelated to the owner of the manifest that
+  // referenced it. Reports whether the block became free.
+  Task<StatusOr<bool>> ReclaimExtentLocal(WorkerStore& store, ExtentRef ref) {
+    while (true) {
+      co_await store.writer_mutex.Lock();
+      BlockState* state = FindBlockState(store, ref.block_id);
+      if (state == nullptr || !state->allocated ||
+          state->allocation_epoch != ref.allocation_epoch) {
+        store.writer_mutex.Unlock(*store.worker);
+        co_return false;
+      }
+      if (state->kind != BlockKind::kValueExtent) {
+        store.writer_mutex.Unlock(*store.worker);
+        co_return Status(StatusCode::kInternal,
+                         "extent reclaim found a record block");
+      }
+      state->live_bytes = 0;
+      if (state->pins != 0 || state->freeing) {
+        store.writer_mutex.Unlock(*store.worker);
+        Status waited = co_await celer::SleepFor(
+            *store.worker, std::chrono::milliseconds(1));
+        if (!waited.ok()) {
+          co_return waited;
+        }
+        continue;
+      }
+      state->freeing = true;
+      store.writer_mutex.Unlock(*store.worker);
+
+      co_await store.writer_mutex.Lock();
+      BlockState* current = FindBlockState(store, ref.block_id);
+      bool freed = false;
+      if (current != nullptr &&
+          current->allocation_epoch == ref.allocation_epoch) {
+        DestroyBlockState(store, ref.block_id);
+        freed = true;
+      }
+      store.writer_mutex.Unlock(*store.worker);
+      co_return freed;
+    }
+  }
+
   Task<Status> ReclaimExtents(
       WorkerStore* store,
       std::shared_ptr<const std::vector<ExtentRef>> extents) {
@@ -5049,41 +5241,28 @@ class StorageEngine::Impl {
     std::vector<std::uint64_t> released;
     released.reserve(extents->size());
     for (const ExtentRef& ref : *extents) {
-      while (true) {
-        co_await store->writer_mutex.Lock();
-        BlockState* state = FindBlockState(*store, ref.block_id);
-        if (state == nullptr || !state->allocated ||
-            state->allocation_epoch != ref.allocation_epoch) {
-          store->writer_mutex.Unlock(*store->worker);
-          break;
-        }
-        if (state->kind != BlockKind::kValueExtent) {
-          store->writer_mutex.Unlock(*store->worker);
-          co_return Status(StatusCode::kInternal,
-                           "extent reclaim found a record block");
-        }
-        state->live_bytes = 0;
-        if (state->pins != 0 || state->freeing) {
-          store->writer_mutex.Unlock(*store->worker);
-          Status waited = co_await celer::SleepFor(
-              *store->worker, std::chrono::milliseconds(1));
-          if (!waited.ok()) {
-            co_return waited;
-          }
-          continue;
-        }
-        state->freeing = true;
-        store->writer_mutex.Unlock(*store->worker);
-
-        co_await store->writer_mutex.Lock();
-        BlockState* current = FindBlockState(*store, ref.block_id);
-        if (current != nullptr && current->allocation_epoch ==
-                                      ref.allocation_epoch) {
-          store->block_states.erase(ref.block_id);
-          released.push_back(ref.block_id);
-        }
-        store->writer_mutex.Unlock(*store->worker);
-        break;
+      // Retiring an extent means touching its BlockState, which only its owner
+      // may do. Looking it up locally instead used to find nothing and skip in
+      // silence, leaking every extent block that had drifted to another owner;
+      // nothing else reclaims them, since extent blocks are not defrag
+      // candidates.
+      const std::uint16_t owner = BlockOwner(ref.block_id);
+      if (owner >= worker_count_) {
+        continue;
+      }
+      StatusOr<bool> freed =
+          owner == store->worker->id()
+              ? co_await ReclaimExtentLocal(*store, ref)
+              : co_await celer::SubmitTaskTo(
+                    owner, [this, owner, ref]() -> Task<StatusOr<bool>> {
+                      co_return co_await ReclaimExtentLocal(*stores_[owner],
+                                                            ref);
+                    });
+      if (!freed.ok()) {
+        co_return freed.status();
+      }
+      if (*freed) {
+        released.push_back(ref.block_id);
       }
     }
     Status returned = co_await ReturnColdBlocks(std::move(released));
@@ -5852,7 +6031,7 @@ class StorageEngine::Impl {
     ::operator delete[](zero_buffer,
                         std::align_val_t(options_.buffers.alignment));
 
-    store.block_states.erase(block_id);
+    DestroyBlockState(store, block_id);
     co_return co_await ReturnReadyBlock(block_id);
   }
 
@@ -5860,6 +6039,15 @@ class StorageEngine::Impl {
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
+  // Which worker owns each block, by device and local block id. A record
+  // carries its block's owner in its index entry, but an extent reference has
+  // no such field, so this is how a worker holding a manifest finds the worker
+  // to dispatch to. Written only by the owner as it allocates or frees a
+  // block, read by anyone.
+  // One dense array per device, indexed by local block id less the device's
+  // data_block_begin. Shared across workers; each entry names its owner and
+  // only that worker touches anything but the owner field.
+  std::vector<std::vector<BlockState>> device_block_states_;
   std::vector<std::unique_ptr<DeviceAllocator>> device_allocators_;
   std::vector<std::size_t> defrag_reserve_blocks_;
   std::unique_ptr<std::atomic<unsigned>[]> active_defrags_by_device_;
