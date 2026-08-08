@@ -5560,8 +5560,18 @@ class StorageEngine::Impl {
           continue;
         }
         RecordLocation& current = identity.entry->value;
+        // The entry may no longer hold the version this identity was staged
+        // for. Matching on block and epoch alone was enough when a block
+        // flushed once: an overwrite necessarily landed in a different block.
+        // With block reuse an overwrite racing this flush lands in the same
+        // block above the snapshot boundary, and marking it flushed would
+        // send readers to disk pages that are still zero. Offsets within one
+        // allocation only grow, so the boundary check identifies stale
+        // versions exactly.
         if (current.block_id == pending->block_id &&
-            current.allocation_epoch == pending->allocation_epoch) {
+            current.allocation_epoch == pending->allocation_epoch &&
+            current.record_offset + current.total_disk_bytes <=
+                pending->committed_bytes) {
           current.in_memory = false;
         }
       }
