@@ -3851,18 +3851,21 @@ class StorageEngine::Impl {
                          "stale or missing external extent");
       }
       std::byte* target = destination.data + output_offset;
-      Status read =
-          owner == store.worker->id()
-              ? co_await ReadExtentInto(store, ref,
-                                        static_cast<std::uint32_t>(index),
-                                        target)
-              : co_await celer::SubmitTaskTo(
-                    owner,
-                    [this, owner, ref, index, target]() -> Task<Status> {
-                      co_return co_await ReadExtentInto(
-                          *stores_[owner], ref,
-                          static_cast<std::uint32_t>(index), target);
-                    });
+      // if/else, not ?:, to keep the two co_awaits in separate full
+      // expressions (GCC coroutine frame-slot aliasing).
+      Status read = Status::Ok();
+      if (owner == store.worker->id()) {
+        read = co_await ReadExtentInto(store, ref,
+                                       static_cast<std::uint32_t>(index),
+                                       target);
+      } else {
+        read = co_await celer::SubmitTaskTo(
+            owner, [this, owner, ref, index, target]() -> Task<Status> {
+              co_return co_await ReadExtentInto(
+                  *stores_[owner], ref, static_cast<std::uint32_t>(index),
+                  target);
+            });
+      }
       if (!read.ok()) {
         co_return read;
       }
@@ -5250,14 +5253,17 @@ class StorageEngine::Impl {
       if (owner >= worker_count_) {
         continue;
       }
-      StatusOr<bool> freed =
-          owner == store->worker->id()
-              ? co_await ReclaimExtentLocal(*store, ref)
-              : co_await celer::SubmitTaskTo(
-                    owner, [this, owner, ref]() -> Task<StatusOr<bool>> {
-                      co_return co_await ReclaimExtentLocal(*stores_[owner],
-                                                            ref);
-                    });
+      // if/else, not ?:, to keep the two co_awaits in separate full
+      // expressions (GCC coroutine frame-slot aliasing).
+      StatusOr<bool> freed = false;
+      if (owner == store->worker->id()) {
+        freed = co_await ReclaimExtentLocal(*store, ref);
+      } else {
+        freed = co_await celer::SubmitTaskTo(
+            owner, [this, owner, ref]() -> Task<StatusOr<bool>> {
+              co_return co_await ReclaimExtentLocal(*stores_[owner], ref);
+            });
+      }
       if (!freed.ok()) {
         co_return freed.status();
       }
@@ -5560,6 +5566,14 @@ class StorageEngine::Impl {
           continue;
         }
         RecordLocation& current = identity.entry->value;
+        // The entry may no longer hold the version this identity was staged
+        // for. Matching on block and epoch alone was enough when a block
+        // flushed once: an overwrite necessarily landed in a different block.
+        // With block reuse an overwrite racing this flush lands in the same
+        // block above the snapshot boundary, and marking it flushed would
+        // send readers to disk pages that are still zero. Offsets within one
+        // allocation only grow, so the boundary check identifies stale
+        // versions exactly.
         // The entry may no longer hold the version this identity was staged
         // for. Matching on block and epoch alone was enough when a block
         // flushed once: an overwrite necessarily landed in a different block.
