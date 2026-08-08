@@ -602,7 +602,14 @@ Task<Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
   // write failure fail-stops the allocator, so this block cannot be reused
   // in the ambiguous state.
   DestroyBlockState(store, block_id);
-  co_return co_await ReturnColdBlocks({block_id});
+  Status returned = co_await ReturnColdBlocks({block_id});
+  if (returned.ok()) {
+    // The source's cleared allocation bit is now durable while its stale
+    // records are still on disk — the exact window the relocation durability
+    // fence exists to protect. Crash-safety tests arm this point.
+    KEYLANE_MAYBE_CRASH_AT("defrag-source-retired");
+  }
+  co_return returned;
 }
 
 }  // namespace keylane::storage

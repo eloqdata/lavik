@@ -7,7 +7,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cerrno>
@@ -17,7 +16,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -268,6 +266,31 @@ class ServerProcess {
     pid_ = -1;
   }
 
+  // Waits for the server to exit on its own (an armed crash point) and
+  // returns its exit code.
+  int AwaitExit(std::chrono::seconds timeout) {
+    if (pid_ <= 0) {
+      Fail("no server process to await");
+    }
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      int status = 0;
+      const pid_t waited = ::waitpid(pid_, &status, WNOHANG);
+      if (waited == pid_) {
+        pid_ = -1;
+        if (!WIFEXITED(status)) {
+          Fail("Keylane terminated without an exit status");
+        }
+        return WEXITSTATUS(status);
+      }
+      if (waited < 0) {
+        Fail("waitpid failed");
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    Fail("Keylane did not exit before the deadline");
+  }
+
  private:
   pid_t pid_ = -1;
 };
@@ -369,24 +392,6 @@ bool BlockBitmapBitIsClear(const std::string& path,
           (1U << bit)) == 0;
 }
 
-bool BlockHeaderIsNonZero(const std::string& path, std::uint64_t block_id) {
-  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    Fail("failed to open data file while checking retired block header");
-  }
-  alignas(keylane::storage::kDirectIoAlignment)
-      std::array<std::byte, keylane::storage::kBlockHeaderBytes> header{};
-  const off_t offset = static_cast<off_t>(
-      keylane::storage::LocalBlockOffset(block_id));
-  const ssize_t read = ::pread(fd, header.data(), header.size(), offset);
-  ::close(fd);
-  if (read != static_cast<ssize_t>(header.size())) {
-    Fail("failed to read retired block header");
-  }
-  return std::any_of(header.begin(), header.end(),
-                     [](std::byte byte) { return byte != std::byte{0}; });
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -476,16 +481,19 @@ int main(int argc, char** argv) {
     }
 
     // A defrag relocation updates the in-memory index before its destination
-    // block is necessarily flushed. Keep periodic flush far away, wait until
-    // defrag has durably cleared an original source allocation bit, then crash
-    // immediately. Recovery must skip that stale source header and find every
-    // key through relocation records committed before the bitmap update.
+    // block is necessarily flushed. Keep periodic flush far away and arm the
+    // "defrag-source-retired" crash point: the server dies the instant a
+    // source block's cleared allocation bit becomes durable, with its stale
+    // records still on disk. Recovery must skip that stale source header and
+    // find every key through relocation records committed before the bitmap
+    // update.
     constexpr unsigned kDefragKeys = 12000;
     CreateDataFile(defrag_crash_path, 128ULL * 1024 * 1024);
-    std::vector<std::uint64_t> original_blocks;
     {
+      ::setenv("KEYLANE_CRASH_POINT", "defrag-source-retired", 1);
       ServerProcess server(argv[1], port, {defrag_crash_path}, log_path,
                            60000);
+      ::unsetenv("KEYLANE_CRASH_POINT");
       RespClient client = Connect(port);
       const std::string small_value(2000, 'd');
       for (unsigned i = 0; i < kDefragKeys; ++i) {
@@ -495,51 +503,52 @@ int main(int argc, char** argv) {
       }
 
       const auto scan_deadline = std::chrono::steady_clock::now() + 20s;
+      bool sources_durable = false;
       while (std::chrono::steady_clock::now() < scan_deadline) {
-        original_blocks = ReadAllocatedRecordBlocks(defrag_crash_path);
-        if (original_blocks.size() >= 2) {
+        if (ReadAllocatedRecordBlocks(defrag_crash_path).size() >= 2) {
+          sources_durable = true;
           break;
         }
         std::this_thread::sleep_for(10ms);
       }
-      if (original_blocks.size() < 2) {
+      if (!sources_durable) {
         Fail("initial record blocks did not become durable");
       }
 
       // Replace 80% of every original block's sequential key population. The
-      // original blocks fall well below the 50% live-ratio threshold, while
-      // the relocation destination remains partial with periodic flush
-      // disabled.
-      for (unsigned i = 0; i < kDefragKeys; ++i) {
-        if (i % 5 == 0) {
-          continue;
-        }
-        const std::string key = "defrag-crash-" + std::to_string(i);
-        Expect(client.Command({"SET", key, small_value}), "+OK",
-               "defrag crash overwrite SET");
-      }
-
-      std::optional<std::uint64_t> source_cleared;
-      const auto defrag_deadline = std::chrono::steady_clock::now() + 30s;
-      while (std::chrono::steady_clock::now() < defrag_deadline &&
-             !source_cleared.has_value()) {
-        for (const std::uint64_t block_id : original_blocks) {
-          if (BlockBitmapBitIsClear(defrag_crash_path, block_id)) {
-            source_cleared = block_id;
-            break;
+      // original blocks fall well below the 50% live-ratio threshold, defrag
+      // retires one of them, and the armed crash point fires — possibly
+      // while these writes are still in flight, so connection loss here is
+      // the expected outcome, not an error.
+      try {
+        for (unsigned i = 0; i < kDefragKeys; ++i) {
+          if (i % 5 == 0) {
+            continue;
           }
+          const std::string key = "defrag-crash-" + std::to_string(i);
+          Expect(client.Command({"SET", key, small_value}), "+OK",
+                 "defrag crash overwrite SET");
         }
-        if (!source_cleared.has_value()) {
-          std::this_thread::sleep_for(1ms);
-        }
+      } catch (const std::exception&) {
+        // The server died mid-write; AwaitExit verifies it was the armed
+        // crash point and not an accident.
       }
-      if (!source_cleared.has_value()) {
-        Fail("defrag did not clear an original source bitmap bit");
+      if (server.AwaitExit(60s) != 86) {
+        Fail("server did not die at the armed defrag crash point");
       }
-      if (!BlockHeaderIsNonZero(defrag_crash_path, *source_cleared)) {
-        Fail("defrag unexpectedly zeroed a retired source header");
+    }
+    // Post-mortem: the crash left at least one retired source block —
+    // allocation bit durably clear while its stale header is still on disk.
+    bool retired_source_found = false;
+    for (const std::uint64_t block_id :
+         ReadAllocatedRecordBlocks(defrag_crash_path)) {
+      if (BlockBitmapBitIsClear(defrag_crash_path, block_id)) {
+        retired_source_found = true;
+        break;
       }
-      server.Crash();
+    }
+    if (!retired_source_found) {
+      Fail("crash point fired without a durably retired source block");
     }
     {
       ServerProcess server(argv[1], port, {defrag_crash_path}, log_path);

@@ -20,6 +20,7 @@
 #include <charconv>
 #include <cerrno>
 #include <coroutine>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -100,6 +101,25 @@ inline bool IsNewer(const RecordLocation& candidate,
   }
   return false;
 }
+
+// Deterministic fault injection for crash-safety tests. Arming is naming the
+// point in the KEYLANE_CRASH_POINT environment variable; execution reaching
+// that point then kills the process on the spot — no flush, no destructors —
+// as if power had been cut, with exit code 86 so the test harness can tell a
+// fired crash point from an accidental death. Debug-only: NDEBUG builds
+// compile the whole mechanism away, so crash-safety scenarios must run
+// against a non-NDEBUG server binary.
+#ifndef NDEBUG
+inline void MaybeCrashAt(const char* point) noexcept {
+  static const char* const armed = std::getenv("KEYLANE_CRASH_POINT");
+  if (armed != nullptr && std::strcmp(armed, point) == 0) {
+    std::_Exit(86);
+  }
+}
+#define KEYLANE_MAYBE_CRASH_AT(point) ::keylane::storage::MaybeCrashAt(point)
+#else
+#define KEYLANE_MAYBE_CRASH_AT(point) ((void)0)
+#endif
 
 inline std::uint64_t UnixTimeMillis() noexcept {
   const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(
