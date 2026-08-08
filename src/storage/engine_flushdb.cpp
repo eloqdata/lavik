@@ -168,11 +168,11 @@ Task<Status> StorageEngine::Impl::ReclaimDetachedIndexes(WorkerStore& store) {
       // A block holds at most kStorageBlockBytes, so the sum still fits the
       // per-record width.
       assert(delta.bytes <= kStorageBlockBytes);
-      RecordLocation aggregate{
+      RetiredRecord aggregate{
           .block_id = block.first,
           .allocation_epoch = block.second,
-          .block_owner = delta.block_owner,
           .total_disk_bytes = static_cast<std::uint32_t>(delta.bytes),
+          .block_owner = delta.block_owner,
       };
       Status dead = co_await MarkRecordDead(aggregate);
       if (!dead.ok()) {

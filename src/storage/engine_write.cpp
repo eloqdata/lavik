@@ -285,11 +285,11 @@ void StorageEngine::Impl::ReleaseStagingBuffer(WorkerStore& store,
 }
 
 Status StorageEngine::Impl::MarkRecordDeadLocal(unsigned owner,
-                                                const RecordLocation& location) {
+                                                const RetiredRecord& record) {
   WorkerStore& store = *stores_[owner];
-  BlockState* state = FindBlockState(store, location.block_id);
+  BlockState* state = FindBlockState(store, record.block_id);
   if (state == nullptr || !state->allocated ||
-      state->allocation_epoch != location.allocation_epoch) {
+      state->allocation_epoch != record.allocation_epoch) {
     return Status(StatusCode::kInternal,
                   "stale block owner while invalidating record");
   }
@@ -299,25 +299,41 @@ Status StorageEngine::Impl::MarkRecordDeadLocal(unsigned owner,
   // reporting would drive live_bytes to zero while records are still
   // reachable, which CleanBlockLocked now reads as "nothing to salvage" and
   // frees without inspecting the block. Fail loudly rather than lose data.
-  if (state->live_bytes < location.total_disk_bytes) {
+  if (state->live_bytes < record.total_disk_bytes) {
     return Status(StatusCode::kInternal,
                   "block live-byte accounting underflow");
   }
-  state->live_bytes -= location.total_disk_bytes;
-  MaybeQueueDefrag(store, location.block_id);
+  state->live_bytes -= record.total_disk_bytes;
+  MaybeQueueDefrag(store, record.block_id);
   return Status::Ok();
 }
 
-Task<Status> StorageEngine::Impl::MarkRecordDead(const RecordLocation& location) {
-  assert(location.block_owner < worker_count_);
-  const unsigned owner = location.block_owner;
+Task<Status> StorageEngine::Impl::MarkRecordDead(const RetiredRecord& record) {
+  assert(record.block_owner < worker_count_);
+  const unsigned owner = record.block_owner;
   if (owner == celer::ThisWorker().id) {
-    co_return MarkRecordDeadLocal(owner, location);
+    co_return MarkRecordDeadLocal(owner, record);
   }
   co_return co_await celer::SubmitTo(
-      owner, [this, owner, location] {
-        return MarkRecordDeadLocal(owner, location);
+      owner, [this, owner, record] {
+        return MarkRecordDeadLocal(owner, record);
       });
+}
+
+Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
+    WorkerStore* store, std::vector<RetiredRecord> records) {
+  for (const RetiredRecord& record : records) {
+    Status dead = co_await MarkRecordDead(record);
+    if (!dead.ok()) {
+      // The inline path fails the client write on an accounting error; here
+      // there is no client left to tell, so fail-stop the writer the same way
+      // a flush IO error does.
+      spdlog::error("retiring superseded record failed: {}", dead.message());
+      store->write_failed = true;
+      co_return dead;
+    }
+  }
+  co_return Status::Ok();
 }
 
 Task<StatusOr<ReservedBlock>> StorageEngine::Impl::TakeStandaloneBlockLocked(
@@ -895,6 +911,10 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
           !for_defrag && previous.has_value() && previous->external
               ? previous->extents
               : nullptr,
+      .retired_record = !for_defrag && previous.has_value()
+                            ? std::optional<RetiredRecord>(
+                                  RetiredRecordOf(*previous))
+                            : std::nullopt,
       .index_generation = store.index_generations[db_id],
       .db_id = db_id,
   });
@@ -920,8 +940,16 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   staging_state->max_lsn = updated.max_lsn;
   state.live_bytes += location.total_disk_bytes;
   state.flush_queued = updated.committed_bytes == kStorageBlockBytes;
-  if (previous.has_value()) {
-    Status dead = co_await MarkRecordDead(*previous);
+  // A superseded record stays in its block's live_bytes until this record's
+  // flush completes (the RecordIdentity above carries it there): the old copy
+  // is the key's only durable version until then, and retiring it now lets
+  // its block reach zero and be durably freed ahead of the replacement — a
+  // crash in that window destroys data that had already been made durable.
+  // Defrag relocations keep the inline retirement: their source blocks are
+  // protected by RelocationDurabilityFence, and the defrag pass needs the
+  // decrement to observe the block emptying within the same pass.
+  if (for_defrag && previous.has_value()) {
+    Status dead = co_await MarkRecordDead(RetiredRecordOf(*previous));
     if (!dead.ok()) {
       store.write_failed = true;
       co_return dead;

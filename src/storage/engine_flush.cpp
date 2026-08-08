@@ -301,9 +301,16 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       co_return Status::Ok();
     }
 
+    // Every staged record in this snapshot is durable now (data pages and
+    // header both fdatasync'd above), so the versions they superseded are no
+    // longer anyone's durable copy and can leave their blocks' accounting.
+    std::vector<RetiredRecord> retired_records;
     for (const RecordIdentity& identity : pending->staged_records) {
       if (identity.retired_extents != nullptr) {
         SpawnExtentReclaim(*store, identity.retired_extents);
+      }
+      if (identity.retired_record.has_value()) {
+        retired_records.push_back(*identity.retired_record);
       }
       if (identity.entry == nullptr) {
         continue;
@@ -338,6 +345,11 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
               pending->committed_bytes) {
         current.in_memory = false;
       }
+    }
+
+    if (!retired_records.empty()) {
+      store->worker->Spawn(
+          MarkRetiredRecordsDead(store, std::move(retired_records)));
     }
 
     if (StagingSlot* slot = StagingFor(*store, *state); slot != nullptr) {

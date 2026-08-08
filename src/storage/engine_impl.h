@@ -322,6 +322,16 @@ struct RelocationDurabilityFence {
   std::uint32_t committed_bytes = 0;
 };
 
+// The accounting handle for a superseded record: enough to subtract it from
+// its block's live_bytes once its replacement no longer needs it as the
+// durable copy.
+struct RetiredRecord {
+  std::uint64_t block_id = 0;
+  std::uint64_t allocation_epoch = 0;
+  std::uint32_t total_disk_bytes = 0;
+  std::uint16_t block_owner = 0;
+};
+
 // Back-pointer from a block to the index entries staged in its write buffer, so
 // the flush completion can flip them to on-disk reads without re-hashing every
 // key. The entry can outlive the index that owns it: FLUSHDB detaches every
@@ -331,6 +341,12 @@ struct RelocationDurabilityFence {
 struct RecordIdentity {
   RecordIndex::Entry* entry = nullptr;
   std::shared_ptr<const std::vector<ExtentRef>> retired_extents;
+  // The version this record superseded. Retired only when this record's
+  // flush completes: until the replacement is durable, the old copy is the
+  // only durable version of the key, and subtracting it from live_bytes any
+  // earlier lets the block reach zero and be durably freed — a crash before
+  // the flush then loses a value that had already been made durable.
+  std::optional<RetiredRecord> retired_record;
   std::uint64_t index_generation = 0;
   std::uint8_t db_id = 0;
 };
@@ -1231,10 +1247,21 @@ class StorageEngine::Impl {
     return defrag_reserve_blocks_[device_index];
   }
 
-  Status MarkRecordDeadLocal(unsigned owner,
-                             const RecordLocation& location);
+  Status MarkRecordDeadLocal(unsigned owner, const RetiredRecord& record);
 
-  Task<Status> MarkRecordDead(const RecordLocation& location);
+  Task<Status> MarkRecordDead(const RetiredRecord& record);
+
+  Task<Status> MarkRetiredRecordsDead(WorkerStore* store,
+                                      std::vector<RetiredRecord> records);
+
+  static RetiredRecord RetiredRecordOf(const RecordLocation& location) {
+    return RetiredRecord{
+        .block_id = location.block_id,
+        .allocation_epoch = location.allocation_epoch,
+        .total_disk_bytes = location.total_disk_bytes,
+        .block_owner = location.block_owner,
+    };
+  }
 
   Task<StatusOr<ReservedBlock>> TakeStandaloneBlockLocked(
       WorkerStore& store);

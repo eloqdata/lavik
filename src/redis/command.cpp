@@ -1494,6 +1494,13 @@ void InitExecRun(ExecRunContext& run,
   }
 }
 
+// A hop that does nothing but acquire (and keep) every shard's holds, so the
+// coordinator can act at the transaction's position in the serial order
+// before running any command.
+Task<Status> ArmOnlyShardCallback(void*, const tx::ShardSlice&) {
+  co_return Status::Ok();
+}
+
 // One EXEC hop = one squashed run: every shard executes its keys of each
 // command in [begin, end) in queue order (same-key commands share an owner,
 // so their relative order is preserved). A command's failure is recorded and
@@ -1834,10 +1841,26 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         co_await DropWatches(ctx);
         co_return EncodedReply(EncodeError("ERR " + scheduled.message()));
       }
-      if (!ctx.watched.empty() && !co_await CheckConnectionWatches(ctx)) {
-        (void)co_await txn.Conclude();
-        co_await DropWatches(ctx);
-        co_return EncodedReply("*-1\r\n");
+      if (!ctx.watched.empty()) {
+        // Schedule only records a queue position; conflicting transactions
+        // ordered ahead of this EXEC have not necessarily run, and their
+        // writes would land after a check taken now. Run an empty hop first:
+        // it returns once every shard has this EXEC's holds, i.e. once
+        // everything serialized before it has committed, which is the point
+        // the watch check is defined at (and where the single-shard path
+        // already takes it).
+        Status armed = co_await txn.Execute(&ArmOnlyShardCallback, nullptr,
+                                            /*conclude=*/false);
+        if (!armed.ok()) {
+          (void)co_await txn.Conclude();
+          co_await DropWatches(ctx);
+          co_return EncodedReply(EncodeError("ERR " + armed.message()));
+        }
+        if (!co_await CheckConnectionWatches(ctx)) {
+          (void)co_await txn.Conclude();
+          co_await DropWatches(ctx);
+          co_return EncodedReply("*-1\r\n");
+        }
       }
       // Squashed execution: each hop covers a whole run of consecutive keyed
       // commands — every shard works its keys of every command in the run in
