@@ -19,8 +19,8 @@ class Transaction;
 //    coroutine's frame; Poll removes them from the queue before resuming, and
 //    the resumed coroutine owns holds via its Guard.
 //  - transaction entries (tx != nullptr): live in the Transaction's per-shard
-//    data; they stay queued (holding their position) until the transaction
-//    concludes, running one armed hop at a time.
+//    data; they stay queued (holding their position) until the transaction's
+//    release hop, running one armed hop at a time.
 struct TxWaiter {
   std::uint64_t txid = 0;
   std::span<const KeyRef> keys;  // each ref carries its database

@@ -248,13 +248,13 @@ Task<Status> Transaction::ExecuteSingleShard() {
   });
 }
 
-Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool conclude) {
+Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
   assert(!shards_.empty() && "Seal before Execute");
   cb_ = cb;
   cb_ctx_ = ctx;
-  concluding_ = conclude;
+  releasing_ = release;
   if (single_shard()) {
-    assert(conclude && "single-shard multi-hop lands with MULTI/EXEC");
+    assert(release && "single-shard multi-hop lands with MULTI/EXEC");
     co_return co_await ExecuteSingleShard();
   }
   assert(scheduled_ && "Schedule before Execute");
@@ -278,7 +278,7 @@ Task<Status> NoopShardCallback(void*, const ShardSlice&) {
 
 }  // namespace
 
-Task<Status> Transaction::Conclude() {
+Task<Status> Transaction::Release() {
   co_return co_await Execute(&NoopShardCallback, nullptr, true);
 }
 
@@ -290,7 +290,7 @@ Task<Status> RunShardHop(TxShard* shard, TxWaiter* node) {
   tx->SetShardStatus(node->shard_slot, std::move(status));
   // Non-suspending epilogue on the shard thread.
   node->running = false;
-  if (tx->concluding()) {
+  if (tx->releasing()) {
     shard->ReleaseHolds(node->keys);
     shard->ReleaseIntents(node->keys);
     node->holds_acquired = false;

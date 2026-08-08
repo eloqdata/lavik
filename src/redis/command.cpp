@@ -1366,7 +1366,7 @@ Task<Status> MultiKeyShardCallback(void* context,
 
 // DEL / EXISTS / MSET / MGET run as one transaction: every key locked up
 // front (across all owning shards), one hop where each shard works its
-// slice, locks released when the hop concludes.
+// slice, locks released when the hop completes.
 Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   const auto& args = request.args;
   auto keys = DetermineKeys(*request.spec, args.size());
@@ -1862,14 +1862,14 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         // the watch check is defined at (and where the single-shard path
         // already takes it).
         Status armed = co_await txn.Execute(&ArmOnlyShardCallback, nullptr,
-                                            /*conclude=*/false);
+                                            /*release=*/false);
         if (!armed.ok()) {
-          (void)co_await txn.Conclude();
+          (void)co_await txn.Release();
           co_await DropWatches(ctx);
           co_return EncodedReply(EncodeError("ERR " + armed.message()));
         }
         if (!co_await CheckConnectionWatches(ctx)) {
-          (void)co_await txn.Conclude();
+          (void)co_await txn.Release();
           co_await DropWatches(ctx);
           co_return EncodedReply("*-1\r\n");
         }
@@ -1897,7 +1897,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         ExecRunContext run;
         InitExecRun(run, queued, cmd_keys, replies, i, end);
         Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
-                                          /*conclude=*/false);
+                                          /*release=*/false);
         if (!hop.ok()) {
           for (std::size_t j = i; j < end; ++j) {
             replies[j] = EncodeStorageError(hop);
@@ -1907,14 +1907,14 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         }
         i = end;
       }
-      Status concluded = co_await txn.Conclude();
-      if (!concluded.ok()) {
-        // Defensive: the no-op conclude hop cannot fail today. If it ever
+      Status released = co_await txn.Release();
+      if (!released.ok()) {
+        // Defensive: the no-op release hop cannot fail today. If it ever
         // can, the watches must still be consumed — EXEC ends them whatever
         // its outcome, and stale entries would falsely abort every later
         // EXEC on this connection.
         co_await DropWatches(ctx);
-        co_return EncodedReply(EncodeError("ERR " + concluded.message()));
+        co_return EncodedReply(EncodeError("ERR " + released.message()));
       }
     }
   } else {

@@ -43,7 +43,7 @@ using ShardCallback = celer::Task<celer::Status> (*)(void* ctx,
 
 // A multi-key transaction, embedded in the coordinator coroutine's frame.
 //
-// Lifecycle: Begin -> AddKey... -> Seal -> [Schedule ->] Execute(conclude).
+// Lifecycle: Begin -> AddKey... -> Seal -> [Schedule ->] Execute(release).
 // Single-shard transactions skip Schedule entirely: Execute hops to the
 // owner and takes the fast-path key-set guard there, never touching the
 // global txid counter. Multi-shard transactions draw a txid, run a schedule
@@ -75,16 +75,16 @@ class Transaction {
   // Multi-shard only; no-op for single-shard transactions.
   celer::Task<celer::Status> Schedule();
 
-  // Runs `cb` on every shard's slice. `conclude` releases all locks and
-  // queue positions once the hop completes. Single-shard transactions
-  // currently require conclude == true (multi-hop lands with MULTI/EXEC).
+  // Runs `cb` on every shard's slice. `release` drops all locks and queue
+  // positions once the hop completes. Single-shard transactions currently
+  // require release == true (multi-hop lands with MULTI/EXEC).
   celer::Task<celer::Status> Execute(ShardCallback cb, void* ctx,
-                                     bool conclude);
+                                     bool release);
 
   // Final no-op hop that releases every shard's locks and queue position.
-  celer::Task<celer::Status> Conclude();
+  celer::Task<celer::Status> Release();
 
-  bool concluding() const { return concluding_; }
+  bool releasing() const { return releasing_; }
 
   // Shard-side entry points (shard thread only).
   celer::Task<celer::Status> InvokeCallback(std::uint16_t shard_slot);
@@ -137,7 +137,7 @@ class Transaction {
   ShardSlice Slice(const ShardData& sd) const;
   celer::Task<celer::Status> ExecuteSingleShard();
 
-  bool concluding_ = false;
+  bool releasing_ = false;
   bool scheduled_ = false;
   std::uint64_t txid_ = 0;
   ShardCallback cb_ = nullptr;

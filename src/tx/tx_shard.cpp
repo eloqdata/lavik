@@ -25,7 +25,7 @@ void TxShard::Poll() {
     }
     if (head->tx != nullptr) {
       // Transaction entry: stays queued (holding its position) until the
-      // transaction concludes; runs one armed hop at a time. Holds are
+      // transaction's release hop; runs one armed hop at a time. Holds are
       // acquired once and retained across hops.
       if (head->running || !head->armed) {
         break;

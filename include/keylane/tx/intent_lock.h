@@ -13,7 +13,7 @@ namespace keylane::tx {
 // run on the owning worker thread in non-suspending sections — no atomics.
 //
 // Two counter layers per fingerprint:
-//  - intents: recorded from scheduling until the transaction concludes.
+//  - intents: recorded from scheduling until the transaction's release hop.
 //    AcquireIntent never blocks; it records the intent and reports whether it
 //    was granted (sole/compatible owner). Intents arbitrate scheduling: a
 //    fully-granted transaction may run immediately, anything else queues.
