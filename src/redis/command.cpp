@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1416,110 +1418,177 @@ struct ExecKey {
   std::uint8_t db = 0;
 };
 
-struct ExecContext {
+// One squashed run of consecutive keyed commands [begin, end): every shard
+// executes its keys of every command in queue order within a single hop.
+// Sinks are per command (indexed by i - begin); shards write disjoint reply
+// slots, per-command atomic counters, and record rare per-command errors
+// under a mutex.
+struct ExecRunContext {
   const std::vector<CommandRequest>* queued = nullptr;
   const std::vector<std::vector<ExecKey>>* cmd_keys = nullptr;
   std::vector<std::string>* replies = nullptr;
-  std::vector<std::optional<std::string>> mget;
-  std::atomic<long long> counter{0};
-  std::size_t current = 0;
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  std::vector<std::vector<std::optional<std::string>>> mget;
+  std::unique_ptr<std::atomic<long long>[]> counters;
+  std::mutex error_mutex;
+  std::vector<Status> errors;
 };
 
-std::string AssembleMultiKeyReply(CommandKind kind, const ExecContext& ctx,
-                                  const Status& ran) {
-  if (!ran.ok()) {
-    return EncodeStorageError(ran);
-  }
-  switch (kind) {
-    case CommandKind::kMSet:
-      return EncodeSimpleString("OK");
-    case CommandKind::kMGet: {
-      std::string reply = "*" + std::to_string(ctx.mget.size()) + "\r\n";
-      for (const auto& frame : ctx.mget) {
-        reply += frame.has_value() ? *frame : "$-1\r\n";
-      }
-      return reply;
+// Builds the replies of a completed run from its per-command sinks.
+// Single-key commands already wrote their slots on the owning shard.
+void AssembleRunReplies(ExecRunContext& run) {
+  for (std::size_t i = run.begin; i < run.end; ++i) {
+    const std::size_t local = i - run.begin;
+    if (!run.errors[local].ok()) {
+      (*run.replies)[i] = EncodeStorageError(run.errors[local]);
+      continue;
     }
-    default:
-      return EncodeInteger(ctx.counter.load(std::memory_order_relaxed));
+    switch ((*run.queued)[i].kind) {
+      case CommandKind::kMSet:
+        (*run.replies)[i] = EncodeSimpleString("OK");
+        break;
+      case CommandKind::kMGet: {
+        std::string reply =
+            "*" + std::to_string(run.mget[local].size()) + "\r\n";
+        for (const auto& frame : run.mget[local]) {
+          reply += frame.has_value() ? *frame : "$-1\r\n";
+        }
+        (*run.replies)[i] = std::move(reply);
+        break;
+      }
+      case CommandKind::kDel:
+      case CommandKind::kExists:
+        (*run.replies)[i] = EncodeInteger(
+            run.counters[local].load(std::memory_order_relaxed));
+        break;
+      default:
+        break;
+    }
   }
 }
 
-// One EXEC hop = one queued command: every shard runs the slice of that
-// command it owns; shards that own none of its keys no-op.
-Task<Status> ExecShardCallback(void* context, const tx::ShardSlice& slice) {
-  auto* ctx = static_cast<ExecContext*>(context);
-  const CommandRequest& cmd = (*ctx->queued)[ctx->current];
-  const auto& args = cmd.args;
-  const unsigned self = ThisWorker().id;
-  if (cmd.kind == CommandKind::kMGet) {
-    std::size_t mine = 0;
-    for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
-      mine += key.owner == self ? 1 : 0;
-    }
-    if (mine > 1) {
-      ShardReadJoin join;
-      join.pending = mine;
-      for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
-        if (key.owner == self) {
-          SpawnOnCurrentWorker(ReadFrameIntoSlot(cmd.db_id, &args[key.arg],
-                                                 key.digest,
-                                                 &ctx->mget[key.slot], &join));
-        }
-      }
-      co_await join.Join();
-      co_return join.error;
+// Prepares the sinks of one squashed run over [begin, end).
+void InitExecRun(ExecRunContext& run,
+                 const std::vector<CommandRequest>& queued,
+                 const std::vector<std::vector<ExecKey>>& cmd_keys,
+                 std::vector<std::string>& replies, std::size_t begin,
+                 std::size_t end) {
+  run.queued = &queued;
+  run.cmd_keys = &cmd_keys;
+  run.replies = &replies;
+  run.begin = begin;
+  run.end = end;
+  const std::size_t count = end - begin;
+  run.counters = std::make_unique<std::atomic<long long>[]>(count);
+  run.errors.assign(count, Status::Ok());
+  run.mget.resize(count);
+  for (std::size_t i = begin; i < end; ++i) {
+    if (queued[i].kind == CommandKind::kMGet) {
+      run.mget[i - begin].assign(cmd_keys[i].size(), std::nullopt);
     }
   }
-  for (const ExecKey& key : (*ctx->cmd_keys)[ctx->current]) {
-    if (key.owner != self) {
-      continue;
+}
+
+// One EXEC hop = one squashed run: every shard executes its keys of each
+// command in [begin, end) in queue order (same-key commands share an owner,
+// so their relative order is preserved). A command's failure is recorded and
+// the remaining commands still run, matching Redis's continue-on-error
+// transaction semantics.
+Task<Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
+  auto* ctx = static_cast<ExecRunContext*>(context);
+  const unsigned self = ThisWorker().id;
+  for (std::size_t i = ctx->begin; i < ctx->end; ++i) {
+    const CommandRequest& cmd = (*ctx->queued)[i];
+    const auto& args = cmd.args;
+    const auto& keys = (*ctx->cmd_keys)[i];
+    const std::size_t local = i - ctx->begin;
+    auto record_error = [&](Status status) {
+      std::lock_guard<std::mutex> lock(ctx->error_mutex);
+      if (ctx->errors[local].ok()) {
+        ctx->errors[local] = std::move(status);
+      }
+    };
+
+    if (cmd.kind == CommandKind::kMGet) {
+      std::size_t mine = 0;
+      for (const ExecKey& key : keys) {
+        mine += key.owner == self ? 1 : 0;
+      }
+      if (mine > 1) {
+        ShardReadJoin join;
+        join.pending = mine;
+        for (const ExecKey& key : keys) {
+          if (key.owner == self) {
+            SpawnOnCurrentWorker(ReadFrameIntoSlot(
+                cmd.db_id, &args[key.arg], key.digest,
+                &ctx->mget[local][key.slot], &join));
+          }
+        }
+        co_await join.Join();
+        if (!join.error.ok()) {
+          record_error(std::move(join.error));
+        }
+        continue;
+      }
     }
-    switch (cmd.kind) {
-      case CommandKind::kMSet: {
-        auto result = co_await g_storage->SetLocked(
-            cmd.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
-        if (!result.ok()) {
-          co_return result.status();
-        }
-        break;
+
+    for (const ExecKey& key : keys) {
+      if (key.owner != self) {
+        continue;
       }
-      case CommandKind::kMGet: {
-        auto value = co_await g_storage->GetLocked(cmd.db_id, args[key.arg],
-                                                   key.digest);
-        if (value.ok()) {
-          const auto bytes = value->network_bytes();
-          ctx->mget[key.slot].emplace(
-              reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        } else if (value.status().code() != StatusCode::kNotFound) {
-          co_return value.status();
+      bool command_failed = false;
+      switch (cmd.kind) {
+        case CommandKind::kMSet: {
+          auto result = co_await g_storage->SetLocked(
+              cmd.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
+          if (!result.ok()) {
+            record_error(result.status());
+            command_failed = true;
+          }
+          break;
         }
-        break;
+        case CommandKind::kMGet: {
+          auto value = co_await g_storage->GetLocked(cmd.db_id, args[key.arg],
+                                                     key.digest);
+          if (value.ok()) {
+            const auto bytes = value->network_bytes();
+            ctx->mget[local][key.slot].emplace(
+                reinterpret_cast<const char*>(bytes.data()), bytes.size());
+          } else if (value.status().code() != StatusCode::kNotFound) {
+            record_error(value.status());
+            command_failed = true;
+          }
+          break;
+        }
+        case CommandKind::kDel: {
+          auto deleted = co_await g_storage->DeleteLocked(
+              cmd.db_id, args[key.arg], key.digest);
+          if (!deleted.ok()) {
+            record_error(deleted.status());
+            command_failed = true;
+          } else if (*deleted) {
+            ctx->counters[local].fetch_add(1, std::memory_order_relaxed);
+          }
+          break;
+        }
+        case CommandKind::kExists: {
+          if (co_await g_storage->ExistsLocked(cmd.db_id, args[key.arg],
+                                               key.digest)) {
+            ctx->counters[local].fetch_add(1, std::memory_order_relaxed);
+          }
+          break;
+        }
+        default:
+          // Single-key command: the sole owner runs the full body and writes
+          // the reply slot directly (errors self-encode).
+          (*ctx->replies)[i] =
+              co_await RunSingleKeyLocked(cmd.db_id, cmd, key.digest);
+          break;
       }
-      case CommandKind::kDel: {
-        auto deleted = co_await g_storage->DeleteLocked(
-            cmd.db_id, args[key.arg], key.digest);
-        if (!deleted.ok()) {
-          co_return deleted.status();
-        }
-        if (*deleted) {
-          ctx->counter.fetch_add(1, std::memory_order_relaxed);
-        }
-        break;
+      if (command_failed) {
+        break;  // abandon this command's remaining keys; run the next one
       }
-      case CommandKind::kExists: {
-        if (co_await g_storage->ExistsLocked(cmd.db_id, args[key.arg],
-                                             key.digest)) {
-          ctx->counter.fetch_add(1, std::memory_order_relaxed);
-        }
-        break;
-      }
-      default:
-        // Single-key command: the sole owner runs the full body and writes
-        // the reply slot directly.
-        (*ctx->replies)[ctx->current] =
-            co_await RunSingleKeyLocked(cmd.db_id, cmd, key.digest);
-        break;
     }
   }
   co_return Status::Ok();
@@ -1715,7 +1784,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
               watch_aborted = true;
               co_return Status::Ok();
             }
-            for (std::size_t i = 0; i < queued.size(); ++i) {
+            std::size_t i = 0;
+            while (i < queued.size()) {
               const CommandRequest& cmd = queued[i];
               if (cmd_keys[i].empty()) {
                 if (cmd.kind == CommandKind::kInfo) {
@@ -1723,31 +1793,19 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
                 } else {
                   replies[i] = run_keyless(cmd);
                 }
+                ++i;
                 continue;
               }
-              switch (cmd.kind) {
-                case CommandKind::kMSet:
-                case CommandKind::kMGet:
-                case CommandKind::kDel:
-                case CommandKind::kExists: {
-                  ExecContext exec_ctx;
-                  exec_ctx.queued = &queued;
-                  exec_ctx.cmd_keys = &cmd_keys;
-                  exec_ctx.replies = &replies;
-                  exec_ctx.current = i;
-                  exec_ctx.mget.assign(
-                      cmd.kind == CommandKind::kMGet ? cmd_keys[i].size() : 0,
-                      std::nullopt);
-                  Status ran = co_await ExecShardCallback(
-                      &exec_ctx, tx::ShardSlice{.keys = {}});
-                  replies[i] = AssembleMultiKeyReply(cmd.kind, exec_ctx, ran);
-                  break;
-                }
-                default:
-                  replies[i] = co_await RunSingleKeyLocked(
-                      cmd.db_id, cmd, cmd_keys[i].front().digest);
-                  break;
+              std::size_t end = i + 1;
+              while (end < queued.size() && !cmd_keys[end].empty()) {
+                ++end;
               }
+              ExecRunContext run;
+              InitExecRun(run, queued, cmd_keys, replies, i, end);
+              (void)co_await ExecRunShardCallback(&run,
+                                                  tx::ShardSlice{.keys = {}});
+              AssembleRunReplies(run);
+              i = end;
             }
             co_return Status::Ok();
           });
@@ -1777,17 +1835,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         co_await DropWatches(ctx);
         co_return EncodedReply("*-1\r\n");
       }
-      // TODO(squashing): batch runs of squashable commands by shard into one
-      // hop instead of one hop per command. Safe because queued commands
-      // cannot reference earlier replies, same-key commands land on the same
-      // shard (preserving order inside its sub-list), and replies fill
-      // position slots; segment at commands with intra-command cross-shard
-      // data flow. Conditions worked out in docs/vll-design.md.
-      ExecContext exec_ctx;
-      exec_ctx.queued = &queued;
-      exec_ctx.cmd_keys = &cmd_keys;
-      exec_ctx.replies = &replies;
-      for (std::size_t i = 0; i < queued.size(); ++i) {
+      // Squashed execution: each hop covers a whole run of consecutive keyed
+      // commands — every shard works its keys of every command in the run in
+      // queue order. Keyless commands break runs, preserving their position
+      // in the serial order.
+      std::size_t i = 0;
+      while (i < queued.size()) {
         const CommandRequest& cmd = queued[i];
         if (cmd_keys[i].empty()) {
           if (cmd.kind == CommandKind::kInfo) {
@@ -1795,28 +1848,25 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
           } else {
             replies[i] = run_keyless(cmd);
           }
+          ++i;
           continue;
         }
-        exec_ctx.current = i;
-        exec_ctx.counter.store(0, std::memory_order_relaxed);
-        exec_ctx.mget.assign(
-            cmd.kind == CommandKind::kMGet ? cmd_keys[i].size() : 0,
-            std::nullopt);
-        Status ran = co_await txn.Execute(&ExecShardCallback, &exec_ctx,
-                                         /*conclude=*/false);
-        switch (cmd.kind) {
-          case CommandKind::kMSet:
-          case CommandKind::kMGet:
-          case CommandKind::kDel:
-          case CommandKind::kExists:
-            replies[i] = AssembleMultiKeyReply(cmd.kind, exec_ctx, ran);
-            break;
-          default:
-            if (!ran.ok()) {
-              replies[i] = EncodeStorageError(ran);
-            }
-            break;
+        std::size_t end = i + 1;
+        while (end < queued.size() && !cmd_keys[end].empty()) {
+          ++end;
         }
+        ExecRunContext run;
+        InitExecRun(run, queued, cmd_keys, replies, i, end);
+        Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
+                                          /*conclude=*/false);
+        if (!hop.ok()) {
+          for (std::size_t j = i; j < end; ++j) {
+            replies[j] = EncodeStorageError(hop);
+          }
+        } else {
+          AssembleRunReplies(run);
+        }
+        i = end;
       }
       Status concluded = co_await txn.Conclude();
       if (!concluded.ok()) {
