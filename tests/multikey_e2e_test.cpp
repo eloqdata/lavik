@@ -398,6 +398,20 @@ int main(int argc, char** argv) {
     expect_members(client.Command({"KEYS", "other"}), 1, {"other"},
                    "KEYS exact");
 
+    // Full Redis glob: character classes, ranges, negation, and escapes.
+    expect_members(client.Command({"KEYS", "kx:[12]"}), 2, {"kx:1", "kx:2"},
+                   "KEYS char class");
+    expect_members(client.Command({"KEYS", "kx:[1-2]"}), 2, {"kx:1", "kx:2"},
+                   "KEYS class range");
+    expect_members(client.Command({"KEYS", "kx:[^1]"}), 2, {"kx:2", "kx:3"},
+                   "KEYS negated class");
+    Expect(client.Command({"SET", "lit*eral", "x"}), "+OK", "escape seed");
+    expect_members(client.Command({"KEYS", "lit\\*eral"}), 1, {"lit*eral"},
+                   "KEYS escaped star");
+    Expect(client.Command({"KEYS", "lit\\?eral"}), "*0",
+           "KEYS escaped question mark");
+    Expect(client.Command({"DEL", "lit*eral"}), ":1", "escape cleanup");
+
     // Streaming stays bounded: several hundred keys still arrive with an
     // exact element count.
     std::vector<std::string> volume_storage;
@@ -448,6 +462,26 @@ int main(int argc, char** argv) {
     }
     if (scan_all("hash").find("kx:") != std::string::npos) {
       Fail("SCAN TYPE hash returned string keys");
+    }
+
+    // SCAN MATCH speaks the same glob dialect.
+    {
+      std::string collected;
+      std::string cursor = "0";
+      do {
+        const std::string reply = client.Command(
+            {"SCAN", cursor, "MATCH", "kx:[13]", "COUNT", "100000"});
+        const std::size_t cursor_start = reply.find("\r\n") + 2;
+        const std::size_t digits = reply.find("\r\n", cursor_start) + 2;
+        const std::size_t digits_end = reply.find("\r\n", digits);
+        cursor = reply.substr(digits, digits_end - digits);
+        collected += reply.substr(digits_end);
+      } while (cursor != "0");
+      if (collected.find("kx:1") == std::string::npos ||
+          collected.find("kx:3") == std::string::npos ||
+          collected.find("kx:2") != std::string::npos) {
+        Fail("SCAN MATCH character class mismatch: " + collected);
+      }
     }
 
     server.Stop();
