@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <csignal>
 #include <cstdint>
@@ -9,6 +10,7 @@
 #include <atomic>
 #include <poll.h>
 #include <span>
+#include <sys/socket.h>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -431,6 +433,44 @@ Task<Status> RedisService::Serve(TcpStream stream) {
   co_return status;
 }
 
+// A gate-holding streamed reply (KEYS) is paced by the peer: a client that
+// stops reading parks the chunk write in io_uring indefinitely while the
+// database gate stays closed and graceful shutdown cannot drain. Redis
+// bounds the analogous exposure with client output-buffer limits that
+// disconnect the offender; the streaming equivalent is a stall deadline —
+// no forward progress on the socket for this long ends the connection.
+constexpr auto kStreamStallLimit = std::chrono::seconds(30);
+
+struct StreamStallState {
+  std::chrono::steady_clock::time_point last_progress;
+  bool done = false;  // same-worker access only
+};
+
+// Watchdog for one streamed reply. shutdown() rather than close: it fails
+// the parked write immediately without releasing the descriptor out from
+// under the pending io_uring operation, and the serve loop's normal
+// teardown then reopens the gate and closes the socket.
+Task<Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
+                                int fd) {
+  while (!state->done) {
+    const auto deadline = state->last_progress + kStreamStallLimit;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      ::shutdown(fd, SHUT_RDWR);
+      co_return Status::Ok();
+    }
+    Status slept = co_await celer::SleepFor(
+        *ThisWorker().self,
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                              now) +
+            std::chrono::milliseconds(1));
+    if (!slept.ok()) {
+      co_return slept;  // worker shutting down
+    }
+  }
+  co_return Status::Ok();
+}
+
 Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
   std::string pending;
 
@@ -476,6 +516,26 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
       ctx.selected_db = *reply.selected_db;
     }
 
+    // Streamed replies hold the database gate at the peer's pace; arm the
+    // stall watchdog for the whole stream, header included. The scope guard
+    // retires it on every exit path, including error co_returns.
+    std::shared_ptr<StreamStallState> stall;
+    struct RetireStall {
+      std::shared_ptr<StreamStallState> state;
+      ~RetireStall() {
+        if (state != nullptr) {
+          state->done = true;
+        }
+      }
+    } retire_stall;
+    if (reply.chunks) {
+      stall = std::make_shared<StreamStallState>();
+      stall->last_progress = std::chrono::steady_clock::now();
+      retire_stall.state = stall;
+      ThisWorker().self->Spawn(
+          BreakStalledStream(stall, stream.NativeFd()));
+    }
+
     Status write_status;
     if (reply.read_trace.request_start_ns != 0) {
       reply.read_trace.send_start_ns = ReadTraceNowNanos();
@@ -492,6 +552,9 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
     // The reply header already committed the element count, so a chunk
     // failure can only end the connection.
     while (write_status.ok() && reply.chunks) {
+      if (stall != nullptr) {
+        stall->last_progress = std::chrono::steady_clock::now();
+      }
       auto chunk = co_await reply.chunks();
       if (!chunk.ok()) {
         co_return chunk.status();
