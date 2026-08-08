@@ -214,6 +214,25 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   co_return next_epoch;
 }
 
+// TODO(replication): the epoch is validated only here at entry, but the loop
+// below suspends repeatedly (key lock, writer_mutex, extent IO, and
+// AdvanceDbEpoch's reclaim wait in the kFlushDb branch), and a handler whose
+// connection died is not cancelled. A reconnecting session's
+// ResetReplicaPartition can run inside such a gap; the stale handler then
+// resumes and keeps writing its old batch, stamped with the post-reset
+// replication_epoch (WriteRecordLocked reads it at write time), overriding
+// the reset tombstones — the replica keeps a key the primary deleted, and no
+// future delta ever corrects it. Design pending: re-validate the epoch after
+// every suspension point (including inside WriteRecordLocked's standby wait,
+// via the defrag-style expected-version handoff), or serialize per-partition
+// application across sessions.
+//
+// TODO(replication): this path applies records without capturing deltas, and
+// CatchUp advances the acknowledged watermark on empty batches, so a node
+// that is both a replica and a source (A -> B -> C) silently forwards nothing
+// after the snapshot baseline: C reports in-sync while diverging forever.
+// Until cascading is designed, the option parser should reject running with
+// --replication-port and --replicate-to at the same time.
 Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {
