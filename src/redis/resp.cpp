@@ -16,16 +16,32 @@ constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 RespParseResult ParseRespCommand(std::string_view input) {
   RespParseResult result;
 
-  // An empty line is a command that does nothing, and clients rely on it:
-  // redis-cli --pipe sends a bare CRLF to terminate any half-written command
-  // before its final handshake. Consume it silently instead of failing the
-  // connection, which would strand every command the client sends afterwards.
-  std::size_t blank = 0;
-  while (blank < input.size() &&
-         (input[blank] == '\r' || input[blank] == '\n')) {
-    ++blank;
+  // An empty multibulk (*0\r\n) is likewise a command that does nothing:
+  // real Redis consumes it without sending anything back, and replying (even
+  // an error) would shift the client's request/reply pairing off by one for
+  // the rest of the connection. Skip them iteratively, interleaved with the
+  // blank lines below.
+  std::size_t skipped = 0;
+  for (;;) {
+    // An empty line is a command that does nothing, and clients rely on it:
+    // redis-cli --pipe sends a bare CRLF to terminate any half-written
+    // command before its final handshake. Consume it silently instead of
+    // failing the connection, which would strand every command the client
+    // sends afterwards.
+    std::size_t leading = 0;
+    while (leading < input.size() &&
+           (input[leading] == '\r' || input[leading] == '\n')) {
+      ++leading;
+    }
+    input.remove_prefix(leading);
+    skipped += leading;
+    if (input.size() >= 4 && input.substr(0, 4) == "*0\r\n") {
+      input.remove_prefix(4);
+      skipped += 4;
+      continue;
+    }
+    break;
   }
-  input.remove_prefix(blank);
 
   if (input.empty() || input.front() != '*') {
     if (!input.empty()) {
@@ -103,7 +119,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
   }
 
   result.state = RespParseState::kOk;
-  result.consumed = blank + pos;
+  result.consumed = skipped + pos;
   return result;
 }
 

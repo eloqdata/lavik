@@ -233,6 +233,15 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 // after the snapshot baseline: C reports in-sync while diverging forever.
 // Until cascading is designed, the option parser should reject running with
 // --replication-port and --replicate-to at the same time.
+//
+// TODO(replication): this path also bypasses the command layer's database
+// gates (file-static in command.cpp), which KEYS and FLUSHDB close to get an
+// exclusive, still keyspace. On a replica, apply traffic keeps mutating the
+// index between KEYS's counting and emitting passes — the announced *N can
+// disagree with the emitted element count, desynchronizing that client's
+// RESP stream — and FLUSHDB's drain-then-detach exclusivity assumption does
+// not hold either. The redesign should either route apply through the gates
+// or pause application while a gated operation is in flight.
 Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {
