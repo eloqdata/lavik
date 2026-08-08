@@ -380,6 +380,13 @@ Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 }
 
 Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
+  // Hard ceiling on one connection's accumulated request bytes. The per-frame
+  // limits (1024 args of up to 512 MiB each) still admit a claimed frame far
+  // larger than RAM, and the buffer grows until the frame completes — without
+  // a cap, one client streaming an oversized frame runs the process out of
+  // memory. 1 GiB matches Redis's query buffer limit and comfortably fits
+  // any legitimate command.
+  constexpr std::size_t kMaxPendingBytes = 1ULL * 1024 * 1024 * 1024;
   std::array<std::byte, 4096> buffer{};
   while (true) {
     RespParseResult parsed = ParseRespCommand(*pending);
@@ -390,6 +397,10 @@ Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pend
     }
     if (parsed.state == RespParseState::kError) {
       co_return parsed.status;
+    }
+    if (pending->size() >= kMaxPendingBytes) {
+      co_return Status(StatusCode::kResourceExhausted,
+                       "client request exceeds the query buffer limit");
     }
 
     auto read_result = co_await stream.ReadSome(buffer);

@@ -72,13 +72,13 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
   while (true) {
     std::optional<PendingFlush> pending;
-    auto release_pending = [&](const PendingFlush& block) {
-      if (block.write_buffer_id != 0) {
-        store->buffers.ReleaseWriteBuffer(block.write_buffer_id);
-      } else if (block.heap_data != nullptr) {
-        store->buffers.ReleaseHeapWriteBuffer(block.heap_data);
-      }
-    };
+    // On any failure below, the staging buffer deliberately stays with its
+    // slot: the block's staging_slot and in_memory still reference it, so
+    // handing it back to the pool would let another writer reacquire memory
+    // that staged readers are still following (and the heap path would
+    // accept the same pointer twice). write_failed fail-stops the writer, so
+    // the buffer simply remains owned by the slot — staged reads keep
+    // working — until shutdown.
 
     {
       co_await store->writer_mutex.Lock();
@@ -103,7 +103,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // Readers do not hold this flush up. It writes only the padding above
       // committed_bytes and a header slot, neither of which a record read
       // touches; it never frees the staging buffer, which the completion
-      // path below defers behind release_pending; and it never erases the
+      // path below defers behind release_pending flags; it never erases the
       // BlockState, which is what pins actually keep alive. Waiting for
       // pins here starved the flush instead: a block under steady read
       // traffic never shows a zero pin count, so its tail stayed dirty
@@ -210,7 +210,6 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
       store->write_failed = true;
       store->flush_running = false;
-      release_pending(*pending);
       co_return Status(StatusCode::kInternal,
                        "invalid pending flush staging buffer");
     }
@@ -234,7 +233,6 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         }
         store->write_failed = true;
         store->flush_running = false;
-        release_pending(*pending);
         if (!written.ok()) {
           co_return written.status();
         }
@@ -256,7 +254,6 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
       store->write_failed = true;
       store->flush_running = false;
-      release_pending(*pending);
       co_return status;
     };
 
@@ -296,7 +293,6 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         state->allocation_epoch != pending->allocation_epoch) {
       state->flush_in_progress = false;
       state->flush_queued = false;
-      release_pending(*pending);
       store->flush_running = false;
       co_return Status::Ok();
     }

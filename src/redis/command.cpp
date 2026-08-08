@@ -1909,6 +1909,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       }
       Status concluded = co_await txn.Conclude();
       if (!concluded.ok()) {
+        // Defensive: the no-op conclude hop cannot fail today. If it ever
+        // can, the watches must still be consumed — EXEC ends them whatever
+        // its outcome, and stale entries would falsely abort every later
+        // EXEC on this connection.
+        co_await DropWatches(ctx);
         co_return EncodedReply(EncodeError("ERR " + concluded.message()));
       }
     }
