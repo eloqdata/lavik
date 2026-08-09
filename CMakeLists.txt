@@ -22,6 +22,18 @@ else()
   message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
 endif()
 
+# The generic Abseil CRC loop calls small load helpers for every input word.
+# Debug -O0 plus AddressSanitizer gives each helper a fake stack frame, making
+# payload checks several orders of magnitude slower while retaining the same
+# sanitizer coverage. Optimize only the CRC implementation in Debug builds.
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  foreach(crc_target IN ITEMS absl_crc_internal absl_crc32c)
+    if (TARGET ${crc_target})
+      target_compile_options(${crc_target} PRIVATE $<$<CONFIG:Debug>:-O1>)
+    endif()
+  endforeach()
+endif()
+
 add_library(keylane_module
   src/storage/buffer_pool.cpp
   src/storage/engine.cpp
@@ -133,7 +145,7 @@ if (BUILD_TESTING)
       NAME keylane_flushdb_reclaim_e2e
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 150)
+    set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 600)
 
     add_executable(keylane_tomb_raider_e2e_test
       tests/tomb_raider_e2e_test.cpp
