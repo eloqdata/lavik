@@ -12,8 +12,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -79,9 +79,8 @@ class RespClient {
       if (received == 0) {
         Fail("server closed the connection mid-bulk");
       }
-      const std::size_t payload =
-          std::min(static_cast<std::size_t>(received),
-                   remaining > 2 ? remaining - 2 : 0);
+      const std::size_t payload = std::min(static_cast<std::size_t>(received),
+                                           remaining > 2 ? remaining - 2 : 0);
       for (std::size_t i = 0; i < payload; ++i) {
         if (chunk[i] != expected_fill) {
           Fail("bulk payload byte mismatch");
@@ -171,8 +170,8 @@ std::uint16_t FindFreePort() {
 }
 
 void CreateDataFile(const std::string& path, std::uint64_t bytes) {
-  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                        0600);
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
     Fail("failed to create test data file");
   }
@@ -217,9 +216,8 @@ class ServerProcess {
       Fail("fork failed");
     }
     if (pid_ == 0) {
-      const int log_fd = ::open(log_path.c_str(),
-                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                0600);
+      const int log_fd = ::open(
+          log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
       if (log_fd >= 0) {
         (void)::dup2(log_fd, STDOUT_FILENO);
         (void)::dup2(log_fd, STDERR_FILENO);
@@ -227,10 +225,14 @@ class ServerProcess {
       }
       std::vector<std::string> arguments{
           binary,
-          "--port", std::to_string(port),
-          "--threads", std::to_string(threads),
-          "--recv-buffers", "0",
-          "--data-file", data_path,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          std::to_string(threads),
+          "--recv-buffers",
+          "0",
+          "--data-file",
+          data_path,
       };
       std::vector<char*> child_argv;
       child_argv.reserve(arguments.size() + 1);

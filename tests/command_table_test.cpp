@@ -1,11 +1,12 @@
+#include "keylane/command_table.h"
+
+#include <gtest/gtest.h>
+
 #include <cstddef>
 #include <string>
 #include <string_view>
 
-#include <gtest/gtest.h>
-
 #include "keylane/command.h"
-#include "keylane/command_table.h"
 
 namespace {
 
@@ -32,9 +33,9 @@ void CheckArity(std::string_view name, std::size_t argc, bool ok) {
     return;
   }
   auto keys = DetermineKeys(*spec, argc);
-  EXPECT_CHECK(keys.ok() == ok,
-               std::string(name) + " argc=" + std::to_string(argc) +
-                   (ok ? " should pass" : " should fail"));
+  EXPECT_CHECK(keys.ok() == ok, std::string(name) +
+                                    " argc=" + std::to_string(argc) +
+                                    (ok ? " should pass" : " should fail"));
   if (!ok && !keys.ok()) {
     const std::string expected = "wrong number of arguments for '" +
                                  std::string(spec->name) + "' command";
@@ -88,7 +89,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
   const char* write_cmds[] = {"set",     "incr",    "del",    "expire",
                               "pexpire", "persist", "flushdb"};
-  const char* read_cmds[] = {"get", "strlen", "ttl",    "pttl",
+  const char* read_cmds[] = {"get",    "strlen", "ttl", "pttl",
                              "exists", "dbsize", "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
@@ -105,9 +106,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                  std::string(name) + " should not have kCmdWrite");
   }
   {
-    const char* gated[] = {"dbsize", "scan",   "del",    "exists", "get",
-                           "strlen", "set",    "incr",   "expire", "pexpire",
-                           "persist", "ttl",   "pttl"};
+    const char* gated[] = {"dbsize",  "scan", "del",  "exists", "get",
+                           "strlen",  "set",  "incr", "expire", "pexpire",
+                           "persist", "ttl",  "pttl"};
     const char* ungated[] = {"ping", "select", "flushdb"};
     for (const char* name : gated) {
       const CommandSpec* spec = FindCommand(name);
@@ -123,19 +124,22 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     }
   }
   {
-    const char* no_keys[] = {"ping", "echo", "select", "dbsize", "scan",
-                             "flushdb"};
+    const char* no_keys[] = {"ping",   "echo", "select",
+                             "dbsize", "scan", "flushdb"};
     for (const char* name : no_keys) {
       const CommandSpec* spec = FindCommand(name);
-      EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdNoKeys) != 0 &&
+      EXPECT_CHECK(spec != nullptr &&
+                       (spec->flags & keylane::kCmdNoKeys) != 0 &&
                        spec->first_key == 0,
                    std::string(name) + " should be keyless");
     }
-    const char* keyed[] = {"get", "set", "del", "exists", "incr", "strlen",
-                           "expire", "pexpire", "persist", "ttl", "pttl"};
+    const char* keyed[] = {"get",     "set",    "del",    "exists",
+                           "incr",    "strlen", "expire", "pexpire",
+                           "persist", "ttl",    "pttl"};
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
-      EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdNoKeys) == 0 &&
+      EXPECT_CHECK(spec != nullptr &&
+                       (spec->flags & keylane::kCmdNoKeys) == 0 &&
                        spec->first_key == 1,
                    std::string(name) + " should have keys at arg 1");
     }
@@ -190,6 +194,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   }
   {
     KeyIndexView view = Keys("ping", 1);
-    EXPECT_CHECK(view.empty() && view.count() == 0, "PING view should be empty");
+    EXPECT_CHECK(view.empty() && view.count() == 0,
+                 "PING view should be empty");
   }
 }

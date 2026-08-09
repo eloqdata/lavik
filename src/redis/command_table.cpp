@@ -6,7 +6,6 @@ namespace keylane {
 
 namespace {
 
-
 constexpr std::uint32_t kKeyedRead = kCmdReadOnly | kCmdUsesDbGate;
 constexpr std::uint32_t kKeyedWrite = kCmdWrite | kCmdUsesDbGate;
 
@@ -32,10 +31,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"del", CommandKind::kDel, 2, 0, 1, -1, 1, kKeyedWrite | kCmdMultiShard},
     {"exists", CommandKind::kExists, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
-    {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2,
-     kKeyedWrite | kCmdMultiShard},
-    {"mget", CommandKind::kMGet, 2, 0, 1, -1, 1,
-     kKeyedRead | kCmdMultiShard},
+    {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2, kKeyedWrite | kCmdMultiShard},
+    {"mget", CommandKind::kMGet, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
     {"multi", CommandKind::kMulti, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"exec", CommandKind::kExec, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"discard", CommandKind::kDiscard, 1, 1, 0, 0, 1, kCmdNoKeys},
@@ -74,24 +71,23 @@ const CommandSpec* FindCommand(std::string_view name) {
 }
 
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
-                                     std::size_t argc) {
+                                           std::size_t argc) {
   if (argc < spec.min_args || (spec.max_args != 0 && argc > spec.max_args)) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
-                  "wrong number of arguments for '" + std::string(spec.name) +
-                      "' command");
+                        "wrong number of arguments for '" +
+                            std::string(spec.name) + "' command");
   }
   KeyIndexView view;
   if (spec.first_key == 0) {
     return view;
   }
   const std::int64_t last =
-      spec.last_key >= 0
-          ? static_cast<std::int64_t>(spec.last_key)
-          : static_cast<std::int64_t>(argc) + spec.last_key;
+      spec.last_key >= 0 ? static_cast<std::int64_t>(spec.last_key)
+                         : static_cast<std::int64_t>(argc) + spec.last_key;
   if (last < spec.first_key || last >= static_cast<std::int64_t>(argc)) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
-                  "wrong number of arguments for '" + std::string(spec.name) +
-                      "' command");
+                        "wrong number of arguments for '" +
+                            std::string(spec.name) + "' command");
   }
   view.first = spec.first_key;
   view.last = static_cast<std::uint16_t>(last);

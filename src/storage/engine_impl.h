@@ -1,9 +1,9 @@
 #pragma once
 
-#include "keylane/storage/engine.h"
-
 #include <fcntl.h>
 #include <linux/fs.h>
+
+#include "keylane/storage/engine.h"
 #ifdef BLOCK_SIZE
 #undef BLOCK_SIZE
 #endif
@@ -16,16 +16,16 @@
 #include <array>
 #include <atomic>
 #include <cassert>
-#include <chrono>
-#include <charconv>
 #include <cerrno>
+#include <charconv>
+#include <chrono>
 #include <coroutine>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
-#include <new>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -43,16 +43,15 @@
 #include "keylane/tx/tx_shard.h"
 #include "spdlog/spdlog.h"
 
-
 namespace keylane::storage {
 
 using celer::AsyncMutex;
 using celer::AsyncNotification;
 using celer::CoroutineBarrier;
-using celer::UnlockGuard;
 using celer::FixedBuffer;
 using celer::FixedFile;
 using celer::Task;
+using celer::UnlockGuard;
 using celer::Worker;
 
 struct RecordLocation {
@@ -90,17 +89,15 @@ struct RecordLocation {
   std::shared_ptr<const std::vector<ExtentRef>> extents;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
-    return block_id == other.block_id &&
-           record_offset == other.record_offset &&
+    return block_id == other.block_id && record_offset == other.record_offset &&
            allocation_epoch == other.allocation_epoch;
   }
 };
 
-
 using RecordIndex = ScanHashMap<RecordLocation>;
 
 inline bool IsNewer(const RecordLocation& candidate,
-             const RecordLocation& current) noexcept {
+                    const RecordLocation& current) noexcept {
   if (candidate.replication_epoch != current.replication_epoch) {
     return candidate.replication_epoch > current.replication_epoch;
   }
@@ -135,7 +132,8 @@ inline bool MaybeFailTxWrite(std::string_view key) noexcept {
   static const char* const armed = std::getenv("KEYLANE_FAIL_TX_WRITE");
   return armed != nullptr && key == armed;
 }
-#define KEYLANE_MAYBE_FAIL_TX_WRITE(key) ::keylane::storage::MaybeFailTxWrite(key)
+#define KEYLANE_MAYBE_FAIL_TX_WRITE(key) \
+  ::keylane::storage::MaybeFailTxWrite(key)
 #else
 #define KEYLANE_MAYBE_CRASH_AT(point) ((void)0)
 #define KEYLANE_MAYBE_FAIL_TX_WRITE(key) false
@@ -149,25 +147,27 @@ inline std::uint64_t UnixTimeMillis() noexcept {
 }
 
 inline bool IsExpired(const RecordLocation& location,
-               std::uint64_t now_ms) noexcept {
-  return location.kind == RecordKind::kValue &&
-         location.expire_at_ms != 0 && location.expire_at_ms <= now_ms;
+                      std::uint64_t now_ms) noexcept {
+  return location.kind == RecordKind::kValue && location.expire_at_ms != 0 &&
+         location.expire_at_ms <= now_ms;
 }
 
-inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>> DecodeManifest(
-    std::span<const std::byte> payload, std::uint64_t logical_size) {
+inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>
+DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
   if (payload.size() < sizeof(ExtentManifestHeader)) {
-    return absl::Status(absl::StatusCode::kInternal, "external value manifest is truncated");
+    return absl::Status(absl::StatusCode::kInternal,
+                        "external value manifest is truncated");
   }
   ExtentManifestHeader header{};
   std::memcpy(&header, payload.data(), sizeof(header));
   if (header.magic != kExtentManifestMagic ||
       header.version != kStorageFormatVersion || header.extent_count == 0 ||
       header.extent_count > kMaxStringExtents ||
-      payload.size() != sizeof(header) +
-                            static_cast<std::size_t>(header.extent_count) *
-                                sizeof(ExtentRef)) {
-    return absl::Status(absl::StatusCode::kInternal, "invalid external value manifest");
+      payload.size() !=
+          sizeof(header) + static_cast<std::size_t>(header.extent_count) *
+                               sizeof(ExtentRef)) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "invalid external value manifest");
   }
   auto refs = std::make_shared<std::vector<ExtentRef>>(header.extent_count);
   std::memcpy(refs->data(), payload.data() + sizeof(header),
@@ -177,22 +177,23 @@ inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>> DecodeManif
     if (ref.block_id == kInvalidBlockId || ref.allocation_epoch == 0 ||
         ref.payload_bytes == 0 || ref.payload_bytes > kExtentPayloadBytes ||
         total > kMaxStringBytes - ref.payload_bytes) {
-      return absl::Status(absl::StatusCode::kInternal, "invalid extent reference");
+      return absl::Status(absl::StatusCode::kInternal,
+                          "invalid extent reference");
     }
     total += ref.payload_bytes;
   }
   if (total != logical_size || total > kMaxStringBytes) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "extent manifest logical size mismatch");
+                        "extent manifest logical size mismatch");
   }
   return std::shared_ptr<const std::vector<ExtentRef>>(std::move(refs));
 }
 
 inline std::string EncodeManifest(std::span<const ExtentRef> refs) {
-  ExtentManifestHeader header{.magic = kExtentManifestMagic,
-                              .version = kStorageFormatVersion,
-                              .extent_count =
-                                  static_cast<std::uint32_t>(refs.size())};
+  ExtentManifestHeader header{
+      .magic = kExtentManifestMagic,
+      .version = kStorageFormatVersion,
+      .extent_count = static_cast<std::uint32_t>(refs.size())};
   std::string output(sizeof(header) + refs.size_bytes(), '\0');
   std::memcpy(output.data(), &header, sizeof(header));
   std::memcpy(output.data() + sizeof(header), refs.data(), refs.size_bytes());
@@ -466,29 +467,27 @@ inline std::optional<std::uint32_t> NextRecordOffset(
 }
 
 inline void AtomicMax(std::atomic<std::uint64_t>* target,
-               std::uint64_t value) noexcept {
+                      std::uint64_t value) noexcept {
   std::uint64_t current = target->load(std::memory_order_relaxed);
-  while (current < value &&
-         !target->compare_exchange_weak(current, value,
-                                        std::memory_order_relaxed)) {
+  while (current < value && !target->compare_exchange_weak(
+                                current, value, std::memory_order_relaxed)) {
   }
 }
 
 inline absl::Status ReadExactlyAt(int fd, std::span<std::byte> output,
-                     std::uint64_t offset) {
+                                  std::uint64_t offset) {
   std::size_t done = 0;
   while (done < output.size()) {
-    const ssize_t read = ::pread(
-        fd, output.data() + done, output.size() - done,
-        static_cast<off_t>(offset + done));
+    const ssize_t read = ::pread(fd, output.data() + done, output.size() - done,
+                                 static_cast<off_t>(offset + done));
     if (read < 0 && errno == EINTR) {
       continue;
     }
     if (read <= 0) {
       return absl::Status(absl::StatusCode::kInternal,
-                    read == 0 ? "short device-label read"
-                              : "device-label read failed: " +
-                                    std::string(std::strerror(errno)));
+                          read == 0 ? "short device-label read"
+                                    : "device-label read failed: " +
+                                          std::string(std::strerror(errno)));
     }
     done += static_cast<std::size_t>(read);
   }
@@ -496,19 +495,19 @@ inline absl::Status ReadExactlyAt(int fd, std::span<std::byte> output,
 }
 
 inline absl::Status WriteExactlyAt(int fd, std::span<const std::byte> input,
-                      std::uint64_t offset) {
+                                   std::uint64_t offset) {
   std::size_t done = 0;
   while (done < input.size()) {
-    const ssize_t written = ::pwrite(
-        fd, input.data() + done, input.size() - done,
-        static_cast<off_t>(offset + done));
+    const ssize_t written =
+        ::pwrite(fd, input.data() + done, input.size() - done,
+                 static_cast<off_t>(offset + done));
     if (written < 0 && errno == EINTR) {
       continue;
     }
     if (written <= 0) {
-      return absl::Status(absl::StatusCode::kInternal,
-                    "device-label write failed: " +
-                        std::string(std::strerror(errno)));
+      return absl::Status(
+          absl::StatusCode::kInternal,
+          "device-label write failed: " + std::string(std::strerror(errno)));
     }
     done += static_cast<std::size_t>(written);
   }
@@ -519,9 +518,9 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
     const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "open device label failed: " + path + ": " +
-                      std::strerror(errno));
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "open device label failed: " + path + ": " + std::strerror(errno));
   }
   std::array<std::byte, kDirectIoAlignment> page{};
   absl::Status status = ReadExactlyAt(fd, page, kDeviceLabelOffset);
@@ -531,7 +530,7 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
   }
   if (close_error != 0) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "close after device-label read failed: " + path);
+                        "close after device-label read failed: " + path);
   }
   if (IsZero(page)) {
     return std::optional<DeviceLabel>{};
@@ -539,25 +538,26 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
   DeviceLabel label{};
   if (!DecodeDeviceLabel(page, &label)) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "invalid or corrupt device label: " + path);
+                        "invalid or corrupt device label: " + path);
   }
   return std::optional<DeviceLabel>{label};
 }
 
-inline absl::Status WriteDeviceLabel(const std::string& path, const DeviceLabel& label) {
+inline absl::Status WriteDeviceLabel(const std::string& path,
+                                     const DeviceLabel& label) {
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "open device label for write failed: " + path + ": " +
-                      std::strerror(errno));
+                        "open device label for write failed: " + path + ": " +
+                            std::strerror(errno));
   }
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeDeviceLabel(label, page);
   absl::Status status = WriteExactlyAt(fd, page, kDeviceLabelOffset);
   if (status.ok() && ::fdatasync(fd) != 0) {
-    status = absl::Status(absl::StatusCode::kInternal,
-                    "device-label fdatasync failed: " + path + ": " +
-                        std::strerror(errno));
+    status = absl::Status(
+        absl::StatusCode::kInternal,
+        "device-label fdatasync failed: " + path + ": " + std::strerror(errno));
   }
   const int close_error = ::close(fd);
   if (!status.ok()) {
@@ -565,7 +565,7 @@ inline absl::Status WriteDeviceLabel(const std::string& path, const DeviceLabel&
   }
   if (close_error != 0) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "close after device-label write failed: " + path);
+                        "close after device-label write failed: " + path);
   }
   return absl::OkStatus();
 }
@@ -612,7 +612,7 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
   }
   if (saw_nonzero && !selected_valid) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "both fixed-metadata page slots are corrupt");
+                        "both fixed-metadata page slots are corrupt");
   }
   return selected;
 }
@@ -626,8 +626,8 @@ inline absl::StatusOr<std::uint64_t> RandomStorageSetId() {
     }
     if (bytes != static_cast<ssize_t>(sizeof(value))) {
       return absl::Status(absl::StatusCode::kInternal,
-                    "getrandom for storage-set id failed: " +
-                        std::string(std::strerror(errno)));
+                          "getrandom for storage-set id failed: " +
+                              std::string(std::strerror(errno)));
     }
   }
   return value;
@@ -684,12 +684,13 @@ struct StoragePathInfo {
   std::uint64_t size_bytes = 0;
 };
 
-inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(const std::string& path) {
+inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
+    const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "open block device for probe failed: " + path +
-                      ": " + std::strerror(errno));
+                        "open block device for probe failed: " + path + ": " +
+                            std::strerror(errno));
   }
 
   int logical_block_bytes = 0;
@@ -700,35 +701,37 @@ inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(const std::string& path)
   const int size_errno = errno;
   const int close_error = ::close(fd);
   if (sector_error != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "BLKSSZGET failed: " + path + ": " +
-                      std::strerror(sector_errno));
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "BLKSSZGET failed: " + path + ": " + std::strerror(sector_errno));
   }
   if (size_error != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "BLKGETSIZE64 failed: " + path + ": " +
-                      std::strerror(size_errno));
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "BLKGETSIZE64 failed: " + path + ": " + std::strerror(size_errno));
   }
   if (close_error != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "close block device after alignment probe failed: " + path);
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "close block device after alignment probe failed: " + path);
   }
 
   const auto alignment = static_cast<std::size_t>(logical_block_bytes);
   if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "block device logical sector size is not a power of two: " +
-                      path);
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "block device logical sector size is not a power of two: " + path);
   }
   return BlockDeviceInfo{.io_alignment = alignment, .size_bytes = size_bytes};
 }
 
-inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(const std::string& path) {
+inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
+    const std::string& path) {
   struct stat file_info {};
   if (::stat(path.c_str(), &file_info) != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                  "stat storage path failed: " + path + ": " +
-                      std::strerror(errno));
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        "stat storage path failed: " + path + ": " + std::strerror(errno));
   }
   if (S_ISBLK(file_info.st_mode)) {
     auto device = ProbeBlockDevice(path);
@@ -742,13 +745,13 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(const std::string& path)
     };
   }
   if (!S_ISREG(file_info.st_mode)) {
-    return absl::Status(absl::StatusCode::kInvalidArgument,
-                  "storage path is neither a regular file nor a block device: " +
-                      path);
+    return absl::Status(
+        absl::StatusCode::kInvalidArgument,
+        "storage path is neither a regular file nor a block device: " + path);
   }
   if (file_info.st_size < 0) {
     return absl::Status(absl::StatusCode::kOutOfRange,
-                  "storage file reports a negative size: " + path);
+                        "storage file reports a negative size: " + path);
   }
   return StoragePathInfo{
       .is_block_device = false,
@@ -768,9 +771,8 @@ inline Task<absl::StatusOr<std::size_t>> ReadStorageBuffer(
 }
 
 inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
-    Worker& worker, FixedFile file,
-    std::span<const std::byte> buffer, bool registered,
-    FixedBuffer registered_buffer, std::uint64_t offset) {
+    Worker& worker, FixedFile file, std::span<const std::byte> buffer,
+    bool registered, FixedBuffer registered_buffer, std::uint64_t offset) {
   if (registered) {
     celer::FixedBuffer target = {
         .data = const_cast<std::byte*>(buffer.data()),
@@ -780,13 +782,12 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
     if (target.index == 0 || target.data == nullptr ||
         target.size > registered_buffer.size) {
       co_return absl::Status(absl::StatusCode::kInternal,
-                       "invalid registered write buffer");
+                             "invalid registered write buffer");
     }
     co_return co_await celer::WriteFixed(worker, file, target, offset);
   }
   co_return co_await celer::Write(worker, file, buffer, offset);
 }
-
 
 class StorageEngine::Impl {
  public:
@@ -841,19 +842,19 @@ class StorageEngine::Impl {
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
     absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents;
-  // txid-tagged records parked by ApplyRecovery until the committed-txid set
-  // is complete (after the recovery barrier).
-  std::vector<RecoveryRecord> recovery_tx_records;
-  // Undo journals of in-flight multi-key writes on this shard, keyed by
-  // txid; written and consumed under store_state_mutex.
-  absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
-  // Relocation fences owed per source block. A salvage pass that fails
-  // midway has already moved records whose copies are not yet durable; the
-  // debt survives the pass here, and CleanBlockLocked settles every owed
-  // fence before the block's bitmap bit may be durably cleared. Same-worker
-  // access only.
-  absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
-      pending_relocation_fences;
+    // txid-tagged records parked by ApplyRecovery until the committed-txid set
+    // is complete (after the recovery barrier).
+    std::vector<RecoveryRecord> recovery_tx_records;
+    // Undo journals of in-flight multi-key writes on this shard, keyed by
+    // txid; written and consumed under store_state_mutex.
+    absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
+    // Relocation fences owed per source block. A salvage pass that fails
+    // midway has already moved records whose copies are not yet durable; the
+    // debt survives the pass here, and CleanBlockLocked settles every owed
+    // fence before the block's bitmap bit may be durably cleared. Same-worker
+    // access only.
+    absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
+        pending_relocation_fences;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};
@@ -892,44 +893,43 @@ class StorageEngine::Impl {
   }
 
   Task<absl::StatusOr<DiskValue>> Get(std::uint8_t db_id, std::string_view key,
-                                ReadLatencyTrace* trace);
+                                      ReadLatencyTrace* trace);
 
   // Caller holds this worker's key lock for `digest` (shared) and runs on
   // OwnerForKey(key). `digest` must equal ComputeDigest(key).
-  Task<absl::StatusOr<DiskValue>> GetLocked(std::uint8_t db_id, std::string_view key,
-                                      const Digest& digest,
-                                      ReadLatencyTrace* trace);
+  Task<absl::StatusOr<DiskValue>> GetLocked(std::uint8_t db_id,
+                                            std::string_view key,
+                                            const Digest& digest,
+                                            ReadLatencyTrace* trace);
 
   Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
-                                             std::string_view key);
+                                                   std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
   Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   const Digest& digest);
+                                                         std::string_view key,
+                                                         const Digest& digest);
 
   Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
-                                std::string_view value,
-                                SetOptions options);
+                                      std::string_view value,
+                                      SetOptions options);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
-  Task<absl::StatusOr<SetResult>> SetLocked(std::uint8_t db_id, std::string_view key,
-                                      const Digest& digest,
-                                      std::string_view value,
-                                      SetOptions options,
-                                      TxShardWrites* tx = nullptr);
+  Task<absl::StatusOr<SetResult>> SetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::string_view value, SetOptions options, TxShardWrites* tx = nullptr);
 
-  Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
-                                     std::string_view key);
+  Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
   Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                            std::string_view key,
                                            const Digest& digest);
 
-  Task<absl::StatusOr<bool>> UpdateExpiration(
-      std::uint8_t db_id, std::string_view key,
-      std::uint64_t expire_at_ms, ExpirationCondition condition);
+  Task<absl::StatusOr<bool>> UpdateExpiration(std::uint8_t db_id,
+                                              std::string_view key,
+                                              std::uint64_t expire_at_ms,
+                                              ExpirationCondition condition);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> UpdateExpirationLocked(
@@ -940,9 +940,10 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
-  Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id, std::string_view key,
-                                    const Digest& digest,
-                                    TxShardWrites* tx = nullptr);
+  Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
+                                          std::string_view key,
+                                          const Digest& digest,
+                                          TxShardWrites* tx = nullptr);
 
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
@@ -957,8 +958,7 @@ class StorageEngine::Impl {
     return TombRaiderTotals{
         .rounds = tomb_raider_rounds_.load(std::memory_order_relaxed),
         .reaped = tomb_raider_reaped_.load(std::memory_order_relaxed),
-        .refreshed =
-            tomb_raider_refreshed_.load(std::memory_order_relaxed),
+        .refreshed = tomb_raider_refreshed_.load(std::memory_order_relaxed),
     };
   }
 
@@ -976,16 +976,15 @@ class StorageEngine::Impl {
                           const Digest& digest);
 
   Task<absl::StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
-                                         std::string_view key);
+                                               std::string_view key);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
-  Task<absl::StatusOr<std::int64_t>> IncrementLocked(std::uint8_t db_id,
-                                               std::string_view key,
-                                               const Digest& digest,
-                                               TxShardWrites* tx = nullptr);
+  Task<absl::StatusOr<std::int64_t>> IncrementLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      TxShardWrites* tx = nullptr);
 
   Task<absl::Status> CommitTxWrites(std::uint64_t txid,
-                              std::vector<TxShardWrites*> shards);
+                                    std::vector<TxShardWrites*> shards);
 
   void NoteTxCommitStarted() noexcept {
     active_tx_commits_.fetch_add(1, std::memory_order_acq_rel);
@@ -1042,12 +1041,12 @@ class StorageEngine::Impl {
       std::uint16_t partition_id);
 
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
-      std::uint16_t partition_id, std::uint8_t db_id,
-      std::uint64_t cursor, std::size_t count);
-
-  PartitionDeltaBatch ReadPartitionDeltas(
-      std::uint16_t partition_id, std::uint64_t after_sequence,
+      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
       std::size_t count);
+
+  PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
+                                          std::uint64_t after_sequence,
+                                          std::size_t count);
 
   void AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                   std::uint64_t through_sequence);
@@ -1100,16 +1099,14 @@ class StorageEngine::Impl {
                              std::uint8_t db_id,
                              const RecordIndex::Entry& entry);
 
-  WorkerStore& CurrentStore() {
-    return *stores_[celer::ThisWorker().id];
-  }
+  WorkerStore& CurrentStore() { return *stores_[celer::ThisWorker().id]; }
 
   const WorkerStore& CurrentStore() const {
     return *stores_[celer::ThisWorker().id];
   }
 
-  WorkerStore::PartitionStore& PartitionFor(
-      WorkerStore& store, std::uint16_t partition_id) const {
+  WorkerStore::PartitionStore& PartitionFor(WorkerStore& store,
+                                            std::uint16_t partition_id) const {
     assert(partition_id < kLogicalStorageShards);
     assert(partition_id % worker_count_ == store.worker->id());
     auto& partition = store.partitions[partition_id / worker_count_];
@@ -1126,8 +1123,8 @@ class StorageEngine::Impl {
     return partition;
   }
 
-  WorkerStore::PartitionStore& PartitionForKey(
-      WorkerStore& store, std::string_view key) const {
+  WorkerStore::PartitionStore& PartitionForKey(WorkerStore& store,
+                                               std::string_view key) const {
     return PartitionFor(store, RedisSlot(key));
   }
 
@@ -1147,8 +1144,8 @@ class StorageEngine::Impl {
     return state.allocated ? &state : nullptr;
   }
 
-  const BlockState* FindBlockState(
-      const WorkerStore& store, std::uint64_t block_id) const noexcept {
+  const BlockState* FindBlockState(const WorkerStore& store,
+                                   std::uint64_t block_id) const noexcept {
     const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
     if (state.owner.load(std::memory_order_acquire) != store.worker->id()) {
       return nullptr;
@@ -1208,13 +1205,12 @@ class StorageEngine::Impl {
   static void ClearBitmapBit(DeviceAllocator& allocator,
                              std::uint32_t local_block) noexcept;
 
-  Task<absl::Status> PersistBitmapPages(
-      std::size_t device_index, DeviceAllocator& allocator,
-      std::vector<std::size_t> page_indexes);
+  Task<absl::Status> PersistBitmapPages(std::size_t device_index,
+                                        DeviceAllocator& allocator,
+                                        std::vector<std::size_t> page_indexes);
 
   Task<absl::Status> InvalidateReactivatedBlockHeadersLocal(
-      std::size_t device_index,
-      std::span<const std::uint64_t> block_ids);
+      std::size_t device_index, std::span<const std::uint64_t> block_ids);
 
   void MaybeRefillDeviceInBackground(std::size_t device_index,
                                      DeviceAllocator& allocator);
@@ -1222,7 +1218,7 @@ class StorageEngine::Impl {
   Task<absl::Status> RefillDeviceInBackground(std::size_t device_index);
 
   Task<absl::Status> RefillReadyBlocksLocal(std::size_t device_index,
-                                      DeviceAllocator& allocator);
+                                            DeviceAllocator& allocator);
 
   Task<absl::StatusOr<ReservedBlock>> AllocateFromDeviceLocal(
       std::size_t device_index, bool for_defrag);
@@ -1236,11 +1232,11 @@ class StorageEngine::Impl {
   Task<absl::Status> ReturnColdBlocks(std::vector<std::uint64_t> block_ids);
 
   Task<absl::Status> PersistEpochValueOnDeviceLocal(std::size_t device_index,
-                                              std::size_t value_index,
-                                              std::uint64_t epoch);
+                                                    std::size_t value_index,
+                                                    std::uint64_t epoch);
 
   Task<absl::Status> PersistEpochValue(std::size_t value_index,
-                                 std::uint64_t epoch);
+                                       std::uint64_t epoch);
 
   // Takes the database out of service on this worker. Everything here is O(the
   // partition count) and runs without suspending, so the caller's FLUSHDB gate
@@ -1303,7 +1299,6 @@ class StorageEngine::Impl {
   std::uint16_t RecoveredBlockOwner(const BlockHeader& block,
                                     std::uint64_t block_id) const noexcept;
 
-
   // `allocated` marks blocks the scan bitmap said were in use — the only ones
   // that cost I/O. Free blocks are skipped without a read, so ETA and percent
   // are computed over allocated blocks; the capacity-wide sweep count only
@@ -1318,19 +1313,17 @@ class StorageEngine::Impl {
 
   void ApplyRecoveredRecord(WorkerStore& store, const RecoveryRecord& record);
 
-  Task<absl::StatusOr<LoadedValue>> LoadValue(WorkerStore& key_store,
-                                        std::uint8_t db_id,
-                                        std::string_view key,
-                                        const Digest& digest,
-                                        RecordLocation location,
-                                        ReadLatencyTrace* trace = nullptr);
+  Task<absl::StatusOr<LoadedValue>> LoadValue(
+      WorkerStore& key_store, std::uint8_t db_id, std::string_view key,
+      const Digest& digest, RecordLocation location,
+      ReadLatencyTrace* trace = nullptr);
 
   // Reads one extent block's payload into `destination`. Runs on the worker
   // that owns that block, which is not necessarily the one holding the
   // manifest, so everything it needs is passed by value.
   Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
-                              std::uint32_t extent_index,
-                              std::byte* destination);
+                                    std::uint32_t extent_index,
+                                    std::byte* destination);
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
@@ -1356,7 +1349,7 @@ class StorageEngine::Impl {
   void ConfigureWorkerDeviceAffinity();
 
   Task<absl::StatusOr<ReservedBlock>> AllocateBlock(WorkerStore& store,
-                                              bool for_defrag);
+                                                    bool for_defrag);
 
   std::size_t DefragReserveForDevice(std::size_t device_index) const noexcept {
     assert(device_index < defrag_reserve_blocks_.size());
@@ -1368,7 +1361,7 @@ class StorageEngine::Impl {
   Task<absl::Status> MarkRecordDead(const RetiredRecord& record);
 
   Task<absl::Status> MarkRetiredRecordsDead(WorkerStore* store,
-                                      std::vector<RetiredRecord> records);
+                                            std::vector<RetiredRecord> records);
 
   static RetiredRecord RetiredRecordOf(const RecordLocation& location) {
     return RetiredRecord{
@@ -1383,42 +1376,34 @@ class StorageEngine::Impl {
   WriteExtentValueLocked(WorkerStore& store, std::string_view value);
 
   Task<absl::Status> AppendLocked(WorkerStore& store,
-                            WorkerStore::PartitionStore& partition,
-                            std::uint8_t db_id,
-                            std::string_view key, std::string_view value,
-                            RecordKind kind, ValueType value_type,
-                            std::uint64_t expire_at_ms,
-                            TxShardWrites* tx = nullptr);
+                                  WorkerStore::PartitionStore& partition,
+                                  std::uint8_t db_id, std::string_view key,
+                                  std::string_view value, RecordKind kind,
+                                  ValueType value_type,
+                                  std::uint64_t expire_at_ms,
+                                  TxShardWrites* tx = nullptr);
 
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
-                                                  bool for_defrag,
-                                                  bool unlock_writer);
+                                                        bool for_defrag,
+                                                        bool unlock_writer);
 
   Task<absl::Status> ReturnReservedBlock(ReservedBlock block);
 
-  Task<absl::Status> WriteRecordLocked(WorkerStore& store, std::uint8_t db_id,
-                                 std::string_view key, std::string_view value,
-                                 RecordKind kind, ValueType value_type,
-                                 std::uint64_t expire_at_ms,
-                                 const Digest& digest,
-                                 std::uint64_t txid,
-                                 std::uint64_t mutation_sequence,
-                                 std::uint64_t relocation_sequence,
-                                 bool for_defrag,
-                                 bool unlock_writer_while_waiting = true,
-                                 bool external = false,
-                                 std::uint64_t logical_size =
-                                     std::numeric_limits<std::uint64_t>::max(),
-                                 std::shared_ptr<const std::vector<ExtentRef>>
-                                     extents = nullptr,
-                                 RecordLocation* written_location = nullptr,
-                                 const RelocationSource* relocation = nullptr,
-                                 TxShardWrites* tx = nullptr,
-                                 std::shared_ptr<std::vector<RetiredRecord>>
-                                     commit_retirements = nullptr);
+  Task<absl::Status> WriteRecordLocked(
+      WorkerStore& store, std::uint8_t db_id, std::string_view key,
+      std::string_view value, RecordKind kind, ValueType value_type,
+      std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
+      std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
+      bool for_defrag, bool unlock_writer_while_waiting = true,
+      bool external = false,
+      std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
+      std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
+      RecordLocation* written_location = nullptr,
+      const RelocationSource* relocation = nullptr, TxShardWrites* tx = nullptr,
+      std::shared_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 
@@ -1436,7 +1421,7 @@ class StorageEngine::Impl {
   void AdvanceExpiryMap(WorkerStore& store);
 
   Task<absl::Status> ExpireCandidate(WorkerStore& store,
-                               WorkerStore::ExpireCandidate candidate);
+                                     WorkerStore::ExpireCandidate candidate);
 
   Task<absl::Status> ActiveExpiration(WorkerStore* store);
 
@@ -1461,7 +1446,7 @@ class StorageEngine::Impl {
   Task<absl::Status> TombSweepLocal(WorkerStore& store);
 
   Task<absl::Status> TombClaimLocal(WorkerStore& store,
-                              std::vector<TombClaim> claims);
+                                    std::vector<TombClaim> claims);
 
   Task<absl::Status> TombReapLocal(WorkerStore& store);
 
@@ -1469,8 +1454,9 @@ class StorageEngine::Impl {
 
   // Spawn an asynchronous extent reclaim, counted from before the spawn so
   // the block allocator's full-device check always sees it in flight.
-  void SpawnExtentReclaim(WorkerStore& store,
-                          std::shared_ptr<const std::vector<ExtentRef>> extents);
+  void SpawnExtentReclaim(
+      WorkerStore& store,
+      std::shared_ptr<const std::vector<ExtentRef>> extents);
 
   Task<absl::Status> ReclaimExtentsCounted(
       WorkerStore* store,
@@ -1479,7 +1465,8 @@ class StorageEngine::Impl {
   // Retires one extent block. Runs on that block's owner, which after a
   // worker-count change is unrelated to the owner of the manifest that
   // referenced it. Reports whether the block became free.
-  Task<absl::StatusOr<bool>> ReclaimExtentLocal(WorkerStore& store, ExtentRef ref);
+  Task<absl::StatusOr<bool>> ReclaimExtentLocal(WorkerStore& store,
+                                                ExtentRef ref);
 
   Task<absl::Status> ReclaimExtents(
       WorkerStore* store,
@@ -1502,7 +1489,7 @@ class StorageEngine::Impl {
   void ReleaseDefragPermit(std::size_t device_index);
 
   Task<absl::Status> StartQueuedDefrag(unsigned worker_id,
-                                 std::size_t device_index);
+                                       std::size_t device_index);
 
   Task<absl::Status> WakeQueuedDefrags(std::size_t device_index);
 
@@ -1524,21 +1511,23 @@ class StorageEngine::Impl {
       const RelocationDurabilityFence& fence);
 
   Task<absl::Status> CleanBlockLocked(WorkerStore& store,
-                                std::uint64_t block_id);
+                                      std::uint64_t block_id);
 
   // Rewrites every record in the block that is still current, so the block ends
   // up with no reachable data and the caller can free it. Clears `defragging`
   // on each failure path so the block stays eligible for a later pass.
-  Task<absl::Status> SalvageBlockRecords(WorkerStore& store, std::uint64_t block_id,
-                                   BlockState& source,
-                                   std::uint32_t source_file_id,
-                                   std::uint64_t source_block_offset);
+  Task<absl::Status> SalvageBlockRecords(WorkerStore& store,
+                                         std::uint64_t block_id,
+                                         BlockState& source,
+                                         std::uint32_t source_file_id,
+                                         std::uint64_t source_block_offset);
 
   // Drains readers and hands the block back to the allocator. The caller must
   // have observed live_bytes == 0 under store_state_mutex and set `freeing`,
   // which stops LoadValueLocal from taking new pins.
-  Task<absl::Status> ReleaseEmptyBlock(WorkerStore& store, std::uint64_t block_id,
-                                 BlockState& source);
+  Task<absl::Status> ReleaseEmptyBlock(WorkerStore& store,
+                                       std::uint64_t block_id,
+                                       BlockState& source);
 
   StorageEngineOptions options_;
   unsigned worker_count_ = 0;

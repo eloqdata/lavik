@@ -184,7 +184,8 @@ class StorageEngine {
   ~StorageEngine();
 
   // Runs on the main thread before Server::Start. Creates/preallocates every
-  // configured file and sizes per-worker metadata, but does not perform data IO.
+  // configured file and sizes per-worker metadata, but does not perform data
+  // IO.
   absl::Status Prepare(unsigned worker_count);
 
   // Runs once on each worker before its listener is opened. Registers the
@@ -249,24 +250,25 @@ class StorageEngine {
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
-  celer::Task<absl::StatusOr<DiskValue>> Get(
-      std::uint8_t db_id, std::string_view key,
-      ReadLatencyTrace* trace = nullptr);
-  celer::Task<absl::StatusOr<std::uint64_t>> StringLength(
-      std::uint8_t db_id, std::string_view key);
-  celer::Task<absl::StatusOr<SetResult>> Set(
-      std::uint8_t db_id, std::string_view key, std::string_view value,
-      SetOptions options = {});
+  celer::Task<absl::StatusOr<DiskValue>> Get(std::uint8_t db_id,
+                                             std::string_view key,
+                                             ReadLatencyTrace* trace = nullptr);
+  celer::Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
+                                                          std::string_view key);
+  celer::Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id,
+                                             std::string_view key,
+                                             std::string_view value,
+                                             SetOptions options = {});
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
-      std::uint8_t db_id, std::string_view key,
-      std::uint64_t expire_at_ms, ExpirationCondition condition);
+      std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
+      ExpirationCondition condition);
   celer::Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id,
-                                             std::string_view key);
+                                           std::string_view key);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
-  celer::Task<absl::StatusOr<std::int64_t>> Increment(
-      std::uint8_t db_id, std::string_view key);
+  celer::Task<absl::StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
+                                                      std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
   // hold this worker's key lock for `digest` in the required mode (shared for
@@ -287,10 +289,12 @@ class StorageEngine {
       ReadLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::StatusOr<SetResult>> SetLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::string_view value, SetOptions options = {},
-      TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<SetResult>> SetLocked(std::uint8_t db_id,
+                                                   std::string_view key,
+                                                   const Digest& digest,
+                                                   std::string_view value,
+                                                   SetOptions options = {},
+                                                   TxShardWrites* tx = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
@@ -299,9 +303,9 @@ class StorageEngine {
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr);
   celer::Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
-                                                  std::string_view key,
-                                                  const Digest& digest,
-                                                  TxShardWrites* tx = nullptr);
+                                                 std::string_view key,
+                                                 const Digest& digest,
+                                                 TxShardWrites* tx = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
   celer::Task<absl::StatusOr<std::int64_t>> IncrementLocked(
@@ -312,8 +316,8 @@ class StorageEngine {
   // succeeded. Runs on any worker; fences and retirements come from the
   // per-shard TxShardWrites. Safe to run in the background — the client
   // reply never waits for durability.
-  celer::Task<absl::Status> CommitTxWrites(
-      std::uint64_t txid, std::vector<TxShardWrites*> shards);
+  celer::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
+                                           std::vector<TxShardWrites*> shards);
 
   // Allocates a transaction id for tagging a multi-key write. Never zero.
   static std::uint64_t AllocateWriteTxid() noexcept;

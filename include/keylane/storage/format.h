@@ -21,17 +21,18 @@ inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
 inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr unsigned kLocalBlockIdBits = 27;
-inline constexpr std::uint64_t kLocalBlockIdLimit =
-    std::uint64_t{1} << kLocalBlockIdBits;
+inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
+                                                    << kLocalBlockIdBits;
 inline constexpr std::uint64_t kLocalBlockIdMask = kLocalBlockIdLimit - 1;
-inline constexpr std::uint64_t kDeviceIdLimit =
-    std::uint64_t{1} << (64 - kLocalBlockIdBits);
+inline constexpr std::uint64_t kDeviceIdLimit = std::uint64_t{1}
+                                                << (64 - kLocalBlockIdBits);
 inline constexpr std::uint64_t kInvalidBlockId =
     std::numeric_limits<std::uint64_t>::max();
 inline constexpr std::uint64_t kDeviceLabelMagic =
-    0x314c42414c4c4bULL;  // KLLABL1
-inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;   // KCOLBLK1
-inline constexpr std::uint64_t kRecordMagic = 0x314b4c5245434f52ULL;  // ROCERLK1
+    0x314c42414c4c4bULL;                                             // KLLABL1
+inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;  // KCOLBLK1
+inline constexpr std::uint64_t kRecordMagic =
+    0x314b4c5245434f52ULL;  // ROCERLK1
 inline constexpr std::uint64_t kExtentManifestMagic =
     0x3154464e4d4c4bULL;  // KLMNFT1
 inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
@@ -70,8 +71,7 @@ inline constexpr std::size_t kEpochMetadataPageCount =
     kMetadataPagePayloadBytes;
 inline constexpr std::uint64_t kEpochMetadataOffset = kDirectIoAlignment;
 inline constexpr std::uint64_t kScanBitmapMetadataOffset =
-    kEpochMetadataOffset +
-    kEpochMetadataPageCount * 2 * kDirectIoAlignment;
+    kEpochMetadataOffset + kEpochMetadataPageCount * 2 * kDirectIoAlignment;
 
 constexpr std::size_t ScanBitmapBytes(std::uint64_t capacity_blocks) noexcept {
   return static_cast<std::size_t>((capacity_blocks + 7) / 8);
@@ -89,19 +89,17 @@ constexpr std::uint64_t FixedMetadataBytes(
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
 }
 
-constexpr std::uint32_t DataBlockBegin(
-    std::uint64_t capacity_blocks) noexcept {
+constexpr std::uint32_t DataBlockBegin(std::uint64_t capacity_blocks) noexcept {
   return static_cast<std::uint32_t>(
       (FixedMetadataBytes(capacity_blocks) + kStorageBlockBytes - 1) /
       kStorageBlockBytes);
 }
 
-constexpr std::uint64_t MetadataPageSlotOffset(
-    std::uint64_t base_offset, std::size_t page_index,
-    unsigned slot) noexcept {
-  return base_offset +
-         (static_cast<std::uint64_t>(page_index) * 2 + slot) *
-             kDirectIoAlignment;
+constexpr std::uint64_t MetadataPageSlotOffset(std::uint64_t base_offset,
+                                               std::size_t page_index,
+                                               unsigned slot) noexcept {
+  return base_offset + (static_cast<std::uint64_t>(page_index) * 2 + slot) *
+                           kDirectIoAlignment;
 }
 
 constexpr std::uint64_t MakeBlockId(std::uint64_t device_id,
@@ -284,26 +282,25 @@ std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
 void EncodeDeviceLabel(
     const DeviceLabel& label,
     std::span<std::byte, kDirectIoAlignment> output) noexcept;
-bool DecodeDeviceLabel(
-    std::span<const std::byte, kDirectIoAlignment> input,
-    DeviceLabel* label) noexcept;
+bool DecodeDeviceLabel(std::span<const std::byte, kDirectIoAlignment> input,
+                       DeviceLabel* label) noexcept;
 
 void EncodeMetadataPage(
-    MetadataPageKind kind, std::uint32_t page_index,
-    std::uint64_t generation, std::span<const std::byte> payload,
+    MetadataPageKind kind, std::uint32_t page_index, std::uint64_t generation,
+    std::span<const std::byte> payload,
     std::span<std::byte, kDirectIoAlignment> output) noexcept;
-bool DecodeMetadataPage(
-    std::span<const std::byte, kDirectIoAlignment> input,
-    MetadataPageKind expected_kind, std::uint32_t expected_page_index,
-    std::uint64_t* generation, std::span<std::byte> payload) noexcept;
+bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
+                        MetadataPageKind expected_kind,
+                        std::uint32_t expected_page_index,
+                        std::uint64_t* generation,
+                        std::span<std::byte> payload) noexcept;
 
 // Encode into / decode from a single header slot page.
 void EncodeBlockHeader(
     const BlockHeader& header,
     std::span<std::byte, kBlockHeaderSlotBytes> output) noexcept;
-bool DecodeBlockHeader(
-    std::span<const std::byte, kBlockHeaderSlotBytes> input,
-    BlockHeader* header) noexcept;
+bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
+                       BlockHeader* header) noexcept;
 
 // Decode the winning slot from a block's full header region: the valid slot
 // with the larger (allocation_epoch, header_sequence). Returns the winning
@@ -314,7 +311,7 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;
-bool DecodeRecordHeader(std::span<const std::byte> input,
-                        RecordHeader* header, std::string_view* key) noexcept;
+bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
+                        std::string_view* key) noexcept;
 
 }  // namespace keylane::storage

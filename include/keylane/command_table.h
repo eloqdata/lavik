@@ -12,7 +12,7 @@ namespace keylane {
 // the single source of truth for write/read classification, DB-gate
 // participation, and key positions.
 enum CommandFlag : std::uint32_t {
-  kCmdWrite = 1u << 0,       // mutates the keyspace; rejected on read-only replicas
+  kCmdWrite = 1u << 0,  // mutates the keyspace; rejected on read-only replicas
   kCmdReadOnly = 1u << 1,    // never mutates the keyspace
   kCmdNoKeys = 1u << 2,      // takes no key arguments
   kCmdMultiShard = 1u << 3,  // key set may span multiple shard owners
@@ -57,6 +57,7 @@ struct KeyIndexView {
 // ("wrong number of arguments for '<name>' command"; callers prepend "ERR ").
 // Commands with key_step > 1 (MSET) must additionally validate key/value
 // pairing in their handler; this only resolves positions.
-absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec, std::size_t argc);
+absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
+                                           std::size_t argc);
 
 }  // namespace keylane

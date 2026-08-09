@@ -7,9 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -36,9 +36,7 @@ class RespClient {
   explicit RespClient(int fd) : fd_(fd) {}
   RespClient(const RespClient&) = delete;
   RespClient& operator=(const RespClient&) = delete;
-  RespClient(RespClient&& other) noexcept : fd_(other.fd_) {
-    other.fd_ = -1;
-  }
+  RespClient(RespClient&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
   RespClient& operator=(RespClient&&) = delete;
   ~RespClient() {
     if (fd_ >= 0) ::close(fd_);
@@ -75,7 +73,8 @@ class RespClient {
  private:
   void SendAll(std::string_view bytes) {
     while (!bytes.empty()) {
-      const ssize_t sent = ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+      const ssize_t sent =
+          ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
       if (sent < 0) {
         if (errno == EINTR) continue;
         Fail("send failed: " + std::string(std::strerror(errno)));
@@ -135,8 +134,8 @@ std::uint16_t FindFreePort() {
 }
 
 void CreateDataFile(const std::string& path, std::uint64_t bytes) {
-  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                        0600);
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) Fail("failed to create test data file");
   const int allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
   const int close_error = ::close(fd);
@@ -172,19 +171,25 @@ class ServerProcess {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
-      const int log_fd = ::open(log_path.c_str(),
-                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                0600);
+      const int log_fd = ::open(
+          log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
       if (log_fd >= 0) {
         (void)::dup2(log_fd, STDOUT_FILENO);
         (void)::dup2(log_fd, STDERR_FILENO);
         ::close(log_fd);
       }
       std::vector<std::string> arguments{
-          binary,          "--port",         std::to_string(port),
-          "--threads",     "1",              "--recv-buffers",
-          "0",             "--flush-max-ms", "20",
-          "--data-file",   data_path,
+          binary,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "1",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          "20",
+          "--data-file",
+          data_path,
       };
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
@@ -238,7 +243,8 @@ void Expect(std::string_view actual, std::string_view expected,
 }
 
 long long IntegerReply(std::string_view reply, std::string_view operation) {
-  if (!reply.starts_with(':')) Fail(std::string(operation) + " was not integer");
+  if (!reply.starts_with(':'))
+    Fail(std::string(operation) + " was not integer");
   long long value = 0;
   const char* begin = reply.data() + 1;
   const char* end = reply.data() + reply.size();
@@ -269,8 +275,7 @@ int main(int argc, char** argv) {
     std::cerr << "usage: ttl_e2e_test /path/to/keylane\n";
     return 2;
   }
-  const std::string prefix =
-      "/tmp/keylane-ttl-" + std::to_string(::getpid());
+  const std::string prefix = "/tmp/keylane-ttl-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
@@ -296,36 +301,33 @@ int main(int argc, char** argv) {
              "GET after successful XX");
       Expect(client.Command({"SET", "missing", "new", "XX"}), "$-1",
              "SET XX missing");
-      Expect(client.Command({"SET", "missing", "new", "NX", "GET"}),
-             "$-1", "SET NX GET create");
+      Expect(client.Command({"SET", "missing", "new", "NX", "GET"}), "$-1",
+             "SET NX GET create");
       Expect(client.Command({"GET", "missing"}), "$3\r\nnew",
              "GET created value");
 
       Expect(client.Command({"SET", "ttl", "one", "PX", "2000"}), "+OK",
              "SET PX");
-      ExpectRange(IntegerReply(client.Command({"PTTL", "ttl"}), "PTTL"),
-                  1, 2000, "PTTL after SET PX");
+      ExpectRange(IntegerReply(client.Command({"PTTL", "ttl"}), "PTTL"), 1,
+                  2000, "PTTL after SET PX");
       Expect(client.Command({"SET", "ttl", "two", "KEEPTTL"}), "+OK",
              "SET KEEPTTL");
-      ExpectRange(IntegerReply(client.Command({"PTTL", "ttl"}), "PTTL"),
-                  1, 2000, "PTTL after KEEPTTL");
-      Expect(client.Command({"SET", "ttl", "three"}), "+OK",
-             "SET clears TTL");
+      ExpectRange(IntegerReply(client.Command({"PTTL", "ttl"}), "PTTL"), 1,
+                  2000, "PTTL after KEEPTTL");
+      Expect(client.Command({"SET", "ttl", "three"}), "+OK", "SET clears TTL");
       Expect(client.Command({"TTL", "ttl"}), ":-1", "TTL persistent");
-      Expect(client.Command({"TTL", "does-not-exist"}), ":-2",
-             "TTL missing");
+      Expect(client.Command({"TTL", "does-not-exist"}), ":-2", "TTL missing");
 
-      const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::system_clock::now()
-                                   .time_since_epoch())
-                               .count();
+      const auto unix_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
       const std::string future_ms = std::to_string(unix_ms + 2000);
-      Expect(client.Command({"SET", "pxat", "v", "PXAT", future_ms}),
-             "+OK", "SET PXAT");
+      Expect(client.Command({"SET", "pxat", "v", "PXAT", future_ms}), "+OK",
+             "SET PXAT");
       ExpectRange(IntegerReply(client.Command({"PTTL", "pxat"}), "PXAT PTTL"),
                   1, 2000, "PXAT deadline");
-      const std::string future_seconds =
-          std::to_string(unix_ms / 1000 + 3);
+      const std::string future_seconds = std::to_string(unix_ms / 1000 + 3);
       Expect(client.Command({"SET", "exat", "v", "EXAT", future_seconds}),
              "+OK", "SET EXAT");
       ExpectRange(IntegerReply(client.Command({"PTTL", "exat"}), "EXAT PTTL"),
@@ -336,28 +338,24 @@ int main(int argc, char** argv) {
 
       Expect(client.Command({"SET", "persistent-conditions", "v"}), "+OK",
              "SET persistent-conditions");
-      Expect(client.Command(
-                 {"EXPIRE", "persistent-conditions", "10", "GT"}),
+      Expect(client.Command({"EXPIRE", "persistent-conditions", "10", "GT"}),
              ":0", "EXPIRE GT treats persistence as infinity");
-      Expect(client.Command(
-                 {"EXPIRE", "persistent-conditions", "10", "LT"}),
+      Expect(client.Command({"EXPIRE", "persistent-conditions", "10", "LT"}),
              ":1", "EXPIRE LT on persistent key");
-      Expect(client.Command(
-                 {"EXPIRE", "persistent-conditions", "20", "XX"}),
+      Expect(client.Command({"EXPIRE", "persistent-conditions", "20", "XX"}),
              ":1", "EXPIRE XX on expiring key");
 
       Expect(client.Command({"SET", "expire-options", "v"}), "+OK",
              "SET expire-options");
-      Expect(client.Command({"EXPIRE", "expire-options", "10", "NX"}),
-             ":1", "EXPIRE NX");
-      Expect(client.Command({"EXPIRE", "expire-options", "20", "NX"}),
-             ":0", "EXPIRE NX failure");
-      Expect(client.Command({"EXPIRE", "expire-options", "20", "GT"}),
-             ":1", "EXPIRE GT");
-      Expect(client.Command({"EXPIRE", "expire-options", "30", "LT"}),
-             ":0", "EXPIRE LT failure");
-      Expect(client.Command({"PERSIST", "expire-options"}), ":1",
-             "PERSIST");
+      Expect(client.Command({"EXPIRE", "expire-options", "10", "NX"}), ":1",
+             "EXPIRE NX");
+      Expect(client.Command({"EXPIRE", "expire-options", "20", "NX"}), ":0",
+             "EXPIRE NX failure");
+      Expect(client.Command({"EXPIRE", "expire-options", "20", "GT"}), ":1",
+             "EXPIRE GT");
+      Expect(client.Command({"EXPIRE", "expire-options", "30", "LT"}), ":0",
+             "EXPIRE LT failure");
+      Expect(client.Command({"PERSIST", "expire-options"}), ":1", "PERSIST");
       Expect(client.Command({"PERSIST", "expire-options"}), ":0",
              "PERSIST without TTL");
       Expect(client.Command({"PEXPIRE", "expire-options", "0"}), ":1",
@@ -365,12 +363,12 @@ int main(int argc, char** argv) {
       Expect(client.Command({"GET", "expire-options"}), "$-1",
              "GET immediate deletion");
 
-      Expect(client.Command({"SET", "counter", "1", "PX", "2000"}),
-             "+OK", "counter SET");
+      Expect(client.Command({"SET", "counter", "1", "PX", "2000"}), "+OK",
+             "counter SET");
       Expect(client.Command({"INCR", "counter"}), ":2", "counter INCR");
       ExpectRange(
-          IntegerReply(client.Command({"PTTL", "counter"}), "counter PTTL"),
-          1, 2000, "INCR preserves TTL");
+          IntegerReply(client.Command({"PTTL", "counter"}), "counter PTTL"), 1,
+          2000, "INCR preserves TTL");
 
       Expect(client.Command({"SET", "race", "old", "PX", "1"}), "+OK",
              "race old SET");
@@ -398,8 +396,8 @@ int main(int argc, char** argv) {
       std::vector<std::string> flushed_values;
       for (int i = 0; i < 4; ++i) {
         flushed_values.emplace_back(200 + 17 * i, static_cast<char>('a' + i));
-        Expect(client.Command({"SET", "flushed-" + std::to_string(i),
-                               flushed_values[i]}),
+        Expect(client.Command(
+                   {"SET", "flushed-" + std::to_string(i), flushed_values[i]}),
                "+OK", "flushed SET");
       }
       Expect(client.Command({"SET", "flushed-ttl", "keepme", "PX", "60000"}),
@@ -426,10 +424,10 @@ int main(int argc, char** argv) {
 
       // Generous TTL: the restart below includes full recovery, which takes
       // several seconds under sanitizer builds; the key must outlive it.
-      Expect(client.Command({"SET", "restart-live", "v", "PX", "60000"}),
-             "+OK", "restart-live SET");
-      Expect(client.Command({"SET", "restart-dead", "v", "PX", "50"}),
-             "+OK", "restart-dead SET");
+      Expect(client.Command({"SET", "restart-live", "v", "PX", "60000"}), "+OK",
+             "restart-live SET");
+      Expect(client.Command({"SET", "restart-dead", "v", "PX", "50"}), "+OK",
+             "restart-dead SET");
       const std::string large_value(9ULL * 1024 * 1024, 'L');
       Expect(client.Command({"SET", "restart-large", large_value}), "+OK",
              "large SET");

@@ -1,11 +1,12 @@
+#include "keylane/storage/scan_hash_map.h"
+
+#include <gtest/gtest.h>
+
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 
-#include <gtest/gtest.h>
-
 #include "keylane/storage/format.h"
-#include "keylane/storage/scan_hash_map.h"
 
 namespace {
 
@@ -71,8 +72,7 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
     map.InsertOrAssign(ComputeDigest(key), key, i);
   }
   while (cursor != 0) {
-    cursor = map.Scan(cursor,
-                      [&](const auto& entry) { ++seen[entry.key]; });
+    cursor = map.Scan(cursor, [&](const auto& entry) { ++seen[entry.key]; });
   }
   for (std::uint64_t i = 0; i < kInitial; ++i) {
     const std::string key = "key-" + std::to_string(i);
@@ -84,9 +84,9 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ASSERT_CHECK(stable == assigned.entry && !assigned.inserted,
                "assign changed the stable entry address");
   ScanHashMap<std::uint64_t> moved(std::move(map));
-  ASSERT_CHECK(map.empty() &&
-                   moved.Find(ComputeDigest("key-0"), "key-0")->value == 42,
-               "map move failed");
+  ASSERT_CHECK(
+      map.empty() && moved.Find(ComputeDigest("key-0"), "key-0")->value == 42,
+      "map move failed");
 
   // Detach hands the whole population to the caller and leaves the source empty
   // and immediately usable. Entry addresses survive the move, which is what
@@ -98,18 +98,17 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
                "detach left entries in the source");
   ASSERT_CHECK(moved.Find(ComputeDigest("key-0"), "key-0") == nullptr,
                "detached entry is still reachable from the source");
-  ASSERT_CHECK(detached.size() == detached_size &&
-                   detached.Find(ComputeDigest("key-0"), "key-0") ==
-                       before_detach,
-               "detach did not carry the population over unchanged");
+  ASSERT_CHECK(
+      detached.size() == detached_size &&
+          detached.Find(ComputeDigest("key-0"), "key-0") == before_detach,
+      "detach did not carry the population over unchanged");
 
   // The source must accept a fresh population, including a key that the
   // detached one still holds.
   auto reinserted = moved.InsertOrAssign(ComputeDigest("key-0"), "key-0", 7);
   ASSERT_CHECK(reinserted.inserted && moved.size() == 1 &&
                    moved.Find(ComputeDigest("key-0"), "key-0")->value == 7 &&
-                   detached.Find(ComputeDigest("key-0"), "key-0")->value ==
-                       42,
+                   detached.Find(ComputeDigest("key-0"), "key-0")->value == 42,
                "source and detached populations are not independent");
 
   // Erase: every other key of a fresh population, verifying removal, size,
@@ -141,8 +140,8 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   seen.clear();
   cursor = 0;
   do {
-    cursor = erasable.Scan(cursor,
-                           [&](const auto& entry) { ++seen[entry.key]; });
+    cursor =
+        erasable.Scan(cursor, [&](const auto& entry) { ++seen[entry.key]; });
   } while (cursor != 0);
   ASSERT_CHECK(seen.size() == erasable.size(),
                "scan after erase missed or duplicated survivors");
@@ -185,10 +184,9 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
         }
       });
     } while (drain_cursor != 0 && victim.empty());
-    ASSERT_CHECK(chained.Erase(collision, victim),
-                 "chain drain erase failed");
+    ASSERT_CHECK(chained.Erase(collision, victim), "chain drain erase failed");
   }
-  ASSERT_CHECK(chained.Find(collision, "chain-1") == nullptr &&
-                   chained.size() == 0,
-               "chain drain left residue");
+  ASSERT_CHECK(
+      chained.Find(collision, "chain-1") == nullptr && chained.size() == 0,
+      "chain drain left residue");
 }

@@ -118,8 +118,8 @@ class ScanHashMap {
       Bucket* top = &table.buckets[hash & BucketMask(table)];
       for (Bucket* bucket = top; bucket != nullptr;
            bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
-        const std::size_t slots = Chained(*bucket) ? kChildSlot
-                                                    : kEntriesPerBucket;
+        const std::size_t slots =
+            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
         for (std::size_t slot = 0; slot < slots; ++slot) {
           if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
               KeyEquals(*bucket->entries[slot], digest, key)) {
@@ -350,8 +350,8 @@ class ScanHashMap {
     Bucket* bucket = &table.buckets[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      const std::size_t slots = Chained(*bucket) ? kChildSlot
-                                                  : kEntriesPerBucket;
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
             KeyEquals(*bucket->entries[slot], digest, key)) {
@@ -364,8 +364,7 @@ class ScanHashMap {
   }
 
   static const Entry* FindInTable(const Table& table, const Digest& digest,
-                                  std::string_view key,
-                                  std::uint64_t hash) {
+                                  std::string_view key, std::uint64_t hash) {
     return FindInTable(const_cast<Table&>(table), digest, key, hash);
   }
 
@@ -393,8 +392,8 @@ class ScanHashMap {
     const std::uint8_t tag = HashTag(hash);
     Bucket* bucket = &table.buckets[hash & BucketMask(table)];
     while (true) {
-      const std::size_t slots = Chained(*bucket) ? kChildSlot
-                                                  : kEntriesPerBucket;
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (!Occupied(*bucket, slot)) {
           bucket->entries[slot] = entry;
@@ -494,8 +493,8 @@ class ScanHashMap {
     }
     const Bucket* bucket = &table.buckets[index];
     while (bucket != nullptr) {
-      const std::size_t slots = Chained(*bucket) ? kChildSlot
-                                                  : kEntriesPerBucket;
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot)) {
           fn(*bucket->entries[slot]);

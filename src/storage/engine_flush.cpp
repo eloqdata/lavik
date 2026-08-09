@@ -3,8 +3,7 @@
 namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
-  const auto interval =
-      std::chrono::milliseconds(options_.flush_max_ms);
+  const auto interval = std::chrono::milliseconds(options_.flush_max_ms);
   while (!store->worker->stop_requested()) {
     absl::Status status = co_await celer::SleepFor(*store->worker, interval);
     if (!status.ok()) {
@@ -52,8 +51,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
   struct FlushRunGuard {
     Impl* engine = nullptr;
     ~FlushRunGuard() {
-      engine->space_reclaim_generation_.fetch_add(
-          1, std::memory_order_release);
+      engine->space_reclaim_generation_.fetch_add(1, std::memory_order_release);
       engine->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
     }
   } flush_run_guard{this};
@@ -95,8 +93,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (state == nullptr) {
         continue;
       }
-      if (!state->allocated || !state->in_memory ||
-          state->staging_slot == 0 || state->flush_in_progress) {
+      if (!state->allocated || !state->in_memory || state->staging_slot == 0 ||
+          state->flush_in_progress) {
         state->flush_queued = false;
         continue;
       }
@@ -121,7 +119,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         store->write_failed = true;
         store->flush_running = false;
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "invalid pending flush staging buffer");
+                               "invalid pending flush staging buffer");
       }
       if (padded == staging_state.durable_bytes) {
         // Nothing new since the last flush. Rewriting the header would only
@@ -158,10 +156,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           .checksum = 0,
           .layout_worker_count = state->layout_worker_count,
       };
-      EncodeBlockHeader(
-          header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                      buffer.data + slot * kBlockHeaderSlotBytes,
-                      kBlockHeaderSlotBytes));
+      EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                    buffer.data + slot * kBlockHeaderSlotBytes,
+                                    kBlockHeaderSlotBytes));
 
       pending.emplace(PendingFlush{
           .block_id = block_id,
@@ -183,14 +180,13 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       state->flush_in_progress = true;
     }
 
-    const auto [file_id, block_offset] =
-        FileOffset(pending->block_id);
-    FixedBuffer staging = pending->write_buffer_id != 0
-                             ? store->buffers.write_buffer(
-                                   pending->write_buffer_id)
-                             : FixedBuffer{.data = pending->heap_data,
-                                          .size = pending->heap_data_size,
-                                          .index = 0};
+    const auto [file_id, block_offset] = FileOffset(pending->block_id);
+    FixedBuffer staging =
+        pending->write_buffer_id != 0
+            ? store->buffers.write_buffer(pending->write_buffer_id)
+            : FixedBuffer{.data = pending->heap_data,
+                          .size = pending->heap_data_size,
+                          .index = 0};
     // The first flush of a block starts at the unused header slot, which is
     // still zero in staging. That makes the slot durably zero before the
     // first header lands in the other one, so a torn first header cannot
@@ -211,18 +207,16 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       store->write_failed = true;
       store->flush_running = false;
       co_return absl::Status(absl::StatusCode::kInternal,
-                       "invalid pending flush staging buffer");
+                             "invalid pending flush staging buffer");
     }
 
-    for (std::size_t write_offset = write_begin;
-         write_offset < write_bytes;) {
+    for (std::size_t write_offset = write_begin; write_offset < write_bytes;) {
       const std::size_t chunk_bytes =
           std::min(options_.flush_size_bytes, write_bytes - write_offset);
       auto written = co_await WriteStorageBuffer(
           *store->worker, store->files[file_id],
           std::span<const std::byte>(staging.data + write_offset, chunk_bytes),
-          pending->write_buffer_id != 0, staging,
-          block_offset + write_offset);
+          pending->write_buffer_id != 0, staging, block_offset + write_offset);
       if (!written.ok() || *written != chunk_bytes) {
         co_await store->store_state_mutex.Lock();
         UnlockGuard guard(&store->store_state_mutex, store->worker);
@@ -237,7 +231,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           co_return written.status();
         }
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "short block flush write");
+                               "short block flush write");
       }
       write_offset += chunk_bytes;
     }
@@ -257,8 +251,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       co_return status;
     };
 
-    auto synced = co_await celer::Fdatasync(*store->worker,
-                                            store->files[file_id]);
+    auto synced =
+        co_await celer::Fdatasync(*store->worker, store->files[file_id]);
     if (!synced.ok()) {
       co_return co_await fail_flush(synced);
     }
@@ -273,9 +267,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         pending->write_buffer_id != 0, staging, slot_offset);
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
       co_return co_await fail_flush(
-          header_written.ok()
-              ? absl::Status(absl::StatusCode::kInternal, "short block header write")
-              : header_written.status());
+          header_written.ok() ? absl::Status(absl::StatusCode::kInternal,
+                                             "short block header write")
+                              : header_written.status());
     }
     synced = co_await celer::Fdatasync(*store->worker, store->files[file_id]);
     if (!synced.ok()) {

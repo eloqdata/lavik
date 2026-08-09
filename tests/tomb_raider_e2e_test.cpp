@@ -7,9 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -36,9 +36,7 @@ class RespClient {
   explicit RespClient(int fd) : fd_(fd) {}
   RespClient(const RespClient&) = delete;
   RespClient& operator=(const RespClient&) = delete;
-  RespClient(RespClient&& other) noexcept : fd_(other.fd_) {
-    other.fd_ = -1;
-  }
+  RespClient(RespClient&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
   RespClient& operator=(RespClient&&) = delete;
   ~RespClient() {
     if (fd_ >= 0) ::close(fd_);
@@ -75,7 +73,8 @@ class RespClient {
  private:
   void SendAll(std::string_view bytes) {
     while (!bytes.empty()) {
-      const ssize_t sent = ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+      const ssize_t sent =
+          ::send(fd_, bytes.data(), bytes.size(), MSG_NOSIGNAL);
       if (sent < 0) {
         if (errno == EINTR) continue;
         Fail("send failed: " + std::string(std::strerror(errno)));
@@ -135,8 +134,8 @@ std::uint16_t FindFreePort() {
 }
 
 void CreateDataFile(const std::string& path, std::uint64_t bytes) {
-  const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
-                        0600);
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) Fail("failed to create test data file");
   const int allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
   const int close_error = ::close(fd);
@@ -172,19 +171,26 @@ class ServerProcess {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
-      const int log_fd = ::open(log_path.c_str(),
-                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                0600);
+      const int log_fd = ::open(
+          log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
       if (log_fd >= 0) {
         (void)::dup2(log_fd, STDOUT_FILENO);
         (void)::dup2(log_fd, STDERR_FILENO);
         ::close(log_fd);
       }
       std::vector<std::string> arguments{
-          binary,          "--port",         std::to_string(port),
-          "--threads",     "1",              "--recv-buffers",
-          "0",             "--flush-max-ms", "20",
-          "--data-file",   data_path,   "--tomb-raider-interval-ms",
+          binary,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "1",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          "20",
+          "--data-file",
+          data_path,
+          "--tomb-raider-interval-ms",
           "500",
       };
       std::vector<char*> child_argv;
@@ -239,7 +245,8 @@ void Expect(std::string_view actual, std::string_view expected,
 }
 
 long long IntegerReply(std::string_view reply, std::string_view operation) {
-  if (!reply.starts_with(':')) Fail(std::string(operation) + " was not integer");
+  if (!reply.starts_with(':'))
+    Fail(std::string(operation) + " was not integer");
   long long value = 0;
   const char* begin = reply.data() + 1;
   const char* end = reply.data() + reply.size();
@@ -262,7 +269,6 @@ std::string ReadFile(const std::string& path) {
   return std::string(std::istreambuf_iterator<char>(input),
                      std::istreambuf_iterator<char>());
 }
-
 
 long long StatField(RespClient& client, std::string_view field) {
   const std::string info = client.Command({"INFO", "stats"});

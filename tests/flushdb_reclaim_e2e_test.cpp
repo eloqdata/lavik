@@ -8,8 +8,8 @@
 #include <unistd.h>
 
 #include <array>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -38,9 +38,7 @@ class RespClient {
   explicit RespClient(int fd) : fd_(fd) {}
   RespClient(const RespClient&) = delete;
   RespClient& operator=(const RespClient&) = delete;
-  RespClient(RespClient&& other) noexcept : fd_(other.fd_) {
-    other.fd_ = -1;
-  }
+  RespClient(RespClient&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
   RespClient& operator=(RespClient&&) = delete;
   ~RespClient() {
     if (fd_ >= 0) {
@@ -128,13 +126,12 @@ std::uint16_t FindFreePort() {
 }
 
 void CreateDataFile(const std::string& path, std::uint64_t bytes) {
-  const int fd = ::open(path.c_str(),
-                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
     Fail("failed to create test data file");
   }
-  const int allocated =
-      ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
+  const int allocated = ::posix_fallocate(fd, 0, static_cast<off_t>(bytes));
   const int close_error = ::close(fd);
   if (allocated != 0 || close_error != 0) {
     Fail("failed to size test data file");
@@ -149,10 +146,8 @@ RespClient Connect(std::uint16_t port) {
       Fail("client socket failed");
     }
     timeval timeout{.tv_sec = 60, .tv_usec = 0};
-    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
-                       sizeof(timeout));
-    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
-                       sizeof(timeout));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -187,9 +182,8 @@ class ServerProcess {
       Fail("fork failed");
     }
     if (pid_ == 0) {
-      const int log_fd = ::open(log_path.c_str(),
-                                O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
-                                0600);
+      const int log_fd = ::open(
+          log_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
       if (log_fd >= 0) {
         (void)::dup2(log_fd, STDOUT_FILENO);
         (void)::dup2(log_fd, STDERR_FILENO);
@@ -197,10 +191,14 @@ class ServerProcess {
       }
       std::vector<std::string> arguments{
           binary,
-          "--port", std::to_string(port),
-          "--threads", "1",
-          "--recv-buffers", "0",
-          "--flush-max-ms", std::to_string(flush_max_ms),
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "1",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          std::to_string(flush_max_ms),
       };
       for (const std::string& data_path : data_paths) {
         arguments.emplace_back("--data-file");
@@ -309,8 +307,7 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-std::vector<std::uint64_t> ReadAllocatedRecordBlocks(
-    const std::string& path) {
+std::vector<std::uint64_t> ReadAllocatedRecordBlocks(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     Fail("failed to open data file for block scan");
@@ -322,14 +319,14 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(
   }
   const std::uint64_t capacity_blocks =
       static_cast<std::uint64_t>(bytes) / keylane::storage::kStorageBlockBytes;
-  const std::uint32_t begin =
-      keylane::storage::DataBlockBegin(capacity_blocks);
+  const std::uint32_t begin = keylane::storage::DataBlockBegin(capacity_blocks);
   alignas(keylane::storage::kDirectIoAlignment)
-      std::array<std::byte, keylane::storage::kBlockHeaderBytes> header{};
+      std::array<std::byte, keylane::storage::kBlockHeaderBytes>
+          header{};
   std::vector<std::uint64_t> blocks;
   for (std::uint32_t local = begin; local < capacity_blocks; ++local) {
-    const off_t offset = static_cast<off_t>(local) *
-                         keylane::storage::kStorageBlockBytes;
+    const off_t offset =
+        static_cast<off_t>(local) * keylane::storage::kStorageBlockBytes;
     const ssize_t read = ::pread(fd, header.data(), header.size(), offset);
     if (read != static_cast<ssize_t>(header.size())) {
       ::close(fd);
@@ -345,27 +342,26 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(
   return blocks;
 }
 
-bool BlockBitmapBitIsClear(const std::string& path,
-                           std::uint64_t block_id) {
+bool BlockBitmapBitIsClear(const std::string& path, std::uint64_t block_id) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     Fail("failed to open data file while reading allocation bitmap");
   }
-  const std::uint32_t local_block =
-      keylane::storage::LocalBlockId(block_id);
+  const std::uint32_t local_block = keylane::storage::LocalBlockId(block_id);
   const std::size_t byte_index = local_block / 8;
   const std::uint32_t page_index = static_cast<std::uint32_t>(
       byte_index / keylane::storage::kMetadataPagePayloadBytes);
   const std::size_t payload_byte =
       byte_index % keylane::storage::kMetadataPagePayloadBytes;
   alignas(keylane::storage::kDirectIoAlignment)
-      std::array<std::byte, keylane::storage::kDirectIoAlignment> page{};
+      std::array<std::byte, keylane::storage::kDirectIoAlignment>
+          page{};
   std::array<std::byte, keylane::storage::kMetadataPagePayloadBytes>
       selected_payload{};
   std::uint64_t selected_generation = 0;
   for (unsigned slot = 0; slot < 2; ++slot) {
-    const off_t offset = static_cast<off_t>(
-        keylane::storage::MetadataPageSlotOffset(
+    const off_t offset =
+        static_cast<off_t>(keylane::storage::MetadataPageSlotOffset(
             keylane::storage::kScanBitmapMetadataOffset, page_index, slot));
     const ssize_t read = ::pread(fd, page.data(), page.size(), offset);
     if (read != static_cast<ssize_t>(page.size())) {
@@ -376,8 +372,8 @@ bool BlockBitmapBitIsClear(const std::string& path,
         payload{};
     std::uint64_t generation = 0;
     if (keylane::storage::DecodeMetadataPage(
-            page, keylane::storage::MetadataPageKind::kScanBitmap,
-            page_index, &generation, payload) &&
+            page, keylane::storage::MetadataPageKind::kScanBitmap, page_index,
+            &generation, payload) &&
         generation > selected_generation) {
       selected_generation = generation;
       selected_payload = payload;
@@ -467,8 +463,8 @@ int main(int argc, char** argv) {
     CreateDataFile(unequal_path_a, 80ULL * 1024 * 1024);
     CreateDataFile(unequal_path_b, 88ULL * 1024 * 1024);
     {
-      ServerProcess server(argv[1], port,
-                           {unequal_path_a, unequal_path_b}, log_path);
+      ServerProcess server(argv[1], port, {unequal_path_a, unequal_path_b},
+                           log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "unequal-device PING");
       for (unsigned i = 0; i < 20; ++i) {
@@ -491,8 +487,7 @@ int main(int argc, char** argv) {
     CreateDataFile(defrag_crash_path, 128ULL * 1024 * 1024);
     {
       ::setenv("KEYLANE_CRASH_POINT", "defrag-source-retired", 1);
-      ServerProcess server(argv[1], port, {defrag_crash_path}, log_path,
-                           60000);
+      ServerProcess server(argv[1], port, {defrag_crash_path}, log_path, 60000);
       ::unsetenv("KEYLANE_CRASH_POINT");
       RespClient client = Connect(port);
       const std::string small_value(2000, 'd');
@@ -554,8 +549,7 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, {defrag_crash_path}, log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "defrag crash restart PING");
-      Expect(client.Command({"DBSIZE"}),
-             ":" + std::to_string(kDefragKeys),
+      Expect(client.Command({"DBSIZE"}), ":" + std::to_string(kDefragKeys),
              "defrag crash restart DBSIZE");
       for (unsigned i : {0U, 1U, kDefragKeys / 2, kDefragKeys - 1}) {
         const std::string key = "defrag-crash-" + std::to_string(i);
@@ -565,11 +559,10 @@ int main(int argc, char** argv) {
       server.Stop();
     }
     {
-      ServerProcess server(argv[1], port,
-                           {unequal_path_a, unequal_path_b}, log_path);
+      ServerProcess server(argv[1], port, {unequal_path_a, unequal_path_b},
+                           log_path);
       RespClient client = Connect(port);
-      Expect(client.Command({"PING"}), "+PONG",
-             "unequal-device restart PING");
+      Expect(client.Command({"PING"}), "+PONG", "unequal-device restart PING");
       Expect(client.Command({"DBSIZE"}), ":20",
              "unequal-device restart DBSIZE");
       Expect(client.Command({"EXISTS", "unequal-0", "unequal-19"}), ":2",

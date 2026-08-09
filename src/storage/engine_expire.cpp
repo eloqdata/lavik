@@ -30,15 +30,13 @@ Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   co_return absl::OkStatus();
 }
 
-void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
-                                                std::uint16_t partition_id,
-                                                std::uint8_t db_id,
-                                                const RecordIndex::Entry& entry) {
+void StorageEngine::Impl::QueueExpiredCandidate(
+    WorkerStore& store, std::uint16_t partition_id, std::uint8_t db_id,
+    const RecordIndex::Entry& entry) {
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
   if (!options_.expiration_authority ||
       store.expired_candidates.size() >= kMaxQueuedExpiredCandidates ||
-      entry.value.kind != RecordKind::kValue ||
-      entry.value.expire_at_ms == 0) {
+      entry.value.kind != RecordKind::kValue || entry.value.expire_at_ms == 0) {
     return;
   }
   store.expired_candidates.push_back(WorkerStore::ExpireCandidate{
@@ -76,8 +74,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       tx::LockMode::kExclusive);
   co_await store.store_state_mutex.Lock();
   UnlockGuard unlock(&store.store_state_mutex, store.worker);
-  auto* current = partition.indexes[candidate.db_id].Find(
-      candidate.digest, candidate.key);
+  auto* current =
+      partition.indexes[candidate.db_id].Find(candidate.digest, candidate.key);
   if (current == nullptr || current->value.kind != RecordKind::kValue ||
       current->value.mutation_sequence != candidate.mutation_sequence ||
       current->value.expire_at_ms != candidate.expire_at_ms ||
@@ -89,9 +87,9 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     // without a durable tombstone above it, recovery would resurrect it
     // once this record's block is reclaimed. Keep the tombstone path for
     // exactly this case.
-    co_return co_await AppendLocked(
-        store, partition, candidate.db_id, candidate.key, {},
-        RecordKind::kTombstone, ValueType::kNone, 0);
+    co_return co_await AppendLocked(store, partition, candidate.db_id,
+                                    candidate.key, {}, RecordKind::kTombstone,
+                                    ValueType::kNone, 0);
   }
   // Memory-only expiration. Every older on-disk version of this key is
   // expired or gone, and the record carries its own expire_at_ms, so
@@ -168,16 +166,14 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     const std::uint64_t now_ms = UnixTimeMillis();
     for (std::size_t step = 0;
          step < kMapStepsPerCycle && !store->partitions.empty(); ++step) {
-      auto& partition =
-          store->partitions[store->expiry_partition_cursor];
+      auto& partition = store->partitions[store->expiry_partition_cursor];
       const std::uint8_t db_id = store->expiry_db_cursor;
       if (partition.expiring_key_count[db_id] == 0) {
         AdvanceExpiryMap(*store);
       } else {
         auto& index = partition.indexes[db_id];
         store->expiry_scan_cursor = index.Scan(
-            store->expiry_scan_cursor,
-            [&](const RecordIndex::Entry& entry) {
+            store->expiry_scan_cursor, [&](const RecordIndex::Entry& entry) {
               if (IsExpired(entry.value, now_ms)) {
                 QueueExpiredCandidate(*store, partition.id, db_id, entry);
               }
@@ -190,13 +186,12 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     }
 
     std::size_t deleted = 0;
-    while (deleted < kDeletesPerCycle &&
-           !store->expired_candidates.empty()) {
+    while (deleted < kDeletesPerCycle && !store->expired_candidates.empty()) {
       WorkerStore::ExpireCandidate candidate =
           std::move(store->expired_candidates.front());
       store->expired_candidates.pop_front();
-      absl::Status expired = co_await ExpireCandidate(*store,
-                                                std::move(candidate));
+      absl::Status expired =
+          co_await ExpireCandidate(*store, std::move(candidate));
       if (!expired.ok()) {
         co_return expired;
       }

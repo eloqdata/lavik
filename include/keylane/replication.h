@@ -36,9 +36,7 @@ class ReplicationManager {
 
   celer::Service* service() noexcept;
   void StorageReady(celer::Worker& worker);
-  bool replica_read_only() const noexcept {
-    return options_.replica_read_only;
-  }
+  bool replica_read_only() const noexcept { return options_.replica_read_only; }
 
  private:
   class Impl;

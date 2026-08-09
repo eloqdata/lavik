@@ -13,13 +13,14 @@ Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
 
   const std::uint64_t current = DbEpoch(db_id);
   if (current == std::numeric_limits<std::uint64_t>::max()) {
-    co_return absl::Status(absl::StatusCode::kOutOfRange, "database epoch exhausted");
+    co_return absl::Status(absl::StatusCode::kOutOfRange,
+                           "database epoch exhausted");
   }
   co_return co_await DetachDbEpoch(db_id, current + 1);
 }
 
 Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
-                                                std::uint64_t next) {
+                                                      std::uint64_t next) {
   if (celer::ThisWorker().id != 0) {
     co_return co_await celer::SubmitTaskTo(
         0, [this, db_id, next]() -> Task<absl::Status> {
@@ -29,7 +30,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
   const std::uint64_t current = DbEpoch(db_id);
   if (next < current) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                     "replica database epoch is ahead of primary");
+                           "replica database epoch is ahead of primary");
   }
   if (next == current) {
     co_return absl::OkStatus();
@@ -93,7 +94,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
 }
 
 Task<absl::Status> StorageEngine::Impl::AdvanceDbEpoch(std::uint8_t db_id,
-                                                 std::uint64_t next) {
+                                                       std::uint64_t next) {
   absl::Status detached = co_await DetachDbEpoch(db_id, next);
   if (!detached.ok()) {
     co_return detached;
@@ -101,7 +102,8 @@ Task<absl::Status> StorageEngine::Impl::AdvanceDbEpoch(std::uint8_t db_id,
   co_return co_await ReclaimDetachedAllWorkers(/*wait=*/true);
 }
 
-void StorageEngine::Impl::DetachDbLocal(WorkerStore& store, std::uint8_t db_id) {
+void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
+                                        std::uint8_t db_id) {
   // FLUSHDB invalidates every watcher of this database, including watches
   // on keys that never existed (Redis semantics).
   tx::CurrentTxShard().MarkAllWatched(db_id);
@@ -128,7 +130,8 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store, std::uint8_t db_id) 
   store.live_key_count[db_id] = 0;
 }
 
-Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(WorkerStore& store) {
+Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
+    WorkerStore& store) {
   while (!store.detached_indexes.empty()) {
     DetachedIndex detached = std::move(store.detached_indexes.front());
     store.detached_indexes.pop_front();
@@ -216,7 +219,8 @@ Task<absl::Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
   co_return status;
 }
 
-Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(WorkerStore& store) {
+Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
+    WorkerStore& store) {
   EnsureDetachedReclaim(store);
   while (store.detached_reclaim_running || !store.detached_indexes.empty()) {
     // A reclaimer that died mid-stream never empties the queue and nothing
@@ -225,15 +229,16 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(WorkerStore& store)
     if (!store.detached_reclaim_running && store.write_failed) {
       break;
     }
-    absl::Status waited = co_await celer::SleepFor(
-        *store.worker, std::chrono::milliseconds(1));
+    absl::Status waited =
+        co_await celer::SleepFor(*store.worker, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return waited;
     }
   }
   if (store.write_failed) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                     "storage writer stopped while reclaiming flushed keys");
+    co_return absl::Status(
+        absl::StatusCode::kInternal,
+        "storage writer stopped while reclaiming flushed keys");
   }
   co_return absl::OkStatus();
 }

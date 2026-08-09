@@ -7,9 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -208,10 +208,17 @@ class ServerProcess {
         ::close(log_fd);
       }
       std::vector<std::string> arguments{
-          binary,        "--port",         std::to_string(port),
-          "--threads",   "4",              "--recv-buffers",
-          "0",           "--flush-max-ms", "20",
-          "--data-file", data_path,
+          binary,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "4",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          "20",
+          "--data-file",
+          data_path,
       };
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
@@ -315,8 +322,7 @@ int main(int argc, char** argv) {
            "queue MGET");
     Expect(client.Command({"EXISTS", "xa", "xa", "nope"}), "+QUEUED",
            "queue EXISTS");
-    Expect(client.Command({"DEL", "xa", "xb", "nope"}), "+QUEUED",
-           "queue DEL");
+    Expect(client.Command({"DEL", "xa", "xb", "nope"}), "+QUEUED", "queue DEL");
     Expect(client.Command({"EXEC"}),
            "*6\r\n+OK\r\n+OK\r\n+OK\r\n*4\r\n" + Bulk("cv") + "\r\n" +
                Bulk("av") + "\r\n$-1\r\n" + Bulk("bv") + "\r\n:2\r\n:2",
@@ -343,8 +349,7 @@ int main(int argc, char** argv) {
 
     Expect(client.Command({"MULTI"}), "+OK", "MULTI arity");
     Expect(client.Command({"GET"}),
-           "-ERR wrong number of arguments for 'get' command",
-           "arity queued");
+           "-ERR wrong number of arguments for 'get' command", "arity queued");
     Expect(client.Command({"EXEC"}),
            "-EXECABORT Transaction discarded because of previous errors.",
            "EXECABORT arity");
@@ -466,8 +471,7 @@ int main(int argc, char** argv) {
     Expect(other.Command({"SET", "w1", "poke"}), "+OK", "poke");
     Expect(client.Command({"UNWATCH"}), "+OK", "UNWATCH");
     Expect(client.Command({"MULTI"}), "+OK", "MULTI unwatched");
-    Expect(client.Command({"SET", "w1", "won"}), "+QUEUED",
-           "queue unwatched");
+    Expect(client.Command({"SET", "w1", "won"}), "+QUEUED", "queue unwatched");
     Expect(client.Command({"EXEC"}), "*1\r\n+OK", "UNWATCH cleared");
 
     // WATCH inside MULTI is refused without dooming the transaction.
@@ -475,8 +479,7 @@ int main(int argc, char** argv) {
     Expect(client.Command({"WATCH", "w1"}),
            "-ERR WATCH inside MULTI is not allowed", "WATCH inside MULTI");
     Expect(client.Command({"PING"}), "+QUEUED", "queue after watch error");
-    Expect(client.Command({"EXEC"}), "*1\r\n+PONG",
-           "EXEC after watch error");
+    Expect(client.Command({"EXEC"}), "*1\r\n+PONG", "EXEC after watch error");
 
     // Passive expiration invalidates like a write.
     Expect(client.Command({"SET", "wexp", "v", "PX", "80"}), "+OK",
@@ -499,8 +502,8 @@ int main(int argc, char** argv) {
     auto contains = [&](const std::string& haystack, std::string_view needle,
                         const char* what) {
       if (haystack.find(needle) == std::string::npos) {
-        Fail(std::string(what) + " missing from INFO reply: " +
-             haystack.substr(0, 300));
+        Fail(std::string(what) +
+             " missing from INFO reply: " + haystack.substr(0, 300));
       }
     };
     contains(info, "# Server", "server section");
@@ -535,7 +538,6 @@ int main(int argc, char** argv) {
 
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
-  std::cout << (exit_code == 0 ? "multi/exec e2e passed\n" : "")
-            << std::flush;
+  std::cout << (exit_code == 0 ? "multi/exec e2e passed\n" : "") << std::flush;
   return exit_code;
 }

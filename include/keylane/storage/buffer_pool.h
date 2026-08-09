@@ -88,7 +88,7 @@ class RegisteredBufferPool {
   ~RegisteredBufferPool();
 
   absl::Status Init(celer::Worker& worker,
-                     const RegisteredBufferPoolOptions& options = {});
+                    const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
   unsigned owner_worker() const noexcept { return owner_worker_; }
@@ -110,7 +110,7 @@ class RegisteredBufferPool {
     }
     const auto id = static_cast<std::size_t>(buffer_id);
     return id <= write_buffers_.size() && id != 0 ? write_buffers_[id - 1]
-                                                 : celer::FixedBuffer{};
+                                                  : celer::FixedBuffer{};
   }
 
   bool TryAcquireWriteBuffer(std::uint16_t* buffer_id) noexcept;

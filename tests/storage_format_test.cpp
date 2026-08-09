@@ -1,9 +1,9 @@
+#include <gtest/gtest.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-
-#include <gtest/gtest.h>
 
 #include "keylane/storage/format.h"
 
@@ -45,8 +45,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     metadata_payload[i] = static_cast<std::byte>(i + 1);
   }
   std::array<std::byte, kDirectIoAlignment> metadata_page{};
-  EncodeMetadataPage(MetadataPageKind::kEpochs, 11, 23,
-                     metadata_payload, metadata_page);
+  EncodeMetadataPage(MetadataPageKind::kEpochs, 11, 23, metadata_payload,
+                     metadata_page);
   std::array<std::byte, 64> decoded_payload{};
   std::uint64_t metadata_generation = 0;
   ASSERT_TRUE(DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 11,
@@ -58,9 +58,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
        ++i) {
     ASSERT_TRUE(decoded_payload[i] == std::byte{0});
   }
-  ASSERT_TRUE(!DecodeMetadataPage(metadata_page,
-                                  MetadataPageKind::kScanBitmap, 11,
-                                  &metadata_generation, decoded_payload));
+  ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kScanBitmap,
+                                  11, &metadata_generation, decoded_payload));
   ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 12,
                                   &metadata_generation, decoded_payload));
   metadata_page.back() ^= std::byte{1};
@@ -108,7 +107,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     ASSERT_TRUE(!DecodeBlockHeaderPages(pages, &winner, &active_slot));
     std::memcpy(pages.data(), block_page.data(), block_page.size());
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
-    ASSERT_TRUE(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
+    ASSERT_TRUE(active_slot == 0 &&
+                winner.committed_bytes == kBlockHeaderBytes);
     BlockHeader newer = header;
     newer.committed_bytes = kBlockHeaderBytes + 4096;
     newer.header_sequence = 2;
@@ -121,7 +121,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
                 winner.committed_bytes == kBlockHeaderBytes + 4096);
     pages[kBlockHeaderSlotBytes + 8] ^= std::byte{0xff};  // tear slot 1
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
-    ASSERT_TRUE(active_slot == 0 && winner.committed_bytes == kBlockHeaderBytes);
+    ASSERT_TRUE(active_slot == 0 &&
+                winner.committed_bytes == kBlockHeaderBytes);
 
     // A flush that adds no records still restamps the header, so equal
     // committed_bytes must be broken by the sequence, not by slot order.
@@ -199,10 +200,10 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   RecordHeader external_record = record;
   external_record.external = true;
   external_record.logical_size = 9ULL * 1024 * 1024;
-  external_record.payload_bytes = sizeof(ExtentManifestHeader) +
-                                  2 * sizeof(ExtentRef);
-  external_record.total_disk_bytes = static_cast<std::uint32_t>(AlignRecord(
-      record_header_bytes + external_record.payload_bytes));
+  external_record.payload_bytes =
+      sizeof(ExtentManifestHeader) + 2 * sizeof(ExtentRef);
+  external_record.total_disk_bytes = static_cast<std::uint32_t>(
+      AlignRecord(record_header_bytes + external_record.payload_bytes));
   std::fill(record_page.begin(), record_page.end(), std::byte{0});
   ASSERT_TRUE(EncodeRecordHeader(
       external_record, key,

@@ -7,9 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -210,10 +210,17 @@ class ServerProcess {
         ::close(log_fd);
       }
       std::vector<std::string> arguments{
-          binary,        "--port",         std::to_string(port),
-          "--threads",   "4",              "--recv-buffers",
-          "0",           "--flush-max-ms", "20",
-          "--data-file", data_path,
+          binary,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "4",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          "20",
+          "--data-file",
+          data_path,
       };
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
@@ -299,16 +306,15 @@ int main(int argc, char** argv) {
 
     // Cross-shard MSET/MGET: values come back in request order regardless of
     // which worker owns each key.
-    Expect(client.Command({"MSET", "mk0", "v0", "mk1", "v1", "mk2", "v2",
-                           "mk3", "v3", "mk4", "v4", "mk5", "v5", "mk6", "v6",
-                           "mk7", "v7"}),
+    Expect(client.Command({"MSET", "mk0", "v0", "mk1", "v1", "mk2", "v2", "mk3",
+                           "v3", "mk4", "v4", "mk5", "v5", "mk6", "v6", "mk7",
+                           "v7"}),
            "+OK", "cross-shard MSET");
     Expect(client.Command({"MGET", "mk5", "mk0", "missing", "mk7", "mk2"}),
            "*5\r\n" + Bulk("v5") + "\r\n" + Bulk("v0") + "\r\n$-1\r\n" +
                Bulk("v7") + "\r\n" + Bulk("v2"),
            "shuffled MGET");
-    Expect(client.Command({"GET", "mk3"}), Bulk("v3"),
-           "single GET after MSET");
+    Expect(client.Command({"GET", "mk3"}), Bulk("v3"), "single GET after MSET");
 
     // Arity and pairing errors.
     Expect(client.Command({"MSET", "solo"}),
@@ -332,16 +338,16 @@ int main(int argc, char** argv) {
     Expect(client.Command({"EXISTS", "dup"}), ":0", "deleted dup");
 
     // Cross-shard DEL counts exactly the live keys it removed.
-    Expect(client.Command({"DEL", "mk0", "missing", "mk5", "mk7", "mk7"}),
-           ":3", "cross-shard DEL");
+    Expect(client.Command({"DEL", "mk0", "missing", "mk5", "mk7", "mk7"}), ":3",
+           "cross-shard DEL");
     Expect(client.Command({"MGET", "mk0", "mk5", "mk7", "mk1"}),
            "*4\r\n$-1\r\n$-1\r\n$-1\r\n" + Bulk("v1"), "MGET after DEL");
 
     // Hashtag keys share one slot: the whole command stays on a single shard
     // (fast path) and must behave identically.
-    Expect(client.Command({"MSET", "{tag}a", "1", "{tag}b", "2", "{tag}c",
-                           "3"}),
-           "+OK", "hashtag MSET");
+    Expect(
+        client.Command({"MSET", "{tag}a", "1", "{tag}b", "2", "{tag}c", "3"}),
+        "+OK", "hashtag MSET");
     Expect(client.Command({"MGET", "{tag}c", "{tag}a", "{tag}b"}),
            "*3\r\n" + Bulk("3") + "\r\n" + Bulk("1") + "\r\n" + Bulk("2"),
            "hashtag MGET");
@@ -353,10 +359,8 @@ int main(int argc, char** argv) {
     {
       const std::string bin_key("k\r\n\x00\xff\x01", 6);
       const std::string bin_value("v\x00\r\n\xfe\\x41", 8);
-      Expect(client.Command({"SET", bin_key, bin_value}), "+OK",
-             "binary SET");
-      Expect(client.Command({"GET", bin_key}), Bulk(bin_value),
-             "binary GET");
+      Expect(client.Command({"SET", bin_key, bin_value}), "+OK", "binary SET");
+      Expect(client.Command({"GET", bin_key}), Bulk(bin_value), "binary GET");
       Expect(client.Command({"MGET", bin_key, "missing"}),
              "*2\r\n" + Bulk(bin_value) + "\r\n$-1", "binary MGET");
       Expect(client.Command({"EXISTS", bin_key}), ":1", "binary EXISTS");
@@ -372,8 +376,8 @@ int main(int argc, char** argv) {
     Expect(client.Command({"DEL", "large", "small"}), ":2", "DEL large");
 
     // ---- KEYS / SCAN TYPE ----
-    Expect(client.Command({"MSET", "kx:1", "a", "kx:2", "b", "kx:3", "c",
-                           "other", "1"}),
+    Expect(client.Command(
+               {"MSET", "kx:1", "a", "kx:2", "b", "kx:3", "c", "other", "1"}),
            "+OK", "KEYS seed");
     auto expect_members = [&](const std::string& reply, std::size_t count,
                               const std::vector<std::string>& members,
@@ -421,8 +425,8 @@ int main(int argc, char** argv) {
         Expect(client.Command({"SET", name, "v"}), "+OK", "long name SET");
         long_names.push_back(std::move(name));
       }
-      expect_members(client.Command({"KEYS", "longname:*"}),
-                     long_names.size(), long_names, "KEYS long names");
+      expect_members(client.Command({"KEYS", "longname:*"}), long_names.size(),
+                     long_names, "KEYS long names");
       for (const std::string& name : long_names) {
         Expect(client.Command({"DEL", name}), ":1", "long name DEL");
       }
@@ -437,8 +441,7 @@ int main(int argc, char** argv) {
       volume_storage.clear();
       mset_args.push_back("MSET");
       for (unsigned i = 0; i < 50; ++i) {
-        volume_storage.push_back("vol:" +
-                                 std::to_string(batch * 50 + i));
+        volume_storage.push_back("vol:" + std::to_string(batch * 50 + i));
         volume_storage.push_back("v");
       }
       for (const std::string& arg : volume_storage) {
@@ -464,8 +467,7 @@ int main(int argc, char** argv) {
       std::string cursor = "0";
       do {
         const std::string reply = client.Command(
-            {"SCAN", cursor, "MATCH", "kx:*", "COUNT", "1000", "TYPE",
-             type});
+            {"SCAN", cursor, "MATCH", "kx:*", "COUNT", "1000", "TYPE", type});
         const std::size_t cursor_start = reply.find("\r\n") + 2;
         const std::size_t digits = reply.find("\r\n", cursor_start) + 2;
         const std::size_t digits_end = reply.find("\r\n", digits);

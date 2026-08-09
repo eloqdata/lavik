@@ -10,8 +10,8 @@ std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
       block.writer_id < worker_count_) {
     return static_cast<std::uint16_t>(block.writer_id);
   }
-  std::uint64_t mixed = block_id ^
-                        (block.allocation_epoch + 0x9e3779b97f4a7c15ULL);
+  std::uint64_t mixed =
+      block_id ^ (block.allocation_epoch + 0x9e3779b97f4a7c15ULL);
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
   mixed ^= mixed >> 31;
@@ -26,10 +26,10 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
       recovery_scanned_records_.fetch_add(records, std::memory_order_relaxed) +
       records;
   const std::uint64_t scanned_allocated =
-      allocated
-          ? recovery_scanned_allocated_.fetch_add(
-                1, std::memory_order_relaxed) + 1
-          : recovery_scanned_allocated_.load(std::memory_order_relaxed);
+      allocated ? recovery_scanned_allocated_.fetch_add(
+                      1, std::memory_order_relaxed) +
+                      1
+                : recovery_scanned_allocated_.load(std::memory_order_relaxed);
   const auto now = std::chrono::steady_clock::now();
   const std::int64_t now_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -41,11 +41,9 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
       return;
     }
   } else {
-    std::int64_t next =
-        recovery_next_log_ms_.load(std::memory_order_relaxed);
-    if (now_ms < next ||
-        !recovery_next_log_ms_.compare_exchange_strong(
-            next, now_ms + 5000, std::memory_order_relaxed)) {
+    std::int64_t next = recovery_next_log_ms_.load(std::memory_order_relaxed);
+    if (now_ms < next || !recovery_next_log_ms_.compare_exchange_strong(
+                             next, now_ms + 5000, std::memory_order_relaxed)) {
       return;
     }
   }
@@ -54,30 +52,26 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
   // is the bitmap's allocated population, not device capacity. Rate, percent,
   // and ETA are all computed over allocated blocks.
   const std::uint64_t allocated_blocks = recovery_allocated_blocks_;
-  const double elapsed_seconds =
-      std::max(0.001, static_cast<double>(now_ms - recovery_started_ms_) /
-                          1000.0);
+  const double elapsed_seconds = std::max(
+      0.001, static_cast<double>(now_ms - recovery_started_ms_) / 1000.0);
   const double block_rate =
       static_cast<double>(scanned_allocated) / elapsed_seconds;
   const double record_rate =
       static_cast<double>(scanned_records) / elapsed_seconds;
   const double percent =
-      allocated_blocks == 0
-          ? 100.0
-          : (static_cast<double>(scanned_allocated) * 100.0) /
-                static_cast<double>(allocated_blocks);
-  const std::uint64_t remaining =
-      allocated_blocks > scanned_allocated
-          ? allocated_blocks - scanned_allocated
-          : 0;
+      allocated_blocks == 0 ? 100.0
+                            : (static_cast<double>(scanned_allocated) * 100.0) /
+                                  static_cast<double>(allocated_blocks);
+  const std::uint64_t remaining = allocated_blocks > scanned_allocated
+                                      ? allocated_blocks - scanned_allocated
+                                      : 0;
   const double eta_seconds =
       block_rate == 0.0 ? 0.0 : static_cast<double>(remaining) / block_rate;
   spdlog::info(
       "storage recovery: blocks={}/{} ({:.1f}%) swept={}/{} records={} "
       "rate={:.0f} blocks/s {:.2f}M records/s eta={:.1f}s",
-      scanned_allocated, allocated_blocks, percent, scanned,
-      total_data_blocks_, scanned_records, block_rate,
-      record_rate / 1000000.0, eta_seconds);
+      scanned_allocated, allocated_blocks, percent, scanned, total_data_blocks_,
+      scanned_records, block_rate, record_rate / 1000000.0, eta_seconds);
 }
 
 Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
@@ -118,11 +112,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     };
   } else {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                     "failed to allocate recovery block buffer");
+                           "failed to allocate recovery block buffer");
   }
   if (recovery.buffer.size < kStorageBlockBytes) {
-    co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                     "recovery block buffer is smaller than a storage block");
+    co_return absl::Status(
+        absl::StatusCode::kResourceExhausted,
+        "recovery block buffer is smaller than a storage block");
   }
   recovery.buffer.size = kStorageBlockBytes;
 
@@ -137,8 +132,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     for (std::uint64_t device_offset = first_device_offset;
          device_offset < device.data_block_count;
          device_offset += worker_count_) {
-      const std::uint32_t local_block = static_cast<std::uint32_t>(
-          device.data_block_begin + device_offset);
+      const std::uint32_t local_block =
+          static_cast<std::uint32_t>(device.data_block_begin + device_offset);
       const std::uint64_t block_id = MakeBlockId(device.id, local_block);
       const DeviceAllocator& allocator = *device_allocators_[device_index];
       const std::size_t bitmap_byte = local_block / 8;
@@ -159,7 +154,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
       if (*read != kBlockHeaderBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "short read while scanning block header");
+                               "short read while scanning block header");
       }
       std::span<const std::byte, kBlockHeaderBytes> block_bytes(
           header_buffer.data, kBlockHeaderBytes);
@@ -182,44 +177,43 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
       if (block.block_id != block_id) {
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "invalid or corrupt block header");
+                               "invalid or corrupt block header");
       }
       AtomicMax(&recovery_device_cursors_[device_index].next_local,
                 static_cast<std::uint64_t>(local_block) + 1);
-      AtomicMax(
-          &recovery_device_cursors_[device_index].next_allocation_epoch,
-          block.allocation_epoch + 1);
+      AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch,
+                block.allocation_epoch + 1);
       AtomicMax(&next_lsn_, block.max_lsn + 1);
 
-      const std::uint16_t block_owner =
-          RecoveredBlockOwner(block, block_id);
-      batches->at(block_owner).blocks.push_back(RecoveryBlock{ActiveBlock{
-          .block_id = block_id,
-          .writer_id = block.writer_id,
-          .layout_worker_count = block.layout_worker_count,
-          .allocation_epoch = block.allocation_epoch,
-          .committed_bytes = block.committed_bytes,
-          .record_count = block.record_count,
-          .max_lsn = block.max_lsn,
-          .kind = block.kind,
-          .extent_index = block.extent_index,
-          .extent_payload_checksum = block.extent_payload_checksum,
-      }});
+      const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
+      batches->at(block_owner)
+          .blocks.push_back(RecoveryBlock{ActiveBlock{
+              .block_id = block_id,
+              .writer_id = block.writer_id,
+              .layout_worker_count = block.layout_worker_count,
+              .allocation_epoch = block.allocation_epoch,
+              .committed_bytes = block.committed_bytes,
+              .record_count = block.record_count,
+              .max_lsn = block.max_lsn,
+              .kind = block.kind,
+              .extent_index = block.extent_index,
+              .extent_payload_checksum = block.extent_payload_checksum,
+          }});
 
       if (block.kind == BlockKind::kValueExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
 
-      read = co_await ReadStorageBuffer(
-          *store.worker, store.files[file_id], recovery.buffer,
-          recovery.registered(), block_offset);
+      read = co_await ReadStorageBuffer(*store.worker, store.files[file_id],
+                                        recovery.buffer, recovery.registered(),
+                                        block_offset);
       if (!read.ok()) {
         co_return read.status();
       }
       if (*read != kStorageBlockBytes) {
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "short read while scanning committed block");
+                               "short read while scanning committed block");
       }
 
       std::uint32_t record_offset = kBlockHeaderBytes;
@@ -229,7 +223,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             recovery.buffer.data, record_offset, block.committed_bytes);
         if (!next.has_value()) {
           co_return absl::Status(absl::StatusCode::kInternal,
-                           "invalid or corrupt committed record header");
+                                 "invalid or corrupt committed record header");
         }
         if (*next != record_offset) {
           record_offset = *next;
@@ -246,7 +240,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 std::numeric_limits<std::uint32_t>::max() ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
           co_return absl::Status(absl::StatusCode::kInternal,
-                           "invalid or corrupt committed record header");
+                                 "invalid or corrupt committed record header");
         }
         AtomicMax(&next_lsn_, record.lsn + 1);
         AtomicMax(&recovery_max_txid_, record.txid);
@@ -264,7 +258,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             StorageShardForKey(key) % block.layout_worker_count !=
                 block.writer_id) {
           co_return absl::Status(absl::StatusCode::kInternal,
-                           "invalid or corrupt committed record header");
+                                 "invalid or corrupt committed record header");
         }
         if (record.db_epoch != DbEpoch(record.db_id)) {
           record_offset += record.total_disk_bytes;
@@ -284,15 +278,14 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           if (record.kind != RecordKind::kValue ||
               record.value_type != ValueType::kString) {
             co_return absl::Status(absl::StatusCode::kInternal,
-                             "unsupported external record type");
+                                   "unsupported external record type");
           }
           const std::byte* payload =
               recovery.buffer.data + record_offset + record.header_bytes;
-          if (Crc32c(std::span<const std::byte>(payload,
-                                                record.payload_bytes)) !=
-              record.payload_checksum) {
+          if (Crc32c(std::span<const std::byte>(
+                  payload, record.payload_bytes)) != record.payload_checksum) {
             co_return absl::Status(absl::StatusCode::kInternal,
-                             "external manifest checksum mismatch");
+                                   "external manifest checksum mismatch");
           }
           auto decoded = DecodeManifest(
               std::span<const std::byte>(payload, record.payload_bytes),
@@ -307,32 +300,34 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             .key = std::string(key),
             .db_id = record.db_id,
             .txid = record.txid,
-            .location = RecordLocation{
-                .block_id = block_id,
-                .replication_epoch = record.replication_epoch,
-                .mutation_sequence = record.mutation_sequence,
-                .allocation_epoch = record.allocation_epoch,
-                .expire_at_ms = record.expire_at_ms,
-                .block_owner = block_owner,
-                .record_offset = record_offset,
-                .total_disk_bytes = record.total_disk_bytes,
-                .logical_size = record.logical_size,
-                .payload_bytes = record.payload_bytes,
-                .relocation_sequence = static_cast<std::uint32_t>(
-                    record.relocation_sequence),
-                .external = record.external,
-                .kind = record.kind,
-                .value_type = record.value_type,
-                .extents = std::move(extents),
-            },
+            .location =
+                RecordLocation{
+                    .block_id = block_id,
+                    .replication_epoch = record.replication_epoch,
+                    .mutation_sequence = record.mutation_sequence,
+                    .allocation_epoch = record.allocation_epoch,
+                    .expire_at_ms = record.expire_at_ms,
+                    .block_owner = block_owner,
+                    .record_offset = record_offset,
+                    .total_disk_bytes = record.total_disk_bytes,
+                    .logical_size = record.logical_size,
+                    .payload_bytes = record.payload_bytes,
+                    .relocation_sequence =
+                        static_cast<std::uint32_t>(record.relocation_sequence),
+                    .external = record.external,
+                    .kind = record.kind,
+                    .value_type = record.value_type,
+                    .extents = std::move(extents),
+                },
         });
         record_offset += record.total_disk_bytes;
         ++records;
       }
       if (record_offset != block.committed_bytes ||
           records != block.record_count) {
-        co_return absl::Status(absl::StatusCode::kInternal,
-                         "block committed boundary does not match records");
+        co_return absl::Status(
+            absl::StatusCode::kInternal,
+            "block committed boundary does not match records");
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
     }
@@ -375,12 +370,11 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
   }
 }
 
-void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
-                                               const RecoveryRecord& recovered) {
+void StorageEngine::Impl::ApplyRecoveredRecord(
+    WorkerStore& store, const RecoveryRecord& recovered) {
   {
     auto& partition = PartitionForKey(store, recovered.key);
-    if (recovered.location.replication_epoch !=
-        partition.replication_epoch) {
+    if (recovered.location.replication_epoch != partition.replication_epoch) {
       return;
     }
     partition.mutation_sequence = std::max(
@@ -392,15 +386,12 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
     // whichever version currently wins learns whether a strictly older,
     // still-unexpired value remains on disk. Equal sequences are relocated
     // copies of the same version and shield nothing.
-    if (found == nullptr ||
-        IsNewer(recovered.location, found->value)) {
+    if (found == nullptr || IsNewer(recovered.location, found->value)) {
       const bool was_live =
-        found != nullptr && found->value.kind == RecordKind::kValue;
+          found != nullptr && found->value.kind == RecordKind::kValue;
       const bool is_live = recovered.location.kind == RecordKind::kValue;
-      const bool was_expiring =
-          was_live && found->value.expire_at_ms != 0;
-      const bool is_expiring =
-          is_live && recovered.location.expire_at_ms != 0;
+      const bool was_expiring = was_live && found->value.expire_at_ms != 0;
+      const bool is_expiring = is_live && recovered.location.expire_at_ms != 0;
       RecordLocation winner = recovered.location;
       if (found != nullptr) {
         winner.shielding =
@@ -410,8 +401,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
                  recovered.location.mutation_sequence &&
              (found->value.expire_at_ms == 0 ||
               found->value.expire_at_ms >
-                  std::max(recovered.location.expire_at_ms,
-                           UnixTimeMillis())));
+                  std::max(recovered.location.expire_at_ms, UnixTimeMillis())));
       }
       index.InsertOrAssign(recovered.digest, recovered.key, winner);
       if (was_live != is_live) {
@@ -435,8 +425,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
                    found->value.mutation_sequence &&
                (recovered.location.expire_at_ms == 0 ||
                 recovered.location.expire_at_ms >
-                    std::max(found->value.expire_at_ms,
-                             UnixTimeMillis()))) {
+                    std::max(found->value.expire_at_ms, UnixTimeMillis()))) {
       found->value.shielding = true;
     }
   }

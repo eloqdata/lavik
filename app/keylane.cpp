@@ -33,7 +33,8 @@ int main(int argc, char** argv) {
   app.add_option("-t,--threads", threads, "Worker thread count")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_option("-i,--idle-timeout", idle_timeout_ms, "Idle timeout in ms (-1 = disabled)")
+  app.add_option("-i,--idle-timeout", idle_timeout_ms,
+                 "Idle timeout in ms (-1 = disabled)")
       ->capture_default_str();
   app.add_option("--recv-buffers", recv_buffer_count,
                  "Multishot recv buffer-ring entries per worker (0 disables)")
@@ -65,8 +66,9 @@ int main(int argc, char** argv) {
                  "Pause after each block the tombstone sweep reads")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
-  app.add_option("--data-file", data_files,
-                 "Existing data file or block device; repeat for multiple paths")
+  app.add_option(
+         "--data-file", data_files,
+         "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
   app.add_option("--replication-port", replication_port,
                  "Internal replication listen port (0 disables receiver)")
@@ -101,8 +103,7 @@ int main(int argc, char** argv) {
     }
     const char* begin = replicate_to.data() + separator + 1;
     const char* end = replicate_to.data() + replicate_to.size();
-    auto [parsed_end, error] =
-        std::from_chars(begin, end, parsed_port);
+    auto [parsed_end, error] = std::from_chars(begin, end, parsed_port);
     if (error != std::errc{} || parsed_end != end || parsed_port == 0 ||
         parsed_port > std::numeric_limits<std::uint16_t>::max()) {
       return 2;
@@ -110,14 +111,10 @@ int main(int argc, char** argv) {
     replication_options.target_ip = replicate_to.substr(0, separator);
     replication_options.target_port = static_cast<std::uint16_t>(parsed_port);
   }
-  return keylane::RunServer(bind_ip, port, threads, idle_timeout_ms,
-                            recv_buffer_count, busy_poll_us,
-                            static_cast<std::size_t>(registered_buffer_mb) * kMiB,
-                            flush_max_ms,
-                            static_cast<std::size_t>(flush_size_kb) * kKiB,
-                            !disable_read_crc,
-                            data_files,
-                            tomb_raider_interval_ms,
-                            tomb_raider_sleep_ms,
-                            std::move(replication_options));
+  return keylane::RunServer(
+      bind_ip, port, threads, idle_timeout_ms, recv_buffer_count, busy_poll_us,
+      static_cast<std::size_t>(registered_buffer_mb) * kMiB, flush_max_ms,
+      static_cast<std::size_t>(flush_size_kb) * kKiB, !disable_read_crc,
+      data_files, tomb_raider_interval_ms, tomb_raider_sleep_ms,
+      std::move(replication_options));
 }

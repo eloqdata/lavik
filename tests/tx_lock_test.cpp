@@ -1,10 +1,10 @@
+#include <gtest/gtest.h>
+
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <string>
 #include <vector>
-
-#include <gtest/gtest.h>
 
 #include "keylane/tx/intent_lock.h"
 #include "keylane/tx/tx_queue.h"
@@ -65,15 +65,18 @@ TEST(TxLockTest, IntentAndHoldCompatibility) {
   // Shared/shared grants; exclusive conflicts both ways.
   EXPECT_CHECK(table.AcquireIntent(fp, LockMode::kShared), "S grant on free");
   EXPECT_CHECK(table.AcquireIntent(fp, LockMode::kShared), "S/S grant");
-  EXPECT_CHECK(!table.AcquireIntent(fp, LockMode::kExclusive), "X blocked by S");
+  EXPECT_CHECK(!table.AcquireIntent(fp, LockMode::kExclusive),
+               "X blocked by S");
   table.ReleaseIntent(fp, LockMode::kExclusive);
   table.ReleaseIntent(fp, LockMode::kShared);
   table.ReleaseIntent(fp, LockMode::kShared);
   EXPECT_CHECK(table.size() == 0, "entry erased when all counters zero");
 
-  EXPECT_CHECK(table.AcquireIntent(fp, LockMode::kExclusive), "X grant on free");
+  EXPECT_CHECK(table.AcquireIntent(fp, LockMode::kExclusive),
+               "X grant on free");
   EXPECT_CHECK(!table.AcquireIntent(fp, LockMode::kShared), "S blocked by X");
-  EXPECT_CHECK(!table.AcquireIntent(fp, LockMode::kExclusive), "X blocked by X");
+  EXPECT_CHECK(!table.AcquireIntent(fp, LockMode::kExclusive),
+               "X blocked by X");
   table.ReleaseIntent(fp, LockMode::kExclusive);
   table.ReleaseIntent(fp, LockMode::kShared);
   table.ReleaseIntent(fp, LockMode::kExclusive);
@@ -139,7 +142,8 @@ TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
   RunWithIo(shard, k1, LockMode::kShared, io_a, order, "A");
   EXPECT_CHECK(order == std::vector<std::string>{"A:start"},
                "A started, sleeping");
-  EXPECT_CHECK(counter.load() == 1, "fast path must not touch the txid counter");
+  EXPECT_CHECK(counter.load() == 1,
+               "fast path must not touch the txid counter");
 
   // t1: writer on k1 conflicts with the sleeping holder -> queues.
   RunImmediate(shard, k1, LockMode::kExclusive, order, "B");
@@ -152,16 +156,18 @@ TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
 
   // Non-conflicting traffic overlaps the sleeping holder's I/O.
   RunImmediate(shard, k2, LockMode::kExclusive, order, "D");
-  EXPECT_CHECK(order.size() == 3 && order[1] == "D:start" && order[2] == "D:done",
-               "D runs immediately on an uncontended key");
+  EXPECT_CHECK(
+      order.size() == 3 && order[1] == "D:start" && order[2] == "D:done",
+      "D runs immediately on an uncontended key");
   EXPECT_CHECK(shard.fastpath_runs() == 2, "A and D took the fast path");
 
   // t3: the sleeping holder finishes; queue drains in txid order.
   io_a.Fire();
-  const std::vector<std::string> expected{
-      "A:start", "D:start", "D:done", "A:done",
-      "B:start", "B:done",  "C:start", "C:done"};
-  EXPECT_CHECK(order == expected, "queue drained in order after holder release");
+  const std::vector<std::string> expected{"A:start", "D:start", "D:done",
+                                          "A:done",  "B:start", "B:done",
+                                          "C:start", "C:done"};
+  EXPECT_CHECK(order == expected,
+               "queue drained in order after holder release");
   EXPECT_CHECK(shard.queued_runs() == 2, "B and C ran from the queue");
   EXPECT_CHECK(shard.committed_txid() == 2,
                "committed_txid advanced to C's txid");

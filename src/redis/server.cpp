@@ -1,33 +1,34 @@
 #include "keylane/server.h"
 
-#include <array>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
-#include <cstddef>
 #include <csignal>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
-#include <atomic>
-#include <poll.h>
-#include <span>
-#include <sys/socket.h>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
-#include <sys/eventfd.h>
-#include <unistd.h>
 
 #include "absl/strings/str_cat.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
-#include "spdlog/spdlog.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
+#include "keylane/replication.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
-#include "keylane/tx/tx_shard.h"
-#include "keylane/replication.h"
 #include "keylane/storage/engine.h"
+#include "keylane/tx/tx_shard.h"
+#include "spdlog/spdlog.h"
 
 namespace keylane {
 using namespace celer;
@@ -35,9 +36,9 @@ using namespace celer;
 namespace {
 
 constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
-    1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 40, 50, 75, 100,
-    150, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000,
-    8000, 10000, 20000, 50000};
+    1,    2,    3,    4,    5,    8,     10,    15,   20,  30,
+    40,   50,   75,   100,  150,  200,   300,   500,  750, 1000,
+    1500, 2000, 3000, 5000, 8000, 10000, 20000, 50000};
 
 struct LatencyDistribution {
   std::uint64_t sum_ns = 0;
@@ -153,12 +154,12 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       100.0 * static_cast<double>(stats.hits) / stats.count,
       100.0 * static_cast<double>(stats.disk_reads) / stats.count,
       100.0 * static_cast<double>(stats.heap_buffers) / stats.count,
-      avg(stats.total), avg(stats.route_out), avg(stats.lookup), avg(stats.buffer),
-      avg(stats.io), avg(stats.decode), avg(stats.route_back), avg(stats.send),
-      p999(stats.total), p999(stats.route_out), p999(stats.lookup),
-      p999(stats.buffer), p999(stats.io), p999(stats.decode),
-      p999(stats.route_back), p999(stats.send),
-      wake_stats.sent, wake_stats.checks);
+      avg(stats.total), avg(stats.route_out), avg(stats.lookup),
+      avg(stats.buffer), avg(stats.io), avg(stats.decode),
+      avg(stats.route_back), avg(stats.send), p999(stats.total),
+      p999(stats.route_out), p999(stats.lookup), p999(stats.buffer),
+      p999(stats.io), p999(stats.decode), p999(stats.route_back),
+      p999(stats.send), wake_stats.sent, wake_stats.checks);
   const auto cycles_to_us = [&](std::uint64_t cycles) {
     return scheduler_stats.cycles_per_second == 0.0
                ? 0.0
@@ -170,7 +171,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
   spdlog::info(
       "scheduler worker={} rounds={} avg-round-us={:.2f} max-round-us={:.2f} "
       "fg-resumes={} fg-us={:.1f} max-fg-us={:.1f} fg-overruns={} "
-      "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} bg-share={:.1f}%",
+      "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} "
+      "bg-share={:.1f}%",
       ThisWorker().id, scheduler_stats.rounds,
       scheduler_stats.rounds == 0
           ? 0.0
@@ -180,8 +182,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       scheduler_stats.foreground_resumes,
       cycles_to_us(scheduler_stats.foreground_cycles),
       cycles_to_us(scheduler_stats.max_foreground_cycles),
-      scheduler_stats.foreground_overruns,
-      scheduler_stats.background_resumes,
+      scheduler_stats.foreground_overruns, scheduler_stats.background_resumes,
       cycles_to_us(scheduler_stats.background_cycles),
       cycles_to_us(scheduler_stats.max_background_cycles),
       scheduler_stats.background_overruns,
@@ -280,8 +281,7 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
     }
     if ((fds[1].revents & POLLIN) != 0) {
       std::uint64_t wake = 0;
-      const ssize_t result =
-          read(server.completion_fd(), &wake, sizeof(wake));
+      const ssize_t result = read(server.completion_fd(), &wake, sizeof(wake));
       if (result < 0 && errno != EAGAIN) {
         spdlog::warn("server completion eventfd read failed errno={}", errno);
       }
@@ -352,9 +352,9 @@ void RedisService::WaitForRequestsDrained() const noexcept {
 bool RedisService::TryBeginRequest() noexcept {
   std::uint64_t state = request_gate_.load(std::memory_order_acquire);
   while ((state & kRequestsClosed) == 0) {
-    if (request_gate_.compare_exchange_weak(
-            state, state + 1, std::memory_order_acq_rel,
-            std::memory_order_acquire)) {
+    if (request_gate_.compare_exchange_weak(state, state + 1,
+                                            std::memory_order_acq_rel,
+                                            std::memory_order_acquire)) {
       return true;
     }
   }
@@ -382,7 +382,8 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   co_return co_await TcpService::Run(worker, ctx);
 }
 
-Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
+Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream,
+                                                  std::string* pending) {
   // Hard ceiling on one connection's accumulated request bytes. The per-frame
   // limits (1024 args of up to 512 MiB each) still admit a claimed frame far
   // larger than RAM, and the buffer grows until the frame completes — without
@@ -409,7 +410,7 @@ Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string
     }
     if (pending->size() >= kMaxPendingBytes) {
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                       "client request exceeds the query buffer limit");
+                             "client request exceeds the query buffer limit");
     }
 
     auto read_result = co_await stream.ReadSome(buffer);
@@ -417,7 +418,8 @@ Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string
       co_return read_result.status();
     }
     if (*read_result == 0) [[unlikely]] {
-      co_return absl::Status(absl::StatusCode::kUnavailable, "peer closed connection");
+      co_return absl::Status(absl::StatusCode::kUnavailable,
+                             "peer closed connection");
     }
     pending->append(reinterpret_cast<const char*>(buffer.data()), *read_result);
   }
@@ -458,7 +460,7 @@ struct StreamStallState {
 // under the pending io_uring operation, and the serve loop's normal
 // teardown then reopens the gate and closes the socket.
 Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
-                                int fd) {
+                                      int fd) {
   while (!state->done) {
     const auto deadline = state->last_progress + kStreamStallLimit;
     const auto now = std::chrono::steady_clock::now();
@@ -468,8 +470,7 @@ Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
     }
     absl::Status slept = co_await celer::SleepFor(
         *ThisWorker().self,
-        std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
-                                                              now) +
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
             std::chrono::milliseconds(1));
     if (!slept.ok()) {
       co_return slept;  // worker shutting down
@@ -478,7 +479,8 @@ Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
+Task<absl::Status> RedisService::Serve(TcpStream& stream,
+                                       ConnectionContext& ctx) {
   std::string pending;
 
   while (stream.IsOpen()) {
@@ -488,14 +490,15 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx
 
     auto command_result = co_await ReadNextCommand(stream, &pending);
     if (!command_result.ok()) [[unlikely]] {
-      if (command_result.status().code() == absl::StatusCode::kUnavailable) [[unlikely]] {
+      if (command_result.status().code() == absl::StatusCode::kUnavailable)
+          [[unlikely]] {
         co_return absl::OkStatus();
       }
 
-      std::string encoded = EncodeError(absl::StrCat("ERR ", command_result.status().message()));
-      auto write_status = co_await stream.WriteAll(
-          std::span<const std::byte>(reinterpret_cast<const std::byte*>(encoded.data()),
-                                     encoded.size()));
+      std::string encoded =
+          EncodeError(absl::StrCat("ERR ", command_result.status().message()));
+      auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
       if (!write_status.ok()) [[unlikely]] {
         co_return write_status;
       }
@@ -515,7 +518,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx
         BuildCommandRequest(std::move(*command_result), ctx.selected_db);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
-      reply.encoded = EncodeError(absl::StrCat("ERR ", request_result.status().message()));
+      reply.encoded =
+          EncodeError(absl::StrCat("ERR ", request_result.status().message()));
     } else {
       reply = co_await DispatchCommand(ctx, std::move(*request_result));
     }
@@ -539,8 +543,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx
       stall = std::make_shared<StreamStallState>();
       stall->last_progress = std::chrono::steady_clock::now();
       retire_stall.state = stall;
-      ThisWorker().self->Spawn(
-          BreakStalledStream(stall, stream.NativeFd()));
+      ThisWorker().self->Spawn(BreakStalledStream(stall, stream.NativeFd()));
     }
 
     absl::Status write_status;
@@ -603,19 +606,20 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx
 
 }  // namespace
 
-int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_count,
-              int idle_timeout_ms, unsigned recv_buffer_count,
-              unsigned busy_poll_us,
-              std::size_t registered_buffer_bytes,
-              std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
-              bool verify_read_crc,
+int RunServer(std::string_view bind_ip, std::uint16_t port,
+              unsigned thread_count, int idle_timeout_ms,
+              unsigned recv_buffer_count, unsigned busy_poll_us,
+              std::size_t registered_buffer_bytes, std::uint32_t flush_max_ms,
+              std::size_t flush_size_bytes, bool verify_read_crc,
               const std::vector<std::string>& data_files,
               std::uint32_t tomb_raider_interval_ms,
               std::uint32_t tomb_raider_sleep_ms,
               ReplicationOptions replication_options) {
   spdlog::info(
-      "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
-      "registered_buffer_bytes={} per worker flush_max_ms={} flush_size_bytes={} "
+      "keylane listening on {}:{} threads={} idle_timeout_ms={} "
+      "busy_poll_us={} "
+      "registered_buffer_bytes={} per worker flush_max_ms={} "
+      "flush_size_bytes={} "
       "verify_read_crc={}",
       bind_ip, port, thread_count, idle_timeout_ms, busy_poll_us,
       registered_buffer_bytes, flush_max_ms, flush_size_bytes, verify_read_crc);

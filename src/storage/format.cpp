@@ -1,12 +1,12 @@
 #include "keylane/storage/format.h"
 
-#include "absl/crc/crc32c.h"
-
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <bit>
+#include <cassert>
 #include <cstring>
+
+#include "absl/crc/crc32c.h"
 
 namespace keylane::storage {
 namespace {
@@ -32,9 +32,8 @@ void Sha1Compress(const std::uint8_t* block,
     words[i] = LoadBigEndian(block + i * 4);
   }
   for (std::size_t i = 16; i < words.size(); ++i) {
-    words[i] = std::rotl(words[i - 3] ^ words[i - 8] ^ words[i - 14] ^
-                             words[i - 16],
-                         1);
+    words[i] = std::rotl(
+        words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
   }
 
   std::uint32_t a = (*state)[0];
@@ -58,8 +57,8 @@ void Sha1Compress(const std::uint8_t* block,
       function = b ^ c ^ d;
       constant = 0xca62c1d6U;
     }
-    const std::uint32_t temp = std::rotl(a, 5) + function + e + constant +
-                               words[i];
+    const std::uint32_t temp =
+        std::rotl(a, 5) + function + e + constant + words[i];
     e = d;
     d = c;
     c = std::rotl(b, 30);
@@ -109,8 +108,8 @@ std::size_t DigestHash::operator()(const Digest& digest) const noexcept {
 }
 
 Digest ComputeDigest(std::string_view key) noexcept {
-  std::array<std::uint32_t, 5> state{
-      0x67452301U, 0xefcdab89U, 0x98badcfeU, 0x10325476U, 0xc3d2e1f0U};
+  std::array<std::uint32_t, 5> state{0x67452301U, 0xefcdab89U, 0x98badcfeU,
+                                     0x10325476U, 0xc3d2e1f0U};
   const auto* input = reinterpret_cast<const std::uint8_t*>(key.data());
   std::size_t remaining = key.size();
   while (remaining >= 64) {
@@ -127,8 +126,7 @@ Digest ComputeDigest(std::string_view key) noexcept {
   const std::size_t tail_bytes = remaining < 56 ? 64 : 128;
   const std::uint64_t bit_length = static_cast<std::uint64_t>(key.size()) * 8;
   for (unsigned i = 0; i < 8; ++i) {
-    tail[tail_bytes - 1 - i] =
-        static_cast<std::uint8_t>(bit_length >> (i * 8));
+    tail[tail_bytes - 1 - i] = static_cast<std::uint8_t>(bit_length >> (i * 8));
   }
   Sha1Compress(tail.data(), &state);
   if (tail_bytes == 128) {
@@ -151,8 +149,8 @@ std::uint32_t StorageShardForKey(std::string_view key) noexcept {
 }
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
-  const absl::string_view input(
-      reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  const absl::string_view input(reinterpret_cast<const char*>(bytes.data()),
+                                bytes.size());
   return static_cast<std::uint32_t>(absl::ComputeCrc32c(input));
 }
 
@@ -167,9 +165,8 @@ void EncodeDeviceLabel(
   std::memcpy(output.data(), &encoded, sizeof(encoded));
 }
 
-bool DecodeDeviceLabel(
-    std::span<const std::byte, kDirectIoAlignment> input,
-    DeviceLabel* label) noexcept {
+bool DecodeDeviceLabel(std::span<const std::byte, kDirectIoAlignment> input,
+                       DeviceLabel* label) noexcept {
   if (label == nullptr) {
     return false;
   }
@@ -199,8 +196,8 @@ bool DecodeDeviceLabel(
 }
 
 void EncodeMetadataPage(
-    MetadataPageKind kind, std::uint32_t page_index,
-    std::uint64_t generation, std::span<const std::byte> payload,
+    MetadataPageKind kind, std::uint32_t page_index, std::uint64_t generation,
+    std::span<const std::byte> payload,
     std::span<std::byte, kDirectIoAlignment> output) noexcept {
   assert(payload.size() <= kMetadataPagePayloadBytes);
   std::fill(output.begin(), output.end(), std::byte{0});
@@ -220,18 +217,18 @@ void EncodeMetadataPage(
   std::memcpy(output.data(), &header, sizeof(header));
 }
 
-bool DecodeMetadataPage(
-    std::span<const std::byte, kDirectIoAlignment> input,
-    MetadataPageKind expected_kind, std::uint32_t expected_page_index,
-    std::uint64_t* generation, std::span<std::byte> payload) noexcept {
+bool DecodeMetadataPage(std::span<const std::byte, kDirectIoAlignment> input,
+                        MetadataPageKind expected_kind,
+                        std::uint32_t expected_page_index,
+                        std::uint64_t* generation,
+                        std::span<std::byte> payload) noexcept {
   if (generation == nullptr) {
     return false;
   }
   MetadataPageHeader header{};
   std::memcpy(&header, input.data(), sizeof(header));
   if (header.magic != kMetadataPageMagic ||
-      header.version != kStorageFormatVersion ||
-      header.kind != expected_kind ||
+      header.version != kStorageFormatVersion || header.kind != expected_kind ||
       header.header_bytes != sizeof(MetadataPageHeader) ||
       header.page_index != expected_page_index || header.generation == 0 ||
       header.payload_bytes > kMetadataPagePayloadBytes ||
@@ -247,8 +244,7 @@ bool DecodeMetadataPage(
     return false;
   }
   std::fill(payload.begin(), payload.end(), std::byte{0});
-  std::memcpy(payload.data(),
-              input.data() + sizeof(MetadataPageHeader),
+  std::memcpy(payload.data(), input.data() + sizeof(MetadataPageHeader),
               header.payload_bytes);
   *generation = header.generation;
   return true;
@@ -273,11 +269,10 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
   bool found = false;
   for (std::uint8_t slot = 0; slot < kBlockHeaderSlots; ++slot) {
     BlockHeader decoded{};
-    if (!DecodeBlockHeader(
-            std::span<const std::byte, kBlockHeaderSlotBytes>(
-                input.data() + slot * kBlockHeaderSlotBytes,
-                kBlockHeaderSlotBytes),
-            &decoded)) {
+    if (!DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes>(
+                               input.data() + slot * kBlockHeaderSlotBytes,
+                               kBlockHeaderSlotBytes),
+                           &decoded)) {
       continue;
     }
     if (!found || decoded.allocation_epoch > best.allocation_epoch ||
@@ -300,16 +295,14 @@ bool DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes> input,
   return true;
 }
 
-bool DecodeBlockHeader(
-    std::span<const std::byte, kBlockHeaderSlotBytes> input,
-    BlockHeader* header) noexcept {
+bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
+                       BlockHeader* header) noexcept {
   if (header == nullptr) {
     return false;
   }
   BlockHeader decoded{};
   std::memcpy(&decoded, input.data(), sizeof(decoded));
-  if (decoded.magic != kBlockMagic ||
-      decoded.block_id == kInvalidBlockId ||
+  if (decoded.magic != kBlockMagic || decoded.block_id == kInvalidBlockId ||
       LocalBlockId(decoded.block_id) == 0 ||
       decoded.version != kStorageFormatVersion ||
       decoded.header_bytes != kBlockHeaderBytes ||
@@ -331,8 +324,7 @@ bool DecodeBlockHeader(
         decoded.extent_payload_checksum != 0) {
       return false;
     }
-  } else if (decoded.record_count != 0 ||
-             decoded.extent_payload_bytes == 0 ||
+  } else if (decoded.record_count != 0 || decoded.extent_payload_bytes == 0 ||
              decoded.extent_payload_bytes > kExtentPayloadBytes ||
              decoded.committed_bytes !=
                  kBlockHeaderBytes + decoded.extent_payload_bytes) {
@@ -350,12 +342,10 @@ bool DecodeBlockHeader(
   return true;
 }
 
-bool EncodeRecordHeader(
-    const RecordHeader& header, std::string_view key,
-    std::span<std::byte> output) noexcept {
+bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
+                        std::span<std::byte> output) noexcept {
   const std::size_t header_bytes = RecordHeaderBytes(key.size());
-  if (header.magic != kRecordMagic ||
-      header.version != kStorageFormatVersion ||
+  if (header.magic != kRecordMagic || header.version != kStorageFormatVersion ||
       key.size() > MaxKeyBytes() || key.size() != header.key_bytes ||
       header.db_id >= kLogicalDatabaseCount ||
       static_cast<std::uint8_t>(header.value_type) >
@@ -376,9 +366,9 @@ bool EncodeRecordHeader(
   }
   std::fill(output.begin(), output.end(), std::byte{0});
   RecordHeader encoded = header;
-  encoded.value_type = static_cast<ValueType>(
-      static_cast<std::uint8_t>(encoded.value_type) |
-      (encoded.external ? kExternalValueMask : 0));
+  encoded.value_type =
+      static_cast<ValueType>(static_cast<std::uint8_t>(encoded.value_type) |
+                             (encoded.external ? kExternalValueMask : 0));
   encoded.external = false;
   encoded.header_checksum = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
@@ -388,9 +378,8 @@ bool EncodeRecordHeader(
   return true;
 }
 
-bool DecodeRecordHeader(
-    std::span<const std::byte> input,
-    RecordHeader* header, std::string_view* key) noexcept {
+bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
+                        std::string_view* key) noexcept {
   if (header == nullptr || key == nullptr ||
       input.size() < sizeof(RecordHeader)) {
     return false;
@@ -416,9 +405,9 @@ bool DecodeRecordHeader(
       decoded.key_bytes > MaxKeyBytes() ||
       decoded.header_bytes != RecordHeaderBytes(decoded.key_bytes) ||
       decoded.header_bytes > input.size() ||
-      decoded.total_disk_bytes != AlignRecord(
-          static_cast<std::size_t>(decoded.header_bytes) +
-          decoded.payload_bytes) ||
+      decoded.total_disk_bytes !=
+          AlignRecord(static_cast<std::size_t>(decoded.header_bytes) +
+                      decoded.payload_bytes) ||
       decoded.total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
     return false;
   }

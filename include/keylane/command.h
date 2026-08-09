@@ -58,8 +58,7 @@ struct CommandRequest {
 
 // Pulls the next chunk of a streamed reply; an empty chunk ends the stream.
 // Lets unbounded replies (KEYS) reach the socket in bounded memory.
-using ReplyChunkSource =
-    std::function<Task<absl::StatusOr<std::string>>()>;
+using ReplyChunkSource = std::function<Task<absl::StatusOr<std::string>>()>;
 
 struct CommandReply {
   // TODO: Add a connection-local RESP reply builder for composite and small
@@ -74,7 +73,7 @@ struct CommandReply {
 };
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
-                                             std::uint8_t db_id);
+                                                   std::uint8_t db_id);
 
 struct ConnectionContext;
 
@@ -88,7 +87,8 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
 Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx);
 
 // Bind command routing to the disk engine. Call once before the server starts.
-void InitStorage(storage::StorageEngine* engine, bool replica_read_only = false);
+void InitStorage(storage::StorageEngine* engine,
+                 bool replica_read_only = false);
 
 // Static facts INFO reports. Call once before the server starts.
 void SetServerInfo(std::uint16_t port, unsigned thread_count);
@@ -97,8 +97,9 @@ void SetServerInfo(std::uint16_t port, unsigned thread_count);
 void ConnectionOpened() noexcept;
 void ConnectionClosed() noexcept;
 
-// Route `request` to the worker owning its Redis hash-slot partition. Async disk
-// operations use SubmitTaskTo and return on the connection's original worker.
+// Route `request` to the worker owning its Redis hash-slot partition. Async
+// disk operations use SubmitTaskTo and return on the connection's original
+// worker.
 Task<CommandReply> ExecuteCommand(const CommandRequest& request);
 
 }  // namespace keylane

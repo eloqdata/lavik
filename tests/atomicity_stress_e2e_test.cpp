@@ -11,9 +11,9 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
-#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <exception>
@@ -238,12 +238,18 @@ class ServerProcess {
       }
       std::vector<std::string> arguments{
           binary,
-          "--port", std::to_string(port),
-          "--threads", "4",
-          "--recv-buffers", "0",
-          "--flush-max-ms", "1",
-          "--flush-size-kb", "4",
-          "--data-file", data_path,
+          "--port",
+          std::to_string(port),
+          "--threads",
+          "4",
+          "--recv-buffers",
+          "0",
+          "--flush-max-ms",
+          "1",
+          "--flush-size-kb",
+          "4",
+          "--data-file",
+          data_path,
       };
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
@@ -315,8 +321,7 @@ void Writer(std::uint16_t port, const char* tag, const char* first,
             const char* second) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire);
-         ++i) {
+    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", first, value, second, value});
@@ -330,8 +335,7 @@ void Writer(std::uint16_t port, const char* tag, const char* first,
   }
 }
 
-void CheckSnapshot(const std::vector<std::string>& abc,
-                   const char* context) {
+void CheckSnapshot(const std::vector<std::string>& abc, const char* context) {
   if (abc.size() != 3) {
     ReportFailure(std::string(context) + ": expected 3 values");
     return;
@@ -340,11 +344,11 @@ void CheckSnapshot(const std::vector<std::string>& abc,
   const std::string& b = abc[1];
   const std::string& c = abc[2];
   if (b.starts_with("W1:") && a != b) {
-    ReportFailure(std::string(context) + ": torn W1 write: a='" + a +
-                  "' b='" + b + "' c='" + c + "'");
+    ReportFailure(std::string(context) + ": torn W1 write: a='" + a + "' b='" +
+                  b + "' c='" + c + "'");
   } else if (b.starts_with("W2:") && c != b) {
-    ReportFailure(std::string(context) + ": torn W2 write: a='" + a +
-                  "' b='" + b + "' c='" + c + "'");
+    ReportFailure(std::string(context) + ": torn W2 write: a='" + a + "' b='" +
+                  b + "' c='" + c + "'");
   }
 }
 
@@ -352,8 +356,7 @@ void MgetReader(std::uint16_t port) {
   try {
     RespClient client = Connect(port);
     while (!stop_flag.load(std::memory_order_acquire)) {
-      const std::string reply =
-          client.Command({"MGET", "sa", "sb", "sc"});
+      const std::string reply = client.Command({"MGET", "sa", "sb", "sc"});
       CheckSnapshot(RespClient::ParseFlatArray(reply), "MGET");
     }
   } catch (const std::exception& error) {
@@ -385,8 +388,7 @@ void ExecReader(std::uint16_t port) {
 void PairWriter(std::uint16_t port, const char* tag) {
   try {
     RespClient client = Connect(port);
-    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire);
-         ++i) {
+    for (std::uint64_t i = 1; !stop_flag.load(std::memory_order_acquire); ++i) {
       const std::string value = std::string(tag) + std::to_string(i);
       const std::string reply =
           client.Command({"MSET", "ha", value, "hb", value});
@@ -438,8 +440,8 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       {
         RespClient seed = Connect(port);
-        if (seed.Command({"MSET", "sa", "W1:0", "sb", "W1:0", "ha", "H0",
-                          "hb", "H0"}) != "+OK") {
+        if (seed.Command({"MSET", "sa", "W1:0", "sb", "W1:0", "ha", "H0", "hb",
+                          "H0"}) != "+OK") {
           Fail("seed MSET failed");
         }
       }

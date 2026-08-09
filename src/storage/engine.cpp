@@ -34,10 +34,8 @@ std::size_t StorageEngine::LocalSize(std::uint8_t db_id) const noexcept {
 }
 
 ScanBatch StorageEngine::ScanPartition(std::uint16_t partition_id,
-                                       std::uint8_t db_id,
-                                       std::uint64_t cursor,
-                                       std::size_t count,
-                                       std::uint64_t now_ms,
+                                       std::uint8_t db_id, std::uint64_t cursor,
+                                       std::size_t count, std::uint64_t now_ms,
                                        std::size_t max_bytes) const {
   return impl_->ScanPartition(partition_id, db_id, cursor, count, now_ms,
                               max_bytes);
@@ -47,9 +45,7 @@ Task<absl::Status> StorageEngine::QuiesceExpiration() {
   return impl_->QuiesceExpiration();
 }
 
-void StorageEngine::ResumeExpiration() noexcept {
-  impl_->ResumeExpiration();
-}
+void StorageEngine::ResumeExpiration() noexcept { impl_->ResumeExpiration(); }
 
 TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
@@ -88,8 +84,8 @@ bool StorageEngine::TryTakeReplicationReady(std::uint16_t* partition_id) {
   return impl_->TryTakeReplicationReady(partition_id);
 }
 
-void StorageEngine::AcknowledgePartitionDeltas(
-    std::uint16_t partition_id, std::uint64_t through_sequence) {
+void StorageEngine::AcknowledgePartitionDeltas(std::uint16_t partition_id,
+                                               std::uint64_t through_sequence) {
   impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
 }
 
@@ -106,8 +102,8 @@ Task<absl::Status> StorageEngine::ApplyReplicaRecords(
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
-                                             std::string_view key,
-                                             ReadLatencyTrace* trace) {
+                                                   std::string_view key,
+                                                   ReadLatencyTrace* trace) {
   return impl_->Get(db_id, key, trace);
 }
 
@@ -117,14 +113,14 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
-                                             std::string_view key,
-                                             std::string_view value,
-                                             SetOptions options) {
+                                                   std::string_view key,
+                                                   std::string_view value,
+                                                   SetOptions options) {
   return impl_->Set(db_id, key, value, options);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
-                                                   std::string_view key) {
+                                                  std::string_view key) {
   return impl_->GetExpiration(db_id, key);
 }
 
@@ -135,7 +131,7 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Delete(std::uint8_t db_id,
-                                           std::string_view key) {
+                                                 std::string_view key) {
   return impl_->Delete(db_id, key);
 }
 
@@ -148,10 +144,9 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::Increment(
   return impl_->Increment(db_id, key);
 }
 
-Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   const Digest& digest,
-                                                   ReadLatencyTrace* trace) {
+Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    ReadLatencyTrace* trace) {
   return impl_->GetLocked(db_id, key, digest, trace);
 }
 
@@ -160,12 +155,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
   return impl_->StringLengthLocked(db_id, key, digest);
 }
 
-Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   const Digest& digest,
-                                                   std::string_view value,
-                                                   SetOptions options,
-                                                   TxShardWrites* tx) {
+Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::string_view value, SetOptions options, TxShardWrites* tx) {
   return impl_->SetLocked(db_id, key, digest, value, options, tx);
 }
 
@@ -184,14 +176,13 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(std::uint8_t db_id,
-                                                 std::string_view key,
-                                                 const Digest& digest,
-                                                 TxShardWrites* tx) {
+                                                       std::string_view key,
+                                                       const Digest& digest,
+                                                       TxShardWrites* tx) {
   return impl_->DeleteLocked(db_id, key, digest, tx);
 }
 
-Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id,
-                                       std::string_view key,
+Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,
                                        const Digest& digest) {
   return impl_->ExistsLocked(db_id, key, digest);
 }
@@ -202,14 +193,14 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
   return impl_->IncrementLocked(db_id, key, digest, tx);
 }
 
-Task<absl::Status> StorageEngine::CommitTxWrites(std::uint64_t txid,
-                                           std::vector<TxShardWrites*> shards) {
+Task<absl::Status> StorageEngine::CommitTxWrites(
+    std::uint64_t txid, std::vector<TxShardWrites*> shards) {
   return impl_->CommitTxWrites(txid, std::move(shards));
 }
 
 std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {
-  return tx::TxRuntime::Get()->next_txid.fetch_add(
-      1, std::memory_order_relaxed);
+  return tx::TxRuntime::Get()->next_txid.fetch_add(1,
+                                                   std::memory_order_relaxed);
 }
 
 void StorageEngine::NoteTxCommitStarted() noexcept {

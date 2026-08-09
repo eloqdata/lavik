@@ -3,9 +3,9 @@
 namespace keylane::storage {
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   std::string_view value,
-                                                   SetOptions options) {
+                                                         std::string_view key,
+                                                         std::string_view value,
+                                                         SetOptions options) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -13,12 +13,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
   co_return co_await SetLocked(db_id, key, digest, value, options);
 }
 
-Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_id,
-                                                         std::string_view key,
-                                                         const Digest& digest,
-                                                         std::string_view value,
-                                                         SetOptions options,
-                                                         TxShardWrites* tx) {
+Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::string_view value, SetOptions options, TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -34,8 +31,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_i
   SetResult result;
   if (options.return_old_value && exists) {
     if (found->value.value_type != ValueType::kString) {
-      co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                       "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     auto loaded = co_await LoadValue(store, db_id, key, digest, found->value);
     if (!loaded.ok()) {
@@ -56,9 +54,9 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_i
     co_return result;
   }
 
-  const std::uint64_t expire_at_ms =
-      options.keep_ttl && exists ? found->value.expire_at_ms
-                                 : options.expire_at_ms;
+  const std::uint64_t expire_at_ms = options.keep_ttl && exists
+                                         ? found->value.expire_at_ms
+                                         : options.expire_at_ms;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx);
@@ -120,9 +118,9 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
-    absl::Status status = co_await AppendLocked(
-        store, partition, db_id, key, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0, tx);
+    absl::Status status =
+        co_await AppendLocked(store, partition, db_id, key, {},
+                              RecordKind::kTombstone, ValueType::kNone, 0, tx);
     if (!status.ok()) {
       co_return status;
     }
@@ -147,7 +145,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(std::uint8_t db_id,
-                                                 std::string_view key) {
+                                                       std::string_view key) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -155,10 +153,9 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(std::uint8_t db_id,
   co_return co_await DeleteLocked(db_id, key, digest);
 }
 
-Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(std::uint8_t db_id,
-                                                       std::string_view key,
-                                                       const Digest& digest,
-                                                       TxShardWrites* tx) {
+Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -180,8 +177,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(std::uint8_t db_id,
   co_return !expired;
 }
 
-Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::Increment(std::uint8_t db_id,
-                                                            std::string_view key) {
+Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::Increment(
+    std::uint8_t db_id, std::string_view key) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -207,32 +204,31 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
                       !IsExpired(found->value, UnixTimeMillis());
   if (exists) {
     if (found->value.value_type != ValueType::kString) {
-      co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                       "WRONGTYPE Operation against a key holding the wrong kind of value");
+      co_return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     expire_at_ms = found->value.expire_at_ms;
-    auto loaded =
-        co_await LoadValue(store, db_id, key, digest, found->value);
+    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value);
     if (!loaded.ok()) {
       co_return loaded.status();
     }
     const std::span<const std::byte> value_bytes = loaded->value();
     std::string_view text(reinterpret_cast<const char*>(value_bytes.data()),
                           value_bytes.size());
-    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(),
-                                        value);
+    auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), value);
     if (error != std::errc{} || end != text.data() + text.size() ||
         value == std::numeric_limits<std::int64_t>::max()) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                       "value is not an integer or out of range");
+                             "value is not an integer or out of range");
     }
   }
   ++value;
   const std::string encoded = std::to_string(value);
-  absl::Status status =
-      co_await AppendLocked(store, partition, db_id, key, encoded,
-                            RecordKind::kValue, ValueType::kString,
-                            expire_at_ms, tx);
+  absl::Status status = co_await AppendLocked(
+      store, partition, db_id, key, encoded, RecordKind::kValue,
+      ValueType::kString, expire_at_ms, tx);
   if (!status.ok()) {
     co_return status;
   }
@@ -241,9 +237,8 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
 
 StagingSlot* StorageEngine::Impl::StagingFor(WorkerStore& store,
                                              const BlockState& state) {
-  return state.staging_slot == 0
-             ? nullptr
-             : &store.staging_slots[state.staging_slot];
+  return state.staging_slot == 0 ? nullptr
+                                 : &store.staging_slots[state.staging_slot];
 }
 
 std::uint16_t StorageEngine::Impl::AcquireStagingSlot(WorkerStore& store) {
@@ -257,8 +252,8 @@ std::uint16_t StorageEngine::Impl::AcquireStagingSlot(WorkerStore& store) {
   return static_cast<std::uint16_t>(store.staging_slots.size() - 1);
 }
 
-FixedBuffer StorageEngine::Impl::StagingBufferFor(WorkerStore& store,
-                                                  const BlockState& state) const {
+FixedBuffer StorageEngine::Impl::StagingBufferFor(
+    WorkerStore& store, const BlockState& state) const {
   const StagingSlot* slot = StagingFor(store, state);
   if (slot == nullptr) {
     return FixedBuffer{};
@@ -266,9 +261,8 @@ FixedBuffer StorageEngine::Impl::StagingBufferFor(WorkerStore& store,
   if (slot->write_buffer_id != 0) {
     return store.buffers.write_buffer(slot->write_buffer_id);
   }
-  return FixedBuffer{.data = slot->heap_data,
-                    .size = slot->heap_data_size,
-                    .index = 0};
+  return FixedBuffer{
+      .data = slot->heap_data, .size = slot->heap_data_size, .index = 0};
 }
 
 void StorageEngine::Impl::ReleaseStagingBuffer(WorkerStore& store,
@@ -288,14 +282,14 @@ void StorageEngine::Impl::ReleaseStagingBuffer(WorkerStore& store,
   state.in_memory = false;
 }
 
-absl::Status StorageEngine::Impl::MarkRecordDeadLocal(unsigned owner,
-                                                const RetiredRecord& record) {
+absl::Status StorageEngine::Impl::MarkRecordDeadLocal(
+    unsigned owner, const RetiredRecord& record) {
   WorkerStore& store = *stores_[owner];
   BlockState* state = FindBlockState(store, record.block_id);
   if (state == nullptr || !state->allocated ||
       state->allocation_epoch != record.allocation_epoch) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "stale block owner while invalidating record");
+                        "stale block owner while invalidating record");
   }
   // live_bytes is the byte sum over exactly the index entries naming this
   // block at this allocation epoch, so the entry being retired here is one of
@@ -305,23 +299,23 @@ absl::Status StorageEngine::Impl::MarkRecordDeadLocal(unsigned owner,
   // frees without inspecting the block. Fail loudly rather than lose data.
   if (state->live_bytes < record.total_disk_bytes) {
     return absl::Status(absl::StatusCode::kInternal,
-                  "block live-byte accounting underflow");
+                        "block live-byte accounting underflow");
   }
   state->live_bytes -= record.total_disk_bytes;
   MaybeQueueDefrag(store, record.block_id);
   return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::MarkRecordDead(const RetiredRecord& record) {
+Task<absl::Status> StorageEngine::Impl::MarkRecordDead(
+    const RetiredRecord& record) {
   assert(record.block_owner < worker_count_);
   const unsigned owner = record.block_owner;
   if (owner == celer::ThisWorker().id) {
     co_return MarkRecordDeadLocal(owner, record);
   }
-  co_return co_await celer::SubmitTo(
-      owner, [this, owner, record] {
-        return MarkRecordDeadLocal(owner, record);
-      });
+  co_return co_await celer::SubmitTo(owner, [this, owner, record] {
+    return MarkRecordDeadLocal(owner, record);
+  });
 }
 
 Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
@@ -335,12 +329,13 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       continue;
     }
     for (const TxShardWrites::Fence& fence : shard->fences) {
-      absl::Status durable = co_await AwaitRelocationDurable(RelocationDurabilityFence{
-          .block_id = fence.block_id,
-          .allocation_epoch = fence.allocation_epoch,
-          .block_owner = fence.block_owner,
-          .committed_bytes = fence.committed_bytes,
-      });
+      absl::Status durable =
+          co_await AwaitRelocationDurable(RelocationDurabilityFence{
+              .block_id = fence.block_id,
+              .allocation_epoch = fence.allocation_epoch,
+              .block_owner = fence.block_owner,
+              .committed_bytes = fence.committed_bytes,
+          });
       if (!durable.ok()) {
         // No commit: recovery aborts the transaction. The routed
         // retirements never fire, so the superseded copies stay accounted —
@@ -433,8 +428,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
       }
     }
     entry.entry->value = *entry.previous;
-    absl::Status dead = MarkRecordDeadLocal(store.worker->id(),
-                                      RetiredRecordOf(applied));
+    absl::Status dead =
+        MarkRecordDeadLocal(store.worker->id(), RetiredRecordOf(applied));
     if (!dead.ok()) {
       store.write_failed = true;
       co_return dead;
@@ -505,7 +500,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     // instead of appending into a stream that will never flush.
     co_await ReturnReservedBlock(*allocated);
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                     "storage writer is stopped after an IO failure");
+                           "storage writer is stopped after an IO failure");
   }
   co_return allocated;
 }
@@ -513,15 +508,15 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
 // Hands a reserved-but-unwritten block back to its device's ready pool. The
 // allocation bit is already durably set, which is exactly the state pool
 // entries are in; the next consumer stamps a fresh allocation epoch.
-Task<absl::Status> StorageEngine::Impl::ReturnReservedBlock(ReservedBlock block) {
+Task<absl::Status> StorageEngine::Impl::ReturnReservedBlock(
+    ReservedBlock block) {
   const std::size_t device_index = DeviceIndexForBlock(block.block_id);
   co_return co_await celer::SubmitTaskTo(
       device_allocators_[device_index]->owner,
       [this, device_index, block]() -> Task<absl::Status> {
         DeviceAllocator& allocator = *device_allocators_[device_index];
         co_await allocator.mutex.Lock();
-        UnlockGuard unlock(&allocator.mutex,
-                           stores_[allocator.owner]->worker);
+        UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
         allocator.ready_blocks.push_back(block.block_id);
         co_return absl::OkStatus();
       });
@@ -532,15 +527,14 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
                                             std::string_view value) {
   if (value.empty() || value.size() > kMaxStringBytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                     "String exceeds the 512 MiB limit");
+                           "String exceeds the 512 MiB limit");
   }
   auto refs = std::make_shared<std::vector<ExtentRef>>();
-  refs->reserve((value.size() + kExtentPayloadBytes - 1) /
-                kExtentPayloadBytes);
+  refs->reserve((value.size() + kExtentPayloadBytes - 1) / kExtentPayloadBytes);
   auto reclaim_allocated = [&]() {
     if (!refs->empty()) {
-      SpawnExtentReclaim(
-          store, std::shared_ptr<const std::vector<ExtentRef>>(refs));
+      SpawnExtentReclaim(store,
+                         std::shared_ptr<const std::vector<ExtentRef>>(refs));
     }
   };
   std::size_t value_offset = 0;
@@ -562,8 +556,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
     state.writer_id = store.worker->id();
     state.layout_worker_count = worker_count_;
     state.allocation_epoch = reserved->allocation_epoch;
-    state.committed_bytes = static_cast<std::uint32_t>(
-        kBlockHeaderBytes + payload_bytes);
+    state.committed_bytes =
+        static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes);
     // An extent block is written whole right here and never enters the flush
     // queue, so it needs no staging slot.
     state.live_bytes = static_cast<std::uint32_t>(payload_bytes);
@@ -581,7 +575,7 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
         !store.buffers.TryAcquireHeapWriteBuffer(&heap_buffer)) {
       reclaim_allocated();
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                       "no extent write buffer is available");
+                             "no extent write buffer is available");
     }
     auto release_buffer = [&]() {
       if (write_buffer_id != 0) {
@@ -600,7 +594,7 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
       release_buffer();
       reclaim_allocated();
       co_return absl::Status(absl::StatusCode::kInternal,
-                       "extent staging buffer is smaller than a block");
+                             "extent staging buffer is smaller than a block");
     }
     std::fill_n(staging.data, kStorageBlockBytes, std::byte{0});
     BlockHeader header{
@@ -611,8 +605,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
         .block_bytes = kStorageBlockBytes,
         .writer_id = store.worker->id(),
         .allocation_epoch = reserved->allocation_epoch,
-        .committed_bytes = static_cast<std::uint32_t>(
-            kBlockHeaderBytes + payload_bytes),
+        .committed_bytes =
+            static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
         .record_count = 0,
         .max_lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed),
         .header_sequence = 1,
@@ -624,9 +618,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
         .extent_payload_bytes = static_cast<std::uint32_t>(payload_bytes),
         .extent_payload_checksum = payload_checksum,
     };
-    EncodeBlockHeader(
-        header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                    staging.data, kBlockHeaderSlotBytes));
+    EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                  staging.data, kBlockHeaderSlotBytes));
     std::memset(staging.data + kBlockHeaderSlotBytes, 0,
                 kBlockHeaderBytes - kBlockHeaderSlotBytes);
     std::memcpy(staging.data + kBlockHeaderBytes, payload.data(),
@@ -649,10 +642,9 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
           write_buffer_id != 0, staging, block_offset + offset);
       if (!written.ok() || *written != chunk) {
         write_ok = false;
-        write_status = written.ok()
-                           ? absl::Status(absl::StatusCode::kInternal,
-                                    "short extent block write")
-                           : written.status();
+        write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
+                                                   "short extent block write")
+                                    : written.status();
         break;
       }
       offset += chunk;
@@ -667,10 +659,9 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
           std::span<const std::byte>(staging.data, kBlockHeaderSlotBytes),
           write_buffer_id != 0, staging, block_offset);
       if (!written.ok() || *written != kBlockHeaderSlotBytes) {
-        write_status = written.ok()
-                           ? absl::Status(absl::StatusCode::kInternal,
-                                    "short extent header write")
-                           : written.status();
+        write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
+                                                   "short extent header write")
+                                    : written.status();
       }
     }
     if (write_status.ok()) {
@@ -689,15 +680,11 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
   co_return std::shared_ptr<const std::vector<ExtentRef>>(std::move(refs));
 }
 
-Task<absl::Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
-                                               WorkerStore::PartitionStore& partition,
-                                               std::uint8_t db_id,
-                                               std::string_view key,
-                                               std::string_view value,
-                                               RecordKind kind,
-                                               ValueType value_type,
-                                               std::uint64_t expire_at_ms,
-                                               TxShardWrites* tx) {
+Task<absl::Status> StorageEngine::Impl::AppendLocked(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    std::uint8_t db_id, std::string_view key, std::string_view value,
+    RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
+    TxShardWrites* tx) {
   const Digest digest = ComputeDigest(key);
   // Every real keyspace modification funnels through here (client writes,
   // deletes, expiration rewrites, active expiry): invalidate watchers.
@@ -715,8 +702,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
     const std::string manifest = EncodeManifest(**extents);
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, 0, false, true, true,
-        value.size(), *extents, nullptr, nullptr, tx);
+        /*txid=*/0, mutation_sequence, 0, false, true, true, value.size(),
+        *extents, nullptr, nullptr, tx);
     if (!status.ok()) {
       store.worker->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -754,8 +741,7 @@ void StorageEngine::Impl::AppendDelta(WorkerStore::PartitionStore& partition,
   }
   while (partition.deltas.size() > kMaxRetainedMutations) {
     partition.delta_floor = std::max(
-        partition.delta_floor,
-        partition.deltas.front().mutation_sequence);
+        partition.delta_floor, partition.deltas.front().mutation_sequence);
     partition.deltas.pop_front();
   }
 }
@@ -774,7 +760,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if (store.write_failed ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                     "storage writer is stopped after an IO failure");
+                           "storage writer is stopped after an IO failure");
   }
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
@@ -784,31 +770,31 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     txid = tx->txid;
     if (KEYLANE_MAYBE_FAIL_TX_WRITE(key)) {
       co_return absl::Status(absl::StatusCode::kInternal,
-                       "injected transaction write fault");
+                             "injected transaction write fault");
     }
   }
   if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
       (kind == RecordKind::kTombstone &&
-       (value_type != ValueType::kNone || expire_at_ms != 0 ||
-        !value.empty() || logical_size != 0 || external)) ||
+       (value_type != ValueType::kNone || expire_at_ms != 0 || !value.empty() ||
+        logical_size != 0 || external)) ||
       (external &&
        (kind != RecordKind::kValue || value_type != ValueType::kString ||
         extents == nullptr || extents->empty()))) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                     "invalid value type or expiration metadata");
+                           "invalid value type or expiration metadata");
   }
   if (key.size() > MaxKeyBytes()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                     "key is too large for the on-disk record header");
+                           "key is too large for the on-disk record header");
   }
   const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
   const std::size_t payload_bytes = value.size();
-  const std::size_t total_disk_bytes = AlignRecord(
-      record_header_bytes + payload_bytes);
+  const std::size_t total_disk_bytes =
+      AlignRecord(record_header_bytes + payload_bytes);
   if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
       total_disk_bytes > options_.buffers.write_buffer_bytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                     "record payload does not fit an inline block");
+                           "record payload does not fit an inline block");
   }
 
   // Logical partitions route keys, but physical append streams are per
@@ -822,8 +808,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       kind == RecordKind::kTxCommit ? nullptr : &PartitionForKey(store, key);
   RecordIndex* index_ptr =
       partition_ptr == nullptr ? nullptr : &partition_ptr->indexes[db_id];
-  const std::uint64_t lsn =
-      next_lsn_.fetch_add(1, std::memory_order_relaxed);
+  const std::uint64_t lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
   auto& active = store.active_block;
   while (!active.has_value() ||
@@ -851,7 +836,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         if (!store.buffers.TryAcquireHeapWriteBuffer(&heap_buffer)) {
           co_await ReturnReservedBlock(*allocated);
           co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                           "no registered or fallback write buffers");
+                                 "no registered or fallback write buffers");
         }
       }
       FixedBuffer staging_buffer =
@@ -868,7 +853,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         }
         co_await ReturnReservedBlock(*allocated);
         co_return absl::Status(absl::StatusCode::kInternal,
-                         "active write staging allocation is invalid");
+                               "active write staging allocation is invalid");
       }
       const std::uint64_t block_id = allocated->block_id;
       std::fill_n(staging_buffer.data, staging_buffer.size, std::byte{0});
@@ -922,7 +907,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
        previous_entry == nullptr ||
        !relocation->Matches(previous_entry->value))) {
     co_return absl::Status(absl::StatusCode::kAborted,
-                     "relocation source changed while waiting");
+                           "relocation source changed while waiting");
   }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
@@ -937,22 +922,24 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   BlockState* state_ptr = FindBlockState(store, updated.block_id);
   if (state_ptr == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
-                     "active block has no owner state");
+                           "active block has no owner state");
   }
   BlockState& state = *state_ptr;
   StagingSlot* staging_state = StagingFor(store, state);
   if (staging_state == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
-                     "active block has no staging slot");
+                           "active block has no staging slot");
   }
-  FixedBuffer staging = updated.write_buffer_id != 0
-                            ? store.buffers.write_buffer(updated.write_buffer_id)
-                            : FixedBuffer{.data = updated.heap_buffer,
-                                         .size = updated.heap_buffer_size,
-                                         .index = 0};
+  FixedBuffer staging =
+      updated.write_buffer_id != 0
+          ? store.buffers.write_buffer(updated.write_buffer_id)
+          : FixedBuffer{.data = updated.heap_buffer,
+                        .size = updated.heap_buffer_size,
+                        .index = 0};
   if (staging.data == nullptr ||
       record_offset + total_disk_bytes > staging.size) {
-    co_return absl::Status(absl::StatusCode::kInternal, "invalid active staging block");
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "invalid active staging block");
   }
   std::fill_n(staging.data + record_offset, total_disk_bytes, std::byte{0});
   RecordHeader record{
@@ -975,8 +962,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
       // fresh read here could adopt it mid-append — turning a record
       // recovery must drop into one it must keep.
-      .db_epoch = relocation != nullptr ? relocation->db_epoch
-                                        : DbEpoch(db_id),
+      .db_epoch = relocation != nullptr ? relocation->db_epoch : DbEpoch(db_id),
       .mutation_sequence = mutation_sequence,
       .relocation_sequence = relocation_sequence,
       .expire_at_ms = expire_at_ms,
@@ -987,9 +973,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .header_checksum = 0,
   };
   std::span<std::byte> record_output(staging.data + record_offset,
-                                    record_header_bytes);
+                                     record_header_bytes);
   if (!EncodeRecordHeader(record, key, record_output)) {
-    co_return absl::Status(absl::StatusCode::kInternal, "record header encoding failed");
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "record header encoding failed");
   }
   if (!value.empty()) {
     std::memcpy(staging.data + record_offset + record_header_bytes,
@@ -1018,8 +1005,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
       .logical_size = logical_size,
       .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
-      .relocation_sequence = static_cast<std::uint32_t>(
-          relocation_sequence),
+      .relocation_sequence = static_cast<std::uint32_t>(relocation_sequence),
       .in_memory = true,
       .external = external,
       // A relocation rewrites the same logical version, so it carries the
@@ -1030,15 +1016,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       // its timestamp whenever this entry may be dropped. Records with no
       // deadline of their own (tombstones, TTL-less values) must judge
       // against now instead, since their successors' deadlines are unknown.
-      .shielding =
-          previous.has_value() &&
-          (relocation != nullptr
-               ? previous->shielding
-               : (previous->shielding ||
-                  (previous->kind == RecordKind::kValue &&
-                   (previous->expire_at_ms == 0 ||
-                    previous->expire_at_ms >
-                        std::max(expire_at_ms, UnixTimeMillis()))))),
+      .shielding = previous.has_value() &&
+                   (relocation != nullptr
+                        ? previous->shielding
+                        : (previous->shielding ||
+                           (previous->kind == RecordKind::kValue &&
+                            (previous->expire_at_ms == 0 ||
+                             previous->expire_at_ms >
+                                 std::max(expire_at_ms, UnixTimeMillis()))))),
       .kind = kind,
       .value_type = value_type,
       .extents = std::move(extents),
@@ -1046,8 +1031,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const bool was_live =
       previous.has_value() && previous->kind == RecordKind::kValue;
   const bool is_live = kind == RecordKind::kValue;
-  const bool was_expiring =
-      was_live && previous->expire_at_ms != 0;
+  const bool was_expiring = was_live && previous->expire_at_ms != 0;
   const bool is_expiring = is_live && expire_at_ms != 0;
   RecordIndex::Entry* inserted_entry = nullptr;
   if (index_ptr != nullptr) {
@@ -1060,10 +1044,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           !for_defrag && previous.has_value() && previous->external
               ? previous->extents
               : nullptr,
-      .retired_record = !for_defrag && !route_to_commit && previous.has_value()
-                            ? std::optional<RetiredRecord>(
-                                  RetiredRecordOf(*previous))
-                            : std::nullopt,
+      .retired_record =
+          !for_defrag && !route_to_commit && previous.has_value()
+              ? std::optional<RetiredRecord>(RetiredRecordOf(*previous))
+              : std::nullopt,
       .tx_retirements = std::move(commit_retirements),
       .index_generation = store.index_generations[db_id],
       .db_id = db_id,
@@ -1088,8 +1072,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     });
   }
   if (tx != nullptr) {
-    const std::uint32_t staged_end = static_cast<std::uint32_t>(
-        record_offset + total_disk_bytes);
+    const std::uint32_t staged_end =
+        static_cast<std::uint32_t>(record_offset + total_disk_bytes);
     bool merged = false;
     for (TxShardWrites::Fence& fence : tx->fences) {
       if (fence.block_id == updated.block_id &&

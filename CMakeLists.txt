@@ -14,12 +14,40 @@ option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
 
+find_program(KEYLANE_CLANG_FORMAT NAMES clang-format-18 clang-format)
+file(GLOB_RECURSE KEYLANE_FORMAT_FILES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/keylane/*.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp
+)
+if (KEYLANE_CLANG_FORMAT)
+  add_custom_target(format
+    COMMAND ${KEYLANE_CLANG_FORMAT} -i ${KEYLANE_FORMAT_FILES}
+    COMMENT "Formatting Keylane sources"
+    VERBATIM
+  )
+  add_custom_target(format-check
+    COMMAND ${KEYLANE_CLANG_FORMAT} --dry-run --Werror ${KEYLANE_FORMAT_FILES}
+    COMMENT "Checking Keylane source formatting"
+    VERBATIM
+  )
+else()
+  message(STATUS "clang-format not found; format targets are disabled")
+endif()
+
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
 else()
   message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
+endif()
+
+if (TARGET format AND TARGET celer-format)
+  add_dependencies(format celer-format)
+  add_dependencies(format-check celer-format-check)
 endif()
 
 # The generic Abseil CRC loop calls small load helpers for every input word.

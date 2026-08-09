@@ -10,8 +10,8 @@ namespace keylane::tx {
 using celer::Task;
 
 void Transaction::AddKey(unsigned owner, std::uint8_t db,
-                         const storage::Digest& digest,
-                         std::uint32_t arg_index, LockMode mode) {
+                         const storage::Digest& digest, std::uint32_t arg_index,
+                         LockMode mode) {
   assert(shards_.empty() && "AddKey after Seal");
   keys_.push_back(TxKey{
       .digest = digest,
@@ -47,8 +47,7 @@ void Transaction::Seal() {
         grouped.push_back(keys_[i]);
       }
     }
-    sd.key_count =
-        static_cast<std::uint16_t>(grouped.size() - sd.key_begin);
+    sd.key_count = static_cast<std::uint16_t>(grouped.size() - sd.key_begin);
     // Deduplicate the lock set: one ref per (db, fingerprint), exclusive if
     // any occurrence writes.
     sd.lock_begin = static_cast<std::uint16_t>(lock_refs_.size());
@@ -84,8 +83,7 @@ void Transaction::Seal() {
 
 ShardSlice Transaction::Slice(const ShardData& sd) const {
   return ShardSlice{
-      .keys = std::span<const TxKey>(keys_.data() + sd.key_begin,
-                                     sd.key_count),
+      .keys = std::span<const TxKey>(keys_.data() + sd.key_begin, sd.key_count),
   };
 }
 
@@ -114,8 +112,7 @@ void Transaction::RoundAwaiter::await_suspend(std::coroutine_handle<> handle) {
     if (sd.shard_id == celer::ThisWorker().id) {
       RunShardPhase(&sd);
     } else {
-      celer::PostRequest(celer::ThisWorker().cross_core, sd.shard_id,
-                         &sd.msg);
+      celer::PostRequest(celer::ThisWorker().cross_core, sd.shard_id, &sd.msg);
     }
   }
 }
@@ -187,7 +184,8 @@ Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
   co_return co_await cb_(cb_ctx_, Slice(shards_[shard_slot]));
 }
 
-void Transaction::SetShardStatus(std::uint16_t shard_slot, absl::Status status) {
+void Transaction::SetShardStatus(std::uint16_t shard_slot,
+                                 absl::Status status) {
   shards_[shard_slot].status = std::move(status);
 }
 
@@ -218,8 +216,7 @@ Task<absl::Status> Transaction::Schedule() {
     co_return absl::OkStatus();
   }
   for (;;) {
-    txid_ = TxRuntime::Get()->next_txid.fetch_add(1,
-                                                  std::memory_order_relaxed);
+    txid_ = TxRuntime::Get()->next_txid.fetch_add(1, std::memory_order_relaxed);
     co_await RoundAwaiter{this, Phase::kSchedule};
     bool failed = false;
     for (const ShardData& sd : shards_) {
@@ -231,8 +228,7 @@ Task<absl::Status> Transaction::Schedule() {
     }
     co_await RoundAwaiter{this, Phase::kCancel};
     ++schedule_retries_;
-    TxRuntime::Get()->schedule_retries.fetch_add(1,
-                                                 std::memory_order_relaxed);
+    TxRuntime::Get()->schedule_retries.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
@@ -247,7 +243,8 @@ Task<absl::Status> Transaction::ExecuteSingleShard() {
   });
 }
 
-Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
+Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
+                                        bool release) {
   assert(!shards_.empty() && "Seal before Execute");
   cb_ = cb;
   cb_ctx_ = ctx;

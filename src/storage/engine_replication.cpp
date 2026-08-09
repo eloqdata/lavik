@@ -2,16 +2,12 @@
 
 namespace keylane::storage {
 
-ScanBatch StorageEngine::Impl::ScanPartition(std::uint16_t partition_id,
-                                             std::uint8_t db_id,
-                                             std::uint64_t cursor,
-                                             std::size_t count,
-                                             std::uint64_t now_ms,
-                                             std::size_t max_bytes) const {
+ScanBatch StorageEngine::Impl::ScanPartition(
+    std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
+    std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) const {
   assert(db_id < kLogicalDatabaseCount);
   assert(count > 0);
-  const auto& index =
-      PartitionFor(CurrentStore(), partition_id).indexes[db_id];
+  const auto& index = PartitionFor(CurrentStore(), partition_id).indexes[db_id];
   ScanBatch result;
   result.cursor = cursor;
   if (now_ms == 0) {
@@ -24,8 +20,8 @@ ScanBatch StorageEngine::Impl::ScanPartition(std::uint16_t partition_id,
   std::size_t iterations = 0;
   std::size_t bytes = 0;
   do {
-    result.cursor = index.Scan(
-        result.cursor, [&](const RecordIndex::Entry& entry) {
+    result.cursor =
+        index.Scan(result.cursor, [&](const RecordIndex::Entry& entry) {
           if (entry.value.kind == RecordKind::kValue &&
               !IsExpired(entry.value, now_ms)) {
             bytes += entry.key.size();
@@ -56,12 +52,13 @@ PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
   return result;
 }
 
-Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartition(
-    std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-    std::size_t count) {
+Task<absl::StatusOr<PartitionSnapshotBatch>>
+StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
+                                       std::uint8_t db_id, std::uint64_t cursor,
+                                       std::size_t count) {
   if (db_id >= kLogicalDatabaseCount || count == 0) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                     "invalid partition snapshot request");
+                           "invalid partition snapshot request");
   }
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
@@ -82,8 +79,7 @@ Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartit
       }
     });
     ++iterations;
-  } while (next != 0 && keys.size() < count &&
-           iterations < max_iterations);
+  } while (next != 0 && keys.size() < count && iterations < max_iterations);
 
   PartitionSnapshotBatch batch;
   batch.cursor = next;
@@ -125,7 +121,8 @@ Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartit
 }
 
 PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
-    std::uint16_t partition_id, std::uint64_t after_sequence, std::size_t count) {
+    std::uint16_t partition_id, std::uint64_t after_sequence,
+    std::size_t count) {
   auto& partition = PartitionFor(CurrentStore(), partition_id);
   partition.delta_queued = false;
   PartitionDeltaBatch batch;
@@ -146,14 +143,13 @@ PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
   return batch;
 }
 
-void StorageEngine::Impl::AcknowledgePartitionDeltas(std::uint16_t partition_id,
-                                                     std::uint64_t through_sequence) {
+void StorageEngine::Impl::AcknowledgePartitionDeltas(
+    std::uint16_t partition_id, std::uint64_t through_sequence) {
   auto& partition = PartitionFor(CurrentStore(), partition_id);
   while (!partition.deltas.empty() &&
          partition.deltas.front().mutation_sequence <= through_sequence) {
     partition.delta_floor = std::max(
-        partition.delta_floor,
-        partition.deltas.front().mutation_sequence);
+        partition.delta_floor, partition.deltas.front().mutation_sequence);
     partition.deltas.pop_front();
   }
   if (!partition.deltas.empty() && !partition.delta_queued) {
@@ -166,7 +162,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::uint16_t partition_id,
     std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs) {
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    absl::Status advanced = co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
+    absl::Status advanced =
+        co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
     if (!advanced.ok()) {
       co_return advanced;
     }
@@ -177,7 +174,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   if (partition.replication_epoch ==
       std::numeric_limits<std::uint64_t>::max()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
-                     "partition replication epoch exhausted");
+                           "partition replication epoch exhausted");
   }
   // Stop this worker's append stream before making the new epoch durable.
   // Otherwise a concurrent command could append an old-epoch record after
@@ -193,10 +190,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 
   std::vector<std::pair<std::uint8_t, std::string>> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    partition.indexes[db_id].ForEach(
-        [&](const RecordIndex::Entry& entry) {
-          old_keys.emplace_back(db_id, entry.key);
-        });
+    partition.indexes[db_id].ForEach([&](const RecordIndex::Entry& entry) {
+      old_keys.emplace_back(db_id, entry.key);
+    });
   }
   partition.replication_epoch = next_epoch;
   partition.mutation_sequence = 0;
@@ -208,8 +204,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   for (const auto& [db_id, key] : old_keys) {
     const Digest digest = ComputeDigest(key);
     absl::Status tombstone = co_await WriteRecordLocked(
-        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, 0, false, false);
+        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone, 0,
+        digest, 0, 0, 0, false, false);
     if (!tombstone.ok()) {
       co_return tombstone;
     }
@@ -261,7 +257,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
   auto& partition = PartitionFor(store, partition_id);
   if (replication_epoch != partition.replication_epoch) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                     "stale partition replication epoch");
+                           "stale partition replication epoch");
   }
   for (const SnapshotRecord& record : records) {
     std::optional<SnapshotRecord> materialized;
@@ -270,17 +266,17 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
         RedisSlot(record.key) != partition_id) {
       if (record.kind != SnapshotRecord::Kind::kFlushDb) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                         "replica record belongs to another partition");
+                               "replica record belongs to another partition");
       }
     }
     if (record.kind == SnapshotRecord::Kind::kFlushDb) {
-      absl::Status advanced = co_await AdvanceDbEpoch(record.db_id,
-                                                record.db_epoch);
+      absl::Status advanced =
+          co_await AdvanceDbEpoch(record.db_id, record.db_epoch);
       if (!advanced.ok()) {
         co_return advanced;
       }
-      partition.mutation_sequence = std::max(
-          partition.mutation_sequence, record.mutation_sequence);
+      partition.mutation_sequence =
+          std::max(partition.mutation_sequence, record.mutation_sequence);
       continue;
     }
     if (record.db_epoch != DbEpoch(record.db_id)) {
@@ -288,20 +284,19 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
         continue;
       }
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                       "replica record database epoch is not installed");
+                             "replica record database epoch is not installed");
     }
 
     if (record.kind == SnapshotRecord::Kind::kValueBegin) {
       if (partition.replica_value_stage.has_value() ||
           record.value_type != ValueType::kString || !record.value.empty() ||
-          record.logical_size == 0 ||
-          record.logical_size > kMaxStringBytes ||
+          record.logical_size == 0 || record.logical_size > kMaxStringBytes ||
           record.chunk_count == 0 ||
           record.chunk_count !=
               (record.logical_size + kExtentPayloadBytes - 1) /
                   kExtentPayloadBytes) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                         "invalid replicated large value begin frame");
+                               "invalid replicated large value begin frame");
       }
       partition.replica_value_stage = ReplicaValueStage{
           .db_id = record.db_id,
@@ -324,15 +319,13 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       if (!stage.has_value() || stage->db_id != record.db_id ||
           stage->db_epoch != record.db_epoch ||
           stage->mutation_sequence != record.mutation_sequence ||
-          stage->key != record.key ||
-          stage->next_chunk != record.chunk_index ||
-          stage->chunk_count != record.chunk_count ||
-          record.value.empty() ||
+          stage->key != record.key || stage->next_chunk != record.chunk_index ||
+          stage->chunk_count != record.chunk_count || record.value.empty() ||
           record.value.size() > kExtentPayloadBytes ||
           record.value.size() > stage->logical_size ||
           stage->value.size() > stage->logical_size - record.value.size()) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                         "invalid replicated large value chunk frame");
+                               "invalid replicated large value chunk frame");
       }
       stage->value.append(record.value);
       ++stage->next_chunk;
@@ -348,7 +341,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           record.chunk_index != stage->chunk_count ||
           stage->value.size() != stage->logical_size) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                         "invalid replicated large value commit frame");
+                               "invalid replicated large value commit frame");
       }
       materialized.emplace(SnapshotRecord{
           .kind = SnapshotRecord::Kind::kValue,
@@ -364,8 +357,9 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       stage.reset();
       effective = &*materialized;
     } else if (partition.replica_value_stage.has_value()) {
-      co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                       "replicated large value frame sequence interrupted");
+      co_return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "replicated large value frame sequence interrupted");
     }
 
     const SnapshotRecord& applied = *effective;
@@ -373,8 +367,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         applied.db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
     // Replicated modifications invalidate local watchers too.
-    tx::CurrentTxShard().MarkWatched(applied.db_id,
-                                     tx::FingerprintOf(digest));
+    tx::CurrentTxShard().MarkWatched(applied.db_id, tx::FingerprintOf(digest));
     co_await store.store_state_mutex.Lock();
     UnlockGuard write_unlock(&store.store_state_mutex, store.worker);
     auto& index = partition.indexes[applied.db_id];
@@ -387,12 +380,11 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     const RecordKind kind = applied.kind == SnapshotRecord::Kind::kValue
                                 ? RecordKind::kValue
                                 : RecordKind::kTombstone;
-    const ValueType value_type = kind == RecordKind::kValue
-                                     ? applied.value_type
-                                     : ValueType::kNone;
+    const ValueType value_type =
+        kind == RecordKind::kValue ? applied.value_type : ValueType::kNone;
     if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                       "replicated value has no Redis type");
+                             "replicated value has no Redis type");
     }
     absl::Status written;
     const std::size_t inline_bytes = AlignRecord(
@@ -406,9 +398,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       const std::string manifest = EncodeManifest(**extents);
       written = co_await WriteRecordLocked(
           store, applied.db_id, applied.key, manifest, kind, value_type,
-          applied.expire_at_ms, digest, /*txid=*/0,
-          applied.mutation_sequence, 0, false, true, true,
-          applied.value.size(), *extents);
+          applied.expire_at_ms, digest, /*txid=*/0, applied.mutation_sequence,
+          0, false, true, true, applied.value.size(), *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
@@ -421,8 +412,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     if (!written.ok()) {
       co_return written;
     }
-    partition.mutation_sequence = std::max(
-        partition.mutation_sequence, applied.mutation_sequence);
+    partition.mutation_sequence =
+        std::max(partition.mutation_sequence, applied.mutation_sequence);
   }
   co_return absl::OkStatus();
 }

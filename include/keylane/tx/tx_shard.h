@@ -176,8 +176,7 @@ class TxShard {
   // True when the connection's registration exists and no write has marked
   // it. The caller pairs this with its own liveness comparison (passive
   // expiration invalidates like a write, mirroring Redis).
-  bool WatchClean(std::uint8_t db_id, LockFp fp,
-                  std::uint64_t conn_id) const {
+  bool WatchClean(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id) const {
     auto it = watches_[db_id].find(fp);
     if (it == watches_[db_id].end()) {
       return false;
