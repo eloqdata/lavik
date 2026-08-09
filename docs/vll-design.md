@@ -1,201 +1,201 @@
-# Plan: keylane VLL 事务框架(参考 the reference engine 设计,原创实现)
+# Plan: keylane VLL transaction framework (original implementation)
 
 ## Context
 
-keylane 是 thread-per-core、io_uring、C++20 协程的磁盘型 Redis 服务(celer submodule 提供运行时)。目前只有引擎内部的逐 key 阻塞锁(`storage::IntentLockTable`),多 key 命令仅 DEL/EXISTS 且逐 key 串行、无原子性,无 MULTI/EXEC。目标:参考 the reference engine 的 VLL(Very Lightweight Locking, Abadi et al.)设计一套**原创**的事务调度框架,支持跨 shard 原子多 key 命令(MSET/MGET、原子 DEL/EXISTS)和 MULTI/EXEC。
+keylane is a thread-per-core, io_uring, C++20-coroutine disk-backed Redis server (the celer submodule provides the runtime). Today it only has the engine's internal per-key blocking locks (`storage::IntentLockTable`); the only multi-key commands are DEL/EXISTS, executed serially per key with no atomicity, and there is no MULTI/EXEC. Goal: design an **original** transaction scheduling framework based on VLL (Very Lightweight Locking, Ren/Thomson/Abadi), supporting cross-shard atomic multi-key commands (MSET/MGET, atomic DEL/EXISTS) and MULTI/EXEC.
 
-**硬性约束(用户要求):单 shard 命令在无竞争路径上绝不触碰全局 atomic txid 计数器。** 做法:txid 懒分配 + 调度期乐观执行(the reference engine 同款思路,但机制适配 celer 的 SPSC lane / 协程模型)。
+**Hard constraint (user requirement): a single-shard command on the uncontended path must never touch the global atomic txid counter.** Approach: lazy txid allocation + optimistic execution at schedule time (the same idea as the reference engine, but with the mechanism adapted to celer's SPSC lanes / coroutine model).
 
-**不抄 the reference engine 代码**——只借用概念:意向计数锁(Acquire 永不阻塞,只记录 intent 并返回"是否全部授予")、每 shard 按 txid 排序的 TxQueue 作仲裁者、全授予⇒可乱序执行、调度可失败但执行永不回滚、锁保持到 concluding hop。
+**No external code is copied** — only concepts are borrowed: intent-counting locks (Acquire never blocks; it records the intent and reports whether everything was granted), a per-shard txid-ordered TxQueue as the arbiter, all-granted ⇒ out-of-order execution allowed, scheduling may fail but execution never rolls back, locks are held until the concluding hop.
 
-**keylane 特有分歧(核心设计创新):** the reference engine 的 shard 回调不抢占、队头 run-to-completion;keylane 引擎操作持锁挂起在磁盘 I/O 上。解法:`IntentLock` 扩展为 **intent + hold 双层计数**——intent 是调度仲裁(the reference engine 语义),hold 标记"回调正在执行(可能挂起)"。挂起的持有者不阻塞不冲突的后续事务(intent 计数使授予检查在持有者睡眠时依然有效);队头只等真正冲突的 hold 排空。这保住了磁盘型 shard 的 I/O 重叠能力。
+**keylane-specific divergence (the core design innovation):** the reference engine's shard callbacks are non-preemptive and the queue head runs to completion; keylane's engine operations suspend on disk I/O while holding locks. Solution: `IntentLock` extends to **two layers of counters, intent + hold** — intent is the scheduling arbiter (the reference engine semantics), hold marks "a callback is currently executing (possibly suspended)". A suspended holder does not block later non-conflicting transactions (the intent counters keep grant checks valid while the holder sleeps); the queue head only waits for genuinely conflicting holds to drain. This preserves the I/O overlap a disk-backed shard depends on.
 
-WATCH 纳入本里程碑(用户追加):做成**基于版本号的乐观校验**,零写路径钩子——keylane 每条 `RecordLocation` 已带 `mutation_sequence`(engine.cpp:3964 每次 AppendLocked 递增;EXPIRE 也是整记录重写会递增;defrag 搬迁保留不变 @5052),FLUSHDB 有 `DbEpoch(db_id)` @2837。快照 + EXEC 时锁下重读比对即可。
+WATCH is included in this milestone (user addition): implemented as **version-number-based optimistic validation** with zero write-path hooks — every keylane `RecordLocation` already carries `mutation_sequence` (engine.cpp:3964, incremented on every AppendLocked; EXPIRE is also a whole-record rewrite and increments it; defrag relocation preserves it @5052), and FLUSHDB has `DbEpoch(db_id)` @2837. Snapshot at WATCH time, re-read and compare under the EXEC locks.
 
-## 一、新模块:`tx/` 调度核心
+## 1. New module: the `tx/` scheduling core
 
-新文件(注册进 CMakeLists.txt 的 `keylane_module`):
+New files (registered in CMakeLists.txt's `keylane_module`):
 ```
-include/keylane/tx/fingerprint.h   LockFp = Digest 前 8 字节(SHA-1 已为索引计算,零额外哈希)
-include/keylane/tx/intent_lock.h   IntentLock 计数器 + LockTable
-include/keylane/tx/tx_queue.h      每 shard TxQueue
-include/keylane/tx/transaction.h   Transaction、ShardData、hop awaiter
-include/keylane/tx/tx_shard.h      TxShard(每 worker)+ TxRuntime(全局)
+include/keylane/tx/fingerprint.h   LockFp = first 8 bytes of the Digest (SHA-1 already computed for the index; zero extra hashing)
+include/keylane/tx/intent_lock.h   IntentLock counters + LockTable
+include/keylane/tx/tx_queue.h      per-shard TxQueue
+include/keylane/tx/transaction.h   Transaction, ShardData, hop awaiter
+include/keylane/tx/tx_shard.h      TxShard (per worker) + TxRuntime (global)
 src/tx/tx_shard.cpp, src/tx/transaction.cpp
 ```
-独立模块而非塞进 WorkerStore:调度发生在命令层(引擎之上),且引擎后台路径也要用;`TxRuntime`(`vector<unique_ptr<TxShard>>` + `atomic<uint64_t> next_txid`)在 RunServer 于 worker 启动前创建。
+A standalone module rather than part of WorkerStore: scheduling happens at the command layer (above the engine), and the engine's background paths need it too. `TxRuntime` (`vector<unique_ptr<TxShard>>` + `atomic<uint64_t> next_txid`) is created in RunServer before the workers start.
 
-### LockTable(每 worker × 16 逻辑 DB 一张,单线程,无 atomic)
+### LockTable (one per worker × 16 logical DBs, single-threaded, no atomics)
 ```cpp
-struct IntentLock {   // absl::flat_hash_map<LockFp, IntentLock, IdentityHash>;四计数全零时删除
-  uint32_t shared_intent, exclusive_intent;   // 调度意向(含排队/运行中)
-  uint32_t shared_held,  exclusive_held;      // 正在执行回调(可能挂起于 I/O)
+struct IntentLock {   // absl::flat_hash_map<LockFp, IntentLock, IdentityHash>; entry removed when all four counters are zero
+  uint32_t shared_intent, exclusive_intent;   // scheduling intents (queued and running alike)
+  uint32_t shared_held,  exclusive_held;      // callback currently executing (possibly suspended on I/O)
 };
-// Acquire(fp, mode): 永远记录 intent,返回 granted:
-//   shared: exclusive_intent==0;  exclusive: shared_intent==0 && exclusive_intent==1(仅自己)
-// CanHold(fp, mode): shared: exclusive_held==0;  exclusive: 两个 held 均 0
-// 另有 ReleaseIntent / AcquireHold(断言 CanHold) / ReleaseHold
+// Acquire(fp, mode): always records the intent, returns granted:
+//   shared: exclusive_intent==0;  exclusive: shared_intent==0 && exclusive_intent==1 (only myself)
+// CanHold(fp, mode): shared: exclusive_held==0;  exclusive: both held counters zero
+// Plus ReleaseIntent / AcquireHold (asserts CanHold) / ReleaseHold
 ```
-无等待队列——旧表的 FIFO waiters 删除,唤醒变为 TxQueue 的 Poll。锁粒度 = 整 key(路由仍按 hashtag slot);fp 碰撞只造成假竞争,正确性由队列排序 + 引擎索引的全 digest 比较兜底。
+No wait queues — the old table's FIFO waiters are gone; wakeup becomes the TxQueue's Poll. Lock granularity = the whole key (routing still by hashtag slot); fp collisions only cause false contention, correctness is backed by queue ordering plus the engine index's full-digest comparison.
 
-**为什么要拆 intent/held(传统 VLL 与 the reference engine 都只有 Cs/Cx):** 它们的执行前提是 run-to-completion——事务开跑后在分区线程上不挂起地跑完,所以任何调度决策时刻"正在执行"这个状态观察不到(之前启动的要么已完成计数已减,要么还排在队列里),两个计数器 + 队列位置即完备。keylane 的回调持锁睡磁盘,出现第三种状态:"不在队列、没结束、正挂着"(快速路径事务从不入队)。此时只看 Cs/Cx 有不可消解的歧义——队头看到冲突计数 1,分不清那是**睡着的前序运行者**(必须等)还是**排在自己后面的 intent**(绝不能等,等了死锁);不等则与睡着者并发读写、撕裂。held 计数恰好补上这一位信息:`*_intent` 保持传统 VLL 语义(排队+运行都计,授予/乱序判定全用它),`*_held` 只计"此刻回调在执行(可能挂着)",不变量 held ⊆ intent;队头门槛 = 轮到我 **且** CanHold 全过。否决的替代:快速路径也入队(需要 txid 排序位 → 碰全局 atomic 或引入无序的 txid=0 条目)、维护运行中事务指针集合(与 held 等价但更重,CanHold 不再 O(1))。
+**Why split intent/held (classic VLL and the reference engine both have only Cs/Cx):** their execution premise is run-to-completion — once a transaction starts it runs on the partition thread without suspending, so at any scheduling decision point the state "currently executing" is unobservable (anything started earlier either finished with its counters already decremented, or is still in the queue); two counters plus a queue position are complete. keylane's callbacks sleep on disk while holding locks, creating a third state: "not in the queue, not finished, currently suspended" (fast-path transactions never enqueue). With only Cs/Cx the queue head faces an unresolvable ambiguity — it sees a conflicting count of 1 and cannot tell whether that is a **sleeping predecessor already running** (must wait) or an **intent queued behind itself** (must never wait — waiting deadlocks); not waiting means racing the sleeper and tearing data. The held counter supplies exactly that missing bit: `*_intent` keeps classic VLL semantics (counts queued and running alike; all grant/out-of-order decisions use it), `*_held` counts only "callback executing right now (possibly suspended)", with the invariant held ⊆ intent; the queue head's start condition = it is my turn **and** CanHold passes. Rejected alternatives: putting the fast path in the queue too (needs a txid ordering slot → touches the global atomic, or introduces unordered txid=0 entries), or maintaining a set of running-transaction pointers (equivalent to held but heavier, and CanHold stops being O(1)).
 
-**intent/held 运转示例(逐拍,k1 计数记作 (Cs_i,Cx_i|Cs_h,Cx_h)):**
+**intent/held walkthrough (beat by beat; k1's counters written (Cs_i,Cx_i|Cs_h,Cx_h)):**
 ```
-t0 GET1 快速路径:记intent授予+记held,挂起读盘         (1,0|1,0)
-t1 SET 到达:不授予→txid入队为头;CanHold(X)见Cs_h=1→等  (1,1|1,0)   ← 等的是 held(运行者)
-t2 GET2 到达:不授予→排 SET 后                          (2,1|1,0)
-t3 GET1 完成:放held+intent→Poll;头CanHold:held全0→跑  (1,1|0,0)   ← 剩的 Cs_i 是 GET2 的 intent,不看
-t4 SET 执行中,GET3 想快速路径:Cx_i=1→不授予入队        (1,1|0,1)   ← 反插队由 intent 层完成
-t5 SET release→出队→Poll→GET2 起跑;完后全零删条目
+t0 GET1 fast path: record intent granted + record held, suspend on disk read   (1,0|1,0)
+t1 SET arrives: not granted → takes txid, enqueues as head; CanHold(X) sees Cs_h=1 → wait  (1,1|1,0)   ← waiting on the held (a runner)
+t2 GET2 arrives: not granted → queues behind SET                               (2,1|1,0)
+t3 GET1 finishes: release held+intent → Poll; head's CanHold: held all zero → run  (1,1|0,0)   ← the remaining Cs_i is GET2's intent; ignored
+t4 SET executing, GET3 tries the fast path: Cx_i=1 → not granted, enqueues     (1,1|0,1)   ← anti-barging is done by the intent layer
+t5 SET releases → dequeues → Poll → GET2 starts; when done all zeros, entry removed
 ```
-队头两次看到非零 shared 计数(t1/t3),held 层一眼分清"运行者(等)"与"排后者(不等)"——单层 Cs/Cx 恰好丢失的就是这一位。快速路径记 held 必成功:全授予⇒唯一意向者⇒(held⊆intent)无人有 held。
+The head sees a nonzero shared count twice (t1/t3); the held layer instantly distinguishes "a runner (wait)" from "someone queued behind (don't wait)" — exactly the bit a single Cs/Cx layer loses. The fast path's held acquisition always succeeds: all-granted ⇒ sole intent holder ⇒ (held ⊆ intent) nobody has a hold.
 
-**the reference engine 面对 SSD offload(tiered storage)的做法及为何不适用(已查证源码):** 它绝不让事务回调持锁睡磁盘——①兜底:`PollExecution` 见 `running_tx_` 直接 return(engine_shard.cc:620),回调真挂起时整个 shard 队列停摆(冲突不冲突都等);②主路径:offload 值的 GET 在 shard 回调里只注册读请求并返回 Future(string_family.cc:75),事务照常 conclude、锁照常释放,真正等磁盘的 `fut.Get()` 在连接 fiber 的 Send 里(:716),已在事务外;一致性靠 OpManager 记账(blob 读完成前不回收、`HasModificationPending` 拦截脏段)。keylane 不能照抄②:the reference engine 内存为主、事务本体只碰 RAM,磁盘读是可挪到锁外的纯数据取回;keylane 磁盘为本,写路径(AppendLocked)与读改写(INCR/EXPIRE 载入→计算→重写)的磁盘 I/O 就在临界区正中间,挪出去原子性即失。故必须支持持锁挂起 → held。潜在未来优化:纯 GET 可学②(锁内取 RecordLocation 快照、放锁后读块,配块租约防 defrag 回收),不影响 held 的必要性。
+**What the reference engine does about SSD offload (tiered storage) and why it does not transfer (verified against their source):** it never lets a transaction callback sleep on disk while holding locks — (1) backstop: `PollExecution` returns immediately when it sees `running_tx_` (engine_shard.cc:620), so if a callback really suspends the whole shard queue stalls (conflicting or not); (2) main path: a GET of an offloaded value only registers a read request inside the shard callback and returns a Future (string_family.cc:75); the transaction concludes and releases locks as usual, and the actual disk wait, `fut.Get()`, happens in the connection fiber's Send (:716), already outside the transaction; consistency is kept by OpManager bookkeeping (no blob reclaim before the read completes, `HasModificationPending` intercepts dirty segments). keylane cannot copy (2): the reference engine is memory-first — the transaction body only touches RAM and the disk read is a pure data fetch movable outside the locks; keylane is disk-native — the write path (AppendLocked) and read-modify-write (INCR/EXPIRE: load → compute → rewrite) have their disk I/O in the middle of the critical section, and moving it out destroys atomicity. Hence suspending while holding locks must be supported → held. Potential future optimization: pure GETs could adopt (2) (snapshot the RecordLocation under the lock, read the block after releasing, with a block lease against defrag reclaim); this does not affect the necessity of held.
 
-### Transaction(栈上、嵌入协调者协程 frame,无堆分配、无引用计数)
+### Transaction (stack-allocated, embedded in the coordinator coroutine's frame; no heap allocation, no reference counting)
 ```cpp
 class Transaction {
   uint8_t db_id;  const CommandContext* ctx;
   struct KeyRef { Digest digest; LockFp fp; uint32_t arg_index; Mode mode; };
-  absl::InlinedVector<KeyRef, 2> keys_;            // 按 shard 连续分组
-  struct ShardData { celer::RemoteWork msg;        // 内嵌 arm/schedule/cancel 消息
+  absl::InlinedVector<KeyRef, 2> keys_;            // grouped contiguously by shard
+  struct ShardData { celer::RemoteWork msg;        // embedded arm/schedule/cancel message
                      uint16_t shard_id, flags;     // kActive|kGranted|kQueued|kHoldsAcquired|kRanFirstHop|kArmed|kScheduleFailed
                      uint16_t key_begin, key_count; };
-  absl::InlinedVector<ShardData, 1> shards_;       // 单 shard 内联 1 元素
-  uint64_t txid_ = 0;                              // 0 = 从未分配(快速路径永远 0)
-  ShardCallback cb_; bool releasing_; uint8_t phase_;   // 回调=函数指针+void* ctx,避免 std::function 堆分配
-  std::atomic<uint32_t> barrier_;                  // 唯一跨线程热字
+  absl::InlinedVector<ShardData, 1> shards_;       // single shard inlined
+  uint64_t txid_ = 0;                              // 0 = never allocated (fast path stays 0 forever)
+  ShardCallback cb_; bool releasing_; uint8_t phase_;   // callback = function pointer + void* ctx, avoiding std::function heap allocation
+  std::atomic<uint32_t> barrier_;                  // the only cross-thread hot word
   std::coroutine_handle<> coord_handle_;  celer::WorkerId coord_worker_;
 };
 ```
-生命周期安全规则:**协调者每发起一轮(schedule/hop/cancel)必等 barrier;shard 对 barrier 的 fetch_sub 是它对 tx 的最后一次访问**——协调者不可能在最后一次递减前恢复,故 frame 不会悬垂(含回调挂起于 io_uring 期间:该 hop 的 barrier 尚未递减)。
+Lifetime safety rule: **the coordinator awaits the barrier after every round it starts (schedule/hop/cancel); a shard's fetch_sub on the barrier is its last access to the tx** — the coordinator cannot resume before the final decrement, so the frame cannot dangle (including while a callback is suspended in io_uring: that hop's barrier has not been decremented yet).
 
-**Hop 协议(celer 原生,替代 the reference engine 的 is_armed 原子交换):** `Execute(cb, release)` 的 awaiter 先写 `coord_handle_`,再 `barrier_.store(n, release)`,然后逐 shard:本地直接调 `ArmOnShard`,远端 `PostRequest(&sd.msg)`(SPSC lane 的 release/acquire 即所有权转移)。`ArmOnShard` 在 shard 线程置 `msg.reply_deferred = true`(抑制 celer 自动回复,已核实 cross_core.h/RunRemoteWork 契约)、标 kArmed、调 `Poll()`。完成侧:`barrier_.fetch_sub(1, acq_rel) == 1` 的 shard 若是协调者 worker 直接 `Enqueue(coord_handle_)`,否则 `PostNotification` 到协调者 worker,由其 drain 循环 Enqueue。**不变量:协调者 handle 只由它自己的 worker 线程 Enqueue。** 回调把结果写进调用者 frame 的槽位;跨 shard 数据只经协调者在 hop 间流动,回调之间绝不通信。
+**Hop protocol (celer-native, replacing the reference engine's is_armed atomic exchange):** the awaiter of `Execute(cb, release)` first writes `coord_handle_`, then `barrier_.store(n, release)`, then per shard: local shards call `ArmOnShard` directly, remote ones get `PostRequest(&sd.msg)` (the SPSC lane's release/acquire is the ownership transfer). `ArmOnShard`, on the shard thread, sets `msg.reply_deferred = true` (suppressing celer's automatic reply; the cross_core.h/RunRemoteWork contract was verified), marks kArmed, and calls `Poll()`. On completion: the shard whose `barrier_.fetch_sub(1, acq_rel) == 1`, if it is the coordinator's worker, directly `Enqueue(coord_handle_)`; otherwise it `PostNotification`s to the coordinator's worker, whose drain loop enqueues. **Invariant: the coordinator handle is only ever enqueued by its own worker thread.** Callbacks write results into slots in the caller's frame; cross-shard data flows only through the coordinator between hops — callbacks never talk to each other.
 
-### TxShard / TxQueue / 调度算法
+### TxShard / TxQueue / the scheduling algorithm
 ```cpp
-struct TxShard { std::array<LockTable, 16> locks; TxQueue queue;   // deque + 惰性 tombstone(v1 从简)
+struct TxShard { std::array<LockTable, 16> locks; TxQueue queue;   // deque + lazy tombstones (v1 keeps it simple)
                  uint64_t committed_txid = 0; bool polling = false; celer::Worker* worker; /* stats */ };
 ```
-**ScheduleInShard(shard 线程,非挂起段):** (1) `txid_ != 0 && txid_ <= committed_txid` → 失败(过期);(2) 无条件记录全部 intent,记 granted;(3) **重排规则:队列非空且我的 txid < 队尾 txid 且 !granted → 释放 intent、调度失败**(队尾可能已乱序执行,不能插到它前面);(4) 按 txid 有序插入。
+**ScheduleInShard (shard thread, non-suspending section):** (1) `txid_ != 0 && txid_ <= committed_txid` → fail (stale); (2) unconditionally record all intents, note granted; (3) **reorder rule: queue non-empty and my txid < tail txid and !granted → release intents, fail the schedule** (the tail may already have executed out of order; nothing may be inserted ahead of it); (4) insert in txid order.
 
-**txid 懒分配:** 多 shard 事务由协调者在每轮调度前 `next_txid.fetch_add(1)`(所有 shard 必须同一 txid);任一 shard 失败 → cancel 轮(成功的 shard 出队+释放+Poll)→ 取更大新 txid 重试(无界重试 + retries 统计)。**单 shard 事务 txid 保持 0 走快速路径;仅当授予检查失败才由 shard 线程 fetch_add 并入队——此时新 txid 必大于队内一切(fetch_add 全局单调 + 实时序),故必然队尾插入、调度永不失败、永不重试。**
+**Lazy txid allocation:** multi-shard transactions have the coordinator `next_txid.fetch_add(1)` before each scheduling round (all shards must share one txid); if any shard fails → a cancel round (successful shards dequeue + release + Poll) → retry with a larger fresh txid (unbounded retries + a retry counter). **Single-shard transactions keep txid 0 on the fast path; only when the grant check fails does the shard thread fetch_add and enqueue — at that point the new txid is necessarily larger than everything in the queue (fetch_add is globally monotonic + real-time order), so it always inserts at the tail, scheduling never fails, and there are no retries.**
 
-**Poll(替代 the reference engine 的 PollExecution + running_tx_ 门):** 从 arm、每次事务完成(含快速路径完成)、cancel、release 触发。取队头(跳 tombstone);头在运行中/未 armed/`!HoldsCompatible(head)` 则 break(对应事件必再触发 Poll);否则 `committed_txid = max(committed_txid, head->txid_)`(**在回调首次可能挂起之前发布**,同一非挂起段,worker 协作调度天然原子)→ AcquireHolds → `SpawnOnCurrentWorker(RunTx)`。RunTx:`co_await cb(...)`(可挂起)→ 非挂起尾声:concluding 则释放 holds+intents、出队、Poll();最后 barrier 递减。多 hop:非 concluding 的 hop 后保留 holds 与队位,下次 arm 见 kRanFirstHop 直接继续(continuation 是 per-tx 标志而非 shard 字段——多个不冲突的挂起事务可同时在飞)。
+**Poll (replacing the reference engine's PollExecution + the running_tx_ gate):** triggered by arm, every transaction completion (fast-path completions included), cancel, and release. Take the queue head (skipping tombstones); if the head is running / not armed / `!HoldsCompatible(head)`, break (the corresponding event will trigger Poll again); otherwise `committed_txid = max(committed_txid, head->txid_)` (**published before the callback's first possible suspension**, in the same non-suspending section — the worker's cooperative scheduling makes this naturally atomic) → AcquireHolds → `SpawnOnCurrentWorker(RunTx)`. RunTx: `co_await cb(...)` (may suspend) → non-suspending epilogue: if concluding, release holds+intents, dequeue, Poll(); finally decrement the barrier. Multi-hop: after a non-concluding hop the holds and queue position are retained; the next arm sees kRanFirstHop and continues directly (the continuation is a per-tx flag, not a shard field — multiple non-conflicting suspended transactions can be in flight simultaneously).
 
-**三类执行体并发模型:** ① 快速路径事务(全授予,txid 0,不入队)——全授予⇒唯一 intent 持有者⇒无冲突 hold,睡眠期间 intent 留在计数器里挡住后来者;② 乱序队内事务(多 shard 全授予)同理;③ 队头——只等先它而行的挂起持有者排空(I12:头的 intent 记录后无新冲突者能获授予,冲突集有限必排空)。
+**Concurrency model of the three execution shapes:** (1) fast-path transactions (all granted, txid 0, never queued) — all-granted ⇒ sole intent holder ⇒ no conflicting hold; while it sleeps its intents stay in the counters fending off newcomers; (2) out-of-order in-queue transactions (multi-shard, all granted) — same argument; (3) the queue head — waits only for suspended holders that started before it to drain (I12: after the head's intents are recorded no new conflicting party can be granted, so the conflict set is finite and must drain).
 
-### 单 shard 快速路径阶梯(免全局 atomic 的证明)
-- **梯 1(连接 worker == owner):** 协调者协程内直接 AcquireAllIntents;全授予 → AcquireHolds → 直接 `co_await GetLocked(...)` → 释放 → Poll。零 txid、零队列、零跨核、零 spawn。
-- **梯 2(远端乐观):** 单条内嵌 msg(kScheduleAndRun),shard drain 循环内授予检查;通过 → 立即 Spawn 运行,**永不入队,txid 终身为 0**。相对现在 SubmitTaskTo 的增量成本:N 次计数增减 + 一次空队检查。
-- **梯 3(竞争回退):** 授予失败(已在 shard 线程)→ shard 线程 fetch_add 取 txid、队尾插入、等 Poll。
-`next_txid` 只在梯 3 与多 shard 调度中被访问;梯 1–2 只碰 per-shard map、per-tx barrier 与 SPSC lane——全局计数器缓存行从不加载。∎
+### The single-shard fast-path ladder (proof that the global atomic is never touched)
+- **Rung 1 (connection worker == owner):** the coordinator coroutine directly AcquireAllIntents; all granted → AcquireHolds → directly `co_await GetLocked(...)` → release → Poll. Zero txid, zero queue, zero cross-core, zero spawn.
+- **Rung 2 (remote optimistic):** a single embedded msg (kScheduleAndRun); the grant check runs inside the shard's drain loop; on success → spawn and run immediately, **never enqueued, txid stays 0 for life**. Incremental cost over today's SubmitTaskTo: N counter increments/decrements + one empty-queue check.
+- **Rung 3 (contention fallback):** grant fails (already on the shard thread) → the shard thread fetch_adds a txid, inserts at the tail, waits for Poll.
+`next_txid` is touched only on rung 3 and in multi-shard scheduling; rungs 1–2 touch only the per-shard map, the per-tx barrier, and the SPSC lane — the global counter's cache line is never loaded. ∎
 
-## 二、命令层
+## 2. The command layer
 
-### 命令表(新 `include/keylane/command_table.h` + `src/redis/command_table.cpp`,行为中性可先合)
-`CommandSpec{name, kind, arity(Redis 约定,负数=最小), first_key, last_key(负=倒数), key_step, flags}`;flags: kWrite/kReadOnly/kNoKeys/kMultiShard/kGlobal/kNoTx/kNotQueueable。constexpr 数组 ~20 项,按长度分桶线性查找(保持零分配)。`DetermineKeys(spec, argc) -> KeyIndexView` 集中 arity 报错(消灭 ExecuteStorageCommand 里 ~10 处重复检查)。替换 `MatchCommandKind` 和硬编码 mutating/uses_db 链;dispatch 本里程碑仍用 switch。
-新表项:MSET `{-3,1,-1,2,W|MS}`(另验 argc 奇偶)、MGET `{-2,1,-1,1,RO|MS}`、DEL/EXISTS 改 MS、MULTI/EXEC/DISCARD `{1,0,0,0,NoTx|NoKeys}`、WATCH `{-2,1,-1,1,RO|MS|NoTx}`(MULTI 内报错)、UNWATCH `{1,0,0,0,NoKeys}`(可入队)。
+### Command table (new `include/keylane/command_table.h` + `src/redis/command_table.cpp`; behavior-neutral, can merge first)
+`CommandSpec{name, kind, arity (Redis convention, negative = minimum), first_key, last_key (negative = from the end), key_step, flags}`; flags: kWrite/kReadOnly/kNoKeys/kMultiShard/kGlobal/kNoTx/kNotQueueable. A constexpr array of ~20 entries, bucketed by length with linear lookup (stays allocation-free). `DetermineKeys(spec, argc) -> KeyIndexView` centralizes arity errors (killing ~10 duplicated checks in ExecuteStorageCommand). Replaces `MatchCommandKind` and the hard-coded mutating/uses_db chains; dispatch stays a switch for this milestone.
+New entries: MSET `{-3,1,-1,2,W|MS}` (plus odd-argc validation), MGET `{-2,1,-1,1,RO|MS}`, DEL/EXISTS become MS, MULTI/EXEC/DISCARD `{1,0,0,0,NoTx|NoKeys}`, WATCH `{-2,1,-1,1,RO|MS|NoTx}` (error inside MULTI), UNWATCH `{1,0,0,0,NoKeys}` (queueable).
 
-### 引擎 API 改造(禁止两套锁并存于同一 key——切换是原子里程碑)
-- **步 A(行为中性):** 8 个客户端操作拆为 `XxxCore`(现有获锁行之后的全部逻辑,writer_mutex 仍内部持有并在返回前释放,key lock→writer_mutex 顺序不变)+ 旧锁包装。公开 `GetLocked/SetLocked/DeleteLocked/ExistsLocked/IncrementLocked/StringLengthLocked/GetExpirationLocked/UpdateExpirationLocked`,**接受预计算 Digest**(SHA-1 移到协调者 worker 计算,shard 不再哈希),debug 断言 `TxShard::HoldsKey`。
-- **步 B(VLL 切换):** 删除引擎内 `key_locks` 获取与 `storage/intent_lock.h`;所有客户端 keyed 命令走事务。
-- **后台路径**(均单 key、已在 owner worker):SnapshotPartition@~1917(S 逐 key)、ApplyReplicaRecords@~2166(X 逐条)、ExpireCandidate@~4511(X)、defrag RelocateIfCurrent@~5036(X)→ 统一改用 `TxShard::RunLocal(db, keys, cb)`(梯 1 阶梯的库化:try-grant 内联执行,否则栈上内部事务入队)。从此与客户端事务同一仲裁体系,公平排序、无第二锁系统。
-- 回调作者规则:writer_mutex 绝不跨 hop 边界持有(现有引擎操作已天然满足)。
+### Engine API rework (two lock systems must never coexist on one key — the switch is an atomic milestone)
+- **Step A (behavior-neutral):** split the 8 client operations into `XxxCore` (everything after the current lock-acquisition line; writer_mutex still taken internally and released before returning; the key lock → writer_mutex order unchanged) + wrappers over the old locks. Expose `GetLocked/SetLocked/DeleteLocked/ExistsLocked/IncrementLocked/StringLengthLocked/GetExpirationLocked/UpdateExpirationLocked`, **taking a precomputed Digest** (SHA-1 moves to the coordinator worker; shards stop hashing), with a debug assertion on `TxShard::HoldsKey`.
+- **Step B (the VLL switch):** delete the engine's internal `key_locks` acquisition and `storage/intent_lock.h`; every client keyed command goes through a transaction.
+- **Background paths** (all single-key, already on the owner worker): SnapshotPartition@~1917 (S per key), ApplyReplicaRecords@~2166 (X per record), ExpireCandidate@~4511 (X), defrag RelocateIfCurrent@~5036 (X) → all switch to `TxShard::RunLocal(db, keys, cb)` (the library form of rung 1: try-grant inline execution, else a stack-embedded internal transaction enqueues). From then on they share one arbitration system with client transactions — fair ordering, no second lock system.
+- Callback author rule: writer_mutex must never be held across a hop boundary (existing engine operations already satisfy this naturally).
 
-### 多 key 命令(单 hop 多 shard;删除 RouteMultiKey)
-ShardView 暴露该 shard 分片的**原始参数下标**。MSET:shard 内按参数序 SetLocked(重复 key 锁去重、写按序 → last-wins);MGET:协调者预分配 `vector<optional<string>>(n)`,各 shard 填自己的槽位(不相交 + barrier acq_rel ⇒ 无竞争),按请求序编码回复;DEL 各 shard 计数求和;EXISTS 按出现次数计数(`EXISTS k k`→2)而锁集去重。单 shard 情形(hashtag)自动走快速路径。
+### Multi-key commands (single hop, multi-shard; RouteMultiKey deleted)
+ShardView exposes the shard's slice as **original argument indices**. MSET: each shard runs SetLocked in argument order (duplicate keys dedup the locks, writes stay ordered → last-wins); MGET: the coordinator preallocates `vector<optional<string>>(n)`, each shard fills its own slots (disjoint + barrier acq_rel ⇒ no race), reply encoded in request order; DEL sums per-shard counts; EXISTS counts occurrences (`EXISTS k k` → 2) while the lock set dedups. The single-shard case (hashtag) automatically takes the fast path.
 
-### MULTI/EXEC(LOCK_AHEAD)+ WATCH
-- 新 `include/keylane/session.h`:`ConnectionContext{selected_db, in_multi, multi_dirty, multi_db, vector<CommandRequest> queued, vector<WatchedKey> watched}`;`WatchedKey{uint8 db; string key; Digest digest; WatchStamp stamp}`,`WatchStamp{uint64 db_epoch; uint64 seq; bool live}`。Serve(server.cpp:405)的 `selected_db` 替换为 ctx,加 `DispatchCommand(ctx, request)` 包装层。
-- 排队语义(Redis 兼容):未知命令/arity/READONLY/kNotQueueable → 报错+置 dirty;嵌套 MULTI、WATCH-inside-MULTI(`-ERR WATCH inside MULTI is not allowed`)→ 报错不置 dirty;SELECT 更新 multi_db 并入队;UNWATCH 可入队(EXEC 内为 no-op);其余 `+QUEUED`。DISCARD/EXEC-without-MULTI 标准错;dirty EXEC → `-EXECABORT`;空队 → `*0`;运行期错误内联在数组里继续执行。
-- **WATCH 机制(用户选定:push 式 shard 本地标记表,零跨线程共享内存)**:每 (worker, db) 一张 `flat_hash_map<LockFp, WatchItems>` 表,表项按 (conn_id, key) 登记,conn_id 只作键、永不解引用。四要素:
-  1. **登记**:WATCH(仅 MULTI 外可用)逐 shard `SubmitTo` 到 owner 建表项(`try_emplace`——重复 WATCH 保留原项原标记,粘性,匹配 Redis);表项记 `live` 位(当时是否存在且未过期);
-  2. **标记**:挂在**真实修改的收口**而非命令分类——`AppendLocked`/索引更新点(覆盖 SET/DEL/INCR/EXPIRE/主动过期)、副本应用写入点、FLUSHDB 清库点(标本 worker 该 db 全部表项,含不存在 key 的 watch);`SET NX` 未生效等"没改"的不标;defrag 搬迁不标。写路径成本 = 空表分支(≈零);
-  3. **检查(EXEC)**:先调度加锁,再看标记。队内命令触及的 shard 在 hop 0 顺路查本 shard 表项;仅被 watch、事务不去的 shard 用普通 `SubmitTo` 读(无锁安全:EXEC 不读该 key,写与 EXEC 任意排序皆合法序列化)。**补被动过期洞**(Redis 亦用 isWatchedKeyExpired 补):比对表项 live 位与当前 IsExpired,变了也中止。任一标记/live 变 → `Release()` 回 `*-1`;竞态论证:标记与检查同 shard 线程,写要么在锁前完成(标记必被看到)要么被 intent 排在事务后,无第三种;
-  4. **清理**:UNWATCH/DISCARD/EXEC(无论成败)与连接断开(M3 唯一清理点)向登记过的 shard 发 `PostNotification` 按 conn_id 擦除(急切发送、异步生效、mailbox 不丢)。
-- EXEC = 一个事务:先取 DbOperationGuard(整个 EXEC 持有,避免 hop 中途 TRYAGAIN);锁集 = 排队命令 key 并集(per-key mode:任一写者触及则 X)→ `InitKeys` 显式 (db,key,mode) 列表 → `Schedule()`(单 shard 全授予时直接取 intent+hold、不入队、txid 0——EXEC 也享受快速路径)→ watch 检查(上述 3)→ 通过则逐命令串行执行:每条内部命令一个非 concluding hop(barrier 分隔),handler 重构为 `RunXxx(Transaction&, request)` 共用于独立执行与 EXEC;无 key 命令(PING/SELECT)在协调者 hop 间执行;末尾 `Release()` 保证锁恰好释放一次。
-- push 式下 Redis 各边界天然对齐:SET 后 DEL 再回收 tombstone(标记在 SET 时已打、粘性,无 pull 式的 ABA);FLUSHDB 使"不存在的 watched key"也失效(清库点标全表);值改回原值仍失效(标记看修改事件不看值)。**备选记录(已评估未采用):pull 式版本快照**——WATCH 时记 `{db_epoch, mutation_sequence, live}` 三元组(复用现成 seq/epoch,零新增状态),EXEC 校验 hop 锁下重比;缺点:watched 需进锁集、多一个校验 hop、tombstone 回收有 ABA 窗口(需最小回收年龄加固)。push 落地遇阻时退回此案。
-- Transaction 公开:`InitKeys` / `Schedule()` / `Execute(cb, release)` / `Release()`(原名 Conclude,2026-08-08 更名)。(RENAME 双 hop 是该 API 的验证命令,作可选扩展项。)
+### MULTI/EXEC (LOCK_AHEAD) + WATCH
+- New `include/keylane/session.h`: `ConnectionContext{selected_db, in_multi, multi_dirty, multi_db, vector<CommandRequest> queued, vector<WatchedKey> watched}`; `WatchedKey{uint8 db; string key; Digest digest; WatchStamp stamp}`, `WatchStamp{uint64 db_epoch; uint64 seq; bool live}`. Serve's (server.cpp:405) `selected_db` becomes the ctx, with a `DispatchCommand(ctx, request)` wrapper layer.
+- Queueing semantics (Redis-compatible): unknown command / arity / READONLY / kNotQueueable → error + set dirty; nested MULTI and WATCH-inside-MULTI (`-ERR WATCH inside MULTI is not allowed`) → error without setting dirty; SELECT updates multi_db and queues; UNWATCH queues (a no-op inside EXEC); everything else `+QUEUED`. DISCARD/EXEC without MULTI are the standard errors; dirty EXEC → `-EXECABORT`; empty queue → `*0`; runtime errors are inlined in the array and execution continues.
+- **WATCH mechanism (user-selected: push-style shard-local mark tables, zero cross-thread shared memory):** one `flat_hash_map<LockFp, WatchItems>` per (worker, db); items are registered by (conn_id, key), conn_id used only as a key and never dereferenced. Four pieces:
+  1. **Registration**: WATCH (only legal outside MULTI) `SubmitTo`s each owner shard to create the item (`try_emplace` — a repeated WATCH keeps the original item and marks, sticky, matching Redis); the item records a `live` bit (existed and unexpired at the time);
+  2. **Marking**: hooked at the **funnel of real modifications**, not at command classification — `AppendLocked`/the index update points (covering SET/DEL/INCR/EXPIRE/active expiry), the replica-apply write point, and FLUSHDB's detach point (marks every item of that db on the worker, including watches on nonexistent keys); "didn't actually change" cases (`SET NX` that did not apply) do not mark; defrag relocation does not mark. Write-path cost = an empty-table branch (≈ zero);
+  3. **Check (EXEC)**: schedule and lock first, then look at the marks. Shards the queued commands touch check their own tables in hop 0 on the way; shards that are only watched, which the transaction never visits, are read via a plain `SubmitTo` (lock-free safe: EXEC does not read that key, so any ordering of the write and the EXEC is a legal serialization). **Passive-expiry hole plugged** (Redis also patches this with isWatchedKeyExpired): compare the item's live bit with the current IsExpired; a change also aborts. Any mark / live change → `Release()` and reply `*-1`; race argument: marking and checking are on the same shard thread — a write either completed before the locks (its mark must be visible) or is ordered behind the transaction by the intents; there is no third case;
+  4. **Cleanup**: UNWATCH/DISCARD/EXEC (either outcome) and connection close (the single cleanup point of M3) `PostNotification` the registered shards to erase by conn_id (sent eagerly, applied asynchronously, the mailbox never drops).
+- EXEC = one transaction: take the DbOperationGuard first (held for the whole EXEC, avoiding mid-hop TRYAGAIN); the lock set = the union of queued commands' keys (per-key mode: X if any writer touches it) → `InitKeys` with an explicit (db, key, mode) list → `Schedule()` (a single-shard all-granted EXEC takes intent+hold directly, never queues, txid 0 — EXEC enjoys the fast path too) → the watch check (item 3 above) → on pass, execute commands serially: one non-concluding hop per queued command (barrier-separated), handlers refactored as `RunXxx(Transaction&, request)` shared between standalone execution and EXEC; keyless commands (PING/SELECT) run on the coordinator between hops; a final `Release()` guarantees the locks are released exactly once.
+- Under the push model the Redis edge cases align naturally: SET-then-DEL with later tombstone reclamation (the mark was set at SET time and is sticky, no pull-style ABA); FLUSHDB invalidates watches on nonexistent keys too (the detach point marks the whole table); a value changed back to the original still invalidates (marks track modification events, not values). **Recorded alternative (evaluated, not chosen): pull-style version snapshots** — WATCH records the `{db_epoch, mutation_sequence, live}` triple (reusing existing seq/epoch, zero new state) and EXEC re-compares under the check hop's locks; drawbacks: watched keys must enter the lock set, one extra validation hop, and tombstone reclamation opens an ABA window (needs a minimum-reclaim-age hardening). Fall back to this if push hits an obstacle.
+- Transaction exposes: `InitKeys` / `Schedule()` / `Execute(cb, release)` / `Release()` (renamed from Conclude, 2026-08-08). (Dual-hop RENAME is the validation command for this API, kept as an optional extension.)
 
-### 复制与 FLUSHDB(本里程碑决策)
-- 复制:保持逐 key delta 不变(在 key lock 之下写入,多 key 事务自然逐 key 发)。**已记录缺口:副本可见撕裂的 MSET/EXEC**(与今日 DEL 行为一致);原子 journaling 留待专门里程碑。副本只读检查同时在 MULTI 排队期执行。
-- FLUSHDB/DBSIZE/SCAN:留在 g_db_gates;每个 VLL 事务全生命周期持 DbOperationGuard;三者 kNotQueueable(与 Redis 的偏差,文档注明);后续里程碑再迁 shard 级全局事务。
+### Replication and FLUSHDB (decisions for this milestone)
+- Replication: keep per-key deltas unchanged (written under the key lock; multi-key transactions naturally emit per key). **Recorded gap: replicas can observe a torn MSET/EXEC** (consistent with today's DEL behavior); atomic journaling deferred to a dedicated milestone. The replica read-only check also runs during MULTI queueing.
+- FLUSHDB/DBSIZE/SCAN: stay behind g_db_gates; every VLL transaction holds a DbOperationGuard for its whole lifetime; all three are kNotQueueable (a documented deviation from Redis); migrating them to shard-level global transactions is a later milestone.
 
-## 三、实现顺序——小里程碑,每步独立编译、测试全绿、可单独合入
+## 3. Implementation order — small milestones, each independently compiling, all tests green, individually mergeable
 
-| # | 目标 | 大小 | 行为变化 |
-|---|------|------|---------|
-| M1 | **命令表**:CommandSpec + FindCommand + DetermineKeys,替换 MatchCommandKind 与硬编码 mutating/uses_db;`tests/command_table_test.cpp` | 小 | 无 |
-| M2 | **引擎拆分**:8 个客户端操作拆出 `*Locked` 变体 + Digest 参数化,旧锁包装保留 | 中 | 无 |
-| M3 | **ConnectionContext** 穿线 Serve/Dispatch(MULTI 还不接);同时把现有循环抽成内层 `ServeLoop(stream, ctx)`,外层 `Serve` 在 `co_await ServeLoop` 后设唯一清理点 `CleanupConnection(ctx)`(所有断开路径必经、可 await——为 WATCH 注销等连接级清理立好结构) | 小 | 无 |
-| M4 | **tx/ 模块**:LockTable(intent+hold)+ TxQueue + TxShard + RunLocal + TxRuntime 接线,只有单测(`tests/tx_lock_test.cpp`,用会挂起的假回调测 grant/hold/queue/poll),不接任何命令 | 中 | 无 |
-| M5 | **VLL 切换**(唯一切换点,此时只剩机械替换):单 key 命令走快速路径阶梯;4 个后台路径迁 RunLocal;删 `WorkerStore::key_locks` 与旧 `storage/intent_lock.h`;事务持 db gate 全生命周期。全 CTest + e2e + ASan | 中 | 无(语义等价) |
-| M6 | **多 shard 单 hop**:调度轮/cancel/重试、hop awaiter + barrier + notification 恢复;MSET/MGET + 原子 DEL/EXISTS(删 RouteMultiKey);`tests/multikey_e2e_test.cpp` | 中 | 新功能 |
-| M7 | **MULTI/EXEC/DISCARD** + Release(时名 Conclude) + 多 hop(continuation);`tests/multi_exec_e2e_test.cpp`。EXEC 执行模型 = **逐命令串行 hop**(用户定,理由:要支持全部命令,串行 hop 对所有命令形态——单 key、多 key、RENAME/EVAL 类跨 shard 数据流、将来阻塞类——统一成立,无需切段判断):每条命令一个非 concluding hop,barrier 分隔,后令可见前令效果、回复按序;内部命令不单独入队——事务间顺序归 TxQueue,事务内顺序归 hop 序。优化挂账(命令面稳定后):分段打包/squashing——正确性三条件已论证(切片预先可定、shard 内保排队序即同 key 必同 shard、回复槽位组装),在跨 shard 数据流命令处切段,段内一 hop | 中 | 新功能 |
-| M8 | **WATCH/UNWATCH**(push 式 shard 本地标记表):登记/修改收口标记/EXEC 锁后检查(含被动过期比对)/急切注销四件套;WATCH e2e 用例并入 multi_exec 测试 | 中 | 新功能 |
-| M9 | **压测 + 观测**:`tests/atomicity_stress_e2e_test.cpp`;fastpath/OOO/queued/retries/head_wait 统计;复制缺口文档。(TxQueue 换 vector-ring + pq_pos 为可选优化) | 小 | 无 |
+| # | Goal | Size | Behavior change |
+|---|------|------|-----------------|
+| M1 | **Command table**: CommandSpec + FindCommand + DetermineKeys, replacing MatchCommandKind and the hard-coded mutating/uses_db; `tests/command_table_test.cpp` | S | none |
+| M2 | **Engine split**: extract `*Locked` variants of the 8 client operations + Digest parameterization, old-lock wrappers retained | M | none |
+| M3 | **ConnectionContext** threaded through Serve/Dispatch (MULTI not wired yet); also extract the existing loop into an inner `ServeLoop(stream, ctx)` with the outer `Serve` establishing the single cleanup point `CleanupConnection(ctx)` after `co_await ServeLoop` (every disconnect path passes through it, awaitable — the structural home for WATCH deregistration and other connection-level cleanup) | S | none |
+| M4 | **tx/ module**: LockTable (intent+hold) + TxQueue + TxShard + RunLocal + TxRuntime wiring, unit tests only (`tests/tx_lock_test.cpp`, using suspending fake callbacks to test grant/hold/queue/poll), no commands wired | M | none |
+| M5 | **The VLL switch** (the single cutover point; by then only mechanical replacement remains): single-key commands take the fast-path ladder; the 4 background paths move to RunLocal; delete `WorkerStore::key_locks` and the old `storage/intent_lock.h`; transactions hold the db gate for their lifetime. Full CTest + e2e + ASan | M | none (semantically equivalent) |
+| M6 | **Multi-shard single hop**: scheduling rounds/cancel/retry, hop awaiter + barrier + notification resumption; MSET/MGET + atomic DEL/EXISTS (RouteMultiKey deleted); `tests/multikey_e2e_test.cpp` | M | new feature |
+| M7 | **MULTI/EXEC/DISCARD** + Release (then named Conclude) + multi-hop (continuations); `tests/multi_exec_e2e_test.cpp`. EXEC execution model = **serial per-command hops** (user decision; rationale: every command must be supported, and serial hops hold uniformly for all command shapes — single-key, multi-key, RENAME/EVAL-style cross-shard dataflow, future blocking commands — with no segmentation logic): one non-concluding hop per command, barrier-separated, later commands see earlier effects, replies in order; inner commands do not enqueue individually — inter-transaction order belongs to the TxQueue, intra-transaction order to the hop sequence. Deferred optimization (once the command surface stabilizes): segment packing / squashing — the three correctness conditions are already argued (slices determinable up front, per-shard queue order preserved i.e. same key ⇒ same shard, reply slot assembly), cutting segments at cross-shard dataflow commands, one hop per segment | M | new feature |
+| M8 | **WATCH/UNWATCH** (push-style shard-local mark tables): the four pieces — registration / marking at modification funnels / post-lock EXEC check (incl. passive-expiry comparison) / eager deregistration; WATCH e2e cases folded into the multi_exec test | M | new feature |
+| M9 | **Stress + observability**: `tests/atomicity_stress_e2e_test.cpp`; fastpath/OOO/queued/retries/head_wait counters; replication-gap documentation. (Swapping TxQueue to a vector-ring + pq_pos is an optional optimization) | S | none |
 
-M1–M4 相互独立;M5 依赖 M2+M4;M6 起顺序依赖。
+M1–M4 are mutually independent; M5 depends on M2+M4; M6 onward are sequential.
 
-### 单 key 命令的成本说明(用户关切)
-切到 VLL 后单 key 命令**运行期成本不升反降**:今天已是 `try_emplace` 20 字节 Digest 键 + waiters 队列检查;之后是 `try_emplace` 8 字节 fp 键(恒等哈希)+ 两个计数器加减 + 一次空队检查。无竞争时不入队、不取 txid、不过 barrier,路由结构(inline 或 SubmitTaskTo)不变。框架复杂度集中在多 key/多 hop 分支,单 key 命令只穿过最平凡路径。
+### Single-key command cost note (user concern)
+After the VLL switch, single-key commands get **cheaper at runtime, not more expensive**: today it is a `try_emplace` with a 20-byte Digest key plus a waiters-queue check; afterwards it is a `try_emplace` with an 8-byte fp key (identity hash) + two counter increments/decrements + one empty-queue check. Uncontended commands never enqueue, never take a txid, never cross a barrier, and the routing structure (inline or SubmitTaskTo) is unchanged. The framework's complexity concentrates in the multi-key/multi-hop branches; single-key commands traverse only the most trivial path.
 
-## 四、验证
+## 4. Verification
 
-- 单测:command_table(arity/负下标/flags)、tx_lock(S/S 授予、S/X 冲突意向、零计数驱逐、RunLocal 对队列的公平性、挂起持有者不挡不冲突事务)。
-- E2E(扩展 RespClient 递归解析数组回复;server `--threads 4` 保证真跨 shard,另留 `--threads 1` 一节):
-  - multikey:乱序跨 shard MGET 按请求序返回、缺失 key 为 nil、MSET 重复 key last-wins、hashtag 快速路径回归。
-  - multi_exec:完整 RESP 语义矩阵(QUEUED/嵌套/EXECABORT/DISCARD/空 EXEC/内联运行错/SELECT-in-MULTI/状态复位)。
-  - WATCH(双连接):他客户端改 watched key → EXEC `*-1` 且队内命令未执行;自己在 MULTI 前改 → 同样失效;无修改 → 成功;值改回原值(SET k v; SET k v)仍失效(版本语义,匹配 Redis);DEL watched → 失效;EXPIRE watched → 失效;watched key 从无到有 → 失效;FLUSHDB → 失效;UNWATCH 后 EXEC 成功;EXEC 后 watch 已清空(再 EXEC 不受旧 watch 影响);WATCH-inside-MULTI 报错但事务可继续;跨 shard watched keys。
-  - **原子性压测**(抓乱序/锁模式/barrier 错误的形状):W1 循环 `MSET a v b v`、W2 循环 `MSET b u c u`(值带写者标签,key 经 CRC16 验证跨 shard);读者(MGET 与 MULTI-GET×3-EXEC 两种)断言:b 是 W1 值 ⇒ a==b,b 是 W2 值 ⇒ c==b;另加同 key 对 (a,b) 重叠锤击断言恒 a==b。跑 5–10s,失败时转储三元组+服务器日志。
-- 每步后:`scripts/build_debug.sh && ctest --test-dir build_debug`;步 5 起加 ASan 构建跑 e2e(build_asan/ 已存在)。
+- Unit tests: command_table (arity / negative indices / flags), tx_lock (S/S grant, S/X conflicting intents, zero-count eviction, RunLocal's fairness toward the queue, suspended holders not blocking non-conflicting transactions).
+- E2E (extend RespClient with recursive array-reply parsing; server `--threads 4` guarantees genuine cross-shard, with a `--threads 1` section kept):
+  - multikey: out-of-order cross-shard MGET returns in request order, missing keys are nil, MSET duplicate keys last-wins, hashtag fast-path regression.
+  - multi_exec: the full RESP semantics matrix (QUEUED / nesting / EXECABORT / DISCARD / empty EXEC / inline runtime errors / SELECT-in-MULTI / state reset).
+  - WATCH (two connections): another client modifies the watched key → EXEC `*-1` and the queued commands never ran; modifying it yourself before MULTI → likewise invalidated; no modification → success; value changed back to the original (SET k v; SET k v) still invalidates (version semantics, matching Redis); DEL of the watched key → invalidates; EXPIRE → invalidates; watched key springing into existence → invalidates; FLUSHDB → invalidates; EXEC succeeds after UNWATCH; watches are cleared after EXEC (a second EXEC is unaffected by old watches); WATCH-inside-MULTI errors but the transaction can continue; cross-shard watched keys.
+  - **Atomicity stress** (shaped to catch out-of-order/lock-mode/barrier bugs): W1 loops `MSET a v b v`, W2 loops `MSET b u c u` (values carry writer tags; keys verified cross-shard via CRC16); readers (both MGET and MULTI-GET×3-EXEC) assert: b is W1's value ⇒ a==b, b is W2's value ⇒ c==b; plus same-pair (a,b) overlap hammering asserting a==b always. Run 5–10s; on failure dump the triple + server log.
+- After every step: `scripts/build_debug.sh && ctest --test-dir build_debug`; from step 5 on, add the ASan build running the e2e suite (build_asan/ already exists).
 
-## 五、已决风险项
+## 5. Settled risk items
 
-- 阻塞命令(未来 BLPOP)会破坏 frame 内嵌生命周期(挂起阻塞事务活过 hop barrier)→ 现在保持 frame 内嵌;记录升级路径:仅 BLOCKING 命令走侵入式引用计数+堆分配。
-- 多 shard 重试理论上可饿死 → 无界重试 + 统计 + 重试间 `celer::Yield`,基准显示问题再处理。
-- 队头被慢速挂起持有者拖延 → 磁盘型原子性的固有代价,per-fp 粒度已限制在真冲突;加 head_wait 统计。
-- `reply_deferred` 契约依赖(已对照 cross_core.h 核实)→ celer 侧加注释 + keylane 加跨 worker arm 压测。
+- Blocking commands (future BLPOP) would break the frame-embedded lifetime (a suspended blocking transaction outlives the hop barrier) → keep frame embedding for now; recorded upgrade path: only BLOCKING commands switch to intrusive refcounting + heap allocation.
+- Multi-shard retries can theoretically starve → unbounded retries + counters + `celer::Yield` between retries; deal with it if benchmarks show a problem.
+- The queue head can be delayed by a slow suspended holder → the inherent cost of disk-backed atomicity; per-fp granularity already limits it to true conflicts; add a head_wait counter.
+- Dependence on the `reply_deferred` contract (verified against cross_core.h) → add a comment on the celer side + a cross-worker arm stress test in keylane.
 
-## 关键文件
+## Key files
 
-改动:`src/redis/command.cpp`(路由重写)、`src/redis/server.cpp`(ctx 穿线)、`include/keylane/command.h`、`src/storage/engine.cpp`(*Locked 拆分、后台路径迁移、删 key_locks)、`include/keylane/storage/engine.h`、`CMakeLists.txt`;删除:`include/keylane/storage/intent_lock.h`;新增:`include/keylane/tx/*`、`src/tx/*`、`include/keylane/command_table.h`、`src/redis/command_table.cpp`、`include/keylane/session.h`、5 个新测试。只读依赖:`celer/include/celer/runtime/cross_core.h`(RemoteWork/PostRequest/PostNotification/reply_deferred)。
+Modified: `src/redis/command.cpp` (routing rewrite), `src/redis/server.cpp` (ctx threading), `include/keylane/command.h`, `src/storage/engine.cpp` (`*Locked` split, background-path migration, key_locks removal), `include/keylane/storage/engine.h`, `CMakeLists.txt`; deleted: `include/keylane/storage/intent_lock.h`; added: `include/keylane/tx/*`, `src/tx/*`, `include/keylane/command_table.h`, `src/redis/command_table.cpp`, `include/keylane/session.h`, 5 new tests. Read-only dependency: `celer/include/celer/runtime/cross_core.h` (RemoteWork/PostRequest/PostNotification/reply_deferred).
 
-## M10:多 key 写的存储故障原子性(2PC commit 记录,2026-08-09 定稿)
+## M10: storage-failure atomicity for multi-key writes (2PC commit records; finalized 2026-08-09)
 
-**问题**:VLL 无 undo。多 key 写(MSET/多 key DEL/EXEC 事务体)中途存储错误(盘满/EIO/写缓冲耗尽)时,已 append 的 shard 生效且持久,失败 shard 报错——客户端收错但留下半套写入,恢复后依然半套。
+**Problem**: VLL has no undo. When a multi-key write (MSET / multi-key DEL / an EXEC body) hits a mid-transaction storage error (disk full / EIO / write-buffer exhaustion), the shards that already appended have taken effect durably while the failing shard reports an error — the client gets an error but half the write remains, and it is still half after recovery.
 
-**方案(用户提出)**:presumed-abort 2PC。数据记录=prepare;发起 worker 在全部参与 shard 数据**持久后**本地 append 一条 commit 记录;恢复时带 txid 的数据记录必须见到对应 commit 记录才保留。
+**Scheme (proposed by the user)**: presumed-abort 2PC. Data records are the prepare; the initiating worker appends a commit record locally **after** every participating shard's data is durable; at recovery, a txid-tagged data record is kept only if its commit record is found.
 
-**表示**:`RecordHeader::generation` 重用改名 `txid`(化石字段:初版 newest-wins 序数,04f10f4 引入 replication_epoch/mutation_sequence 后无任何读者,恒镜像 mutation_sequence)。txid==0 即非事务记录(快速路径恒 0,next_txid 从 1 起),**无需标志位**。defrag 搬迁透传 txid 恰为正确语义(commit 归属跟 txid 不跟物理位置)。FormatVersion 不动(用户:现阶段不管兼容)。
+**Representation**: `RecordHeader::generation` is repurposed and renamed `txid` (a fossil field: the original newest-wins ordinal, left without any reader after 04f10f4 introduced replication_epoch/mutation_sequence; it merely mirrored mutation_sequence). txid==0 means a non-transactional record (the fast path is always 0; next_txid starts at 1), so **no flag bit is needed**. Defrag relocation passing txid through is exactly the right semantics (commit ownership follows the txid, not the physical location). FormatVersion untouched (user: compatibility is not a concern at this stage).
 
-**commit 记录**:新 `RecordKind::kTxCommit`,仅头无 payload,txid 字段=被提交 id,append 进发起 worker 的 active block,走现成 staging/flush/恢复扫描。刷盘顺序用 RelocationDurabilityFence 同款栅栏:协调者攒各参与 shard 的 (block, committed) 高水位,全部持久后才 append commit。commit 自身丢失=整个事务恢复期被弃,落在 relaxed durability 承诺内;被禁止的只是"半套存活"。
+**The commit record**: new `RecordKind::kTxCommit`, header-only with no payload, the txid field holding the committed id, appended into the initiating worker's active block, riding the existing staging/flush/recovery-scan machinery. Flush ordering uses the same fence as RelocationDurabilityFence: the coordinator gathers each participating shard's (block, committed) high-water marks and appends the commit only after all are durable. Losing the commit itself = the whole transaction is dropped at recovery, which falls within the relaxed-durability promise; the only forbidden outcome is "half of it survives".
 
-**退休栅栏路由**:事务写的 previous 退休不挂数据记录的 RecordIdentity,改挂 commit 记录的 identity(commit 块 flush 完成=commit 持久 ⇒ 数据早已持久 ⇒ previous 才可离账)。否则"数据持久了、commit 没持久、previous 已回收、恢复弃新"两头落空。
+**Retirement routing**: a transactional write's superseded previous is not retired via the data record's RecordIdentity but via the commit record's identity (commit block flushed = commit durable ⇒ data durable long before ⇒ only then may the previous leave its accounting). Otherwise "data durable, commit not, previous reclaimed, recovery drops the new" loses both ends.
 
-**恢复**:扫描时带 txid 数据记录旁置 + 收集 kTxCommit 集合;扫完过滤入索引。next_txid 播种=全盘所见 txid 最大值+1(恢复 barrier 处聚合),解决跨重启撞号,零新增元数据。
+**Recovery**: the scan parks txid-tagged data records and collects the kTxCommit set; after the scan, filter into the index. next_txid is seeded to the maximum txid seen on disk + 1 (aggregated at the recovery barrier), solving cross-boot collisions with zero new metadata.
 
-**运行时回滚(保住"读者永不见半套")**:多 key **写**命令(MSET/DEL)从 concluding 单 hop 改为"执行 hop(release=false)→协调者验全部 shard 状态→Release()/回滚 hop",1→2 hop;读命令(MGET/EXISTS)保持 1 hop。EXEC 本就多 hop,结构不变。回滚=各成功 shard 在仍持锁下恢复 previous 索引项 + MarkRecordDead 新记录 + 计数修正;脏记录留 staging,恢复因无 commit 自然弃。
+**Runtime rollback (preserving "readers never see half")**: multi-key **write** commands (MSET/DEL) change from a concluding single hop to "execute hop (release=false) → coordinator checks every shard's status → Release()/rollback hop", 1→2 hops; read commands (MGET/EXISTS) stay at 1 hop. EXEC is already multi-hop, structure unchanged. Rollback = each successful shard, still holding the locks, restores the previous index entries + MarkRecordDead on the new records + counter corrections; the dirty records stay in staging and recovery drops them naturally for lack of a commit.
 
-**复制协同**:回滚过的分区标记 delta overflow 强制副本重拷(现成机制,只在失败路径花钱);事务 delta 不缓冲不改流。
+**Replication interplay**: rolled-back partitions are marked delta-overflow to force a replica re-copy (existing machinery, paid only on the failure path); transactional deltas are neither buffered nor rerouted.
 
-**分阶段**:①txid 字段改名+穿线(全传 0,行为中性)→②kTxCommit+恢复过滤+播种(尚无人写 txid,中性)→③事务路径打标+提交链+退休路由→④2-hop+运行时回滚+复制 overflow→⑤崩溃测试(数据持久而 commit 未持久时崩溃 ⇒ 全弃;commit 持久 ⇒ 全在)+盘满触发的运行时回滚 e2e(小数据文件真实 ENOSPC)。
+**Stages**: ① rename the txid field + thread it through (all writers pass 0, behavior-neutral) → ② kTxCommit + recovery filtering + seeding (nobody writes txids yet, neutral) → ③ transactional tagging + the commit chain + retirement routing → ④ 2-hop + runtime rollback + replication overflow → ⑤ crash tests (crash with data durable but commit not ⇒ all dropped; commit durable ⇒ all present) + a disk-full-triggered runtime rollback e2e (genuine ENOSPC on a small data file).
 
-### M10 实现进展与阶段③前的待决点(2026-08-09)
+### M10 progress and the pre-stage-③ open point (2026-08-09)
 
-已落地:①txid 字段(化石 generation 重用,全写 0,行为中性);②kTxCommit 种类+编解码校验、恢复期"旁置带标记记录→barrier 后按 commit 集合裁决"、next_txid 恢复播种(全盘 max+1,worker 0 置)。均全绿提交。
+Landed: ① the txid field (fossil generation repurposed, all writers stamp 0, behavior-neutral); ② the kTxCommit kind + codec validation, recovery-time "park tagged records → adjudicate after the barrier against the commit set", next_txid recovery seeding (disk-wide max+1, set by worker 0). Both committed green.
 
-**阶段③实现时发现的待决点:commit 记录的回收**。commit 记录 append 后计入块 live_bytes 但永不入索引:defrag salvage 找不到索引项不会搬迁,块也因它永不归零——不处理则每块最终退化为"只剩 commit 记录"的永久泄漏。候选方案:
-- (a) salvage 特判 kTxCommit 无条件搬迁:块能压实,但 commit 记录本身永不消亡,随事务总量无界累积;
-- (b) 引用计数 GC(倾向):协调者维护 txid→{未退休数据记录数, commit 记录位置};事务数据记录退休时(其栅栏化 MarkRecordDead 时点)通知协调者递减,归零即 MarkRecordDead(commit 记录),块自然回收。重启后由恢复重建计数(扫描时同时见到存活的带标记记录与 commit 记录)。代价:跨 worker 通知一次/记录退休 + 恢复期重建表;
-- (c) flush 前改写 staging 抹除 txid(提交决议远快于周期 flush,多数记录可在落盘前去标签+重算头 CRC,从根上免掉 commit 记录):但与"块写满立即 flush"竞争,已刷部分仍需 commit 记录兜底——复杂度换普通路径零膨胀,可作为 (b) 之上的优化。
+**Open point discovered while implementing stage ③: commit-record reclamation.** A commit record counts toward its block's live_bytes but never enters the index: defrag salvage finds no index entry and will not relocate it, and the block never reaches zero because of it — left unhandled, every block eventually degenerates into a permanent "commit records only" leak. Candidates:
+- (a) salvage special-cases kTxCommit and relocates unconditionally: blocks stay compactable, but commit records themselves never die, accumulating without bound with total transaction count;
+- (b) refcount GC (preferred): the coordinator maintains txid → {unretired data-record count, commit-record location}; when a transaction's data record retires (at its fenced MarkRecordDead point) it notifies the coordinator to decrement; at zero, MarkRecordDead the commit record and the block reclaims naturally. After restart, recovery rebuilds the counts (the scan sees both the surviving tagged records and the commit records). Cost: one cross-worker notification per record retirement + a recovery-time table rebuild;
+- (c) rewrite staging before flush to strip the txid (the commit decision is far faster than the periodic flush; most records can be untagged pre-flush with a header-CRC recompute, eliminating the commit record at the root): but it races "block fills → immediate flush", and already-flushed portions still need a commit record as backstop — complexity buying zero bloat on the normal path; viable as an optimization on top of (b).
 
-阶段③按 (b) 实施;(c) 挂账为后续优化。
+Stage ③ proceeds with (b); (c) deferred as a future optimization.
 
-### M10 完成(2026-08-09,commits 143f5a6/33601dd/288da01/6d627f4)
+### M10 complete (2026-08-09; commits 143f5a6/33601dd/288da01/6d627f4)
 
-全部四阶段落地:①txid 字段;②kTxCommit+恢复过滤+播种;③打标+提交链+退休路由(坑:commit 记录不进分区,关停先排水 commit 链,standby 关停报错);④运行时回滚——TxShardWrites.collect_undo 开启 per-shard undo 日志(WorkerStore.tx_undo,txid 键),单 shard 事务回调内自回滚保持 1 hop,多 shard 走 finish 第二 hop(持锁下 rollback/discard);覆盖键恢复 previous+MarkRecordDead 新记录+分区 delta overflow 强制重拷,新建键追加正常墓碑;EXEC 不开 undo(命令级报错为 Redis 语义,崩溃原子性仍由 commit 记录保证)。KEYLANE_FAIL_TX_WRITE 注入测试故障。验证:注入中途失败全量回滚(覆盖/新建/DBSIZE/重启一致)+ tx-commit-append 崩溃矩阵双向。
+All four stages landed: ① the txid field; ② kTxCommit + recovery filtering + seeding; ③ tagging + the commit chain + retirement routing (pitfalls: commit records must not enter partitions; shutdown drains commit chains first; standby errors out waiters during shutdown); ④ runtime rollback — TxShardWrites.collect_undo enables the per-shard undo journal (WorkerStore.tx_undo, keyed by txid); single-shard transactions self-roll-back inside their callback keeping 1 hop, multi-shard goes through a second finish hop (rollback/discard under the still-held locks); overwritten keys restore the previous location + MarkRecordDead the new record + force the partition's delta overflow for a replica re-copy, freshly created keys get a normal tombstone append; EXEC does not enable undo (per-command error reporting is Redis semantics; crash atomicity is still guaranteed by the commit record). KEYLANE_FAIL_TX_WRITE injects test faults. Verified: injected mid-transaction failures roll back fully (overwrites / fresh keys / DBSIZE / consistency across restart) + the tx-commit-append crash matrix in both directions.
 
-**挂账后续**:commit 记录引用计数 GC(方案 b,现为 salvage 前滚复制+永久累积);EXEC 内部单命令(如内嵌 MSET)中途盘错仍部分可见(命令级);scratchpad 的 repro_tx_atomicity.py / 回滚注入脚本移植 C++ e2e;ASan 全量复跑(受 defrag 调度重构影响待另会话落地)。
+**Deferred follow-ups**: commit-record refcount GC (scheme b; currently salvage forward-copies + permanent accumulation); mid-transaction disk errors of a single command inside EXEC (e.g. an embedded MSET) remain partially visible (command-level); porting scratchpad's repro_tx_atomicity.py / the rollback injection script to C++ e2e; a full ASan re-run (pending the defrag scheduling rework landing in the other session).
