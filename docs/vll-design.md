@@ -193,3 +193,9 @@ M1–M4 相互独立;M5 依赖 M2+M4;M6 起顺序依赖。
 - (c) flush 前改写 staging 抹除 txid(提交决议远快于周期 flush,多数记录可在落盘前去标签+重算头 CRC,从根上免掉 commit 记录):但与"块写满立即 flush"竞争,已刷部分仍需 commit 记录兜底——复杂度换普通路径零膨胀,可作为 (b) 之上的优化。
 
 阶段③按 (b) 实施;(c) 挂账为后续优化。
+
+### M10 完成(2026-08-09,commits 143f5a6/33601dd/288da01/6d627f4)
+
+全部四阶段落地:①txid 字段;②kTxCommit+恢复过滤+播种;③打标+提交链+退休路由(坑:commit 记录不进分区,关停先排水 commit 链,standby 关停报错);④运行时回滚——TxShardWrites.collect_undo 开启 per-shard undo 日志(WorkerStore.tx_undo,txid 键),单 shard 事务回调内自回滚保持 1 hop,多 shard 走 finish 第二 hop(持锁下 rollback/discard);覆盖键恢复 previous+MarkRecordDead 新记录+分区 delta overflow 强制重拷,新建键追加正常墓碑;EXEC 不开 undo(命令级报错为 Redis 语义,崩溃原子性仍由 commit 记录保证)。KEYLANE_FAIL_TX_WRITE 注入测试故障。验证:注入中途失败全量回滚(覆盖/新建/DBSIZE/重启一致)+ tx-commit-append 崩溃矩阵双向。
+
+**挂账后续**:commit 记录引用计数 GC(方案 b,现为 salvage 前滚复制+永久累积);EXEC 内部单命令(如内嵌 MSET)中途盘错仍部分可见(命令级);scratchpad 的 repro_tx_atomicity.py / 回滚注入脚本移植 C++ e2e;ASan 全量复跑(受 defrag 调度重构影响待另会话落地)。
