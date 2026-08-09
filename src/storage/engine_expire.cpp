@@ -4,12 +4,22 @@ namespace keylane::storage {
 
 Task<Status> StorageEngine::Impl::QuiesceExpiration() {
   expiration_pause_count_.fetch_add(1, std::memory_order_acq_rel);
+  // Drain the in-flight expiration cycle on every worker. The flag spans a
+  // whole cycle, so once it drops every tombstone of that cycle has landed —
+  // no matter where the cycle suspended along the way. A cycle raises the
+  // flag before it checks the pause count, so it either sees the increment
+  // above and abstains, or is seen here and waited out.
   for (unsigned target = 0; target < worker_count_; ++target) {
     Status drained = co_await celer::SubmitTaskTo(
         target, [this, target]() -> Task<Status> {
           WorkerStore& store = *stores_[target];
-          co_await store.writer_mutex.Lock();
-          store.writer_mutex.Unlock(*store.worker);
+          while (store.expiry_cycle_running) {
+            Status waited = co_await celer::SleepFor(
+                *store.worker, std::chrono::milliseconds(1));
+            if (!waited.ok()) {
+              co_return waited;
+            }
+          }
           co_return Status::Ok();
         });
     if (!drained.ok()) {
@@ -66,14 +76,6 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
       tx::LockMode::kExclusive);
   co_await store.writer_mutex.Lock();
   UnlockGuard unlock(&store.writer_mutex, store.worker);
-  // Re-check after the locks: the acquisitions above suspend, and a
-  // candidate parked on the key lock is invisible to QuiesceExpiration's
-  // writer-mutex drain — it must not delete mid-scan when it wakes. A
-  // candidate that instead beat the drain to the writer mutex finished
-  // before the drain returned, so either way the scan's count stays exact.
-  if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
-    co_return Status::Ok();
-  }
   auto* current = partition.indexes[candidate.db_id].Find(
       candidate.digest, candidate.key);
   if (current == nullptr || current->value.kind != RecordKind::kValue ||
@@ -96,6 +98,15 @@ Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     if (!waited.ok()) {
       co_return waited;
     }
+    // Raise the flag before checking the pause count — with no suspension
+    // between the two, a cycle QuiesceExpiration's increment misses is
+    // already visible to its drain. The guard drops the flag on every exit
+    // from the cycle: abstain, shutdown, delete error, or completion.
+    store->expiry_cycle_running = true;
+    struct CycleGuard {
+      bool* running;
+      ~CycleGuard() { *running = false; }
+    } cycle_guard{&store->expiry_cycle_running};
     if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
       continue;  // a stable-keyspace scan (KEYS) is in flight
     }

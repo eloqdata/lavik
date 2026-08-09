@@ -853,6 +853,11 @@ class StorageEngine::Impl {
     std::size_t expiry_partition_cursor = 0;
     std::uint8_t expiry_db_cursor = 0;
     std::uint64_t expiry_scan_cursor = 0;
+    // True for the whole of one expiration cycle, scan through last tombstone.
+    // QuiesceExpiration waits on it, which covers every suspension inside the
+    // cycle's deletes — including block-allocation waits that release
+    // writer_mutex mid-append.
+    bool expiry_cycle_running = false;
     std::deque<ExpireCandidate> expired_candidates;
   };
 
