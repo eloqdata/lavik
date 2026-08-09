@@ -256,8 +256,34 @@ class DbCloseGuard {
   std::uint8_t db_id_;
 };
 
-Task<CommandReply> ExecuteFlushDb(const CommandRequest& request,
-                                  ReplyBuilder& reply_builder) {
+class MultiDbCloseGuard {
+ public:
+  MultiDbCloseGuard() = default;
+  MultiDbCloseGuard(const MultiDbCloseGuard&) = delete;
+  MultiDbCloseGuard& operator=(const MultiDbCloseGuard&) = delete;
+  ~MultiDbCloseGuard() {
+    for (std::size_t i = 0; i < count_; ++i) {
+      OpenDbGate(dbs_[i]);
+    }
+  }
+
+  bool Add(std::uint8_t db_id) {
+    if (!CloseDbGate(db_id)) {
+      return false;
+    }
+    dbs_[count_++] = db_id;
+    return true;
+  }
+
+ private:
+  std::array<std::uint8_t, storage::kLogicalDatabaseCount> dbs_{};
+  std::size_t count_ = 0;
+};
+
+Task<CommandReply> ExecuteFlush(const CommandRequest& request,
+                                ReplyBuilder& reply_builder) {
+  const std::string_view command_name =
+      request.kind_ == CommandKind::kFlushAll ? "flushall" : "flushdb";
   bool wait_for_reclaim = true;
   if (request.args_.size() == 2) {
     if (CmpCaseInsensitive(request.args_[1], "ASYNC")) {
@@ -266,38 +292,60 @@ Task<CommandReply> ExecuteFlushDb(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
     }
   } else if (request.args_.size() != 1) {
-    co_return BuiltReply(reply_builder.AppendError(
-        "ERR wrong number of arguments for 'flushdb' command"));
+    co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+        "ERR wrong number of arguments for '", command_name, "' command")));
+  }
+
+  std::vector<std::uint8_t> dbs;
+  if (request.kind_ == CommandKind::kFlushAll) {
+    dbs.reserve(storage::kLogicalDatabaseCount);
+    for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
+         ++db_id) {
+      dbs.push_back(db_id);
+    }
+  } else {
+    dbs.push_back(request.db_id_);
   }
 
   absl::Status detached = absl::OkStatus();
   {
-    // The gate closes the database to every other command, so it covers only
-    // the phase that has to be exclusive: draining commands already in flight,
-    // and swapping the indexes out. Reclaiming what was swapped out runs below
-    // with the database open again, since nothing can reach it any more.
-    if (!CloseDbGate(request.db_id_)) {
-      co_return BuiltReply(
-          reply_builder.AppendError("BUSY another FLUSHDB is already running"));
-    }
-    DbCloseGuard reopen(request.db_id_);
-    while ((g_db_gates[request.db_id_].load(std::memory_order_acquire) &
-            kDbGateCountMask) != 0) {
-      absl::Status waited = co_await celer::SleepFor(
-          *ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!waited.ok()) {
-        co_return BuiltReply(
-            reply_builder.AppendError(absl::StrCat("ERR ", waited.message())));
+    // Close the whole target set before draining any one database. FLUSHALL
+    // therefore has one exclusion window across all databases rather than
+    // allowing writes into an already-detached database while it advances the
+    // remaining epochs.
+    MultiDbCloseGuard reopen;
+    for (const std::uint8_t db_id : dbs) {
+      if (!reopen.Add(db_id)) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "BUSY another database flush is already running"));
       }
     }
-    detached = co_await g_storage->FlushDbDetach(request.db_id_);
+
+    for (const std::uint8_t db_id : dbs) {
+      while ((g_db_gates[db_id].load(std::memory_order_acquire) &
+              kDbGateCountMask) != 0) {
+        absl::Status waited = co_await celer::SleepFor(
+            *ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) {
+          co_return BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR ", waited.message())));
+        }
+      }
+    }
+
+    for (const std::uint8_t db_id : dbs) {
+      detached = co_await g_storage->FlushDbDetach(db_id);
+      if (!detached.ok()) {
+        break;
+      }
+    }
   }
+
+  absl::Status reclaimed = co_await g_storage->FlushDbReclaim(wait_for_reclaim);
   if (!detached.ok()) {
     co_return BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", detached.message())));
   }
-
-  absl::Status reclaimed = co_await g_storage->FlushDbReclaim(wait_for_reclaim);
   co_return reclaimed.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
                            : BuiltReply(reply_builder.AppendError(
                                  absl::StrCat("ERR ", reclaimed.message())));
@@ -1896,8 +1944,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     for (const std::uint8_t db : dbs) {
       if (!db_guard.Add(db)) {
         co_await DropWatches(ctx);
-        co_return BuiltReply(
-            reply_builder.AppendError("TRYAGAIN FLUSHDB is in progress"));
+        co_return BuiltReply(reply_builder.AppendError(
+            "TRYAGAIN database flush is in progress"));
       }
     }
 
@@ -2208,14 +2256,15 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
   }
-  if (request.kind_ == CommandKind::kFlushDb) {
-    co_return co_await ExecuteFlushDb(request, reply_builder);
+  if (request.kind_ == CommandKind::kFlushDb ||
+      request.kind_ == CommandKind::kFlushAll) {
+    co_return co_await ExecuteFlush(request, reply_builder);
   }
 
   const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
   if (uses_db && !TryBeginDbOperation(request.db_id_)) {
     co_return BuiltReply(
-        reply_builder.AppendError("TRYAGAIN FLUSHDB is in progress"));
+        reply_builder.AppendError("TRYAGAIN database flush is in progress"));
   }
   std::optional<DbOperationGuard> db_guard;
   if (uses_db) {
@@ -2290,9 +2339,10 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
       co_return co_await ExecuteStorageCommand(request, reply_builder);
 
     case CommandKind::kFlushDb:
+    case CommandKind::kFlushAll:
       // Handled before the DB operation gate above.
       co_return BuiltReply(
-          reply_builder.AppendError("ERR internal FLUSHDB routing error"));
+          reply_builder.AppendError("ERR internal flush routing error"));
 
     default:
       co_return ExecuteSimpleLocalCommand(request, reply_builder);

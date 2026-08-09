@@ -79,6 +79,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("DBSIZE", CommandKind::kDbSize);
   CheckKind("SCAN", CommandKind::kScan);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
+  CheckKind("FLUSHALL", CommandKind::kFlushAll);
   EXPECT_CHECK(FindCommand("NOPE") == nullptr,
                "unknown command should not resolve");
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");
@@ -87,8 +88,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
-  const char* write_cmds[] = {"set",     "incr",    "del",    "expire",
-                              "pexpire", "persist", "flushdb"};
+  const char* write_cmds[] = {"set",     "incr",    "del",     "expire",
+                              "pexpire", "persist", "flushdb", "flushall"};
   const char* read_cmds[] = {"get",    "strlen", "ttl", "pttl",
                              "exists", "dbsize", "scan"};
   for (const char* name : write_cmds) {
@@ -109,7 +110,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     const char* gated[] = {"dbsize",  "scan", "del",  "exists", "get",
                            "strlen",  "set",  "incr", "expire", "pexpire",
                            "persist", "ttl",  "pttl"};
-    const char* ungated[] = {"ping", "select", "flushdb"};
+    const char* ungated[] = {"ping", "select", "flushdb", "flushall"};
     for (const char* name : gated) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(
@@ -124,8 +125,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     }
   }
   {
-    const char* no_keys[] = {"ping",   "echo", "select",
-                             "dbsize", "scan", "flushdb"};
+    const char* no_keys[] = {"ping", "echo",    "select",  "dbsize",
+                             "scan", "flushdb", "flushall"};
     for (const char* name : no_keys) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -168,6 +169,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("del", 100, true);
   CheckArity("dbsize", 1, true);
   CheckArity("dbsize", 2, false);
+  CheckArity("flushall", 1, true);
+  CheckArity("flushall", 2, true);
 
   // Key position resolution.
   {

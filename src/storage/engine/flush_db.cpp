@@ -109,10 +109,13 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   tx::CurrentTxShard().MarkAllWatched(db_id);
   ++store.index_generations_[db_id];
   for (auto& partition : store.partitions_) {
-    store.detached_indexes_.push_back(DetachedIndex{
-        .index_ = partition.indexes_[db_id].Detach(),
-        .db_id_ = db_id,
-    });
+    auto& index = partition.indexes_[db_id];
+    if (index.has_allocated_storage()) {
+      store.detached_indexes_.push_back(DetachedIndex{
+          .index_ = index.Detach(),
+          .db_id_ = db_id,
+      });
+    }
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;
     const std::uint64_t sequence = ++partition.mutation_sequence_;

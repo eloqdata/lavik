@@ -361,6 +361,13 @@ int main(int argc, char** argv) {
            "-EXECABORT Transaction discarded because of previous errors.",
            "EXECABORT flushdb");
 
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI flushall");
+    Expect(client.Command({"FLUSHALL"}),
+           "-ERR flushall is not allowed in transactions", "queue FLUSHALL");
+    Expect(client.Command({"EXEC"}),
+           "-EXECABORT Transaction discarded because of previous errors.",
+           "EXECABORT flushall");
+
     // DISCARD clears everything.
     Expect(client.Command({"MULTI"}), "+OK", "MULTI discard");
     Expect(client.Command({"SET", "d", "1"}), "+QUEUED", "queue discard SET");
@@ -409,6 +416,46 @@ int main(int argc, char** argv) {
     Expect(client.Command({"SELECT", "0"}), "+OK", "back to db0");
     Expect(client.Command({"GET", "c0"}), Bulk("zero"), "db0 read");
     Expect(client.Command({"GET", "c1"}), "$-1", "c1 not in db0");
+
+    // FLUSHALL clears every logical database without changing the connection's
+    // selected database.
+    Expect(client.Command({"SET", "flushall-db0", "zero"}), "+OK",
+           "FLUSHALL seed db0");
+    Expect(client.Command({"SELECT", "1"}), "+OK", "FLUSHALL select db1");
+    Expect(client.Command({"SET", "flushall-db1", "one"}), "+OK",
+           "FLUSHALL seed db1");
+    Expect(client.Command({"SELECT", "15"}), "+OK", "FLUSHALL select db15");
+    Expect(client.Command({"SET", "flushall-db15", "fifteen"}), "+OK",
+           "FLUSHALL seed db15");
+    Expect(client.Command({"FLUSHALL"}), "+OK", "FLUSHALL");
+    Expect(client.Command({"DBSIZE"}), ":0", "FLUSHALL db15 empty");
+    Expect(client.Command({"SELECT", "1"}), "+OK",
+           "FLUSHALL verify select db1");
+    Expect(client.Command({"DBSIZE"}), ":0", "FLUSHALL db1 empty");
+    Expect(client.Command({"SELECT", "0"}), "+OK",
+           "FLUSHALL verify select db0");
+    Expect(client.Command({"DBSIZE"}), ":0", "FLUSHALL db0 empty");
+    Expect(client.Command({"FLUSHALL", "INVALID"}), "-ERR syntax error",
+           "FLUSHALL invalid mode");
+    Expect(client.Command({"FLUSHALL", "SYNC", "EXTRA"}),
+           "-ERR wrong number of arguments for 'flushall' command",
+           "FLUSHALL wrong arity");
+    Expect(client.Command({"SET", "flushall-async-db0", "zero"}), "+OK",
+           "FLUSHALL ASYNC seed db0");
+    Expect(client.Command({"SELECT", "1"}), "+OK", "FLUSHALL ASYNC select db1");
+    Expect(client.Command({"SET", "flushall-async-db1", "one"}), "+OK",
+           "FLUSHALL ASYNC seed db1");
+    Expect(client.Command({"FLUSHALL", "ASYNC"}), "+OK", "FLUSHALL ASYNC");
+    Expect(client.Command({"DBSIZE"}), ":0", "FLUSHALL ASYNC db1 empty");
+    Expect(client.Command({"SELECT", "0"}), "+OK",
+           "FLUSHALL ASYNC verify select db0");
+    Expect(client.Command({"DBSIZE"}), ":0", "FLUSHALL ASYNC db0 empty");
+    Expect(client.Command({"SELECT", "1"}), "+OK",
+           "seed INFO keyspace select db1");
+    Expect(client.Command({"SET", "info-db1", "value"}), "+OK",
+           "seed INFO keyspace db1");
+    Expect(client.Command({"SELECT", "0"}), "+OK",
+           "return to db0 after INFO seed");
 
     // ---- WATCH / UNWATCH ----
     RespClient other = Connect(port);

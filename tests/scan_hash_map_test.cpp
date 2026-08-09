@@ -20,6 +20,8 @@ using keylane::storage::ScanHashMap;
 
 TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ScanHashMap<std::uint64_t> map;
+  ASSERT_CHECK(!map.has_allocated_storage(),
+               "default map unexpectedly owns storage");
   constexpr std::uint64_t kInitial = 10000;
 
   for (std::uint64_t i = 0; i < kInitial; ++i) {
@@ -29,6 +31,8 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
                  "initial insert failed");
   }
   ASSERT_CHECK(map.size() == kInitial, "unexpected map size");
+  ASSERT_CHECK(map.has_allocated_storage(),
+               "populated map does not report its storage");
 
   for (std::uint64_t i = 0; i < kInitial; ++i) {
     const std::string key = "key-" + std::to_string(i);
@@ -96,6 +100,9 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ScanHashMap<std::uint64_t> detached = moved.Detach();
   ASSERT_CHECK(moved.empty() && moved.size() == 0,
                "detach left entries in the source");
+  ASSERT_CHECK(
+      !moved.has_allocated_storage() && detached.has_allocated_storage(),
+      "detach did not transfer allocated storage");
   ASSERT_CHECK(moved.Find(ComputeDigest("key-0"), "key-0") == nullptr,
                "detached entry is still reachable from the source");
   ASSERT_CHECK(

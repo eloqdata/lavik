@@ -19,6 +19,8 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"flushdb", CommandKind::kFlushDb, 1, 0, 0, 0, 1,
      kCmdWrite | kCmdGlobal | kCmdNoKeys},
+    {"flushall", CommandKind::kFlushAll, 1, 0, 0, 0, 1,
+     kCmdWrite | kCmdGlobal | kCmdNoKeys},
     {"get", CommandKind::kGet, 2, 2, 1, 1, 1, kKeyedRead},
     {"set", CommandKind::kSet, 3, 0, 1, 1, 1, kKeyedWrite},
     {"strlen", CommandKind::kStrlen, 2, 2, 1, 1, 1, kKeyedRead},

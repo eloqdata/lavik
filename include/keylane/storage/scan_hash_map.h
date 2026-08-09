@@ -73,6 +73,10 @@ class ScanHashMap {
 
   bool empty() const noexcept { return size() == 0; }
 
+  bool has_allocated_storage() const noexcept {
+    return tables_[0].buckets_ != nullptr || tables_[1].buckets_ != nullptr;
+  }
+
   Entry* Find(const Digest& digest, std::string_view key) {
     RehashStep();
     return FindWithoutStep(digest, key);
