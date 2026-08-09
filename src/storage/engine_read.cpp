@@ -359,8 +359,8 @@ Task<StatusOr<StorageEngine::Impl::LoadedValue>> StorageEngine::Impl::LoadValueL
   if (location.external) {
     co_return co_await LoadExternalValueLocal(store, location, trace);
   }
-  // TODO: Coalesce concurrent reads of the same aligned disk page, like
-  // the reference engine tiering::OpManager::pending_reads_. Key the in-flight table by
+  // TODO: Coalesce concurrent reads of the same aligned disk page. Key an
+  // in-flight table by
   // (file_id, aligned offset, aligned length), submit one read, and fan the
   // decoded result out to all waiting coroutines. In-flight operations must
   // retain values/leases, never flat_hash_map iterators or element pointers.

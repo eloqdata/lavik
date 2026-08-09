@@ -12,7 +12,7 @@ Current `thread_local DbShard tls_db_` is a correctness bug: a key written on
 worker 0 is invisible to a connection handled by worker 1. Data is split
 non-deterministically by which worker accepted the connection, not by key.
 
-## Target Model (ScyllaDB / the reference engine shared-nothing)
+## Target Model (ScyllaDB-style shared-nothing)
 
 - **Data is partitioned by key hash**, deterministically: `shard = hash(key) % N`.
 - **A shard's data is touched only by its owning worker thread** → no locks.
