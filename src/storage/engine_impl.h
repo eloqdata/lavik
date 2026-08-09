@@ -364,6 +364,11 @@ struct RecordIdentity {
   // earlier lets the block reach zero and be durably freed — a crash before
   // the flush then loses a value that had already been made durable.
   std::optional<RetiredRecord> retired_record;
+  // A kTxCommit record additionally carries every retirement of its
+  // transaction: the superseded versions may only leave their blocks'
+  // accounting once the commit itself is durable, since without the commit
+  // recovery drops the replacements and must still find the old copies.
+  std::shared_ptr<std::vector<RetiredRecord>> tx_retirements;
   std::uint64_t index_generation = 0;
   std::uint8_t db_id = 0;
 };
@@ -859,7 +864,8 @@ class StorageEngine::Impl {
   Task<StatusOr<SetResult>> SetLocked(std::uint8_t db_id, std::string_view key,
                                       const Digest& digest,
                                       std::string_view value,
-                                      SetOptions options);
+                                      SetOptions options,
+                                      TxShardWrites* tx = nullptr);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                      std::string_view key);
@@ -876,13 +882,15 @@ class StorageEngine::Impl {
   // Caller holds the key lock (exclusive); takes writer_mutex internally.
   Task<StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::uint64_t expire_at_ms, ExpirationCondition condition);
+      std::uint64_t expire_at_ms, ExpirationCondition condition,
+      TxShardWrites* tx = nullptr);
 
   Task<StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (exclusive); takes writer_mutex internally.
   Task<StatusOr<bool>> DeleteLocked(std::uint8_t db_id, std::string_view key,
-                                    const Digest& digest);
+                                    const Digest& digest,
+                                    TxShardWrites* tx = nullptr);
 
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
@@ -912,7 +920,18 @@ class StorageEngine::Impl {
   // Caller holds the key lock (exclusive); takes writer_mutex internally.
   Task<StatusOr<std::int64_t>> IncrementLocked(std::uint8_t db_id,
                                                std::string_view key,
-                                               const Digest& digest);
+                                               const Digest& digest,
+                                               TxShardWrites* tx = nullptr);
+
+  Task<Status> CommitTxWrites(std::uint64_t txid,
+                              std::vector<TxShardWrites*> shards);
+
+  void NoteTxCommitStarted() noexcept {
+    active_tx_commits_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  void NoteTxCommitFinished() noexcept {
+    active_tx_commits_.fetch_sub(1, std::memory_order_acq_rel);
+  }
 
   unsigned worker_count() const noexcept { return worker_count_; }
 
@@ -1300,7 +1319,8 @@ class StorageEngine::Impl {
                             std::uint8_t db_id,
                             std::string_view key, std::string_view value,
                             RecordKind kind, ValueType value_type,
-                            std::uint64_t expire_at_ms);
+                            std::uint64_t expire_at_ms,
+                            TxShardWrites* tx = nullptr);
 
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);
@@ -1333,7 +1353,10 @@ class StorageEngine::Impl {
                                  std::shared_ptr<const std::vector<ExtentRef>>
                                      extents = nullptr,
                                  RecordLocation* written_location = nullptr,
-                                 const RelocationSource* relocation = nullptr);
+                                 const RelocationSource* relocation = nullptr,
+                                 TxShardWrites* tx = nullptr,
+                                 std::shared_ptr<std::vector<RetiredRecord>>
+                                     commit_retirements = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 
@@ -1461,6 +1484,10 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
   std::atomic<std::uint64_t> recovery_scanned_records_{0};
   std::atomic<std::uint64_t> recovery_max_txid_{0};
+  // Commit chains spawned but not yet finished; graceful shutdown drains
+  // them before the final flush so acknowledged multi-key writes do not
+  // lose their commit records to the shutdown ordering.
+  std::atomic<std::uint64_t> active_tx_commits_{0};
   // Committed transactions seen during the block scans; merged by each
   // worker before the recovery barrier, read only after it.
   std::mutex recovery_committed_mutex_;

@@ -158,8 +158,9 @@ Task<StatusOr<SetResult>> StorageEngine::SetLocked(std::uint8_t db_id,
                                                    std::string_view key,
                                                    const Digest& digest,
                                                    std::string_view value,
-                                                   SetOptions options) {
-  return impl_->SetLocked(db_id, key, digest, value, options);
+                                                   SetOptions options,
+                                                   TxShardWrites* tx) {
+  return impl_->SetLocked(db_id, key, digest, value, options, tx);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
@@ -170,15 +171,17 @@ Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
 
 Task<StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::uint64_t expire_at_ms, ExpirationCondition condition) {
+    std::uint64_t expire_at_ms, ExpirationCondition condition,
+    TxShardWrites* tx) {
   return impl_->UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
-                                       condition);
+                                       condition, tx);
 }
 
 Task<StatusOr<bool>> StorageEngine::DeleteLocked(std::uint8_t db_id,
                                                  std::string_view key,
-                                                 const Digest& digest) {
-  return impl_->DeleteLocked(db_id, key, digest);
+                                                 const Digest& digest,
+                                                 TxShardWrites* tx) {
+  return impl_->DeleteLocked(db_id, key, digest, tx);
 }
 
 Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id,
@@ -188,8 +191,27 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id,
 }
 
 Task<StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
-  return impl_->IncrementLocked(db_id, key, digest);
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    TxShardWrites* tx) {
+  return impl_->IncrementLocked(db_id, key, digest, tx);
+}
+
+Task<Status> StorageEngine::CommitTxWrites(std::uint64_t txid,
+                                           std::vector<TxShardWrites*> shards) {
+  return impl_->CommitTxWrites(txid, std::move(shards));
+}
+
+std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {
+  return tx::TxRuntime::Get()->next_txid.fetch_add(
+      1, std::memory_order_relaxed);
+}
+
+void StorageEngine::NoteTxCommitStarted() noexcept {
+  impl_->NoteTxCommitStarted();
+}
+
+void StorageEngine::NoteTxCommitFinished() noexcept {
+  impl_->NoteTxCommitFinished();
 }
 
 bool StorageEngine::KeyLive(std::uint8_t db_id, std::string_view key,

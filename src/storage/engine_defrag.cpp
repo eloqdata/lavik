@@ -541,6 +541,49 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
       source_location.extents = std::move(*decoded);
     }
 
+    if (record.kind == RecordKind::kTxCommit) {
+      // Commit records live outside the index, so RelocateIfCurrent cannot
+      // move them, yet one must survive as long as any of its transaction's
+      // records might be recovery-newest. Copy it forward, fence the copy,
+      // and retire the original so the block can still empty. Duplicate
+      // commit sightings are harmless at recovery (set semantics).
+      // TODO(tx-gc): reference-count commits against their outstanding
+      // tagged records so fully superseded transactions stop being carried
+      // forward (docs/vll-design.md M10, option b).
+      co_await store.writer_mutex.Lock();
+      RecordLocation relocated_commit;
+      Status commit_written = Status::Ok();
+      {
+        UnlockGuard commit_unlock(&store.writer_mutex, store.worker);
+        commit_written = co_await WriteRecordLocked(
+            store, record.db_id, {}, {}, RecordKind::kTxCommit,
+            ValueType::kNone, 0, record.digest, record.txid, 0,
+            record.relocation_sequence + 1, true, true, false,
+            std::numeric_limits<std::uint64_t>::max(), nullptr,
+            &relocated_commit);
+      }
+      if (!commit_written.ok()) {
+        source.defragging = false;
+        co_return commit_written;
+      }
+      durability_fences.push_back(RelocationDurabilityFence{
+          .block_id = relocated_commit.block_id,
+          .allocation_epoch = relocated_commit.allocation_epoch,
+          .block_owner = relocated_commit.block_owner,
+          .committed_bytes = static_cast<std::uint32_t>(
+              relocated_commit.record_offset +
+              relocated_commit.total_disk_bytes),
+      });
+      Status commit_dead =
+          co_await MarkRecordDead(RetiredRecordOf(source_location));
+      if (!commit_dead.ok()) {
+        source.defragging = false;
+        co_return commit_dead;
+      }
+      record_offset += record.total_disk_bytes;
+      co_await celer::Yield(*store.worker);
+      continue;
+    }
     const unsigned key_owner = OwnerForKey(disk_key);
     const std::string key(disk_key);
     const std::string value(reinterpret_cast<const char*>(value_data),

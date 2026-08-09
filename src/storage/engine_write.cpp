@@ -17,7 +17,8 @@ Task<StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_id,
                                                          std::string_view key,
                                                          const Digest& digest,
                                                          std::string_view value,
-                                                         SetOptions options) {
+                                                         SetOptions options,
+                                                         TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -60,7 +61,7 @@ Task<StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_id,
                                  : options.expire_at_ms;
   Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
-      ValueType::kString, expire_at_ms);
+      ValueType::kString, expire_at_ms, tx);
   if (!status.ok()) {
     co_return status;
   }
@@ -81,7 +82,8 @@ Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpiration(
 
 Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::uint64_t expire_at_ms, ExpirationCondition condition) {
+    std::uint64_t expire_at_ms, ExpirationCondition condition,
+    TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -120,7 +122,7 @@ Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
     Status status = co_await AppendLocked(
         store, partition, db_id, key, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0);
+        ValueType::kNone, 0, tx);
     if (!status.ok()) {
       co_return status;
     }
@@ -137,7 +139,7 @@ Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                          value_bytes.size());
   Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
-      previous.value_type, expire_at_ms);
+      previous.value_type, expire_at_ms, tx);
   if (!status.ok()) {
     co_return status;
   }
@@ -155,7 +157,8 @@ Task<StatusOr<bool>> StorageEngine::Impl::Delete(std::uint8_t db_id,
 
 Task<StatusOr<bool>> StorageEngine::Impl::DeleteLocked(std::uint8_t db_id,
                                                        std::string_view key,
-                                                       const Digest& digest) {
+                                                       const Digest& digest,
+                                                       TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -170,7 +173,7 @@ Task<StatusOr<bool>> StorageEngine::Impl::DeleteLocked(std::uint8_t db_id,
   const bool expired = IsExpired(found->value, UnixTimeMillis());
   Status status =
       co_await AppendLocked(store, partition, db_id, key, {},
-                            RecordKind::kTombstone, ValueType::kNone, 0);
+                            RecordKind::kTombstone, ValueType::kNone, 0, tx);
   if (!status.ok()) {
     co_return status;
   }
@@ -187,7 +190,8 @@ Task<StatusOr<std::int64_t>> StorageEngine::Impl::Increment(std::uint8_t db_id,
 }
 
 Task<StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -228,7 +232,7 @@ Task<StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
   Status status =
       co_await AppendLocked(store, partition, db_id, key, encoded,
                             RecordKind::kValue, ValueType::kString,
-                            expire_at_ms);
+                            expire_at_ms, tx);
   if (!status.ok()) {
     co_return status;
   }
@@ -318,6 +322,63 @@ Task<Status> StorageEngine::Impl::MarkRecordDead(const RetiredRecord& record) {
       owner, [this, owner, record] {
         return MarkRecordDeadLocal(owner, record);
       });
+}
+
+Task<Status> StorageEngine::Impl::CommitTxWrites(
+    std::uint64_t txid, std::vector<TxShardWrites*> shards) {
+  // The commit record must land strictly after every tagged data record is
+  // durable: recovery treats "commit without data" as impossible, and
+  // "data without commit" as an aborted transaction.
+  auto retirements = std::make_shared<std::vector<RetiredRecord>>();
+  for (TxShardWrites* shard : shards) {
+    if (shard == nullptr) {
+      continue;
+    }
+    for (const TxShardWrites::Fence& fence : shard->fences) {
+      Status durable = co_await AwaitRelocationDurable(RelocationDurabilityFence{
+          .block_id = fence.block_id,
+          .allocation_epoch = fence.allocation_epoch,
+          .block_owner = fence.block_owner,
+          .committed_bytes = fence.committed_bytes,
+      });
+      if (!durable.ok()) {
+        // No commit: recovery aborts the transaction. The routed
+        // retirements never fire, so the superseded copies stay accounted —
+        // a leak on an already fail-stopped path, never a loss.
+        co_return durable;
+      }
+    }
+    for (const TxShardWrites::Retired& retired : shard->retirements) {
+      retirements->push_back(RetiredRecord{
+          .block_id = retired.block_id,
+          .allocation_epoch = retired.allocation_epoch,
+          .total_disk_bytes = retired.total_disk_bytes,
+          .block_owner = retired.block_owner,
+      });
+    }
+  }
+  // Every tagged record is durable; the transaction's fate now rests solely
+  // on the commit record. Crash-safety tests arm this point to prove the
+  // all-or-nothing promise: dying here must abort the whole transaction.
+  KEYLANE_MAYBE_CRASH_AT("tx-commit-append");
+  WorkerStore& store = CurrentStore();
+  co_await store.writer_mutex.Lock();
+  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  RecordLocation commit_location;
+  Status written = co_await WriteRecordLocked(
+      store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
+      ComputeDigest({}), txid, 0, 0, false, true, false,
+      std::numeric_limits<std::uint64_t>::max(), nullptr, &commit_location,
+      nullptr, nullptr, std::move(retirements));
+  if (!written.ok()) {
+    co_return written;
+  }
+  // Nudge the commit's own block so the decision becomes durable promptly
+  // instead of waiting out the periodic flush: until it lands, a crash
+  // drops the whole (acknowledged but never durability-promised)
+  // transaction.
+  RequestFlush(store, commit_location.block_id);
+  co_return Status::Ok();
 }
 
 Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
@@ -518,7 +579,8 @@ Task<Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
                                                std::string_view value,
                                                RecordKind kind,
                                                ValueType value_type,
-                                               std::uint64_t expire_at_ms) {
+                                               std::uint64_t expire_at_ms,
+                                               TxShardWrites* tx) {
   const Digest digest = ComputeDigest(key);
   // Every real keyspace modification funnels through here (client writes,
   // deletes, expiration rewrites, active expiry): invalidate watchers.
@@ -537,14 +599,16 @@ Task<Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, 0, false, true, true,
-        value.size(), *extents);
+        value.size(), *extents, nullptr, nullptr, tx);
     if (!status.ok()) {
       store.worker->Spawn(ReclaimExtents(&store, *extents));
     }
   } else {
     status = co_await WriteRecordLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, 0, false);
+        /*txid=*/0, mutation_sequence, 0, false, true, false,
+        std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, nullptr,
+        tx);
   }
   if (status.ok() && partition.capture_deltas) {
     AppendDelta(partition, SnapshotRecord{
@@ -596,9 +660,17 @@ Task<Status> StorageEngine::Impl::FetchStandbyBlock(WorkerStore* store,
 void StorageEngine::Impl::RequestStandbyBlock(WorkerStore& store,
                                               bool for_defrag) {
   if (store.standby_block.has_value() || store.standby_request_pending ||
-      store.write_failed ||
-      (shutdown_flush_requested_.load(std::memory_order_acquire) &&
-       !for_defrag)) {
+      store.write_failed) {
+    return;
+  }
+  if (shutdown_flush_requested_.load(std::memory_order_acquire) &&
+      !for_defrag) {
+    // Waiters must not park forever on a request that will never be issued:
+    // a commit chain racing shutdown lands here, and its transaction is
+    // simply dropped at recovery (never half-kept).
+    store.standby_error = Status(StatusCode::kUnavailable,
+                                 "storage is shutting down");
+    store.standby_ready.NotifyAll(*store.worker);
     return;
   }
   store.standby_error.reset();
@@ -658,7 +730,9 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     bool for_defrag, bool unlock_writer_while_waiting, bool external,
     std::uint64_t logical_size,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
-    RecordLocation* written_location, const RelocationSource* relocation) {
+    RecordLocation* written_location, const RelocationSource* relocation,
+    TxShardWrites* tx,
+    std::shared_ptr<std::vector<RetiredRecord>> commit_retirements) {
   if (store.write_failed ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return Status(StatusCode::kFailedPrecondition,
@@ -666,6 +740,10 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   }
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
+  }
+  if (tx != nullptr) {
+    assert(tx->txid != 0);
+    txid = tx->txid;
   }
   if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
       (kind == RecordKind::kTombstone &&
@@ -695,8 +773,13 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   // worker. This keeps foreground writes local and bounds active 8 MiB
   // buffers by worker count rather than logical partition count.
   const celer::WorkerId writer_id = store.worker->id();
-  auto& partition = PartitionForKey(store, key);
-  auto& index = partition.indexes[db_id];
+  // Commit records are keyless and belong to no partition: they append
+  // wherever their coordinator runs, and recovery reads them independently
+  // of any partition's epochs.
+  WorkerStore::PartitionStore* partition_ptr =
+      kind == RecordKind::kTxCommit ? nullptr : &PartitionForKey(store, key);
+  RecordIndex* index_ptr =
+      partition_ptr == nullptr ? nullptr : &partition_ptr->indexes[db_id];
   const std::uint64_t lsn =
       next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
@@ -802,9 +885,9 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   // FLUSHDB or partition reset can replace the index state during that gap,
   // so capture the previous location only after the append stream is locked
   // again and an active block is available.
-  if (relocation != nullptr &&
+  if (relocation != nullptr && partition_ptr != nullptr &&
       (DbEpoch(db_id) != relocation->db_epoch ||
-       partition.replication_epoch != relocation->replication_epoch ||
+       partition_ptr->replication_epoch != relocation->replication_epoch ||
        store.index_generations[db_id] != relocation->index_generation)) {
     // The population the source record was validated against is gone — a
     // record written now would carry the successor's epochs and resurrect a
@@ -812,7 +895,8 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     co_return Status(StatusCode::kAborted,
                      "relocation target index changed while waiting");
   }
-  auto* previous_entry = index.Find(digest, key);
+  auto* previous_entry =
+      index_ptr == nullptr ? nullptr : index_ptr->Find(digest, key);
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
           ? std::nullopt
@@ -858,7 +942,8 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
       .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
       .txid = txid,
-      .replication_epoch = partition.replication_epoch,
+      .replication_epoch =
+          partition_ptr == nullptr ? 1 : partition_ptr->replication_epoch,
       // A relocation stamps the epoch its source was validated under, not a
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
       // fresh read here could adopt it mid-append — turning a record
@@ -896,7 +981,8 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
 
   const RecordLocation location{
       .block_id = updated.block_id,
-      .replication_epoch = partition.replication_epoch,
+      .replication_epoch =
+          partition_ptr == nullptr ? 1 : partition_ptr->replication_epoch,
       .mutation_sequence = mutation_sequence,
       .allocation_epoch = updated.allocation_epoch,
       .expire_at_ms = expire_at_ms,
@@ -919,34 +1005,72 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   const bool was_expiring =
       was_live && previous->expire_at_ms != 0;
   const bool is_expiring = is_live && expire_at_ms != 0;
-  auto inserted = index.InsertOrAssign(digest, key, location);
+  RecordIndex::Entry* inserted_entry = nullptr;
+  if (index_ptr != nullptr) {
+    inserted_entry = index_ptr->InsertOrAssign(digest, key, location).entry;
+  }
+  const bool route_to_commit = tx != nullptr && previous.has_value();
   store.staged_records[updated.block_id].push_back(RecordIdentity{
-      .entry = inserted.entry,
+      .entry = inserted_entry,
       .retired_extents =
           !for_defrag && previous.has_value() && previous->external
               ? previous->extents
               : nullptr,
-      .retired_record = !for_defrag && previous.has_value()
+      .retired_record = !for_defrag && !route_to_commit && previous.has_value()
                             ? std::optional<RetiredRecord>(
                                   RetiredRecordOf(*previous))
                             : std::nullopt,
+      .tx_retirements = std::move(commit_retirements),
       .index_generation = store.index_generations[db_id],
       .db_id = db_id,
   });
+  if (route_to_commit) {
+    // The superseded version may only leave its block's accounting once the
+    // commit record is durable — recovery drops uncommitted replacements and
+    // must still find the old copy — so its retirement travels with the
+    // transaction instead of this record's flush.
+    tx->retirements.push_back(TxShardWrites::Retired{
+        .block_id = previous->block_id,
+        .allocation_epoch = previous->allocation_epoch,
+        .total_disk_bytes = previous->total_disk_bytes,
+        .block_owner = previous->block_owner,
+    });
+  }
+  if (tx != nullptr) {
+    const std::uint32_t staged_end = static_cast<std::uint32_t>(
+        record_offset + total_disk_bytes);
+    bool merged = false;
+    for (TxShardWrites::Fence& fence : tx->fences) {
+      if (fence.block_id == updated.block_id &&
+          fence.allocation_epoch == updated.allocation_epoch) {
+        fence.committed_bytes = std::max(fence.committed_bytes, staged_end);
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      tx->fences.push_back(TxShardWrites::Fence{
+          .block_id = updated.block_id,
+          .allocation_epoch = updated.allocation_epoch,
+          .committed_bytes = staged_end,
+          .block_owner = writer_id,
+      });
+    }
+  }
   if (was_live != is_live) {
     if (is_live) {
-      ++partition.live_key_count[db_id];
+      ++partition_ptr->live_key_count[db_id];
       ++store.live_key_count[db_id];
     } else {
-      --partition.live_key_count[db_id];
+      --partition_ptr->live_key_count[db_id];
       --store.live_key_count[db_id];
     }
   }
   if (was_expiring != is_expiring) {
     if (is_expiring) {
-      ++partition.expiring_key_count[db_id];
+      ++partition_ptr->expiring_key_count[db_id];
     } else {
-      --partition.expiring_key_count[db_id];
+      --partition_ptr->expiring_key_count[db_id];
     }
   }
   state.committed_bytes = updated.committed_bytes;

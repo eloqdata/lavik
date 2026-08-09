@@ -1,5 +1,7 @@
 #include "engine_impl.h"
 
+#include <thread>
+
 namespace keylane::storage {
 
 Status StorageEngine::Impl::Prepare(unsigned worker_count) {
@@ -713,6 +715,17 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 }
 
 Status StorageEngine::Impl::FlushForShutdown() {
+  // Give in-flight commit chains a chance to append their commit records
+  // before the flush order freezes the append streams: an acknowledged
+  // multi-key write whose commit misses the shutdown flush is dropped whole
+  // at recovery. Bounded — a stuck chain costs only its own transaction,
+  // never the shutdown. Runs on the shutdown thread, not a worker.
+  const auto commit_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (active_tx_commits_.load(std::memory_order_acquire) != 0 &&
+         std::chrono::steady_clock::now() < commit_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
   shutdown_flush_requested_.store(true, std::memory_order_release);
   unsigned completed =
       shutdown_flush_completed_.load(std::memory_order_acquire);

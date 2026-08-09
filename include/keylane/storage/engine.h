@@ -137,6 +137,28 @@ struct ExpirationInfo {
   std::uint64_t expire_at_ms = 0;
 };
 
+// Per-owning-shard accumulator for one multi-key atomic write. The
+// coordinator owns one per shard; each shard writes only its own entry, so
+// no synchronization is needed.
+struct TxShardWrites {
+  std::uint64_t txid = 0;  // input: stamped into every record written
+
+  struct Fence {  // highest staged offset per destination block
+    std::uint64_t block_id = 0;
+    std::uint64_t allocation_epoch = 0;
+    std::uint32_t committed_bytes = 0;
+    std::uint16_t block_owner = 0;
+  };
+  struct Retired {  // superseded previous versions, released at commit
+    std::uint64_t block_id = 0;
+    std::uint64_t allocation_epoch = 0;
+    std::uint32_t total_disk_bytes = 0;
+    std::uint16_t block_owner = 0;
+  };
+  std::vector<Fence> fences;
+  std::vector<Retired> retirements;
+};
+
 class StorageEngine {
  public:
   explicit StorageEngine(StorageEngineOptions options);
@@ -229,6 +251,15 @@ class StorageEngine {
   // reads, exclusive for writes), must run on OwnerForKey(key), and `digest`
   // must equal ComputeDigest(key). Write variants take the worker's
   // writer_mutex internally and release it before returning.
+  //
+  // Multi-key atomic writes pass a TxShardWrites per owning shard: its txid
+  // tags every record written through it, and the shard accumulates the
+  // durability fences and superseded-record retirements the commit needs.
+  // After every shard succeeded, the coordinator calls CommitTxWrites: it
+  // waits until each fence's data is durable, then appends the kTxCommit
+  // record that makes the transaction survive recovery, and only then lets
+  // the superseded records leave their blocks' accounting. Without a commit,
+  // recovery drops every tagged record — all-or-nothing.
   celer::Task<celer::StatusOr<DiskValue>> GetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ReadLatencyTrace* trace = nullptr);
@@ -236,20 +267,40 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const Digest& digest);
   celer::Task<celer::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::string_view value, SetOptions options = {});
+      std::string_view value, SetOptions options = {},
+      TxShardWrites* tx = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
   celer::Task<celer::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::uint64_t expire_at_ms, ExpirationCondition condition);
+      std::uint64_t expire_at_ms, ExpirationCondition condition,
+      TxShardWrites* tx = nullptr);
   celer::Task<celer::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
                                                   std::string_view key,
-                                                  const Digest& digest);
+                                                  const Digest& digest,
+                                                  TxShardWrites* tx = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
   celer::Task<celer::StatusOr<std::int64_t>> IncrementLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest);
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      TxShardWrites* tx = nullptr);
+
+  // Appends the commit record for a transaction whose shard writes all
+  // succeeded. Runs on any worker; fences and retirements come from the
+  // per-shard TxShardWrites. Safe to run in the background — the client
+  // reply never waits for durability.
+  celer::Task<celer::Status> CommitTxWrites(
+      std::uint64_t txid, std::vector<TxShardWrites*> shards);
+
+  // Allocates a transaction id for tagging a multi-key write. Never zero.
+  static std::uint64_t AllocateWriteTxid() noexcept;
+
+  // Bracket a detached commit chain: Started before spawning it (so a
+  // graceful shutdown that already drained client requests still waits for
+  // it), Finished when the chain ends whatever its outcome.
+  void NoteTxCommitStarted() noexcept;
+  void NoteTxCommitFinished() noexcept;
 
   // Freeze/unfreeze expiration writes for stable-count scans (KEYS). The
   // caller must already exclude client writes (closed database gate).

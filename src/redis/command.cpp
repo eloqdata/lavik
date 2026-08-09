@@ -1114,7 +1114,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request) {
 // validated when the command was queued.
 Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                      const CommandRequest& request,
-                                     const storage::Digest& digest) {
+                                     const storage::Digest& digest,
+                                     storage::TxShardWrites* tx) {
   const auto& args = request.args;
   switch (request.kind) {
     case CommandKind::kGet: {
@@ -1135,7 +1136,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
         co_return EncodeError("ERR " + options.status().message());
       }
       auto result = co_await g_storage->SetLocked(db_id, args[1], digest,
-                                                  args[2], *options);
+                                                  args[2], *options, tx);
       if (!result.ok()) {
         co_return EncodeStorageError(result.status());
       }
@@ -1208,7 +1209,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
         expire_at_ms = now_ms + amount * factor;
       }
       auto updated = co_await g_storage->UpdateExpirationLocked(
-          db_id, args[1], digest, expire_at_ms, *condition);
+          db_id, args[1], digest, expire_at_ms, *condition, tx);
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
     }
@@ -1216,13 +1217,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     case CommandKind::kPersist: {
       auto updated = co_await g_storage->UpdateExpirationLocked(
           db_id, args[1], digest, 0,
-          storage::ExpirationCondition::kIfHasExpiration);
+          storage::ExpirationCondition::kIfHasExpiration, tx);
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
     }
 
     case CommandKind::kIncr: {
-      auto value = co_await g_storage->IncrementLocked(db_id, args[1], digest);
+      auto value = co_await g_storage->IncrementLocked(db_id, args[1], digest, tx);
       if (value.ok()) {
         co_return EncodeInteger(*value);
       }
@@ -1297,7 +1298,38 @@ struct MultiKeyContext {
   const CommandRequest* request = nullptr;
   std::vector<std::optional<std::string>> frames;  // MGET: encoded bulk per slot
   std::atomic<long long> hits{0};                  // DEL / EXISTS
+  // Multi-key atomic write: per-worker receipts, non-empty only for tagged
+  // writes (MSET / multi-key DEL). Each shard touches only its own slot.
+  std::vector<storage::TxShardWrites> tx_writes;
 };
+
+// Detached commit chain for one multi-key write: waits for every shard's
+// tagged data to be durable, then appends the kTxCommit record. The client
+// reply never waits for this — losing the commit before it lands drops the
+// whole transaction at recovery, which relaxed durability already allows;
+// what it can never do is keep half of it.
+Task<Status> RunTxCommit(std::uint64_t txid,
+                         std::vector<storage::TxShardWrites> writes) {
+  struct CommitDone {
+    ~CommitDone() { g_storage->NoteTxCommitFinished(); }
+  } commit_done;
+  std::vector<storage::TxShardWrites*> shards;
+  for (auto& shard : writes) {
+    if (!shard.fences.empty() || !shard.retirements.empty()) {
+      shards.push_back(&shard);
+    }
+  }
+  if (shards.empty()) {
+    co_return Status::Ok();
+  }
+  Status committed = co_await g_storage->CommitTxWrites(txid,
+                                                        std::move(shards));
+  if (!committed.ok()) {
+    spdlog::warn("transaction {} commit append failed: {}", txid,
+                 committed.message());
+  }
+  co_return Status::Ok();
+}
 
 Task<Status> MultiKeyShardCallback(void* context,
                                    const tx::ShardSlice& slice) {
@@ -1321,7 +1353,9 @@ Task<Status> MultiKeyShardCallback(void* context,
       case CommandKind::kMSet: {
         auto result = co_await g_storage->SetLocked(
             ctx->request->db_id, name, key.digest, args[key.arg_index + 1],
-            {});
+            {},
+            ctx->tx_writes.empty() ? nullptr
+                                   : &ctx->tx_writes[ThisWorker().id]);
         if (!result.ok()) {
           co_return result.status();
         }
@@ -1340,9 +1374,10 @@ Task<Status> MultiKeyShardCallback(void* context,
         break;
       }
       case CommandKind::kDel: {
-        auto deleted =
-            co_await g_storage->DeleteLocked(ctx->request->db_id, name,
-                                             key.digest);
+        auto deleted = co_await g_storage->DeleteLocked(
+            ctx->request->db_id, name, key.digest,
+            ctx->tx_writes.empty() ? nullptr
+                                   : &ctx->tx_writes[ThisWorker().id]);
         if (!deleted.ok()) {
           co_return deleted.status();
         }
@@ -1393,6 +1428,14 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   if (request.kind == CommandKind::kMGet) {
     ctx.frames.resize(keys->count());
   }
+  std::uint64_t write_txid = 0;
+  if (write && keys->count() > 1) {
+    write_txid = storage::StorageEngine::AllocateWriteTxid();
+    ctx.tx_writes.resize(g_storage->worker_count());
+    for (auto& shard : ctx.tx_writes) {
+      shard.txid = write_txid;
+    }
+  }
 
   Status scheduled = co_await txn.Schedule();
   if (!scheduled.ok()) {
@@ -1400,7 +1443,14 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   }
   Status status = co_await txn.Execute(&MultiKeyShardCallback, &ctx, true);
   if (!status.ok()) {
+    // No commit record is appended: recovery treats every record this write
+    // tagged as an aborted prepare and drops it, so a crash cannot preserve
+    // half of the command.
     co_return EncodedReply(EncodeStorageError(status));
+  }
+  if (write_txid != 0) {
+    g_storage->NoteTxCommitStarted();
+    SpawnOnCurrentWorker(RunTxCommit(write_txid, std::move(ctx.tx_writes)));
   }
 
   switch (request.kind) {
@@ -1438,6 +1488,9 @@ struct ExecKey {
 // under a mutex.
 struct ExecRunContext {
   const std::vector<CommandRequest>* queued = nullptr;
+  // EXEC-wide per-worker write receipts (worker-indexed); each shard touches
+  // only its own slot. Null for read-only transactions.
+  storage::TxShardWrites* tx_writes = nullptr;
   const std::vector<std::vector<ExecKey>>* cmd_keys = nullptr;
   std::vector<std::string>* replies = nullptr;
   std::size_t begin = 0;
@@ -1558,10 +1611,13 @@ Task<Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         continue;
       }
       bool command_failed = false;
+      storage::TxShardWrites* tx =
+          ctx->tx_writes == nullptr ? nullptr : &ctx->tx_writes[self];
       switch (cmd.kind) {
         case CommandKind::kMSet: {
           auto result = co_await g_storage->SetLocked(
-              cmd.db_id, args[key.arg], key.digest, args[key.arg + 1], {});
+              cmd.db_id, args[key.arg], key.digest, args[key.arg + 1], {},
+              tx);
           if (!result.ok()) {
             record_error(result.status());
             command_failed = true;
@@ -1583,7 +1639,7 @@ Task<Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         }
         case CommandKind::kDel: {
           auto deleted = co_await g_storage->DeleteLocked(
-              cmd.db_id, args[key.arg], key.digest);
+              cmd.db_id, args[key.arg], key.digest, tx);
           if (!deleted.ok()) {
             record_error(deleted.status());
             command_failed = true;
@@ -1603,7 +1659,7 @@ Task<Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
           // Single-key command: the sole owner runs the full body and writes
           // the reply slot directly (errors self-encode).
           (*ctx->replies)[i] =
-              co_await RunSingleKeyLocked(cmd.db_id, cmd, key.digest);
+              co_await RunSingleKeyLocked(cmd.db_id, cmd, key.digest, tx);
           break;
       }
       if (command_failed) {
@@ -1782,6 +1838,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       }
     }
 
+    // One write id for the whole EXEC: every record any of its commands
+    // writes carries it, and one commit record at the end covers them all.
+    // Read-only transactions collect no fences and append no commit.
+    const std::uint64_t exec_txid =
+        storage::StorageEngine::AllocateWriteTxid();
+    std::vector<storage::TxShardWrites> tx_writes(g_storage->worker_count());
+    for (auto& shard : tx_writes) {
+      shard.txid = exec_txid;
+    }
+
     // Distinct owners across the whole transaction.
     std::vector<std::uint16_t> owners;
     for (const auto& keys : cmd_keys) {
@@ -1825,6 +1891,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
               }
               ExecRunContext run;
               InitExecRun(run, queued, cmd_keys, replies, i, end);
+              run.tx_writes = tx_writes.data();
               (void)co_await ExecRunShardCallback(&run,
                                                   tx::ShardSlice{.keys = {}});
               AssembleRunReplies(run);
@@ -1840,6 +1907,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         co_await DropWatches(ctx);
         co_return EncodedReply("*-1\r\n");
       }
+      g_storage->NoteTxCommitStarted();
+      SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     } else {
       tx::Transaction txn;
       for (const auto& keys : cmd_keys) {
@@ -1896,6 +1965,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         }
         ExecRunContext run;
         InitExecRun(run, queued, cmd_keys, replies, i, end);
+        run.tx_writes = tx_writes.data();
         Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
                                           /*release=*/false);
         if (!hop.ok()) {
@@ -1916,6 +1986,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         co_await DropWatches(ctx);
         co_return EncodedReply(EncodeError("ERR " + released.message()));
       }
+      g_storage->NoteTxCommitStarted();
+      SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     }
   } else {
     // Keyless-only transaction.

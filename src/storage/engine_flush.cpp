@@ -308,6 +308,13 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (identity.retired_record.has_value()) {
         retired_records.push_back(*identity.retired_record);
       }
+      if (identity.tx_retirements != nullptr) {
+        // A commit record just became durable: its transaction's superseded
+        // versions can finally leave their blocks' accounting.
+        retired_records.insert(retired_records.end(),
+                               identity.tx_retirements->begin(),
+                               identity.tx_retirements->end());
+      }
       if (identity.entry == nullptr) {
         continue;
       }
