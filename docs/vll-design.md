@@ -182,3 +182,14 @@ M1–M4 相互独立;M5 依赖 M2+M4;M6 起顺序依赖。
 **复制协同**:回滚过的分区标记 delta overflow 强制副本重拷(现成机制,只在失败路径花钱);事务 delta 不缓冲不改流。
 
 **分阶段**:①txid 字段改名+穿线(全传 0,行为中性)→②kTxCommit+恢复过滤+播种(尚无人写 txid,中性)→③事务路径打标+提交链+退休路由→④2-hop+运行时回滚+复制 overflow→⑤崩溃测试(数据持久而 commit 未持久时崩溃 ⇒ 全弃;commit 持久 ⇒ 全在)+盘满触发的运行时回滚 e2e(小数据文件真实 ENOSPC)。
+
+### M10 实现进展与阶段③前的待决点(2026-08-09)
+
+已落地:①txid 字段(化石 generation 重用,全写 0,行为中性);②kTxCommit 种类+编解码校验、恢复期"旁置带标记记录→barrier 后按 commit 集合裁决"、next_txid 恢复播种(全盘 max+1,worker 0 置)。均全绿提交。
+
+**阶段③实现时发现的待决点:commit 记录的回收**。commit 记录 append 后计入块 live_bytes 但永不入索引:defrag salvage 找不到索引项不会搬迁,块也因它永不归零——不处理则每块最终退化为"只剩 commit 记录"的永久泄漏。候选方案:
+- (a) salvage 特判 kTxCommit 无条件搬迁:块能压实,但 commit 记录本身永不消亡,随事务总量无界累积;
+- (b) 引用计数 GC(倾向):协调者维护 txid→{未退休数据记录数, commit 记录位置};事务数据记录退休时(其栅栏化 MarkRecordDead 时点)通知协调者递减,归零即 MarkRecordDead(commit 记录),块自然回收。重启后由恢复重建计数(扫描时同时见到存活的带标记记录与 commit 记录)。代价:跨 worker 通知一次/记录退休 + 恢复期重建表;
+- (c) flush 前改写 staging 抹除 txid(提交决议远快于周期 flush,多数记录可在落盘前去标签+重算头 CRC,从根上免掉 commit 记录):但与"块写满立即 flush"竞争,已刷部分仍需 commit 记录兜底——复杂度换普通路径零膨胀,可作为 (b) 之上的优化。
+
+阶段③按 (b) 实施;(c) 挂账为后续优化。
