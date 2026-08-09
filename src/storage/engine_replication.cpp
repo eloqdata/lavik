@@ -182,8 +182,8 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   // Stop this worker's append stream before making the new epoch durable.
   // Otherwise a concurrent command could append an old-epoch record after
   // the metadata commit and receive OK even though restart must discard it.
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
   const std::uint64_t next_epoch = partition.replication_epoch + 1;
   Status persisted = co_await PersistEpochValue(
       kLogicalDatabaseCount + partition_id, next_epoch);
@@ -218,7 +218,7 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 }
 
 // TODO(replication): the epoch is validated only here at entry, but the loop
-// below suspends repeatedly (key lock, writer_mutex, extent IO, and
+// below suspends repeatedly (key lock, store_state_mutex, extent IO, and
 // AdvanceDbEpoch's reclaim wait in the kFlushDb branch), and a handler whose
 // connection died is not cancelled. A reconnecting session's
 // ResetReplicaPartition can run inside such a gap; the stale handler then
@@ -230,10 +230,10 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 // via the defrag-style expected-version handoff), or serialize per-partition
 // application across sessions.
 //
-// TODO(replication): ResetReplicaPartition above holds writer_mutex across
+// TODO(replication): ResetReplicaPartition above holds store_state_mutex across
 // its whole tombstone loop (unlock_writer_while_waiting=false), so on a full
 // device its inline block allocation waits for reclaim progress while the
-// flush that would free space is itself waiting for this writer_mutex — a
+// flush that would free space is itself waiting for this store_state_mutex — a
 // three-way stall that never resolves. When the epoch redesign lands, the
 // loop should release the mutex around allocation waits and revalidate
 // (db_epoch, replication_epoch, index_generation) afterwards, the same
@@ -375,8 +375,8 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
     // Replicated modifications invalidate local watchers too.
     tx::CurrentTxShard().MarkWatched(applied.db_id,
                                      tx::FingerprintOf(digest));
-    co_await store.writer_mutex.Lock();
-    UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+    co_await store.store_state_mutex.Lock();
+    UnlockGuard write_unlock(&store.store_state_mutex, store.worker);
     auto& index = partition.indexes[applied.db_id];
     auto* current = index.Find(digest, applied.key);
     if (current != nullptr &&

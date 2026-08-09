@@ -22,8 +22,8 @@ Task<StatusOr<SetResult>> StorageEngine::Impl::SetLocked(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
 
   auto& index = partition.indexes[db_id];
   auto* found = index.Find(digest, key);
@@ -87,8 +87,8 @@ Task<StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
 
   auto& index = partition.indexes[db_id];
   auto* found = index.Find(digest, key);
@@ -162,8 +162,8 @@ Task<StatusOr<bool>> StorageEngine::Impl::DeleteLocked(std::uint8_t db_id,
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
 
   auto& index = partition.indexes[db_id];
   auto* found = index.Find(digest, key);
@@ -195,8 +195,8 @@ Task<StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
 
   std::int64_t value = 0;
   std::uint64_t expire_at_ms = 0;
@@ -362,8 +362,8 @@ Task<Status> StorageEngine::Impl::CommitTxWrites(
   // all-or-nothing promise: dying here must abort the whole transaction.
   KEYLANE_MAYBE_CRASH_AT("tx-commit-append");
   WorkerStore& store = CurrentStore();
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
   RecordLocation commit_location;
   Status written = co_await WriteRecordLocked(
       store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
@@ -383,8 +383,8 @@ Task<Status> StorageEngine::Impl::CommitTxWrites(
 
 Task<Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
   WorkerStore& store = CurrentStore();
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
   auto found = store.tx_undo.find(txid);
   if (found == store.tx_undo.end()) {
     co_return Status::Ok();
@@ -452,8 +452,8 @@ Task<Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
 
 Task<Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
   WorkerStore& store = CurrentStore();
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
   store.tx_undo.erase(txid);
   co_return Status::Ok();
 }
@@ -479,14 +479,14 @@ Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
 }
 
 // Allocates a block for this writer inline. `unlock_writer` releases the
-// writer mutex across the allocation so appends behind this one keep flowing;
-// the caller must revalidate whatever it read before the call. Every refusal
-// surfaces as an error to exactly this caller — waiters queue on mutexes end
-// to end, so there is no notification to miss.
+// store-state mutex across the allocation so appends behind this one keep
+// flowing; the caller must revalidate whatever it read before the call. Every
+// refusal surfaces as an error to exactly this caller — waiters queue on
+// mutexes end to end, so there is no notification to miss.
 Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     WorkerStore& store, bool for_defrag, bool unlock_writer) {
   if (unlock_writer) {
-    store.writer_mutex.Unlock(*store.worker);
+    store.store_state_mutex.Unlock(*store.worker);
   }
   StatusOr<ReservedBlock> allocated{
       Status(StatusCode::kUnavailable, "storage is shutting down")};
@@ -498,7 +498,7 @@ Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     allocated = co_await AllocateBlock(store, for_defrag);
   }
   if (unlock_writer) {
-    co_await store.writer_mutex.Lock();
+    co_await store.store_state_mutex.Lock();
   }
   if (allocated.ok() && store.write_failed) {
     // The writer fail-stopped while the allocation waited; report that
@@ -838,7 +838,7 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       co_return allocated.status();
     }
     // Another writer may have installed an active block while this coroutine
-    // had writer_mutex released. Keep that one and hand the spare back to
+    // had store_state_mutex released. Keep that one and hand the spare back to
     // the pool instead of overwriting it; the loop re-checks the fit.
     if (active.has_value()) {
       co_await ReturnReservedBlock(*allocated);
@@ -909,22 +909,21 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     }
   }
 
-  // The writer mutex may have been released while a block was allocated.
-  // FLUSHDB or partition reset can replace the index state during that gap,
-  // so capture the previous location only after the append stream is locked
-  // again and an active block is available.
+  // Block allocation may have released the store-state lock. A client write
+  // can replace this key, or FLUSHDB/replica reset can replace its index,
+  // during that gap. Capture and validate the current physical record only
+  // after the append stream is locked again and an active block is available.
+  auto* previous_entry =
+      index_ptr == nullptr ? nullptr : index_ptr->Find(digest, key);
   if (relocation != nullptr && partition_ptr != nullptr &&
       (DbEpoch(db_id) != relocation->db_epoch ||
        partition_ptr->replication_epoch != relocation->replication_epoch ||
-       store.index_generations[db_id] != relocation->index_generation)) {
-    // The population the source record was validated against is gone — a
-    // record written now would carry the successor's epochs and resurrect a
-    // removed key. Abort; the source block simply is not cleaned this pass.
+       store.index_generations[db_id] != relocation->index_generation ||
+       previous_entry == nullptr ||
+       !relocation->Matches(previous_entry->value))) {
     co_return Status(StatusCode::kAborted,
-                     "relocation target index changed while waiting");
+                     "relocation source changed while waiting");
   }
-  auto* previous_entry =
-      index_ptr == nullptr ? nullptr : index_ptr->Find(digest, key);
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
           ? std::nullopt

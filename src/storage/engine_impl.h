@@ -360,16 +360,24 @@ struct RetiredRecord {
 };
 
 // The index state a defrag relocation observed when it validated its source
-// record. WriteRecordLocked can release writer_mutex while it waits for a
-// block allocation; if FLUSHDB detached the database or a replica reset rewrote
-// the partition in that gap, the relocation would insert its (stale) copy
-// into the successor index stamped with the successor's epochs — resurrecting
-// a key the flush or reset just removed. Re-checking these before the append
-// turns that into an aborted, retryable relocation instead.
+// record. WriteRecordLocked can release the store-state lock while it waits
+// for a block allocation. A client write can replace this key, or FLUSHDB and
+// replica reset can replace the whole index, during that gap. Re-checking both
+// the physical record and the population epochs before the append prevents a
+// stale relocation from resurrecting either one.
 struct RelocationSource {
   std::uint64_t db_epoch = 0;
   std::uint64_t replication_epoch = 0;
   std::uint64_t index_generation = 0;
+  std::uint64_t block_id = 0;
+  std::uint64_t allocation_epoch = 0;
+  std::uint32_t record_offset = 0;
+
+  bool Matches(const RecordLocation& location) const noexcept {
+    return location.block_id == block_id &&
+           location.allocation_epoch == allocation_epoch &&
+           location.record_offset == record_offset;
+  }
 };
 
 // Back-pointer from a block to the index entries staged in its write buffer, so
@@ -840,7 +848,7 @@ class StorageEngine::Impl {
   // is complete (after the recovery barrier).
   std::vector<RecoveryRecord> recovery_tx_records;
   // Undo journals of in-flight multi-key writes on this shard, keyed by
-  // txid; written and consumed under writer_mutex.
+  // txid; written and consumed under store_state_mutex.
   absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
   // Relocation fences owed per source block. A salvage pass that fails
   // midway has already moved records whose copies are not yet durable; the
@@ -853,7 +861,10 @@ class StorageEngine::Impl {
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};
     std::uint16_t free_staging_slot = 0;
-    AsyncMutex writer_mutex;
+    // Serializes this store's index, active append block, staging state, and
+    // block accounting. Release it across block allocation and long I/O;
+    // callers that do so must revalidate any state observed before the wait.
+    AsyncMutex store_state_mutex;
     std::deque<std::uint64_t> flush_queue;
     std::deque<std::uint64_t> defrag_queue;
     std::vector<std::size_t> home_devices;
@@ -870,7 +881,7 @@ class StorageEngine::Impl {
     // True for the whole of one expiration cycle, scan through last tombstone.
     // QuiesceExpiration waits on it, which covers every suspension inside the
     // cycle's deletes — including block-allocation waits that release
-    // writer_mutex mid-append.
+    // store_state_mutex mid-append.
     bool expiry_cycle_running = false;
     std::deque<ExpireCandidate> expired_candidates;
   };
@@ -904,7 +915,7 @@ class StorageEngine::Impl {
                                 std::string_view value,
                                 SetOptions options);
 
-  // Caller holds the key lock (exclusive); takes writer_mutex internally.
+  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<StatusOr<SetResult>> SetLocked(std::uint8_t db_id, std::string_view key,
                                       const Digest& digest,
                                       std::string_view value,
@@ -923,7 +934,7 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key,
       std::uint64_t expire_at_ms, ExpirationCondition condition);
 
-  // Caller holds the key lock (exclusive); takes writer_mutex internally.
+  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
@@ -931,7 +942,7 @@ class StorageEngine::Impl {
 
   Task<StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key);
 
-  // Caller holds the key lock (exclusive); takes writer_mutex internally.
+  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<StatusOr<bool>> DeleteLocked(std::uint8_t db_id, std::string_view key,
                                     const Digest& digest,
                                     TxShardWrites* tx = nullptr);
@@ -939,7 +950,7 @@ class StorageEngine::Impl {
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
   // this stops the active-expiry loop and drains any in-flight append by
-  // bouncing off every worker's writer mutex. Pauses nest — the database
+  // bouncing off every worker's store-state mutex. Pauses nest — the database
   // gates are per-db, so KEYS on two databases can overlap — and every
   // successful QuiesceExpiration must be paired with exactly one
   // ResumeExpiration.
@@ -970,7 +981,7 @@ class StorageEngine::Impl {
   Task<StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
                                          std::string_view key);
 
-  // Caller holds the key lock (exclusive); takes writer_mutex internally.
+  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<StatusOr<std::int64_t>> IncrementLocked(std::uint8_t db_id,
                                                std::string_view key,
                                                const Digest& digest,
@@ -1527,8 +1538,8 @@ class StorageEngine::Impl {
                                    std::uint64_t source_block_offset);
 
   // Drains readers and hands the block back to the allocator. The caller must
-  // have observed live_bytes == 0 under writer_mutex and set `freeing`, which
-  // stops LoadValueLocal from taking new pins.
+  // have observed live_bytes == 0 under store_state_mutex and set `freeing`,
+  // which stops LoadValueLocal from taking new pins.
   Task<Status> ReleaseEmptyBlock(WorkerStore& store, std::uint64_t block_id,
                                  BlockState& source);
 

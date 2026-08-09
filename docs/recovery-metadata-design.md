@@ -187,7 +187,7 @@ read-modify-write operations for its own device.
 Each storage worker holds at most one active append block and one standby block
 ID. At 75% active-block occupancy it starts a standby request. Promotion is
 local. If the active block fills before the standby arrives, only the writing
-coroutine waits; it releases the worker writer mutex for ordinary commands so
+coroutine waits; it releases the worker store-state mutex for ordinary commands so
 unrelated work can continue. Partition reset deliberately keeps the mutex while
 waiting because its epoch transition must remain serialized.
 

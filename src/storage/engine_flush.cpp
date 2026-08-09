@@ -21,8 +21,8 @@ Task<Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       co_return status;
     }
 
-    co_await store->writer_mutex.Lock();
-    UnlockGuard guard(&store->writer_mutex, store->worker);
+    co_await store->store_state_mutex.Lock();
+    UnlockGuard guard(&store->store_state_mutex, store->worker);
     FlushActiveBlock(*store);
   }
   co_return Status::Ok();
@@ -81,8 +81,8 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // working — until shutdown.
 
     {
-      co_await store->writer_mutex.Lock();
-      UnlockGuard guard(&store->writer_mutex, store->worker);
+      co_await store->store_state_mutex.Lock();
+      UnlockGuard guard(&store->store_state_mutex, store->worker);
 
       if (store->flush_queue.empty()) {
         store->flush_running = false;
@@ -201,8 +201,8 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
             : pending->durable_bytes;
     const std::size_t write_bytes = pending->committed_bytes;
     if (staging.data == nullptr || staging.size < write_bytes) {
-      co_await store->writer_mutex.Lock();
-      UnlockGuard guard(&store->writer_mutex, store->worker);
+      co_await store->store_state_mutex.Lock();
+      UnlockGuard guard(&store->store_state_mutex, store->worker);
       BlockState* state = FindBlockState(*store, pending->block_id);
       if (state != nullptr) {
         state->flush_in_progress = false;
@@ -224,8 +224,8 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           pending->write_buffer_id != 0, staging,
           block_offset + write_offset);
       if (!written.ok() || *written != chunk_bytes) {
-        co_await store->writer_mutex.Lock();
-        UnlockGuard guard(&store->writer_mutex, store->worker);
+        co_await store->store_state_mutex.Lock();
+        UnlockGuard guard(&store->store_state_mutex, store->worker);
         BlockState* state = FindBlockState(*store, pending->block_id);
         if (state != nullptr) {
           state->flush_in_progress = false;
@@ -245,8 +245,8 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // after the data it describes is durable. Otherwise a crash between the
     // two can leave a header advertising records that were never written.
     auto fail_flush = [&](Status status) -> Task<Status> {
-      co_await store->writer_mutex.Lock();
-      UnlockGuard guard(&store->writer_mutex, store->worker);
+      co_await store->store_state_mutex.Lock();
+      UnlockGuard guard(&store->store_state_mutex, store->worker);
       BlockState* state = FindBlockState(*store, pending->block_id);
       if (state != nullptr) {
         state->flush_in_progress = false;
@@ -282,8 +282,8 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       co_return co_await fail_flush(synced);
     }
 
-    co_await store->writer_mutex.Lock();
-    UnlockGuard write_guard(&store->writer_mutex, store->worker);
+    co_await store->store_state_mutex.Lock();
+    UnlockGuard write_guard(&store->store_state_mutex, store->worker);
     BlockState* state = FindBlockState(*store, pending->block_id);
     if (state == nullptr) {
       store->flush_running = false;

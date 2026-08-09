@@ -43,8 +43,8 @@ Task<Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto detach = [this, target, db_id]() -> Task<Status> {
       WorkerStore& store = *stores_[target];
-      co_await store.writer_mutex.Lock();
-      UnlockGuard unlock(&store.writer_mutex, store.worker);
+      co_await store.store_state_mutex.Lock();
+      UnlockGuard unlock(&store.store_state_mutex, store.worker);
       DetachDbLocal(store, db_id);
       co_return Status::Ok();
     };
@@ -187,8 +187,8 @@ Task<Status> StorageEngine::Impl::ReclaimDetachedIndexes(WorkerStore& store) {
     co_await celer::Yield(*store.worker);
   }
 
-  co_await store.writer_mutex.Lock();
-  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  co_await store.store_state_mutex.Lock();
+  UnlockGuard unlock(&store.store_state_mutex, store.worker);
   SealDeadActiveBlock(store);
   co_return Status::Ok();
 }

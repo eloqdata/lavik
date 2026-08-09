@@ -381,8 +381,8 @@ Task<Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         candidate.db_id, tx::FingerprintOf(candidate.digest),
         tx::LockMode::kExclusive);
-    co_await store.writer_mutex.Lock();
-    UnlockGuard unlock(&store.writer_mutex, store.worker);
+    co_await store.store_state_mutex.Lock();
+    UnlockGuard unlock(&store.store_state_mutex, store.worker);
     auto& partition = PartitionForKey(store, candidate.key);
     auto* entry = partition.indexes[candidate.db_id].Find(
         candidate.digest, candidate.key);

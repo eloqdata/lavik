@@ -272,7 +272,7 @@ class StorageEngine {
   // hold this worker's key lock for `digest` in the required mode (shared for
   // reads, exclusive for writes), must run on OwnerForKey(key), and `digest`
   // must equal ComputeDigest(key). Write variants take the worker's
-  // writer_mutex internally and release it before returning.
+  // store_state_mutex internally and release it before returning.
   //
   // Multi-key atomic writes pass a TxShardWrites per owning shard: its txid
   // tags every record written through it, and the shard accumulates the

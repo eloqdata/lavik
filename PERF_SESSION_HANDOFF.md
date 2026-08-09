@@ -542,7 +542,7 @@ window's added delay:
 
 Thus the clean first reproduction was dominated by worker/cross-core queueing,
 not storage latency or total CPU capacity. Defrag relocation shares the worker,
-key-lock, writer-mutex, and cross-core mailbox paths with foreground requests.
+key-lock, store-state-mutex, and cross-core mailbox paths with foreground requests.
 
 The second reproduction raised CPU and I/O much further, but its most extreme
 interval also overlapped the known device/system slow plateau. NVMe utilization

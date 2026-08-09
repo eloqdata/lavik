@@ -23,21 +23,21 @@ Task<Status> StorageEngine::Impl::ReclaimExtentsCounted(
 Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
     WorkerStore& store, ExtentRef ref) {
   while (true) {
-    co_await store.writer_mutex.Lock();
+    co_await store.store_state_mutex.Lock();
     BlockState* state = FindBlockState(store, ref.block_id);
     if (state == nullptr || !state->allocated ||
         state->allocation_epoch != ref.allocation_epoch) {
-      store.writer_mutex.Unlock(*store.worker);
+      store.store_state_mutex.Unlock(*store.worker);
       co_return false;
     }
     if (state->kind != BlockKind::kValueExtent) {
-      store.writer_mutex.Unlock(*store.worker);
+      store.store_state_mutex.Unlock(*store.worker);
       co_return Status(StatusCode::kInternal,
                        "extent reclaim found a record block");
     }
     state->live_bytes = 0;
     if (state->pins != 0 || state->freeing) {
-      store.writer_mutex.Unlock(*store.worker);
+      store.store_state_mutex.Unlock(*store.worker);
       Status waited = co_await celer::SleepFor(
           *store.worker, std::chrono::milliseconds(1));
       if (!waited.ok()) {
@@ -46,9 +46,9 @@ Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
       continue;
     }
     state->freeing = true;
-    store.writer_mutex.Unlock(*store.worker);
+    store.store_state_mutex.Unlock(*store.worker);
 
-    co_await store.writer_mutex.Lock();
+    co_await store.store_state_mutex.Lock();
     BlockState* current = FindBlockState(store, ref.block_id);
     bool freed = false;
     if (current != nullptr &&
@@ -56,7 +56,7 @@ Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
       DestroyBlockState(store, ref.block_id);
       freed = true;
     }
-    store.writer_mutex.Unlock(*store.worker);
+    store.store_state_mutex.Unlock(*store.worker);
     co_return freed;
   }
 }
@@ -266,13 +266,8 @@ StorageEngine::Impl::RelocateIfCurrent(
     unsigned key_owner, std::string_view key, std::string_view value,
     const RecordHeader& record, const RecordLocation& source_location) {
   WorkerStore& key_store = *stores_[key_owner];
-  // Always dispatched to key_owner's thread (see the defrag loop), so the
-  // current worker's TxShard is the right lock authority.
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      record.db_id, tx::FingerprintOf(record.digest),
-      tx::LockMode::kExclusive);
-  co_await key_store.writer_mutex.Lock();
-  UnlockGuard write_unlock(&key_store.writer_mutex, key_store.worker);
+  co_await key_store.store_state_mutex.Lock();
+  UnlockGuard write_unlock(&key_store.store_state_mutex, key_store.worker);
 
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes[record.db_id];
@@ -293,6 +288,9 @@ StorageEngine::Impl::RelocateIfCurrent(
       .db_epoch = record.db_epoch,
       .replication_epoch = partition.replication_epoch,
       .index_generation = key_store.index_generations[record.db_id],
+      .block_id = source_location.block_id,
+      .allocation_epoch = source_location.allocation_epoch,
+      .record_offset = source_location.record_offset,
   };
 
   RecordLocation relocated;
@@ -303,9 +301,9 @@ StorageEngine::Impl::RelocateIfCurrent(
       record.relocation_sequence + 1, true, true, record.external,
       record.logical_size, source_location.extents, &relocated, &source);
   if (written.code() == StatusCode::kAborted) {
-    // FLUSHDB or a replica reset replaced the index while the write waited
-    // for a block allocation. Nothing was written; the block stays uncleaned
-    // this pass rather than resurrecting a removed key.
+    // A client write replaced this key, or FLUSHDB/replica reset replaced the
+    // index, while relocation waited for a block. Nothing was written; the
+    // source stays uncleaned this pass rather than resurrecting stale state.
     co_return std::optional<RelocationDurabilityFence>{};
   }
   if (!written.ok()) {
@@ -324,11 +322,11 @@ StorageEngine::Impl::RelocateIfCurrent(
 Task<Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     WorkerStore& store, const RelocationDurabilityFence& fence) {
   while (true) {
-    co_await store.writer_mutex.Lock();
+    co_await store.store_state_mutex.Lock();
     bool durable = false;
     bool failed = false;
     {
-      UnlockGuard unlock(&store.writer_mutex, store.worker);
+      UnlockGuard unlock(&store.store_state_mutex, store.worker);
       BlockState* state = FindBlockState(store, fence.block_id);
       if (state == nullptr || !state->allocated ||
           state->allocation_epoch != fence.allocation_epoch) {
@@ -463,8 +461,8 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
   }
 
   {
-    co_await store.writer_mutex.Lock();
-    UnlockGuard write_unlock(&store.writer_mutex, store.worker);
+    co_await store.store_state_mutex.Lock();
+    UnlockGuard write_unlock(&store.store_state_mutex, store.worker);
     if (source.live_bytes != 0) {
       source.defragging = false;
       co_return Status::Ok();
@@ -615,11 +613,11 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
       // TODO(tx-gc): reference-count commits against their outstanding
       // tagged records so fully superseded transactions stop being carried
       // forward (docs/vll-design.md M10, option b).
-      co_await store.writer_mutex.Lock();
+      co_await store.store_state_mutex.Lock();
       RecordLocation relocated_commit;
       Status commit_written = Status::Ok();
       {
-        UnlockGuard commit_unlock(&store.writer_mutex, store.worker);
+        UnlockGuard commit_unlock(&store.store_state_mutex, store.worker);
         commit_written = co_await WriteRecordLocked(
             store, record.db_id, {}, {}, RecordKind::kTxCommit,
             ValueType::kNone, 0, record.digest, record.txid, 0,

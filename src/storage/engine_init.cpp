@@ -860,18 +860,18 @@ Task<Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
     }
   }
 
-  co_await store->writer_mutex.Lock();
+  co_await store->store_state_mutex.Lock();
   {
-    UnlockGuard guard(&store->writer_mutex, store->worker);
+    UnlockGuard guard(&store->store_state_mutex, store->worker);
     SealActiveBlocks(*store);
   }
 
   while (true) {
-    co_await store->writer_mutex.Lock();
+    co_await store->store_state_mutex.Lock();
     bool done = false;
     bool failed = false;
     {
-      UnlockGuard guard(&store->writer_mutex, store->worker);
+      UnlockGuard guard(&store->store_state_mutex, store->worker);
       // Extent reclaims are detached and hop to whichever worker owns the
       // device allocator, so one can still be mid-flight across workers
       // here. Draining the flush queue is not enough: flush completion is
