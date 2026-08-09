@@ -81,7 +81,7 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
 
 namespace {
 
-CommandReply ExecuteLocalCommand(const CommandRequest& request) {
+CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request) {
   CommandReply reply;
   const auto& args = request.args;
 
@@ -132,21 +132,6 @@ CommandReply ExecuteLocalCommand(const CommandRequest& request) {
       return reply;
     }
 
-    case CommandKind::kDbSize:
-    case CommandKind::kFlushDb:
-    case CommandKind::kScan:
-    case CommandKind::kGet:
-    case CommandKind::kStrlen:
-    case CommandKind::kIncr:
-    case CommandKind::kSet:
-    case CommandKind::kExpire:
-    case CommandKind::kPExpire:
-    case CommandKind::kPersist:
-    case CommandKind::kTtl:
-    case CommandKind::kPttl:
-    case CommandKind::kDel:
-    case CommandKind::kExists:
-    case CommandKind::kUnknown:
     default:
       reply.encoded = EncodeError("ERR unknown command '" + args.front() + "'");
       return reply;
@@ -1006,7 +991,7 @@ Task<CommandReply> ExecuteStorageCommand(
     }
 
     default:
-      co_return ExecuteLocalCommand(request);
+      co_return ExecuteSimpleLocalCommand(request);
   }
 }
 
@@ -1866,7 +1851,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
   std::vector<std::string> replies(queued.size());
   std::optional<std::uint8_t> select_db;
   auto run_keyless = [&](const CommandRequest& cmd) {
-    CommandReply local = ExecuteLocalCommand(cmd);
+    CommandReply local = ExecuteSimpleLocalCommand(cmd);
     if (local.selected_db.has_value()) {
       select_db = local.selected_db;
     }
@@ -2130,7 +2115,7 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
     if (kind == CommandKind::kSelect) {
       // Validated by running it: SELECT inside MULTI moves the database for
       // the commands queued after it.
-      CommandReply local = ExecuteLocalCommand(request);
+      CommandReply local = ExecuteSimpleLocalCommand(request);
       if (!local.selected_db.has_value()) {
         ctx.multi_dirty = true;
         co_return local;
@@ -2259,8 +2244,8 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
       // Handled before the DB operation gate above.
       co_return EncodedReply(EncodeError("ERR internal FLUSHDB routing error"));
 
-    default:  // PING, SELECT, local single-key path, unknown
-      co_return ExecuteLocalCommand(request);
+    default:
+      co_return ExecuteSimpleLocalCommand(request);
   }
 }
 
