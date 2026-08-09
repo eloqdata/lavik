@@ -162,3 +162,23 @@ M1–M4 相互独立;M5 依赖 M2+M4;M6 起顺序依赖。
 ## 关键文件
 
 改动:`src/redis/command.cpp`(路由重写)、`src/redis/server.cpp`(ctx 穿线)、`include/keylane/command.h`、`src/storage/engine.cpp`(*Locked 拆分、后台路径迁移、删 key_locks)、`include/keylane/storage/engine.h`、`CMakeLists.txt`;删除:`include/keylane/storage/intent_lock.h`;新增:`include/keylane/tx/*`、`src/tx/*`、`include/keylane/command_table.h`、`src/redis/command_table.cpp`、`include/keylane/session.h`、5 个新测试。只读依赖:`celer/include/celer/runtime/cross_core.h`(RemoteWork/PostRequest/PostNotification/reply_deferred)。
+
+## M10:多 key 写的存储故障原子性(2PC commit 记录,2026-08-09 定稿)
+
+**问题**:VLL 无 undo。多 key 写(MSET/多 key DEL/EXEC 事务体)中途存储错误(盘满/EIO/写缓冲耗尽)时,已 append 的 shard 生效且持久,失败 shard 报错——客户端收错但留下半套写入,恢复后依然半套。
+
+**方案(用户提出)**:presumed-abort 2PC。数据记录=prepare;发起 worker 在全部参与 shard 数据**持久后**本地 append 一条 commit 记录;恢复时带 txid 的数据记录必须见到对应 commit 记录才保留。
+
+**表示**:`RecordHeader::generation` 重用改名 `txid`(化石字段:初版 newest-wins 序数,04f10f4 引入 replication_epoch/mutation_sequence 后无任何读者,恒镜像 mutation_sequence)。txid==0 即非事务记录(快速路径恒 0,next_txid 从 1 起),**无需标志位**。defrag 搬迁透传 txid 恰为正确语义(commit 归属跟 txid 不跟物理位置)。FormatVersion 不动(用户:现阶段不管兼容)。
+
+**commit 记录**:新 `RecordKind::kTxCommit`,仅头无 payload,txid 字段=被提交 id,append 进发起 worker 的 active block,走现成 staging/flush/恢复扫描。刷盘顺序用 RelocationDurabilityFence 同款栅栏:协调者攒各参与 shard 的 (block, committed) 高水位,全部持久后才 append commit。commit 自身丢失=整个事务恢复期被弃,落在 relaxed durability 承诺内;被禁止的只是"半套存活"。
+
+**退休栅栏路由**:事务写的 previous 退休不挂数据记录的 RecordIdentity,改挂 commit 记录的 identity(commit 块 flush 完成=commit 持久 ⇒ 数据早已持久 ⇒ previous 才可离账)。否则"数据持久了、commit 没持久、previous 已回收、恢复弃新"两头落空。
+
+**恢复**:扫描时带 txid 数据记录旁置 + 收集 kTxCommit 集合;扫完过滤入索引。next_txid 播种=全盘所见 txid 最大值+1(恢复 barrier 处聚合),解决跨重启撞号,零新增元数据。
+
+**运行时回滚(保住"读者永不见半套")**:多 key **写**命令(MSET/DEL)从 concluding 单 hop 改为"执行 hop(release=false)→协调者验全部 shard 状态→Release()/回滚 hop",1→2 hop;读命令(MGET/EXISTS)保持 1 hop。EXEC 本就多 hop,结构不变。回滚=各成功 shard 在仍持锁下恢复 previous 索引项 + MarkRecordDead 新记录 + 计数修正;脏记录留 staging,恢复因无 commit 自然弃。
+
+**复制协同**:回滚过的分区标记 delta overflow 强制副本重拷(现成机制,只在失败路径花钱);事务 delta 不缓冲不改流。
+
+**分阶段**:①txid 字段改名+穿线(全传 0,行为中性)→②kTxCommit+恢复过滤+播种(尚无人写 txid,中性)→③事务路径打标+提交链+退休路由→④2-hop+运行时回滚+复制 overflow→⑤崩溃测试(数据持久而 commit 未持久时崩溃 ⇒ 全弃;commit 持久 ⇒ 全在)+盘满触发的运行时回滚 e2e(小数据文件真实 ENOSPC)。
