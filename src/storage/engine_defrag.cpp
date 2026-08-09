@@ -542,6 +542,11 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
   } fence_debt{&store, block_id, &durability_fences};
   std::uint32_t record_offset = kBlockHeaderBytes;
   while (record_offset < source.committed_bytes) {
+    // live_bytes is updated on this worker between salvage resumptions. Zero
+    // proves that no index entry names any record in the source block.
+    if (source.live_bytes == 0) {
+      break;
+    }
     const std::optional<std::uint32_t> next = NextRecordOffset(
         block_data.buffer.data, record_offset, source.committed_bytes);
     if (!next.has_value()) {
@@ -564,6 +569,19 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
       source.defragging = false;
       co_return Status(StatusCode::kInternal,
                        "corrupt committed record during defrag");
+    }
+
+    // FLUSHDB publishes the database epoch before detached-index accounting
+    // reaches every block. A normal record from another epoch is unreachable
+    // and cannot be relocated. Its validated header supplies the bounded disk
+    // length needed to advance without reading or checksumming the payload.
+    // Transaction commit records are database-independent and remain subject
+    // to full validation and relocation.
+    if (record.kind != RecordKind::kTxCommit &&
+        DbEpoch(record.db_id) != record.db_epoch) {
+      record_offset += record.total_disk_bytes;
+      co_await celer::Yield(*store.worker);
+      continue;
     }
 
     RecordLocation source_location{
