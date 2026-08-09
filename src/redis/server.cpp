@@ -484,6 +484,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   std::string pending;
 
   while (stream.IsOpen()) {
+    ctx.reply_builder.Reset();
     if (ShutdownRequested()) [[unlikely]] {
       co_return absl::OkStatus();
     }
@@ -495,8 +496,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return absl::OkStatus();
       }
 
-      std::string encoded =
-          EncodeError(absl::StrCat("ERR ", command_result.status().message()));
+      const std::string_view encoded = ctx.reply_builder.AppendError(
+          absl::StrCat("ERR ", command_result.status().message()));
       auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
       if (!write_status.ok()) [[unlikely]] {
@@ -506,7 +507,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
-      std::string encoded = EncodeError("ERR server is shutting down");
+      const std::string_view encoded =
+          ctx.reply_builder.AppendError("ERR server is shutting down");
       auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
       stream.Close().IgnoreError();
@@ -518,10 +520,11 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         BuildCommandRequest(std::move(*command_result), ctx.selected_db);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
-      reply.encoded =
-          EncodeError(absl::StrCat("ERR ", request_result.status().message()));
+      reply.encoded = ctx.reply_builder.AppendError(
+          absl::StrCat("ERR ", request_result.status().message()));
     } else {
-      reply = co_await DispatchCommand(ctx, std::move(*request_result));
+      reply = co_await DispatchCommand(ctx, std::move(*request_result),
+                                       ctx.reply_builder);
     }
     if (reply.selected_db.has_value()) {
       ctx.selected_db = *reply.selected_db;

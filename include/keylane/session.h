@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "keylane/command.h"
+#include "keylane/resp.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/fingerprint.h"
 
@@ -15,6 +16,7 @@ namespace keylane {
 // end of RedisService::Serve.
 struct ConnectionContext {
   std::uint8_t selected_db = 0;
+  ReplyBuilder reply_builder;
 
   // MULTI/EXEC queueing. `multi_db` tracks SELECTs issued while queueing so
   // every queued command records the database it will execute against;

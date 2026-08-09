@@ -40,9 +40,9 @@ std::chrono::steady_clock::time_point g_server_start;
 std::atomic<std::uint64_t> g_connected_clients{0};
 std::atomic<std::uint64_t> g_commands_processed{0};
 
-CommandReply EncodedReply(std::string encoded) {
+CommandReply BuiltReply(std::string_view encoded) {
   CommandReply reply;
-  reply.encoded = std::move(encoded);
+  reply.encoded = encoded;
   return reply;
 }
 
@@ -81,41 +81,42 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
 
 namespace {
 
-CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request) {
+CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
+                                       ReplyBuilder& reply_builder) {
   CommandReply reply;
   const auto& args = request.args;
 
   switch (request.kind) {
     case CommandKind::kPing:
       if (args.size() == 1) {
-        reply.encoded = EncodeSimpleString("PONG");
+        reply.encoded = reply_builder.AppendSimpleString("PONG");
       } else if (args.size() == 2) {
-        reply.encoded = EncodeBulkString(args[1]);
+        reply.encoded = reply_builder.AppendBulkString(args[1]);
       } else {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'ping' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'ping' command");
       }
       return reply;
 
     case CommandKind::kEcho:
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'echo' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'echo' command");
       } else {
-        reply.encoded = EncodeBulkString(args[1]);
+        reply.encoded = reply_builder.AppendBulkString(args[1]);
       }
       return reply;
 
     case CommandKind::kUnwatch:
       // Inside EXEC this is a no-op: the transaction consumes the watches
       // itself. Outside MULTI, DispatchCommand clears them before this runs.
-      reply.encoded = EncodeSimpleString("OK");
+      reply.encoded = reply_builder.AppendSimpleString("OK");
       return reply;
 
     case CommandKind::kSelect: {
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'select' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'select' command");
         return reply;
       }
       unsigned db_id = 0;
@@ -124,24 +125,27 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request) {
       const auto [parsed_end, error] = std::from_chars(begin, end, db_id);
       if (error != std::errc{} || parsed_end != end ||
           db_id >= storage::kLogicalDatabaseCount) {
-        reply.encoded = EncodeError("ERR DB index is out of range");
+        reply.encoded =
+            reply_builder.AppendError("ERR DB index is out of range");
         return reply;
       }
-      reply.encoded = EncodeSimpleString("OK");
+      reply.encoded = reply_builder.AppendSimpleString("OK");
       reply.selected_db = static_cast<std::uint8_t>(db_id);
       return reply;
     }
 
     default:
-      reply.encoded = EncodeError("ERR unknown command '" + args.front() + "'");
+      reply.encoded = reply_builder.AppendError("ERR unknown command '" +
+                                                args.front() + "'");
       return reply;
   }
 }
 
-Task<CommandReply> ExecuteDbSize(const CommandRequest& request) {
+Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
+                                 ReplyBuilder& reply_builder) {
   if (request.args.size() != 1) {
-    co_return EncodedReply(
-        EncodeError("ERR wrong number of arguments for 'dbsize' command"));
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'dbsize' command"));
   }
 
   std::uint64_t total = 0;
@@ -150,16 +154,17 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request) {
     const std::size_t local_size = co_await SubmitTo(
         target, [db_id] { return g_storage->LocalSize(db_id); });
     if (local_size > std::numeric_limits<std::uint64_t>::max() - total) {
-      co_return EncodedReply(EncodeError("ERR db size overflow"));
+      co_return BuiltReply(reply_builder.AppendError("ERR db size overflow"));
     }
     total += local_size;
   }
   if (total >
       static_cast<std::uint64_t>(std::numeric_limits<long long>::max())) {
-    co_return EncodedReply(
-        EncodeError("ERR db size exceeds RESP integer range"));
+    co_return BuiltReply(
+        reply_builder.AppendError("ERR db size exceeds RESP integer range"));
   }
-  co_return EncodedReply(EncodeInteger(static_cast<long long>(total)));
+  co_return BuiltReply(
+      reply_builder.AppendInteger(static_cast<long long>(total)));
 }
 
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
@@ -251,17 +256,18 @@ class DbCloseGuard {
   std::uint8_t db_id_;
 };
 
-Task<CommandReply> ExecuteFlushDb(const CommandRequest& request) {
+Task<CommandReply> ExecuteFlushDb(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
   bool wait_for_reclaim = true;
   if (request.args.size() == 2) {
     if (CmpCaseInsensitive(request.args[1], "ASYNC")) {
       wait_for_reclaim = false;
     } else if (!CmpCaseInsensitive(request.args[1], "SYNC")) {
-      co_return EncodedReply(EncodeError("ERR syntax error"));
+      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
     }
   } else if (request.args.size() != 1) {
-    co_return EncodedReply(
-        EncodeError("ERR wrong number of arguments for 'flushdb' command"));
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'flushdb' command"));
   }
 
   absl::Status detached = absl::OkStatus();
@@ -271,8 +277,8 @@ Task<CommandReply> ExecuteFlushDb(const CommandRequest& request) {
     // and swapping the indexes out. Reclaiming what was swapped out runs below
     // with the database open again, since nothing can reach it any more.
     if (!CloseDbGate(request.db_id)) {
-      co_return EncodedReply(
-          EncodeError("BUSY another FLUSHDB is already running"));
+      co_return BuiltReply(
+          reply_builder.AppendError("BUSY another FLUSHDB is already running"));
     }
     DbCloseGuard reopen(request.db_id);
     while ((g_db_gates[request.db_id].load(std::memory_order_acquire) &
@@ -280,21 +286,21 @@ Task<CommandReply> ExecuteFlushDb(const CommandRequest& request) {
       absl::Status waited = co_await celer::SleepFor(
           *ThisWorker().self, std::chrono::milliseconds(1));
       if (!waited.ok()) {
-        co_return EncodedReply(
-            EncodeError(absl::StrCat("ERR ", waited.message())));
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", waited.message())));
       }
     }
     detached = co_await g_storage->FlushDbDetach(request.db_id);
   }
   if (!detached.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", detached.message())));
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", detached.message())));
   }
 
   absl::Status reclaimed = co_await g_storage->FlushDbReclaim(wait_for_reclaim);
-  co_return EncodedReply(
-      reclaimed.ok() ? EncodeSimpleString("OK")
-                     : EncodeError(absl::StrCat("ERR ", reclaimed.message())));
+  co_return reclaimed.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+                           : BuiltReply(reply_builder.AppendError(
+                                 absl::StrCat("ERR ", reclaimed.message())));
 }
 
 struct ScanOptions {
@@ -435,11 +441,12 @@ bool GlobMatch(std::string_view pattern, std::string_view text) {
   return p == pattern.size();
 }
 
-Task<CommandReply> ExecuteScan(const CommandRequest& request) {
+Task<CommandReply> ExecuteScan(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
   auto parsed = ParseScanOptions(request.args);
   if (!parsed.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", parsed.status().message())));
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", parsed.status().message())));
   }
 
   constexpr unsigned kPartitionBits = 14;
@@ -464,7 +471,7 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
   std::uint64_t local_cursor = (options.cursor & kPackedLocalMask)
                                << kPartitionBits;
   if (options.cursor != 0 && partition_id >= storage::kLogicalStorageShards) {
-    co_return EncodedReply(EncodeError("ERR invalid cursor"));
+    co_return BuiltReply(reply_builder.AppendError("ERR invalid cursor"));
   }
 
   std::size_t remaining = options.count;
@@ -498,28 +505,29 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request) {
 
     if (batch.cursor != 0) {
       if ((batch.cursor & kDroppedLocalMask) != 0) {
-        co_return EncodedReply(EncodeError("ERR local scan cursor overflow"));
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR local scan cursor overflow"));
       }
       const std::uint64_t cursor =
           (static_cast<std::uint64_t>(partition_id) << kLocalBits) |
           (batch.cursor >> kPartitionBits);
-      co_return EncodedReply(EncodeScanReply(cursor, keys));
+      co_return BuiltReply(EncodeScanReply(reply_builder, cursor, keys));
     }
 
     ++partition_id;
     local_cursor = 0;
     if (partition_id >= storage::kLogicalStorageShards) {
-      co_return EncodedReply(EncodeScanReply(0, keys));
+      co_return BuiltReply(EncodeScanReply(reply_builder, 0, keys));
     }
     if (examined >= remaining ||
         partitions_examined >= max_partitions_per_call) {
       const std::uint64_t cursor = static_cast<std::uint64_t>(partition_id)
                                    << kLocalBits;
-      co_return EncodedReply(EncodeScanReply(cursor, keys));
+      co_return BuiltReply(EncodeScanReply(reply_builder, cursor, keys));
     }
     remaining -= examined;
   }
-  co_return EncodedReply(EncodeScanReply(0, keys));
+  co_return BuiltReply(EncodeScanReply(reply_builder, 0, keys));
 }
 
 std::uint64_t CommandUnixTimeMillis() noexcept;
@@ -628,15 +636,16 @@ Task<absl::StatusOr<std::string>> NextKeysChunk(
   co_return std::string();
 }
 
-Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
+Task<CommandReply> ExecuteKeys(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
   if (request.args.size() != 2) {
-    co_return EncodedReply(
-        EncodeError("ERR wrong number of arguments for 'keys' command"));
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'keys' command"));
   }
   const std::uint8_t db = request.db_id;
   if (!CloseDbGate(db)) {
-    co_return EncodedReply(
-        EncodeError("BUSY another operation is holding the database"));
+    co_return BuiltReply(reply_builder.AppendError(
+        "BUSY another operation is holding the database"));
   }
   auto state = std::make_shared<KeysStreamState>(db);
   state->pattern = request.args[1];
@@ -648,14 +657,14 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
     absl::Status waited = co_await celer::SleepFor(
         *ThisWorker().self, std::chrono::milliseconds(1));
     if (!waited.ok()) {
-      co_return EncodedReply(
-          EncodeError(absl::StrCat("ERR ", waited.message())));
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", waited.message())));
     }
   }
   absl::Status quiesced = co_await g_storage->QuiesceExpiration();
   if (!quiesced.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", quiesced.message())));
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", quiesced.message())));
   }
   state->expiration_quiesced = true;
 
@@ -677,7 +686,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request) {
     }
   }
 
-  CommandReply reply = EncodedReply("*" + std::to_string(matches) + "\r\n");
+  CommandReply reply = BuiltReply(reply_builder.AppendArrayHeader(matches));
   reply.chunks = [state]() { return NextKeysChunk(state); };
   co_return reply;
 }
@@ -704,6 +713,13 @@ std::string EncodeStorageError(const absl::Status& status) {
     return EncodeError(status.message());
   }
   return EncodeError(absl::StrCat("ERR ", status.message()));
+}
+
+std::string_view AppendStorageError(ReplyBuilder& reply_builder,
+                                    const absl::Status& status) {
+  return status.message().starts_with("WRONGTYPE ")
+             ? reply_builder.AppendError(status.message())
+             : reply_builder.AppendError("ERR ", status.message());
 }
 
 absl::StatusOr<storage::SetOptions> ParseSetOptions(
@@ -810,23 +826,24 @@ absl::StatusOr<storage::ExpirationCondition> ParseExpirationCondition(
 }
 
 Task<CommandReply> ExecuteStorageCommand(
-    const CommandRequest& request, ReadLatencyTrace* read_trace = nullptr) {
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    ReadLatencyTrace* read_trace = nullptr) {
   CommandReply reply;
   const auto& args = request.args;
   switch (request.kind) {
     case CommandKind::kGet: {
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'get' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'get' command");
         co_return reply;
       }
       auto value = co_await g_storage->Get(request.db_id, args[1], read_trace);
       if (!value.ok()) {
         if (value.status().code() == absl::StatusCode::kNotFound) {
-          reply.encoded = EncodeNullBulkString();
+          reply.encoded = reply_builder.AppendNullBulkString();
         } else {
-          reply.encoded =
-              EncodeError(absl::StrCat("ERR ", value.status().message()));
+          reply.encoded = reply_builder.AppendError(
+              absl::StrCat("ERR ", value.status().message()));
         }
       } else {
         reply.disk_value.emplace(std::move(*value));
@@ -836,53 +853,55 @@ Task<CommandReply> ExecuteStorageCommand(
 
     case CommandKind::kSet: {
       if (args.size() < 3) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'set' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'set' command");
         co_return reply;
       }
       auto options = ParseSetOptions(args);
       if (!options.ok()) {
-        reply.encoded =
-            EncodeError(absl::StrCat("ERR ", options.status().message()));
+        reply.encoded = reply_builder.AppendError(
+            absl::StrCat("ERR ", options.status().message()));
         co_return reply;
       }
       auto result =
           co_await g_storage->Set(request.db_id, args[1], args[2], *options);
       if (!result.ok()) {
-        reply.encoded = EncodeStorageError(result.status());
+        reply.encoded = AppendStorageError(reply_builder, result.status());
         co_return reply;
       }
       if (options->return_old_value) {
         if (result->old_value.has_value()) {
           reply.disk_value.emplace(std::move(*result->old_value));
         } else {
-          reply.encoded = EncodeNullBulkString();
+          reply.encoded = reply_builder.AppendNullBulkString();
         }
       } else {
-        reply.encoded =
-            result->applied ? EncodeSimpleString("OK") : EncodeNullBulkString();
+        reply.encoded = result->applied ? reply_builder.AppendSimpleString("OK")
+                                        : reply_builder.AppendNullBulkString();
       }
       co_return reply;
     }
 
     case CommandKind::kStrlen: {
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'strlen' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'strlen' command");
         co_return reply;
       }
       auto length = co_await g_storage->StringLength(request.db_id, args[1]);
       if (!length.ok()) {
         if (length.status().code() == absl::StatusCode::kNotFound) {
-          reply.encoded = EncodeInteger(0);
+          reply.encoded = reply_builder.AppendInteger(0);
         } else {
-          reply.encoded = EncodeStorageError(length.status());
+          reply.encoded = AppendStorageError(reply_builder, length.status());
         }
       } else if (*length > static_cast<std::uint64_t>(
                                std::numeric_limits<long long>::max())) {
-        reply.encoded = EncodeError("ERR String length exceeds RESP range");
+        reply.encoded =
+            reply_builder.AppendError("ERR String length exceeds RESP range");
       } else {
-        reply.encoded = EncodeInteger(static_cast<long long>(*length));
+        reply.encoded =
+            reply_builder.AppendInteger(static_cast<long long>(*length));
       }
       co_return reply;
     }
@@ -891,24 +910,25 @@ Task<CommandReply> ExecuteStorageCommand(
     case CommandKind::kPttl: {
       const bool milliseconds = request.kind == CommandKind::kPttl;
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError(std::string("ERR wrong number of arguments for '") +
-                        (milliseconds ? "pttl" : "ttl") + "' command");
+        reply.encoded = reply_builder.AppendError(
+            std::string("ERR wrong number of arguments for '") +
+            (milliseconds ? "pttl" : "ttl") + "' command");
         co_return reply;
       }
       const storage::ExpirationInfo info =
           co_await g_storage->GetExpiration(request.db_id, args[1]);
       if (!info.exists) {
-        reply.encoded = EncodeInteger(-2);
+        reply.encoded = reply_builder.AppendInteger(-2);
       } else if (info.expire_at_ms == 0) {
-        reply.encoded = EncodeInteger(-1);
+        reply.encoded = reply_builder.AppendInteger(-1);
       } else {
         const std::uint64_t now_ms = CommandUnixTimeMillis();
         const std::uint64_t remaining =
             info.expire_at_ms > now_ms ? info.expire_at_ms - now_ms : 0;
         const std::uint64_t output =
             milliseconds ? remaining : remaining / 1000;
-        reply.encoded = EncodeInteger(static_cast<long long>(output));
+        reply.encoded =
+            reply_builder.AppendInteger(static_cast<long long>(output));
       }
       co_return reply;
     }
@@ -917,20 +937,20 @@ Task<CommandReply> ExecuteStorageCommand(
     case CommandKind::kPExpire: {
       const bool milliseconds = request.kind == CommandKind::kPExpire;
       if (args.size() < 3 || args.size() > 4) {
-        reply.encoded =
-            EncodeError(std::string("ERR wrong number of arguments for '") +
-                        (milliseconds ? "pexpire" : "expire") + "' command");
+        reply.encoded = reply_builder.AppendError(
+            std::string("ERR wrong number of arguments for '") +
+            (milliseconds ? "pexpire" : "expire") + "' command");
         co_return reply;
       }
       std::int64_t duration = 0;
       if (!ParseInt64(args[2], &duration)) {
-        reply.encoded =
-            EncodeError("ERR value is not an integer or out of range");
+        reply.encoded = reply_builder.AppendError(
+            "ERR value is not an integer or out of range");
         co_return reply;
       }
       auto condition = ParseExpirationCondition(args);
       if (!condition.ok()) {
-        reply.encoded = EncodeError("ERR syntax error");
+        reply.encoded = reply_builder.AppendError("ERR syntax error");
         co_return reply;
       }
       const std::uint64_t now_ms = CommandUnixTimeMillis();
@@ -941,63 +961,68 @@ Task<CommandReply> ExecuteStorageCommand(
         const std::uint64_t amount = static_cast<std::uint64_t>(duration);
         const std::uint64_t factor = milliseconds ? 1 : 1000;
         if (amount > (kMaxTimestamp - now_ms) / factor) {
-          reply.encoded =
-              EncodeError("ERR invalid expire time in 'expire' command");
+          reply.encoded = reply_builder.AppendError(
+              "ERR invalid expire time in 'expire' command");
           co_return reply;
         }
         expire_at_ms = now_ms + amount * factor;
       }
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id, args[1], expire_at_ms, *condition);
-      reply.encoded = updated.ok() ? EncodeInteger(*updated ? 1 : 0)
-                                   : EncodeStorageError(updated.status());
+      reply.encoded = updated.ok()
+                          ? reply_builder.AppendInteger(*updated ? 1 : 0)
+                          : AppendStorageError(reply_builder, updated.status());
       co_return reply;
     }
 
     case CommandKind::kPersist: {
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'persist' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'persist' command");
         co_return reply;
       }
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id, args[1], 0,
           storage::ExpirationCondition::kIfHasExpiration);
-      reply.encoded = updated.ok() ? EncodeInteger(*updated ? 1 : 0)
-                                   : EncodeStorageError(updated.status());
+      reply.encoded = updated.ok()
+                          ? reply_builder.AppendInteger(*updated ? 1 : 0)
+                          : AppendStorageError(reply_builder, updated.status());
       co_return reply;
     }
 
     case CommandKind::kIncr: {
       if (args.size() != 2) {
-        reply.encoded =
-            EncodeError("ERR wrong number of arguments for 'incr' command");
+        reply.encoded = reply_builder.AppendError(
+            "ERR wrong number of arguments for 'incr' command");
         co_return reply;
       }
       auto value = co_await g_storage->Increment(request.db_id, args[1]);
       if (!value.ok()) {
         if (value.status().message().starts_with("WRONGTYPE ")) {
-          reply.encoded = EncodeError(value.status().message());
+          reply.encoded = reply_builder.AppendError(value.status().message());
         } else {
           reply.encoded =
               value.status().code() == absl::StatusCode::kInvalidArgument
-                  ? EncodeError("ERR value is not an integer or out of range")
-                  : EncodeError(absl::StrCat("ERR ", value.status().message()));
+                  ? reply_builder.AppendError(
+                        "ERR value is not an integer or out of range")
+                  : reply_builder.AppendError(
+                        absl::StrCat("ERR ", value.status().message()));
         }
       } else {
-        reply.encoded = EncodeInteger(*value);
+        reply.encoded = reply_builder.AppendInteger(*value);
       }
       co_return reply;
     }
 
     default:
-      co_return ExecuteSimpleLocalCommand(request);
+      co_return ExecuteSimpleLocalCommand(request, reply_builder);
   }
 }
 
 // INFO: Redis-shaped sections built from what keylane actually tracks. The
 // Transactions section surfaces the VLL scheduler counters.
-Task<CommandReply> ExecuteInfo(const CommandRequest& request) {
+Task<CommandReply> ExecuteInfo(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
   std::string section = "default";
   if (request.args.size() == 2) {
     section = request.args[1];
@@ -1089,7 +1114,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request) {
     }
     info += "\r\n";
   }
-  co_return EncodedReply(EncodeBulkString(info));
+  co_return BuiltReply(reply_builder.AppendBulkString(info));
 }
 
 // Runs one single-key command body against pre-acquired locks, returning the
@@ -1411,16 +1436,17 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
 // DEL / EXISTS / MSET / MGET run as one transaction: every key locked up
 // front (across all owning shards), one hop where each shard works its
 // slice, locks released when the hop completes.
-Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
+Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
+                                   ReplyBuilder& reply_builder) {
   const auto& args = request.args;
   auto keys = DetermineKeys(*request.spec, args.size());
   if (!keys.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", keys.status().message())));
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", keys.status().message())));
   }
   if (request.kind == CommandKind::kMSet && args.size() % 2 != 1) {
-    co_return EncodedReply(
-        EncodeError("ERR wrong number of arguments for 'mset' command"));
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'mset' command"));
   }
 
   const bool write = (request.spec->flags & kCmdWrite) != 0;
@@ -1449,8 +1475,8 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
 
   absl::Status scheduled = co_await txn.Schedule();
   if (!scheduled.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", scheduled.message())));
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", scheduled.message())));
   }
   // A tagged multi-shard write holds every shard's locks across a second
   // hop, so a mid-transaction storage failure can be undone before any other
@@ -1473,7 +1499,7 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
     // appended: recovery treats every record this write tagged as an aborted
     // prepare and drops it, so neither a reader nor a crash can observe half
     // of the command.
-    co_return EncodedReply(EncodeStorageError(status));
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
   if (write_txid != 0) {
     g_storage->NoteTxCommitStarted();
@@ -1482,17 +1508,17 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
 
   switch (request.kind) {
     case CommandKind::kMSet:
-      co_return EncodedReply(EncodeSimpleString("OK"));
+      co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kMGet: {
-      std::string reply = "*" + std::to_string(ctx.frames.size()) + "\r\n";
+      reply_builder.AppendArrayHeader(ctx.frames.size());
       for (const auto& frame : ctx.frames) {
-        reply += frame.has_value() ? *frame : "$-1\r\n";
+        reply_builder.AppendRaw(frame.has_value() ? *frame : "$-1\r\n");
       }
-      co_return EncodedReply(std::move(reply));
+      co_return BuiltReply(reply_builder.View());
     }
     default:
-      co_return EncodedReply(
-          EncodeInteger(ctx.hits.load(std::memory_order_relaxed)));
+      co_return BuiltReply(reply_builder.AppendInteger(
+          ctx.hits.load(std::memory_order_relaxed)));
   }
 }
 
@@ -1723,11 +1749,12 @@ std::vector<tx::KeyRef> DedupExecLocks(
 // Registers each key on its owning shard with a liveness snapshot taken
 // there; duplicates of an already-watched (db, fp) keep the first snapshot.
 Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
-                                const CommandRequest& request) {
+                                const CommandRequest& request,
+                                ReplyBuilder& reply_builder) {
   auto keys = DetermineKeys(*request.spec, request.args.size());
   if (!keys.ok()) {
-    co_return EncodedReply(
-        EncodeError(absl::StrCat("ERR ", keys.status().message())));
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", keys.status().message())));
   }
   for (std::size_t i = keys->first; i <= keys->last; i += keys->step) {
     const std::uint8_t db = ctx.selected_db;
@@ -1760,7 +1787,7 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
         .live = live,
     });
   }
-  co_return EncodedReply(EncodeSimpleString("OK"));
+  co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
 }
 
 // True when every watched key is unmarked and still matches its WATCH-time
@@ -1797,20 +1824,21 @@ Task<absl::Status> DropWatches(ConnectionContext& ctx) {
   co_return absl::OkStatus();
 }
 
-Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
+Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
+                               ReplyBuilder& reply_builder) {
   const std::vector<CommandRequest> queued = std::move(ctx.queued);
   const bool dirty = ctx.multi_dirty;
   ctx.ResetMulti();
   if (dirty) {
     co_await DropWatches(ctx);
-    co_return EncodedReply(EncodeError(
+    co_return BuiltReply(reply_builder.AppendError(
         "EXECABORT Transaction discarded because of previous errors."));
   }
   if (queued.empty()) {
     const bool clean =
         ctx.watched.empty() || co_await CheckConnectionWatches(ctx);
     co_await DropWatches(ctx);
-    co_return EncodedReply(clean ? "*0\r\n" : "*-1\r\n");
+    co_return BuiltReply(reply_builder.AppendRaw(clean ? "*0\r\n" : "*-1\r\n"));
   }
 
   // Precompute every queued command's keys: digests, owners, slots, modes.
@@ -1828,8 +1856,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       // watches whatever its outcome — leaving them registered would
       // false-abort every later EXEC on this connection.
       co_await DropWatches(ctx);
-      co_return EncodedReply(
-          EncodeError(absl::StrCat("ERR ", keys.status().message())));
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", keys.status().message())));
     }
     const bool write = (cmd.spec->flags & kCmdWrite) != 0;
     std::uint16_t slot = 0;
@@ -1851,11 +1879,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
   std::vector<std::string> replies(queued.size());
   std::optional<std::uint8_t> select_db;
   auto run_keyless = [&](const CommandRequest& cmd) {
-    CommandReply local = ExecuteSimpleLocalCommand(cmd);
+    ReplyBuilder local_builder;
+    CommandReply local = ExecuteSimpleLocalCommand(cmd, local_builder);
     if (local.selected_db.has_value()) {
       select_db = local.selected_db;
     }
-    return std::move(local.encoded);
+    return std::string(local.encoded);
   };
 
   if (!dbs.empty()) {
@@ -1863,7 +1892,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     for (const std::uint8_t db : dbs) {
       if (!db_guard.Add(db)) {
         co_await DropWatches(ctx);
-        co_return EncodedReply(EncodeError("TRYAGAIN FLUSHDB is in progress"));
+        co_return BuiltReply(
+            reply_builder.AppendError("TRYAGAIN FLUSHDB is in progress"));
       }
     }
 
@@ -1905,7 +1935,9 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
               const CommandRequest& cmd = queued[i];
               if (cmd_keys[i].empty()) {
                 if (cmd.kind == CommandKind::kInfo) {
-                  replies[i] = (co_await ExecuteInfo(cmd)).encoded;
+                  ReplyBuilder info_builder;
+                  replies[i] =
+                      (co_await ExecuteInfo(cmd, info_builder)).encoded;
                 } else {
                   replies[i] = run_keyless(cmd);
                 }
@@ -1928,12 +1960,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
           });
       if (!status.ok()) {
         co_await DropWatches(ctx);
-        co_return EncodedReply(
-            EncodeError(absl::StrCat("ERR ", status.message())));
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
       }
       if (watch_aborted) {
         co_await DropWatches(ctx);
-        co_return EncodedReply("*-1\r\n");
+        co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
       }
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
@@ -1948,8 +1980,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
       absl::Status scheduled = co_await txn.Schedule();
       if (!scheduled.ok()) {
         co_await DropWatches(ctx);
-        co_return EncodedReply(
-            EncodeError(absl::StrCat("ERR ", scheduled.message())));
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", scheduled.message())));
       }
       if (!ctx.watched.empty()) {
         // Schedule only records a queue position; conflicting transactions
@@ -1965,13 +1997,13 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         if (!armed.ok()) {
           (void)co_await txn.Release();
           co_await DropWatches(ctx);
-          co_return EncodedReply(
-              EncodeError(absl::StrCat("ERR ", armed.message())));
+          co_return BuiltReply(
+              reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
         }
         if (!co_await CheckConnectionWatches(ctx)) {
           (void)co_await txn.Release();
           co_await DropWatches(ctx);
-          co_return EncodedReply("*-1\r\n");
+          co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
         }
       }
       // Squashed execution: each hop covers a whole run of consecutive keyed
@@ -1983,7 +2015,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         const CommandRequest& cmd = queued[i];
         if (cmd_keys[i].empty()) {
           if (cmd.kind == CommandKind::kInfo) {
-            replies[i] = (co_await ExecuteInfo(cmd)).encoded;
+            ReplyBuilder info_builder;
+            replies[i] = (co_await ExecuteInfo(cmd, info_builder)).encoded;
           } else {
             replies[i] = run_keyless(cmd);
           }
@@ -2015,8 +2048,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
         // its outcome, and stale entries would falsely abort every later
         // EXEC on this connection.
         co_await DropWatches(ctx);
-        co_return EncodedReply(
-            EncodeError(absl::StrCat("ERR ", released.message())));
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", released.message())));
       }
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
@@ -2025,11 +2058,12 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     // Keyless-only transaction.
     if (!ctx.watched.empty() && !co_await CheckConnectionWatches(ctx)) {
       co_await DropWatches(ctx);
-      co_return EncodedReply("*-1\r\n");
+      co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
     }
     for (std::size_t i = 0; i < queued.size(); ++i) {
       if (queued[i].kind == CommandKind::kInfo) {
-        replies[i] = (co_await ExecuteInfo(queued[i])).encoded;
+        ReplyBuilder info_builder;
+        replies[i] = (co_await ExecuteInfo(queued[i], info_builder)).encoded;
       } else {
         replies[i] = run_keyless(queued[i]);
       }
@@ -2037,11 +2071,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
   }
 
   co_await DropWatches(ctx);
-  std::string encoded = "*" + std::to_string(replies.size()) + "\r\n";
+  reply_builder.AppendArrayHeader(replies.size());
   for (const std::string& reply : replies) {
-    encoded += reply;
+    reply_builder.AppendRaw(reply);
   }
-  CommandReply reply = EncodedReply(std::move(encoded));
+  CommandReply reply = BuiltReply(reply_builder.View());
   reply.selected_db = select_db;
   co_return reply;
 }
@@ -2068,63 +2102,66 @@ void ConnectionClosed() noexcept {
 }
 
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest request) {
+                                   CommandRequest request,
+                                   ReplyBuilder& reply_builder) {
   g_commands_processed.fetch_add(1, std::memory_order_relaxed);
   const CommandKind kind = request.kind;
   if (ctx.in_multi) {
     switch (kind) {
       case CommandKind::kMulti:
-        co_return EncodedReply(
-            EncodeError("ERR MULTI calls can not be nested"));
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR MULTI calls can not be nested"));
       case CommandKind::kWatch:
-        co_return EncodedReply(
-            EncodeError("ERR WATCH inside MULTI is not allowed"));
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR WATCH inside MULTI is not allowed"));
       case CommandKind::kDiscard:
         ctx.ResetMulti();
         co_await DropWatches(ctx);
-        co_return EncodedReply(EncodeSimpleString("OK"));
+        co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
       case CommandKind::kExec:
-        co_return co_await ExecuteExec(ctx);
+        co_return co_await ExecuteExec(ctx, reply_builder);
       default:
         break;
     }
     // Queue-time validation: errors reply immediately and doom the EXEC.
     if (request.spec == nullptr) {
       ctx.multi_dirty = true;
-      co_return EncodedReply(
-          EncodeError("ERR unknown command '" + request.args.front() + "'"));
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR unknown command '" + request.args.front() + "'"));
     }
     const CommandSpec& spec = *request.spec;
     auto keys = DetermineKeys(spec, request.args.size());
     if (!keys.ok() ||
         (kind == CommandKind::kMSet && request.args.size() % 2 != 1)) {
       ctx.multi_dirty = true;
-      co_return EncodedReply(EncodeError("ERR wrong number of arguments for '" +
-                                         std::string(spec.name) + "' command"));
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR wrong number of arguments for '" +
+                                    std::string(spec.name) + "' command"));
     }
     if (g_replica_read_only && (spec.flags & kCmdWrite) != 0) {
       ctx.multi_dirty = true;
-      co_return EncodedReply(
-          EncodeError("READONLY You can't write against a read only replica."));
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
     }
     if ((spec.flags & kCmdGlobal) != 0) {
       ctx.multi_dirty = true;
-      co_return EncodedReply(EncodeError("ERR " + std::string(spec.name) +
-                                         " is not allowed in transactions"));
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR " + std::string(spec.name) + " is not allowed in transactions"));
     }
     if (kind == CommandKind::kSelect) {
       // Validated by running it: SELECT inside MULTI moves the database for
       // the commands queued after it.
-      CommandReply local = ExecuteSimpleLocalCommand(request);
+      ReplyBuilder local_builder;
+      CommandReply local = ExecuteSimpleLocalCommand(request, local_builder);
       if (!local.selected_db.has_value()) {
         ctx.multi_dirty = true;
-        co_return local;
+        co_return BuiltReply(reply_builder.AppendRaw(local.encoded));
       }
       ctx.multi_db = *local.selected_db;
     }
     request.db_id = ctx.multi_db;
     ctx.queued.push_back(std::move(request));
-    co_return EncodedReply(EncodeSimpleString("QUEUED"));
+    co_return BuiltReply(reply_builder.AppendSimpleString("QUEUED"));
   }
 
   switch (kind) {
@@ -2132,44 +2169,47 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       ctx.in_multi = true;
       ctx.multi_dirty = false;
       ctx.multi_db = ctx.selected_db;
-      co_return EncodedReply(EncodeSimpleString("OK"));
+      co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kExec:
-      co_return EncodedReply(EncodeError("ERR EXEC without MULTI"));
+      co_return BuiltReply(reply_builder.AppendError("ERR EXEC without MULTI"));
     case CommandKind::kDiscard:
-      co_return EncodedReply(EncodeError("ERR DISCARD without MULTI"));
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR DISCARD without MULTI"));
     case CommandKind::kWatch:
       if (request.spec == nullptr) {
         break;
       }
-      co_return co_await ExecuteWatch(ctx, request);
+      co_return co_await ExecuteWatch(ctx, request, reply_builder);
     case CommandKind::kUnwatch:
       co_await DropWatches(ctx);
-      co_return EncodedReply(EncodeSimpleString("OK"));
+      co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     default:
       break;
   }
-  co_return co_await ExecuteCommand(request);
+  co_return co_await ExecuteCommand(request, reply_builder);
 }
 
 Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
   co_return co_await DropWatches(ctx);
 }
 
-Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
+Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
   const auto& args = request.args;
   const std::uint32_t cmd_flags =
       request.spec != nullptr ? request.spec->flags : 0u;
   if (g_replica_read_only && (cmd_flags & kCmdWrite) != 0) {
-    co_return EncodedReply(
-        EncodeError("READONLY You can't write against a read only replica."));
+    co_return BuiltReply(reply_builder.AppendError(
+        "READONLY You can't write against a read only replica."));
   }
   if (request.kind == CommandKind::kFlushDb) {
-    co_return co_await ExecuteFlushDb(request);
+    co_return co_await ExecuteFlushDb(request, reply_builder);
   }
 
   const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
   if (uses_db && !TryBeginDbOperation(request.db_id)) {
-    co_return EncodedReply(EncodeError("TRYAGAIN FLUSHDB is in progress"));
+    co_return BuiltReply(
+        reply_builder.AppendError("TRYAGAIN FLUSHDB is in progress"));
   }
   std::optional<DbOperationGuard> db_guard;
   if (uses_db) {
@@ -2178,22 +2218,22 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
 
   switch (request.kind) {
     case CommandKind::kInfo:
-      co_return co_await ExecuteInfo(request);
+      co_return co_await ExecuteInfo(request, reply_builder);
 
     case CommandKind::kKeys:
-      co_return co_await ExecuteKeys(request);
+      co_return co_await ExecuteKeys(request, reply_builder);
 
     case CommandKind::kDbSize:
-      co_return co_await ExecuteDbSize(request);
+      co_return co_await ExecuteDbSize(request, reply_builder);
 
     case CommandKind::kScan:
-      co_return co_await ExecuteScan(request);
+      co_return co_await ExecuteScan(request, reply_builder);
 
     case CommandKind::kDel:
     case CommandKind::kExists:
     case CommandKind::kMSet:
     case CommandKind::kMGet:
-      co_return co_await ExecuteMultiKey(request);
+      co_return co_await ExecuteMultiKey(request, reply_builder);
 
     case CommandKind::kGet:
     case CommandKind::kStrlen:
@@ -2214,16 +2254,18 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
           CommandReply reply;
           if (trace.remote) {
             reply = co_await SubmitTaskTo(
-                target, [&request, &trace]() -> Task<CommandReply> {
+                target,
+                [&request, &reply_builder, &trace]() -> Task<CommandReply> {
                   trace.owner_start_ns = ReadTraceNowNanos();
-                  CommandReply result =
-                      co_await ExecuteStorageCommand(request, &trace);
+                  CommandReply result = co_await ExecuteStorageCommand(
+                      request, reply_builder, &trace);
                   trace.owner_done_ns = ReadTraceNowNanos();
                   co_return result;
                 });
           } else {
             trace.owner_start_ns = trace.request_start_ns;
-            reply = co_await ExecuteStorageCommand(request, &trace);
+            reply =
+                co_await ExecuteStorageCommand(request, reply_builder, &trace);
             trace.owner_done_ns = ReadTraceNowNanos();
           }
           trace.origin_resume_ns = ReadTraceNowNanos();
@@ -2233,19 +2275,21 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request) {
 #endif
         if (target != ThisWorker().id) {
           co_return co_await SubmitTaskTo(
-              target, [&request]() -> Task<CommandReply> {
-                co_return co_await ExecuteStorageCommand(request);
+              target, [&request, &reply_builder]() -> Task<CommandReply> {
+                co_return co_await ExecuteStorageCommand(request,
+                                                         reply_builder);
               });
         }
       }
-      co_return co_await ExecuteStorageCommand(request);
+      co_return co_await ExecuteStorageCommand(request, reply_builder);
 
     case CommandKind::kFlushDb:
       // Handled before the DB operation gate above.
-      co_return EncodedReply(EncodeError("ERR internal FLUSHDB routing error"));
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR internal FLUSHDB routing error"));
 
     default:
-      co_return ExecuteSimpleLocalCommand(request);
+      co_return ExecuteSimpleLocalCommand(request, reply_builder);
   }
 }
 

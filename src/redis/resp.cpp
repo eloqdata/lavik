@@ -1,6 +1,8 @@
 #include "keylane/resp.h"
 
+#include <cassert>
 #include <charconv>
+#include <limits>
 #include <string_view>
 
 namespace keylane {
@@ -144,67 +146,138 @@ RespParseResult ParseRespCommand(std::string_view input) {
   return result;
 }
 
+namespace {
+
+void AppendUnsigned(std::string& output, std::uint64_t value) {
+  char digits[std::numeric_limits<std::uint64_t>::digits10 + 2];
+  const auto [end, error] =
+      std::to_chars(digits, digits + sizeof(digits), value);
+  assert(error == std::errc{});
+  output.append(digits, end);
+}
+
+}  // namespace
+
+void ReplyBuilder::Reset() {
+  constexpr std::size_t kMaximumRetainedCapacity = 64 * 1024;
+  if (buffer_.capacity() > kMaximumRetainedCapacity) {
+    std::string{}.swap(buffer_);
+  } else {
+    buffer_.clear();
+  }
+}
+
+void ReplyBuilder::Reserve(std::size_t capacity) { buffer_.reserve(capacity); }
+
+std::string_view ReplyBuilder::AppendSimpleString(std::string_view value) {
+  buffer_.push_back('+');
+  buffer_.append(value);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendBulkString(std::string_view value) {
+  buffer_.push_back('$');
+  AppendUnsigned(buffer_, value.size());
+  buffer_.append("\r\n");
+  buffer_.append(value);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendNullBulkString() {
+  buffer_.append("$-1\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendInteger(long long value) {
+  char digits[std::numeric_limits<long long>::digits10 + 3];
+  const auto [end, error] =
+      std::to_chars(digits, digits + sizeof(digits), value);
+  assert(error == std::errc{});
+  buffer_.push_back(':');
+  buffer_.append(digits, end);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendError(std::string_view message) {
+  return AppendError({}, message);
+}
+
+std::string_view ReplyBuilder::AppendError(std::string_view prefix,
+                                           std::string_view message) {
+  buffer_.push_back('-');
+  buffer_.append(prefix);
+  buffer_.append(message);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendArrayHeader(std::uint64_t count) {
+  buffer_.push_back('*');
+  AppendUnsigned(buffer_, count);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendRaw(std::string_view encoded) {
+  buffer_.append(encoded);
+  return buffer_;
+}
+
 std::string EncodeSimpleString(std::string_view value) {
-  std::string out;
-  out.reserve(value.size() + 3);
-  out.push_back('+');
-  out.append(value);
-  out.append("\r\n");
-  return out;
+  ReplyBuilder builder;
+  builder.Reserve(value.size() + 3);
+  builder.AppendSimpleString(value);
+  return std::move(builder).Release();
 }
 
 std::string EncodeBulkString(std::string_view value) {
-  std::string out;
-  out.reserve(value.size() + 32);
-  out.push_back('$');
-  out.append(std::to_string(value.size()));
-  out.append("\r\n");
-  out.append(value);
-  out.append("\r\n");
-  return out;
+  ReplyBuilder builder;
+  builder.Reserve(value.size() + 32);
+  builder.AppendBulkString(value);
+  return std::move(builder).Release();
 }
 
 std::string EncodeNullBulkString() { return "$-1\r\n"; }
 
 std::string EncodeInteger(long long value) {
-  std::string out;
-  out.reserve(32);
-  out.push_back(':');
-  out.append(std::to_string(value));
-  out.append("\r\n");
-  return out;
+  ReplyBuilder builder;
+  builder.Reserve(32);
+  builder.AppendInteger(value);
+  return std::move(builder).Release();
 }
 
 std::string EncodeError(std::string_view message) {
-  std::string out;
-  out.reserve(message.size() + 3);
-  out.push_back('-');
-  out.append(message);
-  out.append("\r\n");
-  return out;
+  ReplyBuilder builder;
+  builder.Reserve(message.size() + 3);
+  builder.AppendError(message);
+  return std::move(builder).Release();
+}
+
+std::string_view EncodeScanReply(ReplyBuilder& builder, std::uint64_t cursor,
+                                 const std::vector<std::string>& keys) {
+  char cursor_digits[std::numeric_limits<std::uint64_t>::digits10 + 2];
+  const auto [cursor_end, error] = std::to_chars(
+      cursor_digits, cursor_digits + sizeof(cursor_digits), cursor);
+  assert(error == std::errc{});
+  builder.Reserve(builder.View().size() + 64 + keys.size() * 16);
+  builder.AppendArrayHeader(2);
+  builder.AppendBulkString(std::string_view(
+      cursor_digits, static_cast<std::size_t>(cursor_end - cursor_digits)));
+  builder.AppendArrayHeader(keys.size());
+  for (const std::string& key : keys) {
+    builder.AppendBulkString(key);
+  }
+  return builder.View();
 }
 
 std::string EncodeScanReply(std::uint64_t cursor,
                             const std::vector<std::string>& keys) {
-  std::string out;
-  out.reserve(64 + keys.size() * 16);
-  out.append("*2\r\n");
-  const std::string encoded_cursor = std::to_string(cursor);
-  out.push_back('$');
-  out.append(std::to_string(encoded_cursor.size()));
-  out.append("\r\n");
-  out.append(encoded_cursor);
-  out.append("\r\n*");
-  out.append(std::to_string(keys.size()));
-  out.append("\r\n");
-  for (const std::string& key : keys) {
-    out.push_back('$');
-    out.append(std::to_string(key.size()));
-    out.append("\r\n");
-    out.append(key);
-    out.append("\r\n");
-  }
-  return out;
+  ReplyBuilder builder;
+  EncodeScanReply(builder, cursor, keys);
+  return std::move(builder).Release();
 }
 
 }  // namespace keylane

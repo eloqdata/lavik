@@ -4,6 +4,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "absl/status/statusor.h"
@@ -14,6 +15,7 @@
 namespace keylane {
 
 struct RespCommand;
+class ReplyBuilder;
 
 using celer::Task;
 
@@ -61,10 +63,12 @@ struct CommandRequest {
 using ReplyChunkSource = std::function<Task<absl::StatusOr<std::string>>()>;
 
 struct CommandReply {
-  // TODO: Add a connection-local RESP reply builder for composite and small
-  // replies. Keep DiskValue as the specialized direct-from-read-buffer GET
-  // path.
-  std::string encoded;
+  // Points into the connection's ReplyBuilder and remains valid until the
+  // current socket write completes. DiskValue keeps the specialized
+  // direct-from-read-buffer GET path.
+  // TODO: Add TcpStream::WriteVAll so composite replies can send independently
+  // produced fragments without flattening them into ReplyBuilder.
+  std::string_view encoded;
   std::optional<storage::DiskValue> disk_value;
   ReplyChunkSource chunks;  // drained after `encoded` when set
   bool close_connection = false;
@@ -80,7 +84,8 @@ struct ConnectionContext;
 // Connection-level dispatch: intercepts MULTI/EXEC/DISCARD and queueing;
 // everything else falls through to ExecuteCommand.
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest request);
+                                   CommandRequest request,
+                                   ReplyBuilder& reply_builder);
 
 // Unregisters every WATCH this connection holds (connection close, UNWATCH,
 // DISCARD, and the end of every EXEC).
@@ -100,6 +105,7 @@ void ConnectionClosed() noexcept;
 // Route `request` to the worker owning its Redis hash-slot partition. Async
 // disk operations use SubmitTaskTo and return on the connection's original
 // worker.
-Task<CommandReply> ExecuteCommand(const CommandRequest& request);
+Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder);
 
 }  // namespace keylane

@@ -144,6 +144,7 @@ if (BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
 
   add_executable(keylane_unit_tests
+    tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/command_table_test.cpp
     tests/tx_lock_test.cpp
