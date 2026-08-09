@@ -223,9 +223,18 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 // replication_epoch (WriteRecordLocked reads it at write time), overriding
 // the reset tombstones — the replica keeps a key the primary deleted, and no
 // future delta ever corrects it. Design pending: re-validate the epoch after
-// every suspension point (including inside WriteRecordLocked's standby wait,
+// every suspension point (including WriteRecordLocked's allocation wait,
 // via the defrag-style expected-version handoff), or serialize per-partition
 // application across sessions.
+//
+// TODO(replication): ResetReplicaPartition above holds writer_mutex across
+// its whole tombstone loop (unlock_writer_while_waiting=false), so on a full
+// device its inline block allocation waits for reclaim progress while the
+// flush that would free space is itself waiting for this writer_mutex — a
+// three-way stall that never resolves. When the epoch redesign lands, the
+// loop should release the mutex around allocation waits and revalidate
+// (db_epoch, replication_epoch, index_generation) afterwards, the same
+// expected-version handoff defrag relocation uses.
 //
 // TODO(replication): this path applies records without capturing deltas, and
 // CatchUp advances the acknowledged watermark on empty batches, so a node

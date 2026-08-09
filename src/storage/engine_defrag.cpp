@@ -304,7 +304,7 @@ StorageEngine::Impl::RelocateIfCurrent(
       record.logical_size, source_location.extents, &relocated, &source);
   if (written.code() == StatusCode::kAborted) {
     // FLUSHDB or a replica reset replaced the index while the write waited
-    // for a standby block. Nothing was written; the block stays uncleaned
+    // for a block allocation. Nothing was written; the block stays uncleaned
     // this pass rather than resurrecting a removed key.
     co_return std::optional<RelocationDurabilityFence>{};
   }

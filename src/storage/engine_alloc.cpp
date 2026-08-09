@@ -229,10 +229,51 @@ Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDeviceLocal(
   }
   const std::uint64_t block_id = allocator.ready_blocks.back();
   allocator.ready_blocks.pop_back();
+  MaybeRefillDeviceInBackground(device_index, allocator);
   co_return ReservedBlock{
       .block_id = block_id,
       .allocation_epoch = allocator.next_allocation_epoch++,
   };
+}
+
+// Tops the ready pool up from the background once it runs low, so the batch
+// bitmap persist in RefillReadyBlocksLocal stays off allocation paths. The
+// refill cadence is unchanged — the pool still drains by one batch between
+// refills — only the trigger point moves ahead of empty.
+void StorageEngine::Impl::MaybeRefillDeviceInBackground(
+    std::size_t device_index, DeviceAllocator& allocator) {
+  constexpr std::size_t kLowWaterBlocks = 32;
+  if (allocator.refill_pending || allocator.failed.has_value()) {
+    return;
+  }
+  if (allocator.next_pristine >= devices_[device_index].capacity_blocks &&
+      allocator.cold_free.empty()) {
+    return;  // Nothing to activate; allocation reports exhaustion itself.
+  }
+  if (allocator.ready_blocks.size() >=
+      DefragReserveForDevice(device_index) + kLowWaterBlocks) {
+    return;
+  }
+  allocator.refill_pending = true;
+  stores_[allocator.owner]->worker->SpawnBackground(
+      RefillDeviceInBackground(device_index));
+}
+
+Task<Status> StorageEngine::Impl::RefillDeviceInBackground(
+    std::size_t device_index) {
+  DeviceAllocator& allocator = *device_allocators_[device_index];
+  co_await allocator.mutex.Lock();
+  UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
+  Status refilled = Status::Ok();
+  if (!allocator.failed.has_value()) {
+    refilled = co_await RefillReadyBlocksLocal(device_index, allocator);
+  }
+  allocator.refill_pending = false;
+  if (!refilled.ok()) {
+    spdlog::error("background block refill failed on device {}: {}",
+                  device_index, refilled.message());
+  }
+  co_return refilled;
 }
 
 Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(

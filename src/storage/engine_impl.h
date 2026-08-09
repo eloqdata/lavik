@@ -346,8 +346,8 @@ struct RetiredRecord {
 };
 
 // The index state a defrag relocation observed when it validated its source
-// record. WriteRecordLocked can release writer_mutex while waiting for a
-// standby block; if FLUSHDB detached the database or a replica reset rewrote
+// record. WriteRecordLocked can release writer_mutex while it waits for a
+// block allocation; if FLUSHDB detached the database or a replica reset rewrote
 // the partition in that gap, the relocation would insert its (stale) copy
 // into the successor index stamped with the successor's epochs — resurrecting
 // a key the flush or reset just removed. Re-checking these before the append
@@ -651,6 +651,7 @@ struct DeviceAllocator {
   std::vector<std::uint64_t> epoch_values;
   std::vector<std::uint64_t> durable_epoch_values;
   std::optional<Status> failed;
+  bool refill_pending = false;
 };
 
 struct BlockDeviceInfo {
@@ -816,9 +817,6 @@ class StorageEngine::Impl {
     bool detached_reclaim_running = false;
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
     std::optional<ActiveBlock> active_block;
-    std::optional<ReservedBlock> standby_block;
-    std::optional<Status> standby_error;
-    AsyncNotification standby_ready;
     // Recovery only. A recovered extent block's identity has to be checked
     // against the manifests that reference it, and the two arrive in separate
     // passes, so they meet here instead of in every BlockState. Cleared once
@@ -852,7 +850,6 @@ class StorageEngine::Impl {
     bool defrag_waiting = false;
     std::size_t defrag_waiting_device = 0;
     std::size_t active_defrag_device = 0;
-    bool standby_request_pending = false;
     std::size_t expiry_partition_cursor = 0;
     std::uint8_t expiry_db_cursor = 0;
     std::uint64_t expiry_scan_cursor = 0;
@@ -1182,6 +1179,11 @@ class StorageEngine::Impl {
       std::size_t device_index,
       std::span<const std::uint64_t> block_ids);
 
+  void MaybeRefillDeviceInBackground(std::size_t device_index,
+                                     DeviceAllocator& allocator);
+
+  Task<Status> RefillDeviceInBackground(std::size_t device_index);
+
   Task<Status> RefillReadyBlocksLocal(std::size_t device_index,
                                       DeviceAllocator& allocator);
 
@@ -1340,9 +1342,6 @@ class StorageEngine::Impl {
     };
   }
 
-  Task<StatusOr<ReservedBlock>> TakeStandaloneBlockLocked(
-      WorkerStore& store);
-
   Task<StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
   WriteExtentValueLocked(WorkerStore& store, std::string_view value);
 
@@ -1357,17 +1356,11 @@ class StorageEngine::Impl {
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);
 
-  Task<Status> FetchStandbyBlock(WorkerStore* store, bool for_defrag);
+  Task<StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
+                                                  bool for_defrag,
+                                                  bool unlock_writer);
 
-  void RequestStandbyBlock(WorkerStore& store, bool for_defrag);
-
-  void MaybePrefetchStandby(WorkerStore& store);
-
-  Task<Status> WaitForStandbyWithWriterUnlocked(WorkerStore& store,
-                                                bool for_defrag);
-
-  Task<Status> WaitForStandbyWithWriterLocked(WorkerStore& store,
-                                              bool for_defrag);
+  Task<Status> ReturnReservedBlock(ReservedBlock block);
 
   Task<Status> WriteRecordLocked(WorkerStore& store, std::uint8_t db_id,
                                  std::string_view key, std::string_view value,

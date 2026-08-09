@@ -474,18 +474,53 @@ Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
   co_return Status::Ok();
 }
 
-Task<StatusOr<ReservedBlock>> StorageEngine::Impl::TakeStandaloneBlockLocked(
-    WorkerStore& store) {
-  while (!store.standby_block.has_value()) {
-    Status waited = co_await WaitForStandbyWithWriterUnlocked(store, false);
-    if (!waited.ok()) {
-      co_return waited;
-    }
+// Allocates a block for this writer inline. `unlock_writer` releases the
+// writer mutex across the allocation so appends behind this one keep flowing;
+// the caller must revalidate whatever it read before the call. Every refusal
+// surfaces as an error to exactly this caller — waiters queue on mutexes end
+// to end, so there is no notification to miss.
+Task<StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
+    WorkerStore& store, bool for_defrag, bool unlock_writer) {
+  if (unlock_writer) {
+    store.writer_mutex.Unlock(*store.worker);
   }
-  const ReservedBlock block = *store.standby_block;
-  store.standby_block.reset();
-  RequestStandbyBlock(store, false);
-  co_return block;
+  StatusOr<ReservedBlock> allocated{
+      Status(StatusCode::kUnavailable, "storage is shutting down")};
+  // A writer racing shutdown must not park behind an allocation the shutdown
+  // flush is waiting out; a dropped commit chain is simply discarded at
+  // recovery (never half-kept). Defrag keeps allocating from its reserve.
+  if (for_defrag ||
+      !shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    allocated = co_await AllocateBlock(store, for_defrag);
+  }
+  if (unlock_writer) {
+    co_await store.writer_mutex.Lock();
+  }
+  if (allocated.ok() && store.write_failed) {
+    // The writer fail-stopped while the allocation waited; report that
+    // instead of appending into a stream that will never flush.
+    co_await ReturnReservedBlock(*allocated);
+    co_return Status(StatusCode::kFailedPrecondition,
+                     "storage writer is stopped after an IO failure");
+  }
+  co_return allocated;
+}
+
+// Hands a reserved-but-unwritten block back to its device's ready pool. The
+// allocation bit is already durably set, which is exactly the state pool
+// entries are in; the next consumer stamps a fresh allocation epoch.
+Task<Status> StorageEngine::Impl::ReturnReservedBlock(ReservedBlock block) {
+  const std::size_t device_index = DeviceIndexForBlock(block.block_id);
+  co_return co_await celer::SubmitTaskTo(
+      device_allocators_[device_index]->owner,
+      [this, device_index, block]() -> Task<Status> {
+        DeviceAllocator& allocator = *device_allocators_[device_index];
+        co_await allocator.mutex.Lock();
+        UnlockGuard unlock(&allocator.mutex,
+                           stores_[allocator.owner]->worker);
+        allocator.ready_blocks.push_back(block.block_id);
+        co_return Status::Ok();
+      });
 }
 
 Task<StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
@@ -507,7 +542,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
   std::size_t value_offset = 0;
   std::uint32_t extent_index = 0;
   while (value_offset < value.size()) {
-    auto reserved = co_await TakeStandaloneBlockLocked(store);
+    auto reserved =
+        co_await AcquireWriteBlock(store, false, /*unlock_writer=*/true);
     if (!reserved.ok()) {
       reclaim_allocated();
       co_return reserved.status();
@@ -720,85 +756,6 @@ void StorageEngine::Impl::AppendDelta(WorkerStore::PartitionStore& partition,
   }
 }
 
-Task<Status> StorageEngine::Impl::FetchStandbyBlock(WorkerStore* store,
-                                                    bool for_defrag) {
-  auto allocated = co_await AllocateBlock(*store, for_defrag);
-  store->standby_request_pending = false;
-  if (allocated.ok()) {
-    store->standby_block = *allocated;
-    store->standby_error.reset();
-  } else {
-    store->standby_error = allocated.status();
-  }
-  store->standby_ready.NotifyAll(*store->worker);
-  co_return allocated.ok() ? Status::Ok() : allocated.status();
-}
-
-void StorageEngine::Impl::RequestStandbyBlock(WorkerStore& store,
-                                              bool for_defrag) {
-  if (store.standby_block.has_value() || store.standby_request_pending ||
-      store.write_failed) {
-    return;
-  }
-  if (shutdown_flush_requested_.load(std::memory_order_acquire) &&
-      !for_defrag) {
-    // Waiters must not park forever on a request that will never be issued:
-    // a commit chain racing shutdown lands here, and its transaction is
-    // simply dropped at recovery (never half-kept).
-    store.standby_error = Status(StatusCode::kUnavailable,
-                                 "storage is shutting down");
-    store.standby_ready.NotifyAll(*store.worker);
-    return;
-  }
-  store.standby_error.reset();
-  store.standby_request_pending = true;
-  if (for_defrag) {
-    store.worker->SpawnBackground(FetchStandbyBlock(&store, true));
-  } else {
-    store.worker->Spawn(FetchStandbyBlock(&store, false));
-  }
-}
-
-void StorageEngine::Impl::MaybePrefetchStandby(WorkerStore& store) {
-  if (!store.active_block.has_value()) {
-    return;
-  }
-  constexpr std::uint64_t kPrefetchNumerator = 3;
-  constexpr std::uint64_t kPrefetchDenominator = 4;
-  const std::uint64_t usable = kStorageBlockBytes - kBlockHeaderBytes;
-  const std::uint64_t used =
-      store.active_block->committed_bytes - kBlockHeaderBytes;
-  if (used * kPrefetchDenominator >= usable * kPrefetchNumerator) {
-    RequestStandbyBlock(store, false);
-  }
-}
-
-Task<Status> StorageEngine::Impl::WaitForStandbyWithWriterUnlocked(
-    WorkerStore& store, bool for_defrag) {
-  RequestStandbyBlock(store, for_defrag);
-  store.writer_mutex.Unlock(*store.worker);
-  co_await store.standby_ready.Wait();
-  co_await store.writer_mutex.Lock();
-  if (store.standby_error.has_value()) {
-    Status status = *store.standby_error;
-    store.standby_error.reset();
-    co_return status;
-  }
-  co_return Status::Ok();
-}
-
-Task<Status> StorageEngine::Impl::WaitForStandbyWithWriterLocked(
-    WorkerStore& store, bool for_defrag) {
-  RequestStandbyBlock(store, for_defrag);
-  co_await store.standby_ready.Wait();
-  if (store.standby_error.has_value()) {
-    Status status = *store.standby_error;
-    store.standby_error.reset();
-    co_return status;
-  }
-  co_return Status::Ok();
-}
-
 Task<Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     std::string_view value, RecordKind kind, ValueType value_type,
@@ -865,43 +822,30 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       next_lsn_.fetch_add(1, std::memory_order_relaxed);
 
   auto& active = store.active_block;
-  if (!active.has_value() ||
-      active->committed_bytes + total_disk_bytes > kStorageBlockBytes) {
+  while (!active.has_value() ||
+         active->committed_bytes + total_disk_bytes > kStorageBlockBytes) {
     if (active.has_value()) {
       RequestFlush(store, active->block_id);
       active.reset();
     }
-    while (!store.standby_block.has_value()) {
-      Status standby = Status::Ok();
-      if (unlock_writer_while_waiting) {
-        standby =
-            co_await WaitForStandbyWithWriterUnlocked(store, for_defrag);
-      } else {
-        standby = co_await WaitForStandbyWithWriterLocked(store,
-                                                          for_defrag);
-      }
-      if (!standby.ok()) {
-        co_return standby;
-      }
-      // Another writer may have installed an active block while this
-      // coroutine had writer_mutex released. Reuse it instead of consuming
-      // a second standby and overwriting that active block.
-      if (active.has_value() &&
-          active->committed_bytes + total_disk_bytes <=
-              kStorageBlockBytes) {
-        break;
-      }
+    auto allocated = co_await AcquireWriteBlock(store, for_defrag,
+                                                unlock_writer_while_waiting);
+    if (!allocated.ok()) {
+      co_return allocated.status();
     }
-    if (!active.has_value() ||
-        active->committed_bytes + total_disk_bytes > kStorageBlockBytes) {
-      if (active.has_value()) {
-        RequestFlush(store, active->block_id);
-        active.reset();
-      }
+    // Another writer may have installed an active block while this coroutine
+    // had writer_mutex released. Keep that one and hand the spare back to
+    // the pool instead of overwriting it; the loop re-checks the fit.
+    if (active.has_value()) {
+      co_await ReturnReservedBlock(*allocated);
+      continue;
+    }
+    {
       std::uint16_t write_buffer_id = 0;
       std::byte* heap_buffer = nullptr;
       if (!store.buffers.TryAcquireWriteBuffer(&write_buffer_id)) {
         if (!store.buffers.TryAcquireHeapWriteBuffer(&heap_buffer)) {
+          co_await ReturnReservedBlock(*allocated);
           co_return Status(StatusCode::kResourceExhausted,
                            "no registered or fallback write buffers");
         }
@@ -918,18 +862,17 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
         } else {
           store.buffers.ReleaseHeapWriteBuffer(heap_buffer);
         }
+        co_await ReturnReservedBlock(*allocated);
         co_return Status(StatusCode::kInternal,
                          "active write staging allocation is invalid");
       }
-      const ReservedBlock allocated = *store.standby_block;
-      store.standby_block.reset();
-      const std::uint64_t block_id = allocated.block_id;
+      const std::uint64_t block_id = allocated->block_id;
       std::fill_n(staging_buffer.data, staging_buffer.size, std::byte{0});
       active = ActiveBlock{
           .block_id = block_id,
           .writer_id = writer_id,
           .layout_worker_count = worker_count_,
-          .allocation_epoch = allocated.allocation_epoch,
+          .allocation_epoch = allocated->allocation_epoch,
           .committed_bytes = kBlockHeaderBytes,
           .record_count = 0,
           .max_lsn = 0,
@@ -962,7 +905,7 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
     }
   }
 
-  // The writer mutex may have been released while waiting for a standby.
+  // The writer mutex may have been released while a block was allocated.
   // FLUSHDB or partition reset can replace the index state during that gap,
   // so capture the previous location only after the append stream is locked
   // again and an active block is available.
@@ -1189,7 +1132,6 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       store.active_block.reset();
     }
   }
-  MaybePrefetchStandby(store);
   if (written_location != nullptr) {
     *written_location = location;
   }
