@@ -41,11 +41,11 @@ constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
     1500, 2000, 3000, 5000, 8000, 10000, 20000, 50000};
 
 struct LatencyDistribution {
-  std::uint64_t sum_ns = 0;
-  std::array<std::uint64_t, kLatencyBucketUpperUs.size()> buckets{};
+  std::uint64_t sum_ns_ = 0;
+  std::array<std::uint64_t, kLatencyBucketUpperUs.size()> buckets_{};
 
   void Add(std::uint64_t ns) noexcept {
-    sum_ns += ns;
+    sum_ns_ += ns;
     const std::uint64_t us = (ns + 999) / 1000;
     const auto it = std::lower_bound(kLatencyBucketUpperUs.begin(),
                                      kLatencyBucketUpperUs.end(), us);
@@ -53,12 +53,12 @@ struct LatencyDistribution {
         it == kLatencyBucketUpperUs.end()
             ? kLatencyBucketUpperUs.size() - 1
             : static_cast<std::size_t>(it - kLatencyBucketUpperUs.begin());
-    ++buckets[index];
+    ++buckets_[index];
   }
 
   double AverageUs(std::uint64_t count) const noexcept {
     return count == 0 ? 0.0
-                      : static_cast<double>(sum_ns) /
+                      : static_cast<double>(sum_ns_) /
                             (1000.0 * static_cast<double>(count));
   }
 
@@ -70,8 +70,8 @@ struct LatencyDistribution {
     const std::uint64_t target = static_cast<std::uint64_t>(
         static_cast<double>(count) * percentile + 0.999999);
     std::uint64_t cumulative = 0;
-    for (std::size_t i = 0; i < buckets.size(); ++i) {
-      cumulative += buckets[i];
+    for (std::size_t i = 0; i < buckets_.size(); ++i) {
+      cumulative += buckets_[i];
       if (cumulative >= target) {
         return kLatencyBucketUpperUs[i];
       }
@@ -81,21 +81,21 @@ struct LatencyDistribution {
 };
 
 struct ReadLatencyStats {
-  std::uint64_t count = 0;
-  std::uint64_t remote = 0;
-  std::uint64_t hits = 0;
-  std::uint64_t disk_reads = 0;
-  std::uint64_t heap_buffers = 0;
-  std::uint64_t next_report_ns = 0;
-  LatencyDistribution total;
-  LatencyDistribution non_network;
-  LatencyDistribution route_out;
-  LatencyDistribution lookup;
-  LatencyDistribution buffer;
-  LatencyDistribution io;
-  LatencyDistribution decode;
-  LatencyDistribution route_back;
-  LatencyDistribution send;
+  std::uint64_t count_ = 0;
+  std::uint64_t remote_ = 0;
+  std::uint64_t hits_ = 0;
+  std::uint64_t disk_reads_ = 0;
+  std::uint64_t heap_buffers_ = 0;
+  std::uint64_t next_report_ns_ = 0;
+  LatencyDistribution total_;
+  LatencyDistribution non_network_;
+  LatencyDistribution route_out_;
+  LatencyDistribution lookup_;
+  LatencyDistribution buffer_;
+  LatencyDistribution io_;
+  LatencyDistribution decode_;
+  LatencyDistribution route_back_;
+  LatencyDistribution send_;
 };
 
 std::uint64_t Elapsed(std::uint64_t end, std::uint64_t start) noexcept {
@@ -104,102 +104,103 @@ std::uint64_t Elapsed(std::uint64_t end, std::uint64_t start) noexcept {
 
 void RecordReadLatency(const ReadLatencyTrace& trace) {
   static thread_local ReadLatencyStats stats;
-  if (trace.request_start_ns == 0 || trace.send_complete_ns == 0) {
+  if (trace.request_start_ns_ == 0 || trace.send_complete_ns_ == 0) {
     return;
   }
-  ++stats.count;
-  stats.remote += trace.remote;
-  stats.hits += trace.hit;
-  stats.disk_reads += trace.disk_read;
-  stats.heap_buffers += trace.heap_read_buffer;
-  stats.total.Add(Elapsed(trace.send_complete_ns, trace.request_start_ns));
-  stats.non_network.Add(Elapsed(trace.send_start_ns, trace.request_start_ns));
-  stats.route_out.Add(Elapsed(trace.owner_start_ns, trace.request_start_ns));
-  stats.lookup.Add(Elapsed(trace.lookup_done_ns, trace.owner_start_ns));
-  stats.buffer.Add(
-      Elapsed(trace.buffer_acquired_ns, trace.buffer_acquire_start_ns));
-  stats.io.Add(Elapsed(trace.io_complete_ns, trace.io_submit_ns));
-  stats.decode.Add(Elapsed(trace.decode_done_ns, trace.io_complete_ns));
-  stats.route_back.Add(Elapsed(trace.origin_resume_ns, trace.owner_done_ns));
-  stats.send.Add(Elapsed(trace.send_complete_ns, trace.send_start_ns));
+  ++stats.count_;
+  stats.remote_ += trace.remote_;
+  stats.hits_ += trace.hit_;
+  stats.disk_reads_ += trace.disk_read_;
+  stats.heap_buffers_ += trace.heap_read_buffer_;
+  stats.total_.Add(Elapsed(trace.send_complete_ns_, trace.request_start_ns_));
+  stats.non_network_.Add(
+      Elapsed(trace.send_start_ns_, trace.request_start_ns_));
+  stats.route_out_.Add(Elapsed(trace.owner_start_ns_, trace.request_start_ns_));
+  stats.lookup_.Add(Elapsed(trace.lookup_done_ns_, trace.owner_start_ns_));
+  stats.buffer_.Add(
+      Elapsed(trace.buffer_acquired_ns_, trace.buffer_acquire_start_ns_));
+  stats.io_.Add(Elapsed(trace.io_complete_ns_, trace.io_submit_ns_));
+  stats.decode_.Add(Elapsed(trace.decode_done_ns_, trace.io_complete_ns_));
+  stats.route_back_.Add(Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
+  stats.send_.Add(Elapsed(trace.send_complete_ns_, trace.send_start_ns_));
 
-  const std::uint64_t now = trace.send_complete_ns;
-  if (stats.next_report_ns == 0) {
-    stats.next_report_ns = now + 10'000'000'000ULL;
+  const std::uint64_t now = trace.send_complete_ns_;
+  if (stats.next_report_ns_ == 0) {
+    stats.next_report_ns_ = now + 10'000'000'000ULL;
     return;
   }
-  if (now < stats.next_report_ns) {
+  if (now < stats.next_report_ns_) {
     return;
   }
 
   const auto avg = [&](const LatencyDistribution& value) {
-    return value.AverageUs(stats.count);
+    return value.AverageUs(stats.count_);
   };
   const auto p999 = [&](const LatencyDistribution& value) {
-    return value.PercentileUpperUs(stats.count, 0.999);
+    return value.PercentileUpperUs(stats.count_, 0.999);
   };
   const auto p9999 = [&](const LatencyDistribution& value) {
-    return value.PercentileUpperUs(stats.count, 0.9999);
+    return value.PercentileUpperUs(stats.count_, 0.9999);
   };
-  const auto wake_stats = ThisWorker().self->TakeWakeStats();
-  const auto scheduler_stats = ThisWorker().self->TakeSchedulerStats();
+  const auto wake_stats = ThisWorker().self_->TakeWakeStats();
+  const auto scheduler_stats = ThisWorker().self_->TakeSchedulerStats();
   spdlog::info(
       "read-latency worker={} n={} remote={:.1f}% hit={:.1f}% disk={:.1f}% "
       "heap-buffer={:.1f}% avg-us total={:.1f} route-out={:.1f} lookup={:.1f} "
       "buffer={:.1f} io={:.1f} decode={:.1f} route-back={:.1f} send={:.1f} "
       "p99.9-us total<={} route-out<={} lookup<={} buffer<={} io<={} "
       "decode<={} route-back<={} send<={} wake-sent={}/{}",
-      ThisWorker().id, stats.count,
-      100.0 * static_cast<double>(stats.remote) / stats.count,
-      100.0 * static_cast<double>(stats.hits) / stats.count,
-      100.0 * static_cast<double>(stats.disk_reads) / stats.count,
-      100.0 * static_cast<double>(stats.heap_buffers) / stats.count,
-      avg(stats.total), avg(stats.route_out), avg(stats.lookup),
-      avg(stats.buffer), avg(stats.io), avg(stats.decode),
-      avg(stats.route_back), avg(stats.send), p999(stats.total),
-      p999(stats.route_out), p999(stats.lookup), p999(stats.buffer),
-      p999(stats.io), p999(stats.decode), p999(stats.route_back),
-      p999(stats.send), wake_stats.sent, wake_stats.checks);
+      ThisWorker().id_, stats.count_,
+      100.0 * static_cast<double>(stats.remote_) / stats.count_,
+      100.0 * static_cast<double>(stats.hits_) / stats.count_,
+      100.0 * static_cast<double>(stats.disk_reads_) / stats.count_,
+      100.0 * static_cast<double>(stats.heap_buffers_) / stats.count_,
+      avg(stats.total_), avg(stats.route_out_), avg(stats.lookup_),
+      avg(stats.buffer_), avg(stats.io_), avg(stats.decode_),
+      avg(stats.route_back_), avg(stats.send_), p999(stats.total_),
+      p999(stats.route_out_), p999(stats.lookup_), p999(stats.buffer_),
+      p999(stats.io_), p999(stats.decode_), p999(stats.route_back_),
+      p999(stats.send_), wake_stats.sent_, wake_stats.checks_);
   const auto cycles_to_us = [&](std::uint64_t cycles) {
-    return scheduler_stats.cycles_per_second == 0.0
+    return scheduler_stats.cycles_per_second_ == 0.0
                ? 0.0
                : static_cast<double>(cycles) * 1'000'000.0 /
-                     scheduler_stats.cycles_per_second;
+                     scheduler_stats.cycles_per_second_;
   };
   const std::uint64_t scheduled_cycles =
-      scheduler_stats.foreground_cycles + scheduler_stats.background_cycles;
+      scheduler_stats.foreground_cycles_ + scheduler_stats.background_cycles_;
   spdlog::info(
       "scheduler worker={} rounds={} avg-round-us={:.2f} max-round-us={:.2f} "
       "fg-resumes={} fg-us={:.1f} max-fg-us={:.1f} fg-overruns={} "
       "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} "
       "bg-share={:.1f}%",
-      ThisWorker().id, scheduler_stats.rounds,
-      scheduler_stats.rounds == 0
+      ThisWorker().id_, scheduler_stats.rounds_,
+      scheduler_stats.rounds_ == 0
           ? 0.0
-          : cycles_to_us(scheduler_stats.round_cycles) /
-                static_cast<double>(scheduler_stats.rounds),
-      cycles_to_us(scheduler_stats.max_round_cycles),
-      scheduler_stats.foreground_resumes,
-      cycles_to_us(scheduler_stats.foreground_cycles),
-      cycles_to_us(scheduler_stats.max_foreground_cycles),
-      scheduler_stats.foreground_overruns, scheduler_stats.background_resumes,
-      cycles_to_us(scheduler_stats.background_cycles),
-      cycles_to_us(scheduler_stats.max_background_cycles),
-      scheduler_stats.background_overruns,
+          : cycles_to_us(scheduler_stats.round_cycles_) /
+                static_cast<double>(scheduler_stats.rounds_),
+      cycles_to_us(scheduler_stats.max_round_cycles_),
+      scheduler_stats.foreground_resumes_,
+      cycles_to_us(scheduler_stats.foreground_cycles_),
+      cycles_to_us(scheduler_stats.max_foreground_cycles_),
+      scheduler_stats.foreground_overruns_, scheduler_stats.background_resumes_,
+      cycles_to_us(scheduler_stats.background_cycles_),
+      cycles_to_us(scheduler_stats.max_background_cycles_),
+      scheduler_stats.background_overruns_,
       scheduled_cycles == 0
           ? 0.0
-          : 100.0 * static_cast<double>(scheduler_stats.background_cycles) /
+          : 100.0 * static_cast<double>(scheduler_stats.background_cycles_) /
                 static_cast<double>(scheduled_cycles));
   spdlog::info(
       "read-latency-p99.99 worker={} n={} non-network-us<={} total-us<={} "
       "storage-io-us<={} route-out-us<={} lookup-us<={} buffer-us<={} "
       "decode-us<={} route-back-us<={} send-us<={}",
-      ThisWorker().id, stats.count, p9999(stats.non_network),
-      p9999(stats.total), p9999(stats.io), p9999(stats.route_out),
-      p9999(stats.lookup), p9999(stats.buffer), p9999(stats.decode),
-      p9999(stats.route_back), p9999(stats.send));
+      ThisWorker().id_, stats.count_, p9999(stats.non_network_),
+      p9999(stats.total_), p9999(stats.io_), p9999(stats.route_out_),
+      p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
+      p9999(stats.route_back_), p9999(stats.send_));
   stats = ReadLatencyStats{};
-  stats.next_report_ns = now + 10'000'000'000ULL;
+  stats.next_report_ns_ = now + 10'000'000'000ULL;
 }
 
 std::atomic<bool> g_shutdown_requested = false;
@@ -394,19 +395,19 @@ Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream,
   std::array<std::byte, 4096> buffer{};
   while (true) {
     RespParseResult parsed = ParseRespCommand(*pending);
-    if (parsed.state == RespParseState::kOk) {
-      RespCommand command = std::move(parsed.command);
-      pending->erase(0, parsed.consumed);
+    if (parsed.state_ == RespParseState::kOk) {
+      RespCommand command = std::move(parsed.command_);
+      pending->erase(0, parsed.consumed_);
       co_return command;
     }
-    if (parsed.state == RespParseState::kError) {
-      co_return parsed.status;
+    if (parsed.state_ == RespParseState::kError) {
+      co_return parsed.status_;
     }
     // Drop skipped filler (blank lines, empty multibulks) even while the
     // next real command is still incomplete: retaining it would grow the
     // buffer without bound and re-scan it from the start on every refill.
-    if (parsed.consumed != 0) {
-      pending->erase(0, parsed.consumed);
+    if (parsed.consumed_ != 0) {
+      pending->erase(0, parsed.consumed_);
     }
     if (pending->size() >= kMaxPendingBytes) {
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
@@ -432,7 +433,7 @@ bool ShutdownRequested() {
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
-  ctx.conn_id = next_connection_id.fetch_add(1, std::memory_order_relaxed);
+  ctx.conn_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed);
   ConnectionOpened();
   const absl::Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
@@ -451,8 +452,8 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
 constexpr auto kStreamStallLimit = std::chrono::seconds(30);
 
 struct StreamStallState {
-  std::chrono::steady_clock::time_point last_progress;
-  bool done = false;  // same-worker access only
+  std::chrono::steady_clock::time_point last_progress_;
+  bool done_ = false;  // same-worker access only
 };
 
 // Watchdog for one streamed reply. shutdown() rather than close: it fails
@@ -461,15 +462,15 @@ struct StreamStallState {
 // teardown then reopens the gate and closes the socket.
 Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
                                       int fd) {
-  while (!state->done) {
-    const auto deadline = state->last_progress + kStreamStallLimit;
+  while (!state->done_) {
+    const auto deadline = state->last_progress_ + kStreamStallLimit;
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       ::shutdown(fd, SHUT_RDWR);
       co_return absl::OkStatus();
     }
     absl::Status slept = co_await celer::SleepFor(
-        *ThisWorker().self,
+        *ThisWorker().self_,
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now) +
             std::chrono::milliseconds(1));
     if (!slept.ok()) {
@@ -484,7 +485,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
   std::string pending;
 
   while (stream.IsOpen()) {
-    ctx.reply_builder.Reset();
+    ctx.reply_builder_.Reset();
     if (ShutdownRequested()) [[unlikely]] {
       co_return absl::OkStatus();
     }
@@ -496,7 +497,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return absl::OkStatus();
       }
 
-      const std::string_view encoded = ctx.reply_builder.AppendError(
+      const std::string_view encoded = ctx.reply_builder_.AppendError(
           absl::StrCat("ERR ", command_result.status().message()));
       auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
@@ -508,7 +509,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 
     if (!TryBeginRequest()) [[unlikely]] {
       const std::string_view encoded =
-          ctx.reply_builder.AppendError("ERR server is shutting down");
+          ctx.reply_builder_.AppendError("ERR server is shutting down");
       auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
       stream.Close().IgnoreError();
@@ -517,17 +518,17 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     RequestGuard request_guard(this);
 
     auto request_result =
-        BuildCommandRequest(std::move(*command_result), ctx.selected_db);
+        BuildCommandRequest(std::move(*command_result), ctx.selected_db_);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
-      reply.encoded = ctx.reply_builder.AppendError(
+      reply.encoded_ = ctx.reply_builder_.AppendError(
           absl::StrCat("ERR ", request_result.status().message()));
     } else {
       reply = co_await DispatchCommand(ctx, std::move(*request_result),
-                                       ctx.reply_builder);
+                                       ctx.reply_builder_);
     }
-    if (reply.selected_db.has_value()) {
-      ctx.selected_db = *reply.selected_db;
+    if (reply.selected_db_.has_value()) {
+      ctx.selected_db_ = *reply.selected_db_;
     }
 
     // Streamed replies hold the database gate at the peer's pace; arm the
@@ -535,40 +536,40 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     // retires it on every exit path, including error co_returns.
     std::shared_ptr<StreamStallState> stall;
     struct RetireStall {
-      std::shared_ptr<StreamStallState> state;
+      std::shared_ptr<StreamStallState> state_;
       ~RetireStall() {
-        if (state != nullptr) {
-          state->done = true;
+        if (state_ != nullptr) {
+          state_->done_ = true;
         }
       }
     } retire_stall;
-    if (reply.chunks) {
+    if (reply.chunks_) {
       stall = std::make_shared<StreamStallState>();
-      stall->last_progress = std::chrono::steady_clock::now();
-      retire_stall.state = stall;
-      ThisWorker().self->Spawn(BreakStalledStream(stall, stream.NativeFd()));
+      stall->last_progress_ = std::chrono::steady_clock::now();
+      retire_stall.state_ = stall;
+      ThisWorker().self_->Spawn(BreakStalledStream(stall, stream.NativeFd()));
     }
 
     absl::Status write_status;
-    if (reply.read_trace.request_start_ns != 0) {
-      reply.read_trace.send_start_ns = ReadTraceNowNanos();
+    if (reply.read_trace_.request_start_ns_ != 0) {
+      reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
     }
-    if (reply.disk_value.has_value()) {
+    if (reply.disk_value_.has_value()) {
       write_status =
-          co_await stream.WriteAll(reply.disk_value->network_bytes());
+          co_await stream.WriteAll(reply.disk_value_->network_bytes());
     } else {
       write_status = co_await stream.WriteAll(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(reply.encoded.data()),
-          reply.encoded.size()));
+          reinterpret_cast<const std::byte*>(reply.encoded_.data()),
+          reply.encoded_.size()));
     }
     // Streamed continuation (KEYS): drain bounded chunks onto the socket.
     // The reply header already committed the element count, so a chunk
     // failure can only end the connection.
-    while (write_status.ok() && reply.chunks) {
+    while (write_status.ok() && reply.chunks_) {
       if (stall != nullptr) {
-        stall->last_progress = std::chrono::steady_clock::now();
+        stall->last_progress_ = std::chrono::steady_clock::now();
       }
-      auto chunk = co_await reply.chunks();
+      auto chunk = co_await reply.chunks_();
       if (!chunk.ok()) {
         co_return chunk.status();
       }
@@ -587,18 +588,18 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         write_status = co_await stream.WriteAll(remaining.first(segment));
         remaining = remaining.subspan(segment);
         if (stall != nullptr) {
-          stall->last_progress = std::chrono::steady_clock::now();
+          stall->last_progress_ = std::chrono::steady_clock::now();
         }
       }
     }
-    if (reply.read_trace.request_start_ns != 0) {
-      reply.read_trace.send_complete_ns = ReadTraceNowNanos();
-      RecordReadLatency(reply.read_trace);
+    if (reply.read_trace_.request_start_ns_ != 0) {
+      reply.read_trace_.send_complete_ns_ = ReadTraceNowNanos();
+      RecordReadLatency(reply.read_trace_);
     }
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }
-    if (reply.close_connection || ShutdownRequested()) [[unlikely]] {
+    if (reply.close_connection_ || ShutdownRequested()) [[unlikely]] {
       stream.Close().IgnoreError();
       co_return absl::OkStatus();
     }
@@ -634,17 +635,17 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
   }
 
   storage::StorageEngineOptions storage_options;
-  storage_options.data_files = data_files;
-  storage_options.flush_max_ms = flush_max_ms;
-  storage_options.flush_size_bytes = flush_size_bytes;
-  storage_options.verify_read_crc = verify_read_crc;
+  storage_options.data_files_ = data_files;
+  storage_options.flush_max_ms_ = flush_max_ms;
+  storage_options.flush_size_bytes_ = flush_size_bytes;
+  storage_options.verify_read_crc_ = verify_read_crc;
   // A node accepting an upstream replication stream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority = replication_options.listen_port == 0;
-  storage_options.tomb_raider_interval_ms = tomb_raider_interval_ms;
-  storage_options.tomb_raider_sleep_ms = tomb_raider_sleep_ms;
-  storage_options.buffers.registered_bytes = registered_buffer_bytes;
+  storage_options.expiration_authority_ = replication_options.listen_port_ == 0;
+  storage_options.tomb_raider_interval_ms_ = tomb_raider_interval_ms;
+  storage_options.tomb_raider_sleep_ms_ = tomb_raider_sleep_ms;
+  storage_options.buffers_.registered_bytes_ = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
   absl::Status storage_status = storage.Prepare(thread_count);
   if (!storage_status.ok()) [[unlikely]] {
@@ -658,11 +659,11 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
   tx::TxRuntime::Create(thread_count);
 
   ServerOptions options;
-  options.bind_ip = std::string(bind_ip);
-  options.thread_count = thread_count;
-  options.idle_timeout_ms = idle_timeout_ms;
-  options.recv_buffer_count = recv_buffer_count;
-  options.busy_poll_us = busy_poll_us;
+  options.bind_ip_ = std::string(bind_ip);
+  options.thread_count_ = thread_count;
+  options.idle_timeout_ms_ = idle_timeout_ms;
+  options.recv_buffer_count_ = recv_buffer_count;
+  options.busy_poll_us_ = busy_poll_us;
 
   RedisService redis(port, &storage, &replication);
   Server server;

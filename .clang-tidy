@@ -1,0 +1,10 @@
+---
+Checks: '-*,readability-identifier-naming'
+WarningsAsErrors: 'readability-identifier-naming'
+HeaderFilterRegex: '(^|.*/)(app|src|tests)/.*|(^|.*/)include/keylane/(command|command_table|pch|read_trace|replication|resp|server|session)\.h|(^|.*/)include/keylane/(storage|tx)/.*'
+CheckOptions:
+  readability-identifier-naming.AggressiveDependentMemberLookup: true
+  readability-identifier-naming.PrivateMemberSuffix: '_'
+  readability-identifier-naming.ProtectedMemberSuffix: '_'
+  readability-identifier-naming.PublicMemberSuffix: '_'
+...

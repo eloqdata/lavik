@@ -23,28 +23,28 @@ void TxShard::Poll() {
     if (head == nullptr) {
       break;
     }
-    if (head->tx != nullptr) {
+    if (head->tx_ != nullptr) {
       // Transaction entry: stays queued (holding its position) until the
       // transaction's release hop; runs one armed hop at a time. Holds are
       // acquired once and retained across hops.
-      if (head->running || !head->armed) {
+      if (head->running_ || !head->armed_) {
         break;
       }
-      if (!head->holds_acquired && !CanHoldAll(head->keys)) {
+      if (!head->holds_acquired_ && !CanHoldAll(head->keys_)) {
         break;
       }
-      committed_txid_ = std::max(committed_txid_, head->txid);
-      if (!head->holds_acquired) {
-        AcquireHolds(head->keys);
-        head->holds_acquired = true;
+      committed_txid_ = std::max(committed_txid_, head->txid_);
+      if (!head->holds_acquired_) {
+        AcquireHolds(head->keys_);
+        head->holds_acquired_ = true;
       }
-      head->armed = false;
-      head->running = true;
+      head->armed_ = false;
+      head->running_ = true;
       ++queued_runs_;
       StartTransactionHop(*this, head);
       break;
     }
-    if (!CanHoldAll(head->keys)) {
+    if (!CanHoldAll(head->keys_)) {
       // A suspended runner still holds a conflicting key; its release will
       // re-poll. The head's recorded intents guarantee no new conflicting
       // holder can appear, so the wait set only drains.
@@ -52,12 +52,12 @@ void TxShard::Poll() {
     }
     // Publish before the head can run (its callback may suspend at any
     // point after resumption).
-    committed_txid_ = std::max(committed_txid_, head->txid);
-    AcquireHolds(head->keys);
+    committed_txid_ = std::max(committed_txid_, head->txid_);
+    AcquireHolds(head->keys_);
     ++queued_runs_;
     // Remove before resuming: once resumed, the waiter (living in the
     // suspended coroutine's frame) is no longer referenced by the queue.
-    std::coroutine_handle<> resume = head->resume;
+    std::coroutine_handle<> resume = head->resume_;
     queue_.PopFront();
     if (worker_ != nullptr) {
       worker_->Enqueue(resume);
@@ -78,7 +78,7 @@ void TxRuntime::Create(unsigned worker_count) {
   runtime->shards_.reserve(worker_count);
   for (unsigned i = 0; i < worker_count; ++i) {
     auto shard = std::make_unique<TxShard>();
-    shard->BindTxidCounter(&runtime->next_txid);
+    shard->BindTxidCounter(&runtime->next_txid_);
     runtime->shards_.push_back(std::move(shard));
   }
   g_runtime = runtime;
@@ -87,7 +87,7 @@ void TxRuntime::Create(unsigned worker_count) {
 TxRuntime* TxRuntime::Get() noexcept { return g_runtime; }
 
 TxShard& CurrentTxShard() {
-  return TxRuntime::Get()->shard(celer::ThisWorker().id);
+  return TxRuntime::Get()->shard(celer::ThisWorker().id_);
 }
 
 }  // namespace keylane::tx

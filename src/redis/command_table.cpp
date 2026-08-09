@@ -63,7 +63,7 @@ bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
 
 const CommandSpec* FindCommand(std::string_view name) {
   for (const CommandSpec& spec : kCommandTable) {
-    if (EqualsIgnoreCase(name, spec.name)) {
+    if (EqualsIgnoreCase(name, spec.name_)) {
       return &spec;
     }
   }
@@ -72,26 +72,26 @@ const CommandSpec* FindCommand(std::string_view name) {
 
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
                                            std::size_t argc) {
-  if (argc < spec.min_args || (spec.max_args != 0 && argc > spec.max_args)) {
+  if (argc < spec.min_args_ || (spec.max_args_ != 0 && argc > spec.max_args_)) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "wrong number of arguments for '" +
-                            std::string(spec.name) + "' command");
+                            std::string(spec.name_) + "' command");
   }
   KeyIndexView view;
-  if (spec.first_key == 0) {
+  if (spec.first_key_ == 0) {
     return view;
   }
   const std::int64_t last =
-      spec.last_key >= 0 ? static_cast<std::int64_t>(spec.last_key)
-                         : static_cast<std::int64_t>(argc) + spec.last_key;
-  if (last < spec.first_key || last >= static_cast<std::int64_t>(argc)) {
+      spec.last_key_ >= 0 ? static_cast<std::int64_t>(spec.last_key_)
+                          : static_cast<std::int64_t>(argc) + spec.last_key_;
+  if (last < spec.first_key_ || last >= static_cast<std::int64_t>(argc)) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "wrong number of arguments for '" +
-                            std::string(spec.name) + "' command");
+                            std::string(spec.name_) + "' command");
   }
-  view.first = spec.first_key;
-  view.last = static_cast<std::uint16_t>(last);
-  view.step = spec.key_step;
+  view.first_ = spec.first_key_;
+  view.last_ = static_cast<std::uint16_t>(last);
+  view.step_ = spec.key_step_;
   return view;
 }
 

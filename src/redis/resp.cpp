@@ -41,11 +41,11 @@ RespParseResult ParseRespCommand(std::string_view input) {
 
     if (input.empty() || input.front() != '*') {
       if (!input.empty()) {
-        result.state = RespParseState::kError;
-        result.status = absl::Status(absl::StatusCode::kInvalidArgument,
-                                     "expected RESP array");
+        result.state_ = RespParseState::kError;
+        result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                      "expected RESP array");
       }
-      result.consumed = skipped;
+      result.consumed_ = skipped;
       return result;
     }
 
@@ -53,7 +53,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
     pos = 1;
     const std::size_t crlf = input.find("\r\n", pos);
     if (crlf == std::string_view::npos) {
-      result.consumed = skipped;
+      result.consumed_ = skipped;
       return result;
     }
 
@@ -61,15 +61,15 @@ RespParseResult ParseRespCommand(std::string_view input) {
     auto [ptr, ec] =
         std::from_chars(input.data() + pos, input.data() + crlf, array_len);
     if (ec != std::errc{} || ptr != input.data() + crlf || array_len < 0) {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kInvalidArgument,
-                                   "invalid RESP array length");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                    "invalid RESP array length");
       return result;
     }
     if (array_len > static_cast<long long>(kMaxArrayLen)) {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kOutOfRange,
-                                   "too many RESP array elements");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kOutOfRange,
+                                    "too many RESP array elements");
       return result;
     }
     // An empty multibulk is a command that does nothing: real Redis consumes
@@ -87,10 +87,10 @@ RespParseResult ParseRespCommand(std::string_view input) {
     pos = crlf + 2;
     break;
   }
-  result.command.args.reserve(count);
+  result.command_.args_.reserve(count);
   // From here on, a truncated command still reports the skipped prefix as
   // consumed: the filler can be dropped while the rest is awaited.
-  result.consumed = skipped;
+  result.consumed_ = skipped;
 
   // Parse each bulk string: $<N>\r\n<data>\r\n
   for (std::size_t i = 0; i < count; ++i) {
@@ -101,9 +101,9 @@ RespParseResult ParseRespCommand(std::string_view input) {
     // of failing the connection.
     if (pos >= input.size()) return result;
     if (input[pos] != '$') {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kInvalidArgument,
-                                   "expected RESP bulk string");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                    "expected RESP bulk string");
       return result;
     }
     ++pos;
@@ -115,15 +115,15 @@ RespParseResult ParseRespCommand(std::string_view input) {
     auto [p2, ec2] =
         std::from_chars(input.data() + pos, input.data() + crlf, bulk_len);
     if (ec2 != std::errc{} || p2 != input.data() + crlf || bulk_len < 0) {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kInvalidArgument,
-                                   "invalid RESP bulk string length");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                    "invalid RESP bulk string length");
       return result;
     }
     if (bulk_len > static_cast<long long>(kMaxBulkLen)) {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kOutOfRange,
-                                   "RESP bulk string too large");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kOutOfRange,
+                                    "RESP bulk string too large");
       return result;
     }
 
@@ -131,18 +131,18 @@ RespParseResult ParseRespCommand(std::string_view input) {
     pos = crlf + 2;
     if (input.size() < pos + data_len + 2) return result;
     if (input[pos + data_len] != '\r' || input[pos + data_len + 1] != '\n') {
-      result.state = RespParseState::kError;
-      result.status = absl::Status(absl::StatusCode::kInvalidArgument,
-                                   "malformed RESP bulk string terminator");
+      result.state_ = RespParseState::kError;
+      result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                    "malformed RESP bulk string terminator");
       return result;
     }
 
-    result.command.args.emplace_back(input.substr(pos, data_len));
+    result.command_.args_.emplace_back(input.substr(pos, data_len));
     pos += data_len + 2;
   }
 
-  result.state = RespParseState::kOk;
-  result.consumed = skipped + pos;
+  result.state_ = RespParseState::kOk;
+  result.consumed_ = skipped + pos;
   return result;
 }
 

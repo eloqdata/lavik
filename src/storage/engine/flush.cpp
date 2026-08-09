@@ -3,14 +3,14 @@
 namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
-  const auto interval = std::chrono::milliseconds(options_.flush_max_ms);
-  while (!store->worker->stop_requested()) {
-    absl::Status status = co_await celer::SleepFor(*store->worker, interval);
+  const auto interval = std::chrono::milliseconds(options_.flush_max_ms_);
+  while (!store->worker_->stop_requested()) {
+    absl::Status status = co_await celer::SleepFor(*store->worker_, interval);
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       co_return status;
     }
-    if (store->worker->stop_requested()) {
+    if (store->worker_->stop_requested()) {
       break;
     }
 
@@ -20,8 +20,8 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       co_return status;
     }
 
-    co_await store->store_state_mutex.Lock();
-    UnlockGuard guard(&store->store_state_mutex, store->worker);
+    co_await store->store_state_mutex_.Lock();
+    UnlockGuard guard(&store->store_state_mutex_, store->worker_);
     FlushActiveBlock(*store);
   }
   co_return absl::OkStatus();
@@ -30,42 +30,43 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
 void StorageEngine::Impl::RequestFlush(WorkerStore& store,
                                        std::uint64_t block_id) {
   BlockState* state = FindBlockState(store, block_id);
-  if (state == nullptr || !state->allocated || !state->in_memory ||
-      state->staging_slot == 0) {
+  if (state == nullptr || !state->allocated_ || !state->in_memory_ ||
+      state->staging_slot_ == 0) {
     return;
   }
-  if (state->flush_queued || state->flush_in_progress) {
+  if (state->flush_queued_ || state->flush_in_progress_) {
     return;
   }
-  state->flush_queued = true;
-  store.flush_queue.push_back(block_id);
-  if (store.flush_running) {
+  state->flush_queued_ = true;
+  store.flush_queue_.push_back(block_id);
+  if (store.flush_running_) {
     return;
   }
-  store.flush_running = true;
+  store.flush_running_ = true;
   active_flushes_.fetch_add(1, std::memory_order_acq_rel);
-  store.worker->Spawn(FlushPendingBlocks(&store));
+  store.worker_->Spawn(FlushPendingBlocks(&store));
 }
 
 Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
   struct FlushRunGuard {
-    Impl* engine = nullptr;
+    Impl* engine_ = nullptr;
     ~FlushRunGuard() {
-      engine->space_reclaim_generation_.fetch_add(1, std::memory_order_release);
-      engine->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
+      engine_->space_reclaim_generation_.fetch_add(1,
+                                                   std::memory_order_release);
+      engine_->active_flushes_.fetch_sub(1, std::memory_order_acq_rel);
     }
   } flush_run_guard{this};
 
   struct PendingFlush {
-    std::uint64_t block_id = 0;
-    std::uint32_t committed_bytes = 0;
-    std::uint32_t durable_bytes = 0;
-    std::uint64_t allocation_epoch = 0;
-    std::uint16_t write_buffer_id = 0;
-    std::byte* heap_data = nullptr;
-    std::size_t heap_data_size = 0;
-    std::uint8_t slot = 0;
-    std::vector<RecordIdentity> staged_records;
+    std::uint64_t block_id_ = 0;
+    std::uint32_t committed_bytes_ = 0;
+    std::uint32_t durable_bytes_ = 0;
+    std::uint64_t allocation_epoch_ = 0;
+    std::uint16_t write_buffer_id_ = 0;
+    std::byte* heap_data_ = nullptr;
+    std::size_t heap_data_size_ = 0;
+    std::uint8_t slot_ = 0;
+    std::vector<RecordIdentity> staged_records_;
   };
 
   while (true) {
@@ -79,23 +80,23 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // working — until shutdown.
 
     {
-      co_await store->store_state_mutex.Lock();
-      UnlockGuard guard(&store->store_state_mutex, store->worker);
+      co_await store->store_state_mutex_.Lock();
+      UnlockGuard guard(&store->store_state_mutex_, store->worker_);
 
-      if (store->flush_queue.empty()) {
-        store->flush_running = false;
+      if (store->flush_queue_.empty()) {
+        store->flush_running_ = false;
         co_return absl::OkStatus();
       }
 
-      const std::uint64_t block_id = store->flush_queue.front();
-      store->flush_queue.pop_front();
+      const std::uint64_t block_id = store->flush_queue_.front();
+      store->flush_queue_.pop_front();
       BlockState* state = FindBlockState(*store, block_id);
       if (state == nullptr) {
         continue;
       }
-      if (!state->allocated || !state->in_memory || state->staging_slot == 0 ||
-          state->flush_in_progress) {
-        state->flush_queued = false;
+      if (!state->allocated_ || !state->in_memory_ ||
+          state->staging_slot_ == 0 || state->flush_in_progress_) {
+        state->flush_queued_ = false;
         continue;
       }
       // Readers do not hold this flush up. It writes only the padding above
@@ -106,127 +107,127 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // pins here starved the flush instead: a block under steady read
       // traffic never shows a zero pin count, so its tail stayed dirty
       // indefinitely and shutdown could not drain the queue.
-      StagingSlot& staging_state = store->staging_slots[state->staging_slot];
+      StagingSlot& staging_state = store->staging_slots_[state->staging_slot_];
       const FixedBuffer buffer = StagingBufferFor(*store, *state);
       // Pad the tail out to a direct-I/O page and move the append cursor
       // past it. Every data page is then written exactly once, so a torn
       // write can never damage a record that is already durable.
       const std::uint32_t padded =
-          static_cast<std::uint32_t>(AlignDirect(state->committed_bytes));
-      if (buffer.data == nullptr || buffer.size < padded ||
-          staging_state.durable_bytes > state->committed_bytes) {
-        state->flush_queued = false;
-        store->write_failed = true;
-        store->flush_running = false;
+          static_cast<std::uint32_t>(AlignDirect(state->committed_bytes_));
+      if (buffer.data_ == nullptr || buffer.size_ < padded ||
+          staging_state.durable_bytes_ > state->committed_bytes_) {
+        state->flush_queued_ = false;
+        store->write_failed_ = true;
+        store->flush_running_ = false;
         co_return absl::Status(absl::StatusCode::kInternal,
                                "invalid pending flush staging buffer");
       }
-      if (padded == staging_state.durable_bytes) {
+      if (padded == staging_state.durable_bytes_) {
         // Nothing new since the last flush. Rewriting the header would only
         // burn a slot and two fdatasyncs.
-        state->flush_queued = false;
+        state->flush_queued_ = false;
         if (!IsActiveBlock(*store, block_id)) {
           ReleaseStagingBuffer(*store, *state);
           MaybeQueueDefrag(*store, block_id);
         }
         continue;
       }
-      std::fill_n(buffer.data + state->committed_bytes,
-                  padded - state->committed_bytes, std::byte{0});
-      state->committed_bytes = padded;
-      if (store->active_block.has_value() &&
-          store->active_block->block_id == block_id) {
-        store->active_block->committed_bytes = padded;
+      std::fill_n(buffer.data_ + state->committed_bytes_,
+                  padded - state->committed_bytes_, std::byte{0});
+      state->committed_bytes_ = padded;
+      if (store->active_block_.has_value() &&
+          store->active_block_->block_id_ == block_id) {
+        store->active_block_->committed_bytes_ = padded;
       }
-      ++staging_state.header_sequence;
-      const std::uint8_t slot = HeaderSlot(staging_state.header_sequence);
+      ++staging_state.header_sequence_;
+      const std::uint8_t slot = HeaderSlot(staging_state.header_sequence_);
 
       const BlockHeader header{
-          .magic = kBlockMagic,
-          .block_id = block_id,
-          .version = kStorageFormatVersion,
-          .header_bytes = kBlockHeaderBytes,
-          .block_bytes = kStorageBlockBytes,
-          .writer_id = state->writer_id,
-          .allocation_epoch = state->allocation_epoch,
-          .committed_bytes = padded,
-          .record_count = staging_state.record_count,
-          .max_lsn = staging_state.max_lsn,
-          .header_sequence = staging_state.header_sequence,
-          .checksum = 0,
-          .layout_worker_count = state->layout_worker_count,
+          .magic_ = kBlockMagic,
+          .block_id_ = block_id,
+          .version_ = kStorageFormatVersion,
+          .header_bytes_ = kBlockHeaderBytes,
+          .block_bytes_ = kStorageBlockBytes,
+          .writer_id_ = state->writer_id_,
+          .allocation_epoch_ = state->allocation_epoch_,
+          .committed_bytes_ = padded,
+          .record_count_ = staging_state.record_count_,
+          .max_lsn_ = staging_state.max_lsn_,
+          .header_sequence_ = staging_state.header_sequence_,
+          .checksum_ = 0,
+          .layout_worker_count_ = state->layout_worker_count_,
       };
       EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                                    buffer.data + slot * kBlockHeaderSlotBytes,
+                                    buffer.data_ + slot * kBlockHeaderSlotBytes,
                                     kBlockHeaderSlotBytes));
 
       pending.emplace(PendingFlush{
-          .block_id = block_id,
-          .committed_bytes = padded,
-          .durable_bytes = staging_state.durable_bytes,
-          .allocation_epoch = state->allocation_epoch,
-          .write_buffer_id = staging_state.write_buffer_id,
-          .heap_data = staging_state.heap_data,
-          .heap_data_size = staging_state.heap_data_size,
-          .slot = slot,
-          .staged_records = {},
+          .block_id_ = block_id,
+          .committed_bytes_ = padded,
+          .durable_bytes_ = staging_state.durable_bytes_,
+          .allocation_epoch_ = state->allocation_epoch_,
+          .write_buffer_id_ = staging_state.write_buffer_id_,
+          .heap_data_ = staging_state.heap_data_,
+          .heap_data_size_ = staging_state.heap_data_size_,
+          .slot_ = slot,
+          .staged_records_ = {},
       });
-      if (auto found = store->staged_records.find(block_id);
-          found != store->staged_records.end()) {
-        pending->staged_records = std::move(found->second);
-        store->staged_records.erase(found);
+      if (auto found = store->staged_records_.find(block_id);
+          found != store->staged_records_.end()) {
+        pending->staged_records_ = std::move(found->second);
+        store->staged_records_.erase(found);
       }
-      state->flush_queued = false;
-      state->flush_in_progress = true;
+      state->flush_queued_ = false;
+      state->flush_in_progress_ = true;
     }
 
-    const auto [file_id, block_offset] = FileOffset(pending->block_id);
+    const auto [file_id, block_offset] = FileOffset(pending->block_id_);
     FixedBuffer staging =
-        pending->write_buffer_id != 0
-            ? store->buffers.write_buffer(pending->write_buffer_id)
-            : FixedBuffer{.data = pending->heap_data,
-                          .size = pending->heap_data_size,
-                          .index = 0};
+        pending->write_buffer_id_ != 0
+            ? store->buffers_.write_buffer(pending->write_buffer_id_)
+            : FixedBuffer{.data_ = pending->heap_data_,
+                          .size_ = pending->heap_data_size_,
+                          .index_ = 0};
     // The first flush of a block starts at the unused header slot, which is
     // still zero in staging. That makes the slot durably zero before the
     // first header lands in the other one, so a torn first header cannot
     // leave a stale header from this block's previous life as the winner.
     const std::size_t write_begin =
-        pending->durable_bytes == kBlockHeaderBytes
-            ? kBlockHeaderSlotBytes * (1 - pending->slot)
-            : pending->durable_bytes;
-    const std::size_t write_bytes = pending->committed_bytes;
-    if (staging.data == nullptr || staging.size < write_bytes) {
-      co_await store->store_state_mutex.Lock();
-      UnlockGuard guard(&store->store_state_mutex, store->worker);
-      BlockState* state = FindBlockState(*store, pending->block_id);
+        pending->durable_bytes_ == kBlockHeaderBytes
+            ? kBlockHeaderSlotBytes * (1 - pending->slot_)
+            : pending->durable_bytes_;
+    const std::size_t write_bytes = pending->committed_bytes_;
+    if (staging.data_ == nullptr || staging.size_ < write_bytes) {
+      co_await store->store_state_mutex_.Lock();
+      UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+      BlockState* state = FindBlockState(*store, pending->block_id_);
       if (state != nullptr) {
-        state->flush_in_progress = false;
-        state->flush_queued = false;
+        state->flush_in_progress_ = false;
+        state->flush_queued_ = false;
       }
-      store->write_failed = true;
-      store->flush_running = false;
+      store->write_failed_ = true;
+      store->flush_running_ = false;
       co_return absl::Status(absl::StatusCode::kInternal,
                              "invalid pending flush staging buffer");
     }
 
     for (std::size_t write_offset = write_begin; write_offset < write_bytes;) {
       const std::size_t chunk_bytes =
-          std::min(options_.flush_size_bytes, write_bytes - write_offset);
+          std::min(options_.flush_size_bytes_, write_bytes - write_offset);
       auto written = co_await WriteStorageBuffer(
-          *store->worker, store->files[file_id],
-          std::span<const std::byte>(staging.data + write_offset, chunk_bytes),
-          pending->write_buffer_id != 0, staging, block_offset + write_offset);
+          *store->worker_, store->files_[file_id],
+          std::span<const std::byte>(staging.data_ + write_offset, chunk_bytes),
+          pending->write_buffer_id_ != 0, staging, block_offset + write_offset);
       if (!written.ok() || *written != chunk_bytes) {
-        co_await store->store_state_mutex.Lock();
-        UnlockGuard guard(&store->store_state_mutex, store->worker);
-        BlockState* state = FindBlockState(*store, pending->block_id);
+        co_await store->store_state_mutex_.Lock();
+        UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+        BlockState* state = FindBlockState(*store, pending->block_id_);
         if (state != nullptr) {
-          state->flush_in_progress = false;
-          state->flush_queued = false;
+          state->flush_in_progress_ = false;
+          state->flush_queued_ = false;
         }
-        store->write_failed = true;
-        store->flush_running = false;
+        store->write_failed_ = true;
+        store->flush_running_ = false;
         if (!written.ok()) {
           co_return written.status();
         }
@@ -239,55 +240,55 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // after the data it describes is durable. Otherwise a crash between the
     // two can leave a header advertising records that were never written.
     auto fail_flush = [&](absl::Status status) -> Task<absl::Status> {
-      co_await store->store_state_mutex.Lock();
-      UnlockGuard guard(&store->store_state_mutex, store->worker);
-      BlockState* state = FindBlockState(*store, pending->block_id);
+      co_await store->store_state_mutex_.Lock();
+      UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+      BlockState* state = FindBlockState(*store, pending->block_id_);
       if (state != nullptr) {
-        state->flush_in_progress = false;
-        state->flush_queued = false;
+        state->flush_in_progress_ = false;
+        state->flush_queued_ = false;
       }
-      store->write_failed = true;
-      store->flush_running = false;
+      store->write_failed_ = true;
+      store->flush_running_ = false;
       co_return status;
     };
 
     auto synced =
-        co_await celer::Fdatasync(*store->worker, store->files[file_id]);
+        co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
     if (!synced.ok()) {
       co_return co_await fail_flush(synced);
     }
 
     const std::uint64_t slot_offset =
-        block_offset + pending->slot * kBlockHeaderSlotBytes;
+        block_offset + pending->slot_ * kBlockHeaderSlotBytes;
     auto header_written = co_await WriteStorageBuffer(
-        *store->worker, store->files[file_id],
+        *store->worker_, store->files_[file_id],
         std::span<const std::byte>(
-            staging.data + pending->slot * kBlockHeaderSlotBytes,
+            staging.data_ + pending->slot_ * kBlockHeaderSlotBytes,
             kBlockHeaderSlotBytes),
-        pending->write_buffer_id != 0, staging, slot_offset);
+        pending->write_buffer_id_ != 0, staging, slot_offset);
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
       co_return co_await fail_flush(
           header_written.ok() ? absl::Status(absl::StatusCode::kInternal,
                                              "short block header write")
                               : header_written.status());
     }
-    synced = co_await celer::Fdatasync(*store->worker, store->files[file_id]);
+    synced = co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
     if (!synced.ok()) {
       co_return co_await fail_flush(synced);
     }
 
-    co_await store->store_state_mutex.Lock();
-    UnlockGuard write_guard(&store->store_state_mutex, store->worker);
-    BlockState* state = FindBlockState(*store, pending->block_id);
+    co_await store->store_state_mutex_.Lock();
+    UnlockGuard write_guard(&store->store_state_mutex_, store->worker_);
+    BlockState* state = FindBlockState(*store, pending->block_id_);
     if (state == nullptr) {
-      store->flush_running = false;
+      store->flush_running_ = false;
       co_return absl::OkStatus();
     }
-    if (!state->allocated || state->flush_in_progress == false ||
-        state->allocation_epoch != pending->allocation_epoch) {
-      state->flush_in_progress = false;
-      state->flush_queued = false;
-      store->flush_running = false;
+    if (!state->allocated_ || state->flush_in_progress_ == false ||
+        state->allocation_epoch_ != pending->allocation_epoch_) {
+      state->flush_in_progress_ = false;
+      state->flush_queued_ = false;
+      store->flush_running_ = false;
       co_return absl::OkStatus();
     }
 
@@ -295,37 +296,37 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // header both fdatasync'd above), so the versions they superseded are no
     // longer anyone's durable copy and can leave their blocks' accounting.
     std::vector<RetiredRecord> retired_records;
-    for (const RecordIdentity& identity : pending->staged_records) {
-      if (identity.retired_extents != nullptr) {
-        SpawnExtentReclaim(*store, identity.retired_extents);
+    for (const RecordIdentity& identity : pending->staged_records_) {
+      if (identity.retired_extents_ != nullptr) {
+        SpawnExtentReclaim(*store, identity.retired_extents_);
       }
-      if (identity.retired_record.has_value()) {
-        retired_records.push_back(*identity.retired_record);
+      if (identity.retired_record_.has_value()) {
+        retired_records.push_back(*identity.retired_record_);
       }
-      if (identity.tx_retirements != nullptr) {
+      if (identity.tx_retirements_ != nullptr) {
         // A commit record just became durable: its transaction's superseded
         // versions can finally leave their blocks' accounting.
         retired_records.insert(retired_records.end(),
-                               identity.tx_retirements->begin(),
-                               identity.tx_retirements->end());
+                               identity.tx_retirements_->begin(),
+                               identity.tx_retirements_->end());
       }
-      if (identity.entry == nullptr) {
+      if (identity.entry_ == nullptr) {
         continue;
       }
       // FLUSHDB detached the population this entry belongs to. The entry is
       // either already freed or waiting to be, and nothing reaches it either
       // way, so it must not be dereferenced.
-      if (identity.index_generation !=
-          store->index_generations[identity.db_id]) {
+      if (identity.index_generation_ !=
+          store->index_generations_[identity.db_id_]) {
         continue;
       }
       // Memory-only expiration freed the entry while its record was still
       // staged; the retirements above still settled, only the marking is
       // moot.
-      if (identity.entry == nullptr) {
+      if (identity.entry_ == nullptr) {
         continue;
       }
-      RecordLocation& current = identity.entry->value;
+      RecordLocation& current = identity.entry_->value_;
       // The entry may no longer hold the version this identity was staged
       // for. Matching on block and epoch alone was enough when a block
       // flushed once: an overwrite necessarily landed in a different block.
@@ -342,11 +343,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // send readers to disk pages that are still zero. Offsets within one
       // allocation only grow, so the boundary check identifies stale
       // versions exactly.
-      if (current.block_id == pending->block_id &&
-          current.allocation_epoch == pending->allocation_epoch &&
-          current.record_offset + current.total_disk_bytes <=
-              pending->committed_bytes) {
-        current.in_memory = false;
+      if (current.block_id_ == pending->block_id_ &&
+          current.allocation_epoch_ == pending->allocation_epoch_ &&
+          current.record_offset_ + current.total_disk_bytes_ <=
+              pending->committed_bytes_) {
+        current.in_memory_ = false;
       }
     }
 
@@ -354,15 +355,15 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // Counted before the spawn so the shutdown drain can never observe
       // zero between this completion and the task's first slice.
       active_settlements_.fetch_add(1, std::memory_order_acq_rel);
-      store->worker->Spawn(
+      store->worker_->Spawn(
           MarkRetiredRecordsDead(store, std::move(retired_records)));
     }
 
     if (StagingSlot* slot = StagingFor(*store, *state); slot != nullptr) {
-      slot->durable_bytes = pending->committed_bytes;
+      slot->durable_bytes_ = pending->committed_bytes_;
     }
-    state->flush_in_progress = false;
-    state->flush_queued = false;
+    state->flush_in_progress_ = false;
+    state->flush_queued_ = false;
 
     // RequestFlush coalesces requests while an earlier snapshot is in
     // flight. If rollover or shutdown sealed the block during that write,
@@ -370,9 +371,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // active_block was cleared. Queue that tail now, before releasing the
     // staging buffer; otherwise shutdown can observe an empty queue and
     // report success while acknowledged records remain only in memory.
-    if (!IsActiveBlock(*store, pending->block_id) &&
-        state->committed_bytes > pending->committed_bytes) {
-      RequestFlush(*store, pending->block_id);
+    if (!IsActiveBlock(*store, pending->block_id_) &&
+        state->committed_bytes_ > pending->committed_bytes_) {
+      RequestFlush(*store, pending->block_id_);
       continue;
     }
 
@@ -380,24 +381,24 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // staging buffer and stays in memory: the periodic flush only makes the
     // tail durable, it no longer retires the block. Sealing is what frees
     // the buffer, and sealing already cleared active_block by this point.
-    if (IsActiveBlock(*store, pending->block_id)) {
+    if (IsActiveBlock(*store, pending->block_id_)) {
       continue;
     }
 
-    state->in_memory = false;
-    if (state->pins > 0) {
-      state->release_pending = true;
+    state->in_memory_ = false;
+    if (state->pins_ > 0) {
+      state->release_pending_ = true;
       continue;
     }
     ReleaseStagingBuffer(*store, *state);
-    MaybeQueueDefrag(*store, pending->block_id);
+    MaybeQueueDefrag(*store, pending->block_id_);
   }
 }
 
 bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,
                                         std::uint64_t block_id) const noexcept {
-  return store.active_block.has_value() &&
-         store.active_block->block_id == block_id;
+  return store.active_block_.has_value() &&
+         store.active_block_->block_id_ == block_id;
 }
 
 }  // namespace keylane::storage

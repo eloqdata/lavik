@@ -12,7 +12,7 @@
 namespace keylane {
 
 struct RespCommand {
-  std::vector<std::string> args;
+  std::vector<std::string> args_;
 };
 
 enum class RespParseState {
@@ -22,10 +22,10 @@ enum class RespParseState {
 };
 
 struct RespParseResult {
-  RespParseState state = RespParseState::kNeedMoreData;
-  std::size_t consumed = 0;
-  absl::Status status = absl::OkStatus();
-  RespCommand command;
+  RespParseState state_ = RespParseState::kNeedMoreData;
+  std::size_t consumed_ = 0;
+  absl::Status status_ = absl::OkStatus();
+  RespCommand command_;
 };
 
 RespParseResult ParseRespCommand(std::string_view input);

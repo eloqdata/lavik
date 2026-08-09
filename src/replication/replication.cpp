@@ -167,16 +167,16 @@ absl::Status DecodeStatus(BytesView response, Reader* reader) {
 }
 
 std::size_t EncodedRecordBytes(const SnapshotRecord& record) {
-  return 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + record.key.size() +
-         record.value.size();
+  return 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + record.key_.size() +
+         record.value_.size();
 }
 
 bool EncodeRecords(std::uint16_t partition_id, std::uint64_t epoch,
                    std::span<const SnapshotRecord> records, Bytes* output) {
   std::size_t bytes = 2 + 8 + 4;
   for (const SnapshotRecord& record : records) {
-    if (record.key.size() > std::numeric_limits<std::uint32_t>::max() ||
-        record.value.size() > std::numeric_limits<std::uint32_t>::max() ||
+    if (record.key_.size() > std::numeric_limits<std::uint32_t>::max() ||
+        record.value_.size() > std::numeric_limits<std::uint32_t>::max() ||
         bytes > kMaxApplyPayload - EncodedRecordBytes(record)) {
       return false;
     }
@@ -188,19 +188,19 @@ bool EncodeRecords(std::uint16_t partition_id, std::uint64_t epoch,
   PutU64(*output, epoch);
   PutU32(*output, static_cast<std::uint32_t>(records.size()));
   for (const SnapshotRecord& record : records) {
-    PutU8(*output, static_cast<std::uint8_t>(record.kind));
-    PutU8(*output, record.db_id);
-    PutU8(*output, static_cast<std::uint8_t>(record.value_type));
-    PutU64(*output, record.db_epoch);
-    PutU64(*output, record.mutation_sequence);
-    PutU64(*output, record.expire_at_ms);
-    PutU64(*output, record.logical_size);
-    PutU32(*output, record.chunk_index);
-    PutU32(*output, record.chunk_count);
-    PutU32(*output, static_cast<std::uint32_t>(record.key.size()));
-    PutU32(*output, static_cast<std::uint32_t>(record.value.size()));
-    PutString(*output, record.key);
-    PutString(*output, record.value);
+    PutU8(*output, static_cast<std::uint8_t>(record.kind_));
+    PutU8(*output, record.db_id_);
+    PutU8(*output, static_cast<std::uint8_t>(record.value_type_));
+    PutU64(*output, record.db_epoch_);
+    PutU64(*output, record.mutation_sequence_);
+    PutU64(*output, record.expire_at_ms_);
+    PutU64(*output, record.logical_size_);
+    PutU32(*output, record.chunk_index_);
+    PutU32(*output, record.chunk_count_);
+    PutU32(*output, static_cast<std::uint32_t>(record.key_.size()));
+    PutU32(*output, static_cast<std::uint32_t>(record.value_.size()));
+    PutString(*output, record.key_);
+    PutString(*output, record.value_);
   }
   return true;
 }
@@ -226,31 +226,33 @@ DecodeRecords(BytesView payload) {
     SnapshotRecord record;
     std::uint32_t key_size = 0;
     std::uint32_t value_size = 0;
-    if (!reader.U8(&kind) || !reader.U8(&record.db_id) ||
-        !reader.U8(&value_type) || !reader.U64(&record.db_epoch) ||
-        !reader.U64(&record.mutation_sequence) ||
-        !reader.U64(&record.expire_at_ms) ||
-        !reader.U64(&record.logical_size) || !reader.U32(&record.chunk_index) ||
-        !reader.U32(&record.chunk_count) || !reader.U32(&key_size) ||
+    if (!reader.U8(&kind) || !reader.U8(&record.db_id_) ||
+        !reader.U8(&value_type) || !reader.U64(&record.db_epoch_) ||
+        !reader.U64(&record.mutation_sequence_) ||
+        !reader.U64(&record.expire_at_ms_) ||
+        !reader.U64(&record.logical_size_) ||
+        !reader.U32(&record.chunk_index_) ||
+        !reader.U32(&record.chunk_count_) || !reader.U32(&key_size) ||
         !reader.U32(&value_size) ||
         kind < static_cast<std::uint8_t>(SnapshotRecord::Kind::kValue) ||
         kind > static_cast<std::uint8_t>(SnapshotRecord::Kind::kValueCommit) ||
-        record.db_id >= storage::kLogicalDatabaseCount ||
+        record.db_id_ >= storage::kLogicalDatabaseCount ||
         value_type > static_cast<std::uint8_t>(storage::ValueType::kStream) ||
-        !reader.String(key_size, &record.key) ||
-        !reader.String(value_size, &record.value)) {
+        !reader.String(key_size, &record.key_) ||
+        !reader.String(value_size, &record.value_)) {
       return absl::Status(absl::StatusCode::kInvalidArgument,
                           "malformed replicated record");
     }
-    record.kind = static_cast<SnapshotRecord::Kind>(kind);
-    record.value_type = static_cast<storage::ValueType>(value_type);
-    const bool value_frame = record.kind == SnapshotRecord::Kind::kValue ||
-                             record.kind == SnapshotRecord::Kind::kValueBegin ||
-                             record.kind == SnapshotRecord::Kind::kValueChunk ||
-                             record.kind == SnapshotRecord::Kind::kValueCommit;
-    if ((value_frame && record.value_type == storage::ValueType::kNone) ||
-        (!value_frame && (record.value_type != storage::ValueType::kNone ||
-                          record.expire_at_ms != 0))) {
+    record.kind_ = static_cast<SnapshotRecord::Kind>(kind);
+    record.value_type_ = static_cast<storage::ValueType>(value_type);
+    const bool value_frame =
+        record.kind_ == SnapshotRecord::Kind::kValue ||
+        record.kind_ == SnapshotRecord::Kind::kValueBegin ||
+        record.kind_ == SnapshotRecord::Kind::kValueChunk ||
+        record.kind_ == SnapshotRecord::Kind::kValueCommit;
+    if ((value_frame && record.value_type_ == storage::ValueType::kNone) ||
+        (!value_frame && (record.value_type_ != storage::ValueType::kNone ||
+                          record.expire_at_ms_ != 0))) {
       return absl::Status(absl::StatusCode::kInvalidArgument,
                           "invalid replicated value metadata");
     }
@@ -268,7 +270,9 @@ DecodeRecords(BytesView payload) {
 class ReplicationManager::Impl {
  public:
   Impl(storage::StorageEngine* storage, const ReplicationOptions& options)
-      : storage_(storage), options_(options), rpc_server_(options.listen_port) {
+      : storage_(storage),
+        options_(options),
+        rpc_server_(options.listen_port_) {
     rpc_server_.OnVerbAsync(kResetPartition, [this](BytesView payload) {
       return HandleReset(payload);
     });
@@ -278,13 +282,13 @@ class ReplicationManager::Impl {
   }
 
   celer::Service* service() noexcept {
-    return options_.listen_port == 0 ? nullptr : &rpc_server_;
+    return options_.listen_port_ == 0 ? nullptr : &rpc_server_;
   }
 
   void StorageReady(celer::Worker& worker) {
     ready_.store(true, std::memory_order_release);
-    if (worker.id() == 0 && !options_.target_ip.empty() &&
-        options_.target_port != 0 && !coordinator_started_) {
+    if (worker.id() == 0 && !options_.target_ip_.empty() &&
+        options_.target_port_ != 0 && !coordinator_started_) {
       coordinator_started_ = true;
       worker.Spawn(Coordinator());
     }
@@ -292,9 +296,9 @@ class ReplicationManager::Impl {
 
  private:
   struct PartitionState {
-    bool complete = false;
-    std::uint64_t target_epoch = 0;
-    std::uint64_t acknowledged = 0;
+    bool complete_ = false;
+    std::uint64_t target_epoch_ = 0;
+    std::uint64_t acknowledged_ = 0;
   };
 
   Task<Bytes> HandleReset(BytesView payload) {
@@ -320,7 +324,7 @@ class ReplicationManager::Impl {
     // if/else, not ?:, to keep the two co_awaits in separate full
     // expressions (GCC coroutine frame-slot aliasing).
     std::optional<absl::StatusOr<std::uint64_t>> reset;
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       reset.emplace(
           co_await storage_->ResetReplicaPartition(partition_id, epochs));
     } else {
@@ -351,7 +355,7 @@ class ReplicationManager::Impl {
     auto [partition_id, epoch, records] = std::move(*decoded);
     const unsigned owner = partition_id % storage_->worker_count();
     absl::Status status;
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       status =
           co_await storage_->ApplyReplicaRecords(partition_id, epoch, records);
     } else {
@@ -381,7 +385,7 @@ class ReplicationManager::Impl {
     Bytes request;
     request.reserve(2 + 8 * storage::kLogicalDatabaseCount);
     PutU16(request, partition_id);
-    for (std::uint64_t epoch : start.db_epochs) PutU64(request, epoch);
+    for (std::uint64_t epoch : start.db_epochs_) PutU64(request, epoch);
     auto response = co_await client.Call(kResetPartition, request);
     if (!response.ok()) co_return response.status();
     Reader reader(BytesView(response->data(), response->size()));
@@ -417,20 +421,20 @@ class ReplicationManager::Impl {
     while (begin < records.size()) {
       if (EncodedRecordBytes(records[begin]) + 2 + 8 + 4 > kMaxApplyPayload) {
         const SnapshotRecord& large = records[begin];
-        if (large.kind != SnapshotRecord::Kind::kValue ||
-            large.value.size() > storage::kMaxStringBytes) {
+        if (large.kind_ != SnapshotRecord::Kind::kValue ||
+            large.value_.size() > storage::kMaxStringBytes) {
           co_return absl::Status(absl::StatusCode::kOutOfRange,
                                  "replicated record exceeds RPC payload limit");
         }
         const std::uint32_t chunk_count = static_cast<std::uint32_t>(
-            (large.value.size() + storage::kExtentPayloadBytes - 1) /
+            (large.value_.size() + storage::kExtentPayloadBytes - 1) /
             storage::kExtentPayloadBytes);
         SnapshotRecord frame = large;
-        frame.kind = SnapshotRecord::Kind::kValueBegin;
-        frame.logical_size = large.value.size();
-        frame.chunk_index = 0;
-        frame.chunk_count = chunk_count;
-        frame.value.clear();
+        frame.kind_ = SnapshotRecord::Kind::kValueBegin;
+        frame.logical_size_ = large.value_.size();
+        frame.chunk_index_ = 0;
+        frame.chunk_count_ = chunk_count;
+        frame.value_.clear();
         absl::Status sent =
             co_await ApplyRemote(client, partition_id, epoch,
                                  std::span<const SnapshotRecord>(&frame, 1));
@@ -439,18 +443,18 @@ class ReplicationManager::Impl {
           const std::size_t offset =
               static_cast<std::size_t>(index) * storage::kExtentPayloadBytes;
           const std::size_t bytes = std::min(storage::kExtentPayloadBytes,
-                                             large.value.size() - offset);
-          frame.kind = SnapshotRecord::Kind::kValueChunk;
-          frame.chunk_index = index;
-          frame.value.assign(large.value.data() + offset, bytes);
+                                             large.value_.size() - offset);
+          frame.kind_ = SnapshotRecord::Kind::kValueChunk;
+          frame.chunk_index_ = index;
+          frame.value_.assign(large.value_.data() + offset, bytes);
           sent =
               co_await ApplyRemote(client, partition_id, epoch,
                                    std::span<const SnapshotRecord>(&frame, 1));
           if (!sent.ok()) co_return sent;
         }
-        frame.kind = SnapshotRecord::Kind::kValueCommit;
-        frame.chunk_index = chunk_count;
-        frame.value.clear();
+        frame.kind_ = SnapshotRecord::Kind::kValueCommit;
+        frame.chunk_index_ = chunk_count;
+        frame.value_.clear();
         sent = co_await ApplyRemote(client, partition_id, epoch,
                                     std::span<const SnapshotRecord>(&frame, 1));
         if (!sent.ok()) co_return sent;
@@ -487,7 +491,7 @@ class ReplicationManager::Impl {
 
   Task<PartitionReplicationStart> BeginLocal(std::uint16_t partition_id) {
     const unsigned owner = partition_id % storage_->worker_count();
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       co_return storage_->BeginPartitionReplication(partition_id);
     }
     co_return co_await celer::SubmitTo(owner, [this, partition_id] {
@@ -498,7 +502,7 @@ class ReplicationManager::Impl {
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotLocal(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor) {
     const unsigned owner = partition_id % storage_->worker_count();
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       co_return co_await storage_->SnapshotPartition(
           partition_id, db_id, cursor, kSnapshotKeysPerBatch);
     }
@@ -514,7 +518,7 @@ class ReplicationManager::Impl {
   Task<PartitionDeltaBatch> ReadDeltasLocal(std::uint16_t partition_id,
                                             std::uint64_t after) {
     const unsigned owner = partition_id % storage_->worker_count();
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       co_return storage_->ReadPartitionDeltas(partition_id, after,
                                               kDeltaRecordsPerBatch);
     }
@@ -527,7 +531,7 @@ class ReplicationManager::Impl {
   Task<absl::Status> AckLocal(std::uint16_t partition_id,
                               std::uint64_t through) {
     const unsigned owner = partition_id % storage_->worker_count();
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       storage_->AcknowledgePartitionDeltas(partition_id, through);
       co_return absl::OkStatus();
     }
@@ -542,24 +546,24 @@ class ReplicationManager::Impl {
                              PartitionState* state) {
     while (true) {
       PartitionDeltaBatch batch =
-          co_await ReadDeltasLocal(partition_id, state->acknowledged);
-      if (batch.overflow) {
+          co_await ReadDeltasLocal(partition_id, state->acknowledged_);
+      if (batch.overflow_) {
         co_return absl::Status(absl::StatusCode::kAborted,
                                "partition delta retention overflow");
       }
       absl::Status applied = co_await ApplyRemote(
-          client, partition_id, state->target_epoch, batch.records);
+          client, partition_id, state->target_epoch_, batch.records_);
       if (!applied.ok()) co_return applied;
-      if (!batch.records.empty()) {
-        state->acknowledged = batch.records.back().mutation_sequence;
+      if (!batch.records_.empty()) {
+        state->acknowledged_ = batch.records_.back().mutation_sequence_;
       } else {
-        state->acknowledged = batch.watermark;
+        state->acknowledged_ = batch.watermark_;
       }
       absl::Status acknowledged =
-          co_await AckLocal(partition_id, state->acknowledged);
+          co_await AckLocal(partition_id, state->acknowledged_);
       if (!acknowledged.ok()) co_return acknowledged;
-      if (state->acknowledged >= batch.watermark &&
-          batch.records.size() < kDeltaRecordsPerBatch) {
+      if (state->acknowledged_ >= batch.watermark_ &&
+          batch.records_.size() < kDeltaRecordsPerBatch) {
         co_return absl::OkStatus();
       }
     }
@@ -595,7 +599,7 @@ class ReplicationManager::Impl {
         const std::uint16_t partition_id = deferred->front();
         deferred->pop_front();
         if (partition_id == skip_partition ||
-            !(*states)[partition_id].complete) {
+            !(*states)[partition_id].complete_) {
           deferred->push_back(partition_id);
           continue;
         }
@@ -609,7 +613,8 @@ class ReplicationManager::Impl {
     while (processed < maximum) {
       std::uint16_t partition_id = 0;
       if (!storage_->TryTakeReplicationReady(&partition_id)) break;
-      if (partition_id == skip_partition || !(*states)[partition_id].complete) {
+      if (partition_id == skip_partition ||
+          !(*states)[partition_id].complete_) {
         if (deferred != nullptr) deferred->push_back(partition_id);
         continue;
       }
@@ -629,13 +634,13 @@ class ReplicationManager::Impl {
     PartitionReplicationStart start = co_await BeginLocal(partition_id);
     auto target_epoch = co_await ResetRemote(client, partition_id, start);
     if (!target_epoch.ok()) co_return target_epoch.status();
-    state->complete = false;
-    state->target_epoch = *target_epoch;
-    state->acknowledged = start.snapshot_sequence;
+    state->complete_ = false;
+    state->target_epoch_ = *target_epoch;
+    state->acknowledged_ = start.snapshot_sequence_;
 
     for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
          ++db_id) {
-      if ((start.nonempty_db_mask & (std::uint16_t{1} << db_id)) == 0) {
+      if ((start.nonempty_db_mask_ & (std::uint16_t{1} << db_id)) == 0) {
         continue;
       }
       std::uint64_t cursor = 0;
@@ -643,9 +648,9 @@ class ReplicationManager::Impl {
         auto batch = co_await SnapshotLocal(partition_id, db_id, cursor);
         if (!batch.ok()) co_return batch.status();
         absl::Status applied = co_await ApplyRemote(
-            client, partition_id, state->target_epoch, batch->records);
+            client, partition_id, state->target_epoch_, batch->records_);
         if (!applied.ok()) co_return applied;
-        cursor = batch->cursor;
+        cursor = batch->cursor_;
         if (drain_others && states != nullptr) {
           absl::Status forwarded = co_await DrainReadyPartitions(
               client, states, deferred, 8, partition_id);
@@ -655,7 +660,7 @@ class ReplicationManager::Impl {
     }
     absl::Status caught_up = co_await CatchUp(client, partition_id, state);
     if (!caught_up.ok()) co_return caught_up;
-    state->complete = true;
+    state->complete_ = true;
     co_return absl::OkStatus();
   }
 
@@ -690,11 +695,11 @@ class ReplicationManager::Impl {
       std::uint16_t partition_id = 0;
       if (!storage_->TryTakeReplicationReady(&partition_id)) {
         absl::Status slept = co_await celer::SleepFor(
-            *celer::ThisWorker().self, std::chrono::milliseconds(1));
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
         if (!slept.ok()) co_return slept;
         continue;
       }
-      if (!states[partition_id].complete) continue;
+      if (!states[partition_id].complete_) continue;
       absl::Status caught_up =
           co_await SynchronizeReadyPartition(client, partition_id, &states);
       if (!caught_up.ok()) co_return caught_up;
@@ -704,22 +709,22 @@ class ReplicationManager::Impl {
   }
 
   Task<absl::Status> Coordinator() {
-    while (!celer::ThisWorker().self->stop_requested()) {
+    while (!celer::ThisWorker().self_->stop_requested()) {
       auto client = std::make_unique<celer::rpc::RpcClient>();
       absl::Status connected =
-          co_await client->Connect(options_.target_ip, options_.target_port);
+          co_await client->Connect(options_.target_ip_, options_.target_port_);
       if (!connected.ok()) {
         spdlog::warn("replication connect to {}:{} failed: {}",
-                     options_.target_ip, options_.target_port,
+                     options_.target_ip_, options_.target_port_,
                      connected.message());
       } else {
-        spdlog::info("replication connected to {}:{}", options_.target_ip,
-                     options_.target_port);
+        spdlog::info("replication connected to {}:{}", options_.target_ip_,
+                     options_.target_port_);
         absl::Status replicated = co_await ReplicateOnce(*client);
         spdlog::warn("replication session ended: {}", replicated.message());
         client->Close();
       }
-      absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self,
+      absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
                                                     std::chrono::seconds(1));
       if (!slept.ok()) co_return slept;
     }

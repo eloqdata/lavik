@@ -6,12 +6,12 @@ std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
     const BlockHeader& block, std::uint64_t block_id) const noexcept {
   // writer_id belongs to the topology that wrote the block and may be
   // greater than the current worker count after a scale-down.
-  if (block.layout_worker_count == worker_count_ &&
-      block.writer_id < worker_count_) {
-    return static_cast<std::uint16_t>(block.writer_id);
+  if (block.layout_worker_count_ == worker_count_ &&
+      block.writer_id_ < worker_count_) {
+    return static_cast<std::uint16_t>(block.writer_id_);
   }
   std::uint64_t mixed =
-      block_id ^ (block.allocation_epoch + 0x9e3779b97f4a7c15ULL);
+      block_id ^ (block.allocation_epoch_ + 0x9e3779b97f4a7c15ULL);
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
   mixed ^= mixed >> 31;
@@ -78,76 +78,76 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     WorkerStore& store, std::vector<RecoveryBatch>* batches,
     std::vector<std::uint64_t>* zero_blocks,
     absl::flat_hash_set<std::uint64_t>* committed_txids) {
-  auto acquired = co_await store.buffers.AcquireReadBuffer();
+  auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) {
     co_return acquired.status();
   }
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer header_buffer = lease.io_buffer();
-  header_buffer.size = kBlockHeaderBytes;
+  header_buffer.size_ = kBlockHeaderBytes;
 
   struct RecoveryBuffer {
-    RegisteredBufferPool* pool = nullptr;
-    std::uint16_t buffer_id = 0;
-    std::byte* heap_data = nullptr;
-    FixedBuffer buffer{};
+    RegisteredBufferPool* pool_ = nullptr;
+    std::uint16_t buffer_id_ = 0;
+    std::byte* heap_data_ = nullptr;
+    FixedBuffer buffer_{};
 
     ~RecoveryBuffer() {
-      if (buffer_id != 0) {
-        pool->ReleaseWriteBuffer(buffer_id);
-      } else if (heap_data != nullptr) {
-        pool->ReleaseHeapWriteBuffer(heap_data);
+      if (buffer_id_ != 0) {
+        pool_->ReleaseWriteBuffer(buffer_id_);
+      } else if (heap_data_ != nullptr) {
+        pool_->ReleaseHeapWriteBuffer(heap_data_);
       }
     }
 
-    bool registered() const noexcept { return buffer_id != 0; }
-  } recovery{.pool = &store.buffers};
-  if (store.buffers.TryAcquireWriteBuffer(&recovery.buffer_id)) {
-    recovery.buffer = store.buffers.write_buffer(recovery.buffer_id);
-  } else if (store.buffers.TryAcquireHeapWriteBuffer(&recovery.heap_data)) {
-    recovery.buffer = FixedBuffer{
-        .data = recovery.heap_data,
-        .size = options_.buffers.write_buffer_bytes,
-        .index = 0,
+    bool registered() const noexcept { return buffer_id_ != 0; }
+  } recovery{.pool_ = &store.buffers_};
+  if (store.buffers_.TryAcquireWriteBuffer(&recovery.buffer_id_)) {
+    recovery.buffer_ = store.buffers_.write_buffer(recovery.buffer_id_);
+  } else if (store.buffers_.TryAcquireHeapWriteBuffer(&recovery.heap_data_)) {
+    recovery.buffer_ = FixedBuffer{
+        .data_ = recovery.heap_data_,
+        .size_ = options_.buffers_.write_buffer_bytes_,
+        .index_ = 0,
     };
   } else {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "failed to allocate recovery block buffer");
   }
-  if (recovery.buffer.size < kStorageBlockBytes) {
+  if (recovery.buffer_.size_ < kStorageBlockBytes) {
     co_return absl::Status(
         absl::StatusCode::kResourceExhausted,
         "recovery block buffer is smaller than a storage block");
   }
-  recovery.buffer.size = kStorageBlockBytes;
+  recovery.buffer_.size_ = kStorageBlockBytes;
 
   std::uint64_t device_linear_begin = 0;
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
     const std::uint64_t first_device_offset =
-        (store.worker->id() + worker_count_ -
+        (store.worker_->id() + worker_count_ -
          device_linear_begin % worker_count_) %
         worker_count_;
     for (std::uint64_t device_offset = first_device_offset;
-         device_offset < device.data_block_count;
+         device_offset < device.data_block_count_;
          device_offset += worker_count_) {
       const std::uint32_t local_block =
-          static_cast<std::uint32_t>(device.data_block_begin + device_offset);
-      const std::uint64_t block_id = MakeBlockId(device.id, local_block);
+          static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);
+      const std::uint64_t block_id = MakeBlockId(device.id_, local_block);
       const DeviceAllocator& allocator = *device_allocators_[device_index];
       const std::size_t bitmap_byte = local_block / 8;
       const unsigned bitmap_bit = local_block % 8;
-      if ((std::to_integer<unsigned>(allocator.scan_bitmap[bitmap_byte]) &
+      if ((std::to_integer<unsigned>(allocator.scan_bitmap_[bitmap_byte]) &
            (1U << bitmap_bit)) == 0) {
         ReportRecoveryProgress(0, /*allocated=*/false);
         continue;
       }
-      const std::uint32_t file_id = device.file_index;
+      const std::uint32_t file_id = device.file_index_;
       const std::uint64_t block_offset =
           static_cast<std::uint64_t>(local_block) * kStorageBlockBytes;
       auto read = co_await ReadStorageBuffer(
-          *store.worker, store.files[file_id], header_buffer,
+          *store.worker_, store.files_[file_id], header_buffer,
           lease.registered(), block_offset);
       if (!read.ok()) {
         co_return read.status();
@@ -157,7 +157,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                                "short read while scanning block header");
       }
       std::span<const std::byte, kBlockHeaderBytes> block_bytes(
-          header_buffer.data, kBlockHeaderBytes);
+          header_buffer.data_, kBlockHeaderBytes);
       if (IsZero(block_bytes)) {
         zero_blocks->push_back(block_id);
         ReportRecoveryProgress(0, /*allocated=*/true);
@@ -175,38 +175,38 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
-      if (block.block_id != block_id) {
+      if (block.block_id_ != block_id) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "invalid or corrupt block header");
       }
-      AtomicMax(&recovery_device_cursors_[device_index].next_local,
+      AtomicMax(&recovery_device_cursors_[device_index].next_local_,
                 static_cast<std::uint64_t>(local_block) + 1);
-      AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch,
-                block.allocation_epoch + 1);
-      AtomicMax(&next_lsn_, block.max_lsn + 1);
+      AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch_,
+                block.allocation_epoch_ + 1);
+      AtomicMax(&next_lsn_, block.max_lsn_ + 1);
 
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
       batches->at(block_owner)
-          .blocks.push_back(RecoveryBlock{ActiveBlock{
-              .block_id = block_id,
-              .writer_id = block.writer_id,
-              .layout_worker_count = block.layout_worker_count,
-              .allocation_epoch = block.allocation_epoch,
-              .committed_bytes = block.committed_bytes,
-              .record_count = block.record_count,
-              .max_lsn = block.max_lsn,
-              .kind = block.kind,
-              .extent_index = block.extent_index,
-              .extent_payload_checksum = block.extent_payload_checksum,
+          .blocks_.push_back(RecoveryBlock{ActiveBlock{
+              .block_id_ = block_id,
+              .writer_id_ = block.writer_id_,
+              .layout_worker_count_ = block.layout_worker_count_,
+              .allocation_epoch_ = block.allocation_epoch_,
+              .committed_bytes_ = block.committed_bytes_,
+              .record_count_ = block.record_count_,
+              .max_lsn_ = block.max_lsn_,
+              .kind_ = block.kind_,
+              .extent_index_ = block.extent_index_,
+              .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
 
-      if (block.kind == BlockKind::kValueExtent) {
+      if (block.kind_ == BlockKind::kValueExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
 
-      read = co_await ReadStorageBuffer(*store.worker, store.files[file_id],
-                                        recovery.buffer, recovery.registered(),
+      read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
+                                        recovery.buffer_, recovery.registered(),
                                         block_offset);
       if (!read.ok()) {
         co_return read.status();
@@ -218,9 +218,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
 
       std::uint32_t record_offset = kBlockHeaderBytes;
       std::uint32_t records = 0;
-      while (record_offset < block.committed_bytes) {
+      while (record_offset < block.committed_bytes_) {
         const std::optional<std::uint32_t> next = NextRecordOffset(
-            recovery.buffer.data, record_offset, block.committed_bytes);
+            recovery.buffer_.data_, record_offset, block.committed_bytes_);
         if (!next.has_value()) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
@@ -232,125 +232,126 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         RecordHeader record{};
         std::string_view key;
         std::span<const std::byte> record_bytes(
-            recovery.buffer.data + record_offset,
-            block.committed_bytes - record_offset);
+            recovery.buffer_.data_ + record_offset,
+            block.committed_bytes_ - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
-            record.allocation_epoch != block.allocation_epoch ||
-            record.relocation_sequence >
+            record.allocation_epoch_ != block.allocation_epoch_ ||
+            record.relocation_sequence_ >
                 std::numeric_limits<std::uint32_t>::max() ||
-            record_offset + record.total_disk_bytes > block.committed_bytes) {
+            record_offset + record.total_disk_bytes_ > block.committed_bytes_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
         }
-        AtomicMax(&next_lsn_, record.lsn + 1);
-        AtomicMax(&recovery_max_txid_, record.txid);
-        if (record.kind == RecordKind::kTxCommit) {
+        AtomicMax(&next_lsn_, record.lsn_ + 1);
+        AtomicMax(&recovery_max_txid_, record.txid_);
+        if (record.kind_ == RecordKind::kTxCommit) {
           // A commit decision, not a keyed record: exempt from the key and
           // epoch filters below — the transaction it commits may span
           // databases and partitions whose epochs are unrelated to this
           // record's own header fields.
-          committed_txids->insert(record.txid);
-          record_offset += record.total_disk_bytes;
+          committed_txids->insert(record.txid_);
+          record_offset += record.total_disk_bytes_;
           ++records;
           continue;
         }
-        if (record.digest != ComputeDigest(key) ||
-            StorageShardForKey(key) % block.layout_worker_count !=
-                block.writer_id) {
+        if (record.digest_ != ComputeDigest(key) ||
+            StorageShardForKey(key) % block.layout_worker_count_ !=
+                block.writer_id_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
         }
-        if (record.db_epoch != DbEpoch(record.db_id)) {
-          record_offset += record.total_disk_bytes;
+        if (record.db_epoch_ != DbEpoch(record.db_id_)) {
+          record_offset += record.total_disk_bytes_;
           ++records;
           continue;
         }
         const std::uint16_t partition_id = RedisSlot(key);
-        if (record.replication_epoch !=
+        if (record.replication_epoch_ !=
             epoch_values_[kLogicalDatabaseCount + partition_id]) {
-          record_offset += record.total_disk_bytes;
+          record_offset += record.total_disk_bytes_;
           ++records;
           continue;
         }
         const unsigned key_owner = OwnerForKey(key);
         std::shared_ptr<const std::vector<ExtentRef>> extents;
-        if (record.external) {
-          if (record.kind != RecordKind::kValue ||
-              record.value_type != ValueType::kString) {
+        if (record.external_) {
+          if (record.kind_ != RecordKind::kValue ||
+              record.value_type_ != ValueType::kString) {
             co_return absl::Status(absl::StatusCode::kInternal,
                                    "unsupported external record type");
           }
           const std::byte* payload =
-              recovery.buffer.data + record_offset + record.header_bytes;
-          if (Crc32c(std::span<const std::byte>(
-                  payload, record.payload_bytes)) != record.payload_checksum) {
+              recovery.buffer_.data_ + record_offset + record.header_bytes_;
+          if (Crc32c(
+                  std::span<const std::byte>(payload, record.payload_bytes_)) !=
+              record.payload_checksum_) {
             co_return absl::Status(absl::StatusCode::kInternal,
                                    "external manifest checksum mismatch");
           }
           auto decoded = DecodeManifest(
-              std::span<const std::byte>(payload, record.payload_bytes),
-              record.logical_size);
+              std::span<const std::byte>(payload, record.payload_bytes_),
+              record.logical_size_);
           if (!decoded.ok()) {
             co_return decoded.status();
           }
           extents = std::move(*decoded);
         }
-        batches->at(key_owner).records.push_back(RecoveryRecord{
-            .digest = record.digest,
-            .key = std::string(key),
-            .db_id = record.db_id,
-            .txid = record.txid,
-            .location =
+        batches->at(key_owner).records_.push_back(RecoveryRecord{
+            .digest_ = record.digest_,
+            .key_ = std::string(key),
+            .db_id_ = record.db_id_,
+            .txid_ = record.txid_,
+            .location_ =
                 RecordLocation{
-                    .block_id = block_id,
-                    .replication_epoch = record.replication_epoch,
-                    .mutation_sequence = record.mutation_sequence,
-                    .allocation_epoch = record.allocation_epoch,
-                    .expire_at_ms = record.expire_at_ms,
-                    .block_owner = block_owner,
-                    .record_offset = record_offset,
-                    .total_disk_bytes = record.total_disk_bytes,
-                    .logical_size = record.logical_size,
-                    .payload_bytes = record.payload_bytes,
-                    .relocation_sequence =
-                        static_cast<std::uint32_t>(record.relocation_sequence),
-                    .external = record.external,
-                    .kind = record.kind,
-                    .value_type = record.value_type,
-                    .extents = std::move(extents),
+                    .block_id_ = block_id,
+                    .replication_epoch_ = record.replication_epoch_,
+                    .mutation_sequence_ = record.mutation_sequence_,
+                    .allocation_epoch_ = record.allocation_epoch_,
+                    .expire_at_ms_ = record.expire_at_ms_,
+                    .block_owner_ = block_owner,
+                    .record_offset_ = record_offset,
+                    .total_disk_bytes_ = record.total_disk_bytes_,
+                    .logical_size_ = record.logical_size_,
+                    .payload_bytes_ = record.payload_bytes_,
+                    .relocation_sequence_ =
+                        static_cast<std::uint32_t>(record.relocation_sequence_),
+                    .external_ = record.external_,
+                    .kind_ = record.kind_,
+                    .value_type_ = record.value_type_,
+                    .extents_ = std::move(extents),
                 },
         });
-        record_offset += record.total_disk_bytes;
+        record_offset += record.total_disk_bytes_;
         ++records;
       }
-      if (record_offset != block.committed_bytes ||
-          records != block.record_count) {
+      if (record_offset != block.committed_bytes_ ||
+          records != block.record_count_) {
         co_return absl::Status(
             absl::StatusCode::kInternal,
             "block committed boundary does not match records");
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
     }
-    device_linear_begin += device.data_block_count;
+    device_linear_begin += device.data_block_count_;
   }
   co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
   WorkerStore& store = *stores_[target];
-  for (const RecoveryBlock& recovered : batch.blocks) {
-    const ActiveBlock& block = recovered.block;
-    BlockState& state = CreateBlockState(store, block.block_id);
-    state.writer_id = block.writer_id;
-    state.layout_worker_count = block.layout_worker_count;
-    state.allocation_epoch = block.allocation_epoch;
-    state.committed_bytes = block.committed_bytes;
-    state.allocated = true;
-    state.kind = block.kind;
-    if (block.kind == BlockKind::kValueExtent) {
-      store.recovered_extents[block.block_id] = ExtentIdentity{
-          .extent_index = block.extent_index,
-          .payload_checksum = block.extent_payload_checksum,
+  for (const RecoveryBlock& recovered : batch.blocks_) {
+    const ActiveBlock& block = recovered.block_;
+    BlockState& state = CreateBlockState(store, block.block_id_);
+    state.writer_id_ = block.writer_id_;
+    state.layout_worker_count_ = block.layout_worker_count_;
+    state.allocation_epoch_ = block.allocation_epoch_;
+    state.committed_bytes_ = block.committed_bytes_;
+    state.allocated_ = true;
+    state.kind_ = block.kind_;
+    if (block.kind_ == BlockKind::kValueExtent) {
+      store.recovered_extents_[block.block_id_] = ExtentIdentity{
+          .extent_index_ = block.extent_index_,
+          .payload_checksum_ = block.extent_payload_checksum_,
       };
     }
 
@@ -358,12 +359,12 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
     // appending to one would otherwise dereference an absent in-memory copy.
   }
 
-  for (const RecoveryRecord& recovered : batch.records) {
-    if (recovered.txid != 0) {
+  for (const RecoveryRecord& recovered : batch.records_) {
+    if (recovered.txid_ != 0) {
       // Whether this record's transaction committed is only decidable once
       // every worker's scan has fed the committed set; park it until after
       // the recovery barrier.
-      store.recovery_tx_records.push_back(recovered);
+      store.recovery_tx_records_.push_back(recovered);
       continue;
     }
     ApplyRecoveredRecord(store, recovered);
@@ -373,60 +374,62 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
 void StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, const RecoveryRecord& recovered) {
   {
-    auto& partition = PartitionForKey(store, recovered.key);
-    if (recovered.location.replication_epoch != partition.replication_epoch) {
+    auto& partition = PartitionForKey(store, recovered.key_);
+    if (recovered.location_.replication_epoch_ !=
+        partition.replication_epoch_) {
       return;
     }
-    partition.mutation_sequence = std::max(
-        partition.mutation_sequence, recovered.location.mutation_sequence);
-    auto& index = partition.indexes[recovered.db_id];
-    auto* found = index.Find(recovered.digest, recovered.key);
+    partition.mutation_sequence_ = std::max(
+        partition.mutation_sequence_, recovered.location_.mutation_sequence_);
+    auto& index = partition.indexes_[recovered.db_id_];
+    auto* found = index.Find(recovered.digest_, recovered.key_);
     // The shielding bit is not persisted; recovery rebuilds it exactly,
     // since every surviving record of the key passes through this merge:
     // whichever version currently wins learns whether a strictly older,
     // still-unexpired value remains on disk. Equal sequences are relocated
     // copies of the same version and shield nothing.
-    if (found == nullptr || IsNewer(recovered.location, found->value)) {
+    if (found == nullptr || IsNewer(recovered.location_, found->value_)) {
       const bool was_live =
-          found != nullptr && found->value.kind == RecordKind::kValue;
-      const bool is_live = recovered.location.kind == RecordKind::kValue;
-      const bool was_expiring = was_live && found->value.expire_at_ms != 0;
-      const bool is_expiring = is_live && recovered.location.expire_at_ms != 0;
-      RecordLocation winner = recovered.location;
+          found != nullptr && found->value_.kind_ == RecordKind::kValue;
+      const bool is_live = recovered.location_.kind_ == RecordKind::kValue;
+      const bool was_expiring = was_live && found->value_.expire_at_ms_ != 0;
+      const bool is_expiring =
+          is_live && recovered.location_.expire_at_ms_ != 0;
+      RecordLocation winner = recovered.location_;
       if (found != nullptr) {
-        winner.shielding =
-            found->value.shielding ||
-            (found->value.kind == RecordKind::kValue &&
-             found->value.mutation_sequence <
-                 recovered.location.mutation_sequence &&
-             (found->value.expire_at_ms == 0 ||
-              found->value.expire_at_ms >
-                  std::max(recovered.location.expire_at_ms, UnixTimeMillis())));
+        winner.shielding_ = found->value_.shielding_ ||
+                            (found->value_.kind_ == RecordKind::kValue &&
+                             found->value_.mutation_sequence_ <
+                                 recovered.location_.mutation_sequence_ &&
+                             (found->value_.expire_at_ms_ == 0 ||
+                              found->value_.expire_at_ms_ >
+                                  std::max(recovered.location_.expire_at_ms_,
+                                           UnixTimeMillis())));
       }
-      index.InsertOrAssign(recovered.digest, recovered.key, winner);
+      index.InsertOrAssign(recovered.digest_, recovered.key_, winner);
       if (was_live != is_live) {
         if (is_live) {
-          ++partition.live_key_count[recovered.db_id];
-          ++store.live_key_count[recovered.db_id];
+          ++partition.live_key_count_[recovered.db_id_];
+          ++store.live_key_count_[recovered.db_id_];
         } else {
-          --partition.live_key_count[recovered.db_id];
-          --store.live_key_count[recovered.db_id];
+          --partition.live_key_count_[recovered.db_id_];
+          --store.live_key_count_[recovered.db_id_];
         }
       }
       if (was_expiring != is_expiring) {
         if (is_expiring) {
-          ++partition.expiring_key_count[recovered.db_id];
+          ++partition.expiring_key_count_[recovered.db_id_];
         } else {
-          --partition.expiring_key_count[recovered.db_id];
+          --partition.expiring_key_count_[recovered.db_id_];
         }
       }
-    } else if (recovered.location.kind == RecordKind::kValue &&
-               recovered.location.mutation_sequence <
-                   found->value.mutation_sequence &&
-               (recovered.location.expire_at_ms == 0 ||
-                recovered.location.expire_at_ms >
-                    std::max(found->value.expire_at_ms, UnixTimeMillis()))) {
-      found->value.shielding = true;
+    } else if (recovered.location_.kind_ == RecordKind::kValue &&
+               recovered.location_.mutation_sequence_ <
+                   found->value_.mutation_sequence_ &&
+               (recovered.location_.expire_at_ms_ == 0 ||
+                recovered.location_.expire_at_ms_ >
+                    std::max(found->value_.expire_at_ms_, UnixTimeMillis()))) {
+      found->value_.shielding_ = true;
     }
   }
 }

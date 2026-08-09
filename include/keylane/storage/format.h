@@ -49,15 +49,15 @@ enum class MetadataPageKind : std::uint16_t {
 };
 
 struct MetadataPageHeader {
-  std::uint64_t magic = kMetadataPageMagic;
-  std::uint32_t version = kStorageFormatVersion;
-  MetadataPageKind kind = MetadataPageKind::kEpochs;
-  std::uint16_t header_bytes = 0;
-  std::uint32_t page_index = 0;
-  std::uint32_t payload_bytes = 0;
-  std::uint64_t generation = 0;
-  std::uint32_t checksum = 0;
-  std::uint32_t reserved = 0;
+  std::uint64_t magic_ = kMetadataPageMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  MetadataPageKind kind_ = MetadataPageKind::kEpochs;
+  std::uint16_t header_bytes_ = 0;
+  std::uint32_t page_index_ = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint64_t generation_ = 0;
+  std::uint32_t checksum_ = 0;
+  std::uint32_t reserved_ = 0;
 };
 
 inline constexpr std::size_t kMetadataPagePayloadBytes =
@@ -121,7 +121,7 @@ constexpr std::uint64_t LocalBlockOffset(std::uint64_t block_id) noexcept {
 }
 
 struct Digest {
-  std::array<std::uint8_t, 20> bytes{};
+  std::array<std::uint8_t, 20> bytes_{};
 
   bool operator==(const Digest&) const noexcept = default;
 };
@@ -162,90 +162,90 @@ enum class ValueType : std::uint8_t {
 };
 
 struct BlockHeader {
-  std::uint64_t magic = kBlockMagic;
-  std::uint64_t block_id = kInvalidBlockId;
-  std::uint32_t version = kStorageFormatVersion;
-  std::uint32_t header_bytes = kBlockHeaderBytes;
-  std::uint32_t block_bytes = kStorageBlockBytes;
-  std::uint32_t writer_id = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t committed_bytes = kBlockHeaderBytes;
-  std::uint32_t record_count = 0;
-  std::uint64_t max_lsn = 0;
+  std::uint64_t magic_ = kBlockMagic;
+  std::uint64_t block_id_ = kInvalidBlockId;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t header_bytes_ = kBlockHeaderBytes;
+  std::uint32_t block_bytes_ = kStorageBlockBytes;
+  std::uint32_t writer_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t committed_bytes_ = kBlockHeaderBytes;
+  std::uint32_t record_count_ = 0;
+  std::uint64_t max_lsn_ = 0;
   // Incremented on every header write for this allocation, and the slot that
   // write lands in is its parity. Slot resolution compares this rather than
   // committed_bytes, which can tie. A flush advances committed_bytes by at
   // least one page, so this cannot exceed kStorageBlockBytes / 4096.
-  std::uint32_t header_sequence = 0;
-  std::uint32_t checksum = 0;
-  std::uint32_t layout_worker_count = 0;
-  BlockKind kind = BlockKind::kRecords;
-  std::array<std::uint8_t, 3> reserved{};
-  std::uint32_t extent_index = 0;
-  std::uint32_t extent_payload_bytes = 0;
-  std::uint32_t extent_payload_checksum = 0;
+  std::uint32_t header_sequence_ = 0;
+  std::uint32_t checksum_ = 0;
+  std::uint32_t layout_worker_count_ = 0;
+  BlockKind kind_ = BlockKind::kRecords;
+  std::array<std::uint8_t, 3> reserved_{};
+  std::uint32_t extent_index_ = 0;
+  std::uint32_t extent_payload_bytes_ = 0;
+  std::uint32_t extent_payload_checksum_ = 0;
 };
 
 // Every configured file or raw block device has an immutable identity. Fixed
 // metadata follows this label, and data begins at DataBlockBegin(capacity).
 struct DeviceLabel {
-  std::uint64_t magic = kDeviceLabelMagic;
-  std::uint32_t version = kStorageFormatVersion;
-  std::uint32_t header_bytes = kDirectIoAlignment;
-  std::uint64_t storage_set_id = 0;
-  std::uint64_t device_id = 0;
-  std::uint64_t capacity_blocks = 0;
-  std::uint32_t device_count = 0;
-  std::uint32_t block_bytes = kStorageBlockBytes;
-  std::uint32_t checksum = 0;
+  std::uint64_t magic_ = kDeviceLabelMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t header_bytes_ = kDirectIoAlignment;
+  std::uint64_t storage_set_id_ = 0;
+  std::uint64_t device_id_ = 0;
+  std::uint64_t capacity_blocks_ = 0;
+  std::uint32_t device_count_ = 0;
+  std::uint32_t block_bytes_ = kStorageBlockBytes;
+  std::uint32_t checksum_ = 0;
 };
 
 struct RecordHeader {
-  std::uint64_t magic = kRecordMagic;
-  std::uint32_t version = kStorageFormatVersion;
-  std::uint16_t header_bytes = 0;
-  RecordKind kind = RecordKind::kValue;
-  std::uint8_t db_id = 0;
-  ValueType value_type = ValueType::kNone;
+  std::uint64_t magic_ = kRecordMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint16_t header_bytes_ = 0;
+  RecordKind kind_ = RecordKind::kValue;
+  std::uint8_t db_id_ = 0;
+  ValueType value_type_ = ValueType::kNone;
   // Transient decoded form. This byte is zero on disk; external is encoded in
   // the high bit of value_type.
-  bool external = false;
-  Digest digest{};
-  std::uint32_t key_bytes = 0;
+  bool external_ = false;
+  Digest digest_{};
+  std::uint32_t key_bytes_ = 0;
   // Redis-visible size: bytes for String and cardinality for collections.
-  std::uint64_t logical_size = 0;
+  std::uint64_t logical_size_ = 0;
   // Physical payload following this header. External roots store a manifest.
-  std::uint32_t payload_bytes = 0;
-  std::uint32_t total_disk_bytes = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
   // Multi-key transaction id, or 0 for a standalone write. Recovery keeps a
   // tagged record only if it also finds the transaction's kTxCommit record;
   // untagged records are kept unconditionally. (This slot was `generation`,
   // the original newest-wins ordinal, orphaned when replication introduced
   // the (replication_epoch, mutation_sequence) order.)
-  std::uint64_t txid = 0;
-  std::uint64_t replication_epoch = 1;
-  std::uint64_t db_epoch = 1;
-  std::uint64_t mutation_sequence = 0;
-  std::uint64_t relocation_sequence = 0;
+  std::uint64_t txid_ = 0;
+  std::uint64_t replication_epoch_ = 1;
+  std::uint64_t db_epoch_ = 1;
+  std::uint64_t mutation_sequence_ = 0;
+  std::uint64_t relocation_sequence_ = 0;
   // Absolute Unix time in milliseconds. Zero means the value does not expire.
-  std::uint64_t expire_at_ms = 0;
-  std::uint64_t lsn = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t payload_checksum = 0;
-  std::uint32_t header_checksum = 0;
+  std::uint64_t expire_at_ms_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t payload_checksum_ = 0;
+  std::uint32_t header_checksum_ = 0;
 };
 
 struct ExtentManifestHeader {
-  std::uint64_t magic = kExtentManifestMagic;
-  std::uint32_t version = kStorageFormatVersion;
-  std::uint32_t extent_count = 0;
+  std::uint64_t magic_ = kExtentManifestMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t extent_count_ = 0;
 };
 
 struct ExtentRef {
-  std::uint64_t block_id = kInvalidBlockId;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t payload_bytes = 0;
-  std::uint32_t payload_checksum = 0;
+  std::uint64_t block_id_ = kInvalidBlockId;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint32_t payload_checksum_ = 0;
 };
 
 inline constexpr std::size_t kExtentPayloadBytes =

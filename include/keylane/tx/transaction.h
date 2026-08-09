@@ -22,17 +22,17 @@ class TxShard;
 // fingerprint, database, and mode for locking, and the argument index it
 // came from so shard callbacks can find paired values and reply slots.
 struct TxKey {
-  storage::Digest digest;
-  LockFp fp = 0;
-  std::uint32_t arg_index = 0;
-  LockMode mode = LockMode::kShared;
-  std::uint8_t db = 0;
+  storage::Digest digest_;
+  LockFp fp_ = 0;
+  std::uint32_t arg_index_ = 0;
+  LockMode mode_ = LockMode::kShared;
+  std::uint8_t db_ = 0;
 };
 
 // The per-shard view handed to a shard callback: this shard's keys in
 // argument order, duplicates included (locking is deduplicated separately).
 struct ShardSlice {
-  std::span<const TxKey> keys;
+  std::span<const TxKey> keys_;
 };
 
 // Shard callbacks are plain function pointers with a caller-owned context so
@@ -96,29 +96,29 @@ class Transaction {
   struct ShardData;
 
   struct ShardMsg : celer::RemoteWork {
-    ShardData* sd = nullptr;
+    ShardData* sd_ = nullptr;
   };
 
   struct ShardData {
-    ShardMsg msg;
-    Transaction* tx = nullptr;
-    TxWaiter node;
-    absl::Status status;
-    std::uint16_t shard_id = 0;
-    std::uint16_t key_begin = 0;
-    std::uint16_t key_count = 0;
-    std::uint16_t lock_begin = 0;
-    std::uint16_t lock_count = 0;
-    Phase phase = Phase::kSchedule;
-    bool schedule_failed = false;
-    bool granted = false;
+    ShardMsg msg_;
+    Transaction* tx_ = nullptr;
+    TxWaiter node_;
+    absl::Status status_;
+    std::uint16_t shard_id_ = 0;
+    std::uint16_t key_begin_ = 0;
+    std::uint16_t key_count_ = 0;
+    std::uint16_t lock_begin_ = 0;
+    std::uint16_t lock_count_ = 0;
+    Phase phase_ = Phase::kSchedule;
+    bool schedule_failed_ = false;
+    bool granted_ = false;
   };
 
   struct RoundAwaiter {
-    Transaction* tx;
-    Phase phase;
+    Transaction* tx_;
+    Phase phase_;
 
-    bool await_ready() const noexcept { return tx->RoundTargets(phase) == 0; }
+    bool await_ready() const noexcept { return tx_->RoundTargets(phase_) == 0; }
     void await_suspend(std::coroutine_handle<> handle);
     void await_resume() const noexcept {}
   };

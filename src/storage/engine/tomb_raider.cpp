@@ -14,13 +14,13 @@ namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(WorkerStore* store) {
   const auto interval =
-      std::chrono::milliseconds(options_.tomb_raider_interval_ms);
-  while (!store->worker->stop_requested()) {
-    absl::Status waited = co_await celer::SleepFor(*store->worker, interval);
+      std::chrono::milliseconds(options_.tomb_raider_interval_ms_);
+  while (!store->worker_->stop_requested()) {
+    absl::Status waited = co_await celer::SleepFor(*store->worker_, interval);
     if (!waited.ok()) {
       co_return waited;
     }
-    if (store->worker->stop_requested() ||
+    if (store->worker_->stop_requested() ||
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;
     }
@@ -45,11 +45,11 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   // requested — a forfeited round costs nothing, the next run redoes it.
   active_settlements_.fetch_add(1, std::memory_order_acq_rel);
   struct RoundGuard {
-    std::atomic<bool>* running;
-    std::atomic<std::uint32_t>* settlements;
+    std::atomic<bool>* running_;
+    std::atomic<std::uint32_t>* settlements_;
     ~RoundGuard() {
-      settlements->fetch_sub(1, std::memory_order_acq_rel);
-      running->store(false, std::memory_order_release);
+      settlements_->fetch_sub(1, std::memory_order_acq_rel);
+      running_->store(false, std::memory_order_release);
     }
   } round_guard{&tomb_raider_running_, &active_settlements_};
 
@@ -88,9 +88,9 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
 
 Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
   std::size_t steps = 0;
-  for (auto& partition : store.partitions) {
+  for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      auto& index = partition.indexes[db_id];
+      auto& index = partition.indexes_[db_id];
       if (index.empty()) {
         continue;
       }
@@ -100,14 +100,14 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
           co_return absl::OkStatus();  // forfeit the round
         }
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
-          if (entry.value.kind == RecordKind::kTombstone ||
-              (entry.value.kind == RecordKind::kValue &&
-               entry.value.shielding)) {
-            entry.value.unclaimed = true;
+          if (entry.value_.kind_ == RecordKind::kTombstone ||
+              (entry.value_.kind_ == RecordKind::kValue &&
+               entry.value_.shielding_)) {
+            entry.value_.unclaimed_ = true;
           }
         });
         if (++steps % 256 == 0) {
-          co_await celer::Yield(*store.worker);
+          co_await celer::Yield(*store.worker_);
         }
       } while (cursor != 0);
     }
@@ -119,17 +119,17 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
     WorkerStore& store, std::vector<TombClaim> claims) {
   std::size_t handled = 0;
   for (const TombClaim& claim : claims) {
-    auto& partition = PartitionForKey(store, claim.key);
-    if (partition.replication_epoch == claim.replication_epoch) {
+    auto& partition = PartitionForKey(store, claim.key_);
+    if (partition.replication_epoch_ == claim.replication_epoch_) {
       auto* entry =
-          partition.indexes[claim.db_id].Find(claim.digest, claim.key);
-      if (entry != nullptr && entry->value.unclaimed &&
-          claim.mutation_sequence < entry->value.mutation_sequence) {
-        entry->value.unclaimed = false;
+          partition.indexes_[claim.db_id_].Find(claim.digest_, claim.key_);
+      if (entry != nullptr && entry->value_.unclaimed_ &&
+          claim.mutation_sequence_ < entry->value_.mutation_sequence_) {
+        entry->value_.unclaimed_ = false;
       }
     }
     if (++handled % 256 == 0) {
-      co_await celer::Yield(*store.worker);
+      co_await celer::Yield(*store.worker_);
     }
   }
   co_return absl::OkStatus();
@@ -137,42 +137,42 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
 
 Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
   struct SweepBuffer {
-    RegisteredBufferPool* pool = nullptr;
-    std::uint16_t buffer_id = 0;
-    std::byte* heap_data = nullptr;
-    FixedBuffer buffer{};
+    RegisteredBufferPool* pool_ = nullptr;
+    std::uint16_t buffer_id_ = 0;
+    std::byte* heap_data_ = nullptr;
+    FixedBuffer buffer_{};
 
     ~SweepBuffer() {
-      if (buffer_id != 0) {
-        pool->ReleaseWriteBuffer(buffer_id);
-      } else if (heap_data != nullptr) {
-        pool->ReleaseHeapWriteBuffer(heap_data);
+      if (buffer_id_ != 0) {
+        pool_->ReleaseWriteBuffer(buffer_id_);
+      } else if (heap_data_ != nullptr) {
+        pool_->ReleaseHeapWriteBuffer(heap_data_);
       }
     }
 
-    bool registered() const noexcept { return buffer_id != 0; }
-  } sweep{.pool = &store.buffers};
-  if (store.buffers.TryAcquireWriteBuffer(&sweep.buffer_id)) {
-    sweep.buffer = store.buffers.write_buffer(sweep.buffer_id);
-  } else if (store.buffers.TryAcquireHeapWriteBuffer(&sweep.heap_data)) {
-    sweep.buffer = FixedBuffer{
-        .data = sweep.heap_data,
-        .size = options_.buffers.write_buffer_bytes,
-        .index = 0,
+    bool registered() const noexcept { return buffer_id_ != 0; }
+  } sweep{.pool_ = &store.buffers_};
+  if (store.buffers_.TryAcquireWriteBuffer(&sweep.buffer_id_)) {
+    sweep.buffer_ = store.buffers_.write_buffer(sweep.buffer_id_);
+  } else if (store.buffers_.TryAcquireHeapWriteBuffer(&sweep.heap_data_)) {
+    sweep.buffer_ = FixedBuffer{
+        .data_ = sweep.heap_data_,
+        .size_ = options_.buffers_.write_buffer_bytes_,
+        .index_ = 0,
     };
   } else {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "failed to allocate a tomb raider sweep buffer");
   }
-  if (sweep.buffer.size < kStorageBlockBytes) {
+  if (sweep.buffer_.size_ < kStorageBlockBytes) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "tomb raider sweep buffer is smaller than a block");
   }
-  sweep.buffer.size = kStorageBlockBytes;
+  sweep.buffer_.size_ = kStorageBlockBytes;
 
   struct BlockSnapshot {
-    std::uint64_t block_id = 0;
-    std::uint64_t allocation_epoch = 0;
+    std::uint64_t block_id_ = 0;
+    std::uint64_t allocation_epoch_ = 0;
   };
   // Blocks allocated after this snapshot cannot matter: new appends carry
   // higher sequences, and relocations only move index-current records — for
@@ -180,11 +180,11 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
   // index and is dropped by salvage, never moved.
   std::vector<BlockSnapshot> blocks;
   ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
-    if (state.kind == BlockKind::kRecords &&
-        state.committed_bytes > kBlockHeaderBytes) {
+    if (state.kind_ == BlockKind::kRecords &&
+        state.committed_bytes_ > kBlockHeaderBytes) {
       blocks.push_back(BlockSnapshot{
-          .block_id = block_id,
-          .allocation_epoch = state.allocation_epoch,
+          .block_id_ = block_id,
+          .allocation_epoch_ = state.allocation_epoch_,
       });
     }
   });
@@ -196,7 +196,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     if (batch.empty()) {
       co_return absl::OkStatus();
     }
-    if (owner == store.worker->id()) {
+    if (owner == store.worker_->id()) {
       co_return co_await TombClaimLocal(store, std::move(batch));
     }
     co_return co_await celer::SubmitTaskTo(
@@ -211,13 +211,13 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       co_return absl::OkStatus();  // forfeit the round
     }
-    BlockState* state = FindBlockState(store, snapshot.block_id);
-    if (state == nullptr || !state->allocated ||
-        state->allocation_epoch != snapshot.allocation_epoch ||
-        state->kind != BlockKind::kRecords) {
+    BlockState* state = FindBlockState(store, snapshot.block_id_);
+    if (state == nullptr || !state->allocated_ ||
+        state->allocation_epoch_ != snapshot.allocation_epoch_ ||
+        state->kind_ != BlockKind::kRecords) {
       continue;  // freed or reused: its old records left the disk with it
     }
-    const std::uint32_t committed = state->committed_bytes;
+    const std::uint32_t committed = state->committed_bytes_;
     if (committed <= kBlockHeaderBytes) {
       continue;
     }
@@ -228,22 +228,22 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
       // without suspending, so the captured prefix is consistent and the
       // slot cannot be released underneath it.
       FixedBuffer staged =
-          slot->write_buffer_id != 0
-              ? store.buffers.write_buffer(slot->write_buffer_id)
-              : FixedBuffer{.data = slot->heap_data,
-                            .size = slot->heap_data_size,
-                            .index = 0};
-      if (staged.data == nullptr || staged.size < committed) {
+          slot->write_buffer_id_ != 0
+              ? store.buffers_.write_buffer(slot->write_buffer_id_)
+              : FixedBuffer{.data_ = slot->heap_data_,
+                            .size_ = slot->heap_data_size_,
+                            .index_ = 0};
+      if (staged.data_ == nullptr || staged.size_ < committed) {
         continue;
       }
-      std::memcpy(sweep.buffer.data, staged.data, committed);
+      std::memcpy(sweep.buffer_.data_, staged.data_, committed);
     } else {
       // Slotless blocks are fully flushed and never appended to again, so
       // the on-disk image below `committed` is final.
-      const auto [file_id, block_offset] = FileOffset(snapshot.block_id);
-      auto read = co_await ReadStorageBuffer(*store.worker,
-                                             store.files[file_id], sweep.buffer,
-                                             sweep.registered(), block_offset);
+      const auto [file_id, block_offset] = FileOffset(snapshot.block_id_);
+      auto read = co_await ReadStorageBuffer(
+          *store.worker_, store.files_[file_id], sweep.buffer_,
+          sweep.registered(), block_offset);
       if (!read.ok()) {
         co_return read.status();
       }
@@ -251,9 +251,9 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         co_return absl::Status(absl::StatusCode::kInternal,
                                "short block read during tomb raider sweep");
       }
-      BlockState* current = FindBlockState(store, snapshot.block_id);
-      if (current == nullptr || !current->allocated ||
-          current->allocation_epoch != snapshot.allocation_epoch) {
+      BlockState* current = FindBlockState(store, snapshot.block_id_);
+      if (current == nullptr || !current->allocated_ ||
+          current->allocation_epoch_ != snapshot.allocation_epoch_) {
         continue;  // reclaimed while the read was in flight
       }
     }
@@ -263,7 +263,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     std::size_t decoded = 0;
     while (record_offset < committed) {
       const std::optional<std::uint32_t> next =
-          NextRecordOffset(sweep.buffer.data, record_offset, committed);
+          NextRecordOffset(sweep.buffer_.data_, record_offset, committed);
       if (!next.has_value()) {
         break;  // torn or foreign bytes: nothing decodable remains
       }
@@ -273,29 +273,29 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
       }
       RecordHeader record{};
       std::string_view disk_key;
-      std::span<const std::byte> record_bytes(sweep.buffer.data + record_offset,
-                                              committed - record_offset);
+      std::span<const std::byte> record_bytes(
+          sweep.buffer_.data_ + record_offset, committed - record_offset);
       if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
-          record.allocation_epoch != snapshot.allocation_epoch ||
-          record.total_disk_bytes == 0 ||
-          record_offset + record.total_disk_bytes > committed) {
+          record.allocation_epoch_ != snapshot.allocation_epoch_ ||
+          record.total_disk_bytes_ == 0 ||
+          record_offset + record.total_disk_bytes_ > committed) {
         break;
       }
-      record_offset += record.total_disk_bytes;
+      record_offset += record.total_disk_bytes_;
       // Only a value that could still be alive claims its key's candidate:
       // expired values are suppressed by their own timestamp, tombstones
       // and commit records suppress nothing worth keeping a marker for,
       // and records from a flushed database epoch are already condemned.
-      if (record.kind == RecordKind::kValue &&
-          record.db_epoch == DbEpoch(record.db_id) &&
-          (record.expire_at_ms == 0 || record.expire_at_ms > now_ms)) {
+      if (record.kind_ == RecordKind::kValue &&
+          record.db_epoch_ == DbEpoch(record.db_id_) &&
+          (record.expire_at_ms_ == 0 || record.expire_at_ms_ > now_ms)) {
         const unsigned key_owner = OwnerForKey(disk_key);
         pending[key_owner].push_back(TombClaim{
-            .mutation_sequence = record.mutation_sequence,
-            .replication_epoch = record.replication_epoch,
-            .digest = record.digest,
-            .key = std::string(disk_key),
-            .db_id = record.db_id,
+            .mutation_sequence_ = record.mutation_sequence_,
+            .replication_epoch_ = record.replication_epoch_,
+            .digest_ = record.digest_,
+            .key_ = std::string(disk_key),
+            .db_id_ = record.db_id_,
         });
         if (pending[key_owner].size() >= 512) {
           absl::Status flushed = co_await flush_claims(key_owner);
@@ -305,15 +305,15 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         }
       }
       if (++decoded % 256 == 0) {
-        co_await celer::Yield(*store.worker);
+        co_await celer::Yield(*store.worker_);
       }
     }
     // Throttle: one block per sleep bounds the sweep's disk-bandwidth and
     // CPU share, so a full-disk round never crowds out online traffic.
-    if (options_.tomb_raider_sleep_ms != 0) {
+    if (options_.tomb_raider_sleep_ms_ != 0) {
       absl::Status slept = co_await celer::SleepFor(
-          *store.worker,
-          std::chrono::milliseconds(options_.tomb_raider_sleep_ms));
+          *store.worker_,
+          std::chrono::milliseconds(options_.tomb_raider_sleep_ms_));
       if (!slept.ok()) {
         co_return slept;
       }
@@ -330,44 +330,44 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
 
 Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
   struct Candidate {
-    Digest digest{};
-    std::string key;
-    std::uint8_t db_id = 0;
+    Digest digest_{};
+    std::string key_;
+    std::uint8_t db_id_ = 0;
   };
   std::vector<Candidate> tombs;
   std::uint64_t refreshed = 0;
   std::size_t steps = 0;
-  for (auto& partition : store.partitions) {
+  for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      auto& index = partition.indexes[db_id];
+      auto& index = partition.indexes_[db_id];
       if (index.empty()) {
         continue;
       }
       std::uint64_t cursor = 0;
       do {
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
-          if (!entry.value.unclaimed) {
+          if (!entry.value_.unclaimed_) {
             return;
           }
-          if (entry.value.kind == RecordKind::kValue) {
+          if (entry.value_.kind_ == RecordKind::kValue) {
             // The sweep found nothing this value was shielding: the sticky
             // bit outlived whatever it once protected. Its next expiry can
             // take the in-memory path.
-            entry.value.unclaimed = false;
-            if (entry.value.shielding) {
-              entry.value.shielding = false;
+            entry.value_.unclaimed_ = false;
+            if (entry.value_.shielding_) {
+              entry.value_.shielding_ = false;
               ++refreshed;
             }
-          } else if (entry.value.kind == RecordKind::kTombstone) {
+          } else if (entry.value_.kind_ == RecordKind::kTombstone) {
             tombs.push_back(Candidate{
-                .digest = entry.digest,
-                .key = entry.key,
-                .db_id = db_id,
+                .digest_ = entry.digest_,
+                .key_ = entry.key_,
+                .db_id_ = db_id,
             });
           }
         });
         if (++steps % 256 == 0) {
-          co_await celer::Yield(*store.worker);
+          co_await celer::Yield(*store.worker_);
         }
       } while (cursor != 0);
     }
@@ -379,36 +379,37 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       break;  // forfeit the rest; totals below still publish
     }
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        candidate.db_id, tx::FingerprintOf(candidate.digest),
+        candidate.db_id_, tx::FingerprintOf(candidate.digest_),
         tx::LockMode::kExclusive);
-    co_await store.store_state_mutex.Lock();
-    UnlockGuard unlock(&store.store_state_mutex, store.worker);
-    auto& partition = PartitionForKey(store, candidate.key);
-    auto* entry = partition.indexes[candidate.db_id].Find(candidate.digest,
-                                                          candidate.key);
-    if (entry == nullptr || entry->value.kind != RecordKind::kTombstone ||
-        !entry->value.unclaimed) {
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+    auto& partition = PartitionForKey(store, candidate.key_);
+    auto* entry = partition.indexes_[candidate.db_id_].Find(candidate.digest_,
+                                                            candidate.key_);
+    if (entry == nullptr || entry->value_.kind_ != RecordKind::kTombstone ||
+        !entry->value_.unclaimed_) {
       continue;  // rewritten or claimed since collection
     }
-    const RecordLocation dropped = entry->value;
+    const RecordLocation dropped = entry->value_;
     // No watcher or replica cares: erasing a tombstone changes nothing a
     // reader can observe. Only the flush completion's staged identities
     // dereference the entry by pointer, so detach them before it is freed.
-    for (auto& [block_id, identities] : store.staged_records) {
+    for (auto& [block_id, identities] : store.staged_records_) {
       for (RecordIdentity& identity : identities) {
-        if (identity.entry == entry) {
-          identity.entry = nullptr;
+        if (identity.entry_ == entry) {
+          identity.entry_ = nullptr;
         }
       }
     }
-    partition.indexes[candidate.db_id].Erase(candidate.digest, candidate.key);
+    partition.indexes_[candidate.db_id_].Erase(candidate.digest_,
+                                               candidate.key_);
     absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
     if (!dead.ok()) {
-      store.write_failed = true;
+      store.write_failed_ = true;
       co_return dead;
     }
     ++reaped;
-    co_await celer::Yield(*store.worker);
+    co_await celer::Yield(*store.worker_);
   }
   if (reaped != 0) {
     tomb_raider_reaped_.fetch_add(reaped, std::memory_order_relaxed);

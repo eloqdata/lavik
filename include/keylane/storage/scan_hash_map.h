@@ -37,18 +37,18 @@ template <typename Value>
 class ScanHashMap {
  public:
   struct Entry {
-    Digest digest{};
-    std::string key;
-    Value value{};
+    Digest digest_{};
+    std::string key_;
+    Value value_{};
 
     Entry(const Digest& digest_arg, std::string_view key_arg,
           const Value& value_arg)
-        : digest(digest_arg), key(key_arg), value(value_arg) {}
+        : digest_(digest_arg), key_(key_arg), value_(value_arg) {}
   };
 
   struct InsertResult {
-    Entry* entry = nullptr;
-    bool inserted = false;
+    Entry* entry_ = nullptr;
+    bool inserted_ = false;
   };
 
   ScanHashMap() = default;
@@ -68,7 +68,7 @@ class ScanHashMap {
   ~ScanHashMap() { Clear(); }
 
   std::size_t size() const noexcept {
-    return tables_[0].used + tables_[1].used;
+    return tables_[0].used_ + tables_[1].used_;
   }
 
   bool empty() const noexcept { return size() == 0; }
@@ -85,7 +85,7 @@ class ScanHashMap {
   InsertResult InsertOrAssign(const Digest& digest, std::string_view key,
                               const Value& value) {
     if (Entry* existing = Find(digest, key); existing != nullptr) {
-      existing->value = value;
+      existing->value_ = value;
       return {existing, false};
     }
 
@@ -112,21 +112,21 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets == nullptr) {
+      if (table.buckets_ == nullptr) {
         continue;
       }
-      Bucket* top = &table.buckets[hash & BucketMask(table)];
+      Bucket* top = &table.buckets_[hash & BucketMask(table)];
       for (Bucket* bucket = top; bucket != nullptr;
            bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
         const std::size_t slots =
             Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
         for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
-              KeyEquals(*bucket->entries[slot], digest, key)) {
-            delete bucket->entries[slot];
-            bucket->entries[slot] = nullptr;
+          if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
+              KeyEquals(*bucket->entries_[slot], digest, key)) {
+            delete bucket->entries_[slot];
+            bucket->entries_[slot] = nullptr;
             ClearOccupied(bucket, slot);
-            --table.used;
+            --table.used_;
             FillBucketHole(top, bucket, slot);
             return true;
           }
@@ -206,52 +206,52 @@ class ScanHashMap {
       std::numeric_limits<std::size_t>::max();
 
   struct alignas(64) Bucket {
-    std::uint8_t presence = 0;
-    std::array<std::uint8_t, kEntriesPerBucket> hashes{};
-    std::array<Entry*, kEntriesPerBucket> entries{};
+    std::uint8_t presence_ = 0;
+    std::array<std::uint8_t, kEntriesPerBucket> hashes_{};
+    std::array<Entry*, kEntriesPerBucket> entries_{};
   };
 
   static_assert(sizeof(Bucket) == 64);
 
   struct Table {
-    std::unique_ptr<Bucket[]> buckets;
-    std::uint8_t exponent = 0;
-    std::size_t used = 0;
+    std::unique_ptr<Bucket[]> buckets_;
+    std::uint8_t exponent_ = 0;
+    std::size_t used_ = 0;
   };
 
   static bool Chained(const Bucket& bucket) noexcept {
-    return (bucket.presence & kChainedBit) != 0;
+    return (bucket.presence_ & kChainedBit) != 0;
   }
 
   static bool Occupied(const Bucket& bucket, std::size_t slot) noexcept {
-    return (bucket.presence & (std::uint8_t{1} << slot)) != 0;
+    return (bucket.presence_ & (std::uint8_t{1} << slot)) != 0;
   }
 
   static void SetOccupied(Bucket* bucket, std::size_t slot) noexcept {
-    bucket->presence |= std::uint8_t{1} << slot;
+    bucket->presence_ |= std::uint8_t{1} << slot;
   }
 
   static void ClearOccupied(Bucket* bucket, std::size_t slot) noexcept {
-    bucket->presence &= ~(std::uint8_t{1} << slot);
+    bucket->presence_ &= ~(std::uint8_t{1} << slot);
   }
 
   static Bucket* Child(Bucket* bucket) noexcept {
     assert(Chained(*bucket));
-    return reinterpret_cast<Bucket*>(bucket->entries[kChildSlot]);
+    return reinterpret_cast<Bucket*>(bucket->entries_[kChildSlot]);
   }
 
   static const Bucket* Child(const Bucket* bucket) noexcept {
     assert(Chained(*bucket));
-    return reinterpret_cast<const Bucket*>(bucket->entries[kChildSlot]);
+    return reinterpret_cast<const Bucket*>(bucket->entries_[kChildSlot]);
   }
 
   static void SetChild(Bucket* bucket, Bucket* child) noexcept {
-    bucket->presence |= kChainedBit;
-    bucket->entries[kChildSlot] = reinterpret_cast<Entry*>(child);
+    bucket->presence_ |= kChainedBit;
+    bucket->entries_[kChildSlot] = reinterpret_cast<Entry*>(child);
   }
 
   static std::size_t BucketCount(const Table& table) noexcept {
-    return table.buckets == nullptr ? 0 : std::size_t{1} << table.exponent;
+    return table.buckets_ == nullptr ? 0 : std::size_t{1} << table.exponent_;
   }
 
   static std::uint64_t BucketMask(const Table& table) noexcept {
@@ -262,9 +262,9 @@ class ScanHashMap {
     std::uint64_t first = 0;
     std::uint64_t second = 0;
     std::uint32_t tail = 0;
-    std::memcpy(&first, digest.bytes.data(), sizeof(first));
-    std::memcpy(&second, digest.bytes.data() + sizeof(first), sizeof(second));
-    std::memcpy(&tail, digest.bytes.data() + 2 * sizeof(first), sizeof(tail));
+    std::memcpy(&first, digest.bytes_.data(), sizeof(first));
+    std::memcpy(&second, digest.bytes_.data() + sizeof(first), sizeof(second));
+    std::memcpy(&tail, digest.bytes_.data() + 2 * sizeof(first), sizeof(tail));
     first ^= second + 0x9e3779b97f4a7c15ULL + (first << 6) + (first >> 2);
     first ^= static_cast<std::uint64_t>(tail) * 0xbf58476d1ce4e5b9ULL;
     first ^= first >> 30;
@@ -280,7 +280,7 @@ class ScanHashMap {
 
   static bool KeyEquals(const Entry& entry, const Digest& digest,
                         std::string_view key) noexcept {
-    return entry.digest == digest && entry.key == key;
+    return entry.digest_ == digest && entry.key_ == key;
   }
 
   static std::uint64_t ReverseBits(std::uint64_t value) noexcept {
@@ -305,9 +305,9 @@ class ScanHashMap {
   bool Rehashing() const noexcept { return rehash_index_ != kNotRehashing; }
 
   void EnsureTable() {
-    if (tables_[0].buckets == nullptr) {
-      tables_[0].buckets = std::make_unique<Bucket[]>(1);
-      tables_[0].exponent = 0;
+    if (tables_[0].buckets_ == nullptr) {
+      tables_[0].buckets_ = std::make_unique<Bucket[]>(1);
+      tables_[0].exponent_ = 0;
     }
   }
 
@@ -316,14 +316,14 @@ class ScanHashMap {
       return;
     }
     const std::size_t buckets = BucketCount(tables_[0]);
-    if (tables_[0].used + 1 <= buckets * kTargetEntriesPerBucket) {
+    if (tables_[0].used_ + 1 <= buckets * kTargetEntriesPerBucket) {
       return;
     }
-    assert(tables_[0].exponent < 63);
-    tables_[1].exponent = tables_[0].exponent + 1;
-    tables_[1].buckets =
-        std::make_unique<Bucket[]>(std::size_t{1} << tables_[1].exponent);
-    tables_[1].used = 0;
+    assert(tables_[0].exponent_ < 63);
+    tables_[1].exponent_ = tables_[0].exponent_ + 1;
+    tables_[1].buckets_ =
+        std::make_unique<Bucket[]>(std::size_t{1} << tables_[1].exponent_);
+    tables_[1].used_ = 0;
     rehash_index_ = 0;
   }
 
@@ -332,10 +332,10 @@ class ScanHashMap {
       return;
     }
 
-    MoveBucket(&tables_[0].buckets[rehash_index_], &tables_[1]);
+    MoveBucket(&tables_[0].buckets_[rehash_index_], &tables_[1]);
     ++rehash_index_;
     if (rehash_index_ == BucketCount(tables_[0])) {
-      assert(tables_[0].used == 0);
+      assert(tables_[0].used_ == 0);
       tables_[0] = std::move(tables_[1]);
       tables_[1] = Table{};
       rehash_index_ = kNotRehashing;
@@ -344,18 +344,18 @@ class ScanHashMap {
 
   static Entry* FindInTable(Table& table, const Digest& digest,
                             std::string_view key, std::uint64_t hash) {
-    if (table.buckets == nullptr) {
+    if (table.buckets_ == nullptr) {
       return nullptr;
     }
-    Bucket* bucket = &table.buckets[hash & BucketMask(table)];
+    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
       const std::size_t slots =
           Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
-            KeyEquals(*bucket->entries[slot], digest, key)) {
-          return bucket->entries[slot];
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
+            KeyEquals(*bucket->entries_[slot], digest, key)) {
+          return bucket->entries_[slot];
         }
       }
       bucket = Chained(*bucket) ? Child(bucket) : nullptr;
@@ -388,18 +388,18 @@ class ScanHashMap {
   }
 
   static void AddToTable(Table& table, Entry* entry) {
-    const std::uint64_t hash = Hash(entry->digest);
+    const std::uint64_t hash = Hash(entry->digest_);
     const std::uint8_t tag = HashTag(hash);
-    Bucket* bucket = &table.buckets[hash & BucketMask(table)];
+    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     while (true) {
       const std::size_t slots =
           Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (!Occupied(*bucket, slot)) {
-          bucket->entries[slot] = entry;
-          bucket->hashes[slot] = tag;
+          bucket->entries_[slot] = entry;
+          bucket->hashes_[slot] = tag;
           SetOccupied(bucket, slot);
-          ++table.used;
+          ++table.used_;
           return;
         }
       }
@@ -409,13 +409,13 @@ class ScanHashMap {
       }
 
       auto* child = new Bucket();
-      Entry* displaced = bucket->entries[kChildSlot];
-      const std::uint8_t displaced_hash = bucket->hashes[kChildSlot];
+      Entry* displaced = bucket->entries_[kChildSlot];
+      const std::uint8_t displaced_hash = bucket->hashes_[kChildSlot];
       assert(Occupied(*bucket, kChildSlot));
       ClearOccupied(bucket, kChildSlot);
       SetChild(bucket, child);
-      child->entries[0] = displaced;
-      child->hashes[0] = displaced_hash;
+      child->entries_[0] = displaced;
+      child->hashes_[0] = displaced_hash;
       SetOccupied(child, 0);
       bucket = child;
     }
@@ -443,15 +443,15 @@ class ScanHashMap {
       }
     }
     if (last != kEntriesPerBucket && !(tail == holed && last == hole_slot)) {
-      holed->entries[hole_slot] = tail->entries[last];
-      holed->hashes[hole_slot] = tail->hashes[last];
+      holed->entries_[hole_slot] = tail->entries_[last];
+      holed->hashes_[hole_slot] = tail->hashes_[last];
       SetOccupied(holed, hole_slot);
-      tail->entries[last] = nullptr;
+      tail->entries_[last] = nullptr;
       ClearOccupied(tail, last);
     }
-    if (tail->presence == 0) {
-      parent->presence &= ~kChainedBit;
-      parent->entries[kChildSlot] = nullptr;
+    if (tail->presence_ == 0) {
+      parent->presence_ &= ~kChainedBit;
+      parent->entries_[kChildSlot] = nullptr;
       delete tail;
     }
   }
@@ -464,7 +464,7 @@ class ScanHashMap {
       const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot)) {
-          AddToTable(*target, bucket->entries[slot]);
+          AddToTable(*target, bucket->entries_[slot]);
           ClearOccupied(bucket, slot);
         }
       }
@@ -473,31 +473,31 @@ class ScanHashMap {
       }
       bucket = next;
     }
-    top->presence = 0;
-    top->entries.fill(nullptr);
-    top->hashes.fill(0);
+    top->presence_ = 0;
+    top->entries_.fill(nullptr);
+    top->hashes_.fill(0);
   }
 
   void MoveBucket(Bucket* top, Table* target) {
-    const std::size_t before = target->used;
+    const std::size_t before = target->used_;
     MoveBucketEntries(top, target);
-    const std::size_t moved = target->used - before;
-    assert(tables_[0].used >= moved);
-    tables_[0].used -= moved;
+    const std::size_t moved = target->used_ - before;
+    assert(tables_[0].used_ >= moved);
+    tables_[0].used_ -= moved;
   }
 
   template <typename Fn>
   static void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) {
-    if (table.buckets == nullptr) {
+    if (table.buckets_ == nullptr) {
       return;
     }
-    const Bucket* bucket = &table.buckets[index];
+    const Bucket* bucket = &table.buckets_[index];
     while (bucket != nullptr) {
       const std::size_t slots =
           Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot)) {
-          fn(*bucket->entries[slot]);
+          fn(*bucket->entries_[slot]);
         }
       }
       bucket = Chained(*bucket) ? Child(bucket) : nullptr;
@@ -515,7 +515,7 @@ class ScanHashMap {
   static void DestroyTable(Table& table, bool destroy_entries) noexcept {
     const std::size_t count = BucketCount(table);
     for (std::size_t index = 0; index < count; ++index) {
-      Bucket* top = &table.buckets[index];
+      Bucket* top = &table.buckets_[index];
       Bucket* bucket = top;
       while (bucket != nullptr) {
         const bool chained = Chained(*bucket);
@@ -524,7 +524,7 @@ class ScanHashMap {
         if (destroy_entries) {
           for (std::size_t slot = 0; slot < slots; ++slot) {
             if (Occupied(*bucket, slot)) {
-              delete bucket->entries[slot];
+              delete bucket->entries_[slot];
             }
           }
         }

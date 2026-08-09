@@ -92,9 +92,9 @@ class TxShard {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
-      waiter_.txid = shard_->AllocateTxid();
-      waiter_.keys = keys_;
-      waiter_.resume = handle;
+      waiter_.txid_ = shard_->AllocateTxid();
+      waiter_.keys_ = keys_;
+      waiter_.resume_ = handle;
       shard_->Enqueue(&waiter_);
     }
 
@@ -144,7 +144,7 @@ class TxShard {
   void Watch(std::uint8_t db_id, LockFp fp, std::uint64_t conn_id) {
     auto& entries = watches_[db_id][fp];
     for (const WatchEntry& entry : entries) {
-      if (entry.conn_id == conn_id) {
+      if (entry.conn_id_ == conn_id) {
         return;  // already registered; the existing marks stay
       }
     }
@@ -161,14 +161,14 @@ class TxShard {
       return;
     }
     for (WatchEntry& entry : it->second) {
-      entry.dirty = true;
+      entry.dirty_ = true;
     }
   }
 
   void MarkAllWatched(std::uint8_t db_id) {
     for (auto& [fp, entries] : watches_[db_id]) {
       for (WatchEntry& entry : entries) {
-        entry.dirty = true;
+        entry.dirty_ = true;
       }
     }
   }
@@ -182,8 +182,8 @@ class TxShard {
       return false;
     }
     for (const WatchEntry& entry : it->second) {
-      if (entry.conn_id == conn_id) {
-        return !entry.dirty;
+      if (entry.conn_id_ == conn_id) {
+        return !entry.dirty_;
       }
     }
     return false;
@@ -197,7 +197,7 @@ class TxShard {
     }
     auto& entries = it->second;
     for (std::size_t i = 0; i < entries.size(); ++i) {
-      if (entries[i].conn_id == conn_id) {
+      if (entries[i].conn_id_ == conn_id) {
         entries[i] = entries.back();
         entries.pop_back();
         break;
@@ -213,18 +213,18 @@ class TxShard {
   bool AcquireIntents(std::span<const KeyRef> keys) {
     bool granted = true;
     for (const KeyRef& key : keys) {
-      granted &= locks_[key.db].AcquireIntent(key.fp, key.mode);
+      granted &= locks_[key.db_].AcquireIntent(key.fp_, key.mode_);
     }
     return granted;
   }
   void ReleaseIntents(std::span<const KeyRef> keys) {
     for (const KeyRef& key : keys) {
-      locks_[key.db].ReleaseIntent(key.fp, key.mode);
+      locks_[key.db_].ReleaseIntent(key.fp_, key.mode_);
     }
   }
   bool CanHoldAll(std::span<const KeyRef> keys) const {
     for (const KeyRef& key : keys) {
-      if (!locks_[key.db].CanHold(key.fp, key.mode)) {
+      if (!locks_[key.db_].CanHold(key.fp_, key.mode_)) {
         return false;
       }
     }
@@ -232,12 +232,12 @@ class TxShard {
   }
   void AcquireHolds(std::span<const KeyRef> keys) {
     for (const KeyRef& key : keys) {
-      locks_[key.db].AcquireHold(key.fp, key.mode);
+      locks_[key.db_].AcquireHold(key.fp_, key.mode_);
     }
   }
   void ReleaseHolds(std::span<const KeyRef> keys) {
     for (const KeyRef& key : keys) {
-      locks_[key.db].ReleaseHold(key.fp, key.mode);
+      locks_[key.db_].ReleaseHold(key.fp_, key.mode_);
     }
   }
 
@@ -281,8 +281,8 @@ class TxShard {
   }
 
   struct WatchEntry {
-    std::uint64_t conn_id = 0;
-    bool dirty = false;
+    std::uint64_t conn_id_ = 0;
+    bool dirty_ = false;
   };
 
   std::array<LockTable, storage::kLogicalDatabaseCount> locks_;
@@ -314,10 +314,10 @@ class TxRuntime {
     return static_cast<unsigned>(shards_.size());
   }
 
-  std::atomic<std::uint64_t> next_txid{1};
+  std::atomic<std::uint64_t> next_txid_{1};
   // Multi-shard schedule rounds that failed the reorder rule and retried
   // with a fresh txid.
-  std::atomic<std::uint64_t> schedule_retries{0};
+  std::atomic<std::uint64_t> schedule_retries_{0};
 
  private:
   std::vector<std::unique_ptr<TxShard>> shards_;

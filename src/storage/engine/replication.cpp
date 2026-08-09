@@ -7,9 +7,10 @@ ScanBatch StorageEngine::Impl::ScanPartition(
     std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) const {
   assert(db_id < kLogicalDatabaseCount);
   assert(count > 0);
-  const auto& index = PartitionFor(CurrentStore(), partition_id).indexes[db_id];
+  const auto& index =
+      PartitionFor(CurrentStore(), partition_id).indexes_[db_id];
   ScanBatch result;
-  result.cursor = cursor;
+  result.cursor_ = cursor;
   if (now_ms == 0) {
     now_ms = UnixTimeMillis();
   }
@@ -20,16 +21,16 @@ ScanBatch StorageEngine::Impl::ScanPartition(
   std::size_t iterations = 0;
   std::size_t bytes = 0;
   do {
-    result.cursor =
-        index.Scan(result.cursor, [&](const RecordIndex::Entry& entry) {
-          if (entry.value.kind == RecordKind::kValue &&
-              !IsExpired(entry.value, now_ms)) {
-            bytes += entry.key.size();
-            result.keys.push_back(entry.key);
+    result.cursor_ =
+        index.Scan(result.cursor_, [&](const RecordIndex::Entry& entry) {
+          if (entry.value_.kind_ == RecordKind::kValue &&
+              !IsExpired(entry.value_, now_ms)) {
+            bytes += entry.key_.size();
+            result.keys_.push_back(entry.key_);
           }
         });
     ++iterations;
-  } while (result.cursor != 0 && result.keys.size() < count &&
+  } while (result.cursor_ != 0 && result.keys_.size() < count &&
            bytes < max_bytes && iterations < max_iterations);
   return result;
 }
@@ -37,16 +38,16 @@ ScanBatch StorageEngine::Impl::ScanPartition(
 PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
     std::uint16_t partition_id) {
   auto& partition = PartitionFor(CurrentStore(), partition_id);
-  partition.capture_deltas = true;
-  partition.deltas.clear();
-  partition.delta_floor = partition.mutation_sequence;
-  partition.delta_queued = false;
+  partition.capture_deltas_ = true;
+  partition.deltas_.clear();
+  partition.delta_floor_ = partition.mutation_sequence_;
+  partition.delta_queued_ = false;
   PartitionReplicationStart result;
-  result.snapshot_sequence = partition.mutation_sequence;
+  result.snapshot_sequence_ = partition.mutation_sequence_;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    result.db_epochs[db_id] = DbEpoch(db_id);
-    if (partition.live_key_count[db_id] != 0) {
-      result.nonempty_db_mask |= static_cast<std::uint16_t>(1U << db_id);
+    result.db_epochs_[db_id] = DbEpoch(db_id);
+    if (partition.live_key_count_[db_id] != 0) {
+      result.nonempty_db_mask_ |= static_cast<std::uint16_t>(1U << db_id);
     }
   }
   return result;
@@ -62,7 +63,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
   }
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
-  auto& index = partition.indexes[db_id];
+  auto& index = partition.indexes_[db_id];
   std::vector<std::string> keys;
   const std::uint64_t now_ms = UnixTimeMillis();
   std::uint64_t next = cursor;
@@ -73,28 +74,28 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
   std::size_t iterations = 0;
   do {
     next = index.Scan(next, [&](const RecordIndex::Entry& entry) {
-      if (entry.value.kind == RecordKind::kValue &&
-          !IsExpired(entry.value, now_ms)) {
-        keys.push_back(entry.key);
+      if (entry.value_.kind_ == RecordKind::kValue &&
+          !IsExpired(entry.value_, now_ms)) {
+        keys.push_back(entry.key_);
       }
     });
     ++iterations;
   } while (next != 0 && keys.size() < count && iterations < max_iterations);
 
   PartitionSnapshotBatch batch;
-  batch.cursor = next;
-  batch.records.reserve(keys.size());
+  batch.cursor_ = next;
+  batch.records_.reserve(keys.size());
   for (const std::string& key : keys) {
     const Digest digest = ComputeDigest(key);
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
     auto* current = index.Find(digest, key);
-    if (current == nullptr || current->value.kind != RecordKind::kValue) {
+    if (current == nullptr || current->value_.kind_ != RecordKind::kValue) {
       continue;
     }
-    const RecordLocation location = current->value;
+    const RecordLocation location = current->value_;
     if (IsExpired(location, UnixTimeMillis())) {
-      QueueExpiredCandidate(store, partition.id, db_id, *current);
+      QueueExpiredCandidate(store, partition.id_, db_id, *current);
       continue;
     }
     auto loaded = co_await LoadValue(store, db_id, key, digest, location);
@@ -105,16 +106,16 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
       co_return loaded.status();
     }
     const std::span<const std::byte> value = loaded->value();
-    batch.records.push_back(SnapshotRecord{
-        .kind = SnapshotRecord::Kind::kValue,
-        .db_id = db_id,
-        .db_epoch = DbEpoch(db_id),
-        .mutation_sequence = location.mutation_sequence,
-        .expire_at_ms = location.expire_at_ms,
-        .value_type = location.value_type,
-        .key = key,
-        .value = std::string(reinterpret_cast<const char*>(value.data()),
-                             value.size()),
+    batch.records_.push_back(SnapshotRecord{
+        .kind_ = SnapshotRecord::Kind::kValue,
+        .db_id_ = db_id,
+        .db_epoch_ = DbEpoch(db_id),
+        .mutation_sequence_ = location.mutation_sequence_,
+        .expire_at_ms_ = location.expire_at_ms_,
+        .value_type_ = location.value_type_,
+        .key_ = key,
+        .value_ = std::string(reinterpret_cast<const char*>(value.data()),
+                              value.size()),
     });
   }
   co_return batch;
@@ -124,18 +125,18 @@ PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
     std::uint16_t partition_id, std::uint64_t after_sequence,
     std::size_t count) {
   auto& partition = PartitionFor(CurrentStore(), partition_id);
-  partition.delta_queued = false;
+  partition.delta_queued_ = false;
   PartitionDeltaBatch batch;
-  batch.watermark = partition.mutation_sequence;
-  batch.overflow = after_sequence < partition.delta_floor;
-  if (batch.overflow || count == 0) {
+  batch.watermark_ = partition.mutation_sequence_;
+  batch.overflow_ = after_sequence < partition.delta_floor_;
+  if (batch.overflow_ || count == 0) {
     return batch;
   }
-  batch.records.reserve(std::min(count, partition.deltas.size()));
-  for (const SnapshotRecord& mutation : partition.deltas) {
-    if (mutation.mutation_sequence > after_sequence) {
-      batch.records.push_back(mutation);
-      if (batch.records.size() == count) {
+  batch.records_.reserve(std::min(count, partition.deltas_.size()));
+  for (const SnapshotRecord& mutation : partition.deltas_) {
+    if (mutation.mutation_sequence_ > after_sequence) {
+      batch.records_.push_back(mutation);
+      if (batch.records_.size() == count) {
         break;
       }
     }
@@ -146,15 +147,15 @@ PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
 void StorageEngine::Impl::AcknowledgePartitionDeltas(
     std::uint16_t partition_id, std::uint64_t through_sequence) {
   auto& partition = PartitionFor(CurrentStore(), partition_id);
-  while (!partition.deltas.empty() &&
-         partition.deltas.front().mutation_sequence <= through_sequence) {
-    partition.delta_floor = std::max(
-        partition.delta_floor, partition.deltas.front().mutation_sequence);
-    partition.deltas.pop_front();
+  while (!partition.deltas_.empty() &&
+         partition.deltas_.front().mutation_sequence_ <= through_sequence) {
+    partition.delta_floor_ = std::max(
+        partition.delta_floor_, partition.deltas_.front().mutation_sequence_);
+    partition.deltas_.pop_front();
   }
-  if (!partition.deltas.empty() && !partition.delta_queued) {
-    partition.delta_queued = true;
-    (void)replication_ready_.enqueue(partition.id);
+  if (!partition.deltas_.empty() && !partition.delta_queued_) {
+    partition.delta_queued_ = true;
+    (void)replication_ready_.enqueue(partition.id_);
   }
 }
 
@@ -171,7 +172,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
-  if (partition.replication_epoch ==
+  if (partition.replication_epoch_ ==
       std::numeric_limits<std::uint64_t>::max()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "partition replication epoch exhausted");
@@ -179,9 +180,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   // Stop this worker's append stream before making the new epoch durable.
   // Otherwise a concurrent command could append an old-epoch record after
   // the metadata commit and receive OK even though restart must discard it.
-  co_await store.store_state_mutex.Lock();
-  UnlockGuard unlock(&store.store_state_mutex, store.worker);
-  const std::uint64_t next_epoch = partition.replication_epoch + 1;
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  const std::uint64_t next_epoch = partition.replication_epoch_ + 1;
   absl::Status persisted = co_await PersistEpochValue(
       kLogicalDatabaseCount + partition_id, next_epoch);
   if (!persisted.ok()) {
@@ -190,17 +191,17 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 
   std::vector<std::pair<std::uint8_t, std::string>> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    partition.indexes[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-      old_keys.emplace_back(db_id, entry.key);
+    partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
+      old_keys.emplace_back(db_id, entry.key_);
     });
   }
-  partition.replication_epoch = next_epoch;
-  partition.mutation_sequence = 0;
-  partition.capture_deltas = false;
-  partition.deltas.clear();
-  partition.replica_value_stage.reset();
-  partition.delta_floor = 0;
-  partition.delta_queued = false;
+  partition.replication_epoch_ = next_epoch;
+  partition.mutation_sequence_ = 0;
+  partition.capture_deltas_ = false;
+  partition.deltas_.clear();
+  partition.replica_value_stage_.reset();
+  partition.delta_floor_ = 0;
+  partition.delta_queued_ = false;
   for (const auto& [db_id, key] : old_keys) {
     const Digest digest = ComputeDigest(key);
     absl::Status tombstone = co_await WriteRecordLocked(
@@ -255,165 +256,166 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::span<const SnapshotRecord> records) {
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
-  if (replication_epoch != partition.replication_epoch) {
+  if (replication_epoch != partition.replication_epoch_) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "stale partition replication epoch");
   }
   for (const SnapshotRecord& record : records) {
     std::optional<SnapshotRecord> materialized;
     const SnapshotRecord* effective = &record;
-    if (record.db_id >= kLogicalDatabaseCount ||
-        RedisSlot(record.key) != partition_id) {
-      if (record.kind != SnapshotRecord::Kind::kFlushDb) {
+    if (record.db_id_ >= kLogicalDatabaseCount ||
+        RedisSlot(record.key_) != partition_id) {
+      if (record.kind_ != SnapshotRecord::Kind::kFlushDb) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "replica record belongs to another partition");
       }
     }
-    if (record.kind == SnapshotRecord::Kind::kFlushDb) {
+    if (record.kind_ == SnapshotRecord::Kind::kFlushDb) {
       absl::Status advanced =
-          co_await AdvanceDbEpoch(record.db_id, record.db_epoch);
+          co_await AdvanceDbEpoch(record.db_id_, record.db_epoch_);
       if (!advanced.ok()) {
         co_return advanced;
       }
-      partition.mutation_sequence =
-          std::max(partition.mutation_sequence, record.mutation_sequence);
+      partition.mutation_sequence_ =
+          std::max(partition.mutation_sequence_, record.mutation_sequence_);
       continue;
     }
-    if (record.db_epoch != DbEpoch(record.db_id)) {
-      if (record.db_epoch < DbEpoch(record.db_id)) {
+    if (record.db_epoch_ != DbEpoch(record.db_id_)) {
+      if (record.db_epoch_ < DbEpoch(record.db_id_)) {
         continue;
       }
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "replica record database epoch is not installed");
     }
 
-    if (record.kind == SnapshotRecord::Kind::kValueBegin) {
-      if (partition.replica_value_stage.has_value() ||
-          record.value_type != ValueType::kString || !record.value.empty() ||
-          record.logical_size == 0 || record.logical_size > kMaxStringBytes ||
-          record.chunk_count == 0 ||
-          record.chunk_count !=
-              (record.logical_size + kExtentPayloadBytes - 1) /
+    if (record.kind_ == SnapshotRecord::Kind::kValueBegin) {
+      if (partition.replica_value_stage_.has_value() ||
+          record.value_type_ != ValueType::kString || !record.value_.empty() ||
+          record.logical_size_ == 0 || record.logical_size_ > kMaxStringBytes ||
+          record.chunk_count_ == 0 ||
+          record.chunk_count_ !=
+              (record.logical_size_ + kExtentPayloadBytes - 1) /
                   kExtentPayloadBytes) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value begin frame");
       }
-      partition.replica_value_stage = ReplicaValueStage{
-          .db_id = record.db_id,
-          .db_epoch = record.db_epoch,
-          .mutation_sequence = record.mutation_sequence,
-          .expire_at_ms = record.expire_at_ms,
-          .logical_size = record.logical_size,
-          .next_chunk = 0,
-          .chunk_count = record.chunk_count,
-          .value_type = record.value_type,
-          .key = record.key,
-          .value = {},
+      partition.replica_value_stage_ = ReplicaValueStage{
+          .db_id_ = record.db_id_,
+          .db_epoch_ = record.db_epoch_,
+          .mutation_sequence_ = record.mutation_sequence_,
+          .expire_at_ms_ = record.expire_at_ms_,
+          .logical_size_ = record.logical_size_,
+          .next_chunk_ = 0,
+          .chunk_count_ = record.chunk_count_,
+          .value_type_ = record.value_type_,
+          .key_ = record.key_,
+          .value_ = {},
       };
-      partition.replica_value_stage->value.reserve(
-          static_cast<std::size_t>(record.logical_size));
+      partition.replica_value_stage_->value_.reserve(
+          static_cast<std::size_t>(record.logical_size_));
       continue;
     }
-    if (record.kind == SnapshotRecord::Kind::kValueChunk) {
-      auto& stage = partition.replica_value_stage;
-      if (!stage.has_value() || stage->db_id != record.db_id ||
-          stage->db_epoch != record.db_epoch ||
-          stage->mutation_sequence != record.mutation_sequence ||
-          stage->key != record.key || stage->next_chunk != record.chunk_index ||
-          stage->chunk_count != record.chunk_count || record.value.empty() ||
-          record.value.size() > kExtentPayloadBytes ||
-          record.value.size() > stage->logical_size ||
-          stage->value.size() > stage->logical_size - record.value.size()) {
+    if (record.kind_ == SnapshotRecord::Kind::kValueChunk) {
+      auto& stage = partition.replica_value_stage_;
+      if (!stage.has_value() || stage->db_id_ != record.db_id_ ||
+          stage->db_epoch_ != record.db_epoch_ ||
+          stage->mutation_sequence_ != record.mutation_sequence_ ||
+          stage->key_ != record.key_ ||
+          stage->next_chunk_ != record.chunk_index_ ||
+          stage->chunk_count_ != record.chunk_count_ || record.value_.empty() ||
+          record.value_.size() > kExtentPayloadBytes ||
+          record.value_.size() > stage->logical_size_ ||
+          stage->value_.size() > stage->logical_size_ - record.value_.size()) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value chunk frame");
       }
-      stage->value.append(record.value);
-      ++stage->next_chunk;
+      stage->value_.append(record.value_);
+      ++stage->next_chunk_;
       continue;
     }
-    if (record.kind == SnapshotRecord::Kind::kValueCommit) {
-      auto& stage = partition.replica_value_stage;
-      if (!stage.has_value() || stage->db_id != record.db_id ||
-          stage->db_epoch != record.db_epoch ||
-          stage->mutation_sequence != record.mutation_sequence ||
-          stage->key != record.key || !record.value.empty() ||
-          stage->next_chunk != stage->chunk_count ||
-          record.chunk_index != stage->chunk_count ||
-          stage->value.size() != stage->logical_size) {
+    if (record.kind_ == SnapshotRecord::Kind::kValueCommit) {
+      auto& stage = partition.replica_value_stage_;
+      if (!stage.has_value() || stage->db_id_ != record.db_id_ ||
+          stage->db_epoch_ != record.db_epoch_ ||
+          stage->mutation_sequence_ != record.mutation_sequence_ ||
+          stage->key_ != record.key_ || !record.value_.empty() ||
+          stage->next_chunk_ != stage->chunk_count_ ||
+          record.chunk_index_ != stage->chunk_count_ ||
+          stage->value_.size() != stage->logical_size_) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value commit frame");
       }
       materialized.emplace(SnapshotRecord{
-          .kind = SnapshotRecord::Kind::kValue,
-          .db_id = stage->db_id,
-          .db_epoch = stage->db_epoch,
-          .mutation_sequence = stage->mutation_sequence,
-          .expire_at_ms = stage->expire_at_ms,
-          .value_type = stage->value_type,
-          .logical_size = stage->logical_size,
-          .key = std::move(stage->key),
-          .value = std::move(stage->value),
+          .kind_ = SnapshotRecord::Kind::kValue,
+          .db_id_ = stage->db_id_,
+          .db_epoch_ = stage->db_epoch_,
+          .mutation_sequence_ = stage->mutation_sequence_,
+          .expire_at_ms_ = stage->expire_at_ms_,
+          .value_type_ = stage->value_type_,
+          .logical_size_ = stage->logical_size_,
+          .key_ = std::move(stage->key_),
+          .value_ = std::move(stage->value_),
       });
       stage.reset();
       effective = &*materialized;
-    } else if (partition.replica_value_stage.has_value()) {
+    } else if (partition.replica_value_stage_.has_value()) {
       co_return absl::Status(
           absl::StatusCode::kInvalidArgument,
           "replicated large value frame sequence interrupted");
     }
 
     const SnapshotRecord& applied = *effective;
-    const Digest digest = ComputeDigest(applied.key);
+    const Digest digest = ComputeDigest(applied.key_);
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        applied.db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+        applied.db_id_, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
     // Replicated modifications invalidate local watchers too.
-    tx::CurrentTxShard().MarkWatched(applied.db_id, tx::FingerprintOf(digest));
-    co_await store.store_state_mutex.Lock();
-    UnlockGuard write_unlock(&store.store_state_mutex, store.worker);
-    auto& index = partition.indexes[applied.db_id];
-    auto* current = index.Find(digest, applied.key);
+    tx::CurrentTxShard().MarkWatched(applied.db_id_, tx::FingerprintOf(digest));
+    co_await store.store_state_mutex_.Lock();
+    UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
+    auto& index = partition.indexes_[applied.db_id_];
+    auto* current = index.Find(digest, applied.key_);
     if (current != nullptr &&
-        current->value.replication_epoch == replication_epoch &&
-        current->value.mutation_sequence >= applied.mutation_sequence) {
+        current->value_.replication_epoch_ == replication_epoch &&
+        current->value_.mutation_sequence_ >= applied.mutation_sequence_) {
       continue;
     }
-    const RecordKind kind = applied.kind == SnapshotRecord::Kind::kValue
+    const RecordKind kind = applied.kind_ == SnapshotRecord::Kind::kValue
                                 ? RecordKind::kValue
                                 : RecordKind::kTombstone;
     const ValueType value_type =
-        kind == RecordKind::kValue ? applied.value_type : ValueType::kNone;
+        kind == RecordKind::kValue ? applied.value_type_ : ValueType::kNone;
     if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "replicated value has no Redis type");
     }
     absl::Status written;
     const std::size_t inline_bytes = AlignRecord(
-        RecordHeaderBytes(applied.key.size()) + applied.value.size());
+        RecordHeaderBytes(applied.key_.size()) + applied.value_.size());
     if (kind == RecordKind::kValue && value_type == ValueType::kString &&
         inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
-      auto extents = co_await WriteExtentValueLocked(store, applied.value);
+      auto extents = co_await WriteExtentValueLocked(store, applied.value_);
       if (!extents.ok()) {
         co_return extents.status();
       }
       const std::string manifest = EncodeManifest(**extents);
       written = co_await WriteRecordLocked(
-          store, applied.db_id, applied.key, manifest, kind, value_type,
-          applied.expire_at_ms, digest, /*txid=*/0, applied.mutation_sequence,
-          0, false, true, true, applied.value.size(), *extents);
+          store, applied.db_id_, applied.key_, manifest, kind, value_type,
+          applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
+          0, false, true, true, applied.value_.size(), *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
     } else {
       written = co_await WriteRecordLocked(
-          store, applied.db_id, applied.key, applied.value, kind, value_type,
-          kind == RecordKind::kValue ? applied.expire_at_ms : 0, digest,
-          /*txid=*/0, applied.mutation_sequence, 0, false);
+          store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
+          kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
+          /*txid=*/0, applied.mutation_sequence_, 0, false);
     }
     if (!written.ok()) {
       co_return written;
     }
-    partition.mutation_sequence =
-        std::max(partition.mutation_sequence, applied.mutation_sequence);
+    partition.mutation_sequence_ =
+        std::max(partition.mutation_sequence_, applied.mutation_sequence_);
   }
   co_return absl::OkStatus();
 }

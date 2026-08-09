@@ -45,15 +45,15 @@ std::uint64_t FileSize(const std::string& path) {
 
 absl::Status Prepare(const std::vector<std::string>& paths) {
   keylane::storage::StorageEngineOptions options;
-  options.data_files = paths;
+  options.data_files_ = paths;
   keylane::storage::StorageEngine engine(std::move(options));
   return engine.Prepare(1);
 }
 
 struct Cleanup {
-  std::vector<std::string> paths;
+  std::vector<std::string> paths_;
   ~Cleanup() {
-    for (const std::string& path : paths) {
+    for (const std::string& path : paths_) {
       (void)::unlink(path.c_str());
     }
   }
@@ -68,8 +68,8 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
 
   const std::string unequal_a = prefix + "-unequal-a.data";
   const std::string unequal_b = prefix + "-unequal-b.data";
-  cleanup.paths.push_back(unequal_a);
-  cleanup.paths.push_back(unequal_b);
+  cleanup.paths_.push_back(unequal_a);
+  cleanup.paths_.push_back(unequal_b);
   ASSERT_CHECK(
       CreateFile(unequal_a, 80 * kMiB) && CreateFile(unequal_b, 88 * kMiB),
       "failed to create unequal-capacity files");
@@ -89,17 +89,17 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
       "backing file smaller than its label was accepted");
 
   const std::string too_small = prefix + "-small.data";
-  cleanup.paths.push_back(too_small);
+  cleanup.paths_.push_back(too_small);
   ASSERT_CHECK(CreateFile(too_small, 72 * kMiB) && !Prepare({too_small}).ok(),
                "single-device file with no foreground block was accepted");
 
   const std::string minimum = prefix + "-minimum.data";
-  cleanup.paths.push_back(minimum);
+  cleanup.paths_.push_back(minimum);
   ASSERT_CHECK(CreateFile(minimum, 80 * kMiB) && Prepare({minimum}).ok(),
                "80 MiB single-device minimum was rejected");
 
   const std::string unaligned = prefix + "-unaligned.data";
-  cleanup.paths.push_back(unaligned);
+  cleanup.paths_.push_back(unaligned);
   ASSERT_CHECK(
       CreateFile(unaligned, 80 * kMiB + 4096) && !Prepare({unaligned}).ok(),
       "unaligned fresh regular file was accepted");

@@ -22,14 +22,14 @@ class Transaction;
 //    data; they stay queued (holding their position) until the transaction's
 //    release hop, running one armed hop at a time.
 struct TxWaiter {
-  std::uint64_t txid = 0;
-  std::span<const KeyRef> keys;  // each ref carries its database
-  std::coroutine_handle<> resume;
-  Transaction* tx = nullptr;
-  std::uint16_t shard_slot = 0;
-  bool armed = false;
-  bool running = false;
-  bool holds_acquired = false;
+  std::uint64_t txid_ = 0;
+  std::span<const KeyRef> keys_;  // each ref carries its database
+  std::coroutine_handle<> resume_;
+  Transaction* tx_ = nullptr;
+  std::uint16_t shard_slot_ = 0;
+  bool armed_ = false;
+  bool running_ = false;
+  bool holds_acquired_ = false;
 };
 
 // Per-shard transaction queue, sorted ascending by txid. Single-threaded.
@@ -37,7 +37,7 @@ struct TxWaiter {
 class TxQueue {
  public:
   void Insert(TxWaiter* waiter) {
-    assert(waiter != nullptr && waiter->txid != 0);
+    assert(waiter != nullptr && waiter->txid_ != 0);
     // Near-monotonic arrival: scan from the tail. Single-shard lazy txid
     // allocation always lands at the tail (the id was drawn after every id
     // already queued); multi-shard scheduling may insert earlier.
@@ -45,7 +45,7 @@ class TxQueue {
     while (it != queue_.begin()) {
       auto prev = it;
       --prev;
-      if (*prev != nullptr && (*prev)->txid < waiter->txid) {
+      if (*prev != nullptr && (*prev)->txid_ < waiter->txid_) {
         break;
       }
       it = prev;
@@ -83,7 +83,7 @@ class TxQueue {
   std::uint64_t TailTxid() const {
     for (auto it = queue_.rbegin(); it != queue_.rend(); ++it) {
       if (*it != nullptr) {
-        return (*it)->txid;
+        return (*it)->txid_;
       }
     }
     return 0;

@@ -23,29 +23,29 @@ class Worker;
 namespace keylane::storage {
 
 struct StorageEngineOptions {
-  std::vector<std::string> data_files{"keylane.data"};
-  std::uint32_t flush_max_ms = 1000;
-  std::size_t flush_size_bytes = 8 * 1024 * 1024;
-  bool verify_read_crc = true;
-  bool expiration_authority = true;
+  std::vector<std::string> data_files_{"keylane.data"};
+  std::uint32_t flush_max_ms_ = 1000;
+  std::size_t flush_size_bytes_ = 8 * 1024 * 1024;
+  bool verify_read_crc_ = true;
+  bool expiration_authority_ = true;
   // Full-disk sweep retiring tombstones no surviving record needs. Zero
   // disables it.
-  std::uint32_t tomb_raider_interval_ms = 600'000;
+  std::uint32_t tomb_raider_interval_ms_ = 600'000;
   // Pause after each block the sweep reads, capping its share of disk
   // bandwidth so online traffic keeps its latency.
-  std::uint32_t tomb_raider_sleep_ms = 10;
-  RegisteredBufferPoolOptions buffers{};
+  std::uint32_t tomb_raider_sleep_ms_ = 10;
+  RegisteredBufferPoolOptions buffers_{};
 };
 
 struct TombRaiderTotals {
-  std::uint64_t rounds = 0;
-  std::uint64_t reaped = 0;
-  std::uint64_t refreshed = 0;
+  std::uint64_t rounds_ = 0;
+  std::uint64_t reaped_ = 0;
+  std::uint64_t refreshed_ = 0;
 };
 
 struct ScanBatch {
-  std::uint64_t cursor = 0;
-  std::vector<std::string> keys;
+  std::uint64_t cursor_ = 0;
+  std::vector<std::string> keys_;
 };
 
 struct SnapshotRecord {
@@ -58,34 +58,34 @@ struct SnapshotRecord {
     kValueCommit = 6,
   };
 
-  Kind kind = Kind::kValue;
-  std::uint8_t db_id = 0;
-  std::uint64_t db_epoch = 0;
-  std::uint64_t mutation_sequence = 0;
-  std::uint64_t expire_at_ms = 0;
-  ValueType value_type = ValueType::kNone;
-  std::uint64_t logical_size = 0;
-  std::uint32_t chunk_index = 0;
-  std::uint32_t chunk_count = 0;
-  std::string key;
-  std::string value;
+  Kind kind_ = Kind::kValue;
+  std::uint8_t db_id_ = 0;
+  std::uint64_t db_epoch_ = 0;
+  std::uint64_t mutation_sequence_ = 0;
+  std::uint64_t expire_at_ms_ = 0;
+  ValueType value_type_ = ValueType::kNone;
+  std::uint64_t logical_size_ = 0;
+  std::uint32_t chunk_index_ = 0;
+  std::uint32_t chunk_count_ = 0;
+  std::string key_;
+  std::string value_;
 };
 
 struct PartitionReplicationStart {
-  std::uint64_t snapshot_sequence = 0;
-  std::uint16_t nonempty_db_mask = 0;
-  std::array<std::uint64_t, 16> db_epochs{};
+  std::uint64_t snapshot_sequence_ = 0;
+  std::uint16_t nonempty_db_mask_ = 0;
+  std::array<std::uint64_t, 16> db_epochs_{};
 };
 
 struct PartitionSnapshotBatch {
-  std::uint64_t cursor = 0;
-  std::vector<SnapshotRecord> records;
+  std::uint64_t cursor_ = 0;
+  std::vector<SnapshotRecord> records_;
 };
 
 struct PartitionDeltaBatch {
-  std::uint64_t watermark = 0;
-  bool overflow = false;
-  std::vector<SnapshotRecord> records;
+  std::uint64_t watermark_ = 0;
+  bool overflow_ = false;
+  std::vector<SnapshotRecord> records_;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -123,17 +123,17 @@ enum class SetCondition : std::uint8_t {
 };
 
 struct SetOptions {
-  SetCondition condition = SetCondition::kNone;
+  SetCondition condition_ = SetCondition::kNone;
   // Absolute Unix time in milliseconds. Zero clears the TTL unless
   // keep_ttl is set.
-  std::uint64_t expire_at_ms = 0;
-  bool keep_ttl = false;
-  bool return_old_value = false;
+  std::uint64_t expire_at_ms_ = 0;
+  bool keep_ttl_ = false;
+  bool return_old_value_ = false;
 };
 
 struct SetResult {
-  bool applied = false;
-  std::optional<DiskValue> old_value;
+  bool applied_ = false;
+  std::optional<DiskValue> old_value_;
 };
 
 enum class ExpirationCondition : std::uint8_t {
@@ -145,35 +145,35 @@ enum class ExpirationCondition : std::uint8_t {
 };
 
 struct ExpirationInfo {
-  bool exists = false;
-  std::uint64_t expire_at_ms = 0;
+  bool exists_ = false;
+  std::uint64_t expire_at_ms_ = 0;
 };
 
 // Per-owning-shard accumulator for one multi-key atomic write. The
 // coordinator owns one per shard; each shard writes only its own entry, so
 // no synchronization is needed.
 struct TxShardWrites {
-  std::uint64_t txid = 0;  // input: stamped into every record written
+  std::uint64_t txid_ = 0;  // input: stamped into every record written
 
   struct Fence {  // highest staged offset per destination block
-    std::uint64_t block_id = 0;
-    std::uint64_t allocation_epoch = 0;
-    std::uint32_t committed_bytes = 0;
-    std::uint16_t block_owner = 0;
+    std::uint64_t block_id_ = 0;
+    std::uint64_t allocation_epoch_ = 0;
+    std::uint32_t committed_bytes_ = 0;
+    std::uint16_t block_owner_ = 0;
   };
   struct Retired {  // superseded previous versions, released at commit
-    std::uint64_t block_id = 0;
-    std::uint64_t allocation_epoch = 0;
-    std::uint32_t total_disk_bytes = 0;
-    std::uint16_t block_owner = 0;
+    std::uint64_t block_id_ = 0;
+    std::uint64_t allocation_epoch_ = 0;
+    std::uint32_t total_disk_bytes_ = 0;
+    std::uint16_t block_owner_ = 0;
   };
-  std::vector<Fence> fences;
-  std::vector<Retired> retirements;
+  std::vector<Fence> fences_;
+  std::vector<Retired> retirements_;
   // Journal undo state for runtime rollback (standalone MSET / multi-key
   // DEL). EXEC leaves this off: its commands report errors individually and
   // never roll back (Redis semantics), while recovery still treats the
   // whole EXEC atomically through the commit record.
-  bool collect_undo = false;
+  bool collect_undo_ = false;
 };
 
 class StorageEngine {

@@ -17,7 +17,7 @@ using LockFp = std::uint64_t;
 
 inline LockFp FingerprintOf(const storage::Digest& digest) noexcept {
   LockFp fp;
-  std::memcpy(&fp, digest.bytes.data(), sizeof(fp));
+  std::memcpy(&fp, digest.bytes_.data(), sizeof(fp));
   return fp;
 }
 
@@ -36,9 +36,9 @@ enum class LockMode : std::uint8_t {
 // logical database whose lock table arbitrates it. Carrying the database per
 // key lets one transaction span databases (SELECT inside MULTI).
 struct KeyRef {
-  LockFp fp = 0;
-  LockMode mode = LockMode::kShared;
-  std::uint8_t db = 0;
+  LockFp fp_ = 0;
+  LockMode mode_ = LockMode::kShared;
+  std::uint8_t db_ = 0;
 };
 
 }  // namespace keylane::tx

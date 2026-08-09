@@ -92,8 +92,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   keylane::ReplicationOptions replication_options;
-  replication_options.listen_port = replication_port;
-  replication_options.replica_read_only = replica_read_only;
+  replication_options.listen_port_ = replication_port;
+  replication_options.replica_read_only_ = replica_read_only;
   if (!replicate_to.empty()) {
     const std::size_t separator = replicate_to.rfind(':');
     unsigned parsed_port = 0;
@@ -108,8 +108,8 @@ int main(int argc, char** argv) {
         parsed_port > std::numeric_limits<std::uint16_t>::max()) {
       return 2;
     }
-    replication_options.target_ip = replicate_to.substr(0, separator);
-    replication_options.target_port = static_cast<std::uint16_t>(parsed_port);
+    replication_options.target_ip_ = replicate_to.substr(0, separator);
+    replication_options.target_port_ = static_cast<std::uint16_t>(parsed_port);
   }
   return keylane::RunServer(
       bind_ip, port, threads, idle_timeout_ms, recv_buffer_count, busy_poll_us,

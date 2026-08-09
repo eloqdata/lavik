@@ -30,11 +30,11 @@ class LockTable {
   bool AcquireIntent(LockFp fp, LockMode mode) {
     IntentLock& lock = map_[fp];
     if (mode == LockMode::kShared) {
-      ++lock.shared_intent;
-      return lock.exclusive_intent == 0;
+      ++lock.shared_intent_;
+      return lock.exclusive_intent_ == 0;
     }
-    ++lock.exclusive_intent;
-    return lock.shared_intent == 0 && lock.exclusive_intent == 1;
+    ++lock.exclusive_intent_;
+    return lock.shared_intent_ == 0 && lock.exclusive_intent_ == 1;
   }
 
   void ReleaseIntent(LockFp fp, LockMode mode) {
@@ -42,11 +42,11 @@ class LockTable {
     assert(it != map_.end());
     IntentLock& lock = it->second;
     if (mode == LockMode::kShared) {
-      assert(lock.shared_intent > 0);
-      --lock.shared_intent;
+      assert(lock.shared_intent_ > 0);
+      --lock.shared_intent_;
     } else {
-      assert(lock.exclusive_intent > 0);
-      --lock.exclusive_intent;
+      assert(lock.exclusive_intent_ > 0);
+      --lock.exclusive_intent_;
     }
     if (lock.IsFree()) {
       map_.erase(it);
@@ -60,19 +60,19 @@ class LockTable {
     }
     const IntentLock& lock = it->second;
     if (mode == LockMode::kShared) {
-      return lock.exclusive_held == 0;
+      return lock.exclusive_held_ == 0;
     }
-    return lock.shared_held == 0 && lock.exclusive_held == 0;
+    return lock.shared_held_ == 0 && lock.exclusive_held_ == 0;
   }
 
   void AcquireHold(LockFp fp, LockMode mode) {
     assert(CanHold(fp, mode));
     IntentLock& lock = map_[fp];
     if (mode == LockMode::kShared) {
-      ++lock.shared_held;
+      ++lock.shared_held_;
     } else {
-      assert(lock.exclusive_held == 0);
-      ++lock.exclusive_held;
+      assert(lock.exclusive_held_ == 0);
+      ++lock.exclusive_held_;
     }
   }
 
@@ -81,11 +81,11 @@ class LockTable {
     assert(it != map_.end());
     IntentLock& lock = it->second;
     if (mode == LockMode::kShared) {
-      assert(lock.shared_held > 0);
-      --lock.shared_held;
+      assert(lock.shared_held_ > 0);
+      --lock.shared_held_;
     } else {
-      assert(lock.exclusive_held == 1);
-      lock.exclusive_held = 0;
+      assert(lock.exclusive_held_ == 1);
+      lock.exclusive_held_ = 0;
     }
     // holds ⊆ intents: a held entry always has intents, so IsFree can only
     // trigger from ReleaseIntent.
@@ -95,14 +95,14 @@ class LockTable {
 
  private:
   struct IntentLock {
-    std::uint32_t shared_intent = 0;
-    std::uint32_t exclusive_intent = 0;
-    std::uint32_t shared_held = 0;
-    std::uint32_t exclusive_held = 0;
+    std::uint32_t shared_intent_ = 0;
+    std::uint32_t exclusive_intent_ = 0;
+    std::uint32_t shared_held_ = 0;
+    std::uint32_t exclusive_held_ = 0;
 
     bool IsFree() const noexcept {
-      return shared_intent == 0 && exclusive_intent == 0 && shared_held == 0 &&
-             exclusive_held == 0;
+      return shared_intent_ == 0 && exclusive_intent_ == 0 &&
+             shared_held_ == 0 && exclusive_held_ == 0;
     }
   };
 

@@ -14,11 +14,11 @@ void Transaction::AddKey(unsigned owner, std::uint8_t db,
                          LockMode mode) {
   assert(shards_.empty() && "AddKey after Seal");
   keys_.push_back(TxKey{
-      .digest = digest,
-      .fp = FingerprintOf(digest),
-      .arg_index = arg_index,
-      .mode = mode,
-      .db = db,
+      .digest_ = digest,
+      .fp_ = FingerprintOf(digest),
+      .arg_index_ = arg_index,
+      .mode_ = mode,
+      .db_ = db,
   });
   owners_.push_back(static_cast<std::uint16_t>(owner));
 }
@@ -37,53 +37,54 @@ void Transaction::Seal() {
   shards_.resize(distinct.size());
   for (std::size_t s = 0; s < distinct.size(); ++s) {
     ShardData& sd = shards_[s];
-    sd.tx = this;
-    sd.msg.sd = &sd;
-    sd.msg.run_fn = &Transaction::ShardPhaseEntry;
-    sd.shard_id = distinct[s];
-    sd.key_begin = static_cast<std::uint16_t>(grouped.size());
+    sd.tx_ = this;
+    sd.msg_.sd_ = &sd;
+    sd.msg_.run_fn_ = &Transaction::ShardPhaseEntry;
+    sd.shard_id_ = distinct[s];
+    sd.key_begin_ = static_cast<std::uint16_t>(grouped.size());
     for (std::size_t i = 0; i < keys_.size(); ++i) {
       if (owners_[i] == distinct[s]) {
         grouped.push_back(keys_[i]);
       }
     }
-    sd.key_count = static_cast<std::uint16_t>(grouped.size() - sd.key_begin);
+    sd.key_count_ = static_cast<std::uint16_t>(grouped.size() - sd.key_begin_);
     // Deduplicate the lock set: one ref per (db, fingerprint), exclusive if
     // any occurrence writes.
-    sd.lock_begin = static_cast<std::uint16_t>(lock_refs_.size());
-    for (std::size_t i = sd.key_begin; i < grouped.size(); ++i) {
+    sd.lock_begin_ = static_cast<std::uint16_t>(lock_refs_.size());
+    for (std::size_t i = sd.key_begin_; i < grouped.size(); ++i) {
       const TxKey& key = grouped[i];
       bool merged = false;
-      for (std::size_t j = sd.lock_begin; j < lock_refs_.size(); ++j) {
-        if (lock_refs_[j].fp == key.fp && lock_refs_[j].db == key.db) {
-          if (key.mode == LockMode::kExclusive) {
-            lock_refs_[j].mode = LockMode::kExclusive;
+      for (std::size_t j = sd.lock_begin_; j < lock_refs_.size(); ++j) {
+        if (lock_refs_[j].fp_ == key.fp_ && lock_refs_[j].db_ == key.db_) {
+          if (key.mode_ == LockMode::kExclusive) {
+            lock_refs_[j].mode_ = LockMode::kExclusive;
           }
           merged = true;
           break;
         }
       }
       if (!merged) {
-        lock_refs_.push_back(KeyRef{key.fp, key.mode, key.db});
+        lock_refs_.push_back(KeyRef{key.fp_, key.mode_, key.db_});
       }
     }
-    sd.lock_count =
-        static_cast<std::uint16_t>(lock_refs_.size() - sd.lock_begin);
+    sd.lock_count_ =
+        static_cast<std::uint16_t>(lock_refs_.size() - sd.lock_begin_);
   }
   keys_ = std::move(grouped);
   // Vectors are final now; hand out the stable spans.
   for (std::size_t s = 0; s < shards_.size(); ++s) {
     ShardData& sd = shards_[s];
-    sd.node.tx = this;
-    sd.node.shard_slot = static_cast<std::uint16_t>(s);
-    sd.node.keys = std::span<const KeyRef>(lock_refs_.data() + sd.lock_begin,
-                                           sd.lock_count);
+    sd.node_.tx_ = this;
+    sd.node_.shard_slot_ = static_cast<std::uint16_t>(s);
+    sd.node_.keys_ = std::span<const KeyRef>(lock_refs_.data() + sd.lock_begin_,
+                                             sd.lock_count_);
   }
 }
 
 ShardSlice Transaction::Slice(const ShardData& sd) const {
   return ShardSlice{
-      .keys = std::span<const TxKey>(keys_.data() + sd.key_begin, sd.key_count),
+      .keys_ =
+          std::span<const TxKey>(keys_.data() + sd.key_begin_, sd.key_count_),
   };
 }
 
@@ -97,22 +98,23 @@ std::uint32_t Transaction::RoundTargets(Phase phase) const {
 
 bool Transaction::InRound(const ShardData& sd, Phase phase) const {
   // Cancel rounds only visit shards whose schedule succeeded.
-  return phase != Phase::kCancel || !sd.schedule_failed;
+  return phase != Phase::kCancel || !sd.schedule_failed_;
 }
 
 void Transaction::RoundAwaiter::await_suspend(std::coroutine_handle<> handle) {
-  tx->coord_handle_ = handle;
-  tx->coord_worker_ = celer::ThisWorker().id;
-  tx->barrier_.store(tx->RoundTargets(phase), std::memory_order_release);
-  for (ShardData& sd : tx->shards_) {
-    if (!tx->InRound(sd, phase)) {
+  tx_->coord_handle_ = handle;
+  tx_->coord_worker_ = celer::ThisWorker().id_;
+  tx_->barrier_.store(tx_->RoundTargets(phase_), std::memory_order_release);
+  for (ShardData& sd : tx_->shards_) {
+    if (!tx_->InRound(sd, phase_)) {
       continue;
     }
-    sd.phase = phase;
-    if (sd.shard_id == celer::ThisWorker().id) {
+    sd.phase_ = phase_;
+    if (sd.shard_id_ == celer::ThisWorker().id_) {
       RunShardPhase(&sd);
     } else {
-      celer::PostRequest(celer::ThisWorker().cross_core, sd.shard_id, &sd.msg);
+      celer::PostRequest(celer::ThisWorker().cross_core_, sd.shard_id_,
+                         &sd.msg_);
     }
   }
 }
@@ -121,19 +123,19 @@ void Transaction::ShardPhaseEntry(celer::RemoteWork* base) {
   auto* msg = static_cast<ShardMsg*>(base);
   // Rounds complete through the transaction barrier, never through the
   // cross-core reply leg.
-  msg->reply_deferred = true;
-  RunShardPhase(msg->sd);
+  msg->reply_deferred_ = true;
+  RunShardPhase(msg->sd_);
 }
 
 void Transaction::RunShardPhase(ShardData* sd) {
-  switch (sd->phase) {
+  switch (sd->phase_) {
     case Phase::kSchedule:
       ScheduleInShard(sd);
-      sd->tx->CompleteShardRound();
+      sd->tx_->CompleteShardRound();
       return;
     case Phase::kCancel:
       CancelInShard(sd);
-      sd->tx->CompleteShardRound();
+      sd->tx_->CompleteShardRound();
       return;
     case Phase::kArm:
       // The barrier is decremented when the hop callback finishes.
@@ -143,40 +145,40 @@ void Transaction::RunShardPhase(ShardData* sd) {
 }
 
 void Transaction::ScheduleInShard(ShardData* sd) {
-  Transaction* tx = sd->tx;
+  Transaction* tx = sd->tx_;
   TxShard& shard = CurrentTxShard();
-  sd->schedule_failed = false;
+  sd->schedule_failed_ = false;
   // Stale txid: a later transaction already committed on this shard, so this
   // position in the serial order is in the past.
   if (tx->txid_ <= shard.committed_txid()) {
-    sd->schedule_failed = true;
+    sd->schedule_failed_ = true;
     return;
   }
-  sd->node.txid = tx->txid_;
-  sd->granted = shard.AcquireIntents(sd->node.keys);
+  sd->node_.txid_ = tx->txid_;
+  sd->granted_ = shard.AcquireIntents(sd->node_.keys_);
   const std::uint64_t tail = shard.queue().TailTxid();
   // Reorder rule: inserting before the tail while conflicting is unsound —
   // a later transaction may already have run out of order assuming nothing
   // precedes it. Fail the schedule; the coordinator retries with a fresh,
   // larger txid.
-  if (!sd->granted && tail != 0 && tx->txid_ < tail) {
-    shard.ReleaseIntents(sd->node.keys);
-    sd->schedule_failed = true;
+  if (!sd->granted_ && tail != 0 && tx->txid_ < tail) {
+    shard.ReleaseIntents(sd->node_.keys_);
+    sd->schedule_failed_ = true;
     return;
   }
-  shard.queue().Insert(&sd->node);
+  shard.queue().Insert(&sd->node_);
 }
 
 void Transaction::CancelInShard(ShardData* sd) {
   TxShard& shard = CurrentTxShard();
-  shard.ReleaseIntents(sd->node.keys);
-  shard.queue().Remove(&sd->node);
-  sd->granted = false;
+  shard.ReleaseIntents(sd->node_.keys_);
+  shard.queue().Remove(&sd->node_);
+  sd->granted_ = false;
   shard.Poll();
 }
 
 void Transaction::ArmInShard(ShardData* sd) {
-  sd->node.armed = true;
+  sd->node_.armed_ = true;
   CurrentTxShard().Poll();
 }
 
@@ -186,25 +188,25 @@ Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
 
 void Transaction::SetShardStatus(std::uint16_t shard_slot,
                                  absl::Status status) {
-  shards_[shard_slot].status = std::move(status);
+  shards_[shard_slot].status_ = std::move(status);
 }
 
 void Transaction::CompleteShardRound() {
   if (barrier_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
     return;
   }
-  if (celer::ThisWorker().id == coord_worker_) {
-    celer::ThisWorker().self->Enqueue(coord_handle_);
+  if (celer::ThisWorker().id_ == coord_worker_) {
+    celer::ThisWorker().self_->Enqueue(coord_handle_);
     return;
   }
   celer::PostNotification(
-      celer::ThisWorker().cross_core, coord_worker_,
+      celer::ThisWorker().cross_core_, coord_worker_,
       celer::RemoteNotification{
-          .context = this,
-          .value = 0,
-          .run_fn =
+          .context_ = this,
+          .value_ = 0,
+          .run_fn_ =
               [](void* context, std::uint64_t) noexcept {
-                celer::ThisWorker().self->Enqueue(
+                celer::ThisWorker().self_->Enqueue(
                     static_cast<Transaction*>(context)->coord_handle_);
               },
       });
@@ -216,11 +218,12 @@ Task<absl::Status> Transaction::Schedule() {
     co_return absl::OkStatus();
   }
   for (;;) {
-    txid_ = TxRuntime::Get()->next_txid.fetch_add(1, std::memory_order_relaxed);
+    txid_ =
+        TxRuntime::Get()->next_txid_.fetch_add(1, std::memory_order_relaxed);
     co_await RoundAwaiter{this, Phase::kSchedule};
     bool failed = false;
     for (const ShardData& sd : shards_) {
-      failed |= sd.schedule_failed;
+      failed |= sd.schedule_failed_;
     }
     if (!failed) {
       scheduled_ = true;
@@ -228,17 +231,17 @@ Task<absl::Status> Transaction::Schedule() {
     }
     co_await RoundAwaiter{this, Phase::kCancel};
     ++schedule_retries_;
-    TxRuntime::Get()->schedule_retries.fetch_add(1, std::memory_order_relaxed);
+    TxRuntime::Get()->schedule_retries_.fetch_add(1, std::memory_order_relaxed);
   }
 }
 
 Task<absl::Status> Transaction::ExecuteSingleShard() {
   // The whole key set lives on one shard: hop there and take the fast-path
   // key-set guard. No txid, no queue entry, no barrier beyond the hop.
-  const unsigned owner = shards_[0].shard_id;
+  const unsigned owner = shards_[0].shard_id_;
   co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<absl::Status> {
     ShardData& sd = shards_[0];
-    auto guard = co_await CurrentTxShard().AcquireKeys(sd.node.keys);
+    auto guard = co_await CurrentTxShard().AcquireKeys(sd.node_.keys_);
     co_return co_await cb_(cb_ctx_, Slice(sd));
   });
 }
@@ -255,12 +258,12 @@ Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
   }
   assert(scheduled_ && "Schedule before Execute");
   for (ShardData& sd : shards_) {
-    sd.status = absl::OkStatus();
+    sd.status_ = absl::OkStatus();
   }
   co_await RoundAwaiter{this, Phase::kArm};
   for (ShardData& sd : shards_) {
-    if (!sd.status.ok()) {
-      co_return sd.status;
+    if (!sd.status_.ok()) {
+      co_return sd.status_;
     }
   }
   co_return absl::OkStatus();
@@ -281,15 +284,15 @@ Task<absl::Status> Transaction::Release() {
 namespace {
 
 Task<absl::Status> RunShardHop(TxShard* shard, TxWaiter* node) {
-  Transaction* tx = node->tx;
-  absl::Status status = co_await tx->InvokeCallback(node->shard_slot);
-  tx->SetShardStatus(node->shard_slot, std::move(status));
+  Transaction* tx = node->tx_;
+  absl::Status status = co_await tx->InvokeCallback(node->shard_slot_);
+  tx->SetShardStatus(node->shard_slot_, std::move(status));
   // Non-suspending epilogue on the shard thread.
-  node->running = false;
+  node->running_ = false;
   if (tx->releasing()) {
-    shard->ReleaseHolds(node->keys);
-    shard->ReleaseIntents(node->keys);
-    node->holds_acquired = false;
+    shard->ReleaseHolds(node->keys_);
+    shard->ReleaseIntents(node->keys_);
+    node->holds_acquired_ = false;
     shard->queue().Remove(node);
     shard->Poll();
   }

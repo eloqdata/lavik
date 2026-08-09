@@ -6,7 +6,7 @@ std::size_t StorageEngine::Impl::DeviceIndexForBlock(
     std::uint64_t block_id) const noexcept {
   const std::size_t device_index = DeviceIdForBlock(block_id);
   assert(device_index < devices_.size());
-  assert(devices_[device_index].id == device_index);
+  assert(devices_[device_index].id_ == device_index);
   return device_index;
 }
 
@@ -14,7 +14,7 @@ bool StorageEngine::Impl::BitmapBit(const DeviceAllocator& allocator,
                                     std::uint32_t local_block) noexcept {
   const std::size_t byte_index = local_block / 8;
   const unsigned bit_index = local_block % 8;
-  return (std::to_integer<unsigned>(allocator.scan_bitmap[byte_index]) &
+  return (std::to_integer<unsigned>(allocator.scan_bitmap_[byte_index]) &
           (1U << bit_index)) != 0;
 }
 
@@ -22,59 +22,59 @@ void StorageEngine::Impl::SetBitmapBit(DeviceAllocator& allocator,
                                        std::uint32_t local_block) noexcept {
   const std::size_t byte_index = local_block / 8;
   const unsigned bit_index = local_block % 8;
-  allocator.scan_bitmap[byte_index] |= static_cast<std::byte>(1U << bit_index);
+  allocator.scan_bitmap_[byte_index] |= static_cast<std::byte>(1U << bit_index);
 }
 
 void StorageEngine::Impl::ClearBitmapBit(DeviceAllocator& allocator,
                                          std::uint32_t local_block) noexcept {
   const std::size_t byte_index = local_block / 8;
   const unsigned bit_index = local_block % 8;
-  allocator.scan_bitmap[byte_index] &=
+  allocator.scan_bitmap_[byte_index] &=
       static_cast<std::byte>(~(1U << bit_index));
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
     std::size_t device_index, DeviceAllocator& allocator,
     std::vector<std::size_t> page_indexes) {
-  assert(celer::ThisWorker().id == allocator.owner);
+  assert(celer::ThisWorker().id_ == allocator.owner_);
   if (page_indexes.empty()) {
     co_return absl::OkStatus();
   }
   std::sort(page_indexes.begin(), page_indexes.end());
   page_indexes.erase(std::unique(page_indexes.begin(), page_indexes.end()),
                      page_indexes.end());
-  WorkerStore& store = *stores_[allocator.owner];
-  auto acquired = co_await store.buffers.AcquireReadBuffer();
+  WorkerStore& store = *stores_[allocator.owner_];
+  auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) {
     co_return acquired.status();
   }
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
-  buffer.size = kDirectIoAlignment;
+  buffer.size_ = kDirectIoAlignment;
   const StorageDevice& device = devices_[device_index];
   std::vector<MetadataPageState> committed;
   committed.reserve(page_indexes.size());
   for (const std::size_t page_index : page_indexes) {
-    if (page_index >= allocator.bitmap_pages.size()) {
+    if (page_index >= allocator.bitmap_pages_.size()) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "bitmap page index is out of range");
     }
     const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
     const std::size_t payload_bytes = std::min(
-        kMetadataPagePayloadBytes, allocator.scan_bitmap.size() - byte_offset);
-    const MetadataPageState current = allocator.bitmap_pages[page_index];
-    const std::uint8_t next_slot = current.active_slot == 0 ? 1 : 0;
-    const std::uint64_t next_generation = current.generation + 1;
-    std::span<std::byte, kDirectIoAlignment> output(buffer.data,
+        kMetadataPagePayloadBytes, allocator.scan_bitmap_.size() - byte_offset);
+    const MetadataPageState current = allocator.bitmap_pages_[page_index];
+    const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
+    const std::uint64_t next_generation = current.generation_ + 1;
+    std::span<std::byte, kDirectIoAlignment> output(buffer.data_,
                                                     kDirectIoAlignment);
     EncodeMetadataPage(
         MetadataPageKind::kScanBitmap, static_cast<std::uint32_t>(page_index),
         next_generation,
-        std::span<const std::byte>(allocator.scan_bitmap.data() + byte_offset,
+        std::span<const std::byte>(allocator.scan_bitmap_.data() + byte_offset,
                                    payload_bytes),
         output);
     auto written = co_await WriteStorageBuffer(
-        *store.worker, store.files[device.file_index], output,
+        *store.worker_, store.files_[device.file_index_], output,
         lease.registered(), buffer,
         MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index,
                                next_slot));
@@ -84,17 +84,17 @@ Task<absl::Status> StorageEngine::Impl::PersistBitmapPages(
                              : written.status();
     }
     committed.push_back(MetadataPageState{
-        .generation = next_generation,
-        .active_slot = next_slot,
+        .generation_ = next_generation,
+        .active_slot_ = next_slot,
     });
   }
-  absl::Status synced =
-      co_await celer::Fdatasync(*store.worker, store.files[device.file_index]);
+  absl::Status synced = co_await celer::Fdatasync(
+      *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     co_return synced;
   }
   for (std::size_t i = 0; i < page_indexes.size(); ++i) {
-    allocator.bitmap_pages[page_indexes[i]] = committed[i];
+    allocator.bitmap_pages_[page_indexes[i]] = committed[i];
   }
   co_return absl::OkStatus();
 }
@@ -105,11 +105,11 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     co_return absl::OkStatus();
   }
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id == allocator.owner);
-  WorkerStore& store = *stores_[allocator.owner];
+  assert(celer::ThisWorker().id_ == allocator.owner_);
+  WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
   auto* zero_header = static_cast<std::byte*>(::operator new[](
-      kBlockHeaderBytes, std::align_val_t(options_.buffers.alignment),
+      kBlockHeaderBytes, std::align_val_t(options_.buffers_.alignment_),
       std::nothrow));
   if (zero_header == nullptr) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
@@ -120,7 +120,7 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
   for (const std::uint64_t block_id : block_ids) {
     assert(DeviceIndexForBlock(block_id) == device_index);
     auto written = co_await WriteStorageBuffer(
-        *store.worker, store.files[device.file_index],
+        *store.worker_, store.files_[device.file_index_],
         std::span<const std::byte>(zero_header, kBlockHeaderBytes), false, {},
         LocalBlockOffset(block_id));
     if (!written.ok() || *written != kBlockHeaderBytes) {
@@ -132,17 +132,17 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     }
   }
   if (status.ok()) {
-    status = co_await celer::Fdatasync(*store.worker,
-                                       store.files[device.file_index]);
+    status = co_await celer::Fdatasync(*store.worker_,
+                                       store.files_[device.file_index_]);
   }
   ::operator delete[](zero_header,
-                      std::align_val_t(options_.buffers.alignment));
+                      std::align_val_t(options_.buffers_.alignment_));
   co_return status;
 }
 
 Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     std::size_t device_index, DeviceAllocator& allocator) {
-  assert(celer::ThisWorker().id == allocator.owner);
+  assert(celer::ThisWorker().id_ == allocator.owner_);
   constexpr std::size_t kActivationBatchBlocks = 256;
   const StorageDevice& device = devices_[device_index];
   std::vector<std::uint64_t> activated;
@@ -150,15 +150,15 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
   std::vector<std::uint64_t> reactivated;
   reactivated.reserve(kActivationBatchBlocks);
   while (activated.size() < kActivationBatchBlocks &&
-         allocator.next_pristine < device.capacity_blocks) {
+         allocator.next_pristine_ < device.capacity_blocks_) {
     const std::uint32_t local =
-        static_cast<std::uint32_t>(allocator.next_pristine++);
-    activated.push_back(MakeBlockId(device.id, local));
+        static_cast<std::uint32_t>(allocator.next_pristine_++);
+    activated.push_back(MakeBlockId(device.id_, local));
   }
   while (activated.size() < kActivationBatchBlocks &&
-         !allocator.cold_free.empty()) {
-    const std::uint64_t block_id = allocator.cold_free.back();
-    allocator.cold_free.pop_back();
+         !allocator.cold_free_.empty()) {
+    const std::uint64_t block_id = allocator.cold_free_.back();
+    allocator.cold_free_.pop_back();
     activated.push_back(block_id);
     reactivated.push_back(block_id);
   }
@@ -173,7 +173,7 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
   absl::Status invalidated = co_await InvalidateReactivatedBlockHeadersLocal(
       device_index, reactivated);
   if (!invalidated.ok()) {
-    allocator.failed = invalidated;
+    allocator.failed_ = invalidated;
     co_return invalidated;
   }
 
@@ -192,11 +192,11 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
     // A failed metadata write has an ambiguous durable state. Do not skip
     // over this activation range or hand out later blocks until restart has
     // selected the newest valid A/B page.
-    allocator.failed = persisted;
+    allocator.failed_ = persisted;
     co_return persisted;
   }
-  allocator.ready_blocks.insert(allocator.ready_blocks.end(), activated.begin(),
-                                activated.end());
+  allocator.ready_blocks_.insert(allocator.ready_blocks_.end(),
+                                 activated.begin(), activated.end());
   co_return absl::OkStatus();
 }
 
@@ -204,31 +204,31 @@ Task<absl::StatusOr<ReservedBlock>>
 StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
                                              bool for_defrag) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id == allocator.owner);
-  co_await allocator.mutex.Lock();
-  UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
-  if (allocator.failed.has_value()) {
-    co_return *allocator.failed;
+  assert(celer::ThisWorker().id_ == allocator.owner_);
+  co_await allocator.mutex_.Lock();
+  UnlockGuard unlock(&allocator.mutex_, stores_[allocator.owner_]->worker_);
+  if (allocator.failed_.has_value()) {
+    co_return *allocator.failed_;
   }
   const std::size_t reserve =
       for_defrag ? 0 : DefragReserveForDevice(device_index);
-  if (allocator.ready_blocks.size() <= reserve) {
+  if (allocator.ready_blocks_.size() <= reserve) {
     absl::Status refill =
         co_await RefillReadyBlocksLocal(device_index, allocator);
     if (!refill.ok()) {
       co_return refill;
     }
   }
-  if (allocator.ready_blocks.size() <= reserve) {
+  if (allocator.ready_blocks_.size() <= reserve) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "device has no allocatable blocks");
   }
-  const std::uint64_t block_id = allocator.ready_blocks.back();
-  allocator.ready_blocks.pop_back();
+  const std::uint64_t block_id = allocator.ready_blocks_.back();
+  allocator.ready_blocks_.pop_back();
   MaybeRefillDeviceInBackground(device_index, allocator);
   co_return ReservedBlock{
-      .block_id = block_id,
-      .allocation_epoch = allocator.next_allocation_epoch++,
+      .block_id_ = block_id,
+      .allocation_epoch_ = allocator.next_allocation_epoch_++,
   };
 }
 
@@ -239,32 +239,32 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
 void StorageEngine::Impl::MaybeRefillDeviceInBackground(
     std::size_t device_index, DeviceAllocator& allocator) {
   constexpr std::size_t kLowWaterBlocks = 32;
-  if (allocator.refill_pending || allocator.failed.has_value()) {
+  if (allocator.refill_pending_ || allocator.failed_.has_value()) {
     return;
   }
-  if (allocator.next_pristine >= devices_[device_index].capacity_blocks &&
-      allocator.cold_free.empty()) {
+  if (allocator.next_pristine_ >= devices_[device_index].capacity_blocks_ &&
+      allocator.cold_free_.empty()) {
     return;  // Nothing to activate; allocation reports exhaustion itself.
   }
-  if (allocator.ready_blocks.size() >=
+  if (allocator.ready_blocks_.size() >=
       DefragReserveForDevice(device_index) + kLowWaterBlocks) {
     return;
   }
-  allocator.refill_pending = true;
-  stores_[allocator.owner]->worker->SpawnBackground(
+  allocator.refill_pending_ = true;
+  stores_[allocator.owner_]->worker_->SpawnBackground(
       RefillDeviceInBackground(device_index));
 }
 
 Task<absl::Status> StorageEngine::Impl::RefillDeviceInBackground(
     std::size_t device_index) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  co_await allocator.mutex.Lock();
-  UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
+  co_await allocator.mutex_.Lock();
+  UnlockGuard unlock(&allocator.mutex_, stores_[allocator.owner_]->worker_);
   absl::Status refilled = absl::OkStatus();
-  if (!allocator.failed.has_value()) {
+  if (!allocator.failed_.has_value()) {
     refilled = co_await RefillReadyBlocksLocal(device_index, allocator);
   }
-  allocator.refill_pending = false;
+  allocator.refill_pending_ = false;
   if (!refilled.ok()) {
     spdlog::error("background block refill failed on device {}: {}",
                   device_index, refilled.message());
@@ -274,8 +274,8 @@ Task<absl::Status> StorageEngine::Impl::RefillDeviceInBackground(
 
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
     std::size_t device_index, bool for_defrag) {
-  const celer::WorkerId owner = device_allocators_[device_index]->owner;
-  if (celer::ThisWorker().id == owner) {
+  const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+  if (celer::ThisWorker().id_ == owner) {
     co_return co_await AllocateFromDeviceLocal(device_index, for_defrag);
   }
   co_return co_await celer::SubmitTaskTo(
@@ -289,11 +289,11 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
 Task<absl::Status> StorageEngine::Impl::ReturnColdBlocksLocal(
     std::size_t device_index, std::vector<std::uint64_t> block_ids) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id == allocator.owner);
-  co_await allocator.mutex.Lock();
-  UnlockGuard unlock(&allocator.mutex, stores_[allocator.owner]->worker);
-  if (allocator.failed.has_value()) {
-    co_return *allocator.failed;
+  assert(celer::ThisWorker().id_ == allocator.owner_);
+  co_await allocator.mutex_.Lock();
+  UnlockGuard unlock(&allocator.mutex_, stores_[allocator.owner_]->worker_);
+  if (allocator.failed_.has_value()) {
+    co_return *allocator.failed_;
   }
   std::vector<std::size_t> dirty_pages;
   dirty_pages.reserve(block_ids.size());
@@ -308,11 +308,11 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocksLocal(
   absl::Status persisted = co_await PersistBitmapPages(device_index, allocator,
                                                        std::move(dirty_pages));
   if (!persisted.ok()) {
-    allocator.failed = persisted;
+    allocator.failed_ = persisted;
     co_return persisted;
   }
-  allocator.cold_free.insert(allocator.cold_free.end(), block_ids.begin(),
-                             block_ids.end());
+  allocator.cold_free_.insert(allocator.cold_free_.end(), block_ids.begin(),
+                              block_ids.end());
   co_return absl::OkStatus();
 }
 
@@ -327,13 +327,13 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
     if (by_device[device_index].empty()) {
       continue;
     }
-    const celer::WorkerId owner = device_allocators_[device_index]->owner;
+    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
     // Deliberately if/else, not a conditional expression: two co_awaits in
     // one full expression miscompile under GCC coroutines (branch awaiter
     // temporaries alias frame slots; destroying the suspended frame then
     // runs destructors on garbage).
     absl::Status returned;
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       returned = co_await ReturnColdBlocksLocal(
           device_index, std::move(by_device[device_index]));
     } else {
@@ -356,30 +356,30 @@ Task<absl::Status> StorageEngine::Impl::ReturnColdBlocks(
 Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
     std::size_t device_index, std::size_t value_index, std::uint64_t epoch) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
-  assert(celer::ThisWorker().id == allocator.owner);
+  assert(celer::ThisWorker().id_ == allocator.owner_);
   if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(
         absl::StatusCode::kFailedPrecondition,
         "epoch metadata writer is stopped after an IO failure");
   }
-  if (value_index >= allocator.epoch_values.size()) {
+  if (value_index >= allocator.epoch_values_.size()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "epoch metadata index is out of range");
   }
-  co_await allocator.mutex.Lock();
-  UnlockGuard allocator_unlock(&allocator.mutex,
-                               stores_[allocator.owner]->worker);
+  co_await allocator.mutex_.Lock();
+  UnlockGuard allocator_unlock(&allocator.mutex_,
+                               stores_[allocator.owner_]->worker_);
   if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(
         absl::StatusCode::kFailedPrecondition,
         "epoch metadata writer is stopped after an IO failure");
   }
-  if (epoch < allocator.epoch_values[value_index]) {
+  if (epoch < allocator.epoch_values_[value_index]) {
     co_return absl::OkStatus();
   }
   const std::uint64_t desired =
-      std::max(epoch, allocator.epoch_values[value_index]);
-  if (allocator.durable_epoch_values[value_index] >= desired) {
+      std::max(epoch, allocator.epoch_values_[value_index]);
+  if (allocator.durable_epoch_values_[value_index] >= desired) {
     co_return absl::OkStatus();
   }
   const std::size_t byte_offset = value_index * sizeof(std::uint64_t);
@@ -387,32 +387,32 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
   const std::size_t page_byte_offset = page_index * kMetadataPagePayloadBytes;
   const std::size_t payload_bytes = std::min(
       kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
-  WorkerStore& store = *stores_[allocator.owner];
-  auto acquired = co_await store.buffers.AcquireReadBuffer();
+  WorkerStore& store = *stores_[allocator.owner_];
+  auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) {
     co_return acquired.status();
   }
   ReadBufferLease lease = std::move(*acquired);
   FixedBuffer buffer = lease.io_buffer();
-  buffer.size = kDirectIoAlignment;
-  allocator.epoch_values[value_index] = desired;
-  const MetadataPageState current = allocator.epoch_pages[page_index];
-  const std::uint8_t next_slot = current.active_slot == 0 ? 1 : 0;
-  const std::uint64_t next_generation = current.generation + 1;
-  std::span<std::byte, kDirectIoAlignment> output(buffer.data,
+  buffer.size_ = kDirectIoAlignment;
+  allocator.epoch_values_[value_index] = desired;
+  const MetadataPageState current = allocator.epoch_pages_[page_index];
+  const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
+  const std::uint64_t next_generation = current.generation_ + 1;
+  std::span<std::byte, kDirectIoAlignment> output(buffer.data_,
                                                   kDirectIoAlignment);
   EncodeMetadataPage(
       MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
       next_generation,
       std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(allocator.epoch_values.data()) +
+          reinterpret_cast<const std::byte*>(allocator.epoch_values_.data()) +
               page_byte_offset,
           payload_bytes),
       output);
   const StorageDevice& device = devices_[device_index];
   auto written = co_await WriteStorageBuffer(
-      *store.worker, store.files[device.file_index], output, lease.registered(),
-      buffer,
+      *store.worker_, store.files_[device.file_index_], output,
+      lease.registered(), buffer,
       MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
   if (!written.ok() || *written != kDirectIoAlignment) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
@@ -421,21 +421,21 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
                        "short write of device epoch metadata")
         : written.status();
   }
-  absl::Status synced =
-      co_await celer::Fdatasync(*store.worker, store.files[device.file_index]);
+  absl::Status synced = co_await celer::Fdatasync(
+      *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {
     epoch_metadata_failed_.store(true, std::memory_order_release);
     co_return synced;
   }
-  allocator.epoch_pages[page_index] = MetadataPageState{
-      .generation = next_generation,
-      .active_slot = next_slot,
+  allocator.epoch_pages_[page_index] = MetadataPageState{
+      .generation_ = next_generation,
+      .active_slot_ = next_slot,
   };
   const std::size_t first_value = page_byte_offset / sizeof(std::uint64_t);
   const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
   for (std::size_t i = 0; i < value_count; ++i) {
-    allocator.durable_epoch_values[first_value + i] =
-        allocator.epoch_values[first_value + i];
+    allocator.durable_epoch_values_[first_value + i] =
+        allocator.epoch_values_[first_value + i];
   }
   co_return absl::OkStatus();
 }
@@ -448,9 +448,9 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
   }
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
-    const celer::WorkerId owner = device_allocators_[device_index]->owner;
+    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
     absl::Status persisted;
-    if (owner == celer::ThisWorker().id) {
+    if (owner == celer::ThisWorker().id_) {
       persisted = co_await PersistEpochValueOnDeviceLocal(device_index,
                                                           value_index, epoch);
     } else {
@@ -471,7 +471,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     WorkerStore& store, bool for_defrag) {
   const std::size_t device_count = devices_.size();
-  std::vector<std::size_t> home_order(store.home_devices.size());
+  std::vector<std::size_t> home_order(store.home_devices_.size());
   for (std::size_t i = 0; i < home_order.size(); ++i) {
     home_order[i] = i;
   }
@@ -479,20 +479,21 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
       home_order.begin(), home_order.end(),
       [this, &store](std::size_t left, std::size_t right) {
         const long double left_score =
-            static_cast<long double>(store.home_device_allocations[left] + 1) /
+            static_cast<long double>(store.home_device_allocations_[left] + 1) /
             static_cast<long double>(
-                ForegroundBlocksForDevice(store.home_devices[left]));
+                ForegroundBlocksForDevice(store.home_devices_[left]));
         const long double right_score =
-            static_cast<long double>(store.home_device_allocations[right] + 1) /
+            static_cast<long double>(store.home_device_allocations_[right] +
+                                     1) /
             static_cast<long double>(
-                ForegroundBlocksForDevice(store.home_devices[right]));
+                ForegroundBlocksForDevice(store.home_devices_[right]));
         return left_score < right_score;
       });
   std::vector<std::size_t> attempt_order;
   attempt_order.reserve(device_count);
   std::vector<bool> included(device_count, false);
   for (const std::size_t home_index : home_order) {
-    const std::size_t device_index = store.home_devices[home_index];
+    const std::size_t device_index = store.home_devices_[home_index];
     attempt_order.push_back(device_index);
     included[device_index] = true;
   }
@@ -503,7 +504,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     }
   }
   while (true) {
-    if (store.write_failed ||
+    if (store.write_failed_ ||
         epoch_metadata_failed_.load(std::memory_order_acquire)) {
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "storage writer is stopped after an IO failure");
@@ -513,12 +514,12 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     for (const std::size_t device_index : attempt_order) {
       auto allocated = co_await AllocateFromDevice(device_index, for_defrag);
       if (allocated.ok()) {
-        auto home = std::find(store.home_devices.begin(),
-                              store.home_devices.end(), device_index);
-        if (home != store.home_devices.end()) {
+        auto home = std::find(store.home_devices_.begin(),
+                              store.home_devices_.end(), device_index);
+        if (home != store.home_devices_.end()) {
           const std::size_t home_index =
-              static_cast<std::size_t>(home - store.home_devices.begin());
-          ++store.home_device_allocations[home_index];
+              static_cast<std::size_t>(home - store.home_devices_.begin());
+          ++store.home_device_allocations_[home_index];
         }
         co_return *allocated;
       }
@@ -544,8 +545,8 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
         pending_defrags_.load(std::memory_order_acquire) != 0 ||
         active_flushes_.load(std::memory_order_acquire) != 0 ||
         active_extent_reclaims_.load(std::memory_order_acquire) != 0) {
-      absl::Status waited =
-          co_await celer::SleepFor(*store.worker, std::chrono::milliseconds(1));
+      absl::Status waited = co_await celer::SleepFor(
+          *store.worker_, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return waited;
       }
@@ -562,8 +563,8 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     for (std::size_t d = 0; d < device_allocators_.size(); ++d) {
       const DeviceAllocator& allocator = *device_allocators_[d];
       devices += " dev" + std::to_string(d) +
-                 " ready=" + std::to_string(allocator.ready_blocks.size()) +
-                 " cold=" + std::to_string(allocator.cold_free.size()) +
+                 " ready=" + std::to_string(allocator.ready_blocks_.size()) +
+                 " cold=" + std::to_string(allocator.cold_free_.size()) +
                  " reserve=" + std::to_string(DefragReserveForDevice(d));
     }
     spdlog::warn(

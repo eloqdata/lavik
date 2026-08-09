@@ -4,7 +4,7 @@ namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
   assert(db_id < kLogicalDatabaseCount);
-  if (celer::ThisWorker().id != 0) {
+  if (celer::ThisWorker().id_ != 0) {
     co_return co_await celer::SubmitTaskTo(
         0, [this, db_id]() -> Task<absl::Status> {
           co_return co_await FlushDbDetach(db_id);
@@ -21,7 +21,7 @@ Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
 
 Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
                                                       std::uint64_t next) {
-  if (celer::ThisWorker().id != 0) {
+  if (celer::ThisWorker().id_ != 0) {
     co_return co_await celer::SubmitTaskTo(
         0, [this, db_id, next]() -> Task<absl::Status> {
           co_return co_await DetachDbEpoch(db_id, next);
@@ -44,8 +44,8 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto detach = [this, target, db_id]() -> Task<absl::Status> {
       WorkerStore& store = *stores_[target];
-      co_await store.store_state_mutex.Lock();
-      UnlockGuard unlock(&store.store_state_mutex, store.worker);
+      co_await store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
       DetachDbLocal(store, db_id);
       co_return absl::OkStatus();
     };
@@ -65,7 +65,7 @@ Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
 }
 
 Task<absl::Status> StorageEngine::Impl::ReclaimDetachedAllWorkers(bool wait) {
-  if (celer::ThisWorker().id != 0) {
+  if (celer::ThisWorker().id_ != 0) {
     co_return co_await celer::SubmitTaskTo(
         0, [this, wait]() -> Task<absl::Status> {
           co_return co_await ReclaimDetachedAllWorkers(wait);
@@ -107,38 +107,38 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   // FLUSHDB invalidates every watcher of this database, including watches
   // on keys that never existed (Redis semantics).
   tx::CurrentTxShard().MarkAllWatched(db_id);
-  ++store.index_generations[db_id];
-  for (auto& partition : store.partitions) {
-    store.detached_indexes.push_back(DetachedIndex{
-        .index = partition.indexes[db_id].Detach(),
-        .db_id = db_id,
+  ++store.index_generations_[db_id];
+  for (auto& partition : store.partitions_) {
+    store.detached_indexes_.push_back(DetachedIndex{
+        .index_ = partition.indexes_[db_id].Detach(),
+        .db_id_ = db_id,
     });
-    partition.live_key_count[db_id] = 0;
-    partition.expiring_key_count[db_id] = 0;
-    const std::uint64_t sequence = ++partition.mutation_sequence;
-    if (partition.capture_deltas) {
+    partition.live_key_count_[db_id] = 0;
+    partition.expiring_key_count_[db_id] = 0;
+    const std::uint64_t sequence = ++partition.mutation_sequence_;
+    if (partition.capture_deltas_) {
       AppendDelta(partition, SnapshotRecord{
-                                 .kind = SnapshotRecord::Kind::kFlushDb,
-                                 .db_id = db_id,
-                                 .db_epoch = DbEpoch(db_id),
-                                 .mutation_sequence = sequence,
-                                 .key = {},
-                                 .value = {},
+                                 .kind_ = SnapshotRecord::Kind::kFlushDb,
+                                 .db_id_ = db_id,
+                                 .db_epoch_ = DbEpoch(db_id),
+                                 .mutation_sequence_ = sequence,
+                                 .key_ = {},
+                                 .value_ = {},
                              });
     }
   }
-  store.live_key_count[db_id] = 0;
+  store.live_key_count_[db_id] = 0;
 }
 
 Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     WorkerStore& store) {
-  while (!store.detached_indexes.empty()) {
-    DetachedIndex detached = std::move(store.detached_indexes.front());
-    store.detached_indexes.pop_front();
+  while (!store.detached_indexes_.empty()) {
+    DetachedIndex detached = std::move(store.detached_indexes_.front());
+    store.detached_indexes_.pop_front();
 
     struct BlockDelta {
-      std::uint64_t bytes = 0;
-      std::uint16_t block_owner = 0;
+      std::uint64_t bytes_ = 0;
+      std::uint16_t block_owner_ = 0;
     };
     // Keyed by allocation epoch as well as block id: entries naming the same
     // block at different epochs are an accounting violation rather than
@@ -153,13 +153,13 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // released as a unit, so they are collected per record rather than
     // folded into the per-block totals.
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
-    detached.index.ForEach([&](const RecordIndex::Entry& entry) {
+    detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
       BlockDelta& delta = dead_by_block[std::pair(
-          entry.value.block_id, entry.value.allocation_epoch)];
-      delta.block_owner = entry.value.block_owner;
-      delta.bytes += entry.value.total_disk_bytes;
-      if (entry.value.external && entry.value.extents != nullptr) {
-        dead_extents.push_back(entry.value.extents);
+          entry.value_.block_id_, entry.value_.allocation_epoch_)];
+      delta.block_owner_ = entry.value_.block_owner_;
+      delta.bytes_ += entry.value_.total_disk_bytes_;
+      if (entry.value_.external_ && entry.value_.extents_ != nullptr) {
+        dead_extents.push_back(entry.value_.extents_);
       }
     });
 
@@ -170,16 +170,16 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     for (const auto& [block, delta] : dead_by_block) {
       // A block holds at most kStorageBlockBytes, so the sum still fits the
       // per-record width.
-      assert(delta.bytes <= kStorageBlockBytes);
+      assert(delta.bytes_ <= kStorageBlockBytes);
       RetiredRecord aggregate{
-          .block_id = block.first,
-          .allocation_epoch = block.second,
-          .total_disk_bytes = static_cast<std::uint32_t>(delta.bytes),
-          .block_owner = delta.block_owner,
+          .block_id_ = block.first,
+          .allocation_epoch_ = block.second,
+          .total_disk_bytes_ = static_cast<std::uint32_t>(delta.bytes_),
+          .block_owner_ = delta.block_owner_,
       };
       absl::Status dead = co_await MarkRecordDead(aggregate);
       if (!dead.ok()) {
-        store.write_failed = true;
+        store.write_failed_ = true;
         co_return dead;
       }
     }
@@ -187,34 +187,34 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // Freeing the entries is the expensive part of this loop, and it happens
     // as `detached` goes out of scope. Yield so online work is polled between
     // populations.
-    co_await celer::Yield(*store.worker);
+    co_await celer::Yield(*store.worker_);
   }
 
-  co_await store.store_state_mutex.Lock();
-  UnlockGuard unlock(&store.store_state_mutex, store.worker);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   SealDeadActiveBlock(store);
   co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::EnsureDetachedReclaim(WorkerStore& store) {
-  if (store.detached_reclaim_running || store.detached_indexes.empty()) {
+  if (store.detached_reclaim_running_ || store.detached_indexes_.empty()) {
     return;
   }
-  store.detached_reclaim_running = true;
+  store.detached_reclaim_running_ = true;
   active_settlements_.fetch_add(1, std::memory_order_acq_rel);
-  store.worker->SpawnBackground(RunDetachedReclaim(&store));
+  store.worker_->SpawnBackground(RunDetachedReclaim(&store));
 }
 
 Task<absl::Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
   struct SettlementGuard {
-    std::atomic<std::uint32_t>* active;
-    ~SettlementGuard() { active->fetch_sub(1, std::memory_order_acq_rel); }
+    std::atomic<std::uint32_t>* active_;
+    ~SettlementGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
   } settlement{&active_settlements_};
   absl::Status status = co_await ReclaimDetachedIndexes(*store);
-  store->detached_reclaim_running = false;
+  store->detached_reclaim_running_ = false;
   if (!status.ok()) {
     spdlog::error("worker[{}] detached index reclaim failed: {}",
-                  store->worker->id(), status.message());
+                  store->worker_->id(), status.message());
   }
   co_return status;
 }
@@ -222,20 +222,20 @@ Task<absl::Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
 Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
     WorkerStore& store) {
   EnsureDetachedReclaim(store);
-  while (store.detached_reclaim_running || !store.detached_indexes.empty()) {
+  while (store.detached_reclaim_running_ || !store.detached_indexes_.empty()) {
     // A reclaimer that died mid-stream never empties the queue and nothing
     // restarts it; fall through to the fail-stop report instead of
     // spinning forever.
-    if (!store.detached_reclaim_running && store.write_failed) {
+    if (!store.detached_reclaim_running_ && store.write_failed_) {
       break;
     }
     absl::Status waited =
-        co_await celer::SleepFor(*store.worker, std::chrono::milliseconds(1));
+        co_await celer::SleepFor(*store.worker_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return waited;
     }
   }
-  if (store.write_failed) {
+  if (store.write_failed_) {
     co_return absl::Status(
         absl::StatusCode::kInternal,
         "storage writer stopped while reclaiming flushed keys");

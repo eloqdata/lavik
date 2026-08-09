@@ -52,10 +52,10 @@ enum class CommandKind {
 struct CommandSpec;
 
 struct CommandRequest {
-  CommandKind kind = CommandKind::kUnknown;
-  std::uint8_t db_id = 0;
-  const CommandSpec* spec = nullptr;
-  std::vector<std::string> args;
+  CommandKind kind_ = CommandKind::kUnknown;
+  std::uint8_t db_id_ = 0;
+  const CommandSpec* spec_ = nullptr;
+  std::vector<std::string> args_;
 };
 
 // Pulls the next chunk of a streamed reply; an empty chunk ends the stream.
@@ -68,12 +68,12 @@ struct CommandReply {
   // direct-from-read-buffer GET path.
   // TODO: Add TcpStream::WriteVAll so composite replies can send independently
   // produced fragments without flattening them into ReplyBuilder.
-  std::string_view encoded;
-  std::optional<storage::DiskValue> disk_value;
-  ReplyChunkSource chunks;  // drained after `encoded` when set
-  bool close_connection = false;
-  ReadLatencyTrace read_trace;
-  std::optional<std::uint8_t> selected_db;
+  std::string_view encoded_;
+  std::optional<storage::DiskValue> disk_value_;
+  ReplyChunkSource chunks_;  // drained after `encoded` when set
+  bool close_connection_ = false;
+  ReadLatencyTrace read_trace_;
+  std::optional<std::uint8_t> selected_db_;
 };
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,

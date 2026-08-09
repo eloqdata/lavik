@@ -55,42 +55,43 @@ using celer::UnlockGuard;
 using celer::Worker;
 
 struct RecordLocation {
-  std::uint64_t block_id = 0;
-  std::uint64_t replication_epoch = 1;
-  std::uint64_t mutation_sequence = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint64_t expire_at_ms = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t replication_epoch_ = 1;
+  std::uint64_t mutation_sequence_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint64_t expire_at_ms_ = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
-  std::uint16_t block_owner = 0;
-  std::uint32_t record_offset = 0;
-  std::uint32_t total_disk_bytes = 0;
-  std::uint64_t logical_size = 0;
-  std::uint32_t payload_bytes = 0;
-  std::uint32_t relocation_sequence = 0;
+  std::uint16_t block_owner_ = 0;
+  std::uint32_t record_offset_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint64_t logical_size_ = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint32_t relocation_sequence_ = 0;
   // Packed flags: one byte for all four.
-  bool in_memory : 1 = false;
-  bool external : 1 = false;
+  bool in_memory_ : 1 = false;
+  bool external_ : 1 = false;
   // True while an older, still-unexpired value of this key may survive on
   // disk. Erasing this entry then would un-suppress that copy: recovery
   // picks the newest surviving record, so the key would resurrect with the
   // stale value. Propagates through every overwrite — tombstones included,
   // since a superseded tombstone leaves the disk like any dead record — and
   // is rebuilt exactly during recovery, which sees every surviving record.
-  bool shielding : 1 = false;
+  bool shielding_ : 1 = false;
   // Tomb-raider round state: set on candidates (tombstones, shielded values)
   // when a round begins, cleared when the sweep finds an older on-disk
   // record the entry still suppresses. Whatever survives the sweep
   // unclaimed proved nothing on disk needs it. False outside rounds, and
   // any overwrite resets it, exempting concurrently-touched keys.
-  bool unclaimed : 1 = false;
-  RecordKind kind = RecordKind::kValue;
-  ValueType value_type = ValueType::kNone;
-  std::shared_ptr<const std::vector<ExtentRef>> extents;
+  bool unclaimed_ : 1 = false;
+  RecordKind kind_ = RecordKind::kValue;
+  ValueType value_type_ = ValueType::kNone;
+  std::shared_ptr<const std::vector<ExtentRef>> extents_;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
-    return block_id == other.block_id && record_offset == other.record_offset &&
-           allocation_epoch == other.allocation_epoch;
+    return block_id_ == other.block_id_ &&
+           record_offset_ == other.record_offset_ &&
+           allocation_epoch_ == other.allocation_epoch_;
   }
 };
 
@@ -98,14 +99,14 @@ using RecordIndex = ScanHashMap<RecordLocation>;
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
-  if (candidate.replication_epoch != current.replication_epoch) {
-    return candidate.replication_epoch > current.replication_epoch;
+  if (candidate.replication_epoch_ != current.replication_epoch_) {
+    return candidate.replication_epoch_ > current.replication_epoch_;
   }
-  if (candidate.mutation_sequence != current.mutation_sequence) {
-    return candidate.mutation_sequence > current.mutation_sequence;
+  if (candidate.mutation_sequence_ != current.mutation_sequence_) {
+    return candidate.mutation_sequence_ > current.mutation_sequence_;
   }
-  if (candidate.relocation_sequence != current.relocation_sequence) {
-    return candidate.relocation_sequence > current.relocation_sequence;
+  if (candidate.relocation_sequence_ != current.relocation_sequence_) {
+    return candidate.relocation_sequence_ > current.relocation_sequence_;
   }
   return false;
 }
@@ -148,8 +149,8 @@ inline std::uint64_t UnixTimeMillis() noexcept {
 
 inline bool IsExpired(const RecordLocation& location,
                       std::uint64_t now_ms) noexcept {
-  return location.kind == RecordKind::kValue && location.expire_at_ms != 0 &&
-         location.expire_at_ms <= now_ms;
+  return location.kind_ == RecordKind::kValue && location.expire_at_ms_ != 0 &&
+         location.expire_at_ms_ <= now_ms;
 }
 
 inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>
@@ -160,27 +161,27 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
   }
   ExtentManifestHeader header{};
   std::memcpy(&header, payload.data(), sizeof(header));
-  if (header.magic != kExtentManifestMagic ||
-      header.version != kStorageFormatVersion || header.extent_count == 0 ||
-      header.extent_count > kMaxStringExtents ||
+  if (header.magic_ != kExtentManifestMagic ||
+      header.version_ != kStorageFormatVersion || header.extent_count_ == 0 ||
+      header.extent_count_ > kMaxStringExtents ||
       payload.size() !=
-          sizeof(header) + static_cast<std::size_t>(header.extent_count) *
+          sizeof(header) + static_cast<std::size_t>(header.extent_count_) *
                                sizeof(ExtentRef)) {
     return absl::Status(absl::StatusCode::kInternal,
                         "invalid external value manifest");
   }
-  auto refs = std::make_shared<std::vector<ExtentRef>>(header.extent_count);
+  auto refs = std::make_shared<std::vector<ExtentRef>>(header.extent_count_);
   std::memcpy(refs->data(), payload.data() + sizeof(header),
               refs->size() * sizeof(ExtentRef));
   std::uint64_t total = 0;
   for (const ExtentRef& ref : *refs) {
-    if (ref.block_id == kInvalidBlockId || ref.allocation_epoch == 0 ||
-        ref.payload_bytes == 0 || ref.payload_bytes > kExtentPayloadBytes ||
-        total > kMaxStringBytes - ref.payload_bytes) {
+    if (ref.block_id_ == kInvalidBlockId || ref.allocation_epoch_ == 0 ||
+        ref.payload_bytes_ == 0 || ref.payload_bytes_ > kExtentPayloadBytes ||
+        total > kMaxStringBytes - ref.payload_bytes_) {
       return absl::Status(absl::StatusCode::kInternal,
                           "invalid extent reference");
     }
-    total += ref.payload_bytes;
+    total += ref.payload_bytes_;
   }
   if (total != logical_size || total > kMaxStringBytes) {
     return absl::Status(absl::StatusCode::kInternal,
@@ -191,9 +192,9 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
 
 inline std::string EncodeManifest(std::span<const ExtentRef> refs) {
   ExtentManifestHeader header{
-      .magic = kExtentManifestMagic,
-      .version = kStorageFormatVersion,
-      .extent_count = static_cast<std::uint32_t>(refs.size())};
+      .magic_ = kExtentManifestMagic,
+      .version_ = kStorageFormatVersion,
+      .extent_count_ = static_cast<std::uint32_t>(refs.size())};
   std::string output(sizeof(header) + refs.size_bytes(), '\0');
   std::memcpy(output.data(), &header, sizeof(header));
   std::memcpy(output.data() + sizeof(header), refs.data(), refs.size_bytes());
@@ -201,19 +202,19 @@ inline std::string EncodeManifest(std::span<const ExtentRef> refs) {
 }
 
 struct ActiveBlock {
-  std::uint64_t block_id = 0;
-  std::uint32_t writer_id = 0;
-  std::uint32_t layout_worker_count = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t committed_bytes = kBlockHeaderBytes;
-  std::uint32_t record_count = 0;
-  std::uint64_t max_lsn = 0;
-  std::uint16_t write_buffer_id = 0;
-  std::byte* heap_buffer = nullptr;
-  std::size_t heap_buffer_size = 0;
-  BlockKind kind = BlockKind::kRecords;
-  std::uint32_t extent_index = 0;
-  std::uint32_t extent_payload_checksum = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint32_t writer_id_ = 0;
+  std::uint32_t layout_worker_count_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t committed_bytes_ = kBlockHeaderBytes;
+  std::uint32_t record_count_ = 0;
+  std::uint64_t max_lsn_ = 0;
+  std::uint16_t write_buffer_id_ = 0;
+  std::byte* heap_buffer_ = nullptr;
+  std::size_t heap_buffer_size_ = 0;
+  BlockKind kind_ = BlockKind::kRecords;
+  std::uint32_t extent_index_ = 0;
+  std::uint32_t extent_payload_checksum_ = 0;
 };
 
 // State that exists only while a block is held in memory behind a staging
@@ -222,18 +223,18 @@ struct ActiveBlock {
 // allocated block carries a BlockState, so this lives in a side table instead
 // of costing all of them 38 bytes.
 struct StagingSlot {
-  std::uint16_t write_buffer_id = 0;
-  std::byte* heap_data = nullptr;
-  std::size_t heap_data_size = 0;
+  std::uint16_t write_buffer_id_ = 0;
+  std::byte* heap_data_ = nullptr;
+  std::size_t heap_data_size_ = 0;
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
-  std::uint32_t durable_bytes = kBlockHeaderBytes;
-  std::uint32_t record_count = 0;
-  std::uint64_t max_lsn = 0;
+  std::uint32_t durable_bytes_ = kBlockHeaderBytes;
+  std::uint32_t record_count_ = 0;
+  std::uint64_t max_lsn_ = 0;
   // Sequence stamped into the last header write. Its parity picks the slot,
   // so the header slot needs no field of its own.
-  std::uint32_t header_sequence = 0;
-  std::uint16_t next_free = 0;
+  std::uint32_t header_sequence_ = 0;
+  std::uint16_t next_free_ = 0;
 };
 
 inline constexpr std::uint16_t kUnownedBlock =
@@ -247,50 +248,50 @@ inline constexpr std::uint16_t kUnownedBlock =
 // atomic. Everything else is the owner's exclusive property, reached only
 // after FindBlockState has confirmed ownership.
 struct alignas(32) BlockState {
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t committed_bytes = 0;
-  std::uint32_t live_bytes = 0;
-  std::uint32_t pins = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t committed_bytes_ = 0;
+  std::uint32_t live_bytes_ = 0;
+  std::uint32_t pins_ = 0;
   // Written only by the owner as it claims or releases the block; read by
   // anyone that needs to know where to dispatch. kUnownedBlock means free.
-  std::atomic<std::uint16_t> owner{kUnownedBlock};
-  std::uint16_t writer_id = 0;
-  std::uint16_t layout_worker_count = 0;
+  std::atomic<std::uint16_t> owner_{kUnownedBlock};
+  std::uint16_t writer_id_ = 0;
+  std::uint16_t layout_worker_count_ = 0;
   // Index into WorkerStore::staging_slots, or 0 when the block has no staging
   // buffer. Ids are 1-based so zero can mean "none".
-  std::uint16_t staging_slot = 0;
+  std::uint16_t staging_slot_ = 0;
   // Bitfields rather than bools: eight of these would otherwise cost a byte
   // each and push the struct past a cache line.
-  bool allocated : 1 = false;
-  bool defrag_queued : 1 = false;
-  bool defragging : 1 = false;
-  bool freeing : 1 = false;
-  bool in_memory : 1 = false;
-  bool flush_queued : 1 = false;
-  bool flush_in_progress : 1 = false;
-  bool release_pending : 1 = false;
-  BlockKind kind = BlockKind::kRecords;
+  bool allocated_ : 1 = false;
+  bool defrag_queued_ : 1 = false;
+  bool defragging_ : 1 = false;
+  bool freeing_ : 1 = false;
+  bool in_memory_ : 1 = false;
+  bool flush_queued_ : 1 = false;
+  bool flush_in_progress_ : 1 = false;
+  bool release_pending_ : 1 = false;
+  BlockKind kind_ = BlockKind::kRecords;
 
   // The atomic member makes this non-assignable, and clearing an entry has to
   // publish the new owner last so no one observes a half-reset block.
   void Reset(std::uint16_t new_owner) noexcept {
-    allocation_epoch = 0;
-    committed_bytes = 0;
-    live_bytes = 0;
-    pins = 0;
-    writer_id = 0;
-    layout_worker_count = 0;
-    staging_slot = 0;
-    allocated = false;
-    defrag_queued = false;
-    defragging = false;
-    freeing = false;
-    in_memory = false;
-    flush_queued = false;
-    flush_in_progress = false;
-    release_pending = false;
-    kind = BlockKind::kRecords;
-    owner.store(new_owner, std::memory_order_release);
+    allocation_epoch_ = 0;
+    committed_bytes_ = 0;
+    live_bytes_ = 0;
+    pins_ = 0;
+    writer_id_ = 0;
+    layout_worker_count_ = 0;
+    staging_slot_ = 0;
+    allocated_ = false;
+    defrag_queued_ = false;
+    defragging_ = false;
+    freeing_ = false;
+    in_memory_ = false;
+    flush_queued_ = false;
+    flush_in_progress_ = false;
+    release_pending_ = false;
+    kind_ = BlockKind::kRecords;
+    owner_.store(new_owner, std::memory_order_release);
   }
 };
 
@@ -302,37 +303,37 @@ static_assert(sizeof(BlockState) == 32);
 static_assert(alignof(BlockState) == 32);
 
 struct ExtentIdentity {
-  std::uint32_t extent_index = 0;
-  std::uint32_t payload_checksum = 0;
+  std::uint32_t extent_index_ = 0;
+  std::uint32_t payload_checksum_ = 0;
 };
 
 struct RecoveryRecord {
-  Digest digest{};
-  std::string key;
-  std::uint8_t db_id = 0;
+  Digest digest_{};
+  std::string key_;
+  std::uint8_t db_id_ = 0;
   // Multi-key transaction tag. Tagged records are parked until every
   // worker's scan has contributed its kTxCommit sightings, then applied only
   // if their transaction committed.
-  std::uint64_t txid = 0;
-  RecordLocation location{};
+  std::uint64_t txid_ = 0;
+  RecordLocation location_{};
 };
 
 struct RecoveryBlock {
-  ActiveBlock block{};
+  ActiveBlock block_{};
 };
 
 struct RecoveryBatch {
-  std::vector<RecoveryRecord> records;
-  std::vector<RecoveryBlock> blocks;
+  std::vector<RecoveryRecord> records_;
+  std::vector<RecoveryBlock> blocks_;
 };
 
 struct RecoveryLiveReference {
-  std::uint64_t block_id = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t bytes = 0;
-  bool extent = false;
-  std::uint32_t extent_index = 0;
-  std::uint32_t extent_payload_checksum = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t bytes_ = 0;
+  bool extent_ = false;
+  std::uint32_t extent_index_ = 0;
+  std::uint32_t extent_payload_checksum_ = 0;
 };
 
 // A relocated record cannot make its source block reclaimable until the
@@ -341,20 +342,20 @@ struct RecoveryLiveReference {
 // once this version is durable, recovery always has at least this copy or a
 // newer relocation to choose from.
 struct RelocationDurabilityFence {
-  std::uint64_t block_id = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint16_t block_owner = 0;
-  std::uint32_t committed_bytes = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint16_t block_owner_ = 0;
+  std::uint32_t committed_bytes_ = 0;
 };
 
 // The accounting handle for a superseded record: enough to subtract it from
 // its block's live_bytes once its replacement no longer needs it as the
 // durable copy.
 struct RetiredRecord {
-  std::uint64_t block_id = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t total_disk_bytes = 0;
-  std::uint16_t block_owner = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint16_t block_owner_ = 0;
 };
 
 // The index state a defrag relocation observed when it validated its source
@@ -364,17 +365,17 @@ struct RetiredRecord {
 // the physical record and the population epochs before the append prevents a
 // stale relocation from resurrecting either one.
 struct RelocationSource {
-  std::uint64_t db_epoch = 0;
-  std::uint64_t replication_epoch = 0;
-  std::uint64_t index_generation = 0;
-  std::uint64_t block_id = 0;
-  std::uint64_t allocation_epoch = 0;
-  std::uint32_t record_offset = 0;
+  std::uint64_t db_epoch_ = 0;
+  std::uint64_t replication_epoch_ = 0;
+  std::uint64_t index_generation_ = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t record_offset_ = 0;
 
   bool Matches(const RecordLocation& location) const noexcept {
-    return location.block_id == block_id &&
-           location.allocation_epoch == allocation_epoch &&
-           location.record_offset == record_offset;
+    return location.block_id_ == block_id_ &&
+           location.allocation_epoch_ == allocation_epoch_ &&
+           location.record_offset_ == record_offset_;
   }
 };
 
@@ -385,51 +386,51 @@ struct RelocationSource {
 // which database generation produced the entry lets the completion detect that
 // and skip the entry instead of following a pointer into a freed population.
 struct RecordIdentity {
-  RecordIndex::Entry* entry = nullptr;
-  std::shared_ptr<const std::vector<ExtentRef>> retired_extents;
+  RecordIndex::Entry* entry_ = nullptr;
+  std::shared_ptr<const std::vector<ExtentRef>> retired_extents_;
   // The version this record superseded. Retired only when this record's
   // flush completes: until the replacement is durable, the old copy is the
   // only durable version of the key, and subtracting it from live_bytes any
   // earlier lets the block reach zero and be durably freed — a crash before
   // the flush then loses a value that had already been made durable.
-  std::optional<RetiredRecord> retired_record;
+  std::optional<RetiredRecord> retired_record_;
   // A kTxCommit record additionally carries every retirement of its
   // transaction: the superseded versions may only leave their blocks'
   // accounting once the commit itself is durable, since without the commit
   // recovery drops the replacements and must still find the old copies.
-  std::shared_ptr<std::vector<RetiredRecord>> tx_retirements;
-  std::uint64_t index_generation = 0;
-  std::uint8_t db_id = 0;
+  std::shared_ptr<std::vector<RetiredRecord>> tx_retirements_;
+  std::uint64_t index_generation_ = 0;
+  std::uint8_t db_id_ = 0;
 };
 
 // One journaled write of an in-flight multi-key transaction, enough to put
 // the index back exactly as it was: entries are address-stable, the key
 // locks are still held, and routed retirements never fired.
 struct TxUndoEntry {
-  RecordIndex::Entry* entry = nullptr;
-  std::optional<RecordLocation> previous;
-  std::uint8_t db_id = 0;
+  RecordIndex::Entry* entry_ = nullptr;
+  std::optional<RecordLocation> previous_;
+  std::uint8_t db_id_ = 0;
 };
 
 struct ReplicaValueStage {
-  std::uint8_t db_id = 0;
-  std::uint64_t db_epoch = 0;
-  std::uint64_t mutation_sequence = 0;
-  std::uint64_t expire_at_ms = 0;
-  std::uint64_t logical_size = 0;
-  std::uint32_t next_chunk = 0;
-  std::uint32_t chunk_count = 0;
-  ValueType value_type = ValueType::kNone;
-  std::string key;
-  std::string value;
+  std::uint8_t db_id_ = 0;
+  std::uint64_t db_epoch_ = 0;
+  std::uint64_t mutation_sequence_ = 0;
+  std::uint64_t expire_at_ms_ = 0;
+  std::uint64_t logical_size_ = 0;
+  std::uint32_t next_chunk_ = 0;
+  std::uint32_t chunk_count_ = 0;
+  ValueType value_type_ = ValueType::kNone;
+  std::string key_;
+  std::string value_;
 };
 
 // One partition's worth of entries taken out of service by FLUSHDB. The entries
 // are unreachable to readers the moment the index is detached, but the blocks
 // they occupy still count them as live until the reclaimer subtracts them.
 struct DetachedIndex {
-  RecordIndex index;
-  std::uint8_t db_id = 0;
+  RecordIndex index_;
+  std::uint8_t db_id_ = 0;
 };
 
 inline bool IsZero(std::span<const std::byte> bytes) noexcept {
@@ -571,20 +572,20 @@ inline absl::Status WriteDeviceLabel(const std::string& path,
 }
 
 struct MetadataPageState {
-  std::uint64_t generation = 0;
-  std::uint8_t active_slot = 0;
+  std::uint64_t generation_ = 0;
+  std::uint8_t active_slot_ = 0;
 };
 
 struct LoadedMetadataPage {
-  std::vector<std::byte> payload;
-  MetadataPageState state{};
+  std::vector<std::byte> payload_;
+  MetadataPageState state_{};
 };
 
 inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
     int fd, std::uint64_t base_offset, MetadataPageKind kind,
     std::uint32_t page_index, std::size_t payload_bytes) {
   LoadedMetadataPage selected;
-  selected.payload.resize(payload_bytes, std::byte{0});
+  selected.payload_.resize(payload_bytes, std::byte{0});
   bool saw_nonzero = false;
   bool selected_valid = false;
   for (unsigned slot = 0; slot < 2; ++slot) {
@@ -603,10 +604,10 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
     if (!DecodeMetadataPage(page, kind, page_index, &generation, payload)) {
       continue;
     }
-    if (!selected_valid || generation > selected.state.generation) {
-      selected.payload = std::move(payload);
-      selected.state.generation = generation;
-      selected.state.active_slot = static_cast<std::uint8_t>(slot);
+    if (!selected_valid || generation > selected.state_.generation_) {
+      selected.payload_ = std::move(payload);
+      selected.state_.generation_ = generation;
+      selected.state_.active_slot_ = static_cast<std::uint8_t>(slot);
       selected_valid = true;
     }
   }
@@ -634,54 +635,54 @@ inline absl::StatusOr<std::uint64_t> RandomStorageSetId() {
 }
 
 struct StorageDevice {
-  std::string path;
-  std::uint64_t id = 0;
-  std::uint64_t capacity_blocks = 0;
-  std::uint32_t data_block_begin = 1;
-  std::uint64_t data_block_count = 0;
-  std::uint32_t file_index = 0;
+  std::string path_;
+  std::uint64_t id_ = 0;
+  std::uint64_t capacity_blocks_ = 0;
+  std::uint32_t data_block_begin_ = 1;
+  std::uint64_t data_block_count_ = 0;
+  std::uint32_t file_index_ = 0;
 };
 
 inline constexpr std::size_t kCacheLineBytes = 64;
 
 struct ReservedBlock {
-  std::uint64_t block_id = 0;
-  std::uint64_t allocation_epoch = 0;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
 };
 
 struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
-  std::atomic<std::uint64_t> next_local{1};
-  std::atomic<std::uint64_t> next_allocation_epoch{1};
+  std::atomic<std::uint64_t> next_local_{1};
+  std::atomic<std::uint64_t> next_allocation_epoch_{1};
 };
 
 static_assert(sizeof(RecoveryDeviceCursor) % kCacheLineBytes == 0);
 
 struct DeviceAllocator {
-  celer::WorkerId owner = 0;
-  AsyncMutex mutex;
-  std::uint32_t data_block_begin = 1;
-  std::uint64_t next_pristine = 1;
-  std::uint64_t next_allocation_epoch = 1;
-  std::vector<std::uint64_t> ready_blocks;
-  std::vector<std::uint64_t> cold_free;
-  std::vector<std::byte> scan_bitmap;
-  std::vector<MetadataPageState> bitmap_pages;
-  std::vector<MetadataPageState> epoch_pages;
-  std::vector<std::uint64_t> epoch_values;
-  std::vector<std::uint64_t> durable_epoch_values;
-  std::optional<absl::Status> failed;
-  bool refill_pending = false;
+  celer::WorkerId owner_ = 0;
+  AsyncMutex mutex_;
+  std::uint32_t data_block_begin_ = 1;
+  std::uint64_t next_pristine_ = 1;
+  std::uint64_t next_allocation_epoch_ = 1;
+  std::vector<std::uint64_t> ready_blocks_;
+  std::vector<std::uint64_t> cold_free_;
+  std::vector<std::byte> scan_bitmap_;
+  std::vector<MetadataPageState> bitmap_pages_;
+  std::vector<MetadataPageState> epoch_pages_;
+  std::vector<std::uint64_t> epoch_values_;
+  std::vector<std::uint64_t> durable_epoch_values_;
+  std::optional<absl::Status> failed_;
+  bool refill_pending_ = false;
 };
 
 struct BlockDeviceInfo {
-  std::size_t io_alignment = 0;
-  std::uint64_t size_bytes = 0;
+  std::size_t io_alignment_ = 0;
+  std::uint64_t size_bytes_ = 0;
 };
 
 struct StoragePathInfo {
-  bool is_block_device = false;
-  std::size_t io_alignment = kDirectIoAlignment;
-  std::uint64_t size_bytes = 0;
+  bool is_block_device_ = false;
+  std::size_t io_alignment_ = kDirectIoAlignment;
+  std::uint64_t size_bytes_ = 0;
 };
 
 inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
@@ -722,7 +723,7 @@ inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
         absl::StatusCode::kInternal,
         "block device logical sector size is not a power of two: " + path);
   }
-  return BlockDeviceInfo{.io_alignment = alignment, .size_bytes = size_bytes};
+  return BlockDeviceInfo{.io_alignment_ = alignment, .size_bytes_ = size_bytes};
 }
 
 inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
@@ -739,9 +740,9 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
       return device.status();
     }
     return StoragePathInfo{
-        .is_block_device = true,
-        .io_alignment = device->io_alignment,
-        .size_bytes = device->size_bytes,
+        .is_block_device_ = true,
+        .io_alignment_ = device->io_alignment_,
+        .size_bytes_ = device->size_bytes_,
     };
   }
   if (!S_ISREG(file_info.st_mode)) {
@@ -754,9 +755,9 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                         "storage file reports a negative size: " + path);
   }
   return StoragePathInfo{
-      .is_block_device = false,
-      .io_alignment = kDirectIoAlignment,
-      .size_bytes = static_cast<std::uint64_t>(file_info.st_size),
+      .is_block_device_ = false,
+      .io_alignment_ = kDirectIoAlignment,
+      .size_bytes_ = static_cast<std::uint64_t>(file_info.st_size),
   };
 }
 
@@ -767,7 +768,7 @@ inline Task<absl::StatusOr<std::size_t>> ReadStorageBuffer(
     co_return co_await celer::ReadFixed(worker, file, buffer, offset);
   }
   co_return co_await celer::Read(
-      worker, file, std::span<std::byte>(buffer.data, buffer.size), offset);
+      worker, file, std::span<std::byte>(buffer.data_, buffer.size_), offset);
 }
 
 inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
@@ -775,12 +776,12 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
     bool registered, FixedBuffer registered_buffer, std::uint64_t offset) {
   if (registered) {
     celer::FixedBuffer target = {
-        .data = const_cast<std::byte*>(buffer.data()),
-        .size = buffer.size(),
-        .index = registered_buffer.index,
+        .data_ = const_cast<std::byte*>(buffer.data()),
+        .size_ = buffer.size(),
+        .index_ = registered_buffer.index_,
     };
-    if (target.index == 0 || target.data == nullptr ||
-        target.size > registered_buffer.size) {
+    if (target.index_ == 0 || target.data_ == nullptr ||
+        target.size_ > registered_buffer.size_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "invalid registered write buffer");
     }
@@ -799,89 +800,89 @@ class StorageEngine::Impl {
  public:
   struct WorkerStore {
     struct PartitionStore {
-      std::uint16_t id = 0;
-      std::array<RecordIndex, kLogicalDatabaseCount> indexes;
-      std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
-      std::array<std::size_t, kLogicalDatabaseCount> expiring_key_count{};
-      std::uint64_t mutation_sequence = 0;
-      std::uint64_t replication_epoch = 1;
-      std::uint64_t delta_floor = 0;
-      bool capture_deltas = false;
-      bool delta_queued = false;
-      std::deque<SnapshotRecord> deltas;
-      std::optional<ReplicaValueStage> replica_value_stage;
+      std::uint16_t id_ = 0;
+      std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
+      std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
+      std::array<std::size_t, kLogicalDatabaseCount> expiring_key_count_{};
+      std::uint64_t mutation_sequence_ = 0;
+      std::uint64_t replication_epoch_ = 1;
+      std::uint64_t delta_floor_ = 0;
+      bool capture_deltas_ = false;
+      bool delta_queued_ = false;
+      std::deque<SnapshotRecord> deltas_;
+      std::optional<ReplicaValueStage> replica_value_stage_;
     };
 
     struct ExpireCandidate {
-      std::uint16_t partition_id = 0;
-      std::uint8_t db_id = 0;
-      Digest digest{};
-      std::uint64_t mutation_sequence = 0;
-      std::uint64_t expire_at_ms = 0;
-      std::string key;
+      std::uint16_t partition_id_ = 0;
+      std::uint8_t db_id_ = 0;
+      Digest digest_{};
+      std::uint64_t mutation_sequence_ = 0;
+      std::uint64_t expire_at_ms_ = 0;
+      std::string key_;
     };
 
-    Worker* worker = nullptr;
-    RegisteredBufferPool buffers;
-    std::vector<FixedFile> files;
-    std::vector<PartitionStore> partitions;
+    Worker* worker_ = nullptr;
+    RegisteredBufferPool buffers_;
+    std::vector<FixedFile> files_;
+    std::vector<PartitionStore> partitions_;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
-        staged_records;
+        staged_records_;
     // Bumped every time FLUSHDB detaches this database's partition indexes.
     // Every index for one database is detached together and without suspending,
     // so one counter per database describes all of them.
-    std::array<std::uint64_t, kLogicalDatabaseCount> index_generations{};
+    std::array<std::uint64_t, kLogicalDatabaseCount> index_generations_{};
     // Populations detached by FLUSHDB, still holding their entries. Draining
     // this is what actually frees them and settles the block accounting.
-    std::deque<DetachedIndex> detached_indexes;
-    bool detached_reclaim_running = false;
-    std::array<std::size_t, kLogicalDatabaseCount> live_key_count{};
-    std::optional<ActiveBlock> active_block;
+    std::deque<DetachedIndex> detached_indexes_;
+    bool detached_reclaim_running_ = false;
+    std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
+    std::optional<ActiveBlock> active_block_;
     // Recovery only. A recovered extent block's identity has to be checked
     // against the manifests that reference it, and the two arrive in separate
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
-    absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents;
+    absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents_;
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
-    std::vector<RecoveryRecord> recovery_tx_records;
+    std::vector<RecoveryRecord> recovery_tx_records_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
     // txid; written and consumed under store_state_mutex.
-    absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
+    absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo_;
     // Relocation fences owed per source block. A salvage pass that fails
     // midway has already moved records whose copies are not yet durable; the
     // debt survives the pass here, and CleanBlockLocked settles every owed
     // fence before the block's bitmap bit may be durably cleared. Same-worker
     // access only.
     absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
-        pending_relocation_fences;
+        pending_relocation_fences_;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
-    std::deque<StagingSlot> staging_slots{1};
-    std::uint16_t free_staging_slot = 0;
+    std::deque<StagingSlot> staging_slots_{1};
+    std::uint16_t free_staging_slot_ = 0;
     // Serializes this store's index, active append block, staging state, and
     // block accounting. Release it across block allocation and long I/O;
     // callers that do so must revalidate any state observed before the wait.
-    AsyncMutex store_state_mutex;
-    std::deque<std::uint64_t> flush_queue;
-    std::deque<std::uint64_t> defrag_queue;
-    std::vector<std::size_t> home_devices;
-    std::vector<std::uint64_t> home_device_allocations;
-    bool flush_running = false;
-    bool write_failed = false;
-    bool defrag_running = false;
-    bool defrag_waiting = false;
-    std::size_t defrag_waiting_device = 0;
-    std::size_t active_defrag_device = 0;
-    std::size_t expiry_partition_cursor = 0;
-    std::uint8_t expiry_db_cursor = 0;
-    std::uint64_t expiry_scan_cursor = 0;
+    AsyncMutex store_state_mutex_;
+    std::deque<std::uint64_t> flush_queue_;
+    std::deque<std::uint64_t> defrag_queue_;
+    std::vector<std::size_t> home_devices_;
+    std::vector<std::uint64_t> home_device_allocations_;
+    bool flush_running_ = false;
+    bool write_failed_ = false;
+    bool defrag_running_ = false;
+    bool defrag_waiting_ = false;
+    std::size_t defrag_waiting_device_ = 0;
+    std::size_t active_defrag_device_ = 0;
+    std::size_t expiry_partition_cursor_ = 0;
+    std::uint8_t expiry_db_cursor_ = 0;
+    std::uint64_t expiry_scan_cursor_ = 0;
     // True for the whole of one expiration cycle, scan through last tombstone.
     // QuiesceExpiration waits on it, which covers every suspension inside the
     // cycle's deletes — including block-allocation waits that release
     // store_state_mutex mid-append.
-    bool expiry_cycle_running = false;
-    std::deque<ExpireCandidate> expired_candidates;
+    bool expiry_cycle_running_ = false;
+    std::deque<ExpireCandidate> expired_candidates_;
   };
 
   absl::Status Prepare(unsigned worker_count);
@@ -956,9 +957,9 @@ class StorageEngine::Impl {
 
   TombRaiderTotals TombRaiderStats() const noexcept {
     return TombRaiderTotals{
-        .rounds = tomb_raider_rounds_.load(std::memory_order_relaxed),
-        .reaped = tomb_raider_reaped_.load(std::memory_order_relaxed),
-        .refreshed = tomb_raider_refreshed_.load(std::memory_order_relaxed),
+        .rounds_ = tomb_raider_rounds_.load(std::memory_order_relaxed),
+        .reaped_ = tomb_raider_reaped_.load(std::memory_order_relaxed),
+        .refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed),
     };
   }
 
@@ -1001,7 +1002,7 @@ class StorageEngine::Impl {
 
   std::size_t LocalSize(std::uint8_t db_id) const noexcept {
     assert(db_id < kLogicalDatabaseCount);
-    return CurrentStore().live_key_count[db_id];
+    return CurrentStore().live_key_count_[db_id];
   }
 
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept {
@@ -1077,17 +1078,17 @@ class StorageEngine::Impl {
   static void ReleaseStagingBuffer(WorkerStore& store, BlockState& state);
 
   struct LoadedValue {
-    ReadBufferLease lease;
-    std::size_t value_offset = 0;
-    std::size_t value_bytes = 0;
+    ReadBufferLease lease_;
+    std::size_t value_offset_ = 0;
+    std::size_t value_bytes_ = 0;
 
     std::span<const std::byte> value() const noexcept {
-      const std::span<std::byte> buffer = lease.bytes();
-      if (value_offset > buffer.size() ||
-          value_bytes > buffer.size() - value_offset) {
+      const std::span<std::byte> buffer = lease_.bytes();
+      if (value_offset_ > buffer.size() ||
+          value_bytes_ > buffer.size() - value_offset_) {
         return {};
       }
-      return buffer.subspan(value_offset, value_bytes);
+      return buffer.subspan(value_offset_, value_bytes_);
     }
   };
 
@@ -1099,27 +1100,27 @@ class StorageEngine::Impl {
                              std::uint8_t db_id,
                              const RecordIndex::Entry& entry);
 
-  WorkerStore& CurrentStore() { return *stores_[celer::ThisWorker().id]; }
+  WorkerStore& CurrentStore() { return *stores_[celer::ThisWorker().id_]; }
 
   const WorkerStore& CurrentStore() const {
-    return *stores_[celer::ThisWorker().id];
+    return *stores_[celer::ThisWorker().id_];
   }
 
   WorkerStore::PartitionStore& PartitionFor(WorkerStore& store,
                                             std::uint16_t partition_id) const {
     assert(partition_id < kLogicalStorageShards);
-    assert(partition_id % worker_count_ == store.worker->id());
-    auto& partition = store.partitions[partition_id / worker_count_];
-    assert(partition.id == partition_id);
+    assert(partition_id % worker_count_ == store.worker_->id());
+    auto& partition = store.partitions_[partition_id / worker_count_];
+    assert(partition.id_ == partition_id);
     return partition;
   }
 
   const WorkerStore::PartitionStore& PartitionFor(
       const WorkerStore& store, std::uint16_t partition_id) const {
     assert(partition_id < kLogicalStorageShards);
-    assert(partition_id % worker_count_ == store.worker->id());
-    const auto& partition = store.partitions[partition_id / worker_count_];
-    assert(partition.id == partition_id);
+    assert(partition_id % worker_count_ == store.worker_->id());
+    const auto& partition = store.partitions_[partition_id / worker_count_];
+    assert(partition.id_ == partition_id);
     return partition;
   }
 
@@ -1138,24 +1139,24 @@ class StorageEngine::Impl {
   BlockState* FindBlockState(WorkerStore& store,
                              std::uint64_t block_id) noexcept {
     BlockState& state = BlockStateAt(block_id);
-    if (state.owner.load(std::memory_order_acquire) != store.worker->id()) {
+    if (state.owner_.load(std::memory_order_acquire) != store.worker_->id()) {
       return nullptr;
     }
-    return state.allocated ? &state : nullptr;
+    return state.allocated_ ? &state : nullptr;
   }
 
   const BlockState* FindBlockState(const WorkerStore& store,
                                    std::uint64_t block_id) const noexcept {
     const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
-    if (state.owner.load(std::memory_order_acquire) != store.worker->id()) {
+    if (state.owner_.load(std::memory_order_acquire) != store.worker_->id()) {
       return nullptr;
     }
-    return state.allocated ? &state : nullptr;
+    return state.allocated_ ? &state : nullptr;
   }
 
   BlockState& CreateBlockState(WorkerStore& store, std::uint64_t block_id) {
     BlockState& state = BlockStateAt(block_id);
-    state.Reset(static_cast<std::uint16_t>(store.worker->id()));
+    state.Reset(static_cast<std::uint16_t>(store.worker_->id()));
     return state;
   }
 
@@ -1168,19 +1169,19 @@ class StorageEngine::Impl {
   // from the atomic and no other worker's fields are touched.
   template <typename Fn>
   void ForEachOwnedBlock(WorkerStore& store, Fn&& fn) {
-    const std::uint16_t me = static_cast<std::uint16_t>(store.worker->id());
+    const std::uint16_t me = static_cast<std::uint16_t>(store.worker_->id());
     for (std::size_t device_index = 0; device_index < devices_.size();
          ++device_index) {
       const StorageDevice& device = devices_[device_index];
       std::vector<BlockState>& states = device_block_states_[device_index];
       for (std::size_t slot = 0; slot < states.size(); ++slot) {
         BlockState& state = states[slot];
-        if (state.owner.load(std::memory_order_acquire) != me ||
-            !state.allocated) {
+        if (state.owner_.load(std::memory_order_acquire) != me ||
+            !state.allocated_) {
           continue;
         }
-        fn(MakeBlockId(device.id, static_cast<std::uint32_t>(
-                                      slot + device.data_block_begin)),
+        fn(MakeBlockId(device.id_, static_cast<std::uint32_t>(
+                                       slot + device.data_block_begin_)),
            state);
       }
     }
@@ -1191,9 +1192,9 @@ class StorageEngine::Impl {
   std::pair<std::uint32_t, std::uint64_t> FileOffset(
       std::uint64_t block_id) const noexcept {
     const StorageDevice& device = devices_[DeviceIndexForBlock(block_id)];
-    assert(LocalBlockId(block_id) >= device.data_block_begin);
-    assert(LocalBlockId(block_id) < device.capacity_blocks);
-    return {device.file_index, LocalBlockOffset(block_id)};
+    assert(LocalBlockId(block_id) >= device.data_block_begin_);
+    assert(LocalBlockId(block_id) < device.capacity_blocks_);
+    return {device.file_index_, LocalBlockOffset(block_id)};
   }
 
   static bool BitmapBit(const DeviceAllocator& allocator,
@@ -1277,9 +1278,9 @@ class StorageEngine::Impl {
     const std::size_t device_index = DeviceIndexForBlock(block_id);
     const StorageDevice& device = devices_[device_index];
     const std::uint32_t local = LocalBlockId(block_id);
-    assert(local >= device.data_block_begin);
-    assert(local < device.capacity_blocks);
-    return device_block_states_[device_index][local - device.data_block_begin];
+    assert(local >= device.data_block_begin_);
+    assert(local < device.capacity_blocks_);
+    return device_block_states_[device_index][local - device.data_block_begin_];
   }
 
   // Which worker owns a block, or kUnownedBlock if it is free. This is the one
@@ -1288,12 +1289,12 @@ class StorageEngine::Impl {
     const std::size_t device_index = DeviceIndexForBlock(block_id);
     const StorageDevice& device = devices_[device_index];
     const std::uint32_t local = LocalBlockId(block_id);
-    if (device_block_states_.empty() || local < device.data_block_begin ||
-        local >= device.capacity_blocks) {
+    if (device_block_states_.empty() || local < device.data_block_begin_ ||
+        local >= device.capacity_blocks_) {
       return kUnownedBlock;
     }
-    return device_block_states_[device_index][local - device.data_block_begin]
-        .owner.load(std::memory_order_acquire);
+    return device_block_states_[device_index][local - device.data_block_begin_]
+        .owner_.load(std::memory_order_acquire);
   }
 
   std::uint16_t RecoveredBlockOwner(const BlockHeader& block,
@@ -1336,7 +1337,7 @@ class StorageEngine::Impl {
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {
-    const std::uint64_t data_blocks = devices_[device_index].data_block_count;
+    const std::uint64_t data_blocks = devices_[device_index].data_block_count_;
     const std::size_t reserve = DefragReserveForDevice(device_index);
     return data_blocks > reserve ? data_blocks - reserve : 0;
   }
@@ -1365,10 +1366,10 @@ class StorageEngine::Impl {
 
   static RetiredRecord RetiredRecordOf(const RecordLocation& location) {
     return RetiredRecord{
-        .block_id = location.block_id,
-        .allocation_epoch = location.allocation_epoch,
-        .total_disk_bytes = location.total_disk_bytes,
-        .block_owner = location.block_owner,
+        .block_id_ = location.block_id_,
+        .allocation_epoch_ = location.allocation_epoch_,
+        .total_disk_bytes_ = location.total_disk_bytes_,
+        .block_owner_ = location.block_owner_,
     };
   }
 
@@ -1430,11 +1431,11 @@ class StorageEngine::Impl {
   // One dangerous older record for a claimed key, seen anywhere on any
   // worker's blocks, exempts the entry for the round.
   struct TombClaim {
-    std::uint64_t mutation_sequence = 0;
-    std::uint64_t replication_epoch = 0;
-    Digest digest{};
-    std::string key;
-    std::uint8_t db_id = 0;
+    std::uint64_t mutation_sequence_ = 0;
+    std::uint64_t replication_epoch_ = 0;
+    Digest digest_{};
+    std::string key_;
+    std::uint8_t db_id_ = 0;
   };
 
   Task<absl::Status> TombRaiderLoop(WorkerStore* store);

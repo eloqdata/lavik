@@ -28,14 +28,14 @@ enum CommandFlag : std::uint32_t {
 // the command name; max_args == 0 means unbounded (option parsing enforces the
 // rest).
 struct CommandSpec {
-  std::string_view name;  // lowercase canonical spelling
-  CommandKind kind = CommandKind::kUnknown;
-  std::uint8_t min_args = 1;
-  std::uint8_t max_args = 0;
-  std::uint8_t first_key = 0;
-  std::int8_t last_key = 0;
-  std::uint8_t key_step = 1;
-  std::uint32_t flags = 0;
+  std::string_view name_;  // lowercase canonical spelling
+  CommandKind kind_ = CommandKind::kUnknown;
+  std::uint8_t min_args_ = 1;
+  std::uint8_t max_args_ = 0;
+  std::uint8_t first_key_ = 0;
+  std::int8_t last_key_ = 0;
+  std::uint8_t key_step_ = 1;
+  std::uint32_t flags_ = 0;
 };
 
 // Case-insensitive lookup; nullptr when the command is unknown.
@@ -44,12 +44,14 @@ const CommandSpec* FindCommand(std::string_view name);
 // Key argument positions resolved against a concrete argc. Keys sit at
 // indices first, first + step, ..., last (inclusive).
 struct KeyIndexView {
-  std::uint16_t first = 0;
-  std::uint16_t last = 0;
-  std::uint8_t step = 1;
+  std::uint16_t first_ = 0;
+  std::uint16_t last_ = 0;
+  std::uint8_t step_ = 1;
 
-  bool empty() const { return first == 0; }
-  std::size_t count() const { return empty() ? 0 : (last - first) / step + 1; }
+  bool empty() const { return first_ == 0; }
+  std::size_t count() const {
+    return empty() ? 0 : (last_ - first_) / step_ + 1;
+  }
 };
 
 // Validates argc against the spec's arity range and resolves key positions.

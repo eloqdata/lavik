@@ -199,8 +199,8 @@ Task<absl::Status> StorageEngine::CommitTxWrites(
 }
 
 std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {
-  return tx::TxRuntime::Get()->next_txid.fetch_add(1,
-                                                   std::memory_order_relaxed);
+  return tx::TxRuntime::Get()->next_txid_.fetch_add(1,
+                                                    std::memory_order_relaxed);
 }
 
 void StorageEngine::NoteTxCommitStarted() noexcept {

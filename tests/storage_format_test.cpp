@@ -20,23 +20,23 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
                 static_cast<std::uint64_t>(local_block) * kStorageBlockBytes);
 
   DeviceLabel label{
-      .magic = kDeviceLabelMagic,
-      .version = kStorageFormatVersion,
-      .header_bytes = kDirectIoAlignment,
-      .storage_set_id = 17,
-      .device_id = device_id,
-      .capacity_blocks = kLocalBlockIdLimit,
-      .device_count = 7,
-      .block_bytes = kStorageBlockBytes,
+      .magic_ = kDeviceLabelMagic,
+      .version_ = kStorageFormatVersion,
+      .header_bytes_ = kDirectIoAlignment,
+      .storage_set_id_ = 17,
+      .device_id_ = device_id,
+      .capacity_blocks_ = kLocalBlockIdLimit,
+      .device_count_ = 7,
+      .block_bytes_ = kStorageBlockBytes,
   };
   std::array<std::byte, kDirectIoAlignment> label_page{};
   EncodeDeviceLabel(label, label_page);
   DeviceLabel decoded_label{};
   ASSERT_TRUE(DecodeDeviceLabel(label_page, &decoded_label));
-  ASSERT_TRUE(decoded_label.storage_set_id == label.storage_set_id);
-  ASSERT_TRUE(decoded_label.device_id == label.device_id);
-  ASSERT_TRUE(decoded_label.capacity_blocks == label.capacity_blocks);
-  ASSERT_TRUE(decoded_label.device_count == label.device_count);
+  ASSERT_TRUE(decoded_label.storage_set_id_ == label.storage_set_id_);
+  ASSERT_TRUE(decoded_label.device_id_ == label.device_id_);
+  ASSERT_TRUE(decoded_label.capacity_blocks_ == label.capacity_blocks_);
+  ASSERT_TRUE(decoded_label.device_count_ == label.device_count_);
   label_page.back() ^= std::byte{1};
   ASSERT_TRUE(!DecodeDeviceLabel(label_page, &decoded_label));
 
@@ -77,26 +77,26 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
                 MetadataPageSlotOffset(kEpochMetadataOffset, 1, 1));
 
   BlockHeader header{
-      .magic = kBlockMagic,
-      .block_id = block_id,
-      .version = kStorageFormatVersion,
-      .header_bytes = kBlockHeaderBytes,
-      .block_bytes = kStorageBlockBytes,
-      .writer_id = 3,
-      .allocation_epoch = 9,
-      .committed_bytes = kBlockHeaderBytes,
-      .record_count = 0,
-      .max_lsn = 0,
-      .header_sequence = 1,
-      .checksum = 0,
-      .layout_worker_count = 4,
+      .magic_ = kBlockMagic,
+      .block_id_ = block_id,
+      .version_ = kStorageFormatVersion,
+      .header_bytes_ = kBlockHeaderBytes,
+      .block_bytes_ = kStorageBlockBytes,
+      .writer_id_ = 3,
+      .allocation_epoch_ = 9,
+      .committed_bytes_ = kBlockHeaderBytes,
+      .record_count_ = 0,
+      .max_lsn_ = 0,
+      .header_sequence_ = 1,
+      .checksum_ = 0,
+      .layout_worker_count_ = 4,
   };
   std::array<std::byte, kBlockHeaderSlotBytes> block_page{};
   EncodeBlockHeader(header, block_page);
   BlockHeader decoded_header{};
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
-  ASSERT_TRUE(decoded_header.block_id == block_id);
-  ASSERT_TRUE(decoded_header.allocation_epoch == header.allocation_epoch);
+  ASSERT_TRUE(decoded_header.block_id_ == block_id);
+  ASSERT_TRUE(decoded_header.allocation_epoch_ == header.allocation_epoch_);
 
   // Double-slot resolution: the valid slot with the larger
   // (allocation_epoch, header_sequence) wins; torn/zero slots are skipped.
@@ -108,75 +108,75 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
     std::memcpy(pages.data(), block_page.data(), block_page.size());
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 0 &&
-                winner.committed_bytes == kBlockHeaderBytes);
+                winner.committed_bytes_ == kBlockHeaderBytes);
     BlockHeader newer = header;
-    newer.committed_bytes = kBlockHeaderBytes + 4096;
-    newer.header_sequence = 2;
+    newer.committed_bytes_ = kBlockHeaderBytes + 4096;
+    newer.header_sequence_ = 2;
     std::array<std::byte, kBlockHeaderSlotBytes> newer_page{};
     EncodeBlockHeader(newer, newer_page);
     std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
                 newer_page.size());
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 1 &&
-                winner.committed_bytes == kBlockHeaderBytes + 4096);
+                winner.committed_bytes_ == kBlockHeaderBytes + 4096);
     pages[kBlockHeaderSlotBytes + 8] ^= std::byte{0xff};  // tear slot 1
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
     ASSERT_TRUE(active_slot == 0 &&
-                winner.committed_bytes == kBlockHeaderBytes);
+                winner.committed_bytes_ == kBlockHeaderBytes);
 
     // A flush that adds no records still restamps the header, so equal
     // committed_bytes must be broken by the sequence, not by slot order.
     BlockHeader restamped = header;
-    restamped.header_sequence = 2;
-    restamped.max_lsn = 77;
+    restamped.header_sequence_ = 2;
+    restamped.max_lsn_ = 77;
     EncodeBlockHeader(restamped, newer_page);
     std::memcpy(pages.data() + kBlockHeaderSlotBytes, newer_page.data(),
                 newer_page.size());
     ASSERT_TRUE(DecodeBlockHeaderPages(pages, &winner, &active_slot));
-    ASSERT_TRUE(active_slot == 1 && winner.max_lsn == 77);
+    ASSERT_TRUE(active_slot == 1 && winner.max_lsn_ == 77);
   }
 
   BlockHeader extent_header = header;
-  extent_header.kind = BlockKind::kValueExtent;
-  extent_header.committed_bytes = kBlockHeaderBytes + 1234;
-  extent_header.extent_index = 2;
-  extent_header.extent_payload_bytes = 1234;
-  extent_header.extent_payload_checksum = 0x12345678U;
+  extent_header.kind_ = BlockKind::kValueExtent;
+  extent_header.committed_bytes_ = kBlockHeaderBytes + 1234;
+  extent_header.extent_index_ = 2;
+  extent_header.extent_payload_bytes_ = 1234;
+  extent_header.extent_payload_checksum_ = 0x12345678U;
   EncodeBlockHeader(extent_header, block_page);
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
-  ASSERT_TRUE(decoded_header.kind == BlockKind::kValueExtent);
-  ASSERT_TRUE(decoded_header.extent_index == extent_header.extent_index);
-  ASSERT_TRUE(decoded_header.extent_payload_bytes ==
-              extent_header.extent_payload_bytes);
-  ASSERT_TRUE(decoded_header.extent_payload_checksum ==
-              extent_header.extent_payload_checksum);
+  ASSERT_TRUE(decoded_header.kind_ == BlockKind::kValueExtent);
+  ASSERT_TRUE(decoded_header.extent_index_ == extent_header.extent_index_);
+  ASSERT_TRUE(decoded_header.extent_payload_bytes_ ==
+              extent_header.extent_payload_bytes_);
+  ASSERT_TRUE(decoded_header.extent_payload_checksum_ ==
+              extent_header.extent_payload_checksum_);
 
   constexpr std::string_view key = "typed-expiring-key";
   constexpr std::string_view value = "value";
   const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
   RecordHeader record{
-      .magic = kRecordMagic,
-      .version = kStorageFormatVersion,
-      .header_bytes = static_cast<std::uint16_t>(record_header_bytes),
-      .kind = RecordKind::kValue,
-      .db_id = 3,
-      .value_type = ValueType::kString,
-      .external = false,
-      .digest = ComputeDigest(key),
-      .key_bytes = static_cast<std::uint32_t>(key.size()),
-      .logical_size = value.size(),
-      .payload_bytes = static_cast<std::uint32_t>(value.size()),
-      .total_disk_bytes = static_cast<std::uint32_t>(
+      .magic_ = kRecordMagic,
+      .version_ = kStorageFormatVersion,
+      .header_bytes_ = static_cast<std::uint16_t>(record_header_bytes),
+      .kind_ = RecordKind::kValue,
+      .db_id_ = 3,
+      .value_type_ = ValueType::kString,
+      .external_ = false,
+      .digest_ = ComputeDigest(key),
+      .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .logical_size_ = value.size(),
+      .payload_bytes_ = static_cast<std::uint32_t>(value.size()),
+      .total_disk_bytes_ = static_cast<std::uint32_t>(
           AlignRecord(record_header_bytes + value.size())),
-      .txid = 4,
-      .replication_epoch = 5,
-      .db_epoch = 6,
-      .mutation_sequence = 7,
-      .relocation_sequence = 8,
-      .expire_at_ms = 1'900'000'000'123ULL,
-      .lsn = 9,
-      .allocation_epoch = 10,
-      .payload_checksum = Crc32c(std::span<const std::byte>(
+      .txid_ = 4,
+      .replication_epoch_ = 5,
+      .db_epoch_ = 6,
+      .mutation_sequence_ = 7,
+      .relocation_sequence_ = 8,
+      .expire_at_ms_ = 1'900'000'000'123ULL,
+      .lsn_ = 9,
+      .allocation_epoch_ = 10,
+      .payload_checksum_ = Crc32c(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(value.data()), value.size())),
   };
   std::array<std::byte, kMaxRecordHeaderBytes> record_page{};
@@ -189,21 +189,21 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       std::span<const std::byte>(record_page.data(), record_header_bytes),
       &decoded_record, &decoded_key));
   ASSERT_TRUE(decoded_key == key);
-  ASSERT_TRUE(decoded_record.value_type == ValueType::kString);
-  ASSERT_TRUE(!decoded_record.external);
-  ASSERT_TRUE(decoded_record.expire_at_ms == record.expire_at_ms);
+  ASSERT_TRUE(decoded_record.value_type_ == ValueType::kString);
+  ASSERT_TRUE(!decoded_record.external_);
+  ASSERT_TRUE(decoded_record.expire_at_ms_ == record.expire_at_ms_);
   record_page[record_header_bytes - 1] ^= std::byte{1};
   ASSERT_TRUE(!DecodeRecordHeader(
       std::span<const std::byte>(record_page.data(), record_header_bytes),
       &decoded_record, &decoded_key));
 
   RecordHeader external_record = record;
-  external_record.external = true;
-  external_record.logical_size = 9ULL * 1024 * 1024;
-  external_record.payload_bytes =
+  external_record.external_ = true;
+  external_record.logical_size_ = 9ULL * 1024 * 1024;
+  external_record.payload_bytes_ =
       sizeof(ExtentManifestHeader) + 2 * sizeof(ExtentRef);
-  external_record.total_disk_bytes = static_cast<std::uint32_t>(
-      AlignRecord(record_header_bytes + external_record.payload_bytes));
+  external_record.total_disk_bytes_ = static_cast<std::uint32_t>(
+      AlignRecord(record_header_bytes + external_record.payload_bytes_));
   std::fill(record_page.begin(), record_page.end(), std::byte{0});
   ASSERT_TRUE(EncodeRecordHeader(
       external_record, key,
@@ -211,8 +211,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(DecodeRecordHeader(
       std::span<const std::byte>(record_page.data(), record_header_bytes),
       &decoded_record, &decoded_key));
-  ASSERT_TRUE(decoded_record.external);
-  ASSERT_TRUE(decoded_record.value_type == ValueType::kString);
-  ASSERT_TRUE(decoded_record.logical_size == external_record.logical_size);
-  ASSERT_TRUE(decoded_record.payload_bytes == external_record.payload_bytes);
+  ASSERT_TRUE(decoded_record.external_);
+  ASSERT_TRUE(decoded_record.value_type_ == ValueType::kString);
+  ASSERT_TRUE(decoded_record.logical_size_ == external_record.logical_size_);
+  ASSERT_TRUE(decoded_record.payload_bytes_ == external_record.payload_bytes_);
 }

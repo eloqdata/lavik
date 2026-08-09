@@ -35,24 +35,24 @@ struct TestTask {
 
 // Awaitable the test fires manually — stands in for a disk I/O suspension.
 struct ManualEvent {
-  std::coroutine_handle<> handle;
-  bool ready = false;
+  std::coroutine_handle<> handle_;
+  bool ready_ = false;
 
   auto operator co_await() {
     struct Awaiter {
-      ManualEvent* event;
-      bool await_ready() const { return event->ready; }
-      void await_suspend(std::coroutine_handle<> h) { event->handle = h; }
+      ManualEvent* event_;
+      bool await_ready() const { return event_->ready_; }
+      void await_suspend(std::coroutine_handle<> h) { event_->handle_ = h; }
       void await_resume() const {}
     };
     return Awaiter{this};
   }
 
   void Fire() {
-    ready = true;
-    if (handle) {
-      auto h = handle;
-      handle = {};
+    ready_ = true;
+    if (handle_) {
+      auto h = handle_;
+      handle_ = {};
       h.resume();
     }
   }
@@ -99,9 +99,9 @@ TEST(TxLockTest, IntentAndHoldCompatibility) {
 
 TEST(TxLockTest, QueueOrdersByTransactionId) {
   TxQueue queue;
-  TxWaiter a{.txid = 5};
-  TxWaiter b{.txid = 3};
-  TxWaiter c{.txid = 7};
+  TxWaiter a{.txid_ = 5};
+  TxWaiter b{.txid_ = 3};
+  TxWaiter c{.txid_ = 7};
   queue.Insert(&a);
   queue.Insert(&b);
   queue.Insert(&c);

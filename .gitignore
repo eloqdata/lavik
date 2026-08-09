@@ -47,7 +47,6 @@ vgcore.*
 /.idea/
 /.vscode/
 .clangd
-.clang-tidy
 
 # OS cruft
 .DS_Store

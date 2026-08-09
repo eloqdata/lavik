@@ -22,7 +22,7 @@ void CheckKind(std::string_view name, CommandKind kind) {
   const CommandSpec* spec = FindCommand(name);
   EXPECT_CHECK(spec != nullptr, std::string(name) + " should resolve");
   if (spec != nullptr) {
-    EXPECT_CHECK(spec->kind == kind, std::string(name) + " kind mismatch");
+    EXPECT_CHECK(spec->kind_ == kind, std::string(name) + " kind mismatch");
   }
 }
 
@@ -38,7 +38,7 @@ void CheckArity(std::string_view name, std::size_t argc, bool ok) {
                                     (ok ? " should pass" : " should fail"));
   if (!ok && !keys.ok()) {
     const std::string expected = "wrong number of arguments for '" +
-                                 std::string(spec->name) + "' command";
+                                 std::string(spec->name_) + "' command";
     EXPECT_CHECK(keys.status().message() == expected,
                  std::string(name) + " arity error message mismatch: " +
                      std::string(keys.status().message()));
@@ -93,16 +93,16 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                              "exists", "dbsize", "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
-    EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdWrite) != 0,
+    EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) != 0,
                  std::string(name) + " should have kCmdWrite");
-    EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdReadOnly) == 0,
+    EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdReadOnly) == 0,
                  std::string(name) + " should not have kCmdReadOnly");
   }
   for (const char* name : read_cmds) {
     const CommandSpec* spec = FindCommand(name);
-    EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdReadOnly) != 0,
+    EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdReadOnly) != 0,
                  std::string(name) + " should have kCmdReadOnly");
-    EXPECT_CHECK(spec != nullptr && (spec->flags & keylane::kCmdWrite) == 0,
+    EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) == 0,
                  std::string(name) + " should not have kCmdWrite");
   }
   {
@@ -113,13 +113,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     for (const char* name : gated) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(
-          spec != nullptr && (spec->flags & keylane::kCmdUsesDbGate) != 0,
+          spec != nullptr && (spec->flags_ & keylane::kCmdUsesDbGate) != 0,
           std::string(name) + " should have kCmdUsesDbGate");
     }
     for (const char* name : ungated) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(
-          spec != nullptr && (spec->flags & keylane::kCmdUsesDbGate) == 0,
+          spec != nullptr && (spec->flags_ & keylane::kCmdUsesDbGate) == 0,
           std::string(name) + " should not have kCmdUsesDbGate");
     }
   }
@@ -129,8 +129,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     for (const char* name : no_keys) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
-                       (spec->flags & keylane::kCmdNoKeys) != 0 &&
-                       spec->first_key == 0,
+                       (spec->flags_ & keylane::kCmdNoKeys) != 0 &&
+                       spec->first_key_ == 0,
                    std::string(name) + " should be keyless");
     }
     const char* keyed[] = {"get",     "set",    "del",    "exists",
@@ -139,8 +139,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
-                       (spec->flags & keylane::kCmdNoKeys) == 0 &&
-                       spec->first_key == 1,
+                       (spec->flags_ & keylane::kCmdNoKeys) == 0 &&
+                       spec->first_key_ == 1,
                    std::string(name) + " should have keys at arg 1");
     }
   }
@@ -172,24 +172,24 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   // Key position resolution.
   {
     KeyIndexView view = Keys("get", 2);
-    EXPECT_CHECK(view.first == 1 && view.last == 1 && view.step == 1 &&
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 1 && view.step_ == 1 &&
                      view.count() == 1,
                  "GET key view mismatch");
   }
   {
     KeyIndexView view = Keys("set", 5);  // SET k v EX 10
-    EXPECT_CHECK(view.first == 1 && view.last == 1 && view.count() == 1,
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 1 && view.count() == 1,
                  "SET key view must cover only the key");
   }
   {
     KeyIndexView view = Keys("del", 5);  // DEL k1 k2 k3 k4
-    EXPECT_CHECK(view.first == 1 && view.last == 4 && view.step == 1 &&
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 4 && view.step_ == 1 &&
                      view.count() == 4,
                  "DEL key view mismatch");
   }
   {
     KeyIndexView view = Keys("exists", 2);
-    EXPECT_CHECK(view.first == 1 && view.last == 1 && view.count() == 1,
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 1 && view.count() == 1,
                  "EXISTS single-key view mismatch");
   }
   {

@@ -76,22 +76,22 @@ ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
 ReadBufferLease::~ReadBufferLease() { Reset(); }
 
 celer::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
-  if (!valid() || buffer_.size < headroom_bytes_ + tailroom_bytes_) {
+  if (!valid() || buffer_.size_ < headroom_bytes_ + tailroom_bytes_) {
     return {};
   }
   return celer::FixedBuffer{
-      .data = buffer_.data + headroom_bytes_,
-      .size = buffer_.size - headroom_bytes_ - tailroom_bytes_,
-      .index = buffer_.index,
+      .data_ = buffer_.data_ + headroom_bytes_,
+      .size_ = buffer_.size_ - headroom_bytes_ - tailroom_bytes_,
+      .index_ = buffer_.index_,
   };
 }
 
 void ReadBufferLease::Reset() noexcept {
   if (pool_ != nullptr) {
     RegisteredBufferPool* pool = std::exchange(pool_, nullptr);
-    pool->Release(buffer_.index);
-  } else if (buffer_.data != nullptr && heap_alignment_ != 0) {
-    ::operator delete[](buffer_.data, std::align_val_t(heap_alignment_));
+    pool->Release(buffer_.index_);
+  } else if (buffer_.data_ != nullptr && heap_alignment_ != 0) {
+    ::operator delete[](buffer_.data_, std::align_val_t(heap_alignment_));
   }
   buffer_ = {};
   heap_alignment_ = 0;
@@ -99,28 +99,29 @@ void ReadBufferLease::Reset() noexcept {
 
 RegisteredBufferPool::~RegisteredBufferPool() {
   if (sentinel_buffer_ != nullptr) {
-    ::operator delete[](sentinel_buffer_, std::align_val_t(options_.alignment));
+    ::operator delete[](sentinel_buffer_,
+                        std::align_val_t(options_.alignment_));
     sentinel_buffer_ = nullptr;
     sentinel_buffer_bytes_ = 0;
   }
   for (const celer::FixedBuffer& buffer : write_buffers_) {
-    if (buffer.data != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data),
-                  options_.alignment)) {
-      ::operator delete[](buffer.data, std::align_val_t(options_.alignment));
+    if (buffer.data_ != nullptr &&
+        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
+                  options_.alignment_)) {
+      ::operator delete[](buffer.data_, std::align_val_t(options_.alignment_));
     }
   }
   for (const celer::FixedBuffer& buffer : read_buffers_) {
-    if (buffer.data != nullptr &&
-        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data),
-                  options_.alignment)) {
-      ::operator delete[](buffer.data, std::align_val_t(options_.alignment));
+    if (buffer.data_ != nullptr &&
+        IsAligned(reinterpret_cast<std::uintptr_t>(buffer.data_),
+                  options_.alignment_)) {
+      ::operator delete[](buffer.data_, std::align_val_t(options_.alignment_));
     }
   }
   for (std::byte* buffer : heap_write_buffers_) {
     if (buffer != nullptr && IsAligned(reinterpret_cast<std::uintptr_t>(buffer),
-                                       options_.alignment)) {
-      ::operator delete[](buffer, std::align_val_t(options_.alignment));
+                                       options_.alignment_)) {
+      ::operator delete[](buffer, std::align_val_t(options_.alignment_));
     }
   }
 }
@@ -131,51 +132,51 @@ absl::Status RegisteredBufferPool::Init(
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is already initialized");
   }
-  if (!IsPowerOfTwo(options.alignment) || options.alignment < 4096) {
+  if (!IsPowerOfTwo(options.alignment_) || options.alignment_ < 4096) {
     return absl::Status(
         absl::StatusCode::kInvalidArgument,
         "registered buffer alignment must be a power of two >= 4096");
   }
-  if (!IsAligned(options.write_buffer_bytes, options.alignment) ||
-      !IsAligned(options.read_payload_bytes, options.alignment) ||
-      !IsAligned(options.read_headroom_bytes, options.alignment) ||
-      !IsAligned(options.read_tailroom_bytes, options.alignment)) {
+  if (!IsAligned(options.write_buffer_bytes_, options.alignment_) ||
+      !IsAligned(options.read_payload_bytes_, options.alignment_) ||
+      !IsAligned(options.read_headroom_bytes_, options.alignment_) ||
+      !IsAligned(options.read_tailroom_bytes_, options.alignment_)) {
     return absl::Status(
         absl::StatusCode::kInvalidArgument,
         "registered buffer sizes must satisfy O_DIRECT alignment");
   }
-  if (options.write_buffer_count == 0) {
+  if (options.write_buffer_count_ == 0) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "at least one write buffer is required");
   }
-  if (options.write_buffer_count >
+  if (options.write_buffer_count_ >
       static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max() - 1)) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "too many write buffers for fixed-buffer indices");
   }
 
-  if (options.write_buffer_bytes == 0 || options.read_payload_bytes == 0 ||
-      options.read_headroom_bytes == 0 || options.read_tailroom_bytes == 0) {
+  if (options.write_buffer_bytes_ == 0 || options.read_payload_bytes_ == 0 ||
+      options.read_headroom_bytes_ == 0 || options.read_tailroom_bytes_ == 0) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "registered buffer sizes must be positive");
   }
-  if (options.write_buffer_bytes > 0 &&
-      (std::numeric_limits<std::size_t>::max() / options.write_buffer_count) <
-          options.write_buffer_bytes) {
+  if (options.write_buffer_bytes_ > 0 &&
+      (std::numeric_limits<std::size_t>::max() / options.write_buffer_count_) <
+          options.write_buffer_bytes_) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "write buffer budget overflow");
   }
 
-  const std::size_t read_slot_bytes = options.read_headroom_bytes +
-                                      options.read_payload_bytes +
-                                      options.read_tailroom_bytes;
+  const std::size_t read_slot_bytes = options.read_headroom_bytes_ +
+                                      options.read_payload_bytes_ +
+                                      options.read_tailroom_bytes_;
   const std::size_t registered_write_count =
-      std::min(options.write_buffer_count,
-               options.registered_bytes / options.write_buffer_bytes);
+      std::min(options.write_buffer_count_,
+               options.registered_bytes_ / options.write_buffer_bytes_);
   const std::size_t registered_write_bytes =
-      registered_write_count * options.write_buffer_bytes;
+      registered_write_count * options.write_buffer_bytes_;
   const std::size_t read_count =
-      (options.registered_bytes - registered_write_bytes) / read_slot_bytes;
+      (options.registered_bytes_ - registered_write_bytes) / read_slot_bytes;
   const std::size_t total_count = registered_write_count + read_count;
   const std::size_t registration_count = total_count + 1;
   if (read_count >= std::numeric_limits<std::uint16_t>::max() ||
@@ -188,9 +189,9 @@ absl::Status RegisteredBufferPool::Init(
   std::vector<iovec> iovecs;
   iovecs.reserve(registration_count);
 
-  const std::size_t sentinel_bytes = options.alignment;
+  const std::size_t sentinel_bytes = options.alignment_;
   auto* sentinel = static_cast<std::byte*>(::operator new[](
-      sentinel_bytes, std::align_val_t(options.alignment), std::nothrow));
+      sentinel_bytes, std::align_val_t(options.alignment_), std::nothrow));
   if (sentinel == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned sentinel buffer allocation failed");
@@ -201,23 +202,23 @@ absl::Status RegisteredBufferPool::Init(
   write_buffers.reserve(registered_write_count);
   for (std::size_t i = 0; i < registered_write_count; ++i) {
     auto* data = static_cast<std::byte*>(
-        ::operator new[](options.write_buffer_bytes,
-                         std::align_val_t(options.alignment), std::nothrow));
+        ::operator new[](options.write_buffer_bytes_,
+                         std::align_val_t(options.alignment_), std::nothrow));
     if (data == nullptr) {
-      ::operator delete[](sentinel, std::align_val_t(options.alignment));
+      ::operator delete[](sentinel, std::align_val_t(options.alignment_));
       for (const celer::FixedBuffer& buffer : write_buffers) {
-        ::operator delete[](buffer.data, std::align_val_t(options.alignment));
+        ::operator delete[](buffer.data_, std::align_val_t(options.alignment_));
       }
       return absl::Status(absl::StatusCode::kResourceExhausted,
                           "aligned registered-write-buffer allocation failed");
     }
     const std::size_t id = i + 1;
     iovecs.push_back(
-        iovec{.iov_base = data, .iov_len = options.write_buffer_bytes});
+        iovec{.iov_base = data, .iov_len = options.write_buffer_bytes_});
     write_buffers.push_back(celer::FixedBuffer{
-        .data = data,
-        .size = options.write_buffer_bytes,
-        .index = static_cast<std::uint16_t>(id),
+        .data_ = data,
+        .size_ = options.write_buffer_bytes_,
+        .index_ = static_cast<std::uint16_t>(id),
     });
   }
 
@@ -225,14 +226,14 @@ absl::Status RegisteredBufferPool::Init(
   read_buffers.reserve(read_count);
   for (std::size_t i = 0; i < read_count; ++i) {
     auto* data = static_cast<std::byte*>(::operator new[](
-        read_slot_bytes, std::align_val_t(options.alignment), std::nothrow));
+        read_slot_bytes, std::align_val_t(options.alignment_), std::nothrow));
     if (data == nullptr) {
-      ::operator delete[](sentinel, std::align_val_t(options.alignment));
+      ::operator delete[](sentinel, std::align_val_t(options.alignment_));
       for (const celer::FixedBuffer& buffer : write_buffers) {
-        ::operator delete[](buffer.data, std::align_val_t(options.alignment));
+        ::operator delete[](buffer.data_, std::align_val_t(options.alignment_));
       }
       for (const celer::FixedBuffer& buffer : read_buffers) {
-        ::operator delete[](buffer.data, std::align_val_t(options.alignment));
+        ::operator delete[](buffer.data_, std::align_val_t(options.alignment_));
       }
       return absl::Status(absl::StatusCode::kResourceExhausted,
                           "aligned registered-read-buffer allocation failed");
@@ -240,26 +241,26 @@ absl::Status RegisteredBufferPool::Init(
     const std::size_t id = read_base + i;
     iovecs.push_back(iovec{.iov_base = data, .iov_len = read_slot_bytes});
     read_buffers.push_back(celer::FixedBuffer{
-        .data = data,
-        .size = read_slot_bytes,
-        .index = static_cast<std::uint16_t>(id),
+        .data_ = data,
+        .size_ = read_slot_bytes,
+        .index_ = static_cast<std::uint16_t>(id),
     });
   }
 
   absl::Status status = worker.RegisterBuffers(iovecs);
   if (!status.ok()) {
-    ::operator delete[](sentinel, std::align_val_t(options.alignment));
+    ::operator delete[](sentinel, std::align_val_t(options.alignment_));
     for (const celer::FixedBuffer& buffer : write_buffers) {
-      ::operator delete[](buffer.data, std::align_val_t(options.alignment));
+      ::operator delete[](buffer.data_, std::align_val_t(options.alignment_));
     }
     for (const celer::FixedBuffer& buffer : read_buffers) {
-      ::operator delete[](buffer.data, std::align_val_t(options.alignment));
+      ::operator delete[](buffer.data_, std::align_val_t(options.alignment_));
     }
     return status;
   }
 
   worker_ = &worker;
-  cross_core_ = celer::ThisWorker().cross_core;
+  cross_core_ = celer::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
   options_ = options;
   sentinel_buffer_ = sentinel;
@@ -311,7 +312,7 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is not initialized");
   }
-  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes &&
+  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes_ &&
       !pool_->free_read_buffers_.empty()) {
     return pool_->TakeReadBuffer();
   }
@@ -325,42 +326,42 @@ ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
   const std::size_t offset = static_cast<std::size_t>(buffer_id - read_base);
   read_buffer_in_use_[offset] = true;
   return ReadBufferLease(this, owner_worker_, read_buffers_[offset],
-                         options_.read_headroom_bytes,
-                         options_.read_tailroom_bytes);
+                         options_.read_headroom_bytes_,
+                         options_.read_tailroom_bytes_);
 }
 
 absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
     std::size_t minimum_payload_bytes) {
   std::size_t payload_bytes =
-      std::max(options_.read_payload_bytes, minimum_payload_bytes);
+      std::max(options_.read_payload_bytes_, minimum_payload_bytes);
   if (payload_bytes >
-      std::numeric_limits<std::size_t>::max() - (options_.alignment - 1)) {
+      std::numeric_limits<std::size_t>::max() - (options_.alignment_ - 1)) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "heap read buffer size overflow");
   }
   payload_bytes =
-      (payload_bytes + options_.alignment - 1) & ~(options_.alignment - 1);
+      (payload_bytes + options_.alignment_ - 1) & ~(options_.alignment_ - 1);
   if (payload_bytes > std::numeric_limits<std::size_t>::max() -
-                          options_.read_headroom_bytes ||
-      payload_bytes + options_.read_headroom_bytes >
+                          options_.read_headroom_bytes_ ||
+      payload_bytes + options_.read_headroom_bytes_ >
           std::numeric_limits<std::size_t>::max() -
-              options_.read_tailroom_bytes) {
+              options_.read_tailroom_bytes_) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "heap read buffer size overflow");
   }
-  const std::size_t bytes = options_.read_headroom_bytes + payload_bytes +
-                            options_.read_tailroom_bytes;
+  const std::size_t bytes = options_.read_headroom_bytes_ + payload_bytes +
+                            options_.read_tailroom_bytes_;
   auto* data = static_cast<std::byte*>(::operator new[](
-      bytes, std::align_val_t(options_.alignment), std::nothrow));
+      bytes, std::align_val_t(options_.alignment_), std::nothrow));
   if (data == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
   }
   return ReadBufferLease(
       owner_worker_,
-      celer::FixedBuffer{.data = data, .size = bytes, .index = 0},
-      options_.read_headroom_bytes, options_.read_tailroom_bytes,
-      options_.alignment);
+      celer::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0},
+      options_.read_headroom_bytes_, options_.read_tailroom_bytes_,
+      options_.alignment_);
 }
 
 std::optional<std::uint16_t> RegisteredBufferPool::TakeWriteBuffer() {
@@ -403,8 +404,8 @@ bool RegisteredBufferPool::TryAcquireHeapWriteBuffer(
     return true;
   }
   auto* data = static_cast<std::byte*>(
-      ::operator new[](options_.write_buffer_bytes,
-                       std::align_val_t(options_.alignment), std::nothrow));
+      ::operator new[](options_.write_buffer_bytes_,
+                       std::align_val_t(options_.alignment_), std::nothrow));
   if (data == nullptr) {
     return false;
   }
@@ -435,19 +436,19 @@ void RegisteredBufferPool::ReleaseWriteBufferLocal(
 
 void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
   const celer::CurrentWorker& current = celer::ThisWorker();
-  if (current.cross_core == cross_core_ && current.id == owner_worker_) {
+  if (current.cross_core_ == cross_core_ && current.id_ == owner_worker_) {
     ReleaseLocal(buffer_id);
     return;
   }
-  if (current.cross_core == nullptr || current.cross_core != cross_core_) {
+  if (current.cross_core_ == nullptr || current.cross_core_ != cross_core_) {
     return;
   }
   celer::PostNotification(
       cross_core_, owner_worker_,
       celer::RemoteNotification{
-          .context = this,
-          .value = buffer_id,
-          .run_fn = &RegisteredBufferPool::HandleRemoteRelease,
+          .context_ = this,
+          .value_ = buffer_id,
+          .run_fn_ = &RegisteredBufferPool::HandleRemoteRelease,
       });
 }
 

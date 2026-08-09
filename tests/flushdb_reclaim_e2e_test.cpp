@@ -334,8 +334,8 @@ std::vector<std::uint64_t> ReadAllocatedRecordBlocks(const std::string& path) {
     }
     keylane::storage::BlockHeader decoded{};
     if (keylane::storage::DecodeBlockHeaderPages(header, &decoded) &&
-        decoded.kind == keylane::storage::BlockKind::kRecords) {
-      blocks.push_back(decoded.block_id);
+        decoded.kind_ == keylane::storage::BlockKind::kRecords) {
+      blocks.push_back(decoded.block_id_);
     }
   }
   ::close(fd);

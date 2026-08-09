@@ -21,13 +21,13 @@ inline constexpr std::size_t kMiB = 1024 * 1024;
 inline constexpr std::size_t kKiB = 1024;
 
 struct RegisteredBufferPoolOptions {
-  std::size_t registered_bytes = 64 * kMiB;
-  std::size_t write_buffer_count = 4;
-  std::size_t write_buffer_bytes = 8 * kMiB;
-  std::size_t read_payload_bytes = 1 * kMiB;
-  std::size_t read_headroom_bytes = 4 * kKiB;
-  std::size_t read_tailroom_bytes = 4 * kKiB;
-  std::size_t alignment = 4 * kKiB;
+  std::size_t registered_bytes_ = 64 * kMiB;
+  std::size_t write_buffer_count_ = 4;
+  std::size_t write_buffer_bytes_ = 8 * kMiB;
+  std::size_t read_payload_bytes_ = 1 * kMiB;
+  std::size_t read_headroom_bytes_ = 4 * kKiB;
+  std::size_t read_tailroom_bytes_ = 4 * kKiB;
+  std::size_t alignment_ = 4 * kKiB;
 };
 
 class RegisteredBufferPool;
@@ -44,10 +44,10 @@ class ReadBufferLease {
   ReadBufferLease& operator=(ReadBufferLease&& other) noexcept;
   ~ReadBufferLease();
 
-  bool valid() const noexcept { return buffer_.data != nullptr; }
+  bool valid() const noexcept { return buffer_.data_ != nullptr; }
   bool registered() const noexcept { return pool_ != nullptr; }
   unsigned owner_worker() const noexcept { return owner_worker_; }
-  std::uint16_t buffer_id() const noexcept { return buffer_.index; }
+  std::uint16_t buffer_id() const noexcept { return buffer_.index_; }
 
   // Entire registered iovec, including framing/alignment headroom and tailroom.
   celer::FixedBuffer registered_buffer() const noexcept { return buffer_; }
@@ -56,7 +56,7 @@ class ReadBufferLease {
   celer::FixedBuffer io_buffer() const noexcept;
 
   std::span<std::byte> bytes() const noexcept {
-    return {buffer_.data, buffer_.size};
+    return {buffer_.data_, buffer_.size_};
   }
   std::size_t headroom_bytes() const noexcept { return headroom_bytes_; }
   std::size_t tailroom_bytes() const noexcept { return tailroom_bytes_; }
