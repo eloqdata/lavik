@@ -117,8 +117,17 @@ inline void MaybeCrashAt(const char* point) noexcept {
   }
 }
 #define KEYLANE_MAYBE_CRASH_AT(point) ::keylane::storage::MaybeCrashAt(point)
+
+// Deterministic write-fault injection for rollback tests: a tagged write of
+// the key named in KEYLANE_FAIL_TX_WRITE fails instead of appending.
+inline bool MaybeFailTxWrite(std::string_view key) noexcept {
+  static const char* const armed = std::getenv("KEYLANE_FAIL_TX_WRITE");
+  return armed != nullptr && key == armed;
+}
+#define KEYLANE_MAYBE_FAIL_TX_WRITE(key) ::keylane::storage::MaybeFailTxWrite(key)
 #else
 #define KEYLANE_MAYBE_CRASH_AT(point) ((void)0)
+#define KEYLANE_MAYBE_FAIL_TX_WRITE(key) false
 #endif
 
 inline std::uint64_t UnixTimeMillis() noexcept {
@@ -370,6 +379,15 @@ struct RecordIdentity {
   // recovery drops the replacements and must still find the old copies.
   std::shared_ptr<std::vector<RetiredRecord>> tx_retirements;
   std::uint64_t index_generation = 0;
+  std::uint8_t db_id = 0;
+};
+
+// One journaled write of an in-flight multi-key transaction, enough to put
+// the index back exactly as it was: entries are address-stable, the key
+// locks are still held, and routed retirements never fired.
+struct TxUndoEntry {
+  RecordIndex::Entry* entry = nullptr;
+  std::optional<RecordLocation> previous;
   std::uint8_t db_id = 0;
 };
 
@@ -809,6 +827,9 @@ class StorageEngine::Impl {
   // txid-tagged records parked by ApplyRecovery until the committed-txid set
   // is complete (after the recovery barrier).
   std::vector<RecoveryRecord> recovery_tx_records;
+  // Undo journals of in-flight multi-key writes on this shard, keyed by
+  // txid; written and consumed under writer_mutex.
+  absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};
@@ -932,6 +953,10 @@ class StorageEngine::Impl {
   void NoteTxCommitFinished() noexcept {
     active_tx_commits_.fetch_sub(1, std::memory_order_acq_rel);
   }
+
+  Task<Status> RollbackTxLocal(std::uint64_t txid);
+
+  Task<Status> DiscardTxUndoLocal(std::uint64_t txid);
 
   unsigned worker_count() const noexcept { return worker_count_; }
 

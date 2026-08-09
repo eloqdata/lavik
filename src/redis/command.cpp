@@ -1301,7 +1301,24 @@ struct MultiKeyContext {
   // Multi-key atomic write: per-worker receipts, non-empty only for tagged
   // writes (MSET / multi-key DEL). Each shard touches only its own slot.
   std::vector<storage::TxShardWrites> tx_writes;
+  // Set by the coordinator between the execute and finish hops of a tagged
+  // multi-shard write: any shard failed, so every shard must undo.
+  bool rollback = false;
 };
+
+// Second hop of a tagged multi-shard write, riding the releasing round: the
+// locks are still held, so undoing (or discarding the journal) here is
+// invisible to every other client — readers can never observe the aborted
+// values.
+Task<Status> MultiKeyFinishCallback(void* context,
+                                    const tx::ShardSlice&) {
+  auto* ctx = static_cast<MultiKeyContext*>(context);
+  const std::uint64_t txid = ctx->tx_writes.front().txid;
+  if (ctx->rollback) {
+    co_return co_await g_storage->RollbackTxLocal(txid);
+  }
+  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+}
 
 // Detached commit chain for one multi-key write: waits for every shard's
 // tagged data to be durable, then appends the kTxCommit record. The client
@@ -1357,6 +1374,10 @@ Task<Status> MultiKeyShardCallback(void* context,
             ctx->tx_writes.empty() ? nullptr
                                    : &ctx->tx_writes[ThisWorker().id]);
         if (!result.ok()) {
+          if (!ctx->tx_writes.empty()) {
+            (void)co_await g_storage->RollbackTxLocal(
+                ctx->tx_writes.front().txid);
+          }
           co_return result.status();
         }
         break;
@@ -1379,6 +1400,10 @@ Task<Status> MultiKeyShardCallback(void* context,
             ctx->tx_writes.empty() ? nullptr
                                    : &ctx->tx_writes[ThisWorker().id]);
         if (!deleted.ok()) {
+          if (!ctx->tx_writes.empty()) {
+            (void)co_await g_storage->RollbackTxLocal(
+                ctx->tx_writes.front().txid);
+          }
           co_return deleted.status();
         }
         if (*deleted) {
@@ -1434,6 +1459,7 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
     ctx.tx_writes.resize(g_storage->worker_count());
     for (auto& shard : ctx.tx_writes) {
       shard.txid = write_txid;
+      shard.collect_undo = true;
     }
   }
 
@@ -1441,11 +1467,27 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request) {
   if (!scheduled.ok()) {
     co_return EncodedReply(EncodeError("ERR " + scheduled.message()));
   }
-  Status status = co_await txn.Execute(&MultiKeyShardCallback, &ctx, true);
+  // A tagged multi-shard write holds every shard's locks across a second
+  // hop, so a mid-transaction storage failure can be undone before any other
+  // client sees it. Single-shard transactions self-roll-back inside their
+  // one hop (Execute requires release there), and reads have nothing to
+  // undo.
+  const bool two_hop = write_txid != 0 && !txn.single_shard();
+  Status status =
+      co_await txn.Execute(&MultiKeyShardCallback, &ctx, !two_hop);
+  if (two_hop) {
+    ctx.rollback = !status.ok();
+    Status finish =
+        co_await txn.Execute(&MultiKeyFinishCallback, &ctx, true);
+    if (!finish.ok() && status.ok()) {
+      status = finish;
+    }
+  }
   if (!status.ok()) {
-    // No commit record is appended: recovery treats every record this write
-    // tagged as an aborted prepare and drops it, so a crash cannot preserve
-    // half of the command.
+    // Runtime state is already rolled back, and no commit record is ever
+    // appended: recovery treats every record this write tagged as an aborted
+    // prepare and drops it, so neither a reader nor a crash can observe half
+    // of the command.
     co_return EncodedReply(EncodeStorageError(status));
   }
   if (write_txid != 0) {

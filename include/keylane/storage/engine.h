@@ -157,6 +157,11 @@ struct TxShardWrites {
   };
   std::vector<Fence> fences;
   std::vector<Retired> retirements;
+  // Journal undo state for runtime rollback (standalone MSET / multi-key
+  // DEL). EXEC leaves this off: its commands report errors individually and
+  // never roll back (Redis semantics), while recovery still treats the
+  // whole EXEC atomically through the commit record.
+  bool collect_undo = false;
 };
 
 class StorageEngine {
@@ -301,6 +306,15 @@ class StorageEngine {
   // it), Finished when the chain ends whatever its outcome.
   void NoteTxCommitStarted() noexcept;
   void NoteTxCommitFinished() noexcept;
+
+  // Undo every journaled write of the transaction on the calling shard:
+  // overwritten keys get their previous location back (and their partitions
+  // force a replica re-copy, since aborted values may already have shipped),
+  // freshly created keys get a normal tombstone appended. Must run on the
+  // owning shard with the transaction's key locks still held.
+  celer::Task<celer::Status> RollbackTxLocal(std::uint64_t txid);
+  // Drop the journal without acting on it (the transaction succeeded).
+  celer::Task<celer::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
   // Freeze/unfreeze expiration writes for stable-count scans (KEYS). The
   // caller must already exclude client writes (closed database gate).

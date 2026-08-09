@@ -214,6 +214,14 @@ void StorageEngine::NoteTxCommitFinished() noexcept {
   impl_->NoteTxCommitFinished();
 }
 
+Task<Status> StorageEngine::RollbackTxLocal(std::uint64_t txid) {
+  return impl_->RollbackTxLocal(txid);
+}
+
+Task<Status> StorageEngine::DiscardTxUndoLocal(std::uint64_t txid) {
+  return impl_->DiscardTxUndoLocal(txid);
+}
+
 bool StorageEngine::KeyLive(std::uint8_t db_id, std::string_view key,
                             const Digest& digest) const {
   return impl_->KeyLive(db_id, key, digest);

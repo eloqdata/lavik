@@ -381,6 +381,83 @@ Task<Status> StorageEngine::Impl::CommitTxWrites(
   co_return Status::Ok();
 }
 
+Task<Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
+  WorkerStore& store = CurrentStore();
+  co_await store.writer_mutex.Lock();
+  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  auto found = store.tx_undo.find(txid);
+  if (found == store.tx_undo.end()) {
+    co_return Status::Ok();
+  }
+  std::vector<TxUndoEntry> undo = std::move(found->second);
+  store.tx_undo.erase(found);
+  // Reverse order: a key written twice in one transaction unwinds through
+  // its intermediate version back to the original.
+  for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+    TxUndoEntry& entry = *it;
+    const RecordLocation applied = entry.entry->value;
+    auto& partition = PartitionForKey(store, entry.entry->key);
+    if (!entry.previous.has_value()) {
+      // The key did not exist: a normal tombstone append restores absence
+      // with every side effect handled (accounting, watchers, and the
+      // replica delta that supersedes the aborted value).
+      Status tombstone = co_await AppendLocked(
+          store, partition, entry.db_id, entry.entry->key, {},
+          RecordKind::kTombstone, ValueType::kNone, 0);
+      if (!tombstone.ok()) {
+        store.write_failed = true;
+        co_return tombstone;
+      }
+      continue;
+    }
+    // Mirror the append-time counter math in reverse.
+    const bool applied_live = applied.kind == RecordKind::kValue;
+    const bool restored_live = entry.previous->kind == RecordKind::kValue;
+    if (applied_live != restored_live) {
+      if (restored_live) {
+        ++partition.live_key_count[entry.db_id];
+        ++store.live_key_count[entry.db_id];
+      } else {
+        --partition.live_key_count[entry.db_id];
+        --store.live_key_count[entry.db_id];
+      }
+    }
+    const bool applied_expiring = applied_live && applied.expire_at_ms != 0;
+    const bool restored_expiring =
+        restored_live && entry.previous->expire_at_ms != 0;
+    if (applied_expiring != restored_expiring) {
+      if (restored_expiring) {
+        ++partition.expiring_key_count[entry.db_id];
+      } else {
+        --partition.expiring_key_count[entry.db_id];
+      }
+    }
+    entry.entry->value = *entry.previous;
+    Status dead = MarkRecordDeadLocal(store.worker->id(),
+                                      RetiredRecordOf(applied));
+    if (!dead.ok()) {
+      store.write_failed = true;
+      co_return dead;
+    }
+    if (partition.capture_deltas) {
+      // The aborted value may already have shipped; there is no delta that
+      // can express "go back", so force the replica to re-copy the
+      // partition.
+      partition.deltas.clear();
+      partition.delta_floor = partition.mutation_sequence;
+    }
+  }
+  co_return Status::Ok();
+}
+
+Task<Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
+  WorkerStore& store = CurrentStore();
+  co_await store.writer_mutex.Lock();
+  UnlockGuard unlock(&store.writer_mutex, store.worker);
+  store.tx_undo.erase(txid);
+  co_return Status::Ok();
+}
+
 Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
     WorkerStore* store, std::vector<RetiredRecord> records) {
   for (const RetiredRecord& record : records) {
@@ -744,6 +821,10 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
   if (tx != nullptr) {
     assert(tx->txid != 0);
     txid = tx->txid;
+    if (KEYLANE_MAYBE_FAIL_TX_WRITE(key)) {
+      co_return Status(StatusCode::kInternal,
+                       "injected transaction write fault");
+    }
   }
   if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
       (kind == RecordKind::kTombstone &&
@@ -1024,6 +1105,13 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       .index_generation = store.index_generations[db_id],
       .db_id = db_id,
   });
+  if (tx != nullptr && tx->collect_undo && inserted_entry != nullptr) {
+    store.tx_undo[txid].push_back(TxUndoEntry{
+        .entry = inserted_entry,
+        .previous = previous,
+        .db_id = db_id,
+    });
+  }
   if (route_to_commit) {
     // The superseded version may only leave its block's accounting once the
     // commit record is durable — recovery drops uncommitted replacements and
