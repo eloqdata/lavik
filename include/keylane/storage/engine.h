@@ -200,9 +200,14 @@ class StorageEngine {
   // may return duplicate keys while the partition index is changing.
   // now_ms fixes the expiration filter timestamp (0 = current time), so a
   // multi-pass scan can see a stable notion of liveness.
+  // max_bytes bounds the accumulated key bytes of one batch (overshoot is
+  // at most one bucket chain, since the scan emits whole chains), so a
+  // caller assembling bounded chunks stays bounded even with huge key
+  // names.
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
                           std::uint64_t cursor, std::size_t count,
-                          std::uint64_t now_ms = 0) const;
+                          std::uint64_t now_ms = 0,
+                          std::size_t max_bytes = SIZE_MAX) const;
 
   // Atomically invalidates one logical DB by advancing its durable epoch and
   // taking its indexes out of service. The command layer must prevent

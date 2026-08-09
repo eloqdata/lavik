@@ -595,9 +595,13 @@ Task<KeysWorkerBatch> KeysBatchOnWorker(std::uint8_t db, unsigned worker,
         unsigned scanned = 0;
         while (batch.partition < storage::kLogicalStorageShards &&
                batch.payload.size() < kChunkBytes) {
+          // The byte budget keeps one step from blowing past the chunk
+          // bound with large key names; overshoot is one bucket chain.
           storage::ScanBatch step = g_storage->ScanPartition(
               static_cast<std::uint16_t>(batch.partition), db, batch.cursor,
-              512, now_ms);
+              512, now_ms,
+              count_only ? kChunkBytes
+                         : kChunkBytes - batch.payload.size());
           for (const std::string& key : step.keys) {
             if (*pattern == "*" || GlobMatch(*pattern, key)) {
               if (count_only) {

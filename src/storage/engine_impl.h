@@ -1027,7 +1027,8 @@ class StorageEngine::Impl {
 
   ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
                           std::uint64_t cursor, std::size_t count,
-                          std::uint64_t now_ms) const;
+                          std::uint64_t now_ms,
+                          std::size_t max_bytes = SIZE_MAX) const;
 
   PartitionReplicationStart BeginPartitionReplication(
       std::uint16_t partition_id);

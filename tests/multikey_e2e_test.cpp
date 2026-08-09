@@ -410,6 +410,23 @@ int main(int argc, char** argv) {
                    "KEYS escaped star");
     Expect(client.Command({"KEYS", "lit\\?eral"}), "*0",
            "KEYS escaped question mark");
+
+    // Large key names: the total far exceeds one 64 KiB stream chunk, so
+    // the reply must arrive complete across several bounded chunks.
+    {
+      std::vector<std::string> long_names;
+      for (int i = 0; i < 48; ++i) {
+        std::string name = "longname:" + std::to_string(i) + ":";
+        name.append(3500, 'x');
+        Expect(client.Command({"SET", name, "v"}), "+OK", "long name SET");
+        long_names.push_back(std::move(name));
+      }
+      expect_members(client.Command({"KEYS", "longname:*"}),
+                     long_names.size(), long_names, "KEYS long names");
+      for (const std::string& name : long_names) {
+        Expect(client.Command({"DEL", name}), ":1", "long name DEL");
+      }
+    }
     Expect(client.Command({"DEL", "lit*eral"}), ":1", "escape cleanup");
 
     // Streaming stays bounded: several hundred keys still arrive with an

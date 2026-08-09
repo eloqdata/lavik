@@ -568,8 +568,21 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
       if (chunk->empty()) {
         break;
       }
-      write_status = co_await stream.WriteAll(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(chunk->data()), chunk->size()));
+      // Write in bounded segments and stamp progress after each one: the
+      // watchdog then judges liveness per segment, so a client draining a
+      // large chunk at a modest rate is never mistaken for a stalled one.
+      constexpr std::size_t kWriteSegmentBytes = 256 * 1024;
+      std::span<const std::byte> remaining(
+          reinterpret_cast<const std::byte*>(chunk->data()), chunk->size());
+      while (write_status.ok() && !remaining.empty()) {
+        const std::size_t segment =
+            std::min(kWriteSegmentBytes, remaining.size());
+        write_status = co_await stream.WriteAll(remaining.first(segment));
+        remaining = remaining.subspan(segment);
+        if (stall != nullptr) {
+          stall->last_progress = std::chrono::steady_clock::now();
+        }
+      }
     }
     if (reply.read_trace.request_start_ns != 0) {
       reply.read_trace.send_complete_ns = ReadTraceNowNanos();

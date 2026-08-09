@@ -6,7 +6,8 @@ ScanBatch StorageEngine::Impl::ScanPartition(std::uint16_t partition_id,
                                              std::uint8_t db_id,
                                              std::uint64_t cursor,
                                              std::size_t count,
-                                             std::uint64_t now_ms) const {
+                                             std::uint64_t now_ms,
+                                             std::size_t max_bytes) const {
   assert(db_id < kLogicalDatabaseCount);
   assert(count > 0);
   const auto& index =
@@ -21,17 +22,19 @@ ScanBatch StorageEngine::Impl::ScanPartition(std::uint16_t partition_id,
           ? std::numeric_limits<std::size_t>::max()
           : count * 10;
   std::size_t iterations = 0;
+  std::size_t bytes = 0;
   do {
     result.cursor = index.Scan(
         result.cursor, [&](const RecordIndex::Entry& entry) {
           if (entry.value.kind == RecordKind::kValue &&
               !IsExpired(entry.value, now_ms)) {
+            bytes += entry.key.size();
             result.keys.push_back(entry.key);
           }
         });
     ++iterations;
   } while (result.cursor != 0 && result.keys.size() < count &&
-           iterations < max_iterations);
+           bytes < max_bytes && iterations < max_iterations);
   return result;
 }
 
