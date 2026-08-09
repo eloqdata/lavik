@@ -211,7 +211,11 @@ bool CloseDbGate(std::uint8_t db_id) noexcept {
 }
 
 void OpenDbGate(std::uint8_t db_id) noexcept {
-  g_db_gates[db_id].store(0, std::memory_order_release);
+  // Clear only the closed bit. After a completed drain the count bits are
+  // zero anyway; on an early exit (today only worker shutdown) in-flight
+  // operations still hold their counts, and zeroing those would let their
+  // EndDbOperation underflow the gate into a permanently-closed value.
+  g_db_gates[db_id].fetch_and(~kDbGateClosed, std::memory_order_acq_rel);
 }
 
 class DbOperationGuard {
@@ -1850,6 +1854,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx) {
     }
     auto keys = DetermineKeys(*cmd.spec, cmd.args.size());
     if (!keys.ok()) {
+      // Unreachable today: queueing ran the same check on the same spec and
+      // arity. Kept defensive, and EXEC must consume the connection's
+      // watches whatever its outcome — leaving them registered would
+      // false-abort every later EXEC on this connection.
+      co_await DropWatches(ctx);
       co_return EncodedReply(EncodeError("ERR " + keys.status().message()));
     }
     const bool write = (cmd.spec->flags & kCmdWrite) != 0;
