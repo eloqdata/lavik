@@ -3,10 +3,11 @@
 #include <unistd.h>
 
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "keylane/storage/engine.h"
 
@@ -14,12 +15,7 @@ namespace {
 
 constexpr std::uint64_t kMiB = 1024 * 1024;
 
-bool Check(bool condition, const char* message) {
-  if (!condition) {
-    std::cerr << message << '\n';
-  }
-  return condition;
-}
+#define ASSERT_CHECK(condition, message) ASSERT_TRUE(condition) << message
 
 bool CreateFile(const std::string& path, std::uint64_t bytes) {
   const int fd = ::open(path.c_str(),
@@ -68,7 +64,7 @@ struct Cleanup {
 
 }  // namespace
 
-int main() {
+TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
   const std::string prefix =
       "/tmp/keylane-storage-capacity-" + std::to_string(::getpid());
   Cleanup cleanup;
@@ -77,62 +73,41 @@ int main() {
   const std::string unequal_b = prefix + "-unequal-b.data";
   cleanup.paths.push_back(unequal_a);
   cleanup.paths.push_back(unequal_b);
-  if (!Check(CreateFile(unequal_a, 80 * kMiB) &&
-                 CreateFile(unequal_b, 88 * kMiB),
-             "failed to create unequal-capacity files")) {
-    return 1;
-  }
-  if (!Check(Prepare({unequal_a, unequal_b}).ok(),
-             "unequal fresh device capacities were rejected")) {
-    return 1;
-  }
-  if (!Check(FileSize(unequal_a) == 80 * kMiB &&
-                 FileSize(unequal_b) == 88 * kMiB,
-             "storage prepare changed regular-file sizes")) {
-    return 1;
-  }
+  ASSERT_CHECK(CreateFile(unequal_a, 80 * kMiB) &&
+                   CreateFile(unequal_b, 88 * kMiB),
+               "failed to create unequal-capacity files");
+  ASSERT_CHECK(Prepare({unequal_a, unequal_b}).ok(),
+               "unequal fresh device capacities were rejected");
+  ASSERT_CHECK(FileSize(unequal_a) == 80 * kMiB &&
+                   FileSize(unequal_b) == 88 * kMiB,
+               "storage prepare changed regular-file sizes");
 
-  if (!Check(GrowFile(unequal_b, 96 * kMiB),
-             "failed to grow initialized test file")) {
-    return 1;
-  }
-  if (!Check(Prepare({unequal_a, unequal_b}).ok(),
-             "larger backing file did not preserve labeled capacity")) {
-    return 1;
-  }
-  if (!Check(::truncate(unequal_a.c_str(),
-                        static_cast<off_t>(72 * kMiB)) == 0 &&
-                 !Prepare({unequal_a, unequal_b}).ok(),
-             "backing file smaller than its label was accepted")) {
-    return 1;
-  }
+  ASSERT_CHECK(GrowFile(unequal_b, 96 * kMiB),
+               "failed to grow initialized test file");
+  ASSERT_CHECK(Prepare({unequal_a, unequal_b}).ok(),
+               "larger backing file did not preserve labeled capacity");
+  ASSERT_CHECK(::truncate(unequal_a.c_str(),
+                          static_cast<off_t>(72 * kMiB)) == 0 &&
+                   !Prepare({unequal_a, unequal_b}).ok(),
+               "backing file smaller than its label was accepted");
 
   const std::string too_small = prefix + "-small.data";
   cleanup.paths.push_back(too_small);
-  if (!Check(CreateFile(too_small, 72 * kMiB) &&
-                 !Prepare({too_small}).ok(),
-             "single-device file with no foreground block was accepted")) {
-    return 1;
-  }
+  ASSERT_CHECK(CreateFile(too_small, 72 * kMiB) &&
+                   !Prepare({too_small}).ok(),
+               "single-device file with no foreground block was accepted");
 
   const std::string minimum = prefix + "-minimum.data";
   cleanup.paths.push_back(minimum);
-  if (!Check(CreateFile(minimum, 80 * kMiB) && Prepare({minimum}).ok(),
-             "80 MiB single-device minimum was rejected")) {
-    return 1;
-  }
+  ASSERT_CHECK(CreateFile(minimum, 80 * kMiB) && Prepare({minimum}).ok(),
+               "80 MiB single-device minimum was rejected");
 
   const std::string unaligned = prefix + "-unaligned.data";
   cleanup.paths.push_back(unaligned);
-  if (!Check(CreateFile(unaligned, 80 * kMiB + 4096) &&
-                 !Prepare({unaligned}).ok(),
-             "unaligned fresh regular file was accepted")) {
-    return 1;
-  }
+  ASSERT_CHECK(CreateFile(unaligned, 80 * kMiB + 4096) &&
+                   !Prepare({unaligned}).ok(),
+               "unaligned fresh regular file was accepted");
 
   const std::string missing = prefix + "-missing.data";
-  if (!Check(!Prepare({missing}).ok(), "missing storage path was created")) {
-    return 1;
-  }
-  return 0;
+  ASSERT_CHECK(!Prepare({missing}).ok(), "missing storage path was created");
 }
