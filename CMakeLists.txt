@@ -10,7 +10,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(KEYLANE_BUILD_EXAMPLE "Build keylane example binary" ON)
 option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
@@ -92,17 +91,15 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endif()
 endif()
 
-if (KEYLANE_BUILD_EXAMPLE)
-  add_executable(keylane
-    app/keylane.cpp
-  )
-  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND KEYLANE_ENABLE_OPT)
-    target_compile_options(keylane PRIVATE -O3 -march=native -flto=auto)
-    target_link_options(keylane PRIVATE -flto=auto)
-  endif()
-  target_precompile_headers(keylane REUSE_FROM keylane_module)
-  target_link_libraries(keylane PRIVATE keylane::module)
+add_executable(keylane
+  app/keylane.cpp
+)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND KEYLANE_ENABLE_OPT)
+  target_compile_options(keylane PRIVATE -O3 -march=native -flto=auto)
+  target_link_options(keylane PRIVATE -flto=auto)
 endif()
+target_precompile_headers(keylane REUSE_FROM keylane_module)
+target_link_libraries(keylane PRIVATE keylane::module)
 
 if (BUILD_TESTING)
   include(FetchContent)
@@ -128,7 +125,7 @@ if (BUILD_TESTING)
   include(GoogleTest)
   gtest_discover_tests(keylane_unit_tests)
 
-  if (KEYLANE_BUILD_EXAMPLE AND UNIX)
+  if (UNIX)
     add_executable(keylane_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp
     )
