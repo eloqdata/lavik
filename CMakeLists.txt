@@ -65,17 +65,17 @@ endif()
 add_library(keylane_module
   src/storage/buffer_pool.cpp
   src/storage/engine.cpp
-  src/storage/engine_alloc.cpp
-  src/storage/engine_defrag.cpp
-  src/storage/engine_expire.cpp
-  src/storage/engine_flush.cpp
-  src/storage/engine_tombraider.cpp
-  src/storage/engine_flushdb.cpp
-  src/storage/engine_init.cpp
-  src/storage/engine_read.cpp
-  src/storage/engine_recovery.cpp
-  src/storage/engine_replication.cpp
-  src/storage/engine_write.cpp
+  src/storage/engine/alloc.cpp
+  src/storage/engine/defrag.cpp
+  src/storage/engine/expire.cpp
+  src/storage/engine/flush.cpp
+  src/storage/engine/flush_db.cpp
+  src/storage/engine/init.cpp
+  src/storage/engine/read.cpp
+  src/storage/engine/recovery.cpp
+  src/storage/engine/replication.cpp
+  src/storage/engine/tomb_raider.cpp
+  src/storage/engine/write.cpp
   src/storage/format.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
