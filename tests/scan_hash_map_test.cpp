@@ -143,5 +143,107 @@ int main() {
     return 1;
   }
 
+  // Erase: every other key of a fresh population, verifying removal, size,
+  // survivor lookups, scan completeness, and slot reuse by re-insertion.
+  ScanHashMap<std::uint64_t> erasable;
+  constexpr std::uint64_t kErasePopulation = 10000;
+  for (std::uint64_t i = 0; i < kErasePopulation; ++i) {
+    const std::string key = "erase-" + std::to_string(i);
+    erasable.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+  for (std::uint64_t i = 0; i < kErasePopulation; i += 2) {
+    const std::string key = "erase-" + std::to_string(i);
+    if (!Check(erasable.Erase(ComputeDigest(key), key), "erase failed")) {
+      return 1;
+    }
+  }
+  if (!Check(erasable.size() == kErasePopulation / 2,
+             "erase left a wrong population count")) {
+    return 1;
+  }
+  for (std::uint64_t i = 0; i < kErasePopulation; ++i) {
+    const std::string key = "erase-" + std::to_string(i);
+    auto* found = erasable.Find(ComputeDigest(key), key);
+    if (i % 2 == 0) {
+      if (!Check(found == nullptr, "erased key is still reachable")) {
+        return 1;
+      }
+    } else if (!Check(found != nullptr && found->value == i,
+                      "erase disturbed a surviving key")) {
+      return 1;
+    }
+  }
+  if (!Check(!erasable.Erase(ComputeDigest("erase-0"), "erase-0"),
+             "double erase reported success")) {
+    return 1;
+  }
+  seen.clear();
+  cursor = 0;
+  do {
+    cursor = erasable.Scan(cursor,
+                           [&](const auto& entry) { ++seen[entry.key]; });
+  } while (cursor != 0);
+  if (!Check(seen.size() == erasable.size(),
+             "scan after erase missed or duplicated survivors")) {
+    return 1;
+  }
+  for (std::uint64_t i = 0; i < kErasePopulation; i += 2) {
+    const std::string key = "erase-" + std::to_string(i);
+    auto again = erasable.InsertOrAssign(ComputeDigest(key), key, i + 1);
+    if (!Check(again.inserted, "reinsert after erase failed")) {
+      return 1;
+    }
+  }
+  if (!Check(erasable.size() == kErasePopulation,
+             "reinsert after erase left a wrong count")) {
+    return 1;
+  }
+
+  // Erase inside one overflow chain: all keys share a digest, so they pile
+  // into a single bucket chain and exercise the hole-filling compaction.
+  ScanHashMap<std::uint64_t> chained;
+  for (std::uint64_t i = 0; i < 64; ++i) {
+    const std::string key = "chain-" + std::to_string(i);
+    chained.InsertOrAssign(collision, key, i);
+  }
+  for (std::uint64_t i = 0; i < 64; i += 3) {
+    const std::string key = "chain-" + std::to_string(i);
+    if (!Check(chained.Erase(collision, key), "chained erase failed")) {
+      return 1;
+    }
+  }
+  for (std::uint64_t i = 0; i < 64; ++i) {
+    const std::string key = "chain-" + std::to_string(i);
+    auto* found = chained.Find(collision, key);
+    if (i % 3 == 0) {
+      if (!Check(found == nullptr, "erased chained key is reachable")) {
+        return 1;
+      }
+    } else if (!Check(found != nullptr && found->value == i,
+                      "chain compaction lost a surviving key")) {
+      return 1;
+    }
+  }
+  while (chained.size() != 0) {
+    std::string victim;
+    std::uint64_t drain_cursor = 0;
+    do {
+      drain_cursor = chained.Scan(drain_cursor, [&](const auto& entry) {
+        if (victim.empty()) {
+          victim = entry.key;
+        }
+      });
+    } while (drain_cursor != 0 && victim.empty());
+    if (!Check(chained.Erase(collision, victim),
+               "chain drain erase failed")) {
+      return 1;
+    }
+  }
+  if (!Check(chained.Find(collision, "chain-1") == nullptr &&
+                 chained.size() == 0,
+             "chain drain left residue")) {
+    return 1;
+  }
+
   return 0;
 }

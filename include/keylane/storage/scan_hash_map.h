@@ -98,6 +98,44 @@ class ScanHashMap {
     return {raw, true};
   }
 
+  // Deletes the matching entry, compacting its bucket chain the way Valkey's
+  // hashtablePop does so chains stay dense and emptied child buckets are
+  // freed. Compaction moves entries only within their own chain, and Scan
+  // emits a whole chain per cursor position, so a concurrent scan never
+  // misses an entry that existed throughout. The table itself never shrinks
+  // (the port dropped shrinking with deletion); slots are reused by later
+  // inserts, so footprint is bounded by the peak live count.
+  bool Erase(const Digest& digest, std::string_view key) {
+    RehashStep();
+    const std::uint64_t hash = Hash(digest);
+    const std::uint8_t tag = HashTag(hash);
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      Table& table = tables_[t];
+      if (table.buckets == nullptr) {
+        continue;
+      }
+      Bucket* top = &table.buckets[hash & BucketMask(table)];
+      for (Bucket* bucket = top; bucket != nullptr;
+           bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
+        const std::size_t slots = Chained(*bucket) ? kChildSlot
+                                                    : kEntriesPerBucket;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          if (Occupied(*bucket, slot) && bucket->hashes[slot] == tag &&
+              KeyEquals(*bucket->entries[slot], digest, key)) {
+            delete bucket->entries[slot];
+            bucket->entries[slot] = nullptr;
+            ClearOccupied(bucket, slot);
+            --table.used;
+            FillBucketHole(top, bucket, slot);
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
   template <typename Fn>
   void ForEach(Fn&& fn) {
     ForEachTable(tables_[0], fn);
@@ -381,6 +419,41 @@ class ScanHashMap {
       child->hashes[0] = displaced_hash;
       SetOccupied(child, 0);
       bucket = child;
+    }
+  }
+
+  // Moves the last entry of the chain into the freed slot and unlinks the
+  // tail bucket once it empties. Only meaningful for chained tops: holes in
+  // an unchained bucket are reused by AddToTable's slot scan.
+  static void FillBucketHole(Bucket* top, Bucket* holed,
+                             std::size_t hole_slot) {
+    if (!Chained(*top)) {
+      return;
+    }
+    Bucket* parent = nullptr;
+    Bucket* tail = top;
+    while (Chained(*tail)) {
+      parent = tail;
+      tail = Child(tail);
+    }
+    std::size_t last = kEntriesPerBucket;
+    for (std::size_t slot = kEntriesPerBucket; slot-- > 0;) {
+      if (Occupied(*tail, slot)) {
+        last = slot;
+        break;
+      }
+    }
+    if (last != kEntriesPerBucket && !(tail == holed && last == hole_slot)) {
+      holed->entries[hole_slot] = tail->entries[last];
+      holed->hashes[hole_slot] = tail->hashes[last];
+      SetOccupied(holed, hole_slot);
+      tail->entries[last] = nullptr;
+      ClearOccupied(tail, last);
+    }
+    if (tail->presence == 0) {
+      parent->presence &= ~kChainedBit;
+      parent->entries[kChildSlot] = nullptr;
+      delete tail;
     }
   }
 

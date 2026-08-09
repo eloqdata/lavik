@@ -74,6 +74,13 @@ struct RecordLocation {
   std::uint32_t relocation_sequence = 0;
   bool in_memory = false;
   bool external = false;
+  // True while an older, still-unexpired value of this key may survive on
+  // disk. Erasing this entry then would un-suppress that copy: recovery
+  // picks the newest surviving record, so the key would resurrect with the
+  // stale value. Propagates through every overwrite — tombstones included,
+  // since a superseded tombstone leaves the disk like any dead record — and
+  // is rebuilt exactly during recovery, which sees every surviving record.
+  bool shielding = false;
   RecordKind kind = RecordKind::kValue;
   ValueType value_type = ValueType::kNone;
   std::shared_ptr<const std::vector<ExtentRef>> extents;

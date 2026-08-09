@@ -325,6 +325,12 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           store->index_generations[identity.db_id]) {
         continue;
       }
+      // Memory-only expiration freed the entry while its record was still
+      // staged; the retirements above still settled, only the marking is
+      // moot.
+      if (identity.entry == nullptr) {
+        continue;
+      }
       RecordLocation& current = identity.entry->value;
       // The entry may no longer hold the version this identity was staged
       // for. Matching on block and epoch alone was enough when a block

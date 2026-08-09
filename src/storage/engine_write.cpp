@@ -1019,6 +1019,23 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
           relocation_sequence),
       .in_memory = true,
       .external = external,
+      // A relocation rewrites the same logical version, so it carries the
+      // bit unchanged. A real overwrite shields what its predecessor was
+      // shielding, plus the buried value itself — but only if that value
+      // could outlive this record's own erasure deadline: a predecessor
+      // whose expiry falls before it would already be self-suppressed by
+      // its timestamp whenever this entry may be dropped. Records with no
+      // deadline of their own (tombstones, TTL-less values) must judge
+      // against now instead, since their successors' deadlines are unknown.
+      .shielding =
+          previous.has_value() &&
+          (relocation != nullptr
+               ? previous->shielding
+               : (previous->shielding ||
+                  (previous->kind == RecordKind::kValue &&
+                   (previous->expire_at_ms == 0 ||
+                    previous->expire_at_ms >
+                        std::max(expire_at_ms, UnixTimeMillis()))))),
       .kind = kind,
       .value_type = value_type,
       .extents = std::move(extents),

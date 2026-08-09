@@ -387,6 +387,11 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
         partition.mutation_sequence, recovered.location.mutation_sequence);
     auto& index = partition.indexes[recovered.db_id];
     auto* found = index.Find(recovered.digest, recovered.key);
+    // The shielding bit is not persisted; recovery rebuilds it exactly,
+    // since every surviving record of the key passes through this merge:
+    // whichever version currently wins learns whether a strictly older,
+    // still-unexpired value remains on disk. Equal sequences are relocated
+    // copies of the same version and shield nothing.
     if (found == nullptr ||
         IsNewer(recovered.location, found->value)) {
       const bool was_live =
@@ -396,8 +401,19 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
           was_live && found->value.expire_at_ms != 0;
       const bool is_expiring =
           is_live && recovered.location.expire_at_ms != 0;
-      index.InsertOrAssign(recovered.digest, recovered.key,
-                           recovered.location);
+      RecordLocation winner = recovered.location;
+      if (found != nullptr) {
+        winner.shielding =
+            found->value.shielding ||
+            (found->value.kind == RecordKind::kValue &&
+             found->value.mutation_sequence <
+                 recovered.location.mutation_sequence &&
+             (found->value.expire_at_ms == 0 ||
+              found->value.expire_at_ms >
+                  std::max(recovered.location.expire_at_ms,
+                           UnixTimeMillis())));
+      }
+      index.InsertOrAssign(recovered.digest, recovered.key, winner);
       if (was_live != is_live) {
         if (is_live) {
           ++partition.live_key_count[recovered.db_id];
@@ -414,6 +430,14 @@ void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
           --partition.expiring_key_count[recovered.db_id];
         }
       }
+    } else if (recovered.location.kind == RecordKind::kValue &&
+               recovered.location.mutation_sequence <
+                   found->value.mutation_sequence &&
+               (recovered.location.expire_at_ms == 0 ||
+                recovered.location.expire_at_ms >
+                    std::max(found->value.expire_at_ms,
+                             UnixTimeMillis()))) {
+      found->value.shielding = true;
     }
   }
 }

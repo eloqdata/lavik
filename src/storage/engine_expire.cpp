@@ -84,9 +84,59 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
       !IsExpired(current->value, UnixTimeMillis())) {
     co_return Status::Ok();
   }
-  co_return co_await AppendLocked(
-      store, partition, candidate.db_id, candidate.key, {},
-      RecordKind::kTombstone, ValueType::kNone, 0);
+  if (current->value.shielding) {
+    // An older, still-unexpired value of this key may survive on disk;
+    // without a durable tombstone above it, recovery would resurrect it
+    // once this record's block is reclaimed. Keep the tombstone path for
+    // exactly this case.
+    co_return co_await AppendLocked(
+        store, partition, candidate.db_id, candidate.key, {},
+        RecordKind::kTombstone, ValueType::kNone, 0);
+  }
+  // Memory-only expiration. Every older on-disk version of this key is
+  // expired or gone, and the record carries its own expire_at_ms, so
+  // recovery and replicas already treat it as absent — nothing needs to be
+  // written. Mirror everything the tombstone append would have done:
+  // invalidate watchers, ship a delete to any capturing replica stream,
+  // settle the block accounting, and drop the entry itself.
+  tx::CurrentTxShard().MarkWatched(candidate.db_id,
+                                   tx::FingerprintOf(candidate.digest));
+  const RecordLocation dropped = current->value;
+  const std::uint64_t sequence = ++partition.mutation_sequence;
+  if (partition.capture_deltas) {
+    AppendDelta(partition, SnapshotRecord{
+                               .kind = SnapshotRecord::Kind::kDelete,
+                               .db_id = candidate.db_id,
+                               .db_epoch = DbEpoch(candidate.db_id),
+                               .mutation_sequence = sequence,
+                               .expire_at_ms = 0,
+                               .value_type = ValueType::kNone,
+                               .key = candidate.key,
+                               .value = {},
+                           });
+  }
+  // The flush completion dereferences staged entries by pointer before it
+  // can match them; detach every identity naming this one before it is
+  // freed. Their retirements still settle — only the marking becomes moot.
+  for (auto& [block_id, identities] : store.staged_records) {
+    for (RecordIdentity& identity : identities) {
+      if (identity.entry == current) {
+        identity.entry = nullptr;
+      }
+    }
+  }
+  --partition.live_key_count[candidate.db_id];
+  --store.live_key_count[candidate.db_id];
+  --partition.expiring_key_count[candidate.db_id];
+  partition.indexes[candidate.db_id].Erase(candidate.digest, candidate.key);
+  if (dropped.external) {
+    SpawnExtentReclaim(store, dropped.extents);
+  }
+  Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
+  if (!dead.ok()) {
+    store.write_failed = true;
+  }
+  co_return dead;
 }
 
 Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
