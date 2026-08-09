@@ -17,6 +17,7 @@
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include "absl/strings/str_cat.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
 #include "spdlog/spdlog.h"
@@ -214,12 +215,12 @@ void ShutdownSignalHandler(int signal) {
   (void)result;
 }
 
-Status InstallShutdownSignalHandler() {
+absl::Status InstallShutdownSignalHandler() {
   g_shutdown_requested.store(false, std::memory_order_release);
   g_last_shutdown_signal = 0;
   g_signal_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (g_signal_event_fd < 0) {
-    return Status(StatusCode::kInternal, "eventfd setup failed");
+    return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
   }
 
   struct sigaction action {};
@@ -229,9 +230,9 @@ Status InstallShutdownSignalHandler() {
       sigaction(SIGTERM, &action, nullptr) != 0) {
     close(g_signal_event_fd);
     g_signal_event_fd = -1;
-    return Status(StatusCode::kInternal, "sigaction setup failed");
+    return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
   }
-  return Status::Ok();
+  return absl::OkStatus();
 }
 
 void CleanupShutdownSignalHandler() noexcept {
@@ -296,7 +297,7 @@ class RedisService final : public TcpService {
       : TcpService(port), storage_(storage), replication_(replication) {}
 
   void Prepare(unsigned thread_count) override;
-  Task<Status> Run(Worker& worker, ServiceContext ctx) override;
+  Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
   bool startup_failed() const noexcept {
     return startup_failed_.load(std::memory_order_acquire);
   }
@@ -304,10 +305,10 @@ class RedisService final : public TcpService {
   void WaitForRequestsDrained() const noexcept;
 
  protected:
-  Task<Status> Serve(TcpStream stream) override;
+  Task<absl::Status> Serve(TcpStream stream) override;
 
  private:
-  Task<Status> Serve(TcpStream& stream, ConnectionContext& ctx);
+  Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
 
   class RequestGuard {
    public:
@@ -365,9 +366,9 @@ void RedisService::EndRequest() noexcept {
   request_gate_.notify_all();
 }
 
-Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
+Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
-  Status status = co_await storage_->InitializeWorker(worker);
+  absl::Status status = co_await storage_->InitializeWorker(worker);
   if (!status.ok()) [[unlikely]] {
     startup_failed_.store(true, std::memory_order_release);
     spdlog::error("worker[{}] storage initialization failed: {}", worker.id(),
@@ -381,7 +382,7 @@ Task<Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   co_return co_await TcpService::Run(worker, ctx);
 }
 
-Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
+Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pending) {
   // Hard ceiling on one connection's accumulated request bytes. The per-frame
   // limits (1024 args of up to 512 MiB each) still admit a claimed frame far
   // larger than RAM, and the buffer grows until the frame completes — without
@@ -407,7 +408,7 @@ Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pend
       pending->erase(0, parsed.consumed);
     }
     if (pending->size() >= kMaxPendingBytes) {
-      co_return Status(StatusCode::kResourceExhausted,
+      co_return absl::Status(absl::StatusCode::kResourceExhausted,
                        "client request exceeds the query buffer limit");
     }
 
@@ -416,7 +417,7 @@ Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pend
       co_return read_result.status();
     }
     if (*read_result == 0) [[unlikely]] {
-      co_return Status(StatusCode::kUnavailable, "peer closed connection");
+      co_return absl::Status(absl::StatusCode::kUnavailable, "peer closed connection");
     }
     pending->append(reinterpret_cast<const char*>(buffer.data()), *read_result);
   }
@@ -426,12 +427,12 @@ bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
-Task<Status> RedisService::Serve(TcpStream stream) {
+Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
   ctx.conn_id = next_connection_id.fetch_add(1, std::memory_order_relaxed);
   ConnectionOpened();
-  const Status status = co_await Serve(stream, ctx);
+  const absl::Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
   co_await ReleaseConnectionWatches(ctx);
@@ -456,16 +457,16 @@ struct StreamStallState {
 // the parked write immediately without releasing the descriptor out from
 // under the pending io_uring operation, and the serve loop's normal
 // teardown then reopens the gate and closes the socket.
-Task<Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
+Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
                                 int fd) {
   while (!state->done) {
     const auto deadline = state->last_progress + kStreamStallLimit;
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
       ::shutdown(fd, SHUT_RDWR);
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
-    Status slept = co_await celer::SleepFor(
+    absl::Status slept = co_await celer::SleepFor(
         *ThisWorker().self,
         std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
                                                               now) +
@@ -474,24 +475,24 @@ Task<Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
       co_return slept;  // worker shutting down
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
-Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
+Task<absl::Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
   std::string pending;
 
   while (stream.IsOpen()) {
     if (ShutdownRequested()) [[unlikely]] {
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
 
     auto command_result = co_await ReadNextCommand(stream, &pending);
     if (!command_result.ok()) [[unlikely]] {
-      if (command_result.status().code() == StatusCode::kUnavailable) [[unlikely]] {
-        co_return Status::Ok();
+      if (command_result.status().code() == absl::StatusCode::kUnavailable) [[unlikely]] {
+        co_return absl::OkStatus();
       }
 
-      std::string encoded = EncodeError("ERR " + command_result.status().message());
+      std::string encoded = EncodeError(absl::StrCat("ERR ", command_result.status().message()));
       auto write_status = co_await stream.WriteAll(
           std::span<const std::byte>(reinterpret_cast<const std::byte*>(encoded.data()),
                                      encoded.size()));
@@ -505,7 +506,7 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
       std::string encoded = EncodeError("ERR server is shutting down");
       auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
           reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
-      stream.Close();
+      stream.Close().IgnoreError();
       co_return write_status;
     }
     RequestGuard request_guard(this);
@@ -514,7 +515,7 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
         BuildCommandRequest(std::move(*command_result), ctx.selected_db);
     CommandReply reply;
     if (!request_result.ok()) [[unlikely]] {
-      reply.encoded = EncodeError("ERR " + request_result.status().message());
+      reply.encoded = EncodeError(absl::StrCat("ERR ", request_result.status().message()));
     } else {
       reply = co_await DispatchCommand(ctx, std::move(*request_result));
     }
@@ -542,7 +543,7 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
           BreakStalledStream(stall, stream.NativeFd()));
     }
 
-    Status write_status;
+    absl::Status write_status;
     if (reply.read_trace.request_start_ns != 0) {
       reply.read_trace.send_start_ns = ReadTraceNowNanos();
     }
@@ -592,12 +593,12 @@ Task<Status> RedisService::Serve(TcpStream& stream, ConnectionContext& ctx) {
       co_return write_status;
     }
     if (reply.close_connection || ShutdownRequested()) [[unlikely]] {
-      stream.Close();
-      co_return Status::Ok();
+      stream.Close().IgnoreError();
+      co_return absl::OkStatus();
     }
   }
 
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 }  // namespace
@@ -638,7 +639,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   storage_options.tomb_raider_sleep_ms = tomb_raider_sleep_ms;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
-  Status storage_status = storage.Prepare(thread_count);
+  absl::Status storage_status = storage.Prepare(thread_count);
   if (!storage_status.ok()) [[unlikely]] {
     spdlog::error("storage prepare failed: {}", storage_status.message());
     CleanupShutdownSignalHandler();
@@ -681,7 +682,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
     server.StopAccepting();
     redis.WaitForRequestsDrained();
     spdlog::info("all active requests drained; flushing storage buffers");
-    Status flush_status = storage.FlushForShutdown();
+    absl::Status flush_status = storage.FlushForShutdown();
     if (!flush_status.ok()) {
       spdlog::error("shutdown storage flush failed: {}",
                     flush_status.message());

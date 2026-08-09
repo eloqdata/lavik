@@ -1,13 +1,11 @@
 #include "keylane/command_table.h"
 
-#include "celer/base/status.h"
+#include "absl/status/statusor.h"
 
 namespace keylane {
 
 namespace {
 
-using celer::Status;
-using celer::StatusCode;
 
 constexpr std::uint32_t kKeyedRead = kCmdReadOnly | kCmdUsesDbGate;
 constexpr std::uint32_t kKeyedWrite = kCmdWrite | kCmdUsesDbGate;
@@ -75,10 +73,10 @@ const CommandSpec* FindCommand(std::string_view name) {
   return nullptr;
 }
 
-StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
+absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
                                      std::size_t argc) {
   if (argc < spec.min_args || (spec.max_args != 0 && argc > spec.max_args)) {
-    return Status(StatusCode::kInvalidArgument,
+    return absl::Status(absl::StatusCode::kInvalidArgument,
                   "wrong number of arguments for '" + std::string(spec.name) +
                       "' command");
   }
@@ -91,7 +89,7 @@ StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
           ? static_cast<std::int64_t>(spec.last_key)
           : static_cast<std::int64_t>(argc) + spec.last_key;
   if (last < spec.first_key || last >= static_cast<std::int64_t>(argc)) {
-    return Status(StatusCode::kInvalidArgument,
+    return absl::Status(absl::StatusCode::kInvalidArgument,
                   "wrong number of arguments for '" + std::string(spec.name) +
                       "' command");
   }

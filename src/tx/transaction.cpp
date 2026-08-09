@@ -7,7 +7,6 @@
 
 namespace keylane::tx {
 
-using celer::Status;
 using celer::Task;
 
 void Transaction::AddKey(unsigned owner, std::uint8_t db,
@@ -184,11 +183,11 @@ void Transaction::ArmInShard(ShardData* sd) {
   CurrentTxShard().Poll();
 }
 
-Task<Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
+Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
   co_return co_await cb_(cb_ctx_, Slice(shards_[shard_slot]));
 }
 
-void Transaction::SetShardStatus(std::uint16_t shard_slot, Status status) {
+void Transaction::SetShardStatus(std::uint16_t shard_slot, absl::Status status) {
   shards_[shard_slot].status = std::move(status);
 }
 
@@ -213,10 +212,10 @@ void Transaction::CompleteShardRound() {
       });
 }
 
-Task<Status> Transaction::Schedule() {
+Task<absl::Status> Transaction::Schedule() {
   assert(!shards_.empty() && "Seal before Schedule");
   if (single_shard()) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   for (;;) {
     txid_ = TxRuntime::Get()->next_txid.fetch_add(1,
@@ -228,7 +227,7 @@ Task<Status> Transaction::Schedule() {
     }
     if (!failed) {
       scheduled_ = true;
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
     co_await RoundAwaiter{this, Phase::kCancel};
     ++schedule_retries_;
@@ -237,18 +236,18 @@ Task<Status> Transaction::Schedule() {
   }
 }
 
-Task<Status> Transaction::ExecuteSingleShard() {
+Task<absl::Status> Transaction::ExecuteSingleShard() {
   // The whole key set lives on one shard: hop there and take the fast-path
   // key-set guard. No txid, no queue entry, no barrier beyond the hop.
   const unsigned owner = shards_[0].shard_id;
-  co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<Status> {
+  co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<absl::Status> {
     ShardData& sd = shards_[0];
     auto guard = co_await CurrentTxShard().AcquireKeys(sd.node.keys);
     co_return co_await cb_(cb_ctx_, Slice(sd));
   });
 }
 
-Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
+Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
   assert(!shards_.empty() && "Seal before Execute");
   cb_ = cb;
   cb_ctx_ = ctx;
@@ -259,7 +258,7 @@ Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
   }
   assert(scheduled_ && "Schedule before Execute");
   for (ShardData& sd : shards_) {
-    sd.status = Status::Ok();
+    sd.status = absl::OkStatus();
   }
   co_await RoundAwaiter{this, Phase::kArm};
   for (ShardData& sd : shards_) {
@@ -267,26 +266,26 @@ Task<Status> Transaction::Execute(ShardCallback cb, void* ctx, bool release) {
       co_return sd.status;
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 namespace {
 
-Task<Status> NoopShardCallback(void*, const ShardSlice&) {
-  co_return Status::Ok();
+Task<absl::Status> NoopShardCallback(void*, const ShardSlice&) {
+  co_return absl::OkStatus();
 }
 
 }  // namespace
 
-Task<Status> Transaction::Release() {
+Task<absl::Status> Transaction::Release() {
   co_return co_await Execute(&NoopShardCallback, nullptr, true);
 }
 
 namespace {
 
-Task<Status> RunShardHop(TxShard* shard, TxWaiter* node) {
+Task<absl::Status> RunShardHop(TxShard* shard, TxWaiter* node) {
   Transaction* tx = node->tx;
-  Status status = co_await tx->InvokeCallback(node->shard_slot);
+  absl::Status status = co_await tx->InvokeCallback(node->shard_slot);
   tx->SetShardStatus(node->shard_slot, std::move(status));
   // Non-suspending epilogue on the shard thread.
   node->running = false;
@@ -299,7 +298,7 @@ Task<Status> RunShardHop(TxShard* shard, TxWaiter* node) {
   }
   // Barrier decrement is the last access to the transaction.
   tx->CompleteShardRound();
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 }  // namespace

@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-#include "celer/base/status.h"
+#include "absl/status/statusor.h"
 
 namespace keylane {
 using namespace celer;
@@ -24,7 +24,7 @@ enum class RespParseState {
 struct RespParseResult {
   RespParseState state = RespParseState::kNeedMoreData;
   std::size_t consumed = 0;
-  Status status = Status::Ok();
+  absl::Status status = absl::OkStatus();
   RespCommand command;
 };
 

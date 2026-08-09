@@ -9,15 +9,15 @@ StorageEngine::StorageEngine(StorageEngineOptions options)
 
 StorageEngine::~StorageEngine() = default;
 
-Status StorageEngine::Prepare(unsigned worker_count) {
+absl::Status StorageEngine::Prepare(unsigned worker_count) {
   return impl_->Prepare(worker_count);
 }
 
-Task<Status> StorageEngine::InitializeWorker(Worker& worker) {
+Task<absl::Status> StorageEngine::InitializeWorker(Worker& worker) {
   return impl_->InitializeWorker(worker);
 }
 
-Status StorageEngine::FlushForShutdown() {
+absl::Status StorageEngine::FlushForShutdown() {
   return impl_->FlushForShutdown();
 }
 
@@ -43,7 +43,7 @@ ScanBatch StorageEngine::ScanPartition(std::uint16_t partition_id,
                               max_bytes);
 }
 
-Task<Status> StorageEngine::QuiesceExpiration() {
+Task<absl::Status> StorageEngine::QuiesceExpiration() {
   return impl_->QuiesceExpiration();
 }
 
@@ -55,11 +55,11 @@ TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
 }
 
-Task<Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
+Task<absl::Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
   return impl_->FlushDbDetach(db_id);
 }
 
-Task<Status> StorageEngine::FlushDbReclaim(bool wait) {
+Task<absl::Status> StorageEngine::FlushDbReclaim(bool wait) {
   return impl_->FlushDbReclaim(wait);
 }
 
@@ -72,7 +72,7 @@ PartitionReplicationStart StorageEngine::BeginPartitionReplication(
   return impl_->BeginPartitionReplication(partition_id);
 }
 
-Task<StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
+Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count) {
   return impl_->SnapshotPartition(partition_id, db_id, cursor, count);
@@ -93,30 +93,30 @@ void StorageEngine::AcknowledgePartitionDeltas(
   impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
 }
 
-Task<StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
     std::uint16_t partition_id,
     std::span<const std::uint64_t, 16> source_db_epochs) {
   return impl_->ResetReplicaPartition(partition_id, source_db_epochs);
 }
 
-Task<Status> StorageEngine::ApplyReplicaRecords(
+Task<absl::Status> StorageEngine::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {
   return impl_->ApplyReplicaRecords(partition_id, replication_epoch, records);
 }
 
-Task<StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
+Task<absl::StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
                                              std::string_view key,
                                              ReadLatencyTrace* trace) {
   return impl_->Get(db_id, key, trace);
 }
 
-Task<StatusOr<std::uint64_t>> StorageEngine::StringLength(
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
     std::uint8_t db_id, std::string_view key) {
   return impl_->StringLength(db_id, key);
 }
 
-Task<StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
+Task<absl::StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
                                              std::string_view key,
                                              std::string_view value,
                                              SetOptions options) {
@@ -128,13 +128,13 @@ Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
   return impl_->GetExpiration(db_id, key);
 }
 
-Task<StatusOr<bool>> StorageEngine::UpdateExpiration(
+Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
     std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
     ExpirationCondition condition) {
   return impl_->UpdateExpiration(db_id, key, expire_at_ms, condition);
 }
 
-Task<StatusOr<bool>> StorageEngine::Delete(std::uint8_t db_id,
+Task<absl::StatusOr<bool>> StorageEngine::Delete(std::uint8_t db_id,
                                            std::string_view key) {
   return impl_->Delete(db_id, key);
 }
@@ -143,24 +143,24 @@ Task<bool> StorageEngine::Exists(std::uint8_t db_id, std::string_view key) {
   return impl_->Exists(db_id, key);
 }
 
-Task<StatusOr<std::int64_t>> StorageEngine::Increment(
+Task<absl::StatusOr<std::int64_t>> StorageEngine::Increment(
     std::uint8_t db_id, std::string_view key) {
   return impl_->Increment(db_id, key);
 }
 
-Task<StatusOr<DiskValue>> StorageEngine::GetLocked(std::uint8_t db_id,
+Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(std::uint8_t db_id,
                                                    std::string_view key,
                                                    const Digest& digest,
                                                    ReadLatencyTrace* trace) {
   return impl_->GetLocked(db_id, key, digest, trace);
 }
 
-Task<StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest) {
   return impl_->StringLengthLocked(db_id, key, digest);
 }
 
-Task<StatusOr<SetResult>> StorageEngine::SetLocked(std::uint8_t db_id,
+Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(std::uint8_t db_id,
                                                    std::string_view key,
                                                    const Digest& digest,
                                                    std::string_view value,
@@ -175,7 +175,7 @@ Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
   return impl_->GetExpirationLocked(db_id, key, digest);
 }
 
-Task<StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
+Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::uint64_t expire_at_ms, ExpirationCondition condition,
     TxShardWrites* tx) {
@@ -183,7 +183,7 @@ Task<StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
                                        condition, tx);
 }
 
-Task<StatusOr<bool>> StorageEngine::DeleteLocked(std::uint8_t db_id,
+Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(std::uint8_t db_id,
                                                  std::string_view key,
                                                  const Digest& digest,
                                                  TxShardWrites* tx) {
@@ -196,13 +196,13 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id,
   return impl_->ExistsLocked(db_id, key, digest);
 }
 
-Task<StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
+Task<absl::StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     TxShardWrites* tx) {
   return impl_->IncrementLocked(db_id, key, digest, tx);
 }
 
-Task<Status> StorageEngine::CommitTxWrites(std::uint64_t txid,
+Task<absl::Status> StorageEngine::CommitTxWrites(std::uint64_t txid,
                                            std::vector<TxShardWrites*> shards) {
   return impl_->CommitTxWrites(txid, std::move(shards));
 }
@@ -220,11 +220,11 @@ void StorageEngine::NoteTxCommitFinished() noexcept {
   impl_->NoteTxCommitFinished();
 }
 
-Task<Status> StorageEngine::RollbackTxLocal(std::uint64_t txid) {
+Task<absl::Status> StorageEngine::RollbackTxLocal(std::uint64_t txid) {
   return impl_->RollbackTxLocal(txid);
 }
 
-Task<Status> StorageEngine::DiscardTxUndoLocal(std::uint64_t txid) {
+Task<absl::Status> StorageEngine::DiscardTxUndoLocal(std::uint64_t txid) {
   return impl_->DiscardTxUndoLocal(txid);
 }
 

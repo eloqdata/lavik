@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-#include "celer/base/status.h"
+#include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/read_trace.h"
 #include "keylane/storage/buffer_pool.h"
@@ -185,13 +185,13 @@ class StorageEngine {
 
   // Runs on the main thread before Server::Start. Creates/preallocates every
   // configured file and sizes per-worker metadata, but does not perform data IO.
-  celer::Status Prepare(unsigned worker_count);
+  absl::Status Prepare(unsigned worker_count);
 
   // Runs once on each worker before its listener is opened. Registers the
   // complete fixed-file table, opens every file with O_DIRECT into its fixed
   // slot, and performs parallel recovery.
-  celer::Task<celer::Status> InitializeWorker(celer::Worker& worker);
-  celer::Status FlushForShutdown();
+  celer::Task<absl::Status> InitializeWorker(celer::Worker& worker);
+  absl::Status FlushForShutdown();
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
@@ -214,13 +214,13 @@ class StorageEngine {
   // concurrent operations in that DB while this coroutine runs, and may allow
   // them again as soon as it returns: the DB is observably empty from here on.
   // Cost is bounded by the partition count, not by the number of keys.
-  celer::Task<celer::Status> FlushDbDetach(std::uint8_t db_id);
+  celer::Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
 
   // Retires what FlushDbDetach took out of service, subtracting it from the
   // block accounting and freeing it. Safe to run with the DB open and serving.
   // `wait` distinguishes FLUSHDB SYNC from FLUSHDB ASYNC: a reclaimer runs
   // either way, and only the caller's completion differs.
-  celer::Task<celer::Status> FlushDbReclaim(bool wait);
+  celer::Task<absl::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
 
   // Source-side per-partition migration primitives. Begin captures
@@ -228,7 +228,7 @@ class StorageEngine {
   // every mutation after that fence until acknowledged.
   PartitionReplicationStart BeginPartitionReplication(
       std::uint16_t partition_id);
-  celer::Task<celer::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
+  celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
       std::size_t count);
   PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
@@ -240,32 +240,32 @@ class StorageEngine {
 
   // Replica-side primitives. Reset returns a new local replication epoch that
   // fences every record from an earlier copy of this partition.
-  celer::Task<celer::StatusOr<std::uint64_t>> ResetReplicaPartition(
+  celer::Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
       std::span<const std::uint64_t, 16> source_db_epochs);
-  celer::Task<celer::Status> ApplyReplicaRecords(
+  celer::Task<absl::Status> ApplyReplicaRecords(
       std::uint16_t partition_id, std::uint64_t replication_epoch,
       std::span<const SnapshotRecord> records);
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
-  celer::Task<celer::StatusOr<DiskValue>> Get(
+  celer::Task<absl::StatusOr<DiskValue>> Get(
       std::uint8_t db_id, std::string_view key,
       ReadLatencyTrace* trace = nullptr);
-  celer::Task<celer::StatusOr<std::uint64_t>> StringLength(
+  celer::Task<absl::StatusOr<std::uint64_t>> StringLength(
       std::uint8_t db_id, std::string_view key);
-  celer::Task<celer::StatusOr<SetResult>> Set(
+  celer::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {});
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
-  celer::Task<celer::StatusOr<bool>> UpdateExpiration(
+  celer::Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key,
       std::uint64_t expire_at_ms, ExpirationCondition condition);
-  celer::Task<celer::StatusOr<bool>> Delete(std::uint8_t db_id,
+  celer::Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id,
                                              std::string_view key);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
-  celer::Task<celer::StatusOr<std::int64_t>> Increment(
+  celer::Task<absl::StatusOr<std::int64_t>> Increment(
       std::uint8_t db_id, std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
@@ -282,29 +282,29 @@ class StorageEngine {
   // record that makes the transaction survive recovery, and only then lets
   // the superseded records leave their blocks' accounting. Without a commit,
   // recovery drops every tagged record — all-or-nothing.
-  celer::Task<celer::StatusOr<DiskValue>> GetLocked(
+  celer::Task<absl::StatusOr<DiskValue>> GetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ReadLatencyTrace* trace = nullptr);
-  celer::Task<celer::StatusOr<std::uint64_t>> StringLengthLocked(
+  celer::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<celer::StatusOr<SetResult>> SetLocked(
+  celer::Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options = {},
       TxShardWrites* tx = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
-  celer::Task<celer::StatusOr<bool>> UpdateExpirationLocked(
+  celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr);
-  celer::Task<celer::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
+  celer::Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest,
                                                   TxShardWrites* tx = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
-  celer::Task<celer::StatusOr<std::int64_t>> IncrementLocked(
+  celer::Task<absl::StatusOr<std::int64_t>> IncrementLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr);
 
@@ -312,7 +312,7 @@ class StorageEngine {
   // succeeded. Runs on any worker; fences and retirements come from the
   // per-shard TxShardWrites. Safe to run in the background — the client
   // reply never waits for durability.
-  celer::Task<celer::Status> CommitTxWrites(
+  celer::Task<absl::Status> CommitTxWrites(
       std::uint64_t txid, std::vector<TxShardWrites*> shards);
 
   // Allocates a transaction id for tagging a multi-key write. Never zero.
@@ -329,13 +329,13 @@ class StorageEngine {
   // force a replica re-copy, since aborted values may already have shipped),
   // freshly created keys get a normal tombstone appended. Must run on the
   // owning shard with the transaction's key locks still held.
-  celer::Task<celer::Status> RollbackTxLocal(std::uint64_t txid);
+  celer::Task<absl::Status> RollbackTxLocal(std::uint64_t txid);
   // Drop the journal without acting on it (the transaction succeeded).
-  celer::Task<celer::Status> DiscardTxUndoLocal(std::uint64_t txid);
+  celer::Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
   // Freeze/unfreeze expiration writes for stable-count scans (KEYS). The
   // caller must already exclude client writes (closed database gate).
-  celer::Task<celer::Status> QuiesceExpiration();
+  celer::Task<absl::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
 
   // Lifetime totals of the tomb raider (rounds run, tombstone entries

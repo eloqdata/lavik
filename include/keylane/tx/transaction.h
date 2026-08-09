@@ -7,7 +7,7 @@
 #include <span>
 
 #include "absl/container/inlined_vector.h"
-#include "celer/base/status.h"
+#include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/task.h"
 #include "keylane/storage/format.h"
@@ -38,7 +38,7 @@ struct ShardSlice {
 // Shard callbacks are plain function pointers with a caller-owned context so
 // the hot path never heap-allocates a closure. They run on the owning shard
 // with all of the transaction's holds acquired and may suspend on disk I/O.
-using ShardCallback = celer::Task<celer::Status> (*)(void* ctx,
+using ShardCallback = celer::Task<absl::Status> (*)(void* ctx,
                                                      const ShardSlice& slice);
 
 // A multi-key transaction, embedded in the coordinator coroutine's frame.
@@ -73,23 +73,23 @@ class Transaction {
   std::size_t shard_count() const { return shards_.size(); }
 
   // Multi-shard only; no-op for single-shard transactions.
-  celer::Task<celer::Status> Schedule();
+  celer::Task<absl::Status> Schedule();
 
   // Runs `cb` on every shard's slice. `release` drops all locks and queue
   // positions once the hop completes. Single-shard transactions currently
   // require release == true (multi-hop lands with MULTI/EXEC).
-  celer::Task<celer::Status> Execute(ShardCallback cb, void* ctx,
+  celer::Task<absl::Status> Execute(ShardCallback cb, void* ctx,
                                      bool release);
 
   // Final no-op hop that releases every shard's locks and queue position.
-  celer::Task<celer::Status> Release();
+  celer::Task<absl::Status> Release();
 
   bool releasing() const { return releasing_; }
 
   // Shard-side entry points (shard thread only).
-  celer::Task<celer::Status> InvokeCallback(std::uint16_t shard_slot);
+  celer::Task<absl::Status> InvokeCallback(std::uint16_t shard_slot);
   void CompleteShardRound();
-  void SetShardStatus(std::uint16_t shard_slot, celer::Status status);
+  void SetShardStatus(std::uint16_t shard_slot, absl::Status status);
 
  private:
   enum class Phase : std::uint8_t { kSchedule, kCancel, kArm };
@@ -104,7 +104,7 @@ class Transaction {
     ShardMsg msg;
     Transaction* tx = nullptr;
     TxWaiter node;
-    celer::Status status;
+    absl::Status status;
     std::uint16_t shard_id = 0;
     std::uint16_t key_begin = 0;
     std::uint16_t key_count = 0;
@@ -135,7 +135,7 @@ class Transaction {
   static void CancelInShard(ShardData* sd);
   static void ArmInShard(ShardData* sd);
   ShardSlice Slice(const ShardData& sd) const;
-  celer::Task<celer::Status> ExecuteSingleShard();
+  celer::Task<absl::Status> ExecuteSingleShard();
 
   bool releasing_ = false;
   bool scheduled_ = false;

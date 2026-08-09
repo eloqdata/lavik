@@ -56,11 +56,11 @@ PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
   return result;
 }
 
-Task<StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartition(
+Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count) {
   if (db_id >= kLogicalDatabaseCount || count == 0) {
-    co_return Status(StatusCode::kInvalidArgument,
+    co_return absl::Status(absl::StatusCode::kInvalidArgument,
                      "invalid partition snapshot request");
   }
   WorkerStore& store = CurrentStore();
@@ -103,7 +103,7 @@ Task<StatusOr<PartitionSnapshotBatch>> StorageEngine::Impl::SnapshotPartition(
     }
     auto loaded = co_await LoadValue(store, db_id, key, digest, location);
     if (!loaded.ok()) {
-      if (loaded.status().code() == StatusCode::kNotFound) {
+      if (loaded.status().code() == absl::StatusCode::kNotFound) {
         continue;
       }
       co_return loaded.status();
@@ -162,11 +162,11 @@ void StorageEngine::Impl::AcknowledgePartitionDeltas(std::uint16_t partition_id,
   }
 }
 
-Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::uint16_t partition_id,
     std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs) {
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    Status advanced = co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
+    absl::Status advanced = co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
     if (!advanced.ok()) {
       co_return advanced;
     }
@@ -176,7 +176,7 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   auto& partition = PartitionFor(store, partition_id);
   if (partition.replication_epoch ==
       std::numeric_limits<std::uint64_t>::max()) {
-    co_return Status(StatusCode::kOutOfRange,
+    co_return absl::Status(absl::StatusCode::kOutOfRange,
                      "partition replication epoch exhausted");
   }
   // Stop this worker's append stream before making the new epoch durable.
@@ -185,7 +185,7 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   co_await store.store_state_mutex.Lock();
   UnlockGuard unlock(&store.store_state_mutex, store.worker);
   const std::uint64_t next_epoch = partition.replication_epoch + 1;
-  Status persisted = co_await PersistEpochValue(
+  absl::Status persisted = co_await PersistEpochValue(
       kLogicalDatabaseCount + partition_id, next_epoch);
   if (!persisted.ok()) {
     co_return persisted;
@@ -207,7 +207,7 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   partition.delta_queued = false;
   for (const auto& [db_id, key] : old_keys) {
     const Digest digest = ComputeDigest(key);
-    Status tombstone = co_await WriteRecordLocked(
+    absl::Status tombstone = co_await WriteRecordLocked(
         store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone,
         0, digest, 0, 0, 0, false, false);
     if (!tombstone.ok()) {
@@ -254,13 +254,13 @@ Task<StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 // RESP stream — and FLUSHDB's drain-then-detach exclusivity assumption does
 // not hold either. The redesign should either route apply through the gates
 // or pause application while a gated operation is in flight.
-Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
+Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   if (replication_epoch != partition.replication_epoch) {
-    co_return Status(StatusCode::kFailedPrecondition,
+    co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                      "stale partition replication epoch");
   }
   for (const SnapshotRecord& record : records) {
@@ -269,12 +269,12 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
     if (record.db_id >= kLogicalDatabaseCount ||
         RedisSlot(record.key) != partition_id) {
       if (record.kind != SnapshotRecord::Kind::kFlushDb) {
-        co_return Status(StatusCode::kInvalidArgument,
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
                          "replica record belongs to another partition");
       }
     }
     if (record.kind == SnapshotRecord::Kind::kFlushDb) {
-      Status advanced = co_await AdvanceDbEpoch(record.db_id,
+      absl::Status advanced = co_await AdvanceDbEpoch(record.db_id,
                                                 record.db_epoch);
       if (!advanced.ok()) {
         co_return advanced;
@@ -287,7 +287,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
       if (record.db_epoch < DbEpoch(record.db_id)) {
         continue;
       }
-      co_return Status(StatusCode::kFailedPrecondition,
+      co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                        "replica record database epoch is not installed");
     }
 
@@ -300,7 +300,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
           record.chunk_count !=
               (record.logical_size + kExtentPayloadBytes - 1) /
                   kExtentPayloadBytes) {
-        co_return Status(StatusCode::kInvalidArgument,
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
                          "invalid replicated large value begin frame");
       }
       partition.replica_value_stage = ReplicaValueStage{
@@ -331,7 +331,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
           record.value.size() > kExtentPayloadBytes ||
           record.value.size() > stage->logical_size ||
           stage->value.size() > stage->logical_size - record.value.size()) {
-        co_return Status(StatusCode::kInvalidArgument,
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
                          "invalid replicated large value chunk frame");
       }
       stage->value.append(record.value);
@@ -347,7 +347,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
           stage->next_chunk != stage->chunk_count ||
           record.chunk_index != stage->chunk_count ||
           stage->value.size() != stage->logical_size) {
-        co_return Status(StatusCode::kInvalidArgument,
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
                          "invalid replicated large value commit frame");
       }
       materialized.emplace(SnapshotRecord{
@@ -364,7 +364,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
       stage.reset();
       effective = &*materialized;
     } else if (partition.replica_value_stage.has_value()) {
-      co_return Status(StatusCode::kInvalidArgument,
+      co_return absl::Status(absl::StatusCode::kInvalidArgument,
                        "replicated large value frame sequence interrupted");
     }
 
@@ -391,10 +391,10 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
                                      ? applied.value_type
                                      : ValueType::kNone;
     if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
-      co_return Status(StatusCode::kInvalidArgument,
+      co_return absl::Status(absl::StatusCode::kInvalidArgument,
                        "replicated value has no Redis type");
     }
-    Status written;
+    absl::Status written;
     const std::size_t inline_bytes = AlignRecord(
         RecordHeaderBytes(applied.key.size()) + applied.value.size());
     if (kind == RecordKind::kValue && value_type == ValueType::kString &&
@@ -424,7 +424,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
     partition.mutation_sequence = std::max(
         partition.mutation_sequence, applied.mutation_sequence);
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 }  // namespace keylane::storage

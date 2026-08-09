@@ -46,7 +46,7 @@ std::uint64_t FileSize(const std::string& path) {
              : 0;
 }
 
-celer::Status Prepare(const std::vector<std::string>& paths) {
+absl::Status Prepare(const std::vector<std::string>& paths) {
   keylane::storage::StorageEngineOptions options;
   options.data_files = paths;
   keylane::storage::StorageEngine engine(std::move(options));

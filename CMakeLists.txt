@@ -79,6 +79,9 @@ target_link_libraries(keylane_module PUBLIC
   absl::crc32c
   absl::flat_hash_map
   absl::inlined_vector
+  absl::status
+  absl::statusor
+  absl::strings
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

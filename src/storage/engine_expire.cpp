@@ -2,7 +2,7 @@
 
 namespace keylane::storage {
 
-Task<Status> StorageEngine::Impl::QuiesceExpiration() {
+Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   expiration_pause_count_.fetch_add(1, std::memory_order_acq_rel);
   // Drain the in-flight expiration cycle on every worker. The flag spans a
   // whole cycle, so once it drops every tombstone of that cycle has landed —
@@ -10,24 +10,24 @@ Task<Status> StorageEngine::Impl::QuiesceExpiration() {
   // flag before it checks the pause count, so it either sees the increment
   // above and abstains, or is seen here and waited out.
   for (unsigned target = 0; target < worker_count_; ++target) {
-    Status drained = co_await celer::SubmitTaskTo(
-        target, [this, target]() -> Task<Status> {
+    absl::Status drained = co_await celer::SubmitTaskTo(
+        target, [this, target]() -> Task<absl::Status> {
           WorkerStore& store = *stores_[target];
           while (store.expiry_cycle_running) {
-            Status waited = co_await celer::SleepFor(
+            absl::Status waited = co_await celer::SleepFor(
                 *store.worker, std::chrono::milliseconds(1));
             if (!waited.ok()) {
               co_return waited;
             }
           }
-          co_return Status::Ok();
+          co_return absl::OkStatus();
         });
     if (!drained.ok()) {
       ResumeExpiration();
       co_return drained;
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
@@ -63,12 +63,12 @@ void StorageEngine::Impl::AdvanceExpiryMap(WorkerStore& store) {
   }
 }
 
-Task<Status> StorageEngine::Impl::ExpireCandidate(
+Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     WorkerStore& store, WorkerStore::ExpireCandidate candidate) {
   if (candidate.partition_id >= kLogicalStorageShards ||
       candidate.db_id >= kLogicalDatabaseCount ||
       expiration_pause_count_.load(std::memory_order_acquire) != 0) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   auto& partition = PartitionFor(store, candidate.partition_id);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -82,7 +82,7 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
       current->value.mutation_sequence != candidate.mutation_sequence ||
       current->value.expire_at_ms != candidate.expire_at_ms ||
       !IsExpired(current->value, UnixTimeMillis())) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   if (current->value.shielding) {
     // An older, still-unexpired value of this key may survive on disk;
@@ -132,19 +132,19 @@ Task<Status> StorageEngine::Impl::ExpireCandidate(
   if (dropped.external) {
     SpawnExtentReclaim(store, dropped.extents);
   }
-  Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
+  absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
   if (!dead.ok()) {
     store.write_failed = true;
   }
   co_return dead;
 }
 
-Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
   constexpr auto kInterval = std::chrono::milliseconds(10);
   constexpr std::size_t kMapStepsPerCycle = 256;
   constexpr std::size_t kDeletesPerCycle = 64;
   while (!store->worker->stop_requested()) {
-    Status waited = co_await celer::SleepFor(*store->worker, kInterval);
+    absl::Status waited = co_await celer::SleepFor(*store->worker, kInterval);
     if (!waited.ok()) {
       co_return waited;
     }
@@ -195,7 +195,7 @@ Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       WorkerStore::ExpireCandidate candidate =
           std::move(store->expired_candidates.front());
       store->expired_candidates.pop_front();
-      Status expired = co_await ExpireCandidate(*store,
+      absl::Status expired = co_await ExpireCandidate(*store,
                                                 std::move(candidate));
       if (!expired.ok()) {
         co_return expired;
@@ -204,7 +204,7 @@ Task<Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       co_await celer::Yield(*store->worker);
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 }  // namespace keylane::storage

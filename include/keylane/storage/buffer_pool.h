@@ -7,7 +7,7 @@
 #include <span>
 #include <vector>
 
-#include "celer/base/status.h"
+#include "absl/status/statusor.h"
 #include "celer/io/storage.h"
 
 namespace celer {
@@ -87,7 +87,7 @@ class RegisteredBufferPool {
   RegisteredBufferPool& operator=(const RegisteredBufferPool&) = delete;
   ~RegisteredBufferPool();
 
-  celer::Status Init(celer::Worker& worker,
+  absl::Status Init(celer::Worker& worker,
                      const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
@@ -126,7 +126,7 @@ class RegisteredBufferPool {
 
     bool await_ready() const noexcept;
     bool await_suspend(std::coroutine_handle<> awaiting);
-    celer::StatusOr<ReadBufferLease> await_resume();
+    absl::StatusOr<ReadBufferLease> await_resume();
 
    private:
     RegisteredBufferPool* pool_ = nullptr;
@@ -143,7 +143,7 @@ class RegisteredBufferPool {
   friend class ReadBufferLease;
 
   ReadBufferLease TakeReadBuffer();
-  celer::StatusOr<ReadBufferLease> AllocateHeapReadBuffer(
+  absl::StatusOr<ReadBufferLease> AllocateHeapReadBuffer(
       std::size_t minimum_payload_bytes);
   std::optional<std::uint16_t> TakeWriteBuffer();
   void ReleaseWriteBufferLocal(std::uint16_t buffer_id) noexcept;

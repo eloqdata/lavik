@@ -40,7 +40,7 @@ void CheckArity(std::string_view name, std::size_t argc, bool ok) {
                                  std::string(spec->name) + "' command";
     EXPECT_CHECK(keys.status().message() == expected,
                  std::string(name) + " arity error message mismatch: " +
-                     keys.status().message());
+                     std::string(keys.status().message()));
   }
 }
 

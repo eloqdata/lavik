@@ -80,7 +80,7 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
       record_rate / 1000000.0, eta_seconds);
 }
 
-Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
+Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     WorkerStore& store, std::vector<RecoveryBatch>* batches,
     std::vector<std::uint64_t>* zero_blocks,
     absl::flat_hash_set<std::uint64_t>* committed_txids) {
@@ -117,11 +117,11 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         .index = 0,
     };
   } else {
-    co_return Status(StatusCode::kResourceExhausted,
+    co_return absl::Status(absl::StatusCode::kResourceExhausted,
                      "failed to allocate recovery block buffer");
   }
   if (recovery.buffer.size < kStorageBlockBytes) {
-    co_return Status(StatusCode::kResourceExhausted,
+    co_return absl::Status(absl::StatusCode::kResourceExhausted,
                      "recovery block buffer is smaller than a storage block");
   }
   recovery.buffer.size = kStorageBlockBytes;
@@ -158,7 +158,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         co_return read.status();
       }
       if (*read != kBlockHeaderBytes) {
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "short read while scanning block header");
       }
       std::span<const std::byte, kBlockHeaderBytes> block_bytes(
@@ -181,7 +181,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       if (block.block_id != block_id) {
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "invalid or corrupt block header");
       }
       AtomicMax(&recovery_device_cursors_[device_index].next_local,
@@ -218,7 +218,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         co_return read.status();
       }
       if (*read != kStorageBlockBytes) {
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "short read while scanning committed block");
       }
 
@@ -228,7 +228,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         const std::optional<std::uint32_t> next = NextRecordOffset(
             recovery.buffer.data, record_offset, block.committed_bytes);
         if (!next.has_value()) {
-          co_return Status(StatusCode::kInternal,
+          co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid or corrupt committed record header");
         }
         if (*next != record_offset) {
@@ -245,7 +245,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
             record.relocation_sequence >
                 std::numeric_limits<std::uint32_t>::max() ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
-          co_return Status(StatusCode::kInternal,
+          co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid or corrupt committed record header");
         }
         AtomicMax(&next_lsn_, record.lsn + 1);
@@ -263,7 +263,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         if (record.digest != ComputeDigest(key) ||
             StorageShardForKey(key) % block.layout_worker_count !=
                 block.writer_id) {
-          co_return Status(StatusCode::kInternal,
+          co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid or corrupt committed record header");
         }
         if (record.db_epoch != DbEpoch(record.db_id)) {
@@ -283,7 +283,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
         if (record.external) {
           if (record.kind != RecordKind::kValue ||
               record.value_type != ValueType::kString) {
-            co_return Status(StatusCode::kInternal,
+            co_return absl::Status(absl::StatusCode::kInternal,
                              "unsupported external record type");
           }
           const std::byte* payload =
@@ -291,7 +291,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
           if (Crc32c(std::span<const std::byte>(payload,
                                                 record.payload_bytes)) !=
               record.payload_checksum) {
-            co_return Status(StatusCode::kInternal,
+            co_return absl::Status(absl::StatusCode::kInternal,
                              "external manifest checksum mismatch");
           }
           auto decoded = DecodeManifest(
@@ -331,14 +331,14 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
       }
       if (record_offset != block.committed_bytes ||
           records != block.record_count) {
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "block committed boundary does not match records");
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
     }
     device_linear_begin += device.data_block_count;
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {

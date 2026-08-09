@@ -8,7 +8,7 @@ void StorageEngine::Impl::SpawnExtentReclaim(
   store.worker->Spawn(ReclaimExtentsCounted(&store, std::move(extents)));
 }
 
-Task<Status> StorageEngine::Impl::ReclaimExtentsCounted(
+Task<absl::Status> StorageEngine::Impl::ReclaimExtentsCounted(
     WorkerStore* store, std::shared_ptr<const std::vector<ExtentRef>> extents) {
   struct ReclaimGuard {
     Impl* engine = nullptr;
@@ -20,7 +20,7 @@ Task<Status> StorageEngine::Impl::ReclaimExtentsCounted(
   co_return co_await ReclaimExtents(store, std::move(extents));
 }
 
-Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
+Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
     WorkerStore& store, ExtentRef ref) {
   while (true) {
     co_await store.store_state_mutex.Lock();
@@ -32,13 +32,13 @@ Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
     }
     if (state->kind != BlockKind::kValueExtent) {
       store.store_state_mutex.Unlock(*store.worker);
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "extent reclaim found a record block");
     }
     state->live_bytes = 0;
     if (state->pins != 0 || state->freeing) {
       store.store_state_mutex.Unlock(*store.worker);
-      Status waited = co_await celer::SleepFor(
+      absl::Status waited = co_await celer::SleepFor(
           *store.worker, std::chrono::milliseconds(1));
       if (!waited.ok()) {
         co_return waited;
@@ -61,10 +61,10 @@ Task<StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
   }
 }
 
-Task<Status> StorageEngine::Impl::ReclaimExtents(
+Task<absl::Status> StorageEngine::Impl::ReclaimExtents(
     WorkerStore* store, std::shared_ptr<const std::vector<ExtentRef>> extents) {
   if (extents == nullptr) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   std::vector<std::uint64_t> released;
   released.reserve(extents->size());
@@ -80,12 +80,12 @@ Task<Status> StorageEngine::Impl::ReclaimExtents(
     }
     // if/else, not ?:, to keep the two co_awaits in separate full
     // expressions (GCC coroutine frame-slot aliasing).
-    StatusOr<bool> freed = false;
+    absl::StatusOr<bool> freed = false;
     if (owner == store->worker->id()) {
       freed = co_await ReclaimExtentLocal(*store, ref);
     } else {
       freed = co_await celer::SubmitTaskTo(
-          owner, [this, owner, ref]() -> Task<StatusOr<bool>> {
+          owner, [this, owner, ref]() -> Task<absl::StatusOr<bool>> {
             co_return co_await ReclaimExtentLocal(*stores_[owner], ref);
           });
     }
@@ -96,12 +96,12 @@ Task<Status> StorageEngine::Impl::ReclaimExtents(
       released.push_back(ref.block_id);
     }
   }
-  Status returned = co_await ReturnColdBlocks(std::move(released));
+  absl::Status returned = co_await ReturnColdBlocks(std::move(released));
   if (!returned.ok()) {
     co_return returned;
   }
   space_reclaim_generation_.fetch_add(1, std::memory_order_release);
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 bool StorageEngine::Impl::IsDefragCandidate(const WorkerStore& store,
@@ -155,13 +155,13 @@ void StorageEngine::Impl::ReleaseDefragPermit(std::size_t device_index) {
   active_defrags_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-Task<Status> StorageEngine::Impl::StartQueuedDefrag(unsigned worker_id,
+Task<absl::Status> StorageEngine::Impl::StartQueuedDefrag(unsigned worker_id,
                                                     std::size_t device_index) {
   WorkerStore& store = *stores_[worker_id];
   if (!store.defrag_waiting ||
       store.defrag_waiting_device != device_index) {
     ReleaseDefragPermit(device_index);
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   store.defrag_waiting = false;
   if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
@@ -169,28 +169,28 @@ Task<Status> StorageEngine::Impl::StartQueuedDefrag(unsigned worker_id,
       DeviceIndexForBlock(store.defrag_queue.front()) != device_index) {
     ReleaseDefragPermit(device_index);
     RequestDefrag(store);
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   store.defrag_running = true;
   store.active_defrag_device = device_index;
   store.worker->SpawnBackground(DefragOne(&store));
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
-Task<Status> StorageEngine::Impl::WakeQueuedDefrags(std::size_t device_index) {
+Task<absl::Status> StorageEngine::Impl::WakeQueuedDefrags(std::size_t device_index) {
   while (TryAcquireDefragPermit(device_index)) {
     std::uint16_t worker_id = 0;
     if (!defrag_ready_by_device_[device_index].try_dequeue(worker_id)) {
       ReleaseDefragPermit(device_index);
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
     pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
-    Status started;
+    absl::Status started;
     if (worker_id == celer::ThisWorker().id) {
       started = co_await StartQueuedDefrag(worker_id, device_index);
     } else {
       started = co_await celer::SubmitTaskTo(
-          worker_id, [this, worker_id, device_index]() -> Task<Status> {
+          worker_id, [this, worker_id, device_index]() -> Task<absl::Status> {
             co_return co_await StartQueuedDefrag(worker_id, device_index);
           });
     }
@@ -199,7 +199,7 @@ Task<Status> StorageEngine::Impl::WakeQueuedDefrags(std::size_t device_index) {
       co_return started;
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::RequestDefrag(WorkerStore& store) {
@@ -235,33 +235,33 @@ void StorageEngine::Impl::FinishDefragPass(WorkerStore& store) {
   store.worker->SpawnBackground(WakeQueuedDefrags(completed_device));
 }
 
-Task<Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
   if (store->defrag_queue.empty()) {
     FinishDefragPass(*store);
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   const std::uint64_t candidate = store->defrag_queue.front();
   store->defrag_queue.pop_front();
   BlockState* candidate_state = FindBlockState(*store, candidate);
   if (candidate_state == nullptr) {
     FinishDefragPass(*store);
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   candidate_state->defrag_queued = false;
 
-  Status status = co_await CleanBlockLocked(*store, candidate);
+  absl::Status status = co_await CleanBlockLocked(*store, candidate);
   if (!status.ok()) {
     spdlog::error("worker[{}] defrag block {} failed: {}",
                   store->worker->id(), candidate, status.message());
   }
-  if (status.code() == StatusCode::kResourceExhausted) {
+  if (status.code() == absl::StatusCode::kResourceExhausted) {
     MaybeQueueDefrag(*store, candidate);
   }
   FinishDefragPass(*store);
   co_return status;
 }
 
-Task<StatusOr<std::optional<RelocationDurabilityFence>>>
+Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
 StorageEngine::Impl::RelocateIfCurrent(
     unsigned key_owner, std::string_view key, std::string_view value,
     const RecordHeader& record, const RecordLocation& source_location) {
@@ -294,13 +294,13 @@ StorageEngine::Impl::RelocateIfCurrent(
   };
 
   RecordLocation relocated;
-  Status written = co_await WriteRecordLocked(
+  absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id, key, value, record.kind, record.value_type,
       record.expire_at_ms, record.digest, record.txid,
       record.mutation_sequence,
       record.relocation_sequence + 1, true, true, record.external,
       record.logical_size, source_location.extents, &relocated, &source);
-  if (written.code() == StatusCode::kAborted) {
+  if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
     // index, while relocation waited for a block. Nothing was written; the
     // source stays uncleaned this pass rather than resurrecting stale state.
@@ -319,7 +319,7 @@ StorageEngine::Impl::RelocateIfCurrent(
       });
 }
 
-Task<Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
+Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
     WorkerStore& store, const RelocationDurabilityFence& fence) {
   while (true) {
     co_await store.store_state_mutex.Lock();
@@ -348,13 +348,13 @@ Task<Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
       failed = store.write_failed;
     }
     if (failed) {
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "storage write failed while flushing defrag relocation");
     }
     if (durable) {
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
-    Status waited = co_await celer::SleepFor(
+    absl::Status waited = co_await celer::SleepFor(
         *store.worker, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       co_return waited;
@@ -362,10 +362,10 @@ Task<Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
   }
 }
 
-Task<Status> StorageEngine::Impl::AwaitRelocationDurable(
+Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurable(
     const RelocationDurabilityFence& fence) {
   if (fence.block_owner >= worker_count_) {
-    co_return Status(StatusCode::kInternal,
+    co_return absl::Status(absl::StatusCode::kInternal,
                      "defrag relocation has an invalid block owner");
   }
   WorkerStore& owner = *stores_[fence.block_owner];
@@ -374,7 +374,7 @@ Task<Status> StorageEngine::Impl::AwaitRelocationDurable(
   }
   co_return co_await celer::SubmitTaskTo(
       fence.block_owner,
-      [this, fence]() -> Task<Status> {
+      [this, fence]() -> Task<absl::Status> {
         co_return co_await AwaitRelocationDurableLocal(
             *stores_[fence.block_owner], fence);
       });
@@ -406,17 +406,17 @@ void MergeRelocationFences(std::vector<RelocationDurabilityFence>* into,
 
 }  // namespace
 
-Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
+Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
                                                    std::uint64_t block_id) {
   BlockState* source_ptr = FindBlockState(store, block_id);
   if (source_ptr == nullptr) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   BlockState& source = *source_ptr;
   if (!source.allocated || source.in_memory || source.pins != 0 ||
       source.flush_queued || source.flush_in_progress ||
       IsActiveBlock(store, block_id)) {
-    co_return Status::Ok();
+    co_return absl::OkStatus();
   }
   source.defragging = true;
   const auto [source_file_id, source_block_offset] = FileOffset(block_id);
@@ -430,7 +430,7 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
   // reading 8 MiB and CRC-checking every record in it. FLUSHDB empties whole
   // blocks at once, which is where this dominates.
   if (source.live_bytes != 0) {
-    Status salvaged = co_await SalvageBlockRecords(
+    absl::Status salvaged = co_await SalvageBlockRecords(
         store, block_id, source, source_file_id, source_block_offset);
     if (!salvaged.ok()) {
       co_return salvaged;
@@ -447,7 +447,7 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
     std::vector<RelocationDurabilityFence> fences = std::move(owed->second);
     store.pending_relocation_fences.erase(owed);
     for (std::size_t i = 0; i < fences.size(); ++i) {
-      Status durable = co_await AwaitRelocationDurable(fences[i]);
+      absl::Status durable = co_await AwaitRelocationDurable(fences[i]);
       if (!durable.ok()) {
         // Re-stash the unconfirmed remainder for the next pass.
         std::vector<RelocationDurabilityFence> remainder(
@@ -465,14 +465,14 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
     UnlockGuard write_unlock(&store.store_state_mutex, store.worker);
     if (source.live_bytes != 0) {
       source.defragging = false;
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
     source.freeing = true;
   }
   co_return co_await ReleaseEmptyBlock(store, block_id, source);
 }
 
-Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
+Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
                                                       std::uint64_t block_id,
                                                       BlockState& source,
                                                       std::uint32_t source_file_id,
@@ -503,12 +503,12 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     };
   } else {
     source.defragging = false;
-    co_return Status(StatusCode::kResourceExhausted,
+    co_return absl::Status(absl::StatusCode::kResourceExhausted,
                      "failed to allocate defrag block buffer");
   }
   if (block_data.buffer.size < kStorageBlockBytes) {
     source.defragging = false;
-    co_return Status(StatusCode::kResourceExhausted,
+    co_return absl::Status(absl::StatusCode::kResourceExhausted,
                      "defrag block buffer is smaller than a storage block");
   }
   block_data.buffer.size = kStorageBlockBytes;
@@ -518,7 +518,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
   if (!read.ok() || *read != kStorageBlockBytes) {
     source.defragging = false;
     co_return read.ok()
-                  ? Status(StatusCode::kInternal,
+                  ? absl::Status(absl::StatusCode::kInternal,
                            "short block read during defrag")
                   : read.status();
   }
@@ -551,7 +551,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
         block_data.buffer.data, record_offset, source.committed_bytes);
     if (!next.has_value()) {
       source.defragging = false;
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "corrupt committed record during defrag");
     }
     if (*next != record_offset) {
@@ -567,7 +567,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
         record.allocation_epoch != source.allocation_epoch ||
         record_offset + record.total_disk_bytes > source.committed_bytes) {
       source.defragging = false;
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "corrupt committed record during defrag");
     }
 
@@ -608,7 +608,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
                                          record.payload_bytes)) !=
         record.payload_checksum) {
       source.defragging = false;
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "value checksum mismatch during defrag");
     }
     if (record.external) {
@@ -633,7 +633,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
       // forward (docs/vll-design.md M10, option b).
       co_await store.store_state_mutex.Lock();
       RecordLocation relocated_commit;
-      Status commit_written = Status::Ok();
+      absl::Status commit_written = absl::OkStatus();
       {
         UnlockGuard commit_unlock(&store.store_state_mutex, store.worker);
         commit_written = co_await WriteRecordLocked(
@@ -655,7 +655,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
               relocated_commit.record_offset +
               relocated_commit.total_disk_bytes),
       });
-      Status commit_dead =
+      absl::Status commit_dead =
           co_await MarkRecordDead(RetiredRecordOf(source_location));
       if (!commit_dead.ok()) {
         source.defragging = false;
@@ -669,7 +669,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     const std::string key(disk_key);
     const std::string value(reinterpret_cast<const char*>(value_data),
                             record.payload_bytes);
-    StatusOr<std::optional<RelocationDurabilityFence>> relocated(
+    absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
         std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker->id()) {
       relocated = co_await RelocateIfCurrent(
@@ -679,7 +679,7 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
           key_owner,
           [this, key_owner, key, value, record,
            source_location]() mutable
-              -> Task<StatusOr<std::optional<
+              -> Task<absl::StatusOr<std::optional<
                   RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(
                 key_owner, key, value, record, source_location);
@@ -711,14 +711,14 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     // I/O and cross-core work are polled first.
     co_await celer::Yield(*store.worker);
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
-Task<Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
+Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
                                                     std::uint64_t block_id,
                                                     BlockState& source) {
   while (source.pins != 0) {
-    Status waited = co_await celer::SleepFor(
+    absl::Status waited = co_await celer::SleepFor(
         *store.worker, std::chrono::milliseconds(1));
     if (!waited.ok()) {
       source.freeing = false;
@@ -733,7 +733,7 @@ Task<Status> StorageEngine::Impl::ReleaseEmptyBlock(WorkerStore& store,
   // write failure fail-stops the allocator, so this block cannot be reused
   // in the ambiguous state.
   DestroyBlockState(store, block_id);
-  Status returned = co_await ReturnColdBlocks({block_id});
+  absl::Status returned = co_await ReturnColdBlocks({block_id});
   if (returned.ok()) {
     // The source's cleared allocation bit is now durable while its stale
     // records are still on disk — the exact window the relocation durability

@@ -57,6 +57,6 @@ struct KeyIndexView {
 // ("wrong number of arguments for '<name>' command"; callers prepend "ERR ").
 // Commands with key_step > 1 (MSET) must additionally validate key/value
 // pairing in their handler; this only resolves positions.
-StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec, std::size_t argc);
+absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec, std::size_t argc);
 
 }  // namespace keylane

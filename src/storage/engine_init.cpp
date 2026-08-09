@@ -4,18 +4,18 @@
 
 namespace keylane::storage {
 
-Status StorageEngine::Impl::Prepare(unsigned worker_count) {
+absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   if (worker_count == 0 || options_.data_files.empty()) {
-    return Status(StatusCode::kInvalidArgument,
+    return absl::Status(absl::StatusCode::kInvalidArgument,
                   "storage requires workers and at least one data file");
   }
   if (worker_count > kLogicalStorageShards) {
-    return Status(StatusCode::kInvalidArgument,
+    return absl::Status(absl::StatusCode::kInvalidArgument,
                   "storage worker count exceeds logical storage shards");
   }
   if (options_.data_files.size() >
       std::numeric_limits<std::uint16_t>::max()) {
-    return Status(StatusCode::kOutOfRange, "too many data files");
+    return absl::Status(absl::StatusCode::kOutOfRange, "too many data files");
   }
 
   std::size_t direct_io_alignment = 1;
@@ -29,7 +29,7 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       return probed.status();
     }
     if (probed->size_bytes < 2 * kStorageBlockBytes) {
-      return Status(StatusCode::kOutOfRange,
+      return absl::Status(absl::StatusCode::kOutOfRange,
                     "storage path is too small to hold metadata and data: " +
                         path);
     }
@@ -59,36 +59,36 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     if (storage_set_id == 0) {
       storage_set_id = label.storage_set_id;
     } else if (storage_set_id != label.storage_set_id) {
-      return Status(StatusCode::kFailedPrecondition,
+      return absl::Status(absl::StatusCode::kFailedPrecondition,
                     "configured devices belong to different storage sets");
     }
     if (expected_device_count == 0) {
       expected_device_count = label.device_count;
     } else if (expected_device_count != label.device_count) {
-      return Status(StatusCode::kFailedPrecondition,
+      return absl::Status(absl::StatusCode::kFailedPrecondition,
                     "configured devices disagree on storage-set size");
     }
     if (!seen_device_ids.try_emplace(label.device_id, i).second) {
-      return Status(StatusCode::kFailedPrecondition,
+      return absl::Status(absl::StatusCode::kFailedPrecondition,
                     "duplicate device id in configured storage files");
     }
   }
 
   if (has_existing_device && has_empty_device) {
-    return Status(
-        StatusCode::kFailedPrecondition,
+    return absl::Status(
+        absl::StatusCode::kFailedPrecondition,
         "mixing initialized and empty storage devices is not supported; "
         "online device-set expansion is not implemented");
   }
   if (has_existing_device) {
     if (expected_device_count != labels.size()) {
-      return Status(StatusCode::kFailedPrecondition,
+      return absl::Status(absl::StatusCode::kFailedPrecondition,
                     "configured storage device count does not match the "
                     "persisted storage set; a device may be missing");
     }
     for (std::uint64_t id = 0; id < expected_device_count; ++id) {
       if (!seen_device_ids.contains(id)) {
-        return Status(StatusCode::kFailedPrecondition,
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
                       "configured storage set is missing device id " +
                           std::to_string(id));
       }
@@ -116,7 +116,7 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       const std::uint64_t required_bytes =
           capacity_blocks * kStorageBlockBytes;
       if (probed.size_bytes < required_bytes) {
-        return Status(StatusCode::kFailedPrecondition,
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
                       "storage path is smaller than its persisted capacity: " +
                           options_.data_files[i]);
       }
@@ -129,14 +129,14 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     } else {
       if (!probed.is_block_device &&
           probed.size_bytes % kStorageBlockBytes != 0) {
-        return Status(
-            StatusCode::kInvalidArgument,
+        return absl::Status(
+            absl::StatusCode::kInvalidArgument,
             "new regular storage file size must be a multiple of 8 MiB: " +
                 options_.data_files[i]);
       }
       capacity_blocks = probed.size_bytes / kStorageBlockBytes;
       if (capacity_blocks > kLocalBlockIdLimit) {
-        return Status(StatusCode::kOutOfRange,
+        return absl::Status(absl::StatusCode::kOutOfRange,
                       "each data file or device is limited to 1 PiB: " +
                           options_.data_files[i]);
       }
@@ -152,19 +152,19 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     const std::uint32_t data_block_begin =
         DataBlockBegin(capacity_blocks);
     if (capacity_blocks > kLocalBlockIdLimit) {
-      return Status(StatusCode::kOutOfRange,
+      return absl::Status(absl::StatusCode::kOutOfRange,
                     "persisted device capacity exceeds the 1 PiB limit: " +
                         options_.data_files[i]);
     }
     if (data_block_begin >= capacity_blocks) {
-      return Status(StatusCode::kOutOfRange,
+      return absl::Status(absl::StatusCode::kOutOfRange,
                     "fixed metadata leaves no data blocks: " +
                         options_.data_files[i]);
     }
     if (capacity_blocks - data_block_begin <=
         kDefragReserveBlocksPerDevice) {
-      return Status(
-          StatusCode::kOutOfRange,
+      return absl::Status(
+          absl::StatusCode::kOutOfRange,
           "storage path has no foreground block after its per-device "
           "defrag reserve; each device must be at least 80 MiB: " +
               options_.data_files[i]);
@@ -212,8 +212,8 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     }
   }
   if (foreground_blocks == 0) {
-    return Status(
-        StatusCode::kOutOfRange,
+    return absl::Status(
+        absl::StatusCode::kOutOfRange,
         "storage set has no foreground blocks after the defrag reserve; "
         "a single-device storage set must be at least 80 MiB");
   }
@@ -230,7 +230,7 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           .device_count = expected_device_count,
           .block_bytes = kStorageBlockBytes,
       };
-      Status written = WriteDeviceLabel(options_.data_files[i], label);
+      absl::Status written = WriteDeviceLabel(options_.data_files[i], label);
       if (!written.ok()) {
         return written;
       }
@@ -259,8 +259,8 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       options_.flush_size_bytes > kStorageBlockBytes ||
       (options_.flush_size_bytes & (options_.flush_size_bytes - 1)) != 0 ||
       options_.flush_size_bytes % direct_io_alignment_ != 0) {
-    return Status(
-        StatusCode::kInvalidArgument,
+    return absl::Status(
+        absl::StatusCode::kInvalidArgument,
         "flush size must be a power of two between the direct-I/O alignment "
         "and the 8 MiB storage block size");
   }
@@ -293,11 +293,11 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
 
     const int fd = ::open(device.path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
-      return Status(StatusCode::kInternal,
+      return absl::Status(absl::StatusCode::kInternal,
                     "open fixed metadata failed: " + device.path + ": " +
                         std::strerror(errno));
     }
-    Status load_status = Status::Ok();
+    absl::Status load_status = absl::OkStatus();
     for (std::size_t page_index = 0;
          page_index < kEpochMetadataPageCount; ++page_index) {
       const std::size_t byte_offset =
@@ -347,11 +347,12 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     }
     const int close_error = ::close(fd);
     if (!load_status.ok()) {
-      return Status(load_status.code(),
-                    load_status.message() + ": " + device.path);
+        return absl::Status(load_status.code(),
+                           std::string(load_status.message()) + ": " +
+                               device.path);
     }
     if (close_error != 0) {
-      return Status(StatusCode::kInternal,
+      return absl::Status(absl::StatusCode::kInternal,
                     "close fixed metadata failed: " + device.path);
     }
 
@@ -435,14 +436,14 @@ Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   recovery_accounting_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
-  return Status::Ok();
+  return absl::OkStatus();
 }
 
-Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
+Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   WorkerStore& store = *stores_[worker.id()];
   store.worker = &worker;
 
-  Status status = store.buffers.Init(worker, options_.buffers);
+  absl::Status status = store.buffers.Init(worker, options_.buffers);
   if (status.ok()) {
     status = worker.RegisterFixedFiles(
         static_cast<unsigned>(options_.data_files.size()));
@@ -496,11 +497,11 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     if (target == worker.id()) {
       ApplyRecovery(target, std::move(batches[target]));
     } else {
-      Status apply = co_await celer::SubmitTo(
+      absl::Status apply = co_await celer::SubmitTo(
           target,
           [this, target, batch = std::move(batches[target])]() mutable {
             ApplyRecovery(target, std::move(batch));
-            return Status::Ok();
+            return absl::OkStatus();
           });
       if (!apply.ok()) {
         Fail(apply);
@@ -563,7 +564,7 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                 const std::uint16_t extent_owner =
                     BlockOwner(extent.block_id);
                 if (extent_owner >= worker_count_) {
-                  Fail(Status(StatusCode::kInternal,
+                  Fail(absl::Status(absl::StatusCode::kInternal,
                               "manifest references an unscanned extent"));
                   return;
                 }
@@ -596,7 +597,7 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                 FindBlockState(owner_store, reference.block_id);
             if (state == nullptr || !state->allocated ||
                 state->allocation_epoch != reference.allocation_epoch) {
-              return Status(StatusCode::kInternal,
+              return absl::Status(absl::StatusCode::kInternal,
                             "recovery live reference has no owning block");
             }
             if (reference.extent) {
@@ -609,17 +610,17 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                   found->second.extent_index != reference.extent_index ||
                   found->second.payload_checksum !=
                       reference.extent_payload_checksum) {
-                return Status(StatusCode::kInternal,
+                return absl::Status(absl::StatusCode::kInternal,
                               "live extent header does not match manifest");
               }
             }
             state->live_bytes += reference.bytes;
           }
-          return Status::Ok();
+          return absl::OkStatus();
         };
     // if/else, not ?:, to keep the co_await out of a conditional
     // expression (GCC coroutine frame-slot aliasing).
-    Status applied = Status::Ok();
+    absl::Status applied = absl::OkStatus();
     if (owner == worker.id()) {
       applied = apply_live();
     } else {
@@ -669,7 +670,7 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
               allocator.ready_blocks.end(),
               std::make_move_iterator(blocks.begin()),
               std::make_move_iterator(blocks.end()));
-          return Status::Ok();
+          return absl::OkStatus();
         };
     // if/else, not ?:, to keep the co_await out of a conditional
     // expression (GCC coroutine frame-slot aliasing).
@@ -715,10 +716,10 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       worker.SpawnBackground(TombRaiderLoop(&store));
     }
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
-Status StorageEngine::Impl::FlushForShutdown() {
+absl::Status StorageEngine::Impl::FlushForShutdown() {
   // Give in-flight commit chains a chance to append their commit records
   // before the flush order freezes the append streams: an acknowledged
   // multi-key write whose commit misses the shutdown flush is dropped whole
@@ -738,13 +739,13 @@ Status StorageEngine::Impl::FlushForShutdown() {
     completed = shutdown_flush_completed_.load(std::memory_order_acquire);
   }
   if (shutdown_flush_failed_.load(std::memory_order_acquire)) {
-    return Status(StatusCode::kInternal,
+    return absl::Status(absl::StatusCode::kInternal,
                   "one or more workers failed to flush during shutdown");
   }
-  return Status::Ok();
+  return absl::OkStatus();
 }
 
-void StorageEngine::Impl::Fail(const Status& status) {
+void StorageEngine::Impl::Fail(const absl::Status& status) {
   open_barrier_->Abort(status);
   metadata_barrier_->Abort(status);
   recovery_barrier_->Abort(status);
@@ -851,9 +852,9 @@ void StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
   }
 }
 
-Task<Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
   while (active_defrags_.load(std::memory_order_acquire) != 0) {
-    Status status = co_await celer::SleepFor(
+    absl::Status status = co_await celer::SleepFor(
         *store->worker, std::chrono::milliseconds(1));
     if (!status.ok()) {
       co_return status;
@@ -883,13 +884,13 @@ Task<Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
       failed = store->write_failed;
     }
     if (failed) {
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "storage write failed while draining shutdown buffers");
     }
     if (done) {
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
-    Status status = co_await celer::SleepFor(
+    absl::Status status = co_await celer::SleepFor(
         *store->worker, std::chrono::milliseconds(1));
     if (!status.ok()) {
       co_return status;
@@ -897,7 +898,7 @@ Task<Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
   }
 }
 
-void StorageEngine::Impl::CompleteShutdownFlush(const Status& status) {
+void StorageEngine::Impl::CompleteShutdownFlush(const absl::Status& status) {
   if (!status.ok()) {
     shutdown_flush_failed_.store(true, std::memory_order_release);
   }

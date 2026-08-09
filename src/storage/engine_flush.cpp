@@ -2,11 +2,11 @@
 
 namespace keylane::storage {
 
-Task<Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
   const auto interval =
       std::chrono::milliseconds(options_.flush_max_ms);
   while (!store->worker->stop_requested()) {
-    Status status = co_await celer::SleepFor(*store->worker, interval);
+    absl::Status status = co_await celer::SleepFor(*store->worker, interval);
     if (!status.ok()) {
       CompleteShutdownFlush(status);
       co_return status;
@@ -25,7 +25,7 @@ Task<Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
     UnlockGuard guard(&store->store_state_mutex, store->worker);
     FlushActiveBlock(*store);
   }
-  co_return Status::Ok();
+  co_return absl::OkStatus();
 }
 
 void StorageEngine::Impl::RequestFlush(WorkerStore& store,
@@ -48,7 +48,7 @@ void StorageEngine::Impl::RequestFlush(WorkerStore& store,
   store.worker->Spawn(FlushPendingBlocks(&store));
 }
 
-Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
   struct FlushRunGuard {
     Impl* engine = nullptr;
     ~FlushRunGuard() {
@@ -86,7 +86,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
       if (store->flush_queue.empty()) {
         store->flush_running = false;
-        co_return Status::Ok();
+        co_return absl::OkStatus();
       }
 
       const std::uint64_t block_id = store->flush_queue.front();
@@ -120,7 +120,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         state->flush_queued = false;
         store->write_failed = true;
         store->flush_running = false;
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "invalid pending flush staging buffer");
       }
       if (padded == staging_state.durable_bytes) {
@@ -210,7 +210,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       }
       store->write_failed = true;
       store->flush_running = false;
-      co_return Status(StatusCode::kInternal,
+      co_return absl::Status(absl::StatusCode::kInternal,
                        "invalid pending flush staging buffer");
     }
 
@@ -236,7 +236,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         if (!written.ok()) {
           co_return written.status();
         }
-        co_return Status(StatusCode::kInternal,
+        co_return absl::Status(absl::StatusCode::kInternal,
                          "short block flush write");
       }
       write_offset += chunk_bytes;
@@ -244,7 +244,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // The header is the block's commit record, so it must land strictly
     // after the data it describes is durable. Otherwise a crash between the
     // two can leave a header advertising records that were never written.
-    auto fail_flush = [&](Status status) -> Task<Status> {
+    auto fail_flush = [&](absl::Status status) -> Task<absl::Status> {
       co_await store->store_state_mutex.Lock();
       UnlockGuard guard(&store->store_state_mutex, store->worker);
       BlockState* state = FindBlockState(*store, pending->block_id);
@@ -274,7 +274,7 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
       co_return co_await fail_flush(
           header_written.ok()
-              ? Status(StatusCode::kInternal, "short block header write")
+              ? absl::Status(absl::StatusCode::kInternal, "short block header write")
               : header_written.status());
     }
     synced = co_await celer::Fdatasync(*store->worker, store->files[file_id]);
@@ -287,14 +287,14 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     BlockState* state = FindBlockState(*store, pending->block_id);
     if (state == nullptr) {
       store->flush_running = false;
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
     if (!state->allocated || state->flush_in_progress == false ||
         state->allocation_epoch != pending->allocation_epoch) {
       state->flush_in_progress = false;
       state->flush_queued = false;
       store->flush_running = false;
-      co_return Status::Ok();
+      co_return absl::OkStatus();
     }
 
     // Every staged record in this snapshot is durable now (data pages and

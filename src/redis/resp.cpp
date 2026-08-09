@@ -41,7 +41,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
       if (!input.empty()) {
         result.state = RespParseState::kError;
         result.status =
-            Status(StatusCode::kInvalidArgument, "expected RESP array");
+            absl::Status(absl::StatusCode::kInvalidArgument, "expected RESP array");
       }
       result.consumed = skipped;
       return result;
@@ -61,13 +61,13 @@ RespParseResult ParseRespCommand(std::string_view input) {
     if (ec != std::errc{} || ptr != input.data() + crlf || array_len < 0) {
       result.state = RespParseState::kError;
       result.status =
-          Status(StatusCode::kInvalidArgument, "invalid RESP array length");
+          absl::Status(absl::StatusCode::kInvalidArgument, "invalid RESP array length");
       return result;
     }
     if (array_len > static_cast<long long>(kMaxArrayLen)) {
       result.state = RespParseState::kError;
       result.status =
-          Status(StatusCode::kOutOfRange, "too many RESP array elements");
+          absl::Status(absl::StatusCode::kOutOfRange, "too many RESP array elements");
       return result;
     }
     // An empty multibulk is a command that does nothing: real Redis consumes
@@ -101,7 +101,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
     if (input[pos] != '$') {
       result.state = RespParseState::kError;
       result.status =
-          Status(StatusCode::kInvalidArgument, "expected RESP bulk string");
+          absl::Status(absl::StatusCode::kInvalidArgument, "expected RESP bulk string");
       return result;
     }
     ++pos;
@@ -113,12 +113,12 @@ RespParseResult ParseRespCommand(std::string_view input) {
     auto [p2, ec2] = std::from_chars(input.data() + pos, input.data() + crlf, bulk_len);
     if (ec2 != std::errc{} || p2 != input.data() + crlf || bulk_len < 0) {
       result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kInvalidArgument, "invalid RESP bulk string length");
+      result.status = absl::Status(absl::StatusCode::kInvalidArgument, "invalid RESP bulk string length");
       return result;
     }
     if (bulk_len > static_cast<long long>(kMaxBulkLen)) {
       result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kOutOfRange, "RESP bulk string too large");
+      result.status = absl::Status(absl::StatusCode::kOutOfRange, "RESP bulk string too large");
       return result;
     }
 
@@ -127,7 +127,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
     if (input.size() < pos + data_len + 2) return result;
     if (input[pos + data_len] != '\r' || input[pos + data_len + 1] != '\n') {
       result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kInvalidArgument, "malformed RESP bulk string terminator");
+      result.status = absl::Status(absl::StatusCode::kInvalidArgument, "malformed RESP bulk string terminator");
       return result;
     }
 
