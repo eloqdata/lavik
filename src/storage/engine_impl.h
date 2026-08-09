@@ -830,6 +830,13 @@ class StorageEngine::Impl {
   // Undo journals of in-flight multi-key writes on this shard, keyed by
   // txid; written and consumed under writer_mutex.
   absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo;
+  // Relocation fences owed per source block. A salvage pass that fails
+  // midway has already moved records whose copies are not yet durable; the
+  // debt survives the pass here, and CleanBlockLocked settles every owed
+  // fence before the block's bitmap bit may be durably cleared. Same-worker
+  // access only.
+  absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
+      pending_relocation_fences;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};

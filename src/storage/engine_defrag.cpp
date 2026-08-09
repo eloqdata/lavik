@@ -382,6 +382,32 @@ Task<Status> StorageEngine::Impl::AwaitRelocationDurable(
       });
 }
 
+namespace {
+
+// Deduplicated by destination (block, epoch, owner), keeping the highest
+// staged boundary — awaiting that covers every lower one.
+void MergeRelocationFences(std::vector<RelocationDurabilityFence>* into,
+                           const std::vector<RelocationDurabilityFence>& from) {
+  for (const RelocationDurabilityFence& fence : from) {
+    bool merged = false;
+    for (RelocationDurabilityFence& existing : *into) {
+      if (existing.block_id == fence.block_id &&
+          existing.allocation_epoch == fence.allocation_epoch &&
+          existing.block_owner == fence.block_owner) {
+        existing.committed_bytes =
+            std::max(existing.committed_bytes, fence.committed_bytes);
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      into->push_back(fence);
+    }
+  }
+}
+
+}  // namespace
+
 Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
                                                    std::uint64_t block_id) {
   BlockState* source_ptr = FindBlockState(store, block_id);
@@ -410,6 +436,29 @@ Task<Status> StorageEngine::Impl::CleanBlockLocked(WorkerStore& store,
         store, block_id, source, source_file_id, source_block_offset);
     if (!salvaged.ok()) {
       co_return salvaged;
+    }
+  }
+
+  // Do not clear the source block's allocation bitmap bit until every
+  // relocation ever made out of it — this pass's and any failed earlier
+  // pass's — is covered by a durable destination header. If the process dies
+  // while waiting, recovery still scans the source; if it dies afterwards,
+  // recovery skips it or selects the higher-sequence relocation.
+  if (auto owed = store.pending_relocation_fences.find(block_id);
+      owed != store.pending_relocation_fences.end()) {
+    std::vector<RelocationDurabilityFence> fences = std::move(owed->second);
+    store.pending_relocation_fences.erase(owed);
+    for (std::size_t i = 0; i < fences.size(); ++i) {
+      Status durable = co_await AwaitRelocationDurable(fences[i]);
+      if (!durable.ok()) {
+        // Re-stash the unconfirmed remainder for the next pass.
+        std::vector<RelocationDurabilityFence> remainder(
+            fences.begin() + static_cast<std::ptrdiff_t>(i), fences.end());
+        MergeRelocationFences(&store.pending_relocation_fences[block_id],
+                              remainder);
+        source.defragging = false;
+        co_return durable;
+      }
     }
   }
 
@@ -476,7 +525,23 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
                   : read.status();
   }
 
+  // Every fence this pass produces is deposited into the store's per-block
+  // debt on every exit path (the destructor runs on error returns too): a
+  // pass that fails midway has already moved records, and forgetting their
+  // fences let a later pass durably free the source before those copies
+  // were flushed — records that were durable before defrag died with it.
   std::vector<RelocationDurabilityFence> durability_fences;
+  struct FenceDebt {
+    WorkerStore* store;
+    std::uint64_t block_id;
+    std::vector<RelocationDurabilityFence>* fences;
+    ~FenceDebt() {
+      if (!fences->empty()) {
+        MergeRelocationFences(&(*store).pending_relocation_fences[block_id],
+                              *fences);
+      }
+    }
+  } fence_debt{&store, block_id, &durability_fences};
   std::uint32_t record_offset = kBlockHeaderBytes;
   while (record_offset < source.committed_bytes) {
     const std::optional<std::uint32_t> next = NextRecordOffset(
@@ -629,18 +694,6 @@ Task<Status> StorageEngine::Impl::SalvageBlockRecords(WorkerStore& store,
     // expires this defers the cleaner to the next scheduler round so online
     // I/O and cross-core work are polled first.
     co_await celer::Yield(*store.worker);
-  }
-  // Do not clear the source block's allocation bitmap bit until every newly
-  // written destination record is covered by a durable destination header.
-  // If the process dies while waiting, recovery still scans the source; if it
-  // dies afterwards, recovery skips it or selects the higher-sequence
-  // relocation if the bitmap update had not become durable yet.
-  for (const RelocationDurabilityFence& fence : durability_fences) {
-    Status durable = co_await AwaitRelocationDurable(fence);
-    if (!durable.ok()) {
-      source.defragging = false;
-      co_return durable;
-    }
   }
   co_return Status::Ok();
 }
