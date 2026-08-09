@@ -28,7 +28,19 @@ struct StorageEngineOptions {
   std::size_t flush_size_bytes = 8 * 1024 * 1024;
   bool verify_read_crc = true;
   bool expiration_authority = true;
+  // Full-disk sweep retiring tombstones no surviving record needs. Zero
+  // disables it.
+  std::uint32_t tomb_raider_interval_ms = 600'000;
+  // Pause after each block the sweep reads, capping its share of disk
+  // bandwidth so online traffic keeps its latency.
+  std::uint32_t tomb_raider_sleep_ms = 10;
   RegisteredBufferPoolOptions buffers{};
+};
+
+struct TombRaiderTotals {
+  std::uint64_t rounds = 0;
+  std::uint64_t reaped = 0;
+  std::uint64_t refreshed = 0;
 };
 
 struct ScanBatch {
@@ -206,7 +218,7 @@ class StorageEngine {
   celer::Task<celer::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
 
-  // Source-side partition migration primitives. Begin captures
+  // Source-side per-partition migration primitives. Begin captures
   // a sequence fence, Snapshot reads the baseline tree, and ReadDeltas returns
   // every mutation after that fence until acknowledged.
   PartitionReplicationStart BeginPartitionReplication(
@@ -320,6 +332,10 @@ class StorageEngine {
   // caller must already exclude client writes (closed database gate).
   celer::Task<celer::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
+
+  // Lifetime totals of the tomb raider (rounds run, tombstone entries
+  // reaped, stale shielding bits cleared).
+  TombRaiderTotals TombRaiderStats() const noexcept;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
   // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).

@@ -72,15 +72,22 @@ struct RecordLocation {
   std::uint64_t logical_size = 0;
   std::uint32_t payload_bytes = 0;
   std::uint32_t relocation_sequence = 0;
-  bool in_memory = false;
-  bool external = false;
+  // Packed flags: one byte for all four.
+  bool in_memory : 1 = false;
+  bool external : 1 = false;
   // True while an older, still-unexpired value of this key may survive on
   // disk. Erasing this entry then would un-suppress that copy: recovery
   // picks the newest surviving record, so the key would resurrect with the
   // stale value. Propagates through every overwrite — tombstones included,
   // since a superseded tombstone leaves the disk like any dead record — and
   // is rebuilt exactly during recovery, which sees every surviving record.
-  bool shielding = false;
+  bool shielding : 1 = false;
+  // Tomb-raider round state: set on candidates (tombstones, shielded values)
+  // when a round begins, cleared when the sweep finds an older on-disk
+  // record the entry still suppresses. Whatever survives the sweep
+  // unclaimed proved nothing on disk needs it. False outside rounds, and
+  // any overwrite resets it, exempting concurrently-touched keys.
+  bool unclaimed : 1 = false;
   RecordKind kind = RecordKind::kValue;
   ValueType value_type = ValueType::kNone;
   std::shared_ptr<const std::vector<ExtentRef>> extents;
@@ -938,6 +945,15 @@ class StorageEngine::Impl {
   // ResumeExpiration.
   Task<Status> QuiesceExpiration();
 
+  TombRaiderTotals TombRaiderStats() const noexcept {
+    return TombRaiderTotals{
+        .rounds = tomb_raider_rounds_.load(std::memory_order_relaxed),
+        .reaped = tomb_raider_reaped_.load(std::memory_order_relaxed),
+        .refreshed =
+            tomb_raider_refreshed_.load(std::memory_order_relaxed),
+    };
+  }
+
   void ResumeExpiration() noexcept {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
@@ -1415,6 +1431,31 @@ class StorageEngine::Impl {
 
   Task<Status> ActiveExpiration(WorkerStore* store);
 
+  // Tomb raider: a full-disk sweep that retires tombstones nothing on disk
+  // needs any more, and re-validates stale shielding bits along the way.
+  // One dangerous older record for a claimed key, seen anywhere on any
+  // worker's blocks, exempts the entry for the round.
+  struct TombClaim {
+    std::uint64_t mutation_sequence = 0;
+    std::uint64_t replication_epoch = 0;
+    Digest digest{};
+    std::string key;
+    std::uint8_t db_id = 0;
+  };
+
+  Task<Status> TombRaiderLoop(WorkerStore* store);
+
+  Task<Status> RunTombRaider();
+
+  Task<Status> TombMarkLocal(WorkerStore& store);
+
+  Task<Status> TombSweepLocal(WorkerStore& store);
+
+  Task<Status> TombClaimLocal(WorkerStore& store,
+                              std::vector<TombClaim> claims);
+
+  Task<Status> TombReapLocal(WorkerStore& store);
+
   Task<Status> PeriodicFlush(WorkerStore* store);
 
   // Spawn an asynchronous extent reclaim, counted from before the spawn so
@@ -1512,6 +1553,10 @@ class StorageEngine::Impl {
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
   std::atomic<std::uint32_t> expiration_pause_count_{0};
+  std::atomic<bool> tomb_raider_running_{false};
+  std::atomic<std::uint64_t> tomb_raider_rounds_{0};
+  std::atomic<std::uint64_t> tomb_raider_reaped_{0};
+  std::atomic<std::uint64_t> tomb_raider_refreshed_{0};
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;

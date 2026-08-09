@@ -21,6 +21,8 @@ int main(int argc, char** argv) {
   std::uint32_t flush_max_ms = 1000;
   unsigned flush_size_kb = 8192;
   bool disable_read_crc = false;
+  std::uint32_t tomb_raider_interval_ms = 600'000;
+  std::uint32_t tomb_raider_sleep_ms = 10;
   std::vector<std::string> data_files{"keylane.data"};
   std::uint16_t replication_port = 0;
   std::string replicate_to;
@@ -55,6 +57,14 @@ int main(int argc, char** argv) {
       ->check(CLI::PositiveNumber);
   app.add_flag("--disable-read-crc", disable_read_crc,
                "Skip payload CRC32C verification on GET reads");
+  app.add_option("--tomb-raider-interval-ms", tomb_raider_interval_ms,
+                 "Interval between tombstone-reclaim disk sweeps (0 disables)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--tomb-raider-sleep-ms", tomb_raider_sleep_ms,
+                 "Pause after each block the tombstone sweep reads")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--data-file", data_files,
                  "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
@@ -107,5 +117,7 @@ int main(int argc, char** argv) {
                             static_cast<std::size_t>(flush_size_kb) * kKiB,
                             !disable_read_crc,
                             data_files,
+                            tomb_raider_interval_ms,
+                            tomb_raider_sleep_ms,
                             std::move(replication_options));
 }

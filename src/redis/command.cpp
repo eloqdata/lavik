@@ -1050,10 +1050,15 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request) {
             "\r\n\r\n";
   }
   if (wants("stats")) {
+    const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     info += "# Stats\r\n";
     info += "total_commands_processed:" +
             std::to_string(
                 g_commands_processed.load(std::memory_order_relaxed)) +
+            "\r\n";
+    info += "tomb_raider_rounds:" + std::to_string(raider.rounds) + "\r\n";
+    info += "tomb_raider_reaped:" + std::to_string(raider.reaped) + "\r\n";
+    info += "tomb_raider_refreshed:" + std::to_string(raider.refreshed) +
             "\r\n\r\n";
   }
   if (wants("replication")) {

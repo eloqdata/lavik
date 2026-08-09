@@ -590,6 +590,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
               std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
               bool verify_read_crc,
               const std::vector<std::string>& data_files,
+              std::uint32_t tomb_raider_interval_ms,
+              std::uint32_t tomb_raider_sleep_ms,
               ReplicationOptions replication_options) {
   spdlog::info(
       "keylane listening on {}:{} threads={} idle_timeout_ms={} busy_poll_us={} "
@@ -613,6 +615,8 @@ int RunServer(std::string_view bind_ip, std::uint16_t port, unsigned thread_coun
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
   storage_options.expiration_authority = replication_options.listen_port == 0;
+  storage_options.tomb_raider_interval_ms = tomb_raider_interval_ms;
+  storage_options.tomb_raider_sleep_ms = tomb_raider_sleep_ms;
   storage_options.buffers.registered_bytes = registered_buffer_bytes;
   storage::StorageEngine storage(std::move(storage_options));
   Status storage_status = storage.Prepare(thread_count);

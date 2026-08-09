@@ -29,6 +29,7 @@ add_library(keylane_module
   src/storage/engine_defrag.cpp
   src/storage/engine_expire.cpp
   src/storage/engine_flush.cpp
+  src/storage/engine_tombraider.cpp
   src/storage/engine_flushdb.cpp
   src/storage/engine_init.cpp
   src/storage/engine_read.cpp
@@ -133,6 +134,18 @@ if (BUILD_TESTING)
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 150)
+
+    add_executable(keylane_tomb_raider_e2e_test
+      tests/tomb_raider_e2e_test.cpp
+    )
+    target_link_libraries(keylane_tomb_raider_e2e_test
+      PRIVATE keylane::module
+    )
+    add_test(
+      NAME keylane_tomb_raider_e2e
+      COMMAND keylane_tomb_raider_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_tomb_raider_e2e PROPERTIES TIMEOUT 120)
 
     add_executable(keylane_multikey_e2e_test
       tests/multikey_e2e_test.cpp

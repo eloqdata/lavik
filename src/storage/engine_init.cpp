@@ -710,6 +710,10 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   worker.SpawnRoot(PeriodicFlush(&store));
   if (options_.expiration_authority) {
     worker.SpawnBackground(ActiveExpiration(&store));
+    // One coordinator drives the whole-engine round; worker 0 hosts it.
+    if (worker.id() == 0 && options_.tomb_raider_interval_ms != 0) {
+      worker.SpawnBackground(TombRaiderLoop(&store));
+    }
   }
   co_return Status::Ok();
 }

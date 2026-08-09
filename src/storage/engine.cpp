@@ -49,6 +49,10 @@ void StorageEngine::ResumeExpiration() noexcept {
   impl_->ResumeExpiration();
 }
 
+TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
+  return impl_->TombRaiderStats();
+}
+
 Task<Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
   return impl_->FlushDbDetach(db_id);
 }
