@@ -1312,7 +1312,7 @@ class StorageEngine::Impl {
                                  RecordKind kind, ValueType value_type,
                                  std::uint64_t expire_at_ms,
                                  const Digest& digest,
-                                 std::uint64_t generation,
+                                 std::uint64_t txid,
                                  std::uint64_t mutation_sequence,
                                  std::uint64_t relocation_sequence,
                                  bool for_defrag,

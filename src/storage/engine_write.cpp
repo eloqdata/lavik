@@ -536,7 +536,7 @@ Task<Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
     const std::string manifest = EncodeManifest(**extents);
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
-        mutation_sequence, mutation_sequence, 0, false, true, true,
+        /*txid=*/0, mutation_sequence, 0, false, true, true,
         value.size(), *extents);
     if (!status.ok()) {
       store.worker->Spawn(ReclaimExtents(&store, *extents));
@@ -544,7 +544,7 @@ Task<Status> StorageEngine::Impl::AppendLocked(WorkerStore& store,
   } else {
     status = co_await WriteRecordLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        mutation_sequence, mutation_sequence, 0, false);
+        /*txid=*/0, mutation_sequence, 0, false);
   }
   if (status.ok() && partition.capture_deltas) {
     AppendDelta(partition, SnapshotRecord{
@@ -653,7 +653,7 @@ Task<Status> StorageEngine::Impl::WaitForStandbyWithWriterLocked(
 Task<Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     std::string_view value, RecordKind kind, ValueType value_type,
-    std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t generation,
+    std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
     std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
     bool for_defrag, bool unlock_writer_while_waiting, bool external,
     std::uint64_t logical_size,
@@ -857,7 +857,7 @@ Task<Status> StorageEngine::Impl::WriteRecordLocked(
       .logical_size = logical_size,
       .payload_bytes = static_cast<std::uint32_t>(payload_bytes),
       .total_disk_bytes = static_cast<std::uint32_t>(total_disk_bytes),
-      .generation = generation,
+      .txid = txid,
       .replication_epoch = partition.replication_epoch,
       // A relocation stamps the epoch its source was validated under, not a
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a

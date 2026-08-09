@@ -394,7 +394,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
       const std::string manifest = EncodeManifest(**extents);
       written = co_await WriteRecordLocked(
           store, applied.db_id, applied.key, manifest, kind, value_type,
-          applied.expire_at_ms, digest, applied.mutation_sequence,
+          applied.expire_at_ms, digest, /*txid=*/0,
           applied.mutation_sequence, 0, false, true, true,
           applied.value.size(), *extents);
       if (!written.ok()) {
@@ -404,7 +404,7 @@ Task<Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id, applied.key, applied.value, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms : 0, digest,
-          applied.mutation_sequence, applied.mutation_sequence, 0, false);
+          /*txid=*/0, applied.mutation_sequence, 0, false);
     }
     if (!written.ok()) {
       co_return written;

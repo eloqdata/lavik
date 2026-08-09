@@ -298,7 +298,7 @@ StorageEngine::Impl::RelocateIfCurrent(
   RecordLocation relocated;
   Status written = co_await WriteRecordLocked(
       key_store, record.db_id, key, value, record.kind, record.value_type,
-      record.expire_at_ms, record.digest, record.generation,
+      record.expire_at_ms, record.digest, record.txid,
       record.mutation_sequence,
       record.relocation_sequence + 1, true, true, record.external,
       record.logical_size, source_location.extents, &relocated, &source);

@@ -166,7 +166,7 @@ int main() {
       .payload_bytes = static_cast<std::uint32_t>(value.size()),
       .total_disk_bytes = static_cast<std::uint32_t>(
           AlignRecord(record_header_bytes + value.size())),
-      .generation = 4,
+      .txid = 4,
       .replication_epoch = 5,
       .db_epoch = 6,
       .mutation_sequence = 7,

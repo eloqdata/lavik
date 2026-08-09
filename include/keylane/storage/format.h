@@ -215,7 +215,12 @@ struct RecordHeader {
   // Physical payload following this header. External roots store a manifest.
   std::uint32_t payload_bytes = 0;
   std::uint32_t total_disk_bytes = 0;
-  std::uint64_t generation = 0;
+  // Multi-key transaction id, or 0 for a standalone write. Recovery keeps a
+  // tagged record only if it also finds the transaction's kTxCommit record;
+  // untagged records are kept unconditionally. (This slot was `generation`,
+  // the original newest-wins ordinal, orphaned when replication introduced
+  // the (replication_epoch, mutation_sequence) order.)
+  std::uint64_t txid = 0;
   std::uint64_t replication_epoch = 1;
   std::uint64_t db_epoch = 1;
   std::uint64_t mutation_sequence = 0;
