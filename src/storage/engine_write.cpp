@@ -460,6 +460,10 @@ Task<Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
 
 Task<Status> StorageEngine::Impl::MarkRetiredRecordsDead(
     WorkerStore* store, std::vector<RetiredRecord> records) {
+  struct SettlementGuard {
+    std::atomic<std::uint32_t>* active;
+    ~SettlementGuard() { active->fetch_sub(1, std::memory_order_acq_rel); }
+  } settlement{&active_settlements_};
   for (const RetiredRecord& record : records) {
     Status dead = co_await MarkRecordDead(record);
     if (!dead.ok()) {

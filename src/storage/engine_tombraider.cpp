@@ -39,10 +39,19 @@ Task<Status> StorageEngine::Impl::RunTombRaider() {
           expected, true, std::memory_order_acq_rel)) {
     co_return Status::Ok();
   }
+  // The round counts as a settlement: its frames park on cross-worker hops,
+  // so the shutdown drain must not finish under it. In exchange, every
+  // phase aborts at its next block/batch boundary once a shutdown flush is
+  // requested — a forfeited round costs nothing, the next run redoes it.
+  active_settlements_.fetch_add(1, std::memory_order_acq_rel);
   struct RoundGuard {
     std::atomic<bool>* running;
-    ~RoundGuard() { running->store(false, std::memory_order_release); }
-  } round_guard{&tomb_raider_running_};
+    std::atomic<std::uint32_t>* settlements;
+    ~RoundGuard() {
+      settlements->fetch_sub(1, std::memory_order_acq_rel);
+      running->store(false, std::memory_order_release);
+    }
+  } round_guard{&tomb_raider_running_, &active_settlements_};
 
   // The reap must not start until every worker's sweep has finished: the
   // record that still needs a candidate may sit in the last unswept block.
@@ -87,6 +96,9 @@ Task<Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
       }
       std::uint64_t cursor = 0;
       do {
+        if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+          co_return Status::Ok();  // forfeit the round
+        }
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
           if (entry.value.kind == RecordKind::kTombstone ||
               (entry.value.kind == RecordKind::kValue &&
@@ -196,6 +208,9 @@ Task<Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
   };
 
   for (const BlockSnapshot& snapshot : blocks) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+      co_return Status::Ok();  // forfeit the round
+    }
     BlockState* state = FindBlockState(store, snapshot.block_id);
     if (state == nullptr || !state->allocated ||
         state->allocation_epoch != snapshot.allocation_epoch ||
@@ -360,6 +375,9 @@ Task<Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
 
   std::uint64_t reaped = 0;
   for (const Candidate& candidate : tombs) {
+    if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+      break;  // forfeit the rest; totals below still publish
+    }
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         candidate.db_id, tx::FingerprintOf(candidate.digest),
         tx::LockMode::kExclusive);

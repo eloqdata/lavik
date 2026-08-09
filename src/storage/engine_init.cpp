@@ -878,7 +878,8 @@ Task<Status> StorageEngine::Impl::FlushWorkerForShutdown(WorkerStore* store) {
       // itself what spawns them, and letting a worker tear down under one
       // frees the coroutine frame it is running on.
       done = !store->flush_running && store->flush_queue.empty() &&
-             active_extent_reclaims_.load(std::memory_order_acquire) == 0;
+             active_extent_reclaims_.load(std::memory_order_acquire) == 0 &&
+             active_settlements_.load(std::memory_order_acquire) == 0;
       failed = store->write_failed;
     }
     if (failed) {

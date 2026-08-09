@@ -357,6 +357,9 @@ Task<Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     }
 
     if (!retired_records.empty()) {
+      // Counted before the spawn so the shutdown drain can never observe
+      // zero between this completion and the task's first slice.
+      active_settlements_.fetch_add(1, std::memory_order_acq_rel);
       store->worker->Spawn(
           MarkRetiredRecordsDead(store, std::move(retired_records)));
     }

@@ -198,10 +198,15 @@ void StorageEngine::Impl::EnsureDetachedReclaim(WorkerStore& store) {
     return;
   }
   store.detached_reclaim_running = true;
+  active_settlements_.fetch_add(1, std::memory_order_acq_rel);
   store.worker->SpawnBackground(RunDetachedReclaim(&store));
 }
 
 Task<Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
+  struct SettlementGuard {
+    std::atomic<std::uint32_t>* active;
+    ~SettlementGuard() { active->fetch_sub(1, std::memory_order_acq_rel); }
+  } settlement{&active_settlements_};
   Status status = co_await ReclaimDetachedIndexes(*store);
   store->detached_reclaim_running = false;
   if (!status.ok()) {
@@ -214,6 +219,12 @@ Task<Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
 Task<Status> StorageEngine::Impl::AwaitDetachedReclaim(WorkerStore& store) {
   EnsureDetachedReclaim(store);
   while (store.detached_reclaim_running || !store.detached_indexes.empty()) {
+    // A reclaimer that died mid-stream never empties the queue and nothing
+    // restarts it; fall through to the fail-stop report instead of
+    // spinning forever.
+    if (!store.detached_reclaim_running && store.write_failed) {
+      break;
+    }
     Status waited = co_await celer::SleepFor(
         *store.worker, std::chrono::milliseconds(1));
     if (!waited.ok()) {

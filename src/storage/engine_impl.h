@@ -1553,6 +1553,14 @@ class StorageEngine::Impl {
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
   std::atomic<std::uint32_t> expiration_pause_count_{0};
+  // Background tasks that settle accounting through cross-worker hops
+  // (retired-record settlement, detached-index reclaim, a tomb raider
+  // round). A frame parked on such a hop is registered with the remote
+  // worker; tearing its own worker down under it lets the remote resume a
+  // destroyed frame. The shutdown drain waits for this to reach zero, so
+  // every one of these tasks must be short-lived or abort promptly once
+  // shutdown_flush_requested_ is set.
+  std::atomic<std::uint32_t> active_settlements_{0};
   std::atomic<bool> tomb_raider_running_{false};
   std::atomic<std::uint64_t> tomb_raider_rounds_{0};
   std::atomic<std::uint64_t> tomb_raider_reaped_{0};
