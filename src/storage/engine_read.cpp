@@ -190,28 +190,60 @@ StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(LoadedValue loaded) {
 Task<StatusOr<StorageEngine::Impl::LoadedValue>> StorageEngine::Impl::LoadValue(
     WorkerStore& key_store, std::uint8_t db_id, std::string_view key,
     const Digest& digest, RecordLocation location, ReadLatencyTrace* trace) {
-  assert(location.block_owner < worker_count_);
-  // An external value's manifest is already decoded in this index entry, so
-  // the record's own block holds nothing worth reading. Assemble here and
-  // let each extent go straight to its block's owner, rather than hopping to
-  // the record's owner first and having it acquire the output buffer from
-  // its pool and hand the lease back across workers.
-  if (location.external) {
-    co_return co_await LoadExternalValueLocal(key_store, location, trace);
+  while (true) {
+    assert(location.block_owner < worker_count_);
+    StatusOr<LoadedValue> loaded(
+        Status(StatusCode::kInternal, "value read was not dispatched"));
+
+    // An external value's manifest is already decoded in this index entry,
+    // so the record's own block holds nothing worth reading. Assemble here
+    // and let each extent go straight to its block's owner, rather than
+    // hopping to the record's owner first and having it acquire the output
+    // buffer from its pool and hand the lease back across workers.
+    if (location.external) {
+      loaded = co_await LoadExternalValueLocal(key_store, location, trace);
+    } else if (location.block_owner == key_store.worker->id()) {
+      loaded = co_await LoadValueLocal(key_store, db_id, key, digest, location,
+                                       trace);
+    } else {
+      const unsigned owner = location.block_owner;
+      std::string owned_key(key);
+      loaded = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, db_id, key = std::move(owned_key), digest, location,
+           trace]() mutable -> Task<StatusOr<LoadedValue>> {
+            co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
+                                              digest, location, trace);
+          });
+    }
+    if (loaded.ok() || loaded.status().code() != StatusCode::kAborted) {
+      co_return loaded;
+    }
+
+    // Defrag relocates records without acquiring key locks. A reader can copy
+    // an index location, suspend while dispatching to the block owner or
+    // waiting for a read buffer, and arrive after the source block is freed.
+    // Resolve the key on its owner and follow the current physical location.
+    // The caller's key lock serializes logical mutations, so only a physical
+    // relocation of the same mutation is retryable.
+    auto& index = PartitionForKey(key_store, key).indexes[db_id];
+    auto* current = index.Find(digest, key);
+    if (current == nullptr || current->value.kind != RecordKind::kValue ||
+        current->value.replication_epoch != location.replication_epoch ||
+        current->value.mutation_sequence != location.mutation_sequence) {
+      // Database-epoch invalidation is not serialized by an individual key
+      // lock. If it removed or replaced this logical mutation while the read
+      // was suspended, report ordinary absence; snapshot callers already
+      // skip NotFound and foreground GET produces a nil reply.
+      co_return Status(StatusCode::kNotFound, "key not found");
+    }
+    if (current->value.SamePhysicalRecord(location)) {
+      // The index still endorses the location that failed validation, so this
+      // is corruption rather than a relocation race. Preserve a hard error.
+      co_return Status(StatusCode::kInternal, loaded.status().message());
+    }
+    location = current->value;
   }
-  if (location.block_owner == key_store.worker->id()) {
-    co_return co_await LoadValueLocal(key_store, db_id, key, digest, location,
-                                      trace);
-  }
-  const unsigned owner = location.block_owner;
-  std::string owned_key(key);
-  co_return co_await celer::SubmitTaskTo(
-      owner,
-      [this, owner, db_id, key = std::move(owned_key), digest, location,
-       trace]() mutable -> Task<StatusOr<LoadedValue>> {
-        co_return co_await LoadValueLocal(*stores_[owner], db_id, key, digest,
-                                          location, trace);
-      });
 }
 
 Task<Status> StorageEngine::Impl::ReadExtentInto(WorkerStore& store,
@@ -222,7 +254,7 @@ Task<Status> StorageEngine::Impl::ReadExtentInto(WorkerStore& store,
   if (state == nullptr || !state->allocated || state->freeing ||
       state->kind != BlockKind::kValueExtent ||
       state->allocation_epoch != ref.allocation_epoch) {
-    co_return Status(StatusCode::kInternal,
+    co_return Status(StatusCode::kAborted,
                      "stale or missing external extent");
   }
   ++state->pins;
@@ -401,7 +433,7 @@ Task<StatusOr<StorageEngine::Impl::LoadedValue>> StorageEngine::Impl::LoadValueL
   BlockState* state = FindBlockState(store, location.block_id);
   if (state == nullptr || !state->allocated || state->freeing ||
       state->allocation_epoch != location.allocation_epoch) {
-    co_return Status(StatusCode::kInternal, "stale index block epoch");
+    co_return Status(StatusCode::kAborted, "stale index block epoch");
   }
 
   // Only records appended since the last flush live in a staging buffer, so
@@ -448,7 +480,7 @@ Task<StatusOr<StorageEngine::Impl::LoadedValue>> StorageEngine::Impl::LoadValueL
         location.logical_size != record.logical_size ||
         location.payload_bytes != record.payload_bytes ||
         location.total_disk_bytes != record.total_disk_bytes) {
-      co_return Status(StatusCode::kInternal,
+      co_return Status(StatusCode::kAborted,
                        "record does not match in-memory location");
     }
     std::memcpy(io.data, record_bytes + record.header_bytes,
@@ -530,7 +562,7 @@ Task<StatusOr<StorageEngine::Impl::LoadedValue>> StorageEngine::Impl::LoadValueL
       record.logical_size != location.logical_size ||
       record.payload_bytes != location.payload_bytes ||
       record.total_disk_bytes != location.total_disk_bytes) {
-    co_return Status(StatusCode::kInternal,
+    co_return Status(StatusCode::kAborted,
                      "record does not match in-memory location");
   }
   const std::byte* value_data = record_data + record.header_bytes;
