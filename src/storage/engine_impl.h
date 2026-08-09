@@ -289,6 +289,10 @@ struct RecoveryRecord {
   Digest digest{};
   std::string key;
   std::uint8_t db_id = 0;
+  // Multi-key transaction tag. Tagged records are parked until every
+  // worker's scan has contributed its kTxCommit sightings, then applied only
+  // if their transaction committed.
+  std::uint64_t txid = 0;
   RecordLocation location{};
 };
 
@@ -797,6 +801,9 @@ class StorageEngine::Impl {
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
     absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents;
+  // txid-tagged records parked by ApplyRecovery until the committed-txid set
+  // is complete (after the recovery barrier).
+  std::vector<RecoveryRecord> recovery_tx_records;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots{1};
@@ -1212,11 +1219,14 @@ class StorageEngine::Impl {
   // are computed over allocated blocks; the capacity-wide sweep count only
   // detects completion.
   void ReportRecoveryProgress(std::uint64_t records, bool allocated);
-  Task<Status> ScanAssignedBlocks(WorkerStore& store,
-                                  std::vector<RecoveryBatch>* batches,
-                                  std::vector<std::uint64_t>* zero_blocks);
+  Task<Status> ScanAssignedBlocks(
+      WorkerStore& store, std::vector<RecoveryBatch>* batches,
+      std::vector<std::uint64_t>* zero_blocks,
+      absl::flat_hash_set<std::uint64_t>* committed_txids);
 
   void ApplyRecovery(unsigned target, RecoveryBatch batch);
+
+  void ApplyRecoveredRecord(WorkerStore& store, const RecoveryRecord& record);
 
   Task<StatusOr<LoadedValue>> LoadValue(WorkerStore& key_store,
                                         std::uint8_t db_id,
@@ -1450,6 +1460,11 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
   std::atomic<std::uint64_t> recovery_scanned_records_{0};
+  std::atomic<std::uint64_t> recovery_max_txid_{0};
+  // Committed transactions seen during the block scans; merged by each
+  // worker before the recovery barrier, read only after it.
+  std::mutex recovery_committed_mutex_;
+  absl::flat_hash_set<std::uint64_t> recovery_committed_txids_;
   std::atomic<std::uint64_t> recovery_scanned_allocated_{0};
   // Blocks the loaded scan bitmaps mark as allocated, summed over all devices
   // in Prepare. This is the recovery scan's real workload.

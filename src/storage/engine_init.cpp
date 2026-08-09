@@ -475,10 +475,16 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 
   std::vector<RecoveryBatch> batches(worker_count_);
   std::vector<std::uint64_t> zero_blocks;
-  status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks);
+  absl::flat_hash_set<std::uint64_t> committed_txids;
+  status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
+                                       &committed_txids);
   if (!status.ok()) {
     Fail(status);
     co_return status;
+  }
+  if (!committed_txids.empty()) {
+    std::lock_guard<std::mutex> lock(recovery_committed_mutex_);
+    recovery_committed_txids_.merge(committed_txids);
   }
 
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -504,6 +510,27 @@ Task<Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   status = co_await recovery_barrier_->Wait(worker);
   if (!status.ok()) {
     co_return status;
+  }
+
+  // Every scan has fed the committed set by now (merges happen before the
+  // barrier); decide the parked transaction-tagged records. A tagged record
+  // without its commit record is a prepare whose transaction never durably
+  // committed — recovery drops it, which is exactly the all-or-nothing the
+  // commit protocol promises.
+  for (const RecoveryRecord& parked : store.recovery_tx_records) {
+    if (recovery_committed_txids_.contains(parked.txid)) {
+      ApplyRecoveredRecord(store, parked);
+    }
+  }
+  store.recovery_tx_records.clear();
+  store.recovery_tx_records.shrink_to_fit();
+  if (worker.id() == 0) {
+    // Seed the transaction-id counter above everything on disk so a new
+    // boot's transactions can never alias a previous boot's commit records.
+    tx::TxRuntime::Get()->next_txid.store(
+        std::max<std::uint64_t>(
+            recovery_max_txid_.load(std::memory_order_relaxed) + 1, 1),
+        std::memory_order_relaxed);
   }
 
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(

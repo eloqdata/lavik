@@ -82,7 +82,8 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
 
 Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
     WorkerStore& store, std::vector<RecoveryBatch>* batches,
-    std::vector<std::uint64_t>* zero_blocks) {
+    std::vector<std::uint64_t>* zero_blocks,
+    absl::flat_hash_set<std::uint64_t>* committed_txids) {
   auto acquired = co_await store.buffers.AcquireReadBuffer();
   if (!acquired.ok()) {
     co_return acquired.status();
@@ -241,9 +242,6 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
             block.committed_bytes - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
             record.allocation_epoch != block.allocation_epoch ||
-            record.digest != ComputeDigest(key) ||
-            StorageShardForKey(key) % block.layout_worker_count !=
-                block.writer_id ||
             record.relocation_sequence >
                 std::numeric_limits<std::uint32_t>::max() ||
             record_offset + record.total_disk_bytes > block.committed_bytes) {
@@ -251,6 +249,23 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
                            "invalid or corrupt committed record header");
         }
         AtomicMax(&next_lsn_, record.lsn + 1);
+        AtomicMax(&recovery_max_txid_, record.txid);
+        if (record.kind == RecordKind::kTxCommit) {
+          // A commit decision, not a keyed record: exempt from the key and
+          // epoch filters below — the transaction it commits may span
+          // databases and partitions whose epochs are unrelated to this
+          // record's own header fields.
+          committed_txids->insert(record.txid);
+          record_offset += record.total_disk_bytes;
+          ++records;
+          continue;
+        }
+        if (record.digest != ComputeDigest(key) ||
+            StorageShardForKey(key) % block.layout_worker_count !=
+                block.writer_id) {
+          co_return Status(StatusCode::kInternal,
+                           "invalid or corrupt committed record header");
+        }
         if (record.db_epoch != DbEpoch(record.db_id)) {
           record_offset += record.total_disk_bytes;
           ++records;
@@ -291,6 +306,7 @@ Task<Status> StorageEngine::Impl::ScanAssignedBlocks(
             .digest = record.digest,
             .key = std::string(key),
             .db_id = record.db_id,
+            .txid = record.txid,
             .location = RecordLocation{
                 .block_id = block_id,
                 .replication_epoch = record.replication_epoch,
@@ -348,10 +364,24 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
   }
 
   for (const RecoveryRecord& recovered : batch.records) {
+    if (recovered.txid != 0) {
+      // Whether this record's transaction committed is only decidable once
+      // every worker's scan has fed the committed set; park it until after
+      // the recovery barrier.
+      store.recovery_tx_records.push_back(recovered);
+      continue;
+    }
+    ApplyRecoveredRecord(store, recovered);
+  }
+}
+
+void StorageEngine::Impl::ApplyRecoveredRecord(WorkerStore& store,
+                                               const RecoveryRecord& recovered) {
+  {
     auto& partition = PartitionForKey(store, recovered.key);
     if (recovered.location.replication_epoch !=
         partition.replication_epoch) {
-      continue;
+      return;
     }
     partition.mutation_sequence = std::max(
         partition.mutation_sequence, recovered.location.mutation_sequence);

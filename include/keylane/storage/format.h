@@ -139,6 +139,10 @@ std::uint32_t StorageShardForKey(std::string_view key) noexcept;
 enum class RecordKind : std::uint8_t {
   kValue = 1,
   kTombstone = 2,
+  // A multi-key transaction's commit decision: header-only, txid names the
+  // committed transaction, keyless (key_bytes == 0). Never enters the index;
+  // recovery keeps txid-tagged data records only when it finds this.
+  kTxCommit = 3,
 };
 
 enum class BlockKind : std::uint8_t {
