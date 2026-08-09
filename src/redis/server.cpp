@@ -400,6 +400,12 @@ Task<StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream, std::string* pend
     if (parsed.state == RespParseState::kError) {
       co_return parsed.status;
     }
+    // Drop skipped filler (blank lines, empty multibulks) even while the
+    // next real command is still incomplete: retaining it would grow the
+    // buffer without bound and re-scan it from the start on every refill.
+    if (parsed.consumed != 0) {
+      pending->erase(0, parsed.consumed);
+    }
     if (pending->size() >= kMaxPendingBytes) {
       co_return Status(StatusCode::kResourceExhausted,
                        "client request exceeds the query buffer limit");

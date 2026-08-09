@@ -16,12 +16,13 @@ constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 RespParseResult ParseRespCommand(std::string_view input) {
   RespParseResult result;
 
-  // An empty multibulk (*0\r\n) is likewise a command that does nothing:
-  // real Redis consumes it without sending anything back, and replying (even
-  // an error) would shift the client's request/reply pairing off by one for
-  // the rest of the connection. Skip them iteratively, interleaved with the
-  // blank lines below.
+  // Whatever gets skipped below is reported as consumed even when no
+  // complete command follows: a stream of nothing but filler would
+  // otherwise be retained forever and re-scanned from the start on every
+  // refill — quadratic work for bytes that carry no command.
   std::size_t skipped = 0;
+  std::size_t pos = 0;
+  std::size_t count = 0;
   for (;;) {
     // An empty line is a command that does nothing, and clients rely on it:
     // redis-cli --pipe sends a bare CRLF to terminate any half-written
@@ -35,43 +36,59 @@ RespParseResult ParseRespCommand(std::string_view input) {
     }
     input.remove_prefix(leading);
     skipped += leading;
-    if (input.size() >= 4 && input.substr(0, 4) == "*0\r\n") {
-      input.remove_prefix(4);
-      skipped += 4;
+
+    if (input.empty() || input.front() != '*') {
+      if (!input.empty()) {
+        result.state = RespParseState::kError;
+        result.status =
+            Status(StatusCode::kInvalidArgument, "expected RESP array");
+      }
+      result.consumed = skipped;
+      return result;
+    }
+
+    // Parse array length: *<N>\r\n
+    pos = 1;
+    const std::size_t crlf = input.find("\r\n", pos);
+    if (crlf == std::string_view::npos) {
+      result.consumed = skipped;
+      return result;
+    }
+
+    long long array_len = 0;
+    auto [ptr, ec] =
+        std::from_chars(input.data() + pos, input.data() + crlf, array_len);
+    if (ec != std::errc{} || ptr != input.data() + crlf || array_len < 0) {
+      result.state = RespParseState::kError;
+      result.status =
+          Status(StatusCode::kInvalidArgument, "invalid RESP array length");
+      return result;
+    }
+    if (array_len > static_cast<long long>(kMaxArrayLen)) {
+      result.state = RespParseState::kError;
+      result.status =
+          Status(StatusCode::kOutOfRange, "too many RESP array elements");
+      return result;
+    }
+    // An empty multibulk is a command that does nothing: real Redis consumes
+    // it without sending anything back, and replying (even an error) would
+    // shift the client's request/reply pairing off by one for the rest of
+    // the connection. Every spelling of zero (*0, *000, *-0) qualifies, so
+    // the decision is made on the parsed count, not the raw bytes.
+    if (array_len == 0) {
+      input.remove_prefix(crlf + 2);
+      skipped += crlf + 2;
       continue;
     }
+
+    count = static_cast<std::size_t>(array_len);
+    pos = crlf + 2;
     break;
   }
-
-  if (input.empty() || input.front() != '*') {
-    if (!input.empty()) {
-      result.state = RespParseState::kError;
-      result.status = Status(StatusCode::kInvalidArgument, "expected RESP array");
-    }
-    return result;
-  }
-
-  // Parse array length: *<N>\r\n
-  std::size_t pos = 1;
-  std::size_t crlf = input.find("\r\n", pos);
-  if (crlf == std::string_view::npos) return result;
-
-  long long array_len = 0;
-  auto [ptr, ec] = std::from_chars(input.data() + pos, input.data() + crlf, array_len);
-  if (ec != std::errc{} || ptr != input.data() + crlf || array_len < 0) {
-    result.state = RespParseState::kError;
-    result.status = Status(StatusCode::kInvalidArgument, "invalid RESP array length");
-    return result;
-  }
-  if (array_len > static_cast<long long>(kMaxArrayLen)) {
-    result.state = RespParseState::kError;
-    result.status = Status(StatusCode::kOutOfRange, "too many RESP array elements");
-    return result;
-  }
-
-  const auto count = static_cast<std::size_t>(array_len);
-  pos = crlf + 2;
   result.command.args.reserve(count);
+  // From here on, a truncated command still reports the skipped prefix as
+  // consumed: the filler can be dropped while the rest is awaited.
+  result.consumed = skipped;
 
   // Parse each bulk string: $<N>\r\n<data>\r\n
   for (std::size_t i = 0; i < count; ++i) {
@@ -89,7 +106,7 @@ RespParseResult ParseRespCommand(std::string_view input) {
     }
     ++pos;
 
-    crlf = input.find("\r\n", pos);
+    const std::size_t crlf = input.find("\r\n", pos);
     if (crlf == std::string_view::npos) return result;
 
     long long bulk_len = 0;
