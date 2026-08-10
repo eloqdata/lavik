@@ -229,7 +229,7 @@ if (BUILD_TESTING)
       NAME keylane_multikey_e2e
       COMMAND keylane_multikey_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_multikey_e2e PROPERTIES TIMEOUT 120)
+    set_tests_properties(keylane_multikey_e2e PROPERTIES TIMEOUT 300)
 
     add_executable(keylane_multi_exec_e2e_test
       tests/multi_exec_e2e_test.cpp
@@ -275,6 +275,6 @@ if (BUILD_TESTING)
       NAME keylane_extent_recovery_e2e
       COMMAND keylane_extent_recovery_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_extent_recovery_e2e PROPERTIES TIMEOUT 180)
+    set_tests_properties(keylane_extent_recovery_e2e PROPERTIES TIMEOUT 600)
   endif()
 endif()

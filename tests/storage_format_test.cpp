@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "keylane/storage/format.h"
 
@@ -137,14 +138,14 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   }
 
   BlockHeader extent_header = header;
-  extent_header.kind_ = BlockKind::kValueExtent;
+  extent_header.kind_ = BlockKind::kPayloadExtent;
   extent_header.committed_bytes_ = kBlockHeaderBytes + 1234;
   extent_header.extent_index_ = 2;
   extent_header.extent_payload_bytes_ = 1234;
   extent_header.extent_payload_checksum_ = 0x12345678U;
   EncodeBlockHeader(extent_header, block_page);
   ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
-  ASSERT_TRUE(decoded_header.kind_ == BlockKind::kValueExtent);
+  ASSERT_TRUE(decoded_header.kind_ == BlockKind::kPayloadExtent);
   ASSERT_TRUE(decoded_header.extent_index_ == extent_header.extent_index_);
   ASSERT_TRUE(decoded_header.extent_payload_bytes_ ==
               extent_header.extent_payload_bytes_);
@@ -215,4 +216,46 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(decoded_record.value_type_ == ValueType::kString);
   ASSERT_TRUE(decoded_record.logical_size_ == external_record.logical_size_);
   ASSERT_TRUE(decoded_record.payload_bytes_ == external_record.payload_bytes_);
+}
+
+TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
+  using namespace keylane::storage;
+
+  const std::string key(8192, 'k');
+  const std::size_t header_bytes = RecordHeaderBytes(key.size(), true);
+  ASSERT_LE(header_bytes, kMaxRecordHeaderBytes);
+  RecordHeader record{
+      .magic_ = kRecordMagic,
+      .version_ = kStorageFormatVersion,
+      .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
+      .kind_ = RecordKind::kTombstone,
+      .db_id_ = 2,
+      .value_type_ = ValueType::kNone,
+      .external_ = false,
+      .key_external_ = true,
+      .digest_ = ComputeDigest(key),
+      .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .logical_size_ = 0,
+      .payload_bytes_ = static_cast<std::uint32_t>(key.size()),
+      .total_disk_bytes_ =
+          static_cast<std::uint32_t>(AlignRecord(header_bytes + key.size())),
+      .replication_epoch_ = 3,
+      .db_epoch_ = 4,
+      .mutation_sequence_ = 5,
+      .allocation_epoch_ = 6,
+  };
+  std::array<std::byte, kMaxRecordHeaderBytes> page{};
+  ASSERT_TRUE(EncodeRecordHeader(
+      record, key, std::span<std::byte>(page.data(), header_bytes)));
+
+  RecordHeader decoded{};
+  std::string_view decoded_key;
+  ASSERT_TRUE(
+      DecodeRecordHeader(std::span<const std::byte>(page.data(), header_bytes),
+                         &decoded, &decoded_key));
+  EXPECT_TRUE(decoded.key_external_);
+  EXPECT_TRUE(decoded_key.empty());
+  EXPECT_EQ(decoded.key_bytes_, key.size());
+  EXPECT_EQ(decoded.header_bytes_, AlignRecord(sizeof(RecordHeader)));
+  EXPECT_EQ(decoded.payload_bytes_, key.size());
 }

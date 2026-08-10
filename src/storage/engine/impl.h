@@ -70,9 +70,10 @@ struct RecordLocation {
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
   std::uint16_t block_owner_ = 0;
-  // Packed flags: one byte for all four.
+  // Packed flags: one byte for all five.
   bool in_memory_ : 1 = false;
   bool external_ : 1 = false;
+  bool key_external_ : 1 = false;
   // True while an older, still-unexpired value of this key may survive on
   // disk. Erasing this entry then would un-suppress that copy: recovery
   // picks the newest surviving record, so the key would resurrect with the
@@ -181,13 +182,13 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
   for (const ExtentRef& ref : *refs) {
     if (ref.block_id_ == kInvalidBlockId || ref.allocation_epoch_ == 0 ||
         ref.payload_bytes_ == 0 || ref.payload_bytes_ > kExtentPayloadBytes ||
-        total > kMaxStringBytes - ref.payload_bytes_) {
+        total > kMaxRecordPayloadBytes - ref.payload_bytes_) {
       return absl::Status(absl::StatusCode::kInternal,
                           "invalid extent reference");
     }
     total += ref.payload_bytes_;
   }
-  if (total != logical_size || total > kMaxStringBytes) {
+  if (total != logical_size || total > kMaxRecordPayloadBytes) {
     return absl::Status(absl::StatusCode::kInternal,
                         "extent manifest logical size mismatch");
   }
@@ -361,6 +362,8 @@ struct RetiredRecord {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
   std::uint16_t block_owner_ = 0;
+  ExtentManifest dependent_extents_;
+  std::shared_ptr<const std::vector<ExtentManifest>> extra_dependent_extents_;
 };
 
 // The index state a defrag relocation observed when it validated its source
@@ -855,6 +858,11 @@ class StorageEngine::Impl {
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
     absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents_;
+    // Recovery-only exact identities for external-key entries. Runtime index
+    // entries deliberately omit the full key, but recovery already had to
+    // materialize it for routing, so retain it until every version is merged.
+    absl::flat_hash_map<const RecordIndex::Entry*, std::string>
+        recovery_external_keys_;
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
     std::vector<RecoveryRecord> recovery_tx_records_;
@@ -868,6 +876,11 @@ class StorageEngine::Impl {
     // access only.
     absl::flat_hash_map<std::uint64_t, std::vector<RelocationDurabilityFence>>
         pending_relocation_fences_;
+    // A retired root record's shared key/value extents remain needed by
+    // recovery until the whole records block is durably removed from the
+    // allocation bitmap.
+    absl::flat_hash_map<std::uint64_t, std::vector<ExtentManifest>>
+        deferred_dependent_extent_reclaims_;
     // Index 0 is the "no staging buffer" sentinel. A deque keeps references
     // stable as the table grows, since heap fallback buffers are unbounded.
     std::deque<StagingSlot> staging_slots_{1};
@@ -981,8 +994,8 @@ class StorageEngine::Impl {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
 
-  bool KeyLive(std::uint8_t db_id, std::string_view key,
-               const Digest& digest) const;
+  Task<bool> KeyLive(std::uint8_t db_id, std::string_view key,
+                     const Digest& digest);
 
   Task<bool> Exists(std::uint8_t db_id, std::string_view key);
 
@@ -1047,10 +1060,10 @@ class StorageEngine::Impl {
 
   Task<absl::Status> AdvanceDbEpoch(std::uint8_t db_id, std::uint64_t next);
 
-  ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
-                          std::uint64_t cursor, std::size_t count,
-                          std::uint64_t now_ms,
-                          std::size_t max_bytes = SIZE_MAX) const;
+  Task<absl::StatusOr<ScanBatch>> ScanPartition(
+      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
+      std::size_t count, std::uint64_t now_ms,
+      std::size_t max_bytes = SIZE_MAX);
 
   PartitionReplicationStart BeginPartitionReplication(
       std::uint16_t partition_id);
@@ -1112,7 +1125,8 @@ class StorageEngine::Impl {
 
   void QueueExpiredCandidate(WorkerStore& store, std::uint16_t partition_id,
                              std::uint8_t db_id,
-                             const RecordIndex::Entry& entry);
+                             const RecordIndex::Entry& entry,
+                             std::string_view known_key = {});
 
   WorkerStore& CurrentStore() { return *stores_[celer::ThisWorker().id_]; }
 
@@ -1338,6 +1352,42 @@ class StorageEngine::Impl {
                                                     : found->second;
   }
 
+  static ExtentManifest DependentExtentsFor(const WorkerStore& store,
+                                            const RecordIndex::Entry* entry) {
+    if (entry == nullptr || !entry->value_.key_external_) [[likely]] {
+      return {};
+    }
+    return entry->value_.external_ ? ExtentsFor(store, entry)
+                                   : ExtentManifest{};
+  }
+
+  Task<absl::StatusOr<std::string>> LoadExternalKey(WorkerStore& store,
+                                                    ExtentManifest extents,
+                                                    std::size_t key_bytes);
+  Task<absl::StatusOr<std::string>> LoadOutOfIndexKey(
+      WorkerStore& store, const RecordLocation& location,
+      ExtentManifest extents, std::size_t key_bytes);
+  Task<absl::StatusOr<std::string>> LoadInlineRecordKeyLocal(
+      WorkerStore& store, const RecordLocation& location,
+      std::size_t key_bytes);
+  Task<absl::StatusOr<std::string>> LoadExternalKeyForRecovery(
+      WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
+
+  Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
+                                               const RecordIndex::Entry& entry,
+                                               std::string_view key);
+  Task<absl::StatusOr<bool>> VerifyExternalKeyExtents(WorkerStore& store,
+                                                      ExtentManifest extents,
+                                                      std::string_view key);
+  Task<absl::StatusOr<bool>> VerifyInlineRecordKey(
+      WorkerStore& store, const RecordLocation& location, std::string_view key);
+  Task<absl::StatusOr<bool>> VerifyInlineRecordKeyLocal(
+      WorkerStore& store, const RecordLocation& location, std::string_view key);
+
+  Task<absl::StatusOr<RecordIndex::Entry*>> FindVerifiedEntry(
+      WorkerStore& store, RecordIndex& index, const Digest& digest,
+      std::string_view key);
+
   Task<absl::StatusOr<LoadedValue>> LoadValue(
       WorkerStore& key_store, std::uint8_t db_id, std::string_view key,
       const Digest& digest, RecordLocation location, ExtentManifest extents,
@@ -1352,7 +1402,7 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ExtentManifest extents, ReadLatencyTrace* trace);
+      ExtentManifest extents, std::size_t key_bytes, ReadLatencyTrace* trace);
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
@@ -1388,17 +1438,21 @@ class StorageEngine::Impl {
   Task<absl::Status> MarkRetiredRecordsDead(WorkerStore* store,
                                             std::vector<RetiredRecord> records);
 
-  static RetiredRecord RetiredRecordOf(const RecordLocation& location) {
+  static RetiredRecord RetiredRecordOf(const RecordLocation& location,
+                                       ExtentManifest dependent_extents = {}) {
     return RetiredRecord{
         .block_id_ = location.block_id_,
         .allocation_epoch_ = location.allocation_epoch_,
         .total_disk_bytes_ = location.total_disk_bytes_,
         .block_owner_ = location.block_owner_,
+        .dependent_extents_ = std::move(dependent_extents),
+        .extra_dependent_extents_ = nullptr,
     };
   }
 
   Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
-  WriteExtentValueLocked(WorkerStore& store, std::string_view value);
+  WriteExtentValueLocked(WorkerStore& store, std::string_view first,
+                         std::string_view second = {});
 
   Task<absl::Status> AppendLocked(WorkerStore& store,
                                   WorkerStore::PartitionStore& partition,
@@ -1423,7 +1477,7 @@ class StorageEngine::Impl {
       std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
       std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
       bool for_defrag, bool unlock_writer_while_waiting = true,
-      bool external = false,
+      bool external = false, bool key_external = false,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       RecordLocation* written_location = nullptr,

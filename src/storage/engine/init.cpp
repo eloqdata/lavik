@@ -13,6 +13,12 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "storage worker count exceeds logical storage shards");
   }
+  if (options_.inline_key_max_bytes_ == 0 ||
+      options_.inline_key_max_bytes_ > MaxInlineKeyBytes()) {
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "inline key limit must be between 1 and " +
+                            std::to_string(MaxInlineKeyBytes()) + " bytes");
+  }
   if (options_.data_files_.size() > std::numeric_limits<std::uint16_t>::max()) {
     return absl::Status(absl::StatusCode::kOutOfRange, "too many data files");
   }
@@ -513,6 +519,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   store.recovery_tx_records_.clear();
   store.recovery_tx_records_.shrink_to_fit();
+  store.recovery_external_keys_.clear();
+  store.recovery_external_keys_.rehash(0);
   if (worker.id() == 0) {
     // Seed the transaction-id counter above everything on disk so a new
     // boot's transactions can never alias a previous boot's commit records.
@@ -579,7 +587,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         if (reference.extent_) {
           const auto found =
               owner_store.recovered_extents_.find(reference.block_id_);
-          if (state->kind_ != BlockKind::kValueExtent ||
+          if (state->kind_ != BlockKind::kPayloadExtent ||
               state->committed_bytes_ != kBlockHeaderBytes + reference.bytes_ ||
               found == owner_store.recovered_extents_.end() ||
               found->second.extent_index_ != reference.extent_index_ ||
@@ -665,7 +673,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   auto orphan_extents = std::make_shared<std::vector<ExtentRef>>();
   ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
-    if (state.kind_ == BlockKind::kValueExtent && state.live_bytes_ == 0) {
+    if (state.kind_ == BlockKind::kPayloadExtent && state.live_bytes_ == 0) {
       orphan_extents->push_back(ExtentRef{
           .block_id_ = block_id,
           .allocation_epoch_ = state.allocation_epoch_,

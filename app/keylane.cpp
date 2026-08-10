@@ -69,6 +69,10 @@ int main(int argc, char** argv) {
          "--data-file", options.data_files_,
          "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
+  app.add_option("--inline-key-max-bytes", options.inline_key_max_bytes_,
+                 "Largest key retained complete in the in-memory index")
+      ->check(CLI::Range(std::size_t{1}, keylane::storage::MaxInlineKeyBytes()))
+      ->capture_default_str();
   app.add_option("--replication-port",
                  options.replication_options_.listen_port_,
                  "Internal replication listen port (0 disables receiver)")

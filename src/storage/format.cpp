@@ -316,7 +316,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
     return false;
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
-       decoded.kind_ != BlockKind::kValueExtent) ||
+       decoded.kind_ != BlockKind::kPayloadExtent) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
   }
@@ -345,24 +345,29 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept {
-  const std::size_t header_bytes = RecordHeaderBytes(key.size());
+  const std::size_t header_bytes =
+      RecordHeaderBytes(key.size(), header.key_external_);
   if (header.magic_ != kRecordMagic ||
       header.version_ != kStorageFormatVersion || key.size() > MaxKeyBytes() ||
       key.size() != header.key_bytes_ ||
+      (header.key_external_ && key.empty()) ||
       header.db_id_ >= kLogicalDatabaseCount ||
       static_cast<std::uint8_t>(header.value_type_) >
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (header.kind_ == RecordKind::kValue &&
        header.value_type_ == ValueType::kNone) ||
       (header.kind_ == RecordKind::kTombstone &&
-       (header.logical_size_ != 0 || header.payload_bytes_ != 0 ||
-        header.external_ || header.expire_at_ms_ != 0 ||
-        header.value_type_ != ValueType::kNone)) ||
+       (header.logical_size_ != 0 || header.expire_at_ms_ != 0 ||
+        header.value_type_ != ValueType::kNone ||
+        (!header.key_external_ &&
+         (header.payload_bytes_ != 0 || header.external_)) ||
+        (header.key_external_ && !header.external_ &&
+         header.payload_bytes_ != header.key_bytes_))) ||
       (header.kind_ == RecordKind::kTxCommit &&
        (header.logical_size_ != 0 || header.payload_bytes_ != 0 ||
         header.external_ || header.expire_at_ms_ != 0 ||
         header.value_type_ != ValueType::kNone || header.txid_ == 0 ||
-        header.key_bytes_ != 0)) ||
+        header.key_bytes_ != 0 || header.key_external_)) ||
       header.header_bytes_ != header_bytes || output.size() != header_bytes) {
     return false;
   }
@@ -372,9 +377,14 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
       static_cast<ValueType>(static_cast<std::uint8_t>(encoded.value_type_) |
                              (encoded.external_ ? kExternalValueMask : 0));
   encoded.external_ = false;
+  encoded.key_bytes_ = static_cast<std::uint32_t>(encoded.key_bytes_) |
+                       (encoded.key_external_ ? kExternalKeyMask : 0);
+  encoded.key_external_ = false;
   encoded.header_checksum_ = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
-  std::memcpy(output.data() + sizeof(encoded), key.data(), key.size());
+  if (!header.key_external_) {
+    std::memcpy(output.data() + sizeof(encoded), key.data(), key.size());
+  }
   encoded.header_checksum_ = Crc32c(output);
   std::memcpy(output.data(), &encoded, sizeof(encoded));
   return true;
@@ -393,6 +403,9 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   decoded.external_ = (encoded_type & kExternalValueMask) != 0;
   decoded.value_type_ =
       static_cast<ValueType>(encoded_type & ~kExternalValueMask);
+  const std::uint32_t encoded_key_bytes = decoded.key_bytes_;
+  decoded.key_external_ = (encoded_key_bytes & kExternalKeyMask) != 0;
+  decoded.key_bytes_ = encoded_key_bytes & ~kExternalKeyMask;
   if (decoded.magic_ != kRecordMagic ||
       decoded.version_ != kStorageFormatVersion ||
       (decoded.kind_ != RecordKind::kValue &&
@@ -405,7 +418,8 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.value_type_ == ValueType::kNone) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
       decoded.key_bytes_ > MaxKeyBytes() ||
-      decoded.header_bytes_ != RecordHeaderBytes(decoded.key_bytes_) ||
+      decoded.header_bytes_ !=
+          RecordHeaderBytes(decoded.key_bytes_, decoded.key_external_) ||
       decoded.header_bytes_ > input.size() ||
       decoded.total_disk_bytes_ !=
           AlignRecord(static_cast<std::size_t>(decoded.header_bytes_) +
@@ -414,13 +428,20 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     return false;
   }
   if (decoded.kind_ != RecordKind::kValue &&
-      (decoded.logical_size_ != 0 || decoded.payload_bytes_ != 0 ||
-       decoded.external_ || decoded.expire_at_ms_ != 0 ||
+      (decoded.logical_size_ != 0 || decoded.expire_at_ms_ != 0 ||
        decoded.value_type_ != ValueType::kNone)) {
     return false;
   }
+  if (decoded.kind_ == RecordKind::kTombstone &&
+      ((!decoded.key_external_ &&
+        (decoded.payload_bytes_ != 0 || decoded.external_)) ||
+       (decoded.key_external_ && !decoded.external_ &&
+        decoded.payload_bytes_ != decoded.key_bytes_))) {
+    return false;
+  }
   if (decoded.kind_ == RecordKind::kTxCommit &&
-      (decoded.txid_ == 0 || decoded.key_bytes_ != 0)) {
+      (decoded.txid_ == 0 || decoded.key_bytes_ != 0 ||
+       decoded.key_external_)) {
     return false;
   }
   const std::uint32_t expected = decoded.header_checksum_;
@@ -429,6 +450,8 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   RecordHeader checksum_header = decoded;
   checksum_header.value_type_ = static_cast<ValueType>(encoded_type);
   checksum_header.external_ = false;
+  checksum_header.key_bytes_ = encoded_key_bytes;
+  checksum_header.key_external_ = false;
   checksum_header.header_checksum_ = 0;
   std::memcpy(copy.data(), &checksum_header, sizeof(checksum_header));
   if (Crc32c(std::span<const std::byte>(copy.data(), decoded.header_bytes_)) !=
@@ -436,9 +459,13 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     return false;
   }
   *header = decoded;
-  *key = std::string_view(
-      reinterpret_cast<const char*>(input.data() + sizeof(RecordHeader)),
-      decoded.key_bytes_);
+  if (decoded.key_external_) {
+    *key = {};
+  } else {
+    *key = std::string_view(
+        reinterpret_cast<const char*>(input.data() + sizeof(RecordHeader)),
+        decoded.key_bytes_);
+  }
   return true;
 }
 

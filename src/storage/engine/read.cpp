@@ -19,6 +19,13 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
   auto& partition = PartitionForKey(store, key);
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    found = *resolved;
+  }
   if (found == nullptr || found->value_.kind_ == RecordKind::kTombstone) {
     if (trace != nullptr) {
       trace->lookup_done_ns_ = ReadTraceNowNanos();
@@ -27,7 +34,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
   }
   const std::uint64_t now_ms = UnixTimeMillis();
   if (IsExpired(found->value_, now_ms)) {
-    QueueExpiredCandidate(store, partition.id_, db_id, *found);
+    QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     if (trace != nullptr) {
       trace->lookup_done_ns_ = ReadTraceNowNanos();
     }
@@ -61,11 +68,19 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  auto* found = partition.indexes_[db_id].Find(digest, key);
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    found = *resolved;
+  }
   if (found == nullptr || found->value_.kind_ != RecordKind::kValue ||
       IsExpired(found->value_, UnixTimeMillis())) {
     if (found != nullptr && IsExpired(found->value_, UnixTimeMillis())) {
-      QueueExpiredCandidate(store, partition.id_, db_id, *found);
+      QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     }
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
   }
@@ -91,12 +106,20 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
-  auto* found = partition.indexes_[db_id].Find(digest, key);
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return ExpirationInfo{};
+    }
+    found = *resolved;
+  }
   if (found == nullptr || found->value_.kind_ != RecordKind::kValue) {
     co_return ExpirationInfo{};
   }
   if (IsExpired(found->value_, UnixTimeMillis())) {
-    QueueExpiredCandidate(store, partition.id_, db_id, *found);
+    QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return ExpirationInfo{};
   }
   co_return ExpirationInfo{
@@ -105,15 +128,23 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   };
 }
 
-bool StorageEngine::Impl::KeyLive(std::uint8_t db_id, std::string_view key,
-                                  const Digest& digest) const {
+Task<bool> StorageEngine::Impl::KeyLive(std::uint8_t db_id,
+                                        std::string_view key,
+                                        const Digest& digest) {
   assert(db_id < kLogicalDatabaseCount);
-  const WorkerStore& store = CurrentStore();
-  auto& partition = const_cast<Impl*>(this)->PartitionForKey(
-      const_cast<WorkerStore&>(store), key);
-  const auto* found = partition.indexes_[db_id].Find(digest, key);
-  return found != nullptr && found->value_.kind_ == RecordKind::kValue &&
-         !IsExpired(found->value_, UnixTimeMillis());
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return false;
+    }
+    found = *resolved;
+  }
+  co_return found != nullptr && found->value_.kind_ == RecordKind::kValue &&
+      !IsExpired(found->value_, UnixTimeMillis());
 }
 
 Task<bool> StorageEngine::Impl::Exists(std::uint8_t db_id,
@@ -133,11 +164,18 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
   auto& partition = PartitionForKey(store, key);
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return false;
+    }
+    found = *resolved;
+  }
   if (found == nullptr || found->value_.kind_ != RecordKind::kValue) {
     co_return false;
   }
   if (IsExpired(found->value_, UnixTimeMillis())) {
-    QueueExpiredCandidate(store, partition.id_, db_id, *found);
+    QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return false;
   }
   co_return true;
@@ -204,8 +242,8 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
     // hopping to the record's owner first and having it acquire the output
     // buffer from its pool and hand the lease back across workers.
     if (location.external_) {
-      loaded = co_await LoadExternalValueLocal(key_store, location,
-                                               std::move(extents), trace);
+      loaded = co_await LoadExternalValueLocal(
+          key_store, location, std::move(extents), key.size(), trace);
     } else if (location.block_owner_ == key_store.worker_->id()) {
       loaded = co_await LoadValueLocal(key_store, db_id, key, digest, location,
                                        trace);
@@ -231,7 +269,11 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
     // The caller's key lock serializes logical mutations, so only a physical
     // relocation of the same mutation is retryable.
     auto& index = PartitionForKey(key_store, key).indexes_[db_id];
-    auto* current = index.Find(digest, key);
+    auto resolved = co_await FindVerifiedEntry(key_store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    auto* current = *resolved;
     if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
         current->value_.replication_epoch_ != location.replication_epoch_ ||
         current->value_.mutation_sequence_ != location.mutation_sequence_) {
@@ -257,7 +299,7 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
     std::byte* destination) {
   BlockState* state = FindBlockState(store, ref.block_id_);
   if (state == nullptr || !state->allocated_ || state->freeing_ ||
-      state->kind_ != BlockKind::kValueExtent ||
+      state->kind_ != BlockKind::kPayloadExtent ||
       state->allocation_epoch_ != ref.allocation_epoch_) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "stale or missing external extent");
@@ -290,7 +332,7 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
   if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
                                   io.data_, kBlockHeaderBytes),
                               &header) ||
-      header.kind_ != BlockKind::kValueExtent ||
+      header.kind_ != BlockKind::kPayloadExtent ||
       header.block_id_ != ref.block_id_ ||
       header.allocation_epoch_ != ref.allocation_epoch_ ||
       header.extent_index_ != extent_index ||
@@ -309,10 +351,394 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
   co_return absl::OkStatus();
 }
 
+Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
+    WorkerStore& store, ExtentManifest extents, std::size_t key_bytes) {
+  if (extents == nullptr || key_bytes == 0 || key_bytes > MaxKeyBytes()) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external key has no valid extent manifest");
+  }
+  std::string key(key_bytes, '\0');
+  std::size_t offset = 0;
+  for (std::size_t index = 0; index < extents->size() && offset < key.size();
+       ++index) {
+    const ExtentRef& ref = extents->at(index);
+    const std::uint16_t owner = BlockOwner(ref.block_id_);
+    if (owner >= worker_count_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "stale or missing external key extent");
+    }
+    const std::size_t remaining = key.size() - offset;
+    std::vector<std::byte> partial;
+    std::byte* destination = nullptr;
+    if (ref.payload_bytes_ <= remaining) {
+      destination = reinterpret_cast<std::byte*>(key.data() + offset);
+    } else {
+      partial.resize(ref.payload_bytes_);
+      destination = partial.data();
+    }
+    absl::Status read = absl::OkStatus();
+    if (owner == store.worker_->id()) {
+      read = co_await ReadExtentInto(
+          store, ref, static_cast<std::uint32_t>(index), destination);
+    } else {
+      read = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, ref, index, destination]() -> Task<absl::Status> {
+            co_return co_await ReadExtentInto(*stores_[owner], ref,
+                                              static_cast<std::uint32_t>(index),
+                                              destination);
+          });
+    }
+    if (!read.ok()) {
+      co_return read;
+    }
+    const std::size_t copy_bytes =
+        std::min<std::size_t>(ref.payload_bytes_, key.size() - offset);
+    if (!partial.empty()) {
+      std::memcpy(key.data() + offset, partial.data(), copy_bytes);
+    }
+    offset += copy_bytes;
+  }
+  if (offset != key.size()) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external key manifest is truncated");
+  }
+  co_return key;
+}
+
+Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadOutOfIndexKey(
+    WorkerStore& store, const RecordLocation& location, ExtentManifest extents,
+    std::size_t key_bytes) {
+  if (location.external_) {
+    co_return co_await LoadExternalKey(store, std::move(extents), key_bytes);
+  }
+  if (location.block_owner_ == store.worker_->id()) {
+    co_return co_await LoadInlineRecordKeyLocal(store, location, key_bytes);
+  }
+  const unsigned owner = location.block_owner_;
+  if (owner >= worker_count_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "inline key block has no owner");
+  }
+  co_return co_await celer::SubmitTaskTo(
+      owner,
+      [this, owner, location,
+       key_bytes]() -> Task<absl::StatusOr<std::string>> {
+        co_return co_await LoadInlineRecordKeyLocal(*stores_[owner], location,
+                                                    key_bytes);
+      });
+}
+
+Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadInlineRecordKeyLocal(
+    WorkerStore& store, const RecordLocation& location, std::size_t key_bytes) {
+  if (!location.key_external_ || location.external_ || key_bytes == 0 ||
+      key_bytes > MaxKeyBytes()) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "key is not stored in the record payload");
+  }
+  BlockState* state = FindBlockState(store, location.block_id_);
+  if (state == nullptr || !state->allocated_ || state->freeing_ ||
+      state->allocation_epoch_ != location.allocation_epoch_) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "stale inline key record");
+  }
+  const std::byte* record_data = nullptr;
+  ReadBufferLease lease;
+  if (location.in_memory_ && state->in_memory_) [[unlikely]] {
+    const FixedBuffer staging = StagingBufferFor(store, *state);
+    if (staging.data_ == nullptr ||
+        location.record_offset_ + location.total_disk_bytes_ > staging.size_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "invalid staged inline key record");
+    }
+    record_data = staging.data_ + location.record_offset_;
+  } else {
+    const auto [file_id, block_offset] = FileOffset(location.block_id_);
+    const std::uint64_t absolute_offset =
+        block_offset + location.record_offset_;
+    const std::uint64_t mask = direct_io_alignment_ - 1;
+    const std::uint64_t aligned_offset = absolute_offset & ~mask;
+    const std::size_t headroom =
+        static_cast<std::size_t>(absolute_offset - aligned_offset);
+    const std::size_t read_bytes =
+        (headroom + location.total_disk_bytes_ + direct_io_alignment_ - 1) &
+        ~static_cast<std::size_t>(mask);
+    ++state->pins_;
+    struct PinGuard {
+      WorkerStore* store_;
+      BlockState* state_;
+      ~PinGuard() {
+        --state_->pins_;
+        if (state_->pins_ == 0 && state_->release_pending_) {
+          ReleaseStagingBuffer(*store_, *state_);
+        }
+      }
+    } pin{&store, state};
+    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    lease = std::move(*acquired);
+    FixedBuffer io = lease.io_buffer();
+    io.size_ = read_bytes;
+    auto read =
+        co_await ReadStorageBuffer(*store.worker_, store.files_[file_id], io,
+                                   lease.registered(), aligned_offset);
+    if (!read.ok()) {
+      co_return read.status();
+    }
+    if (*read != read_bytes) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "short inline key record read");
+    }
+    record_data = io.data_ + headroom;
+  }
+  RecordHeader record{};
+  std::string_view header_key;
+  if (!DecodeRecordHeader(
+          std::span<const std::byte>(record_data, location.total_disk_bytes_),
+          &record, &header_key) ||
+      !record.key_external_ || record.external_ ||
+      record.key_bytes_ != key_bytes || record.payload_bytes_ < key_bytes ||
+      record.allocation_epoch_ != location.allocation_epoch_ ||
+      record.mutation_sequence_ != location.mutation_sequence_ ||
+      record.relocation_sequence_ != location.relocation_sequence_) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "inline key record changed");
+  }
+  const char* key_data =
+      reinterpret_cast<const char*>(record_data + record.header_bytes_);
+  co_return std::string(key_data, key_bytes);
+}
+
+Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyExternalKey(
+    WorkerStore& store, const RecordIndex::Entry& entry, std::string_view key) {
+  if (entry.key_complete()) [[likely]] {
+    co_return entry.key() == key;
+  }
+  if (!entry.value_.key_external_ || entry.logical_key_size() != key.size())
+      [[unlikely]] {
+    co_return false;
+  }
+  if (!entry.value_.external_) {
+    co_return co_await VerifyInlineRecordKey(store, entry.value_, key);
+  }
+  co_return co_await VerifyExternalKeyExtents(store, ExtentsFor(store, &entry),
+                                              key);
+}
+
+Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyExternalKeyExtents(
+    WorkerStore& store, ExtentManifest extents, std::string_view key) {
+  if (extents == nullptr) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external key manifest is missing");
+  }
+  std::vector<std::byte> buffer;
+  std::size_t offset = 0;
+  for (std::size_t index = 0; index < extents->size() && offset < key.size();
+       ++index) {
+    const ExtentRef& ref = extents->at(index);
+    buffer.resize(ref.payload_bytes_);
+    const std::uint16_t owner = BlockOwner(ref.block_id_);
+    if (owner >= worker_count_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "stale or missing external key extent");
+    }
+    absl::Status read = absl::OkStatus();
+    if (owner == store.worker_->id()) {
+      read = co_await ReadExtentInto(
+          store, ref, static_cast<std::uint32_t>(index), buffer.data());
+    } else {
+      read = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, ref, index,
+           destination = buffer.data()]() -> Task<absl::Status> {
+            co_return co_await ReadExtentInto(*stores_[owner], ref,
+                                              static_cast<std::uint32_t>(index),
+                                              destination);
+          });
+    }
+    if (!read.ok()) {
+      co_return read;
+    }
+    const std::size_t compare_bytes =
+        std::min<std::size_t>(ref.payload_bytes_, key.size() - offset);
+    if (std::memcmp(buffer.data(), key.data() + offset, compare_bytes) != 0) {
+      co_return false;
+    }
+    offset += compare_bytes;
+  }
+  co_return offset == key.size();
+}
+
+Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyInlineRecordKey(
+    WorkerStore& store, const RecordLocation& location, std::string_view key) {
+  if (location.block_owner_ == store.worker_->id()) {
+    co_return co_await VerifyInlineRecordKeyLocal(store, location, key);
+  }
+  const unsigned owner = location.block_owner_;
+  if (owner >= worker_count_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "inline key block has no owner");
+  }
+  std::string owned_key(key);
+  co_return co_await celer::SubmitTaskTo(
+      owner,
+      [this, owner, location,
+       key = std::move(owned_key)]() -> Task<absl::StatusOr<bool>> {
+        co_return co_await VerifyInlineRecordKeyLocal(*stores_[owner], location,
+                                                      key);
+      });
+}
+
+Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyInlineRecordKeyLocal(
+    WorkerStore& store, const RecordLocation& location, std::string_view key) {
+  if (!location.key_external_ || location.external_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "key is not stored in the record payload");
+  }
+  BlockState* state = FindBlockState(store, location.block_id_);
+  if (state == nullptr || !state->allocated_ || state->freeing_ ||
+      state->allocation_epoch_ != location.allocation_epoch_) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "stale inline key record");
+  }
+  const std::byte* record_data = nullptr;
+  ReadBufferLease lease;
+  if (location.in_memory_ && state->in_memory_) [[unlikely]] {
+    const FixedBuffer staging = StagingBufferFor(store, *state);
+    if (staging.data_ == nullptr ||
+        location.record_offset_ + location.total_disk_bytes_ > staging.size_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "invalid staged inline key record");
+    }
+    record_data = staging.data_ + location.record_offset_;
+  } else {
+    const auto [file_id, block_offset] = FileOffset(location.block_id_);
+    const std::uint64_t absolute_offset =
+        block_offset + location.record_offset_;
+    const std::uint64_t mask = direct_io_alignment_ - 1;
+    const std::uint64_t aligned_offset = absolute_offset & ~mask;
+    const std::size_t headroom =
+        static_cast<std::size_t>(absolute_offset - aligned_offset);
+    const std::size_t read_bytes =
+        (headroom + location.total_disk_bytes_ + direct_io_alignment_ - 1) &
+        ~static_cast<std::size_t>(mask);
+    ++state->pins_;
+    struct PinGuard {
+      WorkerStore* store_;
+      BlockState* state_;
+      ~PinGuard() {
+        --state_->pins_;
+        if (state_->pins_ == 0 && state_->release_pending_) {
+          ReleaseStagingBuffer(*store_, *state_);
+        }
+      }
+    } pin{&store, state};
+    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    lease = std::move(*acquired);
+    FixedBuffer io = lease.io_buffer();
+    io.size_ = read_bytes;
+    auto read =
+        co_await ReadStorageBuffer(*store.worker_, store.files_[file_id], io,
+                                   lease.registered(), aligned_offset);
+    if (!read.ok()) {
+      co_return read.status();
+    }
+    if (*read != read_bytes) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "short inline key record read");
+    }
+    record_data = io.data_ + headroom;
+  }
+  RecordHeader record{};
+  std::string_view header_key;
+  const auto record_bytes =
+      std::span<const std::byte>(record_data, location.total_disk_bytes_);
+  if (!DecodeRecordHeader(record_bytes, &record, &header_key) ||
+      !record.key_external_ || record.external_ ||
+      record.key_bytes_ != key.size() ||
+      record.payload_bytes_ < record.key_bytes_ ||
+      record.allocation_epoch_ != location.allocation_epoch_ ||
+      record.mutation_sequence_ != location.mutation_sequence_ ||
+      record.relocation_sequence_ != location.relocation_sequence_) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "inline key record changed");
+  }
+  const std::byte* payload = record_data + record.header_bytes_;
+  co_return std::memcmp(payload, key.data(), key.size()) == 0;
+}
+
+Task<absl::StatusOr<RecordIndex::Entry*>>
+StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
+                                       const Digest& digest,
+                                       std::string_view key) {
+  struct Candidate {
+    RecordIndex::Entry* entry_ = nullptr;
+    ExtentManifest extents_;
+    RecordLocation location_{};
+    std::uint64_t hash_ = 0;
+  };
+  for (;;) {
+    RecordIndex::Entry* first = index.Find(digest, key);
+    if (first == nullptr || first->key_complete()) [[likely]] {
+      co_return first;
+    }
+    std::vector<Candidate> candidates;
+    for (RecordIndex::Entry* entry : index.FindCandidates(digest, key)) {
+      candidates.push_back(Candidate{
+          .entry_ = entry,
+          .extents_ = ExtentsFor(store, entry),
+          .location_ = entry->value_,
+          .hash_ = entry->hash_,
+      });
+    }
+    bool changed = false;
+    for (const Candidate& candidate : candidates) {
+      absl::StatusOr<bool> verified(false);
+      if (candidate.location_.external_) {
+        verified =
+            co_await VerifyExternalKeyExtents(store, candidate.extents_, key);
+      } else {
+        verified =
+            co_await VerifyInlineRecordKey(store, candidate.location_, key);
+      }
+      const bool still_current =
+          index.Contains(candidate.entry_, candidate.hash_) &&
+          candidate.entry_->value_.SamePhysicalRecord(candidate.location_);
+      if (!verified.ok()) {
+        if (verified.status().code() == absl::StatusCode::kAborted &&
+            !still_current) {
+          changed = true;
+          break;
+        }
+        co_return verified.status().code() == absl::StatusCode::kAborted
+            ? absl::Status(absl::StatusCode::kInternal,
+                           verified.status().message())
+            : verified.status();
+      }
+      if (!still_current) {
+        changed = true;
+        break;
+      }
+      if (*verified) {
+        co_return candidate.entry_;
+      }
+    }
+    if (!changed) {
+      co_return static_cast<RecordIndex::Entry*>(nullptr);
+    }
+  }
+}
+
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                                             const RecordLocation& location,
                                             ExtentManifest extents,
+                                            std::size_t key_bytes,
                                             ReadLatencyTrace* trace) {
   if (!location.external_ || extents == nullptr ||
       location.logical_size_ > kMaxStringBytes) {
@@ -341,13 +767,25 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   if (trace != nullptr) {
     trace->io_submit_ns_ = ReadTraceNowNanos();
   }
+  const std::uint64_t key_prefix = location.key_external_ ? key_bytes : 0;
+  const std::uint64_t expected_extent_bytes =
+      key_prefix + location.logical_size_;
+  std::uint64_t extent_offset = 0;
   std::size_t output_offset = 0;
   for (std::size_t index = 0; index < extents->size(); ++index) {
     const ExtentRef& ref = extents->at(index);
-    if (output_offset + ref.payload_bytes_ > location.logical_size_) {
+    if (extent_offset + ref.payload_bytes_ > expected_extent_bytes) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "extent header does not match manifest");
     }
+    const std::uint64_t extent_end = extent_offset + ref.payload_bytes_;
+    if (extent_end <= key_prefix) {
+      extent_offset = extent_end;
+      continue;
+    }
+    const std::size_t source_offset = static_cast<std::size_t>(
+        key_prefix > extent_offset ? key_prefix - extent_offset : 0);
+    const std::size_t copy_bytes = ref.payload_bytes_ - source_offset;
     // The manifest is held by the record's owner, but each extent block has
     // its own owner, and after a worker-count change the two are unrelated.
     // Hop to the block's owner exactly as LoadValue does for records.
@@ -356,7 +794,12 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
       co_return absl::Status(absl::StatusCode::kInternal,
                              "stale or missing external extent");
     }
+    std::vector<std::byte> partial;
     std::byte* target = destination.data_ + output_offset;
+    if (source_offset != 0) {
+      partial.resize(ref.payload_bytes_);
+      target = partial.data();
+    }
     // if/else, not ?:, to keep the two co_awaits in separate full
     // expressions (GCC coroutine frame-slot aliasing).
     absl::Status read = absl::OkStatus();
@@ -374,9 +817,15 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     if (!read.ok()) {
       co_return read;
     }
-    output_offset += ref.payload_bytes_;
+    if (!partial.empty()) {
+      std::memcpy(destination.data_ + output_offset,
+                  partial.data() + source_offset, copy_bytes);
+    }
+    output_offset += copy_bytes;
+    extent_offset = extent_end;
   }
-  if (output_offset != location.logical_size_) {
+  if (extent_offset != expected_extent_bytes ||
+      output_offset != location.logical_size_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value length does not match manifest");
   }
@@ -462,7 +911,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
       co_return absl::Status(absl::StatusCode::kInternal,
                              "external value requires extent loading");
     }
-    if (location.payload_bytes_ > io.size_) {
+    if (location.logical_size_ > io.size_) {
       co_return absl::Status(absl::StatusCode::kOutOfRange,
                              "value exceeds registered read buffer capacity");
     }
@@ -474,7 +923,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
     if (!DecodeRecordHeader(std::span<const std::byte>(
                                 record_bytes, location.total_disk_bytes_),
                             &record, &disk_key) ||
-        record.db_id_ != db_id || record.digest_ != digest || disk_key != key ||
+        record.db_id_ != db_id || record.digest_ != digest ||
+        (!record.key_external_ && disk_key != key) ||
         record.kind_ != RecordKind::kValue ||
         record.db_epoch_ != DbEpoch(db_id) ||
         record.mutation_sequence_ != location.mutation_sequence_ ||
@@ -484,17 +934,31 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
         record.expire_at_ms_ != location.expire_at_ms_ ||
         record.value_type_ != location.value_type_ ||
         record.external_ != location.external_ ||
+        record.key_external_ != location.key_external_ ||
         location.logical_size_ != record.logical_size_ ||
         location.payload_bytes_ != record.payload_bytes_ ||
         location.total_disk_bytes_ != record.total_disk_bytes_) {
       co_return absl::Status(absl::StatusCode::kAborted,
                              "record does not match in-memory location");
     }
-    std::memcpy(io.data_, record_bytes + record.header_bytes_,
-                location.payload_bytes_);
+    const std::byte* payload_data = record_bytes + record.header_bytes_;
+    const std::size_t key_prefix = record.key_external_ ? record.key_bytes_ : 0;
+    if (record.payload_bytes_ < key_prefix ||
+        (record.key_external_ &&
+         (record.key_bytes_ != key.size() ||
+          std::memcmp(payload_data, key.data(), key.size()) != 0))) {
+      co_return absl::Status(absl::StatusCode::kAborted,
+                             "record key does not match location");
+    }
+    const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
+    if (value_bytes != record.logical_size_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "inline value length does not match metadata");
+    }
+    std::memcpy(io.data_, payload_data + key_prefix, value_bytes);
     if (options_.verify_read_crc_ &&
-        Crc32c(std::span<const std::byte>(io.data_, record.payload_bytes_)) !=
-            record.payload_checksum_) {
+        Crc32c(std::span<const std::byte>(
+            payload_data, record.payload_bytes_)) != record.payload_checksum_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "record value checksum mismatch");
     }
@@ -503,8 +967,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
     }
     const std::size_t value_offset =
         static_cast<std::size_t>(io.data_ - lease.bytes().data());
-    co_return LoadedValue{std::move(lease), value_offset,
-                          record.payload_bytes_};
+    co_return LoadedValue{std::move(lease), value_offset, value_bytes};
   }
 
   // Only the disk read suspends while holding the BlockState pointer, so it
@@ -557,7 +1020,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   std::span<const std::byte> record_bytes(record_data,
                                           location.total_disk_bytes_);
   if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
-      record.db_id_ != db_id || record.digest_ != digest || disk_key != key ||
+      record.db_id_ != db_id || record.digest_ != digest ||
+      (!record.key_external_ && disk_key != key) ||
       record.kind_ != RecordKind::kValue ||
       record.db_epoch_ != DbEpoch(db_id) ||
       record.mutation_sequence_ != location.mutation_sequence_ ||
@@ -567,22 +1031,37 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
       record.expire_at_ms_ != location.expire_at_ms_ ||
       record.value_type_ != location.value_type_ ||
       record.external_ != location.external_ ||
+      record.key_external_ != location.key_external_ ||
       record.logical_size_ != location.logical_size_ ||
       record.payload_bytes_ != location.payload_bytes_ ||
       record.total_disk_bytes_ != location.total_disk_bytes_) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "record does not match in-memory location");
   }
-  const std::byte* value_data = record_data + record.header_bytes_;
+  const std::byte* payload_data = record_data + record.header_bytes_;
+  const std::size_t key_prefix = record.key_external_ ? record.key_bytes_ : 0;
+  if (record.payload_bytes_ < key_prefix ||
+      (record.key_external_ &&
+       (record.key_bytes_ != key.size() ||
+        std::memcmp(payload_data, key.data(), key.size()) != 0))) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "record key does not match location");
+  }
+  const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
+  if (value_bytes != record.logical_size_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "inline value length does not match metadata");
+  }
+  const std::byte* value_data = payload_data + key_prefix;
   if (options_.verify_read_crc_ &&
-      Crc32c(std::span<const std::byte>(value_data, record.payload_bytes_)) !=
+      Crc32c(std::span<const std::byte>(payload_data, record.payload_bytes_)) !=
           record.payload_checksum_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record value checksum mismatch");
   }
   const std::byte* framed_value = value_data;
-  if (record.payload_bytes_ > DirectGetValueLimit()) {
-    std::memmove(io.data_, value_data, record.payload_bytes_);
+  if (value_bytes > DirectGetValueLimit()) {
+    std::memmove(io.data_, value_data, value_bytes);
     framed_value = io.data_;
   }
   if (trace != nullptr) {
@@ -590,7 +1069,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   }
   const std::size_t value_offset =
       static_cast<std::size_t>(framed_value - lease.bytes().data());
-  co_return LoadedValue{std::move(lease), value_offset, record.payload_bytes_};
+  co_return LoadedValue{std::move(lease), value_offset, value_bytes};
 }
 
 }  // namespace keylane::storage

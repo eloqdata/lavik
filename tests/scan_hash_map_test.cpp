@@ -200,3 +200,18 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
       chained.Find(collision, "chain-1") == nullptr && chained.size() == 0,
       "chain drain left residue");
 }
+
+TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
+  ScanHashMap<std::uint64_t> map;
+  const std::string key(8192, 'x');
+  const Digest digest = ComputeDigest(key);
+  auto inserted = map.InsertOrAssign(digest, key, 42, false);
+  ASSERT_TRUE(inserted.inserted_);
+  EXPECT_FALSE(inserted.entry_->key_complete());
+  EXPECT_TRUE(inserted.entry_->key().empty());
+  EXPECT_EQ(inserted.entry_->logical_key_size(), key.size());
+  EXPECT_EQ(inserted.entry_->external_key_digest(), digest);
+  EXPECT_EQ(map.Find(digest, key), inserted.entry_);
+  EXPECT_TRUE(map.Erase(inserted.entry_));
+  EXPECT_TRUE(map.empty());
+}

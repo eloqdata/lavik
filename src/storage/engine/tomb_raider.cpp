@@ -121,8 +121,12 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
   for (const TombClaim& claim : claims) {
     auto& partition = PartitionForKey(store, claim.key_);
     if (partition.replication_epoch_ == claim.replication_epoch_) {
-      auto* entry =
-          partition.indexes_[claim.db_id_].Find(claim.digest_, claim.key_);
+      auto resolved = co_await FindVerifiedEntry(
+          store, partition.indexes_[claim.db_id_], claim.digest_, claim.key_);
+      if (!resolved.ok()) {
+        co_return resolved.status();
+      }
+      auto* entry = *resolved;
       if (entry != nullptr && entry->value_.unclaimed_ &&
           claim.mutation_sequence_ < entry->value_.mutation_sequence_) {
         entry->value_.unclaimed_ = false;
@@ -289,6 +293,36 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
       if (record.kind_ == RecordKind::kValue &&
           record.db_epoch_ == DbEpoch(record.db_id_) &&
           (record.expire_at_ms_ == 0 || record.expire_at_ms_ > now_ms)) {
+        const std::byte* payload_data = sweep.buffer_.data_ + record_offset -
+                                        record.total_disk_bytes_ +
+                                        record.header_bytes_;
+        const auto payload =
+            std::span<const std::byte>(payload_data, record.payload_bytes_);
+        std::string loaded_key;
+        if (record.key_external_) [[unlikely]] {
+          if (record.external_) {
+            auto manifest = DecodeManifest(
+                payload, static_cast<std::uint64_t>(record.key_bytes_) +
+                             record.logical_size_);
+            if (!manifest.ok()) {
+              co_return manifest.status();
+            }
+            auto external_key =
+                co_await LoadExternalKey(store, *manifest, record.key_bytes_);
+            if (!external_key.ok()) {
+              co_return external_key.status();
+            }
+            loaded_key = std::move(*external_key);
+            disk_key = loaded_key;
+          } else {
+            if (record.payload_bytes_ < record.key_bytes_) {
+              co_return absl::Status(absl::StatusCode::kInternal,
+                                     "inline external key is truncated");
+            }
+            disk_key = std::string_view(
+                reinterpret_cast<const char*>(payload_data), record.key_bytes_);
+          }
+        }
         const unsigned key_owner = OwnerForKey(disk_key);
         pending[key_owner].push_back(TombClaim{
             .mutation_sequence_ = record.mutation_sequence_,
@@ -332,6 +366,9 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
   struct Candidate {
     Digest digest_{};
     std::string key_;
+    ExtentManifest extents_;
+    RecordLocation location_{};
+    std::uint32_t key_bytes_ = 0;
     std::uint8_t db_id_ = 0;
   };
   std::vector<Candidate> tombs;
@@ -360,8 +397,13 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
             }
           } else if (entry.value_.kind_ == RecordKind::kTombstone) {
             tombs.push_back(Candidate{
-                .digest_ = ComputeDigest(entry.key()),
-                .key_ = std::string(entry.key()),
+                .digest_ = entry.key_complete() ? ComputeDigest(entry.key())
+                                                : entry.external_key_digest(),
+                .key_ = entry.key_complete() ? std::string(entry.key())
+                                             : std::string{},
+                .extents_ = DependentExtentsFor(store, &entry),
+                .location_ = entry.value_,
+                .key_bytes_ = entry.logical_key_size(),
                 .db_id_ = db_id,
             });
           }
@@ -374,9 +416,17 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
   }
 
   std::uint64_t reaped = 0;
-  for (const Candidate& candidate : tombs) {
+  for (Candidate& candidate : tombs) {
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;  // forfeit the rest; totals below still publish
+    }
+    if (candidate.key_.empty() && candidate.key_bytes_ != 0) [[unlikely]] {
+      auto key = co_await LoadOutOfIndexKey(
+          store, candidate.location_, candidate.extents_, candidate.key_bytes_);
+      if (!key.ok()) {
+        co_return key.status();
+      }
+      candidate.key_ = std::move(*key);
     }
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         candidate.db_id_, tx::FingerprintOf(candidate.digest_),
@@ -384,13 +434,20 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
     co_await store.store_state_mutex_.Lock();
     UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
     auto& partition = PartitionForKey(store, candidate.key_);
-    auto* entry = partition.indexes_[candidate.db_id_].Find(candidate.digest_,
-                                                            candidate.key_);
+    auto resolved =
+        co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
+                                   candidate.digest_, candidate.key_);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    auto* entry = *resolved;
     if (entry == nullptr || entry->value_.kind_ != RecordKind::kTombstone ||
         !entry->value_.unclaimed_) {
       continue;  // rewritten or claimed since collection
     }
     const RecordLocation dropped = entry->value_;
+    const ExtentManifest dropped_dependent_extents =
+        DependentExtentsFor(store, entry);
     // No watcher or replica cares: erasing a tombstone changes nothing a
     // reader can observe. Only the flush completion's staged identities
     // dereference the entry by pointer, so detach them before it is freed.
@@ -402,9 +459,9 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       }
     }
     store.external_manifests_.erase(entry);
-    partition.indexes_[candidate.db_id_].Erase(candidate.digest_,
-                                               candidate.key_);
-    absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
+    partition.indexes_[candidate.db_id_].Erase(entry);
+    absl::Status dead = co_await MarkRecordDead(
+        RetiredRecordOf(dropped, dropped_dependent_extents));
     if (!dead.ok()) {
       store.write_failed_ = true;
       co_return dead;

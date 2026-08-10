@@ -29,6 +29,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "keylane/storage/format.h"
 
@@ -38,33 +39,62 @@ template <typename Value>
 class ScanHashMap {
  public:
   struct Entry {
+    static constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
+
     std::uint64_t hash_ = 0;
     Value value_{};
     std::uint32_t key_size_ = 0;
 
+    bool key_complete() const noexcept {
+      return (key_size_ & kExternalKeyMask) == 0;
+    }
+
+    std::uint32_t logical_key_size() const noexcept {
+      return key_size_ & ~kExternalKeyMask;
+    }
+
     std::string_view key() const noexcept {
-      return {reinterpret_cast<const char*>(this + 1), key_size_};
+      return key_complete()
+                 ? std::string_view(reinterpret_cast<const char*>(this + 1),
+                                    logical_key_size())
+                 : std::string_view{};
+    }
+
+    Digest external_key_digest() const noexcept {
+      Digest digest;
+      if (!key_complete()) {
+        std::memcpy(digest.bytes_.data(), this + 1, digest.bytes_.size());
+      }
+      return digest;
     }
 
     static Entry* Create(const Digest& digest, std::string_view key,
-                         const Value& value) {
-      if (key.size() > std::numeric_limits<std::uint32_t>::max() ||
-          key.size() >
-              std::numeric_limits<std::size_t>::max() - sizeof(Entry)) {
+                         const Value& value, bool key_complete = true) {
+      if (key.size() >= kExternalKeyMask) {
+        throw std::bad_alloc();
+      }
+      const std::size_t tail_bytes =
+          key_complete ? key.size() : digest.bytes_.size();
+      if (tail_bytes >
+          std::numeric_limits<std::size_t>::max() - sizeof(Entry)) {
         throw std::bad_alloc();
       }
       static_assert(alignof(Entry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
-      void* storage = ::operator new(sizeof(Entry) + key.size());
+      void* storage = ::operator new(sizeof(Entry) + tail_bytes);
       Entry* entry = nullptr;
       try {
-        entry = new (storage)
-            Entry(Hash(digest), static_cast<std::uint32_t>(key.size()), value);
+        entry = new (storage) Entry(Hash(digest),
+                                    static_cast<std::uint32_t>(key.size()) |
+                                        (key_complete ? 0 : kExternalKeyMask),
+                                    value);
       } catch (...) {
         ::operator delete(storage);
         throw;
       }
-      if (!key.empty()) {
+      if (key_complete && !key.empty()) {
         std::memcpy(entry + 1, key.data(), key.size());
+      } else if (!key_complete) {
+        std::memcpy(entry + 1, digest.bytes_.data(), digest.bytes_.size());
       }
       return entry;
     }
@@ -122,8 +152,45 @@ class ScanHashMap {
     return FindWithoutStep(digest, key);
   }
 
+  std::vector<Entry*> FindCandidates(const Digest& digest,
+                                     std::string_view key) {
+    RehashStep();
+    std::vector<Entry*> result;
+    const std::uint64_t hash = Hash(digest);
+    AppendCandidates(tables_[0], digest, key, hash, &result);
+    if (Rehashing()) {
+      AppendCandidates(tables_[1], digest, key, hash, &result);
+    }
+    return result;
+  }
+
+  bool Contains(const Entry* entry, std::uint64_t hash) const noexcept {
+    if (entry == nullptr) {
+      return false;
+    }
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      const Table& table = tables_[t];
+      if (table.buckets_ == nullptr) {
+        continue;
+      }
+      const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      while (bucket != nullptr) {
+        const std::size_t slots =
+            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          if (Occupied(*bucket, slot) && bucket->entries_[slot] == entry) {
+            return true;
+          }
+        }
+        bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      }
+    }
+    return false;
+  }
+
   InsertResult InsertOrAssign(const Digest& digest, std::string_view key,
-                              const Value& value) {
+                              const Value& value, bool key_complete = true) {
     if (Entry* existing = Find(digest, key); existing != nullptr) {
       existing->value_ = value;
       return {existing, false};
@@ -132,11 +199,23 @@ class ScanHashMap {
     EnsureTable();
     MaybeStartExpansion();
     std::unique_ptr<Entry, void (*)(Entry*)> entry(
-        Entry::Create(digest, key, value), &Entry::Destroy);
+        Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
     Entry* raw = entry.get();
     AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
     entry.release();
     return {raw, true};
+  }
+
+  Entry* InsertNew(const Digest& digest, std::string_view key,
+                   const Value& value, bool key_complete = true) {
+    EnsureTable();
+    MaybeStartExpansion();
+    std::unique_ptr<Entry, void (*)(Entry*)> entry(
+        Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
+    Entry* raw = entry.get();
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
+    entry.release();
+    return raw;
   }
 
   // Deletes the matching entry, compacting its bucket chain the way Valkey's
@@ -163,8 +242,40 @@ class ScanHashMap {
             Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
         for (std::size_t slot = 0; slot < slots; ++slot) {
           if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-              KeyEquals(*bucket->entries_[slot], key)) {
+              KeyEquals(*bucket->entries_[slot], digest, key)) {
             Entry::Destroy(bucket->entries_[slot]);
+            bucket->entries_[slot] = nullptr;
+            ClearOccupied(bucket, slot);
+            --table.used_;
+            FillBucketHole(top, bucket, slot);
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  bool Erase(Entry* entry) {
+    if (entry == nullptr) {
+      return false;
+    }
+    RehashStep();
+    const std::uint64_t hash = entry->hash_;
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      Table& table = tables_[t];
+      if (table.buckets_ == nullptr) {
+        continue;
+      }
+      Bucket* top = &table.buckets_[hash & BucketMask(table)];
+      for (Bucket* bucket = top; bucket != nullptr;
+           bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
+        const std::size_t slots =
+            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          if (Occupied(*bucket, slot) && bucket->entries_[slot] == entry) {
+            Entry::Destroy(entry);
             bucket->entries_[slot] = nullptr;
             ClearOccupied(bucket, slot);
             --table.used_;
@@ -319,8 +430,13 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
-  static bool KeyEquals(const Entry& entry, std::string_view key) noexcept {
-    return entry.key() == key;
+  static bool KeyEquals(const Entry& entry, const Digest& digest,
+                        std::string_view key) noexcept {
+    if (entry.key_complete()) [[likely]] {
+      return entry.key() == key;
+    }
+    return entry.logical_key_size() == key.size() &&
+           entry.external_key_digest() == digest;
   }
 
   static std::uint64_t ReverseBits(std::uint64_t value) noexcept {
@@ -382,8 +498,8 @@ class ScanHashMap {
     }
   }
 
-  static Entry* FindInTable(Table& table, const Digest&, std::string_view key,
-                            std::uint64_t hash) {
+  static Entry* FindInTable(Table& table, const Digest& digest,
+                            std::string_view key, std::uint64_t hash) {
     if (table.buckets_ == nullptr) {
       return nullptr;
     }
@@ -394,7 +510,7 @@ class ScanHashMap {
           Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-            KeyEquals(*bucket->entries_[slot], key)) {
+            KeyEquals(*bucket->entries_[slot], digest, key)) {
           return bucket->entries_[slot];
         }
       }
@@ -406,6 +522,27 @@ class ScanHashMap {
   static const Entry* FindInTable(const Table& table, const Digest& digest,
                                   std::string_view key, std::uint64_t hash) {
     return FindInTable(const_cast<Table&>(table), digest, key, hash);
+  }
+
+  static void AppendCandidates(Table& table, const Digest& digest,
+                               std::string_view key, std::uint64_t hash,
+                               std::vector<Entry*>* result) {
+    if (table.buckets_ == nullptr) {
+      return;
+    }
+    Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    const std::uint8_t tag = HashTag(hash);
+    while (bucket != nullptr) {
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
+            KeyEquals(*bucket->entries_[slot], digest, key)) {
+          result->push_back(bucket->entries_[slot]);
+        }
+      }
+      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+    }
   }
 
   Entry* FindWithoutStep(const Digest& digest, std::string_view key) {

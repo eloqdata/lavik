@@ -36,7 +36,9 @@ inline constexpr std::uint64_t kRecordMagic =
 inline constexpr std::uint64_t kExtentManifestMagic =
     0x3154464e4d4c4bULL;  // KLMNFT1
 inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
+inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
 inline constexpr std::uint8_t kExternalValueMask = 0x80;
+inline constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
 inline constexpr std::uint64_t kMetadataPageMagic =
     0x31475041544d4c4bULL;  // KLMETAP1
 inline constexpr std::uint32_t kLogicalStorageShards = 16384;
@@ -145,7 +147,7 @@ enum class RecordKind : std::uint8_t {
 
 enum class BlockKind : std::uint8_t {
   kRecords = 1,
-  kValueExtent = 2,
+  kPayloadExtent = 2,
 };
 
 // Stable on-disk Redis value type identifiers. Only strings are implemented
@@ -207,14 +209,19 @@ struct RecordHeader {
   RecordKind kind_ = RecordKind::kValue;
   std::uint8_t db_id_ = 0;
   ValueType value_type_ = ValueType::kNone;
-  // Transient decoded form. This byte is zero on disk; external is encoded in
-  // the high bit of value_type.
-  bool external_ = false;
+  // Transient decoded form. This byte is zero on disk; the flags are encoded
+  // in value_type_ and key_bytes_. Keeping them as bit fields preserves the
+  // fixed on-disk header layout.
+  bool external_ : 1 = false;
+  bool key_external_ : 1 = false;
   Digest digest_{};
   std::uint32_t key_bytes_ = 0;
   // Redis-visible size: bytes for String and cardinality for collections.
   std::uint64_t logical_size_ = 0;
-  // Physical payload following this header. External roots store a manifest.
+  // Physical payload following this header. For an out-of-index key, an
+  // inline payload is key || value; an external payload is one manifest for
+  // the same logical concatenation. Small keys remain in the header and an
+  // external payload then contains only the value.
   std::uint32_t payload_bytes_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
   // Multi-key transaction id, or 0 for a standalone write. Recovery keeps a
@@ -251,7 +258,7 @@ struct ExtentRef {
 inline constexpr std::size_t kExtentPayloadBytes =
     kStorageBlockBytes - kBlockHeaderBytes;
 inline constexpr std::size_t kMaxStringExtents =
-    (kMaxStringBytes + kExtentPayloadBytes - 1) / kExtentPayloadBytes;
+    (kMaxRecordPayloadBytes + kExtentPayloadBytes - 1) / kExtentPayloadBytes;
 
 static_assert(sizeof(BlockHeader) <= kBlockHeaderBytes);
 static_assert(sizeof(DeviceLabel) <= kDirectIoAlignment);
@@ -273,9 +280,27 @@ constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes) noexcept {
   return AlignRecord(sizeof(RecordHeader) + key_bytes);
 }
 
-constexpr std::size_t MaxKeyBytes() noexcept {
+constexpr std::size_t MaxKeyBytes() noexcept { return kMaxStringBytes; }
+
+constexpr std::size_t MaxInlineKeyBytes() noexcept {
   return kMaxRecordHeaderBytes - sizeof(RecordHeader);
 }
+
+inline constexpr std::size_t kDefaultInlineKeyBytes = MaxInlineKeyBytes();
+
+constexpr std::size_t ExtentManifestBytes(std::size_t logical_bytes) noexcept {
+  return sizeof(ExtentManifestHeader) +
+         ((logical_bytes + kExtentPayloadBytes - 1) / kExtentPayloadBytes) *
+             sizeof(ExtentRef);
+}
+
+constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
+                                        bool key_external) noexcept {
+  return AlignRecord(sizeof(RecordHeader) + (key_external ? 0 : key_bytes));
+}
+
+static_assert(RecordHeaderBytes(kMaxStringBytes, true) ==
+              AlignRecord(sizeof(RecordHeader)));
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
 

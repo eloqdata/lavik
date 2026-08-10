@@ -638,12 +638,12 @@ int RunServer(ServerOptions options) {
       "busy_poll_us={} "
       "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
       "flush_size_bytes={} "
-      "verify_read_crc={}",
+      "inline_key_max_bytes={} verify_read_crc={}",
       options.bind_ip_, options.port_, options.metrics_port_,
       options.thread_count_, options.idle_timeout_ms_, options.busy_poll_us_,
       options.registered_buffer_bytes_, options.max_memory_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
-      options.verify_read_crc_);
+      options.inline_key_max_bytes_, options.verify_read_crc_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
@@ -668,6 +668,7 @@ int RunServer(ServerOptions options) {
   storage_options.flush_max_ms_ = options.flush_max_ms_;
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.verify_read_crc_ = options.verify_read_crc_;
+  storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
   // A node accepting an upstream replication stream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.

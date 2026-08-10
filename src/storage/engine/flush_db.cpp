@@ -142,6 +142,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     struct BlockDelta {
       std::uint64_t bytes_ = 0;
       std::uint16_t block_owner_ = 0;
+      std::vector<ExtentManifest> dependent_extents_;
     };
     // Keyed by allocation epoch as well as block id: entries naming the same
     // block at different epochs are an accounting violation rather than
@@ -164,7 +165,11 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       if (entry.value_.external_) {
         auto manifest = store.external_manifests_.find(&entry);
         if (manifest != store.external_manifests_.end()) {
-          dead_extents.push_back(std::move(manifest->second));
+          if (entry.value_.key_external_) [[unlikely]] {
+            delta.dependent_extents_.push_back(std::move(manifest->second));
+          } else {
+            dead_extents.push_back(std::move(manifest->second));
+          }
           store.external_manifests_.erase(manifest);
         }
       }
@@ -174,7 +179,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       SpawnExtentReclaim(store, extents);
     }
 
-    for (const auto& [block, delta] : dead_by_block) {
+    for (auto& [block, delta] : dead_by_block) {
       // A block holds at most kStorageBlockBytes, so the sum still fits the
       // per-record width.
       assert(delta.bytes_ <= kStorageBlockBytes);
@@ -183,6 +188,12 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           .allocation_epoch_ = block.second,
           .total_disk_bytes_ = static_cast<std::uint32_t>(delta.bytes_),
           .block_owner_ = delta.block_owner_,
+          .dependent_extents_ = nullptr,
+          .extra_dependent_extents_ =
+              delta.dependent_extents_.empty()
+                  ? nullptr
+                  : std::make_shared<const std::vector<ExtentManifest>>(
+                        std::move(delta.dependent_extents_)),
       };
       absl::Status dead = co_await MarkRecordDead(aggregate);
       if (!dead.ok()) {

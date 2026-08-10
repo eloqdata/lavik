@@ -581,19 +581,26 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
   std::vector<std::string> keys;
   while (partition_id < storage::kLogicalStorageShards) {
     const unsigned worker_id = partition_id % g_storage->worker_count();
-    storage::ScanBatch batch;
+    absl::StatusOr<storage::ScanBatch> scanned;
     if (worker_id == ThisWorker().id_) {
-      batch = g_storage->ScanPartition(static_cast<std::uint16_t>(partition_id),
-                                       request.db_id_, local_cursor, remaining);
+      scanned = co_await g_storage->ScanPartition(
+          static_cast<std::uint16_t>(partition_id), request.db_id_,
+          local_cursor, remaining);
     } else {
-      batch = co_await SubmitTo(
+      scanned = co_await celer::SubmitTaskTo(
           worker_id,
-          [partition_id, db_id = request.db_id_, local_cursor, remaining] {
-            return g_storage->ScanPartition(
+          [partition_id, db_id = request.db_id_, local_cursor,
+           remaining]() -> Task<absl::StatusOr<storage::ScanBatch>> {
+            co_return co_await g_storage->ScanPartition(
                 static_cast<std::uint16_t>(partition_id), db_id, local_cursor,
                 remaining);
           });
     }
+    if (!scanned.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", scanned.status().message())));
+    }
+    storage::ScanBatch batch = std::move(*scanned);
     ++partitions_examined;
 
     const std::size_t examined = batch.keys_.size();
@@ -667,6 +674,7 @@ struct KeysStreamState {
 // or just counting them. Yields periodically so other databases' traffic on
 // the worker keeps flowing.
 struct KeysWorkerBatch {
+  absl::Status status_;
   std::string payload_;
   std::uint64_t matches_ = 0;
   unsigned partition_ = 0;
@@ -689,10 +697,15 @@ Task<KeysWorkerBatch> KeysBatchOnWorker(
                batch.payload_.size() < kChunkBytes) {
           // The byte budget keeps one step from blowing past the chunk
           // bound with large key names; overshoot is one bucket chain.
-          storage::ScanBatch step = g_storage->ScanPartition(
+          auto scanned_step = co_await g_storage->ScanPartition(
               static_cast<std::uint16_t>(batch.partition_), db, batch.cursor_,
               512, now_ms,
               count_only ? kChunkBytes : kChunkBytes - batch.payload_.size());
+          if (!scanned_step.ok()) {
+            batch.status_ = scanned_step.status();
+            co_return batch;
+          }
+          storage::ScanBatch step = std::move(*scanned_step);
           for (const std::string& key : step.keys_) {
             if (*pattern == "*" || GlobMatch(*pattern, key)) {
               if (count_only) {
@@ -724,6 +737,9 @@ Task<absl::StatusOr<std::string>> NextKeysChunk(
     KeysWorkerBatch batch = co_await KeysBatchOnWorker(
         state->db_, state->worker_, state->partition_, state->cursor_,
         state->now_ms_, &state->pattern_, /*count_only=*/false);
+    if (!batch.status_.ok()) {
+      co_return batch.status_;
+    }
     if (batch.worker_done_) {
       ++state->worker_;
       state->partition_ = 0;
@@ -780,6 +796,10 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
       KeysWorkerBatch batch = co_await KeysBatchOnWorker(
           db, worker, partition, cursor, state->now_ms_, &state->pattern_,
           /*count_only=*/true);
+      if (!batch.status_.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", batch.status_.message())));
+      }
       matches += batch.matches_;
       if (batch.worker_done_) {
         break;
@@ -1914,11 +1934,12 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
     }
     const std::uint16_t owner =
         static_cast<std::uint16_t>(ShardForKey(request.args_[i]));
-    const bool live =
-        co_await SubmitTo(owner, [key = std::string(request.args_[i]), db,
-                                  digest, fp, conn = ctx.conn_id_]() {
+    const bool live = co_await celer::SubmitTaskTo(
+        owner,
+        [key = std::string(request.args_[i]), db, digest, fp,
+         conn = ctx.conn_id_]() -> Task<bool> {
           tx::CurrentTxShard().Watch(db, fp, conn);
-          return g_storage->KeyLive(db, key, digest);
+          co_return co_await g_storage->KeyLive(db, key, digest);
         });
     ctx.watched_.push_back(ConnectionContext::WatchedKey{
         .key_ = request.args_[i],
@@ -1939,12 +1960,15 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
 // against their own snapshot.
 Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
   for (const auto& watched : ctx.watched_) {
-    const bool clean = co_await SubmitTo(
+    const bool clean = co_await celer::SubmitTaskTo(
         watched.owner_,
         [key = watched.key_, db = watched.db_, digest = watched.digest_,
-         fp = watched.fp_, live = watched.live_, conn = ctx.conn_id_]() {
-          return tx::CurrentTxShard().WatchClean(db, fp, conn) &&
-                 g_storage->KeyLive(db, key, digest) == live;
+         fp = watched.fp_, live = watched.live_,
+         conn = ctx.conn_id_]() -> Task<bool> {
+          if (!tx::CurrentTxShard().WatchClean(db, fp, conn)) {
+            co_return false;
+          }
+          co_return co_await g_storage->KeyLive(db, key, digest) == live;
         });
     if (!clean) {
       co_return false;

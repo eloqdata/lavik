@@ -2,6 +2,70 @@
 
 namespace keylane::storage {
 
+Task<absl::StatusOr<std::string>>
+StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
+                                                ExtentManifest extents,
+                                                std::size_t key_bytes) {
+  if (extents == nullptr || key_bytes == 0 || key_bytes > MaxKeyBytes()) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "recovered external key manifest is invalid");
+  }
+  std::string key(key_bytes, '\0');
+  std::size_t offset = 0;
+  for (std::size_t index = 0; index < extents->size() && offset < key.size();
+       ++index) {
+    const ExtentRef& ref = extents->at(index);
+    const std::size_t read_bytes =
+        AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
+    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+    if (!acquired.ok()) {
+      co_return acquired.status();
+    }
+    ReadBufferLease lease = std::move(*acquired);
+    FixedBuffer io = lease.io_buffer();
+    io.size_ = read_bytes;
+    const auto [file_id, block_offset] = FileOffset(ref.block_id_);
+    auto read =
+        co_await ReadStorageBuffer(*store.worker_, store.files_[file_id], io,
+                                   lease.registered(), block_offset);
+    if (!read.ok()) {
+      co_return read.status();
+    }
+    if (*read != read_bytes) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "short recovered key extent read");
+    }
+    BlockHeader header{};
+    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                    io.data_, kBlockHeaderBytes),
+                                &header) ||
+        header.kind_ != BlockKind::kPayloadExtent ||
+        header.block_id_ != ref.block_id_ ||
+        header.allocation_epoch_ != ref.allocation_epoch_ ||
+        header.extent_index_ != index ||
+        header.extent_payload_bytes_ != ref.payload_bytes_ ||
+        header.extent_payload_checksum_ != ref.payload_checksum_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "recovered key extent does not match manifest");
+    }
+    const auto payload = std::span<const std::byte>(
+        io.data_ + kBlockHeaderBytes, ref.payload_bytes_);
+    if (Crc32c(payload) != ref.payload_checksum_) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "recovered key extent checksum mismatch");
+    }
+    const std::size_t copy_bytes =
+        std::min(payload.size(), key.size() - offset);
+    std::memcpy(key.data() + offset, payload.data(), copy_bytes);
+    offset += copy_bytes;
+  }
+  if (offset != key.size()) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "recovered external key is truncated");
+  }
+  co_return key;
+}
+
 std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
     const BlockHeader& block, std::uint64_t block_id) const noexcept {
   // writer_id belongs to the topology that wrote the block and may be
@@ -200,7 +264,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
 
-      if (block.kind_ == BlockKind::kValueExtent) {
+      if (block.kind_ == BlockKind::kPayloadExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
@@ -254,16 +318,54 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           ++records;
           continue;
         }
+        if (record.db_epoch_ != DbEpoch(record.db_id_)) {
+          record_offset += record.total_disk_bytes_;
+          ++records;
+          continue;
+        }
+        const std::byte* payload =
+            recovery.buffer_.data_ + record_offset + record.header_bytes_;
+        const auto payload_span =
+            std::span<const std::byte>(payload, record.payload_bytes_);
+        if (Crc32c(payload_span) != record.payload_checksum_) {
+          co_return absl::Status(absl::StatusCode::kInternal,
+                                 "record payload checksum mismatch");
+        }
+        ExtentManifest extents;
+        if (record.external_) {
+          const std::uint64_t extent_bytes =
+              record.logical_size_ +
+              (record.key_external_ ? record.key_bytes_ : 0);
+          auto decoded = DecodeManifest(payload_span, extent_bytes);
+          if (!decoded.ok()) {
+            co_return decoded.status();
+          }
+          extents = std::move(*decoded);
+        }
+        std::string loaded_key;
+        if (record.key_external_) [[unlikely]] {
+          if (record.external_) {
+            auto external_key = co_await LoadExternalKeyForRecovery(
+                store, extents, record.key_bytes_);
+            if (!external_key.ok()) {
+              co_return external_key.status();
+            }
+            loaded_key = std::move(*external_key);
+            key = loaded_key;
+          } else {
+            if (record.payload_bytes_ < record.key_bytes_) {
+              co_return absl::Status(absl::StatusCode::kInternal,
+                                     "inline external key is truncated");
+            }
+            key = std::string_view(reinterpret_cast<const char*>(payload),
+                                   record.key_bytes_);
+          }
+        }
         if (record.digest_ != ComputeDigest(key) ||
             StorageShardForKey(key) % block.layout_worker_count_ !=
                 block.writer_id_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
-        }
-        if (record.db_epoch_ != DbEpoch(record.db_id_)) {
-          record_offset += record.total_disk_bytes_;
-          ++records;
-          continue;
         }
         const std::uint16_t partition_id = RedisSlot(key);
         if (record.replication_epoch_ !=
@@ -273,29 +375,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           continue;
         }
         const unsigned key_owner = OwnerForKey(key);
-        std::shared_ptr<const std::vector<ExtentRef>> extents;
-        if (record.external_) {
-          if (record.kind_ != RecordKind::kValue ||
-              record.value_type_ != ValueType::kString) {
-            co_return absl::Status(absl::StatusCode::kInternal,
-                                   "unsupported external record type");
-          }
-          const std::byte* payload =
-              recovery.buffer_.data_ + record_offset + record.header_bytes_;
-          if (Crc32c(
-                  std::span<const std::byte>(payload, record.payload_bytes_)) !=
-              record.payload_checksum_) {
-            co_return absl::Status(absl::StatusCode::kInternal,
-                                   "external manifest checksum mismatch");
-          }
-          auto decoded = DecodeManifest(
-              std::span<const std::byte>(payload, record.payload_bytes_),
-              record.logical_size_);
-          if (!decoded.ok()) {
-            co_return decoded.status();
-          }
-          extents = std::move(*decoded);
-        }
         batches->at(key_owner).records_.push_back(RecoveryRecord{
             .digest_ = record.digest_,
             .key_ = std::string(key),
@@ -316,10 +395,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                         static_cast<std::uint32_t>(record.relocation_sequence_),
                     .block_owner_ = block_owner,
                     .external_ = record.external_,
+                    .key_external_ = record.key_external_,
                     .kind_ = record.kind_,
                     .value_type_ = record.value_type_,
                 },
-            .extents_ = std::move(extents),
+            .extents_ = extents,
         });
         record_offset += record.total_disk_bytes_;
         ++records;
@@ -348,7 +428,7 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
     state.committed_bytes_ = block.committed_bytes_;
     state.allocated_ = true;
     state.kind_ = block.kind_;
-    if (block.kind_ == BlockKind::kValueExtent) {
+    if (block.kind_ == BlockKind::kPayloadExtent) {
       store.recovered_extents_[block.block_id_] = ExtentIdentity{
           .extent_index_ = block.extent_index_,
           .payload_checksum_ = block.extent_payload_checksum_,
@@ -382,7 +462,20 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
     partition.mutation_sequence_ = std::max(
         partition.mutation_sequence_, recovered.location_.mutation_sequence_);
     auto& index = partition.indexes_[recovered.db_id_];
-    auto* found = index.Find(recovered.digest_, recovered.key_);
+    RecordIndex::Entry* found = nullptr;
+    for (RecordIndex::Entry* candidate :
+         index.FindCandidates(recovered.digest_, recovered.key_)) {
+      if (candidate->key_complete()) {
+        found = candidate;
+        break;
+      }
+      const auto external_key = store.recovery_external_keys_.find(candidate);
+      if (external_key != store.recovery_external_keys_.end() &&
+          external_key->second == recovered.key_) {
+        found = candidate;
+        break;
+      }
+    }
     // The shielding bit is not persisted; recovery rebuilds it exactly,
     // since every surviving record of the key passes through this merge:
     // whichever version currently wins learns whether a strictly older,
@@ -406,14 +499,24 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                   std::max(recovered.location_.expire_at_ms_,
                                            UnixTimeMillis())));
       }
-      RecordIndex::Entry* winner_entry =
-          index.InsertOrAssign(recovered.digest_, recovered.key_, winner)
-              .entry_;
+      RecordIndex::Entry* winner_entry = found;
+      if (winner_entry != nullptr) {
+        winner_entry->value_ = winner;
+      } else {
+        winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
+                                       winner, !winner.key_external_);
+      }
       if (winner.external_) {
         store.external_manifests_.insert_or_assign(winner_entry,
                                                    recovered.extents_);
       } else {
         store.external_manifests_.erase(winner_entry);
+      }
+      if (winner.key_external_) [[unlikely]] {
+        store.recovery_external_keys_.insert_or_assign(winner_entry,
+                                                       recovered.key_);
+      } else {
+        store.recovery_external_keys_.erase(winner_entry);
       }
       if (was_live != is_live) {
         if (is_live) {

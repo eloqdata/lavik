@@ -28,6 +28,9 @@ struct StorageEngineOptions {
   std::size_t flush_size_bytes_ = 8 * 1024 * 1024;
   bool verify_read_crc_ = true;
   bool expiration_authority_ = true;
+  // Keys at or below this size stay complete in the in-memory index. Larger
+  // keys are stored in disk extents and verified on demand.
+  std::size_t inline_key_max_bytes_ = kDefaultInlineKeyBytes;
   // Full-disk sweep retiring tombstones no surviving record needs. Zero
   // disables it.
   std::uint32_t tomb_raider_interval_ms_ = 600'000;
@@ -179,6 +182,7 @@ struct TxShardWrites {
     std::uint64_t allocation_epoch_ = 0;
     std::uint32_t total_disk_bytes_ = 0;
     std::uint16_t block_owner_ = 0;
+    std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
@@ -218,10 +222,10 @@ class StorageEngine {
   // at most one bucket chain, since the scan emits whole chains), so a
   // caller assembling bounded chunks stays bounded even with huge key
   // names.
-  ScanBatch ScanPartition(std::uint16_t partition_id, std::uint8_t db_id,
-                          std::uint64_t cursor, std::size_t count,
-                          std::uint64_t now_ms = 0,
-                          std::size_t max_bytes = SIZE_MAX) const;
+  celer::Task<absl::StatusOr<ScanBatch>> ScanPartition(
+      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
+      std::size_t count, std::uint64_t now_ms = 0,
+      std::size_t max_bytes = SIZE_MAX);
 
   // Atomically invalidates one logical DB by advancing its durable epoch and
   // taking its indexes out of service. The command layer must prevent
@@ -362,8 +366,8 @@ class StorageEngine {
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
   // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).
-  bool KeyLive(std::uint8_t db_id, std::string_view key,
-               const Digest& digest) const;
+  celer::Task<bool> KeyLive(std::uint8_t db_id, std::string_view key,
+                            const Digest& digest);
 
  private:
   class Impl;

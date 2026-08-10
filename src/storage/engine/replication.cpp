@@ -2,9 +2,9 @@
 
 namespace keylane::storage {
 
-ScanBatch StorageEngine::Impl::ScanPartition(
+Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-    std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) const {
+    std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) {
   assert(db_id < kLogicalDatabaseCount);
   assert(count > 0);
   const auto& index =
@@ -21,18 +21,54 @@ ScanBatch StorageEngine::Impl::ScanPartition(
   std::size_t iterations = 0;
   std::size_t bytes = 0;
   do {
+    struct ExternalCandidate {
+      const RecordIndex::Entry* entry_ = nullptr;
+      ExtentManifest extents_;
+      RecordLocation location_{};
+      std::uint64_t hash_ = 0;
+      std::uint32_t key_bytes_ = 0;
+    };
+    std::vector<ExternalCandidate> external;
     result.cursor_ =
         index.Scan(result.cursor_, [&](const RecordIndex::Entry& entry) {
           if (entry.value_.kind_ == RecordKind::kValue &&
               !IsExpired(entry.value_, now_ms)) {
-            bytes += entry.key().size();
-            result.keys_.emplace_back(entry.key());
+            if (entry.key_complete()) [[likely]] {
+              bytes += entry.key().size();
+              result.keys_.emplace_back(entry.key());
+            } else [[unlikely]] {
+              external.push_back(ExternalCandidate{
+                  .entry_ = &entry,
+                  .extents_ = ExtentsFor(CurrentStore(), &entry),
+                  .location_ = entry.value_,
+                  .hash_ = entry.hash_,
+                  .key_bytes_ = entry.logical_key_size(),
+              });
+            }
           }
         });
+    for (const ExternalCandidate& candidate : external) {
+      auto key =
+          co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
+                                     candidate.extents_, candidate.key_bytes_);
+      if (!key.ok()) {
+        co_return key.status();
+      }
+      if (!index.Contains(candidate.entry_, candidate.hash_)) {
+        continue;
+      }
+      const RecordIndex::Entry* current = candidate.entry_;
+      if (current->value_.SamePhysicalRecord(candidate.location_) &&
+          current->value_.kind_ == RecordKind::kValue &&
+          !IsExpired(current->value_, now_ms)) {
+        bytes += key->size();
+        result.keys_.push_back(std::move(*key));
+      }
+    }
     ++iterations;
   } while (result.cursor_ != 0 && result.keys_.size() < count &&
            bytes < max_bytes && iterations < max_iterations);
-  return result;
+  co_return result;
 }
 
 PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
@@ -64,23 +100,14 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   auto& index = partition.indexes_[db_id];
-  std::vector<std::string> keys;
   const std::uint64_t now_ms = UnixTimeMillis();
-  std::uint64_t next = cursor;
-  const std::size_t max_iterations =
-      count > std::numeric_limits<std::size_t>::max() / 10
-          ? std::numeric_limits<std::size_t>::max()
-          : count * 10;
-  std::size_t iterations = 0;
-  do {
-    next = index.Scan(next, [&](const RecordIndex::Entry& entry) {
-      if (entry.value_.kind_ == RecordKind::kValue &&
-          !IsExpired(entry.value_, now_ms)) {
-        keys.emplace_back(entry.key());
-      }
-    });
-    ++iterations;
-  } while (next != 0 && keys.size() < count && iterations < max_iterations);
+  auto scanned = co_await ScanPartition(partition_id, db_id, cursor, count,
+                                        now_ms, SIZE_MAX);
+  if (!scanned.ok()) {
+    co_return scanned.status();
+  }
+  std::vector<std::string> keys = std::move(scanned->keys_);
+  const std::uint64_t next = scanned->cursor_;
 
   PartitionSnapshotBatch batch;
   batch.cursor_ = next;
@@ -89,13 +116,17 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
     const Digest digest = ComputeDigest(key);
     auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
         db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
-    auto* current = index.Find(digest, key);
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    auto* current = *resolved;
     if (current == nullptr || current->value_.kind_ != RecordKind::kValue) {
       continue;
     }
     const RecordLocation location = current->value_;
     if (IsExpired(location, UnixTimeMillis())) {
-      QueueExpiredCandidate(store, partition.id_, db_id, *current);
+      QueueExpiredCandidate(store, partition.id_, db_id, *current, key);
       continue;
     }
     auto loaded = co_await LoadValue(store, db_id, key, digest, location,
@@ -192,9 +223,23 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
 
   std::vector<std::pair<std::uint8_t, std::string>> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    std::vector<const RecordIndex::Entry*> external_entries;
     partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-      old_keys.emplace_back(db_id, std::string(entry.key()));
+      if (entry.key_complete()) [[likely]] {
+        old_keys.emplace_back(db_id, std::string(entry.key()));
+      } else [[unlikely]] {
+        external_entries.push_back(&entry);
+      }
     });
+    for (const RecordIndex::Entry* entry : external_entries) {
+      auto key = co_await LoadOutOfIndexKey(store, entry->value_,
+                                            ExtentsFor(store, entry),
+                                            entry->logical_key_size());
+      if (!key.ok()) {
+        co_return key.status();
+      }
+      old_keys.emplace_back(db_id, std::move(*key));
+    }
   }
   partition.replication_epoch_ = next_epoch;
   partition.mutation_sequence_ = 0;
@@ -205,10 +250,28 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   partition.delta_queued_ = false;
   for (const auto& [db_id, key] : old_keys) {
     const Digest digest = ComputeDigest(key);
+    const bool key_external = key.size() > options_.inline_key_max_bytes_;
+    const bool external =
+        AlignRecord(RecordHeaderBytes(key.size(), key_external) +
+                    (key_external ? key.size() : 0)) >
+        kStorageBlockBytes - kBlockHeaderBytes;
+    ExtentManifest extents;
+    std::string manifest;
+    if (external) [[unlikely]] {
+      auto written = co_await WriteExtentValueLocked(store, key);
+      if (!written.ok()) {
+        co_return written.status();
+      }
+      extents = std::move(*written);
+      manifest = EncodeManifest(*extents);
+    }
     absl::Status tombstone = co_await WriteRecordLocked(
-        store, db_id, key, {}, RecordKind::kTombstone, ValueType::kNone, 0,
-        digest, 0, 0, 0, false, false);
+        store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
+        0, digest, 0, 0, 0, false, false, external, key_external, 0, extents);
     if (!tombstone.ok()) {
+      if (extents != nullptr) [[unlikely]] {
+        SpawnExtentReclaim(store, extents);
+      }
       co_return tombstone;
     }
   }
@@ -374,7 +437,12 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     co_await store.store_state_mutex_.Lock();
     UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
     auto& index = partition.indexes_[applied.db_id_];
-    auto* current = index.Find(digest, applied.key_);
+    auto resolved =
+        co_await FindVerifiedEntry(store, index, digest, applied.key_);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    auto* current = *resolved;
     if (current != nullptr &&
         current->value_.replication_epoch_ == replication_epoch &&
         current->value_.mutation_sequence_ >= applied.mutation_sequence_) {
@@ -390,11 +458,19 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
                              "replicated value has no Redis type");
     }
     absl::Status written;
-    const std::size_t inline_bytes = AlignRecord(
-        RecordHeaderBytes(applied.key_.size()) + applied.value_.size());
-    if (kind == RecordKind::kValue && value_type == ValueType::kString &&
-        inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
-      auto extents = co_await WriteExtentValueLocked(store, applied.value_);
+    const bool key_external =
+        applied.key_.size() > options_.inline_key_max_bytes_;
+    const std::uint64_t logical_payload_bytes =
+        static_cast<std::uint64_t>(applied.value_.size()) +
+        (key_external ? applied.key_.size() : 0);
+    const std::size_t inline_bytes =
+        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_external) +
+                    static_cast<std::size_t>(logical_payload_bytes));
+    if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
+      auto extents = co_await WriteExtentValueLocked(
+          store,
+          key_external ? std::string_view(applied.key_) : std::string_view{},
+          applied.value_);
       if (!extents.ok()) {
         co_return extents.status();
       }
@@ -402,7 +478,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, manifest, kind, value_type,
           applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          0, false, true, true, applied.value_.size(), *extents);
+          0, false, true, true, key_external, applied.value_.size(), *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
@@ -410,7 +486,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
-          /*txid=*/0, applied.mutation_sequence_, 0, false);
+          /*txid=*/0, applied.mutation_sequence_, 0, false, true, false,
+          key_external, applied.value_.size(), nullptr);
     }
     if (!written.ok()) {
       co_return written;

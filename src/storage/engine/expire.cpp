@@ -30,9 +30,11 @@ Task<absl::Status> StorageEngine::Impl::QuiesceExpiration() {
   co_return absl::OkStatus();
 }
 
-void StorageEngine::Impl::QueueExpiredCandidate(
-    WorkerStore& store, std::uint16_t partition_id, std::uint8_t db_id,
-    const RecordIndex::Entry& entry) {
+void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
+                                                std::uint16_t partition_id,
+                                                std::uint8_t db_id,
+                                                const RecordIndex::Entry& entry,
+                                                std::string_view known_key) {
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
   if (!options_.expiration_authority_ ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
@@ -40,13 +42,18 @@ void StorageEngine::Impl::QueueExpiredCandidate(
       entry.value_.expire_at_ms_ == 0) {
     return;
   }
+  const std::string_view key = entry.key_complete() ? entry.key() : known_key;
+  if (key.empty() && entry.logical_key_size() != 0) {
+    return;
+  }
   store.expired_candidates_.push_back(WorkerStore::ExpireCandidate{
       .partition_id_ = partition_id,
       .db_id_ = db_id,
-      .digest_ = ComputeDigest(entry.key()),
+      .digest_ = entry.key_complete() ? ComputeDigest(key)
+                                      : entry.external_key_digest(),
       .mutation_sequence_ = entry.value_.mutation_sequence_,
       .expire_at_ms_ = entry.value_.expire_at_ms_,
-      .key_ = std::string(entry.key()),
+      .key_ = std::string(key),
   });
 }
 
@@ -75,8 +82,13 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       tx::LockMode::kExclusive);
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  auto* current = partition.indexes_[candidate.db_id_].Find(candidate.digest_,
-                                                            candidate.key_);
+  auto resolved =
+      co_await FindVerifiedEntry(store, partition.indexes_[candidate.db_id_],
+                                 candidate.digest_, candidate.key_);
+  if (!resolved.ok()) {
+    co_return resolved.status();
+  }
+  auto* current = *resolved;
   if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
       current->value_.mutation_sequence_ != candidate.mutation_sequence_ ||
       current->value_.expire_at_ms_ != candidate.expire_at_ms_ ||
@@ -102,6 +114,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
                                    tx::FingerprintOf(candidate.digest_));
   const RecordLocation dropped = current->value_;
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
+  const ExtentManifest dropped_dependent_extents =
+      DependentExtentsFor(store, current);
   const std::uint64_t sequence = ++partition.mutation_sequence_;
   if (partition.capture_deltas_) {
     AppendDelta(partition, SnapshotRecord{
@@ -129,11 +143,12 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   --store.live_key_count_[candidate.db_id_];
   --partition.expiring_key_count_[candidate.db_id_];
   store.external_manifests_.erase(current);
-  partition.indexes_[candidate.db_id_].Erase(candidate.digest_, candidate.key_);
-  if (dropped.external_) {
+  partition.indexes_[candidate.db_id_].Erase(current);
+  if (dropped.external_ && !dropped.key_external_) {
     SpawnExtentReclaim(store, dropped_extents);
   }
-  absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
+  absl::Status dead = co_await MarkRecordDead(
+      RetiredRecordOf(dropped, dropped_dependent_extents));
   if (!dead.ok()) {
     store.write_failed_ = true;
   }
@@ -175,12 +190,46 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         AdvanceExpiryMap(*store);
       } else {
         auto& index = partition.indexes_[db_id];
+        struct ExternalExpired {
+          RecordIndex::Entry* entry_ = nullptr;
+          ExtentManifest extents_;
+          RecordLocation location_{};
+          std::uint64_t hash_ = 0;
+          std::uint32_t key_bytes_ = 0;
+        };
+        std::vector<ExternalExpired> external_expired;
         store->expiry_scan_cursor_ = index.Scan(
-            store->expiry_scan_cursor_, [&](const RecordIndex::Entry& entry) {
+            store->expiry_scan_cursor_, [&](RecordIndex::Entry& entry) {
               if (IsExpired(entry.value_, now_ms)) {
-                QueueExpiredCandidate(*store, partition.id_, db_id, entry);
+                if (entry.key_complete()) [[likely]] {
+                  QueueExpiredCandidate(*store, partition.id_, db_id, entry);
+                } else {
+                  external_expired.push_back(ExternalExpired{
+                      .entry_ = &entry,
+                      .extents_ = ExtentsFor(*store, &entry),
+                      .location_ = entry.value_,
+                      .hash_ = entry.hash_,
+                      .key_bytes_ = entry.logical_key_size(),
+                  });
+                }
               }
             });
+        for (const ExternalExpired& candidate : external_expired) {
+          auto key = co_await LoadOutOfIndexKey(*store, candidate.location_,
+                                                candidate.extents_,
+                                                candidate.key_bytes_);
+          if (!key.ok()) {
+            co_return key.status();
+          }
+          if (!index.Contains(candidate.entry_, candidate.hash_)) {
+            continue;
+          }
+          RecordIndex::Entry* current = candidate.entry_;
+          if (current->value_.SamePhysicalRecord(candidate.location_) &&
+              IsExpired(current->value_, now_ms)) {
+            QueueExpiredCandidate(*store, partition.id_, db_id, *current, *key);
+          }
+        }
         if (store->expiry_scan_cursor_ == 0) {
           AdvanceExpiryMap(*store);
         }

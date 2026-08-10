@@ -292,13 +292,30 @@ void Expect(std::string_view actual, std::string_view expected,
   }
 }
 
+void ExpectEventually(RespClient& client,
+                      const std::vector<std::string_view>& command,
+                      std::string_view expected, std::string_view operation) {
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  std::string actual;
+  do {
+    actual = client.Command(command);
+    if (actual == expected) {
+      return;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  Expect(actual, expected, operation);
+}
+
 // Comfortably past the inline limit of one block minus its header, so each
 // value lands in dedicated extent blocks.
 constexpr std::size_t kExternalBytes = 9ULL * 1024 * 1024;
 constexpr int kExternalKeys = 3;
 
 std::string ExternalKey(int index) {
-  return "external-" + std::to_string(index);
+  // Exercise external keys and external values together. The key is well
+  // above the fixed record-header key limit.
+  return std::string(5000, static_cast<char>('a' + index)) + "-external";
 }
 
 }  // namespace
@@ -318,6 +335,10 @@ int main(int argc, char** argv) {
     CreateDataFile(data_path, 768ULL * 1024 * 1024);
 
     const std::string value(kExternalBytes, 'X');
+    const std::string inline_combined_key(6ULL * 1024 * 1024, 'i');
+    const std::string inline_combined_value(1ULL * 1024 * 1024, 'I');
+    const std::string shared_extent_key(6ULL * 1024 * 1024, 's');
+    const std::string shared_extent_value(6ULL * 1024 * 1024, 'S');
     const std::uint16_t port = FindFreePort();
 
     // Written under four workers.
@@ -330,6 +351,17 @@ int main(int argc, char** argv) {
         Expect(client.Command({"STRLEN", ExternalKey(i)}),
                ":" + std::to_string(kExternalBytes), "external STRLEN");
       }
+      Expect(
+          client.Command({"SET", inline_combined_key, inline_combined_value}),
+          "+OK", "inline combined SET");
+      Expect(client.Command({"STRLEN", inline_combined_key}),
+             ":" + std::to_string(inline_combined_value.size()),
+             "inline combined STRLEN");
+      Expect(client.Command({"SET", shared_extent_key, shared_extent_value}),
+             "+OK", "shared extent SET");
+      Expect(client.Command({"STRLEN", shared_extent_key}),
+             ":" + std::to_string(shared_extent_value.size()),
+             "shared extent STRLEN");
       server.Stop();
     }
 
@@ -348,6 +380,14 @@ int main(int argc, char** argv) {
           Fail("recovered external GET returned " + std::to_string(length));
         }
       }
+      if (client.CommandBulkLength({"GET", inline_combined_key}, 'I') !=
+          static_cast<std::int64_t>(inline_combined_value.size())) {
+        Fail("recovered inline combined GET returned the wrong value");
+      }
+      if (client.CommandBulkLength({"GET", shared_extent_key}, 'S') !=
+          static_cast<std::int64_t>(shared_extent_value.size())) {
+        Fail("recovered shared extent GET returned the wrong value");
+      }
       // Overwriting retires the extents, which reclaims them through their
       // owning worker.
       for (int i = 0; i < kExternalKeys; ++i) {
@@ -356,17 +396,27 @@ int main(int argc, char** argv) {
         Expect(client.Command({"STRLEN", ExternalKey(i)}), ":5",
                "overwritten STRLEN");
       }
+      Expect(client.Command({"SET", inline_combined_key, "small"}), "+OK",
+             "inline combined overwrite");
+      Expect(client.Command({"SET", shared_extent_key, "small"}), "+OK",
+             "shared extent overwrite");
       server.Stop();
     }
 
-    // And again at a third worker count, now that the extents are gone.
+    // Restart after overwrite at a third worker count. Old roots may remain
+    // in partially live record blocks, so a shared key/value extent chain
+    // must survive until the root block is durably retired.
     {
       ServerProcess server(argv[1], port, data_path, log_path, 3);
       RespClient client = Connect(port);
       for (int i = 0; i < kExternalKeys; ++i) {
-        Expect(client.Command({"STRLEN", ExternalKey(i)}), ":5",
-               "post-reclaim STRLEN");
+        const std::string key = ExternalKey(i);
+        ExpectEventually(client, {"STRLEN", key}, ":5", "post-reclaim STRLEN");
       }
+      ExpectEventually(client, {"STRLEN", inline_combined_key}, ":5",
+                       "post-reclaim inline combined STRLEN");
+      ExpectEventually(client, {"STRLEN", shared_extent_key}, ":5",
+                       "post-reclaim shared extent STRLEN");
       server.Stop();
     }
 

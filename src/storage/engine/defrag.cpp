@@ -30,7 +30,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(
       store.store_state_mutex_.Unlock(*store.worker_);
       co_return false;
     }
-    if (state->kind_ != BlockKind::kValueExtent) {
+    if (state->kind_ != BlockKind::kPayloadExtent) {
       store.store_state_mutex_.Unlock(*store.worker_);
       co_return absl::Status(absl::StatusCode::kInternal,
                              "extent reclaim found a record block");
@@ -282,9 +282,15 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
 
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
-  auto* current = index.Find(record.digest_, key);
-  if (current == nullptr ||
-      !current->value_.SamePhysicalRecord(source_location)) {
+  RecordIndex::Entry* current = nullptr;
+  for (RecordIndex::Entry* candidate :
+       index.FindCandidates(record.digest_, key)) {
+    if (candidate->value_.SamePhysicalRecord(source_location)) {
+      current = candidate;
+      break;
+    }
+  }
+  if (current == nullptr) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
   // A source from a flushed database epoch is already condemned: FLUSHDB has
@@ -309,8 +315,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
       record.expire_at_ms_, record.digest_, record.txid_,
       record.mutation_sequence_, record.relocation_sequence_ + 1, true, true,
-      record.external_, record.logical_size_, ExtentsFor(key_store, current),
-      &relocated, &source);
+      record.external_, record.key_external_, record.logical_size_,
+      ExtentsFor(key_store, current), &relocated, &source);
   if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
     // index, while relocation waited for a block. Nothing was written; the
@@ -578,18 +584,51 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       co_return absl::Status(absl::StatusCode::kInternal,
                              "corrupt committed record during defrag");
     }
-
-    // FLUSHDB publishes the database epoch before detached-index accounting
-    // reaches every block. A normal record from another epoch is unreachable
-    // and cannot be relocated. Its validated header supplies the bounded disk
-    // length needed to advance without reading or checksumming the payload.
-    // Transaction commit records are database-independent and remain subject
-    // to full validation and relocation.
+    // A record from a flushed database epoch is unreachable. Its header is
+    // sufficient to advance safely; do not checksum a large payload or read
+    // a shared extent chain that can no longer affect recovery.
     if (record.kind_ != RecordKind::kTxCommit &&
         DbEpoch(record.db_id_) != record.db_epoch_) {
       record_offset += record.total_disk_bytes_;
       co_await celer::Yield(*store.worker_);
       continue;
+    }
+    const std::byte* payload_data =
+        block_data.buffer_.data_ + record_offset + record.header_bytes_;
+    const auto payload =
+        std::span<const std::byte>(payload_data, record.payload_bytes_);
+    if (Crc32c(payload) != record.payload_checksum_) {
+      source.defragging_ = false;
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "payload checksum mismatch during defrag");
+    }
+    std::string loaded_key;
+    if (record.key_external_) [[unlikely]] {
+      if (record.external_) {
+        auto decoded = DecodeManifest(
+            payload, static_cast<std::uint64_t>(record.key_bytes_) +
+                         record.logical_size_);
+        if (!decoded.ok()) {
+          source.defragging_ = false;
+          co_return decoded.status();
+        }
+        auto external_key =
+            co_await LoadExternalKey(store, *decoded, record.key_bytes_);
+        if (!external_key.ok()) {
+          source.defragging_ = false;
+          co_return external_key.status();
+        }
+        loaded_key = std::move(*external_key);
+        disk_key = loaded_key;
+      } else {
+        if (record.payload_bytes_ < record.key_bytes_) {
+          source.defragging_ = false;
+          co_return absl::Status(absl::StatusCode::kInternal,
+                                 "inline external key is truncated");
+        }
+        disk_key = std::string_view(reinterpret_cast<const char*>(payload_data),
+                                    record.key_bytes_);
+      }
     }
 
     RecordLocation source_location{
@@ -606,21 +645,14 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
             static_cast<std::uint32_t>(record.relocation_sequence_),
         .block_owner_ = store.worker_->id(),
         .external_ = record.external_,
+        .key_external_ = record.key_external_,
         .kind_ = record.kind_,
         .value_type_ = record.value_type_,
     };
-    const std::byte* value_data =
-        block_data.buffer_.data_ + record_offset + record.header_bytes_;
-    if (Crc32c(std::span<const std::byte>(value_data, record.payload_bytes_)) !=
-        record.payload_checksum_) {
-      source.defragging_ = false;
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "value checksum mismatch during defrag");
-    }
     if (record.external_) {
-      auto decoded = DecodeManifest(
-          std::span<const std::byte>(value_data, record.payload_bytes_),
-          record.logical_size_);
+      const std::uint64_t extent_bytes =
+          record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
+      auto decoded = DecodeManifest(payload, extent_bytes);
       if (!decoded.ok()) {
         source.defragging_ = false;
         co_return decoded.status();
@@ -644,7 +676,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         commit_written = co_await WriteRecordLocked(
             store, record.db_id_, {}, {}, RecordKind::kTxCommit,
             ValueType::kNone, 0, record.digest_, record.txid_, 0,
-            record.relocation_sequence_ + 1, true, true, false,
+            record.relocation_sequence_ + 1, true, true, false, false,
             std::numeric_limits<std::uint64_t>::max(), nullptr,
             &relocated_commit);
       }
@@ -672,8 +704,11 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     }
     const unsigned key_owner = OwnerForKey(disk_key);
     const std::string key(disk_key);
-    const std::string value(reinterpret_cast<const char*>(value_data),
-                            record.payload_bytes_);
+    const std::size_t key_prefix =
+        record.key_external_ && !record.external_ ? record.key_bytes_ : 0;
+    const std::string value(
+        reinterpret_cast<const char*>(payload_data + key_prefix),
+        record.payload_bytes_ - key_prefix);
     absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
         std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker_->id()) {
@@ -741,6 +776,14 @@ Task<absl::Status> StorageEngine::Impl::ReleaseEmptyBlock(
     // records are still on disk — the exact window the relocation durability
     // fence exists to protect. Crash-safety tests arm this point.
     KEYLANE_MAYBE_CRASH_AT("defrag-source-retired");
+    auto deferred = store.deferred_dependent_extent_reclaims_.find(block_id);
+    if (deferred != store.deferred_dependent_extent_reclaims_.end()) {
+      std::vector<ExtentManifest> manifests = std::move(deferred->second);
+      store.deferred_dependent_extent_reclaims_.erase(deferred);
+      for (const ExtentManifest& manifest : manifests) {
+        SpawnExtentReclaim(store, manifest);
+      }
+    }
   }
   co_return returned;
 }
