@@ -253,5 +253,5 @@ different command-line device order therefore does not rewrite data.
 - The bitmap does not avoid record scanning on a nearly full device. Fast
   recovery at high occupancy will eventually require a partitioned persistent
   index checkpoint.
-- Online device-set expansion/removal is not implemented; changing the set
-  during development requires clearing it.
+- Device addition requires a restart with the complete old set and zero-label
+  new paths. Online addition and device removal are not implemented.

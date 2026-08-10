@@ -3,6 +3,66 @@
 #include "impl.h"
 
 namespace keylane::storage {
+namespace {
+
+absl::Status InitializeAddedDeviceMetadata(
+    const std::string& path, std::uint64_t capacity_blocks,
+    const std::vector<std::uint64_t>& epoch_values) {
+  std::array<std::byte, kDirectIoAlignment> zero{};
+  absl::Status status =
+      WriteExactlyAt(path, zero, kDeviceLabelOffset, true);
+  if (!status.ok()) {
+    return status;
+  }
+
+  for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
+       ++page_index) {
+    const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
+    const std::size_t payload_bytes = std::min(
+        kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
+    status = WriteExactlyAt(
+        path, zero,
+        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 1), false);
+    if (!status.ok()) {
+      return status;
+    }
+    std::array<std::byte, kDirectIoAlignment> page{};
+    EncodeMetadataPage(
+        MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index), 1,
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(epoch_values.data()) +
+                byte_offset,
+            payload_bytes),
+        page);
+    status = WriteExactlyAt(
+        path, page,
+        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 0), true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  const std::size_t bitmap_pages = ScanBitmapPageCount(capacity_blocks);
+  for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
+    status = WriteExactlyAt(
+        path, zero,
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 0),
+        false);
+    if (!status.ok()) {
+      return status;
+    }
+    status = WriteExactlyAt(
+        path, zero,
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1),
+        true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return absl::OkStatus();
+}
+
+}  // namespace
 
 absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   if (worker_count == 0 || options_.data_files_.empty()) {
@@ -56,7 +116,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   }
 
   std::uint64_t storage_set_id = 0;
-  std::uint32_t expected_device_count = 0;
+  std::uint32_t minimum_device_count = 0;
+  std::uint32_t maximum_device_count = 0;
   bool has_existing_device = false;
   bool has_empty_device = false;
   absl::flat_hash_map<std::uint64_t, std::size_t> seen_device_ids;
@@ -74,31 +135,72 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           absl::StatusCode::kFailedPrecondition,
           "configured devices belong to different storage sets");
     }
-    if (expected_device_count == 0) {
-      expected_device_count = label.device_count_;
-    } else if (expected_device_count != label.device_count_) {
-      return absl::Status(absl::StatusCode::kFailedPrecondition,
-                          "configured devices disagree on storage-set size");
-    }
+    minimum_device_count =
+        minimum_device_count == 0
+            ? label.device_count_
+            : std::min(minimum_device_count, label.device_count_);
+    maximum_device_count =
+        std::max(maximum_device_count, label.device_count_);
     if (!seen_device_ids.try_emplace(label.device_id_, i).second) {
       return absl::Status(absl::StatusCode::kFailedPrecondition,
                           "duplicate device id in configured storage files");
     }
   }
 
-  if (has_existing_device && has_empty_device) {
-    return absl::Status(
-        absl::StatusCode::kFailedPrecondition,
-        "mixing initialized and empty storage devices is not supported; "
-        "online device-set expansion is not implemented");
-  }
+  const std::uint32_t configured_device_count =
+      static_cast<std::uint32_t>(labels.size());
+  std::vector<std::uint64_t> assigned_device_ids(labels.size(), kInvalidBlockId);
+  std::uint32_t previous_device_count = 0;
   if (has_existing_device) {
-    if (expected_device_count != labels.size()) {
+    previous_device_count = minimum_device_count;
+    if (maximum_device_count > configured_device_count ||
+        (maximum_device_count != previous_device_count &&
+         maximum_device_count != configured_device_count)) {
       return absl::Status(absl::StatusCode::kFailedPrecondition,
-                          "configured storage device count does not match the "
-                          "persisted storage set; a device may be missing");
+                          "configured devices disagree on storage-set size");
     }
-    for (std::uint64_t id = 0; id < expected_device_count; ++id) {
+    for (const auto& [id, path_index] : seen_device_ids) {
+      const DeviceLabel& label = *labels[path_index];
+      if (id >= configured_device_count ||
+          (label.device_count_ != previous_device_count &&
+           label.device_count_ != configured_device_count)) {
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
+                            "invalid interrupted storage-set expansion state");
+      }
+      assigned_device_ids[path_index] = id;
+    }
+    // The complete old set must be present. This prevents an empty replacement
+    // path from silently hiding a lost initialized device.
+    for (std::uint64_t id = 0; id < previous_device_count; ++id) {
+      if (!seen_device_ids.contains(id)) {
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
+                            "configured storage set is missing existing "
+                            "device id " +
+                                std::to_string(id));
+      }
+    }
+    if (configured_device_count == previous_device_count && has_empty_device) {
+      return absl::Status(absl::StatusCode::kFailedPrecondition,
+                          "an empty path cannot replace a missing initialized "
+                          "storage device");
+    }
+    std::uint64_t next_id = previous_device_count;
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      if (labels[i].has_value()) {
+        continue;
+      }
+      while (seen_device_ids.contains(next_id)) {
+        ++next_id;
+      }
+      if (next_id >= configured_device_count) {
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
+                            "storage expansion has no device id for new path");
+      }
+      assigned_device_ids[i] = next_id;
+      seen_device_ids.emplace(next_id, i);
+      ++next_id;
+    }
+    for (std::uint64_t id = 0; id < configured_device_count; ++id) {
       if (!seen_device_ids.contains(id)) {
         return absl::Status(absl::StatusCode::kFailedPrecondition,
                             "configured storage set is missing device id " +
@@ -111,7 +213,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       return generated.status();
     }
     storage_set_id = *generated;
-    expected_device_count = static_cast<std::uint32_t>(labels.size());
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      assigned_device_ids[i] = i;
+    }
   }
 
   devices_.clear();
@@ -120,11 +224,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (std::size_t i = 0; i < labels.size(); ++i) {
     const StoragePathInfo& probed = path_info[i];
     std::uint64_t capacity_blocks = 0;
-    std::uint64_t device_id = i;
+    const std::uint64_t device_id = assigned_device_ids[i];
     if (labels[i].has_value()) {
       const DeviceLabel& label = *labels[i];
       capacity_blocks = label.capacity_blocks_;
-      device_id = label.device_id_;
       const std::uint64_t required_bytes = capacity_blocks * kStorageBlockBytes;
       if (probed.size_bytes_ < required_bytes) {
         return absl::Status(
@@ -230,16 +333,90 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         "a single-device storage set must be at least 80 MiB");
   }
 
-  for (std::size_t i = 0; i < labels.size(); ++i) {
-    if (!labels[i].has_value()) {
+  if (has_existing_device &&
+      configured_device_count > previous_device_count) {
+    std::vector<std::uint64_t> canonical_epochs(kEpochValueCount, 1);
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      if (!labels[i].has_value()) {
+        continue;
+      }
+      for (std::size_t page_index = 0;
+           page_index < kEpochMetadataPageCount; ++page_index) {
+        const std::size_t byte_offset =
+            page_index * kMetadataPagePayloadBytes;
+        const std::size_t payload_bytes = std::min(
+            kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
+        auto loaded = ReadMetadataPagePair(
+            options_.data_files_[i], kEpochMetadataOffset,
+            MetadataPageKind::kEpochs,
+            static_cast<std::uint32_t>(page_index), payload_bytes);
+        if (!loaded.ok()) {
+          return loaded.status();
+        }
+        const std::size_t first_value = byte_offset / sizeof(std::uint64_t);
+        const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
+        for (std::size_t value_index = 0; value_index < value_count;
+             ++value_index) {
+          std::uint64_t value = 0;
+          std::memcpy(&value,
+                      loaded->payload_.data() +
+                          value_index * sizeof(std::uint64_t),
+                      sizeof(value));
+          canonical_epochs[first_value + value_index] =
+              std::max(canonical_epochs[first_value + value_index], value);
+        }
+      }
+    }
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      if (labels[i].has_value()) {
+        continue;
+      }
+      absl::Status initialized = InitializeAddedDeviceMetadata(
+          options_.data_files_[i], capacity_by_path[i], canonical_epochs);
+      if (!initialized.ok()) {
+        return initialized;
+      }
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
           .version_ = kStorageFormatVersion,
           .header_bytes_ = kDirectIoAlignment,
           .storage_set_id_ = storage_set_id,
-          .device_id_ = i,
+          .device_id_ = assigned_device_ids[i],
           .capacity_blocks_ = capacity_by_path[i],
-          .device_count_ = expected_device_count,
+          .device_count_ = configured_device_count,
+          .block_bytes_ = kStorageBlockBytes,
+      };
+      absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);
+      if (!written.ok()) {
+        return written;
+      }
+      labels[i] = label;
+    }
+    // Publish all new labels before changing an old label's member count. An
+    // interrupted run therefore remains recognizable and safe to retry.
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      if (labels[i]->device_count_ == configured_device_count) {
+        continue;
+      }
+      labels[i]->device_count_ = configured_device_count;
+      absl::Status written =
+          WriteDeviceLabel(options_.data_files_[i], *labels[i]);
+      if (!written.ok()) {
+        return written;
+      }
+    }
+    spdlog::info("expanded storage set from {} to {} devices",
+                 previous_device_count, configured_device_count);
+  } else if (!has_existing_device) {
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+      DeviceLabel label{
+          .magic_ = kDeviceLabelMagic,
+          .version_ = kStorageFormatVersion,
+          .header_bytes_ = kDirectIoAlignment,
+          .storage_set_id_ = storage_set_id,
+          .device_id_ = assigned_device_ids[i],
+          .capacity_blocks_ = capacity_by_path[i],
+          .device_count_ = configured_device_count,
           .block_bytes_ = kStorageBlockBytes,
       };
       absl::Status written = WriteDeviceLabel(options_.data_files_[i], label);

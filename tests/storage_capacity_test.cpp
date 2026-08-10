@@ -107,3 +107,42 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
   const std::string missing = prefix + "-missing.data";
   ASSERT_CHECK(!Prepare({missing}).ok(), "missing storage path was created");
 }
+
+TEST(StorageCapacityTest, ExpandsAnInitializedStorageSet) {
+  const std::string prefix =
+      "/tmp/keylane-storage-expansion-" + std::to_string(::getpid());
+  Cleanup cleanup;
+  const std::string original = prefix + "-original.data";
+  const std::string added = prefix + "-added.data";
+  cleanup.paths_ = {original, added};
+
+  ASSERT_CHECK(CreateFile(original, 80 * kMiB),
+               "failed to create original storage file");
+  ASSERT_CHECK(Prepare({original}).ok(),
+               "failed to initialize original storage set");
+  ASSERT_CHECK(CreateFile(added, 88 * kMiB),
+               "failed to create added storage file");
+  ASSERT_CHECK(Prepare({added, original}).ok(),
+               "failed to expand initialized storage set");
+  ASSERT_CHECK(Prepare({original, added}).ok(),
+               "expanded storage set did not reopen in a new argument order");
+  ASSERT_CHECK(!Prepare({original}).ok(),
+               "expanded storage set reopened with a missing member");
+}
+
+TEST(StorageCapacityTest, RejectsForeignDeviceDuringExpansion) {
+  const std::string prefix =
+      "/tmp/keylane-storage-foreign-" + std::to_string(::getpid());
+  Cleanup cleanup;
+  const std::string first = prefix + "-first.data";
+  const std::string foreign = prefix + "-foreign.data";
+  cleanup.paths_ = {first, foreign};
+
+  ASSERT_CHECK(CreateFile(first, 80 * kMiB) &&
+                   CreateFile(foreign, 80 * kMiB),
+               "failed to create foreign-device test files");
+  ASSERT_CHECK(Prepare({first}).ok() && Prepare({foreign}).ok(),
+               "failed to initialize independent storage sets");
+  ASSERT_CHECK(!Prepare({first, foreign}).ok(),
+               "foreign initialized device was accepted as an expansion");
+}

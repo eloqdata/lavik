@@ -234,11 +234,49 @@ Namespaces on one controller share that controller's hardware resources and
 failure domain; namespaces on distinct controllers have separate PCI paths.
 Keylane treats each namespace URI as one storage device in either case.
 
-All paths in one process must be the complete members of the same persisted
-Keylane storage set. Fresh devices must be initialized together. An existing
-single-device set cannot be extended merely by adding an argument, and online
-device addition/removal is not implemented. Argument order does not define
-persistent device identity after initialization.
+All paths in one process must include the complete persisted Keylane storage
+set. To add fresh namespaces, stop Keylane and restart it with every existing
+URI plus the zero-label new URIs. The fixed metadata on new namespaces is
+initialized automatically; existing data remains in place. Expansion is safe
+to retry after interruption. A foreign initialized namespace is rejected, so
+clear its Keylane label before intentionally reusing it as a new member.
+Argument order does not define persistent device identity after initialization.
+Online addition and device removal are not implemented.
+
+To expand an existing SPDK set, stop Keylane before changing driver ownership.
+If the new namespace contains an old Keylane storage set, temporarily expose
+it through the kernel, verify its PCI-to-device mapping, and clear only its
+label before binding it to VFIO. Never clear an existing member being kept.
+
+```sh
+# Example only: resolve these names and BDFs on the current host.
+readlink -f /sys/class/block/nvme1n1/device/device
+lsblk -o NAME,PATH,SIZE,MODEL,SERIAL,MOUNTPOINTS /dev/nvme1n1
+findmnt -rn -S /dev/nvme1n1
+sudo fuser -v /dev/nvme1n1
+sudo blkdiscard -z -f --offset 0 --length 4096 /dev/nvme1n1
+
+SPDK_BDFS='0000:01:00.0 0000:02:00.0'
+sudo env \
+  PCI_ALLOWED="$SPDK_BDFS" \
+  DRIVER_OVERRIDE=vfio-pci \
+  TARGET_USER="$(id -un)" \
+  HUGEMEM=8192 \
+  celer/third_party/spdk/scripts/setup.sh
+
+./bld-spdk/keylane \
+  --port=6379 \
+  --metrics-port=9100 \
+  --threads=8 \
+  --registered-buffer-mb=256 \
+  --data-file=spdk://0000:01:00.0/1 \
+  --data-file=spdk://0000:02:00.0/1
+```
+
+Wait for both device lines, the expansion log, and recovery completion. Every
+later start must repeat both URIs. The operation initializes only fixed
+metadata on the new namespace; it does not rewrite records on existing
+namespaces.
 
 `--defrag-max-active-per-device=N` and runtime `DEFRAG MAX-ACTIVE N` apply to
 each device independently. With two devices and `N=1`, at most one relocation
