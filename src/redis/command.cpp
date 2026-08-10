@@ -2654,29 +2654,29 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE
-        if (request.kind == CommandKind::kGet) {
+        if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;
-          trace.request_start_ns = ReadTraceNowNanos();
-          trace.remote = target != ThisWorker().id;
+          trace.request_start_ns_ = ReadTraceNowNanos();
+          trace.remote_ = target != ThisWorker().id_;
           CommandReply reply;
-          if (trace.remote) {
+          if (trace.remote_) {
             reply = co_await SubmitTaskTo(
                 target,
                 [&request, &reply_builder, &trace]() -> Task<CommandReply> {
-                  trace.owner_start_ns = ReadTraceNowNanos();
+                  trace.owner_start_ns_ = ReadTraceNowNanos();
                   CommandReply result = co_await ExecuteStorageCommand(
                       request, reply_builder, &trace);
-                  trace.owner_done_ns = ReadTraceNowNanos();
+                  trace.owner_done_ns_ = ReadTraceNowNanos();
                   co_return result;
                 });
           } else {
-            trace.owner_start_ns = trace.request_start_ns;
+            trace.owner_start_ns_ = trace.request_start_ns_;
             reply =
                 co_await ExecuteStorageCommand(request, reply_builder, &trace);
-            trace.owner_done_ns = ReadTraceNowNanos();
+            trace.owner_done_ns_ = ReadTraceNowNanos();
           }
-          trace.origin_resume_ns = ReadTraceNowNanos();
-          reply.read_trace = trace;
+          trace.origin_resume_ns_ = ReadTraceNowNanos();
+          reply.read_trace_ = trace;
           co_return reply;
         }
 #endif
