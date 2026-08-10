@@ -17,11 +17,14 @@ struct ServerOptions {
   std::uint16_t port_ = 6379;
   std::uint16_t metrics_port_ = 0;
   unsigned thread_count_ = 1;
+  bool pin_workers_ = true;
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;
   unsigned busy_poll_us_ = 0;
   unsigned background_budget_us_ = 50;
   unsigned background_warrant_percent_ = 10;
+  unsigned spdk_max_completions_per_poll_ = 0;
+  unsigned spdk_foreground_pre_poll_us_ = 0;
   long mimalloc_purge_delay_ms_ = kDefaultMimallocPurgeDelayMs;
   std::size_t registered_buffer_bytes_ = 16ULL * 1024 * 1024;
   std::uint64_t max_memory_bytes_ = 0;

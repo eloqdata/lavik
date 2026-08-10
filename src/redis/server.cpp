@@ -130,7 +130,11 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
 
   const std::uint64_t now = trace.send_complete_ns_;
   if (stats.next_report_ns_ == 0) {
-    stats.next_report_ns_ = now + 10'000'000'000ULL;
+    // Keep worker reports out of the same logger critical section. Synchronous
+    // bursts from every worker otherwise become an artificial tail-latency
+    // event in the trace build itself.
+    stats.next_report_ns_ = now + 10'000'000'000ULL +
+                            100'000'000ULL * ThisWorker().id_;
     return;
   }
   if (now < stats.next_report_ns_) {
@@ -177,7 +181,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       "scheduler worker={} rounds={} avg-round-us={:.2f} max-round-us={:.2f} "
       "fg-resumes={} fg-us={:.1f} max-fg-us={:.1f} fg-overruns={} "
       "bg-resumes={} bg-us={:.1f} max-bg-us={:.1f} bg-overruns={} "
-      "bg-share={:.1f}%",
+      "bg-share={:.1f}% spdk-polls={} empty={:.1f}% completions={} "
+      "max-batch={} avg-poll-us={:.3f} max-poll-us={:.1f}",
       ThisWorker().id_, scheduler_stats.rounds_,
       scheduler_stats.rounds_ == 0
           ? 0.0
@@ -194,7 +199,19 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       scheduled_cycles == 0
           ? 0.0
           : 100.0 * static_cast<double>(scheduler_stats.background_cycles_) /
-                static_cast<double>(scheduled_cycles));
+                static_cast<double>(scheduled_cycles),
+      scheduler_stats.storage_poll_calls_,
+      scheduler_stats.storage_poll_calls_ == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(scheduler_stats.storage_poll_empty_) /
+                static_cast<double>(scheduler_stats.storage_poll_calls_),
+      scheduler_stats.storage_completions_,
+      scheduler_stats.storage_max_completions_,
+      scheduler_stats.storage_poll_calls_ == 0
+          ? 0.0
+          : cycles_to_us(scheduler_stats.storage_poll_cycles_) /
+                static_cast<double>(scheduler_stats.storage_poll_calls_),
+      cycles_to_us(scheduler_stats.storage_max_poll_cycles_));
   spdlog::info(
       "read-latency-p99.99 worker={} n={} non-network-us<={} total-us<={} "
       "storage-io-us<={} route-out-us<={} lookup-us<={} buffer-us<={} "
@@ -204,7 +221,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
       p9999(stats.route_back_), p9999(stats.send_));
   stats = ReadLatencyStats{};
-  stats.next_report_ns_ = now + 10'000'000'000ULL;
+  stats.next_report_ns_ = now + 10'000'000'000ULL +
+                          100'000'000ULL * ThisWorker().id_;
 }
 
 std::atomic<bool> g_shutdown_requested = false;
@@ -639,18 +657,22 @@ int RunServer(ServerOptions options) {
                mi_option_get(mi_option_arena_eager_commit),
                mi_option_get(mi_option_allow_thp));
   spdlog::info(
-      "keylane listening on {}:{} metrics_port={} threads={} "
+      "keylane listening on {}:{} metrics_port={} threads={} pin_workers={} "
       "idle_timeout_ms={} "
       "busy_poll_us={} background_budget_us={} "
       "background_warrant_percent={} "
+      "spdk_max_completions_per_poll={} spdk_foreground_pre_poll_us={} "
       "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
       "flush_size_bytes={} "
       "inline_key_max_bytes={} verify_read_crc={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={}",
       options.bind_ip_, options.port_, options.metrics_port_,
-      options.thread_count_, options.idle_timeout_ms_, options.busy_poll_us_,
+      options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
+      options.busy_poll_us_,
       options.background_budget_us_, options.background_warrant_percent_,
+      options.spdk_max_completions_per_poll_,
+      options.spdk_foreground_pre_poll_us_,
       options.registered_buffer_bytes_, options.max_memory_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
       options.inline_key_max_bytes_, options.verify_read_crc_,
@@ -712,12 +734,17 @@ int RunServer(ServerOptions options) {
   celer::ServerOptions runtime_options;
   runtime_options.bind_ip_ = options.bind_ip_;
   runtime_options.thread_count_ = options.thread_count_;
+  runtime_options.pin_workers_ = options.pin_workers_;
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
   runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
   runtime_options.busy_poll_us_ = options.busy_poll_us_;
   runtime_options.background_budget_us_ = options.background_budget_us_;
   runtime_options.background_warrant_percent_ =
       options.background_warrant_percent_;
+  runtime_options.spdk_max_completions_per_poll_ =
+      options.spdk_max_completions_per_poll_;
+  runtime_options.spdk_foreground_pre_poll_us_ =
+      options.spdk_foreground_pre_poll_us_;
 
   RedisService redis(options.port_, &storage, &replication);
   std::unique_ptr<Service> metrics;

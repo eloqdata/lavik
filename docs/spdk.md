@@ -141,9 +141,10 @@ KEYLANE_BIND_IP=127.0.0.1
 KEYLANE_PORT=6379
 KEYLANE_METRICS_PORT=9100
 KEYLANE_THREADS=8
+KEYLANE_CPUS=0-7
 KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
 
-./bld-spdk/keylane \
+taskset -c "$KEYLANE_CPUS" ./bld-spdk/keylane \
   --bind="$KEYLANE_BIND_IP" \
   --port="$KEYLANE_PORT" \
   --metrics-port="$KEYLANE_METRICS_PORT" \
@@ -153,6 +154,8 @@ KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
   --busy-poll-us=20 \
   --background-budget-us=10 \
   --background-warrant-percent=1 \
+  --spdk-max-completions-per-poll=8 \
+  --spdk-foreground-pre-poll-us=5 \
   --mimalloc-purge-delay-ms=60000 \
   --flush-max-ms=1000 \
   --flush-size-kb=128 \
@@ -163,9 +166,25 @@ KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
   --data-file="$KEYLANE_SPDK_URI"
 ```
 
-Use `taskset`, cpusets, or the service manager to pin the process when CPU
-isolation is part of the deployment. Do not copy a benchmark host's CPU list
-without checking NUMA topology.
+Keylane pins workers by default. It reads the inherited affinity mask and maps
+worker 0 to the first allowed CPU, worker 1 to the second, and so on. Thus
+`taskset -c 8-15 ... --threads=8` maps workers to CPUs 8 through 15 rather than
+allowing all eight workers to migrate across that set. Startup fails when the
+allowed CPU count is smaller than the worker count. Use `--no-pin-workers` only
+when operating-system scheduling is intentionally preferred.
+
+Use `taskset`, cpusets, or the service manager to define the process CPU set.
+Do not copy a benchmark host's CPU list without checking NUMA topology. SPDK
+poll-mode workers are particularly sensitive to migration and preemption while
+I/O is outstanding.
+
+`--spdk-max-completions-per-poll=8` bounds one event-loop poll's completion
+work, preventing a completion burst from monopolizing a worker. The budget is
+shared fairly across all open SPDK namespaces on that worker.
+`--spdk-foreground-pre-poll-us=5` lets newly arrived network and cross-worker
+foreground work run for a small bounded slice before the storage completion
+poll. Both values are tunable; `0` restores unbounded completion draining or
+disables the pre-poll slice, respectively.
 
 `--registered-buffer-mb` is a budget **per worker**. With 256 MiB and eight
 workers, a process can reserve roughly 2 GiB of fixed storage buffers, before

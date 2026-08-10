@@ -4,8 +4,9 @@ Updated: 2026-08-10 UTC
 
 ## Current source state
 
-- Latest Keylane commit: 68229aa feat: add SPDK storage and runtime defrag tuning
-- Celer submodule: 257f2d2 feat: add SPDK storage backend
+- Keylane branch: main; this handoff update contains the SPDK tail-latency
+  tuning and default worker-pinning integration.
+- Celer submodule: 2f93c69 perf: reduce SPDK worker tail latency
 - mimalloc submodule: acf2fdd (v3.4.5)
 - io_uring build directory: ./bld
 - SPDK build directory: ./bld-spdk
@@ -136,6 +137,8 @@ The current SPDK server uses:
       --busy-poll-us=20 \
       --background-budget-us=10 \
       --background-warrant-percent=1 \
+      --spdk-max-completions-per-poll=8 \
+      --spdk-foreground-pre-poll-us=5 \
       --mimalloc-purge-delay-ms=60000 \
       --data-file=spdk://69f9:00:00.0/1 \
       --threads=8 \
@@ -147,6 +150,12 @@ The current SPDK server uses:
       --defrag-paused \
       --defrag-max-active-per-device=1 \
       --defrag-sleep-ms=100
+
+Worker pinning is enabled by default. The runtime enumerates the inherited
+CPU-affinity mask in ascending order and pins worker `i` to allowed CPU `i`.
+For the command above the eight workers are therefore pinned one-to-one to
+CPUs 0-7. `--no-pin-workers` restores the old behavior in which every worker
+inherits the whole 0-7 mask and may migrate between those CPUs.
 
 Before starting it, reserve hugepages and bind only the first controller:
 
@@ -186,6 +195,57 @@ The comparable io_uring launch is:
       --defrag-paused \
       --defrag-max-active-per-device=1 \
       --defrag-sleep-ms=100
+
+### Worker-affinity and SPDK polling retest
+
+The 2026-08-10 tail investigation isolated the two servers by pausing the
+inactive process with `SIGSTOP`; Prometheus scraping was also disabled for one
+control. Removing Prometheus made no measurable difference: SPDK remained at
+0.22182 ms average, 1.111 ms p99.9, and 2.479 ms p99.99. Grafana queries
+Prometheus rather than Keylane directly, and scrape duration was about 1 ms,
+so monitoring was ruled out as the SPDK tail source.
+
+Celer previously inherited the process-level `taskset -c 0-7` mask for every
+worker but did not pin individual worker threads. SPDK workers remain runnable
+while their qpairs have outstanding I/O, making scheduler migration and
+preemption much more visible than for io_uring workers that block awaiting
+CQEs. Dynamically pinning worker 0 through worker 7 to CPUs 0 through 7 changed
+the isolated 40-second pure-read result as follows:
+
+    Backend     Worker affinity    GET/s       Average       p99.9       p99.99
+    SPDK        shared 0-7 mask    99,997.27   0.22182 ms    1.111 ms    2.479 ms
+    SPDK        one CPU/worker     99,994.01   0.22188 ms    0.959 ms    1.775 ms
+    io_uring    shared 0-7 mask    99,994       0.24220 ms    1.151 ms    2.127 ms
+    io_uring    one CPU/worker     99,994.01   0.24313 ms    1.039 ms    2.079 ms
+
+Pinning improved SPDK p99.99 by 28.4% in this A/B and improved io_uring by
+only 2.3%. The runtime now performs that one-to-one mapping by default, using
+the inherited affinity list rather than assuming CPU numbers start at zero.
+
+The SPDK hot path was also changed to reuse a preallocated per-worker request
+pool instead of allocating one callback object per I/O. Completion processing
+can be capped with `--spdk-max-completions-per-poll`; multiple namespaces are
+polled round-robin under the shared cap. A small
+`--spdk-foreground-pre-poll-us` slice prevents storage polling from repeatedly
+winning over fresh network and cross-worker work. Trace runs showed that about
+98.4% of SPDK poll calls were empty; normal nonempty batches were small, so the
+cap is primarily a burst guard rather than the main average-latency change.
+
+The deployed release settings are a completion cap of 8 and a 5 us foreground
+pre-poll slice. After recovery confirmed exactly 200,000,000 keys, the final
+warm isolated run produced:
+
+    GET/s:       99,995.39
+    average:     0.22078 ms
+    p99.9:       0.967 ms
+    p99.99:      1.719 ms
+
+An immediately preceding 40-second run contained a one-second throughput dip
+and reported 2.719 ms p99.99. Similar isolated runs alternated between clean
+1.7-2.5 ms tails and occasional scheduler/allocator/host stalls. The clean
+result establishes that SPDK itself is no longer slower than io_uring here,
+but a longer production-window percentile must retain those system-level
+stalls rather than selecting only the best interval.
 
 ### 60-second mimalloc purge-delay restart
 

@@ -37,6 +37,9 @@ int main(int argc, char** argv) {
   app.add_option("-t,--threads", options.thread_count_, "Worker thread count")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_flag("--pin-workers,!--no-pin-workers", options.pin_workers_,
+               "Pin workers one-to-one to CPUs in the inherited affinity mask")
+      ->capture_default_str();
   app.add_option("-i,--idle-timeout", options.idle_timeout_ms_,
                  "Idle timeout in ms (-1 = disabled)")
       ->capture_default_str();
@@ -57,6 +60,16 @@ int main(int argc, char** argv) {
                  "Maximum rolling worker CPU share guaranteed to background tasks")
       ->capture_default_str()
       ->check(CLI::Range(1U, 100U));
+  app.add_option("--spdk-max-completions-per-poll",
+                 options.spdk_max_completions_per_poll_,
+                 "Maximum SPDK completions processed per worker poll (0 = unlimited)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--spdk-foreground-pre-poll-us",
+                 options.spdk_foreground_pre_poll_us_,
+                 "Foreground worker slice before each SPDK completion poll")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--mimalloc-purge-delay-ms", options.mimalloc_purge_delay_ms_,
                  "Mimalloc purge delay in ms (-1 disables purging)")
       ->capture_default_str()
