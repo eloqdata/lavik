@@ -11,7 +11,9 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -298,6 +300,20 @@ long long AwaitRoundBeyond(RespClient& client, long long floor) {
   Fail("tomb raider round did not complete in time");
 }
 
+std::string LocalTimeAfter(std::chrono::seconds offset) {
+  const std::time_t target = std::time(nullptr) + offset.count();
+  std::tm local{};
+  if (::localtime_r(&target, &local) == nullptr) {
+    Fail("localtime_r failed");
+  }
+  char buffer[9]{};
+  if (std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", local.tm_hour,
+                    local.tm_min, local.tm_sec) != 8) {
+    Fail("daily time formatting failed");
+  }
+  return buffer;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -328,9 +344,42 @@ int main(int argc, char** argv) {
       if (StatField(client, "tomb_raider_enabled") != 0) {
         Fail("tomb raider did not report disabled");
       }
+      if (client.Command({"TOMBRAIDER", "STATUS"}).find("mode=off") ==
+          std::string::npos) {
+        Fail("TOMBRAIDER STATUS did not report off mode");
+      }
       Expect(client.Command({"TOMBRAIDER", "INVALID"}), "-ERR syntax error",
              "TOMBRAIDER invalid mode");
+      Expect(client.Command({"TOMBRAIDER", "INTERVAL", "0"}),
+             "-ERR value is not an integer or out of range",
+             "TOMBRAIDER zero interval");
+      Expect(client.Command({"TOMBRAIDER", "BLOCK-SLEEP", "0"}), "+OK",
+             "TOMBRAIDER BLOCK-SLEEP");
+      if (StatField(client, "tomb_raider_block_sleep_ms") != 0) {
+        Fail("tomb raider did not update block sleep");
+      }
+
+      const std::string daily = LocalTimeAfter(2s);
+      Expect(client.Command({"TOMBRAIDER", "DAILY", daily}), "+OK",
+             "TOMBRAIDER DAILY");
+      if (client.Command({"TOMBRAIDER", "STATUS"}).find("mode=daily") ==
+          std::string::npos) {
+        Fail("TOMBRAIDER STATUS did not report daily mode");
+      }
+      const long long daily_rounds = AwaitRoundBeyond(client, disabled_rounds);
+      std::this_thread::sleep_for(1200ms);
+      if (StatField(client, "tomb_raider_rounds") != daily_rounds) {
+        Fail("daily tomb raider ran more than once");
+      }
+      Expect(client.Command({"TOMBRAIDER", "OFF"}), "+OK",
+             "TOMBRAIDER daily OFF");
       Expect(client.Command({"TOMBRAIDER", "ON"}), "+OK", "TOMBRAIDER ON");
+      if (client.Command({"TOMBRAIDER", "STATUS"}).find("mode=daily") ==
+          std::string::npos) {
+        Fail("TOMBRAIDER ON did not restore daily mode");
+      }
+      Expect(client.Command({"TOMBRAIDER", "INTERVAL", "500"}), "+OK",
+             "TOMBRAIDER INTERVAL");
       if (StatField(client, "tomb_raider_enabled") != 1) {
         Fail("tomb raider did not report enabled");
       }

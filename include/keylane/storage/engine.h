@@ -40,10 +40,33 @@ struct StorageEngineOptions {
   RegisteredBufferPoolOptions buffers_{};
 };
 
+enum class TombRaiderMode : std::uint8_t {
+  kOff,
+  kInterval,
+  kDaily,
+};
+
+enum class TombRaiderConfigAction : std::uint8_t {
+  kOff,
+  kOn,
+  kInterval,
+  kBlockSleep,
+  kDaily,
+};
+
+struct TombRaiderConfigUpdate {
+  TombRaiderConfigAction action_ = TombRaiderConfigAction::kOff;
+  std::uint64_t value_ = 0;
+};
+
 struct TombRaiderTotals {
   std::uint64_t rounds_ = 0;
   std::uint64_t reaped_ = 0;
   std::uint64_t refreshed_ = 0;
+  std::uint64_t interval_ms_ = 0;
+  std::uint32_t block_sleep_ms_ = 0;
+  std::uint32_t daily_second_ = 0;
+  TombRaiderMode mode_ = TombRaiderMode::kOff;
   bool enabled_ = false;
   bool running_ = false;
 };
@@ -364,11 +387,9 @@ class StorageEngine {
   // Lifetime totals of the tomb raider (rounds run, tombstone entries
   // reaped, stale shielding bits cleared).
   TombRaiderTotals TombRaiderStats() const noexcept;
-  // Disabling lets an in-flight round finish and prevents subsequent rounds;
-  // enabling restores interval-based scheduling.
-  // Returns false when this server has no expiration authority or the
-  // configured interval is zero.
-  bool SetTombRaiderEnabled(bool enabled) noexcept;
+  // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
+  // the new schedule starts counting from that completion.
+  celer::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
   celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a

@@ -175,7 +175,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("flushall", 2, true);
   CheckArity("tombraider", 1, false);
   CheckArity("tombraider", 2, true);
-  CheckArity("tombraider", 3, false);
+  CheckArity("tombraider", 3, true);
+  CheckArity("tombraider", 4, false);
 
   // Key position resolution.
   {

@@ -1,6 +1,55 @@
+#include <ctime>
+#include <optional>
+
 #include "impl.h"
 
 namespace keylane::storage {
+
+namespace {
+
+constexpr auto kMaxScheduleSleep = std::chrono::minutes(1);
+
+template <typename Duration>
+std::chrono::milliseconds ScheduleSleep(Duration remaining) {
+  auto result =
+      std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
+  if (result <= std::chrono::milliseconds::zero()) {
+    return std::chrono::milliseconds(1);
+  }
+  return std::min(result, std::chrono::duration_cast<std::chrono::milliseconds>(
+                              kMaxScheduleSleep));
+}
+
+std::optional<std::chrono::system_clock::time_point> NextDailyTime(
+    std::uint32_t daily_second) {
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+  std::tm local{};
+  if (::localtime_r(&now_time, &local) == nullptr) {
+    return std::nullopt;
+  }
+  local.tm_hour = static_cast<int>(daily_second / 3600);
+  local.tm_min = static_cast<int>((daily_second % 3600) / 60);
+  local.tm_sec = static_cast<int>(daily_second % 60);
+  local.tm_isdst = -1;
+  std::time_t scheduled = std::mktime(&local);
+  if (scheduled == static_cast<std::time_t>(-1)) {
+    return std::nullopt;
+  }
+  auto due = std::chrono::system_clock::from_time_t(scheduled);
+  if (due <= now) {
+    ++local.tm_mday;
+    local.tm_isdst = -1;
+    scheduled = std::mktime(&local);
+    if (scheduled == static_cast<std::time_t>(-1)) {
+      return std::nullopt;
+    }
+    due = std::chrono::system_clock::from_time_t(scheduled);
+  }
+  return due;
+}
+
+}  // namespace
 
 // A tombstone (and the index entry pinning it) is dead weight once no older
 // record of its key survives on disk: recovery would conclude "absent" with
@@ -12,20 +61,171 @@ namespace keylane::storage {
 // forfeits the round, and recovery rebuilds both tombstone entries and
 // shielding bits exactly from the surviving records.
 
-Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(WorkerStore* store) {
-  const auto interval =
-      std::chrono::milliseconds(options_.tomb_raider_interval_ms_);
+Task<absl::Status> StorageEngine::Impl::ConfigureTombRaider(
+    TombRaiderConfigUpdate update) {
+  co_return co_await celer::SubmitTo(
+      0, [this, update] { return ApplyTombRaiderConfig(*stores_[0], update); });
+}
+
+absl::Status StorageEngine::Impl::ApplyTombRaiderConfig(
+    WorkerStore& coordinator, TombRaiderConfigUpdate update) {
+  const bool needs_authority =
+      update.action_ == TombRaiderConfigAction::kOn ||
+      update.action_ == TombRaiderConfigAction::kInterval ||
+      update.action_ == TombRaiderConfigAction::kDaily;
+  if (needs_authority && !options_.expiration_authority_) {
+    return absl::Status(absl::StatusCode::kFailedPrecondition,
+                        "tomb raider is unavailable on this server");
+  }
+
+  TombRaiderMode mode =
+      tomb_raider_config_.mode_.load(std::memory_order_relaxed);
+  bool reschedule = false;
+  auto begin_reschedule = [this] {
+    tomb_raider_config_.generation_.fetch_add(1, std::memory_order_acq_rel);
+  };
+  switch (update.action_) {
+    case TombRaiderConfigAction::kOff:
+      if (mode == TombRaiderMode::kOff) {
+        return absl::OkStatus();
+      }
+      begin_reschedule();
+      tomb_raider_config_.last_mode_.store(mode, std::memory_order_relaxed);
+      mode = TombRaiderMode::kOff;
+      reschedule = true;
+      break;
+    case TombRaiderConfigAction::kOn:
+      if (mode != TombRaiderMode::kOff) {
+        return absl::OkStatus();
+      }
+      mode = tomb_raider_config_.last_mode_.load(std::memory_order_relaxed);
+      if (mode == TombRaiderMode::kInterval &&
+          tomb_raider_config_.interval_ms_.load(std::memory_order_relaxed) ==
+              0) {
+        return absl::Status(absl::StatusCode::kFailedPrecondition,
+                            "no previous tomb raider schedule");
+      }
+      begin_reschedule();
+      reschedule = true;
+      break;
+    case TombRaiderConfigAction::kInterval:
+      if (update.value_ == 0 ||
+          update.value_ > static_cast<std::uint64_t>(
+                              std::chrono::milliseconds::max().count())) {
+        return absl::Status(absl::StatusCode::kInvalidArgument,
+                            "invalid tomb raider interval");
+      }
+      begin_reschedule();
+      tomb_raider_config_.interval_ms_.store(update.value_,
+                                             std::memory_order_relaxed);
+      mode = TombRaiderMode::kInterval;
+      tomb_raider_config_.last_mode_.store(mode, std::memory_order_relaxed);
+      reschedule = true;
+      break;
+    case TombRaiderConfigAction::kBlockSleep:
+      if (update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+        return absl::Status(absl::StatusCode::kInvalidArgument,
+                            "invalid tomb raider block sleep");
+      }
+      tomb_raider_config_.block_sleep_ms_.store(
+          static_cast<std::uint32_t>(update.value_), std::memory_order_release);
+      return absl::OkStatus();
+    case TombRaiderConfigAction::kDaily:
+      if (update.value_ >= 24 * 60 * 60) {
+        return absl::Status(absl::StatusCode::kInvalidArgument,
+                            "invalid tomb raider daily time");
+      }
+      begin_reschedule();
+      tomb_raider_config_.daily_second_.store(
+          static_cast<std::uint32_t>(update.value_), std::memory_order_relaxed);
+      mode = TombRaiderMode::kDaily;
+      tomb_raider_config_.last_mode_.store(mode, std::memory_order_relaxed);
+      reschedule = true;
+      break;
+  }
+
+  if (!reschedule) {
+    return absl::OkStatus();
+  }
+  tomb_raider_config_.mode_.store(mode, std::memory_order_relaxed);
+  const std::uint64_t generation =
+      tomb_raider_config_.generation_.fetch_add(1, std::memory_order_acq_rel) +
+      1;
+  if (mode != TombRaiderMode::kOff) {
+    coordinator.worker_->SpawnBackground(
+        TombRaiderLoop(&coordinator, generation));
+  }
+  return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(
+    WorkerStore* store, std::uint64_t generation) {
   while (!store->worker_->stop_requested()) {
-    absl::Status waited = co_await celer::SleepFor(*store->worker_, interval);
-    if (!waited.ok()) {
-      co_return waited;
-    }
     if (store->worker_->stop_requested() ||
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;
     }
-    if (!tomb_raider_enabled_.load(std::memory_order_acquire)) {
+    if (generation !=
+        tomb_raider_config_.generation_.load(std::memory_order_acquire)) {
+      break;
+    }
+    const TombRaiderMode mode =
+        tomb_raider_config_.mode_.load(std::memory_order_relaxed);
+    if (mode == TombRaiderMode::kOff) {
+      break;
+    }
+    if (tomb_raider_running_.load(std::memory_order_acquire)) {
+      co_await tomb_raider_round_finished_.Wait();
       continue;
+    }
+
+    if (mode == TombRaiderMode::kInterval) {
+      const std::uint64_t interval =
+          tomb_raider_config_.interval_ms_.load(std::memory_order_relaxed);
+      if (interval == 0 ||
+          interval > static_cast<std::uint64_t>(
+                         std::chrono::milliseconds::max().count())) {
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                               "invalid tomb raider interval");
+      }
+      const auto due = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(interval);
+      while (std::chrono::steady_clock::now() < due) {
+        absl::Status waited = co_await celer::SleepFor(
+            *store->worker_,
+            ScheduleSleep(due - std::chrono::steady_clock::now()));
+        if (!waited.ok()) {
+          co_return waited;
+        }
+        if (generation !=
+            tomb_raider_config_.generation_.load(std::memory_order_acquire)) {
+          co_return absl::OkStatus();
+        }
+      }
+    } else {
+      const auto due = NextDailyTime(
+          tomb_raider_config_.daily_second_.load(std::memory_order_relaxed));
+      if (!due.has_value()) {
+        co_return absl::Status(absl::StatusCode::kInternal,
+                               "failed to calculate tomb raider daily time");
+      }
+      while (std::chrono::system_clock::now() < *due) {
+        absl::Status waited = co_await celer::SleepFor(
+            *store->worker_,
+            ScheduleSleep(*due - std::chrono::system_clock::now()));
+        if (!waited.ok()) {
+          co_return waited;
+        }
+        if (generation !=
+            tomb_raider_config_.generation_.load(std::memory_order_acquire)) {
+          co_return absl::OkStatus();
+        }
+      }
+    }
+
+    if (generation !=
+        tomb_raider_config_.generation_.load(std::memory_order_acquire)) {
+      break;
     }
     absl::Status round = co_await RunTombRaider();
     if (!round.ok()) {
@@ -50,11 +250,15 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   struct RoundGuard {
     std::atomic<bool>* running_;
     std::atomic<std::uint32_t>* settlements_;
+    AsyncNotification* finished_;
+    Worker* worker_;
     ~RoundGuard() {
       settlements_->fetch_sub(1, std::memory_order_acq_rel);
       running_->store(false, std::memory_order_release);
+      finished_->NotifyAll(*worker_);
     }
-  } round_guard{&tomb_raider_running_, &active_settlements_};
+  } round_guard{&tomb_raider_running_, &active_settlements_,
+                &tomb_raider_round_finished_, celer::ThisWorker().self_};
 
   // The reap must not start until every worker's sweep has finished: the
   // record that still needs a candidate may sit in the last unswept block.
@@ -347,10 +551,11 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     }
     // Throttle: one block per sleep bounds the sweep's disk-bandwidth and
     // CPU share, so a full-disk round never crowds out online traffic.
-    if (options_.tomb_raider_sleep_ms_ != 0) {
+    const std::uint32_t block_sleep_ms =
+        tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
+    if (block_sleep_ms != 0) {
       absl::Status slept = co_await celer::SleepFor(
-          *store.worker_,
-          std::chrono::milliseconds(options_.tomb_raider_sleep_ms_));
+          *store.worker_, std::chrono::milliseconds(block_sleep_ms));
       if (!slept.ok()) {
         co_return slept;
       }

@@ -50,8 +50,9 @@ TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
 }
 
-bool StorageEngine::SetTombRaiderEnabled(bool enabled) noexcept {
-  return impl_->SetTombRaiderEnabled(enabled);
+Task<absl::Status> StorageEngine::ConfigureTombRaider(
+    TombRaiderConfigUpdate update) {
+  return impl_->ConfigureTombRaider(update);
 }
 
 Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {

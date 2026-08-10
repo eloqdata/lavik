@@ -221,23 +221,124 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
       reply_builder.AppendInteger(static_cast<long long>(total)));
 }
 
-CommandReply ExecuteTombRaider(const CommandRequest& request,
-                               ReplyBuilder& reply_builder) {
-  if (request.args_.size() != 2) {
-    return BuiltReply(reply_builder.AppendError(
+bool ParseUint64(std::string_view text, std::uint64_t* value) {
+  if (text.empty()) {
+    return false;
+  }
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [parsed_end, error] = std::from_chars(begin, end, *value);
+  return error == std::errc{} && parsed_end == end;
+}
+
+absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text) {
+  std::array<std::uint64_t, 3> parts{};
+  std::size_t count = 0;
+  while (!text.empty() && count < parts.size()) {
+    const std::size_t separator = text.find(':');
+    const std::string_view part = text.substr(0, separator);
+    if (!ParseUint64(part, &parts[count++])) {
+      return absl::Status(absl::StatusCode::kInvalidArgument,
+                          "daily time must be HH:MM or HH:MM:SS");
+    }
+    if (separator == std::string_view::npos) {
+      text = {};
+    } else {
+      text.remove_prefix(separator + 1);
+      if (text.empty()) {
+        return absl::Status(absl::StatusCode::kInvalidArgument,
+                            "daily time must be HH:MM or HH:MM:SS");
+      }
+    }
+  }
+  if (!text.empty() || (count != 2 && count != 3) || parts[0] >= 24 ||
+      parts[1] >= 60 || parts[2] >= 60) {
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "daily time must be HH:MM or HH:MM:SS");
+  }
+  return static_cast<std::uint32_t>(parts[0] * 3600 + parts[1] * 60 + parts[2]);
+}
+
+std::string FormatDailySecond(std::uint32_t daily_second) {
+  const std::uint32_t hour = daily_second / 3600;
+  const std::uint32_t minute = (daily_second % 3600) / 60;
+  const std::uint32_t second = daily_second % 60;
+  auto two_digits = [](std::uint32_t value) {
+    return value < 10 ? absl::StrCat("0", value) : absl::StrCat(value);
+  };
+  return absl::StrCat(two_digits(hour), ":", two_digits(minute), ":",
+                      two_digits(second));
+}
+
+std::string_view TombRaiderModeName(storage::TombRaiderMode mode) {
+  switch (mode) {
+    case storage::TombRaiderMode::kOff:
+      return "off";
+    case storage::TombRaiderMode::kInterval:
+      return "interval";
+    case storage::TombRaiderMode::kDaily:
+      return "daily";
+  }
+  return "off";
+}
+
+Task<CommandReply> ExecuteTombRaider(const CommandRequest& request,
+                                     ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  if (args.size() < 2 || args.size() > 3) {
+    co_return BuiltReply(reply_builder.AppendError(
         "ERR wrong number of arguments for 'tombraider' command"));
   }
-  bool enabled = false;
-  if (CmpCaseInsensitive(request.args_[1], "ON")) {
-    enabled = true;
-  } else if (!CmpCaseInsensitive(request.args_[1], "OFF")) {
-    return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+
+  if (CmpCaseInsensitive(args[1], "STATUS")) {
+    if (args.size() != 2) {
+      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+    }
+    const storage::TombRaiderTotals status = g_storage->TombRaiderStats();
+    co_return BuiltReply(reply_builder.AppendBulkString(absl::StrCat(
+        "mode=", TombRaiderModeName(status.mode_), " interval_ms=",
+        status.interval_ms_, " block_sleep_ms=", status.block_sleep_ms_,
+        " daily=", FormatDailySecond(status.daily_second_),
+        " timezone=local running=", status.running_ ? 1 : 0)));
   }
-  if (!g_storage->SetTombRaiderEnabled(enabled)) {
-    return BuiltReply(reply_builder.AppendError(
-        "ERR tomb raider is disabled by server configuration"));
+
+  storage::TombRaiderConfigUpdate update;
+  if (CmpCaseInsensitive(args[1], "ON") && args.size() == 2) {
+    update.action_ = storage::TombRaiderConfigAction::kOn;
+  } else if (CmpCaseInsensitive(args[1], "OFF") && args.size() == 2) {
+    update.action_ = storage::TombRaiderConfigAction::kOff;
+  } else if (CmpCaseInsensitive(args[1], "INTERVAL") && args.size() == 3) {
+    update.action_ = storage::TombRaiderConfigAction::kInterval;
+    if (!ParseUint64(args[2], &update.value_) || update.value_ == 0) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR value is not an integer or out of range"));
+    }
+  } else if ((CmpCaseInsensitive(args[1], "BLOCK-SLEEP") ||
+              CmpCaseInsensitive(args[1], "SLEEP")) &&
+             args.size() == 3) {
+    update.action_ = storage::TombRaiderConfigAction::kBlockSleep;
+    if (!ParseUint64(args[2], &update.value_) ||
+        update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR value is not an integer or out of range"));
+    }
+  } else if (CmpCaseInsensitive(args[1], "DAILY") && args.size() == 3) {
+    auto daily_second = ParseDailySecond(args[2]);
+    if (!daily_second.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", daily_second.status().message())));
+    }
+    update.action_ = storage::TombRaiderConfigAction::kDaily;
+    update.value_ = *daily_second;
+  } else {
+    co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
   }
-  return BuiltReply(reply_builder.AppendSimpleString("OK"));
+
+  const absl::Status configured =
+      co_await g_storage->ConfigureTombRaider(update);
+  co_return configured.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+                            : BuiltReply(reply_builder.AppendError(
+                                  absl::StrCat("ERR ", configured.message())));
 }
 
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
@@ -1246,7 +1347,17 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info += std::string("tomb_raider_enabled:") +
             (raider.enabled_ ? "1\r\n" : "0\r\n");
     info += std::string("tomb_raider_running:") +
-            (raider.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
+            (raider.running_ ? "1\r\n" : "0\r\n");
+    info +=
+        "tomb_raider_mode:" + std::string(TombRaiderModeName(raider.mode_)) +
+        "\r\n";
+    info += "tomb_raider_interval_ms:" + std::to_string(raider.interval_ms_) +
+            "\r\n";
+    info +=
+        "tomb_raider_block_sleep_ms:" + std::to_string(raider.block_sleep_ms_) +
+        "\r\n";
+    info += "tomb_raider_daily_second:" + std::to_string(raider.daily_second_) +
+            "\r\n\r\n";
   }
   if (wants("replication")) {
     info += "# Replication\r\n";
@@ -2445,7 +2556,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
       co_return co_await ExecuteScan(request, reply_builder);
 
     case CommandKind::kTombRaider:
-      co_return ExecuteTombRaider(request, reply_builder);
+      co_return co_await ExecuteTombRaider(request, reply_builder);
 
     case CommandKind::kDel:
     case CommandKind::kExists:

@@ -693,8 +693,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (options_.expiration_authority_) {
     worker.SpawnBackground(ActiveExpiration(&store));
     // One coordinator drives the whole-engine round; worker 0 hosts it.
-    if (worker.id() == 0 && options_.tomb_raider_interval_ms_ != 0) {
-      worker.SpawnBackground(TombRaiderLoop(&store));
+    if (worker.id() == 0 &&
+        tomb_raider_config_.mode_.load(std::memory_order_relaxed) !=
+            TombRaiderMode::kOff) {
+      worker.SpawnBackground(TombRaiderLoop(
+          &store,
+          tomb_raider_config_.generation_.load(std::memory_order_relaxed)));
     }
   }
   co_return absl::OkStatus();

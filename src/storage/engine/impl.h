@@ -803,9 +803,17 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
 class StorageEngine::Impl {
  public:
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
-    tomb_raider_enabled_.store(options_.expiration_authority_ &&
-                                   options_.tomb_raider_interval_ms_ != 0,
-                               std::memory_order_relaxed);
+    const TombRaiderMode mode =
+        options_.expiration_authority_ && options_.tomb_raider_interval_ms_ != 0
+            ? TombRaiderMode::kInterval
+            : TombRaiderMode::kOff;
+    tomb_raider_config_.mode_.store(mode, std::memory_order_relaxed);
+    tomb_raider_config_.last_mode_.store(TombRaiderMode::kInterval,
+                                         std::memory_order_relaxed);
+    tomb_raider_config_.interval_ms_.store(options_.tomb_raider_interval_ms_,
+                                           std::memory_order_relaxed);
+    tomb_raider_config_.block_sleep_ms_.store(options_.tomb_raider_sleep_ms_,
+                                              std::memory_order_relaxed);
   }
 
  private:
@@ -985,23 +993,33 @@ class StorageEngine::Impl {
   Task<absl::Status> QuiesceExpiration();
 
   TombRaiderTotals TombRaiderStats() const noexcept {
-    return TombRaiderTotals{
-        .rounds_ = tomb_raider_rounds_.load(std::memory_order_relaxed),
-        .reaped_ = tomb_raider_reaped_.load(std::memory_order_relaxed),
-        .refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed),
-        .enabled_ = tomb_raider_enabled_.load(std::memory_order_relaxed),
-        .running_ = tomb_raider_running_.load(std::memory_order_relaxed),
-    };
+    TombRaiderTotals totals;
+    std::uint64_t before = 0;
+    std::uint64_t after = 0;
+    do {
+      before = tomb_raider_config_.generation_.load(std::memory_order_acquire);
+      if ((before & 1) != 0) {
+        continue;
+      }
+      totals.interval_ms_ =
+          tomb_raider_config_.interval_ms_.load(std::memory_order_relaxed);
+      totals.block_sleep_ms_ =
+          tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
+      totals.daily_second_ =
+          tomb_raider_config_.daily_second_.load(std::memory_order_relaxed);
+      totals.mode_ = tomb_raider_config_.mode_.load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      after = tomb_raider_config_.generation_.load(std::memory_order_acquire);
+    } while (before != after || (after & 1) != 0);
+    totals.rounds_ = tomb_raider_rounds_.load(std::memory_order_relaxed);
+    totals.reaped_ = tomb_raider_reaped_.load(std::memory_order_relaxed);
+    totals.refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed);
+    totals.enabled_ = totals.mode_ != TombRaiderMode::kOff;
+    totals.running_ = tomb_raider_running_.load(std::memory_order_relaxed);
+    return totals;
   }
 
-  bool SetTombRaiderEnabled(bool enabled) noexcept {
-    if (enabled && (!options_.expiration_authority_ ||
-                    options_.tomb_raider_interval_ms_ == 0)) {
-      return false;
-    }
-    tomb_raider_enabled_.store(enabled, std::memory_order_release);
-    return true;
-  }
+  Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 
@@ -1531,7 +1549,11 @@ class StorageEngine::Impl {
     std::uint8_t db_id_ = 0;
   };
 
-  Task<absl::Status> TombRaiderLoop(WorkerStore* store);
+  Task<absl::Status> TombRaiderLoop(WorkerStore* store,
+                                    std::uint64_t generation);
+
+  absl::Status ApplyTombRaiderConfig(WorkerStore& coordinator,
+                                     TombRaiderConfigUpdate update);
 
   Task<absl::Status> RunTombRaider();
 
@@ -1653,7 +1675,18 @@ class StorageEngine::Impl {
   // every one of these tasks must be short-lived or abort promptly once
   // shutdown_flush_requested_ is set.
   std::atomic<std::uint32_t> active_settlements_{0};
-  std::atomic<bool> tomb_raider_enabled_{false};
+  struct alignas(64) TombRaiderRuntimeConfig {
+    // Even values are stable scheduler generations; odd means a worker-0
+    // configuration update is publishing new fields.
+    std::atomic<std::uint64_t> generation_{2};
+    std::atomic<std::uint64_t> interval_ms_{0};
+    std::atomic<std::uint32_t> block_sleep_ms_{0};
+    std::atomic<std::uint32_t> daily_second_{0};
+    std::atomic<TombRaiderMode> mode_{TombRaiderMode::kOff};
+    std::atomic<TombRaiderMode> last_mode_{TombRaiderMode::kInterval};
+  } tomb_raider_config_;
+  static_assert(sizeof(TombRaiderRuntimeConfig) == 64);
+  AsyncNotification tomb_raider_round_finished_;
   std::atomic<bool> tomb_raider_running_{false};
   std::atomic<std::uint64_t> tomb_raider_rounds_{0};
   std::atomic<std::uint64_t> tomb_raider_reaped_{0};
