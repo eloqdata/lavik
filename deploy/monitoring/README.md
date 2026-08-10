@@ -32,11 +32,12 @@ cp .env.example .env
 ${EDITOR:-vi} .env
 ```
 
-At minimum, set a reachable target and replace the Grafana password:
+At minimum, set a reachable target. The default Grafana login is
+`admin`/`admin`; replace the password for production deployments:
 
 ```dotenv
 KEYLANE_TARGETS=10.0.0.11:9100
-GRAFANA_ADMIN_PASSWORD=replace-with-a-strong-password
+GRAFANA_ADMIN_PASSWORD=admin
 ```
 
 Validate and start the stack:
@@ -53,9 +54,9 @@ Open the following URL in a browser, replacing the host and port if needed:
 http://MONITORING_HOST:3000/d/keylane-overview/keylane-overview
 ```
 
-Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`.
-The Prometheus datasource and the `Keylane Overview` dashboard are provisioned
-automatically.
+Log in with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`
+(`admin`/`admin` by default). The Prometheus datasource and the
+`Keylane Overview` dashboard are provisioned automatically.
 
 Prometheus is bound to `127.0.0.1:9090` on the monitoring host by default. Its
 target status is available locally at:
