@@ -153,7 +153,7 @@ KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
   --busy-poll-us=20 \
   --background-budget-us=10 \
   --background-warrant-percent=1 \
-  --mimalloc-purge-delay-ms=-1 \
+  --mimalloc-purge-delay-ms=60000 \
   --flush-max-ms=1000 \
   --flush-size-kb=128 \
   --disable-read-crc \
@@ -172,6 +172,12 @@ workers, a process can reserve roughly 2 GiB of fixed storage buffers, before
 adaptive overflow and other memory. The overflow read pool grows to the
 observed per-worker concurrency high-water mark when fixed read buffers are
 busy, then reuses those DMA buffers instead of allocating on every later miss.
+
+A finite purge delay is recommended for recovery-heavy deployments. A 60-second
+delay retains recently freed pages for reuse while allowing recovery's arena
+high-water memory to return to the OS. `-1` can improve extreme tail latency by
+avoiding recommit faults, but it may retain tens of GiB after a large recovery
+and provides no proactive response to Linux or cgroup memory pressure.
 
 Wait for `storage recovery complete` before sending traffic, then validate:
 

@@ -4,19 +4,19 @@ Updated: 2026-08-10 UTC
 
 ## Current source state
 
-- Latest Keylane commit: 8c171a9 feat: make tomb raider scheduling configurable
-- Celer submodule: b3d78fe runtime: clear background task registration on
-  shutdown, plus the local SPDK storage-backend implementation described below
+- Latest Keylane commit: 68229aa feat: add SPDK storage and runtime defrag tuning
+- Celer submodule: 257f2d2 feat: add SPDK storage backend
 - mimalloc submodule: acf2fdd (v3.4.5)
 - io_uring build directory: ./bld
 - SPDK build directory: ./bld-spdk
-- Current live process: local SPDK build on `spdk://69f9:00:00.0/1`, with
-  built-in mimalloc 3.4.5, purge disabled, THP disabled at compile time, eager
-  arena commit enabled, tomb raider enabled at a 600,000 ms interval with a
-  10 ms per-block sleep, and an active two-hour 1:1 observation run.
-- `/dev/nvme1n1` and its historical io_uring dataset were preserved. The old
-  io_uring process was gracefully stopped before the SPDK test so both servers
-  did not contend for CPUs 0-7.
+- Two processes are live on CPUs 0-7 for read-tail A/B. The SPDK build uses
+  `spdk://69f9:00:00.0/1` on Redis/metrics ports 6379/9100 and has 200,000,000
+  logical keys. The io_uring build uses `/dev/nvme1n1` on ports 6380/9101 and
+  has 250,931,993 logical keys. Both use 256 MiB registered storage buffers per
+  worker, a 60,000 ms mimalloc purge delay, tomb raider disabled, and defrag
+  paused. At idle each process consumes about 4% CPU because busy-poll is 20us.
+- Prometheus scrapes both metrics ports. Grafana histogram quantiles retain the
+  `instance` label instead of incorrectly merging buckets across servers.
 - aerospike-bench.conf, bld/, bld-libc/, bld-spdk/, celer-raft/,
   perf_reports/, and the local block-device helper are untracked and
   intentionally not committed.
@@ -32,8 +32,9 @@ Build:
 Mimalloc is now mandatory: `KEYLANE_USE_MIMALLOC` no longer exists. Every
 Keylane build links mimalloc 3.4.5, compiles with `MI_NO_THP=ON` and
 `MI_DEFAULT_ARENA_EAGER_COMMIT=1`, and defaults the runtime purge delay to
-`-1`. The startup log is the source of truth and should report
-`purge_delay=-1 arena_eager_commit=1 allow_thp=0`.
+`-1`. The current A/B overrides it to 60,000 ms. The startup log is the source
+of truth and should report `purge_delay=60000 arena_eager_commit=1 allow_thp=0`
+for these two live processes.
 
 SPDK build:
 
@@ -133,14 +134,19 @@ The current SPDK server uses:
       --recv-buffers=1024 \
       --registered-buffer-mb=256 \
       --busy-poll-us=20 \
-      --mimalloc-purge-delay-ms=-1 \
+      --background-budget-us=10 \
+      --background-warrant-percent=1 \
+      --mimalloc-purge-delay-ms=60000 \
       --data-file=spdk://69f9:00:00.0/1 \
       --threads=8 \
       --flush-max-ms=1000 \
       --flush-size-kb=128 \
       --disable-read-crc \
-      --tomb-raider-interval-ms=600000 \
-      --tomb-raider-sleep-ms=10
+      --tomb-raider-interval-ms=0 \
+      --tomb-raider-sleep-ms=10 \
+      --defrag-paused \
+      --defrag-max-active-per-device=1 \
+      --defrag-sleep-ms=100
 
 Before starting it, reserve hugepages and bind only the first controller:
 
@@ -149,7 +155,7 @@ Before starting it, reserve hugepages and bind only the first controller:
       'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode'
     cd celer/third_party/spdk
     sudo env PCI_ALLOWED='69f9:00:00.0' DRIVER_OVERRIDE=vfio-pci \
-      HUGEMEM=2048 ./scripts/setup.sh
+      HUGEMEM=4096 ./scripts/setup.sh
     cd ../../..
 
 To return only that controller to the kernel NVMe driver after Keylane stops:
@@ -162,16 +168,46 @@ The comparable io_uring launch is:
 
     sudo taskset -c 0-7 ./bld/keylane \
       --bind=10.0.0.4 \
-      --port=6379 \
-      --metrics-port=9100 \
+      --port=6380 \
+      --metrics-port=9101 \
       --recv-buffers 1024 \
       --registered-buffer-mb=256 \
       --busy-poll-us=20 \
+      --background-budget-us=10 \
+      --background-warrant-percent=1 \
+      --mimalloc-purge-delay-ms=60000 \
       --data-file=/dev/nvme1n1 \
       --threads=8 \
       --flush-max-ms=1000 \
       --flush-size-kb=128 \
-      --disable-read-crc
+      --disable-read-crc \
+      --tomb-raider-interval-ms=0 \
+      --tomb-raider-sleep-ms=10 \
+      --defrag-paused \
+      --defrag-max-active-per-device=1 \
+      --defrag-sleep-ms=100
+
+### 60-second mimalloc purge-delay restart
+
+The SPDK process was restarted twice against the same 200,000,000-key device
+with every option unchanged except mimalloc purge delay. Recovery throughput
+was effectively unchanged: both runs scanned near 1.71-1.72M records/s and
+became ready in about 206 seconds.
+
+With purge disabled, ready-state allocator live bytes were 27.45 GB while RSS
+was 74.83 GB; allocator active was 93.23 GB. With a 60,000 ms delay, RSS was
+52.31 GB immediately after recovery and 27.53 GB after one purge cycle, while
+live bytes remained 27.45 GB. SPDK additionally mapped 3.72 GiB of hugetlb
+memory from the separately configured 4 GiB hugepage pool.
+
+This demonstrates recovery-time retained pages rather than a larger live
+index. Mimalloc can reuse compatible pages, but per-thread heaps, size classes,
+hash-table growth, and abandoned segments prevent arbitrary immediate reuse.
+On allocation failure mimalloc forces a collect/purge and retries once, but it
+does not proactively monitor Linux `MemAvailable` or cgroup pressure. Linux may
+invoke the OOM killer before that retry, and `purge=-1` disables OS purging even
+for the forced collect path. Keep the 60-second delay for the dual-instance A/B
+unless a controlled latency test explicitly changes it.
 
 `--data-file-size-mb` no longer exists. Raw block devices use their
 persisted or detected full capacity, so passing the old option aborts startup.
