@@ -17,7 +17,10 @@ and uses the Prometheus text exposition format.
 - `keylane_command_calls_total{command}`: completed commands by command name.
 - `keylane_command_duration_seconds`: command execution histogram, from
   dispatch through reply construction; socket response writes are excluded.
-- `keylane_connected_clients`: current Redis client connections.
+- `keylane_connections`: all current TCP connections, including Redis clients,
+  Prometheus scrapes, and replication connections.
+- `keylane_connected_clients`: current Redis client connections. This is always
+  less than or equal to `keylane_connections`.
 
 For example, per-command QPS and aggregate p99 latency are:
 

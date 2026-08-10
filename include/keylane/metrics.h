@@ -35,6 +35,7 @@ struct CommandMetricTotals {
 
 struct WorkerMetricsSnapshot {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
+  std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
   std::uint64_t defrag_successes_ = 0;
   std::uint64_t defrag_resource_exhausted_ = 0;

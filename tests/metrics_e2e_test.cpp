@@ -315,7 +315,12 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   const std::string_view body(response.data() + body_offset + 4,
                               response.size() - body_offset - 4);
   EXPECT_GE(MetricValue(body, "keylane_commands_total"), 3);
-  EXPECT_EQ(MetricValue(body, "keylane_connected_clients"), 1);
+  const std::uint64_t connections = MetricValue(body, "keylane_connections");
+  const std::uint64_t connected_clients =
+      MetricValue(body, "keylane_connected_clients");
+  EXPECT_GE(connections, 2);
+  EXPECT_EQ(connected_clients, 1);
+  EXPECT_LE(connected_clients, connections);
   EXPECT_GT(MetricValue(body, "keylane_storage_capacity_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_storage_available_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_filesystem_available_bytes"), 0);

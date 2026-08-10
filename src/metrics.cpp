@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "absl/strings/str_cat.h"
 #include "celer/net/http_service.h"
@@ -125,8 +126,12 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   result.counter_frequency_ = g_counter_frequency;
   for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
     // Copy on the owner rather than reading its live cache lines remotely.
-    const WorkerMetricsShard shard = co_await celer::SubmitTo(
-        worker, [worker] { return g_worker_metrics[worker]; });
+    const auto [shard, connections] =
+        co_await celer::SubmitTo(worker, [worker] {
+          return std::pair{g_worker_metrics[worker],
+                           celer::ThisWorker().self_->ActiveConnectionCount()};
+        });
+    result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
     result.defrag_successes_ += shard.defrag_successes_;
     result.defrag_resource_exhausted_ += shard.defrag_resource_exhausted_;
@@ -312,6 +317,11 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
 
   absl::StrAppend(
       &output,
+      "# HELP keylane_connections Current TCP connections, including Redis "
+      "clients, metrics scrapes, and replication.\n"
+      "# TYPE keylane_connections gauge\n"
+      "keylane_connections ",
+      worker_metrics.connections_, "\n",
       "# HELP keylane_connected_clients Current Redis client connections.\n"
       "# TYPE keylane_connected_clients gauge\n"
       "keylane_connected_clients ",
