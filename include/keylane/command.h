@@ -38,6 +38,7 @@ enum class CommandKind {
   kScan,
   kSelect,
   kSet,
+  kLPush,
   kMSet,
   kMGet,
   kMulti,

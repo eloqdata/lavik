@@ -268,5 +268,17 @@ if (BUILD_TESTING)
       COMMAND keylane_extent_recovery_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_extent_recovery_e2e PROPERTIES TIMEOUT 600)
+
+    add_executable(keylane_list_e2e_test
+      tests/list_e2e_test.cpp
+    )
+    target_link_libraries(keylane_list_e2e_test
+      PRIVATE keylane::module GTest::gtest
+    )
+    add_test(
+      NAME keylane_list_e2e
+      COMMAND keylane_list_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 300)
   endif()
 endif()

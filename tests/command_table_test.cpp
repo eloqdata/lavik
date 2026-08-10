@@ -64,6 +64,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("get", CommandKind::kGet);
   CheckKind("GeT", CommandKind::kGet);
   CheckKind("SET", CommandKind::kSet);
+  CheckKind("LPUSH", CommandKind::kLPush);
   CheckKind("DEL", CommandKind::kDel);
   CheckKind("EXISTS", CommandKind::kExists);
   CheckKind("INCR", CommandKind::kIncr);
@@ -90,8 +91,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
-  const char* write_cmds[] = {"set",     "incr",    "del",     "expire",
-                              "pexpire", "persist", "flushdb", "flushall"};
+  const char* write_cmds[] = {"set",     "lpush",   "incr",
+                              "del",     "expire",  "pexpire",
+                              "persist", "flushdb", "flushall"};
   const char* read_cmds[] = {"get",    "strlen", "ttl", "pttl",
                              "exists", "dbsize", "scan"};
   for (const char* name : write_cmds) {
@@ -109,9 +111,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                  std::string(name) + " should not have kCmdWrite");
   }
   {
-    const char* gated[] = {"dbsize",  "scan", "del",  "exists", "get",
-                           "strlen",  "set",  "incr", "expire", "pexpire",
-                           "persist", "ttl",  "pttl"};
+    const char* gated[] = {"dbsize",  "scan",    "del",   "exists", "get",
+                           "strlen",  "set",     "lpush", "incr",   "expire",
+                           "pexpire", "persist", "ttl",   "pttl"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
@@ -137,9 +139,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                        spec->first_key_ == 0,
                    std::string(name) + " should be keyless");
     }
-    const char* keyed[] = {"get",     "set",    "del",    "exists",
-                           "incr",    "strlen", "expire", "pexpire",
-                           "persist", "ttl",    "pttl"};
+    const char* keyed[] = {"get",     "set",     "lpush",  "del",
+                           "exists",  "incr",    "strlen", "expire",
+                           "pexpire", "persist", "ttl",    "pttl"};
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -156,6 +158,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("set", 2, false);
   CheckArity("set", 3, true);
   CheckArity("set", 8, true);  // options validated by the parser, not arity
+  CheckArity("lpush", 2, false);
+  CheckArity("lpush", 3, true);
+  CheckArity("lpush", 100, true);
   CheckArity("expire", 3, true);
   CheckArity("expire", 4, true);
   CheckArity("expire", 2, false);

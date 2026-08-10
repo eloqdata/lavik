@@ -422,6 +422,7 @@ class ReplicationManager::Impl {
       if (EncodedRecordBytes(records[begin]) + 2 + 8 + 4 > kMaxApplyPayload) {
         const SnapshotRecord& large = records[begin];
         if (large.kind_ != SnapshotRecord::Kind::kValue ||
+            large.value_type_ != storage::ValueType::kString ||
             large.value_.size() > storage::kMaxStringBytes) {
           co_return absl::Status(absl::StatusCode::kOutOfRange,
                                  "replicated record exceeds RPC payload limit");

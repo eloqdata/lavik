@@ -61,6 +61,7 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
   std::size_t keys = 0;
   switch (request.kind_) {
     case CommandKind::kSet:
+    case CommandKind::kLPush:
     case CommandKind::kIncr:
       keys = 1;
       break;
@@ -1029,6 +1030,11 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
              : reply_builder.AppendError("ERR ", status.message());
 }
 
+bool IsMissingStringValue(const absl::Status& status) {
+  return status.code() == absl::StatusCode::kNotFound ||
+         status.message().starts_with("WRONGTYPE ");
+}
+
 absl::StatusOr<storage::SetOptions> ParseSetOptions(
     const std::vector<std::string>& args) {
   storage::SetOptions options;
@@ -1149,8 +1155,7 @@ Task<CommandReply> ExecuteStorageCommand(
         if (value.status().code() == absl::StatusCode::kNotFound) {
           reply.encoded_ = reply_builder.AppendNullBulkString();
         } else {
-          reply.encoded_ = reply_builder.AppendError(
-              absl::StrCat("ERR ", value.status().message()));
+          reply.encoded_ = AppendStorageError(reply_builder, value.status());
         }
       } else {
         reply.disk_value_.emplace(std::move(*value));
@@ -1187,6 +1192,19 @@ Task<CommandReply> ExecuteStorageCommand(
                              ? reply_builder.AppendSimpleString("OK")
                              : reply_builder.AppendNullBulkString();
       }
+      co_return reply;
+    }
+
+    case CommandKind::kLPush: {
+      std::vector<std::string_view> values;
+      values.reserve(args.size() - 2);
+      for (std::size_t index = 2; index < args.size(); ++index) {
+        values.push_back(args[index]);
+      }
+      auto size = co_await g_storage->ListPush(request.db_id_, args[1], values);
+      reply.encoded_ =
+          size.ok() ? reply_builder.AppendInteger(static_cast<long long>(*size))
+                    : AppendStorageError(reply_builder, size.status());
       co_return reply;
     }
 
@@ -1529,6 +1547,18 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                  : EncodeNullBulkString();
     }
 
+    case CommandKind::kLPush: {
+      std::vector<std::string_view> values;
+      values.reserve(args.size() - 2);
+      for (std::size_t index = 2; index < args.size(); ++index) {
+        values.push_back(args[index]);
+      }
+      auto size = co_await g_storage->ListPushLocked(db_id, args[1], digest,
+                                                     values, tx);
+      co_return size.ok() ? EncodeInteger(static_cast<long long>(*size))
+                          : EncodeStorageError(size.status());
+    }
+
     case CommandKind::kStrlen: {
       auto length =
           co_await g_storage->StringLengthLocked(db_id, args[1], digest);
@@ -1662,7 +1692,7 @@ Task<absl::Status> ReadFrameIntoSlot(std::uint8_t db, const std::string* key,
   if (value.ok()) {
     const auto bytes = value->network_bytes();
     slot->emplace(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  } else if (value.status().code() != absl::StatusCode::kNotFound) {
+  } else if (!IsMissingStringValue(value.status())) {
     status = value.status();
   }
   join->Complete(std::move(status));
@@ -1768,7 +1798,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
           const auto bytes = value->network_bytes();
           ctx->frames_[key.arg_index_ - 1].emplace(
               reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        } else if (value.status().code() != absl::StatusCode::kNotFound) {
+        } else if (!IsMissingStringValue(value.status())) {
           co_return value.status();
         }
         break;
@@ -2052,7 +2082,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
             const auto bytes = value->network_bytes();
             ctx->mget_[local][key.slot_].emplace(
                 reinterpret_cast<const char*>(bytes.data()), bytes.size());
-          } else if (value.status().code() != absl::StatusCode::kNotFound) {
+          } else if (!IsMissingStringValue(value.status())) {
             record_error(value.status());
             command_failed = true;
           }
@@ -2645,6 +2675,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kGet:
     case CommandKind::kStrlen:
     case CommandKind::kSet:
+    case CommandKind::kLPush:
     case CommandKind::kIncr:
     case CommandKind::kExpire:
     case CommandKind::kPExpire:

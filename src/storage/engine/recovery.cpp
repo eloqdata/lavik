@@ -336,7 +336,10 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           const std::uint64_t extent_bytes =
               record.logical_size_ +
               (record.key_external_ ? record.key_bytes_ : 0);
-          auto decoded = DecodeManifest(payload_span, extent_bytes);
+          auto decoded =
+              DecodeManifest(payload_span, extent_bytes,
+                             record.kind_ != RecordKind::kValue ||
+                                 record.value_type_ == ValueType::kString);
           if (!decoded.ok()) {
             co_return decoded.status();
           }
@@ -387,7 +390,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     .mutation_sequence_ = record.mutation_sequence_,
                     .allocation_epoch_ = record.allocation_epoch_,
                     .expire_at_ms_ = record.expire_at_ms_,
-                    .logical_size_ = record.logical_size_,
+                    .logical_size_ =
+                        static_cast<std::uint32_t>(record.logical_size_),
                     .record_offset_ = record_offset,
                     .total_disk_bytes_ = record.total_disk_bytes_,
                     .payload_bytes_ = record.payload_bytes_,

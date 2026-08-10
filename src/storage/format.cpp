@@ -416,6 +416,11 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (decoded.kind_ == RecordKind::kValue &&
        decoded.value_type_ == ValueType::kNone) ||
+      (decoded.kind_ == RecordKind::kValue &&
+       ((decoded.value_type_ == ValueType::kString &&
+         decoded.logical_size_ > kMaxStringBytes) ||
+        (decoded.value_type_ != ValueType::kString &&
+         decoded.logical_size_ > std::numeric_limits<std::uint32_t>::max()))) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
       decoded.key_bytes_ > MaxKeyBytes() ||
       decoded.header_bytes_ !=

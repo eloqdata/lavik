@@ -23,6 +23,7 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdWrite | kCmdGlobal | kCmdNoKeys},
     {"get", CommandKind::kGet, 2, 2, 1, 1, 1, kKeyedRead},
     {"set", CommandKind::kSet, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"lpush", CommandKind::kLPush, 3, 0, 1, 1, 1, kKeyedWrite},
     {"strlen", CommandKind::kStrlen, 2, 2, 1, 1, 1, kKeyedRead},
     {"incr", CommandKind::kIncr, 2, 2, 1, 1, 1, kKeyedWrite},
     {"expire", CommandKind::kExpire, 3, 4, 1, 1, 1, kKeyedWrite},

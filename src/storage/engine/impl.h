@@ -63,9 +63,15 @@ struct RecordLocation {
   std::uint64_t mutation_sequence_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t expire_at_ms_ = 0;
-  std::uint64_t logical_size_ = 0;
+  // Redis strings are capped at 512 MiB, so their logical byte length fits in
+  // 32 bits. Collection cardinalities use the same field and are consequently
+  // capped at UINT32_MAX.
+  std::uint32_t logical_size_ = 0;
   std::uint32_t record_offset_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
+  // Serialized bytes following the record header. Unlike logical_size_, this
+  // remains a byte count for collection values whose Redis-visible size is
+  // their element count.
   std::uint32_t payload_bytes_ = 0;
   std::uint32_t relocation_sequence_ = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
@@ -88,8 +94,8 @@ struct RecordLocation {
   // unclaimed proved nothing on disk needs it. False outside rounds, and
   // any overwrite resets it, exempting concurrently-touched keys.
   bool unclaimed_ : 1 = false;
-  RecordKind kind_ = RecordKind::kValue;
-  ValueType value_type_ = ValueType::kNone;
+  RecordKind kind_ : 2 = RecordKind::kValue;
+  ValueType value_type_ : 3 = ValueType::kNone;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
     return block_id_ == other.block_id_ &&
@@ -100,8 +106,10 @@ struct RecordLocation {
 
 using RecordIndex = ScanHashMap<RecordLocation>;
 
-static_assert(sizeof(RecordLocation) == 72);
-static_assert(sizeof(RecordIndex::Entry) == 88);
+static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
+static_assert(sizeof(RecordLocation) == 64);
+static_assert(alignof(RecordLocation) == 8);
+static_assert(sizeof(RecordIndex::Entry) == 80);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -160,7 +168,8 @@ inline bool IsExpired(const RecordLocation& location,
 }
 
 inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>
-DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
+DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size,
+               bool validate_logical_bytes = true) {
   if (payload.size() < sizeof(ExtentManifestHeader)) {
     return absl::Status(absl::StatusCode::kInternal,
                         "external value manifest is truncated");
@@ -189,7 +198,8 @@ DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size) {
     }
     total += ref.payload_bytes_;
   }
-  if (total != logical_size || total > kMaxRecordPayloadBytes) {
+  if ((validate_logical_bytes && total != logical_size) ||
+      total > kMaxRecordPayloadBytes) {
     return absl::Status(absl::StatusCode::kInternal,
                         "extent manifest logical size mismatch");
   }
@@ -991,6 +1001,15 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options, TxShardWrites* tx = nullptr);
 
+  Task<absl::StatusOr<std::uint64_t>> ListPush(
+      std::uint8_t db_id, std::string_view key,
+      std::span<const std::string_view> values);
+
+  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
+  Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
+
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
@@ -1538,13 +1557,12 @@ class StorageEngine::Impl {
   WriteExtentValueLocked(WorkerStore& store, std::string_view first,
                          std::string_view second = {});
 
-  Task<absl::Status> AppendLocked(WorkerStore& store,
-                                  WorkerStore::PartitionStore& partition,
-                                  std::uint8_t db_id, std::string_view key,
-                                  std::string_view value, RecordKind kind,
-                                  ValueType value_type,
-                                  std::uint64_t expire_at_ms,
-                                  TxShardWrites* tx = nullptr);
+  Task<absl::Status> AppendLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, std::string_view value,
+      RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
+      TxShardWrites* tx = nullptr,
+      std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max());
 
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);

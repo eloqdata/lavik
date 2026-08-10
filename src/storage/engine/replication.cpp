@@ -145,6 +145,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
         .mutation_sequence_ = location.mutation_sequence_,
         .expire_at_ms_ = location.expire_at_ms_,
         .value_type_ = location.value_type_,
+        .logical_size_ = location.logical_size_,
         .key_ = key,
         .value_ = std::string(reinterpret_cast<const char*>(value.data()),
                               value.size()),
@@ -478,7 +479,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, manifest, kind, value_type,
           applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          0, false, true, true, key_external, applied.value_.size(), *extents);
+          0, false, true, true, key_external, applied.logical_size_, *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
@@ -487,7 +488,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
           /*txid=*/0, applied.mutation_sequence_, 0, false, true, false,
-          key_external, applied.value_.size(), nullptr);
+          key_external, applied.logical_size_, nullptr);
     }
     if (!written.ok()) {
       co_return written;

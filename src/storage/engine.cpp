@@ -136,6 +136,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
   return impl_->Set(db_id, key, value, options);
 }
 
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
+    std::uint8_t db_id, std::string_view key,
+    std::span<const std::string_view> values) {
+  return impl_->ListPush(db_id, key, values);
+}
+
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
                                                   std::string_view key) {
   return impl_->GetExpiration(db_id, key);
@@ -176,6 +182,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::string_view value, SetOptions options, TxShardWrites* tx) {
   return impl_->SetLocked(db_id, key, digest, value, options, tx);
+}
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPushLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::span<const std::string_view> values, TxShardWrites* tx) {
+  return impl_->ListPushLocked(db_id, key, digest, values, tx);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,

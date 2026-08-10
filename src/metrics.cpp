@@ -191,6 +191,8 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "select";
     case CommandKind::kSet:
       return "set";
+    case CommandKind::kLPush:
+      return "lpush";
     case CommandKind::kMSet:
       return "mset";
     case CommandKind::kMGet:

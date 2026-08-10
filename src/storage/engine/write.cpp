@@ -2,6 +2,196 @@
 
 namespace keylane::storage {
 
+namespace {
+
+constexpr std::string_view kListEncodingMagic = "KLL1";
+constexpr std::size_t kListEncodingHeaderBytes = 8;
+
+void AppendU32(std::string* output, std::uint32_t value) {
+  output->push_back(static_cast<char>(value));
+  output->push_back(static_cast<char>(value >> 8));
+  output->push_back(static_cast<char>(value >> 16));
+  output->push_back(static_cast<char>(value >> 24));
+}
+
+bool ReadU32(std::string_view input, std::size_t* offset,
+             std::uint32_t* value) {
+  if (*offset > input.size() || input.size() - *offset < sizeof(*value)) {
+    return false;
+  }
+  const auto* bytes =
+      reinterpret_cast<const unsigned char*>(input.data()) + *offset;
+  *value = static_cast<std::uint32_t>(bytes[0]) |
+           (static_cast<std::uint32_t>(bytes[1]) << 8) |
+           (static_cast<std::uint32_t>(bytes[2]) << 16) |
+           (static_cast<std::uint32_t>(bytes[3]) << 24);
+  *offset += sizeof(*value);
+  return true;
+}
+
+absl::StatusOr<std::vector<std::string_view>> DecodeList(
+    std::string_view encoded, std::uint32_t logical_size) {
+  if (encoded.size() < kListEncodingHeaderBytes ||
+      encoded.substr(0, kListEncodingMagic.size()) != kListEncodingMagic) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "invalid persisted list encoding");
+  }
+  std::size_t offset = kListEncodingMagic.size();
+  std::uint32_t count = 0;
+  if (!ReadU32(encoded, &offset, &count) || count != logical_size ||
+      count >
+          (encoded.size() - kListEncodingHeaderBytes) / sizeof(std::uint32_t)) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "persisted list length does not match metadata");
+  }
+  std::vector<std::string_view> elements;
+  elements.reserve(count);
+  for (std::uint32_t index = 0; index < count; ++index) {
+    std::uint32_t bytes = 0;
+    if (!ReadU32(encoded, &offset, &bytes) || offset > encoded.size() ||
+        bytes > encoded.size() - offset) {
+      return absl::Status(absl::StatusCode::kInternal,
+                          "persisted list element is truncated");
+    }
+    elements.emplace_back(encoded.data() + offset, bytes);
+    offset += bytes;
+  }
+  if (offset != encoded.size()) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "persisted list has trailing bytes");
+  }
+  return elements;
+}
+
+absl::StatusOr<std::string> EncodePushedList(
+    std::span<const std::string_view> pushed,
+    std::span<const std::string_view> existing) {
+  std::uint64_t encoded_bytes = kListEncodingHeaderBytes;
+  auto account = [&encoded_bytes](std::string_view element) {
+    if (element.size() > kMaxStringBytes ||
+        encoded_bytes > kMaxStringBytes - sizeof(std::uint32_t) ||
+        element.size() >
+            kMaxStringBytes - encoded_bytes - sizeof(std::uint32_t)) {
+      return false;
+    }
+    encoded_bytes += sizeof(std::uint32_t) + element.size();
+    return true;
+  };
+  for (std::string_view element : pushed) {
+    if (!account(element)) {
+      return absl::Status(absl::StatusCode::kOutOfRange,
+                          "list payload exceeds storage limits");
+    }
+  }
+  for (std::string_view element : existing) {
+    if (!account(element)) {
+      return absl::Status(absl::StatusCode::kOutOfRange,
+                          "list payload exceeds storage limits");
+    }
+  }
+
+  if (existing.size() > std::numeric_limits<std::uint32_t>::max() ||
+      pushed.size() >
+          std::numeric_limits<std::uint32_t>::max() - existing.size()) {
+    return absl::Status(absl::StatusCode::kOutOfRange,
+                        "list has too many elements");
+  }
+  const std::uint64_t count = pushed.size() + existing.size();
+  std::string output;
+  output.reserve(static_cast<std::size_t>(encoded_bytes));
+  output.append(kListEncodingMagic);
+  AppendU32(&output, static_cast<std::uint32_t>(count));
+  for (auto it = pushed.rbegin(); it != pushed.rend(); ++it) {
+    AppendU32(&output, static_cast<std::uint32_t>(it->size()));
+    output.append(*it);
+  }
+  for (std::string_view element : existing) {
+    AppendU32(&output, static_cast<std::uint32_t>(element.size()));
+    output.append(element);
+  }
+  return output;
+}
+
+}  // namespace
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPush(
+    std::uint8_t db_id, std::string_view key,
+    std::span<const std::string_view> values) {
+  assert(db_id < kLogicalDatabaseCount);
+  const Digest digest = ComputeDigest(key);
+  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+  co_return co_await ListPushLocked(db_id, key, digest, values);
+}
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::span<const std::string_view> values, TxShardWrites* tx) {
+  assert(db_id < kLogicalDatabaseCount);
+  if (values.empty()) {
+    co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                           "LPUSH requires at least one element");
+  }
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) {
+      co_return resolved.status();
+    }
+    found = *resolved;
+  }
+
+  std::vector<std::string_view> existing;
+  std::optional<LoadedValue> loaded;
+  std::uint64_t expire_at_ms = 0;
+  const bool exists = found != nullptr &&
+                      found->value_.kind_ == RecordKind::kValue &&
+                      !IsExpired(found->value_, UnixTimeMillis());
+  if (exists) {
+    if (found->value_.value_type_ != ValueType::kList) {
+      co_return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
+    expire_at_ms = found->value_.expire_at_ms_;
+    auto value = co_await LoadValue(store, db_id, key, digest, found->value_,
+                                    ExtentsFor(store, found));
+    if (!value.ok()) {
+      co_return value.status();
+    }
+    loaded.emplace(std::move(*value));
+    const auto bytes = loaded->value();
+    auto decoded =
+        DecodeList(std::string_view(reinterpret_cast<const char*>(bytes.data()),
+                                    bytes.size()),
+                   found->value_.logical_size_);
+    if (!decoded.ok()) {
+      co_return decoded.status();
+    }
+    existing = std::move(*decoded);
+  }
+
+  auto encoded = EncodePushedList(values, existing);
+  if (!encoded.ok()) {
+    co_return encoded.status();
+  }
+  loaded.reset();
+  const std::uint64_t new_size = values.size() + existing.size();
+  absl::Status status = co_await AppendLocked(
+      store, partition, db_id, key, *encoded, RecordKind::kValue,
+      ValueType::kList, expire_at_ms, tx, new_size);
+  if (!status.ok()) {
+    co_return status;
+  }
+  co_return new_size;
+}
+
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
                                                          std::string_view key,
                                                          std::string_view value,
@@ -153,7 +343,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                          value_bytes.size());
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
-      previous.value_type_, expire_at_ms, tx);
+      previous.value_type_, expire_at_ms, tx, previous.logical_size_);
   if (!status.ok()) {
     co_return status;
   }
@@ -779,7 +969,10 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, std::string_view value,
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
-    TxShardWrites* tx) {
+    TxShardWrites* tx, std::uint64_t logical_size) {
+  if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
+    logical_size = value.size();
+  }
   const Digest digest = ComputeDigest(key);
   // Every real keyspace modification funnels through here (client writes,
   // deletes, expiration rewrites, active expiry): invalidate watchers.
@@ -803,7 +996,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, 0, false, true, true, key_external,
-        value.size(), *extents, nullptr, nullptr, tx);
+        logical_size, *extents, nullptr, nullptr, tx);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -811,7 +1004,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     status = co_await WriteRecordLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, 0, false, true, false, key_external,
-        value.size(), nullptr, nullptr, nullptr, tx);
+        logical_size, nullptr, nullptr, nullptr, tx);
   }
   if (status.ok() && partition.capture_deltas_) {
     AppendDelta(partition, SnapshotRecord{
@@ -823,6 +1016,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                .mutation_sequence_ = mutation_sequence,
                                .expire_at_ms_ = expire_at_ms,
                                .value_type_ = value_type,
+                               .logical_size_ = logical_size,
                                .key_ = std::string(key),
                                .value_ = std::string(value),
                            });
@@ -876,10 +1070,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       (kind == RecordKind::kTombstone &&
        (value_type != ValueType::kNone || expire_at_ms != 0 ||
         logical_size != 0 || (!external && !value.empty()))) ||
-      (external &&
-       (extents == nullptr || extents->empty() ||
-        (kind == RecordKind::kTombstone && !key_external) ||
-        (kind == RecordKind::kValue && value_type != ValueType::kString))) ||
+      (external && (extents == nullptr || extents->empty() ||
+                    (kind == RecordKind::kTombstone && !key_external))) ||
       (key_external && key.empty())) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid value type or expiration metadata");
@@ -888,27 +1080,37 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "key exceeds the Redis-compatible 512 MiB limit");
   }
-  if (logical_size > kMaxStringBytes ||
-      logical_size + (key_external ? key.size() : 0) > kMaxRecordPayloadBytes) {
+  const bool invalid_logical_size =
+      (value_type == ValueType::kString && logical_size > kMaxStringBytes) ||
+      (value_type != ValueType::kString &&
+       logical_size > std::numeric_limits<std::uint32_t>::max());
+  const std::uint64_t key_prefix = key_external ? key.size() : 0;
+  if (invalid_logical_size || value.size() > kMaxRecordPayloadBytes ||
+      key_prefix > kMaxRecordPayloadBytes - value.size()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record key and value exceed storage limits");
   }
   if (external) {
-    const std::uint64_t expected_extent_bytes =
-        logical_size + (key_external ? key.size() : 0);
     std::uint64_t extent_bytes = 0;
     for (const ExtentRef& ref : *extents) {
       if (ref.payload_bytes_ == 0 ||
-          ref.payload_bytes_ > expected_extent_bytes - extent_bytes) {
+          ref.payload_bytes_ > kMaxRecordPayloadBytes - extent_bytes) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid external payload manifest");
       }
       extent_bytes += ref.payload_bytes_;
     }
-    if (extent_bytes != expected_extent_bytes) {
+    const bool exact_extent_bytes =
+        kind != RecordKind::kValue || value_type == ValueType::kString;
+    if (extent_bytes < key_prefix ||
+        (exact_extent_bytes && extent_bytes != key_prefix + logical_size)) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "external payload length mismatch");
     }
+  } else if (kind == RecordKind::kValue && value_type == ValueType::kString &&
+             value.size() != logical_size) {
+    co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                           "inline string length mismatch");
   }
   const std::size_t record_header_bytes =
       RecordHeaderBytes(key.size(), key_external);
@@ -1147,7 +1349,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .mutation_sequence_ = mutation_sequence,
       .allocation_epoch_ = updated.allocation_epoch_,
       .expire_at_ms_ = expire_at_ms,
-      .logical_size_ = logical_size,
+      .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .record_offset_ = record_offset,
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),

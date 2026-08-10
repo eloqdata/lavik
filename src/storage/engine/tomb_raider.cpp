@@ -508,9 +508,11 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         std::string loaded_key;
         if (record.key_external_) [[unlikely]] {
           if (record.external_) {
-            auto manifest = DecodeManifest(
-                payload, static_cast<std::uint64_t>(record.key_bytes_) +
-                             record.logical_size_);
+            auto manifest =
+                DecodeManifest(payload,
+                               static_cast<std::uint64_t>(record.key_bytes_) +
+                                   record.logical_size_,
+                               record.value_type_ == ValueType::kString);
             if (!manifest.ok()) {
               co_return manifest.status();
             }

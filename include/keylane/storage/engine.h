@@ -335,6 +335,9 @@ class StorageEngine {
                                              std::string_view key,
                                              std::string_view value,
                                              SetOptions options = {});
+  celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
+      std::uint8_t db_id, std::string_view key,
+      std::span<const std::string_view> values);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -371,6 +374,9 @@ class StorageEngine {
                                                    std::string_view value,
                                                    SetOptions options = {},
                                                    TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);

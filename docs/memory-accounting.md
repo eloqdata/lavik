@@ -74,11 +74,11 @@ entry header. Entry and key use one allocation for every key length; there is
 no 32-byte `std::string` object and no second allocation after an SSO boundary.
 Compile-time layout checks currently enforce:
 
-- `RecordLocation`: 72 bytes (previously 96).
-- index entry header: 88 bytes (previously 152, before separately allocated key
+- `RecordLocation`: 64 bytes (previously 96).
+- index entry header: 80 bytes (previously 152, before separately allocated key
   characters).
 
-The allocator charge for an entry is the size class containing `88 + key
+The allocator charge for an entry is the size class containing `80 + key
 length` bytes. Bucket pointer/tag overhead is separate: each 64-byte bucket
 targets six entries, about 10.7 bytes per key at the expansion threshold and
 about twice that immediately after a table doubles. Incremental rehashing can

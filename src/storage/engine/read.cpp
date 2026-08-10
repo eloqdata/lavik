@@ -40,6 +40,11 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     }
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
   }
+  if (found->value_.value_type_ != ValueType::kString) {
+    co_return absl::Status(
+        absl::StatusCode::kInvalidArgument,
+        "WRONGTYPE Operation against a key holding the wrong kind of value");
+  }
   if (trace != nullptr) {
     trace->hit_ = true;
     trace->lookup_done_ns_ = ReadTraceNowNanos();
@@ -740,22 +745,41 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                                             ExtentManifest extents,
                                             std::size_t key_bytes,
                                             ReadLatencyTrace* trace) {
-  if (!location.external_ || extents == nullptr ||
-      location.logical_size_ > kMaxStringBytes) {
+  if (!location.external_ || extents == nullptr) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value has no valid extent manifest");
+  }
+  const std::uint64_t key_prefix = location.key_external_ ? key_bytes : 0;
+  std::uint64_t extent_bytes = 0;
+  for (const ExtentRef& ref : *extents) {
+    if (ref.payload_bytes_ == 0 ||
+        ref.payload_bytes_ > kMaxRecordPayloadBytes - extent_bytes) {
+      co_return absl::Status(absl::StatusCode::kInternal,
+                             "invalid external value manifest");
+    }
+    extent_bytes += ref.payload_bytes_;
+  }
+  if (extent_bytes < key_prefix) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external key exceeds extent payload");
+  }
+  const std::uint64_t value_bytes = extent_bytes - key_prefix;
+  if (location.value_type_ == ValueType::kString &&
+      value_bytes != location.logical_size_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external string length does not match metadata");
   }
   if (trace != nullptr) {
     trace->buffer_acquire_start_ns_ = ReadTraceNowNanos();
   }
   auto acquired = co_await store.buffers_.AcquireReadBuffer(
-      static_cast<std::size_t>(location.logical_size_));
+      static_cast<std::size_t>(value_bytes));
   if (!acquired.ok()) {
     co_return acquired.status();
   }
   ReadBufferLease output = std::move(*acquired);
   FixedBuffer destination = output.io_buffer();
-  if (destination.size_ < location.logical_size_) {
+  if (destination.size_ < value_bytes) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "external value exceeds read buffer capacity");
   }
@@ -767,14 +791,11 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   if (trace != nullptr) {
     trace->io_submit_ns_ = ReadTraceNowNanos();
   }
-  const std::uint64_t key_prefix = location.key_external_ ? key_bytes : 0;
-  const std::uint64_t expected_extent_bytes =
-      key_prefix + location.logical_size_;
   std::uint64_t extent_offset = 0;
   std::size_t output_offset = 0;
   for (std::size_t index = 0; index < extents->size(); ++index) {
     const ExtentRef& ref = extents->at(index);
-    if (extent_offset + ref.payload_bytes_ > expected_extent_bytes) {
+    if (extent_offset + ref.payload_bytes_ > extent_bytes) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "extent header does not match manifest");
     }
@@ -824,8 +845,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     output_offset += copy_bytes;
     extent_offset = extent_end;
   }
-  if (extent_offset != expected_extent_bytes ||
-      output_offset != location.logical_size_) {
+  if (extent_offset != extent_bytes || output_offset != value_bytes) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value length does not match manifest");
   }
@@ -911,11 +931,6 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
       co_return absl::Status(absl::StatusCode::kInternal,
                              "external value requires extent loading");
     }
-    if (location.logical_size_ > io.size_) {
-      co_return absl::Status(absl::StatusCode::kOutOfRange,
-                             "value exceeds registered read buffer capacity");
-    }
-
     const std::byte* record_bytes =
         in_mem_buffer.data_ + location.record_offset_;
     RecordHeader record{};
@@ -951,7 +966,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
                              "record key does not match location");
     }
     const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
-    if (value_bytes != record.logical_size_) {
+    if (record.value_type_ == ValueType::kString &&
+        value_bytes != record.logical_size_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "inline value length does not match metadata");
     }
@@ -1048,7 +1064,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
                            "record key does not match location");
   }
   const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
-  if (value_bytes != record.logical_size_) {
+  if (record.value_type_ == ValueType::kString &&
+      value_bytes != record.logical_size_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "inline value length does not match metadata");
   }

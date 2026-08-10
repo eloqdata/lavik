@@ -698,9 +698,12 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     std::string loaded_key;
     if (record.key_external_) [[unlikely]] {
       if (record.external_) {
-        auto decoded = DecodeManifest(
-            payload, static_cast<std::uint64_t>(record.key_bytes_) +
-                         record.logical_size_);
+        auto decoded =
+            DecodeManifest(payload,
+                           static_cast<std::uint64_t>(record.key_bytes_) +
+                               record.logical_size_,
+                           record.kind_ != RecordKind::kValue ||
+                               record.value_type_ == ValueType::kString);
         if (!decoded.ok()) {
           source.defragging_ = false;
           co_return decoded.status();
@@ -730,7 +733,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         .mutation_sequence_ = record.mutation_sequence_,
         .allocation_epoch_ = record.allocation_epoch_,
         .expire_at_ms_ = record.expire_at_ms_,
-        .logical_size_ = record.logical_size_,
+        .logical_size_ = static_cast<std::uint32_t>(record.logical_size_),
         .record_offset_ = record_offset,
         .total_disk_bytes_ = record.total_disk_bytes_,
         .payload_bytes_ = record.payload_bytes_,
@@ -745,7 +748,10 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     if (record.external_) {
       const std::uint64_t extent_bytes =
           record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
-      auto decoded = DecodeManifest(payload, extent_bytes);
+      auto decoded =
+          DecodeManifest(payload, extent_bytes,
+                         record.kind_ != RecordKind::kValue ||
+                             record.value_type_ == ValueType::kString);
       if (!decoded.ok()) {
         source.defragging_ = false;
         co_return decoded.status();
