@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "absl/strings/str_cat.h"
 #include "celer/net/server.h"
@@ -629,16 +630,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 
 }  // namespace
 
-int RunServer(std::string_view bind_ip, std::uint16_t port,
-              std::uint16_t metrics_port, unsigned thread_count,
-              int idle_timeout_ms, unsigned recv_buffer_count,
-              unsigned busy_poll_us, std::size_t registered_buffer_bytes,
-              std::uint64_t max_memory_bytes, std::uint32_t flush_max_ms,
-              std::size_t flush_size_bytes, bool verify_read_crc,
-              const std::vector<std::string>& data_files,
-              std::uint32_t tomb_raider_interval_ms,
-              std::uint32_t tomb_raider_sleep_ms,
-              ReplicationOptions replication_options) {
+int RunServer(ServerOptions options) {
   spdlog::info(
       "keylane listening on {}:{} metrics_port={} threads={} "
       "idle_timeout_ms={} "
@@ -646,11 +638,13 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
       "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
       "flush_size_bytes={} "
       "verify_read_crc={}",
-      bind_ip, port, metrics_port, thread_count, idle_timeout_ms, busy_poll_us,
-      registered_buffer_bytes, max_memory_bytes, flush_max_ms, flush_size_bytes,
-      verify_read_crc);
+      options.bind_ip_, options.port_, options.metrics_port_,
+      options.thread_count_, options.idle_timeout_ms_, options.busy_poll_us_,
+      options.registered_buffer_bytes_, options.max_memory_bytes_,
+      options.flush_max_ms_, options.flush_size_bytes_,
+      options.verify_read_crc_);
 
-  const absl::Status memory_status = InitMemoryLimit(max_memory_bytes);
+  const absl::Status memory_status = InitMemoryLimit(options.max_memory_bytes_);
   if (!memory_status.ok()) {
     spdlog::error("memory limit setup failed: {}", memory_status.message());
     return 1;
@@ -668,50 +662,52 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
   }
 
   storage::StorageEngineOptions storage_options;
-  storage_options.data_files_ = data_files;
-  storage_options.flush_max_ms_ = flush_max_ms;
-  storage_options.flush_size_bytes_ = flush_size_bytes;
-  storage_options.verify_read_crc_ = verify_read_crc;
+  storage_options.data_files_ = std::move(options.data_files_);
+  storage_options.flush_max_ms_ = options.flush_max_ms_;
+  storage_options.flush_size_bytes_ = options.flush_size_bytes_;
+  storage_options.verify_read_crc_ = options.verify_read_crc_;
   // A node accepting an upstream replication stream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority_ = replication_options.listen_port_ == 0;
-  storage_options.tomb_raider_interval_ms_ = tomb_raider_interval_ms;
-  storage_options.tomb_raider_sleep_ms_ = tomb_raider_sleep_ms;
-  storage_options.buffers_.registered_bytes_ = registered_buffer_bytes;
+  storage_options.expiration_authority_ =
+      options.replication_options_.listen_port_ == 0;
+  storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
+  storage_options.tomb_raider_sleep_ms_ = options.tomb_raider_sleep_ms_;
+  storage_options.buffers_.registered_bytes_ = options.registered_buffer_bytes_;
   storage::StorageEngine storage(std::move(storage_options));
-  absl::Status storage_status = storage.Prepare(thread_count);
+  absl::Status storage_status = storage.Prepare(options.thread_count_);
   if (!storage_status.ok()) [[unlikely]] {
     spdlog::error("storage prepare failed: {}", storage_status.message());
     CleanupShutdownSignalHandler();
     return 1;
   }
-  ReplicationManager replication(&storage, replication_options);
+  ReplicationManager replication(&storage,
+                                 std::move(options.replication_options_));
   InitStorage(&storage, replication.replica_read_only());
-  InitWorkerMetrics(thread_count);
-  SetServerInfo(port, thread_count);
-  tx::TxRuntime::Create(thread_count);
+  InitWorkerMetrics(options.thread_count_);
+  SetServerInfo(options.port_, options.thread_count_);
+  tx::TxRuntime::Create(options.thread_count_);
 
-  ServerOptions options;
-  options.bind_ip_ = std::string(bind_ip);
-  options.thread_count_ = thread_count;
-  options.idle_timeout_ms_ = idle_timeout_ms;
-  options.recv_buffer_count_ = recv_buffer_count;
-  options.busy_poll_us_ = busy_poll_us;
+  celer::ServerOptions runtime_options;
+  runtime_options.bind_ip_ = options.bind_ip_;
+  runtime_options.thread_count_ = options.thread_count_;
+  runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
+  runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
+  runtime_options.busy_poll_us_ = options.busy_poll_us_;
 
-  RedisService redis(port, &storage, &replication);
+  RedisService redis(options.port_, &storage, &replication);
   std::unique_ptr<Service> metrics;
   Server server;
   server.AddService(&redis);
-  if (metrics_port != 0) {
-    metrics = CreateMetricsService(metrics_port, &storage);
+  if (options.metrics_port_ != 0) {
+    metrics = CreateMetricsService(options.metrics_port_, &storage);
     server.AddService(metrics.get());
   }
   if (celer::Service* replication_service = replication.service();
       replication_service != nullptr) {
     server.AddService(replication_service);
   }
-  auto start_status = server.Start(options);
+  auto start_status = server.Start(runtime_options);
   if (!start_status.ok()) [[unlikely]] {
     spdlog::error("server start failed: {}", start_status.message());
     CleanupShutdownSignalHandler();
