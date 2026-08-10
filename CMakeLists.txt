@@ -71,12 +71,14 @@ add_library(keylane_module
   src/storage/engine/flush.cpp
   src/storage/engine/flush_db.cpp
   src/storage/engine/init.cpp
+  src/storage/engine/metrics.cpp
   src/storage/engine/read.cpp
   src/storage/engine/recovery.cpp
   src/storage/engine/replication.cpp
   src/storage/engine/tomb_raider.cpp
   src/storage/engine/write.cpp
   src/storage/format.cpp
+  src/metrics.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/command.cpp
@@ -217,6 +219,16 @@ if (BUILD_TESTING)
       COMMAND keylane_ttl_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_ttl_e2e PROPERTIES TIMEOUT 90)
+
+    add_executable(keylane_metrics_e2e_test
+      tests/metrics_e2e_test.cpp
+    )
+    target_link_libraries(keylane_metrics_e2e_test PRIVATE GTest::gtest)
+    add_test(
+      NAME keylane_metrics_e2e
+      COMMAND keylane_metrics_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_metrics_e2e PROPERTIES TIMEOUT 120)
 
     add_executable(keylane_extent_recovery_e2e_test
       tests/extent_recovery_e2e_test.cpp

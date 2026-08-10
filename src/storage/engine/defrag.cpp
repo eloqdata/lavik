@@ -1,4 +1,5 @@
 #include "impl.h"
+#include "keylane/metrics.h"
 
 namespace keylane::storage {
 
@@ -161,6 +162,7 @@ Task<absl::Status> StorageEngine::Impl::StartQueuedDefrag(
     co_return absl::OkStatus();
   }
   store.defrag_waiting_ = false;
+  SetDefragPending(false);
   if (shutdown_flush_requested_.load(std::memory_order_acquire) ||
       store.defrag_running_ || store.defrag_queue_.empty() ||
       DeviceIndexForBlock(store.defrag_queue_.front()) != device_index) {
@@ -169,6 +171,7 @@ Task<absl::Status> StorageEngine::Impl::StartQueuedDefrag(
     co_return absl::OkStatus();
   }
   store.defrag_running_ = true;
+  SetDefragActive(true);
   store.active_defrag_device_ = device_index;
   store.worker_->SpawnBackground(DefragOne(&store));
   co_return absl::OkStatus();
@@ -209,11 +212,13 @@ void StorageEngine::Impl::RequestDefrag(WorkerStore& store) {
   const std::size_t device_index =
       DeviceIndexForBlock(store.defrag_queue_.front());
   store.defrag_waiting_ = true;
+  SetDefragPending(true);
   store.defrag_waiting_device_ = device_index;
   pending_defrags_.fetch_add(1, std::memory_order_acq_rel);
   if (!defrag_ready_by_device_[device_index].enqueue(store.worker_->id())) {
     pending_defrags_.fetch_sub(1, std::memory_order_acq_rel);
     store.defrag_waiting_ = false;
+    SetDefragPending(false);
     spdlog::error("worker[{}] failed to enqueue defrag request for device {}",
                   store.worker_->id(), devices_[device_index].id_);
     return;
@@ -224,6 +229,7 @@ void StorageEngine::Impl::RequestDefrag(WorkerStore& store) {
 void StorageEngine::Impl::FinishDefragPass(WorkerStore& store) {
   const std::size_t completed_device = store.active_defrag_device_;
   store.defrag_running_ = false;
+  SetDefragActive(false);
   // Queue this worker's next candidate before releasing the active permit,
   // so foreground allocation never observes a false no-reclaim gap.
   RequestDefrag(store);
@@ -247,6 +253,13 @@ Task<absl::Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
   candidate_state->defrag_queued_ = false;
 
   absl::Status status = co_await CleanBlockLocked(*store, candidate);
+  if (status.ok()) {
+    RecordDefragMetric(DefragMetricResult::kSuccess);
+  } else if (status.code() == absl::StatusCode::kResourceExhausted) {
+    RecordDefragMetric(DefragMetricResult::kResourceExhausted);
+  } else {
+    RecordDefragMetric(DefragMetricResult::kFailure);
+  }
   if (!status.ok()) {
     spdlog::error("worker[{}] defrag block {} failed: {}", store->worker_->id(),
                   candidate, status.message());

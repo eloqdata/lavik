@@ -43,6 +43,19 @@ struct TombRaiderTotals {
   std::uint64_t refreshed_ = 0;
 };
 
+struct StorageDeviceMetrics {
+  std::string path_;
+  std::uint64_t device_id_ = 0;
+  std::uint64_t capacity_bytes_ = 0;
+  // Space available to foreground writes after preserving the defrag reserve.
+  std::uint64_t available_bytes_ = 0;
+  std::optional<std::uint64_t> filesystem_available_bytes_;
+};
+
+struct StorageMetricsSnapshot {
+  std::vector<StorageDeviceMetrics> devices_;
+};
+
 struct ScanBatch {
   std::uint64_t cursor_ = 0;
   std::vector<std::string> keys_;
@@ -345,6 +358,7 @@ class StorageEngine {
   // Lifetime totals of the tomb raider (rounds run, tombstone entries
   // reaped, stale shielding bits cleared).
   TombRaiderTotals TombRaiderStats() const noexcept;
+  celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
   // live (non-tombstone, unexpired) value. Must run on OwnerForKey(key).

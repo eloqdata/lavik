@@ -18,8 +18,10 @@
 #include "absl/strings/str_cat.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
+#include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
 #include "keylane/command_table.h"
+#include "keylane/metrics.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
 #include "keylane/storage/engine.h"
@@ -37,8 +39,6 @@ bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
 std::chrono::steady_clock::time_point g_server_start;
-std::atomic<std::uint64_t> g_connected_clients{0};
-std::atomic<std::uint64_t> g_commands_processed{0};
 
 CommandReply BuiltReply(std::string_view encoded) {
   CommandReply reply;
@@ -1084,6 +1084,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       section == "default" || section == "all" || section == "everything";
   auto wants = [&](std::string_view name) { return all || section == name; };
 
+  std::optional<WorkerMetricsSnapshot> runtime_metrics;
+  if (wants("clients") || wants("stats")) {
+    runtime_metrics = co_await CollectWorkerMetrics();
+  }
+
   std::string info;
   if (wants("server")) {
     const auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1098,18 +1103,14 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   }
   if (wants("clients")) {
     info += "# Clients\r\n";
-    info +=
-        "connected_clients:" +
-        std::to_string(g_connected_clients.load(std::memory_order_relaxed)) +
-        "\r\n\r\n";
+    info += "connected_clients:" +
+            std::to_string(runtime_metrics->connected_clients_) + "\r\n\r\n";
   }
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     info += "# Stats\r\n";
-    info +=
-        "total_commands_processed:" +
-        std::to_string(g_commands_processed.load(std::memory_order_relaxed)) +
-        "\r\n";
+    info += "total_commands_processed:" +
+            std::to_string(runtime_metrics->TotalCalls()) + "\r\n";
     info += "tomb_raider_rounds:" + std::to_string(raider.rounds_) + "\r\n";
     info += "tomb_raider_reaped:" + std::to_string(raider.reaped_) + "\r\n";
     info += "tomb_raider_refreshed:" + std::to_string(raider.refreshed_) +
@@ -2146,18 +2147,13 @@ void SetServerInfo(std::uint16_t port, unsigned thread_count) {
   g_server_start = std::chrono::steady_clock::now();
 }
 
-void ConnectionOpened() noexcept {
-  g_connected_clients.fetch_add(1, std::memory_order_relaxed);
-}
+void ConnectionOpened() noexcept { RecordConnectionOpened(); }
 
-void ConnectionClosed() noexcept {
-  g_connected_clients.fetch_sub(1, std::memory_order_relaxed);
-}
+void ConnectionClosed() noexcept { RecordConnectionClosed(); }
 
-Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest request,
-                                   ReplyBuilder& reply_builder) {
-  g_commands_processed.fetch_add(1, std::memory_order_relaxed);
+Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
+                                       CommandRequest request,
+                                       ReplyBuilder& reply_builder) {
   const CommandKind kind = request.kind_;
   if (ctx.in_multi_) {
     switch (kind) {
@@ -2241,6 +2237,17 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       break;
   }
   co_return co_await ExecuteCommand(request, reply_builder);
+}
+
+Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
+                                   CommandRequest request,
+                                   ReplyBuilder& reply_builder) {
+  const CommandKind kind = request.kind_;
+  const std::uint64_t started = celer::ReadCycleCounter();
+  CommandReply reply =
+      co_await DispatchCommandImpl(ctx, std::move(request), reply_builder);
+  RecordCommandMetric(kind, celer::ReadCycleCounter() - started);
+  co_return reply;
 }
 
 Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {

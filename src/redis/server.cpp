@@ -23,6 +23,7 @@
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
+#include "keylane/metrics.h"
 #include "keylane/replication.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
@@ -611,21 +612,22 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(std::string_view bind_ip, std::uint16_t port,
-              unsigned thread_count, int idle_timeout_ms,
-              unsigned recv_buffer_count, unsigned busy_poll_us,
-              std::size_t registered_buffer_bytes, std::uint32_t flush_max_ms,
-              std::size_t flush_size_bytes, bool verify_read_crc,
-              const std::vector<std::string>& data_files,
+              std::uint16_t metrics_port, unsigned thread_count,
+              int idle_timeout_ms, unsigned recv_buffer_count,
+              unsigned busy_poll_us, std::size_t registered_buffer_bytes,
+              std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
+              bool verify_read_crc, const std::vector<std::string>& data_files,
               std::uint32_t tomb_raider_interval_ms,
               std::uint32_t tomb_raider_sleep_ms,
               ReplicationOptions replication_options) {
   spdlog::info(
-      "keylane listening on {}:{} threads={} idle_timeout_ms={} "
+      "keylane listening on {}:{} metrics_port={} threads={} "
+      "idle_timeout_ms={} "
       "busy_poll_us={} "
       "registered_buffer_bytes={} per worker flush_max_ms={} "
       "flush_size_bytes={} "
       "verify_read_crc={}",
-      bind_ip, port, thread_count, idle_timeout_ms, busy_poll_us,
+      bind_ip, port, metrics_port, thread_count, idle_timeout_ms, busy_poll_us,
       registered_buffer_bytes, flush_max_ms, flush_size_bytes, verify_read_crc);
 
   const auto signal_status = InstallShutdownSignalHandler();
@@ -655,6 +657,7 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
   }
   ReplicationManager replication(&storage, replication_options);
   InitStorage(&storage, replication.replica_read_only());
+  InitWorkerMetrics(thread_count);
   SetServerInfo(port, thread_count);
   tx::TxRuntime::Create(thread_count);
 
@@ -666,8 +669,13 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
   options.busy_poll_us_ = busy_poll_us;
 
   RedisService redis(port, &storage, &replication);
+  std::unique_ptr<Service> metrics;
   Server server;
   server.AddService(&redis);
+  if (metrics_port != 0) {
+    metrics = CreateMetricsService(metrics_port, &storage);
+    server.AddService(metrics.get());
+  }
   if (celer::Service* replication_service = replication.service();
       replication_service != nullptr) {
     server.AddService(replication_service);

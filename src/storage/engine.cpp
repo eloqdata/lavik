@@ -51,6 +51,10 @@ TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
 }
 
+Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {
+  return impl_->CollectMetrics();
+}
+
 Task<absl::Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
   return impl_->FlushDbDetach(db_id);
 }

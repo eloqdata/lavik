@@ -175,6 +175,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         .data_block_begin_ = data_block_begin,
         .data_block_count_ = capacity_blocks - data_block_begin,
         .file_index_ = static_cast<std::uint32_t>(i),
+        .is_block_device_ = path_info[i].is_block_device_,
     });
   }
   std::sort(devices_.begin(), devices_.end(),

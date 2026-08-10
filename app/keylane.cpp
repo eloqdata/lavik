@@ -13,6 +13,7 @@ int main(int argc, char** argv) {
 
   std::string bind_ip = "127.0.0.1";
   std::uint16_t port = 6379;
+  std::uint16_t metrics_port = 0;
   unsigned threads = 1;
   int idle_timeout_ms = -1;
   unsigned recv_buffer_count = 1024;
@@ -30,6 +31,10 @@ int main(int argc, char** argv) {
 
   app.add_option("-b,--bind", bind_ip, "Bind address")->capture_default_str();
   app.add_option("-p,--port", port, "Listen port")->capture_default_str();
+  app.add_option("--metrics-port", metrics_port,
+                 "Prometheus HTTP listen port (0 disables)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("-t,--threads", threads, "Worker thread count")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
@@ -112,9 +117,9 @@ int main(int argc, char** argv) {
     replication_options.target_port_ = static_cast<std::uint16_t>(parsed_port);
   }
   return keylane::RunServer(
-      bind_ip, port, threads, idle_timeout_ms, recv_buffer_count, busy_poll_us,
-      static_cast<std::size_t>(registered_buffer_mb) * kMiB, flush_max_ms,
-      static_cast<std::size_t>(flush_size_kb) * kKiB, !disable_read_crc,
-      data_files, tomb_raider_interval_ms, tomb_raider_sleep_ms,
-      std::move(replication_options));
+      bind_ip, port, metrics_port, threads, idle_timeout_ms, recv_buffer_count,
+      busy_poll_us, static_cast<std::size_t>(registered_buffer_mb) * kMiB,
+      flush_max_ms, static_cast<std::size_t>(flush_size_kb) * kKiB,
+      !disable_read_crc, data_files, tomb_raider_interval_ms,
+      tomb_raider_sleep_ms, std::move(replication_options));
 }

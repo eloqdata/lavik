@@ -641,6 +641,7 @@ struct StorageDevice {
   std::uint32_t data_block_begin_ = 1;
   std::uint64_t data_block_count_ = 0;
   std::uint32_t file_index_ = 0;
+  bool is_block_device_ = false;
 };
 
 inline constexpr std::size_t kCacheLineBytes = 64;
@@ -962,6 +963,8 @@ class StorageEngine::Impl {
         .refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed),
     };
   }
+
+  Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   void ResumeExpiration() noexcept {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
