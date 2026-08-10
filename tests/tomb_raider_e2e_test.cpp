@@ -319,6 +319,21 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "PING");
+      Expect(client.Command({"TOMBRAIDER", "OFF"}), "+OK", "TOMBRAIDER OFF");
+      const long long disabled_rounds = StatField(client, "tomb_raider_rounds");
+      std::this_thread::sleep_for(700ms);
+      if (StatField(client, "tomb_raider_rounds") != disabled_rounds) {
+        Fail("tomb raider ran while disabled");
+      }
+      if (StatField(client, "tomb_raider_enabled") != 0) {
+        Fail("tomb raider did not report disabled");
+      }
+      Expect(client.Command({"TOMBRAIDER", "INVALID"}), "-ERR syntax error",
+             "TOMBRAIDER invalid mode");
+      Expect(client.Command({"TOMBRAIDER", "ON"}), "+OK", "TOMBRAIDER ON");
+      if (StatField(client, "tomb_raider_enabled") != 1) {
+        Fail("tomb raider did not report enabled");
+      }
 
       // Reapable: the only older record expires on its own, after which
       // nothing on disk needs the tombstone.

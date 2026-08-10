@@ -802,7 +802,11 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
 
 class StorageEngine::Impl {
  public:
-  explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {}
+  explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
+    tomb_raider_enabled_.store(options_.expiration_authority_ &&
+                                   options_.tomb_raider_interval_ms_ != 0,
+                               std::memory_order_relaxed);
+  }
 
  private:
   std::size_t direct_io_alignment_ = kDirectIoAlignment;
@@ -985,7 +989,18 @@ class StorageEngine::Impl {
         .rounds_ = tomb_raider_rounds_.load(std::memory_order_relaxed),
         .reaped_ = tomb_raider_reaped_.load(std::memory_order_relaxed),
         .refreshed_ = tomb_raider_refreshed_.load(std::memory_order_relaxed),
+        .enabled_ = tomb_raider_enabled_.load(std::memory_order_relaxed),
+        .running_ = tomb_raider_running_.load(std::memory_order_relaxed),
     };
+  }
+
+  bool SetTombRaiderEnabled(bool enabled) noexcept {
+    if (enabled && (!options_.expiration_authority_ ||
+                    options_.tomb_raider_interval_ms_ == 0)) {
+      return false;
+    }
+    tomb_raider_enabled_.store(enabled, std::memory_order_release);
+    return true;
   }
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
@@ -1638,6 +1653,7 @@ class StorageEngine::Impl {
   // every one of these tasks must be short-lived or abort promptly once
   // shutdown_flush_requested_ is set.
   std::atomic<std::uint32_t> active_settlements_{0};
+  std::atomic<bool> tomb_raider_enabled_{false};
   std::atomic<bool> tomb_raider_running_{false};
   std::atomic<std::uint64_t> tomb_raider_rounds_{0};
   std::atomic<std::uint64_t> tomb_raider_reaped_{0};

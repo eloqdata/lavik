@@ -221,6 +221,25 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
       reply_builder.AppendInteger(static_cast<long long>(total)));
 }
 
+CommandReply ExecuteTombRaider(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
+  if (request.args_.size() != 2) {
+    return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'tombraider' command"));
+  }
+  bool enabled = false;
+  if (CmpCaseInsensitive(request.args_[1], "ON")) {
+    enabled = true;
+  } else if (!CmpCaseInsensitive(request.args_[1], "OFF")) {
+    return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+  }
+  if (!g_storage->SetTombRaiderEnabled(enabled)) {
+    return BuiltReply(reply_builder.AppendError(
+        "ERR tomb raider is disabled by server configuration"));
+  }
+  return BuiltReply(reply_builder.AppendSimpleString("OK"));
+}
+
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
 constexpr std::uint64_t kDbGateCountMask = ~kDbGateClosed;
 std::array<std::atomic<std::uint64_t>, storage::kLogicalDatabaseCount>
@@ -1222,8 +1241,12 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(runtime_metrics->TotalCalls()) + "\r\n";
     info += "tomb_raider_rounds:" + std::to_string(raider.rounds_) + "\r\n";
     info += "tomb_raider_reaped:" + std::to_string(raider.reaped_) + "\r\n";
-    info += "tomb_raider_refreshed:" + std::to_string(raider.refreshed_) +
-            "\r\n\r\n";
+    info +=
+        "tomb_raider_refreshed:" + std::to_string(raider.refreshed_) + "\r\n";
+    info += std::string("tomb_raider_enabled:") +
+            (raider.enabled_ ? "1\r\n" : "0\r\n");
+    info += std::string("tomb_raider_running:") +
+            (raider.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
   }
   if (wants("replication")) {
     info += "# Replication\r\n";
@@ -2420,6 +2443,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
 
     case CommandKind::kScan:
       co_return co_await ExecuteScan(request, reply_builder);
+
+    case CommandKind::kTombRaider:
+      co_return ExecuteTombRaider(request, reply_builder);
 
     case CommandKind::kDel:
     case CommandKind::kExists:

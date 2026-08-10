@@ -24,6 +24,9 @@ Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(WorkerStore* store) {
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;
     }
+    if (!tomb_raider_enabled_.load(std::memory_order_acquire)) {
+      continue;
+    }
     absl::Status round = co_await RunTombRaider();
     if (!round.ok()) {
       spdlog::error("tomb raider round failed: {}", round.message());

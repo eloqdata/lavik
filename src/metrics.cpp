@@ -209,6 +209,8 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "info";
     case CommandKind::kKeys:
       return "keys";
+    case CommandKind::kTombRaider:
+      return "tombraider";
     case CommandKind::kUnknown:
     case CommandKind::kCount:
       return "unknown";

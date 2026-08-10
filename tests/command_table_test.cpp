@@ -80,6 +80,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("SCAN", CommandKind::kScan);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
+  CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   EXPECT_CHECK(FindCommand("NOPE") == nullptr,
                "unknown command should not resolve");
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");
@@ -110,7 +111,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     const char* gated[] = {"dbsize",  "scan", "del",  "exists", "get",
                            "strlen",  "set",  "incr", "expire", "pexpire",
                            "persist", "ttl",  "pttl"};
-    const char* ungated[] = {"ping", "select", "flushdb", "flushall"};
+    const char* ungated[] = {"ping", "select", "flushdb", "flushall",
+                             "tombraider"};
     for (const char* name : gated) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(
@@ -125,8 +127,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     }
   }
   {
-    const char* no_keys[] = {"ping", "echo",    "select",  "dbsize",
-                             "scan", "flushdb", "flushall"};
+    const char* no_keys[] = {"ping", "echo",    "select",   "dbsize",
+                             "scan", "flushdb", "flushall", "tombraider"};
     for (const char* name : no_keys) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -171,6 +173,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("dbsize", 2, false);
   CheckArity("flushall", 1, true);
   CheckArity("flushall", 2, true);
+  CheckArity("tombraider", 1, false);
+  CheckArity("tombraider", 2, true);
+  CheckArity("tombraider", 3, false);
 
   // Key position resolution.
   {

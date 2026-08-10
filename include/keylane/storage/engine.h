@@ -44,6 +44,8 @@ struct TombRaiderTotals {
   std::uint64_t rounds_ = 0;
   std::uint64_t reaped_ = 0;
   std::uint64_t refreshed_ = 0;
+  bool enabled_ = false;
+  bool running_ = false;
 };
 
 struct StorageDeviceMetrics {
@@ -362,6 +364,11 @@ class StorageEngine {
   // Lifetime totals of the tomb raider (rounds run, tombstone entries
   // reaped, stale shielding bits cleared).
   TombRaiderTotals TombRaiderStats() const noexcept;
+  // Disabling lets an in-flight round finish and prevents subsequent rounds;
+  // enabling restores interval-based scheduling.
+  // Returns false when this server has no expiration authority or the
+  // configured interval is zero.
+  bool SetTombRaiderEnabled(bool enabled) noexcept;
   celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a
