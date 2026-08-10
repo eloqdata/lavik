@@ -14,6 +14,22 @@ option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
 
+set(KEYLANE_SANITIZER_BUILD OFF)
+string(CONCAT KEYLANE_COMPILER_AND_LINKER_FLAGS
+  "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} "
+  "${CMAKE_C_FLAGS_DEBUG} ${CMAKE_CXX_FLAGS_DEBUG} "
+  "${CMAKE_C_FLAGS_RELEASE} ${CMAKE_CXX_FLAGS_RELEASE} "
+  "${CMAKE_C_FLAGS_RELWITHDEBINFO} ${CMAKE_CXX_FLAGS_RELWITHDEBINFO} "
+  "${CMAKE_C_FLAGS_MINSIZEREL} ${CMAKE_CXX_FLAGS_MINSIZEREL}")
+if (KEYLANE_COMPILER_AND_LINKER_FLAGS MATCHES "-fsanitize=")
+  set(KEYLANE_SANITIZER_BUILD ON)
+endif()
+option(KEYLANE_USE_MIMALLOC "Use mimalloc for C++ allocations" ON)
+if (KEYLANE_SANITIZER_BUILD)
+  set(KEYLANE_USE_MIMALLOC OFF CACHE BOOL
+      "Use mimalloc for C++ allocations" FORCE)
+endif()
+
 find_program(KEYLANE_CLANG_FORMAT NAMES clang-format-18 clang-format)
 file(GLOB_RECURSE KEYLANE_FORMAT_FILES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp
@@ -43,6 +59,20 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
 else()
   message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
+endif()
+
+if (KEYLANE_USE_MIMALLOC)
+  if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mimalloc/CMakeLists.txt)
+    message(FATAL_ERROR
+      "mimalloc submodule not found; run git submodule update --init --recursive")
+  endif()
+  set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+  set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+  set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
+  set(MI_GUARDED OFF CACHE BOOL "" FORCE)
+  add_subdirectory(third_party/mimalloc)
 endif()
 
 if (TARGET format AND TARGET celer-format)
@@ -78,6 +108,7 @@ add_library(keylane_module
   src/storage/engine/tomb_raider.cpp
   src/storage/engine/write.cpp
   src/storage/format.cpp
+  src/memory.cpp
   src/metrics.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
@@ -102,6 +133,7 @@ target_precompile_headers(keylane_module PRIVATE
 target_compile_features(keylane_module PUBLIC cxx_std_23)
 target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_READ_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_READ_LATENCY_TRACE}>
+  KEYLANE_USE_MIMALLOC=$<BOOL:${KEYLANE_USE_MIMALLOC}>
 )
 target_link_libraries(keylane_module PUBLIC
   celer::core
@@ -113,6 +145,9 @@ target_link_libraries(keylane_module PUBLIC
   absl::statusor
   absl::strings
 )
+if (KEYLANE_USE_MIMALLOC)
+  target_link_libraries(keylane_module PUBLIC mimalloc-static)
+endif()
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(keylane_module PRIVATE -Wall -Wextra -Wpedantic)
@@ -127,6 +162,9 @@ endif()
 add_executable(keylane
   app/keylane.cpp
 )
+if (KEYLANE_USE_MIMALLOC)
+  target_sources(keylane PRIVATE app/mimalloc_new_delete.cpp)
+endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND KEYLANE_ENABLE_OPT)
   target_compile_options(keylane PRIVATE -O3 -march=native -flto=auto)
   target_link_options(keylane PRIVATE -flto=auto)

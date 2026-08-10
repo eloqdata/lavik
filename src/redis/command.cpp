@@ -21,6 +21,7 @@
 #include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
 #include "keylane/command_table.h"
+#include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
@@ -39,6 +40,59 @@ bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
 std::chrono::steady_clock::time_point g_server_start;
+
+constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
+
+std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
+  return right > std::numeric_limits<std::size_t>::max() - left
+             ? std::numeric_limits<std::size_t>::max()
+             : left + right;
+}
+
+std::size_t RequestArgumentBytes(const CommandRequest& request) noexcept {
+  std::size_t result = sizeof(CommandRequest);
+  for (const std::string& argument : request.args_) {
+    result = SaturatingAdd(result, argument.size());
+  }
+  return result;
+}
+
+std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
+  std::size_t keys = 0;
+  switch (request.kind_) {
+    case CommandKind::kSet:
+    case CommandKind::kIncr:
+      keys = 1;
+      break;
+    case CommandKind::kMSet:
+      keys = request.args_.size() > 1 ? (request.args_.size() - 1) / 2 : 0;
+      break;
+    default:
+      return 0;
+  }
+  const std::size_t index_bytes =
+      keys > std::numeric_limits<std::size_t>::max() /
+                  kEstimatedIndexBytesPerKey
+          ? std::numeric_limits<std::size_t>::max()
+          : keys * kEstimatedIndexBytesPerKey;
+  // Include parsed arguments because the cached allocator sample can precede
+  // this request by up to 100ms. Actual container growth is reconciled from
+  // mimalloc by the background sampler.
+  return SaturatingAdd(RequestArgumentBytes(request), index_bytes);
+}
+
+bool RejectForMemory(std::size_t additional_bytes) noexcept {
+  if (additional_bytes == 0 || !WouldExceedMemoryLimit(additional_bytes)) {
+    return false;
+  }
+  RecordMemoryRejection();
+  return true;
+}
+
+std::string_view AppendOomError(ReplyBuilder& reply_builder) {
+  return reply_builder.AppendError(
+      "OOM command not allowed when used memory > 'maxmemory'.");
+}
 
 CommandReply BuiltReply(std::string_view encoded) {
   CommandReply reply;
@@ -1106,6 +1160,39 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info += "connected_clients:" +
             std::to_string(runtime_metrics->connected_clients_) + "\r\n\r\n";
   }
+  if (wants("memory")) {
+    const MemoryStats memory = GetMemoryStats();
+    const double fragmentation =
+        memory.used_bytes_ == 0 ? 0.0
+                                : static_cast<double>(memory.rss_bytes_) /
+                                      static_cast<double>(memory.used_bytes_);
+    info += "# Memory\r\n";
+    info += "used_memory:" + std::to_string(memory.used_bytes_) + "\r\n";
+    info +=
+        "used_memory_human:" + HumanReadableMemory(memory.used_bytes_) + "\r\n";
+    info += "used_memory_rss:" + std::to_string(memory.rss_bytes_) + "\r\n";
+    info += "used_memory_rss_human:" + HumanReadableMemory(memory.rss_bytes_) +
+            "\r\n";
+    info +=
+        "used_memory_peak:" + std::to_string(memory.peak_used_bytes_) + "\r\n";
+    info += "used_memory_peak_human:" +
+            HumanReadableMemory(memory.peak_used_bytes_) + "\r\n";
+    info += "maxmemory:" + std::to_string(memory.max_bytes_) + "\r\n";
+    info +=
+        "maxmemory_human:" + HumanReadableMemory(memory.max_bytes_) + "\r\n";
+    info += "maxmemory_policy:noeviction\r\n";
+    info +=
+        "allocator_allocated:" + std::to_string(memory.used_bytes_) + "\r\n";
+    info +=
+        "allocator_active:" + std::to_string(memory.committed_bytes_) + "\r\n";
+    info += "allocator_resident:" + std::to_string(memory.rss_bytes_) + "\r\n";
+    info +=
+        "allocator_reserved:" + std::to_string(memory.reserved_bytes_) + "\r\n";
+    info += "mem_fragmentation_ratio:" + absl::StrCat(fragmentation) + "\r\n";
+    info +=
+        "oom_rejected_commands:" + std::to_string(memory.rejected_commands_) +
+        "\r\n\r\n";
+  }
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     info += "# Stats\r\n";
@@ -1894,6 +1981,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     co_return BuiltReply(reply_builder.AppendRaw(clean ? "*0\r\n" : "*-1\r\n"));
   }
 
+  std::size_t exec_memory_growth = 0;
+  for (const CommandRequest& command : queued) {
+    exec_memory_growth =
+        SaturatingAdd(exec_memory_growth, EstimatedMemoryGrowth(command));
+  }
+  if (RejectForMemory(exec_memory_growth)) {
+    co_await DropWatches(ctx);
+    co_return BuiltReply(AppendOomError(reply_builder));
+  }
+
   // Precompute every queued command's keys: digests, owners, slots, modes.
   std::vector<std::vector<ExecKey>> cmd_keys(queued.size());
   std::vector<std::uint8_t> dbs;  // distinct databases with keyed commands
@@ -2209,6 +2306,10 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       }
       ctx.multi_db_ = *local.selected_db_;
     }
+    if (RejectForMemory(RequestArgumentBytes(request))) {
+      ctx.multi_dirty_ = true;
+      co_return BuiltReply(AppendOomError(reply_builder));
+    }
     request.db_id_ = ctx.multi_db_;
     ctx.queued_.push_back(std::move(request));
     co_return BuiltReply(reply_builder.AppendSimpleString("QUEUED"));
@@ -2262,6 +2363,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   if (g_replica_read_only && (cmd_flags & kCmdWrite) != 0) {
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
+  }
+  if (RejectForMemory(EstimatedMemoryGrowth(request))) {
+    co_return BuiltReply(AppendOomError(reply_builder));
   }
   if (request.kind_ == CommandKind::kFlushDb ||
       request.kind_ == CommandKind::kFlushAll) {

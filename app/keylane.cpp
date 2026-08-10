@@ -19,6 +19,7 @@ int main(int argc, char** argv) {
   unsigned recv_buffer_count = 1024;
   unsigned busy_poll_us = 0;
   unsigned registered_buffer_mb = 16;
+  std::uint64_t max_memory_bytes = 0;
   std::uint32_t flush_max_ms = 1000;
   unsigned flush_size_kb = 8192;
   bool disable_read_crc = false;
@@ -53,6 +54,10 @@ int main(int argc, char** argv) {
                  "Registered storage buffer budget in MiB per worker")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_option("--max-memory,--maxmemory", max_memory_bytes,
+                 "Maximum process memory (0 uses 80% of memory capacity)")
+      ->capture_default_str()
+      ->transform(CLI::AsSizeValue(false));
   app.add_option("--flush-max-ms", flush_max_ms,
                  "Maximum age of a partial write block before flush")
       ->capture_default_str()
@@ -119,7 +124,8 @@ int main(int argc, char** argv) {
   return keylane::RunServer(
       bind_ip, port, metrics_port, threads, idle_timeout_ms, recv_buffer_count,
       busy_poll_us, static_cast<std::size_t>(registered_buffer_mb) * kMiB,
-      flush_max_ms, static_cast<std::size_t>(flush_size_kb) * kKiB,
-      !disable_read_crc, data_files, tomb_raider_interval_ms,
-      tomb_raider_sleep_ms, std::move(replication_options));
+      max_memory_bytes, flush_max_ms,
+      static_cast<std::size_t>(flush_size_kb) * kKiB, !disable_read_crc,
+      data_files, tomb_raider_interval_ms, tomb_raider_sleep_ms,
+      std::move(replication_options));
 }

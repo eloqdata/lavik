@@ -23,6 +23,7 @@
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
 #include "keylane/command.h"
+#include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication.h"
 #include "keylane/resp.h"
@@ -255,6 +256,8 @@ enum class WaitResult {
   kStopped,
 };
 
+Task<absl::Status> SampleMemory(Worker& worker);
+
 template <typename Server>
 WaitResult WaitForSignalOrServerStop(const Server& server) {
   pollfd fds[2] = {
@@ -380,6 +383,9 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   }
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
+  if (worker.id() == 0) {
+    worker.SpawnBackground(SampleMemory(worker));
+  }
   replication_->StorageReady(worker);
   co_return co_await TcpService::Run(worker, ctx);
 }
@@ -429,6 +435,18 @@ Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream,
 
 bool ShutdownRequested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
+}
+
+Task<absl::Status> SampleMemory(Worker& worker) {
+  while (!worker.stop_requested()) {
+    RefreshMemoryStats();
+    absl::Status slept =
+        co_await celer::SleepFor(worker, std::chrono::milliseconds(100));
+    if (!slept.ok()) {
+      co_return absl::OkStatus();
+    }
+  }
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
@@ -615,8 +633,9 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
               std::uint16_t metrics_port, unsigned thread_count,
               int idle_timeout_ms, unsigned recv_buffer_count,
               unsigned busy_poll_us, std::size_t registered_buffer_bytes,
-              std::uint32_t flush_max_ms, std::size_t flush_size_bytes,
-              bool verify_read_crc, const std::vector<std::string>& data_files,
+              std::uint64_t max_memory_bytes, std::uint32_t flush_max_ms,
+              std::size_t flush_size_bytes, bool verify_read_crc,
+              const std::vector<std::string>& data_files,
               std::uint32_t tomb_raider_interval_ms,
               std::uint32_t tomb_raider_sleep_ms,
               ReplicationOptions replication_options) {
@@ -624,11 +643,23 @@ int RunServer(std::string_view bind_ip, std::uint16_t port,
       "keylane listening on {}:{} metrics_port={} threads={} "
       "idle_timeout_ms={} "
       "busy_poll_us={} "
-      "registered_buffer_bytes={} per worker flush_max_ms={} "
+      "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
       "flush_size_bytes={} "
       "verify_read_crc={}",
       bind_ip, port, metrics_port, thread_count, idle_timeout_ms, busy_poll_us,
-      registered_buffer_bytes, flush_max_ms, flush_size_bytes, verify_read_crc);
+      registered_buffer_bytes, max_memory_bytes, flush_max_ms, flush_size_bytes,
+      verify_read_crc);
+
+  const absl::Status memory_status = InitMemoryLimit(max_memory_bytes);
+  if (!memory_status.ok()) {
+    spdlog::error("memory limit setup failed: {}", memory_status.message());
+    return 1;
+  }
+  const MemoryStats initial_memory = GetMemoryStats();
+  spdlog::info("memory limit={} ({}) initial_used={} initial_rss={}",
+               initial_memory.max_bytes_,
+               HumanReadableMemory(initial_memory.max_bytes_),
+               initial_memory.used_bytes_, initial_memory.rss_bytes_);
 
   const auto signal_status = InstallShutdownSignalHandler();
   if (!signal_status.ok()) [[unlikely]] {

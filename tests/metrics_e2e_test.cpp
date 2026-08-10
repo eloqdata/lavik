@@ -182,6 +182,8 @@ class ServerProcess {
           "2",
           "--recv-buffers",
           "0",
+          "--max-memory",
+          "1073741824",
           "--flush-max-ms",
           "20",
           "--data-file",
@@ -307,6 +309,11 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_EQ(client.Command({"PING"}), "+PONG");
   EXPECT_EQ(client.Command({"SET", "metrics-key", "metrics-value"}), "+OK");
   EXPECT_EQ(client.Command({"GET", "metrics-key"}), "$13\r\nmetrics-value");
+  const std::string memory_info = client.Command({"INFO", "memory"});
+  EXPECT_NE(memory_info.find("# Memory\r\n"), std::string::npos);
+  EXPECT_NE(memory_info.find("maxmemory:1073741824\r\n"), std::string::npos);
+  EXPECT_NE(memory_info.find("maxmemory_policy:noeviction\r\n"),
+            std::string::npos);
 
   const std::string response = HttpGet(metrics_port, "/metrics");
   ASSERT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -321,6 +328,10 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_GE(connections, 2);
   EXPECT_EQ(connected_clients, 1);
   EXPECT_LE(connected_clients, connections);
+  EXPECT_GT(MetricValue(body, "keylane_memory_current_bytes"), 0);
+  EXPECT_GT(MetricValue(body, "keylane_memory_rss_bytes"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_memory_max_bytes"), 1073741824);
+  EXPECT_EQ(MetricValue(body, "keylane_memory_rejected_commands_total"), 0);
   EXPECT_GT(MetricValue(body, "keylane_storage_capacity_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_storage_available_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_filesystem_available_bytes"), 0);

@@ -14,6 +14,18 @@ A ready-to-run Prometheus and Grafana deployment, including a provisioned
 dashboard and multi-node discovery, is available in
 [`deploy/monitoring`](../deploy/monitoring/README.md).
 
+## Memory limit
+
+`--max-memory` (also accepted as `--maxmemory`) sets the process memory limit
+and accepts byte-size suffixes such as `8GiB`. A value of zero, the default,
+uses 80% of the smaller of the host memory capacity and the process cgroup
+limit. Commands that may grow retained memory return a Redis-compatible OOM
+error when the cached allocator or RSS measurement would cross the limit.
+
+Allocator and RSS measurements are refreshed every 100ms outside command
+execution. The SET/MSET/INCR hot path performs relaxed atomic reads and a
+small allocation estimate; it does not query the allocator or `/proc`.
+
 ## Business metrics
 
 - `keylane_commands_total`: completed Redis commands. QPS is
@@ -56,6 +68,21 @@ Defrag activity can be compared with command latency using:
 ```promql
 sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
 ```
+
+## Memory metrics
+
+- `keylane_memory_current_bytes`: the larger of allocator-used bytes and RSS;
+  this value is used for limit enforcement.
+- `keylane_memory_used_bytes`: live bytes reported by mimalloc.
+- `keylane_memory_rss_bytes`: resident process memory.
+- `keylane_memory_committed_bytes`: bytes committed by mimalloc.
+- `keylane_memory_reserved_bytes`: virtual address space reserved by mimalloc.
+- `keylane_memory_max_bytes`: configured process memory limit.
+- `keylane_memory_rejected_commands_total`: commands rejected by the limit.
+
+The same values are available through Redis `INFO memory`, including
+`used_memory`, `used_memory_rss`, `maxmemory`, and
+`oom_rejected_commands`.
 
 ## Update model
 

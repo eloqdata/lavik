@@ -15,6 +15,7 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
+#include "keylane/memory.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
@@ -256,6 +257,9 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =
       co_await storage.CollectMetrics();
+  const MemoryStats memory_metrics = GetMemoryStats();
+  const std::uint64_t current_memory =
+      std::max(memory_metrics.used_bytes_, memory_metrics.rss_bytes_);
   std::string& output = *output_ptr;
   output.clear();
   output.reserve(32 * 1024);
@@ -342,6 +346,39 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_storage_defrag_pending gauge\n"
       "keylane_storage_defrag_pending ",
       worker_metrics.pending_defrags_, "\n",
+      "# HELP keylane_memory_current_bytes Current process memory used for "
+      "limit enforcement.\n"
+      "# TYPE keylane_memory_current_bytes gauge\n"
+      "keylane_memory_current_bytes ",
+      current_memory, "\n",
+      "# HELP keylane_memory_used_bytes Bytes currently allocated through "
+      "the configured allocator.\n"
+      "# TYPE keylane_memory_used_bytes gauge\n"
+      "keylane_memory_used_bytes ",
+      memory_metrics.used_bytes_, "\n",
+      "# HELP keylane_memory_rss_bytes Resident process memory.\n"
+      "# TYPE keylane_memory_rss_bytes gauge\n"
+      "keylane_memory_rss_bytes ",
+      memory_metrics.rss_bytes_, "\n",
+      "# HELP keylane_memory_committed_bytes Memory committed by the "
+      "configured allocator.\n"
+      "# TYPE keylane_memory_committed_bytes gauge\n"
+      "keylane_memory_committed_bytes ",
+      memory_metrics.committed_bytes_, "\n",
+      "# HELP keylane_memory_reserved_bytes Address space reserved by the "
+      "configured allocator.\n"
+      "# TYPE keylane_memory_reserved_bytes gauge\n"
+      "keylane_memory_reserved_bytes ",
+      memory_metrics.reserved_bytes_, "\n",
+      "# HELP keylane_memory_max_bytes Configured process memory limit.\n"
+      "# TYPE keylane_memory_max_bytes gauge\n"
+      "keylane_memory_max_bytes ",
+      memory_metrics.max_bytes_, "\n",
+      "# HELP keylane_memory_rejected_commands_total Commands rejected by "
+      "the memory limit.\n"
+      "# TYPE keylane_memory_rejected_commands_total counter\n"
+      "keylane_memory_rejected_commands_total ",
+      memory_metrics.rejected_commands_, "\n",
       "# HELP keylane_storage_capacity_bytes Usable data capacity.\n"
       "# TYPE keylane_storage_capacity_bytes gauge\n"
       "# HELP keylane_storage_available_bytes Space available to foreground "
