@@ -10,6 +10,8 @@
 
 namespace keylane {
 
+inline constexpr long kDefaultMimallocPurgeDelayMs = -1;
+
 struct ServerOptions {
   std::string bind_ip_ = "127.0.0.1";
   std::uint16_t port_ = 6379;
@@ -18,6 +20,7 @@ struct ServerOptions {
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;
   unsigned busy_poll_us_ = 0;
+  long mimalloc_purge_delay_ms_ = kDefaultMimallocPurgeDelayMs;
   std::size_t registered_buffer_bytes_ = 16ULL * 1024 * 1024;
   std::uint64_t max_memory_bytes_ = 0;
   std::size_t inline_key_max_bytes_ = storage::kDefaultInlineKeyBytes;

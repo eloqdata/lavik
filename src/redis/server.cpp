@@ -633,6 +633,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(ServerOptions options) {
+  mi_option_set(mi_option_purge_delay, options.mimalloc_purge_delay_ms_);
   spdlog::info("mimalloc purge_delay={} arena_eager_commit={} allow_thp={}",
                mi_option_get(mi_option_purge_delay),
                mi_option_get(mi_option_arena_eager_commit),
