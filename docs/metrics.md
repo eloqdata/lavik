@@ -10,6 +10,10 @@ curl http://127.0.0.1:9100/metrics
 `--metrics-port=0` disables the HTTP listener. The endpoint is `GET /metrics`
 and uses the Prometheus text exposition format.
 
+A ready-to-run Prometheus and Grafana deployment, including a provisioned
+dashboard and multi-node discovery, is available in
+[`deploy/monitoring`](../deploy/monitoring/README.md).
+
 ## Business metrics
 
 - `keylane_commands_total`: completed Redis commands. QPS is

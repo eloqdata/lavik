@@ -53,3 +53,4 @@ vgcore.*
 Thumbs.db
 build-keylane/
 dump.rdb
+/deploy/monitoring/.env

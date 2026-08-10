@@ -1,0 +1,90 @@
+name: keylane-monitoring
+
+services:
+  target-config:
+    image: "${BUSYBOX_IMAGE:-busybox:1.37.0}"
+    restart: "no"
+    environment:
+      KEYLANE_TARGETS: "${KEYLANE_TARGETS:?Set KEYLANE_TARGETS to host:9100}"
+    volumes:
+      - prometheus-targets:/targets
+    command:
+      - sh
+      - -ec
+      - |
+        old_ifs="$${IFS}"
+        case "$${KEYLANE_TARGETS}" in
+          ,*|*,|*,,*)
+            echo "KEYLANE_TARGETS contains an empty target" >&2
+            exit 1
+            ;;
+        esac
+        IFS=,
+        set -- $${KEYLANE_TARGETS}
+        IFS="$${old_ifs}"
+        targets_json=
+        for target do
+          case "$${target}" in
+            ""|*\"*|*\\*|*/*|*" "*)
+              echo "invalid Keylane target: '$${target}'" >&2
+              exit 1
+              ;;
+            *:*) ;;
+            *)
+              echo "Keylane target must be host:port: '$${target}'" >&2
+              exit 1
+              ;;
+          esac
+          if [ -n "$${targets_json}" ]; then
+            targets_json="$${targets_json},"
+          fi
+          targets_json="$${targets_json}\"$${target}\""
+        done
+        if [ -z "$${targets_json}" ]; then
+          echo "KEYLANE_TARGETS must contain at least one target" >&2
+          exit 1
+        fi
+        printf '[{"targets":[%s],"labels":{"service":"keylane"}}]\n' \
+          "$${targets_json}" > /targets/keylane.json.tmp
+        mv /targets/keylane.json.tmp /targets/keylane.json
+
+  prometheus:
+    image: "${PROMETHEUS_IMAGE:-prom/prometheus:v3.11.3}"
+    restart: unless-stopped
+    depends_on:
+      target-config:
+        condition: service_completed_successfully
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}"
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "${PROMETHEUS_BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-targets:/etc/prometheus/targets:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: "${GRAFANA_IMAGE:-grafana/grafana:13.1.0}"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    ports:
+      - "${GRAFANA_BIND_ADDRESS:-0.0.0.0}:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+volumes:
+  prometheus-targets:
+  prometheus-data:
+  grafana-data:

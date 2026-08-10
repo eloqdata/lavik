@@ -1,0 +1,13 @@
+apiVersion: 1
+
+providers:
+  - name: Keylane
+    orgId: 1
+    folder: Keylane
+    folderUid: keylane
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
