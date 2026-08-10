@@ -1,27 +1,32 @@
 # Keylane Performance Session Handoff
 
-Updated: 2026-08-07 UTC
+Updated: 2026-08-10 UTC
 
 ## Current source state
 
-- Latest Keylane commit: c3488d9 Persist recovery metadata through device owners
-- Celer submodule: a5cd07d Narrow worker IDs to 16 bits
-- Celer has local accept-time connection-balancing changes: every worker keeps
-  its `SO_REUSEPORT` listener, then accepted sockets are assigned round-robin
-  before recv is armed. Live request-boundary migration is intentionally left
-  as a TODO.
+- Latest Keylane commit: 390197c storage: avoid defrag key-lock deadlock
+- Celer submodule: 035bf0a Add coroutine sync primitives lifted from keylane's
+  storage engine
+- Celer and celer-raft are clean at their recorded submodule commits; there are
+  no local submodule changes in this session.
 - Build directory: ./bld
 - aerospike-bench.conf and bld/ are untracked and intentionally not committed.
 
 Build:
 
+    cmake -S . -B bld \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=ON
     cmake --build bld -j 8
 
 ## Machine and storage
 
 - Keylane uses CPUs 0-7 with 8 workers.
 - memtier uses CPUs 8-15 with 8 threads and 10 connections per thread.
-- Keylane raw device: /dev/nvme1n1
+- Keylane raw device: /dev/nvme1n1, 1,920,383,410,176 bytes total.
+- Current Keylane automatically uses the complete raw-device capacity. It
+  exposed 228,926 8 MiB data blocks, including eight defrag-reserve blocks,
+  and 1,920,370,475,008 usable data bytes in this session.
 - Dragonfly tiered device: /dev/nvme0n1, ext4, mounted at /mnt/data0 with
   noatime. Files use the prefix /mnt/data0/dfly/tiered/dragonfly.
 - /dev/nvme0n1 ext4 UUID: 1fff0614-431d-49f9-ab95-0402163791d7.
@@ -31,16 +36,17 @@ Build:
 
 ## Current dataset
 
-- Exactly 200 million keys, freshly refilled with c3488d9 using 8 workers.
-- Prefix: kvkeyprefix_
+- Exactly 200 million keys, freshly refilled with 390197c using 8 workers.
+- Prefix: kv_
 - Range: 1 through 200000000.
 - Values are fixed at 2000 bytes.
 - Mixed tests overwrite existing keys.
-- Latest memtier-reported fill rate: 460,364 SET/s.
+- Latest memtier-reported fill rate: 468,358 SET/s.
 - Records are packed inside 8 MiB storage blocks.
 - Average physical GET read size is 2.56 KiB after 512-byte alignment.
-- Latest full-scan recovery rate is approximately 1.54 million records/s.
-- Full recovery and worker initialization take roughly 2.5 minutes.
+- Latest full-scan recovery rate is approximately 1.71 million records/s.
+- The latest scan took 116.8 seconds; all workers were ready 157.5 seconds
+  after launch.
 
 Initial fill:
 
@@ -49,7 +55,7 @@ Initial fill:
       -n allkeys \
       --distinct-client-seed \
       --ratio=1:0 \
-      --key-prefix="kvkeyprefix_" \
+      --key-prefix="kv_" \
       --key-minimum=1 \
       --key-maximum=200000000 \
       --random-data \
@@ -75,11 +81,16 @@ The latest server was tested with 128 KiB flush submissions:
       --registered-buffer-mb=64 \
       --busy-poll-us=20 \
       --data-file=/dev/nvme1n1 \
-      --data-file-size-mb=614400 \
       --threads=8 \
       --flush-max-ms=1000 \
       --flush-size-kb=128 \
       --disable-read-crc
+
+`--data-file-size-mb` no longer exists on 390197c. Raw block devices use their
+persisted or detected full capacity, so passing the old option aborts startup.
+The latest launch also leaves the new tomb-raider defaults enabled:
+`--tomb-raider-interval-ms=600000` and `--tomb-raider-sleep-ms=10`. Set the
+interval to zero only when a test explicitly needs periodic sweeps disabled.
 
 Graceful stop:
 
@@ -122,7 +133,7 @@ Pure random read, 60 seconds:
       --test-time 60 \
       --distinct-client-seed \
       --ratio=0:1 \
-      --key-prefix="kvkeyprefix_" \
+      --key-prefix="kv_" \
       --key-minimum=1 \
       --key-maximum=200000000 \
       --random-data \
@@ -140,7 +151,7 @@ SET:GET = 1:10, 60 seconds:
       --test-time 60 \
       --distinct-client-seed \
       --ratio=1:10 \
-      --key-prefix="kvkeyprefix_" \
+      --key-prefix="kv_" \
       --key-minimum=1 \
       --key-maximum=200000000 \
       --random-data \
@@ -158,7 +169,7 @@ SET:GET = 1:1, 300 seconds:
       --test-time 300 \
       --distinct-client-seed \
       --ratio=1:1 \
-      --key-prefix="kvkeyprefix_" \
+      --key-prefix="kv_" \
       --key-minimum=1 \
       --key-maximum=200000000 \
       --random-data \
@@ -174,6 +185,102 @@ Collect iostat without the misleading since-boot first report:
     iostat -y -t -xmd 1 305 > /tmp/keylane-test.iostat
 
 ## Results
+
+### Latest main 390197c fresh refill and standard retest
+
+This 2026-08-09/10 UTC retest started from an empty `/dev/nvme1n1`, used the
+launch command above, and refilled exactly 200,000,000 fixed-size 2,000-byte
+values. Keylane used CPUs 0-7 with eight workers. memtier used CPUs 8-15 with
+eight threads, ten connections per thread, and the full 200-million-key range.
+The build was Release with native optimization, LTO, and detailed GET latency
+tracing enabled.
+
+Fresh fill:
+
+    SET/s:       468,358.46
+    average:     0.17057 ms
+    p99:         0.567 ms
+    p99.9:       1.583 ms
+    p99.99:      2.223 ms
+    records:     200,000,000
+
+After a graceful shutdown, recovery found exactly 200,000,000 records. The
+data-block scan took 116.8 seconds at approximately 1.71 million records/s;
+all eight workers were initialized 157.5 seconds after launch. DB 0 reported
+200,000,000 keys, DB 1 reported zero, and keys 1, 100,000,000, and 200,000,000
+all had 2,000-byte values.
+
+The first formal pure-read run hit the recurring device slowdown during
+seconds 53-57. It fell to approximately 74K GET/s at 1.08 ms average latency
+in that interval, so it is retained as an affected sample:
+
+    GET/s:       97,613.95
+    average:     0.30396 ms
+    p99:         1.407 ms
+    p99.9:       1.767 ms
+    p99.99:      2.239 ms
+
+The immediate pure-read confirmation was a clean 60-second window:
+
+    GET/s:       99,996.41
+    average:     0.24468 ms
+    p99:         0.639 ms
+    p99.9:       1.167 ms
+    p99.99:      2.111 ms
+    hits:        6,000,080
+    misses:      0
+
+SET:GET = 1:10, clean 60-second window:
+
+    Type       Ops/s       Average       p99          p99.9        p99.99
+    SET         9,091.73   0.10296 ms    0.479 ms     0.903 ms     1.775 ms
+    GET        90,908.56   0.24265 ms    0.599 ms     1.047 ms     2.079 ms
+    Total     100,000.29   0.22995 ms    0.591 ms     1.039 ms     2.063 ms
+
+SET:GET = 1:1, 300 seconds:
+
+    Type       Ops/s       Average       p99          p99.9        p99.99
+    SET        49,995.71   0.12056 ms    0.551 ms     1.007 ms     1.823 ms
+    GET        49,995.67   0.27119 ms    0.815 ms     1.335 ms     2.527 ms
+    Total      99,991.38   0.19588 ms    0.711 ms     1.199 ms     2.319 ms
+
+Every formal GET was a hit. Full-window server and raw-device averages were:
+
+    Workload             CPU       r/s         rMiB/s    rAwait     w/s      wMiB/s   wAwait
+    Pure read affected   318.55%   97,615.4    247.27    0.150 ms     0.0      0.00   0.000 ms
+    Pure read clean      270.38%   99,999.7    253.29    0.131 ms     0.0      0.00   0.000 ms
+    1:10                 270.55%   90,906.1    230.25    0.130 ms   163.1     18.50   0.286 ms
+    1:1, 300 seconds     234.05%   49,993.1    128.36    0.120 ms   852.5    103.05   0.163 ms
+
+The clean random-read request size averaged 2.59 KiB. The affected pure-read
+run reached 100% device utilization and 0.340 ms one-second read await during
+its slow plateau; the clean confirmation peaked at 42.2% utilization and
+0.140 ms read await.
+
+The default 600-second tomb-raider interval remained enabled. Near the end of
+the five-minute 1:1 run, approximately ten minutes after worker initialization,
+a 512 KiB sequential sweep became visible. Its I/O overlapped roughly the last
+two measured seconds and continued after foreground traffic stopped. This
+raised the full-window 1:1 read bandwidth slightly above the foreground-only
+rate, but aggregate throughput stayed at the 100K/s target. The final
+ten-second server histograms also showed wider storage-I/O p99.99 buckets, so
+the 1:1 tail above includes the current default periodic-maintenance behavior.
+
+After all workloads, DB 0 still contained exactly 200,000,000 keys, DB 1 was
+empty, and the three sampled values remained 2,000 bytes. The server log had
+no fatal, assertion, corruption, checksum, storage, or request errors. Keylane
+was stopped cleanly and all storage buffers were durably flushed.
+
+Artifacts:
+
+    /tmp/keylane-390197c-w8-refill-server.log
+    /tmp/keylane-390197c-w8-refill.{memtier,iostat,pidstat}
+    /tmp/keylane-390197c-w8-recovery-bench-server.log
+    /tmp/keylane-390197c-w8-read80-warmup.memtier
+    /tmp/keylane-390197c-w8-read80.{memtier,iostat,pidstat}
+    /tmp/keylane-390197c-w8-read80-confirm.{memtier,iostat,pidstat}
+    /tmp/keylane-390197c-w8-mixed1to10.{memtier,iostat,pidstat}
+    /tmp/keylane-390197c-w8-mixed1to1-300s.{memtier,iostat,pidstat}
 
 ### Pure read clean windows
 
@@ -765,8 +872,8 @@ available in /tmp.
 After all Dragonfly mixed tests, DBSIZE remained exactly 200,000,000; sampled
 first, middle, and last values remained 2000 bytes. Every formal benchmark GET
 hit, and no fatal, error, assertion, or corruption message appeared in the
-Dragonfly log. Dragonfly remains running as PID 7829 on port 6379 and must not
-be restarted casually because tiered recovery is slow.
+Dragonfly log. Dragonfly was left running as PID 7829 at the end of that
+historical comparison, but it was no longer running during the 390197c retest.
 
 ### Pure read, one connection, 10 workers
 
@@ -914,6 +1021,6 @@ These disappear after reboot:
    the same five-minute 1:1 workload. Compare GET p99.9/p99.99, wareq-sz, and
    per-second read await against the 128 KiB results.
 
-6. No Keylane process was left running. The final shutdown drained requests and
-   durably flushed all storage buffers. Dragonfly PID 7829 was intentionally
-   left running on port 6379; do not restart it unless required.
+6. No Keylane or Dragonfly process was left running after the 390197c retest.
+   The final Keylane shutdown drained requests and durably flushed all storage
+   buffers.
