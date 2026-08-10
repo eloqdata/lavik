@@ -48,6 +48,7 @@ enum class CommandKind {
   kInfo,
   kKeys,
   kTombRaider,
+  kDefrag,
   kUnknown,
   kCount,
 };

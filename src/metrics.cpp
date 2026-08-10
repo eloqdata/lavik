@@ -211,6 +211,8 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "keys";
     case CommandKind::kTombRaider:
       return "tombraider";
+    case CommandKind::kDefrag:
+      return "defrag";
     case CommandKind::kUnknown:
     case CommandKind::kCount:
       return "unknown";
@@ -260,6 +262,7 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =
       co_await storage.CollectMetrics();
+  const storage::DefragTotals defrag = storage.DefragStats();
   const MemoryStats memory_metrics = GetMemoryStats();
   const std::uint64_t current_memory = memory_metrics.used_bytes_;
   std::string& output = *output_ptr;
@@ -348,6 +351,26 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_storage_defrag_pending gauge\n"
       "keylane_storage_defrag_pending ",
       worker_metrics.pending_defrags_, "\n",
+      "# HELP keylane_storage_defrag_paused Whether relocation jobs are "
+      "paused while candidates remain queued.\n"
+      "# TYPE keylane_storage_defrag_paused gauge\n"
+      "keylane_storage_defrag_paused ",
+      defrag.paused_ ? 1 : 0, "\n",
+      "# HELP keylane_storage_defrag_max_active_per_device Runtime maximum "
+      "concurrent relocations per device.\n"
+      "# TYPE keylane_storage_defrag_max_active_per_device gauge\n"
+      "keylane_storage_defrag_max_active_per_device ",
+      defrag.max_active_per_device_, "\n",
+      "# HELP keylane_storage_defrag_block_sleep_seconds Runtime cooldown "
+      "after each relocated block.\n"
+      "# TYPE keylane_storage_defrag_block_sleep_seconds gauge\n"
+      "keylane_storage_defrag_block_sleep_seconds ",
+      static_cast<double>(defrag.block_sleep_ms_) / 1000.0, "\n",
+      "# HELP keylane_storage_defrag_record_sleep_seconds Runtime pause "
+      "after each record examined by defrag.\n"
+      "# TYPE keylane_storage_defrag_record_sleep_seconds gauge\n"
+      "keylane_storage_defrag_record_sleep_seconds ",
+      static_cast<double>(defrag.record_sleep_us_) / 1'000'000.0, "\n",
       "# HELP keylane_memory_current_bytes Current process memory used for "
       "limit enforcement.\n"
       "# TYPE keylane_memory_current_bytes gauge\n"

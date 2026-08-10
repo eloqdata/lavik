@@ -45,7 +45,7 @@ class ReadBufferLease {
   ~ReadBufferLease();
 
   bool valid() const noexcept { return buffer_.data_ != nullptr; }
-  bool registered() const noexcept { return pool_ != nullptr; }
+  bool registered() const noexcept { return buffer_.index_ != 0; }
   unsigned owner_worker() const noexcept { return owner_worker_; }
   std::uint16_t buffer_id() const noexcept { return buffer_.index_; }
 
@@ -71,6 +71,10 @@ class ReadBufferLease {
   ReadBufferLease(unsigned owner_worker, celer::FixedBuffer buffer,
                   std::size_t headroom_bytes, std::size_t tailroom_bytes,
                   std::size_t heap_alignment) noexcept;
+  ReadBufferLease(RegisteredBufferPool* pool, unsigned owner_worker,
+                  celer::FixedBuffer buffer, std::size_t headroom_bytes,
+                  std::size_t tailroom_bytes,
+                  std::size_t overflow_id) noexcept;
 
   RegisteredBufferPool* pool_ = nullptr;
   unsigned owner_worker_ = 0;
@@ -78,6 +82,7 @@ class ReadBufferLease {
   std::size_t headroom_bytes_ = 0;
   std::size_t tailroom_bytes_ = 0;
   std::size_t heap_alignment_ = 0;
+  std::size_t overflow_id_ = 0;
 };
 
 class RegisteredBufferPool {
@@ -145,11 +150,15 @@ class RegisteredBufferPool {
   ReadBufferLease TakeReadBuffer();
   absl::StatusOr<ReadBufferLease> AllocateHeapReadBuffer(
       std::size_t minimum_payload_bytes);
+  void ReleaseOverflow(std::size_t overflow_id) noexcept;
+  void ReleaseOverflowLocal(std::size_t overflow_id) noexcept;
   std::optional<std::uint16_t> TakeWriteBuffer();
   void ReleaseWriteBufferLocal(std::uint16_t buffer_id) noexcept;
   void Release(std::uint16_t buffer_id) noexcept;
   void ReleaseLocal(std::uint16_t buffer_id) noexcept;
   static void HandleRemoteRelease(void* context, std::uint64_t value) noexcept;
+  static void HandleRemoteOverflowRelease(void* context,
+                                          std::uint64_t value) noexcept;
   bool IsReadBufferId(std::uint16_t buffer_id) const noexcept;
   bool IsWriteBufferId(std::uint16_t buffer_id) const noexcept;
 
@@ -167,6 +176,12 @@ class RegisteredBufferPool {
   std::vector<celer::FixedBuffer> read_buffers_;
   std::vector<std::uint16_t> free_read_buffers_;
   std::vector<bool> read_buffer_in_use_;
+  // SPDK and io_uring overflow reads grow this cache to the observed
+  // concurrency high-water mark. Released DMA/aligned buffers are reused,
+  // avoiding allocation and huge-page faults on every pool miss.
+  std::vector<celer::FixedBuffer> overflow_read_buffers_;
+  std::vector<std::size_t> free_overflow_read_buffers_;
+  std::vector<bool> overflow_read_buffer_in_use_;
 };
 
 }  // namespace keylane::storage

@@ -90,9 +90,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "min(up{job=\"keylane\",instance=~\"$instance\"})",
+          "expr": "min by (instance) (up{job=\"keylane\",instance=~\"$instance\"})",
           "instant": true,
-          "legendFormat": "Status",
+          "legendFormat": "{{instance}}",
           "range": false,
           "refId": "A"
         }
@@ -151,9 +151,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(rate(keylane_commands_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (instance) (rate(keylane_commands_total{instance=~\"$instance\"}[$__rate_interval]))",
           "instant": false,
-          "legendFormat": "QPS",
+          "legendFormat": "{{instance}}",
           "range": true,
           "refId": "A"
         }
@@ -220,9 +220,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
           "instant": false,
-          "legendFormat": "P99",
+          "legendFormat": "{{instance}} P99",
           "range": true,
           "refId": "A"
         }
@@ -290,9 +290,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.999, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.999, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
           "instant": false,
-          "legendFormat": "P99.9",
+          "legendFormat": "{{instance}} P99.9",
           "range": true,
           "refId": "A"
         }
@@ -360,9 +360,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9999, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.9999, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
           "instant": false,
-          "legendFormat": "P99.99",
+          "legendFormat": "{{instance}} P99.99",
           "range": true,
           "refId": "A"
         }
@@ -420,9 +420,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(keylane_connected_clients{instance=~\"$instance\"})",
+          "expr": "sum by (instance) (keylane_connected_clients{instance=~\"$instance\"})",
           "instant": true,
-          "legendFormat": "Clients",
+          "legendFormat": "{{instance}}",
           "range": false,
           "refId": "A"
         }
@@ -480,9 +480,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(keylane_connections{instance=~\"$instance\"})",
+          "expr": "sum by (instance) (keylane_connections{instance=~\"$instance\"})",
           "instant": true,
-          "legendFormat": "Connections",
+          "legendFormat": "{{instance}}",
           "range": false,
           "refId": "A"
         }
@@ -640,9 +640,9 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (command) (rate(keylane_command_calls_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "expr": "sum by (instance, command) (rate(keylane_command_calls_total{instance=~\"$instance\"}[$__rate_interval]))",
           "instant": false,
-          "legendFormat": "{{command}}",
+          "legendFormat": "{{instance}} {{command}}",
           "range": true,
           "refId": "A"
         }
@@ -732,36 +732,36 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P50",
+          "expr": "histogram_quantile(0.50, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P50",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P95",
+          "expr": "histogram_quantile(0.95, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P95",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P99",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P99",
           "range": true,
           "refId": "C"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.999, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P99.9 (estimated)",
+          "expr": "histogram_quantile(0.999, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P99.9 (estimated)",
           "range": true,
           "refId": "D"
         },
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9999, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P99.99 (estimated)",
+          "expr": "histogram_quantile(0.9999, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P99.99 (estimated)",
           "range": true,
           "refId": "E"
         }
@@ -774,7 +774,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Correlates aggregate command P99 latency with running and queued defrag work.",
+      "description": "Correlates per-instance command P99 latency with running, queued, paused, and configured defrag work.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -871,6 +871,46 @@
                 "value": 10
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "D"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Defrag controls"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "E"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "Defrag controls"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
           }
         ]
       },
@@ -900,24 +940,38 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "P99 latency",
+          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P99 latency",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum(keylane_storage_defrag_active{instance=~\"$instance\"})",
-          "legendFormat": "Active defrag",
+          "expr": "keylane_storage_defrag_active{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} active defrag",
           "range": true,
           "refId": "B"
         },
         {
           "editorMode": "code",
-          "expr": "sum(keylane_storage_defrag_pending{instance=~\"$instance\"})",
-          "legendFormat": "Pending defrag",
+          "expr": "keylane_storage_defrag_pending{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} pending defrag",
           "range": true,
           "refId": "C"
+        },
+        {
+          "editorMode": "code",
+          "expr": "keylane_storage_defrag_paused{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} paused",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "editorMode": "code",
+          "expr": "keylane_storage_defrag_max_active_per_device{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} max active/device",
+          "range": true,
+          "refId": "E"
         }
       ],
       "title": "Defrag Impact on P99 Latency",
@@ -1003,8 +1057,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum by (result) (rate(keylane_storage_defrag_runs_total{instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{result}}",
+          "expr": "sum by (instance, result) (rate(keylane_storage_defrag_runs_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{result}}",
           "range": true,
           "refId": "A"
         }
@@ -1094,15 +1148,15 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "sum(keylane_connections{instance=~\"$instance\"})",
-          "legendFormat": "All TCP connections",
+          "expr": "keylane_connections{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} all TCP connections",
           "range": true,
           "refId": "A"
         },
         {
           "editorMode": "code",
-          "expr": "sum(keylane_connected_clients{instance=~\"$instance\"})",
-          "legendFormat": "Redis clients",
+          "expr": "keylane_connected_clients{instance=~\"$instance\"}",
+          "legendFormat": "{{instance}} Redis clients",
           "range": true,
           "refId": "B"
         }

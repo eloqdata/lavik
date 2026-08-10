@@ -37,7 +37,41 @@ struct StorageEngineOptions {
   // Pause after each block the sweep reads, capping its share of disk
   // bandwidth so online traffic keeps its latency.
   std::uint32_t tomb_raider_sleep_ms_ = 10;
+  // Maximum number of block relocations allowed to run concurrently on one
+  // device. This cannot exceed the eight-block per-device defrag reserve.
+  unsigned defrag_max_active_per_device_ = 8;
+  // Asynchronous cooldown after a relocation pass. The pass keeps its device
+  // permit while suspended so another worker cannot bypass device pacing.
+  std::uint32_t defrag_sleep_ms_ = 0;
+  // Asynchronous pacing between records within one block relocation. Zero
+  // keeps the cooperative-yield-only behavior.
+  std::uint32_t defrag_record_sleep_us_ = 0;
+  // Queue candidates without starting relocation jobs. Runtime DEFRAG RESUME
+  // releases the queued work.
+  bool defrag_paused_ = false;
   RegisteredBufferPoolOptions buffers_{};
+};
+
+enum class DefragConfigAction : std::uint8_t {
+  kPause,
+  kResume,
+  kMaxActivePerDevice,
+  kBlockSleep,
+  kRecordSleep,
+};
+
+struct DefragConfigUpdate {
+  DefragConfigAction action_ = DefragConfigAction::kMaxActivePerDevice;
+  std::uint64_t value_ = 0;
+};
+
+struct DefragTotals {
+  bool paused_ = false;
+  unsigned max_active_per_device_ = 0;
+  std::uint32_t block_sleep_ms_ = 0;
+  std::uint32_t record_sleep_us_ = 0;
+  unsigned active_ = 0;
+  unsigned pending_ = 0;
 };
 
 enum class TombRaiderMode : std::uint8_t {
@@ -390,6 +424,11 @@ class StorageEngine {
   // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
   // the new schedule starts counting from that completion.
   celer::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
+  // Runtime relocation pacing. Reducing concurrency does not cancel active
+  // passes; it prevents replacements until the active count reaches the new
+  // limit. Sleep changes take effect at the next checkpoint.
+  DefragTotals DefragStats() const noexcept;
+  celer::Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
   celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a

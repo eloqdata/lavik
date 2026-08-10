@@ -55,6 +55,15 @@ Task<absl::Status> StorageEngine::ConfigureTombRaider(
   return impl_->ConfigureTombRaider(update);
 }
 
+DefragTotals StorageEngine::DefragStats() const noexcept {
+  return impl_->DefragStats();
+}
+
+Task<absl::Status> StorageEngine::ConfigureDefrag(
+    DefragConfigUpdate update) {
+  return impl_->ConfigureDefrag(update);
+}
+
 Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {
   return impl_->CollectMetrics();
 }

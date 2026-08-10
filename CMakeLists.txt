@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
+option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
 
 set(KEYLANE_ASAN_BUILD OFF)
 string(CONCAT KEYLANE_COMPILER_AND_LINKER_FLAGS
@@ -48,6 +49,7 @@ else()
 endif()
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CELER_WITH_SPDK_STORAGE ${KEYLANE_WITH_SPDK} CACHE BOOL "" FORCE)
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")

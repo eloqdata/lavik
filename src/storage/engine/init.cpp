@@ -19,6 +19,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                         "inline key limit must be between 1 and " +
                             std::to_string(MaxInlineKeyBytes()) + " bytes");
   }
+  if (options_.defrag_max_active_per_device_ == 0 ||
+      options_.defrag_max_active_per_device_ >
+          kDefragReserveBlocksPerDevice) {
+    return absl::Status(
+        absl::StatusCode::kInvalidArgument,
+        "defrag concurrency must be between 1 and the per-device reserve");
+  }
   if (options_.data_files_.size() > std::numeric_limits<std::uint16_t>::max()) {
     return absl::Status(absl::StatusCode::kOutOfRange, "too many data files");
   }
@@ -293,12 +300,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     allocator->epoch_values_.assign(kEpochValueCount, 1);
     allocator->durable_epoch_values_.assign(kEpochValueCount, 1);
 
-    const int fd = ::open(device.path_.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-      return absl::Status(absl::StatusCode::kInternal,
-                          "open fixed metadata failed: " + device.path_ + ": " +
-                              std::strerror(errno));
-    }
     absl::Status load_status = absl::OkStatus();
     for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
          ++page_index) {
@@ -306,7 +307,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       const std::size_t payload_bytes = std::min(
           kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
       auto loaded = ReadMetadataPagePair(
-          fd, kEpochMetadataOffset, MetadataPageKind::kEpochs,
+          device.path_, kEpochMetadataOffset, MetadataPageKind::kEpochs,
           static_cast<std::uint32_t>(page_index), payload_bytes);
       if (!loaded.ok()) {
         load_status = loaded.status();
@@ -334,7 +335,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       const std::size_t payload_bytes =
           std::min(kMetadataPagePayloadBytes, bitmap_bytes - byte_offset);
       auto loaded = ReadMetadataPagePair(
-          fd, kScanBitmapMetadataOffset, MetadataPageKind::kScanBitmap,
+          device.path_, kScanBitmapMetadataOffset,
+          MetadataPageKind::kScanBitmap,
           static_cast<std::uint32_t>(page_index), payload_bytes);
       if (!loaded.ok()) {
         load_status = loaded.status();
@@ -344,17 +346,11 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       std::memcpy(allocator->scan_bitmap_.data() + byte_offset,
                   loaded->payload_.data(), payload_bytes);
     }
-    const int close_error = ::close(fd);
     if (!load_status.ok()) {
       return absl::Status(
           load_status.code(),
           std::string(load_status.message()) + ": " + device.path_);
     }
-    if (close_error != 0) {
-      return absl::Status(absl::StatusCode::kInternal,
-                          "close fixed metadata failed: " + device.path_);
-    }
-
     for (std::uint64_t local = device.capacity_blocks_;
          local-- > device.data_block_begin_;) {
       const std::size_t byte_index = static_cast<std::size_t>(local / 8);

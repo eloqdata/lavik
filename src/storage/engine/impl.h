@@ -33,6 +33,7 @@
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
+#include "celer/io/spdk_storage.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/concurrentqueue.h"
 #include "celer/runtime/cross_core.h"
@@ -524,23 +525,59 @@ inline absl::Status WriteExactlyAt(int fd, std::span<const std::byte> input,
   return absl::OkStatus();
 }
 
-inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
-    const std::string& path) {
+inline absl::Status ReadExactlyAt(const std::string& path,
+                                  std::span<std::byte> output,
+                                  std::uint64_t offset) {
+  if (celer::IsSpdkStoragePath(path)) {
+    return celer::ReadSpdkStorage(path, output, offset);
+  }
   const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
   if (fd < 0) {
-    return absl::Status(
-        absl::StatusCode::kInternal,
-        "open device label failed: " + path + ": " + std::strerror(errno));
+    return absl::Status(absl::StatusCode::kInternal,
+                        "open storage path for read failed: " + path + ": " +
+                            std::strerror(errno));
   }
-  std::array<std::byte, kDirectIoAlignment> page{};
-  absl::Status status = ReadExactlyAt(fd, page, kDeviceLabelOffset);
+  absl::Status status = ReadExactlyAt(fd, output, offset);
   const int close_error = ::close(fd);
+  if (status.ok() && close_error != 0) {
+    status = absl::Status(absl::StatusCode::kInternal,
+                          "close storage path after read failed: " + path);
+  }
+  return status;
+}
+
+inline absl::Status WriteExactlyAt(const std::string& path,
+                                   std::span<const std::byte> input,
+                                   std::uint64_t offset, bool flush) {
+  if (celer::IsSpdkStoragePath(path)) {
+    return celer::WriteSpdkStorage(path, input, offset, flush);
+  }
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "open storage path for write failed: " + path + ": " +
+                            std::strerror(errno));
+  }
+  absl::Status status = WriteExactlyAt(fd, input, offset);
+  if (status.ok() && flush && ::fdatasync(fd) != 0) {
+    status = absl::Status(absl::StatusCode::kInternal,
+                          "storage fdatasync failed: " + path + ": " +
+                              std::strerror(errno));
+  }
+  const int close_error = ::close(fd);
+  if (status.ok() && close_error != 0) {
+    status = absl::Status(absl::StatusCode::kInternal,
+                          "close storage path after write failed: " + path);
+  }
+  return status;
+}
+
+inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
+    const std::string& path) {
+  std::array<std::byte, kDirectIoAlignment> page{};
+  absl::Status status = ReadExactlyAt(path, page, kDeviceLabelOffset);
   if (!status.ok()) {
     return status;
-  }
-  if (close_error != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "close after device-label read failed: " + path);
   }
   if (IsZero(page)) {
     return std::optional<DeviceLabel>{};
@@ -555,29 +592,9 @@ inline absl::StatusOr<std::optional<DeviceLabel>> ReadDeviceLabel(
 
 inline absl::Status WriteDeviceLabel(const std::string& path,
                                      const DeviceLabel& label) {
-  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
-  if (fd < 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "open device label for write failed: " + path + ": " +
-                            std::strerror(errno));
-  }
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeDeviceLabel(label, page);
-  absl::Status status = WriteExactlyAt(fd, page, kDeviceLabelOffset);
-  if (status.ok() && ::fdatasync(fd) != 0) {
-    status = absl::Status(
-        absl::StatusCode::kInternal,
-        "device-label fdatasync failed: " + path + ": " + std::strerror(errno));
-  }
-  const int close_error = ::close(fd);
-  if (!status.ok()) {
-    return status;
-  }
-  if (close_error != 0) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "close after device-label write failed: " + path);
-  }
-  return absl::OkStatus();
+  return WriteExactlyAt(path, page, kDeviceLabelOffset, true);
 }
 
 struct MetadataPageState {
@@ -591,7 +608,7 @@ struct LoadedMetadataPage {
 };
 
 inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
-    int fd, std::uint64_t base_offset, MetadataPageKind kind,
+    const std::string& path, std::uint64_t base_offset, MetadataPageKind kind,
     std::uint32_t page_index, std::size_t payload_bytes) {
   LoadedMetadataPage selected;
   selected.payload_.resize(payload_bytes, std::byte{0});
@@ -600,7 +617,7 @@ inline absl::StatusOr<LoadedMetadataPage> ReadMetadataPagePair(
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
     absl::Status read = ReadExactlyAt(
-        fd, page, MetadataPageSlotOffset(base_offset, page_index, slot));
+        path, page, MetadataPageSlotOffset(base_offset, page_index, slot));
     if (!read.ok()) {
       return read;
     }
@@ -738,6 +755,15 @@ inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
 
 inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
     const std::string& path) {
+  if (celer::IsSpdkStoragePath(path)) {
+    auto device = celer::ProbeSpdkStorage(path);
+    if (!device.ok()) {
+      return device.status();
+    }
+    return StoragePathInfo{.is_block_device_ = true,
+                           .io_alignment_ = device->io_alignment_,
+                           .size_bytes_ = device->size_bytes_};
+  }
   struct stat file_info {};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
@@ -814,6 +840,14 @@ class StorageEngine::Impl {
                                            std::memory_order_relaxed);
     tomb_raider_config_.block_sleep_ms_.store(options_.tomb_raider_sleep_ms_,
                                               std::memory_order_relaxed);
+    defrag_config_.max_active_per_device_.store(
+        options_.defrag_max_active_per_device_, std::memory_order_relaxed);
+    defrag_config_.block_sleep_ms_.store(options_.defrag_sleep_ms_,
+                                         std::memory_order_relaxed);
+    defrag_config_.record_sleep_us_.store(options_.defrag_record_sleep_us_,
+                                          std::memory_order_relaxed);
+    defrag_config_.paused_.store(options_.defrag_paused_,
+                                 std::memory_order_relaxed);
   }
 
  private:
@@ -1020,6 +1054,23 @@ class StorageEngine::Impl {
   }
 
   Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
+
+  DefragTotals DefragStats() const noexcept {
+    return DefragTotals{
+        .paused_ = defrag_config_.paused_.load(std::memory_order_acquire),
+        .max_active_per_device_ =
+            defrag_config_.max_active_per_device_.load(
+                std::memory_order_acquire),
+        .block_sleep_ms_ =
+            defrag_config_.block_sleep_ms_.load(std::memory_order_acquire),
+        .record_sleep_us_ =
+            defrag_config_.record_sleep_us_.load(std::memory_order_acquire),
+        .active_ = active_defrags_.load(std::memory_order_acquire),
+        .pending_ = pending_defrags_.load(std::memory_order_acquire),
+    };
+  }
+
+  Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 
@@ -1615,6 +1666,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> DefragOne(WorkerStore* store);
 
+  Task<absl::Status> DefragRecordCheckpoint(WorkerStore& store);
+
   Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
   RelocateIfCurrent(unsigned key_owner, std::string_view key,
                     std::string_view value, const RecordHeader& record,
@@ -1675,6 +1728,12 @@ class StorageEngine::Impl {
   // every one of these tasks must be short-lived or abort promptly once
   // shutdown_flush_requested_ is set.
   std::atomic<std::uint32_t> active_settlements_{0};
+  struct alignas(64) DefragRuntimeConfig {
+    std::atomic<bool> paused_{false};
+    std::atomic<unsigned> max_active_per_device_{1};
+    std::atomic<std::uint32_t> block_sleep_ms_{0};
+    std::atomic<std::uint32_t> record_sleep_us_{0};
+  } defrag_config_;
   struct alignas(64) TombRaiderRuntimeConfig {
     // Even values are stable scheduler generations; odd means a worker-0
     // configuration update is publishing new fields.
@@ -1716,7 +1775,6 @@ class StorageEngine::Impl {
   std::atomic<bool> recovery_complete_logged_{false};
   std::int64_t recovery_started_ms_ = 0;
   static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
-  static constexpr unsigned kDefragPermitsPerDevice = 8;
   std::atomic<std::uint64_t> next_lsn_{1};
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
   std::atomic<unsigned> active_defrags_{0};

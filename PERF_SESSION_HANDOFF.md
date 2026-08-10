@@ -4,54 +4,105 @@ Updated: 2026-08-10 UTC
 
 ## Current source state
 
-- Latest Keylane commit: 390197c storage: avoid defrag key-lock deadlock
-- Celer submodule: 035bf0a Add coroutine sync primitives lifted from keylane's
-  storage engine
-- Celer and celer-raft are clean at their recorded submodule commits; there are
-  no local submodule changes in this session.
-- Build directory: ./bld
-- aerospike-bench.conf and bld/ are untracked and intentionally not committed.
+- Latest Keylane commit: 8c171a9 feat: make tomb raider scheduling configurable
+- Celer submodule: b3d78fe runtime: clear background task registration on
+  shutdown, plus the local SPDK storage-backend implementation described below
+- mimalloc submodule: acf2fdd (v3.4.5)
+- io_uring build directory: ./bld
+- SPDK build directory: ./bld-spdk
+- Current live process: local SPDK build on `spdk://69f9:00:00.0/1`, with
+  built-in mimalloc 3.4.5, purge disabled, THP disabled at compile time, eager
+  arena commit enabled, tomb raider enabled at a 600,000 ms interval with a
+  10 ms per-block sleep, and an active two-hour 1:1 observation run.
+- `/dev/nvme1n1` and its historical io_uring dataset were preserved. The old
+  io_uring process was gracefully stopped before the SPDK test so both servers
+  did not contend for CPUs 0-7.
+- aerospike-bench.conf, bld/, bld-libc/, bld-spdk/, celer-raft/,
+  perf_reports/, and the local block-device helper are untracked and
+  intentionally not committed.
 
 Build:
 
     cmake -S . -B bld \
       -DCMAKE_BUILD_TYPE=Release \
-      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=ON
+      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=OFF \
+      -DKEYLANE_WITH_SPDK=OFF
     cmake --build bld -j 8
+
+Mimalloc is now mandatory: `KEYLANE_USE_MIMALLOC` no longer exists. Every
+Keylane build links mimalloc 3.4.5, compiles with `MI_NO_THP=ON` and
+`MI_DEFAULT_ARENA_EAGER_COMMIT=1`, and defaults the runtime purge delay to
+`-1`. The startup log is the source of truth and should report
+`purge_delay=-1 arena_eager_commit=1 allow_thp=0`.
+
+SPDK build:
+
+    git submodule update --init --recursive
+    sudo apt-get install -y \
+      build-essential cmake pkg-config ninja-build meson python3 \
+      python3-tabulate python3-pyelftools libnuma-dev uuid-dev libaio-dev \
+      libssl-dev
+    cmake -S . -B bld-spdk \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DKEYLANE_ENABLE_READ_LATENCY_TRACE=OFF \
+      -DKEYLANE_WITH_SPDK=ON
+    cmake --build bld-spdk -j 8
+
+`KEYLANE_WITH_SPDK=ON` changes only the storage backend. Networking remains on
+celer/io_uring. SPDK v26.05 is a nested celer submodule pinned at
+`d519b163cbc0e2f28c35d9bc86d610da368b032c`; SPDK and DPDK are linked
+statically, so `bld-spdk/keylane` has no runtime `libspdk` or `librte`
+dependency.
 
 ## Machine and storage
 
 - Keylane uses CPUs 0-7 with 8 workers.
 - memtier uses CPUs 8-15 with 8 threads and 10 connections per thread.
-- Keylane raw device: /dev/nvme1n1, 1,920,383,410,176 bytes total.
+- Historical io_uring device: `/dev/nvme1n1`, PCI `021d:00:00.0`,
+  1,920,383,410,176 bytes total. It still contains the previous dataset.
+- Current SPDK test device: first NVMe, PCI `69f9:00:00.0`, namespace 1,
+  exposed to Keylane as `spdk://69f9:00:00.0/1` with the same capacity.
 - Current Keylane automatically uses the complete raw-device capacity. It
   exposed 228,926 8 MiB data blocks, including eight defrag-reserve blocks,
   and 1,920,370,475,008 usable data bytes in this session.
-- Dragonfly tiered device: /dev/nvme0n1, ext4, mounted at /mnt/data0 with
-  noatime. Files use the prefix /mnt/data0/dfly/tiered/dragonfly.
-- /dev/nvme0n1 ext4 UUID: 1fff0614-431d-49f9-ab95-0402163791d7.
+- The first NVMe was verified unmounted and without a filesystem signature,
+  then destructively initialized for this SPDK test. While bound to vfio-pci,
+  `/dev/nvme0n1` intentionally does not exist.
 - Logical sector size: 512 bytes.
-- Warning: /dev/nvme1n1 contains the current benchmark dataset. Do not discard
-  or format it unless a fresh fill is intended.
+- Secure Boot lockdown rejects direct BAR mapping through `uio_pci_generic` on
+  this Azure host. VFIO works only with temporary no-IOMMU mode because the VM
+  exposes no IOMMU group. This permits DMA without IOMMU isolation; do not use
+  it with an untrusted process.
+- Warning: both NVMe devices now contain benchmark datasets. Do not discard or
+  format either unless a fresh fill is intended.
 
 ## Current dataset
 
-- Exactly 200 million keys, freshly refilled with 390197c using 8 workers.
+- The SPDK device contains exactly 200 million logical keys, freshly filled by
+  the local 8c171a9 SPDK build using eight workers.
 - Prefix: kv_
 - Range: 1 through 200000000.
 - Values are fixed at 2000 bytes.
 - Mixed tests overwrite existing keys.
-- Latest memtier-reported fill rate: 468,358 SET/s.
+- SPDK fill rate: 475,698 SET/s. The comparable io_uring historical fill was
+  489,176 SET/s, so SPDK was 2.8% slower in this run.
 - Records are packed inside 8 MiB storage blocks.
 - Average physical GET read size is 2.56 KiB after 512-byte alignment.
-- Latest full-scan recovery rate is approximately 1.71 million records/s.
-- The latest scan took 116.8 seconds; all workers were ready 157.5 seconds
-  after launch.
+- The clean post-fill SPDK restart scanned exactly 200 million records in
+  116.3 seconds at 1.72 million records/s; all workers were ready 150.5 seconds
+  after launch. `DBSIZE` returned exactly 200 million, and keys 1, 100000000,
+  and 200000000 each had a 2000-byte value.
+- The formal 1:10 and 1:1 tests subsequently added overwrite records but did
+  not change the logical key count.
+- The final post-test restart scanned 215,545,468 physical record versions.
+  After recovery, `DBSIZE` was still exactly 200 million; keys 1, 100000000,
+  and 200000000 were each 2000 bytes, and all defrag result counters remained
+  zero.
 
 Initial fill:
 
     taskset -c 8-15 memtier_benchmark \
-      -t 8 -c 10 -s 127.0.0.1 -p 6379 \
+      -t 8 -c 10 -s 10.0.0.4 -p 6379 \
       -n allkeys \
       --distinct-client-seed \
       --ratio=1:0 \
@@ -65,7 +116,7 @@ Initial fill:
       --key-pattern=P:P
 
 Ordinary blkdiscard did not guarantee zero reads on this Azure NVMe. To erase
-and refill, stop Keylane and use the zeroing discard:
+and refill an io_uring device, stop Keylane and use the zeroing discard:
 
     sudo blkdiscard -z -f --length 644245094400 /dev/nvme1n1
 
@@ -73,11 +124,72 @@ This command is destructive.
 
 ## Keylane launch
 
-The latest server was tested with 128 KiB flush submissions:
+The current SPDK server uses:
 
-    sudo env LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4 \
-      taskset -c 0-7 ./bld/keylane \
+    sudo taskset -c 0-7 ./bld-spdk/keylane \
+      --bind=10.0.0.4 \
+      --port=6379 \
+      --metrics-port=9100 \
+      --recv-buffers=1024 \
+      --registered-buffer-mb=256 \
+      --busy-poll-us=20 \
+      --mimalloc-purge-delay-ms=-1 \
+      --data-file=spdk://69f9:00:00.0/1 \
+      --threads=8 \
+      --flush-max-ms=1000 \
+      --flush-size-kb=128 \
+      --disable-read-crc \
+      --tomb-raider-interval-ms=600000 \
+      --tomb-raider-sleep-ms=10
+
+Before starting it, reserve hugepages and bind only the first controller:
+
+    sudo modprobe vfio-pci
+    sudo sh -c \
+      'echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode'
+    cd celer/third_party/spdk
+    sudo env PCI_ALLOWED='69f9:00:00.0' DRIVER_OVERRIDE=vfio-pci \
+      HUGEMEM=2048 ./scripts/setup.sh
+    cd ../../..
+
+To return only that controller to the kernel NVMe driver after Keylane stops:
+
+    cd celer/third_party/spdk
+    sudo env PCI_ALLOWED='69f9:00:00.0' ./scripts/setup.sh reset
+    cd ../../..
+
+The comparable io_uring launch is:
+
+    sudo taskset -c 0-7 ./bld/keylane \
+      --bind=10.0.0.4 \
+      --port=6379 \
+      --metrics-port=9100 \
       --recv-buffers 1024 \
+      --registered-buffer-mb=256 \
+      --busy-poll-us=20 \
+      --data-file=/dev/nvme1n1 \
+      --threads=8 \
+      --flush-max-ms=1000 \
+      --flush-size-kb=128 \
+      --disable-read-crc
+
+`--data-file-size-mb` no longer exists. Raw block devices use their
+persisted or detected full capacity, so passing the old option aborts startup.
+The memory-accounting fix makes the default automatic limit usable on
+this dataset. Do not restore the historical `--max-memory=1tb` benchmark
+workaround. The io_uring command above uses the tomb-raider defaults,
+`--tomb-raider-interval-ms=600000` and `--tomb-raider-sleep-ms=10`. The current
+SPDK command now uses the same schedule for the long online-defrag observation.
+
+Historical tcmalloc launch used before mimalloc became mandatory (not the
+current process and not supported by current CMake):
+
+    sudo env LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc.so.4 \
+      taskset -c 0-7 ./bld-libc/keylane \
+      --bind=10.0.0.4 \
+      --port=6379 \
+      --metrics-port=9100 \
+      --recv-buffers=1024 \
       --registered-buffer-mb=64 \
       --busy-poll-us=20 \
       --data-file=/dev/nvme1n1 \
@@ -86,11 +198,8 @@ The latest server was tested with 128 KiB flush submissions:
       --flush-size-kb=128 \
       --disable-read-crc
 
-`--data-file-size-mb` no longer exists on 390197c. Raw block devices use their
-persisted or detected full capacity, so passing the old option aborts startup.
-The latest launch also leaves the new tomb-raider defaults enabled:
-`--tomb-raider-interval-ms=600000` and `--tomb-raider-sleep-ms=10`. Set the
-interval to zero only when a test explicitly needs periodic sweeps disabled.
+That command requires the historical `bld-libc` binary. It cannot be recreated
+from current main because the allocator switch was removed.
 
 Graceful stop:
 
@@ -112,7 +221,9 @@ Wait for shutdown so partial write buffers are flushed before restarting.
 - Registered slices use WriteFixed; heap fallback buffers use ordinary async
   write.
 - Flush size must be a power of two between direct-I/O alignment and 8 MiB.
-- Detailed GET phase latency logging is enabled in this build.
+- Detailed GET phase latency logging is disabled in both current builds. The
+  older 99e1d01 trace path had a compile issue; that historical limitation is
+  not evidence about current main.
 
 Aerospike reference:
 
@@ -129,7 +240,7 @@ requested rate is 100,000 operations/s.
 Pure random read, 60 seconds:
 
     taskset -c 8-15 memtier_benchmark \
-      -t 8 -c 10 -s 127.0.0.1 -p 6379 \
+      -t 8 -c 10 -s 10.0.0.4 -p 6379 \
       --test-time 60 \
       --distinct-client-seed \
       --ratio=0:1 \
@@ -147,7 +258,7 @@ Pure random read, 60 seconds:
 SET:GET = 1:10, 60 seconds:
 
     taskset -c 8-15 memtier_benchmark \
-      -t 8 -c 10 -s 127.0.0.1 -p 6379 \
+      -t 8 -c 10 -s 10.0.0.4 -p 6379 \
       --test-time 60 \
       --distinct-client-seed \
       --ratio=1:10 \
@@ -165,7 +276,7 @@ SET:GET = 1:10, 60 seconds:
 SET:GET = 1:1, 300 seconds:
 
     taskset -c 8-15 memtier_benchmark \
-      -t 8 -c 10 -s 127.0.0.1 -p 6379 \
+      -t 8 -c 10 -s 10.0.0.4 -p 6379 \
       --test-time 300 \
       --distinct-client-seed \
       --ratio=1:1 \
@@ -184,7 +295,458 @@ Collect iostat without the misleading since-boot first report:
 
     iostat -y -t -xmd 1 305 > /tmp/keylane-test.iostat
 
+This works only while the controller is owned by the kernel NVMe driver. SPDK
+owns the first controller through VFIO, so its operations are intentionally
+absent from `iostat` and the kernel block layer.
+
 ## Results
+
+### SPDK tomb-raider long-run baseline
+
+Before the two-hour online-defrag observation on 2026-08-10, the SPDK server
+was cleanly restarted with the normal 600,000 ms tomb-raider interval and 10 ms
+per-block sleep. Tomb raider was then temporarily switched off at runtime so
+the three standard baseline windows contained no background scan or defrag.
+All windows requested 100,000 operations/s over the complete 200-million-key
+`kv_` range. `DBSIZE` remained exactly 200 million, every GET was a hit, OOM
+rejections stayed zero, and all defrag counters stayed zero.
+
+    Workload       Ops/s       Average       p99.9       p99.99      Server CPU
+    Pure GET       99,971.82   0.21274 ms    1.271 ms    5.983 ms     271.52%
+    1:10 total     99,989.60   0.21748 ms    1.503 ms    5.311 ms     253.27%
+    1:1 total      99,999.46   0.18219 ms    1.231 ms    3.007 ms     222.76%
+
+The 1:10 split was 9,090.65 SET/s at 0.08924 ms average and 90,898.94
+GET/s at 0.23031 ms average. The five-minute 1:1 split was 49,999.78 SET/s at
+0.11645 ms average and 49,999.67 GET/s at 0.24793 ms average. Its SET/GET
+p99.99 values were 2.463/3.455 ms. These are the no-background-work reference
+numbers for the following two-hour 1:1 run.
+
+Artifacts use this prefix:
+
+    /tmp/keylane-spdk-defrag-basic-{read,1to10,1to1}.{memtier,pidstat}
+    /tmp/keylane-spdk-defrag-basic-{read,1to10,1to1}.{before,after}.metrics
+
+The two-hour 1:1 run started at `2026-08-10T08:36:31Z` and is scheduled to end
+at `2026-08-10T10:36:31Z`. It uses the same 100,000 ops/s command as the
+five-minute baseline. Tomb raider was reset to `INTERVAL 600000` immediately
+before the workload, so the first background round is expected approximately
+ten minutes into the window. Prometheus and Grafana were both healthy when the
+run started. Full-window artifacts are:
+
+    /tmp/keylane-spdk-defrag-2h-1to1.memtier
+    /tmp/keylane-spdk-defrag-2h-1to1.pidstat
+    /tmp/keylane-spdk-defrag-2h-1to1.timeline
+    /tmp/keylane-spdk-defrag-2h-1to1.{before,after}.metrics
+    /tmp/keylane-spdk-defrag-2h-1to1.{before,after}.info
+
+### SPDK v26.05 backend on the first NVMe
+
+This 2026-08-10 test used the local `KEYLANE_WITH_SPDK=ON` implementation,
+SPDK v26.05, statically linked DPDK, mandatory mimalloc, eight Keylane workers
+on CPUs 0-7, and the first NVMe at `69f9:00:00.0`. Networking remained
+io_uring. The storage URI was `spdk://69f9:00:00.0/1`, flush submissions were
+128 KiB, purge and tomb raider were disabled, THP was compile-time disabled,
+and eager arena commit was compile-time enabled.
+
+The first multi-worker attempt exposed a critical DPDK integration detail:
+`spdk_env_init(core_mask=0x1)` changed the calling thread's affinity to CPU 0,
+so all subsequently created Keylane workers inherited CPU 0. Fill throughput
+was only 52,547 SET/s. The backend now saves and restores the caller's affinity
+around SPDK initialization. After the fix, all workers inherited CPUs 0-7 and
+the device was zeroed before the formal refill.
+
+Fresh 200-million-key fill:
+
+    SET/s:       475,698.23
+    average:     0.16778 ms
+    p99:         0.527 ms
+    p99.9:       1.535 ms
+    p99.99:      2.207 ms
+    records:     200,000,000
+
+This is 2.8% below the comparable io_uring fill rate of 489,175.53 SET/s. A
+graceful restart then recovered exactly 200 million physical and logical
+records. The data-block scan took approximately 116.3 seconds at 1.72 million
+records/s; all eight workers were ready about 150.5 seconds after launch. These
+times are effectively the same as the historical io_uring recovery.
+
+Two clean 60-second pure-read windows at 100,000 requested GET/s gave:
+
+    Window    GET/s       Average       p99.9       p99.99
+    A         99,976.36   0.22238 ms    1.479 ms    6.079 ms
+    B         99,951.61   0.21323 ms    1.367 ms    6.623 ms
+    Mean      99,963.99   0.21781 ms    1.423 ms    6.351 ms
+
+All GETs were hits. Server CPU during the loaded portion was approximately
+255%. Against the 3a247ca io_uring mean, SPDK improved average latency by 7.9%
+and CPU by roughly 6%, but p99.9 increased 14.4% and p99.99 increased 49.8%.
+The extreme-tail regression repeated in both full windows; it is not a single
+sample anomaly.
+
+SET:GET = 1:10, clean 60-second window:
+
+    Type       Ops/s       Average       p99.9       p99.99
+    SET         9,091.20   0.08311 ms    0.839 ms    3.151 ms
+    GET        90,903.68   0.22064 ms    1.143 ms    4.639 ms
+    Total      99,994.88   0.20813 ms    1.127 ms    4.479 ms
+
+Server CPU was approximately 261%. Compared with the same tomb-raider-off
+io_uring window, average latency improved 10.5%, p99.9 improved 1.4%, CPU was
+effectively unchanged, and p99.99 regressed 40.7%.
+
+SET:GET = 1:1, full 300-second window:
+
+    Type       Ops/s       Average       p99.9       p99.99
+    SET        49,999.60   0.11647 ms    1.199 ms    2.831 ms
+    GET        49,999.35   0.24791 ms    1.423 ms    3.631 ms
+    Total      99,998.95   0.18219 ms    1.319 ms    3.279 ms
+
+Against the historical io_uring five-minute result, SPDK improved average
+latency by 6.1%, while p99.9 regressed 7.9% and p99.99 regressed 29.8%. The
+logical count remained exactly 200 million after every test. There were no OOM
+rejections, qpair/completion errors, or formal-window defrag runs or errors.
+
+Conclusion: this first implementation is functionally sound and removes some
+average-path overhead, but it is not yet a tail-latency win. The next useful
+work is correlated per-request SPDK submit/completion tracing and qpair polling
+delay measurement. Kernel `iostat` cannot observe the VFIO-owned controller,
+so do not compare the SPDK run using missing block-layer statistics.
+
+One pre-refill smoke test repeatedly overwrote the same redis-benchmark key
+about 10,000 times. After restart, the existing Keylane defrag path reported
+`block live-byte accounting underflow`, and a later FLUSHALL reclamation
+reported that the storage writer had stopped. The fresh sequential refill and
+all formal SPDK windows did not reproduce it: defrag error stayed zero. Keep
+this separate overwrite/defrag issue visible rather than treating the smoke
+failure as an NVMe completion error.
+
+Artifacts:
+
+    /tmp/keylane-spdk-fill.perf.data
+    /tmp/keylane-spdk-fill.perf.record
+
+### Latest 8c171a9 kernel perf attribution before SPDK
+
+The user-run 1:1 memtier workload on the io_uring build used 16 threads, ten
+connections per thread, a total requested rate of 100,000 ops/s, the
+`kv_1..kv_200000000` range, random 1000-4000-byte values, and tomb raider
+disabled. A 30-second profile saved as
+`/tmp/keylane-8c171a9-live-memtier.perf.data` captured 48,134 samples with zero
+lost samples.
+
+The raw perf DSO split was 57.31% kernel, 39.42% Keylane, and 2.89% libc, but
+perf callchain collection inflated kernel cost. A less intrusive pidstat window
+measured 120.6% user and 108.8% system CPU, so kernel work was approximately
+47.4% of server CPU. The device sustained about 50,000 reads/s and 132 MiB/s,
+about 1,000 writes/s and 126 MiB/s, 0.12-0.14 ms await, and roughly 33% device
+utilization.
+
+`nvme_submit_cmds` accounted for 16.04% of all perf samples; the remaining
+block/storage kernel path was roughly another 1%. Therefore about 17% of total
+on-CPU samples were work that SPDK could plausibly bypass. The 7.50%
+`_raw_spin_unlock_irqrestore` entry was traced through loopback TCP receive and
+send paths, not filesystem or NVMe work, so SPDK storage cannot remove it.
+
+### Mimalloc purge, eager-commit, and THP environment A/B
+
+This 2026-08-10 UTC A/B used the unchanged 3a247ca Release binary with built-in
+mimalloc 3.4.5; no code was changed or rebuilt. Each configuration was applied
+at process startup, one variable at a time except for the explicitly requested
+purge-off plus THP-off combination. Every restart recovered the same
+237,312,012 physical records and 220,716,329 logical keys. After a 15-second
+warmup, each reported window read random keys from `kv_1..kv_200000000` for 60
+seconds at a requested 100,000 GET/s. All GETs were hits.
+
+The table reports clean-window means. Control includes two opening windows and
+one closing confirmation; the other rows include two windows each.
+
+    Configuration                   GET/s       Average     p99.9      p99.99     vs control   CPU       minflt/s   RSS
+    control (no override)           99,996.93   0.23562 ms  1.130 ms   3.567 ms      --        267.41%    17.89     31.78 GB
+    PURGE_DELAY=-1                  99,996.67   0.23693 ms  1.151 ms   2.087 ms    -41.5%      263.95%     0.00     55.12 GB
+    ARENA_EAGER_COMMIT=1            99,996.51   0.23430 ms  1.063 ms   3.375 ms     -5.4%      269.05%    14.16     31.80 GB
+    ALLOW_THP=0                     99,997.45   0.23820 ms  1.175 ms   2.183 ms    -38.8%      269.52%    23.44     30.76 GB
+    PURGE_DELAY=-1 + ALLOW_THP=0    99,997.65   0.23346 ms  0.991 ms   1.903 ms    -46.6%      273.18%     0.36     53.88 GB
+
+Disabling purge is the strongest isolated result. Its p99.99 values were 2.175
+and 1.999 ms versus the control's 3.695, 3.519, and closing 3.487 ms. It removed
+measured minor faults from the read windows, strongly linking the old extreme
+tail to purged pages being faulted back in. The tradeoff is substantial: RSS
+rose about 73% because unused pages were no longer returned to the OS.
+
+Setting `MIMALLOC_ARENA_EAGER_COMMIT=1` did not produce a material independent
+change. Mimalloc's Linux default is `2`, which already enables eager arena
+commit on an overcommit OS, so this result is expected and does not support
+first-touch commit as the main tail source.
+
+Disabling THP alone also reduced p99.99, but average latency increased 1.1%,
+p99.9 increased 4.0%, minor faults increased, and startup-to-ready recovery was
+approximately 190.0 seconds versus about 177-179 seconds for control. RSS fell
+about 3.2%. It is useful for extreme tail but has broader performance costs.
+
+The combined purge-off plus THP-off setting was best overall in these windows:
+p99.99 fell 46.6% versus control and 8.8% versus purge-off alone, while p99.9
+fell to 0.991 ms. Its RSS remained high because purge was disabled. Combination
+recovery took approximately 184.2 seconds, slower than control but faster than
+THP-off alone.
+
+All clean windows sustained 100,000 device reads/s, about 253.3 MiB/s, and
+0.13-0.14 ms average read await. One first combination window hit the recurring
+NVMe slow plateau (96,656 GET/s, 0.293 ms average latency, and 324.6% server
+CPU); it is preserved but excluded from every mean above. The closing control
+returned to 3.487 ms p99.99 with normal device metrics, ruling out test-order
+drift as the explanation for the improvements. No configuration recorded an
+OOM rejection.
+
+The server was finally left running in the no-override mimalloc control
+configuration.
+
+With purge and THP both enabled (the no-override mimalloc defaults), a clean
+SET:GET=1:10, 60-second mixed window gave:
+
+    Type       Ops/s       Average       p99.9        p99.99
+    SET         9,091.80   0.10847 ms    0.943 ms     1.927 ms
+    GET        90,907.94   0.30037 ms    2.847 ms     3.503 ms
+    Total      99,999.74   0.28292 ms    2.831 ms     3.455 ms
+
+Server CPU averaged 295.05%, with 45.98 minor faults/s. The device averaged
+91,889.6 reads/s, 722.14 MiB/s reads, 0.190 ms read await, 163.3 writes/s,
+18.56 MiB/s writes, and 0.271 ms write await. A later source and timing audit
+showed that the unexpectedly high read bandwidth was the periodic tomb-raider
+sweep, not SET read amplification or defrag. The raider wakes every 600 seconds,
+reads each allocated 8 MiB records block, and sleeps 10 ms per block; the device
+splits those large reads into approximately 512 KiB operations. This matches the
+observed extra approximately 470 MiB/s and 1,000 reads/s. Plain SET only looks
+up the old metadata in memory and appends a new record; it loads the old value
+only for the SET GET option. Current allocator bytes changed only from
+30,794,996,584 to 30,795,828,072; RSS remained about 31.85 GB and OOM rejections
+stayed zero.
+
+An immediate confirmation window, still overlapping the tomb-raider sweep,
+reproduced the approximately 692 MiB/s read bandwidth but entered the recurring
+NVMe slow plateau and delivered only 96,553 ops/s; it is excluded from the clean
+result above. Defrag run, active, and pending metrics were all zero.
+
+To isolate the mixed workload, Keylane was then gracefully restarted with
+`--tomb-raider-interval-ms=0`. Before the test, five consecutive idle samples
+reported zero device reads and writes, and `INFO` reported zero tomb-raider
+rounds. The clean SET:GET=1:10 window gave:
+
+    Type       Ops/s       Average       p99.9        p99.99
+    SET         9,091.71   0.10016 ms    0.927 ms     4.351 ms
+    GET        90,906.48   0.24571 ms    1.159 ms     3.103 ms
+    Total      99,998.19   0.23248 ms    1.143 ms     3.183 ms
+
+Server CPU averaged 259.10%. The device averaged 90,906.1 reads/s, 234.67
+MiB/s reads, 0.140 ms read await, 164.5 writes/s, 18.70 MiB/s writes, and 0.439
+ms write await. Tomb-raider rounds remained zero throughout, memory-limit
+rejections remained zero, and current allocator bytes changed only from
+31,647,278,616 to 31,651,356,176.
+
+Compared with the tomb-raider-overlapped full-throughput window, disabling the
+raider for this test reduced read bandwidth by 67.5%, server CPU by 12.2%,
+average latency by 17.8%, and p99.9 by 59.6%. This confirms that plain SET does
+not cause the observed read amplification; it came from the background sweep.
+
+Artifacts:
+
+    /tmp/keylane-3a247ca-miab-control-*
+    /tmp/keylane-3a247ca-miab-purge-off-*
+    /tmp/keylane-3a247ca-miab-eager-commit-*
+    /tmp/keylane-3a247ca-miab-thp-off-*
+    /tmp/keylane-3a247ca-miab-purge-thp-off-*
+    /tmp/keylane-3a247ca-miab-control-confirm-*
+    /tmp/keylane-3a247ca-miab-control-ratio1-10*
+    /tmp/keylane-3a247ca-mimalloc-tomb-off-*
+
+### Latest main 3a247ca mimalloc memory-accounting retest
+
+This 2026-08-10 UTC retest fast-forwarded main from 99e1d01 to 3a247ca and
+rebuilt Release with `KEYLANE_USE_MIMALLOC=ON`, mimalloc 3.4.5, LTO, and
+detailed GET tracing disabled. Celer remained at b3d78fe. The existing raw-disk
+dataset was preserved; no refill was required.
+
+Keylane started without an explicit `--max-memory` override. It selected the
+automatic 108,010,510,746-byte (100.59 GiB) limit. Recovery scanned 215,543,309
+physical records in 133.12 seconds and all workers were ready after 154.22
+seconds. `DBSIZE` returned exactly 200,000,000, and `kv_1`, `kv_100000000`, and
+`kv_200000000` all had 2,000-byte values.
+
+Three clean 60-second pure-read windows at a requested 100,000 operations/s
+gave:
+
+    Window    GET/s        Average       p99.9        p99.99       Server CPU
+    A         99,999.52    0.23995 ms    1.319 ms     4.607 ms     266.22%
+    B         99,997.01    0.22998 ms    1.119 ms     4.031 ms     279.77%
+    C         99,996.14    0.23946 ms    1.295 ms     4.079 ms     265.88%
+    Mean      99,997.56    0.23646 ms    1.244 ms     4.239 ms     270.62%
+
+All 18,000,240 GETs were hits. The SSD sustained 100,000 reads/s and about
+253.30 MiB/s in every window. One-second average read await was 0.13-0.14 ms;
+there were no writes in the pure-read windows. Saved before/after Prometheus
+command counters exactly match each memtier operation count, confirming that a
+later user-run workload did not overlap these formal windows.
+
+Compared with the two clean 99e1d01 mimalloc windows, average latency increased
+1.1%, p99.9 improved 0.5%, and p99.99 increased from 3.903 ms to 4.239 ms
+(8.6%). The extreme-tail increase repeated in all three windows, but the rest
+of the distribution and the SSD average await did not regress. The old theory
+that a 100-ms `mi_stats_get()` sample alone explained the tail is incomplete:
+3a247ca now samples only the lightweight sharded live-byte counters every
+100 ms and moves mimalloc diagnostics to explicit metrics/INFO refreshes. It
+also adds `mi_usable_size()` plus a worker-local accounting update to each C++
+allocation and free. That is the main new hot-path candidate, but attributing
+the 8.6% p99.99 difference requires a same-commit build that disables only the
+allocation hooks; the current measurements do not prove causality.
+
+SET:GET = 1:10, clean 60-second window with the default automatic limit:
+
+    Type       Ops/s       Average       p99.9        p99.99
+    SET         9,091.70   0.10306 ms    1.007 ms     2.591 ms
+    GET        90,906.36   0.24613 ms    1.191 ms     3.743 ms
+    Total      99,998.07   0.23312 ms    1.175 ms     3.599 ms
+
+This mixed result is effectively unchanged at p99.99 from the 99e1d01 valid
+workaround run (3.631 ms). Memory accounting remained below the automatic
+limit throughout: before and after the mixed window, current used bytes were
+27,909,105,296 and 27,874,545,744, while RSS was approximately 28.35 GB
+(26.40 GiB). There were zero memory-limit rejections and no OOM responses.
+After all test windows, `INFO memory` reported 25.66 GiB current, 26.40 GiB
+RSS, and 26.08 GiB
+peak current. This confirms the false-OOM bug is fixed and also reflects the
+smaller 3a247ca index footprint; the previous process RSS was approximately
+38 GB on the same logical dataset.
+
+Artifacts:
+
+    /tmp/keylane-3a247ca-w8-mimalloc-fixed-server.log
+    /tmp/keylane-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{memtier,pidstat,iostat}
+    /tmp/keylane-3a247ca-w8-mimalloc-fixed-read80-{a,b,c}.{before,after}.metrics
+    /tmp/keylane-3a247ca-w8-mimalloc-fixed-ratio1-10.{memtier,pidstat,iostat}
+    /tmp/keylane-3a247ca-w8-mimalloc-fixed-ratio1-10.{before,after}.metrics
+
+### Latest main 99e1d01 mimalloc retest and allocator tail A/B
+
+This 2026-08-10 UTC retest started from a discarded `/dev/nvme1n1` and
+refilled exactly 200,000,000 keys named `kv_1` through `kv_200000000`, each
+with a fixed 2,000-byte value. Keylane used CPUs 0-7 with eight workers;
+memtier used CPUs 8-15 with eight threads and ten connections per thread. The
+build was Release with native optimization, LTO, mimalloc 3.4.5, and detailed
+GET tracing disabled.
+
+Fresh fill:
+
+    SET/s:       489,175.53
+    average:     0.16337 ms
+    p99:         0.615 ms
+    p99.9:       1.639 ms
+    p99.99:      2.447 ms
+    records:     200,000,000
+    server CPU:  780.45%
+    writes:      8,115.94/s, 996.96 MiB/s
+
+After a graceful shutdown, recovery found exactly 200,000,000 physical and
+logical records. The data-block scan took 115.66 seconds at approximately
+1.73 million records/s; all eight workers were ready 144.41 seconds after
+launch. DB 0 reported 200,000,000 keys, and the first, middle, and last values
+were all 2,000 bytes.
+
+The first formal pure-read window used the default automatic memory limit and
+preceded any rejected write traffic:
+
+    GET/s:       99,996.20
+    average:     0.23091 ms
+    p99:         0.559 ms
+    p99.9:       1.295 ms
+    p99.99:      3.919 ms
+    hits:        6,000,080
+    misses:      0
+
+The first 1:10 attempt was invalid. After recovery, the allocator gauge was
+93,053,255,680 bytes while RSS was approximately 38.0 GB. During overwriting
+SETs the gauge rose above the automatically selected 108,010,510,746-byte
+limit, even though RSS remained approximately 38.0 GB. Keylane rejected
+350,000 commands with `OOM command not allowed when used memory >
+'maxmemory'`. The same failure reproduced in the atomicity stress test. The
+server was restarted with `--max-memory=1tb`; the invalid window is excluded
+from all performance results below.
+
+Pure-read confirmation after the 1 TiB workaround:
+
+    GET/s:       99,998.50
+    average:     0.23685 ms
+    p99:         0.615 ms
+    p99.9:       1.207 ms
+    p99.99:      3.887 ms
+    hits:        6,000,080
+    misses:      0
+
+SET:GET = 1:10, clean 60-second window with the workaround:
+
+    Type       Ops/s       Average       p99          p99.9        p99.99
+    SET         9,091.55   0.09475 ms    0.359 ms     0.895 ms     5.375 ms
+    GET        90,904.84   0.23774 ms    0.583 ms     1.199 ms     3.583 ms
+    Total      99,996.39   0.22474 ms    0.575 ms     1.175 ms     3.631 ms
+
+SET:GET = 1:1, 300 seconds with the workaround:
+
+    Type       Ops/s       Average       p99          p99.9        p99.99
+    SET        49,992.23   0.11826 ms    0.567 ms     1.031 ms     1.943 ms
+    GET        49,992.11   0.26971 ms    0.847 ms     1.367 ms     2.879 ms
+    Total      99,984.34   0.19399 ms    0.727 ms     1.223 ms     2.527 ms
+
+Every valid formal GET was a hit. Full-window server and device averages for
+the workaround runs were:
+
+    Workload           CPU       r/s         rMiB/s    rAwait     w/s      wMiB/s   wAwait
+    Pure read confirm  263.90%   100,000.0   253.29    0.140 ms     0.0      0.00   0.000 ms
+    1:10               266.20%    90,906.0   230.27    0.132 ms   163.4     18.57   0.477 ms
+    1:1, 300 seconds   222.14%    49,989.2   126.63    0.121 ms   849.9    102.72   0.172 ms
+
+At the end of the five-minute mixed test, the mimalloc gauge was approximately
+110.45 GB while process RSS remained approximately 38.0 GB and the explicit
+1 TiB run had zero memory-limit rejections. This confirms that the automatic
+limit failure is a gauge/enforcement problem rather than physical memory
+exhaustion in this workload.
+
+The new pure-read p99.99 was reproducibly near 3.9 ms even though average,
+p99, CPU, device throughput, and average read await did not regress. A
+same-commit allocator A/B used `bld-libc`, built with
+`KEYLANE_USE_MIMALLOC=OFF`; all other build, server, dataset, CPU, and memtier
+parameters were unchanged. Two clean 60-second windows gave:
+
+    Allocator      Average       p99          p99.9        p99.99
+    mimalloc       0.23388 ms    0.587 ms     1.251 ms     3.903 ms
+    libc           0.23908 ms    0.583 ms     1.259 ms     2.791 ms
+
+Disabling mimalloc reduced clean-window p99.99 by 28.5% while the other
+latency levels stayed essentially unchanged. The strongest mechanism is the
+new memory sampler: worker 0 calls the global `mi_stats_get()` every 100 ms.
+That is approximately 600 samples per 60-second run, the same order as the
+600 slowest requests that define p99.99 among six million operations. This is
+high-confidence evidence that the combined mimalloc/statistics path causes a
+large part of the new extreme tail; isolating allocator behavior from
+`mi_stats_get()` itself still requires a mimalloc build with statistics
+sampling disabled. One libc window hit the recurring NVMe slowdown and is
+excluded from the clean A/B average.
+
+The logged TSC conversion frequency is not responsible. Keylane reported
+2,793.437-2,793.439 MHz, matching the kernel's 2,793.437 MHz detection. The
+machine uses TSC as its clocksource and advertises `constant_tsc`,
+`nonstop_tsc`, `tsc_reliable`, and `tsc_known_freq`.
+
+Artifacts:
+
+    /tmp/keylane-99e1d01-w8-refill-server.log
+    /tmp/keylane-99e1d01-w8-refill.{memtier,iostat,pidstat}
+    /tmp/keylane-99e1d01-w8-recovery-server.log
+    /tmp/keylane-99e1d01-w8-read80.{memtier,iostat,pidstat}
+    /tmp/keylane-99e1d01-w8-max1tb-server.log
+    /tmp/keylane-99e1d01-w8-max1tb-mixed1to10.{memtier,iostat,pidstat}
+    /tmp/keylane-99e1d01-w8-max1tb-mixed1to1-300s.{memtier,iostat,pidstat}
+    /tmp/keylane-99e1d01-w8-max1tb-read80-confirm.{memtier,iostat,pidstat}
+    /tmp/keylane-99e1d01-w8-libc-server.log
+    /tmp/keylane-99e1d01-w8-libc-read80-{a,b,c}.{memtier,iostat,pidstat}
 
 ### Latest main 390197c fresh refill and standard retest
 

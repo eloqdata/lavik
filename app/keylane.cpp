@@ -48,6 +48,15 @@ int main(int argc, char** argv) {
                  "Busy-poll CQ and cross-core mailboxes before parking")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--background-budget-us", options.background_budget_us_,
+                 "Maximum worker background slice in microseconds")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--background-warrant-percent",
+                 options.background_warrant_percent_,
+                 "Maximum rolling worker CPU share guaranteed to background tasks")
+      ->capture_default_str()
+      ->check(CLI::Range(1U, 100U));
   app.add_option("--mimalloc-purge-delay-ms", options.mimalloc_purge_delay_ms_,
                  "Mimalloc purge delay in ms (-1 disables purging)")
       ->capture_default_str()
@@ -78,6 +87,22 @@ int main(int argc, char** argv) {
                  "Pause after each block the tombstone sweep reads")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--defrag-max-active-per-device",
+                 options.defrag_max_active_per_device_,
+                 "Maximum concurrent block relocations per storage device")
+      ->capture_default_str()
+      ->check(CLI::Range(1U, 8U));
+  app.add_option("--defrag-sleep-ms", options.defrag_sleep_ms_,
+                 "Asynchronous cooldown after each relocated block")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--defrag-record-sleep-us",
+                 options.defrag_record_sleep_us_,
+                 "Asynchronous pause after each record examined by defrag")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_flag("--defrag-paused", options.defrag_paused_,
+               "Queue defrag candidates without running relocation jobs");
   app.add_option(
          "--data-file", options.data_files_,
          "Existing data file or block device; repeat for multiple paths")

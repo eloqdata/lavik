@@ -641,15 +641,21 @@ int RunServer(ServerOptions options) {
   spdlog::info(
       "keylane listening on {}:{} metrics_port={} threads={} "
       "idle_timeout_ms={} "
-      "busy_poll_us={} "
+      "busy_poll_us={} background_budget_us={} "
+      "background_warrant_percent={} "
       "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
       "flush_size_bytes={} "
-      "inline_key_max_bytes={} verify_read_crc={}",
+      "inline_key_max_bytes={} verify_read_crc={} "
+      "defrag_max_active_per_device={} defrag_sleep_ms={} "
+      "defrag_record_sleep_us={} defrag_paused={}",
       options.bind_ip_, options.port_, options.metrics_port_,
       options.thread_count_, options.idle_timeout_ms_, options.busy_poll_us_,
+      options.background_budget_us_, options.background_warrant_percent_,
       options.registered_buffer_bytes_, options.max_memory_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
-      options.inline_key_max_bytes_, options.verify_read_crc_);
+      options.inline_key_max_bytes_, options.verify_read_crc_,
+      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
+      options.defrag_record_sleep_us_, options.defrag_paused_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
@@ -682,6 +688,12 @@ int RunServer(ServerOptions options) {
       options.replication_options_.listen_port_ == 0;
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
   storage_options.tomb_raider_sleep_ms_ = options.tomb_raider_sleep_ms_;
+  storage_options.defrag_max_active_per_device_ =
+      options.defrag_max_active_per_device_;
+  storage_options.defrag_sleep_ms_ = options.defrag_sleep_ms_;
+  storage_options.defrag_record_sleep_us_ =
+      options.defrag_record_sleep_us_;
+  storage_options.defrag_paused_ = options.defrag_paused_;
   storage_options.buffers_.registered_bytes_ = options.registered_buffer_bytes_;
   storage::StorageEngine storage(std::move(storage_options));
   absl::Status storage_status = storage.Prepare(options.thread_count_);
@@ -703,6 +715,9 @@ int RunServer(ServerOptions options) {
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
   runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
   runtime_options.busy_poll_us_ = options.busy_poll_us_;
+  runtime_options.background_budget_us_ = options.background_budget_us_;
+  runtime_options.background_warrant_percent_ =
+      options.background_warrant_percent_;
 
   RedisService redis(options.port_, &storage, &replication);
   std::unique_ptr<Service> metrics;

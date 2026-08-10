@@ -108,9 +108,8 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
   assert(celer::ThisWorker().id_ == allocator.owner_);
   WorkerStore& store = *stores_[allocator.owner_];
   const StorageDevice& device = devices_[device_index];
-  auto* zero_header = static_cast<std::byte*>(::operator new[](
-      kBlockHeaderBytes, std::align_val_t(options_.buffers_.alignment_),
-      std::nothrow));
+  auto* zero_header = static_cast<std::byte*>(celer::AllocateStorageBuffer(
+      kBlockHeaderBytes, options_.buffers_.alignment_));
   if (zero_header == nullptr) {
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "failed to allocate recycled-block header buffer");
@@ -135,8 +134,7 @@ Task<absl::Status> StorageEngine::Impl::InvalidateReactivatedBlockHeadersLocal(
     status = co_await celer::Fdatasync(*store.worker_,
                                        store.files_[device.file_index_]);
   }
-  ::operator delete[](zero_header,
-                      std::align_val_t(options_.buffers_.alignment_));
+  celer::FreeStorageBuffer(zero_header, options_.buffers_.alignment_);
   co_return status;
 }
 

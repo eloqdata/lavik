@@ -335,6 +335,38 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
       Expect(client.Command({"PING"}), "+PONG", "PING");
+      Expect(client.Command({"DEFRAG", "MAX-ACTIVE", "1"}), "+OK",
+             "DEFRAG MAX-ACTIVE");
+      Expect(client.Command({"DEFRAG", "BLOCK-SLEEP-MS", "25"}), "+OK",
+             "DEFRAG BLOCK-SLEEP-MS");
+      Expect(client.Command({"DEFRAG", "RECORD-SLEEP-US", "7"}), "+OK",
+             "DEFRAG RECORD-SLEEP-US");
+      Expect(client.Command({"DEFRAG", "PAUSE"}), "+OK", "DEFRAG PAUSE");
+      const std::string defrag_status =
+          client.Command({"DEFRAG", "STATUS"});
+      if (defrag_status.find("paused=1") == std::string::npos ||
+          defrag_status.find("max_active_per_device=1") == std::string::npos ||
+          defrag_status.find("block_sleep_ms=25") == std::string::npos ||
+          defrag_status.find("record_sleep_us=7") == std::string::npos) {
+        Fail("DEFRAG STATUS did not report runtime settings");
+      }
+      if (StatField(client, "defrag_max_active_per_device") != 1 ||
+          StatField(client, "defrag_paused") != 1 ||
+          StatField(client, "defrag_block_sleep_ms") != 25 ||
+          StatField(client, "defrag_record_sleep_us") != 7) {
+        Fail("INFO stats did not report defrag runtime settings");
+      }
+      Expect(client.Command({"DEFRAG", "RESUME"}), "+OK",
+             "DEFRAG RESUME");
+      Expect(client.Command({"DEFRAG", "MAX-ACTIVE", "0"}),
+             "-ERR value is not an integer or out of range",
+             "DEFRAG zero concurrency");
+      Expect(client.Command({"DEFRAG", "INVALID", "1"}),
+             "-ERR syntax error", "DEFRAG invalid setting");
+      Expect(client.Command({"DEFRAG", "BLOCK-SLEEP-MS", "0"}), "+OK",
+             "DEFRAG reset block sleep");
+      Expect(client.Command({"DEFRAG", "RECORD-SLEEP-US", "0"}), "+OK",
+             "DEFRAG reset record sleep");
       Expect(client.Command({"TOMBRAIDER", "OFF"}), "+OK", "TOMBRAIDER OFF");
       const long long disabled_rounds = StatField(client, "tomb_raider_rounds");
       std::this_thread::sleep_for(700ms);

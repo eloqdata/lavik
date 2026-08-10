@@ -341,6 +341,70 @@ Task<CommandReply> ExecuteTombRaider(const CommandRequest& request,
                                   absl::StrCat("ERR ", configured.message())));
 }
 
+Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
+                                ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  if (args.size() < 2 || args.size() > 3) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'defrag' command"));
+  }
+
+  if (CmpCaseInsensitive(args[1], "STATUS")) {
+    if (args.size() != 2) {
+      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+    }
+    const storage::DefragTotals status = g_storage->DefragStats();
+    co_return BuiltReply(reply_builder.AppendBulkString(absl::StrCat(
+        "paused=", status.paused_ ? 1 : 0, " max_active_per_device=",
+        status.max_active_per_device_,
+        " block_sleep_ms=", status.block_sleep_ms_, " record_sleep_us=",
+        status.record_sleep_us_, " active_total=", status.active_,
+        " pending_total=", status.pending_)));
+  }
+
+  storage::DefragConfigUpdate update;
+  if (CmpCaseInsensitive(args[1], "PAUSE") && args.size() == 2) {
+    update.action_ = storage::DefragConfigAction::kPause;
+  } else if (CmpCaseInsensitive(args[1], "RESUME") && args.size() == 2) {
+    update.action_ = storage::DefragConfigAction::kResume;
+  } else if ((CmpCaseInsensitive(args[1], "MAX-ACTIVE") ||
+       CmpCaseInsensitive(args[1], "CONCURRENCY")) &&
+      args.size() == 3) {
+    update.action_ = storage::DefragConfigAction::kMaxActivePerDevice;
+    if (!ParseUint64(args[2], &update.value_) || update.value_ == 0 ||
+        update.value_ > 8) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR value is not an integer or out of range"));
+    }
+  } else if ((CmpCaseInsensitive(args[1], "BLOCK-SLEEP-MS") ||
+              CmpCaseInsensitive(args[1], "BLOCK-SLEEP") ||
+              CmpCaseInsensitive(args[1], "SLEEP")) &&
+             args.size() == 3) {
+    update.action_ = storage::DefragConfigAction::kBlockSleep;
+    if (!ParseUint64(args[2], &update.value_) ||
+        update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR value is not an integer or out of range"));
+    }
+  } else if ((CmpCaseInsensitive(args[1], "RECORD-SLEEP-US") ||
+              CmpCaseInsensitive(args[1], "RECORD-SLEEP")) &&
+             args.size() == 3) {
+    update.action_ = storage::DefragConfigAction::kRecordSleep;
+    if (!ParseUint64(args[2], &update.value_) ||
+        update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR value is not an integer or out of range"));
+    }
+  } else {
+    co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+  }
+
+  const absl::Status configured = co_await g_storage->ConfigureDefrag(update);
+  co_return configured.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+                            : BuiltReply(reply_builder.AppendError(
+                                  absl::StrCat("ERR ", configured.message())));
+}
+
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
 constexpr std::uint64_t kDbGateCountMask = ~kDbGateClosed;
 std::array<std::atomic<std::uint64_t>, storage::kLogicalDatabaseCount>
@@ -1337,6 +1401,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   }
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
+    const storage::DefragTotals defrag = g_storage->DefragStats();
     info += "# Stats\r\n";
     info += "total_commands_processed:" +
             std::to_string(runtime_metrics->TotalCalls()) + "\r\n";
@@ -1358,6 +1423,16 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "\r\n";
     info += "tomb_raider_daily_second:" + std::to_string(raider.daily_second_) +
             "\r\n\r\n";
+    info += "defrag_max_active_per_device:" +
+            std::to_string(defrag.max_active_per_device_) + "\r\n";
+    info += std::string("defrag_paused:") +
+            (defrag.paused_ ? "1\r\n" : "0\r\n");
+    info += "defrag_block_sleep_ms:" +
+            std::to_string(defrag.block_sleep_ms_) + "\r\n";
+    info += "defrag_record_sleep_us:" +
+            std::to_string(defrag.record_sleep_us_) + "\r\n";
+    info += "defrag_active:" + std::to_string(defrag.active_) + "\r\n";
+    info += "defrag_pending:" + std::to_string(defrag.pending_) + "\r\n\r\n";
   }
   if (wants("replication")) {
     info += "# Replication\r\n";
@@ -2557,6 +2632,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
 
     case CommandKind::kTombRaider:
       co_return co_await ExecuteTombRaider(request, reply_builder);
+
+    case CommandKind::kDefrag:
+      co_return co_await ExecuteDefrag(request, reply_builder);
 
     case CommandKind::kDel:
     case CommandKind::kExists:

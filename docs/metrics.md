@@ -50,6 +50,32 @@ histogram_quantile(
 
 ## Storage metrics
 
+The active defrag tuning values are exported alongside the work gauges so
+latency graphs can be correlated with runtime A/B changes:
+
+- `keylane_storage_defrag_max_active_per_device`
+- `keylane_storage_defrag_block_sleep_seconds`
+- `keylane_storage_defrag_record_sleep_seconds`
+- `keylane_storage_defrag_paused`
+
+They can be changed without restarting Keylane:
+
+```text
+DEFRAG PAUSE
+DEFRAG RESUME
+DEFRAG MAX-ACTIVE 1
+DEFRAG BLOCK-SLEEP-MS 100
+DEFRAG RECORD-SLEEP-US 10
+DEFRAG STATUS
+```
+
+Reducing concurrency does not cancel relocations already in flight. A block
+sleep change applies after the current block; record sleep is loaded at every
+record checkpoint. Zero disables either sleep. `PAUSE` prevents new relocation
+jobs from starting but lets an already active job finish; queued candidates are
+woken by `RESUME`. Pausing defrag indefinitely can eventually prevent writes
+from reclaiming space on a nearly full device.
+
 - `keylane_storage_defrag_runs_total{result}`: completed defrag attempts,
   classified as `success`, `resource_exhausted`, or `error`.
 - `keylane_storage_defrag_active`: defrag jobs currently running.

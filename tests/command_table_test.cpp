@@ -81,6 +81,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
+  CheckKind("DEFRAG", CommandKind::kDefrag);
   EXPECT_CHECK(FindCommand("NOPE") == nullptr,
                "unknown command should not resolve");
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");

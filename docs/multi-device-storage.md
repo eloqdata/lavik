@@ -90,12 +90,14 @@ keeps the usual rollover off the latency-critical path without reserving an
 and allocation counters are worker-local; the hot path does not read a shared
 global free-space counter.
 
-Defrag scheduling is also per device. A device has its own ready queue and up
-to eight active defrag permits, matching its eight-block reserve. A source
-block is queued on the device that contains it, so a busy or full device does
-not consume another device's permits. The reserve is capacity, not eight fixed
-block identities: defrag consumes a ready destination, returns the cleaned
-source, and the protected free space rotates over time.
+Defrag scheduling is also per device. A device has its own ready queue and a
+runtime-configurable active-job limit, capped at eight to match its eight-block
+reserve. `DEFRAG MAX-ACTIVE N` therefore applies independently to every device,
+not across the whole process. A source block is queued on the device that
+contains it, so a busy or full device does not consume another device's
+permits. The reserve is capacity, not eight fixed block identities: defrag
+consumes a ready destination, returns the cleaned source, and the protected
+free space rotates over time.
 
 ## Recovery and worker-count changes
 

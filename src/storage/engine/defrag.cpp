@@ -133,11 +133,77 @@ void StorageEngine::Impl::MaybeQueueDefrag(WorkerStore& store,
   RequestDefrag(store);
 }
 
+Task<absl::Status> StorageEngine::Impl::ConfigureDefrag(
+    DefragConfigUpdate update) {
+  co_return co_await celer::SubmitTo(0, [this, update] {
+    switch (update.action_) {
+      case DefragConfigAction::kPause:
+        defrag_config_.paused_.store(true, std::memory_order_release);
+        return absl::OkStatus();
+      case DefragConfigAction::kResume:
+        if (defrag_config_.paused_.exchange(false,
+                                            std::memory_order_acq_rel)) {
+          for (std::size_t device_index = 0;
+               device_index < devices_.size(); ++device_index) {
+            stores_[0]->worker_->SpawnBackground(
+                WakeQueuedDefrags(device_index));
+          }
+        }
+        return absl::OkStatus();
+      case DefragConfigAction::kMaxActivePerDevice: {
+        if (update.value_ == 0 ||
+            update.value_ > kDefragReserveBlocksPerDevice) {
+          return absl::Status(
+              absl::StatusCode::kInvalidArgument,
+              "defrag concurrency must be between 1 and the per-device "
+              "reserve");
+        }
+        const unsigned requested = static_cast<unsigned>(update.value_);
+        const unsigned previous =
+            defrag_config_.max_active_per_device_.exchange(
+                requested, std::memory_order_acq_rel);
+        if (requested > previous) {
+          for (std::size_t device_index = 0;
+               device_index < devices_.size(); ++device_index) {
+            stores_[0]->worker_->SpawnBackground(
+                WakeQueuedDefrags(device_index));
+          }
+        }
+        return absl::OkStatus();
+      }
+      case DefragConfigAction::kBlockSleep:
+        if (update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+          return absl::Status(absl::StatusCode::kInvalidArgument,
+                              "invalid defrag block sleep");
+        }
+        defrag_config_.block_sleep_ms_.store(
+            static_cast<std::uint32_t>(update.value_),
+            std::memory_order_release);
+        return absl::OkStatus();
+      case DefragConfigAction::kRecordSleep:
+        if (update.value_ > std::numeric_limits<std::uint32_t>::max()) {
+          return absl::Status(absl::StatusCode::kInvalidArgument,
+                              "invalid defrag record sleep");
+        }
+        defrag_config_.record_sleep_us_.store(
+            static_cast<std::uint32_t>(update.value_),
+            std::memory_order_release);
+        return absl::OkStatus();
+    }
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "invalid defrag configuration action");
+  });
+}
+
 bool StorageEngine::Impl::TryAcquireDefragPermit(std::size_t device_index) {
+  if (defrag_config_.paused_.load(std::memory_order_acquire)) {
+    return false;
+  }
   std::atomic<unsigned>& device_active =
       active_defrags_by_device_[device_index];
   unsigned active = device_active.load(std::memory_order_acquire);
-  while (active < kDefragPermitsPerDevice) {
+  while (active < defrag_config_.max_active_per_device_.load(
+                      std::memory_order_acquire)) {
     if (device_active.compare_exchange_weak(active, active + 1,
                                             std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
@@ -267,8 +333,31 @@ Task<absl::Status> StorageEngine::Impl::DefragOne(WorkerStore* store) {
   if (status.code() == absl::StatusCode::kResourceExhausted) {
     MaybeQueueDefrag(*store, candidate);
   }
+  const std::uint32_t block_sleep_ms =
+      defrag_config_.block_sleep_ms_.load(std::memory_order_acquire);
+  if (block_sleep_ms != 0 &&
+      !shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    // Hold the device permit during an asynchronous cooldown. This paces the
+    // device rather than merely delaying this worker while another worker
+    // immediately takes its place. SleepFor suspends only this background
+    // coroutine; it never blocks the worker thread.
+    (void)co_await celer::SleepFor(
+        *store->worker_, std::chrono::milliseconds(block_sleep_ms));
+  }
   FinishDefragPass(*store);
   co_return status;
+}
+
+Task<absl::Status> StorageEngine::Impl::DefragRecordCheckpoint(
+    WorkerStore& store) {
+  const std::uint32_t sleep_us =
+      defrag_config_.record_sleep_us_.load(std::memory_order_acquire);
+  if (sleep_us != 0) {
+    co_return co_await celer::SleepFor(*store.worker_,
+                                      std::chrono::microseconds(sleep_us));
+  }
+  co_await celer::Yield(*store.worker_);
+  co_return absl::OkStatus();
 }
 
 Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
@@ -590,7 +679,11 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     if (record.kind_ != RecordKind::kTxCommit &&
         DbEpoch(record.db_id_) != record.db_epoch_) {
       record_offset += record.total_disk_bytes_;
-      co_await celer::Yield(*store.worker_);
+      absl::Status paced = co_await DefragRecordCheckpoint(store);
+      if (!paced.ok()) {
+        source.defragging_ = false;
+        co_return paced;
+      }
       continue;
     }
     const std::byte* payload_data =
@@ -699,7 +792,11 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         co_return commit_dead;
       }
       record_offset += record.total_disk_bytes_;
-      co_await celer::Yield(*store.worker_);
+      absl::Status paced = co_await DefragRecordCheckpoint(store);
+      if (!paced.ok()) {
+        source.defragging_ = false;
+        co_return paced;
+      }
       continue;
     }
     const unsigned key_owner = OwnerForKey(disk_key);
@@ -744,10 +841,14 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       }
     }
     record_offset += record.total_disk_bytes_;
-    // Cheap while the 50 us background slice has budget remaining; once it
-    // expires this defers the cleaner to the next scheduler round so online
-    // I/O and cross-core work are polled first.
-    co_await celer::Yield(*store.worker_);
+    // With record_sleep_us=0 this is the cooperative background-budget
+    // checkpoint. A positive value forces an asynchronous pause after every
+    // record, smoothing one block's CPU, cross-core, and device-I/O burst.
+    absl::Status paced = co_await DefragRecordCheckpoint(store);
+    if (!paced.ok()) {
+      source.defragging_ = false;
+      co_return paced;
+    }
   }
   co_return absl::OkStatus();
 }
