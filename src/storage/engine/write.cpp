@@ -35,7 +35,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
           absl::StatusCode::kInvalidArgument,
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
-    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_);
+    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
+                                     ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -128,7 +129,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   const RecordLocation previous = found->value_;
-  auto loaded = co_await LoadValue(store, db_id, key, digest, previous);
+  auto loaded = co_await LoadValue(store, db_id, key, digest, previous,
+                                   ExtentsFor(store, found));
   if (!loaded.ok()) {
     co_return loaded.status();
   }
@@ -209,7 +211,8 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     expire_at_ms = found->value_.expire_at_ms_;
-    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_);
+    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
+                                     ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -391,13 +394,13 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
   for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
     TxUndoEntry& entry = *it;
     const RecordLocation applied = entry.entry_->value_;
-    auto& partition = PartitionForKey(store, entry.entry_->key_);
+    auto& partition = PartitionForKey(store, entry.entry_->key());
     if (!entry.previous_.has_value()) {
       // The key did not exist: a normal tombstone append restores absence
       // with every side effect handled (accounting, watchers, and the
       // replica delta that supersedes the aborted value).
       absl::Status tombstone = co_await AppendLocked(
-          store, partition, entry.db_id_, entry.entry_->key_, {},
+          store, partition, entry.db_id_, entry.entry_->key(), {},
           RecordKind::kTombstone, ValueType::kNone, 0);
       if (!tombstone.ok()) {
         store.write_failed_ = true;
@@ -406,6 +409,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
       continue;
     }
     // Mirror the append-time counter math in reverse.
+    const ExtentManifest applied_extents = ExtentsFor(store, entry.entry_);
     const bool applied_live = applied.kind_ == RecordKind::kValue;
     const bool restored_live = entry.previous_->kind_ == RecordKind::kValue;
     if (applied_live != restored_live) {
@@ -428,6 +432,15 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
       }
     }
     entry.entry_->value_ = *entry.previous_;
+    if (entry.previous_->external_) {
+      store.external_manifests_.insert_or_assign(entry.entry_,
+                                                 entry.previous_extents_);
+    } else {
+      store.external_manifests_.erase(entry.entry_);
+    }
+    if (applied.external_ && applied_extents != nullptr) {
+      SpawnExtentReclaim(store, applied_extents);
+    }
     absl::Status dead =
         MarkRecordDeadLocal(store.worker_->id(), RetiredRecordOf(applied));
     if (!dead.ok()) {
@@ -914,6 +927,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       previous_entry == nullptr
           ? std::nullopt
           : std::optional<RecordLocation>(previous_entry->value_);
+  const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
   ActiveBlock updated = *active;
   const std::uint32_t record_offset = updated.committed_bytes_;
   updated.committed_bytes_ += static_cast<std::uint32_t>(total_disk_bytes);
@@ -1002,12 +1016,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .mutation_sequence_ = mutation_sequence,
       .allocation_epoch_ = updated.allocation_epoch_,
       .expire_at_ms_ = expire_at_ms,
-      .block_owner_ = writer_id,
+      .logical_size_ = logical_size,
       .record_offset_ = record_offset,
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
-      .logical_size_ = logical_size,
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
       .relocation_sequence_ = static_cast<std::uint32_t>(relocation_sequence),
+      .block_owner_ = writer_id,
       .in_memory_ = true,
       .external_ = external,
       // A relocation rewrites the same logical version, so it carries the
@@ -1028,7 +1042,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                                   std::max(expire_at_ms, UnixTimeMillis()))))),
       .kind_ = kind,
       .value_type_ = value_type,
-      .extents_ = std::move(extents),
   };
   const bool was_live =
       previous.has_value() && previous->kind_ == RecordKind::kValue;
@@ -1038,13 +1051,18 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   RecordIndex::Entry* inserted_entry = nullptr;
   if (index_ptr != nullptr) {
     inserted_entry = index_ptr->InsertOrAssign(digest, key, location).entry_;
+    if (external) {
+      store.external_manifests_.insert_or_assign(inserted_entry, extents);
+    } else {
+      store.external_manifests_.erase(inserted_entry);
+    }
   }
   const bool route_to_commit = tx != nullptr && previous.has_value();
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
       .entry_ = inserted_entry,
       .retired_extents_ =
           !for_defrag && previous.has_value() && previous->external_
-              ? previous->extents_
+              ? previous_extents
               : nullptr,
       .retired_record_ =
           !for_defrag && !route_to_commit && previous.has_value()
@@ -1058,6 +1076,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     store.tx_undo_[txid].push_back(TxUndoEntry{
         .entry_ = inserted_entry,
         .previous_ = previous,
+        .previous_extents_ = previous_extents,
         .db_id_ = db_id,
     });
   }

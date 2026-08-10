@@ -61,7 +61,8 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   std::unordered_map<std::string, unsigned> seen;
   std::uint64_t cursor = 0;
   do {
-    cursor = map.Scan(cursor, [&](const auto& entry) { ++seen[entry.key_]; });
+    cursor = map.Scan(
+        cursor, [&](const auto& entry) { ++seen[std::string(entry.key())]; });
   } while (cursor != 0);
   ASSERT_CHECK(seen.size() == map.size(), "stable scan missed entries");
   for (const auto& [key, count] : seen) {
@@ -70,13 +71,15 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   }
 
   seen.clear();
-  cursor = map.Scan(0, [&](const auto& entry) { ++seen[entry.key_]; });
+  cursor =
+      map.Scan(0, [&](const auto& entry) { ++seen[std::string(entry.key())]; });
   for (std::uint64_t i = kInitial; i < kInitial + 20000; ++i) {
     const std::string key = "key-" + std::to_string(i);
     map.InsertOrAssign(ComputeDigest(key), key, i);
   }
   while (cursor != 0) {
-    cursor = map.Scan(cursor, [&](const auto& entry) { ++seen[entry.key_]; });
+    cursor = map.Scan(
+        cursor, [&](const auto& entry) { ++seen[std::string(entry.key())]; });
   }
   for (std::uint64_t i = 0; i < kInitial; ++i) {
     const std::string key = "key-" + std::to_string(i);
@@ -147,8 +150,8 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   seen.clear();
   cursor = 0;
   do {
-    cursor =
-        erasable.Scan(cursor, [&](const auto& entry) { ++seen[entry.key_]; });
+    cursor = erasable.Scan(
+        cursor, [&](const auto& entry) { ++seen[std::string(entry.key())]; });
   } while (cursor != 0);
   ASSERT_CHECK(seen.size() == erasable.size(),
                "scan after erase missed or duplicated survivors");
@@ -187,7 +190,7 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
     do {
       drain_cursor = chained.Scan(drain_cursor, [&](const auto& entry) {
         if (victim.empty()) {
-          victim = entry.key_;
+          victim = entry.key();
         }
       });
     } while (drain_cursor != 0 && victim.empty());

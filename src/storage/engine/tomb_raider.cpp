@@ -360,8 +360,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
             }
           } else if (entry.value_.kind_ == RecordKind::kTombstone) {
             tombs.push_back(Candidate{
-                .digest_ = entry.digest_,
-                .key_ = entry.key_,
+                .digest_ = ComputeDigest(entry.key()),
+                .key_ = std::string(entry.key()),
                 .db_id_ = db_id,
             });
           }
@@ -401,6 +401,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
         }
       }
     }
+    store.external_manifests_.erase(entry);
     partition.indexes_[candidate.db_id_].Erase(candidate.digest_,
                                                candidate.key_);
     absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));

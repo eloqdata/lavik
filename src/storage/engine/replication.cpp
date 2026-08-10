@@ -25,8 +25,8 @@ ScanBatch StorageEngine::Impl::ScanPartition(
         index.Scan(result.cursor_, [&](const RecordIndex::Entry& entry) {
           if (entry.value_.kind_ == RecordKind::kValue &&
               !IsExpired(entry.value_, now_ms)) {
-            bytes += entry.key_.size();
-            result.keys_.push_back(entry.key_);
+            bytes += entry.key().size();
+            result.keys_.emplace_back(entry.key());
           }
         });
     ++iterations;
@@ -76,7 +76,7 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
     next = index.Scan(next, [&](const RecordIndex::Entry& entry) {
       if (entry.value_.kind_ == RecordKind::kValue &&
           !IsExpired(entry.value_, now_ms)) {
-        keys.push_back(entry.key_);
+        keys.emplace_back(entry.key());
       }
     });
     ++iterations;
@@ -98,7 +98,8 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
       QueueExpiredCandidate(store, partition.id_, db_id, *current);
       continue;
     }
-    auto loaded = co_await LoadValue(store, db_id, key, digest, location);
+    auto loaded = co_await LoadValue(store, db_id, key, digest, location,
+                                     ExtentsFor(store, current));
     if (!loaded.ok()) {
       if (loaded.status().code() == absl::StatusCode::kNotFound) {
         continue;
@@ -192,7 +193,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   std::vector<std::pair<std::uint8_t, std::string>> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-      old_keys.emplace_back(db_id, entry.key_);
+      old_keys.emplace_back(db_id, std::string(entry.key()));
     });
   }
   partition.replication_epoch_ = next_epoch;

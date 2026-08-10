@@ -373,6 +373,7 @@ void RedisService::EndRequest() noexcept {
 }
 
 Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
+  BindMemoryAccountingShard(worker.id());
   tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
   absl::Status status = co_await storage_->InitializeWorker(worker);
   if (!status.ok()) [[unlikely]] {
@@ -644,7 +645,8 @@ int RunServer(ServerOptions options) {
       options.flush_max_ms_, options.flush_size_bytes_,
       options.verify_read_crc_);
 
-  const absl::Status memory_status = InitMemoryLimit(options.max_memory_bytes_);
+  const absl::Status memory_status =
+      InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
   if (!memory_status.ok()) {
     spdlog::error("memory limit setup failed: {}", memory_status.message());
     return 1;

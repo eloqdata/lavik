@@ -38,8 +38,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     trace->lookup_done_ns_ = ReadTraceNowNanos();
   }
 
-  auto loaded =
-      co_await LoadValue(store, db_id, key, digest, found->value_, trace);
+  auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
+                                   ExtentsFor(store, found), trace);
   if (!loaded.ok()) {
     co_return loaded.status();
   }
@@ -191,7 +191,7 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
                                std::string_view key, const Digest& digest,
-                               RecordLocation location,
+                               RecordLocation location, ExtentManifest extents,
                                ReadLatencyTrace* trace) {
   while (true) {
     assert(location.block_owner_ < worker_count_);
@@ -204,7 +204,8 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
     // hopping to the record's owner first and having it acquire the output
     // buffer from its pool and hand the lease back across workers.
     if (location.external_) {
-      loaded = co_await LoadExternalValueLocal(key_store, location, trace);
+      loaded = co_await LoadExternalValueLocal(key_store, location,
+                                               std::move(extents), trace);
     } else if (location.block_owner_ == key_store.worker_->id()) {
       loaded = co_await LoadValueLocal(key_store, db_id, key, digest, location,
                                        trace);
@@ -247,6 +248,7 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
                              loaded.status().message());
     }
     location = current->value_;
+    extents = ExtentsFor(key_store, current);
   }
 }
 
@@ -310,8 +312,9 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
                                             const RecordLocation& location,
+                                            ExtentManifest extents,
                                             ReadLatencyTrace* trace) {
-  if (!location.external_ || location.extents_ == nullptr ||
+  if (!location.external_ || extents == nullptr ||
       location.logical_size_ > kMaxStringBytes) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external value has no valid extent manifest");
@@ -339,8 +342,8 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
     trace->io_submit_ns_ = ReadTraceNowNanos();
   }
   std::size_t output_offset = 0;
-  for (std::size_t index = 0; index < location.extents_->size(); ++index) {
-    const ExtentRef& ref = location.extents_->at(index);
+  for (std::size_t index = 0; index < extents->size(); ++index) {
+    const ExtentRef& ref = extents->at(index);
     if (output_offset + ref.payload_bytes_ > location.logical_size_) {
       co_return absl::Status(absl::StatusCode::kInternal,
                              "extent header does not match manifest");
@@ -392,7 +395,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
                                     RecordLocation location,
                                     ReadLatencyTrace* trace) {
   if (location.external_) {
-    co_return co_await LoadExternalValueLocal(store, location, trace);
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "external value was dispatched as inline");
   }
   // TODO: Coalesce concurrent reads of the same aligned disk page. Key an
   // in-flight table by

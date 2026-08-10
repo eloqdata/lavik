@@ -54,20 +54,22 @@ using celer::Task;
 using celer::UnlockGuard;
 using celer::Worker;
 
+using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
+
 struct RecordLocation {
   std::uint64_t block_id_ = 0;
   std::uint64_t replication_epoch_ = 1;
   std::uint64_t mutation_sequence_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t expire_at_ms_ = 0;
+  std::uint64_t logical_size_ = 0;
+  std::uint32_t record_offset_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint32_t relocation_sequence_ = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
   std::uint16_t block_owner_ = 0;
-  std::uint32_t record_offset_ = 0;
-  std::uint32_t total_disk_bytes_ = 0;
-  std::uint64_t logical_size_ = 0;
-  std::uint32_t payload_bytes_ = 0;
-  std::uint32_t relocation_sequence_ = 0;
   // Packed flags: one byte for all four.
   bool in_memory_ : 1 = false;
   bool external_ : 1 = false;
@@ -86,7 +88,6 @@ struct RecordLocation {
   bool unclaimed_ : 1 = false;
   RecordKind kind_ = RecordKind::kValue;
   ValueType value_type_ = ValueType::kNone;
-  std::shared_ptr<const std::vector<ExtentRef>> extents_;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
     return block_id_ == other.block_id_ &&
@@ -96,6 +97,9 @@ struct RecordLocation {
 };
 
 using RecordIndex = ScanHashMap<RecordLocation>;
+
+static_assert(sizeof(RecordLocation) == 72);
+static_assert(sizeof(RecordIndex::Entry) == 88);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -316,6 +320,7 @@ struct RecoveryRecord {
   // if their transaction committed.
   std::uint64_t txid_ = 0;
   RecordLocation location_{};
+  ExtentManifest extents_;
 };
 
 struct RecoveryBlock {
@@ -409,6 +414,7 @@ struct RecordIdentity {
 struct TxUndoEntry {
   RecordIndex::Entry* entry_ = nullptr;
   std::optional<RecordLocation> previous_;
+  ExtentManifest previous_extents_;
   std::uint8_t db_id_ = 0;
 };
 
@@ -829,6 +835,11 @@ class StorageEngine::Impl {
     std::vector<PartitionStore> partitions_;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records_;
+    // External manifests are exceptional and relatively large. Keeping them
+    // here, keyed by the address-stable index entry, avoids a shared_ptr in
+    // every ordinary key while preserving O(1) FLUSHDB detachment.
+    absl::flat_hash_map<const RecordIndex::Entry*, ExtentManifest>
+        external_manifests_;
     // Bumped every time FLUSHDB detaches this database's partition indexes.
     // Every index for one database is detached together and without suspending,
     // so one counter per database describes all of them.
@@ -1317,9 +1328,19 @@ class StorageEngine::Impl {
 
   void ApplyRecoveredRecord(WorkerStore& store, const RecoveryRecord& record);
 
+  static ExtentManifest ExtentsFor(const WorkerStore& store,
+                                   const RecordIndex::Entry* entry) {
+    if (entry == nullptr || !entry->value_.external_) {
+      return {};
+    }
+    const auto found = store.external_manifests_.find(entry);
+    return found == store.external_manifests_.end() ? ExtentManifest{}
+                                                    : found->second;
+  }
+
   Task<absl::StatusOr<LoadedValue>> LoadValue(
       WorkerStore& key_store, std::uint8_t db_id, std::string_view key,
-      const Digest& digest, RecordLocation location,
+      const Digest& digest, RecordLocation location, ExtentManifest extents,
       ReadLatencyTrace* trace = nullptr);
 
   // Reads one extent block's payload into `destination`. Runs on the worker
@@ -1331,7 +1352,7 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
-      ReadLatencyTrace* trace);
+      ExtentManifest extents, ReadLatencyTrace* trace);
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,

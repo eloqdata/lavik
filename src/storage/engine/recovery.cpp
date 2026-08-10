@@ -308,18 +308,18 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     .mutation_sequence_ = record.mutation_sequence_,
                     .allocation_epoch_ = record.allocation_epoch_,
                     .expire_at_ms_ = record.expire_at_ms_,
-                    .block_owner_ = block_owner,
+                    .logical_size_ = record.logical_size_,
                     .record_offset_ = record_offset,
                     .total_disk_bytes_ = record.total_disk_bytes_,
-                    .logical_size_ = record.logical_size_,
                     .payload_bytes_ = record.payload_bytes_,
                     .relocation_sequence_ =
                         static_cast<std::uint32_t>(record.relocation_sequence_),
+                    .block_owner_ = block_owner,
                     .external_ = record.external_,
                     .kind_ = record.kind_,
                     .value_type_ = record.value_type_,
-                    .extents_ = std::move(extents),
                 },
+            .extents_ = std::move(extents),
         });
         record_offset += record.total_disk_bytes_;
         ++records;
@@ -406,7 +406,15 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                   std::max(recovered.location_.expire_at_ms_,
                                            UnixTimeMillis())));
       }
-      index.InsertOrAssign(recovered.digest_, recovered.key_, winner);
+      RecordIndex::Entry* winner_entry =
+          index.InsertOrAssign(recovered.digest_, recovered.key_, winner)
+              .entry_;
+      if (winner.external_) {
+        store.external_manifests_.insert_or_assign(winner_entry,
+                                                   recovered.extents_);
+      } else {
+        store.external_manifests_.erase(winner_entry);
+      }
       if (was_live != is_live) {
         if (is_live) {
           ++partition.live_key_count_[recovered.db_id_];

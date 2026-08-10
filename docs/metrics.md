@@ -71,18 +71,28 @@ sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
 
 ## Memory metrics
 
-- `keylane_memory_current_bytes`: the larger of allocator-used bytes and RSS;
-  this value is used for limit enforcement.
-- `keylane_memory_used_bytes`: live bytes reported by mimalloc.
-- `keylane_memory_rss_bytes`: resident process memory.
-- `keylane_memory_committed_bytes`: bytes committed by mimalloc.
-- `keylane_memory_reserved_bytes`: virtual address space reserved by mimalloc.
+- `keylane_memory_current_bytes`: cached allocator usable bytes used for limit
+  enforcement.
+- `keylane_memory_used_bytes`: allocator usable bytes.
+- `keylane_memory_rss_bytes`: resident process memory, refreshed when metrics
+  or `INFO memory` is requested.
+- `keylane_memory_committed_bytes`: pages committed by mimalloc; diagnostic
+  only and valid without per-allocation mimalloc statistics.
+- `keylane_memory_reserved_bytes`: virtual address space reserved by mimalloc;
+  diagnostic only.
 - `keylane_memory_max_bytes`: configured process memory limit.
 - `keylane_memory_rejected_commands_total`: commands rejected by the limit.
 
 The same values are available through Redis `INFO memory`, including
 `used_memory`, `used_memory_rss`, `maxmemory`, and
 `oom_rejected_commands`.
+
+Worker 0 sums the cache-line-separated worker allocation counters every 100 ms.
+Release builds keep mimalloc's generic per-allocation statistics disabled and
+use Keylane's own lightweight usable-size accounting instead. The hot command
+path reads only the cached gauge and adds a conservative request-size estimate,
+so it performs no allocator aggregation or `/proc` I/O. RSS is diagnostic only
+and is sampled by the explicit metrics/INFO request.
 
 ## Update model
 

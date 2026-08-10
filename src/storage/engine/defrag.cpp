@@ -309,7 +309,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
       record.expire_at_ms_, record.digest_, record.txid_,
       record.mutation_sequence_, record.relocation_sequence_ + 1, true, true,
-      record.external_, record.logical_size_, source_location.extents_,
+      record.external_, record.logical_size_, ExtentsFor(key_store, current),
       &relocated, &source);
   if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
@@ -598,17 +598,16 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         .mutation_sequence_ = record.mutation_sequence_,
         .allocation_epoch_ = record.allocation_epoch_,
         .expire_at_ms_ = record.expire_at_ms_,
-        .block_owner_ = store.worker_->id(),
+        .logical_size_ = record.logical_size_,
         .record_offset_ = record_offset,
         .total_disk_bytes_ = record.total_disk_bytes_,
-        .logical_size_ = record.logical_size_,
         .payload_bytes_ = record.payload_bytes_,
         .relocation_sequence_ =
             static_cast<std::uint32_t>(record.relocation_sequence_),
+        .block_owner_ = store.worker_->id(),
         .external_ = record.external_,
         .kind_ = record.kind_,
         .value_type_ = record.value_type_,
-        .extents_ = {},
     };
     const std::byte* value_data =
         block_data.buffer_.data_ + record_offset + record.header_bytes_;
@@ -626,7 +625,6 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         source.defragging_ = false;
         co_return decoded.status();
       }
-      source_location.extents_ = std::move(*decoded);
     }
 
     if (record.kind_ == RecordKind::kTxCommit) {

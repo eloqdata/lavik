@@ -35,11 +35,24 @@ struct alignas(64) MemoryCounterCache {
   std::atomic<std::uint64_t> rejected_commands_{0};
 };
 
+struct alignas(64) AllocationShard {
+  std::atomic<std::int64_t> bytes_{0};
+};
+
+constexpr unsigned kMaxMemoryWorkers = 1024;
+
 static_assert(sizeof(MemoryGaugeCache) == 64);
 static_assert(sizeof(MemoryCounterCache) == 64);
+static_assert(sizeof(AllocationShard) == 64);
 
 MemoryGaugeCache g_memory_gauges;
 MemoryCounterCache g_memory_counters;
+// Slot zero collects allocations made outside a bound worker. Worker N uses
+// slot N+1, so workers never update the same cache line.
+std::array<AllocationShard, kMaxMemoryWorkers + 1> g_allocation_shards;
+std::atomic<unsigned> g_accounted_workers{0};
+thread_local unsigned g_allocation_shard = 0;
+thread_local std::int64_t g_local_allocated_bytes = 0;
 
 std::string ReadSmallFile(const char* path) {
   const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
@@ -101,13 +114,15 @@ std::uint64_t MemoryCapacity() {
 }
 
 std::uint64_t ProcessRss() noexcept {
-  const int fd = ::open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+  // Metrics and INFO may be scraped repeatedly. Keep the procfs descriptor
+  // for the process lifetime and use pread so callers share no file offset.
+  static const int fd = ::open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+  static const long page_size = ::sysconf(_SC_PAGESIZE);
   if (fd < 0) {
     return 0;
   }
   std::array<char, 128> buffer{};
-  const ssize_t bytes = ::read(fd, buffer.data(), buffer.size());
-  (void)::close(fd);
+  const ssize_t bytes = ::pread(fd, buffer.data(), buffer.size(), 0);
   if (bytes <= 0) {
     return 0;
   }
@@ -122,13 +137,31 @@ std::uint64_t ProcessRss() noexcept {
   }
   const std::uint64_t pages =
       ParseUnsigned(std::string_view(statm).substr(resident));
-  const long page_size = ::sysconf(_SC_PAGESIZE);
   if (page_size <= 0 || pages > std::numeric_limits<std::uint64_t>::max() /
                                     static_cast<std::uint64_t>(page_size)) {
     return 0;
   }
   return pages * static_cast<std::uint64_t>(page_size);
 }
+
+#if KEYLANE_USE_MIMALLOC
+std::uint64_t AllocatorUsed() noexcept {
+  const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
+  std::int64_t total = 0;
+  for (unsigned index = 0; index <= workers; ++index) {
+    const std::int64_t shard =
+        g_allocation_shards[index].bytes_.load(std::memory_order_relaxed);
+    if (shard > 0 && total > std::numeric_limits<std::int64_t>::max() - shard) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
+    if (shard < 0 && total < std::numeric_limits<std::int64_t>::min() - shard) {
+      return 0;
+    }
+    total += shard;
+  }
+  return total > 0 ? static_cast<std::uint64_t>(total) : 0;
+}
+#endif
 
 void UpdatePeak(std::uint64_t current) noexcept {
   std::uint64_t peak =
@@ -141,7 +174,13 @@ void UpdatePeak(std::uint64_t current) noexcept {
 
 }  // namespace
 
-absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes) {
+absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes,
+                             unsigned worker_count) {
+  if (worker_count == 0 || worker_count > kMaxMemoryWorkers) {
+    return absl::Status(absl::StatusCode::kInvalidArgument,
+                        "worker count exceeds memory accounting capacity");
+  }
+  g_accounted_workers.store(worker_count, std::memory_order_release);
   std::uint64_t maximum = configured_max_bytes;
   if (maximum == 0) {
     const std::uint64_t capacity = MemoryCapacity();
@@ -158,36 +197,70 @@ absl::Status InitMemoryLimit(std::uint64_t configured_max_bytes) {
   }
   g_memory_gauges.max_bytes_.store(maximum, std::memory_order_relaxed);
   RefreshMemoryStats();
+  RefreshMemoryDiagnostics();
   return absl::OkStatus();
+}
+
+void AccountMemoryAllocation(std::int64_t delta) noexcept {
+  if (g_allocation_shard == 0) {
+    // Startup and miscellaneous non-worker threads share the fallback shard;
+    // their allocation rate is not part of the command hot path.
+    g_allocation_shards[0].bytes_.fetch_add(delta, std::memory_order_relaxed);
+    return;
+  }
+  // One thread owns every non-zero shard. Publish with a plain relaxed atomic
+  // store (a normal store on the supported CPUs), avoiding a locked RMW on
+  // every allocation/free while worker 0 remains able to sample safely.
+  g_local_allocated_bytes += delta;
+  g_allocation_shards[g_allocation_shard].bytes_.store(
+      g_local_allocated_bytes, std::memory_order_relaxed);
+}
+
+void BindMemoryAccountingShard(unsigned worker_id) noexcept {
+  const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
+  const unsigned next = worker_id < workers ? worker_id + 1 : 0;
+  if (next == g_allocation_shard) {
+    return;
+  }
+  g_allocation_shard = next;
+  g_local_allocated_bytes =
+      g_allocation_shards[next].bytes_.load(std::memory_order_relaxed);
 }
 
 void RefreshMemoryStats() noexcept {
   std::uint64_t used = 0;
-  std::uint64_t committed = 0;
-  std::uint64_t reserved = 0;
+#if KEYLANE_USE_MIMALLOC
+  used = AllocatorUsed();
+#else
+  // Sanitizer builds do not install the mimalloc C++ allocation hooks.
+  used = ProcessRss();
+#endif
+#if !KEYLANE_USE_MIMALLOC
+  g_memory_gauges.committed_bytes_.store(used, std::memory_order_relaxed);
+  g_memory_gauges.reserved_bytes_.store(used, std::memory_order_relaxed);
+#endif
+  g_memory_gauges.used_bytes_.store(used, std::memory_order_relaxed);
+  UpdatePeak(used);
+}
+
+void RefreshMemoryDiagnostics() noexcept {
+  const std::uint64_t rss = ProcessRss();
+  if (rss != 0) {
+    g_memory_gauges.rss_bytes_.store(rss, std::memory_order_relaxed);
+  }
 #if KEYLANE_USE_MIMALLOC
   mi_stats_t_decl(stats);
   if (mi_stats_get(&stats)) {
-    used = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(0, stats.malloc_normal.current) +
-        std::max<std::int64_t>(0, stats.malloc_huge.current));
-    committed = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(0, stats.committed.current));
-    reserved = static_cast<std::uint64_t>(
-        std::max<std::int64_t>(0, stats.reserved.current));
+    g_memory_gauges.committed_bytes_.store(
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, stats.committed.current)),
+        std::memory_order_relaxed);
+    g_memory_gauges.reserved_bytes_.store(
+        static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, stats.reserved.current)),
+        std::memory_order_relaxed);
   }
 #endif
-  const std::uint64_t rss = ProcessRss();
-#if !KEYLANE_USE_MIMALLOC
-  used = rss;
-  committed = rss;
-  reserved = rss;
-#endif
-  g_memory_gauges.used_bytes_.store(used, std::memory_order_relaxed);
-  g_memory_gauges.rss_bytes_.store(rss, std::memory_order_relaxed);
-  g_memory_gauges.committed_bytes_.store(committed, std::memory_order_relaxed);
-  g_memory_gauges.reserved_bytes_.store(reserved, std::memory_order_relaxed);
-  UpdatePeak(used);
 }
 
 MemoryStats GetMemoryStats() noexcept {
@@ -212,10 +285,7 @@ bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept {
       g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
   const std::uint64_t used =
       g_memory_gauges.used_bytes_.load(std::memory_order_relaxed);
-  const std::uint64_t rss =
-      g_memory_gauges.rss_bytes_.load(std::memory_order_relaxed);
-  const std::uint64_t observed = std::max(used, rss);
-  return observed >= maximum || additional_bytes > maximum - observed;
+  return used >= maximum || additional_bytes > maximum - used;
 }
 
 void RecordMemoryRejection() noexcept {

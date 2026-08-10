@@ -24,6 +24,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -37,13 +38,48 @@ template <typename Value>
 class ScanHashMap {
  public:
   struct Entry {
-    Digest digest_{};
-    std::string key_;
+    std::uint64_t hash_ = 0;
     Value value_{};
+    std::uint32_t key_size_ = 0;
 
-    Entry(const Digest& digest_arg, std::string_view key_arg,
-          const Value& value_arg)
-        : digest_(digest_arg), key_(key_arg), value_(value_arg) {}
+    std::string_view key() const noexcept {
+      return {reinterpret_cast<const char*>(this + 1), key_size_};
+    }
+
+    static Entry* Create(const Digest& digest, std::string_view key,
+                         const Value& value) {
+      if (key.size() > std::numeric_limits<std::uint32_t>::max() ||
+          key.size() >
+              std::numeric_limits<std::size_t>::max() - sizeof(Entry)) {
+        throw std::bad_alloc();
+      }
+      static_assert(alignof(Entry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+      void* storage = ::operator new(sizeof(Entry) + key.size());
+      Entry* entry = nullptr;
+      try {
+        entry = new (storage)
+            Entry(Hash(digest), static_cast<std::uint32_t>(key.size()), value);
+      } catch (...) {
+        ::operator delete(storage);
+        throw;
+      }
+      if (!key.empty()) {
+        std::memcpy(entry + 1, key.data(), key.size());
+      }
+      return entry;
+    }
+
+    static void Destroy(Entry* entry) noexcept {
+      if (entry == nullptr) {
+        return;
+      }
+      entry->~Entry();
+      ::operator delete(entry);
+    }
+
+   private:
+    Entry(std::uint64_t hash, std::uint32_t key_size, const Value& value)
+        : hash_(hash), value_(value), key_size_(key_size) {}
   };
 
   struct InsertResult {
@@ -95,7 +131,8 @@ class ScanHashMap {
 
     EnsureTable();
     MaybeStartExpansion();
-    auto entry = std::make_unique<Entry>(digest, key, value);
+    std::unique_ptr<Entry, void (*)(Entry*)> entry(
+        Entry::Create(digest, key, value), &Entry::Destroy);
     Entry* raw = entry.get();
     AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
     entry.release();
@@ -126,8 +163,8 @@ class ScanHashMap {
             Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
         for (std::size_t slot = 0; slot < slots; ++slot) {
           if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-              KeyEquals(*bucket->entries_[slot], digest, key)) {
-            delete bucket->entries_[slot];
+              KeyEquals(*bucket->entries_[slot], key)) {
+            Entry::Destroy(bucket->entries_[slot]);
             bucket->entries_[slot] = nullptr;
             ClearOccupied(bucket, slot);
             --table.used_;
@@ -282,9 +319,8 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
-  static bool KeyEquals(const Entry& entry, const Digest& digest,
-                        std::string_view key) noexcept {
-    return entry.digest_ == digest && entry.key_ == key;
+  static bool KeyEquals(const Entry& entry, std::string_view key) noexcept {
+    return entry.key() == key;
   }
 
   static std::uint64_t ReverseBits(std::uint64_t value) noexcept {
@@ -346,8 +382,8 @@ class ScanHashMap {
     }
   }
 
-  static Entry* FindInTable(Table& table, const Digest& digest,
-                            std::string_view key, std::uint64_t hash) {
+  static Entry* FindInTable(Table& table, const Digest&, std::string_view key,
+                            std::uint64_t hash) {
     if (table.buckets_ == nullptr) {
       return nullptr;
     }
@@ -358,7 +394,7 @@ class ScanHashMap {
           Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-            KeyEquals(*bucket->entries_[slot], digest, key)) {
+            KeyEquals(*bucket->entries_[slot], key)) {
           return bucket->entries_[slot];
         }
       }
@@ -392,7 +428,7 @@ class ScanHashMap {
   }
 
   static void AddToTable(Table& table, Entry* entry) {
-    const std::uint64_t hash = Hash(entry->digest_);
+    const std::uint64_t hash = entry->hash_;
     const std::uint8_t tag = HashTag(hash);
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     while (true) {
@@ -528,7 +564,7 @@ class ScanHashMap {
         if (destroy_entries) {
           for (std::size_t slot = 0; slot < slots; ++slot) {
             if (Occupied(*bucket, slot)) {
-              delete bucket->entries_[slot];
+              Entry::Destroy(bucket->entries_[slot]);
             }
           }
         }

@@ -43,10 +43,10 @@ void StorageEngine::Impl::QueueExpiredCandidate(
   store.expired_candidates_.push_back(WorkerStore::ExpireCandidate{
       .partition_id_ = partition_id,
       .db_id_ = db_id,
-      .digest_ = entry.digest_,
+      .digest_ = ComputeDigest(entry.key()),
       .mutation_sequence_ = entry.value_.mutation_sequence_,
       .expire_at_ms_ = entry.value_.expire_at_ms_,
-      .key_ = entry.key_,
+      .key_ = std::string(entry.key()),
   });
 }
 
@@ -101,6 +101,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   tx::CurrentTxShard().MarkWatched(candidate.db_id_,
                                    tx::FingerprintOf(candidate.digest_));
   const RecordLocation dropped = current->value_;
+  const ExtentManifest dropped_extents = ExtentsFor(store, current);
   const std::uint64_t sequence = ++partition.mutation_sequence_;
   if (partition.capture_deltas_) {
     AppendDelta(partition, SnapshotRecord{
@@ -127,9 +128,10 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   --partition.live_key_count_[candidate.db_id_];
   --store.live_key_count_[candidate.db_id_];
   --partition.expiring_key_count_[candidate.db_id_];
+  store.external_manifests_.erase(current);
   partition.indexes_[candidate.db_id_].Erase(candidate.digest_, candidate.key_);
   if (dropped.external_) {
-    SpawnExtentReclaim(store, dropped.extents_);
+    SpawnExtentReclaim(store, dropped_extents);
   }
   absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(dropped));
   if (!dead.ok()) {

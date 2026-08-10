@@ -254,12 +254,12 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
 
 celer::Task<absl::Status> RenderPrometheusMetrics(
     const storage::StorageEngine& storage, std::string* output_ptr) {
+  RefreshMemoryDiagnostics();
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =
       co_await storage.CollectMetrics();
   const MemoryStats memory_metrics = GetMemoryStats();
-  const std::uint64_t current_memory =
-      std::max(memory_metrics.used_bytes_, memory_metrics.rss_bytes_);
+  const std::uint64_t current_memory = memory_metrics.used_bytes_;
   std::string& output = *output_ptr;
   output.clear();
   output.reserve(32 * 1024);
@@ -351,8 +351,8 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_memory_current_bytes gauge\n"
       "keylane_memory_current_bytes ",
       current_memory, "\n",
-      "# HELP keylane_memory_used_bytes Bytes currently allocated through "
-      "the configured allocator.\n"
+      "# HELP keylane_memory_used_bytes Allocator usable bytes used for "
+      "limit enforcement.\n"
       "# TYPE keylane_memory_used_bytes gauge\n"
       "keylane_memory_used_bytes ",
       memory_metrics.used_bytes_, "\n",

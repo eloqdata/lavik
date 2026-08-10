@@ -76,8 +76,8 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
           ? std::numeric_limits<std::size_t>::max()
           : keys * kEstimatedIndexBytesPerKey;
   // Include parsed arguments because the cached allocator sample can precede
-  // this request by up to 100ms. Actual container growth is reconciled from
-  // mimalloc by the background sampler.
+  // this request by up to 100ms. Actual process growth is reconciled from RSS
+  // by the background sampler.
   return SaturatingAdd(RequestArgumentBytes(request), index_bytes);
 }
 
@@ -1161,11 +1161,13 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(runtime_metrics->connected_clients_) + "\r\n\r\n";
   }
   if (wants("memory")) {
+    RefreshMemoryDiagnostics();
     const MemoryStats memory = GetMemoryStats();
     const double fragmentation =
-        memory.used_bytes_ == 0 ? 0.0
-                                : static_cast<double>(memory.rss_bytes_) /
-                                      static_cast<double>(memory.used_bytes_);
+        memory.committed_bytes_ == 0
+            ? 0.0
+            : static_cast<double>(memory.rss_bytes_) /
+                  static_cast<double>(memory.committed_bytes_);
     info += "# Memory\r\n";
     info += "used_memory:" + std::to_string(memory.used_bytes_) + "\r\n";
     info +=

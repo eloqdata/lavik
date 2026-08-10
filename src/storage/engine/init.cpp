@@ -533,10 +533,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             .allocation_epoch_ = location.allocation_epoch_,
             .bytes_ = location.total_disk_bytes_,
         });
-        if (location.external_ && location.extents_ != nullptr) {
-          for (std::size_t extent_index = 0;
-               extent_index < location.extents_->size(); ++extent_index) {
-            const ExtentRef& extent = location.extents_->at(extent_index);
+        const ExtentManifest extents = ExtentsFor(store, &entry);
+        if (location.external_ && extents != nullptr) {
+          for (std::size_t extent_index = 0; extent_index < extents->size();
+               ++extent_index) {
+            const ExtentRef& extent = extents->at(extent_index);
             // An extent block's owner is derived from its own block id,
             // so it is unrelated to the owner of the block holding this
             // manifest. Charging the reference to the record's owner

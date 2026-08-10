@@ -161,8 +161,12 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           entry.value_.block_id_, entry.value_.allocation_epoch_)];
       delta.block_owner_ = entry.value_.block_owner_;
       delta.bytes_ += entry.value_.total_disk_bytes_;
-      if (entry.value_.external_ && entry.value_.extents_ != nullptr) {
-        dead_extents.push_back(entry.value_.extents_);
+      if (entry.value_.external_) {
+        auto manifest = store.external_manifests_.find(&entry);
+        if (manifest != store.external_manifests_.end()) {
+          dead_extents.push_back(std::move(manifest->second));
+          store.external_manifests_.erase(manifest);
+        }
       }
     });
 
