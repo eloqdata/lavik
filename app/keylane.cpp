@@ -1,3 +1,5 @@
+#include <mimalloc.h>
+
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -9,6 +11,13 @@
 #include "keylane/server.h"
 
 int main(int argc, char** argv) {
+  // Compile-time defaults make THP and eager commit effective during
+  // mimalloc's process constructor. Reassert all three before application
+  // allocations.
+  mi_option_set(mi_option_purge_delay, -1);
+  mi_option_set(mi_option_arena_eager_commit, 1);
+  mi_option_set(mi_option_allow_thp, 0);
+
   CLI::App app{"keylane — high-performance Redis-compatible storage"};
 
   keylane::ServerOptions options;

@@ -1,5 +1,6 @@
 #include "keylane/server.h"
 
+#include <mimalloc.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -632,6 +633,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(ServerOptions options) {
+  spdlog::info("mimalloc purge_delay={} arena_eager_commit={} allow_thp={}",
+               mi_option_get(mi_option_purge_delay),
+               mi_option_get(mi_option_arena_eager_commit),
+               mi_option_get(mi_option_allow_thp));
   spdlog::info(
       "keylane listening on {}:{} metrics_port={} threads={} "
       "idle_timeout_ms={} "

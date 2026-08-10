@@ -56,8 +56,7 @@ Prometheus exports:
 `used_memory_peak`, `maxmemory`, `allocator_active`, `allocator_resident`,
 `allocator_reserved`, and `oom_rejected_commands`. `mem_fragmentation_ratio`
 is RSS divided by allocator committed bytes. RSS is diagnostic only and never
-participates in admission. In non-mimalloc builds used, committed, and reserved
-fall back to RSS for sanitizer testing.
+participates in admission.
 
 ## Index memory layout
 

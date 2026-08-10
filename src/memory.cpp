@@ -15,9 +15,7 @@
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
-#if KEYLANE_USE_MIMALLOC
 #include "mimalloc-stats.h"
-#endif
 
 namespace keylane {
 namespace {
@@ -144,7 +142,6 @@ std::uint64_t ProcessRss() noexcept {
   return pages * static_cast<std::uint64_t>(page_size);
 }
 
-#if KEYLANE_USE_MIMALLOC
 std::uint64_t AllocatorUsed() noexcept {
   const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
   std::int64_t total = 0;
@@ -161,7 +158,6 @@ std::uint64_t AllocatorUsed() noexcept {
   }
   return total > 0 ? static_cast<std::uint64_t>(total) : 0;
 }
-#endif
 
 void UpdatePeak(std::uint64_t current) noexcept {
   std::uint64_t peak =
@@ -228,17 +224,7 @@ void BindMemoryAccountingShard(unsigned worker_id) noexcept {
 }
 
 void RefreshMemoryStats() noexcept {
-  std::uint64_t used = 0;
-#if KEYLANE_USE_MIMALLOC
-  used = AllocatorUsed();
-#else
-  // Sanitizer builds do not install the mimalloc C++ allocation hooks.
-  used = ProcessRss();
-#endif
-#if !KEYLANE_USE_MIMALLOC
-  g_memory_gauges.committed_bytes_.store(used, std::memory_order_relaxed);
-  g_memory_gauges.reserved_bytes_.store(used, std::memory_order_relaxed);
-#endif
+  const std::uint64_t used = AllocatorUsed();
   g_memory_gauges.used_bytes_.store(used, std::memory_order_relaxed);
   UpdatePeak(used);
 }
@@ -248,7 +234,6 @@ void RefreshMemoryDiagnostics() noexcept {
   if (rss != 0) {
     g_memory_gauges.rss_bytes_.store(rss, std::memory_order_relaxed);
   }
-#if KEYLANE_USE_MIMALLOC
   mi_stats_t_decl(stats);
   if (mi_stats_get(&stats)) {
     g_memory_gauges.committed_bytes_.store(
@@ -260,7 +245,6 @@ void RefreshMemoryDiagnostics() noexcept {
             std::max<std::int64_t>(0, stats.reserved.current)),
         std::memory_order_relaxed);
   }
-#endif
 }
 
 MemoryStats GetMemoryStats() noexcept {
