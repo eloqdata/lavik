@@ -12,10 +12,12 @@ Updated: 2026-08-10 UTC
 - SPDK build directory: ./bld-spdk
 - Two processes are live on CPUs 0-7 for read-tail A/B. The SPDK build uses
   `spdk://69f9:00:00.0/1` on Redis/metrics ports 6379/9100 and has 200,000,000
-  logical keys. The io_uring build uses `/dev/nvme1n1` on ports 6380/9101 and
-  has 250,931,993 logical keys. Both use 256 MiB registered storage buffers per
-  worker, a 60,000 ms mimalloc purge delay, tomb raider disabled, and defrag
-  paused. At idle each process consumes about 4% CPU because busy-poll is 20us.
+  keys in the benchmark range and currently reports 206,811,216 total logical
+  keys after a newer refill. The io_uring build uses `/dev/nvme1n1` on ports
+  6380/9101 and has 250,931,993 logical keys. Both use 256 MiB registered
+  storage buffers per worker, a 60,000 ms mimalloc purge delay, tomb raider
+  disabled, and defrag paused. At idle each process consumes about 4% CPU
+  because busy-poll is 20us.
 - Prometheus scrapes both metrics ports. Grafana histogram quantiles retain the
   `instance` label instead of incorrectly merging buckets across servers.
 - aerospike-bench.conf, bld/, bld-libc/, bld-spdk/, celer-raft/,
@@ -80,8 +82,9 @@ dependency.
 
 ## Current dataset
 
-- The SPDK device contains exactly 200 million logical keys, freshly filled by
-  the local 8c171a9 SPDK build using eight workers.
+- The SPDK device contains all 200 million benchmark keys. After the latest
+  user refill it reports 206,811,216 total logical keys; the earlier exactly
+  200-million-key fill described below remains the historical comparison.
 - Prefix: kv_
 - Range: 1 through 200000000.
 - Values are fixed at 2000 bytes.
@@ -232,8 +235,8 @@ winning over fresh network and cross-worker work. Trace runs showed that about
 cap is primarily a burst guard rather than the main average-latency change.
 
 The deployed release settings are a completion cap of 8 and a 5 us foreground
-pre-poll slice. After recovery confirmed exactly 200,000,000 keys, the final
-warm isolated run produced:
+pre-poll slice. Before rebasing the newly arrived persistent-list commit, a
+warm isolated run against the earlier exactly 200,000,000-key state produced:
 
     GET/s:       99,995.39
     average:     0.22078 ms
@@ -246,6 +249,21 @@ and reported 2.719 ms p99.99. Similar isolated runs alternated between clean
 result establishes that SPDK itself is no longer slower than io_uring here,
 but a longer production-window percentile must retain those system-level
 stalls rather than selecting only the best interval.
+
+After rebasing Keylane `e552276` and deploying final main `231da6b` with Celer
+`2f93c69`, the user-refilled dataset reported 206,811,216 total keys. Keys
+`kv_1`, `kv_100000000`, and `kv_200000000` were each 2000 bytes, and the full
+random benchmark range was all hits. The first post-recovery window contained
+two short throughput stalls and reported 3.215 ms p99.99. The immediately
+following clean 40-second hot-state window reported:
+
+    GET/s:       99,996.83
+    average:     0.22262 ms
+    p99.9:       0.959 ms
+    p99.99:      1.855 ms
+
+This final-main clean p99.99 is 10.8% below the 2.079 ms worker-pinned io_uring
+comparison and 51.9% below the user's original 3.855 ms SPDK observation.
 
 ### 60-second mimalloc purge-delay restart
 
