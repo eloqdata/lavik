@@ -1,8 +1,8 @@
-# Keylane SPDK/io_uring、Dragonfly Tiered Storage 与 Apache Kvrocks 性能对比（2026-08-11）
+# Keylane SPDK/io_uring、Dragonfly、Garnet 与 Apache Kvrocks 性能对比（2026-08-11）
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，io_uring 双裸块设备的纯写 QPS 最高；不需要 SPDK、RAID 或裸块设备的 io_uring 双文件方案仍明显高于 Dragonfly 和 Kvrocks。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，io_uring 双裸块设备的纯写 QPS 最高；Microsoft Garnet 是三个非 Keylane 系统中纯写和混合 QPS 最高的一组，纯读 QPS 略低于 Dragonfly，但 p99.9 明显更低。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
@@ -10,21 +10,26 @@
 | 纯读 GET | Keylane io_uring（双裸块设备） | 278,223.05 | 0.511 | 2.399 |
 | 纯读 GET | Keylane io_uring（双 XFS 文件） | 275,869.18 | 0.511 | 2.511 |
 | 纯读 GET | Dragonfly Tiered Storage | 237,334.07 | 1.511 | 8.031 |
+| 纯读 GET | Microsoft Garnet Storage Tier | 229,277.75 | 2.143 | 2.623 |
 | 纯读 GET | Apache Kvrocks | 105,865.14 | 1.479 | 1.655 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 418,140.27 | 0.991 | 1.647 |
 | 纯写 SET | Keylane SPDK | 410,003.11 | 1.023 | 1.823 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 404,836.60 | 1.015 | 1.679 |
+| 纯写 SET | Microsoft Garnet Storage Tier | 381,280.31 | 1.167 | 1.463 |
 | 纯写 SET | Dragonfly Tiered Storage | 220,881.37 | 4.191 | 9.471 |
 | 纯写 SET | Apache Kvrocks | 166,106.17 | 1.359 | 3.775 |
 | 1:1 读写混合 | Keylane SPDK | 349,069.27 | 0.655 | 1.655 |
 | 1:1 读写混合 | Keylane io_uring（双裸块设备） | 330,866.27 | 0.799 | 1.855 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 320,834.33 | 0.831 | 1.975 |
+| 1:1 读写混合 | Microsoft Garnet Storage Tier | 286,026.66 | 1.759 | 2.575 |
 | 1:1 读写混合 | Dragonfly Tiered Storage | 217,717.09 | 3.599 | 9.279 |
 | 1:1 读写混合 | Apache Kvrocks | 52,569.09 | 3.711 | 5.439 |
 
 io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 0.85%（纯读）、3.29%（纯写）和 3.13%（1:1），p99.9 分别低 4.46%、1.91% 和 6.08%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
 
 SPDK 相比 io_uring 双裸块设备的纯读和混合 QPS 分别高 11.59% 和 5.50%，但 raw io_uring 的纯写 QPS 高 1.98%、纯写 p99.9 低 9.65%。SPDK 的主要收益仍集中在随机读和读写并发路径，而不是顺序批量写入。
+
+Garnet 的纯读 QPS 比 Dragonfly 低 3.39%，但纯读 p99.9 低 67.34%；纯写和混合 QPS 分别比 Dragonfly 高 72.62% 和 31.38%，p99.9 分别低 84.55% 和 72.25%。与最快的 Keylane 后端相比，Garnet 的纯读、纯写和混合 QPS 分别低 26.15%、8.82% 和 18.06%；Garnet 的纯写 p99.9 为 1.463 ms，是本表所有系统中最低值，但其纯读和混合 p99.9 仍高于三个 Keylane 后端。
 
 ## 测试环境
 
@@ -33,9 +38,9 @@ SPDK 相比 io_uring 双裸块设备的纯读和混合 QPS 分别高 11.59% 和 
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。五个服务/后端在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。六个服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
+Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
 
 ## 结果边界与公平性说明
 
@@ -45,6 +50,11 @@ Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-rai
 - 两组 io_uring 都在各自全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称。raw 组将平均读请求从文件版约 6.6 KiB 降至约 3.1 KiB，但总随机读仍受两盘合计约 28.2 万 IOPS 限制，因此纯读 QPS 只提高 0.85%。
 - raw io_uring 需要独占块设备，部署和运维约束接近 SPDK；regular-file io_uring 包含 XFS 成本，但更接近普通 Linux 文件部署。两者都保留 Linux NVMe 驱动、中断和内核块层成本。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O，每组测试前清理 Linux page cache，因此结果不代表其 O_DIRECT 模式或 warm page-cache 模式。
+- Garnet 使用官方 v2.1.3 Release 源码直接发布二进制，不使用容器。只测试 raw string `GET`/`SET`，因此关闭 object store 和 pub/sub；4 GiB index 按官方每 key 约 16 bytes 的规则覆盖 2 亿 key，避免默认 128 MiB index 产生长 hash chain。
+- Garnet storage tier 使用 Linux Native libaio、4 个 completion threads、每设备 512 个最大 in-flight I/O、8 KiB initial record read，并保留默认开启的 scatter-gather GET。64 GiB hybrid log 和 32 GiB read cache 加上 index 后，正式测试时进程 RSS 约 101 GiB；这是一组偏向最高性能的配置，不代表低内存部署。
+- Garnet 正式测试前用 640 个连接做了 180 秒随机 GET 预热；read cache 达到完整 32 GiB，48,617,210 次预热 GET 全部命中，预热成绩不计入表格。正式纯读的 68,783,514 次 GET，以及混合测试中的全部 GET 也都是 0 miss。
+- Garnet 关闭 AOF、checkpoint 和 compaction，因此表中不包含同步持久化或旧版本回收成本。storage-tier hybrid log 本身不是可重启恢复的数据副本；测试期间纯写和混合覆盖产生的旧版本没有回收，log 目录从灌数后的约 414 GiB 增长到约 767 GiB。该配置适合隔离在线数据路径的上限，不代表可以无限期维持的磁盘稳态。
+- Garnet v2.1.3 在 `--no-obj` 模式下执行 `DBSIZE` 会在全库扫描路径触发 `NullReferenceException` 并关闭该管理连接。它没有影响灌数和 GET/SET 会话；本次改用恰好 200,000,000 次成功 SET、`INFO store` 的 506,254,709,784-byte log tail，以及后续随机 GET 全部 0 miss 交叉校验数据完整性。
 - Kvrocks 的正式测试是刻意隔离 compaction 的 best-case：先等待灌数触发的 compaction 完成，再动态关闭 auto compaction。三组正式测试期间 `num_running_compactions=0`。
 - Kvrocks 的 80 GiB HCC block cache 在正式计时前已预热到 `85,899,049,296` bytes。数据目录当时约 552 GiB，因此 cache 已满不代表整个数据集都在内存中；随机读仍会发生真实块设备读取。
 - Kvrocks 纯写结束时 metadata L0 文件数为 268；混合测试结束时为 310，`estimate_pending_compaction_bytes[metadata]` 约 7.04 GB。也就是说，报告中的 Kvrocks 写入成绩推迟了不可避免的在线 compaction 成本，不代表可以长期维持的稳态吞吐。
@@ -194,7 +204,7 @@ sudo systemd-run \
 
 ### 3. 创建 RAID0 和 XFS
 
-Dragonfly 和 Kvrocks 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
+Dragonfly、Garnet 和 Kvrocks 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
 
 ```bash
 sudo wipefs -a /dev/nvme0n1
@@ -352,9 +362,87 @@ sudo systemd-run \
 | WAL 开启、per-write sync 关闭 | 保留进程崩溃恢复并减少 fsync 延迟 | 机器掉电可能丢失最近写入 |
 | 16 workers、`max_open_files=-1` | 使用全部 server CPU 并避免反复打开文件 | 增加线程和文件描述符资源占用 |
 
-### 6. 全量灌入 2 亿条数据
+### 6. 编译并启动 Microsoft Garnet
 
-清空对应服务后，从 client 使用 640 个连接完成全量 SET：
+测试版本：[`Garnet 2.1.3`](https://github.com/microsoft/garnet/releases/tag/v2.1.3)，tag/commit 为 `v2.1.3` / `b4bf6275351dad3202467d88814a9aee793286c9`。直接发布并运行 Linux x64 二进制，不使用容器。内存和索引容量依据官方 [memory sizing](https://microsoft.github.io/garnet/docs/getting-started/memory) 说明，storage tier、Native I/O 和 read cache 参数见官方 [configuration reference](https://microsoft.github.io/garnet/docs/getting-started/configuration)。该版本要求 .NET SDK 10.0.302：
+
+```bash
+git clone --depth 1 --branch v2.1.3 \
+  https://github.com/microsoft/garnet.git
+cd garnet
+
+curl -fsSL https://dot.net/v1/dotnet-install.sh \
+  -o /tmp/garnet-dotnet-install.sh
+bash /tmp/garnet-dotnet-install.sh \
+  --version 10.0.302 \
+  --install-dir /opt/dotnet-garnet
+
+sudo apt-get install -y libaio-dev liburing2 patchelf
+
+/opt/dotnet-garnet/dotnet publish \
+  main/GarnetServer/GarnetServer.csproj \
+  -c Release \
+  -f net10.0 \
+  -r linux-x64 \
+  --self-contained false \
+  -o /opt/garnet-2.1.3
+```
+
+Ubuntu 24.04 的 libaio runtime SONAME 是 `libaio.so.1t64`，而官方预编译 native-device library 引用 `libaio.so.1`。本次只改 ELF dependency 名称，不改 Garnet 代码；其他发行版如果 `ldd` 没有显示 `libaio.so.1 => not found`，不需要执行：
+
+```bash
+patchelf --replace-needed libaio.so.1 libaio.so.1t64 \
+  /opt/garnet-2.1.3/runtimes/linux-x64/native/libnative_device.so
+patchelf --replace-needed libaio.so.1 libaio.so.1t64 \
+  /opt/garnet-2.1.3/runtimes/linux-x64/native/libnative_device_libaio.so
+```
+
+下面配置只提供 storage-tier cache-store 语义，不启用 AOF 或 checkpoint recovery。hybrid log 会把内存中放不下的页写到 `hlog.*` segment，但这些文件本身不等于可在进程重启后恢复的数据副本。测试期间关闭 compaction，避免后台回收干扰 300 秒窗口；长期运行必须重新评估 compaction、AOF/checkpoint、磁盘容量和延迟之间的取舍。
+
+```bash
+sudo mkdir -p /mnt/data/garnet/log /mnt/data/garnet/checkpoints
+sudo chown -R "$(id -un):$(id -gn)" /mnt/data/garnet
+
+sudo systemd-run \
+  --unit=garnet-perf.service \
+  --collect \
+  --property=AllowedCPUs=0-15 \
+  --property=LimitNOFILE=1048576 \
+  --setenv=DOTNET_ROOT=/opt/dotnet-garnet \
+  --setenv=DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+  /opt/garnet-2.1.3/GarnetServer \
+  --bind 10.0.0.4 \
+  --port 6379 \
+  --protected-mode false \
+  --memory 64g \
+  --page 4m \
+  --segment 1g \
+  --index 4g \
+  --index-max-size 4g \
+  --storage-tier \
+  --logdir /mnt/data/garnet/log \
+  --checkpointdir /mnt/data/garnet/checkpoints \
+  --readcache \
+  --readcache-memory 32g \
+  --readcache-page 4m \
+  --no-obj \
+  --no-pubsub \
+  --device-type Native \
+  --device-io-backend Libaio \
+  --device-completion-threads 4 \
+  --device-throttle-limit 512 \
+  --initial-io-record-size 8k \
+  --compaction-freq 0 \
+  --compaction-type None \
+  --network-connection-limit 10000 \
+  --minthreads 16 \
+  --miniothreads 16 \
+  --logger-level Warning
+```
+
+### 7. 全量灌入 2 亿条数据
+
+只在确认目标是允许清空的空白测试实例后执行一次 `FLUSHALL`，再从 client 使用 640 个连接完成全量 SET。`FLUSHALL` 会删除全库，已经灌完数据后不得再次执行：
 
 ```bash
 redis-cli -h 10.0.0.4 -p 6379 FLUSHALL
@@ -375,9 +463,36 @@ taskset -c 0-15 memtier_benchmark \
   --hide-histogram
 ```
 
-Keylane io_uring 双文件版本本次灌数完成 200,000,000 次 SET，memtier wall time 为 354.674 秒，平均 584,416.51 QPS；双裸块设备版本 wall time 为 358.076 秒，平均 586,921.49 QPS。Kvrocks 用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
+Keylane io_uring 双文件版本本次灌数完成 200,000,000 次 SET，memtier wall time 为 354.674 秒，平均 584,416.51 QPS；双裸块设备版本 wall time 为 358.076 秒，平均 586,921.49 QPS。Garnet wall time 为 379.803 秒，平均 529,218.32 QPS；灌数后 `INFO store` 报告 `Log.TailAddress=506254709784`，log 目录约 414 GiB。Kvrocks 用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
 
-### 7. 等待 Kvrocks compaction 完成并预热 block cache
+### 8. 预热 Garnet read cache
+
+Garnet 全量灌数完成后，用 640 个连接执行 180 秒随机 GET，直到 `ReadCache.AllocatedPageCount=8192`、`ReadCache.CurrentMemorySizeBytes=34359738368`。预热输出不计入正式结果；本次预热完成 48,617,210 次 GET，全部命中。
+
+```bash
+taskset -c 0-15 memtier_benchmark \
+  -t 16 -c 40 \
+  -s 10.0.0.4 -p 6379 \
+  --test-time 180 \
+  --distinct-client-seed \
+  --ratio=0:1 \
+  --key-prefix="kv_" \
+  --key-minimum=1 \
+  --key-maximum=200000000 \
+  --random-data \
+  --data-size-range=1000-4000 \
+  --data-size-pattern=R \
+  --hide-histogram \
+  --print-percentiles="99,99.9" \
+  --randomize
+
+redis-cli -h 10.0.0.4 -p 6379 INFO store \
+  | grep -E 'Log\.(Head|Flushed|Tail)|ReadCache\.(Allocated|Current)'
+```
+
+不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应同时确认全量灌数恰好完成 200,000,000 次 SET、预热 GET 为 0 miss，并保存 `INFO store` 地址用于审计。
+
+### 9. 等待 Kvrocks compaction 完成并预热 block cache
 
 灌数完成后保持 auto compaction 开启，持续检查 RocksDB 状态。只有 `num_running_compactions=0`、所有 `estimate_pending_compaction_bytes=0`，并确认不会立刻调度下一轮任务后才继续。本次 metadata 文件从 L0/L1=`92/5` 收敛到 `0/12`，`compaction_count=1`。
 
@@ -417,11 +532,13 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'block_cache_usage|num_running_compactions|num_background_errors'
 ```
 
-### 8. 依次执行三组正式测试
+### 10. 依次执行三组正式测试
 
 `RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 block cache 仍为满容量、`num_running_compactions=0` 且没有 background error。
 
-Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring，以及已经预热的 Kvrocks 不执行 `drop_caches`。
+Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring、使用 Native O_DIRECT storage tier 的 Garnet，以及已经预热的 Kvrocks 不执行 `drop_caches`。
+
+Garnet 三组顺序为 GET、SET、1:1，全部在同一个进程和数据集上执行，不重启、不清库。纯写和混合会继续追加 hybrid-log 旧版本；本次三组完成后 `Log.TailAddress=884989925872`，log 目录约 767 GiB。Garnet 正式测试中的 GET 全部为 hit。
 
 ```bash
 # 仅 Dragonfly：每组测试前在 Server 执行
