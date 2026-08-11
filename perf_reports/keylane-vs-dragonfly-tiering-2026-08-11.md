@@ -2,24 +2,29 @@
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 在三种 workload 下的 QPS 均最高；不需要 SPDK、RAID 或裸块设备的 Keylane io_uring 双文件方案仍明显高于 Dragonfly 和 Kvrocks。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，io_uring 双裸块设备的纯写 QPS 最高；不需要 SPDK、RAID 或裸块设备的 io_uring 双文件方案仍明显高于 Dragonfly 和 Kvrocks。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
 | 纯读 GET | Keylane SPDK | 310,459.04 | 0.463 | 1.295 |
+| 纯读 GET | Keylane io_uring（双裸块设备） | 278,223.05 | 0.511 | 2.399 |
 | 纯读 GET | Keylane io_uring（双 XFS 文件） | 275,869.18 | 0.511 | 2.511 |
 | 纯读 GET | Dragonfly Tiered Storage | 237,334.07 | 1.511 | 8.031 |
 | 纯读 GET | Apache Kvrocks | 105,865.14 | 1.479 | 1.655 |
+| 纯写 SET | Keylane io_uring（双裸块设备） | 418,140.27 | 0.991 | 1.647 |
 | 纯写 SET | Keylane SPDK | 410,003.11 | 1.023 | 1.823 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 404,836.60 | 1.015 | 1.679 |
 | 纯写 SET | Dragonfly Tiered Storage | 220,881.37 | 4.191 | 9.471 |
 | 纯写 SET | Apache Kvrocks | 166,106.17 | 1.359 | 3.775 |
 | 1:1 读写混合 | Keylane SPDK | 349,069.27 | 0.655 | 1.655 |
+| 1:1 读写混合 | Keylane io_uring（双裸块设备） | 330,866.27 | 0.799 | 1.855 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 320,834.33 | 0.831 | 1.975 |
 | 1:1 读写混合 | Dragonfly Tiered Storage | 217,717.09 | 3.599 | 9.279 |
 | 1:1 读写混合 | Apache Kvrocks | 52,569.09 | 3.711 | 5.439 |
 
-SPDK 相比 io_uring 双文件方案的 QPS 分别高 12.54%（纯读）、1.28%（纯写）和 8.80%（1:1）。纯写时 io_uring 的 p99.9 反而低 7.90%；纯读和混合时 SPDK 的 p99.9 分别低 48.43% 和 16.20%。这说明 SPDK 的主要收益集中在随机读和读写并发路径，而不是顺序批量写入。
+io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 0.85%（纯读）、3.29%（纯写）和 3.13%（1:1），p99.9 分别低 4.46%、1.91% 和 6.08%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
+
+SPDK 相比 io_uring 双裸块设备的纯读和混合 QPS 分别高 11.59% 和 5.50%，但 raw io_uring 的纯写 QPS 高 1.98%、纯写 p99.9 低 9.65%。SPDK 的主要收益仍集中在随机读和读写并发路径，而不是顺序批量写入。
 
 ## 测试环境
 
@@ -28,16 +33,17 @@ SPDK 相比 io_uring 双文件方案的 QPS 分别高 12.54%（纯读）、1.28%
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。四个服务/后端在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。五个服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 两个后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O，不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
+Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
 
 ## 结果边界与公平性说明
 
 - Keylane 不使用 LSM-tree，没有 RocksDB compaction；本组 Keylane 测试暂停了自身 defrag。
-- Keylane io_uring 使用 regular files，但存储文件以 O_DIRECT 打开，不依赖 Linux page cache。两块盘没有组成 RAID；Keylane 自己把两个文件识别为独立设备并各分配 8 个 home workers。
+- Keylane io_uring 的 raw 和 regular-file 两组使用同一个二进制和服务参数。regular files 以 O_DIRECT 打开，不依赖 Linux page cache；raw 组绕过 XFS，但仍经过 Linux block layer 和 NVMe 内核驱动。两块盘均未组成 RAID，Keylane 自己把两个路径识别为独立设备并各分配 8 个 home workers。
 - 当前代码把 `--registered-buffer-mb=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
-- io_uring 全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称；结果包含 XFS、Linux block layer、NVMe 内核驱动和中断路径的成本，因此比 SPDK 更接近普通 Linux 文件部署。
+- 两组 io_uring 都在各自全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称。raw 组将平均读请求从文件版约 6.6 KiB 降至约 3.1 KiB，但总随机读仍受两盘合计约 28.2 万 IOPS 限制，因此纯读 QPS 只提高 0.85%。
+- raw io_uring 需要独占块设备，部署和运维约束接近 SPDK；regular-file io_uring 包含 XFS 成本，但更接近普通 Linux 文件部署。两者都保留 Linux NVMe 驱动、中断和内核块层成本。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O，每组测试前清理 Linux page cache，因此结果不代表其 O_DIRECT 模式或 warm page-cache 模式。
 - Kvrocks 的正式测试是刻意隔离 compaction 的 best-case：先等待灌数触发的 compaction 完成，再动态关闭 auto compaction。三组正式测试期间 `num_running_compactions=0`。
 - Kvrocks 的 80 GiB HCC block cache 在正式计时前已预热到 `85,899,049,296` bytes。数据目录当时约 552 GiB，因此 cache 已满不代表整个数据集都在内存中；随机读仍会发生真实块设备读取。
@@ -73,9 +79,9 @@ sudo ./bld-spdk/keylane \
   --defrag-sleep-ms=100
 ```
 
-### 2. 编译并启动 Keylane io_uring 双文件版本
+### 2. 编译并启动 Keylane io_uring
 
-普通 io_uring 构建显式关闭 SPDK。下面的两盘初始化命令会清除目标设备的现有文件系统和数据；必须先按实际机器确认设备名，且不能包含系统盘。
+普通 io_uring 构建显式关闭 SPDK。raw 和 regular-file 两种存储方式共用同一个二进制：
 
 ```bash
 cmake -S . -B bld-iouring-files -G Ninja \
@@ -84,7 +90,13 @@ cmake -S . -B bld-iouring-files -G Ninja \
   -DKEYLANE_ENABLE_OPT=ON \
   -DKEYLANE_WITH_SPDK=OFF
 cmake --build bld-iouring-files -j 16
+```
 
+#### 双 XFS regular files
+
+下面的两盘初始化命令会清除目标设备的现有文件系统和数据；必须先按实际机器确认设备名，且不能包含系统盘。
+
+```bash
 sudo wipefs -a /dev/nvme0n1
 sudo wipefs -a /dev/nvme1n1
 sudo mkfs.xfs -f -L keylane0 /dev/nvme0n1
@@ -132,6 +144,53 @@ sudo systemd-run \
 ```
 
 本次启动日志确认每个文件容量为 1,717,986,918,400 bytes、各有 204,799 个 data blocks，两个设备分别分配 8 个 home workers，direct-I/O alignment 为 4,096 bytes。
+
+#### 双 raw block devices
+
+raw 版本需要卸载文件系统并独占设备。以下操作会使原文件系统和 Keylane 文件数据不可访问；`wipefs` 加前 8 MiB zeroout 用于建立新的 Keylane metadata/bitmap，不是全盘安全擦除，旧数据块可能仍物理存在但不会进入新存储集。
+
+```bash
+sudo systemctl kill -s SIGINT keylane-iouring-files.service
+sudo umount /mnt/data0
+sudo umount /mnt/data1
+
+sudo wipefs -a /dev/nvme0n1
+sudo wipefs -a /dev/nvme1n1
+sudo blkdiscard --zeroout --force \
+  --offset 0 --length 8388608 /dev/nvme0n1
+sudo blkdiscard --zeroout --force \
+  --offset 0 --length 8388608 /dev/nvme1n1
+
+sudo systemd-run \
+  --unit=keylane-iouring-block.service \
+  --collect \
+  --property=AllowedCPUs=0-15 \
+  --property=LimitNOFILE=1048576 \
+  /path/to/bld-iouring-files/keylane \
+  --bind=10.0.0.4 \
+  --port=6379 \
+  --metrics-port=9100 \
+  --threads=16 \
+  --pin-workers \
+  --recv-buffers=1024 \
+  --registered-buffer-mb=256 \
+  --busy-poll-us=20 \
+  --background-budget-us=10 \
+  --background-warrant-percent=1 \
+  --mimalloc-purge-delay-ms=60000 \
+  --data-file=/dev/nvme0n1 \
+  --data-file=/dev/nvme1n1 \
+  --flush-max-ms=1000 \
+  --flush-size-kb=128 \
+  --disable-read-crc \
+  --tomb-raider-interval-ms=0 \
+  --tomb-raider-sleep-ms=10 \
+  --defrag-paused \
+  --defrag-max-active-per-device=1 \
+  --defrag-sleep-ms=100
+```
+
+本次每个 NVMe 的原始容量为 1,920,383,410,176 bytes；Keylane 使用其中 1,920,378,863,616 bytes，忽略不足一个 8 MiB block 的尾部。每盘有 228,926 个 data blocks、分配 8 个 home workers，direct-I/O alignment 为 512 bytes。
 
 ### 3. 创建 RAID0 和 XFS
 
@@ -316,7 +375,7 @@ taskset -c 0-15 memtier_benchmark \
   --hide-histogram
 ```
 
-Keylane io_uring 双文件版本本次灌数完成 200,000,000 次 SET，用时 354.674 秒，平均 584,416.51 QPS；Kvrocks 用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
+Keylane io_uring 双文件版本本次灌数完成 200,000,000 次 SET，memtier wall time 为 354.674 秒，平均 584,416.51 QPS；双裸块设备版本 wall time 为 358.076 秒，平均 586,921.49 QPS。Kvrocks 用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
 
 ### 7. 等待 Kvrocks compaction 完成并预热 block cache
 
@@ -362,7 +421,7 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
 
 `RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 block cache 仍为满容量、`num_running_compactions=0` 且没有 background error。
 
-Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane SPDK、使用 O_DIRECT regular files 的 Keylane io_uring，以及已经预热的 Kvrocks 不执行 `drop_caches`。
+Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring，以及已经预热的 Kvrocks 不执行 `drop_caches`。
 
 ```bash
 # 仅 Dragonfly：每组测试前在 Server 执行
