@@ -45,7 +45,10 @@ class ReadBufferLease {
   ~ReadBufferLease();
 
   bool valid() const noexcept { return buffer_.data_ != nullptr; }
-  bool registered() const noexcept { return buffer_.index_ != 0; }
+  // True only when the slot is backed by a ring-registered iovec, so it gates
+  // fixed-buffer IO. A pool that fell back to unregistered mode at Init keeps
+  // its slot ids but reports false here. Defined after RegisteredBufferPool.
+  bool registered() const noexcept;
   unsigned owner_worker() const noexcept { return owner_worker_; }
   std::uint16_t buffer_id() const noexcept { return buffer_.index_; }
 
@@ -96,6 +99,10 @@ class RegisteredBufferPool {
                     const RegisteredBufferPoolOptions& options = {});
 
   bool initialized() const noexcept { return worker_ != nullptr; }
+  // False when io_uring buffer registration failed at Init and the pool fell
+  // back to plain (non-fixed) IO on the same aligned memory. Immutable after
+  // Init, so cross-worker reads through moved leases need no synchronization.
+  bool buffers_registered() const noexcept { return buffers_registered_; }
   unsigned owner_worker() const noexcept { return owner_worker_; }
   std::size_t read_buffer_count() const noexcept {
     return read_buffers_.size();
@@ -165,6 +172,7 @@ class RegisteredBufferPool {
   celer::Worker* worker_ = nullptr;
   celer::CrossCore* cross_core_ = nullptr;
   unsigned owner_worker_ = 0;
+  bool buffers_registered_ = false;
   RegisteredBufferPoolOptions options_{};
   std::byte* sentinel_buffer_ = nullptr;
   std::size_t sentinel_buffer_bytes_ = 0;
@@ -183,5 +191,10 @@ class RegisteredBufferPool {
   std::vector<std::size_t> free_overflow_read_buffers_;
   std::vector<bool> overflow_read_buffer_in_use_;
 };
+
+inline bool ReadBufferLease::registered() const noexcept {
+  return buffer_.index_ != 0 && pool_ != nullptr &&
+         pool_->buffers_registered_;
+}
 
 }  // namespace keylane::storage

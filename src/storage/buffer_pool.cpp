@@ -12,6 +12,7 @@
 #include "celer/io/spdk_storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "spdlog/spdlog.h"
 
 namespace keylane::storage {
 namespace {
@@ -276,7 +277,12 @@ absl::Status RegisteredBufferPool::Init(
   }
 
   absl::Status status = worker.RegisterBuffers(iovecs);
+  bool buffers_registered = status.ok();
   if (!status.ok()) {
+#ifdef CELER_WITH_SPDK_STORAGE
+    // SPDK registration is a DMA-addressability check; memory that fails it
+    // cannot be handed to the device at all, so plain IO would fail the same
+    // way. Fail fast instead of degrading.
     celer::FreeStorageBuffer(sentinel, options.alignment_);
     for (const celer::FixedBuffer& buffer : write_buffers) {
       celer::FreeStorageBuffer(buffer.data_, options.alignment_);
@@ -285,11 +291,20 @@ absl::Status RegisteredBufferPool::Init(
       celer::FreeStorageBuffer(buffer.data_, options.alignment_);
     }
     return status;
+#else
+    // The buffers themselves are fine; only the fixed-IO fast path is lost.
+    // Keep the pool and submit plain (non-fixed) reads and writes instead.
+    spdlog::warn(
+        "worker {}: io_uring buffer registration failed ({}); falling back to "
+        "unregistered IO — raise RLIMIT_MEMLOCK to restore fixed-buffer IO",
+        worker.id(), status.message());
+#endif
   }
 
   worker_ = &worker;
   cross_core_ = celer::ThisWorker().cross_core_;
   owner_worker_ = worker.id();
+  buffers_registered_ = buffers_registered;
   options_ = options;
   sentinel_buffer_ = sentinel;
   sentinel_buffer_bytes_ = sentinel_bytes;

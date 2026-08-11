@@ -924,7 +924,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
       auto written = co_await WriteStorageBuffer(
           *store.worker_, store.files_[file_id],
           std::span<const std::byte>(staging.data_ + offset, chunk),
-          write_buffer_id != 0, staging, block_offset + offset);
+          write_buffer_id != 0 && store.buffers_.buffers_registered(), staging,
+          block_offset + offset);
       if (!written.ok() || *written != chunk) {
         write_ok = false;
         write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
@@ -942,7 +943,8 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
       auto written = co_await WriteStorageBuffer(
           *store.worker_, store.files_[file_id],
           std::span<const std::byte>(staging.data_, kBlockHeaderSlotBytes),
-          write_buffer_id != 0, staging, block_offset);
+          write_buffer_id != 0 && store.buffers_.buffers_registered(), staging,
+          block_offset);
       if (!written.ok() || *written != kBlockHeaderSlotBytes) {
         write_status = written.ok() ? absl::Status(absl::StatusCode::kInternal,
                                                    "short extent header write")

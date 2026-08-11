@@ -217,7 +217,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       auto written = co_await WriteStorageBuffer(
           *store->worker_, store->files_[file_id],
           std::span<const std::byte>(staging.data_ + write_offset, chunk_bytes),
-          pending->write_buffer_id_ != 0, staging, block_offset + write_offset);
+          pending->write_buffer_id_ != 0 && store->buffers_.buffers_registered(),
+          staging, block_offset + write_offset);
       if (!written.ok() || *written != chunk_bytes) {
         co_await store->store_state_mutex_.Lock();
         UnlockGuard guard(&store->store_state_mutex_, store->worker_);
@@ -265,7 +266,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         std::span<const std::byte>(
             staging.data_ + pending->slot_ * kBlockHeaderSlotBytes,
             kBlockHeaderSlotBytes),
-        pending->write_buffer_id_ != 0, staging, slot_offset);
+        pending->write_buffer_id_ != 0 && store->buffers_.buffers_registered(),
+        staging, slot_offset);
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
       co_return co_await fail_flush(
           header_written.ok() ? absl::Status(absl::StatusCode::kInternal,

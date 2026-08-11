@@ -796,7 +796,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
   }
   if (trace != nullptr) {
     trace->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace->heap_read_buffer_ = !output.registered();
+    trace->heap_read_buffer_ = output.buffer_id() == 0;
     trace->disk_read_ = true;
   }
   if (trace != nullptr) {
@@ -913,7 +913,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   ReadBufferLease lease = std::move(*acquired);
   if (trace != nullptr) {
     trace->buffer_acquired_ns_ = ReadTraceNowNanos();
-    trace->heap_read_buffer_ = !lease.registered();
+    trace->heap_read_buffer_ = lease.buffer_id() == 0;
   }
 
   BlockState* state = FindBlockState(store, location.block_id_);
