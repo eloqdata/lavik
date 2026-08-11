@@ -300,8 +300,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             block.committed_bytes_ - record_offset);
         if (!DecodeRecordHeader(record_bytes, &record, &key) ||
             record.allocation_epoch_ != block.allocation_epoch_ ||
-            record.relocation_sequence_ >
-                std::numeric_limits<std::uint32_t>::max() ||
             record_offset + record.total_disk_bytes_ > block.committed_bytes_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
@@ -383,10 +381,10 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             .key_ = std::string(key),
             .db_id_ = record.db_id_,
             .txid_ = record.txid_,
+            .replication_epoch_ = record.replication_epoch_,
             .location_ =
                 RecordLocation{
                     .block_id_ = block_id,
-                    .replication_epoch_ = record.replication_epoch_,
                     .mutation_sequence_ = record.mutation_sequence_,
                     .allocation_epoch_ = record.allocation_epoch_,
                     .expire_at_ms_ = record.expire_at_ms_,
@@ -394,9 +392,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                         static_cast<std::uint32_t>(record.logical_size_),
                     .record_offset_ = record_offset,
                     .total_disk_bytes_ = record.total_disk_bytes_,
-                    .payload_bytes_ = record.payload_bytes_,
-                    .relocation_sequence_ =
-                        static_cast<std::uint32_t>(record.relocation_sequence_),
                     .block_owner_ = block_owner,
                     .external_ = record.external_,
                     .key_external_ = record.key_external_,
@@ -459,8 +454,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, const RecoveryRecord& recovered) {
   {
     auto& partition = PartitionForKey(store, recovered.key_);
-    if (recovered.location_.replication_epoch_ !=
-        partition.replication_epoch_) {
+    if (recovered.replication_epoch_ != partition.replication_epoch_) {
       return;
     }
     partition.mutation_sequence_ = std::max(

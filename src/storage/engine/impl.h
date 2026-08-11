@@ -59,7 +59,6 @@ using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
 
 struct RecordLocation {
   std::uint64_t block_id_ = 0;
-  std::uint64_t replication_epoch_ = 1;
   std::uint64_t mutation_sequence_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t expire_at_ms_ = 0;
@@ -69,11 +68,6 @@ struct RecordLocation {
   std::uint32_t logical_size_ = 0;
   std::uint32_t record_offset_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
-  // Serialized bytes following the record header. Unlike logical_size_, this
-  // remains a byte count for collection values whose Redis-visible size is
-  // their element count.
-  std::uint32_t payload_bytes_ = 0;
-  std::uint32_t relocation_sequence_ = 0;
   // Owner in the current process topology. Unlike the persisted writer_id,
   // this must always be in [0, worker_count).
   std::uint16_t block_owner_ = 0;
@@ -107,20 +101,14 @@ struct RecordLocation {
 using RecordIndex = ScanHashMap<RecordLocation>;
 
 static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
-static_assert(sizeof(RecordLocation) == 64);
+static_assert(sizeof(RecordLocation) == 48);
 static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 80);
+static_assert(sizeof(RecordIndex::Entry) == 64);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
-  if (candidate.replication_epoch_ != current.replication_epoch_) {
-    return candidate.replication_epoch_ > current.replication_epoch_;
-  }
   if (candidate.mutation_sequence_ != current.mutation_sequence_) {
     return candidate.mutation_sequence_ > current.mutation_sequence_;
-  }
-  if (candidate.relocation_sequence_ != current.relocation_sequence_) {
-    return candidate.relocation_sequence_ > current.relocation_sequence_;
   }
   return false;
 }
@@ -331,6 +319,9 @@ struct RecoveryRecord {
   // worker's scan has contributed its kTxCommit sightings, then applied only
   // if their transaction committed.
   std::uint64_t txid_ = 0;
+  // Recovery filters this durable generation before installing the location.
+  // Every live entry then inherits PartitionStore::replication_epoch_.
+  std::uint64_t replication_epoch_ = 1;
   RecordLocation location_{};
   ExtentManifest extents_;
 };
@@ -1492,8 +1483,9 @@ class StorageEngine::Impl {
       std::string_view key);
 
   Task<absl::StatusOr<LoadedValue>> LoadValue(
-      WorkerStore& key_store, std::uint8_t db_id, std::string_view key,
-      const Digest& digest, RecordLocation location, ExtentManifest extents,
+      WorkerStore& key_store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      RecordLocation location, ExtentManifest extents,
       ReadLatencyTrace* trace = nullptr);
 
   // Reads one extent block's payload into `destination`. Runs on the worker
@@ -1510,7 +1502,7 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       const Digest& digest, RecordLocation location,
-      ReadLatencyTrace* trace = nullptr);
+      std::uint64_t replication_epoch, ReadLatencyTrace* trace = nullptr);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {

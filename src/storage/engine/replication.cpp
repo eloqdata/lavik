@@ -129,8 +129,8 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
       QueueExpiredCandidate(store, partition.id_, db_id, *current, key);
       continue;
     }
-    auto loaded = co_await LoadValue(store, db_id, key, digest, location,
-                                     ExtentsFor(store, current));
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     location, ExtentsFor(store, current));
     if (!loaded.ok()) {
       if (loaded.status().code() == absl::StatusCode::kNotFound) {
         continue;
@@ -437,6 +437,10 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     tx::CurrentTxShard().MarkWatched(applied.db_id_, tx::FingerprintOf(digest));
     co_await store.store_state_mutex_.Lock();
     UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
+    if (replication_epoch != partition.replication_epoch_) [[unlikely]] {
+      co_return absl::Status(absl::StatusCode::kFailedPrecondition,
+                             "stale partition replication epoch");
+    }
     auto& index = partition.indexes_[applied.db_id_];
     auto resolved =
         co_await FindVerifiedEntry(store, index, digest, applied.key_);
@@ -445,7 +449,6 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     }
     auto* current = *resolved;
     if (current != nullptr &&
-        current->value_.replication_epoch_ == replication_epoch &&
         current->value_.mutation_sequence_ >= applied.mutation_sequence_) {
       continue;
     }

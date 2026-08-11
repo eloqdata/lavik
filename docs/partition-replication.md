@@ -110,20 +110,18 @@ This implementation must not yet be presented as completed production HA:
 
 ## Index-memory follow-up
 
-`RecordLocation` was reduced from 64 to 56 bytes by removing the redundant
-in-memory `db_epoch` and narrowing `block_owner` to 16 bits. `record_offset`
-remains 32 bits: it is an offset inside an 8 MiB block, which does not fit in 16
-bits, and using a 23-bit implementation-defined bit-field would add masking to
-the GET path for no whole-structure saving by itself.
+`RecordLocation` is 48 bytes. The durable replication epoch remains in every
+record header and in the partition metadata, but is not duplicated in every
+live index entry: recovery filters records by epoch before insertion, and reads
+capture the partition epoch together with the location. The index entry header
+is 64 bytes and stores its immutable key in the same allocation immediately
+after the header. Payload length and relocation ordinal
+remain durable header fields but are decoded only when needed instead of being
+duplicated in every live location.
 
-This is still too large for small values. A current map entry is approximately
-112 bytes before allocator and bucket overhead: 20-byte digest, 32-byte
-`std::string`, and 56-byte location plus alignment. A later memory-focused
-change should measure and address the whole entry rather than only reorder the
-location fields. Candidate work is a 64-bit hash with full-key collision
-checking, arena/inline key storage, and splitting recovery-only version fields
-from the compact online location. The native replication correctness fields
-must not be truncated without an explicit wrap/recovery design.
+`record_offset` remains 32 bits: it is an offset inside an 8 MiB block, which
+does not fit in 16 bits, and using a 23-bit implementation-defined bit-field
+would add masking to the GET path for no whole-structure saving by itself.
 
 The partition snapshot/delta machinery is intended to remain the native
 Keylane-to-Keylane replication path. Redis interoperability should be a

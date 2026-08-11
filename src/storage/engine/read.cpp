@@ -50,8 +50,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     trace->lookup_done_ns_ = ReadTraceNowNanos();
   }
 
-  auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
-                                   ExtentsFor(store, found), trace);
+  auto loaded =
+      co_await LoadValue(store, partition, db_id, key, digest, found->value_,
+                         ExtentsFor(store, found), trace);
   if (!loaded.ok()) {
     co_return loaded.status();
   }
@@ -232,10 +233,15 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
-StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
-                               std::string_view key, const Digest& digest,
-                               RecordLocation location, ExtentManifest extents,
+StorageEngine::Impl::LoadValue(WorkerStore& key_store,
+                               WorkerStore::PartitionStore& partition,
+                               std::uint8_t db_id, std::string_view key,
+                               const Digest& digest, RecordLocation location,
+                               ExtentManifest extents,
                                ReadLatencyTrace* trace) {
+  // The caller already resolved the key's partition for the index lookup.
+  // Reuse it across retries instead of recomputing the Redis slot.
+  const std::uint64_t replication_epoch = partition.replication_epoch_;
   while (true) {
     assert(location.block_owner_ < worker_count_);
     absl::StatusOr<LoadedValue> loaded(absl::Status(
@@ -251,17 +257,25 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
           key_store, location, std::move(extents), key.size(), trace);
     } else if (location.block_owner_ == key_store.worker_->id()) {
       loaded = co_await LoadValueLocal(key_store, db_id, key, digest, location,
-                                       trace);
+                                       replication_epoch, trace);
     } else {
       const unsigned owner = location.block_owner_;
       std::string owned_key(key);
       loaded = co_await celer::SubmitTaskTo(
           owner,
           [this, owner, db_id, key = std::move(owned_key), digest, location,
+           replication_epoch,
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
-                                              digest, location, trace);
+                                              digest, location,
+                                              replication_epoch, trace);
           });
+    }
+    // Replica reset is partition-wide and does not take each key lock. Reject
+    // a result that crossed an epoch change, including a successful extent
+    // read, rather than returning a value from the retired generation.
+    if (partition.replication_epoch_ != replication_epoch) [[unlikely]] {
+      co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
     if (loaded.ok() || loaded.status().code() != absl::StatusCode::kAborted) {
       co_return loaded;
@@ -273,14 +287,13 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store, std::uint8_t db_id,
     // Resolve the key on its owner and follow the current physical location.
     // The caller's key lock serializes logical mutations, so only a physical
     // relocation of the same mutation is retryable.
-    auto& index = PartitionForKey(key_store, key).indexes_[db_id];
+    auto& index = partition.indexes_[db_id];
     auto resolved = co_await FindVerifiedEntry(key_store, index, digest, key);
     if (!resolved.ok()) {
       co_return resolved.status();
     }
     auto* current = *resolved;
     if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
-        current->value_.replication_epoch_ != location.replication_epoch_ ||
         current->value_.mutation_sequence_ != location.mutation_sequence_) {
       // Database-epoch invalidation is not serialized by an individual key
       // lock. If it removed or replaced this logical mutation while the read
@@ -506,8 +519,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadInlineRecordKeyLocal(
       !record.key_external_ || record.external_ ||
       record.key_bytes_ != key_bytes || record.payload_bytes_ < key_bytes ||
       record.allocation_epoch_ != location.allocation_epoch_ ||
-      record.mutation_sequence_ != location.mutation_sequence_ ||
-      record.relocation_sequence_ != location.relocation_sequence_) {
+      record.mutation_sequence_ != location.mutation_sequence_) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "inline key record changed");
   }
@@ -668,8 +680,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyInlineRecordKeyLocal(
       record.key_bytes_ != key.size() ||
       record.payload_bytes_ < record.key_bytes_ ||
       record.allocation_epoch_ != location.allocation_epoch_ ||
-      record.mutation_sequence_ != location.mutation_sequence_ ||
-      record.relocation_sequence_ != location.relocation_sequence_) {
+      record.mutation_sequence_ != location.mutation_sequence_) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "inline key record changed");
   }
@@ -862,6 +873,7 @@ Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
                                     std::string_view key, const Digest& digest,
                                     RecordLocation location,
+                                    std::uint64_t replication_epoch,
                                     ReadLatencyTrace* trace) {
   if (location.external_) {
     co_return absl::Status(absl::StatusCode::kInternal,
@@ -943,15 +955,13 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
         record.kind_ != RecordKind::kValue ||
         record.db_epoch_ != DbEpoch(db_id) ||
         record.mutation_sequence_ != location.mutation_sequence_ ||
-        record.replication_epoch_ != location.replication_epoch_ ||
-        record.relocation_sequence_ != location.relocation_sequence_ ||
+        record.replication_epoch_ != replication_epoch ||
         record.allocation_epoch_ != location.allocation_epoch_ ||
         record.expire_at_ms_ != location.expire_at_ms_ ||
         record.value_type_ != location.value_type_ ||
         record.external_ != location.external_ ||
         record.key_external_ != location.key_external_ ||
         location.logical_size_ != record.logical_size_ ||
-        location.payload_bytes_ != record.payload_bytes_ ||
         location.total_disk_bytes_ != record.total_disk_bytes_) {
       co_return absl::Status(absl::StatusCode::kAborted,
                              "record does not match in-memory location");
@@ -1041,15 +1051,13 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
       record.kind_ != RecordKind::kValue ||
       record.db_epoch_ != DbEpoch(db_id) ||
       record.mutation_sequence_ != location.mutation_sequence_ ||
-      record.replication_epoch_ != location.replication_epoch_ ||
-      record.relocation_sequence_ != location.relocation_sequence_ ||
+      record.replication_epoch_ != replication_epoch ||
       record.allocation_epoch_ != location.allocation_epoch_ ||
       record.expire_at_ms_ != location.expire_at_ms_ ||
       record.value_type_ != location.value_type_ ||
       record.external_ != location.external_ ||
       record.key_external_ != location.key_external_ ||
       record.logical_size_ != location.logical_size_ ||
-      record.payload_bytes_ != location.payload_bytes_ ||
       record.total_disk_bytes_ != location.total_disk_bytes_) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "record does not match in-memory location");

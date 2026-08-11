@@ -160,8 +160,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     expire_at_ms = found->value_.expire_at_ms_;
-    auto value = co_await LoadValue(store, db_id, key, digest, found->value_,
-                                    ExtentsFor(store, found));
+    auto value = co_await LoadValue(store, partition, db_id, key, digest,
+                                    found->value_, ExtentsFor(store, found));
     if (!value.ok()) {
       co_return value.status();
     }
@@ -232,8 +232,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
           absl::StatusCode::kInvalidArgument,
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
-    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
-                                     ExtentsFor(store, found));
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     found->value_, ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -333,8 +333,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   const RecordLocation previous = found->value_;
-  auto loaded = co_await LoadValue(store, db_id, key, digest, previous,
-                                   ExtentsFor(store, found));
+  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                   previous, ExtentsFor(store, found));
   if (!loaded.ok()) {
     co_return loaded.status();
   }
@@ -429,8 +429,8 @@ Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     expire_at_ms = found->value_.expire_at_ms_;
-    auto loaded = co_await LoadValue(store, db_id, key, digest, found->value_,
-                                     ExtentsFor(store, found));
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     found->value_, ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -1344,16 +1344,12 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 
   const RecordLocation location{
       .block_id_ = updated.block_id_,
-      .replication_epoch_ =
-          partition_ptr == nullptr ? 1 : partition_ptr->replication_epoch_,
       .mutation_sequence_ = mutation_sequence,
       .allocation_epoch_ = updated.allocation_epoch_,
       .expire_at_ms_ = expire_at_ms,
       .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .record_offset_ = record_offset,
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
-      .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
-      .relocation_sequence_ = static_cast<std::uint32_t>(relocation_sequence),
       .block_owner_ = writer_id,
       .in_memory_ = true,
       .external_ = external,
