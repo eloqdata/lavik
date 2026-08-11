@@ -1,20 +1,25 @@
-# Keylane SPDK、Dragonfly Tiered Storage 与 Apache Kvrocks 性能对比（2026-08-11）
+# Keylane SPDK/io_uring、Dragonfly Tiered Storage 与 Apache Kvrocks 性能对比（2026-08-11）
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane 在三种 workload 下的 QPS 均最高，p99 和 p99.9 也最低。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 在三种 workload 下的 QPS 均最高；不需要 SPDK、RAID 或裸块设备的 Keylane io_uring 双文件方案仍明显高于 Dragonfly 和 Kvrocks。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
 | 纯读 GET | Keylane SPDK | 310,459.04 | 0.463 | 1.295 |
+| 纯读 GET | Keylane io_uring（双 XFS 文件） | 275,869.18 | 0.511 | 2.511 |
 | 纯读 GET | Dragonfly Tiered Storage | 237,334.07 | 1.511 | 8.031 |
 | 纯读 GET | Apache Kvrocks | 105,865.14 | 1.479 | 1.655 |
 | 纯写 SET | Keylane SPDK | 410,003.11 | 1.023 | 1.823 |
+| 纯写 SET | Keylane io_uring（双 XFS 文件） | 404,836.60 | 1.015 | 1.679 |
 | 纯写 SET | Dragonfly Tiered Storage | 220,881.37 | 4.191 | 9.471 |
 | 纯写 SET | Apache Kvrocks | 166,106.17 | 1.359 | 3.775 |
 | 1:1 读写混合 | Keylane SPDK | 349,069.27 | 0.655 | 1.655 |
+| 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 320,834.33 | 0.831 | 1.975 |
 | 1:1 读写混合 | Dragonfly Tiered Storage | 217,717.09 | 3.599 | 9.279 |
 | 1:1 读写混合 | Apache Kvrocks | 52,569.09 | 3.711 | 5.439 |
+
+SPDK 相比 io_uring 双文件方案的 QPS 分别高 12.54%（纯读）、1.28%（纯写）和 8.80%（1:1）。纯写时 io_uring 的 p99.9 反而低 7.90%；纯读和混合时 SPDK 的 p99.9 分别低 48.43% 和 16.20%。这说明 SPDK 的主要收益集中在随机读和读写并发路径，而不是顺序批量写入。
 
 ## 测试环境
 
@@ -23,13 +28,15 @@
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。三个服务在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。四个服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 使用 16 workers、双 NVMe SPDK、暂停 defrag、关闭 tomb-raider。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
+Keylane 两个后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O，不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，关闭压缩，并在全量灌数后的 compaction 完成且 block cache 预热满以后计时。
 
 ## 结果边界与公平性说明
 
 - Keylane 不使用 LSM-tree，没有 RocksDB compaction；本组 Keylane 测试暂停了自身 defrag。
+- Keylane io_uring 使用 regular files，但存储文件以 O_DIRECT 打开，不依赖 Linux page cache。两块盘没有组成 RAID；Keylane 自己把两个文件识别为独立设备并各分配 8 个 home workers。
+- io_uring 全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称；结果包含 XFS、Linux block layer、NVMe 内核驱动和中断路径的成本，因此比 SPDK 更接近普通 Linux 文件部署。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O，每组测试前清理 Linux page cache，因此结果不代表其 O_DIRECT 模式或 warm page-cache 模式。
 - Kvrocks 的正式测试是刻意隔离 compaction 的 best-case：先等待灌数触发的 compaction 完成，再动态关闭 auto compaction。三组正式测试期间 `num_running_compactions=0`。
 - Kvrocks 的 80 GiB HCC block cache 在正式计时前已预热到 `85,899,049,296` bytes。数据目录当时约 552 GiB，因此 cache 已满不代表整个数据集都在内存中；随机读仍会发生真实块设备读取。
@@ -65,7 +72,67 @@ sudo ./bld-spdk/keylane \
   --defrag-sleep-ms=100
 ```
 
-### 2. 创建 RAID0 和 XFS
+### 2. 编译并启动 Keylane io_uring 双文件版本
+
+普通 io_uring 构建显式关闭 SPDK。下面的两盘初始化命令会清除目标设备的现有文件系统和数据；必须先按实际机器确认设备名，且不能包含系统盘。
+
+```bash
+cmake -S . -B bld-iouring-files -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=OFF \
+  -DKEYLANE_ENABLE_OPT=ON \
+  -DKEYLANE_WITH_SPDK=OFF
+cmake --build bld-iouring-files -j 16
+
+sudo wipefs -a /dev/nvme0n1
+sudo wipefs -a /dev/nvme1n1
+sudo mkfs.xfs -f -L keylane0 /dev/nvme0n1
+sudo mkfs.xfs -f -L keylane1 /dev/nvme1n1
+
+sudo mkdir -p /mnt/data0 /mnt/data1
+sudo mount -o noatime /dev/nvme0n1 /mnt/data0
+sudo mount -o noatime /dev/nvme1n1 /mnt/data1
+sudo chown "$(id -un):$(id -gn)" /mnt/data0 /mnt/data1
+
+fallocate -l 1600G /mnt/data0/keylane.data
+fallocate -l 1600G /mnt/data1/keylane.data
+```
+
+`1,600 GiB` 是本机实验值，不是 Keylane 固定要求。部署时应按实际磁盘容量预留文件系统日志和运维空间；每个新文件必须是 8 MiB 的整数倍。Keylane 不会在启动时创建、扩展或 truncate 文件。
+
+```bash
+sudo systemd-run \
+  --unit=keylane-iouring-files.service \
+  --collect \
+  --property=AllowedCPUs=0-15 \
+  --property=LimitNOFILE=1048576 \
+  /path/to/bld-iouring-files/keylane \
+  --bind=10.0.0.4 \
+  --port=6379 \
+  --metrics-port=9100 \
+  --threads=16 \
+  --pin-workers \
+  --recv-buffers=1024 \
+  --registered-buffer-mb=256 \
+  --busy-poll-us=20 \
+  --background-budget-us=10 \
+  --background-warrant-percent=1 \
+  --mimalloc-purge-delay-ms=60000 \
+  --data-file=/mnt/data0/keylane.data \
+  --data-file=/mnt/data1/keylane.data \
+  --flush-max-ms=1000 \
+  --flush-size-kb=128 \
+  --disable-read-crc \
+  --tomb-raider-interval-ms=0 \
+  --tomb-raider-sleep-ms=10 \
+  --defrag-paused \
+  --defrag-max-active-per-device=1 \
+  --defrag-sleep-ms=100
+```
+
+本次启动日志确认每个文件容量为 1,717,986,918,400 bytes、各有 204,799 个 data blocks，两个设备分别分配 8 个 home workers，direct-I/O alignment 为 4,096 bytes。
+
+### 3. 创建 RAID0 和 XFS
 
 Dragonfly 和 Kvrocks 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
 
@@ -86,7 +153,7 @@ sudo mount -o noatime /dev/md/storage-raid0 /mnt/data
 
 本次实际阵列为 RAID0、512 KiB chunk，总容量 3.49 TiB，挂载点为 `/mnt/data`。
 
-### 3. 启动 Dragonfly Tiered Storage
+### 4. 启动 Dragonfly Tiered Storage
 
 测试版本：`dragonfly v1.40.1-434478e00c366c711985d0b3269023fc39db8ad1`。直接使用官方 GitHub Release 的 x86-64 二进制，二进制 SHA-256 为 `1d2b6654f4488ebc3f6cd5061199158880f6d957534705cd548a909108507b8b`，不使用容器运行时。
 
@@ -126,7 +193,7 @@ sudo systemd-run \
   --version_check=false
 ```
 
-### 4. 编译并启动 Apache Kvrocks
+### 5. 编译并启动 Apache Kvrocks
 
 测试版本：`kvrocks version 2.16.0 (commit 28440b5)`。下面是本次使用的完整配置；其中会影响性能或持久性语义的设置全部保留，避免只公布成绩而隐藏调优条件。
 
@@ -225,7 +292,7 @@ sudo systemd-run \
 | WAL 开启、per-write sync 关闭 | 保留进程崩溃恢复并减少 fsync 延迟 | 机器掉电可能丢失最近写入 |
 | 16 workers、`max_open_files=-1` | 使用全部 server CPU 并避免反复打开文件 | 增加线程和文件描述符资源占用 |
 
-### 5. 全量灌入 2 亿条数据
+### 6. 全量灌入 2 亿条数据
 
 清空对应服务后，从 client 使用 640 个连接完成全量 SET：
 
@@ -248,9 +315,9 @@ taskset -c 0-15 memtier_benchmark \
   --hide-histogram
 ```
 
-Kvrocks 本次灌数完成 200,000,000 次 SET，用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
+Keylane io_uring 双文件版本本次灌数完成 200,000,000 次 SET，用时 354.674 秒，平均 584,416.51 QPS；Kvrocks 用时 1,847.693 秒，平均 113,040.98 QPS。灌数吞吐只用于确认复现过程，不计入上面的正式对比表。
 
-### 6. 等待 Kvrocks compaction 完成并预热 block cache
+### 7. 等待 Kvrocks compaction 完成并预热 block cache
 
 灌数完成后保持 auto compaction 开启，持续检查 RocksDB 状态。只有 `num_running_compactions=0`、所有 `estimate_pending_compaction_bytes=0`，并确认不会立刻调度下一轮任务后才继续。本次 metadata 文件从 L0/L1=`92/5` 收敛到 `0/12`，`compaction_count=1`。
 
@@ -290,11 +357,11 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'block_cache_usage|num_running_compactions|num_background_errors'
 ```
 
-### 7. 依次执行三组正式测试
+### 8. 依次执行三组正式测试
 
 `RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 block cache 仍为满容量、`num_running_compactions=0` 且没有 background error。
 
-Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane 和已经预热的 Kvrocks 不执行 `drop_caches`。
+Dragonfly 每组测试前在 server 执行 `sync` 并清理 Linux page cache；不清空数据库。Keylane SPDK、使用 O_DIRECT regular files 的 Keylane io_uring，以及已经预热的 Kvrocks 不执行 `drop_caches`。
 
 ```bash
 # 仅 Dragonfly：每组测试前在 Server 执行
