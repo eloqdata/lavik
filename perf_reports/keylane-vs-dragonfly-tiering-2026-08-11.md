@@ -570,12 +570,3 @@ taskset -c 0-15 memtier_benchmark \
   --print-percentiles="99,99.9" \
   --randomize
 ```
-
-如果测试实例随后转为长期运行，应按生产 workload 重新选择 compaction 策略。下面仅示范恢复本次调优前的 L0 门槛并开启 auto compaction：
-
-```bash
-redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.level0_file_num_compaction_trigger 16
-redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.level0_slowdown_writes_trigger 128
-redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.level0_stop_writes_trigger 256
-redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.disable_auto_compactions no
-```
