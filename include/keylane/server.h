@@ -10,7 +10,7 @@
 
 namespace keylane {
 
-inline constexpr long kDefaultMimallocPurgeDelayMs = -1;
+inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
 
 struct ServerOptions {
   std::string bind_ip_ = "127.0.0.1";

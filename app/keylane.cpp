@@ -12,9 +12,9 @@
 
 int main(int argc, char** argv) {
   // Compile-time defaults make THP and eager commit effective during
-  // mimalloc's process constructor. Reassert all three before application
-  // allocations.
-  mi_option_set(mi_option_purge_delay, keylane::kDefaultMimallocPurgeDelayMs);
+  // mimalloc's process constructor. Reassert both before application
+  // allocations. Leave purge_delay at mimalloc's native default throughout
+  // recovery; the configured online value is applied after recovery finishes.
   mi_option_set(mi_option_arena_eager_commit, 1);
   mi_option_set(mi_option_allow_thp, 0);
 
@@ -71,7 +71,8 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
   app.add_option("--mimalloc-purge-delay-ms", options.mimalloc_purge_delay_ms_,
-                 "Mimalloc purge delay in ms (-1 disables purging)")
+                 "Online mimalloc purge delay in ms, applied after recovery "
+                 "(-1 disables purging)")
       ->capture_default_str()
       ->check(CLI::Range(-1L, std::numeric_limits<long>::max()));
   app.add_option("--registered-buffer-mb", registered_buffer_mb,

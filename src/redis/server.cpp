@@ -24,6 +24,7 @@
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
+#include "celer/runtime/sync.h"
 #include "keylane/command.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
@@ -318,8 +319,12 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 class RedisService final : public TcpService {
  public:
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
-               ReplicationManager* replication)
-      : TcpService(port), storage_(storage), replication_(replication) {}
+               ReplicationManager* replication,
+               long online_mimalloc_purge_delay_ms)
+      : TcpService(port),
+        storage_(storage),
+        replication_(replication),
+        online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -353,12 +358,19 @@ class RedisService final : public TcpService {
   static constexpr std::uint64_t kRequestCountMask = ~kRequestsClosed;
   storage::StorageEngine* storage_;
   ReplicationManager* replication_;
+  long online_mimalloc_purge_delay_ms_;
+  std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
+  std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
+  std::unique_ptr<CoroutineBarrier> online_allocator_barrier_;
   std::atomic<bool> startup_failed_{false};
   std::atomic<std::uint64_t> request_gate_{0};
 };
 
 void RedisService::Prepare(unsigned thread_count) {
   TcpService::Prepare(thread_count);
+  recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
+  recovery_collect_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
+  online_allocator_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
 }
 
 void RedisService::StopAcceptingRequests() noexcept {
@@ -400,6 +412,29 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     spdlog::error("worker[{}] storage initialization failed: {}", worker.id(),
                   status.message());
     worker.RequestStop();
+    co_return status;
+  }
+
+  // mi_collect is local to the calling thread's heap. First wait until every
+  // recovery coroutine (and its temporary allocations) has been destroyed,
+  // then collect on every worker while mimalloc still uses its native purge
+  // delay. Switch the process-wide option only after all collectors finish.
+  status = co_await recovery_ready_barrier_->Wait(worker);
+  if (!status.ok()) [[unlikely]] {
+    co_return status;
+  }
+  mi_collect(true);
+  status = co_await recovery_collect_barrier_->Wait(worker);
+  if (!status.ok()) [[unlikely]] {
+    co_return status;
+  }
+  if (worker.id() == 0) {
+    mi_option_set(mi_option_purge_delay, online_mimalloc_purge_delay_ms_);
+    spdlog::info("mimalloc recovery collection complete; online purge_delay={}",
+                 mi_option_get(mi_option_purge_delay));
+  }
+  status = co_await online_allocator_barrier_->Wait(worker);
+  if (!status.ok()) [[unlikely]] {
     co_return status;
   }
 
@@ -651,11 +686,12 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(ServerOptions options) {
-  mi_option_set(mi_option_purge_delay, options.mimalloc_purge_delay_ms_);
-  spdlog::info("mimalloc purge_delay={} arena_eager_commit={} allow_thp={}",
-               mi_option_get(mi_option_purge_delay),
-               mi_option_get(mi_option_arena_eager_commit),
-               mi_option_get(mi_option_allow_thp));
+  spdlog::info(
+      "mimalloc recovery_purge_delay={} online_purge_delay={} "
+      "arena_eager_commit={} allow_thp={}",
+      mi_option_get(mi_option_purge_delay), options.mimalloc_purge_delay_ms_,
+      mi_option_get(mi_option_arena_eager_commit),
+      mi_option_get(mi_option_allow_thp));
   spdlog::info(
       "keylane listening on {}:{} metrics_port={} threads={} pin_workers={} "
       "idle_timeout_ms={} "
@@ -746,7 +782,8 @@ int RunServer(ServerOptions options) {
   runtime_options.spdk_foreground_pre_poll_us_ =
       options.spdk_foreground_pre_poll_us_;
 
-  RedisService redis(options.port_, &storage, &replication);
+  RedisService redis(options.port_, &storage, &replication,
+                     options.mimalloc_purge_delay_ms_);
   std::unique_ptr<Service> metrics;
   Server server;
   server.AddService(&redis);

@@ -34,10 +34,12 @@ Build:
 
 Mimalloc is now mandatory: `KEYLANE_USE_MIMALLOC` no longer exists. Every
 Keylane build links mimalloc 3.4.5, compiles with `MI_NO_THP=ON` and
-`MI_DEFAULT_ARENA_EAGER_COMMIT=1`, and defaults the runtime purge delay to
-`-1`. The current A/B overrides it to 60,000 ms. The startup log is the source
-of truth and should report `purge_delay=60000 arena_eager_commit=1 allow_thp=0`
-for these two live processes.
+`MI_DEFAULT_ARENA_EAGER_COMMIT=1`. Recovery keeps mimalloc's native 1,000 ms
+purge delay; after every worker has finished recovery and forced a local heap
+collection, Keylane switches to the configured online delay, which defaults to
+60,000 ms. The startup log is the source of truth and should report
+`recovery_purge_delay=1000 online_purge_delay=60000 arena_eager_commit=1
+allow_thp=0`, followed by the online-switch log after recovery.
 
 SPDK build:
 
