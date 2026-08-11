@@ -206,7 +206,6 @@ sudo systemd-run \
   /tmp/dragonfly-v1.40.1 \
   --logtostderr \
   --bind=10.0.0.4 \
-  --port=6379 \
   --proactor_threads=16 \
   --proactor_affinity_mode=on \
   --maxmemory=64GB \
@@ -447,7 +446,6 @@ sudo systemd-run \
   --setenv=DOTNET_CLI_TELEMETRY_OPTOUT=1 \
   /opt/garnet-2.1.3/GarnetServer \
   --bind 10.0.0.4 \
-  --port 6379 \
   --protected-mode false \
   --memory 64g \
   --page 4m \
