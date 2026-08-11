@@ -1,14 +1,33 @@
 #include <mimalloc.h>
+#include <sched.h>
 
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "keylane/CLI11.hpp"
 #include "keylane/server.h"
+
+namespace {
+
+unsigned DefaultWorkerThreadCount() {
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (::sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+    const int count = CPU_COUNT(&allowed);
+    if (count > 0) {
+      return static_cast<unsigned>(count);
+    }
+  }
+  const unsigned count = std::thread::hardware_concurrency();
+  return count == 0 ? 1U : count;
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   // Compile-time defaults make THP and eager commit effective during
@@ -21,8 +40,9 @@ int main(int argc, char** argv) {
   CLI::App app{"keylane — high-performance Redis-compatible storage"};
 
   keylane::ServerOptions options;
-  unsigned registered_buffer_mb = 16;
-  unsigned flush_size_kb = 8192;
+  options.thread_count_ = DefaultWorkerThreadCount();
+  unsigned registered_buffer_mb = 256;
+  unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
   std::string replicate_to;
 

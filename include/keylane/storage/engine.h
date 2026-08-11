@@ -25,7 +25,7 @@ namespace keylane::storage {
 struct StorageEngineOptions {
   std::vector<std::string> data_files_{"keylane.data"};
   std::uint32_t flush_max_ms_ = 1000;
-  std::size_t flush_size_bytes_ = 8 * 1024 * 1024;
+  std::size_t flush_size_bytes_ = 128 * 1024;
   bool verify_read_crc_ = true;
   bool expiration_authority_ = true;
   // Keys at or below this size stay complete in the in-memory index. Larger
@@ -33,7 +33,7 @@ struct StorageEngineOptions {
   std::size_t inline_key_max_bytes_ = kDefaultInlineKeyBytes;
   // Full-disk sweep retiring tombstones no surviving record needs. Zero
   // disables it.
-  std::uint32_t tomb_raider_interval_ms_ = 600'000;
+  std::uint32_t tomb_raider_interval_ms_ = 86'400'000;
   // Pause after each block the sweep reads, capping its share of disk
   // bandwidth so online traffic keeps its latency.
   std::uint32_t tomb_raider_sleep_ms_ = 10;

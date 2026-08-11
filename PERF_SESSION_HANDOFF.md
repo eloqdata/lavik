@@ -1,6 +1,6 @@
 # Keylane Performance Session Handoff
 
-Updated: 2026-08-10 UTC
+Updated: 2026-08-11 UTC
 
 ## Current source state
 
@@ -293,9 +293,8 @@ unless a controlled latency test explicitly changes it.
 persisted or detected full capacity, so passing the old option aborts startup.
 The memory-accounting fix makes the default automatic limit usable on
 this dataset. Do not restore the historical `--max-memory=1tb` benchmark
-workaround. The io_uring command above uses the tomb-raider defaults,
-`--tomb-raider-interval-ms=600000` and `--tomb-raider-sleep-ms=10`. The current
-SPDK command now uses the same schedule for the long online-defrag observation.
+workaround. The current tomb-raider defaults are a 24-hour interval
+(`--tomb-raider-interval-ms=86400000`) and a 10 ms per-block sleep.
 
 Historical tcmalloc launch used before mimalloc became mandatory (not the
 current process and not supported by current CMake):
@@ -330,8 +329,7 @@ Wait for shutdown so partial write buffers are flushed before restarting.
 - /dev/nvme1n1 therefore uses 512-byte read offset and length alignment.
 - Regular files continue to use 4096-byte alignment.
 - --flush-size-kb controls the maximum storage write submission.
-- Default --flush-size-kb is 8192, preserving the old 8 MiB behavior.
-- The tested value is 128.
+- Default --flush-size-kb is 128, matching the tested 128 KiB submission size.
 - The 8 MiB write buffer, on-disk block, index, and recovery format are
   unchanged.
 - Registered slices use WriteFixed; heap fallback buffers use ordinary async
