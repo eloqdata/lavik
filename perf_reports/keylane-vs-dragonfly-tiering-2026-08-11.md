@@ -58,8 +58,8 @@ Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-rai
 - Garnet 正式测试前用 640 个连接做了 180 秒随机 GET 预热；read cache 达到完整 32 GiB，48,617,210 次预热 GET 全部命中，预热成绩不计入表格。正式纯读的 68,783,514 次 GET，以及混合测试中的全部 GET 也都是 0 miss。
 - Garnet 关闭 AOF、checkpoint 和 compaction，因此表中不包含同步持久化或旧版本回收成本。storage-tier hybrid log 本身不是可重启恢复的数据副本；测试期间纯写和混合覆盖产生的旧版本没有回收，log 目录从灌数后的约 414 GiB 增长到约 767 GiB。该配置适合隔离在线数据路径的上限，不代表可以无限期维持的磁盘稳态。
 - Garnet v2.1.3 在 `--no-obj` 模式下执行 `DBSIZE` 会在全库扫描路径触发 `NullReferenceException` 并关闭该管理连接。它没有影响灌数和 GET/SET 会话；本次改用恰好 200,000,000 次成功 SET、`INFO store` 的 506,254,709,784-byte log tail，以及后续随机 GET 全部 0 miss 交叉校验数据完整性。
-- Kvrocks 从全量灌数开始关闭自动 compaction，但保留正常 memtable flush；L0 compaction、slowdown 和 stop 阈值都设为该版本上限 1024。该配置用于隔离前台请求路径，生产环境通常需要在线 compaction，其资源开销可能影响吞吐和延迟。
-- Kvrocks 的 80 GiB HCC block cache 在正式计时前预热到稳定容量；cache 已满不表示整个数据集都在内存中，随机读仍会访问块设备。
+- Kvrocks 全量灌数期间保持正常 flush 和自动 compaction；灌数结束后关闭自动 compaction，再进行正式测试。该配置用于隔离正式计时窗口的前台请求路径，生产环境通常需要在线 compaction，其资源开销可能影响吞吐和延迟。
+- Kvrocks 配置 80 GiB HCC block cache，但灌数结束后不做额外读预热；关闭 auto compaction 并确认当时已经执行的 job 退出后，直接开始正式测试。
 - Kvrocks 关闭 WAL、per-write sync、压缩和 Blob GC。WAL 关闭会改变故障恢复语义；正式测试结果只代表这组明确配置下的数据路径性能。
 - Pika 使用官方 v4.0.3 tag（commit `d16db1eee9aadb1db42338269936deb7b584ddcc`）直接编译 Release 二进制，不使用容器；该 commit 的二进制版本字符串仍显示 4.0.2，因此同时记录 tag、commit 和自报版本，避免版本歧义。
 - Pika 的 3 个 RocksDB instances 各配置 8 GiB shared block cache，合计 24 GiB；RTC cache 配置 32 GiB。正式计时前执行随机 GET 预热，256.023 秒完成约 2550 万次 GET，平均 99,633.56 QPS 且 0 miss，预热成绩不计入表格。
@@ -273,10 +273,10 @@ rocksdb.compression no
 rocksdb.compression_start_level 0
 rocksdb.compaction_readahead_size 2097152
 rocksdb.enable_pipelined_write yes
-rocksdb.level0_file_num_compaction_trigger 1024
-rocksdb.level0_slowdown_writes_trigger 1024
-rocksdb.level0_stop_writes_trigger 1024
-rocksdb.disable_auto_compactions yes
+rocksdb.level0_file_num_compaction_trigger 16
+rocksdb.level0_slowdown_writes_trigger 128
+rocksdb.level0_stop_writes_trigger 256
+rocksdb.disable_auto_compactions no
 rocksdb.enable_blob_files yes
 rocksdb.min_blob_size 1000
 rocksdb.blob_file_size 1073741824
@@ -314,7 +314,7 @@ sudo systemd-run \
 | Blob GC 关闭 | 避免测试期间 GC 抢占 I/O | 覆盖写产生的旧 blob 不回收，磁盘持续增长 |
 | SST/WAL/blob 压缩关闭 | 降低 CPU 消耗 | 增加设备容量和写带宽需求 |
 | 512 MiB write buffer、最多 8 个、最少 2 个合并 | 扩大写缓冲并减少 L0 flush 文件数 | 增加内存占用 |
-| auto compaction 关闭、三个 L0 阈值设为上限 1024 | 灌数、预热和正式窗口只允许 flush，不调度自动 compaction | 长期运行需要重新开启后台整理 |
+| 灌数期间开启 auto compaction，L0 门槛 16/128/256 | 使用正常 flush/compaction 路径构造初始数据 | 灌数期间会占用后台 CPU/I/O |
 | 16 background jobs、4 subcompactions、2 MiB compaction readahead | 为恢复常规 compaction 后保留并行能力 | 在线 compaction 会占用 CPU/I/O |
 | L1 base 64 GiB、multiplier 10、关闭 dynamic level bytes | 控制常规 level compaction 的容量布局 | 需要按实际数据量调整 |
 | pipelined write、async read I/O、I/O 不限速 | 提高并行度和吞吐 | 峰值时更容易打满设备 |
@@ -527,41 +527,26 @@ redis-cli -h 10.0.0.4 -p 6379 INFO store \
 
 Pika 使用相同的随机 GET 预热命令。本次预热运行 256.023 秒，完成约 2550 万次 GET，平均 99,633.56 QPS，全部命中；预热结果不计入正式成绩。
 
-### 10. 验证 Kvrocks no-compaction 状态并预热 block cache
+### 10. 关闭 Kvrocks auto compaction
 
-Kvrocks 从空库启动前已经在配置文件中关闭 auto compaction，并把 L0 compaction、slowdown 和 stop 阈值都设为 1024。flush 正常生成 L0 SST，但灌数、预热和三组正式测试期间不调度自动 compaction。灌数过程中持续确认 `num_running_compactions=0`、没有 background error，且 L0 文件数没有达到 1024：
+Kvrocks 灌数期间保持 auto compaction 开启。全量 SET 完成后立即关闭 auto compaction，并把 L0 slowdown/stop 门槛提高到该版本上限 1024，避免正式纯写和混合窗口触发停写。只等待当时已经执行的后台 job 正常退出，不等待或触发额外轮次；随后不做 block-cache 预热，直接开始正式测试：
+
+```bash
+redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.disable_auto_compactions yes
+redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.level0_slowdown_writes_trigger 1024
+redis-cli -h 10.0.0.4 -p 6379 CONFIG SET rocksdb.level0_stop_writes_trigger 1024
+```
+
+确认 `num_running_compactions=0`、没有 background error，并记录切换时的 level 状态：
 
 ```bash
 redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'num_files_at_level|estimate_pending_compaction_bytes|num_running_compactions|compaction_count'
 ```
 
-在 client 运行随机 GET 预热。预热输出不计入成绩；在 `block_cache_usage` 达到稳定容量后用 `Ctrl+C` 停止预热，再确认 compaction 仍为 0：
-
-```bash
-taskset -c 0-15 memtier_benchmark \
-  -t 16 -c 40 \
-  -s 10.0.0.4 -p 6379 \
-  --test-time 3600 \
-  --distinct-client-seed \
-  --ratio=0:1 \
-  --key-prefix="kv_" \
-  --key-minimum=1 \
-  --key-maximum=200000000 \
-  --random-data \
-  --data-size-range=1000-4000 \
-  --data-size-pattern=R \
-  --hide-histogram \
-  --print-percentiles="99,99.9" \
-  --randomize
-
-redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
-  | grep -E 'block_cache_usage|num_running_compactions|num_background_errors'
-```
-
 ### 11. 依次执行三组正式测试
 
-`RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 block cache 仍为满容量、`num_running_compactions=0` 且没有 background error。
+`RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 `num_running_compactions=0` 且没有 background error。
 
 所有系统在三组正式测试之间都不清理操作系统 page cache。Dragonfly 保留预热后的 Linux page cache；Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring、使用 Native O_DIRECT storage tier 的 Garnet，以及已经预热的 Kvrocks 本身不依赖该 page-cache 路径。
 
