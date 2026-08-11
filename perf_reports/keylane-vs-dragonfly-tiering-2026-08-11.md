@@ -36,6 +36,7 @@ Keylane 两个后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。
 
 - Keylane 不使用 LSM-tree，没有 RocksDB compaction；本组 Keylane 测试暂停了自身 defrag。
 - Keylane io_uring 使用 regular files，但存储文件以 O_DIRECT 打开，不依赖 Linux page cache。两块盘没有组成 RAID；Keylane 自己把两个文件识别为独立设备并各分配 8 个 home workers。
+- 当前代码把 `--registered-buffer-mb=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
 - io_uring 全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称；结果包含 XFS、Linux block layer、NVMe 内核驱动和中断路径的成本，因此比 SPDK 更接近普通 Linux 文件部署。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O，每组测试前清理 Linux page cache，因此结果不代表其 O_DIRECT 模式或 warm page-cache 模式。
 - Kvrocks 的正式测试是刻意隔离 compaction 的 best-case：先等待灌数触发的 compaction 完成，再动态关闭 auto compaction。三组正式测试期间 `num_running_compactions=0`。
