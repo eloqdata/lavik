@@ -78,8 +78,6 @@ sudo systemd-run \
   --property=LimitNOFILE=infinity \
   /path/to/bld-spdk/keylane \
   --bind=10.0.0.4 \
-  --port=6379 \
-  --metrics-port=9100 \
   --data-file=spdk://69f9:00:00.0/1 \
   --data-file=spdk://021d:00:00.0/1
 ```
@@ -127,8 +125,6 @@ sudo systemd-run \
   --property=LimitNOFILE=infinity \
   /path/to/bld-iouring-files/keylane \
   --bind=10.0.0.4 \
-  --port=6379 \
-  --metrics-port=9100 \
   --data-file=/mnt/data0/keylane.data \
   --data-file=/mnt/data1/keylane.data
 ```
@@ -159,8 +155,6 @@ sudo systemd-run \
   --property=LimitNOFILE=infinity \
   /path/to/bld-iouring-files/keylane \
   --bind=10.0.0.4 \
-  --port=6379 \
-  --metrics-port=9100 \
   --data-file=/dev/nvme0n1 \
   --data-file=/dev/nvme1n1
 ```

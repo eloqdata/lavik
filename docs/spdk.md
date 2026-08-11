@@ -138,17 +138,16 @@ so only deployment-specific values are required:
 
 ```sh
 KEYLANE_BIND_IP=127.0.0.1
-KEYLANE_PORT=6379
-KEYLANE_METRICS_PORT=9100
 KEYLANE_CPUS=0-7
 KEYLANE_SPDK_URI='spdk://0000:01:00.0/1'
 
 taskset -c "$KEYLANE_CPUS" ./bld-spdk/keylane \
   --bind="$KEYLANE_BIND_IP" \
-  --port="$KEYLANE_PORT" \
-  --metrics-port="$KEYLANE_METRICS_PORT" \
   --data-file="$KEYLANE_SPDK_URI"
 ```
+
+Redis traffic uses the default port 6379. Prometheus metrics are disabled by
+default; add `--metrics-port=9100` only when a metrics collector is needed.
 
 Keylane pins workers by default. It reads the inherited affinity mask and maps
 worker 0 to the first allowed CPU, worker 1 to the second, and so on. Thus
