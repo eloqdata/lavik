@@ -207,7 +207,6 @@ sudo systemd-run \
   --logtostderr \
   --bind=10.0.0.4 \
   --proactor_threads=16 \
-  --proactor_affinity_mode=on \
   --maxmemory=64GB \
   --dir=/mnt/data/dragonfly \
   --dbfilename= \
@@ -216,9 +215,23 @@ sudo systemd-run \
   --backing_file_direct=false \
   --tiered_offload_threshold=1.0 \
   --tiered_experimental_cooling=false \
-  --tiered_max_pending_stash_bytes=16MB \
-  --primary_port_http_enabled=false
+  --tiered_max_pending_stash_bytes=16MB
 ```
+
+Dragonfly v1.40.1 的显式参数均用于确定测试资源边界、容纳完整数据集或提高性能：
+
+| 设置 | 目的与性能含义 |
+| --- | --- |
+| `--proactor_threads=16` | 明确使用 server 的 16 个可用 CPU，与其他被测系统的 CPU 范围一致。 |
+| `--maxmemory=64GB` | 给 Dragonfly 内存层设定 64 GiB 上限；超过内存层容量的数据由 tiered storage 承载，Linux 仍可利用剩余内存作为 page cache。 |
+| `--dbfilename=` | 正式窗口不生成 snapshot 文件，避免快照 I/O 干扰在线 GET/SET。 |
+| `--tiering_disk_storage_initial_size=40GB` | 把初始 tier 文件从默认 256 MiB 提高到 40 GiB，减少灌数早期反复扩展文件的开销。 |
+| `--backing_file_direct=false` | 默认值为 `true`；这里显式使用 buffered I/O，使正常运行中的 Linux page cache 能服务随机读。灌数后预热，正式测试之间不清 cache。 |
+| `--tiered_offload_threshold=1.0` | 默认值为 `0.5`；可用内存比例一旦低于 100% 就尽早 offload，避免 2 亿条数据先逼近 64 GiB 内存上限后集中 backpressure。 |
+| `--tiered_experimental_cooling=false` | 默认开启的 experimental cooling 在本 workload 下会降低灌数和前台吞吐；关闭中间 cooling 层，让可 offload 的 value 直接进入存储路径。 |
+| `--tiered_max_pending_stash_bytes=16MB` | 从默认 256 KiB 提高到 16 MiB，允许更多写入在途和批处理，以更充分利用双 NVMe 带宽。 |
+
+`proactor_affinity_mode=on` 和 `version_check=true` 都保持默认值，因此不在命令中重复。version check 仍然开启。
 
 ### 5. 编译并启动 Apache Kvrocks
 
