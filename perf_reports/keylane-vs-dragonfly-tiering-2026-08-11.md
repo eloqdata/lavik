@@ -1,5 +1,7 @@
 # Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks 与 Pika 性能对比（2026-08-11）
 
+> 2026-08-12 更新：Keylane 三种后端正在按统一的 5 分钟口径复测。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写；下表将在全部复测完成后统一替换。本次复测保持 defrag 开启，具体参数见“Keylane defrag 参数”。
+
 ## 测试结果
 
 本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，io_uring 双裸块设备的纯写 QPS 最高；Microsoft Garnet 是三个非 Keylane 系统中纯写和混合 QPS 最高的一组，纯读 QPS 略低于 Dragonfly，但 p99.9 明显更低。
@@ -41,16 +43,16 @@ Garnet 的纯读 QPS 比 Dragonfly 低 3.39%，但纯读 p99.9 低 67.34%；纯�
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。七组服务/后端在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。每个后端只灌入一次 2 亿条初始数据，随后依次执行纯读、1:1 读写混合和纯写，三组之间不重启、不清库。七组服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-raider。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。
+Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。
 
 ## 结果边界与公平性说明
 
-- Keylane 不使用 LSM-tree，没有 RocksDB compaction；本组 Keylane 测试暂停了自身 defrag。
+- Keylane 不使用 LSM-tree，没有 RocksDB compaction；本轮复测始终保持自身 defrag 开启。纯读不产生旧版本，不会主动触发 defrag；1:1 使用每设备最多 2 个活动任务、块间冷却 15 ms；纯写使用每设备最多 6 个活动任务且不设置块间冷却。两种写入负载的记录间冷却均为 0。
 - Keylane io_uring 的 raw 和 regular-file 两组使用同一个二进制和服务参数。regular files 以 O_DIRECT 打开，不依赖 Linux page cache；raw 组绕过 XFS，但仍经过 Linux block layer 和 NVMe 内核驱动。两块盘均未组成 RAID，Keylane 自己把两个路径识别为独立设备并各分配 8 个 home workers。
 - 当前代码把 `--registered-buffer-mb=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
-- 两组 io_uring 都在各自全量灌数后直接运行正式测试，没有挑选短窗口。纯读和混合期间两块盘都约 100% util，且 I/O 量对称。raw 组将平均读请求从文件版约 6.6 KiB 降至约 3.1 KiB，但总随机读仍受两盘合计约 28.2 万 IOPS 限制，因此纯读 QPS 只提高 0.85%。
+- 三种 Keylane 后端都在各自全量灌数后直接运行正式测试，没有预先老化数据或挑选短窗口。每种后端只灌数一次，正式顺序固定为纯读、1:1 读写混合、纯写。纯读和混合期间两块盘都约 100% util，且 I/O 量对称。raw 组将平均读请求从文件版约 6.6 KiB 降至约 3.1 KiB，但总随机读仍受两盘合计约 28.2 万 IOPS 限制，因此纯读 QPS 只提高 0.85%。
 - raw io_uring 需要独占块设备，部署和运维约束接近 SPDK；regular-file io_uring 包含 XFS 成本，但更接近普通 Linux 文件部署。两者都保留 Linux NVMe 驱动、中断和内核块层成本。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O。正常运行会保留 Linux page cache，因此新复现口径在灌数后先预热、正式测试之间不清 page cache。表内当前 Dragonfly 数字来自此前 cold-cache 流程，已明确标记为待重测，不能当作 warm-cache 结果。
 - Garnet 使用官方 v2.1.3 Release 源码直接发布二进制，不使用容器。只测试 raw string `GET`/`SET`，因此关闭 object store 和 pub/sub；4 GiB index 按官方每 key 约 16 bytes 的规则覆盖 2 亿 key，避免默认 128 MiB index 产生长 hash chain。
@@ -67,7 +69,33 @@ Keylane 三个存储后端都使用 16 workers、暂停 defrag、关闭 tomb-rai
 
 ## 复现步骤
 
-### 1. 启动 Keylane SPDK
+### 1. Keylane defrag 参数
+
+Keylane 三种后端使用相同的动态参数。defrag 始终保持开启；参数在相应 workload 开始前设置。
+
+1:1 读写混合使用较低的后台并行度，并在处理完每个 block 后冷却 15 ms，以降低在线长尾：
+
+```bash
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG MAX-ACTIVE 2
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG BLOCK-SLEEP 15
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG RECORD-SLEEP 0
+```
+
+纯写使用更高的每设备并行度，使后台回收速度能够跟上持续覆盖写入：
+
+```bash
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG MAX-ACTIVE 6
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG BLOCK-SLEEP 0
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG RECORD-SLEEP 0
+```
+
+`MAX-ACTIVE` 是每个存储设备的上限；本次使用两个设备，因此全进程最多分别有 4 个或 12 个活动 defrag 任务。`BLOCK-SLEEP` 的单位是毫秒，`RECORD-SLEEP` 的单位是微秒。纯读不产生覆盖写旧版本，沿用启动默认值即可。可用下面的命令确认当前配置、活动任务和排队任务：
+
+```bash
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG STATUS
+```
+
+### 2. 启动 Keylane SPDK
 
 ```bash
 sudo systemd-run \
@@ -82,7 +110,7 @@ sudo systemd-run \
   --data-file=spdk://021d:00:00.0/1
 ```
 
-### 2. 编译并启动 Keylane io_uring
+### 3. 编译并启动 Keylane io_uring
 
 普通 io_uring 构建显式关闭 SPDK。raw 和 regular-file 两种存储方式共用同一个二进制：
 
@@ -161,7 +189,7 @@ sudo systemd-run \
 
 本次每个 NVMe 的原始容量为 1,920,383,410,176 bytes；Keylane 使用其中 1,920,378,863,616 bytes，忽略不足一个 8 MiB block 的尾部。每盘有 228,926 个 data blocks、分配 8 个 home workers，direct-I/O alignment 为 512 bytes。
 
-### 3. 创建 RAID0 和 XFS
+### 4. 创建 RAID0 和 XFS
 
 Dragonfly、Garnet 和 Kvrocks 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
 
@@ -182,7 +210,7 @@ sudo mount -o noatime /dev/md/storage-raid0 /mnt/data
 
 本次实际阵列为 RAID0、512 KiB chunk，总容量 3.49 TiB，挂载点为 `/mnt/data`。
 
-### 4. 启动 Dragonfly Tiered Storage
+### 5. 启动 Dragonfly Tiered Storage
 
 测试版本：`dragonfly v1.40.1-434478e00c366c711985d0b3269023fc39db8ad1`。直接使用官方 GitHub Release 的 x86-64 二进制，二进制 SHA-256 为 `1d2b6654f4488ebc3f6cd5061199158880f6d957534705cd548a909108507b8b`，不使用容器运行时。版本检查保持 Dragonfly 默认开启。
 
@@ -233,7 +261,7 @@ Dragonfly v1.40.1 的显式参数均用于确定测试资源边界、容纳完�
 
 `proactor_affinity_mode=on` 和 `version_check=true` 都保持默认值，因此不在命令中重复。version check 仍然开启。
 
-### 5. 编译并启动 Apache Kvrocks
+### 6. 编译并启动 Apache Kvrocks
 
 测试版本：`kvrocks version 2.16.0 (commit 28440b5)`。下面是本次使用的完整配置；其中会影响性能或持久性语义的设置全部保留，避免只公布成绩而隐藏调优条件。
 
@@ -334,7 +362,7 @@ sudo systemd-run \
 | WAL 和 per-write sync 均关闭 | 隔离数据写入路径并提高写吞吐 | 进程或机器故障可能丢失尚未 flush 的数据 |
 | 16 workers、`max_open_files=-1` | 使用全部 server CPU 并避免反复打开文件 | 增加线程和文件描述符资源占用 |
 
-### 6. 编译并启动 Pika
+### 7. 编译并启动 Pika
 
 测试源码为官方 `v4.0.3` tag（commit `d16db1eee9aadb1db42338269936deb7b584ddcc`）；该 commit 编译出的 `pika -v` 显示 `pika_version: 4.0.2`。下面使用源码 Release 二进制直接运行，不使用容器：
 
@@ -409,7 +437,7 @@ sudo systemd-run \
 redis-cli -h 10.0.0.4 -p 6379 CONFIG SET disable_auto_compactions true
 ```
 
-### 7. 编译并启动 Microsoft Garnet
+### 8. 编译并启动 Microsoft Garnet
 
 测试版本：[`Garnet 2.1.3`](https://github.com/microsoft/garnet/releases/tag/v2.1.3)，tag/commit 为 `v2.1.3` / `b4bf6275351dad3202467d88814a9aee793286c9`。直接发布并运行 Linux x64 二进制，不使用容器。内存和索引容量依据官方 [memory sizing](https://microsoft.github.io/garnet/docs/getting-started/memory) 说明，storage tier、Native I/O 和 read cache 参数见官方 [configuration reference](https://microsoft.github.io/garnet/docs/getting-started/configuration)。该版本要求 .NET SDK 10.0.302：
 
@@ -486,7 +514,7 @@ sudo systemd-run \
   --logger-level Warning
 ```
 
-### 8. 全量灌入 2 亿条数据
+### 9. 全量灌入 2 亿条数据
 
 只在确认目标是允许清空的空白测试实例后执行一次 `FLUSHALL`，再从 client 使用 640 个连接完成全量 SET。`FLUSHALL` 会删除全库，已经灌完数据后不得再次执行：
 
@@ -511,7 +539,7 @@ taskset -c 0-15 memtier_benchmark \
 
 灌数阶段只用于构造相同的 2 亿条初始数据，不记录耗时或吞吐，也不计入正式对比结果。
 
-### 9. 预热 Dragonfly、Garnet 与 Pika cache
+### 10. 预热 Dragonfly、Garnet 与 Pika cache
 
 Dragonfly 全量灌数后先用随机 GET 预热 Linux page cache，随后三组正式测试之间不清 page cache、不重启。Garnet 用同一命令预热到 `ReadCache.AllocatedPageCount=8192`、`ReadCache.CurrentMemorySizeBytes=34359738368`。预热输出不计入正式结果；本次 Garnet 预热完成 48,617,210 次 GET，全部命中。
 
@@ -540,7 +568,7 @@ redis-cli -h 10.0.0.4 -p 6379 INFO store \
 
 Pika 使用相同的随机 GET 预热命令。本次预热运行 256.023 秒，完成约 2550 万次 GET，平均 99,633.56 QPS，全部命中；预热结果不计入正式成绩。
 
-### 10. 关闭 Kvrocks auto compaction
+### 11. 关闭 Kvrocks auto compaction
 
 Kvrocks 灌数期间保持 auto compaction 开启。全量 SET 完成后立即关闭 auto compaction，并把 L0 slowdown/stop 门槛提高到该版本上限 1024，避免正式纯写和混合窗口触发停写。只等待当时已经执行的后台 job 正常退出，不等待或触发额外轮次；随后不做 block-cache 预热，直接开始正式测试：
 
@@ -557,9 +585,9 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'num_files_at_level|estimate_pending_compaction_bytes|num_running_compactions|compaction_count'
 ```
 
-### 11. 依次执行三组正式测试
+### 12. 依次执行三组正式测试
 
-`RATIO` 依次替换为纯读 `0:1`、纯写 `1:0` 和 1:1 混合 `1:1`。每组结束后确认 `num_running_compactions=0` 且没有 background error。
+`RATIO` 依次替换为纯读 `0:1`、1:1 混合 `1:1` 和纯写 `1:0`。每个后端只执行一次全量灌数，三组正式测试共用这份数据。每组结束后确认没有 background error；Keylane 还需用 `DEFRAG STATUS` 记录活动和排队任务。
 
 所有系统在三组正式测试之间都不清理操作系统 page cache。Dragonfly 保留预热后的 Linux page cache；Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring、使用 Native O_DIRECT storage tier 的 Garnet，以及已经预热的 Kvrocks 本身不依赖该 page-cache 路径。
 
