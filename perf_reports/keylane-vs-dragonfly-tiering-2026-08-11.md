@@ -1,14 +1,14 @@
 # Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks 与 Pika 性能对比（2026-08-11）
 
-> 2026-08-12 更新：Keylane file io_uring 和 raw io_uring 已按统一的 5 分钟口径完成复测，表内已替换为本轮结果；SPDK 仍为上一轮结果，等待本轮复测完成后替换。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次复测保持 defrag 开启，具体参数见“Keylane defrag 参数”。
+> 2026-08-12 更新：Keylane SPDK、raw io_uring 和 file io_uring 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次复测保持 defrag 开启，具体参数见“Keylane defrag 参数”。
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。file io_uring 与 raw io_uring 已完成本轮统一口径复测；SPDK 和其他系统的表内数字将在相应复测完成后继续更新。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 略高；其他系统的表内数字将在相应复测完成后继续更新。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
-| 纯读 GET | Keylane SPDK（上一轮，待复测） | 310,459.04 | 0.463 | 1.295 |
+| 纯读 GET | Keylane SPDK | 310,387.22 | 0.455 | 0.895 |
 | 纯读 GET | Keylane io_uring（双裸块设备） | 278,924.72 | 0.503 | 2.319 |
 | 纯读 GET | Keylane io_uring（双 XFS 文件） | 272,726.70 | 0.519 | 2.319 |
 | 纯读 GET | Dragonfly Tiered Storage（待 warm-cache 重测） | 237,334.07 | 1.511 | 8.031 |
@@ -16,13 +16,13 @@
 | 纯读 GET | Apache Kvrocks | 105,865.14 | 1.479 | 1.655 |
 | 纯读 GET | Pika | 96,994.53 | 1.647 | 3.791 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 393,732.53 | 1.015 | 1.647 |
-| 纯写 SET | Keylane SPDK（上一轮，待复测） | 410,003.11 | 1.023 | 1.823 |
+| 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 385,324.26 | 1.055 | 1.727 |
 | 纯写 SET | Microsoft Garnet Storage Tier | 381,280.31 | 1.167 | 1.463 |
 | 纯写 SET | Dragonfly Tiered Storage（待 warm-cache 重测） | 220,881.37 | 4.191 | 9.471 |
 | 纯写 SET | Apache Kvrocks | 166,106.17 | 1.359 | 3.775 |
 | 纯写 SET | Pika | 156,673.29 | 1.455 | 2.239 |
-| 1:1 读写混合 | Keylane SPDK（上一轮，待复测） | 349,069.27 | 0.655 | 1.655 |
+| 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双裸块设备） | 328,831.03 | 0.655 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 326,110.00 | 0.687 | 1.503 |
 | 1:1 读写混合 | Microsoft Garnet Storage Tier | 286,026.66 | 1.759 | 2.575 |
@@ -32,9 +32,9 @@
 
 io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 2.27%（纯读）、2.18%（纯写）和 0.83%（1:1）；纯读 p99.9 相同，纯写和 1:1 的 p99.9 分别低 4.63% 和 3.73%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
 
-SPDK 与 io_uring 的对比结论将在本轮 SPDK 复测完成后更新；当前 SPDK 行仅保留上一轮数据作为临时参考，不与本轮 io_uring 数字计算差异。
+SPDK 相比 raw io_uring 的纯读和 1:1 QPS 分别高 11.28% 和 7.18%；raw io_uring 的纯写 QPS 高 0.37%。SPDK 纯读 p99.9 低 61.41%，1:1 p99.9 相同，纯写 p99.9 低 2.43%。本轮 SPDK 的主要吞吐收益集中在随机读和读写并发路径，纯写吞吐则与 raw io_uring 接近。
 
-Garnet 的纯读 QPS 比 Dragonfly 低 3.39%，但纯读 p99.9 低 67.34%；纯写和混合 QPS 分别比 Dragonfly 高 72.62% 和 31.38%，p99.9 分别低 84.55% 和 72.25%。与最快的 Keylane 后端相比，Garnet 的纯读、纯写和混合 QPS 分别低 26.15%、8.82% 和 18.06%；Garnet 的纯写 p99.9 为 1.463 ms，是本表所有系统中最低值，但其纯读和混合 p99.9 仍高于三个 Keylane 后端。
+Garnet 的纯读 QPS 比 Dragonfly 低 3.39%，但纯读 p99.9 低 67.34%；纯写和混合 QPS 分别比 Dragonfly 高 72.62% 和 31.38%，p99.9 分别低 84.55% 和 72.25%。与最快的 Keylane 后端相比，Garnet 的纯读、纯写和混合 QPS 分别低 26.13%、3.16% 和 18.85%；Garnet 的纯写 p99.9 为 1.463 ms，是本表当前所有系统中最低值，但其纯读和混合 p99.9 仍高于三个 Keylane 后端。
 
 ## 测试环境
 
