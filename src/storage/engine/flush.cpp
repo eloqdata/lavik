@@ -269,10 +269,12 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         pending->write_buffer_id_ != 0 && store->buffers_.buffers_registered(),
         staging, slot_offset);
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
-      co_return co_await fail_flush(
-          header_written.ok() ? absl::Status(absl::StatusCode::kInternal,
-                                             "short block header write")
-                              : header_written.status());
+      absl::Status header_status =
+          header_written.ok()
+              ? absl::Status(absl::StatusCode::kInternal,
+                             "short block header write")
+              : header_written.status();
+      co_return co_await fail_flush(std::move(header_status));
     }
     synced = co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
     if (!synced.ok()) {
