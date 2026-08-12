@@ -1,10 +1,10 @@
 # Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks 与 Pika 性能对比（2026-08-11）
 
-> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage 和 Apache Kvrocks 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，Kvrocks 保持 auto compaction 开启。
+> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Apache Kvrocks 和 Pika 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，Kvrocks 和 Pika 保持 auto compaction 开启。
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 略高；Pika 和 Garnet 的表内数字将在相应复测完成后继续更新。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 略高；Garnet 的表内数字将在复测完成后继续更新。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
@@ -14,21 +14,21 @@
 | 纯读 GET | Dragonfly Tiered Storage | 187,652.86 | 2.911 | 16.383 |
 | 纯读 GET | Microsoft Garnet Storage Tier | 229,277.75 | 2.143 | 2.623 |
 | 纯读 GET | Apache Kvrocks | 70,671.82 | 2.479 | 3.407 |
-| 纯读 GET | Pika | 96,994.53 | 1.647 | 3.791 |
+| 纯读 GET | Pika | 86,669.28 | 1.775 | 2.383 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 393,732.53 | 1.015 | 1.647 |
 | 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 385,324.26 | 1.055 | 1.727 |
 | 纯写 SET | Microsoft Garnet Storage Tier | 381,280.31 | 1.167 | 1.463 |
 | 纯写 SET | Dragonfly Tiered Storage | 199,233.52 | 4.639 | 10.303 |
 | 纯写 SET | Apache Kvrocks | 110,166.99 | 1.759 | 2.671 |
-| 纯写 SET | Pika | 156,673.29 | 1.455 | 2.239 |
+| 纯写 SET | Pika | 79,537.31 | 4.223 | 7.327 |
 | 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双裸块设备） | 328,831.03 | 0.655 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 326,110.00 | 0.687 | 1.503 |
 | 1:1 读写混合 | Microsoft Garnet Storage Tier | 286,026.66 | 1.759 | 2.575 |
 | 1:1 读写混合 | Dragonfly Tiered Storage | 207,247.53 | 4.015 | 9.791 |
 | 1:1 读写混合 | Apache Kvrocks | 88,084.47 | 2.207 | 4.927 |
-| 1:1 读写混合 | Pika | 51,035.84 | 3.839 | 5.247 |
+| 1:1 读写混合 | Pika | 75,324.05 | 3.615 | 6.527 |
 
 io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 2.27%（纯读）、2.18%（纯写）和 0.83%（1:1）；纯读 p99.9 相同，纯写和 1:1 的 p99.9 分别低 4.63% 和 3.73%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
 
@@ -64,8 +64,8 @@ Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 
 - Kvrocks 配置 80 GiB HCC block cache，灌数结束后不做额外读预热。
 - Kvrocks 关闭 WAL、per-write sync、压缩和 Blob GC。WAL 关闭会改变故障恢复语义；正式测试结果只代表这组明确配置下的数据路径性能。
 - Pika 使用官方 v4.0.3 tag（commit `d16db1eee9aadb1db42338269936deb7b584ddcc`）直接编译 Release 二进制，不使用容器；该 commit 的二进制版本字符串仍显示 4.0.2，因此同时记录 tag、commit 和自报版本，避免版本歧义。
-- Pika 的 3 个 RocksDB instances 各配置 8 GiB shared block cache，合计 24 GiB；RTC cache 配置 32 GiB。正式计时前执行随机 GET 预热，256.023 秒完成约 2550 万次 GET，平均 99,633.56 QPS 且 0 miss，预热成绩不计入表格。
-- Pika 关闭 RocksDB WAL/binlog 和压缩。灌数与后台整理完成后关闭自动 compaction，再进行正式测试；该配置用于隔离前台请求路径。生产环境通常需要在线 compaction，其资源开销可能影响吞吐和延迟。
+- Pika 的 3 个 RocksDB instances 各配置 8 GiB shared block cache，合计 24 GiB；RTC cache 配置 32 GiB。本轮不额外等待 cache 预热或后台整理，灌数完成后直接开始正式纯读。
+- Pika 关闭 RocksDB WAL/binlog 和压缩，但灌数和三组正式测试期间始终保持 auto compaction 开启，使结果包含在线 compaction 对业务请求的实际影响。
 
 ## 复现步骤
 
@@ -431,10 +431,10 @@ sudo systemd-run \
   -c /path/to/pika/conf/pika.conf
 ```
 
-全量灌数和后台整理结束后，在正式预热前动态关闭自动 compaction：
+正式测试保持 auto compaction 开启。灌数完成后不等待后台任务清零，开始纯读前确认配置仍为 `false`：
 
 ```bash
-redis-cli -h 10.0.0.4 -p 6379 CONFIG SET disable_auto_compactions true
+redis-cli -h 10.0.0.4 -p 6379 CONFIG GET disable_auto_compactions
 ```
 
 ### 8. 编译并启动 Microsoft Garnet
@@ -566,7 +566,7 @@ redis-cli -h 10.0.0.4 -p 6379 INFO store \
 
 不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应同时确认全量灌数恰好完成 200,000,000 次 SET、预热 GET 为 0 miss，并保存 `INFO store` 地址用于审计。
 
-Pika 使用相同的随机 GET 预热命令。本次预热运行 256.023 秒，完成约 2550 万次 GET，平均 99,633.56 QPS，全部命中；预热结果不计入正式成绩。
+Pika 本轮不执行额外随机 GET 预热；灌数完成后直接开始正式纯读，auto compaction 保持开启。
 
 ### 11. 确认 Kvrocks auto compaction
 
