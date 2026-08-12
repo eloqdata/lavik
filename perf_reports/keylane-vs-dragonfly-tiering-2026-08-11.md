@@ -1,17 +1,17 @@
 # Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks 与 Pika 性能对比（2026-08-11）
 
-> 2026-08-12 更新：Keylane SPDK、raw io_uring 和 file io_uring 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次复测保持 defrag 开启，具体参数见“Keylane defrag 参数”。
+> 2026-08-12 更新：Keylane SPDK、raw io_uring、file io_uring 和 Dragonfly Tiered Storage 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，具体参数见“Keylane defrag 参数”。
 
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 略高；其他系统的表内数字将在相应复测完成后继续更新。
+本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 略高；Kvrocks、Pika 和 Garnet 的表内数字将在相应复测完成后继续更新。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
 | 纯读 GET | Keylane SPDK | 310,387.22 | 0.455 | 0.895 |
 | 纯读 GET | Keylane io_uring（双裸块设备） | 278,924.72 | 0.503 | 2.319 |
 | 纯读 GET | Keylane io_uring（双 XFS 文件） | 272,726.70 | 0.519 | 2.319 |
-| 纯读 GET | Dragonfly Tiered Storage（待 warm-cache 重测） | 237,334.07 | 1.511 | 8.031 |
+| 纯读 GET | Dragonfly Tiered Storage | 187,652.86 | 2.911 | 16.383 |
 | 纯读 GET | Microsoft Garnet Storage Tier | 229,277.75 | 2.143 | 2.623 |
 | 纯读 GET | Apache Kvrocks | 105,865.14 | 1.479 | 1.655 |
 | 纯读 GET | Pika | 96,994.53 | 1.647 | 3.791 |
@@ -19,14 +19,14 @@
 | 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 385,324.26 | 1.055 | 1.727 |
 | 纯写 SET | Microsoft Garnet Storage Tier | 381,280.31 | 1.167 | 1.463 |
-| 纯写 SET | Dragonfly Tiered Storage（待 warm-cache 重测） | 220,881.37 | 4.191 | 9.471 |
+| 纯写 SET | Dragonfly Tiered Storage | 199,233.52 | 4.639 | 10.303 |
 | 纯写 SET | Apache Kvrocks | 166,106.17 | 1.359 | 3.775 |
 | 纯写 SET | Pika | 156,673.29 | 1.455 | 2.239 |
 | 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双裸块设备） | 328,831.03 | 0.655 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 326,110.00 | 0.687 | 1.503 |
 | 1:1 读写混合 | Microsoft Garnet Storage Tier | 286,026.66 | 1.759 | 2.575 |
-| 1:1 读写混合 | Dragonfly Tiered Storage（待 warm-cache 重测） | 217,717.09 | 3.599 | 9.279 |
+| 1:1 读写混合 | Dragonfly Tiered Storage | 207,247.53 | 4.015 | 9.791 |
 | 1:1 读写混合 | Apache Kvrocks | 52,569.09 | 3.711 | 5.439 |
 | 1:1 读写混合 | Pika | 51,035.84 | 3.839 | 5.247 |
 
@@ -34,7 +34,7 @@ io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 2.27%（纯读）�
 
 SPDK 相比 raw io_uring 的纯读和 1:1 QPS 分别高 11.28% 和 7.18%；raw io_uring 的纯写 QPS 高 0.37%。SPDK 纯读 p99.9 低 61.41%，1:1 p99.9 相同，纯写 p99.9 低 2.43%。本轮 SPDK 的主要吞吐收益集中在随机读和读写并发路径，纯写吞吐则与 raw io_uring 接近。
 
-Garnet 的纯读 QPS 比 Dragonfly 低 3.39%，但纯读 p99.9 低 67.34%；纯写和混合 QPS 分别比 Dragonfly 高 72.62% 和 31.38%，p99.9 分别低 84.55% 和 72.25%。与最快的 Keylane 后端相比，Garnet 的纯读、纯写和混合 QPS 分别低 26.13%、3.16% 和 18.85%；Garnet 的纯写 p99.9 为 1.463 ms，是本表当前所有系统中最低值，但其纯读和混合 p99.9 仍高于三个 Keylane 后端。
+Dragonfly 本轮保持正常 tiered-storage 回收，灌数后执行 180 秒随机 GET 预热，三组正式测试之间不重启、不清库、不清 Linux page cache。正式结果采用完整 300 秒均值。
 
 ## 测试环境
 
@@ -54,7 +54,7 @@ Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 
 - 当前代码把 `--registered-buffer-mb=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
 - 三种 Keylane 后端都在各自全量灌数后直接运行正式测试，没有预先老化数据或挑选短窗口。每种后端只灌数一次，正式顺序固定为纯读、1:1 读写混合、纯写。纯读和混合期间两块盘 I/O 量对称；raw 组绕过文件系统，file 组则保留更通用的普通 Linux 文件部署方式。
 - raw io_uring 需要独占块设备，部署和运维约束接近 SPDK；regular-file io_uring 包含 XFS 成本，但更接近普通 Linux 文件部署。两者都保留 Linux NVMe 驱动、中断和内核块层成本。
-- Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O。正常运行会保留 Linux page cache，因此新复现口径在灌数后先预热、正式测试之间不清 page cache。表内当前 Dragonfly 数字来自此前 cold-cache 流程，已明确标记为待重测，不能当作 warm-cache 结果。
+- Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O。正常运行会保留 Linux page cache，因此本轮在灌数后执行 180 秒随机 GET 预热，随后依次执行纯读、1:1 和纯写；正式测试之间不清 page cache、不重启。
 - Garnet 使用官方 v2.1.3 Release 源码直接发布二进制，不使用容器。只测试 raw string `GET`/`SET`，因此关闭 object store 和 pub/sub；4 GiB index 按官方每 key 约 16 bytes 的规则覆盖 2 亿 key，避免默认 128 MiB index 产生长 hash chain。
 - Garnet storage tier 使用 Linux Native libaio、4 个 completion threads、每设备 512 个最大 in-flight I/O、8 KiB initial record read，并保留默认开启的 scatter-gather GET。64 GiB hybrid log 和 32 GiB read cache 加上 index 后，正式测试时进程 RSS 约 101 GiB；这是一组偏向最高性能的配置，不代表低内存部署。
 - Garnet 正式测试前用 640 个连接做了 180 秒随机 GET 预热；read cache 达到完整 32 GiB，48,617,210 次预热 GET 全部命中，预热成绩不计入表格。正式纯读的 68,783,514 次 GET，以及混合测试中的全部 GET 也都是 0 miss。
