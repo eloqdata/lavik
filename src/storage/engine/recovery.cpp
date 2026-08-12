@@ -138,6 +138,31 @@ void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
       scanned_records, block_rate, record_rate / 1000000.0, eta_seconds);
 }
 
+Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
+    WorkerStore& store, std::vector<RecoveryBatch>* batches) {
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    RecoveryBatch& pending = batches->at(target);
+    if (pending.blocks_.empty() && pending.records_.empty()) {
+      continue;
+    }
+    RecoveryBatch batch;
+    std::swap(batch, pending);
+    if (target == store.worker_->id()) {
+      ApplyRecovery(target, std::move(batch));
+      continue;
+    }
+    absl::Status applied = co_await celer::SubmitTo(
+        target, [this, target, batch = std::move(batch)]() mutable {
+          ApplyRecovery(target, std::move(batch));
+          return absl::OkStatus();
+        });
+    if (!applied.ok()) {
+      co_return applied;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
     WorkerStore& store, std::vector<RecoveryBatch>* batches,
     std::vector<std::uint64_t>* zero_blocks,
@@ -186,6 +211,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         "recovery block buffer is smaller than a storage block");
   }
   recovery.buffer_.size_ = kStorageBlockBytes;
+  // Merge recovered entries incrementally. Keeping every historical version
+  // until the entire device scan completes can exceed RAM even when the final
+  // live index fits comfortably.
+  constexpr std::size_t kRecoveryBatchItems = 1U << 20;
+  std::size_t buffered_items = 0;
 
   std::uint64_t device_linear_begin = 0;
   for (std::size_t device_index = 0; device_index < devices_.size();
@@ -242,8 +272,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       if (block.block_id_ != block_id) {
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "invalid or corrupt block header");
+        // The bitmap records activation, not a committed write. A valid
+        // header naming another physical block is stale media contents. Do
+        // not recover it and do not rewrite the allocation bitmap.
+        ReportRecoveryProgress(0, /*allocated=*/true);
+        continue;
       }
       AtomicMax(&recovery_device_cursors_[device_index].next_local_,
                 static_cast<std::uint64_t>(local_block) + 1);
@@ -265,9 +298,17 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .extent_index_ = block.extent_index_,
               .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
+      ++buffered_items;
 
       if (block.kind_ == BlockKind::kPayloadExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
+        if (buffered_items >= kRecoveryBatchItems) {
+          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
+          if (!applied.ok()) {
+            co_return applied;
+          }
+          buffered_items = 0;
+        }
         continue;
       }
 
@@ -402,6 +443,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 },
             .extents_ = extents,
         });
+        ++buffered_items;
         record_offset += record.total_disk_bytes_;
         ++records;
       }
@@ -412,6 +454,13 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             "block committed boundary does not match records");
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
+      if (buffered_items >= kRecoveryBatchItems) {
+        absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
+        if (!applied.ok()) {
+          co_return applied;
+        }
+        buffered_items = 0;
+      }
     }
     device_linear_begin += device.data_block_count_;
   }

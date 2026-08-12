@@ -1431,6 +1431,8 @@ class StorageEngine::Impl {
       WorkerStore& store, std::vector<RecoveryBatch>* batches,
       std::vector<std::uint64_t>* zero_blocks,
       absl::flat_hash_set<std::uint64_t>* committed_txids);
+  Task<absl::Status> ApplyRecoveryBatches(WorkerStore& store,
+                                          std::vector<RecoveryBatch>* batches);
 
   void ApplyRecovery(unsigned target, RecoveryBatch batch);
 

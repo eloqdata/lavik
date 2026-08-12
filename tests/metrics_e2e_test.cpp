@@ -344,6 +344,9 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_NE(
       body.find("keylane_command_duration_seconds_bucket{command=\"get\""),
       std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_duration_seconds_bucket{command=\"get\","
+                      "le=\"0.003\"}"),
+            std::string_view::npos);
   EXPECT_NE(body.find("keylane_storage_defrag_runs_total{result=\"success\"}"),
             std::string_view::npos);
   EXPECT_NE(body.find("keylane_storage_defrag_active "),

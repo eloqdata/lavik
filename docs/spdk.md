@@ -162,6 +162,10 @@ Do not copy a benchmark host's CPU list without checking NUMA topology. SPDK
 poll-mode workers are particularly sensitive to migration and preemption while
 I/O is outstanding.
 
+For latency-sensitive deployments, also reserve physical cores for the network
+device's completion IRQs and keep them disjoint from the Keylane worker set.
+See [Network IRQ Affinity Tuning for Tail Latency](irq-affinity-tuning.md).
+
 `--spdk-max-completions-per-poll=8` bounds one event-loop poll's completion
 work, preventing a completion burst from monopolizing a worker. The budget is
 shared fairly across all open SPDK namespaces on that worker.

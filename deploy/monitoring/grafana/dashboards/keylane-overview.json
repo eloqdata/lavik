@@ -235,7 +235,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Estimated from Prometheus histogram buckets; precision is limited by bucket width.",
+      "description": "Estimated from Prometheus histogram buckets. Keylane exports SLO-focused boundaries at 1, 1.25, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, and 8 ms.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -253,11 +253,11 @@
               },
               {
                 "color": "yellow",
-                "value": 0.01
+                "value": 0.0025
               },
               {
                 "color": "red",
-                "value": 0.1
+                "value": 0.003
               }
             ]
           },
@@ -712,7 +712,7 @@
         "y": 4
       },
       "id": 8,
-      "description": "P99.9 and P99.99 are estimates interpolated from Prometheus histogram buckets; use longer windows for low-volume traffic.",
+      "description": "P99.9 and P99.99 are estimates interpolated from Prometheus histogram buckets. Keylane exports dense boundaries around the 3 ms SLO and progressively wider buckets at higher latency; use longer windows for low-volume traffic.",
       "options": {
         "legend": {
           "calcs": [
@@ -774,7 +774,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "Correlates per-instance command P99 latency with running, queued, paused, and configured defrag work.",
+      "description": "Correlates per-instance command P99.9 latency with running, queued, paused, and configured defrag work.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -940,8 +940,8 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
-          "legendFormat": "{{instance}} P99 latency",
+          "expr": "histogram_quantile(0.999, sum by (instance, le) (rate(keylane_command_duration_seconds_bucket{instance=~\"$instance\"}[$__rate_interval])))",
+          "legendFormat": "{{instance}} P99.9 latency",
           "range": true,
           "refId": "A"
         },
@@ -974,7 +974,7 @@
           "refId": "E"
         }
       ],
-      "title": "Defrag Impact on P99 Latency",
+      "title": "Defrag Impact on P99.9 Latency",
       "type": "timeseries"
     },
     {

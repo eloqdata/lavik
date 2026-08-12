@@ -656,23 +656,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     recovery_committed_txids_.merge(committed_txids);
   }
 
-  for (unsigned target = 0; target < worker_count_; ++target) {
-    if (batches[target].blocks_.empty() && batches[target].records_.empty()) {
-      continue;
-    }
-    if (target == worker.id()) {
-      ApplyRecovery(target, std::move(batches[target]));
-    } else {
-      absl::Status apply = co_await celer::SubmitTo(
-          target, [this, target, batch = std::move(batches[target])]() mutable {
-            ApplyRecovery(target, std::move(batch));
-            return absl::OkStatus();
-          });
-      if (!apply.ok()) {
-        Fail(apply);
-        co_return apply;
-      }
-    }
+  status = co_await ApplyRecoveryBatches(store, &batches);
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
   }
 
   status = co_await recovery_barrier_->Wait(worker);

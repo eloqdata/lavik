@@ -176,6 +176,7 @@ if (BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
 
   add_executable(keylane_unit_tests
+    tests/cross_core_active_sender_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/command_table_test.cpp
@@ -201,6 +202,12 @@ if (BUILD_TESTING)
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
     )
     set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 600)
+    add_test(
+      NAME keylane_stale_block_recovery_e2e
+      COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
+              --stale-header-only
+    )
+    set_tests_properties(keylane_stale_block_recovery_e2e PROPERTIES TIMEOUT 60)
 
     add_executable(keylane_tomb_raider_e2e_test
       tests/tomb_raider_e2e_test.cpp

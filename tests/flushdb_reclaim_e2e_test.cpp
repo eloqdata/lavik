@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -388,11 +389,81 @@ bool BlockBitmapBitIsClear(const std::string& path, std::uint64_t block_id) {
           (1U << bit)) == 0;
 }
 
+std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
+    const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    Fail("failed to open data file while injecting a stale block header");
+  }
+  const off_t bytes = ::lseek(fd, 0, SEEK_END);
+  if (bytes < 0) {
+    ::close(fd);
+    Fail("failed to size data file while injecting a stale block header");
+  }
+  const std::uint64_t capacity_blocks =
+      static_cast<std::uint64_t>(bytes) / keylane::storage::kStorageBlockBytes;
+  const std::uint32_t begin = keylane::storage::DataBlockBegin(capacity_blocks);
+  alignas(keylane::storage::kDirectIoAlignment)
+      std::array<std::byte, keylane::storage::kBlockHeaderBytes>
+          candidate{};
+  std::array<std::byte, keylane::storage::kBlockHeaderBytes> committed{};
+  std::uint32_t committed_local = 0;
+  std::uint32_t unused_local = 0;
+  for (std::uint32_t local = begin; local < capacity_blocks; ++local) {
+    const off_t offset =
+        static_cast<off_t>(local) * keylane::storage::kStorageBlockBytes;
+    const ssize_t read =
+        ::pread(fd, candidate.data(), candidate.size(), offset);
+    if (read != static_cast<ssize_t>(candidate.size())) {
+      ::close(fd);
+      Fail("failed to scan headers while injecting a stale block header");
+    }
+    keylane::storage::BlockHeader decoded{};
+    if (keylane::storage::DecodeBlockHeaderPages(candidate, &decoded) &&
+        decoded.kind_ == keylane::storage::BlockKind::kRecords) {
+      if (committed_local == 0) {
+        committed = candidate;
+        committed_local = local;
+      }
+      continue;
+    }
+    if (unused_local == 0 &&
+        std::all_of(candidate.begin(), candidate.end(),
+                    [](std::byte byte) { return byte == std::byte{0}; })) {
+      unused_local = local;
+    }
+  }
+  if (committed_local == 0 || unused_local == 0) {
+    ::close(fd);
+    Fail("test data file lacks a committed and an unused block");
+  }
+  const std::uint64_t target = keylane::storage::MakeBlockId(0, unused_local);
+  if (BlockBitmapBitIsClear(path, target)) {
+    ::close(fd);
+    Fail("stale-header target was not activated in the allocation bitmap");
+  }
+  const off_t target_offset =
+      static_cast<off_t>(unused_local) * keylane::storage::kStorageBlockBytes;
+  const ssize_t written =
+      ::pwrite(fd, committed.data(), committed.size(), target_offset);
+  const int sync_error =
+      written == static_cast<ssize_t>(committed.size()) ? ::fdatasync(fd) : -1;
+  const int close_error = ::close(fd);
+  if (written != static_cast<ssize_t>(committed.size()) || sync_error != 0 ||
+      close_error != 0) {
+    Fail("failed to inject and persist a stale block header");
+  }
+  return target;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2) {
-    std::cerr << "usage: flushdb_reclaim_e2e_test /path/to/keylane\n";
+  const bool stale_header_only =
+      argc == 3 && std::string_view(argv[2]) == "--stale-header-only";
+  if (argc != 2 && !stale_header_only) {
+    std::cerr << "usage: flushdb_reclaim_e2e_test /path/to/keylane "
+                 "[--stale-header-only]\n";
     return 2;
   }
 
@@ -402,11 +473,13 @@ int main(int argc, char** argv) {
   const std::string unequal_path_a = prefix + "-unequal-a.data";
   const std::string unequal_path_b = prefix + "-unequal-b.data";
   const std::string defrag_crash_path = prefix + "-defrag-crash.data";
+  const std::string stale_header_path = prefix + "-stale-header.data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
   (void)::unlink(unequal_path_a.c_str());
   (void)::unlink(unequal_path_b.c_str());
   (void)::unlink(defrag_crash_path.c_str());
+  (void)::unlink(stale_header_path.c_str());
   (void)::unlink(log_path.c_str());
 
   try {
@@ -448,6 +521,40 @@ int main(int argc, char** argv) {
       Expect(client.Command({"EXISTS", "old-0", "fresh"}), ":1",
              "EXISTS before restart");
       server.Stop();
+    }
+
+    // The bitmap means activated, not committed. Model an affected on-disk
+    // image by putting a CRC-valid committed header in another activated but
+    // unwritten physical block. Recovery must ignore the block-id mismatch,
+    // retain current data, and leave the bitmap unchanged.
+    CreateDataFile(stale_header_path, 80ULL * 1024 * 1024);
+    {
+      ServerProcess server(argv[1], port, {stale_header_path}, log_path, 10);
+      RespClient client = Connect(port);
+      Expect(client.Command({"SET", "fresh-format", "fresh-value"}), "+OK",
+             "stale-header initial SET");
+      server.Stop();
+    }
+    const std::uint64_t stale_header_target =
+        CopyCommittedHeaderToUnusedAllocatedBlock(stale_header_path);
+    {
+      ServerProcess server(argv[1], port, {stale_header_path}, log_path, 10);
+      RespClient client = Connect(port);
+      Expect(client.Command({"DBSIZE"}), ":1", "stale-header DBSIZE");
+      Expect(client.Command({"EXISTS", "missing", "fresh-format"}), ":1",
+             "stale-header EXISTS");
+      Expect(client.Command({"GET", "fresh-format"}), "$11",
+             "stale-header GET");
+      server.Stop();
+    }
+    if (BlockBitmapBitIsClear(stale_header_path, stale_header_target)) {
+      Fail("recovery cleared the stale-header allocation bit");
+    }
+    if (stale_header_only) {
+      (void)::unlink(data_path.c_str());
+      (void)::unlink(stale_header_path.c_str());
+      (void)::unlink(log_path.c_str());
+      return 0;
     }
 
     {
@@ -574,6 +681,7 @@ int main(int argc, char** argv) {
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
     (void)::unlink(defrag_crash_path.c_str());
+    (void)::unlink(stale_header_path.c_str());
     (void)::unlink(log_path.c_str());
     return 0;
   } catch (const std::exception& error) {
@@ -586,6 +694,7 @@ int main(int argc, char** argv) {
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
     (void)::unlink(defrag_crash_path.c_str());
+    (void)::unlink(stale_header_path.c_str());
     (void)::unlink(log_path.c_str());
     return 1;
   }

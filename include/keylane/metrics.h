@@ -16,11 +16,12 @@ namespace storage {
 class StorageEngine;
 }
 
-inline constexpr std::array<std::uint64_t, 24> kCommandLatencyBucketUpperUs{
-    1,       2,       4,         8,         16,        32,
-    64,      128,     256,       512,       1'000,     2'000,
-    4'000,   8'000,   16'000,    32'000,    64'000,    128'000,
-    256'000, 512'000, 1'000'000, 2'000'000, 4'000'000, 8'000'000};
+inline constexpr std::array<std::uint64_t, 31> kCommandLatencyBucketUpperUs{
+    1,         2,         4,        8,       16,      32,      64,
+    128,       256,       512,      1'000,   1'250,   1'500,   2'000,
+    2'500,     3'000,     3'500,    4'000,   5'000,   6'000,   8'000,
+    16'000,    32'000,    64'000,   128'000, 256'000, 512'000, 1'000'000,
+    2'000'000, 4'000'000, 8'000'000};
 
 inline constexpr std::size_t kCommandKindCount =
     static_cast<std::size_t>(CommandKind::kCount);
