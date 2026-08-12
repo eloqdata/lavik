@@ -1,6 +1,6 @@
-# Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks、Pika 与 Tendis 性能对比（2026-08-11）
+# Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks、Pika、Tendis 与 KeyDB On Flash 性能对比（2026-08-11）
 
-> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks、Pika 和 Tendis 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，Garnet、Kvrocks、Pika 和 Tendis 保持各自的后台回收或 auto compaction 开启。
+> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks、Pika、Tendis 和 KeyDB On Flash 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，其他系统保持各自的后台回收或 auto compaction 开启。
 
 ## 测试结果
 
@@ -16,6 +16,7 @@
 | 纯读 GET | Pika | 86,669.28 | 1.775 | 2.383 |
 | 纯读 GET | Apache Kvrocks | 70,671.82 | 2.479 | 3.407 |
 | 纯读 GET | Tendis | 68,860.36 | 2.063 | 5.855 |
+| 纯读 GET | KeyDB On Flash | 6,146.18 | 18.047 | 25.471 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 393,732.53 | 1.015 | 1.647 |
 | 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 385,324.26 | 1.055 | 1.727 |
@@ -24,6 +25,7 @@
 | 纯写 SET | Tendis | 160,641.92 | 1.335 | 2.127 |
 | 纯写 SET | Apache Kvrocks | 110,166.99 | 1.759 | 2.671 |
 | 纯写 SET | Pika | 79,537.31 | 4.223 | 7.327 |
+| 纯写 SET | KeyDB On Flash | 5,395.49 | 24.447 | 31.359 |
 | 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双裸块设备） | 328,831.03 | 0.655 | 1.447 |
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 326,110.00 | 0.687 | 1.503 |
@@ -32,6 +34,7 @@
 | 1:1 读写混合 | Tendis | 102,212.78 | 1.439 | 1.975 |
 | 1:1 读写混合 | Apache Kvrocks | 88,084.47 | 2.207 | 4.927 |
 | 1:1 读写混合 | Pika | 75,324.05 | 3.615 | 6.527 |
+| 1:1 读写混合 | KeyDB On Flash | 5,197.16 | 29.311 | 39.167 |
 
 io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 2.27%（纯读）、2.18%（纯写）和 0.83%（1:1）；纯读 p99.9 相同，纯写和 1:1 的 p99.9 分别低 4.63% 和 3.73%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
 
@@ -43,6 +46,8 @@ Garnet 本轮使用每 300 秒运行一次的 Lookup compaction，并启用 `com
 
 Tendis 本轮始终开启 RocksDB auto compaction 和 Blob GC。2 亿条灌数完成后不做额外 GET 预热，也不等待后台整理，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试，因此结果包含缓存冷启动和在线后台整理的影响。
 
+KeyDB On Flash 本轮保留 RocksDB WAL 和 auto compaction，使用 64 GiB DRAM 热层。2 亿条灌数完成后不做额外 GET 预热，也不等待后台整理，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试。公共 workload 是均匀随机访问，因此大部分请求落到 Flash；该结果不代表 KeyDB 官方建议的热点分布场景。
+
 ## 测试环境
 
 | 角色 | Azure 机型 | 地址 |
@@ -50,9 +55,9 @@ Tendis 本轮始终开启 RocksDB auto compaction 和 Blob GC。2 亿条灌数�
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。每个后端只灌入一次 2 亿条初始数据，随后依次执行纯读、1:1 读写混合和纯写，三组之间不重启、不清库。八组服务/后端在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。每个后端只灌入一次 2 亿条初始数据，随后依次执行纯读、1:1 读写混合和纯写，三组之间不重启、不清库。九组服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。Tendis 使用 tag `2.8.4-rocksdb-v8.5.3`、16 executor threads、10 个 RocksDB stores、72 GiB shared block/blob cache、同一个 RAID0/XFS，并关闭 WAL、binlog 和压缩。
+Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。Tendis 使用 tag `2.8.4-rocksdb-v8.5.3`、16 executor threads、10 个 RocksDB stores、72 GiB shared block/blob cache、同一个 RAID0/XFS，并关闭 WAL、binlog 和压缩。KeyDB On Flash 使用 v6.3.4、4 个 server threads、64 GiB DRAM 热层、同一个 RAID0/XFS，并保留 RocksDB WAL。
 
 ## 结果边界与公平性说明
 
@@ -76,6 +81,10 @@ Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 
 - Tendis 使用官方 tag `2.8.4-rocksdb-v8.5.3`（commit `6a5a4945f1b8dd9d248d8f25325c12881a3cbf5d`）直接编译 Release 二进制，不使用容器。默认的 10 个 RocksDB stores 各自维护 memtable 和后台任务；72 GiB block cache 由所有 stores 共享，Blob cache 计入同一个容量。
 - Tendis 关闭 RocksDB WAL、Tendis binlog、per-transaction log flush 和压缩，故障恢复与复制语义不同于默认生产配置；auto compaction 和 Blob GC 在灌数及三组正式测试期间始终开启，覆盖写产生的旧 blob 可以被在线回收。
 - Tendis 每个 store 使用 256 MiB write buffer、最多 4 个 memtables；全量灌数完成后不预热、不等待 compaction 清零，直接开始纯读。测试过程中没有发生 write stop 或后台错误。
+- KeyDB On Flash 使用官方 v6.3.4（commit `7e7e5e57d25fe246a8201f0acf5e7363c0bf1e14`）源码启用 `ENABLE_FLASH=yes` 直接编译，不使用容器。官方将 On Flash 标注为 beta；结果只代表该实验特性在本 workload 和版本下的表现。
+- KeyDB On Flash 使用 64 GiB `maxmemory` 和 `allkeys-lru`，未关闭内存 key cache；2 亿 key 的均匀随机访问与其面向热点数据的设计并不匹配，但与其他后端的测试 key 分布完全相同。正式纯读的所有 GET 都命中，说明低吞吐不是 missing key 导致。
+- KeyDB On Flash 保留 RocksDB WAL、auto compaction 和默认无压缩数据列族，AOF/RDB 关闭以避免重复持久化。RocksDB `max_background_jobs=16`、`max_total_wal_size=8 GiB`；4、8、16 个 server threads 的短读测试分别约为 267.9k、202.6k、41.4k QPS，因此正式测试采用官方推荐上限 4 threads。
+- KeyDB On Flash 全量灌数后不预热、不等待后台整理，立即开始正式纯读。三组结束后 `DBSIZE` 仍为 200,000,000，服务 active，无错误回复或拒绝连接；数据目录约占 552 GiB。
 
 ## 复现步骤
 
@@ -201,7 +210,7 @@ sudo systemd-run \
 
 ### 4. 创建 RAID0 和 XFS
 
-Dragonfly、Garnet、Kvrocks、Pika 和 Tendis 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
+Dragonfly、Garnet、Kvrocks、Pika、Tendis 和 KeyDB On Flash 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
 
 ```bash
 sudo wipefs -a /dev/nvme0n1
@@ -615,7 +624,84 @@ sudo systemd-run \
   /path/to/tendis-perf.conf
 ```
 
-### 10. 全量灌入 2 亿条数据
+### 10. 编译并启动 KeyDB On Flash
+
+测试版本为官方 [`KeyDB v6.3.4`](https://github.com/Snapchat/KeyDB/releases/tag/v6.3.4)，commit `7e7e5e57d25fe246a8201f0acf5e7363c0bf1e14`。官方 [On Flash 文档](https://docs.keydb.dev/docs/flash/) 将该功能标注为 beta，并要求在编译时显式启用 Flash：
+
+```bash
+git clone --recursive --branch v6.3.4 --depth 1 \
+  https://github.com/Snapchat/KeyDB.git
+cd KeyDB
+make -j 16 ENABLE_FLASH=yes BUILD_TLS=no
+
+./src/keydb-server --is-flash-enabled
+```
+
+Ubuntu 24.04 的 GCC 13 编译 KeyDB 锁定的旧 RocksDB commit `444b3f4845dd01b0d127c4b420fdd3b50ad56682` 时，两个头文件依赖旧编译器的间接 include。若报 `uint8_t/uint64_t does not name a type`，仅补标准头后重新构建，不改变运行逻辑：
+
+```diff
+--- a/deps/rocksdb/table/block_based/data_block_hash_index.h
++++ b/deps/rocksdb/table/block_based/data_block_hash_index.h
+@@
++#include <cstdint>
+ #include <string>
+
+--- a/deps/rocksdb/util/string_util.h
++++ b/deps/rocksdb/util/string_util.h
+@@
++#include <cstdint>
+ #include <string>
+```
+
+本次 `keydb-flash.conf`：
+
+```text
+bind 10.0.0.4
+protected-mode no
+port 6379
+daemonize no
+loglevel warning
+logfile ""
+databases 1
+save ""
+appendonly no
+
+server-threads 4
+server-thread-affinity true
+min-clients-per-thread 10
+maxclients 10000
+tcp-backlog 8192
+
+maxmemory 64gb
+maxmemory-policy allkeys-lru
+maxmemory-samples 16
+
+storage-provider flash /mnt/data/keydb-flash
+storage-provider-options max_background_jobs=16;max_total_wal_size=8589934592
+```
+
+64 GiB 是官方 sizing 文档建议的约 50% 物理内存热层；`allkeys-lru` 保留热点数据，淘汰只移除 DRAM cache 中的对象，Flash 中的数据仍可读取。关闭 AOF 和 RDB 是为了避免在 Flash 自身 RocksDB 持久化之外再生成一套日志或快照；RocksDB WAL 保持开启。`max_background_jobs=16` 使用 server 可用 CPU 执行 flush/compaction，8 GiB WAL 上限减少频繁强制 flush，auto compaction 保持开启。
+
+KeyDB 官方提示 server threads 过多会增加 spinlock 争用，并推荐不超过 4。本机用 200 万条数据、80 个连接和 `flash-disable-key-cache=yes` 隔离 Flash 读取后，4、8、16 threads 的 30 秒纯读分别约为 267.9k、202.6k、41.4k QPS，因此正式测试选择 4；`flash-disable-key-cache` 只用于线程选型，正式灌数和测试保持默认 `no`。
+
+```bash
+sudo mkdir -p /mnt/data/keydb-flash
+sudo chown -R "$(id -un):$(id -gn)" /mnt/data/keydb-flash
+
+sudo systemd-run \
+  --unit=keydb-flash.service \
+  --collect \
+  --property=AllowedCPUs=0-15 \
+  --property=LimitMEMLOCK=infinity \
+  --property=LimitNOFILE=infinity \
+  /path/to/KeyDB/src/keydb-server \
+  /path/to/keydb-flash.conf
+
+redis-cli -h 10.0.0.4 -p 6379 INFO memory \
+  | grep '^storage_provider:flash'
+```
+
+### 11. 全量灌入 2 亿条数据
 
 只在确认目标是允许清空的空白测试实例后执行一次 `FLUSHALL`，再从 client 使用 640 个连接完成全量 SET。`FLUSHALL` 会删除全库，已经灌完数据后不得再次执行：
 
@@ -640,7 +726,7 @@ taskset -c 0-15 memtier_benchmark \
 
 灌数阶段只用于构造相同的 2 亿条初始数据，不记录耗时或吞吐，也不计入正式对比结果。
 
-### 11. 预热 Dragonfly page cache
+### 12. 预热 Dragonfly page cache
 
 Dragonfly 全量灌数后先用随机 GET 预热 Linux page cache，随后三组正式测试之间不清 page cache、不重启。预热输出不计入正式结果。
 
@@ -663,9 +749,9 @@ taskset -c 0-15 memtier_benchmark \
 
 ```
 
-Garnet、Kvrocks、Pika 和 Tendis 本轮均不执行额外随机 GET 预热；灌数完成后直接开始正式纯读，各自的后台回收或 auto compaction 保持开启。不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应确认全量灌数恰好完成 200,000,000 次 SET，并保存 `INFO store` 地址用于审计。
+Garnet、Kvrocks、Pika、Tendis 和 KeyDB On Flash 本轮均不执行额外随机 GET 预热；灌数完成后直接开始正式纯读，各自的后台回收或 auto compaction 保持开启。不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应确认全量灌数恰好完成 200,000,000 次 SET，并保存 `INFO store` 地址用于审计。KeyDB On Flash 可用 `DBSIZE` 验证恰好为 200,000,000，并用 `INFO memory` 确认 `storage_provider:flash`。
 
-### 12. 确认 Kvrocks auto compaction
+### 13. 确认 Kvrocks auto compaction
 
 Kvrocks 在灌数和正式测试期间始终保持 auto compaction 开启。灌数完成后不等待正在执行或排队的 compaction，直接开始正式纯读，使测试覆盖真实在线后台整理成本。开始前确认配置没有被动态改为关闭：
 
@@ -680,9 +766,9 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'num_files_at_level|estimate_pending_compaction_bytes|num_running_compactions|compaction_count'
 ```
 
-### 13. 依次执行三组正式测试
+### 14. 依次执行三组正式测试
 
-`RATIO` 依次替换为纯读 `0:1`、1:1 混合 `1:1` 和纯写 `1:0`。每个后端只执行一次全量灌数，三组正式测试共用这份数据。每组结束后确认没有 background error；Keylane 还需用 `DEFRAG STATUS` 记录活动和排队任务。Kvrocks、Pika、Garnet 和 Tendis 的后台 compaction/回收保持开启，不等待任务清零。
+`RATIO` 依次替换为纯读 `0:1`、1:1 混合 `1:1` 和纯写 `1:0`。每个后端只执行一次全量灌数，三组正式测试共用这份数据。每组结束后确认没有 background error；Keylane 还需用 `DEFRAG STATUS` 记录活动和排队任务。Kvrocks、Pika、Garnet、Tendis 和 KeyDB On Flash 的后台 compaction/回收保持开启，不等待任务清零。
 
 所有系统在三组正式测试之间都不清理操作系统 page cache。只有 Dragonfly 在正式测试前执行额外的 Linux page-cache 预热；其余后端不做额外读预热，并保留灌数和前序正式 workload 自然形成的缓存状态。Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring，以及使用 Native O_DIRECT storage tier 的 Garnet 不依赖该 page-cache 路径。
 
