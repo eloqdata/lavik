@@ -2,9 +2,11 @@
 
 > 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks、Pika、Tendis 和 KeyDB On Flash 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，其他系统保持各自的后台回收或 auto compaction 开启。
 
+> 2026-08-12 补充：增加 Azure Managed Redis 480 GB/16 vCPU 实例的独立容量与性能测试。该组使用约 400 GB 数据和 60 秒窗口，已用 `*` 标入主榜单，并在表下说明与本地双 NVMe 300 秒结果的口径差异。
+
 ## 测试结果
 
-本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 最高；三种 Keylane 后端在三类 workload 中均保持最高的一组吞吐。
+除带 `*` 的 Azure Managed Redis 独立结果外，本次测试使用双 NVMe、2 亿条 1–4 KB 数据、80 个客户端连接和不限速 workload。Keylane SPDK 的纯读和混合 QPS 最高，raw io_uring 的纯写 QPS 最高；三种 Keylane 后端在三类 workload 中均保持最高的一组吞吐。
 
 | Workload | 系统 | QPS | p99 (ms) | p99.9 (ms) |
 | --- | --- | ---: | ---: | ---: |
@@ -16,6 +18,7 @@
 | 纯读 GET | Pika | 86,669.28 | 1.775 | 2.383 |
 | 纯读 GET | Apache Kvrocks | 70,671.82 | 2.479 | 3.407 |
 | 纯读 GET | Tendis | 68,860.36 | 2.063 | 5.855 |
+| 纯读 GET | Azure Managed Redis* | 44,480.15 | 5.855 | 11.839 |
 | 纯读 GET | KeyDB On Flash | 6,146.18 | 18.047 | 25.471 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 393,732.53 | 1.015 | 1.647 |
 | 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
@@ -24,6 +27,7 @@
 | 纯写 SET | Dragonfly Tiered Storage | 199,233.52 | 4.639 | 10.303 |
 | 纯写 SET | Tendis | 160,641.92 | 1.335 | 2.127 |
 | 纯写 SET | Apache Kvrocks | 110,166.99 | 1.759 | 2.671 |
+| 纯写 SET | Azure Managed Redis* | 84,863.93 | 3.199 | 7.839 |
 | 纯写 SET | Pika | 79,537.31 | 4.223 | 7.327 |
 | 纯写 SET | KeyDB On Flash | 5,395.49 | 24.447 | 31.359 |
 | 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
@@ -34,7 +38,10 @@
 | 1:1 读写混合 | Tendis | 102,212.78 | 1.439 | 1.975 |
 | 1:1 读写混合 | Apache Kvrocks | 88,084.47 | 2.207 | 4.927 |
 | 1:1 读写混合 | Pika | 75,324.05 | 3.615 | 6.527 |
+| 1:1 读写混合 | Azure Managed Redis* | 55,351.99 | 5.311 | 11.839 |
 | 1:1 读写混合 | KeyDB On Flash | 5,197.16 | 29.311 | 39.167 |
+
+\* Azure Managed Redis 使用 480 GB/16 vCPU 托管实例、154,088,000 条约 400 GB 数据和 60 秒窗口，通过 Private Endpoint 测试；其余系统使用本地双 NVMe、2 亿条数据和 300 秒窗口。因此该行可用于同一 workload 下的实测数量级对照，但不是完全同口径排名。容量、网络和复现细节见下方独立小节。
 
 io_uring 双裸块设备相比双 XFS 文件的 QPS 分别高 2.27%（纯读）、2.18%（纯写）和 0.83%（1:1）；纯读 p99.9 相同，纯写和 1:1 的 p99.9 分别低 4.63% 和 3.73%。绕过 XFS 有稳定但不大的收益；双文件方案保留了大部分性能，同时更容易按普通 Linux 文件方式部署。
 
@@ -47,6 +54,66 @@ Garnet 本轮使用每 300 秒运行一次的 Lookup compaction，并启用 `com
 Tendis 本轮始终开启 RocksDB auto compaction 和 Blob GC。2 亿条灌数完成后不做额外 GET 预热，也不等待后台整理，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试，因此结果包含缓存冷启动和在线后台整理的影响。
 
 KeyDB On Flash 本轮保留 RocksDB WAL 和 auto compaction，使用 64 GiB DRAM 热层。2 亿条灌数完成后不做额外 GET 预热，也不等待后台整理，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试。公共 workload 是均匀随机访问，因此大部分请求落到 Flash；该结果不代表 KeyDB 官方建议的热点分布场景。
+
+## Azure Managed Redis 独立容量测试
+
+这组结果回答两个独立问题：480 GB/16 vCPU 托管实例在本 workload 下能灌入多少数据，以及在约 400 GB 数据集上、80 个连接且不限制 QPS 时的短窗口性能。结果已用 `*` 加入主榜单用于数量级对照；因为数据量、测试时长、网络路径和服务形态不同，不应把它视为完全同口径比较。
+
+| Workload | QPS | p99 (ms) | p99.9 (ms) | 窗口 | 校验 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 纯读 GET | 44,480.15 | 5.855 | 11.839 | 60 s | 100% hit，0 error |
+| 1:1 读写混合 | 55,351.99 | 5.311 | 11.839 | 60 s | GET 100% hit，0 error |
+| 纯写 SET | 84,863.93 | 3.199 | 7.839 | 60 s | 0 error |
+
+实例运行 Redis 7.4.3，`INFO server` 报告 `redis_mode:standalone`，使用 `noeviction`。Client 为 `Standard_L16s_v3`，通过同一 VNet 内的 Private Endpoint `10.0.0.6:10000` 直连；该实例关闭 TLS，因此命令未使用 `--tls`，endpoint 也不要求 `--cluster-mode`。Microsoft 文档说明 Azure Managed Redis 使用 10000 端口；只有 OSS cluster policy 必须使用 memtier `--cluster-mode`，Enterprise cluster policy 可按非集群 endpoint 使用。生产复现应优先把标准 hostname 解析到 Private Endpoint，而不是长期硬编码私网 IP。
+
+容量使用 Redis `INFO memory` 的 `used_memory` 计数，而不是只累计 value 字节。最终正式数据集包含 154,088,000 个连续 key，测试前 `used_memory=400,002,049,295` bytes。随后按约 10 GB 一档追加，最后一档完整成功后的状态为 166,088,001 个 key、`used_memory=432,447,820,034` bytes、`evicted_keys=0`；再追加 320 万个新 key 时全部返回 `OOM command not allowed when used memory > 'maxmemory'`，`DBSIZE` 没有增加。因此本 workload 的最后完整成功点约为 432.45 GB `used_memory`，不是 480 GB 标称容量的精确可用数据量。
+
+容量探测触顶后执行 `FLUSHDB SYNC`，确认 `DBSIZE=0` 且 `used_memory` 回到约 96 MB，再重新灌入正式的约 400 GB 数据。三组最终日志均无 OOM、认证或连接错误；纯读和混合的 GET 均全部命中。纯写完整窗口前另跑了 10 秒同参数安全探测，确认不会在 60 秒内触顶；该 10 秒结果未计入表格。三组结束后 `DBSIZE` 仍为 154,088,000、`evicted_keys=0`，`used_memory=426,201,007,973` bytes。覆盖写会提高热数据内存占用，因此接近容量上限的持续写入测试必须同时监控 OOM 和 `used_memory`，不能把 Redis error reply 计为成功吞吐。
+
+复现时先配置 Azure Managed Redis Private Endpoint 和 Private DNS。Microsoft 建议客户端仍连接 `<cache>.<region>.redis.azure.net:10000`，并让 `privatelink.redis.azure.net` 私有 DNS zone 把标准 hostname 解析到私网地址。本次临时 DNS 尚未关联到 client VNet，因此非 TLS 实例直接使用已批准 Private Endpoint 的 `10.0.0.6` 做测试。
+
+```bash
+# 在 client 执行；不要把真实 access key 写入报告或仓库
+export AMR_HOST=10.0.0.6
+export AMR_PORT=10000
+export AMR_ACCESS_KEY='<access-key>'
+
+# 构造约 400 GB 的连续数据集
+taskset -c 0-15 memtier_benchmark \
+  -s "$AMR_HOST" -p "$AMR_PORT" -a "$AMR_ACCESS_KEY" \
+  -t 16 -c 40 \
+  -n allkeys \
+  --distinct-client-seed \
+  --ratio=1:0 \
+  --key-pattern=P:P \
+  --key-prefix="kv_" \
+  --key-minimum=1 \
+  --key-maximum=154088000 \
+  --random-data \
+  --data-size-range=1000-4000 \
+  --data-size-pattern=R \
+  --hide-histogram
+
+# RATIO 依次替换为 0:1、1:1 和 1:0；每组结束后检查日志中没有 OOM/error
+taskset -c 0-15 memtier_benchmark \
+  -s "$AMR_HOST" -p "$AMR_PORT" -a "$AMR_ACCESS_KEY" \
+  -t 8 -c 10 \
+  --test-time 60 \
+  --distinct-client-seed \
+  --ratio=RATIO \
+  --key-prefix="kv_" \
+  --key-minimum=1 \
+  --key-maximum=154088000 \
+  --random-data \
+  --data-size-range=1000-4000 \
+  --data-size-pattern=R \
+  --hide-histogram \
+  --print-percentiles="99,99.9" \
+  --randomize
+```
+
+参考：[Azure Managed Redis 性能测试建议](https://learn.microsoft.com/en-us/azure/redis/best-practices-performance)、[Azure Managed Redis Private Link](https://learn.microsoft.com/en-us/azure/redis/private-link)。
 
 ## 测试环境
 
