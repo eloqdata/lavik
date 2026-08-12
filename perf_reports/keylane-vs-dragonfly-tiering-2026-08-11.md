@@ -1,6 +1,6 @@
-# Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks 与 Pika 性能对比（2026-08-11）
+# Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks、Pika 与 Tendis 性能对比（2026-08-11）
 
-> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks 和 Pika 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，Garnet、Kvrocks 和 Pika 保持各自的后台回收或 auto compaction 开启。
+> 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks、Pika 和 Tendis 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，Garnet、Kvrocks、Pika 和 Tendis 保持各自的后台回收或 auto compaction 开启。
 
 ## 测试结果
 
@@ -15,11 +15,13 @@
 | 纯读 GET | Dragonfly Tiered Storage | 187,652.86 | 2.911 | 16.383 |
 | 纯读 GET | Pika | 86,669.28 | 1.775 | 2.383 |
 | 纯读 GET | Apache Kvrocks | 70,671.82 | 2.479 | 3.407 |
+| 纯读 GET | Tendis | 68,860.36 | 2.063 | 5.855 |
 | 纯写 SET | Keylane io_uring（双裸块设备） | 393,732.53 | 1.015 | 1.647 |
 | 纯写 SET | Keylane SPDK | 392,283.87 | 0.999 | 1.607 |
 | 纯写 SET | Keylane io_uring（双 XFS 文件） | 385,324.26 | 1.055 | 1.727 |
 | 纯写 SET | Microsoft Garnet Storage Tier | 361,960.06 | 1.583 | 3.391 |
 | 纯写 SET | Dragonfly Tiered Storage | 199,233.52 | 4.639 | 10.303 |
+| 纯写 SET | Tendis | 160,641.92 | 1.335 | 2.127 |
 | 纯写 SET | Apache Kvrocks | 110,166.99 | 1.759 | 2.671 |
 | 纯写 SET | Pika | 79,537.31 | 4.223 | 7.327 |
 | 1:1 读写混合 | Keylane SPDK | 352,442.49 | 0.631 | 1.447 |
@@ -27,6 +29,7 @@
 | 1:1 读写混合 | Keylane io_uring（双 XFS 文件） | 326,110.00 | 0.687 | 1.503 |
 | 1:1 读写混合 | Microsoft Garnet Storage Tier | 209,366.38 | 2.511 | 4.895 |
 | 1:1 读写混合 | Dragonfly Tiered Storage | 207,247.53 | 4.015 | 9.791 |
+| 1:1 读写混合 | Tendis | 102,212.78 | 1.439 | 1.975 |
 | 1:1 读写混合 | Apache Kvrocks | 88,084.47 | 2.207 | 4.927 |
 | 1:1 读写混合 | Pika | 75,324.05 | 3.615 | 6.527 |
 
@@ -38,6 +41,8 @@ Dragonfly 本轮保持正常 tiered-storage 回收，灌数后执行 180 秒随�
 
 Garnet 本轮使用每 300 秒运行一次的 Lookup compaction，并启用 `compaction-force-delete` 直接删除完成回收的旧 segment。灌数完成后不做额外 GET 预热，也不等待后台回收，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试。
 
+Tendis 本轮始终开启 RocksDB auto compaction 和 Blob GC。2 亿条灌数完成后不做额外 GET 预热，也不等待后台整理，立即按纯读、1:1、纯写的顺序执行三组完整 300 秒测试，因此结果包含缓存冷启动和在线后台整理的影响。
+
 ## 测试环境
 
 | 角色 | Azure 机型 | 地址 |
@@ -45,9 +50,9 @@ Garnet 本轮使用每 300 秒运行一次的 Lookup compaction，并启用 `com
 | Server | `Standard_L16s_v3` | `10.0.0.4:6379` |
 | Client | `Standard_L16s_v3` | `10.0.0.5` |
 
-公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。每个后端只灌入一次 2 亿条初始数据，随后依次执行纯读、1:1 读写混合和纯写，三组之间不重启、不清库。七组服务/后端在不同时段独占同一个端口运行，不并发运行。
+公共 workload：8 个 memtier threads、每个 thread 10 个连接、1,000–4,000 byte 随机 value、key 范围 `kv_1`–`kv_200000000`、每组 300 秒、不限制 QPS。每个后端只灌入一次 2 亿条初始数据，随后依次执行纯读、1:1 读写混合和纯写，三组之间不重启、不清库。八组服务/后端在不同时段独占同一个端口运行，不并发运行。
 
-Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。
+Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 直接访问两个 NVMe namespace；raw io_uring 通过 Linux NVMe 驱动直接访问两个块设备，direct-I/O alignment 为 512 bytes；file io_uring 让两块 NVMe 各自使用独立 XFS，并通过两个 1,600 GiB 预分配 regular files 执行 4 KiB 对齐的 O_DIRECT I/O。两种 io_uring 方案都不使用 RAID。Dragonfly 使用 v1.40.1、16 proactor threads、双 NVMe Linux RAID0、XFS，并关闭 experimental cooling。Garnet 使用 v2.1.3、.NET 10.0.302、同一个 RAID0/XFS、64 GiB hybrid-log memory、32 GiB read cache、4 GiB index 和 Linux Native libaio。Kvrocks 使用 v2.16.0、16 workers、同一个 RAID0/XFS、80 GiB block cache、BlobDB，并关闭压缩。Pika 使用 Git tag v4.0.3、16 network threads、32 request threads、3 个 RocksDB instances、共 24 GiB block cache 和 32 GiB RTC cache，并关闭压缩与 binlog。Tendis 使用 tag `2.8.4-rocksdb-v8.5.3`、16 executor threads、10 个 RocksDB stores、72 GiB shared block/blob cache、同一个 RAID0/XFS，并关闭 WAL、binlog 和压缩。
 
 ## 结果边界与公平性说明
 
@@ -68,6 +73,9 @@ Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 
 - Pika 使用官方 v4.0.3 tag（commit `d16db1eee9aadb1db42338269936deb7b584ddcc`）直接编译 Release 二进制，不使用容器；该 commit 的二进制版本字符串仍显示 4.0.2，因此同时记录 tag、commit 和自报版本，避免版本歧义。
 - Pika 的 3 个 RocksDB instances 各配置 8 GiB shared block cache，合计 24 GiB；RTC cache 配置 32 GiB。本轮不额外等待 cache 预热或后台整理，灌数完成后直接开始正式纯读。
 - Pika 关闭 RocksDB WAL/binlog 和压缩，但灌数和三组正式测试期间始终保持 auto compaction 开启，使结果包含在线 compaction 对业务请求的实际影响。
+- Tendis 使用官方 tag `2.8.4-rocksdb-v8.5.3`（commit `6a5a4945f1b8dd9d248d8f25325c12881a3cbf5d`）直接编译 Release 二进制，不使用容器。默认的 10 个 RocksDB stores 各自维护 memtable 和后台任务；72 GiB block cache 由所有 stores 共享，Blob cache 计入同一个容量。
+- Tendis 关闭 RocksDB WAL、Tendis binlog、per-transaction log flush 和压缩，故障恢复与复制语义不同于默认生产配置；auto compaction 和 Blob GC 在灌数及三组正式测试期间始终开启，覆盖写产生的旧 blob 可以被在线回收。
+- Tendis 每个 store 使用 256 MiB write buffer、最多 4 个 memtables；全量灌数完成后不预热、不等待 compaction 清零，直接开始纯读。测试过程中没有发生 write stop 或后台错误。
 
 ## 复现步骤
 
@@ -193,7 +201,7 @@ sudo systemd-run \
 
 ### 4. 创建 RAID0 和 XFS
 
-Dragonfly、Garnet 和 Kvrocks 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
+Dragonfly、Garnet、Kvrocks、Pika 和 Tendis 在不同时段复用这个文件系统。以下命令会清空 `/dev/nvme0n1` 和 `/dev/nvme1n1`；执行前必须按实际机器重新确认设备名，且不能包含系统盘。
 
 ```bash
 sudo wipefs -a /dev/nvme0n1
@@ -517,7 +525,97 @@ sudo systemd-run \
   --logger-level Warning
 ```
 
-### 9. 全量灌入 2 亿条数据
+### 9. 编译并启动 Tendis
+
+测试源码为官方 [`2.8.4-rocksdb-v8.5.3`](https://github.com/Tencent/Tendis/tree/2.8.4-rocksdb-v8.5.3) tag（commit `6a5a4945f1b8dd9d248d8f25325c12881a3cbf5d`）。直接编译并运行 Release 二进制，不使用容器：
+
+```bash
+git clone --recursive --branch 2.8.4-rocksdb-v8.5.3 \
+  https://github.com/Tencent/Tendis.git
+cd Tendis
+
+cmake -S . -B build-perf -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_DISABLE_FIND_PACKAGE_Gflags=TRUE \
+  -DCMAKE_DISABLE_FIND_PACKAGE_GTest=TRUE
+cmake --build build-perf -j 16 --target tendisplus
+
+sudo mkdir -p /mnt/data/tendis/{db,log,dump}
+sudo chown -R "$(id -un):$(id -gn)" /mnt/data/tendis
+```
+
+`tendis-perf.conf`：
+
+```text
+bind 10.0.0.4
+port 6379
+daemon off
+logLevel warning
+logdir /mnt/data/tendis/log
+dumpdir /mnt/data/tendis/dump
+dir /mnt/data/tendis/db
+pidfile /mnt/data/tendis/tendisplus.pid
+slowlog /mnt/data/tendis/log/slowlog
+maxclients 10000
+tcp-backlog 8192
+
+netIoThreadNum 4
+executorThreadNum 16
+executorWorkPoolSize 4
+binlog-enabled no
+binlog-save-logs no
+checkkeytypeforsetcmd no
+
+rocks.blockcachemb 73728
+rocks.blockcache_num_shard_bits 8
+rocks.blobcache_in_blockcache yes
+rocks.disable_wal yes
+rocks.flush_log_at_trx_commit no
+rocks.compress_type none
+rocks.rate_limiter_rate_bytes_per_sec 0
+rocks.write_buffer_size 268435456
+rocks.max_write_buffer_number 4
+rocks.min_write_buffer_number_to_merge 2
+rocks.target_file_size_base 536870912
+rocks.max_bytes_for_level_base 68719476736
+rocks.level_compaction_dynamic_level_bytes 1
+rocks.level0_file_num_compaction_trigger 16
+rocks.level0_slowdown_writes_trigger 128
+rocks.level0_stop_writes_trigger 256
+rocks.max_background_jobs 16
+rocks.max_subcompactions 4
+rocks.compaction_readahead_size 2097152
+rocks.enable_pipelined_write 1
+rocks.max_open_files -1
+rocks.cache_index_and_filter_blocks 1
+rocks.pin_l0_filter_and_index_blocks_in_cache 1
+rocks.partition_filters 1
+rocks.block_size 16384
+rocks.use_direct_reads 0
+rocks.use_direct_io_for_flush_and_compaction 0
+rocks.enable_blob_files 1
+rocks.min_blob_size 1000
+rocks.blob_file_size 1073741824
+rocks.blob_compression_type none
+rocks.enable_blob_garbage_collection 1
+rocks.blob_garbage_collection_age_cutoff 0.25
+rocks.blob_garbage_collection_force_threshold 0.5
+```
+
+72 GiB cache 在 10 个 stores 之间共享；256 MiB write buffer 和最多 4 个 memtables 则对每个 store 分别生效。使用 buffered I/O 让 Linux page cache 参与普通文件访问，但本轮不执行额外 GET 预热。关闭 WAL、Tendis binlog 和压缩以偏向最高数据路径吞吐；保持 auto compaction 和 Blob GC 开启，使实例在覆盖写下具备持续回收旧版本的能力。
+
+```bash
+sudo systemd-run \
+  --unit=tendis-perf.service \
+  --collect \
+  --property=AllowedCPUs=0-15 \
+  --property=LimitMEMLOCK=infinity \
+  --property=LimitNOFILE=infinity \
+  /path/to/Tendis/build-perf/bin/tendisplus \
+  /path/to/tendis-perf.conf
+```
+
+### 10. 全量灌入 2 亿条数据
 
 只在确认目标是允许清空的空白测试实例后执行一次 `FLUSHALL`，再从 client 使用 640 个连接完成全量 SET。`FLUSHALL` 会删除全库，已经灌完数据后不得再次执行：
 
@@ -542,7 +640,7 @@ taskset -c 0-15 memtier_benchmark \
 
 灌数阶段只用于构造相同的 2 亿条初始数据，不记录耗时或吞吐，也不计入正式对比结果。
 
-### 10. 预热 Dragonfly page cache
+### 11. 预热 Dragonfly page cache
 
 Dragonfly 全量灌数后先用随机 GET 预热 Linux page cache，随后三组正式测试之间不清 page cache、不重启。预热输出不计入正式结果。
 
@@ -565,9 +663,9 @@ taskset -c 0-15 memtier_benchmark \
 
 ```
 
-Garnet、Kvrocks 和 Pika 本轮均不执行额外随机 GET 预热；灌数完成后直接开始正式纯读，各自的后台回收或 auto compaction 保持开启。不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应确认全量灌数恰好完成 200,000,000 次 SET，并保存 `INFO store` 地址用于审计。
+Garnet、Kvrocks、Pika 和 Tendis 本轮均不执行额外随机 GET 预热；灌数完成后直接开始正式纯读，各自的后台回收或 auto compaction 保持开启。不要用 Garnet v2.1.3 的 `DBSIZE` 验证这组 `--no-obj` 数据；该组合存在前述管理命令异常。应确认全量灌数恰好完成 200,000,000 次 SET，并保存 `INFO store` 地址用于审计。
 
-### 11. 确认 Kvrocks auto compaction
+### 12. 确认 Kvrocks auto compaction
 
 Kvrocks 在灌数和正式测试期间始终保持 auto compaction 开启。灌数完成后不等待正在执行或排队的 compaction，直接开始正式纯读，使测试覆盖真实在线后台整理成本。开始前确认配置没有被动态改为关闭：
 
@@ -582,9 +680,9 @@ redis-cli -h 10.0.0.4 -p 6379 INFO rocksdb \
   | grep -E 'num_files_at_level|estimate_pending_compaction_bytes|num_running_compactions|compaction_count'
 ```
 
-### 12. 依次执行三组正式测试
+### 13. 依次执行三组正式测试
 
-`RATIO` 依次替换为纯读 `0:1`、1:1 混合 `1:1` 和纯写 `1:0`。每个后端只执行一次全量灌数，三组正式测试共用这份数据。每组结束后确认没有 background error；Keylane 还需用 `DEFRAG STATUS` 记录活动和排队任务。Kvrocks、Pika 和 Garnet 的后台 compaction/回收保持开启，不等待任务清零。
+`RATIO` 依次替换为纯读 `0:1`、1:1 混合 `1:1` 和纯写 `1:0`。每个后端只执行一次全量灌数，三组正式测试共用这份数据。每组结束后确认没有 background error；Keylane 还需用 `DEFRAG STATUS` 记录活动和排队任务。Kvrocks、Pika、Garnet 和 Tendis 的后台 compaction/回收保持开启，不等待任务清零。
 
 所有系统在三组正式测试之间都不清理操作系统 page cache。只有 Dragonfly 在正式测试前执行额外的 Linux page-cache 预热；其余后端不做额外读预热，并保留灌数和前序正式 workload 自然形成的缓存状态。Keylane SPDK、raw io_uring、使用 O_DIRECT regular files 的 io_uring，以及使用 Native O_DIRECT storage tier 的 Garnet 不依赖该 page-cache 路径。
 
