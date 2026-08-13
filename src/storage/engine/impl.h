@@ -52,19 +52,83 @@ using celer::CoroutineBarrier;
 using celer::FixedBuffer;
 using celer::FixedFile;
 using celer::Task;
-using celer::UnlockGuard;
 using celer::Worker;
 
+// Storage operations occasionally pin immutable physical state, release the
+// worker-local metadata mutex across IO, then reacquire it for publication.
+class UnlockGuard {
+ public:
+  UnlockGuard(AsyncMutex* mutex, Worker* worker)
+      : mutex_(mutex), worker_(worker) {}
+  UnlockGuard(const UnlockGuard&) = delete;
+  UnlockGuard& operator=(const UnlockGuard&) = delete;
+  ~UnlockGuard() { Unlock(); }
+
+  void Unlock() {
+    if (!owns_) return;
+    mutex_->Unlock(*worker_);
+    owns_ = false;
+  }
+  void Adopt() { owns_ = true; }
+
+ private:
+  AsyncMutex* mutex_;
+  Worker* worker_;
+  bool owns_ = true;
+};
+
 using ExtentManifest = std::shared_ptr<const std::vector<ExtentRef>>;
+
+struct ListState {
+  std::uint64_t element_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+  std::uint32_t segment_count_ = 0;
+  std::uint32_t tree_height_ = 0;
+  DirectRecordRef directory_root_{};
+  // Runtime-only stable owner handle. It is deliberately absent from the
+  // encoded root: recovery assigns a fresh handle to every winning root.
+  // RENAME can therefore update one owner record instead of every object.
+  std::uint64_t owner_id_ = 0;
+};
+
+struct ListSegmentMeta {
+  DirectRecordRef segment_{};
+  std::uint64_t element_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+};
+
+struct ListDirectoryChildMeta {
+  DirectRecordRef child_{};
+  std::uint64_t element_count_ = 0;
+  std::uint64_t segment_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+};
+
+struct ListDirectoryNode {
+  std::uint32_t level_ = 0;
+  std::uint64_t element_count_ = 0;
+  std::uint64_t segment_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+  std::vector<ListDirectoryChildMeta> children_;
+  std::vector<ListSegmentMeta> segments_;
+
+  bool leaf() const noexcept { return level_ == 0; }
+};
+
+absl::StatusOr<ListState> DecodeListRoot(
+    std::span<const std::byte> payload);
+std::string EncodeListRoot(const ListState& state);
+absl::StatusOr<ListDirectoryNode> DecodeListDirectory(
+    std::span<const std::byte> payload);
+std::string EncodeListDirectory(const ListDirectoryNode& node);
 
 struct RecordLocation {
   std::uint64_t block_id_ = 0;
   std::uint64_t mutation_sequence_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t expire_at_ms_ = 0;
-  // Redis strings are capped at 512 MiB, so their logical byte length fits in
-  // 32 bits. Collection cardinalities use the same field and are consequently
-  // capped at UINT32_MAX.
+  // Exact bytes/cardinality for inline values, or kSegmentedCollection for a
+  // collection whose sparse type-specific side table owns the 64-bit value.
   std::uint32_t logical_size_ = 0;
   std::uint32_t record_offset_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
@@ -88,7 +152,7 @@ struct RecordLocation {
   // unclaimed proved nothing on disk needs it. False outside rounds, and
   // any overwrite resets it, exempting concurrently-touched keys.
   bool unclaimed_ : 1 = false;
-  RecordKind kind_ : 2 = RecordKind::kValue;
+  RecordKind kind_ : 3 = RecordKind::kValue;
   ValueType value_type_ : 3 = ValueType::kNone;
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
@@ -225,7 +289,7 @@ struct ActiveBlock {
 // buffer: the buffer itself and the bookkeeping the flusher needs. At most a
 // handful of blocks per worker are in that state at once, while every
 // allocated block carries a BlockState, so this lives in a side table instead
-// of costing all of them 38 bytes.
+// of charging staging-only state to every block.
 struct StagingSlot {
   std::uint16_t write_buffer_id_ = 0;
   std::byte* heap_data_ = nullptr;
@@ -233,6 +297,10 @@ struct StagingSlot {
   // Bytes already written and fdatasynced. Direct-I/O aligned, so appends
   // never land in a durable page and a flush only writes the new tail.
   std::uint32_t durable_bytes_ = kBlockHeaderBytes;
+  // Current append boundary, including direct-I/O padding inserted by an
+  // in-flight flush. Keeping it beside durable_bytes_ lets INFO aggregate
+  // dirty staging bytes without walking every allocated block.
+  std::uint32_t committed_bytes_ = kBlockHeaderBytes;
   std::uint32_t record_count_ = 0;
   std::uint64_t max_lsn_ = 0;
   // Sequence stamped into the last header write. Its parity picks the slot,
@@ -319,11 +387,22 @@ struct RecoveryRecord {
   // worker's scan has contributed its kTxCommit sightings, then applied only
   // if their transaction committed.
   std::uint64_t txid_ = 0;
+  // Physical append order, used only to choose between defrag copies with
+  // the same logical mutation sequence during recovery.
+  std::uint64_t lsn_ = 0;
   // Recovery filters this durable generation before installing the location.
   // Every live entry then inherits PartitionStore::replication_epoch_.
   std::uint64_t replication_epoch_ = 1;
   RecordLocation location_{};
   ExtentManifest extents_;
+  std::optional<ListState> list_state_;
+};
+
+struct RecoveryListObject {
+  DirectRecordRef reference_;
+  std::optional<ListDirectoryNode> directory_;
+  ExtentManifest extents_;
+  std::uint64_t logical_size_ = 0;
 };
 
 struct RecoveryBlock {
@@ -333,6 +412,14 @@ struct RecoveryBlock {
 struct RecoveryBatch {
   std::vector<RecoveryRecord> records_;
   std::vector<RecoveryBlock> blocks_;
+  // Anonymous collection objects are discovered by the worker performing the
+  // physical scan, which is not necessarily the block's owner after a worker
+  // count change. Route their compact recovery metadata with the block so the
+  // later reachability walk can find it in the owning WorkerStore.
+  std::vector<RecoveryListObject> list_objects_;
+  // Commit records are not indexed, but defrag relocates them until tx GC
+  // exists. Charge them as live after recovery so salvage can retire them.
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> commit_records_;
 };
 
 struct RecoveryLiveReference {
@@ -364,8 +451,49 @@ struct RetiredRecord {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
   std::uint16_t block_owner_ = 0;
+  std::uint32_t record_offset_ = 0;
+  bool collection_object_ = false;
   ExtentManifest dependent_extents_;
+  ExtentManifest immediate_extents_;
   std::shared_ptr<const std::vector<ExtentManifest>> extra_dependent_extents_;
+};
+
+struct DirectRecordIdentity {
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t record_offset_ = 0;
+
+  friend bool operator==(const DirectRecordIdentity&,
+                         const DirectRecordIdentity&) = default;
+
+  template <typename H>
+  friend H AbslHashValue(H state, const DirectRecordIdentity& identity) {
+    return H::combine(std::move(state), identity.block_id_,
+                      identity.allocation_epoch_, identity.record_offset_);
+  }
+};
+
+struct ListObjectRuntimeMeta {
+  DirectRecordRef reference_;
+  // Directories are small and hot, so retain the decoded child array. Segment
+  // payloads stay on disk; a null directory distinguishes them.
+  std::optional<ListDirectoryNode> directory_;
+  ExtentManifest extents_;
+  std::uint64_t owner_id_ = 0;
+  std::uint64_t logical_size_ = 0;
+  // Reverse edge for O(tree height) relocation. It is an accelerator only:
+  // publication races may leave a stale edge, so defrag validates it against
+  // the current root and falls back to a resident-directory walk.
+  DirectRecordRef parent_{};
+  std::uint32_t parent_slot_ = 0;
+  bool parent_is_leaf_ = false;
+};
+
+struct ListOwnerRuntime {
+  std::uint8_t db_id_ = 0;
+  std::string key_;
+  Digest digest_{};
+  std::uint64_t index_generation_ = 0;
 };
 
 // The index state a defrag relocation observed when it validated its source
@@ -420,6 +548,7 @@ struct TxUndoEntry {
   RecordIndex::Entry* entry_ = nullptr;
   std::optional<RecordLocation> previous_;
   ExtentManifest previous_extents_;
+  std::optional<ListState> previous_list_state_;
   std::uint8_t db_id_ = 0;
 };
 
@@ -428,7 +557,10 @@ struct ReplicaValueStage {
   std::uint64_t db_epoch_ = 0;
   std::uint64_t mutation_sequence_ = 0;
   std::uint64_t expire_at_ms_ = 0;
+  // Redis logical bytes/cardinality and portable encoded byte size differ
+  // for collection values, so framed replication tracks both.
   std::uint64_t logical_size_ = 0;
+  std::uint64_t encoded_size_ = 0;
   std::uint32_t next_chunk_ = 0;
   std::uint32_t chunk_count_ = 0;
   ValueType value_type_ = ValueType::kNone;
@@ -880,6 +1012,13 @@ class StorageEngine::Impl {
     };
 
     Worker* worker_ = nullptr;
+    // Hot-path physical append ordinal. Recovery seeds every worker above the
+    // greatest durable LSN; workers then advance disjoint striped sequences
+    // by worker_count, so allocation is local and needs no atomic operation.
+    std::uint64_t next_lsn_ = 0;
+    // Runtime-only List owner handles are worker-striped just like LSNs. Zero
+    // means "not bound" and is never allocated.
+    std::uint64_t next_list_owner_id_ = 0;
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
     std::vector<PartitionStore> partitions_;
@@ -890,6 +1029,20 @@ class StorageEngine::Impl {
     // every ordinary key while preserving O(1) FLUSHDB detachment.
     absl::flat_hash_map<const RecordIndex::Entry*, ExtentManifest>
         external_manifests_;
+    // Present only for List roots whose generic logical size is the segmented
+    // marker. Entry addresses are stable for the life of an attached index.
+    absl::flat_hash_map<const RecordIndex::Entry*, ListState>
+        list_states_;
+    // Only oversized anonymous collection objects need extent manifests.
+    // Keeping them sparse preserves the 32-byte physical reference while
+    // allowing runtime retirement to reclaim the dependent extent chain.
+    absl::flat_hash_map<DirectRecordIdentity, ExtentManifest>
+        collection_object_manifests_;
+    // Sparse resident metadata for large Lists. Directory payloads and the
+    // reverse object-to-owner edge are kept; segment contents are not.
+    absl::flat_hash_map<DirectRecordIdentity, ListObjectRuntimeMeta>
+        list_objects_;
+    absl::flat_hash_map<std::uint64_t, ListOwnerRuntime> list_owners_;
     // Bumped every time FLUSHDB detaches this database's partition indexes.
     // Every index for one database is detached together and without suspending,
     // so one counter per database describes all of them.
@@ -905,17 +1058,31 @@ class StorageEngine::Impl {
     // passes, so they meet here instead of in every BlockState. Cleared once
     // the live-reference pass has run.
     absl::flat_hash_map<std::uint64_t, ExtentIdentity> recovered_extents_;
+    // Recovery-only metadata decoded during the single physical block scan.
+    // Segment payload bytes are never retained; directory entries and an
+    // oversized segment's sparse extent manifest are enough for reachability.
+    absl::flat_hash_map<DirectRecordIdentity, RecoveryListObject>
+        recovery_list_objects_;
     // Recovery-only exact identities for external-key entries. Runtime index
     // entries deliberately omit the full key, but recovery already had to
     // materialize it for routing, so retain it until every version is merged.
     absl::flat_hash_map<const RecordIndex::Entry*, std::string>
         recovery_external_keys_;
+    // Recovery-only physical LSN of the candidate installed in each index
+    // entry. Cleared after all versions have been merged.
+    absl::flat_hash_map<const RecordIndex::Entry*, std::uint64_t>
+        recovery_lsns_;
     // txid-tagged records parked by ApplyRecovery until the committed-txid set
     // is complete (after the recovery barrier).
     std::vector<RecoveryRecord> recovery_tx_records_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
     // txid; written and consumed under store_state_mutex.
     absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo_;
+    // Anonymous collection objects allocated by an in-flight transaction.
+    // Commit forgets this journal; runtime abort retires every object after
+    // restoring the previous top-level roots.
+    absl::flat_hash_map<std::uint64_t, std::vector<RetiredRecord>>
+        tx_new_collection_objects_;
     // Relocation fences owed per source block. A salvage pass that fails
     // midway has already moved records whose copies are not yet durable; the
     // debt survives the pass here, and CleanBlockLocked settles every owed
@@ -1001,6 +1168,14 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
 
+  Task<absl::StatusOr<ListResult>> ExecuteList(
+      std::uint8_t db_id, std::string_view key,
+      const ListOperation& operation);
+
+  Task<absl::StatusOr<ListResult>> ExecuteListLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const ListOperation& operation, TxShardWrites* tx = nullptr);
+
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
   // Caller holds the key lock (shared); see GetLocked.
@@ -1081,6 +1256,8 @@ class StorageEngine::Impl {
   }
 
   Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
+
+  Task<StorageDurabilityStats> DurabilityStats() const;
 
   Task<StorageMetricsSnapshot> CollectMetrics() const;
 
@@ -1226,6 +1403,20 @@ class StorageEngine::Impl {
 
   const WorkerStore& CurrentStore() const {
     return *stores_[celer::ThisWorker().id_];
+  }
+
+  absl::StatusOr<std::uint64_t> AllocateLsn(WorkerStore& store) {
+    const std::uint64_t stride = worker_count_;
+    const std::uint64_t lsn = store.next_lsn_;
+    if (lsn == 0) {
+      return absl::Status(absl::StatusCode::kResourceExhausted,
+                          "physical LSN space is exhausted");
+    }
+    store.next_lsn_ =
+        lsn > std::numeric_limits<std::uint64_t>::max() - stride
+            ? 0
+            : lsn + stride;
+    return lsn;
   }
 
   WorkerStore::PartitionStore& PartitionFor(WorkerStore& store,
@@ -1448,6 +1639,18 @@ class StorageEngine::Impl {
                                                     : found->second;
   }
 
+  static std::optional<ListState> ListStateFor(
+      const WorkerStore& store, const RecordIndex::Entry* entry) {
+    if (entry == nullptr ||
+        entry->value_.logical_size_ != kSegmentedCollection) {
+      return {};
+    }
+    const auto found = store.list_states_.find(entry);
+    return found == store.list_states_.end()
+               ? std::optional<ListState>{}
+               : std::optional<ListState>{found->second};
+  }
+
   static ExtentManifest DependentExtentsFor(const WorkerStore& store,
                                             const RecordIndex::Entry* entry) {
     if (entry == nullptr || !entry->value_.key_external_) [[likely]] {
@@ -1542,10 +1745,77 @@ class StorageEngine::Impl {
         .allocation_epoch_ = location.allocation_epoch_,
         .total_disk_bytes_ = location.total_disk_bytes_,
         .block_owner_ = location.block_owner_,
+        .record_offset_ = location.record_offset_,
+        .collection_object_ = false,
         .dependent_extents_ = std::move(dependent_extents),
+        .immediate_extents_ = nullptr,
         .extra_dependent_extents_ = nullptr,
     };
   }
+
+  RetiredRecord RetiredRecordOf(const DirectRecordRef& reference,
+                                ExtentManifest dependent_extents = {}) const {
+    const std::uint16_t owner = BlockOwner(reference.block_id_);
+    if (dependent_extents == nullptr && owner < stores_.size() &&
+        stores_[owner] != nullptr) {
+      const auto found = stores_[owner]->collection_object_manifests_.find(
+          DirectRecordIdentity{reference.block_id_,
+                               reference.allocation_epoch_,
+                               reference.record_offset_});
+      if (found != stores_[owner]->collection_object_manifests_.end()) {
+        dependent_extents = found->second;
+      }
+    }
+    return RetiredRecord{
+        .block_id_ = reference.block_id_,
+        .allocation_epoch_ = reference.allocation_epoch_,
+        .total_disk_bytes_ = reference.total_disk_bytes_,
+        .block_owner_ = owner,
+        .record_offset_ = reference.record_offset_,
+        .collection_object_ = true,
+        .dependent_extents_ = std::move(dependent_extents),
+        .immediate_extents_ = nullptr,
+        .extra_dependent_extents_ = nullptr,
+    };
+  }
+
+  Task<absl::StatusOr<DirectRecordRef>> WriteCollectionObjectLocked(
+      WorkerStore& store, std::uint8_t db_id, ValueType value_type,
+      std::string_view payload, TxShardWrites* tx = nullptr,
+      std::uint64_t logical_size = 0, std::uint64_t owner_id = 0,
+      bool for_defrag = false);
+
+  Task<absl::StatusOr<std::optional<ListDirectoryNode>>>
+  LoadListDirectoryMeta(WorkerStore& store,
+                        const DirectRecordRef& reference);
+
+  Task<absl::StatusOr<std::optional<ListObjectRuntimeMeta>>>
+  LoadListObjectMeta(WorkerStore& store,
+                     const DirectRecordRef& reference);
+
+  Task<absl::StatusOr<std::string>> LoadCollectionObject(
+      WorkerStore& store, const DirectRecordRef& reference,
+      ValueType expected_type);
+
+  Task<absl::StatusOr<std::string>> LoadCollectionObjectLocal(
+      WorkerStore& store, const DirectRecordRef& reference,
+      ValueType expected_type);
+
+  Task<absl::StatusOr<std::vector<RetiredRecord>>>
+  CollectListTreeRetirements(WorkerStore& store,
+                             const ListState& state);
+
+  // Convert a physical segmented List tree into the portable KLL1 value used
+  // by snapshot/delta replication. Caller holds store_state_mutex_.
+  Task<absl::StatusOr<std::string>> MaterializeListValueLocked(
+      WorkerStore& store, const ListState& state);
+
+  Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
+  RelocateListCollectionObject(std::uint64_t owner_id,
+                               DirectRecordRef source);
+
+  Task<absl::StatusOr<RetiredRecord>> ResolveCollectionRetirement(
+      WorkerStore& store, const DirectRecordRef& reference);
 
   Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
   WriteExtentValueLocked(WorkerStore& store, std::string_view first,
@@ -1556,7 +1826,9 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, std::string_view value,
       RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
       TxShardWrites* tx = nullptr,
-      std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max());
+      std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
+      std::shared_ptr<std::vector<RetiredRecord>> commit_retirements =
+          nullptr);
 
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);
@@ -1571,8 +1843,8 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
       std::string_view value, RecordKind kind, ValueType value_type,
       std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
-      std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
-      bool for_defrag, bool unlock_writer_while_waiting = true,
+      std::uint64_t mutation_sequence, bool for_defrag,
+      bool unlock_writer_while_waiting = true,
       bool external = false, bool key_external = false,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
@@ -1771,6 +2043,9 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
   std::atomic<std::uint64_t> recovery_scanned_records_{0};
   std::atomic<std::uint64_t> recovery_max_txid_{0};
+  // Cold-path reduction over every scanned record/block. After the recovery
+  // barrier it seeds each worker's non-atomic striped LSN sequence.
+  std::atomic<std::uint64_t> recovery_max_lsn_{0};
   // Commit chains spawned but not yet finished; graceful shutdown drains
   // them before the final flush so acknowledged multi-key writes do not
   // lose their commit records to the shutdown ordering.
@@ -1787,7 +2062,6 @@ class StorageEngine::Impl {
   std::atomic<bool> recovery_complete_logged_{false};
   std::int64_t recovery_started_ms_ = 0;
   static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
-  std::atomic<std::uint64_t> next_lsn_{1};
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
   std::atomic<unsigned> active_defrags_{0};
   std::atomic<unsigned> pending_defrags_{0};

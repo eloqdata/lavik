@@ -193,6 +193,48 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "set";
     case CommandKind::kLPush:
       return "lpush";
+    case CommandKind::kLPushX:
+      return "lpushx";
+    case CommandKind::kRPush:
+      return "rpush";
+    case CommandKind::kRPushX:
+      return "rpushx";
+    case CommandKind::kLPop:
+      return "lpop";
+    case CommandKind::kRPop:
+      return "rpop";
+    case CommandKind::kLLen:
+      return "llen";
+    case CommandKind::kLIndex:
+      return "lindex";
+    case CommandKind::kLRange:
+      return "lrange";
+    case CommandKind::kLSet:
+      return "lset";
+    case CommandKind::kLInsert:
+      return "linsert";
+    case CommandKind::kLRem:
+      return "lrem";
+    case CommandKind::kLTrim:
+      return "ltrim";
+    case CommandKind::kLPos:
+      return "lpos";
+    case CommandKind::kLMove:
+      return "lmove";
+    case CommandKind::kRPopLPush:
+      return "rpoplpush";
+    case CommandKind::kLMPop:
+      return "lmpop";
+    case CommandKind::kBLPop:
+      return "blpop";
+    case CommandKind::kBRPop:
+      return "brpop";
+    case CommandKind::kBLMove:
+      return "blmove";
+    case CommandKind::kBRPopLPush:
+      return "brpoplpush";
+    case CommandKind::kBLMPop:
+      return "blmpop";
     case CommandKind::kMSet:
       return "mset";
     case CommandKind::kMGet:

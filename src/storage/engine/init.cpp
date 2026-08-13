@@ -1,5 +1,6 @@
 #include <thread>
 
+#include "absl/strings/str_cat.h"
 #include "impl.h"
 
 namespace keylane::storage {
@@ -583,6 +584,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (unsigned i = 0; i < worker_count; ++i) {
     stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_.back();
+    store.next_list_owner_id_ = static_cast<std::uint64_t>(i) + 1;
     store.partitions_.reserve((kLogicalStorageShards + worker_count - 1 - i) /
                               worker_count);
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;
@@ -667,6 +669,23 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     co_return status;
   }
 
+  // LSN comparisons are only between physical copies of one logical key
+  // version. All publications for a key run on its current key owner. Seed
+  // every worker above all durable values, then stripe by worker id so normal
+  // appends need only this worker-local integer. A topology change happens
+  // across this recovery boundary, where the new base again exceeds every
+  // value produced by the old topology.
+  const std::uint64_t recovered_max_lsn =
+      recovery_max_lsn_.load(std::memory_order_relaxed);
+  if (recovered_max_lsn >
+      std::numeric_limits<std::uint64_t>::max() - worker_count_) {
+    status = absl::Status(absl::StatusCode::kResourceExhausted,
+                          "physical LSN space is exhausted");
+    Fail(status);
+    co_return status;
+  }
+  store.next_lsn_ = recovered_max_lsn + 1 + worker.id();
+
   // Every scan has fed the committed set by now (merges happen before the
   // barrier); decide the parked transaction-tagged records. A tagged record
   // without its commit record is a prepare whose transaction never durably
@@ -679,8 +698,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
   store.recovery_tx_records_.clear();
   store.recovery_tx_records_.shrink_to_fit();
-  store.recovery_external_keys_.clear();
-  store.recovery_external_keys_.rehash(0);
+  store.recovery_lsns_.clear();
+  store.recovery_lsns_.rehash(0);
   if (worker.id() == 0) {
     // Seed the transaction-id counter above everything on disk so a new
     // boot's transactions can never alias a previous boot's commit records.
@@ -691,6 +710,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
+  struct RecoveredListRoot {
+    ListState state_;
+    std::uint64_t owner_id_ = 0;
+  };
+  std::vector<RecoveredListRoot> recovered_list_roots;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
@@ -701,11 +725,53 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             .allocation_epoch_ = location.allocation_epoch_,
             .bytes_ = location.total_disk_bytes_,
         });
+        if (const std::optional<ListState> list_state =
+                ListStateFor(store, &entry);
+            list_state.has_value()) {
+          ListState bound = *list_state;
+          const std::uint64_t owner_id = store.next_list_owner_id_;
+          if (owner_id == 0) {
+            Fail(absl::ResourceExhaustedError(
+                "runtime List owner id space is exhausted"));
+            return;
+          }
+          store.next_list_owner_id_ =
+              owner_id > std::numeric_limits<std::uint64_t>::max() -
+                             worker_count_
+                  ? 0
+                  : owner_id + worker_count_;
+          bound.owner_id_ = owner_id;
+          store.list_states_.insert_or_assign(&entry, bound);
+          std::string owner_key;
+          if (entry.key_complete()) {
+            owner_key = std::string(entry.key());
+          } else {
+            const auto recovered_key =
+                store.recovery_external_keys_.find(&entry);
+            if (recovered_key == store.recovery_external_keys_.end()) {
+              Fail(absl::InternalError(
+                  "recovered segmented List has no complete key"));
+              return;
+            }
+            owner_key = recovered_key->second;
+          }
+          store.list_owners_.insert_or_assign(
+              owner_id,
+              ListOwnerRuntime{
+                  .db_id_ = db_id,
+                  .key_ = owner_key,
+                  .digest_ = entry.key_complete()
+                                 ? ComputeDigest(owner_key)
+                                 : entry.external_key_digest(),
+                  .index_generation_ = store.index_generations_[db_id],
+              });
+          recovered_list_roots.push_back(
+              RecoveredListRoot{.state_ = bound, .owner_id_ = owner_id});
+        }
         const ExtentManifest extents = ExtentsFor(store, &entry);
         if (location.external_ && extents != nullptr) {
-          for (std::size_t extent_index = 0; extent_index < extents->size();
-               ++extent_index) {
-            const ExtentRef& extent = extents->at(extent_index);
+          auto add_extent = [&](const ExtentRef& extent,
+                                std::uint32_t extent_index) {
             // An extent block's owner is derived from its own block id,
             // so it is unrelated to the owner of the block holding this
             // manifest. Charging the reference to the record's owner
@@ -715,20 +781,188 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             if (extent_owner >= worker_count_) {
               Fail(absl::Status(absl::StatusCode::kInternal,
                                 "manifest references an unscanned extent"));
-              return;
+              return false;
             }
             live_by_owner[extent_owner].push_back(RecoveryLiveReference{
                 .block_id_ = extent.block_id_,
                 .allocation_epoch_ = extent.allocation_epoch_,
                 .bytes_ = extent.payload_bytes_,
                 .extent_ = true,
-                .extent_index_ = static_cast<std::uint32_t>(extent_index),
+                .extent_index_ = extent_index,
                 .extent_payload_checksum_ = extent.payload_checksum_,
             });
+            return true;
+          };
+          for (std::size_t extent_index = 0; extent_index < extents->size();
+               ++extent_index) {
+            if (!add_extent(extents->at(extent_index),
+                            static_cast<std::uint32_t>(extent_index))) {
+              return;
+            }
           }
         }
       });
     }
+  }
+
+  // Collection objects have no index entries of their own. Charge only the
+  // objects reachable from each winning List root; unpublished COW paths and
+  // aborted transaction paths consequently stay at zero live bytes and are
+  // reclaimed without a second disk scan.
+  struct PendingListObject {
+    DirectRecordRef reference_;
+    bool directory_ = false;
+    std::uint64_t owner_id_ = 0;
+    DirectRecordRef parent_{};
+    std::uint32_t parent_slot_ = 0;
+    bool parent_is_leaf_ = false;
+  };
+  std::vector<std::vector<
+      std::pair<DirectRecordIdentity, ExtentManifest>>>
+      collection_manifests_by_owner(worker_count_);
+  std::vector<std::vector<
+      std::pair<DirectRecordIdentity, ListObjectRuntimeMeta>>>
+      runtime_objects_by_owner(worker_count_);
+  absl::flat_hash_set<DirectRecordIdentity> visited_list_objects;
+  std::vector<PendingListObject> pending_list_objects;
+  auto fail_list_recovery = [this](absl::Status failure) {
+    Fail(failure);
+    return failure;
+  };
+  for (const RecoveredListRoot& root : recovered_list_roots) {
+    pending_list_objects.push_back(
+        PendingListObject{root.state_.directory_root_, true,
+                          root.owner_id_, {}, 0, false});
+  }
+  while (!pending_list_objects.empty()) {
+    PendingListObject object = pending_list_objects.back();
+    pending_list_objects.pop_back();
+    const std::uint16_t owner = BlockOwner(object.reference_.block_id_);
+    if (owner >= worker_count_) {
+      co_return fail_list_recovery(absl::Status(
+          absl::StatusCode::kInternal,
+          "List tree references an unscanned block"));
+    }
+    const DirectRecordIdentity identity{
+        object.reference_.block_id_, object.reference_.allocation_epoch_,
+        object.reference_.record_offset_};
+    if (!visited_list_objects.insert(identity).second) {
+      co_return fail_list_recovery(absl::InternalError(
+          "List tree contains a cycle or shared physical object"));
+    }
+    const WorkerStore& object_store = *stores_[owner];
+    const auto recovered = object_store.recovery_list_objects_.find(identity);
+    if (recovered == object_store.recovery_list_objects_.end()) {
+      co_return fail_list_recovery(absl::InternalError(absl::StrCat(
+          "List tree reference was not found by the physical scan: block=",
+          object.reference_.block_id_, " epoch=",
+          object.reference_.allocation_epoch_, " offset=",
+          object.reference_.record_offset_, " owner=", owner)));
+    }
+    if (recovered->second.reference_ != object.reference_ ||
+        object.directory_ != recovered->second.directory_.has_value()) {
+      const DirectRecordRef& scanned = recovered->second.reference_;
+      co_return fail_list_recovery(absl::InternalError(absl::StrCat(
+          "List tree reference does not match the physical scan: block=",
+          object.reference_.block_id_, " epoch=",
+          object.reference_.allocation_epoch_, " offset=",
+          object.reference_.record_offset_, " expected_bytes=",
+          object.reference_.total_disk_bytes_, " scanned_bytes=",
+          scanned.total_disk_bytes_, " expected_crc=",
+          object.reference_.payload_checksum_, " scanned_crc=",
+          scanned.payload_checksum_, " expected_directory=",
+          object.directory_, " scanned_directory=",
+          recovered->second.directory_.has_value())));
+    }
+    live_by_owner[owner].push_back(RecoveryLiveReference{
+        .block_id_ = object.reference_.block_id_,
+        .allocation_epoch_ = object.reference_.allocation_epoch_,
+        .bytes_ = object.reference_.total_disk_bytes_,
+    });
+    runtime_objects_by_owner[owner].push_back(
+        {identity,
+         ListObjectRuntimeMeta{
+             .reference_ = recovered->second.reference_,
+             .directory_ = recovered->second.directory_,
+             .extents_ = recovered->second.extents_,
+             .owner_id_ = object.owner_id_,
+             .logical_size_ = recovered->second.logical_size_,
+             .parent_ = object.parent_,
+             .parent_slot_ = object.parent_slot_,
+             .parent_is_leaf_ = object.parent_is_leaf_,
+         }});
+    if (const ExtentManifest& manifest = recovered->second.extents_;
+        manifest != nullptr) {
+      collection_manifests_by_owner[owner].push_back({identity, manifest});
+      for (std::size_t extent_index = 0;
+           extent_index < manifest->size(); ++extent_index) {
+        const ExtentRef& extent = manifest->at(extent_index);
+        const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
+        if (extent_owner >= worker_count_) {
+          co_return fail_list_recovery(absl::Status(
+              absl::StatusCode::kInternal,
+              "List segment references an unscanned extent"));
+        }
+        live_by_owner[extent_owner].push_back(RecoveryLiveReference{
+            .block_id_ = extent.block_id_,
+            .allocation_epoch_ = extent.allocation_epoch_,
+            .bytes_ = extent.payload_bytes_,
+            .extent_ = true,
+            .extent_index_ = static_cast<std::uint32_t>(extent_index),
+            .extent_payload_checksum_ = extent.payload_checksum_,
+        });
+      }
+    }
+    if (!object.directory_) continue;
+    const ListDirectoryNode& directory = *recovered->second.directory_;
+    if (directory.leaf()) {
+      for (std::size_t slot = 0; slot < directory.segments_.size(); ++slot) {
+        const ListSegmentMeta& segment = directory.segments_[slot];
+        pending_list_objects.push_back(
+            PendingListObject{segment.segment_, false, object.owner_id_,
+                              object.reference_,
+                              static_cast<std::uint32_t>(slot),
+                              true});
+      }
+    } else {
+      for (std::size_t slot = 0; slot < directory.children_.size(); ++slot) {
+        const ListDirectoryChildMeta& child = directory.children_[slot];
+        pending_list_objects.push_back(
+            PendingListObject{child.child_, true, object.owner_id_,
+                              object.reference_,
+                              static_cast<std::uint32_t>(slot), false});
+      }
+    }
+  }
+
+  for (unsigned owner = 0; owner < worker_count_; ++owner) {
+    if (collection_manifests_by_owner[owner].empty() &&
+        runtime_objects_by_owner[owner].empty()) {
+      continue;
+    }
+    auto install_manifests =
+        [this, owner,
+         manifests = std::move(collection_manifests_by_owner[owner]),
+         objects = std::move(runtime_objects_by_owner[owner])]() mutable {
+          WorkerStore& owner_store = *stores_[owner];
+          for (auto& [identity, manifest] : manifests) {
+            owner_store.collection_object_manifests_.insert_or_assign(
+                identity, std::move(manifest));
+          }
+          for (auto& [identity, object] : objects) {
+            owner_store.list_objects_.insert_or_assign(identity,
+                                                        std::move(object));
+          }
+          return absl::OkStatus();
+        };
+    absl::Status installed;
+    if (owner == worker.id()) {
+      installed = install_manifests();
+    } else {
+      installed =
+          co_await celer::SubmitTo(owner, std::move(install_manifests));
+    }
+    if (!installed.ok()) co_return fail_list_recovery(installed);
   }
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     if (live_by_owner[owner].empty()) {
@@ -782,6 +1016,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
   store.recovered_extents_.clear();
+  store.recovery_external_keys_.clear();
+  store.recovery_external_keys_.rehash(0);
+  store.recovery_list_objects_.clear();
+  store.recovery_list_objects_.rehash(0);
 
   std::vector<std::vector<std::uint64_t>> free_by_device(devices_.size());
   for (std::uint64_t block_id : zero_blocks) {

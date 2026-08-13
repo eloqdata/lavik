@@ -115,9 +115,10 @@ record header and in the partition metadata, but is not duplicated in every
 live index entry: recovery filters records by epoch before insertion, and reads
 capture the partition epoch together with the location. The index entry header
 is 64 bytes and stores its immutable key in the same allocation immediately
-after the header. Payload length and relocation ordinal
-remain durable header fields but are decoded only when needed instead of being
-duplicated in every live location.
+after the header. Payload length remains a durable header field but is decoded
+only when needed instead of being duplicated in every live location. Physical
+relocation ordering uses the durable LSN; there is no separate relocation
+ordinal.
 
 `record_offset` remains 32 bits: it is an offset inside an 8 MiB block, which
 does not fit in 16 bits, and using a 23-bit implementation-defined bit-field

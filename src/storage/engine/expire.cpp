@@ -95,14 +95,28 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       !IsExpired(current->value_, UnixTimeMillis())) {
     co_return absl::OkStatus();
   }
+  std::vector<RetiredRecord> list_tree_retirements;
+  std::uint64_t list_owner_id = 0;
+  if (const std::optional<ListState> state = ListStateFor(store, current);
+      state.has_value()) {
+    list_owner_id = state->owner_id_;
+    unlock.Unlock();
+    auto collected = co_await CollectListTreeRetirements(store, *state);
+    if (!collected.ok()) co_return collected.status();
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    list_tree_retirements = std::move(*collected);
+  }
   if (current->value_.shielding_) {
     // An older, still-unexpired value of this key may survive on disk;
     // without a durable tombstone above it, recovery would resurrect it
     // once this record's block is reclaimed. Keep the tombstone path for
     // exactly this case.
-    co_return co_await AppendLocked(store, partition, candidate.db_id_,
-                                    candidate.key_, {}, RecordKind::kTombstone,
-                                    ValueType::kNone, 0);
+    co_return co_await AppendLocked(
+        store, partition, candidate.db_id_, candidate.key_, {},
+        RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0,
+        std::make_shared<std::vector<RetiredRecord>>(
+            std::move(list_tree_retirements)));
   }
   // Memory-only expiration. Every older on-disk version of this key is
   // expired or gone, and the record carries its own expire_at_ms, so
@@ -143,6 +157,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   --store.live_key_count_[candidate.db_id_];
   --partition.expiring_key_count_[candidate.db_id_];
   store.external_manifests_.erase(current);
+  store.list_states_.erase(current);
+  if (list_owner_id != 0) store.list_owners_.erase(list_owner_id);
   partition.indexes_[candidate.db_id_].Erase(current);
   if (dropped.external_ && !dropped.key_external_) {
     SpawnExtentReclaim(store, dropped_extents);
@@ -151,6 +167,14 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       RetiredRecordOf(dropped, dropped_dependent_extents));
   if (!dead.ok()) {
     store.write_failed_ = true;
+    co_return dead;
+  }
+  for (const RetiredRecord& retired : list_tree_retirements) {
+    dead = co_await MarkRecordDead(retired);
+    if (!dead.ok()) {
+      store.write_failed_ = true;
+      co_return dead;
+    }
   }
   co_return dead;
 }

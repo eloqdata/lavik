@@ -98,6 +98,9 @@ add_library(keylane_module
   src/storage/engine/flush.cpp
   src/storage/engine/flush_db.cpp
   src/storage/engine/init.cpp
+  src/storage/engine/list_api.cpp
+  src/storage/engine/list_codec.cpp
+  src/storage/engine/list_tree.cpp
   src/storage/engine/metrics.cpp
   src/storage/engine/read.cpp
   src/storage/engine/recovery.cpp
@@ -110,6 +113,7 @@ add_library(keylane_module
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/command.cpp
+  src/redis/list_command.cpp
   src/redis/command_table.cpp
   src/redis/server.cpp
   src/tx/tx_shard.cpp

@@ -398,13 +398,14 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .allocation_epoch_ = source_location.allocation_epoch_,
       .record_offset_ = source_location.record_offset_,
   };
+  const std::optional<ListState> list_state = ListStateFor(key_store, current);
 
   RecordLocation relocated;
   absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
       record.expire_at_ms_, record.digest_, record.txid_,
-      record.mutation_sequence_, record.relocation_sequence_ + 1, true, true,
-      record.external_, record.key_external_, record.logical_size_,
+      record.mutation_sequence_, true, true, record.external_,
+      record.key_external_, record.logical_size_,
       ExtentsFor(key_store, current), &relocated, &source);
   if (written.code() == absl::StatusCode::kAborted) {
     // A client write replaced this key, or FLUSHDB/replica reset replaced the
@@ -415,6 +416,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   if (!written.ok()) {
     co_return written;
   }
+  if (list_state.has_value()) {
+    key_store.list_states_.insert_or_assign(current, *list_state);
+  }
   co_return std::optional<RelocationDurabilityFence>(RelocationDurabilityFence{
       .block_id_ = relocated.block_id_,
       .allocation_epoch_ = relocated.allocation_epoch_,
@@ -422,6 +426,318 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .committed_bytes_ = static_cast<std::uint32_t>(
           relocated.record_offset_ + relocated.total_disk_bytes_),
   });
+}
+
+Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
+StorageEngine::Impl::RelocateListCollectionObject(
+    std::uint64_t owner_id, DirectRecordRef source) {
+  if (owner_id == 0) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+  const unsigned key_owner =
+      static_cast<unsigned>((owner_id - 1) % worker_count_);
+  if (key_owner != celer::ThisWorker().id_) {
+    co_return absl::InternalError(
+        "List collection relocation ran on the wrong key owner");
+  }
+  WorkerStore& store = *stores_[key_owner];
+  const auto owner_found = store.list_owners_.find(owner_id);
+  if (owner_found == store.list_owners_.end()) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+  const ListOwnerRuntime owner = owner_found->second;
+  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+      owner.db_id_, tx::FingerprintOf(owner.digest_),
+      tx::LockMode::kExclusive);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+
+  // The owner record may have been replaced while the key lock suspended.
+  const auto current_owner = store.list_owners_.find(owner_id);
+  if (current_owner == store.list_owners_.end() ||
+      current_owner->second.db_id_ != owner.db_id_ ||
+      current_owner->second.key_ != owner.key_ ||
+      current_owner->second.digest_ != owner.digest_ ||
+      current_owner->second.index_generation_ != owner.index_generation_) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+  auto& partition = PartitionForKey(store, owner.key_);
+  auto& index = partition.indexes_[owner.db_id_];
+  RecordIndex::Entry* entry = index.Find(owner.digest_, owner.key_);
+  if (entry != nullptr && !entry->key_complete()) [[unlikely]] {
+    auto verified = co_await FindVerifiedEntry(
+        store, index, owner.digest_, owner.key_);
+    if (!verified.ok()) co_return verified.status();
+    entry = *verified;
+  }
+  const std::optional<ListState> current_state = ListStateFor(store, entry);
+  if (entry == nullptr || entry->value_.kind_ != RecordKind::kValue ||
+      entry->value_.value_type_ != ValueType::kList ||
+      !current_state.has_value() || current_state->owner_id_ != owner_id ||
+      store.index_generations_[owner.db_id_] != owner.index_generation_ ||
+      DbEpoch(owner.db_id_) == 0 || entry->value_.external_ ||
+      entry->value_.key_external_) {
+    // Missing/stale ownership is an ordinary race with DEL, demotion,
+    // RENAME, or another COW update. It is never storage corruption.
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+
+  struct ParentEdge {
+    DirectRecordRef parent_;
+    std::size_t selected_ = 0;
+    bool segment_ = false;
+  };
+  absl::flat_hash_map<DirectRecordIdentity, ParentEdge> parents;
+  absl::flat_hash_map<DirectRecordIdentity,
+                      std::pair<DirectRecordRef, ListDirectoryNode>>
+      directories;
+  auto identity_of = [](const DirectRecordRef& reference) {
+    return DirectRecordIdentity{reference.block_id_,
+                                reference.allocation_epoch_,
+                                reference.record_offset_};
+  };
+  bool reachable = false;
+  bool source_is_directory = false;
+  std::uint64_t source_logical_size = 0;
+  // The normal path follows validated resident reverse edges and touches only
+  // O(tree height) metadata. A COW publication that later aborted can leave a
+  // stale accelerator edge; fall back to a complete resident-directory walk
+  // in that case, never to trusting the stale edge.
+  DirectRecordRef fast_cursor = source;
+  while (true) {
+    auto meta = co_await LoadListObjectMeta(store, fast_cursor);
+    if (!meta.ok()) co_return meta.status();
+    if (!meta->has_value() || (**meta).owner_id_ != owner_id) break;
+    if (fast_cursor == source) {
+      source_is_directory = (**meta).directory_.has_value();
+      source_logical_size = (**meta).logical_size_;
+    }
+    if ((**meta).directory_.has_value()) {
+      directories.insert_or_assign(
+          identity_of(fast_cursor),
+          std::pair<DirectRecordRef, ListDirectoryNode>{
+              fast_cursor, *(**meta).directory_});
+    }
+    if (fast_cursor == current_state->directory_root_) {
+      reachable = true;
+      break;
+    }
+    if (!(**meta).parent_.valid()) break;
+    auto parent_meta =
+        co_await LoadListObjectMeta(store, (**meta).parent_);
+    if (!parent_meta.ok()) co_return parent_meta.status();
+    if (!parent_meta->has_value() ||
+        (**parent_meta).owner_id_ != owner_id ||
+        !(**parent_meta).directory_.has_value()) {
+      break;
+    }
+    const ListDirectoryNode& parent_directory =
+        *(**parent_meta).directory_;
+    const std::size_t slot = (**meta).parent_slot_;
+    const bool edge_matches =
+        (**meta).parent_is_leaf_
+            ? (parent_directory.leaf() &&
+               slot < parent_directory.segments_.size() &&
+               parent_directory.segments_[slot].segment_ == fast_cursor)
+            : (!parent_directory.leaf() &&
+               slot < parent_directory.children_.size() &&
+               parent_directory.children_[slot].child_ == fast_cursor);
+    if (!edge_matches) break;
+    directories.insert_or_assign(
+        identity_of((**meta).parent_),
+        std::pair<DirectRecordRef, ListDirectoryNode>{
+            (**meta).parent_, parent_directory});
+    parents.insert_or_assign(
+        identity_of(fast_cursor),
+        ParentEdge{(**meta).parent_, slot, (**meta).parent_is_leaf_});
+    fast_cursor = (**meta).parent_;
+  }
+
+  if (!reachable) {
+    parents.clear();
+    directories.clear();
+    source_is_directory = false;
+    source_logical_size = 0;
+    std::vector<DirectRecordRef> pending{current_state->directory_root_};
+    while (!pending.empty()) {
+      const DirectRecordRef directory_ref = pending.back();
+      pending.pop_back();
+      auto cached = co_await LoadListDirectoryMeta(store, directory_ref);
+      if (!cached.ok()) co_return cached.status();
+      ListDirectoryNode directory;
+      if (cached->has_value()) {
+        directory = std::move(**cached);
+      } else {
+        auto payload = co_await LoadCollectionObject(
+            store, directory_ref, ValueType::kList);
+        if (!payload.ok()) {
+          if (payload.status().code() == absl::StatusCode::kAborted) {
+            co_return std::optional<RelocationDurabilityFence>{};
+          }
+          co_return payload.status();
+        }
+        auto decoded = DecodeListDirectory(std::as_bytes(
+            std::span<const char>(payload->data(), payload->size())));
+        if (!decoded.ok()) co_return decoded.status();
+        directory = std::move(*decoded);
+      }
+      const DirectRecordIdentity directory_identity =
+          identity_of(directory_ref);
+      if (directory_ref == source) {
+        reachable = true;
+        source_is_directory = true;
+      }
+      directories.insert_or_assign(
+          directory_identity,
+          std::pair<DirectRecordRef, ListDirectoryNode>{directory_ref,
+                                                         directory});
+      const ListDirectoryNode& resident =
+          directories.at(directory_identity).second;
+      if (resident.leaf()) {
+        for (std::size_t i = 0; i < resident.segments_.size(); ++i) {
+          const ListSegmentMeta& segment = resident.segments_[i];
+          parents.insert_or_assign(identity_of(segment.segment_),
+                                   ParentEdge{directory_ref, i, true});
+          if (segment.segment_ == source) {
+            reachable = true;
+            source_logical_size = segment.element_count_;
+          }
+        }
+      } else {
+        for (std::size_t i = 0; i < resident.children_.size(); ++i) {
+          const DirectRecordRef child = resident.children_[i].child_;
+          parents.insert_or_assign(identity_of(child),
+                                   ParentEdge{directory_ref, i, false});
+          pending.push_back(child);
+        }
+      }
+    }
+  }
+  if (!reachable) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+
+  std::vector<DirectRecordRef> new_objects;
+  std::vector<DirectRecordRef> old_path;
+  auto cleanup_new = [&]() {
+    for (const DirectRecordRef& reference : new_objects) {
+      MarkRecordDeadLocal(store.worker_->id(), RetiredRecordOf(reference))
+          .IgnoreError();
+    }
+  };
+  bool published = false;
+  struct CleanupGuard {
+    decltype(cleanup_new)* cleanup_;
+    bool* published_;
+    ~CleanupGuard() {
+      if (!*published_) cleanup_->operator()();
+    }
+  } cleanup_guard{&cleanup_new, &published};
+
+  std::string source_payload;
+  if (source_is_directory) {
+    source_payload = EncodeListDirectory(directories.at(identity_of(source)).second);
+  } else {
+    auto loaded =
+        co_await LoadCollectionObject(store, source, ValueType::kList);
+    if (!loaded.ok()) {
+      if (loaded.status().code() == absl::StatusCode::kAborted) {
+        co_return std::optional<RelocationDurabilityFence>{};
+      }
+      co_return loaded.status();
+    }
+    source_payload = std::move(*loaded);
+  }
+  auto copied = co_await WriteCollectionObjectLocked(
+      store, owner.db_id_, ValueType::kList, source_payload, nullptr,
+      source_logical_size, owner_id, true);
+  if (!copied.ok()) co_return copied.status();
+  DirectRecordRef replacement = *copied;
+  new_objects.push_back(replacement);
+  old_path.push_back(source);
+
+  DirectRecordRef cursor = source;
+  while (cursor != current_state->directory_root_) {
+    const auto parent = parents.find(identity_of(cursor));
+    if (parent == parents.end()) {
+      co_return absl::InternalError(
+          "reachable List object has no directory parent");
+    }
+    auto directory = directories.find(identity_of(parent->second.parent_));
+    if (directory == directories.end()) {
+      co_return absl::InternalError("List relocation parent is missing");
+    }
+    ListDirectoryNode rewritten = directory->second.second;
+    if (parent->second.segment_) {
+      if (!rewritten.leaf() ||
+          parent->second.selected_ >= rewritten.segments_.size() ||
+          rewritten.segments_[parent->second.selected_].segment_ != cursor) {
+        co_return std::optional<RelocationDurabilityFence>{};
+      }
+      rewritten.segments_[parent->second.selected_].segment_ = replacement;
+    } else {
+      if (rewritten.leaf() ||
+          parent->second.selected_ >= rewritten.children_.size() ||
+          rewritten.children_[parent->second.selected_].child_ != cursor) {
+        co_return std::optional<RelocationDurabilityFence>{};
+      }
+      rewritten.children_[parent->second.selected_].child_ = replacement;
+    }
+    const std::string encoded = EncodeListDirectory(rewritten);
+    auto written = co_await WriteCollectionObjectLocked(
+        store, owner.db_id_, ValueType::kList, encoded, nullptr, 0, owner_id,
+        true);
+    if (!written.ok()) co_return written.status();
+    new_objects.push_back(*written);
+    old_path.push_back(parent->second.parent_);
+    cursor = parent->second.parent_;
+    replacement = *written;
+  }
+
+  std::vector<RetiredRecord> resolved;
+  resolved.reserve(old_path.size());
+  for (const DirectRecordRef& old : old_path) {
+    auto retirement = co_await ResolveCollectionRetirement(store, old);
+    if (!retirement.ok()) co_return retirement.status();
+    resolved.push_back(std::move(*retirement));
+  }
+  auto retirements =
+      std::make_shared<std::vector<RetiredRecord>>(std::move(resolved));
+  ListState relocated_state = *current_state;
+  relocated_state.directory_root_ = replacement;
+  const std::string root_payload = EncodeListRoot(relocated_state);
+  const RecordLocation root_source = entry->value_;
+  const RelocationSource relocation_source{
+      .db_epoch_ = DbEpoch(owner.db_id_),
+      .replication_epoch_ = partition.replication_epoch_,
+      .index_generation_ = owner.index_generation_,
+      .block_id_ = root_source.block_id_,
+      .allocation_epoch_ = root_source.allocation_epoch_,
+      .record_offset_ = root_source.record_offset_,
+  };
+  RecordLocation relocated_root;
+  absl::Status root_written = co_await WriteRecordLocked(
+      store, owner.db_id_, owner.key_, root_payload, RecordKind::kValue,
+      ValueType::kList, root_source.expire_at_ms_, owner.digest_, 0,
+      root_source.mutation_sequence_, true, true, false, false,
+      kSegmentedCollection, nullptr, &relocated_root, &relocation_source,
+      nullptr, std::move(retirements));
+  if (root_written.code() == absl::StatusCode::kAborted) {
+    co_return std::optional<RelocationDurabilityFence>{};
+  }
+  if (!root_written.ok()) co_return root_written;
+  store.list_states_.insert_or_assign(entry, relocated_state);
+  published = true;
+  KEYLANE_MAYBE_CRASH_AT("list-defrag-root-published");
+  co_return std::optional<RelocationDurabilityFence>{
+      RelocationDurabilityFence{
+          .block_id_ = relocated_root.block_id_,
+          .allocation_epoch_ = relocated_root.allocation_epoch_,
+          .block_owner_ = relocated_root.block_owner_,
+          .committed_bytes_ = static_cast<std::uint32_t>(
+              relocated_root.record_offset_ +
+              relocated_root.total_disk_bytes_),
+      }};
 }
 
 Task<absl::Status> StorageEngine::Impl::AwaitRelocationDurableLocal(
@@ -518,7 +834,8 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
     co_return absl::OkStatus();
   }
   BlockState& source = *source_ptr;
-  if (!source.allocated_ || source.in_memory_ || source.pins_ != 0 ||
+  if (!source.allocated_ || source.defragging_ || source.in_memory_ ||
+      source.pins_ != 0 ||
       source.flush_queued_ || source.flush_in_progress_ ||
       IsActiveBlock(store, block_id)) {
     co_return absl::OkStatus();
@@ -697,6 +1014,75 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       co_return absl::Status(absl::StatusCode::kInternal,
                              "payload checksum mismatch during defrag");
     }
+    // Collection objects are addressed by immutable physical references in
+    // their parent directory. Moving one requires a COW rewrite through the
+    // keyed root, but it must not prevent ordinary records later in this
+    // mixed block from being relocated.
+    if (record.kind_ == RecordKind::kCollectionObject) {
+      const DirectRecordIdentity identity{
+          block_id, record.allocation_epoch_, record_offset};
+      const auto runtime = store.list_objects_.find(identity);
+      if (runtime != store.list_objects_.end()) {
+        const DirectRecordRef reference{
+            .block_id_ = block_id,
+            .allocation_epoch_ = record.allocation_epoch_,
+            .record_offset_ = record_offset,
+            .total_disk_bytes_ = record.total_disk_bytes_,
+            .payload_checksum_ = record.payload_checksum_,
+            .reserved_ = 0,
+        };
+        if (runtime->second.reference_ == reference &&
+            runtime->second.owner_id_ != 0) {
+          const std::uint64_t owner_id = runtime->second.owner_id_;
+          const unsigned key_owner =
+              static_cast<unsigned>((owner_id - 1) % worker_count_);
+          absl::StatusOr<std::optional<RelocationDurabilityFence>> relocated(
+              std::optional<RelocationDurabilityFence>{});
+          if (key_owner == store.worker_->id()) {
+            relocated =
+                co_await RelocateListCollectionObject(owner_id, reference);
+          } else {
+            relocated = co_await celer::SubmitTaskTo(
+                key_owner,
+                [this, owner_id, reference]()
+                    -> Task<absl::StatusOr<std::optional<
+                        RelocationDurabilityFence>>> {
+                  co_return co_await RelocateListCollectionObject(owner_id,
+                                                                  reference);
+                });
+          }
+          if (!relocated.ok()) {
+            source.defragging_ = false;
+            co_return relocated.status();
+          }
+          if (relocated->has_value()) {
+            const RelocationDurabilityFence& fence = **relocated;
+            auto existing = std::find_if(
+                durability_fences.begin(), durability_fences.end(),
+                [&](const RelocationDurabilityFence& candidate) {
+                  return candidate.block_owner_ == fence.block_owner_ &&
+                         candidate.block_id_ == fence.block_id_ &&
+                         candidate.allocation_epoch_ ==
+                             fence.allocation_epoch_;
+                });
+            if (existing == durability_fences.end()) {
+              durability_fences.push_back(fence);
+            } else {
+              existing->committed_bytes_ =
+                  std::max(existing->committed_bytes_,
+                           fence.committed_bytes_);
+            }
+          }
+        }
+      }
+      record_offset += record.total_disk_bytes_;
+      absl::Status paced = co_await DefragRecordCheckpoint(store);
+      if (!paced.ok()) {
+        source.defragging_ = false;
+        co_return paced;
+      }
+      continue;
+    }
     std::string loaded_key;
     if (record.key_external_) [[unlikely]] {
       if (record.external_) {
@@ -744,8 +1130,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         .value_type_ = record.value_type_,
     };
     if (record.external_) {
-      const std::uint64_t extent_bytes =
-          record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
+      const std::uint64_t extent_bytes = record.logical_size_ +
+          (record.key_external_ ? record.key_bytes_ : 0);
       auto decoded =
           DecodeManifest(payload, extent_bytes,
                          record.kind_ != RecordKind::kValue ||
@@ -773,7 +1159,7 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         commit_written = co_await WriteRecordLocked(
             store, record.db_id_, {}, {}, RecordKind::kTxCommit,
             ValueType::kNone, 0, record.digest_, record.txid_, 0,
-            record.relocation_sequence_ + 1, true, true, false, false,
+            true, true, false, false,
             std::numeric_limits<std::uint64_t>::max(), nullptr,
             &relocated_commit);
       }

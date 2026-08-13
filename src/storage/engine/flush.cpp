@@ -135,6 +135,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       std::fill_n(buffer.data_ + state->committed_bytes_,
                   padded - state->committed_bytes_, std::byte{0});
       state->committed_bytes_ = padded;
+      staging_state.committed_bytes_ = padded;
       if (store->active_block_.has_value() &&
           store->active_block_->block_id_ == block_id) {
         store->active_block_->committed_bytes_ = padded;

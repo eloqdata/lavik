@@ -157,6 +157,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // released as a unit, so they are collected per record rather than
     // folded into the per-block totals.
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
+    std::vector<ListState> dead_list_trees;
     detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
       BlockDelta& delta = dead_by_block[std::pair(
           entry.value_.block_id_, entry.value_.allocation_epoch_)];
@@ -173,7 +174,24 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           store.external_manifests_.erase(manifest);
         }
       }
+      if (const std::optional<ListState> state = ListStateFor(store, &entry);
+          state.has_value()) {
+        dead_list_trees.push_back(*state);
+        if (state->owner_id_ != 0) {
+          store.list_owners_.erase(state->owner_id_);
+        }
+      }
+      store.list_states_.erase(&entry);
     });
+
+    std::vector<RetiredRecord> dead_list_objects;
+    for (const ListState& state : dead_list_trees) {
+      auto collected = co_await CollectListTreeRetirements(store, state);
+      if (!collected.ok()) co_return collected.status();
+      dead_list_objects.insert(dead_list_objects.end(),
+                               std::make_move_iterator(collected->begin()),
+                               std::make_move_iterator(collected->end()));
+    }
 
     for (const auto& extents : dead_extents) {
       SpawnExtentReclaim(store, extents);
@@ -188,7 +206,10 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           .allocation_epoch_ = block.second,
           .total_disk_bytes_ = static_cast<std::uint32_t>(delta.bytes_),
           .block_owner_ = delta.block_owner_,
+          .record_offset_ = 0,
+          .collection_object_ = false,
           .dependent_extents_ = nullptr,
+          .immediate_extents_ = nullptr,
           .extra_dependent_extents_ =
               delta.dependent_extents_.empty()
                   ? nullptr
@@ -196,6 +217,14 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
                         std::move(delta.dependent_extents_)),
       };
       absl::Status dead = co_await MarkRecordDead(aggregate);
+      if (!dead.ok()) {
+        store.write_failed_ = true;
+        co_return dead;
+      }
+    }
+
+    for (const RetiredRecord& record : dead_list_objects) {
+      absl::Status dead = co_await MarkRecordDead(record);
       if (!dead.ok()) {
         store.write_failed_ = true;
         co_return dead;

@@ -1,196 +1,29 @@
 #include "impl.h"
 
+#include "absl/strings/str_cat.h"
+
 namespace keylane::storage {
 
 namespace {
 
-constexpr std::string_view kListEncodingMagic = "KLL1";
-constexpr std::size_t kListEncodingHeaderBytes = 8;
-
-void AppendU32(std::string* output, std::uint32_t value) {
-  output->push_back(static_cast<char>(value));
-  output->push_back(static_cast<char>(value >> 8));
-  output->push_back(static_cast<char>(value >> 16));
-  output->push_back(static_cast<char>(value >> 24));
-}
-
-bool ReadU32(std::string_view input, std::size_t* offset,
-             std::uint32_t* value) {
-  if (*offset > input.size() || input.size() - *offset < sizeof(*value)) {
-    return false;
+ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
+                                      ExtentManifest replacement) {
+  if (previous == nullptr || previous->empty()) return {};
+  if (replacement == nullptr || replacement->empty()) return previous;
+  auto retired = std::make_shared<std::vector<ExtentRef>>();
+  for (const ExtentRef& old : *previous) {
+    const bool reused = std::any_of(
+        replacement->begin(), replacement->end(), [&](const ExtentRef& next) {
+          return old.block_id_ == next.block_id_ &&
+                 old.allocation_epoch_ == next.allocation_epoch_;
+        });
+    if (!reused) retired->push_back(old);
   }
-  const auto* bytes =
-      reinterpret_cast<const unsigned char*>(input.data()) + *offset;
-  *value = static_cast<std::uint32_t>(bytes[0]) |
-           (static_cast<std::uint32_t>(bytes[1]) << 8) |
-           (static_cast<std::uint32_t>(bytes[2]) << 16) |
-           (static_cast<std::uint32_t>(bytes[3]) << 24);
-  *offset += sizeof(*value);
-  return true;
-}
-
-absl::StatusOr<std::vector<std::string_view>> DecodeList(
-    std::string_view encoded, std::uint32_t logical_size) {
-  if (encoded.size() < kListEncodingHeaderBytes ||
-      encoded.substr(0, kListEncodingMagic.size()) != kListEncodingMagic) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "invalid persisted list encoding");
-  }
-  std::size_t offset = kListEncodingMagic.size();
-  std::uint32_t count = 0;
-  if (!ReadU32(encoded, &offset, &count) || count != logical_size ||
-      count >
-          (encoded.size() - kListEncodingHeaderBytes) / sizeof(std::uint32_t)) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "persisted list length does not match metadata");
-  }
-  std::vector<std::string_view> elements;
-  elements.reserve(count);
-  for (std::uint32_t index = 0; index < count; ++index) {
-    std::uint32_t bytes = 0;
-    if (!ReadU32(encoded, &offset, &bytes) || offset > encoded.size() ||
-        bytes > encoded.size() - offset) {
-      return absl::Status(absl::StatusCode::kInternal,
-                          "persisted list element is truncated");
-    }
-    elements.emplace_back(encoded.data() + offset, bytes);
-    offset += bytes;
-  }
-  if (offset != encoded.size()) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "persisted list has trailing bytes");
-  }
-  return elements;
-}
-
-absl::StatusOr<std::string> EncodePushedList(
-    std::span<const std::string_view> pushed,
-    std::span<const std::string_view> existing) {
-  std::uint64_t encoded_bytes = kListEncodingHeaderBytes;
-  auto account = [&encoded_bytes](std::string_view element) {
-    if (element.size() > kMaxStringBytes ||
-        encoded_bytes > kMaxStringBytes - sizeof(std::uint32_t) ||
-        element.size() >
-            kMaxStringBytes - encoded_bytes - sizeof(std::uint32_t)) {
-      return false;
-    }
-    encoded_bytes += sizeof(std::uint32_t) + element.size();
-    return true;
-  };
-  for (std::string_view element : pushed) {
-    if (!account(element)) {
-      return absl::Status(absl::StatusCode::kOutOfRange,
-                          "list payload exceeds storage limits");
-    }
-  }
-  for (std::string_view element : existing) {
-    if (!account(element)) {
-      return absl::Status(absl::StatusCode::kOutOfRange,
-                          "list payload exceeds storage limits");
-    }
-  }
-
-  if (existing.size() > std::numeric_limits<std::uint32_t>::max() ||
-      pushed.size() >
-          std::numeric_limits<std::uint32_t>::max() - existing.size()) {
-    return absl::Status(absl::StatusCode::kOutOfRange,
-                        "list has too many elements");
-  }
-  const std::uint64_t count = pushed.size() + existing.size();
-  std::string output;
-  output.reserve(static_cast<std::size_t>(encoded_bytes));
-  output.append(kListEncodingMagic);
-  AppendU32(&output, static_cast<std::uint32_t>(count));
-  for (auto it = pushed.rbegin(); it != pushed.rend(); ++it) {
-    AppendU32(&output, static_cast<std::uint32_t>(it->size()));
-    output.append(*it);
-  }
-  for (std::string_view element : existing) {
-    AppendU32(&output, static_cast<std::uint32_t>(element.size()));
-    output.append(element);
-  }
-  return output;
+  if (retired->empty()) return {};
+  return std::shared_ptr<const std::vector<ExtentRef>>(std::move(retired));
 }
 
 }  // namespace
-
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPush(
-    std::uint8_t db_id, std::string_view key,
-    std::span<const std::string_view> values) {
-  assert(db_id < kLogicalDatabaseCount);
-  const Digest digest = ComputeDigest(key);
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  co_return co_await ListPushLocked(db_id, key, digest, values);
-}
-
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::span<const std::string_view> values, TxShardWrites* tx) {
-  assert(db_id < kLogicalDatabaseCount);
-  if (values.empty()) {
-    co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                           "LPUSH requires at least one element");
-  }
-  WorkerStore& store = CurrentStore();
-  auto& partition = PartitionForKey(store, key);
-  co_await store.store_state_mutex_.Lock();
-  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
-  if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
-    found = *resolved;
-  }
-
-  std::vector<std::string_view> existing;
-  std::optional<LoadedValue> loaded;
-  std::uint64_t expire_at_ms = 0;
-  const bool exists = found != nullptr &&
-                      found->value_.kind_ == RecordKind::kValue &&
-                      !IsExpired(found->value_, UnixTimeMillis());
-  if (exists) {
-    if (found->value_.value_type_ != ValueType::kList) {
-      co_return absl::Status(
-          absl::StatusCode::kInvalidArgument,
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
-    }
-    expire_at_ms = found->value_.expire_at_ms_;
-    auto value = co_await LoadValue(store, partition, db_id, key, digest,
-                                    found->value_, ExtentsFor(store, found));
-    if (!value.ok()) {
-      co_return value.status();
-    }
-    loaded.emplace(std::move(*value));
-    const auto bytes = loaded->value();
-    auto decoded =
-        DecodeList(std::string_view(reinterpret_cast<const char*>(bytes.data()),
-                                    bytes.size()),
-                   found->value_.logical_size_);
-    if (!decoded.ok()) {
-      co_return decoded.status();
-    }
-    existing = std::move(*decoded);
-  }
-
-  auto encoded = EncodePushedList(values, existing);
-  if (!encoded.ok()) {
-    co_return encoded.status();
-  }
-  loaded.reset();
-  const std::uint64_t new_size = values.size() + existing.size();
-  absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key, *encoded, RecordKind::kValue,
-      ValueType::kList, expire_at_ms, tx, new_size);
-  if (!status.ok()) {
-    co_return status;
-  }
-  co_return new_size;
-}
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
                                                          std::string_view key,
@@ -255,10 +88,41 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   const std::uint64_t expire_at_ms = options.keep_ttl_ && exists
                                          ? found->value_.expire_at_ms_
                                          : options.expire_at_ms_;
+  std::shared_ptr<std::vector<RetiredRecord>> tree_retirements;
+  const std::size_t tx_retirement_start =
+      tx == nullptr ? 0 : tx->retirements_.size();
+  if (const std::optional<ListState> state = ListStateFor(store, found);
+      state.has_value()) {
+    unlock.Unlock();
+    auto collected = co_await CollectListTreeRetirements(store, *state);
+    if (!collected.ok()) co_return collected.status();
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    if (tx == nullptr) {
+      tree_retirements = std::make_shared<std::vector<RetiredRecord>>(
+          std::move(*collected));
+    } else {
+      for (const RetiredRecord& record : *collected) {
+        tx->retirements_.push_back(TxShardWrites::Retired{
+            .block_id_ = record.block_id_,
+            .allocation_epoch_ = record.allocation_epoch_,
+            .total_disk_bytes_ = record.total_disk_bytes_,
+            .block_owner_ = record.block_owner_,
+            .record_offset_ = record.record_offset_,
+            .collection_object_ = true,
+            .dependent_extents_ = record.dependent_extents_,
+            .immediate_extents_ = nullptr,
+        });
+      }
+    }
+  }
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
-      ValueType::kString, expire_at_ms, tx);
+      ValueType::kString, expire_at_ms, tx,
+      std::numeric_limits<std::uint64_t>::max(),
+      std::move(tree_retirements));
   if (!status.ok()) {
+    if (tx != nullptr) tx->retirements_.resize(tx_retirement_start);
     co_return status;
   }
   result.applied_ = true;
@@ -323,16 +187,59 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
 
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
-    absl::Status status =
-        co_await AppendLocked(store, partition, db_id, key, {},
-                              RecordKind::kTombstone, ValueType::kNone, 0, tx);
+    std::shared_ptr<std::vector<RetiredRecord>> tree_retirements;
+    const std::size_t tx_retirement_start =
+        tx == nullptr ? 0 : tx->retirements_.size();
+    if (const std::optional<ListState> state = ListStateFor(store, found);
+        state.has_value()) {
+      unlock.Unlock();
+      auto collected = co_await CollectListTreeRetirements(store, *state);
+      if (!collected.ok()) co_return collected.status();
+      co_await store.store_state_mutex_.Lock();
+      unlock.Adopt();
+      if (tx == nullptr) {
+        tree_retirements = std::make_shared<std::vector<RetiredRecord>>(
+            std::move(*collected));
+      } else {
+        for (const RetiredRecord& record : *collected) {
+          tx->retirements_.push_back(TxShardWrites::Retired{
+              .block_id_ = record.block_id_,
+              .allocation_epoch_ = record.allocation_epoch_,
+              .total_disk_bytes_ = record.total_disk_bytes_,
+              .block_owner_ = record.block_owner_,
+              .record_offset_ = record.record_offset_,
+              .collection_object_ = true,
+              .dependent_extents_ = record.dependent_extents_,
+              .immediate_extents_ = nullptr,
+          });
+        }
+      }
+    }
+    absl::Status status = co_await AppendLocked(
+        store, partition, db_id, key, {}, RecordKind::kTombstone,
+        ValueType::kNone, 0, tx, 0, std::move(tree_retirements));
     if (!status.ok()) {
+      if (tx != nullptr) tx->retirements_.resize(tx_retirement_start);
       co_return status;
     }
     co_return true;
   }
 
   const RecordLocation previous = found->value_;
+  if (const std::optional<ListState> state = ListStateFor(store, found);
+      state.has_value()) {
+    const std::string root = EncodeListRoot(*state);
+    absl::Status status = co_await AppendLocked(
+        store, partition, db_id, key, root, RecordKind::kValue,
+        ValueType::kList, expire_at_ms, tx, kSegmentedCollection);
+    if (!status.ok()) co_return status;
+    RecordIndex::Entry* current_entry = index.Find(digest, key);
+    if (current_entry == nullptr) {
+      co_return absl::InternalError("List TTL rewrite lost its index entry");
+    }
+    store.list_states_.insert_or_assign(current_entry, *state);
+    co_return true;
+  }
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
   if (!loaded.ok()) {
@@ -381,10 +288,40 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     co_return false;
   }
   const bool expired = IsExpired(found->value_, UnixTimeMillis());
+  std::shared_ptr<std::vector<RetiredRecord>> tree_retirements;
+  const std::size_t tx_retirement_start =
+      tx == nullptr ? 0 : tx->retirements_.size();
+  if (const std::optional<ListState> list_state = ListStateFor(store, found);
+      list_state.has_value()) {
+    unlock.Unlock();
+    auto collected = co_await CollectListTreeRetirements(store, *list_state);
+    if (!collected.ok()) co_return collected.status();
+    co_await store.store_state_mutex_.Lock();
+    unlock.Adopt();
+    if (tx == nullptr) {
+      tree_retirements = std::make_shared<std::vector<RetiredRecord>>(
+          std::move(*collected));
+    } else {
+      for (const RetiredRecord& record : *collected) {
+        tx->retirements_.push_back(TxShardWrites::Retired{
+            .block_id_ = record.block_id_,
+            .allocation_epoch_ = record.allocation_epoch_,
+            .total_disk_bytes_ = record.total_disk_bytes_,
+            .block_owner_ = record.block_owner_,
+            .record_offset_ = record.record_offset_,
+            .collection_object_ = true,
+            .dependent_extents_ = record.dependent_extents_,
+            .immediate_extents_ = nullptr,
+        });
+      }
+    }
+  }
   absl::Status status =
       co_await AppendLocked(store, partition, db_id, key, {},
-                            RecordKind::kTombstone, ValueType::kNone, 0, tx);
+                            RecordKind::kTombstone, ValueType::kNone, 0, tx, 0,
+                            std::move(tree_retirements));
   if (!status.ok()) {
+    if (tx != nullptr) tx->retirements_.resize(tx_retirement_start);
     co_return status;
   }
   co_return !expired;
@@ -519,8 +456,12 @@ absl::Status StorageEngine::Impl::MarkRecordDeadLocal(
   // reachable, which CleanBlockLocked now reads as "nothing to salvage" and
   // frees without inspecting the block. Fail loudly rather than lose data.
   if (state->live_bytes_ < record.total_disk_bytes_) {
-    return absl::Status(absl::StatusCode::kInternal,
-                        "block live-byte accounting underflow");
+    return absl::Status(
+        absl::StatusCode::kInternal,
+        absl::StrCat("block live-byte accounting underflow: block=",
+                     record.block_id_, " live=", state->live_bytes_,
+                     " retire=", record.total_disk_bytes_, " epoch=",
+                     record.allocation_epoch_));
   }
   if (record.dependent_extents_ != nullptr) [[unlikely]] {
     store.deferred_dependent_extent_reclaims_[record.block_id_].push_back(
@@ -531,6 +472,15 @@ absl::Status StorageEngine::Impl::MarkRecordDeadLocal(
         store.deferred_dependent_extent_reclaims_[record.block_id_];
     deferred.insert(deferred.end(), record.extra_dependent_extents_->begin(),
                     record.extra_dependent_extents_->end());
+  }
+  if (record.immediate_extents_ != nullptr) [[unlikely]] {
+    SpawnExtentReclaim(store, record.immediate_extents_);
+  }
+  if (record.collection_object_) {
+    const DirectRecordIdentity identity{
+        record.block_id_, record.allocation_epoch_, record.record_offset_};
+    store.collection_object_manifests_.erase(identity);
+    store.list_objects_.erase(identity);
   }
   state->live_bytes_ -= record.total_disk_bytes_;
   MaybeQueueDefrag(store, record.block_id_);
@@ -580,7 +530,10 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
           .allocation_epoch_ = retired.allocation_epoch_,
           .total_disk_bytes_ = retired.total_disk_bytes_,
           .block_owner_ = retired.block_owner_,
+          .record_offset_ = retired.record_offset_,
+          .collection_object_ = retired.collection_object_,
           .dependent_extents_ = retired.dependent_extents_,
+          .immediate_extents_ = retired.immediate_extents_,
           .extra_dependent_extents_ = nullptr,
       });
     }
@@ -595,7 +548,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   RecordLocation commit_location;
   absl::Status written = co_await WriteRecordLocked(
       store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
-      ComputeDigest({}), txid, 0, 0, false, true, false, false,
+      ComputeDigest({}), txid, 0, false, true, false, false,
       std::numeric_limits<std::uint64_t>::max(), nullptr, &commit_location,
       nullptr, nullptr, std::move(retirements));
   if (!written.ok()) {
@@ -613,8 +566,18 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
   WorkerStore& store = CurrentStore();
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+  std::vector<RetiredRecord> new_collection_objects;
+  if (auto objects = store.tx_new_collection_objects_.find(txid);
+      objects != store.tx_new_collection_objects_.end()) {
+    new_collection_objects = std::move(objects->second);
+    store.tx_new_collection_objects_.erase(objects);
+  }
   auto found = store.tx_undo_.find(txid);
   if (found == store.tx_undo_.end()) {
+    for (const RetiredRecord& object : new_collection_objects) {
+      absl::Status dead = MarkRecordDeadLocal(store.worker_->id(), object);
+      if (!dead.ok()) co_return dead;
+    }
     co_return absl::OkStatus();
   }
   std::vector<TxUndoEntry> undo = std::move(found->second);
@@ -684,9 +647,29 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
     } else {
       store.external_manifests_.erase(entry.entry_);
     }
+    if (entry.previous_list_state_.has_value()) {
+      store.list_states_.insert_or_assign(entry.entry_,
+                                          *entry.previous_list_state_);
+      const ListState& restored = *entry.previous_list_state_;
+      if (restored.owner_id_ != 0) {
+        store.list_owners_.insert_or_assign(
+            restored.owner_id_,
+            ListOwnerRuntime{
+                .db_id_ = entry.db_id_,
+                .key_ = std::string(undo_key),
+                .digest_ = ComputeDigest(undo_key),
+                .index_generation_ =
+                    store.index_generations_[entry.db_id_],
+            });
+      }
+    } else {
+      store.list_states_.erase(entry.entry_);
+    }
     if (applied.external_ && !applied.key_external_ &&
         applied_extents != nullptr) {
-      SpawnExtentReclaim(store, applied_extents);
+      SpawnExtentReclaim(
+          store,
+          ExtentsNotReferencedBy(applied_extents, entry.previous_extents_));
     }
     absl::Status dead = MarkRecordDeadLocal(
         store.worker_->id(),
@@ -703,6 +686,17 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(std::uint64_t txid) {
       partition.delta_floor_ = partition.mutation_sequence_;
     }
   }
+  // Anonymous COW objects are deliberately untagged so a committed root can
+  // reach them without retaining tx metadata forever. Runtime abort therefore
+  // mirrors commit retirement explicitly: after every keyed root has been
+  // restored, none of these newly allocated objects is reachable.
+  for (const RetiredRecord& object : new_collection_objects) {
+    absl::Status dead = MarkRecordDeadLocal(store.worker_->id(), object);
+    if (!dead.ok()) {
+      store.write_failed_ = true;
+      co_return dead;
+    }
+  }
   co_return absl::OkStatus();
 }
 
@@ -711,6 +705,7 @@ Task<absl::Status> StorageEngine::Impl::DiscardTxUndoLocal(std::uint64_t txid) {
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   store.tx_undo_.erase(txid);
+  store.tx_new_collection_objects_.erase(txid);
   co_return absl::OkStatus();
 }
 
@@ -884,6 +879,12 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
         .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
         .payload_checksum_ = payload_checksum,
     };
+    auto allocated_lsn = AllocateLsn(store);
+    if (!allocated_lsn.ok()) {
+      release_buffer();
+      reclaim_allocated();
+      co_return allocated_lsn.status();
+    }
     BlockHeader header{
         .magic_ = kBlockMagic,
         .block_id_ = reserved->block_id_,
@@ -895,7 +896,7 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
         .committed_bytes_ =
             static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
         .record_count_ = 0,
-        .max_lsn_ = next_lsn_.fetch_add(1, std::memory_order_relaxed),
+        .max_lsn_ = *allocated_lsn,
         .header_sequence_ = 1,
         .checksum_ = 0,
         .layout_worker_count_ = worker_count_,
@@ -971,9 +972,23 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     std::uint8_t db_id, std::string_view key, std::string_view value,
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
-    TxShardWrites* tx, std::uint64_t logical_size) {
+    TxShardWrites* tx, std::uint64_t logical_size,
+    std::shared_ptr<std::vector<RetiredRecord>> commit_retirements) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
+  }
+  std::string portable_list_value;
+  std::uint64_t replicated_logical_size = logical_size;
+  if (partition.capture_deltas_ && kind == RecordKind::kValue &&
+      value_type == ValueType::kList &&
+      logical_size == kSegmentedCollection) {
+    auto state = DecodeListRoot(std::as_bytes(
+        std::span<const char>(value.data(), value.size())));
+    if (!state.ok()) co_return state.status();
+    auto materialized = co_await MaterializeListValueLocked(store, *state);
+    if (!materialized.ok()) co_return materialized.status();
+    portable_list_value = std::move(*materialized);
+    replicated_logical_size = state->element_count_;
   }
   const Digest digest = ComputeDigest(key);
   // Every real keyspace modification funnels through here (client writes,
@@ -997,16 +1012,18 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     const std::string manifest = EncodeManifest(**extents);
     status = co_await WriteRecordLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, 0, false, true, true, key_external,
-        logical_size, *extents, nullptr, nullptr, tx);
+        /*txid=*/0, mutation_sequence, false, true, true, key_external,
+        logical_size, *extents, nullptr, nullptr, tx,
+        std::move(commit_retirements));
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
   } else {
     status = co_await WriteRecordLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
-        /*txid=*/0, mutation_sequence, 0, false, true, false, key_external,
-        logical_size, nullptr, nullptr, nullptr, tx);
+        /*txid=*/0, mutation_sequence, false, true, false, key_external,
+        logical_size, nullptr, nullptr, nullptr, tx,
+        std::move(commit_retirements));
   }
   if (status.ok() && partition.capture_deltas_) {
     AppendDelta(partition, SnapshotRecord{
@@ -1018,9 +1035,11 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                .mutation_sequence_ = mutation_sequence,
                                .expire_at_ms_ = expire_at_ms,
                                .value_type_ = value_type,
-                               .logical_size_ = logical_size,
+                               .logical_size_ = replicated_logical_size,
                                .key_ = std::string(key),
-                               .value_ = std::string(value),
+                               .value_ = portable_list_value.empty()
+                                             ? std::string(value)
+                                             : std::move(portable_list_value),
                            });
   }
   co_return status;
@@ -1045,8 +1064,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     WorkerStore& store, std::uint8_t db_id, std::string_view key,
     std::string_view value, RecordKind kind, ValueType value_type,
     std::uint64_t expire_at_ms, const Digest& digest, std::uint64_t txid,
-    std::uint64_t mutation_sequence, std::uint64_t relocation_sequence,
-    bool for_defrag, bool unlock_writer_while_waiting, bool external,
+    std::uint64_t mutation_sequence, bool for_defrag,
+    bool unlock_writer_while_waiting, bool external,
     bool key_external, std::uint64_t logical_size,
     std::shared_ptr<const std::vector<ExtentRef>> extents,
     RecordLocation* written_location, const RelocationSource* relocation,
@@ -1084,8 +1103,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   const bool invalid_logical_size =
       (value_type == ValueType::kString && logical_size > kMaxStringBytes) ||
-      (value_type != ValueType::kString &&
-       logical_size > std::numeric_limits<std::uint32_t>::max());
+      logical_size > std::numeric_limits<std::uint32_t>::max();
   const std::uint64_t key_prefix = key_external ? key.size() : 0;
   if (invalid_logical_size || value.size() > kMaxRecordPayloadBytes ||
       key_prefix > kMaxRecordPayloadBytes - value.size()) {
@@ -1134,10 +1152,17 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // wherever their coordinator runs, and recovery reads them independently
   // of any partition's epochs.
   WorkerStore::PartitionStore* partition_ptr =
-      kind == RecordKind::kTxCommit ? nullptr : &PartitionForKey(store, key);
+      kind == RecordKind::kTxCommit ||
+              kind == RecordKind::kCollectionObject
+          ? nullptr
+          : &PartitionForKey(store, key);
   RecordIndex* index_ptr =
       partition_ptr == nullptr ? nullptr : &partition_ptr->indexes_[db_id];
-  const std::uint64_t lsn = next_lsn_.fetch_add(1, std::memory_order_relaxed);
+  auto allocated_lsn = AllocateLsn(store);
+  if (!allocated_lsn.ok()) {
+    co_return allocated_lsn.status();
+  }
+  const std::uint64_t lsn = *allocated_lsn;
 
   auto& active = store.active_block_;
   while (!active.has_value() ||
@@ -1215,6 +1240,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       staging_state.write_buffer_id_ = write_buffer_id;
       staging_state.heap_data_ = heap_buffer;
       staging_state.heap_data_size_ = options_.buffers_.write_buffer_bytes_;
+      staging_state.committed_bytes_ = kBlockHeaderBytes;
       store.staged_records_.erase(block_id);
 
       // The header region stays zero in staging until a flush encodes it
@@ -1254,6 +1280,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           ? std::nullopt
           : std::optional<RecordLocation>(previous_entry->value_);
   const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
+  const std::optional<ListState> previous_list_state =
+      ListStateFor(store, previous_entry);
+  const ExtentManifest retired_value_extents = ExtentsNotReferencedBy(
+      previous_extents, external && !key_external ? extents : nullptr);
   const ExtentManifest previous_dependent_extents =
       DependentExtentsFor(store, previous_entry);
   ActiveBlock updated = *active;
@@ -1296,7 +1326,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .key_external_ = key_external,
       .digest_ = digest,
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
-      .logical_size_ = logical_size,
+      .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
       .txid_ = txid,
@@ -1309,7 +1339,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .db_epoch_ =
           relocation != nullptr ? relocation->db_epoch_ : DbEpoch(db_id),
       .mutation_sequence_ = mutation_sequence,
-      .relocation_sequence_ = relocation_sequence,
       .expire_at_ms_ = expire_at_ms,
       .lsn_ = lsn,
       .allocation_epoch_ = updated.allocation_epoch_,
@@ -1394,16 +1423,34 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     } else {
       store.external_manifests_.erase(inserted_entry);
     }
+    if (relocation != nullptr && previous_list_state.has_value()) {
+      store.list_states_.insert_or_assign(inserted_entry,
+                                          *previous_list_state);
+    } else {
+      store.list_states_.erase(inserted_entry);
+    }
+    const bool next_segmented_list =
+        kind == RecordKind::kValue && value_type == ValueType::kList &&
+        logical_size == kSegmentedCollection;
+    if (previous_list_state.has_value() && !next_segmented_list &&
+        previous_list_state->owner_id_ != 0) {
+      store.list_owners_.erase(previous_list_state->owner_id_);
+    }
   }
   const bool route_to_commit = tx != nullptr && previous.has_value();
+  const bool defer_defrag_retirement =
+      for_defrag && commit_retirements != nullptr;
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
       .entry_ = inserted_entry,
-      .retired_extents_ = !for_defrag && previous.has_value() &&
+      .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
+                                  !route_to_commit &&
+                                  previous.has_value() &&
                                   previous->external_ &&
                                   !previous->key_external_
-                              ? previous_extents
+                              ? retired_value_extents
                               : nullptr,
-      .retired_record_ = !for_defrag && !route_to_commit && previous.has_value()
+      .retired_record_ = (!for_defrag || defer_defrag_retirement) &&
+                                  !route_to_commit && previous.has_value()
                              ? std::optional<RetiredRecord>(RetiredRecordOf(
                                    *previous, previous_dependent_extents))
                              : std::nullopt,
@@ -1416,6 +1463,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         .entry_ = inserted_entry,
         .previous_ = previous,
         .previous_extents_ = previous_extents,
+        .previous_list_state_ = previous_list_state,
         .db_id_ = db_id,
     });
   }
@@ -1429,7 +1477,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         .allocation_epoch_ = previous->allocation_epoch_,
         .total_disk_bytes_ = previous->total_disk_bytes_,
         .block_owner_ = previous->block_owner_,
-        .dependent_extents_ = previous_dependent_extents,
+        .record_offset_ = previous->record_offset_,
+        .collection_object_ = false,
+        .dependent_extents_ = previous->key_external_
+                                  ? previous_dependent_extents
+                                  : nullptr,
+        .immediate_extents_ = previous->key_external_
+                                  ? nullptr
+                                  : retired_value_extents,
     });
   }
   if (tx != nullptr) {
@@ -1471,6 +1526,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   state.committed_bytes_ = updated.committed_bytes_;
   state.in_memory_ = true;
+  staging_state->committed_bytes_ = updated.committed_bytes_;
   staging_state->record_count_ = updated.record_count_;
   staging_state->max_lsn_ = updated.max_lsn_;
   state.live_bytes_ += location.total_disk_bytes_;
@@ -1483,7 +1539,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // Defrag relocations keep the inline retirement: their source blocks are
   // protected by RelocationDurabilityFence, and the defrag pass needs the
   // decrement to observe the block emptying within the same pass.
-  if (for_defrag && previous.has_value()) {
+  if (for_defrag && !defer_defrag_retirement && previous.has_value()) {
     absl::Status dead = co_await MarkRecordDead(RetiredRecordOf(*previous));
     if (!dead.ok()) {
       store.write_failed_ = true;
@@ -1501,6 +1557,162 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     *written_location = location;
   }
   co_return absl::OkStatus();
+}
+
+Task<absl::StatusOr<DirectRecordRef>>
+StorageEngine::Impl::WriteCollectionObjectLocked(
+    WorkerStore& store, std::uint8_t db_id, ValueType value_type,
+    std::string_view payload, TxShardWrites* tx, std::uint64_t logical_size,
+    std::uint64_t owner_id, bool for_defrag) {
+  const bool external =
+      AlignRecord(RecordHeaderBytes(0, false) + payload.size()) >
+          kStorageBlockBytes - kBlockHeaderBytes ||
+      AlignRecord(RecordHeaderBytes(0, false) + payload.size()) >
+          options_.buffers_.write_buffer_bytes_;
+  ExtentManifest extents;
+  std::string manifest;
+  std::string_view record_payload = payload;
+  if (external) {
+    auto written_extents = co_await WriteExtentValueLocked(store, payload);
+    if (!written_extents.ok()) co_return written_extents.status();
+    extents = std::move(*written_extents);
+    manifest = EncodeManifest(*extents);
+    record_payload = manifest;
+  }
+  RecordLocation location;
+  absl::Status written = co_await WriteRecordLocked(
+      store, db_id, {}, record_payload, RecordKind::kCollectionObject,
+      value_type, 0, ComputeDigest({}), 0, 0, for_defrag, true, external, false,
+      external ? payload.size() : logical_size, extents, &location, nullptr,
+      nullptr);
+  if (!written.ok()) {
+    if (extents != nullptr) SpawnExtentReclaim(store, std::move(extents));
+    co_return written;
+  }
+  DirectRecordRef reference{
+      .block_id_ = location.block_id_,
+      .allocation_epoch_ = location.allocation_epoch_,
+      .record_offset_ = location.record_offset_,
+      .total_disk_bytes_ = location.total_disk_bytes_,
+      .payload_checksum_ = Crc32c(std::as_bytes(std::span<const char>(
+          record_payload.data(), record_payload.size()))),
+      .reserved_ = 0,
+  };
+  if (extents != nullptr) {
+    store.collection_object_manifests_.insert_or_assign(
+        DirectRecordIdentity{reference.block_id_, reference.allocation_epoch_,
+                             reference.record_offset_},
+        extents);
+  }
+  if (owner_id != 0 && value_type == ValueType::kList) {
+    std::optional<ListDirectoryNode> directory;
+    if (payload.size() >= sizeof(std::uint64_t)) {
+      std::uint64_t magic = 0;
+      std::memcpy(&magic, payload.data(), sizeof(magic));
+      if (magic == kListDirectoryMagic) {
+        auto decoded = DecodeListDirectory(std::as_bytes(
+            std::span<const char>(payload.data(), payload.size())));
+        if (!decoded.ok()) {
+          MarkRecordDeadLocal(store.worker_->id(), RetiredRecordOf(reference))
+              .IgnoreError();
+          co_return decoded.status();
+        }
+        directory = std::move(*decoded);
+      }
+    }
+    store.list_objects_.insert_or_assign(
+        DirectRecordIdentity{reference.block_id_, reference.allocation_epoch_,
+                             reference.record_offset_},
+        ListObjectRuntimeMeta{
+            .reference_ = reference,
+            .directory_ = directory,
+            .extents_ = extents,
+            .owner_id_ = owner_id,
+            .logical_size_ = logical_size,
+        });
+    if (directory.has_value()) {
+      struct ParentUpdate {
+        DirectRecordIdentity child_;
+        std::uint32_t slot_ = 0;
+        bool leaf_ = false;
+      };
+      std::vector<std::vector<ParentUpdate>> by_owner(worker_count_);
+      if (directory->leaf()) {
+        for (std::size_t slot = 0; slot < directory->segments_.size(); ++slot) {
+          const DirectRecordRef& child =
+              directory->segments_[slot].segment_;
+          by_owner[BlockOwner(child.block_id_)].push_back(ParentUpdate{
+              .child_ = DirectRecordIdentity{
+                  child.block_id_, child.allocation_epoch_,
+                  child.record_offset_},
+              .slot_ = static_cast<std::uint32_t>(slot),
+              .leaf_ = true,
+          });
+        }
+      } else {
+        for (std::size_t slot = 0; slot < directory->children_.size(); ++slot) {
+          const DirectRecordRef& child = directory->children_[slot].child_;
+          by_owner[BlockOwner(child.block_id_)].push_back(ParentUpdate{
+              .child_ = DirectRecordIdentity{
+                  child.block_id_, child.allocation_epoch_,
+                  child.record_offset_},
+              .slot_ = static_cast<std::uint32_t>(slot),
+              .leaf_ = false,
+          });
+        }
+      }
+      for (unsigned child_owner = 0; child_owner < worker_count_;
+           ++child_owner) {
+        if (by_owner[child_owner].empty()) continue;
+        auto apply = [this, child_owner, owner_id, reference,
+                      updates = std::move(by_owner[child_owner])]() mutable {
+          WorkerStore& child_store = *stores_[child_owner];
+          for (const ParentUpdate& update : updates) {
+            auto child = child_store.list_objects_.find(update.child_);
+            if (child == child_store.list_objects_.end() ||
+                child->second.owner_id_ != owner_id) {
+              continue;
+            }
+            child->second.parent_ = reference;
+            child->second.parent_slot_ = update.slot_;
+            child->second.parent_is_leaf_ = update.leaf_;
+          }
+          return absl::OkStatus();
+        };
+        absl::Status linked;
+        if (child_owner == store.worker_->id()) {
+          linked = apply();
+        } else {
+          linked = co_await celer::SubmitTo(child_owner, std::move(apply));
+        }
+        if (!linked.ok()) co_return linked;
+      }
+    }
+  }
+  if (tx != nullptr) {
+    const std::uint32_t staged_end =
+        location.record_offset_ + location.total_disk_bytes_;
+    bool merged = false;
+    for (TxShardWrites::Fence& fence : tx->fences_) {
+      if (fence.block_id_ == location.block_id_ &&
+          fence.allocation_epoch_ == location.allocation_epoch_) {
+        fence.committed_bytes_ = std::max(fence.committed_bytes_, staged_end);
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      tx->fences_.push_back(TxShardWrites::Fence{
+          .block_id_ = location.block_id_,
+          .allocation_epoch_ = location.allocation_epoch_,
+          .committed_bytes_ = staged_end,
+          .block_owner_ = location.block_owner_,
+      });
+    }
+    store.tx_new_collection_objects_[tx->txid_].push_back(
+        RetiredRecordOf(reference));
+  }
+  co_return reference;
 }
 
 void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {

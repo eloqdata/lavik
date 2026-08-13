@@ -29,6 +29,7 @@
 #include "keylane/storage/format.h"
 #include "keylane/tx/transaction.h"
 #include "keylane/tx/tx_shard.h"
+#include "list_command.h"
 
 namespace keylane {
 using namespace celer;
@@ -62,9 +63,44 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
   switch (request.kind_) {
     case CommandKind::kSet:
     case CommandKind::kLPush:
+    case CommandKind::kLPushX:
+    case CommandKind::kRPush:
+    case CommandKind::kRPushX:
+    case CommandKind::kLPop:
+    case CommandKind::kRPop:
+    case CommandKind::kLSet:
+    case CommandKind::kLInsert:
+    case CommandKind::kLRem:
+    case CommandKind::kLTrim:
     case CommandKind::kIncr:
       keys = 1;
       break;
+    case CommandKind::kLMove:
+    case CommandKind::kRPopLPush:
+    case CommandKind::kBLMove:
+    case CommandKind::kBRPopLPush:
+      keys = 2;
+      break;
+    case CommandKind::kBLPop:
+    case CommandKind::kBRPop:
+      keys = request.args_.size() > 2 ? request.args_.size() - 2 : 0;
+      break;
+    case CommandKind::kLMPop:
+    case CommandKind::kBLMPop: {
+      const std::size_t count_arg =
+          request.kind_ == CommandKind::kBLMPop ? 2 : 1;
+      if (count_arg >= request.args_.size()) return RequestArgumentBytes(request);
+      std::uint64_t parsed_keys = 0;
+      const std::string_view text = request.args_[count_arg];
+      const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+                                          parsed_keys);
+      keys = parsed.ec == std::errc{} &&
+                     parsed.ptr == text.data() + text.size()
+                 ? static_cast<std::size_t>(std::min<std::uint64_t>(
+                       parsed_keys, std::numeric_limits<std::size_t>::max()))
+                 : 0;
+      break;
+    }
     case CommandKind::kMSet:
       keys = request.args_.size() > 1 ? (request.args_.size() - 1) / 2 : 0;
       break;
@@ -1195,18 +1231,21 @@ Task<CommandReply> ExecuteStorageCommand(
       co_return reply;
     }
 
-    case CommandKind::kLPush: {
-      std::vector<std::string_view> values;
-      values.reserve(args.size() - 2);
-      for (std::size_t index = 2; index < args.size(); ++index) {
-        values.push_back(args[index]);
-      }
-      auto size = co_await g_storage->ListPush(request.db_id_, args[1], values);
-      reply.encoded_ =
-          size.ok() ? reply_builder.AppendInteger(static_cast<long long>(*size))
-                    : AppendStorageError(reply_builder, size.status());
-      co_return reply;
-    }
+    case CommandKind::kLPush:
+    case CommandKind::kLPushX:
+    case CommandKind::kRPush:
+    case CommandKind::kRPushX:
+    case CommandKind::kLPop:
+    case CommandKind::kRPop:
+    case CommandKind::kLLen:
+    case CommandKind::kLIndex:
+    case CommandKind::kLRange:
+    case CommandKind::kLSet:
+    case CommandKind::kLInsert:
+    case CommandKind::kLRem:
+    case CommandKind::kLTrim:
+    case CommandKind::kLPos:
+      co_return co_await ExecuteSingleListCommand(request, reply_builder);
 
     case CommandKind::kStrlen: {
       if (args.size() != 2) {
@@ -1420,6 +1459,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     const storage::DefragTotals defrag = g_storage->DefragStats();
+    const storage::StorageDurabilityStats durability =
+        co_await g_storage->DurabilityStats();
     info += "# Stats\r\n";
     info += "total_commands_processed:" +
             std::to_string(runtime_metrics->TotalCalls()) + "\r\n";
@@ -1451,6 +1492,14 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(defrag.record_sleep_us_) + "\r\n";
     info += "defrag_active:" + std::to_string(defrag.active_) + "\r\n";
     info += "defrag_pending:" + std::to_string(defrag.pending_) + "\r\n\r\n";
+    info += "storage_dirty_staging_bytes:" +
+            std::to_string(durability.dirty_staging_bytes_) + "\r\n";
+    info += "storage_flushes_pending:" +
+            std::to_string(durability.flushes_pending_) + "\r\n";
+    info += "storage_tx_commits_pending:" +
+            std::to_string(durability.tx_commits_pending_) + "\r\n";
+    info += std::string("storage_durability_pending:") +
+            (durability.pending() ? "1\r\n\r\n" : "0\r\n\r\n");
   }
   if (wants("replication")) {
     info += "# Replication\r\n";
@@ -1547,16 +1596,24 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                  : EncodeNullBulkString();
     }
 
-    case CommandKind::kLPush: {
-      std::vector<std::string_view> values;
-      values.reserve(args.size() - 2);
-      for (std::size_t index = 2; index < args.size(); ++index) {
-        values.push_back(args[index]);
-      }
-      auto size = co_await g_storage->ListPushLocked(db_id, args[1], digest,
-                                                     values, tx);
-      co_return size.ok() ? EncodeInteger(static_cast<long long>(*size))
-                          : EncodeStorageError(size.status());
+    case CommandKind::kLPush:
+    case CommandKind::kLPushX:
+    case CommandKind::kRPush:
+    case CommandKind::kRPushX:
+    case CommandKind::kLPop:
+    case CommandKind::kRPop:
+    case CommandKind::kLLen:
+    case CommandKind::kLIndex:
+    case CommandKind::kLRange:
+    case CommandKind::kLSet:
+    case CommandKind::kLInsert:
+    case CommandKind::kLRem:
+    case CommandKind::kLTrim:
+    case CommandKind::kLPos: {
+      ReplyBuilder list_reply_builder;
+      CommandReply reply = co_await ExecuteSingleListCommandLocked(
+          request, digest, tx, list_reply_builder);
+      co_return std::string(reply.encoded_);
     }
 
     case CommandKind::kStrlen: {
@@ -1839,7 +1896,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
 Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
                                    ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
-  auto keys = DetermineKeys(*request.spec_, args.size());
+  auto keys = DetermineKeys(*request.spec_, args);
   if (!keys.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR ", keys.status().message())));
@@ -1932,6 +1989,77 @@ struct ExecKey {
   tx::LockMode mode_ = tx::LockMode::kShared;
   std::uint8_t db_ = 0;
 };
+
+bool IsExecSequentialListPop(CommandKind kind) {
+  return kind == CommandKind::kLMPop || kind == CommandKind::kBLMPop ||
+         kind == CommandKind::kBLPop || kind == CommandKind::kBRPop;
+}
+
+Task<std::string> ExecuteExecSequentialListPop(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  if (keys.empty()) co_return EncodeError("ERR syntax error");
+  const auto& args = command.args_;
+  bool left = command.kind_ != CommandKind::kBRPop;
+  std::uint64_t count = 1;
+  const bool nested = command.kind_ == CommandKind::kLMPop ||
+                      command.kind_ == CommandKind::kBLMPop;
+  if (nested) {
+    const std::size_t direction = keys.back().arg_ + 1;
+    if (direction >= args.size()) co_return EncodeError("ERR syntax error");
+    if (CmpCaseInsensitive(args[direction], "left")) {
+      left = true;
+    } else if (CmpCaseInsensitive(args[direction], "right")) {
+      left = false;
+    } else {
+      co_return EncodeError("ERR syntax error");
+    }
+    if (direction + 1 < args.size()) {
+      if (direction + 2 >= args.size() ||
+          !CmpCaseInsensitive(args[direction + 1], "count")) {
+        co_return EncodeError("ERR syntax error");
+      }
+      const std::string_view text = args[direction + 2];
+      const auto parsed =
+          std::from_chars(text.data(), text.data() + text.size(), count);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != text.data() + text.size() || count == 0) {
+        co_return EncodeError("ERR count should be greater than 0");
+      }
+    }
+  }
+
+  for (const ExecKey& key : keys) {
+    auto pop = [&]() -> Task<absl::StatusOr<storage::ListResult>> {
+      storage::ListOperation operation;
+      operation.kind_ = left ? storage::ListOperationKind::kPopLeft
+                             : storage::ListOperationKind::kPopRight;
+      operation.count_ = count;
+      operation.count_provided_ = true;
+      co_return co_await g_storage->ExecuteListLocked(
+          command.db_id_, args[key.arg_], key.digest_, operation,
+          &tx_writes[key.owner_]);
+    };
+    absl::StatusOr<storage::ListResult> result =
+        key.owner_ == ThisWorker().id_ ? co_await pop()
+                                      : co_await SubmitTaskTo(key.owner_, pop);
+    if (!result.ok()) co_return EncodeStorageError(result.status());
+    if (result->values_.empty()) continue;
+    ReplyBuilder builder;
+    builder.AppendArrayHeader(2);
+    builder.AppendBulkString(args[key.arg_]);
+    if (nested) {
+      builder.AppendArrayHeader(result->values_.size());
+      for (const std::string& value : result->values_) {
+        builder.AppendBulkString(value);
+      }
+    } else {
+      builder.AppendBulkString(result->values_.front());
+    }
+    co_return std::string(builder.View());
+  }
+  co_return "*-1\r\n";
+}
 
 // One squashed run of consecutive keyed commands [begin, end): every shard
 // executes its keys of every command in queue order within a single hop.
@@ -2152,7 +2280,7 @@ std::vector<tx::KeyRef> DedupExecLocks(
 Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
                                 const CommandRequest& request,
                                 ReplyBuilder& reply_builder) {
-  auto keys = DetermineKeys(*request.spec_, request.args_.size());
+  auto keys = DetermineKeys(*request.spec_, request.args_);
   if (!keys.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR ", keys.status().message())));
@@ -2261,10 +2389,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   std::vector<std::uint8_t> dbs;  // distinct databases with keyed commands
   for (std::size_t i = 0; i < queued.size(); ++i) {
     const CommandRequest& cmd = queued[i];
-    if (cmd.spec_ == nullptr || cmd.spec_->first_key_ == 0) {
+    if (cmd.spec_ == nullptr || (cmd.spec_->flags_ & kCmdNoKeys) != 0) {
       continue;
     }
-    auto keys = DetermineKeys(*cmd.spec_, cmd.args_.size());
+    auto keys = DetermineKeys(*cmd.spec_, cmd.args_);
     if (!keys.ok()) {
       // Unreachable today: queueing ran the same check on the same spec and
       // arity. Kept defensive, and EXEC must consume the connection's
@@ -2360,8 +2488,15 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                 ++i;
                 continue;
               }
+              if (IsExecSequentialListPop(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialListPop(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
               std::size_t end = i + 1;
-              while (end < queued.size() && !cmd_keys[end].empty()) {
+              while (end < queued.size() && !cmd_keys[end].empty() &&
+                     !IsExecSequentialListPop(queued[end].kind_)) {
                 ++end;
               }
               ExecRunContext run;
@@ -2399,23 +2534,17 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         co_return BuiltReply(reply_builder.AppendError(
             absl::StrCat("ERR ", scheduled.message())));
       }
+      // Acquire and retain every shard's holds before the coordinator runs
+      // argument-ordered commands such as LMPOP one key at a time.
+      absl::Status armed = co_await txn.Execute(
+          &ArmOnlyShardCallback, nullptr, /*release=*/false);
+      if (!armed.ok()) {
+        (void)co_await txn.Release();
+        co_await DropWatches(ctx);
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
+      }
       if (!ctx.watched_.empty()) {
-        // Schedule only records a queue position; conflicting transactions
-        // ordered ahead of this EXEC have not necessarily run, and their
-        // writes would land after a check taken now. Run an empty hop first:
-        // it returns once every shard has this EXEC's holds, i.e. once
-        // everything serialized before it has committed, which is the point
-        // the watch check is defined at (and where the single-shard path
-        // already takes it).
-        absl::Status armed =
-            co_await txn.Execute(&ArmOnlyShardCallback, nullptr,
-                                 /*release=*/false);
-        if (!armed.ok()) {
-          (void)co_await txn.Release();
-          co_await DropWatches(ctx);
-          co_return BuiltReply(
-              reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
-        }
         if (!co_await CheckConnectionWatches(ctx)) {
           (void)co_await txn.Release();
           co_await DropWatches(ctx);
@@ -2439,8 +2568,15 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
           ++i;
           continue;
         }
+        if (IsExecSequentialListPop(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialListPop(
+              cmd, cmd_keys[i], tx_writes);
+          ++i;
+          continue;
+        }
         std::size_t end = i + 1;
-        while (end < queued.size() && !cmd_keys[end].empty()) {
+        while (end < queued.size() && !cmd_keys[end].empty() &&
+               !IsExecSequentialListPop(queued[end].kind_)) {
           ++end;
         }
         ExecRunContext run;
@@ -2500,6 +2636,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
 
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_storage = engine;
+  InitListCommandStorage(engine);
   g_replica_read_only = replica_read_only;
 }
 
@@ -2541,7 +2678,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           "ERR unknown command '" + request.args_.front() + "'"));
     }
     const CommandSpec& spec = *request.spec_;
-    auto keys = DetermineKeys(spec, request.args_.size());
+    auto keys = DetermineKeys(spec, request.args_);
     if (!keys.ok() ||
         (kind == CommandKind::kMSet && request.args_.size() % 2 != 1)) {
       ctx.multi_dirty_ = true;
@@ -2672,10 +2809,35 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kMGet:
       co_return co_await ExecuteMultiKey(request, reply_builder);
 
+    case CommandKind::kLMove:
+    case CommandKind::kRPopLPush:
+    case CommandKind::kLMPop:
+      co_return co_await ExecuteListMultiKey(request, reply_builder);
+
+    case CommandKind::kBLPop:
+    case CommandKind::kBRPop:
+    case CommandKind::kBLMove:
+    case CommandKind::kBRPopLPush:
+    case CommandKind::kBLMPop:
+      co_return co_await ExecuteBlockingListCommand(request, reply_builder);
+
     case CommandKind::kGet:
     case CommandKind::kStrlen:
     case CommandKind::kSet:
     case CommandKind::kLPush:
+    case CommandKind::kLPushX:
+    case CommandKind::kRPush:
+    case CommandKind::kRPushX:
+    case CommandKind::kLPop:
+    case CommandKind::kRPop:
+    case CommandKind::kLLen:
+    case CommandKind::kLIndex:
+    case CommandKind::kLRange:
+    case CommandKind::kLSet:
+    case CommandKind::kLInsert:
+    case CommandKind::kLRem:
+    case CommandKind::kLTrim:
+    case CommandKind::kLPos:
     case CommandKind::kIncr:
     case CommandKind::kExpire:
     case CommandKind::kPExpire:

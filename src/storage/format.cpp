@@ -368,6 +368,10 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
         header.external_ || header.expire_at_ms_ != 0 ||
         header.value_type_ != ValueType::kNone || header.txid_ == 0 ||
         header.key_bytes_ != 0 || header.key_external_)) ||
+      (header.kind_ == RecordKind::kCollectionObject &&
+       (header.value_type_ == ValueType::kNone || header.txid_ != 0 ||
+        header.expire_at_ms_ != 0 || header.key_bytes_ != 0 ||
+        header.key_external_)) ||
       header.header_bytes_ != header_bytes || output.size() != header_bytes) {
     return false;
   }
@@ -410,17 +414,16 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
       decoded.version_ != kStorageFormatVersion ||
       (decoded.kind_ != RecordKind::kValue &&
        decoded.kind_ != RecordKind::kTombstone &&
-       decoded.kind_ != RecordKind::kTxCommit) ||
+       decoded.kind_ != RecordKind::kTxCommit &&
+       decoded.kind_ != RecordKind::kCollectionObject) ||
       decoded.db_id_ >= kLogicalDatabaseCount ||
       static_cast<std::uint8_t>(decoded.value_type_) >
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (decoded.kind_ == RecordKind::kValue &&
        decoded.value_type_ == ValueType::kNone) ||
       (decoded.kind_ == RecordKind::kValue &&
-       ((decoded.value_type_ == ValueType::kString &&
-         decoded.logical_size_ > kMaxStringBytes) ||
-        (decoded.value_type_ != ValueType::kString &&
-         decoded.logical_size_ > std::numeric_limits<std::uint32_t>::max()))) ||
+       decoded.value_type_ == ValueType::kString &&
+       decoded.logical_size_ > kMaxStringBytes) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
       decoded.key_bytes_ > MaxKeyBytes() ||
       decoded.header_bytes_ !=
@@ -433,6 +436,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     return false;
   }
   if (decoded.kind_ != RecordKind::kValue &&
+      decoded.kind_ != RecordKind::kCollectionObject &&
       (decoded.logical_size_ != 0 || decoded.expire_at_ms_ != 0 ||
        decoded.value_type_ != ValueType::kNone)) {
     return false;
@@ -446,6 +450,12 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
   }
   if (decoded.kind_ == RecordKind::kTxCommit &&
       (decoded.txid_ == 0 || decoded.key_bytes_ != 0 ||
+       decoded.key_external_)) {
+    return false;
+  }
+  if (decoded.kind_ == RecordKind::kCollectionObject &&
+      (decoded.value_type_ == ValueType::kNone || decoded.txid_ != 0 ||
+       decoded.expire_at_ms_ != 0 || decoded.key_bytes_ != 0 ||
        decoded.key_external_)) {
     return false;
   }

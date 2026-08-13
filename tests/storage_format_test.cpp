@@ -173,7 +173,6 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       .replication_epoch_ = 5,
       .db_epoch_ = 6,
       .mutation_sequence_ = 7,
-      .relocation_sequence_ = 8,
       .expire_at_ms_ = 1'900'000'000'123ULL,
       .lsn_ = 9,
       .allocation_epoch_ = 10,

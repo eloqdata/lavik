@@ -20,6 +20,12 @@ inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
 inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// A collection whose cardinality does not live in the generic record header.
+// The type-specific descriptor and its sparse in-memory side table own the
+// exact 64-bit cardinality. Strings can never collide with this marker because
+// Redis-compatible strings are capped at 512 MiB.
+inline constexpr std::uint32_t kSegmentedCollection =
+    std::numeric_limits<std::uint32_t>::max();
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -35,6 +41,10 @@ inline constexpr std::uint64_t kRecordMagic =
     0x314b4c5245434f52ULL;  // ROCERLK1
 inline constexpr std::uint64_t kExtentManifestMagic =
     0x3154464e4d4c4bULL;  // KLMNFT1
+inline constexpr std::uint64_t kListRootMagic =
+    0x31544f4f524c4bULL;  // KLROOT1
+inline constexpr std::uint64_t kListDirectoryMagic =
+    0x315249444c4c4bULL;  // KLLDIR1
 inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
 inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
 inline constexpr std::uint8_t kExternalValueMask = 0x80;
@@ -143,6 +153,9 @@ enum class RecordKind : std::uint8_t {
   // committed transaction, keyless (key_bytes == 0). Never enters the index;
   // recovery keeps txid-tagged data records only when it finds this.
   kTxCommit = 3,
+  // Anonymous immutable collection node. It never enters the Redis key index;
+  // liveness comes only from a reachable top-level collection root.
+  kCollectionObject = 4,
 };
 
 enum class BlockKind : std::uint8_t {
@@ -216,8 +229,9 @@ struct RecordHeader {
   bool key_external_ : 1 = false;
   Digest digest_{};
   std::uint32_t key_bytes_ = 0;
-  // Redis-visible size: bytes for String and cardinality for collections.
-  std::uint64_t logical_size_ = 0;
+  // Redis-visible bytes/cardinality, or kSegmentedCollection when the exact
+  // collection cardinality lives in its type-specific descriptor.
+  std::uint32_t logical_size_ = 0;
   // Physical payload following this header. For an out-of-index key, an
   // inline payload is key || value; an external payload is one manifest for
   // the same logical concatenation. Small keys remain in the header and an
@@ -233,7 +247,6 @@ struct RecordHeader {
   std::uint64_t replication_epoch_ = 1;
   std::uint64_t db_epoch_ = 1;
   std::uint64_t mutation_sequence_ = 0;
-  std::uint64_t relocation_sequence_ = 0;
   // Absolute Unix time in milliseconds. Zero means the value does not expire.
   std::uint64_t expire_at_ms_ = 0;
   std::uint64_t lsn_ = 0;
@@ -255,6 +268,67 @@ struct ExtentRef {
   std::uint32_t payload_checksum_ = 0;
 };
 
+// Direct immutable-record identity used by collection roots and directory
+// nodes. Block id alone is insufficient because reclaimed ids are reused.
+struct DirectRecordRef {
+  std::uint64_t block_id_ = kInvalidBlockId;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t record_offset_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint32_t payload_checksum_ = 0;
+  std::uint32_t reserved_ = 0;
+
+  bool valid() const noexcept {
+    return block_id_ != kInvalidBlockId && allocation_epoch_ != 0 &&
+           total_disk_bytes_ != 0 && reserved_ == 0;
+  }
+  bool operator==(const DirectRecordRef&) const = default;
+};
+
+// Fixed inline payload of a segmented List's top-level Redis record.
+struct ListRootHeader {
+  std::uint64_t magic_ = kListRootMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t header_bytes_ = 80;
+  std::uint64_t element_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+  std::uint32_t segment_count_ = 0;
+  std::uint32_t tree_height_ = 0;
+  DirectRecordRef directory_root_{};
+  std::uint64_t reserved_ = 0;
+};
+
+enum class ListDirectoryKind : std::uint32_t {
+  kInternal = 1,
+  kLeaf = 2,
+};
+
+struct ListDirectoryHeader {
+  std::uint64_t magic_ = kListDirectoryMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t header_bytes_ = 56;
+  ListDirectoryKind kind_ = ListDirectoryKind::kLeaf;
+  std::uint32_t level_ = 0;
+  std::uint32_t entry_count_ = 0;
+  std::uint32_t reserved_ = 0;
+  std::uint64_t element_count_ = 0;
+  std::uint64_t segment_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+};
+
+struct ListDirectoryChild {
+  DirectRecordRef child_{};
+  std::uint64_t subtree_element_count_ = 0;
+  std::uint64_t subtree_segment_count_ = 0;
+  std::uint64_t subtree_encoded_bytes_ = 0;
+};
+
+struct ListDirectorySegment {
+  DirectRecordRef segment_{};
+  std::uint64_t element_count_ = 0;
+  std::uint64_t encoded_bytes_ = 0;
+};
+
 inline constexpr std::size_t kExtentPayloadBytes =
     kStorageBlockBytes - kBlockHeaderBytes;
 inline constexpr std::size_t kMaxStringExtents =
@@ -265,8 +339,14 @@ static_assert(sizeof(DeviceLabel) <= kDirectIoAlignment);
 static_assert(sizeof(MetadataPageHeader) < kDirectIoAlignment);
 static_assert(kMetadataPagePayloadBytes % sizeof(std::uint64_t) == 0);
 static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
+static_assert(sizeof(RecordHeader) == 120);
 static_assert(sizeof(ExtentManifestHeader) == 16);
 static_assert(sizeof(ExtentRef) == 24);
+static_assert(sizeof(DirectRecordRef) == 32);
+static_assert(sizeof(ListRootHeader) == 80);
+static_assert(sizeof(ListDirectoryHeader) == 56);
+static_assert(sizeof(ListDirectoryChild) == 56);
+static_assert(sizeof(ListDirectorySegment) == 48);
 
 constexpr std::size_t AlignDirect(std::size_t size) noexcept {
   return (size + kDirectIoAlignment - 1) & ~(kDirectIoAlignment - 1);

@@ -671,6 +671,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       }
     }
     store.external_manifests_.erase(entry);
+    store.list_states_.erase(entry);
     partition.indexes_[candidate.db_id_].Erase(entry);
     absl::Status dead = co_await MarkRecordDead(
         RetiredRecordOf(dropped, dropped_dependent_extents));

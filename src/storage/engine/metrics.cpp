@@ -8,6 +8,44 @@
 
 namespace keylane::storage {
 
+Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
+  StorageDurabilityStats result{
+      .dirty_staging_bytes_ = 0,
+      .flushes_pending_ = active_flushes_.load(std::memory_order_acquire),
+      // Sample before visiting workers. A commit chain registered before the
+      // INFO request may finish and append on a worker already visited; the
+      // initial nonzero sample keeps this observation conservative, and the
+      // following poll will see the appended record's dirty bytes.
+      .tx_commits_pending_ =
+          active_tx_commits_.load(std::memory_order_acquire),
+  };
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    result.dirty_staging_bytes_ +=
+        co_await celer::SubmitTo(target, [this, target] {
+          const WorkerStore& store = *stores_[target];
+          std::uint64_t dirty = 0;
+          // This non-suspending callback runs on the owning worker, so no
+          // store mutex or hot-path atomics are needed for the local snapshot.
+          for (const StagingSlot& slot : store.staging_slots_) {
+            const bool allocated =
+                slot.write_buffer_id_ != 0 || slot.heap_data_ != nullptr;
+            if (!allocated) continue;
+            if (slot.committed_bytes_ >= slot.durable_bytes_) {
+              dirty += slot.committed_bytes_ - slot.durable_bytes_;
+            }
+          }
+          return dirty;
+        });
+  }
+  result.flushes_pending_ =
+      std::max(result.flushes_pending_,
+               active_flushes_.load(std::memory_order_acquire));
+  result.tx_commits_pending_ =
+      std::max(result.tx_commits_pending_,
+               active_tx_commits_.load(std::memory_order_acquire));
+  co_return result;
+}
+
 Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
   struct AllocatorMetrics {
     std::uint64_t available_blocks_ = 0;

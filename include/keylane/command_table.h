@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
+#include <string>
 #include <string_view>
 
 #include "keylane/command.h"
@@ -18,10 +20,12 @@ enum CommandFlag : std::uint32_t {
   kCmdMultiShard = 1u << 3,  // key set may span multiple shard owners
   kCmdGlobal = 1u << 4,      // fans out to every worker
   kCmdUsesDbGate = 1u << 5,  // holds a DbOperationGuard while executing
+  kCmdMovableKeys = 1u << 6, // key range is derived from command arguments
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the
-// argument index of the first key (0 = no keys), `last_key` is the index of
+// argument index of the first key (0 = no statically described keys),
+// `last_key` is the index of
 // the last key with negative values counting from the end (-1 = last arg),
 // `key_step` is the distance between consecutive keys (MSET = 2). Arity is an
 // inclusive [min_args, max_args] range over the full argument vector including
@@ -61,5 +65,10 @@ struct KeyIndexView {
 // pairing in their handler; this only resolves positions.
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
                                            std::size_t argc);
+
+// Resolves argument-dependent key ranges such as LMPOP/BLMPOP in addition to
+// the static Redis key spec above.
+absl::StatusOr<KeyIndexView> DetermineKeys(
+    const CommandSpec& spec, std::span<const std::string> args);
 
 }  // namespace keylane

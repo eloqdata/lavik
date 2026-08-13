@@ -422,8 +422,10 @@ class ReplicationManager::Impl {
       if (EncodedRecordBytes(records[begin]) + 2 + 8 + 4 > kMaxApplyPayload) {
         const SnapshotRecord& large = records[begin];
         if (large.kind_ != SnapshotRecord::Kind::kValue ||
-            large.value_type_ != storage::ValueType::kString ||
-            large.value_.size() > storage::kMaxStringBytes) {
+            (large.value_type_ != storage::ValueType::kString &&
+             large.value_type_ != storage::ValueType::kList) ||
+            (large.value_type_ == storage::ValueType::kString &&
+             large.value_.size() > storage::kMaxStringBytes)) {
           co_return absl::Status(absl::StatusCode::kOutOfRange,
                                  "replicated record exceeds RPC payload limit");
         }
@@ -435,7 +437,11 @@ class ReplicationManager::Impl {
         frame.logical_size_ = large.value_.size();
         frame.chunk_index_ = 0;
         frame.chunk_count_ = chunk_count;
-        frame.value_.clear();
+        frame.value_.assign(sizeof(large.logical_size_), '\0');
+        for (std::size_t byte = 0; byte < sizeof(large.logical_size_); ++byte) {
+          frame.value_[byte] =
+              static_cast<char>(large.logical_size_ >> (byte * 8));
+        }
         absl::Status sent =
             co_await ApplyRemote(client, partition_id, epoch,
                                  std::span<const SnapshotRecord>(&frame, 1));

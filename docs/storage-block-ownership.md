@@ -59,9 +59,9 @@ Hashing blocks when it differs spreads old IO and defrag work across all current
 workers instead of concentrating it on the old worker-id range.
 
 Recovery sends block metadata to `block_owner` and record metadata to
-`key_owner`. Each key owner resolves generations/relocation sequences/LSNs in
-its local index. A second accounting phase sends only the winning index
-locations to their block owners to rebuild exact `live_bytes`.
+`key_owner`. Each key owner resolves logical mutation sequences and physical
+LSNs in its local index. A second accounting phase sends only the winning
+index locations to their block owners to rebuild exact `live_bytes`.
 
 No data is rewritten during startup.
 

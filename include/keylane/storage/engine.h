@@ -74,6 +74,22 @@ struct DefragTotals {
   unsigned pending_ = 0;
 };
 
+// Cold-path observability for tests and operators that need to know whether
+// every write acknowledged so far has crossed its crash-durability boundary.
+// Dirty bytes include queued and in-flight block flushes. Pending transaction
+// commits cover the interval between acknowledging a tagged write and
+// appending its commit decision.
+struct StorageDurabilityStats {
+  std::uint64_t dirty_staging_bytes_ = 0;
+  unsigned flushes_pending_ = 0;
+  std::uint64_t tx_commits_pending_ = 0;
+
+  bool pending() const noexcept {
+    return dirty_staging_bytes_ != 0 || flushes_pending_ != 0 ||
+           tx_commits_pending_ != 0;
+  }
+};
+
 enum class TombRaiderMode : std::uint8_t {
   kOff,
   kInterval,
@@ -211,6 +227,50 @@ struct SetResult {
   std::optional<DiskValue> old_value_;
 };
 
+enum class ListOperationKind : std::uint8_t {
+  kPushLeft,
+  kPushRight,
+  kPushLeftIfExists,
+  kPushRightIfExists,
+  kPopLeft,
+  kPopRight,
+  kLength,
+  kIndex,
+  kRange,
+  kSet,
+  kInsertBefore,
+  kInsertAfter,
+  kRemove,
+  kTrim,
+  kPosition,
+  kMoveWithin,
+};
+
+// One single-key List operation. Views remain owned by the command request for
+// the lifetime of the awaited call.
+struct ListOperation {
+  ListOperationKind kind_ = ListOperationKind::kLength;
+  std::vector<std::string_view> values_;
+  std::string_view value_;
+  std::string_view pivot_;
+  std::int64_t first_ = 0;
+  std::int64_t second_ = 0;
+  std::uint64_t count_ = 0;
+  std::int64_t rank_ = 1;
+  std::uint64_t max_length_ = 0;
+  bool count_provided_ = false;
+  bool max_length_provided_ = false;
+};
+
+struct ListResult {
+  bool key_exists_ = false;
+  bool changed_ = false;
+  std::uint64_t length_ = 0;
+  std::int64_t integer_ = 0;
+  std::vector<std::string> values_;
+  std::vector<std::int64_t> positions_;
+};
+
 enum class ExpirationCondition : std::uint8_t {
   kNone,
   kIfNoExpiration,
@@ -241,7 +301,13 @@ struct TxShardWrites {
     std::uint64_t allocation_epoch_ = 0;
     std::uint32_t total_disk_bytes_ = 0;
     std::uint16_t block_owner_ = 0;
+    std::uint32_t record_offset_ = 0;
+    bool collection_object_ = false;
     std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
+    // Value-only extents can be reclaimed as soon as the transaction commit
+    // is durable. External-key extents stay dependent on the stale records
+    // block because recovery may still need them to identify that record.
+    std::shared_ptr<const std::vector<ExtentRef>> immediate_extents_;
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
@@ -338,6 +404,9 @@ class StorageEngine {
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values);
+  celer::Task<absl::StatusOr<ListResult>> ExecuteList(
+      std::uint8_t db_id, std::string_view key,
+      const ListOperation& operation);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -377,6 +446,9 @@ class StorageEngine {
   celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const ListOperation& operation, TxShardWrites* tx = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
@@ -435,6 +507,7 @@ class StorageEngine {
   // limit. Sleep changes take effect at the next checkpoint.
   DefragTotals DefragStats() const noexcept;
   celer::Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
+  celer::Task<StorageDurabilityStats> DurabilityStats() const;
   celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 
   // Non-suspending index probe for WATCH: whether the key currently holds a

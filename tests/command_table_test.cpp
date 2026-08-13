@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "keylane/command.h"
 
@@ -212,4 +213,30 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     EXPECT_CHECK(view.empty() && view.count() == 0,
                  "PING view should be empty");
   }
+}
+
+TEST(CommandTableTest, ResolvesMovableListPopKeys) {
+  const CommandSpec* lmpop = FindCommand("lmpop");
+  ASSERT_NE(lmpop, nullptr);
+  const std::vector<std::string> lm_args{
+      "LMPOP", "2", "first", "second", "LEFT", "COUNT", "3"};
+  auto lm_keys = DetermineKeys(*lmpop, lm_args);
+  ASSERT_TRUE(lm_keys.ok()) << lm_keys.status();
+  EXPECT_EQ(lm_keys->first_, 2);
+  EXPECT_EQ(lm_keys->last_, 3);
+  EXPECT_EQ(lm_keys->count(), 2);
+
+  const CommandSpec* blmpop = FindCommand("blmpop");
+  ASSERT_NE(blmpop, nullptr);
+  const std::vector<std::string> blm_args{
+      "BLMPOP", "1", "3", "a", "b", "c", "RIGHT"};
+  auto blm_keys = DetermineKeys(*blmpop, blm_args);
+  ASSERT_TRUE(blm_keys.ok()) << blm_keys.status();
+  EXPECT_EQ(blm_keys->first_, 3);
+  EXPECT_EQ(blm_keys->last_, 5);
+  EXPECT_EQ(blm_keys->count(), 3);
+
+  const std::vector<std::string> invalid{
+      "LMPOP", "3", "only-one", "LEFT"};
+  EXPECT_FALSE(DetermineKeys(*lmpop, invalid).ok());
 }

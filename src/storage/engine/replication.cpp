@@ -129,6 +129,30 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
       QueueExpiredCandidate(store, partition.id_, db_id, *current, key);
       continue;
     }
+    if (location.value_type_ == ValueType::kList &&
+        location.logical_size_ == kSegmentedCollection) {
+      co_await store.store_state_mutex_.Lock();
+      UnlockGuard store_unlock(&store.store_state_mutex_, store.worker_);
+      const std::optional<ListState> state = ListStateFor(store, current);
+      if (!state.has_value()) {
+        co_return absl::InternalError(
+            "segmented List side state is missing during snapshot");
+      }
+      auto portable = co_await MaterializeListValueLocked(store, *state);
+      if (!portable.ok()) co_return portable.status();
+      batch.records_.push_back(SnapshotRecord{
+          .kind_ = SnapshotRecord::Kind::kValue,
+          .db_id_ = db_id,
+          .db_epoch_ = DbEpoch(db_id),
+          .mutation_sequence_ = location.mutation_sequence_,
+          .expire_at_ms_ = location.expire_at_ms_,
+          .value_type_ = ValueType::kList,
+          .logical_size_ = state->element_count_,
+          .key_ = key,
+          .value_ = std::move(*portable),
+      });
+      continue;
+    }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                      location, ExtentsFor(store, current));
     if (!loaded.ok()) {
@@ -268,7 +292,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     }
     absl::Status tombstone = co_await WriteRecordLocked(
         store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, 0, false, false, external, key_external, 0, extents);
+        0, digest, 0, 0, false, false, external, key_external, 0, extents);
     if (!tombstone.ok()) {
       if (extents != nullptr) [[unlikely]] {
         SpawnExtentReclaim(store, extents);
@@ -354,9 +378,22 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     }
 
     if (record.kind_ == SnapshotRecord::Kind::kValueBegin) {
+      std::uint64_t value_logical_size = 0;
+      if (record.value_.size() == sizeof(value_logical_size)) {
+        for (std::size_t byte = 0; byte < sizeof(value_logical_size); ++byte) {
+          value_logical_size |= static_cast<std::uint64_t>(
+                                    static_cast<unsigned char>(record.value_[byte]))
+                                << (byte * 8);
+        }
+      }
       if (partition.replica_value_stage_.has_value() ||
-          record.value_type_ != ValueType::kString || !record.value_.empty() ||
-          record.logical_size_ == 0 || record.logical_size_ > kMaxStringBytes ||
+          (record.value_type_ != ValueType::kString &&
+           record.value_type_ != ValueType::kList) ||
+          record.value_.size() != sizeof(value_logical_size) ||
+          value_logical_size > std::numeric_limits<std::uint32_t>::max() ||
+          record.logical_size_ == 0 ||
+          (record.value_type_ == ValueType::kString &&
+           record.logical_size_ > kMaxStringBytes) ||
           record.chunk_count_ == 0 ||
           record.chunk_count_ !=
               (record.logical_size_ + kExtentPayloadBytes - 1) /
@@ -369,7 +406,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           .db_epoch_ = record.db_epoch_,
           .mutation_sequence_ = record.mutation_sequence_,
           .expire_at_ms_ = record.expire_at_ms_,
-          .logical_size_ = record.logical_size_,
+          .logical_size_ = value_logical_size,
+          .encoded_size_ = record.logical_size_,
           .next_chunk_ = 0,
           .chunk_count_ = record.chunk_count_,
           .value_type_ = record.value_type_,
@@ -389,8 +427,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           stage->next_chunk_ != record.chunk_index_ ||
           stage->chunk_count_ != record.chunk_count_ || record.value_.empty() ||
           record.value_.size() > kExtentPayloadBytes ||
-          record.value_.size() > stage->logical_size_ ||
-          stage->value_.size() > stage->logical_size_ - record.value_.size()) {
+          record.value_.size() > stage->encoded_size_ ||
+          stage->value_.size() > stage->encoded_size_ - record.value_.size()) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value chunk frame");
       }
@@ -406,7 +444,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
           stage->key_ != record.key_ || !record.value_.empty() ||
           stage->next_chunk_ != stage->chunk_count_ ||
           record.chunk_index_ != stage->chunk_count_ ||
-          stage->value_.size() != stage->logical_size_) {
+          stage->value_.size() != stage->encoded_size_) {
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value commit frame");
       }
@@ -482,7 +520,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, manifest, kind, value_type,
           applied.expire_at_ms_, digest, /*txid=*/0, applied.mutation_sequence_,
-          0, false, true, true, key_external, applied.logical_size_, *extents);
+          false, true, true, key_external, applied.logical_size_, *extents);
       if (!written.ok()) {
         SpawnExtentReclaim(store, *extents);
       }
@@ -490,7 +528,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       written = co_await WriteRecordLocked(
           store, applied.db_id_, applied.key_, applied.value_, kind, value_type,
           kind == RecordKind::kValue ? applied.expire_at_ms_ : 0, digest,
-          /*txid=*/0, applied.mutation_sequence_, 0, false, true, false,
+          /*txid=*/0, applied.mutation_sequence_, false, true, false,
           key_external, applied.logical_size_, nullptr);
     }
     if (!written.ok()) {

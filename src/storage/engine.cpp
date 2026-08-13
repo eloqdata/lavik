@@ -64,6 +64,10 @@ Task<absl::Status> StorageEngine::ConfigureDefrag(
   return impl_->ConfigureDefrag(update);
 }
 
+Task<StorageDurabilityStats> StorageEngine::DurabilityStats() const {
+  return impl_->DurabilityStats();
+}
+
 Task<StorageMetricsSnapshot> StorageEngine::CollectMetrics() const {
   return impl_->CollectMetrics();
 }
@@ -142,6 +146,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
   return impl_->ListPush(db_id, key, values);
 }
 
+Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteList(
+    std::uint8_t db_id, std::string_view key,
+    const ListOperation& operation) {
+  return impl_->ExecuteList(db_id, key, operation);
+}
+
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
                                                   std::string_view key) {
   return impl_->GetExpiration(db_id, key);
@@ -188,6 +198,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPushLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::span<const std::string_view> values, TxShardWrites* tx) {
   return impl_->ListPushLocked(db_id, key, digest, values, tx);
+}
+
+Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteListLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const ListOperation& operation, TxShardWrites* tx) {
+  return impl_->ExecuteListLocked(db_id, key, digest, operation, tx);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
