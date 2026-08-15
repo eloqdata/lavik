@@ -16,14 +16,8 @@ Keylane 在 4 亿条 1–4 KB 数据、10 万 QPS、95% 读 / 5% 覆盖写的持
 
 ## Grafana 截图
 
-> **截图占位：** 请在这里放入覆盖 `2026-08-13 07:06:30` 至 `2026-08-15 07:06:30 UTC` 的 Grafana 截图，建议同时显示 QPS、p99.9、p99.99、defrag rate/active 和两块设备的 available/used space。
+<img width="1512" height="949" alt="image" src="https://github.com/user-attachments/assets/4783c5a6-80ec-48ec-b048-bb1a7764054d" />
 
-<!-- GRAFANA_SCREENSHOT_START
-将截图保存为 perf_reports/images/keylane-spdk-48h-stability-2026-08-15.png，
-创建 perf_reports/images/ 目录，然后取消下面一行的注释：
-
-![Keylane SPDK 48 小时 Grafana 监控](./images/keylane-spdk-48h-stability-2026-08-15.png)
-GRAFANA_SCREENSHOT_END -->
 
 ## 48 小时结果
 
