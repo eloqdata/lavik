@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -12,7 +13,15 @@ namespace keylane {
 
 inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
 
+struct ReplicaOfConfig {
+  std::string host_;
+  std::uint16_t port_ = 0;
+
+  bool operator==(const ReplicaOfConfig&) const = default;
+};
+
 struct ServerOptions {
+  std::string config_file_;
   std::string bind_ip_ = "127.0.0.1";
   std::uint16_t port_ = 6379;
   std::uint16_t metrics_port_ = 0;
@@ -39,6 +48,7 @@ struct ServerOptions {
   std::uint32_t defrag_sleep_ms_ = 0;
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
+  std::optional<ReplicaOfConfig> replicaof_;
   ReplicationOptions replication_options_;
 };
 

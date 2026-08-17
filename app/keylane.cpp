@@ -4,12 +4,14 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <limits>
 #include <string>
 #include <thread>
 #include <utility>
 
 #include "keylane/CLI11.hpp"
+#include "keylane/config.h"
 #include "keylane/server.h"
 
 namespace {
@@ -41,11 +43,23 @@ int main(int argc, char** argv) {
 
   keylane::ServerOptions options;
   options.thread_count_ = DefaultWorkerThreadCount();
+  std::string config_file;
+  if (argc > 1 && argv[1][0] != '-') {
+    config_file = argv[1];
+    const absl::Status loaded =
+        keylane::LoadRedisConfigFile(config_file, &options);
+    if (!loaded.ok()) {
+      std::cerr << "Configuration error: " << loaded.message() << '\n';
+      return 1;
+    }
+  }
   unsigned registered_buffer_mb = 256;
   unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
   std::string replicate_to;
 
+  app.add_option("config", config_file,
+                 "Redis-style configuration file (must be the first argument)");
   app.add_option("-b,--bind", options.bind_ip_, "Bind address")
       ->capture_default_str();
   app.add_option("-p,--port", options.port_, "Listen port")
@@ -160,6 +174,11 @@ int main(int argc, char** argv) {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
     return app.exit(e);
+  }
+  if (!config_file.empty() && config_file != options.config_file_) {
+    std::cerr << "Configuration error: the configuration file must be the "
+                 "first argument\n";
+    return 2;
   }
 
   constexpr std::size_t kMiB = 1024 * 1024;

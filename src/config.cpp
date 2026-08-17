@@ -1,0 +1,199 @@
+#include "keylane/config.h"
+
+#include <cctype>
+#include <charconv>
+#include <cstdint>
+#include <fstream>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <vector>
+
+#include "absl/status/status.h"
+#include "absl/strings/ascii.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
+
+namespace keylane {
+namespace {
+
+template <typename T>
+absl::Status ParseUnsigned(std::string_view text, std::string_view name,
+                           T* value, bool allow_zero) {
+  static_assert(std::is_unsigned_v<T>);
+  T parsed = 0;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [parsed_end, error] = std::from_chars(begin, end, parsed);
+  if (text.empty() || error != std::errc{} || parsed_end != end ||
+      (!allow_zero && parsed == 0)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid ", name, " '", text, "'"));
+  }
+  *value = parsed;
+  return absl::OkStatus();
+}
+
+absl::StatusOr<bool> ParseYesNo(std::string_view text, std::string_view name) {
+  if (absl::EqualsIgnoreCase(text, "yes")) return true;
+  if (absl::EqualsIgnoreCase(text, "no")) return false;
+  return absl::InvalidArgumentError(
+      absl::StrCat(name, " must be 'yes' or 'no'"));
+}
+
+absl::Status WrongArgumentCount(std::string_view name) {
+  return absl::InvalidArgumentError(
+      absl::StrCat("wrong number of arguments for '", name, "' directive"));
+}
+
+char DecodeEscape(char escaped) {
+  switch (escaped) {
+    case 'n':
+      return '\n';
+    case 'r':
+      return '\r';
+    case 't':
+      return '\t';
+    case 'b':
+      return '\b';
+    case 'a':
+      return '\a';
+    default:
+      return escaped;
+  }
+}
+
+}  // namespace
+
+absl::StatusOr<std::vector<std::string>> ParseRedisConfigLine(
+    std::string_view line) {
+  std::vector<std::string> result;
+  std::size_t position = 0;
+  while (position < line.size()) {
+    while (position < line.size() &&
+           std::isspace(static_cast<unsigned char>(line[position]))) {
+      ++position;
+    }
+    if (position == line.size() || line[position] == '#') break;
+
+    std::string token;
+    char quote = 0;
+    if (line[position] == '\'' || line[position] == '"') {
+      quote = line[position++];
+    }
+    bool closed = quote == 0;
+    while (position < line.size()) {
+      const char current = line[position];
+      if (quote != 0) {
+        if (current == quote) {
+          ++position;
+          closed = true;
+          break;
+        }
+      } else if (std::isspace(static_cast<unsigned char>(current)) ||
+                 current == '#') {
+        break;
+      }
+      if (current == '\\' && position + 1 < line.size()) {
+        token.push_back(DecodeEscape(line[position + 1]));
+        position += 2;
+      } else {
+        token.push_back(current);
+        ++position;
+      }
+    }
+    if (!closed) {
+      return absl::InvalidArgumentError("unterminated quoted argument");
+    }
+    if (quote != 0 && position < line.size() &&
+        !std::isspace(static_cast<unsigned char>(line[position])) &&
+        line[position] != '#') {
+      return absl::InvalidArgumentError(
+          "quoted argument must be followed by whitespace or a comment");
+    }
+    result.push_back(std::move(token));
+    if (position < line.size() && line[position] == '#') break;
+  }
+  return result;
+}
+
+absl::Status ApplyRedisConfigDirective(
+    const std::vector<std::string>& directive, ServerOptions* options) {
+  if (options == nullptr) {
+    return absl::InvalidArgumentError("server options must not be null");
+  }
+  if (directive.empty()) return absl::OkStatus();
+
+  const std::string name = absl::AsciiStrToLower(directive.front());
+  if (name == "bind") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    if (directive[1].empty()) {
+      return absl::InvalidArgumentError("bind address must not be empty");
+    }
+    options->bind_ip_ = directive[1];
+    return absl::OkStatus();
+  }
+  if (name == "port") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], "port", &options->port_, true);
+  }
+  if (name == "threads" || name == "io-threads") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->thread_count_, false);
+  }
+  if (name == "replicaof") {
+    if (directive.size() != 3) return WrongArgumentCount(name);
+    if (directive[1].empty()) {
+      return absl::InvalidArgumentError("replicaof host must not be empty");
+    }
+    std::uint16_t port = 0;
+    absl::Status parsed =
+        ParseUnsigned(directive[2], "replicaof port", &port, false);
+    if (!parsed.ok()) return parsed;
+    options->replicaof_ = ReplicaOfConfig{directive[1], port};
+    return absl::OkStatus();
+  }
+  if (name == "replica-read-only") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto read_only = ParseYesNo(directive[1], name);
+    if (!read_only.ok()) return read_only.status();
+    options->replication_options_.replica_read_only_ = *read_only;
+    return absl::OkStatus();
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("unsupported configuration directive '", name, "'"));
+}
+
+absl::Status LoadRedisConfigFile(const std::string& path,
+                                 ServerOptions* options) {
+  std::ifstream input(path);
+  if (!input.is_open()) {
+    return absl::NotFoundError(
+        absl::StrCat("cannot open configuration file '", path, "'"));
+  }
+
+  std::string line;
+  std::size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    auto directive = ParseRedisConfigLine(line);
+    if (!directive.ok()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          path, ":", line_number, ": ", directive.status().message()));
+    }
+    absl::Status applied = ApplyRedisConfigDirective(*directive, options);
+    if (!applied.ok()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat(path, ":", line_number, ": ", applied.message()));
+    }
+  }
+  if (input.bad()) {
+    return absl::DataLossError(
+        absl::StrCat("failed while reading configuration file '", path, "'"));
+  }
+  options->config_file_ = path;
+  return absl::OkStatus();
+}
+
+}  // namespace keylane

@@ -243,6 +243,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"discard", CommandKind::kDiscard, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"watch", CommandKind::kWatch, 2, 0, 1, -1, 1, kCmdReadOnly},
     {"unwatch", CommandKind::kUnwatch, 1, 1, 0, 0, 1, kCmdNoKeys},
+    {"replicaof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
+     kCmdNoKeys | kCmdGlobal},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"keys", CommandKind::kKeys, 2, 2, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
