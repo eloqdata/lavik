@@ -398,6 +398,19 @@ int main(int argc, char** argv) {
       Expect(client.Command({"PERSIST", "expire-options"}), ":1", "PERSIST");
       Expect(client.Command({"PERSIST", "expire-options"}), ":0",
              "PERSIST without TTL");
+      Expect(client.Command({"SET", "strict-expire", "safe"}), "+OK",
+             "strict expiration seed");
+      for (const auto& command : std::vector<std::vector<std::string_view>>{
+               {"EXPIRE", "strict-expire", "-0"},
+               {"PEXPIRE", "strict-expire", "00"},
+               {"EXPIREAT", "strict-expire", "010"},
+               {"PEXPIREAT", "strict-expire", "-0"}}) {
+        Expect(client.Command(command),
+               "-ERR value is not an integer or out of range",
+               "non-canonical expiration rejected");
+        Expect(client.Command({"GET", "strict-expire"}), "$4\r\nsafe",
+               "rejected expiration preserves key");
+      }
       Expect(client.Command({"PEXPIRE", "expire-options", "0"}), ":1",
              "PEXPIRE immediate delete");
       Expect(client.Command({"GET", "expire-options"}), "$-1",

@@ -16,6 +16,7 @@
 
 namespace {
 
+using keylane::CommandCanonicalName;
 using keylane::CommandKind;
 using keylane::CommandSpec;
 using keylane::DetermineKeys;
@@ -173,6 +174,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("GeT", CommandKind::kGet);
   CheckKind("SET", CommandKind::kSet);
   CheckKind("APPEND", CommandKind::kAppend);
+  CheckKind("GETBIT", CommandKind::kGetBit);
+  CheckKind("SETBIT", CommandKind::kSetBit);
+  CheckKind("BITCOUNT", CommandKind::kBitCount);
+  CheckKind("BITPOS", CommandKind::kBitPos);
+  CheckKind("BITFIELD", CommandKind::kBitField);
+  CheckKind("BITFIELD_RO", CommandKind::kBitFieldRo);
+  CheckKind("BITOP", CommandKind::kBitOp);
   CheckKind("DECR", CommandKind::kDecr);
   CheckKind("DECRBY", CommandKind::kDecrBy);
   CheckKind("GETDEL", CommandKind::kGetDel);
@@ -235,6 +243,11 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");
   EXPECT_CHECK(FindCommand("GETT") == nullptr,
                "prefix collision should not resolve");
+  for (std::size_t value = 0;
+       value < static_cast<std::size_t>(CommandKind::kUnknown); ++value) {
+    EXPECT_NE(CommandCanonicalName(static_cast<CommandKind>(value)), "unknown");
+  }
+  EXPECT_EQ(CommandCanonicalName(CommandKind::kUnknown), "unknown");
   // Leave the upper arity open so the option parser can report Redis's
   // syntax error for trailing tokens instead of the global arity error.
   EXPECT_EQ(FindCommand("zrangebyscore")->max_args_, 0);
@@ -258,13 +271,14 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
-  const char* write_cmds[] = {"set",     "lpush",    "incr",      "del",
-                              "unlink",  "rename",   "renamenx",  "expire",
-                              "pexpire", "expireat", "pexpireat", "copy",
-                              "persist", "flushdb",  "flushall"};
-  const char* read_cmds[] = {"get",        "strlen",      "ttl",    "pttl",
-                             "expiretime", "pexpiretime", "type",   "exists",
-                             "touch",      "randomkey",   "dbsize", "scan"};
+  const char* write_cmds[] = {
+      "set",      "setbit",    "bitfield", "bitop",    "lpush",   "incr",
+      "del",      "unlink",    "rename",   "renamenx", "expire",  "pexpire",
+      "expireat", "pexpireat", "copy",     "persist",  "flushdb", "flushall"};
+  const char* read_cmds[] = {"get",         "getbit",      "bitcount", "bitpos",
+                             "bitfield_ro", "strlen",      "ttl",      "pttl",
+                             "expiretime",  "pexpiretime", "type",     "exists",
+                             "touch",       "randomkey",   "dbsize",   "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) != 0,
@@ -281,11 +295,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   }
   {
     const char* gated[] = {
-        "dbsize",     "scan",        "type",    "del",       "unlink",
-        "rename",     "renamenx",    "exists",  "get",       "strlen",
-        "set",        "lpush",       "incr",    "expire",    "pexpire",
-        "expireat",   "pexpireat",   "persist", "ttl",       "pttl",
-        "expiretime", "pexpiretime", "touch",   "randomkey", "copy"};
+        "dbsize",      "scan",        "type",     "del",       "unlink",
+        "rename",      "renamenx",    "exists",   "get",       "strlen",
+        "set",         "lpush",       "incr",     "expire",    "pexpire",
+        "expireat",    "pexpireat",   "persist",  "ttl",       "pttl",
+        "expiretime",  "pexpiretime", "touch",    "randomkey", "copy",
+        "getbit",      "setbit",      "bitcount", "bitpos",    "bitfield",
+        "bitfield_ro", "bitop"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
@@ -312,11 +328,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                        spec->first_key_ == 0,
                    std::string(name) + " should be keyless");
     }
-    const char* keyed[] = {
-        "get",         "set",       "lpush",   "del",    "unlink", "rename",
-        "renamenx",    "exists",    "incr",    "strlen", "expire", "pexpire",
-        "expireat",    "pexpireat", "persist", "ttl",    "pttl",   "expiretime",
-        "pexpiretime", "copy",      "touch"};
+    const char* keyed[] = {"get",      "set",        "lpush",       "del",
+                           "unlink",   "rename",     "renamenx",    "exists",
+                           "incr",     "strlen",     "expire",      "pexpire",
+                           "expireat", "pexpireat",  "persist",     "ttl",
+                           "pttl",     "expiretime", "pexpiretime", "copy",
+                           "touch",    "getbit",     "setbit",      "bitcount",
+                           "bitpos",   "bitfield",   "bitfield_ro"};
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -366,6 +384,23 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("randomkey", 1, true);
   CheckArity("randomkey", 2, false);
   CheckArity("append", 3, true);
+  CheckArity("getbit", 3, true);
+  CheckArity("getbit", 2, false);
+  CheckArity("getbit", 4, false);
+  CheckArity("setbit", 4, true);
+  CheckArity("setbit", 3, false);
+  CheckArity("bitcount", 2, true);
+  CheckArity("bitcount", 5, true);
+  CheckArity("bitcount", 6, true);  // parser reports syntax errors
+  CheckArity("bitpos", 3, true);
+  CheckArity("bitpos", 6, true);
+  CheckArity("bitpos", 7, true);  // parser reports syntax errors
+  CheckArity("bitfield", 2, true);
+  CheckArity("bitfield", 20, true);
+  CheckArity("bitfield_ro", 2, true);
+  CheckArity("bitop", 4, true);
+  CheckArity("bitop", 3, false);
+  CheckArity("bitop", 20, true);
   CheckArity("getex", 2, true);
   CheckArity("getex", 4, true);
   CheckArity("getex", 5, true);  // parser reports illegal option shapes
@@ -408,6 +443,12 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     EXPECT_CHECK(view.first_ == 1 && view.last_ == 6 && view.step_ == 2 &&
                      view.count() == 3,
                  "MSETNX key view mismatch");
+  }
+  {
+    KeyIndexView view = Keys("bitop", 6);  // BITOP op dst src1 src2 src3
+    EXPECT_CHECK(view.first_ == 2 && view.last_ == 5 && view.step_ == 1 &&
+                     view.count() == 4,
+                 "BITOP key view mismatch");
   }
   {
     KeyIndexView view = Keys("del", 5);  // DEL k1 k2 k3 k4
@@ -604,6 +645,13 @@ TEST(CommandTableTest, ResolvesMovableSortedSetPopKeys) {
   ASSERT_TRUE(zm_keys.ok()) << zm_keys.status();
   EXPECT_EQ(zm_keys->first_, 2);
   EXPECT_EQ(zm_keys->last_, 3);
+
+  const std::vector<std::string> noncanonical{"ZMPOP", "02", "first", "second",
+                                              "MIN"};
+  auto noncanonical_keys = DetermineKeys(*zmpop, noncanonical);
+  ASSERT_FALSE(noncanonical_keys.ok());
+  EXPECT_EQ(noncanonical_keys.status().message(),
+            "numkeys should be greater than 0");
 
   const CommandSpec* bzmpop = FindCommand("bzmpop");
   ASSERT_NE(bzmpop, nullptr);

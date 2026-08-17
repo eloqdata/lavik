@@ -1014,6 +1014,11 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
     EXPECT_EQ(client.Command({"BLMPOP", "0.1", "2", "blmpop-one", "blmpop-two",
                               "LEFT", "COUNT", "2"}),
               "*2\r\n" + Bulk("blmpop-two") + "\r\n" + BulkArray({"p1", "p2"}));
+    EXPECT_EQ(client.Command({"BLMPOP", "0", "3", "only-one", "LEFT"}),
+              "-ERR syntax error");
+    EXPECT_EQ(client.Command({"BLMPOP", "0", "9223372036854775807", "only-one",
+                              "LEFT"}),
+              "-ERR syntax error");
     EXPECT_EQ(client.Command({"BLMOVE", "missing-source", "missing-dest",
                               "LEFT", "RIGHT", "0.01"}),
               "$-1");
@@ -2351,8 +2356,13 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"BZPOPMIN", "zmpop-timeout", "0.01"}), "*-1");
     EXPECT_EQ(client.Command({"ZMPOP", "1", "zmpop-empty", "MIN", "garbage"}),
               "-ERR syntax error");
+    EXPECT_EQ(client.Command({"ZMPOP", "01", "zmpop-empty", "MIN"}),
+              "-ERR numkeys should be greater than 0");
     EXPECT_EQ(
         client.Command({"ZMPOP", "1", "zmpop-empty", "MIN", "COUNT", "bad"}),
+        "-ERR count should be greater than 0");
+    EXPECT_EQ(
+        client.Command({"ZMPOP", "1", "zmpop-empty", "MIN", "COUNT", "02"}),
         "-ERR count should be greater than 0");
 
     auto zset_waiting_on_list = std::async(std::launch::async, [port] {
@@ -2396,9 +2406,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command(
                   {"ZADD", "blocking-zset-chain", "1", "first", "2", "second"}),
               ":2");
-    EXPECT_EQ(first_chained_zpop.get(),
-              "*3\r\n" + Bulk("blocking-zset-chain") + "\r\n" + Bulk("first") +
-                  "\r\n" + Bulk("1"));
+    EXPECT_EQ(first_chained_zpop.get(), "*3\r\n" + Bulk("blocking-zset-chain") +
+                                            "\r\n" + Bulk("first") + "\r\n" +
+                                            Bulk("1"));
     EXPECT_EQ(second_chained_zpop.get(),
               "*3\r\n" + Bulk("blocking-zset-chain") + "\r\n" + Bulk("second") +
                   "\r\n" + Bulk("2"));
@@ -2436,6 +2446,13 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               "+QUEUED");
     EXPECT_TRUE(client.Command({"EXEC"}).starts_with(
         "*1\r\n-ERR timeout is not a float or out of range"));
+    EXPECT_EQ(client.Command({"ZCARD", "bad-timeout-zpop"}), ":1");
+    EXPECT_EQ(client.Command({"BZPOPMIN", "bad-timeout-zpop", "1e100"}),
+              "-ERR timeout is out of range");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"BZPOPMIN", "bad-timeout-zpop", "1e100"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n-ERR timeout is out of range");
     EXPECT_EQ(client.Command({"ZCARD", "bad-timeout-zpop"}), ":1");
     EXPECT_EQ(client.Command({"ZADD", "z2", "4", "one", "5", "four"}), ":2");
     EXPECT_EQ(client.Command({"ZINTER", "2", "z", "z2", "WITHSCORES"}),
@@ -3274,6 +3291,10 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
   const std::uint16_t port = FindFreePort();
   const std::string cross_a = KeyForWorker("string-cross-a", 0, 2);
   const std::string cross_b = KeyForWorker("string-cross-b", 1, 2);
+  const std::string bitmap_a = KeyForWorker("bitmap-cross-a", 0, 2);
+  const std::string bitmap_b = KeyForWorker("bitmap-cross-b", 1, 2);
+  const std::string bitmap_destination =
+      KeyForWorker("bitmap-cross-destination", 1, 2);
   {
     ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
     RespClient client(port);
@@ -3383,6 +3404,107 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
     EXPECT_EQ(client.Command({"LCS", "not-string", cross_b}),
               "-ERR The specified keys must contain string values");
 
+    EXPECT_EQ(client.Command({"GETBIT", "missing-bitmap", "123"}), ":0");
+    EXPECT_EQ(client.Command({"SETBIT", "bitmap", "0", "1"}), ":0");
+    EXPECT_EQ(client.Command({"SETBIT", "bitmap", "9", "1"}), ":0");
+    EXPECT_EQ(client.Command({"GETBIT", "bitmap", "0"}), ":1");
+    EXPECT_EQ(client.Command({"GETBIT", "bitmap", "1"}), ":0");
+    EXPECT_EQ(client.Command({"GET", "bitmap"}),
+              Bulk(std::string("\x80\x40", 2)));
+    EXPECT_EQ(client.Command({"PEXPIRE", "bitmap", "60000"}), ":1");
+    EXPECT_EQ(client.Command({"SETBIT", "bitmap", "1", "1"}), ":0");
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "bitmap"}).substr(1)), 0);
+    EXPECT_EQ(client.Command({"BITCOUNT", "bitmap"}), ":3");
+    EXPECT_EQ(client.Command({"BITCOUNT", "bitmap", "-1", "-1"}), ":1");
+    EXPECT_EQ(client.Command({"BITCOUNT", "bitmap", "0", "8", "BIT"}), ":2");
+    EXPECT_EQ(client.Command({"BITCOUNT", "bitmap", "0", "1", "BYTE", "extra"}),
+              "-ERR syntax error");
+    EXPECT_EQ(client.Command({"BITPOS", "bitmap", "1"}), ":0");
+    EXPECT_EQ(client.Command({"BITPOS", "bitmap", "0"}), ":2");
+    EXPECT_EQ(client.Command({"BITPOS", "bitmap", "1", "1", "1"}), ":9");
+    EXPECT_EQ(client.Command({"BITPOS", "bitmap", "1", "2", "7", "BIT"}),
+              ":-1");
+    EXPECT_EQ(
+        client.Command({"BITPOS", "bitmap", "1", "0", "1", "BIT", "extra"}),
+        "-ERR syntax error");
+    EXPECT_EQ(client.Command({"BITPOS", "missing-bitmap", "0", "bad"}), ":0");
+    EXPECT_EQ(client.Command({"SET", "empty-bitmap", ""}), "+OK");
+    EXPECT_EQ(client.Command({"BITPOS", "empty-bitmap", "0"}), ":-1");
+    EXPECT_EQ(client.Command({"GETBIT", "bitmap", "-1"}),
+              "-ERR bit offset is not an integer or out of range");
+    EXPECT_EQ(client.Command({"SETBIT", "bitmap", "2", "2"}),
+              "-ERR bit is not an integer or out of range");
+
+    EXPECT_EQ(
+        client.Command({"BITFIELD", "field", "SET", "u4", "0", "15", "OVERFLOW",
+                        "FAIL", "INCRBY", "u4", "0", "1", "GET", "u4", "0"}),
+        "*3\r\n:0\r\n$-1\r\n:15");
+    EXPECT_EQ(client.Command({"BITFIELD", "field", "OVERFLOW", "SAT", "INCRBY",
+                              "u4", "0", "1"}),
+              "*1\r\n:15");
+    EXPECT_EQ(client.Command({"BITFIELD", "field", "SET", "i12", "4", "-2",
+                              "GET", "i12", "4"}),
+              "*2\r\n:0\r\n:-2");
+    EXPECT_EQ(client.Command({"BITFIELD", "field", "SET", "u8", "#2", "42",
+                              "GET", "u8", "16"}),
+              "*2\r\n:0\r\n:42");
+    EXPECT_EQ(client.Command({"BITFIELD_RO", "field", "GET", "u8", "#2"}),
+              "*1\r\n:42");
+    EXPECT_EQ(client.Command({"BITFIELD_RO", "field", "SET", "u8", "0", "1"}),
+              "-ERR BITFIELD_RO only supports the GET subcommand");
+    EXPECT_EQ(client.Command({"BITFIELD", "field", "GET", "u64", "0"}),
+              "-ERR Invalid bitfield type. Use something like i16 u8. Note "
+              "that u64 is not supported but i64 is.");
+    EXPECT_EQ(
+        client.Command({"GETBIT", "not-string", "0"}),
+        "-WRONGTYPE Operation against a key holding the wrong kind of value");
+
+    EXPECT_EQ(client.Command({"SET", bitmap_a, std::string("\x0f\xf0", 2)}),
+              "+OK");
+    EXPECT_EQ(client.Command({"SET", bitmap_b, std::string("\x33\x55", 2)}),
+              "+OK");
+    EXPECT_EQ(client.Command(
+                  {"BITOP", "XOR", bitmap_destination, bitmap_a, bitmap_b}),
+              ":2");
+    EXPECT_EQ(client.Command({"GET", bitmap_destination}),
+              Bulk(std::string("\x3c\xa5", 2)));
+    EXPECT_EQ(client.Command({"BITOP", "AND", "bitmap-and-missing", bitmap_a,
+                              "bitmap-missing-source"}),
+              ":2");
+    EXPECT_EQ(client.Command({"GET", "bitmap-and-missing"}),
+              Bulk(std::string("\0\0", 2)));
+    EXPECT_EQ(client.Command({"PEXPIRE", bitmap_destination, "60000"}), ":1");
+    EXPECT_EQ(client.Command({"BITOP", "OR", bitmap_destination, bitmap_a}),
+              ":2");
+    EXPECT_EQ(client.Command({"PTTL", bitmap_destination}), ":-1");
+    EXPECT_EQ(
+        client.Command({"SET", "bitmap-in-place", std::string("\x0f", 1)}),
+        "+OK");
+    EXPECT_EQ(
+        client.Command({"BITOP", "NOT", "bitmap-in-place", "bitmap-in-place"}),
+        ":1");
+    EXPECT_EQ(client.Command({"GET", "bitmap-in-place"}),
+              Bulk(std::string("\xf0", 1)));
+    EXPECT_EQ(client.Command({"SET", "bitmap-empty-destination", "old"}),
+              "+OK");
+    EXPECT_EQ(client.Command({"BITOP", "OR", "bitmap-empty-destination",
+                              "bitmap-missing-source"}),
+              ":0");
+    EXPECT_EQ(client.Command({"GET", "bitmap-empty-destination"}), "$-1");
+    EXPECT_EQ(client.Command({"RPUSH", "bitmap-list-destination", "old"}),
+              ":1");
+    EXPECT_EQ(
+        client.Command({"BITOP", "OR", "bitmap-list-destination", bitmap_a}),
+        ":2");
+    EXPECT_EQ(client.Command({"GET", "bitmap-list-destination"}),
+              Bulk(std::string("\x0f\xf0", 2)));
+    EXPECT_EQ(
+        client.Command({"BITOP", "NOT", "bitmap-bad", bitmap_a, bitmap_b}),
+        "-ERR BITOP NOT must be called with a single source key.");
+    EXPECT_EQ(
+        client.Command({"BITOP", "OR", "bitmap-bad", bitmap_a, "not-string"}),
+        "-WRONGTYPE Operation against a key holding the wrong kind of value");
+
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"APPEND", "exec-string", "a"}), "+QUEUED");
     EXPECT_EQ(client.Command({"INCRBY", "exec-number", "4"}), "+QUEUED");
@@ -3397,6 +3519,25 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
     EXPECT_EQ(client.Command({"LCS", cross_a, cross_a, "LEN"}), "+QUEUED");
     EXPECT_EQ(client.Command({"EXEC"}), "*2\r\n:1\r\n:6");
     EXPECT_EQ(client.Command({"GET", "exec-duplicate"}), Bulk("last"));
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"SETBIT", "exec-bitmap", "0", "1"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"BITFIELD", "exec-bitmap", "INCRBY", "u4", "0",
+                              "1", "GET", "u4", "0"}),
+              "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"BITOP", "XOR", "exec-bitop", bitmap_a, bitmap_b}),
+        "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*3\r\n:0\r\n*2\r\n:9\r\n:9\r\n:2");
+    EXPECT_EQ(client.Command({"GET", "exec-bitop"}),
+              Bulk(std::string("\x3c\xa5", 2)));
+    EXPECT_EQ(client.Command({"SET", "exec-strict-expire", "safe"}), "+OK");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"EXPIRE", "exec-strict-expire", "00"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"GET", "exec-strict-expire"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}),
+              "*2\r\n-ERR value is not an integer or out of range\r\n" +
+                  Bulk("safe"));
     ASSERT_TRUE(WaitForDurability(client));
     server.Stop();
   }
@@ -3408,6 +3549,14 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
     EXPECT_EQ(client.Command({"GET", "duplicate-msetnx"}), Bulk("last"));
     EXPECT_EQ(client.Command({"GET", "exec-string"}), Bulk("a"));
     EXPECT_EQ(client.Command({"GET", "exec-nx-b"}), Bulk("b"));
+    EXPECT_EQ(client.Command({"GET", "bitmap"}),
+              Bulk(std::string("\xc0\x40", 2)));
+    EXPECT_EQ(client.Command({"BITFIELD_RO", "field", "GET", "u8", "#2"}),
+              "*1\r\n:42");
+    EXPECT_EQ(client.Command({"GET", bitmap_destination}),
+              Bulk(std::string("\x0f\xf0", 2)));
+    EXPECT_EQ(client.Command({"GET", "exec-bitop"}),
+              Bulk(std::string("\x3c\xa5", 2)));
     EXPECT_GT(std::stoll(client.Command({"PTTL", "append"}).substr(1)), 0);
     server.Stop();
   }

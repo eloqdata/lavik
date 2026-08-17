@@ -237,3 +237,20 @@ TEST(ScanHashMapTest, ForEachWhileStopsImmediately) {
   }));
   EXPECT_EQ(visited, map.size());
 }
+
+TEST(ScanHashMapTest, FairRandomEntrySamplesExistingEntries) {
+  ScanHashMap<std::uint64_t> map;
+  EXPECT_EQ(map.FairRandomEntry(1), nullptr);
+  for (std::uint64_t i = 0; i < 1000; ++i) {
+    const std::string key = "sample-" + std::to_string(i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+  std::unordered_map<std::uint64_t, unsigned> seen;
+  for (std::uint64_t entropy = 1; entropy <= 1000; ++entropy) {
+    auto* selected = map.FairRandomEntry(entropy * 0x9e3779b97f4a7c15ULL);
+    ASSERT_NE(selected, nullptr);
+    EXPECT_LT(selected->value_, 1000u);
+    ++seen[selected->value_];
+  }
+  EXPECT_GT(seen.size(), 100u);
+}

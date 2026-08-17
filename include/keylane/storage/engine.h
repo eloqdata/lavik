@@ -336,6 +336,9 @@ struct CompactValueView {
 struct CompactValueUpdate {
   bool changed_ = false;
   bool erase_ = false;
+  // Reuses the callback's current encoded view for metadata-only rewrites.
+  // Valid only for an existing non-erased value.
+  bool reuse_encoded_ = false;
   std::string encoded_;
   std::uint64_t logical_size_ = 0;
   // nullopt preserves the current deadline (or persistence for a new key).

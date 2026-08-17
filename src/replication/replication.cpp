@@ -436,7 +436,7 @@ class ReplicationManager::Impl {
             (nonempty_collection && large.logical_size_ == 0) ||
             (large.value_type_ == storage::ValueType::kString &&
              large.logical_size_ != large.value_.size()) ||
-            large.value_.size() > storage::kMaxStringBytes ||
+            large.value_.size() > storage::kMaxBitmapBytes ||
             (large.value_.size() + storage::kExtentPayloadBytes - 1) /
                     storage::kExtentPayloadBytes >
                 std::numeric_limits<std::uint32_t>::max()) {

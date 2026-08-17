@@ -48,6 +48,10 @@ struct CommandSpec {
 // Case-insensitive lookup; nullptr when the command is unknown.
 const CommandSpec* FindCommand(std::string_view name);
 
+// Canonical lowercase spelling for metrics and diagnostics. Every supported
+// CommandKind is checked against the table at compile time.
+std::string_view CommandCanonicalName(CommandKind kind) noexcept;
+
 // Key argument positions resolved against a concrete argc. Keys sit at
 // indices first, first + step, ..., last (inclusive).
 struct KeyIndexView {

@@ -439,8 +439,8 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
   const std::size_t count_arg = request.kind_ == CommandKind::kBZMPop ? 2 : 1;
   const std::size_t first_key = count_arg + 1;
   std::int64_t parsed_keys = 0;
-  if (count_arg >= args.size() || !ParseInt(args[count_arg], &parsed_keys) ||
-      parsed_keys <= 0) {
+  if (count_arg >= args.size() ||
+      !ParseRedisInt64(args[count_arg], &parsed_keys) || parsed_keys <= 0) {
     return absl::InvalidArgumentError("numkeys should be greater than 0");
   }
   const std::uint64_t key_count = static_cast<std::uint64_t>(parsed_keys);
@@ -465,7 +465,8 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
       return absl::InvalidArgumentError("syntax error");
     }
     std::int64_t parsed_count = 0;
-    if (!ParseInt(args[direction + 2], &parsed_count) || parsed_count <= 0) {
+    if (!ParseRedisInt64(args[direction + 2], &parsed_count) ||
+        parsed_count <= 0) {
       return absl::InvalidArgumentError("count should be greater than 0");
     }
     shape.count_ = static_cast<std::uint64_t>(parsed_count);
@@ -473,7 +474,8 @@ absl::StatusOr<MultiPopShape> ParseMultiPopShape(
   return shape;
 }
 
-absl::StatusOr<double> ParseBlockingZSetTimeout(const CommandRequest& request) {
+absl::StatusOr<std::optional<std::chrono::steady_clock::time_point>>
+ParseBlockingZSetDeadline(const CommandRequest& request) {
   const std::size_t timeout_arg =
       request.kind_ == CommandKind::kBZMPop ? 1 : request.args_.size() - 1;
   double timeout_seconds = 0;
@@ -483,7 +485,7 @@ absl::StatusOr<double> ParseBlockingZSetTimeout(const CommandRequest& request) {
   if (timeout_seconds < 0) {
     return absl::InvalidArgumentError("timeout is negative");
   }
-  return timeout_seconds;
+  return BlockingDeadlineFromSeconds(timeout_seconds);
 }
 
 Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
@@ -2810,7 +2812,7 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     std::vector<storage::TxShardWrites>& tx_writes) {
   ReplyBuilder builder;
   if (request.kind_ != CommandKind::kZMPop) {
-    auto timeout = ParseBlockingZSetTimeout(request);
+    auto timeout = ParseBlockingZSetDeadline(request);
     if (!timeout.ok()) {
       co_return std::string(builder.AppendError(
           absl::StrCat("ERR ", timeout.status().message())));
@@ -2857,111 +2859,48 @@ Task<std::string> ExecuteZSetMultiPopLocked(
 Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
                                               ReplyBuilder& builder) {
   const auto& args = request.args_;
-  auto parsed_timeout = ParseBlockingZSetTimeout(request);
-  if (!parsed_timeout.ok()) {
+  auto deadline = ParseBlockingZSetDeadline(request);
+  if (!deadline.ok()) {
     co_return Built(builder.AppendError(
-        absl::StrCat("ERR ", parsed_timeout.status().message())));
+        absl::StrCat("ERR ", deadline.status().message())));
   }
-  const double timeout_seconds = *parsed_timeout;
   auto shape = ParseMultiPopShape(request);
   if (!shape.ok()) {
     co_return Built(
         builder.AppendError(absl::StrCat("ERR ", shape.status().message())));
   }
 
-  const bool infinite = timeout_seconds == 0;
-  const auto started = std::chrono::steady_clock::now();
-  std::optional<std::chrono::steady_clock::time_point> deadline;
-  if (!infinite) {
-    constexpr long double kNanosecondsPerSecond = 1'000'000'000.0L;
-    const long double nanoseconds =
-        static_cast<long double>(timeout_seconds) * kNanosecondsPerSecond;
-    const auto maximum = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::time_point::max() - started);
-    if (!std::isfinite(timeout_seconds) ||
-        nanoseconds > static_cast<long double>(maximum.count())) {
-      co_return Built(builder.AppendError("ERR timeout is out of range"));
-    }
-    deadline = started +
-               std::chrono::nanoseconds(static_cast<std::int64_t>(nanoseconds));
+  std::vector<BlockingWaitSpec> specs;
+  specs.reserve(shape->key_args_.size());
+  for (std::size_t argument : shape->key_args_) {
+    specs.push_back(BlockingWaitSpec{
+        .key_ = args[argument],
+        .lane_ = {},
+        .value_type_ = BlockingValueType::kSortedSet,
+        .policy_ = BlockingQueuePolicy::kFifo,
+        .stream_after_ = std::nullopt,
+    });
   }
-
-  std::unique_ptr<BlockingWaitHandle> waiter;
-  while (true) {
-    if (waiter) {
-      const BlockingWakeReason state = BlockingWaitState(*waiter);
-      if (state == BlockingWakeReason::kTimeout) {
-        co_return Built(builder.AppendRaw("*-1\r\n"));
-      }
-      if (state == BlockingWakeReason::kCancelled) {
-        co_return Built(
-            builder.AppendError("ERR blocking Sorted Set wait cancelled"));
-      }
-      if (state == BlockingWakeReason::kReady)
-        (void)ResetBlockingReady(*waiter);
-    }
-
-    while (!TryBeginCommandDbOperation(request.db_id_)) {
-      if (deadline && std::chrono::steady_clock::now() >= *deadline) {
-        co_return Built(builder.AppendRaw("*-1\r\n"));
-      }
-      absl::Status slept = co_await celer::SleepFor(
-          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
-      if (!slept.ok()) co_return Built(StorageError(builder, slept));
-    }
-    struct AttemptGuard {
-      explicit AttemptGuard(std::uint8_t db) : db_(db) {}
-      ~AttemptGuard() { Release(); }
-      void Release() {
-        if (!active_) return;
-        EndCommandDbOperation(db_);
-        active_ = false;
-      }
-      std::uint8_t db_;
-      bool active_ = true;
-    } gate(request.db_id_);
+  auto attempt = [&]() -> Task<BlockingAttemptResult> {
     ReplyBuilder attempt_builder;
     bool empty = false;
-    CommandReply attempt = co_await ExecuteZSetMultiPopAttempt(
+    CommandReply result = co_await ExecuteZSetMultiPopAttempt(
         request, attempt_builder, &empty);
-    if (!empty) co_return Built(builder.AppendRaw(attempt.encoded_));
-    if (deadline && std::chrono::steady_clock::now() >= *deadline) {
-      co_return Built(builder.AppendRaw("*-1\r\n"));
-    }
-
-    if (!waiter) {
-      std::vector<BlockingWaitSpec> specs;
-      specs.reserve(shape->key_args_.size());
-      for (std::size_t argument : shape->key_args_) {
-        specs.push_back(BlockingWaitSpec{
-            .key_ = args[argument],
-            .lane_ = {},
-            .value_type_ = BlockingValueType::kSortedSet,
-            .policy_ = BlockingQueuePolicy::kFifo,
-            .stream_after_ = std::nullopt,
-        });
-      }
-      // Do not count registration or suspension as an active DB operation.
-      gate.Release();
-      auto registered = co_await RegisterBlockingWait(
-          request.db_id_, std::move(specs), deadline);
-      if (!registered.ok()) {
-        co_return Built(StorageError(builder, registered.status()));
-      }
-      waiter = std::move(*registered);
-      continue;  // closes the empty-check/register race
-    }
-
-    gate.Release();
-    const BlockingWakeReason woke = co_await WaitForBlockingReady(*waiter);
-    if (woke == BlockingWakeReason::kTimeout) {
-      co_return Built(builder.AppendRaw("*-1\r\n"));
-    }
-    if (woke == BlockingWakeReason::kCancelled) {
-      co_return Built(
-          builder.AppendError("ERR blocking Sorted Set wait cancelled"));
-    }
-  }
+    if (empty) co_return BlockingAttemptResult{};
+    co_return BlockingAttemptResult{
+        BlockingAttemptState::kComplete,
+        Built(builder.AppendRaw(result.encoded_))};
+  };
+  auto timeout_reply = [&] {
+    return Built(builder.AppendRaw("*-1\r\n"));
+  };
+  auto status_reply = [&](const absl::Status& status) {
+    return Built(StorageError(builder, status));
+  };
+  co_return co_await ExecuteBlockingWaitLoop(
+      request.db_id_, std::move(specs), *deadline,
+      "blocking Sorted Set wait cancelled", std::move(attempt), timeout_reply,
+      status_reply);
 }
 
 }  // namespace keylane

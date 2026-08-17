@@ -38,6 +38,9 @@ inline constexpr std::uint64_t kExtentManifestMagic =
 inline constexpr std::uint64_t kHashValueMagic =
     0x3145554c4156484bULL;  // KHVALUE1
 inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
+// BITFIELD bounds the starting bit like Redis 7.2. A 64-bit field beginning
+// at the final legal offset can extend through eight additional bytes.
+inline constexpr std::uint64_t kMaxBitmapBytes = kMaxStringBytes + 8;
 inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
 inline constexpr std::uint8_t kExternalValueMask = 0x80;
 inline constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;

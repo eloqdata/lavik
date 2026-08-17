@@ -5,6 +5,7 @@
 
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
+#include "keylane/redis_parse.h"
 
 namespace keylane {
 
@@ -34,6 +35,14 @@ constexpr CommandSpec kCommandTable[] = {
     {"getrange", CommandKind::kGetRange, 4, 4, 1, 1, 1, kKeyedRead},
     {"getset", CommandKind::kGetSet, 3, 3, 1, 1, 1, kKeyedWrite},
     {"append", CommandKind::kAppend, 3, 3, 1, 1, 1, kKeyedWrite},
+    {"getbit", CommandKind::kGetBit, 3, 3, 1, 1, 1, kKeyedRead},
+    {"setbit", CommandKind::kSetBit, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"bitcount", CommandKind::kBitCount, 2, 0, 1, 1, 1, kKeyedRead},
+    {"bitpos", CommandKind::kBitPos, 3, 0, 1, 1, 1, kKeyedRead},
+    {"bitfield", CommandKind::kBitField, 2, 0, 1, 1, 1, kKeyedWrite},
+    {"bitfield_ro", CommandKind::kBitFieldRo, 2, 0, 1, 1, 1, kKeyedRead},
+    {"bitop", CommandKind::kBitOp, 4, 0, 2, -1, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
     {"set", CommandKind::kSet, 3, 0, 1, 1, 1, kKeyedWrite},
     {"setex", CommandKind::kSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
     {"psetex", CommandKind::kPSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
@@ -242,6 +251,23 @@ constexpr CommandSpec kCommandTable[] = {
     {"defrag", CommandKind::kDefrag, 2, 3, 0, 0, 1, kCmdNoKeys | kCmdGlobal},
 };
 
+consteval bool CommandTableCoversEveryKind() {
+  for (std::size_t value = 0;
+       value < static_cast<std::size_t>(CommandKind::kUnknown); ++value) {
+    bool found = false;
+    for (const CommandSpec& spec : kCommandTable) {
+      if (static_cast<std::size_t>(spec.kind_) == value) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+static_assert(CommandTableCoversEveryKind());
+
 bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
   if (name.size() != lower.size()) {
     return false;
@@ -267,6 +293,13 @@ const CommandSpec* FindCommand(std::string_view name) {
     }
   }
   return nullptr;
+}
+
+std::string_view CommandCanonicalName(CommandKind kind) noexcept {
+  for (const CommandSpec& spec : kCommandTable) {
+    if (spec.kind_ == kind) return spec.name_;
+  }
+  return "unknown";
 }
 
 absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
@@ -398,10 +431,7 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
                          spec.kind_ == CommandKind::kBZMPop;
   if (zset_mpop) {
     std::int64_t signed_count = 0;
-    const auto signed_parsed = std::from_chars(
-        text.data(), text.data() + text.size(), signed_count);
-    if (signed_parsed.ec != std::errc{} ||
-        signed_parsed.ptr != text.data() + text.size() || signed_count <= 0) {
+    if (!ParseRedisInt64(text, &signed_count) || signed_count <= 0) {
       return absl::InvalidArgumentError("numkeys should be greater than 0");
     }
   }

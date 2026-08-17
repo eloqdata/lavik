@@ -18,7 +18,8 @@ Task<CommandReply> ExecuteSingleListCommandLocked(const CommandRequest& request,
                                                   ReplyBuilder& reply_builder);
 
 Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
-                                       ReplyBuilder& reply_builder);
+                                       ReplyBuilder& reply_builder,
+                                       bool* unavailable = nullptr);
 
 Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                                               ReplyBuilder& reply_builder);

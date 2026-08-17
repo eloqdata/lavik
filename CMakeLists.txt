@@ -115,6 +115,7 @@ add_library(keylane_module
   src/metrics.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
+  src/redis/blocking_wait.cpp
   src/redis/command.cpp
   src/redis/hash_command.cpp
   src/redis/list_command.cpp

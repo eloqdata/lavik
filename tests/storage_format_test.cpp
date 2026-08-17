@@ -216,6 +216,21 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(decoded_record.value_type_ == ValueType::kString);
   ASSERT_TRUE(decoded_record.logical_size_ == external_record.logical_size_);
   ASSERT_TRUE(decoded_record.payload_bytes_ == external_record.payload_bytes_);
+
+  external_record.logical_size_ = kMaxBitmapBytes;
+  ASSERT_TRUE(EncodeRecordHeader(
+      external_record, key,
+      std::span<std::byte>(record_page.data(), record_header_bytes)));
+  ASSERT_TRUE(DecodeRecordHeader(
+      std::span<const std::byte>(record_page.data(), record_header_bytes),
+      &decoded_record, &decoded_key));
+  external_record.logical_size_ = kMaxBitmapBytes + 1;
+  ASSERT_TRUE(EncodeRecordHeader(
+      external_record, key,
+      std::span<std::byte>(record_page.data(), record_header_bytes)));
+  ASSERT_FALSE(DecodeRecordHeader(
+      std::span<const std::byte>(record_page.data(), record_header_bytes),
+      &decoded_record, &decoded_key));
 }
 
 TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {

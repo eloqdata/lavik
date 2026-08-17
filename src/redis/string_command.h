@@ -25,6 +25,20 @@ celer::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,
     storage::TxShardWrites* tx, ReplyBuilder& reply_builder);
 
+celer::Task<CommandReply> ExecuteBitmapCommand(const CommandRequest& request,
+                                               ReplyBuilder& reply_builder);
+
+celer::Task<CommandReply> ExecuteBitmapCommandLocked(
+    const CommandRequest& request, const storage::Digest& digest,
+    storage::TxShardWrites* tx, ReplyBuilder& reply_builder);
+
+celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
+                                              ReplyBuilder& reply_builder);
+
+celer::Task<std::string> ExecuteBitOpLocked(
+    const CommandRequest& request, std::span<const StringExecKey> locked_keys,
+    std::vector<storage::TxShardWrites>& tx_writes);
+
 celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,
                                             ReplyBuilder& reply_builder);
 

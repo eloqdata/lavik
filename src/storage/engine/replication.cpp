@@ -392,7 +392,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
            value_logical_size != record.logical_size_) ||
           value_logical_size > std::numeric_limits<std::uint32_t>::max() ||
           record.logical_size_ == 0 ||
-          record.logical_size_ > kMaxStringBytes ||
+          record.logical_size_ > kMaxBitmapBytes ||
           record.chunk_count_ == 0 ||
           record.chunk_count_ !=
               (record.logical_size_ + kExtentPayloadBytes - 1) /

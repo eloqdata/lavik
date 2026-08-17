@@ -27,6 +27,7 @@
 #include "celer/runtime/worker.h"
 #include "hash_command.h"
 #include "keylane/command_table.h"
+#include "keylane/expiration.h"
 #include "keylane/glob.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
@@ -83,6 +84,9 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kPSetEx:
     case CommandKind::kSetNx:
     case CommandKind::kSetRange:
+    case CommandKind::kSetBit:
+    case CommandKind::kBitField:
+    case CommandKind::kBitOp:
     case CommandKind::kGetSet:
     case CommandKind::kAppend:
     case CommandKind::kIncrBy:
@@ -313,6 +317,8 @@ Task<CommandReply> ExecuteRandomKey(const CommandRequest& request,
   // A worker's live count can temporarily include expired records awaiting
   // their tombstone. Remove an empty result from this draw and retry the
   // remaining workers; RandomKeyLocal itself filters those stale entries.
+  constexpr unsigned kMaximumTransientRetries = 100;
+  unsigned transient_retries = 0;
   while (total != 0) {
     std::uint64_t rank = RandomRank(total, RandomSampleGenerator());
     unsigned selected = 0;
@@ -325,6 +331,10 @@ Task<CommandReply> ExecuteRandomKey(const CommandRequest& request,
       return g_storage->RandomKeyLocal(db);
     });
     if (!key.ok()) {
+      if (key.status().code() == absl::StatusCode::kAborted &&
+          transient_retries++ < kMaximumTransientRetries) {
+        continue;
+      }
       co_return BuiltReply(AppendStorageError(reply_builder, key.status()));
     }
     if (key->has_value()) {
@@ -895,8 +905,6 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
   co_return BuiltReply(EncodeScanReply(reply_builder, 0, keys));
 }
 
-std::uint64_t CommandUnixTimeMillis() noexcept;
-
 // KEYS streams its reply in bounded memory. RESP2 arrays announce their
 // element count first, so the keyspace must hold still between the counting
 // pass and the emitting pass: the database gate is closed (like FLUSHDB) and
@@ -1023,7 +1031,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   }
   auto state = std::make_shared<KeysStreamState>(db);
   state->pattern_ = request.args_[1];
-  state->now_ms_ = CommandUnixTimeMillis();
+  state->now_ms_ = RedisUnixTimeMillis();
   // Drain in-flight commands, then freeze expiration writes: from here to the
   // end of the stream the keyspace cannot change, so the counted N is exact.
   while ((g_db_gates[db].load(std::memory_order_acquire) & kDbGateCountMask) !=
@@ -1067,13 +1075,6 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   CommandReply reply = BuiltReply(reply_builder.AppendArrayHeader(matches));
   reply.chunks_ = [state]() { return NextKeysChunk(state); };
   co_return reply;
-}
-
-std::uint64_t CommandUnixTimeMillis() noexcept {
-  const auto value = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-  return value > 0 ? static_cast<std::uint64_t>(value) : 0;
 }
 
 bool ParseInt64(std::string_view text, std::int64_t* value) {
@@ -1253,7 +1254,7 @@ Task<CommandReply> ExecuteNegativeRandomStream(
         reply_builder.AppendError("TRYAGAIN database flush is in progress"));
   }
   DbOperationGuard initial_db_guard(db);
-  state->now_ms_ = CommandUnixTimeMillis();
+  state->now_ms_ = RedisUnixTimeMillis();
   absl::StatusOr<storage::HashResult> length =
       co_await BeginNegativeRandomStream(state);
   if (!length.ok()) {
@@ -1319,7 +1320,7 @@ PrepareTransactionalNegativeRandomStreamLocked(
   operation.kind_ = options.hash_ && options.with_values_
                         ? storage::HashOperationKind::kGetAll
                         : storage::HashOperationKind::kKeys;
-  operation.now_ms_ = CommandUnixTimeMillis();
+  operation.now_ms_ = RedisUnixTimeMillis();
 
   absl::StatusOr<storage::HashResult> snapshot;
   if (options.zset_) {
@@ -1390,7 +1391,7 @@ absl::StatusOr<storage::SetOptions> ParseSetOptions(
   bool condition_seen = false;
   bool expiration_seen = false;
   bool get_seen = false;
-  const std::uint64_t now_ms = CommandUnixTimeMillis();
+  const std::uint64_t now_ms = RedisUnixTimeMillis();
   constexpr std::uint64_t kMaxTimestamp =
       static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
 
@@ -1489,11 +1490,6 @@ absl::StatusOr<storage::ExpirationCondition> ParseExpirationCondition(
 
 absl::StatusOr<std::uint64_t> ParseExpirationDeadline(CommandKind kind,
                                                       std::string_view text) {
-  std::int64_t value = 0;
-  if (!ParseInt64(text, &value)) {
-    return absl::InvalidArgumentError(
-        "value is not an integer or out of range");
-  }
   const bool seconds =
       kind == CommandKind::kExpire || kind == CommandKind::kExpireAt;
   const bool absolute =
@@ -1503,26 +1499,9 @@ absl::StatusOr<std::uint64_t> ParseExpirationDeadline(CommandKind kind,
                                    : kind == CommandKind::kExpireAt
                                        ? "expireat"
                                        : "pexpireat";
-  if (seconds && (value > std::numeric_limits<std::int64_t>::max() / 1000 ||
-                  value < std::numeric_limits<std::int64_t>::min() / 1000)) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("invalid expire time in '", command, "' command"));
-  }
-  if (seconds) value *= 1000;
-
-  const std::uint64_t now_ms = CommandUnixTimeMillis();
-  const std::int64_t signed_now = static_cast<std::int64_t>(now_ms);
-  if (!absolute) {
-    if (value > std::numeric_limits<std::int64_t>::max() - signed_now) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("invalid expire time in '", command, "' command"));
-    }
-    value += signed_now;
-  }
-  // The storage API uses zero for persistence. Map every already-expired
-  // signed timestamp to a positive sentinel which UpdateExpiration converts
-  // to a tombstone immediately.
-  return value <= signed_now ? 1 : static_cast<std::uint64_t>(value);
+  return ParseRedisExpirationDeadline(
+      text, seconds, absolute, command,
+      PastExpirationPolicy::kExpireImmediately);
 }
 
 long long ExpirationReplySeconds(std::uint64_t milliseconds) {
@@ -1612,6 +1591,14 @@ Task<CommandReply> ExecuteStorageCommand(
     case CommandKind::kSetRange:
     case CommandKind::kSubstr:
       co_return co_await ExecuteStringCommand(request, reply_builder);
+
+    case CommandKind::kGetBit:
+    case CommandKind::kSetBit:
+    case CommandKind::kBitCount:
+    case CommandKind::kBitPos:
+    case CommandKind::kBitField:
+    case CommandKind::kBitFieldRo:
+      co_return co_await ExecuteBitmapCommand(request, reply_builder);
 
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
@@ -1752,7 +1739,7 @@ Task<CommandReply> ExecuteStorageCommand(
       } else if (info.expire_at_ms_ == 0) {
         reply.encoded_ = reply_builder.AppendInteger(-1);
       } else {
-        const std::uint64_t now_ms = CommandUnixTimeMillis();
+        const std::uint64_t now_ms = RedisUnixTimeMillis();
         const std::uint64_t value =
             absolute
                 ? info.expire_at_ms_
@@ -2067,6 +2054,18 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       co_return std::string(reply.encoded_);
     }
 
+    case CommandKind::kGetBit:
+    case CommandKind::kSetBit:
+    case CommandKind::kBitCount:
+    case CommandKind::kBitPos:
+    case CommandKind::kBitField:
+    case CommandKind::kBitFieldRo: {
+      ReplyBuilder bitmap_reply_builder;
+      CommandReply reply = co_await ExecuteBitmapCommandLocked(
+          request, digest, tx, bitmap_reply_builder);
+      co_return std::string(reply.encoded_);
+    }
+
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
     case CommandKind::kRPush:
@@ -2210,7 +2209,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       if (info.expire_at_ms_ == 0) {
         co_return EncodeInteger(-1);
       }
-      const std::uint64_t now_ms = CommandUnixTimeMillis();
+      const std::uint64_t now_ms = RedisUnixTimeMillis();
       const std::uint64_t value =
           absolute
               ? info.expire_at_ms_
@@ -2364,6 +2363,72 @@ Task<absl::Status> RunTxCommit(std::uint64_t txid,
   co_return absl::OkStatus();
 }
 
+using TwoPhaseCallback =
+    Task<absl::Status> (*)(void*, const tx::ShardSlice&);
+
+Task<absl::Status> ReleaseHeldKeys(void*, const tx::ShardSlice&);
+
+struct TwoPhaseResult {
+  absl::Status status_;
+  std::uint64_t txid_ = 0;
+  bool skipped_ = false;
+};
+
+template <typename Context>
+Task<absl::Status> TwoPhaseFinishCallback(void* opaque,
+                                          const tx::ShardSlice&) {
+  auto* context = static_cast<Context*>(opaque);
+  const std::uint64_t txid = context->writes_.front().txid_;
+  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
+  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+}
+
+template <typename Context, typename ShouldSkip>
+Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
+    tx::Transaction& transaction, Context* context,
+    TwoPhaseCallback read_callback, TwoPhaseCallback write_callback,
+    TwoPhaseCallback single_shard_callback, ShouldSkip should_skip) {
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) co_return TwoPhaseResult{std::move(status)};
+
+  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+  context->writes_.resize(g_storage->worker_count());
+  for (storage::TxShardWrites& writes : context->writes_) {
+    writes.txid_ = txid;
+    writes.collect_undo_ = true;
+  }
+  auto disarm_undo = [&] {
+    for (storage::TxShardWrites& writes : context->writes_) {
+      writes.collect_undo_ = false;
+    }
+  };
+
+  if (transaction.single_shard()) {
+    status = co_await transaction.Execute(single_shard_callback, context, true);
+    disarm_undo();
+    const bool skipped = status.ok() && should_skip(*context);
+    co_return TwoPhaseResult{std::move(status), txid, skipped};
+  }
+
+  status = co_await transaction.Execute(read_callback, context, false);
+  if (!status.ok() || should_skip(*context)) {
+    absl::Status released =
+        co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
+    disarm_undo();
+    if (status.ok() && !released.ok()) status = std::move(released);
+    const bool skipped = status.ok();
+    co_return TwoPhaseResult{std::move(status), txid, skipped};
+  }
+
+  status = co_await transaction.Execute(write_callback, context, false);
+  context->rollback_ = !status.ok();
+  absl::Status finished = co_await transaction.Execute(
+      &TwoPhaseFinishCallback<Context>, context, true);
+  if (status.ok() && !finished.ok()) status = std::move(finished);
+  disarm_undo();
+  co_return TwoPhaseResult{std::move(status), txid, false};
+}
+
 struct RenameContext {
   const CommandRequest* request_ = nullptr;
   storage::RawValue source_;
@@ -2409,13 +2474,6 @@ Task<absl::Status> RenameWriteCallback(void* opaque,
     }
   }
   co_return absl::OkStatus();
-}
-
-Task<absl::Status> RenameFinishCallback(void* opaque, const tx::ShardSlice&) {
-  auto* context = static_cast<RenameContext*>(opaque);
-  const std::uint64_t txid = context->writes_.front().txid_;
-  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
 
 Task<absl::Status> RenameSingleShardCallback(void* opaque,
@@ -2502,70 +2560,28 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
-  absl::Status status = co_await transaction.Schedule();
+  RenameContext context;
+  context.request_ = &request;
+  TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
+      transaction, &context, &RenameReadCallback, &RenameWriteCallback,
+      &RenameSingleShardCallback,
+      [nx](const RenameContext& value) {
+        return nx && value.destination_exists_;
+      });
+  absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
     if (status.code() == absl::StatusCode::kNotFound) {
       co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
     }
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
-
-  RenameContext context;
-  context.request_ = &request;
-  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
-  context.writes_.resize(g_storage->worker_count());
-  for (auto& writes : context.writes_) {
-    writes.txid_ = txid;
-    writes.collect_undo_ = true;
-  }
-
-  if (transaction.single_shard()) {
-    status = co_await transaction.Execute(&RenameSingleShardCallback, &context,
-                                          true);
-    for (auto& writes : context.writes_) writes.collect_undo_ = false;
-    if (!status.ok()) {
-      if (status.code() == absl::StatusCode::kNotFound) {
-        co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
-      }
-      co_return BuiltReply(AppendStorageError(reply_builder, status));
-    }
-    if (nx && context.destination_exists_) {
-      co_return BuiltReply(reply_builder.AppendInteger(0));
-    }
-    g_storage->NoteTxCommitStarted();
-    SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
-    NotifyRenamedValue(request.db_id_, args[2], context.source_.value_type_);
-    co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
-                            : reply_builder.AppendSimpleString("OK"));
-  }
-
-  status = co_await transaction.Execute(&RenameReadCallback, &context, false);
-  if (!status.ok() || (nx && context.destination_exists_)) {
-    (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
-    if (!status.ok()) {
-      if (status.code() == absl::StatusCode::kNotFound) {
-        co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
-      }
-      co_return BuiltReply(AppendStorageError(reply_builder, status));
-    }
+  if (execution.skipped_) {
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
 
-  status = co_await transaction.Execute(&RenameWriteCallback, &context, false);
-  context.rollback_ = !status.ok();
-  absl::Status finished =
-      co_await transaction.Execute(&RenameFinishCallback, &context, true);
-  if (status.ok() && !finished.ok()) status = finished;
-  for (auto& writes : context.writes_) writes.collect_undo_ = false;
-  if (!status.ok()) {
-    if (status.code() == absl::StatusCode::kNotFound) {
-      co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
-    }
-    co_return BuiltReply(AppendStorageError(reply_builder, status));
-  }
-
   g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  SpawnOnCurrentWorker(
+      RunTxCommit(execution.txid_, std::move(context.writes_)));
   NotifyRenamedValue(request.db_id_, args[2], context.source_.value_type_);
   co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
                           : reply_builder.AppendSimpleString("OK"));
@@ -2650,13 +2666,6 @@ Task<absl::Status> CopyWriteCallback(void* opaque,
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> CopyFinishCallback(void* opaque, const tx::ShardSlice&) {
-  auto* context = static_cast<CopyContext*>(opaque);
-  const std::uint64_t txid = context->writes_.front().txid_;
-  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
-}
-
 Task<absl::Status> CopySingleShardCallback(void* opaque,
                                            const tx::ShardSlice& slice) {
   auto* context = static_cast<CopyContext*>(opaque);
@@ -2701,50 +2710,26 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
                      storage::ComputeDigest(args[2]), 2,
                      tx::LockMode::kExclusive);
   transaction.Seal();
-  absl::Status status = co_await transaction.Schedule();
-  if (!status.ok()) {
-    co_return BuiltReply(AppendStorageError(reply_builder, status));
-  }
-
   CopyContext context;
   context.request_ = &request;
   context.options_ = *options;
-  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
-  context.writes_.resize(g_storage->worker_count());
-  for (storage::TxShardWrites& writes : context.writes_) {
-    writes.txid_ = txid;
-    writes.collect_undo_ = true;
-  }
-
-  if (transaction.single_shard()) {
-    status =
-        co_await transaction.Execute(&CopySingleShardCallback, &context, true);
-    for (auto& writes : context.writes_) writes.collect_undo_ = false;
-  } else {
-    status = co_await transaction.Execute(&CopyReadCallback, &context, false);
-    if (!status.ok() || !context.source_.has_value() ||
-        (context.destination_exists_ && !options->replace_)) {
-      (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
-      for (auto& writes : context.writes_) writes.collect_undo_ = false;
-    } else {
-      status =
-          co_await transaction.Execute(&CopyWriteCallback, &context, false);
-      context.rollback_ = !status.ok();
-      absl::Status finished =
-          co_await transaction.Execute(&CopyFinishCallback, &context, true);
-      if (status.ok() && !finished.ok()) status = finished;
-      for (auto& writes : context.writes_) writes.collect_undo_ = false;
-    }
-  }
+  TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
+      transaction, &context, &CopyReadCallback, &CopyWriteCallback,
+      &CopySingleShardCallback, [](const CopyContext& value) {
+        return !value.source_.has_value() ||
+               (value.destination_exists_ && !value.options_.replace_);
+      });
+  absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
-  if (!context.copied_) {
+  if (execution.skipped_ || !context.copied_) {
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
 
   g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  SpawnOnCurrentWorker(
+      RunTxCommit(execution.txid_, std::move(context.writes_)));
   NotifyRenamedValue(options->destination_db_, args[2],
                      context.source_->value_type_);
   co_return BuiltReply(reply_builder.AppendInteger(1));
@@ -2788,13 +2773,6 @@ Task<absl::Status> MSetNxWriteCallback(void* opaque, const tx::ShardSlice&) {
   co_return co_await MSetNxWriteLocal(static_cast<MSetNxContext*>(opaque));
 }
 
-Task<absl::Status> MSetNxFinishCallback(void* opaque, const tx::ShardSlice&) {
-  auto* context = static_cast<MSetNxContext*>(opaque);
-  const std::uint64_t txid = context->writes_.front().txid_;
-  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
-  co_return co_await g_storage->DiscardTxUndoLocal(txid);
-}
-
 Task<absl::Status> MSetNxSingleShardCallback(void* opaque,
                                              const tx::ShardSlice& slice) {
   auto* context = static_cast<MSetNxContext*>(opaque);
@@ -2826,54 +2804,23 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
-  absl::Status status = co_await transaction.Schedule();
-  if (!status.ok()) {
-    co_return BuiltReply(AppendStorageError(reply_builder, status));
-  }
-
   MSetNxContext context;
   context.request_ = &request;
-  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
-  context.writes_.resize(g_storage->worker_count());
-  for (storage::TxShardWrites& writes : context.writes_) {
-    writes.txid_ = txid;
-    writes.collect_undo_ = true;
-  }
-
-  if (transaction.single_shard()) {
-    status = co_await transaction.Execute(&MSetNxSingleShardCallback, &context,
-                                          true);
-    for (auto& writes : context.writes_) writes.collect_undo_ = false;
-    if (!status.ok()) {
-      co_return BuiltReply(AppendStorageError(reply_builder, status));
-    }
-    if (context.exists_.load(std::memory_order_relaxed)) {
-      co_return BuiltReply(reply_builder.AppendInteger(0));
-    }
-    g_storage->NoteTxCommitStarted();
-    SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
-    co_return BuiltReply(reply_builder.AppendInteger(1));
-  }
-
-  status = co_await transaction.Execute(&MSetNxCheckCallback, &context, false);
-  if (!status.ok() || context.exists_.load(std::memory_order_relaxed)) {
-    (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
-    co_return status.ok()
-        ? BuiltReply(reply_builder.AppendInteger(0))
-        : BuiltReply(AppendStorageError(reply_builder, status));
-  }
-
-  status = co_await transaction.Execute(&MSetNxWriteCallback, &context, false);
-  context.rollback_ = !status.ok();
-  absl::Status finished =
-      co_await transaction.Execute(&MSetNxFinishCallback, &context, true);
-  if (status.ok() && !finished.ok()) status = finished;
-  for (auto& writes : context.writes_) writes.collect_undo_ = false;
+  TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
+      transaction, &context, &MSetNxCheckCallback, &MSetNxWriteCallback,
+      &MSetNxSingleShardCallback, [](const MSetNxContext& value) {
+        return value.exists_.load(std::memory_order_relaxed);
+      });
+  absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
+  if (execution.skipped_) {
+    co_return BuiltReply(reply_builder.AppendInteger(0));
+  }
   g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  SpawnOnCurrentWorker(
+      RunTxCommit(execution.txid_, std::move(context.writes_)));
   co_return BuiltReply(reply_builder.AppendInteger(1));
 }
 
@@ -3082,10 +3029,6 @@ bool IsExecSequentialListMove(CommandKind kind) {
          kind == CommandKind::kBLMove || kind == CommandKind::kBRPopLPush;
 }
 
-bool IsExecSequentialListCommand(CommandKind kind) {
-  return IsExecSequentialListPop(kind) || IsExecSequentialListMove(kind);
-}
-
 bool IsExecSequentialSetMulti(CommandKind kind) {
   return kind == CommandKind::kSDiff || kind == CommandKind::kSDiffStore ||
          kind == CommandKind::kSInter || kind == CommandKind::kSInterCard ||
@@ -3114,7 +3057,8 @@ bool IsExecSequentialCopy(CommandKind kind) {
 }
 
 bool IsExecSequentialStringMulti(CommandKind kind) {
-  return kind == CommandKind::kMSetNx || kind == CommandKind::kLcs;
+  return kind == CommandKind::kMSetNx || kind == CommandKind::kLcs ||
+         kind == CommandKind::kBitOp;
 }
 
 std::optional<std::uint16_t> GeoStoreDestinationArg(
@@ -3137,6 +3081,32 @@ std::optional<std::uint16_t> GeoStoreDestinationArg(
 
 bool IsExecSequentialStreamRead(CommandKind kind) {
   return kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup;
+}
+
+enum class ExecSequentialFamily : std::uint8_t {
+  kNone,
+  kListPop,
+  kListMove,
+  kRename,
+  kCopy,
+  kStringMulti,
+  kSetMulti,
+  kZSetMulti,
+  kStreamRead,
+};
+
+ExecSequentialFamily ClassifyExecSequential(CommandKind kind) {
+  if (IsExecSequentialListPop(kind)) return ExecSequentialFamily::kListPop;
+  if (IsExecSequentialListMove(kind)) return ExecSequentialFamily::kListMove;
+  if (IsExecSequentialRename(kind)) return ExecSequentialFamily::kRename;
+  if (IsExecSequentialCopy(kind)) return ExecSequentialFamily::kCopy;
+  if (IsExecSequentialStringMulti(kind))
+    return ExecSequentialFamily::kStringMulti;
+  if (IsExecSequentialSetMulti(kind)) return ExecSequentialFamily::kSetMulti;
+  if (IsExecSequentialZSetMulti(kind)) return ExecSequentialFamily::kZSetMulti;
+  if (IsExecSequentialStreamRead(kind))
+    return ExecSequentialFamily::kStreamRead;
+  return ExecSequentialFamily::kNone;
 }
 
 Task<std::string> ExecuteExecSequentialZSetMulti(
@@ -3384,12 +3354,16 @@ Task<std::string> ExecuteExecSequentialCopy(
 Task<std::string> ExecuteExecSequentialStringMulti(
     const CommandRequest& command, const std::vector<ExecKey>& keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
-  if (command.kind_ == CommandKind::kLcs) {
+  if (command.kind_ == CommandKind::kLcs ||
+      command.kind_ == CommandKind::kBitOp) {
     std::vector<StringExecKey> string_keys;
     string_keys.reserve(keys.size());
     for (const ExecKey& key : keys) {
       string_keys.push_back(StringExecKey{
           .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+    }
+    if (command.kind_ == CommandKind::kBitOp) {
+      co_return co_await ExecuteBitOpLocked(command, string_keys, tx_writes);
     }
     co_return co_await ExecuteLcsLocked(command, string_keys);
   }
@@ -3886,6 +3860,38 @@ Task<std::string> ExecuteExecSequentialListMove(
   co_return EncodeBulkString(popped->values_.front());
 }
 
+Task<std::string> ExecuteExecSequentialCommand(
+    ExecSequentialFamily family, const CommandRequest& command,
+    const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  switch (family) {
+    case ExecSequentialFamily::kListPop:
+      co_return co_await ExecuteExecSequentialListPop(command, keys, tx_writes);
+    case ExecSequentialFamily::kListMove:
+      co_return co_await ExecuteExecSequentialListMove(command, keys,
+                                                       tx_writes);
+    case ExecSequentialFamily::kRename:
+      co_return co_await ExecuteExecSequentialRename(command, keys, tx_writes);
+    case ExecSequentialFamily::kCopy:
+      co_return co_await ExecuteExecSequentialCopy(command, keys, tx_writes);
+    case ExecSequentialFamily::kStringMulti:
+      co_return co_await ExecuteExecSequentialStringMulti(command, keys,
+                                                          tx_writes);
+    case ExecSequentialFamily::kSetMulti:
+      co_return co_await ExecuteExecSequentialSetMulti(command, keys,
+                                                       tx_writes);
+    case ExecSequentialFamily::kZSetMulti:
+      co_return co_await ExecuteExecSequentialZSetMulti(command, keys,
+                                                        tx_writes);
+    case ExecSequentialFamily::kStreamRead:
+      co_return co_await ExecuteExecSequentialStreamRead(command, keys,
+                                                         tx_writes);
+    case ExecSequentialFamily::kNone:
+      co_return EncodeError("ERR internal EXEC sequential routing error");
+  }
+  co_return EncodeError("ERR internal EXEC sequential routing error");
+}
+
 // One squashed run of consecutive keyed commands [begin, end): every shard
 // executes its keys of every command in queue order within a single hop.
 // Sinks are per command (indexed by i - begin); shards write disjoint reply
@@ -4303,6 +4309,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                             cmd.kind_ == CommandKind::kZRangeStore ||
                             cmd.kind_ == CommandKind::kGeoSearchStore ||
                             GeoStoreDestinationArg(cmd).has_value();
+    const bool bitop_store = cmd.kind_ == CommandKind::kBitOp;
     const std::uint16_t zset_destination =
         GeoStoreDestinationArg(cmd).value_or(1);
     if (zset_store) {
@@ -4316,14 +4323,27 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
           .db_ = cmd.db_id_,
       });
     }
+    if (bitop_store) {
+      cmd_keys[i].push_back(ExecKey{
+          .digest_ = storage::ComputeDigest(cmd.args_[2]),
+          .owner_ = static_cast<std::uint16_t>(ShardForKey(cmd.args_[2])),
+          .arg_ = 2,
+          .slot_ = slot++,
+          .mode_ = tx::LockMode::kExclusive,
+          .db_ = cmd.db_id_,
+      });
+    }
     for (std::size_t a = keys->first_; a <= keys->last_; a += keys->step_) {
       if (zset_store && a == zset_destination) continue;
+      if (bitop_store && a == 2) continue;
       cmd_keys[i].push_back(ExecKey{
           .digest_ = storage::ComputeDigest(cmd.args_[a]),
           .owner_ = static_cast<std::uint16_t>(ShardForKey(cmd.args_[a])),
           .arg_ = static_cast<std::uint16_t>(a),
           .slot_ = slot++,
-          .mode_ = write ? tx::LockMode::kExclusive : tx::LockMode::kShared,
+          .mode_ = bitop_store ? tx::LockMode::kShared
+                               : (write ? tx::LockMode::kExclusive
+                                        : tx::LockMode::kShared),
           .db_ = cmd.db_id_,
       });
     }
@@ -4411,63 +4431,18 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                 ++i;
                 continue;
               }
-              if (IsExecSequentialListPop(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialListPop(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialListMove(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialListMove(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialRename(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialRename(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialCopy(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialCopy(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialStringMulti(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialStringMulti(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialSetMulti(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialSetMulti(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialZSetMulti(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialZSetMulti(
-                    cmd, cmd_keys[i], tx_writes);
-                ++i;
-                continue;
-              }
-              if (IsExecSequentialStreamRead(cmd.kind_)) {
-                replies[i] = co_await ExecuteExecSequentialStreamRead(
-                    cmd, cmd_keys[i], tx_writes);
+              const ExecSequentialFamily sequential =
+                  ClassifyExecSequential(cmd.kind_);
+              if (sequential != ExecSequentialFamily::kNone) {
+                replies[i] = co_await ExecuteExecSequentialCommand(
+                    sequential, cmd, cmd_keys[i], tx_writes);
                 ++i;
                 continue;
               }
               std::size_t end = i + 1;
               while (end < queued.size() && !cmd_keys[end].empty() &&
-                     !IsExecSequentialListCommand(queued[end].kind_) &&
-                     !IsExecSequentialRename(queued[end].kind_) &&
-                     !IsExecSequentialCopy(queued[end].kind_) &&
-                     !IsExecSequentialStringMulti(queued[end].kind_) &&
-                     !IsExecSequentialSetMulti(queued[end].kind_) &&
-                     !IsExecSequentialZSetMulti(queued[end].kind_) &&
-                     !IsExecSequentialStreamRead(queued[end].kind_)) {
+                     ClassifyExecSequential(queued[end].kind_) ==
+                         ExecSequentialFamily::kNone) {
                 ++end;
               }
               ExecRunContext run;
@@ -4539,63 +4514,18 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
           ++i;
           continue;
         }
-        if (IsExecSequentialListPop(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialListPop(cmd, cmd_keys[i],
-                                                             tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialListMove(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialListMove(cmd, cmd_keys[i],
-                                                              tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialRename(cmd.kind_)) {
-          replies[i] =
-              co_await ExecuteExecSequentialRename(cmd, cmd_keys[i], tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialCopy(cmd.kind_)) {
-          replies[i] =
-              co_await ExecuteExecSequentialCopy(cmd, cmd_keys[i], tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialStringMulti(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialStringMulti(
-              cmd, cmd_keys[i], tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialSetMulti(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialSetMulti(cmd, cmd_keys[i],
-                                                              tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialZSetMulti(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialZSetMulti(cmd, cmd_keys[i],
-                                                               tx_writes);
-          ++i;
-          continue;
-        }
-        if (IsExecSequentialStreamRead(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialStreamRead(
-              cmd, cmd_keys[i], tx_writes);
+        const ExecSequentialFamily sequential =
+            ClassifyExecSequential(cmd.kind_);
+        if (sequential != ExecSequentialFamily::kNone) {
+          replies[i] = co_await ExecuteExecSequentialCommand(
+              sequential, cmd, cmd_keys[i], tx_writes);
           ++i;
           continue;
         }
         std::size_t end = i + 1;
         while (end < queued.size() && !cmd_keys[end].empty() &&
-               !IsExecSequentialListCommand(queued[end].kind_) &&
-               !IsExecSequentialRename(queued[end].kind_) &&
-               !IsExecSequentialCopy(queued[end].kind_) &&
-               !IsExecSequentialStringMulti(queued[end].kind_) &&
-               !IsExecSequentialSetMulti(queued[end].kind_) &&
-               !IsExecSequentialZSetMulti(queued[end].kind_) &&
-               !IsExecSequentialStreamRead(queued[end].kind_)) {
+               ClassifyExecSequential(queued[end].kind_) ==
+                   ExecSequentialFamily::kNone) {
           ++end;
         }
         ExecRunContext run;
@@ -4673,6 +4603,7 @@ void EndCommandDbOperation(std::uint8_t db_id) noexcept {
 
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_storage = engine;
+  InitBlockingWaitStorage(engine);
   InitHashCommandStorage(engine);
   InitListCommandStorage(engine);
   InitSetCommandStorage(engine);
@@ -4883,6 +4814,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kLcs:
       co_return co_await ExecuteLcsCommand(request, reply_builder);
 
+    case CommandKind::kBitOp:
+      co_return co_await ExecuteBitOpCommand(request, reply_builder);
+
     case CommandKind::kDel:
     case CommandKind::kUnlink:
     case CommandKind::kExists:
@@ -4958,6 +4892,12 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kGetRange:
     case CommandKind::kGetSet:
     case CommandKind::kAppend:
+    case CommandKind::kGetBit:
+    case CommandKind::kSetBit:
+    case CommandKind::kBitCount:
+    case CommandKind::kBitPos:
+    case CommandKind::kBitField:
+    case CommandKind::kBitFieldRo:
     case CommandKind::kStrlen:
     case CommandKind::kSet:
     case CommandKind::kSetEx:

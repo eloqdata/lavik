@@ -89,6 +89,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   }
   if (!update->changed_) co_return absl::OkStatus();
   if (update->erase_ && !exists) co_return absl::OkStatus();
+  if (update->reuse_encoded_ &&
+      (!exists || update->erase_ || !update->encoded_.empty())) {
+    co_return absl::InternalError("invalid compact payload reuse");
+  }
   if (!update->erase_ && update->logical_size_ == 0 &&
       value_type == ValueType::kSortedSet) {
     co_return absl::InvalidArgumentError(
@@ -103,11 +107,15 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       update->erase_
           ? 0
           : update->expire_at_ms_.value_or(exists ? location.expire_at_ms_ : 0);
+  const std::string_view encoded =
+      update->reuse_encoded_ ? view->encoded_ : std::string_view(update->encoded_);
+  const std::uint64_t logical_size =
+      update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key,
-      update->erase_ ? std::string_view{} : std::string_view(update->encoded_),
+      update->erase_ ? std::string_view{} : encoded,
       kind, published_type, expire_at_ms, tx,
-      update->erase_ ? 0 : update->logical_size_);
+      update->erase_ ? 0 : logical_size);
   co_return status;
 }
 

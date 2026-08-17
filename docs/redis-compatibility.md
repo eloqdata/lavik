@@ -11,6 +11,12 @@ The Redis 7.2 String command group is complete: `APPEND`, `DECR`, `DECRBY`,
 `SETNX`, `SETRANGE`, `STRLEN`, and `SUBSTR`. `SET` supports
 `NX`/`XX`, `GET`, `EX`/`PX`/`EXAT`/`PXAT`, and `KEEPTTL`.
 
+The Redis 7.2 Bitmap surface is also complete: `GETBIT`, `SETBIT`,
+`BITCOUNT` (including `BYTE` and `BIT` ranges), `BITPOS`, `BITFIELD`,
+`BITFIELD_RO`, and atomic cross-shard `BITOP`. Bitmap values use the ordinary
+String representation and therefore interoperate directly with String
+commands.
+
 The current key and expiration surface includes:
 
 - `DEL`, `UNLINK`, `RENAME`, `RENAMENX`, `COPY`, `EXISTS`, `TOUCH`,

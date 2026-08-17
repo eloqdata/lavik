@@ -931,7 +931,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                            "key exceeds the Redis-compatible 512 MiB limit");
   }
   const bool invalid_logical_size =
-      (value_type == ValueType::kString && logical_size > kMaxStringBytes) ||
+      (value_type == ValueType::kString && logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
   const std::uint64_t key_prefix = key_external ? key.size() : 0;
   if (invalid_logical_size || value.size() > kMaxRecordPayloadBytes ||

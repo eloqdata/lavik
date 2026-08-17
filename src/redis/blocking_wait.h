@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -12,6 +13,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
+#include "keylane/command.h"
 
 namespace keylane {
 
@@ -23,6 +25,22 @@ enum class BlockingWakeReason : std::uint8_t {
 };
 
 enum class BlockingQueuePolicy : std::uint8_t { kFifo, kBroadcast };
+
+enum class BlockingAttemptState : std::uint8_t { kUnavailable, kComplete };
+
+struct BlockingAttemptResult {
+  BlockingAttemptState state_ = BlockingAttemptState::kUnavailable;
+  CommandReply reply_;
+};
+
+using BlockingAttempt =
+    std::function<celer::Task<BlockingAttemptResult>()>;
+using BlockingReplyFactory = std::function<CommandReply()>;
+using BlockingStatusReplyFactory =
+    std::function<CommandReply(const absl::Status&)>;
+
+absl::StatusOr<std::optional<std::chrono::steady_clock::time_point>>
+BlockingDeadlineFromSeconds(double timeout_seconds);
 
 // Blocking readiness is type-specific. A write of a different Redis type to
 // the same physical key must not wake a waiter and turn an otherwise valid
@@ -76,6 +94,18 @@ BlockingWakeReason BlockingWaitState(const BlockingWaitHandle& handle);
 bool ResetBlockingReady(BlockingWaitHandle& handle);
 void FinishBlockingWait(BlockingWaitHandle& handle);
 
+// Runs the common check/register/recheck/wait state machine used by blocking
+// collection commands. The attempt callback explicitly distinguishes an
+// unavailable value from a completed command, so reply encodings never become
+// control-flow signals.
+celer::Task<CommandReply> ExecuteBlockingWaitLoop(
+    std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+    std::optional<std::chrono::steady_clock::time_point> deadline,
+    std::string cancellation_message, BlockingAttempt attempt,
+    BlockingReplyFactory timeout_reply,
+    BlockingStatusReplyFactory status_reply);
+
+void InitBlockingWaitStorage(storage::StorageEngine* engine);
 void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key);
 void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,

@@ -302,6 +302,34 @@ class ScanHashMap {
            ForEachTableWhile(tables_[1], fn);
   }
 
+  // Samples a short range of buckets and chooses uniformly from the sampled
+  // entries, matching the bounded-work shape of Valkey's fair random lookup.
+  // The caller may reject unsuitable records and retry with fresh entropy.
+  Entry* FairRandomEntry(std::uint64_t entropy) {
+    if (empty()) return nullptr;
+    constexpr std::size_t kSampleEntries = 15;
+    constexpr std::size_t kMaximumScanSteps = 32;
+    std::array<Entry*, kSampleEntries> sampled{};
+    std::size_t count = 0;
+    std::uint64_t cursor = entropy;
+    for (std::size_t step = 0;
+         step < kMaximumScanSteps && count < sampled.size(); ++step) {
+      cursor = Scan(cursor, [&](Entry& entry) {
+        if (count < sampled.size()) sampled[count++] = &entry;
+      });
+      if (cursor == 0) break;
+    }
+    if (count == 0) return nullptr;
+    // SplitMix64 finalizer keeps the sample choice independent from the bits
+    // consumed by the scan cursor.
+    entropy ^= entropy >> 30;
+    entropy *= 0xbf58476d1ce4e5b9ULL;
+    entropy ^= entropy >> 27;
+    entropy *= 0x94d049bb133111ebULL;
+    entropy ^= entropy >> 31;
+    return sampled[entropy % count];
+  }
+
   // A cursor of zero starts and completes a full scan. The callback may be
   // invoked more than once for an entry if the table changes between calls.
   template <typename Fn>
