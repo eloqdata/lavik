@@ -109,6 +109,7 @@ add_library(keylane_module
   src/storage/engine/read.cpp
   src/storage/engine/recovery.cpp
   src/storage/engine/replication.cpp
+  src/storage/engine/replication_log.cpp
   src/storage/engine/tomb_raider.cpp
   src/storage/engine/write.cpp
   src/storage/format.cpp
@@ -207,6 +208,18 @@ if (BUILD_TESTING)
   gtest_discover_tests(keylane_unit_tests)
 
   if (UNIX)
+    add_executable(keylane_replication_log_e2e_test
+      tests/replication_log_e2e_test.cpp
+    )
+    target_link_libraries(keylane_replication_log_e2e_test
+      PRIVATE keylane::module
+    )
+    add_test(
+      NAME keylane_replication_log_e2e
+      COMMAND keylane_replication_log_e2e_test
+    )
+    set_tests_properties(keylane_replication_log_e2e PROPERTIES TIMEOUT 120)
+
     add_executable(keylane_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp
     )

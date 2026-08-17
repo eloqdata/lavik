@@ -251,9 +251,9 @@ flow LSN 用于传输续传；partition sequence 用于数据正确性。两者�
 ```text
 WorkerReplicationLog
   next_flow_lsn
-  bounded ring<MutationRef>
-  per-partition position index
-  active replica sessions
+  bounded deque<ReplicationLogBlock>
+  block LSN ranges + sparse frame offsets
+  one active 8 MiB staging block
 ```
 
 关键规则：
@@ -263,27 +263,30 @@ WorkerReplicationLog
 - ACK 不直接删除 backlog；
 - backlog 达到记录数或字节数上限时覆盖最老 event；
 - 落后于 floor 的 session full sync，不能让最慢 replica 阻止覆盖；
-- 同时限制 backlog record count、logical bytes、pinned disk bytes 和 age；
+- 同时限制 backlog block bytes、frame count、logical bytes 和 age；
 - 没有 replica 时可以不保留 backlog，首个 replica 直接 full sync；
-- 写路径只发布 bounded metadata，不等待任何网络发送。
+- 写路径只向有界后台发布器提交 committed event，不等待 backlog IO 或任何网络发送；
+- backlog 分配或 IO 失败只将该 flow 标记为 invalid，主写继续，replica 改走 full sync；
+- master 重启更换 replid，恢复只识别并回收旧 replication blocks。
 
 每个 mutation 记录 `partition_id`，per-partition index 用于 full sync 期间按
 `partition_sequence` 查找 delta。稳定阶段按 flow LSN 顺序发送。
 
 ### 8.1 Value 如何进入 backlog
 
-不能像当前实现一样为每次 mutation 无界复制完整 `std::string`。建议：
+backlog block 保存自包含的逻辑 event，不引用可能被 defrag/覆盖的主数据物理位置：
 
-- 小 Value 可以 inline，并计入 backlog bytes；
-- 大 Value 保存不可变 `RecordIdentity` 和 extent manifest；
-- backlog 对对应物理 record/extents 加 replication pin；
-- sender 从磁盘分块读取并编码；
-- event 被覆盖且没有 session 引用时释放 pin；
-- 磁盘空间紧张时优先驱逐 backlog，让慢 replica full sync；
-- output window 同样有界，连接不能无限积累待发送 Value。
+- 小 event 编成单 frame；
+- 大 Value 由 payload source 流式写成共享同一 flow LSN 的多个 frame；
+- frame 可以跨 block，使用 first/last flag 和 fragment index；
+- 一个 event 要么完整保留，要么整体位于 floor 之前，不能只留下中间 fragment；
+- receiver 收到 last frame 后才发布 Value；
+- 内存只保存 active block、block LSN 范围和每 64 frame 一个稀疏 offset；
+- sealed block 只要求运行期 IO 完成，不进入主写 fdatasync durability boundary；
+- output window 仍然独立有界，连接不能无限预取 backlog frame。
 
-这样内存上限与 Value 大小解耦。物理引用只在 master 本机作为临时读取句柄存在，
-绝不出现在网络协议里。
+这会增加一次顺序写放大，但消除了 replication pin 对 defrag 和主数据回收的长期阻塞，
+也让断线续传不依赖主数据 block 是否已经被重写。
 
 ## 9. 全量同步
 
@@ -591,7 +594,8 @@ bytes 和 replication pin 导致的不可回收 bytes。
 ### M4：有界 multi-replica backlog 和 partial sync
 
 - per-worker flow LSN；
-- record/byte/pinned-byte 有界共享 ring；
+- 自包含 replication block、LSN range 和稀疏 frame index；
+- block/frame/logical-byte 有界共享 backlog；
 - per-session ACK，不再按单 replica ACK 删除；
 - reconnect CONTINUE；
 - overflow full-sync fallback；
@@ -599,7 +603,8 @@ bytes 和 replication pin 导致的不可回收 bytes。
 
 ### M5：大 Value 流式化
 
-- master backlog 使用 inline/pinned RecordIdentity；
+- master backlog 使用 self-contained begin/chunk/commit frame；
+- 主数据 extent reader 直接流入 active replication block，不复制完整 Value；
 - snapshot/delta chunk reader；
 - target staged extent writer；
 - begin/chunk/commit checksum 和取消回收；

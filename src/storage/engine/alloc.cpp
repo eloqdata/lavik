@@ -200,7 +200,7 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
 
 Task<absl::StatusOr<ReservedBlock>>
 StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
-                                             bool for_defrag) {
+                                             AllocationPurpose purpose) {
   DeviceAllocator& allocator = *device_allocators_[device_index];
   assert(celer::ThisWorker().id_ == allocator.owner_);
   co_await allocator.mutex_.Lock();
@@ -208,8 +208,9 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
   if (allocator.failed_.has_value()) {
     co_return *allocator.failed_;
   }
-  const std::size_t reserve =
-      for_defrag ? 0 : DefragReserveForDevice(device_index);
+  const std::size_t reserve = purpose == AllocationPurpose::kDefrag
+                                  ? 0
+                                  : DefragReserveForDevice(device_index);
   if (allocator.ready_blocks_.size() <= reserve) {
     absl::Status refill =
         co_await RefillReadyBlocksLocal(device_index, allocator);
@@ -271,16 +272,15 @@ Task<absl::Status> StorageEngine::Impl::RefillDeviceInBackground(
 }
 
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateFromDevice(
-    std::size_t device_index, bool for_defrag) {
+    std::size_t device_index, AllocationPurpose purpose) {
   const celer::WorkerId owner = device_allocators_[device_index]->owner_;
   if (celer::ThisWorker().id_ == owner) {
-    co_return co_await AllocateFromDeviceLocal(device_index, for_defrag);
+    co_return co_await AllocateFromDeviceLocal(device_index, purpose);
   }
   co_return co_await celer::SubmitTaskTo(
       owner,
-      [this, device_index,
-       for_defrag]() -> Task<absl::StatusOr<ReservedBlock>> {
-        co_return co_await AllocateFromDeviceLocal(device_index, for_defrag);
+      [this, device_index, purpose]() -> Task<absl::StatusOr<ReservedBlock>> {
+        co_return co_await AllocateFromDeviceLocal(device_index, purpose);
       });
 }
 
@@ -467,7 +467,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
 }
 
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
-    WorkerStore& store, bool for_defrag) {
+    WorkerStore& store, AllocationPurpose purpose) {
   const std::size_t device_count = devices_.size();
   std::vector<std::size_t> home_order(store.home_devices_.size());
   for (std::size_t i = 0; i < home_order.size(); ++i) {
@@ -510,7 +510,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     const std::uint64_t generation_before =
         space_reclaim_generation_.load(std::memory_order_acquire);
     for (const std::size_t device_index : attempt_order) {
-      auto allocated = co_await AllocateFromDevice(device_index, for_defrag);
+      auto allocated = co_await AllocateFromDevice(device_index, purpose);
       if (allocated.ok()) {
         auto home = std::find(store.home_devices_.begin(),
                               store.home_devices_.end(), device_index);
@@ -529,9 +529,13 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     // Defrag allocations consume the protected reserve. Waiting for another
     // defrag from inside DefragOne would deadlock when the reserve is truly
     // exhausted, so only foreground allocation waits for reclaim progress.
-    if (for_defrag) {
+    if (purpose == AllocationPurpose::kDefrag) {
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
                              "defrag reserve is exhausted");
+    }
+    if (purpose == AllocationPurpose::kReplication) {
+      co_return absl::Status(absl::StatusCode::kResourceExhausted,
+                             "replication backlog has no allocatable blocks");
     }
 
     const std::uint64_t generation_after =

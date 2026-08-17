@@ -589,7 +589,9 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   // recovery (never half-kept). Defrag keeps allocating from its reserve.
   if (for_defrag ||
       !shutdown_flush_requested_.load(std::memory_order_acquire)) {
-    allocated = co_await AllocateBlock(store, for_defrag);
+    allocated = co_await AllocateBlock(
+        store, for_defrag ? AllocationPurpose::kDefrag
+                          : AllocationPurpose::kForeground);
   }
   if (unlock_writer) {
     co_await store.store_state_mutex_.Lock();

@@ -738,6 +738,15 @@ struct ReservedBlock {
   std::uint64_t allocation_epoch_ = 0;
 };
 
+enum class AllocationPurpose : std::uint8_t {
+  kForeground,
+  kDefrag,
+  // Best-effort runtime backlog allocation. It preserves the defrag reserve
+  // and reports exhaustion immediately instead of waiting for primary-data
+  // reclamation.
+  kReplication,
+};
+
 struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
   std::atomic<std::uint64_t> next_local_{1};
   std::atomic<std::uint64_t> next_allocation_epoch_{1};
@@ -916,6 +925,39 @@ class StorageEngine::Impl {
 
  public:
   struct WorkerStore {
+    struct ReplicationSparseOffset {
+      std::uint64_t lsn_ = 0;
+      std::uint32_t fragment_index_ = 0;
+      std::uint32_t byte_offset_ = kBlockHeaderBytes;
+    };
+
+    struct ReplicationLogBlock {
+      std::uint64_t block_id_ = kInvalidBlockId;
+      std::uint64_t allocation_epoch_ = 0;
+      std::uint64_t first_lsn_ = 0;
+      std::uint64_t last_lsn_ = 0;
+      std::uint32_t committed_bytes_ = kBlockHeaderBytes;
+      std::uint32_t frame_count_ = 0;
+      bool sealed_ = false;
+      std::vector<ReplicationSparseOffset> sparse_offsets_;
+    };
+
+    struct ReplicationLogRuntime {
+      AsyncMutex mutex_;
+      ReplicationLogState state_ = ReplicationLogState::kDisabled;
+      std::uint64_t log_epoch_ = 0;
+      std::uint64_t next_lsn_ = 1;
+      std::size_t max_blocks_ = 0;
+      std::deque<ReplicationLogBlock> blocks_;
+      std::byte* active_buffer_ = nullptr;
+
+      ~ReplicationLogRuntime() {
+        if (active_buffer_ != nullptr) {
+          celer::FreeStorageBuffer(active_buffer_, kDirectIoAlignment);
+        }
+      }
+    };
+
     struct PartitionStore {
       std::uint16_t id_ = 0;
       std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
@@ -963,6 +1005,7 @@ class StorageEngine::Impl {
     std::deque<DetachedIndex> detached_indexes_;
     bool detached_reclaim_running_ = false;
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
+    ReplicationLogRuntime replication_log_;
     std::optional<ActiveBlock> active_block_;
     // Recovery only. A recovered extent block's identity has to be checked
     // against the manifests that reference it, and the two arrive in separate
@@ -1290,6 +1333,16 @@ class StorageEngine::Impl {
                                           std::uint64_t after_sequence,
                                           std::size_t count);
 
+  Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
+                                          std::size_t capacity_bytes);
+  Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
+      ReplicationLogAppend event);
+  Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
+      ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
+  Task<absl::Status> DisableReplicationLog();
+  ReplicationLogInfo LocalReplicationLogInfo() const;
+
   void AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                   std::uint64_t through_sequence);
 
@@ -1309,6 +1362,13 @@ class StorageEngine::Impl {
   absl::Status FlushForShutdown();
 
  private:
+  Task<absl::Status> EnsureReplicationLogActiveBlock(
+      WorkerStore& store, std::uint64_t protected_lsn);
+  Task<absl::Status> SealReplicationLogActiveBlock(WorkerStore& store);
+  Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
+                                                 std::uint64_t keep_from_lsn,
+                                                 bool force_all = false);
+
   static StagingSlot* StagingFor(WorkerStore& store, const BlockState& state);
 
   static std::uint16_t AcquireStagingSlot(WorkerStore& store);
@@ -1482,10 +1542,10 @@ class StorageEngine::Impl {
                                             DeviceAllocator& allocator);
 
   Task<absl::StatusOr<ReservedBlock>> AllocateFromDeviceLocal(
-      std::size_t device_index, bool for_defrag);
+      std::size_t device_index, AllocationPurpose purpose);
 
   Task<absl::StatusOr<ReservedBlock>> AllocateFromDevice(
-      std::size_t device_index, bool for_defrag);
+      std::size_t device_index, AllocationPurpose purpose);
 
   Task<absl::Status> ReturnColdBlocksLocal(
       std::size_t device_index, std::vector<std::uint64_t> block_ids);
@@ -1659,7 +1719,7 @@ class StorageEngine::Impl {
   void ConfigureWorkerDeviceAffinity();
 
   Task<absl::StatusOr<ReservedBlock>> AllocateBlock(WorkerStore& store,
-                                                    bool for_defrag);
+                                                    AllocationPurpose purpose);
 
   std::size_t DefragReserveForDevice(std::size_t device_index) const noexcept {
     assert(device_index < defrag_reserve_blocks_.size());

@@ -181,6 +181,62 @@ struct PartitionDeltaBatch {
   std::vector<SnapshotRecord> records_;
 };
 
+enum class ReplicationLogState : std::uint8_t {
+  kDisabled,
+  kActive,
+  // The backlog has a gap or an I/O/allocation failure. Primary storage may
+  // continue serving, but replicas must use a new full synchronization.
+  kInvalid,
+};
+
+class ReplicationLogPayloadSource {
+ public:
+  virtual ~ReplicationLogPayloadSource() = default;
+  virtual std::uint64_t size() const noexcept = 0;
+  // Must fill output exactly or return an error. The source and any storage it
+  // references remain alive until AppendReplicationLog completes.
+  virtual celer::Task<absl::Status> Read(std::uint64_t offset,
+                                         std::span<std::byte> output) = 0;
+};
+
+struct ReplicationLogAppend {
+  ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
+  std::uint16_t partition_id_ = 0;
+  std::uint64_t partition_sequence_ = 0;
+  // Exactly one payload form is used. A source allows a future external-value
+  // extent reader to stream directly into replication blocks; string_view is
+  // the zero-extra-copy path for values already resident in the write call.
+  std::string_view payload_;
+  ReplicationLogPayloadSource* payload_source_ = nullptr;
+};
+
+struct ReplicationLogCursor {
+  std::uint64_t lsn_ = 1;
+  std::uint32_t fragment_index_ = 0;
+
+  bool operator==(const ReplicationLogCursor&) const noexcept = default;
+};
+
+struct ReplicationLogFrame {
+  ReplicationFrameHeader header_{};
+  std::string payload_;
+};
+
+struct ReplicationLogBatch {
+  ReplicationLogCursor next_{};
+  std::vector<ReplicationLogFrame> frames_;
+  bool at_tail_ = false;
+};
+
+struct ReplicationLogInfo {
+  ReplicationLogState state_ = ReplicationLogState::kDisabled;
+  std::uint64_t log_epoch_ = 0;
+  std::uint64_t floor_lsn_ = 1;
+  std::uint64_t tail_lsn_ = 0;
+  std::size_t block_count_ = 0;
+  std::size_t capacity_bytes_ = 0;
+};
+
 // A value read directly into a registered storage buffer. network_bytes()
 // contains a complete RESP bulk-string frame and remains valid until this
 // move-only object is destroyed after the network send CQE.
@@ -471,6 +527,19 @@ class StorageEngine {
   void AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                   std::uint64_t through_sequence);
   bool TryTakeReplicationReady(std::uint16_t* partition_id);
+
+  // Runtime-only source replication backlog for the current storage worker.
+  // These calls must execute on that worker. The log is shared by every
+  // downstream replica; each replica owns only a ReplicationLogCursor.
+  celer::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
+                                                 std::size_t capacity_bytes);
+  celer::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
+      ReplicationLogAppend event);
+  celer::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
+      ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  celer::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
+  celer::Task<absl::Status> DisableReplicationLog();
+  ReplicationLogInfo LocalReplicationLogInfo() const;
 
   // Replica-side primitives. Reset returns a new local replication epoch that
   // fences every record from an earlier copy of this partition.

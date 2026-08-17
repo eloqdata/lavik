@@ -113,6 +113,34 @@ bool StorageEngine::TryTakeReplicationReady(std::uint16_t* partition_id) {
   return impl_->TryTakeReplicationReady(partition_id);
 }
 
+Task<absl::Status> StorageEngine::EnableReplicationLog(
+    std::uint64_t log_epoch, std::size_t capacity_bytes) {
+  return impl_->EnableReplicationLog(log_epoch, capacity_bytes);
+}
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::AppendReplicationLog(
+    ReplicationLogAppend event) {
+  return impl_->AppendReplicationLog(event);
+}
+
+Task<absl::StatusOr<ReplicationLogBatch>> StorageEngine::ReadReplicationLog(
+    ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames) {
+  return impl_->ReadReplicationLog(next, max_bytes, max_frames);
+}
+
+Task<absl::Status> StorageEngine::TrimReplicationLog(
+    std::uint64_t keep_from_lsn) {
+  return impl_->TrimReplicationLog(keep_from_lsn);
+}
+
+Task<absl::Status> StorageEngine::DisableReplicationLog() {
+  return impl_->DisableReplicationLog();
+}
+
+ReplicationLogInfo StorageEngine::LocalReplicationLogInfo() const {
+  return impl_->LocalReplicationLogInfo();
+}
+
 void StorageEngine::AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                                std::uint64_t through_sequence) {
   impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);

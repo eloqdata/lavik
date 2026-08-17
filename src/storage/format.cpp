@@ -316,19 +316,35 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
     return false;
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
-       decoded.kind_ != BlockKind::kPayloadExtent) ||
+       decoded.kind_ != BlockKind::kPayloadExtent &&
+       decoded.kind_ != BlockKind::kReplicationLog) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
   }
   if (decoded.kind_ == BlockKind::kRecords) {
     if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
-        decoded.extent_payload_checksum_ != 0) {
+        decoded.extent_payload_checksum_ != 0 ||
+        decoded.replication_log_epoch_ != 0 ||
+        decoded.first_replication_lsn_ != 0 ||
+        decoded.last_replication_lsn_ != 0) {
       return false;
     }
-  } else if (decoded.record_count_ != 0 || decoded.extent_payload_bytes_ == 0 ||
-             decoded.extent_payload_bytes_ > kExtentPayloadBytes ||
-             decoded.committed_bytes_ !=
-                 kBlockHeaderBytes + decoded.extent_payload_bytes_) {
+  } else if (decoded.kind_ == BlockKind::kPayloadExtent) {
+    if (decoded.record_count_ != 0 || decoded.extent_payload_bytes_ == 0 ||
+        decoded.extent_payload_bytes_ > kExtentPayloadBytes ||
+        decoded.committed_bytes_ !=
+            kBlockHeaderBytes + decoded.extent_payload_bytes_ ||
+        decoded.replication_log_epoch_ != 0 ||
+        decoded.first_replication_lsn_ != 0 ||
+        decoded.last_replication_lsn_ != 0) {
+      return false;
+    }
+  } else if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
+             decoded.extent_payload_checksum_ != 0 || decoded.max_lsn_ != 0 ||
+             decoded.replication_log_epoch_ == 0 ||
+             decoded.record_count_ == 0 ||
+             decoded.first_replication_lsn_ == 0 ||
+             decoded.last_replication_lsn_ < decoded.first_replication_lsn_) {
     return false;
   }
   const std::uint32_t expected = decoded.checksum_;
@@ -471,6 +487,64 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
         decoded.key_bytes_);
   }
   return true;
+}
+
+bool EncodeReplicationFrameHeader(
+    const ReplicationFrameHeader& header,
+    std::span<std::byte, sizeof(ReplicationFrameHeader)> output) noexcept {
+  if (header.magic_ != kReplicationFrameMagic ||
+      header.version_ != kStorageFormatVersion ||
+      header.header_bytes_ != sizeof(ReplicationFrameHeader) ||
+      header.lsn_ == 0 || header.partition_id_ >= kLogicalStorageShards ||
+      header.reserved_ != 0 ||
+      header.payload_bytes_ > kStorageBlockBytes - kBlockHeaderBytes -
+                                  sizeof(ReplicationFrameHeader) ||
+      header.total_disk_bytes_ !=
+          AlignRecord(sizeof(ReplicationFrameHeader) + header.payload_bytes_)) {
+    return false;
+  }
+  const std::uint8_t allowed_flags =
+      ReplicationFrameFlag::kFirst | ReplicationFrameFlag::kLast;
+  const bool first = (header.flags_ & static_cast<std::uint8_t>(
+                                          ReplicationFrameFlag::kFirst)) != 0;
+  if ((header.flags_ & ~allowed_flags) != 0 ||
+      first != (header.fragment_index_ == 0)) {
+    return false;
+  }
+  if (header.kind_ != ReplicationEventKind::kMutation &&
+      header.kind_ != ReplicationEventKind::kTransaction &&
+      header.kind_ != ReplicationEventKind::kControl) {
+    return false;
+  }
+  ReplicationFrameHeader encoded = header;
+  encoded.header_checksum_ = 0;
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  encoded.header_checksum_ = Crc32c(output);
+  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  return true;
+}
+
+bool DecodeReplicationFrameHeader(std::span<const std::byte> input,
+                                  ReplicationFrameHeader* header) noexcept {
+  if (header == nullptr || input.size() < sizeof(ReplicationFrameHeader)) {
+    return false;
+  }
+  ReplicationFrameHeader decoded{};
+  std::memcpy(&decoded, input.data(), sizeof(decoded));
+  std::array<std::byte, sizeof(ReplicationFrameHeader)> encoded{};
+  const std::uint32_t expected = decoded.header_checksum_;
+  decoded.header_checksum_ = 0;
+  std::memcpy(encoded.data(), &decoded, sizeof(decoded));
+  if (Crc32c(encoded) != expected) {
+    return false;
+  }
+  decoded.header_checksum_ = expected;
+  std::array<std::byte, sizeof(ReplicationFrameHeader)> validated{};
+  return EncodeReplicationFrameHeader(decoded, validated) &&
+                 std::memcmp(validated.data(), input.data(),
+                             validated.size()) == 0
+             ? (*header = decoded, true)
+             : false;
 }
 
 }  // namespace keylane::storage

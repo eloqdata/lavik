@@ -275,6 +275,74 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   EXPECT_EQ(decoded.payload_bytes_, key.size());
 }
 
+TEST(StorageFormatTest, EncodesRuntimeReplicationBlocksAndFrames) {
+  using namespace keylane::storage;
+
+  constexpr std::uint64_t block_id = MakeBlockId(3, 9);
+  BlockHeader block{
+      .block_id_ = block_id,
+      .writer_id_ = 2,
+      .allocation_epoch_ = 17,
+      .committed_bytes_ = static_cast<std::uint32_t>(
+          kBlockHeaderBytes + sizeof(ReplicationFrameHeader)),
+      .record_count_ = 1,
+      .layout_worker_count_ = 4,
+      .kind_ = BlockKind::kReplicationLog,
+      .replication_log_epoch_ = 23,
+      .first_replication_lsn_ = 41,
+      .last_replication_lsn_ = 41,
+  };
+  std::array<std::byte, kBlockHeaderSlotBytes> block_page{};
+  EncodeBlockHeader(block, block_page);
+  BlockHeader decoded_block{};
+  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_block));
+  EXPECT_EQ(decoded_block.kind_, BlockKind::kReplicationLog);
+  EXPECT_EQ(decoded_block.replication_log_epoch_, 23);
+  EXPECT_EQ(decoded_block.first_replication_lsn_, 41);
+  EXPECT_EQ(decoded_block.last_replication_lsn_, 41);
+
+  BlockHeader invalid = block;
+  invalid.max_lsn_ = 1;
+  EncodeBlockHeader(invalid, block_page);
+  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_block));
+  invalid = block;
+  invalid.first_replication_lsn_ = 42;
+  EncodeBlockHeader(invalid, block_page);
+  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_block));
+
+  constexpr std::string_view payload = "replication-payload";
+  ReplicationFrameHeader frame{
+      .header_bytes_ = sizeof(ReplicationFrameHeader),
+      .kind_ = ReplicationEventKind::kMutation,
+      .flags_ = ReplicationFrameFlag::kFirst | ReplicationFrameFlag::kLast,
+      .lsn_ = 41,
+      .partition_sequence_ = 99,
+      .payload_bytes_ = static_cast<std::uint32_t>(payload.size()),
+      .total_disk_bytes_ = static_cast<std::uint32_t>(
+          AlignRecord(sizeof(ReplicationFrameHeader) + payload.size())),
+      .fragment_index_ = 0,
+      .partition_id_ = 1234,
+      .payload_checksum_ = Crc32c(std::span<const std::byte>(
+          reinterpret_cast<const std::byte*>(payload.data()), payload.size())),
+  };
+  std::array<std::byte, sizeof(ReplicationFrameHeader)> frame_bytes{};
+  ASSERT_TRUE(EncodeReplicationFrameHeader(frame, frame_bytes));
+  ReplicationFrameHeader decoded_frame{};
+  ASSERT_TRUE(DecodeReplicationFrameHeader(frame_bytes, &decoded_frame));
+  EXPECT_EQ(decoded_frame.lsn_, frame.lsn_);
+  EXPECT_EQ(decoded_frame.partition_sequence_, frame.partition_sequence_);
+  EXPECT_EQ(decoded_frame.partition_id_, frame.partition_id_);
+  EXPECT_EQ(decoded_frame.payload_checksum_, frame.payload_checksum_);
+
+  // Middle fragments deliberately carry neither boundary flag.
+  frame.flags_ = 0;
+  frame.fragment_index_ = 1;
+  ASSERT_TRUE(EncodeReplicationFrameHeader(frame, frame_bytes));
+  ASSERT_TRUE(DecodeReplicationFrameHeader(frame_bytes, &decoded_frame));
+  frame_bytes[7] ^= std::byte{1};
+  EXPECT_FALSE(DecodeReplicationFrameHeader(frame_bytes, &decoded_frame));
+}
+
 TEST(StorageFormatTest, RejectsOversizedInlineHeaderBeforeChecksumCopy) {
   using namespace keylane::storage;
 

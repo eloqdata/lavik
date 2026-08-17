@@ -33,6 +33,8 @@ inline constexpr std::uint64_t kDeviceLabelMagic =
 inline constexpr std::uint64_t kBlockMagic = 0x314b4c424c4f434bULL;  // KCOLBLK1
 inline constexpr std::uint64_t kRecordMagic =
     0x314b4c5245434f52ULL;  // ROCERLK1
+inline constexpr std::uint64_t kReplicationFrameMagic =
+    0x314c5045524c4bULL;  // KLREPL1
 inline constexpr std::uint64_t kExtentManifestMagic =
     0x3154464e4d4c4bULL;                                              // KLMNFT1
 inline constexpr std::uint64_t kHashValueMagic =
@@ -161,7 +163,26 @@ enum class RecordKind : std::uint8_t {
 enum class BlockKind : std::uint8_t {
   kRecords = 1,
   kPayloadExtent = 2,
+  // Runtime-only replication backlog. Recovery recognizes and reclaims these
+  // blocks instead of treating them as primary data.
+  kReplicationLog = 3,
 };
+
+enum class ReplicationEventKind : std::uint8_t {
+  kMutation = 1,
+  kTransaction = 2,
+  kControl = 3,
+};
+
+enum class ReplicationFrameFlag : std::uint8_t {
+  kFirst = 1U << 0,
+  kLast = 1U << 1,
+};
+
+constexpr std::uint8_t operator|(ReplicationFrameFlag left,
+                                 ReplicationFrameFlag right) noexcept {
+  return static_cast<std::uint8_t>(left) | static_cast<std::uint8_t>(right);
+}
 
 // Stable on-disk Redis value type identifiers. Only strings are implemented
 // today; reserving the remaining top-level types keeps expiration and recovery
@@ -199,6 +220,32 @@ struct BlockHeader {
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
+  // Replication-log coordinates are deliberately separate from max_lsn_,
+  // which is the physical primary-storage append order.
+  std::uint64_t replication_log_epoch_ = 0;
+  std::uint64_t first_replication_lsn_ = 0;
+  std::uint64_t last_replication_lsn_ = 0;
+};
+
+// A logical replication event may span multiple frames and blocks. Every
+// fragment shares one LSN. The receiver publishes the event only after seeing
+// kLast, which keeps future large values atomic without retaining them whole
+// in memory.
+struct ReplicationFrameHeader {
+  std::uint64_t magic_ = kReplicationFrameMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint16_t header_bytes_ = 0;
+  ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
+  std::uint8_t flags_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t partition_sequence_ = 0;
+  std::uint32_t payload_bytes_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint32_t fragment_index_ = 0;
+  std::uint16_t partition_id_ = 0;
+  std::uint16_t reserved_ = 0;
+  std::uint32_t payload_checksum_ = 0;
+  std::uint32_t header_checksum_ = 0;
 };
 
 // Every configured file or raw block device has an immutable identity. Fixed
@@ -279,6 +326,7 @@ static_assert(sizeof(MetadataPageHeader) < kDirectIoAlignment);
 static_assert(kMetadataPagePayloadBytes % sizeof(std::uint64_t) == 0);
 static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
 static_assert(sizeof(RecordHeader) == 120);
+static_assert(sizeof(ReplicationFrameHeader) == 56);
 static_assert(sizeof(ExtentManifestHeader) == 16);
 static_assert(sizeof(ExtentRef) == 24);
 
@@ -352,5 +400,11 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept;
 bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
                         std::string_view* key) noexcept;
+
+bool EncodeReplicationFrameHeader(
+    const ReplicationFrameHeader& header,
+    std::span<std::byte, sizeof(ReplicationFrameHeader)> output) noexcept;
+bool DecodeReplicationFrameHeader(std::span<const std::byte> input,
+                                  ReplicationFrameHeader* header) noexcept;
 
 }  // namespace keylane::storage

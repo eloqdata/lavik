@@ -283,6 +283,15 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 static_cast<std::uint64_t>(local_block) + 1);
       AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch_,
                 block.allocation_epoch_ + 1);
+      if (block.kind_ == BlockKind::kReplicationLog) {
+        // A backlog is valid only for the master's in-memory replid/log epoch.
+        // Restart establishes a new replid, so retaining or parsing this block
+        // could only offer a false partial-sync promise. Return it to the
+        // runtime ready pool while preserving its allocation-epoch high water.
+        zero_blocks->push_back(block_id);
+        ReportRecoveryProgress(0, /*allocated=*/true);
+        continue;
+      }
       AtomicMax(&recovery_max_lsn_, block.max_lsn_);
 
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
