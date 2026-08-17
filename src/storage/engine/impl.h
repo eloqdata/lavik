@@ -1368,6 +1368,9 @@ class StorageEngine::Impl {
   Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
                                                  std::uint64_t keep_from_lsn,
                                                  bool force_all = false);
+  Task<absl::Status> PublishReplicationCommand(
+      std::uint16_t partition_id, std::uint64_t partition_sequence,
+      std::uint8_t db_id, std::span<const std::string_view> args);
 
   static StagingSlot* StagingFor(WorkerStore& store, const BlockState& state);
 
@@ -1757,7 +1760,8 @@ class StorageEngine::Impl {
       RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
       TxShardWrites* tx = nullptr,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
-      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr);
+      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
+      std::uint64_t* committed_sequence = nullptr);
 
   void AppendDelta(WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);

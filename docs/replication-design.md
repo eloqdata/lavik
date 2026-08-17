@@ -13,7 +13,7 @@ Keylane 原生复制采用以下模型：
   `REPLICAOF host port`；
 - master 可以同时服务多个 replica，每个 replica 拥有独立 session 和发送游标；
 - 全量复制使用“partition snapshot + snapshot 期间的 mutation delta”；
-- 稳态复制发送提交后的逻辑状态变化，不转发客户端原始命令，也不复制本机物理块引用；
+- 稳态复制发送提交后规范化的确定性命令，不转发客户端原始请求，也不复制本机物理块引用；
 - 每个 source worker 维护独立 replication LSN 和有界 backlog，replica 保存一个 LSN 向量；
 - backlog 同时按记录数和逻辑字节数限制，慢 replica 不得无限钉住内存或磁盘；
 - backlog 已覆盖时只让对应 replica 重新全量，不影响其他 replica；
@@ -54,17 +54,19 @@ backlog 所有权和 session 模型需要重构。
 这些能力必须构建在本文的 apply、逻辑 mutation 和 role state machine 之上，不能
 反过来污染第一版原生协议。
 
-## 3. 为什么复制逻辑状态变化
+## 3. 为什么复制规范化命令
 
-复制单元选择“提交后的逻辑状态变化”：
+复制单元选择“提交后的确定性命令”：
 
 ```text
-PUT_VALUE(db, key, value_type, encoded_value, expire_at, partition_seq)
-DELETE(db, key, partition_seq)
-ADVANCE_DB_EPOCH(db, db_epoch, partition_seq)
+SET key value [PXAT absolute_ms]
+DEL key
+RESTORE key absolute_ttl logical_value
+DB_EPOCH(db, new_epoch, barrier_id)
 ```
 
-不直接复制原始客户端命令，原因是：
+这些不是原始客户端请求：条件写只在成功后发布，TTL 转成绝对时间，随机操作发布其
+确定结果，集合可转换成确定性的修改命令或 RESTORE。原因是：
 
 - 命令可能包含当前时间、随机数、条件写和阻塞语义；
 - master 与 replica 执行时的数据前置状态可能不同；
@@ -74,9 +76,9 @@ ADVANCE_DB_EPOCH(db, db_epoch, partition_seq)
 不复制物理 storage delta，原因是 block ID、allocation epoch、record offset、extent
 和 worker ownership 都是单机状态。网络协议只传稳定逻辑编码。
 
-当前集合类型是单记录编码，因此集合修改暂时复制修改后的完整逻辑 Value。未来大
-Value 拆分后，协议仍使用 begin/chunk/commit，只是 chunk 的来源变为对象迭代器，
-不改变复制状态机。
+当前集合类型是单记录编码，因此集合修改可以暂时发布包含完整逻辑 Value 的 RESTORE。
+未来大 Value 拆分后，命令参数由对象迭代器流式提供；底层 frame 可以分片，但业务层
+仍然只有一条命令和一个 flow LSN。
 
 ## 4. 角色和状态机
 
@@ -199,7 +201,7 @@ payload CRC32C
 - FLOW_OPEN / FLOW_ACK / HEARTBEAT；
 - PARTITION_RESET；
 - SNAPSHOT_RECORD / SNAPSHOT_END；
-- MUTATION_BEGIN / MUTATION_CHUNK / MUTATION_COMMIT；
+- COMMAND_DATA（可以使用 first/last 和 fragment index 分成多个传输 frame）；
 - TX_BEGIN / TX_FRAGMENT / TX_COMMIT；
 - DB_EPOCH；
 - SESSION_END。
@@ -277,10 +279,10 @@ WorkerReplicationLog
 backlog block 保存自包含的逻辑 event，不引用可能被 defrag/覆盖的主数据物理位置：
 
 - 小 event 编成单 frame；
-- 大 Value 由 payload source 流式写成共享同一 flow LSN 的多个 frame；
+- 大命令由 payload source 流式写成共享同一 flow LSN 的多个 frame；
 - frame 可以跨 block，使用 first/last flag 和 fragment index；
 - 一个 event 要么完整保留，要么整体位于 floor 之前，不能只留下中间 fragment；
-- receiver 收到 last frame 后才发布 Value；
+- receiver 收到 last frame 并完成命令校验后才发布结果；
 - 内存只保存 active block、block LSN 范围和每 64 frame 一个稀疏 offset；
 - sealed block 只要求运行期 IO 完成，不进入主写 fdatasync durability boundary；
 - output window 仍然独立有界，连接不能无限预取 backlog frame。
@@ -400,20 +402,18 @@ Apply 的幂等规则：
 
 ## 12. 大 Value
 
-网络层统一使用：
+网络层对一条逻辑命令统一使用：
 
 ```text
-MUTATION_BEGIN(metadata, total_encoded_bytes, chunk_count, digest)
-MUTATION_CHUNK(index, bytes, chunk_crc)
-MUTATION_COMMIT(full_digest)
+COMMAND_DATA(lsn, fragment_index, FIRST/LAST, bytes, frame_crc)
 ```
 
-当前 `replica_value_stage_` 会把所有 chunk 拼回一个 `std::string`，未来不能继续这样做。
-Target 应直接将 chunk 写入 staged extents：
+frame 分片不是 `SET_CHUNK` 一类业务命令。接收端命令解码器把大参数直接写入 staged
+extents，不能长期把全部 frame 拼回一个 `std::string`：
 
-1. BEGIN 创建不可见 staging object；
-2. CHUNK 顺序写 extents，保持 bounded buffer；
-3. COMMIT 校验长度和 digest；
+1. 解码到大参数头时创建不可见 staging object；
+2. 后续 COMMAND_DATA 顺序写 extents，保持 bounded buffer；
+3. 收到 LAST 后校验命令长度和 digest；
 4. 最后写并发布顶层逻辑 record/root；
 5. 失败、断线、reset 和进程恢复时回收未发布 extents。
 
@@ -452,7 +452,9 @@ Full sync snapshot 在 key lock 下等待正在提交的 transaction，因此只
 - master 是过期 mutation 的唯一 authority；
 - replica 读路径可以隐藏已经到期的值，但 ONLINE_REPLICA 不生成自己的 tombstone；
 - 提升为 master 后启用主动过期和 tomb raider；
-- FLUSHDB 复制为 DB epoch advancement，不发送所有 key 的 DEL；
+- FLUSHDB 复制为广播到每个 source flow 的 DB epoch barrier，不发送所有 key 的 DEL；
+- FLUSHALL 在一个 barrier 中携带 16 个新 DB epoch；target 收齐所有 flow 后才原子
+  detach 旧索引并放行 barrier 后的命令；
 - DB epoch 必须在该 DB 后续 mutation 之前安装并持久化；
 - full sync 的 target reset 和 DB epoch advance 使用统一 gate/generation 机制。
 
@@ -603,7 +605,7 @@ bytes 和 replication pin 导致的不可回收 bytes。
 
 ### M5：大 Value 流式化
 
-- master backlog 使用 self-contained begin/chunk/commit frame；
+- master backlog 使用一条命令 LSN 下的 self-contained transport frames；
 - 主数据 extent reader 直接流入 active replication block，不复制完整 Value；
 - snapshot/delta chunk reader；
 - target staged extent writer；

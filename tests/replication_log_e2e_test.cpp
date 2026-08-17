@@ -12,12 +12,16 @@
 #include <string_view>
 
 #include "celer/net/server.h"
+#include "keylane/command.h"
 #include "keylane/memory.h"
+#include "keylane/metrics.h"
+#include "keylane/replication_command.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
 
 namespace {
 
+using keylane::ReplicatedCommand;
 using keylane::storage::ReplicationEventKind;
 using keylane::storage::ReplicationLogAppend;
 using keylane::storage::ReplicationLogCursor;
@@ -231,6 +235,127 @@ class ReplicationLogService final : public celer::Service {
               storage_->LocalReplicationLogInfo().block_count_ == 0,
           "disable did not reclaim the replication log");
 
+    // The storage commit path emits deterministic commands. Large arguments
+    // may span replication frames, but decode and apply still see one command
+    // and one LSN.
+    status = co_await storage_->EnableReplicationLog(19, 3 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    constexpr std::uint64_t kExpireAt = 4'102'444'800'000ULL;
+    auto set = co_await storage_->Set(
+        2, "replication-set", "value",
+        {.condition_ = keylane::storage::SetCondition::kNone,
+         .expire_at_ms_ = kExpireAt});
+    if (!set.ok()) co_return set.status();
+    Check(set->applied_ && storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
+          "committed SET did not publish exactly one command");
+    auto skipped = co_await storage_->Set(
+        2, "replication-set", "ignored",
+        {.condition_ = keylane::storage::SetCondition::kIfAbsent});
+    if (!skipped.ok()) co_return skipped.status();
+    Check(!skipped->applied_ &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
+          "conditional SET no-op published a replication command");
+
+    std::string large_value(9 * kMiB, 'V');
+    auto large_set =
+        co_await storage_->Set(2, "replication-large", large_value, {});
+    if (!large_set.ok()) co_return large_set.status();
+    Check(large_set->applied_ &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ == 2,
+          "large SET did not retain one logical LSN");
+
+    std::vector<ReplicatedCommand> commands;
+    cursor = {};
+    while (cursor.lsn_ <= 2) {
+      const std::uint64_t command_lsn = cursor.lsn_;
+      std::string encoded;
+      std::uint32_t fragments = 0;
+      do {
+        auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+        if (!batch.ok()) co_return batch.status();
+        Check(batch->frames_.size() == 1 &&
+                  batch->frames_.front().header_.lsn_ == command_lsn,
+              "command frame crossed an LSN boundary");
+        encoded.append(batch->frames_.front().payload_);
+        ++fragments;
+        cursor = batch->next_;
+      } while (cursor.lsn_ == command_lsn);
+      auto decoded = keylane::DecodeReplicationCommand(encoded);
+      if (!decoded.ok()) co_return decoded.status();
+      Check(encoded.size() > 1 &&
+                !keylane::DecodeReplicationCommand(
+                     std::string_view(encoded).substr(0, encoded.size() - 1))
+                     .ok(),
+            "truncated replication command was accepted");
+      if (command_lsn == 1) {
+        Check(fragments == 1 && decoded->db_id_ == 2 &&
+                  decoded->args_ == std::vector<std::string>(
+                                        {"SET", "replication-set", "value",
+                                         "PXAT", std::to_string(kExpireAt)}),
+              "SET was not normalized with its absolute expiry");
+      } else {
+        Check(fragments > 1 && decoded->db_id_ == 2 &&
+                  decoded->args_.size() == 3 && decoded->args_[0] == "SET" &&
+                  decoded->args_[1] == "replication-large" &&
+                  decoded->args_[2] == large_value,
+              "large SET was not reconstructed as one logical command");
+      }
+      commands.push_back(std::move(*decoded));
+    }
+
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    auto removed_set = co_await storage_->Delete(2, "replication-set");
+    auto removed_large = co_await storage_->Delete(2, "replication-large");
+    if (!removed_set.ok()) co_return removed_set.status();
+    if (!removed_large.ok()) co_return removed_large.status();
+    for (const ReplicatedCommand& command : commands) {
+      status = co_await keylane::ApplyReplicatedCommand(command);
+      if (!status.ok()) co_return status;
+    }
+    auto restored_length =
+        co_await storage_->StringLength(2, "replication-set");
+    auto restored_large_length =
+        co_await storage_->StringLength(2, "replication-large");
+    if (!restored_length.ok()) co_return restored_length.status();
+    if (!restored_large_length.ok()) co_return restored_large_length.status();
+    const auto restored_expiry =
+        co_await storage_->GetExpiration(2, "replication-set");
+    Check(*restored_length == 5 &&
+              *restored_large_length == large_value.size() &&
+              restored_expiry.exists_ &&
+              restored_expiry.expire_at_ms_ == kExpireAt,
+          "replica command apply changed SET state");
+
+    status = co_await storage_->EnableReplicationLog(20, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    auto deleted = co_await storage_->Delete(2, "replication-set");
+    if (!deleted.ok()) co_return deleted.status();
+    auto missing = co_await storage_->Delete(2, "replication-missing");
+    if (!missing.ok()) co_return missing.status();
+    Check(*deleted && !*missing &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
+          "DEL publication did not follow its logical result");
+    auto del_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
+    if (!del_batch.ok()) co_return del_batch.status();
+    Check(del_batch->frames_.size() == 1 && del_batch->at_tail_,
+          "single-key DEL did not produce one frame");
+    auto del_command =
+        keylane::DecodeReplicationCommand(del_batch->frames_.front().payload_);
+    if (!del_command.ok()) co_return del_command.status();
+    Check(del_command->db_id_ == 2 &&
+              del_command->args_ ==
+                  std::vector<std::string>({"DEL", "replication-set"}),
+          "DEL command payload changed");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    auto recreated = co_await storage_->Set(2, "replication-set", "again", {});
+    if (!recreated.ok()) co_return recreated.status();
+    status = co_await keylane::ApplyReplicatedCommand(*del_command);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(2, "replication-set"),
+          "replica DEL did not remove the key");
+
     // Leave one sealed block and one active block behind. A fresh process must
     // recognize both as runtime-only backlog and recover without parsing them
     // as primary records.
@@ -259,6 +384,8 @@ int RunOnce(const std::string& path, bool exercise) {
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
   StorageEngine storage(std::move(options));
+  keylane::InitWorkerMetrics(1);
+  keylane::InitStorage(&storage, true);
   const absl::Status prepared = storage.Prepare(1);
   if (!prepared.ok()) {
     std::cerr << prepared << '\n';

@@ -33,6 +33,7 @@
 #include "keylane/metrics.h"
 #include "keylane/random_sample.h"
 #include "keylane/redis_parse.h"
+#include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
 #include "keylane/storage/engine.h"
@@ -4744,14 +4745,16 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
 
 Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                                   ReplyBuilder& reply_builder) {
+  const bool replication_origin = request.replication_origin_;
   const auto& args = request.args_;
   const std::uint32_t cmd_flags =
       request.spec_ != nullptr ? request.spec_->flags_ : 0u;
-  if (g_replica_read_only && (cmd_flags & kCmdWrite) != 0) {
+  if (!replication_origin && g_replica_read_only &&
+      (cmd_flags & kCmdWrite) != 0) {
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
   }
-  if (RejectForMemory(EstimatedMemoryGrowth(request))) {
+  if (!replication_origin && RejectForMemory(EstimatedMemoryGrowth(request))) {
     co_return BuiltReply(AppendOomError(reply_builder));
   }
   if (request.kind_ == CommandKind::kFlushDb ||
@@ -5048,6 +5051,36 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     default:
       co_return ExecuteSimpleLocalCommand(request, reply_builder);
   }
+}
+
+Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
+  RespCommand wire{.args_ = command.args_};
+  auto request = BuildCommandRequest(std::move(wire), command.db_id_);
+  if (!request.ok()) co_return request.status();
+  request->replication_origin_ = true;
+  const bool canonical_set = request->kind_ == CommandKind::kSet &&
+                             (request->args_.size() == 3 ||
+                              (request->args_.size() == 5 &&
+                               CmpCaseInsensitive(request->args_[3], "PXAT")));
+  const bool canonical_del =
+      request->kind_ == CommandKind::kDel && request->args_.size() == 2;
+  if (!canonical_set && !canonical_del) {
+    co_return absl::Status(
+        absl::StatusCode::kInvalidArgument,
+        "replication command is not a canonical SET or single-key DEL");
+  }
+
+  ReplyBuilder reply_builder;
+  CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
+  if (reply.disk_value_.has_value() || reply.chunks_) {
+    co_return absl::Status(absl::StatusCode::kInternal,
+                           "replication write produced a streamed reply");
+  }
+  if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
+    co_return absl::Status(absl::StatusCode::kFailedPrecondition,
+                           std::string(reply.encoded_));
+  }
+  co_return absl::OkStatus();
 }
 
 }  // namespace keylane

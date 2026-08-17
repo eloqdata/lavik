@@ -1,4 +1,5 @@
 #include "absl/strings/str_cat.h"
+#include "keylane/replication_command.h"
 #include "impl.h"
 
 namespace keylane::storage {
@@ -23,6 +24,25 @@ ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
 }
 
 }  // namespace
+
+Task<absl::Status> StorageEngine::Impl::PublishReplicationCommand(
+    std::uint16_t partition_id, std::uint64_t partition_sequence,
+    std::uint8_t db_id, std::span<const std::string_view> args) {
+  if (LocalReplicationLogInfo().state_ != ReplicationLogState::kActive) {
+    co_return absl::OkStatus();
+  }
+  auto source = ReplicationCommandPayloadSource::Create(db_id, args);
+  if (!source.ok()) co_return source.status();
+  auto appended = co_await AppendReplicationLog(ReplicationLogAppend{
+      .kind_ = ReplicationEventKind::kMutation,
+      .partition_id_ = partition_id,
+      .partition_sequence_ = partition_sequence,
+      .payload_ = {},
+      .payload_source_ = &*source,
+  });
+  if (!appended.ok()) co_return appended.status();
+  co_return absl::OkStatus();
+}
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
                                                          std::string_view key,
@@ -87,12 +107,32 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   const std::uint64_t expire_at_ms = options.keep_ttl_ && exists
                                          ? found->value_.expire_at_ms_
                                          : options.expire_at_ms_;
+  std::uint64_t mutation_sequence = 0;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
-      std::numeric_limits<std::uint64_t>::max());
+      std::numeric_limits<std::uint64_t>::max(), nullptr, &mutation_sequence);
   if (!status.ok()) co_return status;
   result.applied_ = true;
+  if (tx == nullptr) {
+    const std::uint16_t partition_id = partition.id_;
+    unlock.Unlock();
+    std::string expire_text;
+    std::array<std::string_view, 5> args{"SET", key, value, {}, {}};
+    std::size_t argc = 3;
+    if (expire_at_ms != 0) {
+      expire_text = std::to_string(expire_at_ms);
+      args[3] = "PXAT";
+      args[4] = expire_text;
+      argc = 5;
+    }
+    absl::Status published = co_await PublishReplicationCommand(
+        partition_id, mutation_sequence, db_id,
+        std::span<const std::string_view>(args.data(), argc));
+    if (!published.ok()) {
+      spdlog::warn("replication SET publish failed: {}", published.message());
+    }
+  }
   co_return result;
 }
 
@@ -210,10 +250,21 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     co_return false;
   }
   const bool expired = IsExpired(found->value_, UnixTimeMillis());
+  std::uint64_t mutation_sequence = 0;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, {}, RecordKind::kTombstone,
-      ValueType::kNone, 0, tx, 0);
+      ValueType::kNone, 0, tx, 0, nullptr, &mutation_sequence);
   if (!status.ok()) co_return status;
+  if (!expired && tx == nullptr) {
+    const std::uint16_t partition_id = partition.id_;
+    unlock.Unlock();
+    const std::array<std::string_view, 2> args{"DEL", key};
+    absl::Status published = co_await PublishReplicationCommand(
+        partition_id, mutation_sequence, db_id, args);
+    if (!published.ok()) {
+      spdlog::warn("replication DEL publish failed: {}", published.message());
+    }
+  }
   co_return !expired;
 }
 
@@ -818,7 +869,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint8_t db_id, std::string_view key, std::string_view value,
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
     TxShardWrites* tx, std::uint64_t logical_size,
-    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements) {
+    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
+    std::uint64_t* committed_sequence) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -856,6 +908,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         /*txid=*/0, mutation_sequence, false, true, false, key_external,
         logical_size, nullptr, nullptr, nullptr, tx,
         std::move(commit_retirements));
+  }
+  if (status.ok() && committed_sequence != nullptr) {
+    *committed_sequence = mutation_sequence;
   }
   if (status.ok() && partition.capture_deltas_) {
     std::string replicated_value(value);
