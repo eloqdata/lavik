@@ -3,11 +3,16 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <random>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "keylane/command.h"
+#include "keylane/glob.h"
 
 namespace {
 
@@ -16,6 +21,108 @@ using keylane::CommandSpec;
 using keylane::DetermineKeys;
 using keylane::FindCommand;
 using keylane::KeyIndexView;
+
+// Test-only transliteration of Valkey's stringmatchlen_impl (nocase=false).
+// Keeping the oracle independent of the iterative production matcher catches
+// subtle cursor-consumption differences in malformed/trailing character
+// classes that are difficult to establish by inspection.
+bool ValkeyGlobReferenceImpl(const char* pattern, int pattern_length,
+                             const char* text, int text_length,
+                             bool* skip_longer_matches) {
+  while (pattern_length != 0 && text_length != 0) {
+    switch (pattern[0]) {
+      case '*':
+        while (pattern_length > 1 && pattern[1] == '*') {
+          ++pattern;
+          --pattern_length;
+        }
+        if (pattern_length == 1) return true;
+        while (text_length != 0) {
+          if (ValkeyGlobReferenceImpl(pattern + 1, pattern_length - 1, text,
+                                      text_length, skip_longer_matches)) {
+            return true;
+          }
+          if (*skip_longer_matches) return false;
+          ++text;
+          --text_length;
+        }
+        *skip_longer_matches = true;
+        return false;
+      case '?':
+        ++text;
+        --text_length;
+        break;
+      case '[': {
+        ++pattern;
+        --pattern_length;
+        bool negate = pattern_length != 0 && pattern[0] == '^';
+        if (negate) {
+          ++pattern;
+          --pattern_length;
+        }
+        bool matched = false;
+        while (true) {
+          if (pattern_length >= 2 && pattern[0] == '\\') {
+            ++pattern;
+            --pattern_length;
+            matched = matched || pattern[0] == text[0];
+          } else if (pattern_length != 0 && pattern[0] == ']') {
+            break;
+          } else if (pattern_length == 0) {
+            --pattern;
+            ++pattern_length;
+            break;
+          } else if (pattern_length >= 3 && pattern[1] == '-') {
+            unsigned char first = static_cast<unsigned char>(pattern[0]);
+            unsigned char last = static_cast<unsigned char>(pattern[2]);
+            if (first > last) std::swap(first, last);
+            const unsigned char value = static_cast<unsigned char>(text[0]);
+            matched = matched || (value >= first && value <= last);
+            pattern += 2;
+            pattern_length -= 2;
+          } else {
+            matched = matched || pattern[0] == text[0];
+          }
+          ++pattern;
+          --pattern_length;
+        }
+        if (negate) matched = !matched;
+        if (!matched) return false;
+        ++text;
+        --text_length;
+        break;
+      }
+      case '\\':
+        if (pattern_length >= 2) {
+          ++pattern;
+          --pattern_length;
+        }
+        [[fallthrough]];
+      default:
+        if (pattern[0] != text[0]) return false;
+        ++text;
+        --text_length;
+        break;
+    }
+    ++pattern;
+    --pattern_length;
+    if (text_length == 0) {
+      while (pattern_length != 0 && pattern[0] == '*') {
+        ++pattern;
+        --pattern_length;
+      }
+      break;
+    }
+  }
+  return pattern_length == 0 && text_length == 0;
+}
+
+bool ValkeyGlobReference(std::string_view pattern, std::string_view text) {
+  bool skip_longer_matches = false;
+  return ValkeyGlobReferenceImpl(
+      pattern.data(), static_cast<int>(pattern.size()), text.data(),
+      static_cast<int>(text.size()), &skip_longer_matches);
+}
 
 #define EXPECT_CHECK(condition, message) EXPECT_TRUE(condition) << message
 
@@ -80,23 +187,51 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("SELECT", CommandKind::kSelect);
   CheckKind("DBSIZE", CommandKind::kDbSize);
   CheckKind("SCAN", CommandKind::kScan);
+  CheckKind("TYPE", CommandKind::kType);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
+  CheckKind("ZADD", CommandKind::kZAdd);
+  CheckKind("ZRANGESTORE", CommandKind::kZRangeStore);
+  CheckKind("GEOSEARCH", CommandKind::kGeoSearch);
+  CheckKind("GEOSEARCHSTORE", CommandKind::kGeoSearchStore);
+  CheckKind("GEORADIUS_RO", CommandKind::kGeoRadiusRo);
+  CheckKind("GEORADIUSBYMEMBER_RO", CommandKind::kGeoRadiusByMemberRo);
+  CheckKind("XADD", CommandKind::kXAdd);
+  CheckKind("XREADGROUP", CommandKind::kXReadGroup);
   EXPECT_CHECK(FindCommand("NOPE") == nullptr,
                "unknown command should not resolve");
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");
   EXPECT_CHECK(FindCommand("GETT") == nullptr,
                "prefix collision should not resolve");
+  // Leave the upper arity open so the option parser can report Redis's
+  // syntax error for trailing tokens instead of the global arity error.
+  EXPECT_EQ(FindCommand("zrangebyscore")->max_args_, 0);
+  EXPECT_EQ(FindCommand("zrevrangebyscore")->max_args_, 0);
+  EXPECT_EQ(FindCommand("geopos")->min_args_, 2);
+  EXPECT_EQ(FindCommand("geohash")->min_args_, 2);
+  for (const char* name : {"blpop", "brpop", "blmove", "brpoplpush", "blmpop",
+                           "xread", "xreadgroup"}) {
+    const CommandSpec* spec = FindCommand(name);
+    EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdMayBlock) != 0,
+                 std::string(name) + " should have kCmdMayBlock");
+  }
+  EXPECT_EQ(FindCommand("lpop")->flags_ & keylane::kCmdMayBlock, 0u);
+  EXPECT_EQ(FindCommand("xrange")->flags_ & keylane::kCmdMayBlock, 0u);
+  const CommandSpec* radius_member = FindCommand("georadiusbymember");
+  ASSERT_NE(radius_member, nullptr);
+  EXPECT_NE(radius_member->flags_ & keylane::kCmdWrite, 0u);
+  EXPECT_NE(radius_member->flags_ & keylane::kCmdMultiShard, 0u);
+  EXPECT_NE(radius_member->flags_ & keylane::kCmdMovableKeys, 0u);
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
   const char* write_cmds[] = {"set",     "lpush",   "incr",
                               "del",     "expire",  "pexpire",
                               "persist", "flushdb", "flushall"};
-  const char* read_cmds[] = {"get",    "strlen", "ttl", "pttl",
-                             "exists", "dbsize", "scan"};
+  const char* read_cmds[] = {"get",  "strlen", "ttl",    "pttl",
+                             "type", "exists", "dbsize", "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) != 0,
@@ -112,9 +247,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                  std::string(name) + " should not have kCmdWrite");
   }
   {
-    const char* gated[] = {"dbsize",  "scan",    "del",   "exists", "get",
-                           "strlen",  "set",     "lpush", "incr",   "expire",
-                           "pexpire", "persist", "ttl",   "pttl"};
+    const char* gated[] = {"dbsize", "scan",    "type",  "del",    "exists",
+                           "get",    "strlen",  "set",   "lpush",  "incr",
+                           "expire", "pexpire", "persist", "ttl", "pttl"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
@@ -215,11 +350,131 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   }
 }
 
+TEST(CommandTableTest, ResolvesStreamReadMovableKeys) {
+  const CommandSpec* read = FindCommand("xread");
+  ASSERT_NE(read, nullptr);
+  const std::vector<std::string> args = {"XREAD",   "COUNT", "5", "BLOCK", "10",
+                                         "STREAMS", "a",     "b", "0-0",   "$"};
+  auto keys = DetermineKeys(*read, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 6);
+  EXPECT_EQ(keys->last_, 7);
+  EXPECT_EQ(keys->count(), 2);
+
+  const std::vector<std::string> unbalanced = {"XREAD", "STREAMS", "a", "b",
+                                               "0-0"};
+  auto unbalanced_keys = DetermineKeys(*read, unbalanced);
+  EXPECT_FALSE(unbalanced_keys.ok());
+  EXPECT_EQ(unbalanced_keys.status().message(),
+            "Unbalanced 'xread' list of streams: for each stream key an ID "
+            "or '$' must be specified.");
+
+  const CommandSpec* group_read = FindCommand("xreadgroup");
+  ASSERT_NE(group_read, nullptr);
+  const std::vector<std::string> group_args = {
+      "XREADGROUP", "GROUP", "group", "STREAMS", "COUNT", "1",
+      "STREAMS",    "first", "second", "0",       ">"};
+  auto group_keys = DetermineKeys(*group_read, group_args);
+  ASSERT_TRUE(group_keys.ok()) << group_keys.status();
+  EXPECT_EQ(group_keys->first_, 7);
+  EXPECT_EQ(group_keys->last_, 8);
+
+  std::vector<std::string> oversized{"XREAD", "STREAMS"};
+  constexpr std::size_t kTooManyStreamKeys =
+      static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max());
+  oversized.reserve(2 + 2 * kTooManyStreamKeys);
+  for (std::size_t i = 0; i < kTooManyStreamKeys; ++i)
+    oversized.push_back("key");
+  for (std::size_t i = 0; i < kTooManyStreamKeys; ++i)
+    oversized.push_back("0");
+  EXPECT_FALSE(DetermineKeys(*read, oversized).ok());
+}
+
+TEST(CommandTableTest, AcceptsExtendedPendingIdleForm) {
+  const CommandSpec* pending = FindCommand("xpending");
+  ASSERT_NE(pending, nullptr);
+  EXPECT_TRUE(DetermineKeys(
+                  *pending,
+                  std::vector<std::string>{"XPENDING", "stream", "group",
+                                           "IDLE", "1000", "-", "+", "10",
+                                           "consumer"})
+                  .ok());
+}
+
+TEST(CommandTableTest, StreamHelpHasNoKey) {
+  for (const char* name : {"xgroup", "xinfo"}) {
+    const CommandSpec* spec = FindCommand(name);
+    ASSERT_NE(spec, nullptr);
+    const std::vector<std::string> args{name, "HELP"};
+    auto keys = DetermineKeys(*spec, args);
+    ASSERT_TRUE(keys.ok()) << keys.status();
+    EXPECT_TRUE(keys->empty());
+  }
+}
+
+TEST(CommandTableTest, ResolvesSortedSetAggregateKeys) {
+  const CommandSpec* read = FindCommand("zinter");
+  ASSERT_NE(read, nullptr);
+  const std::vector<std::string> read_args = {
+      "ZINTER", "2", "a", "b", "WEIGHTS", "2", "3", "WITHSCORES"};
+  auto read_keys = DetermineKeys(*read, read_args);
+  ASSERT_TRUE(read_keys.ok()) << read_keys.status();
+  EXPECT_EQ(read_keys->first_, 2);
+  EXPECT_EQ(read_keys->last_, 3);
+
+  const CommandSpec* store = FindCommand("zunionstore");
+  ASSERT_NE(store, nullptr);
+  const std::vector<std::string> store_args = {"ZUNIONSTORE", "out", "2", "a",
+                                               "b"};
+  auto store_keys = DetermineKeys(*store, store_args);
+  ASSERT_TRUE(store_keys.ok()) << store_keys.status();
+  EXPECT_EQ(store_keys->first_, 3);
+  EXPECT_EQ(store_keys->last_, 4);
+
+  for (const auto& [args, message] :
+       std::vector<std::pair<std::vector<std::string>, std::string>>{
+           {{"ZUNIONSTORE", "out", "not-an-integer", "a"},
+            "value is not an integer or out of range"},
+           {{"ZUNIONSTORE", "out", "0", "a"},
+            "at least 1 input key is needed for 'zunionstore' command"},
+           {{"ZUNIONSTORE", "out", "2", "a"}, "syntax error"}}) {
+    auto invalid = DetermineKeys(*store, args);
+    ASSERT_FALSE(invalid.ok());
+    EXPECT_EQ(invalid.status().message(), message);
+  }
+}
+
+TEST(CommandTableTest, ResolvesSortedSetAndGeoStoreKeys) {
+  for (const char* name : {"zrangestore", "geosearchstore"}) {
+    const CommandSpec* spec = FindCommand(name);
+    ASSERT_NE(spec, nullptr);
+    const std::vector<std::string> args =
+        std::string_view(name) == "zrangestore"
+            ? std::vector<std::string>{"ZRANGESTORE", "destination", "source",
+                                       "0", "-1"}
+            : std::vector<std::string>{
+                  "GEOSEARCHSTORE", "destination", "source", "FROMLONLAT",
+                  "0", "0", "BYRADIUS", "1", "km"};
+    auto keys = DetermineKeys(*spec, args);
+    ASSERT_TRUE(keys.ok()) << keys.status();
+    EXPECT_EQ(keys->first_, 1);
+    EXPECT_EQ(keys->last_, 2);
+  }
+  const CommandSpec* radius = FindCommand("georadius");
+  ASSERT_NE(radius, nullptr);
+  const std::vector<std::string> args = {
+      "GEORADIUS", "source", "0", "0", "1", "km", "STORE", "destination"};
+  auto keys = DetermineKeys(*radius, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 1);
+  EXPECT_EQ(keys->last_, 1);
+}
+
 TEST(CommandTableTest, ResolvesMovableListPopKeys) {
   const CommandSpec* lmpop = FindCommand("lmpop");
   ASSERT_NE(lmpop, nullptr);
-  const std::vector<std::string> lm_args{
-      "LMPOP", "2", "first", "second", "LEFT", "COUNT", "3"};
+  const std::vector<std::string> lm_args{"LMPOP", "2",     "first", "second",
+                                         "LEFT",  "COUNT", "3"};
   auto lm_keys = DetermineKeys(*lmpop, lm_args);
   ASSERT_TRUE(lm_keys.ok()) << lm_keys.status();
   EXPECT_EQ(lm_keys->first_, 2);
@@ -228,15 +483,95 @@ TEST(CommandTableTest, ResolvesMovableListPopKeys) {
 
   const CommandSpec* blmpop = FindCommand("blmpop");
   ASSERT_NE(blmpop, nullptr);
-  const std::vector<std::string> blm_args{
-      "BLMPOP", "1", "3", "a", "b", "c", "RIGHT"};
+  const std::vector<std::string> blm_args{"BLMPOP", "1", "3",    "a",
+                                          "b",      "c", "RIGHT"};
   auto blm_keys = DetermineKeys(*blmpop, blm_args);
   ASSERT_TRUE(blm_keys.ok()) << blm_keys.status();
   EXPECT_EQ(blm_keys->first_, 3);
   EXPECT_EQ(blm_keys->last_, 5);
   EXPECT_EQ(blm_keys->count(), 3);
 
-  const std::vector<std::string> invalid{
-      "LMPOP", "3", "only-one", "LEFT"};
+  const std::vector<std::string> invalid{"LMPOP", "3", "only-one", "LEFT"};
   EXPECT_FALSE(DetermineKeys(*lmpop, invalid).ok());
+
+  std::vector<std::string> overflowing;
+  overflowing.reserve(65538);
+  overflowing.push_back("LMPOP");
+  overflowing.push_back("65535");
+  for (std::size_t i = 0; i < 65535; ++i) overflowing.push_back("key");
+  overflowing.push_back("LEFT");
+  EXPECT_FALSE(DetermineKeys(*lmpop, overflowing).ok());
+}
+
+TEST(CommandTableTest, RedisGlobTrailingHyphenIsRangeEndpoint) {
+  EXPECT_TRUE(keylane::RedisGlobMatch("[a-]", "]"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[a-]", "_"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[a-]", "a"));
+  EXPECT_FALSE(keylane::RedisGlobMatch("[a-]", "-"));
+  // The endpoint ']' is consumed by the range. The following '*' remains
+  // inside the now-unterminated class instead of matching the rest of text.
+  EXPECT_FALSE(keylane::RedisGlobMatch("[b-]*", "bbba"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[b-]*", "b"));
+}
+
+TEST(CommandTableTest, RedisGlobOnlyCaretNegatesAndEscapesPrecedeRanges) {
+  EXPECT_TRUE(keylane::RedisGlobMatch("[!a]", "!"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[!a]", "a"));
+  EXPECT_FALSE(keylane::RedisGlobMatch("[!a]", "b"));
+
+  EXPECT_TRUE(keylane::RedisGlobMatch("[\\a-z]", "a"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[\\a-z]", "-"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[\\a-z]", "z"));
+  EXPECT_FALSE(keylane::RedisGlobMatch("[\\a-z]", "b"));
+
+  EXPECT_TRUE(keylane::RedisGlobMatch("[abc", "a"));
+  EXPECT_TRUE(keylane::RedisGlobMatch("[abc", "c"));
+  EXPECT_FALSE(keylane::RedisGlobMatch("[abc", "["));
+  EXPECT_FALSE(keylane::RedisGlobMatch("[abc", "d"));
+}
+
+TEST(CommandTableTest, RedisGlobMatchesValkeyReference) {
+  constexpr std::string_view alphabet = "*?[]^-\\abc";
+  std::mt19937_64 random(0x4b45594c414e45ULL);
+  for (std::size_t iteration = 0; iteration < 200000; ++iteration) {
+    std::string pattern(random() % 9, '\0');
+    std::string text(random() % 9, '\0');
+    for (char& byte : pattern) byte = alphabet[random() % alphabet.size()];
+    for (char& byte : text) byte = alphabet[random() % alphabet.size()];
+    ASSERT_EQ(keylane::RedisGlobMatch(pattern, text),
+              ValkeyGlobReference(pattern, text))
+        << "pattern=" << pattern << " text=" << text;
+  }
+}
+
+TEST(CommandTableTest, ResolvesSInterCardKeysAndRedis72Errors) {
+  const CommandSpec* spec = FindCommand("sintercard");
+  ASSERT_NE(spec, nullptr);
+  const std::vector<std::string> valid{"SINTERCARD", "2",     "first",
+                                       "second",     "LIMIT", "1"};
+  auto keys = DetermineKeys(*spec, valid);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 2);
+  EXPECT_EQ(keys->last_, 3);
+  EXPECT_EQ(keys->count(), 2);
+
+  const std::vector<std::string> zero{"SINTERCARD", "0", "set"};
+  auto zero_keys = DetermineKeys(*spec, zero);
+  ASSERT_FALSE(zero_keys.ok());
+  EXPECT_EQ(zero_keys.status().message(), "numkeys should be greater than 0");
+
+  const std::vector<std::string> too_many{"SINTERCARD", "2", "set"};
+  auto too_many_keys = DetermineKeys(*spec, too_many);
+  ASSERT_FALSE(too_many_keys.ok());
+  EXPECT_EQ(too_many_keys.status().message(),
+            "Number of keys can't be greater than number of args");
+
+  const std::vector<std::string> trailing{"SINTERCARD", "1", "set", "bad"};
+  auto trailing_keys = DetermineKeys(*spec, trailing);
+  ASSERT_FALSE(trailing_keys.ok());
+  EXPECT_EQ(trailing_keys.status().message(), "syntax error");
+
+  const std::vector<std::string> repeated{
+      "SINTERCARD", "1", "set", "LIMIT", "1", "LIMIT", "2"};
+  EXPECT_TRUE(DetermineKeys(*spec, repeated).ok());
 }

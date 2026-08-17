@@ -93,13 +93,16 @@ add_library(keylane_module
   src/storage/buffer_pool.cpp
   src/storage/engine.cpp
   src/storage/engine/alloc.cpp
+  src/storage/engine/compact_api.cpp
   src/storage/engine/defrag.cpp
   src/storage/engine/expire.cpp
   src/storage/engine/flush.cpp
   src/storage/engine/flush_db.cpp
+  src/storage/engine/hash_api.cpp
+  src/storage/engine/hash_codec.cpp
+  src/storage/engine/hash_tree.cpp
   src/storage/engine/init.cpp
   src/storage/engine/list_api.cpp
-  src/storage/engine/list_codec.cpp
   src/storage/engine/list_tree.cpp
   src/storage/engine/metrics.cpp
   src/storage/engine/read.cpp
@@ -113,7 +116,11 @@ add_library(keylane_module
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/command.cpp
+  src/redis/hash_command.cpp
   src/redis/list_command.cpp
+  src/redis/set_command.cpp
+  src/redis/stream_command.cpp
+  src/redis/zset_command.cpp
   src/redis/command_table.cpp
   src/redis/server.cpp
   src/tx/tx_shard.cpp
@@ -184,6 +191,7 @@ if (BUILD_TESTING)
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/command_table_test.cpp
+    tests/random_sample_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp
@@ -290,6 +298,10 @@ if (BUILD_TESTING)
       NAME keylane_list_e2e
       COMMAND keylane_list_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 300)
+    if (KEYLANE_ASAN_BUILD)
+      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 900)
+    else()
+      set_tests_properties(keylane_list_e2e PROPERTIES TIMEOUT 300)
+    endif()
   endif()
 endif()

@@ -8,12 +8,67 @@ atomicity, errors, and RESP2 replies.
 The current string and expiration surface is:
 
 - `SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT|KEEPTTL]`
-- `GET`, `INCR`, `DEL`, and `EXISTS`
+- `GET`, `INCR`, `DEL`, `EXISTS`, `TYPE`, and `SCAN` with `TYPE` filtering
 - `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, and `PERSIST`
 - Redis 7.2 `EXPIRE`/`PEXPIRE` conditions: `NX`, `XX`, `GT`, and `LT`
 
 Redis 8.4 comparison options (`IFEQ`, `IFNE`, `IFDEQ`, and `IFDNE`) are not
 part of this target.
+
+Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
+scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s
+fixed-versus-scientific notation and unpadded exponent spelling.
+Integer-valued doubles in Redis's conservative `double2ll` range (from
+`-LLONG_MAX/2` through `LLONG_MAX/2`) use ordinary decimal integer notation
+instead. `GEODIST` uses four digits after the decimal point, while `GEOPOS`
+uses human-readable 17-place formatting with trailing fractional zeroes
+removed. These paths intentionally do not share one generic floating-point
+formatter because Redis 7.2 does not format them the same way.
+
+Command-level regression cases should compare complete RESP2 bytes with Redis
+Open Source 7.2. This includes the reply container type, null array versus null
+bulk string, precise error text, and state after rejected commands. A newer
+Redis server is not an interchangeable oracle: floating-point replies and
+some Stream result shapes changed after 7.2.
+
+## Collection storage
+
+List, Hash, Set, Sorted Set, geospatial index, and Stream values are stored as
+single atomic records. A command decodes, modifies, and rewrites one complete
+key while holding its intent lock. Large-key splitting is not currently
+implemented; `large-key-design.md` records constraints for a future redesign.
+
+The implemented Sorted Set surface is `ZADD`, `ZCARD`, `ZCOUNT`, `ZINCRBY`,
+`ZLEXCOUNT`, `ZMSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`, `ZRANGE`,
+`ZRANGESTORE`, and the legacy range aliases, `ZRANK`, `ZREVRANK`, `ZREM`, the three `ZREMRANGE*`
+commands, `ZSCAN`, and `ZSCORE`.
+Cross-key `ZDIFF`, `ZINTER`, `ZINTERCARD`, and `ZUNION`, including their
+`*STORE` forms, use the same distributed intent-lock transaction path as Set
+algebra commands.
+
+Negative-count `HRANDFIELD`, `SRANDMEMBER`, and `ZRANDMEMBER` replies larger
+than 1000 samples are streamed in bounded batches. Both ordinary commands and
+EXEC capture the collection's compact value once, release DB/key or transaction
+locks, and drain the RESP reply from that immutable view in the same bounded
+batches. The requested count therefore does not determine working-set memory,
+concurrent deletion cannot fabricate replacement samples after the array header
+has been sent, and slow clients do not retain storage locks.
+
+Geospatial indexes reuse the Sorted Set representation and expose `GEOADD`,
+`GEODIST`, `GEOHASH`, `GEOPOS`, `GEORADIUS`, `GEORADIUSBYMEMBER`, and
+`GEOSEARCH`. The legacy radius commands support `STORE`/`STOREDIST`, and
+`GEOSEARCHSTORE` is implemented on the same cross-key transaction path.
+
+The Stream surface is `XADD`, `XDEL`, `XLEN`, `XRANGE`, `XREVRANGE`, `XTRIM`,
+`XSETID`, `XREAD`, `XREADGROUP`, `XGROUP`, `XACK`, `XPENDING`, `XCLAIM`,
+`XAUTOCLAIM`, and `XINFO`. Blocking List and Stream commands share a per-shard
+wait registry. A key owner maintains its local FIFO lanes and sends readiness
+events to the waiting command's worker; waiter state is therefore worker-local
+and needs no mutex. List and consumer-group lanes wake one waiter at a time,
+while non-consuming `XREAD` uses a private broadcast lane and an event-ID
+predicate so every reader whose cursor is behind the append is rechecked.
+Commands release the DB gate while suspended and always recheck storage after
+registration or wakeup, which closes both check/register and flush races.
 
 ## Type and expiration metadata
 

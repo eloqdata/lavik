@@ -472,12 +472,14 @@ int main(int argc, char** argv) {
   const std::string data_path = prefix + ".data";
   const std::string unequal_path_a = prefix + "-unequal-a.data";
   const std::string unequal_path_b = prefix + "-unequal-b.data";
+  const std::string expiry_full_path = prefix + "-expiry-full.data";
   const std::string defrag_crash_path = prefix + "-defrag-crash.data";
   const std::string stale_header_path = prefix + "-stale-header.data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
   (void)::unlink(unequal_path_a.c_str());
   (void)::unlink(unequal_path_b.c_str());
+  (void)::unlink(expiry_full_path.c_str());
   (void)::unlink(defrag_crash_path.c_str());
   (void)::unlink(stale_header_path.c_str());
   (void)::unlink(log_path.c_str());
@@ -521,6 +523,79 @@ int main(int argc, char** argv) {
       Expect(client.Command({"EXISTS", "old-0", "fresh"}), ":1",
              "EXISTS before restart");
       server.Stop();
+    }
+
+    // Fill a device after placing several unshielded, short-lived records in
+    // its first records block. Once their TTLs elapse, appending a tombstone
+    // has no foreground block available. Active expiration must be able to
+    // retire those records in memory, allowing defrag to reclaim their block
+    // and restore write availability.
+    if (!stale_header_only) {
+      CreateDataFile(expiry_full_path, 80ULL * 1024 * 1024);
+      {
+        ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
+        RespClient client = Connect(port);
+        constexpr unsigned kExpiringKeys = 7;
+        for (unsigned i = 0; i < kExpiringKeys; ++i) {
+          const std::string key = "full-expiring-" + std::to_string(i);
+          Expect(client.Command({"SET", key, value, "PX", "5000"}), "+OK",
+                 "full-device expiring SET");
+        }
+        bool observed_full = false;
+        for (unsigned i = 0; i < 64; ++i) {
+          const std::string key = "full-live-" + std::to_string(i);
+          const std::string response = client.Command({"SET", key, value});
+          if (response == "+OK") continue;
+          if (response.starts_with("-ERR ") &&
+              response.find("out of disk space") != std::string::npos) {
+            observed_full = true;
+            break;
+          }
+          Fail("full-device SET returned an unexpected response: " +
+               response);
+        }
+        if (!observed_full) {
+          Fail("expiration test device did not reach foreground exhaustion");
+        }
+
+        const auto reclaim_deadline = std::chrono::steady_clock::now() + 20s;
+        bool write_recovered = false;
+        while (std::chrono::steady_clock::now() < reclaim_deadline) {
+          const std::string response =
+              client.Command({"SET", "after-full-expiry", value});
+          if (response == "+OK") {
+            write_recovered = true;
+            break;
+          }
+          if (!response.starts_with("-ERR ") ||
+              response.find("out of disk space") == std::string::npos) {
+            Fail("post-expiration SET returned an unexpected response: " +
+                 response);
+          }
+          std::this_thread::sleep_for(100ms);
+        }
+        if (!write_recovered) {
+          Fail("expired records did not restore full-device write capacity");
+        }
+        std::vector<std::string_view> exists{"EXISTS"};
+        std::vector<std::string> expiring_names;
+        expiring_names.reserve(kExpiringKeys);
+        for (unsigned i = 0; i < kExpiringKeys; ++i) {
+          expiring_names.push_back("full-expiring-" + std::to_string(i));
+        }
+        for (const std::string& key : expiring_names) exists.push_back(key);
+        Expect(client.Command(exists), ":0", "full-device expired EXISTS");
+        server.Stop();
+      }
+      {
+        ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
+        RespClient client = Connect(port);
+        Expect(client.Command({"EXISTS", "full-expiring-0"}), ":0",
+               "full-device expired key after restart");
+        Expect(client.Command({"EXISTS", "after-full-expiry"}), ":1",
+               "full-device recovered write after restart");
+        server.Stop();
+      }
     }
 
     // The bitmap means activated, not committed. Model an affected on-disk
@@ -680,6 +755,7 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
+    (void)::unlink(expiry_full_path.c_str());
     (void)::unlink(defrag_crash_path.c_str());
     (void)::unlink(stale_header_path.c_str());
     (void)::unlink(log_path.c_str());
@@ -693,6 +769,7 @@ int main(int argc, char** argv) {
     (void)::unlink(data_path.c_str());
     (void)::unlink(unequal_path_a.c_str());
     (void)::unlink(unequal_path_b.c_str());
+    (void)::unlink(expiry_full_path.c_str());
     (void)::unlink(defrag_crash_path.c_str());
     (void)::unlink(stale_header_path.c_str());
     (void)::unlink(log_path.c_str());

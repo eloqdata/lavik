@@ -1,4 +1,4 @@
-# Plan: keylane VLL transaction framework (original implementation)
+# Keylane transaction design
 
 ## Context
 
@@ -169,9 +169,9 @@ Modified: `src/redis/command.cpp` (routing rewrite), `src/redis/server.cpp` (ctx
 
 **Scheme (proposed by the user)**: presumed-abort 2PC. Data records are the prepare; the initiating worker appends a commit record locally **after** every participating shard's data is durable; at recovery, a txid-tagged data record is kept only if its commit record is found.
 
-**Representation**: `RecordHeader::generation` is repurposed and renamed `txid` (a fossil field: the original newest-wins ordinal, left without any reader after 04f10f4 introduced replication_epoch/mutation_sequence; it merely mirrored mutation_sequence). txid==0 means a non-transactional record (the fast path is always 0; next_txid starts at 1), so **no flag bit is needed**. Defrag relocation passing txid through is exactly the right semantics (commit ownership follows the txid, not the physical location). FormatVersion untouched (user: compatibility is not a concern at this stage).
+**Representation**: `RecordHeader::generation` is repurposed and renamed `txid` (a fossil field: the original newest-wins ordinal, left without any reader after 04f10f4 introduced replication_epoch/mutation_sequence; it merely mirrored mutation_sequence). txid==0 means a non-transactional record (the fast path is always 0; next_txid starts at 1), so **no flag bit is needed**. The initial implementation preserves txid across defrag relocation. The fence-set GC follow-up below deliberately changes that rule: a relocation may write txid=0 only after it has positive proof that the transaction's commit record is durable. FormatVersion remains untouched while old development data files are recreated rather than upgraded.
 
-**The commit record**: new `RecordKind::kTxCommit`, header-only with no payload, the txid field holding the committed id, appended into the initiating worker's active block, riding the existing staging/flush/recovery-scan machinery. Flush ordering uses the same fence as RelocationDurabilityFence: the coordinator gathers each participating shard's (block, committed) high-water marks and appends the commit only after all are durable. Losing the commit itself = the whole transaction is dropped at recovery, which falls within the relaxed-durability promise; the only forbidden outcome is "half of it survives".
+**The commit record**: new `RecordKind::kTxCommit`, header-only with no payload, the txid field holding the committed id. The current implementation appends it into the initiating worker's ordinary active block, riding the existing staging/flush/recovery-scan machinery. Flush ordering uses the same fence as RelocationDurabilityFence: the coordinator gathers each participating shard's (block, committed) high-water marks and appends the commit only after all are durable. Losing the commit itself = the whole transaction is dropped at recovery, which falls within the relaxed-durability promise; the only forbidden outcome is "half of it survives". Fence-set GC moves future commit records to a separate per-worker commit append stream so a commit can never pin one of its own tagged birth blocks.
 
 **Retirement routing**: a transactional write's superseded previous is not retired via the data record's RecordIdentity but via the commit record's identity (commit block flushed = commit durable ⇒ data durable long before ⇒ only then may the previous leave its accounting). Otherwise "data durable, commit not, previous reclaimed, recovery drops the new" loses both ends.
 
@@ -183,19 +183,171 @@ Modified: `src/redis/command.cpp` (routing rewrite), `src/redis/server.cpp` (ctx
 
 **Stages**: ① rename the txid field + thread it through (all writers pass 0, behavior-neutral) → ② kTxCommit + recovery filtering + seeding (nobody writes txids yet, neutral) → ③ transactional tagging + the commit chain + retirement routing → ④ 2-hop + runtime rollback + replication overflow → ⑤ crash tests (crash with data durable but commit not ⇒ all dropped; commit durable ⇒ all present) + a disk-full-triggered runtime rollback e2e (genuine ENOSPC on a small data file).
 
-### M10 progress and the pre-stage-③ open point (2026-08-09)
+### M10 progress and the pre-stage-③ open point (historical, 2026-08-09)
 
 Landed: ① the txid field (fossil generation repurposed, all writers stamp 0, behavior-neutral); ② the kTxCommit kind + codec validation, recovery-time "park tagged records → adjudicate after the barrier against the commit set", next_txid recovery seeding (disk-wide max+1, set by worker 0). Both committed green.
 
-**Open point discovered while implementing stage ③: commit-record reclamation.** A commit record counts toward its block's live_bytes but never enters the index: defrag salvage finds no index entry and will not relocate it, and the block never reaches zero because of it — left unhandled, every block eventually degenerates into a permanent "commit records only" leak. Candidates:
+**Open point discovered while implementing stage ③: commit-record reclamation.** A commit record counts toward its block's live_bytes but never enters the index: defrag salvage finds no index entry and will not relocate it, and the block never reaches zero because of it — left unhandled, every block eventually degenerates into a permanent "commit records only" leak. The candidates considered at the time were:
 - (a) salvage special-cases kTxCommit and relocates unconditionally: blocks stay compactable, but commit records themselves never die, accumulating without bound with total transaction count;
-- (b) refcount GC (preferred): the coordinator maintains txid → {unretired data-record count, commit-record location}; when a transaction's data record retires (at its fenced MarkRecordDead point) it notifies the coordinator to decrement; at zero, MarkRecordDead the commit record and the block reclaims naturally. After restart, recovery rebuilds the counts (the scan sees both the surviving tagged records and the commit records). Cost: one cross-worker notification per record retirement + a recovery-time table rebuild;
-- (c) rewrite staging before flush to strip the txid (the commit decision is far faster than the periodic flush; most records can be untagged pre-flush with a header-CRC recompute, eliminating the commit record at the root): but it races "block fills → immediate flush", and already-flushed portions still need a commit record as backstop — complexity buying zero bloat on the normal path; viable as an optimization on top of (b).
+- (b) refcount GC: the coordinator maintains txid → {unretired data-record count, commit-record location}; when a transaction's data record retires (at its fenced MarkRecordDead point) it notifies the coordinator to decrement; at zero, MarkRecordDead the commit record and the block reclaims naturally. After restart, recovery rebuilds the counts (the scan sees both the surviving tagged records and the commit records). Cost: obtaining txid on every retirement, one cross-worker notification per record retirement, and either a wider primary index or a disk-header read;
+- (c) rewrite staging before flush to strip the txid (the commit decision is far faster than the periodic flush; most records can be untagged pre-flush with a header-CRC recompute, eliminating the commit record at the root): but it races "block fills → immediate flush", and already-flushed portions still need a commit record as backstop — complexity buying zero bloat on the normal path; viable only as an optimization on top of a complete commit-GC scheme.
 
-Stage ③ proceeds with (b); (c) deferred as a future optimization.
+Stage ③ shipped with (a) as a correctness-first stopgap. The fence-set design below supersedes the planned refcount scheme. Staging rewrite remains a possible optimization on top, not a correctness requirement.
 
 ### M10 complete (2026-08-09; commits 143f5a6/33601dd/288da01/6d627f4)
 
 All four stages landed: ① the txid field; ② kTxCommit + recovery filtering + seeding; ③ tagging + the commit chain + retirement routing (pitfalls: commit records must not enter partitions; shutdown drains commit chains first; standby errors out waiters during shutdown); ④ runtime rollback — TxShardWrites.collect_undo enables the per-shard undo journal (WorkerStore.tx_undo, keyed by txid); single-shard transactions self-roll-back inside their callback keeping 1 hop, multi-shard goes through a second finish hop (rollback/discard under the still-held locks); overwritten keys restore the previous location + MarkRecordDead the new record + force the partition's delta overflow for a replica re-copy, freshly created keys get a normal tombstone append; EXEC does not enable undo (per-command error reporting is Redis semantics; crash atomicity is still guaranteed by the commit record). KEYLANE_FAIL_TX_WRITE injects test faults. Verified: injected mid-transaction failures roll back fully (overwrites / fresh keys / DBSIZE / consistency across restart) + the tx-commit-append crash matrix in both directions.
 
-**Deferred follow-ups**: commit-record refcount GC (scheme b; currently salvage forward-copies + permanent accumulation); mid-transaction disk errors of a single command inside EXEC (e.g. an embedded MSET) remain partially visible (command-level); porting scratchpad's repro_tx_atomicity.py / the rollback injection script to C++ e2e; a full ASan re-run (pending the defrag scheduling rework landing in the other session).
+**Deferred follow-ups**: fence-set commit GC (specified below; current salvage still forward-copies commits permanently); mid-transaction disk errors of a single command inside EXEC (e.g. an embedded MSET) remain partially visible (command-level); porting scratchpad's repro_tx_atomicity.py / the rollback injection script to C++ e2e; a full ASan re-run (pending the defrag scheduling rework landing in the other session).
+
+### M10.1 planned: tagged-birth-block fence-set GC (2026-08-13)
+
+#### Why block membership is sufficient
+
+A commit record is needed only while a recovery-visible record carrying its txid can still exist. Transaction prepare writes create tagged records in a small, exactly known set of physical records blocks. A committed record relocated by defrag no longer needs transaction evidence: the destination is protected by the existing `RelocationDurabilityFence`, so recovery sees either the old tagged source together with its commit or the durable destination. The destination may therefore carry txid=0. Once every original tagged birth block has been durably removed from the allocation bitmap, no record anywhere on allocated storage can require that transaction's commit.
+
+This replaces per-record retirement counting with per-block lifetime tracking. It is deliberately conservative: overwriting the last tagged record does not immediately free the commit; the commit waits until the record's birth block is reclaimed. Record overwrite, expiration, and ordinary `MarkRecordDead` paths pay no tx-GC work.
+
+#### Separate durability fences from tagged birth blocks
+
+`TxShardWrites::fences_` is not itself the GC set. It contains every record
+boundary that must be durable before the commit can publish. If a future
+large-key design adds anonymous COW objects, their publication fences and the
+tagged-record birth-block GC set must remain separate; see
+`large-key-design.md`.
+
+Each shard therefore collects two distinct sets:
+
+```text
+durability_fences       (block, allocation_epoch, committed_bytes)
+    every write that must be durable before kTxCommit
+
+tagged_birth_blocks     distinct (block, allocation_epoch)
+    only records whose on-disk RecordHeader.txid != 0
+```
+
+The first set preserves the existing commit ordering. Only `tagged_birth_blocks` feeds GC. Multiple tagged records from one transaction in one block create one membership entry.
+
+#### Commit-only append stream
+
+Future commit records use a separate per-worker append stream shared by all transactions. A commit must not be appended to an ordinary data active block: that block can also be one of the transaction's tagged birth blocks, producing an unbreakable cycle in which GC waits for the block's allocation epoch to advance while the commit's own live bytes prevent the block from emptying.
+
+Commit blocks contain only `kTxCommit` records, are flushed with the normal two-slot header protocol, and are not salvaged by ordinary defrag. Dead commits decrement their block accounting; the block is released naturally when all of its commits are dead. If an implementation must open data created by the old mixed-stream scheme, recovery must either migrate every still-needed co-located commit once into the commit stream or reject/recreate that development data. It may not install a self-referential fence set.
+
+#### Runtime tables and the durable publication point
+
+The table is proportional to outstanding tagged birth blocks, not historical transaction count:
+
+```text
+TxGcEntry
+    txid
+    coordinator_worker
+    remaining_birth_blocks
+    commit_record_locations[]   // normally one; recovery may find old copies
+
+block_tx_watchers[(block_id, allocation_epoch)]
+    TxGcHandle[]
+```
+
+`txid -> birth blocks` alone would require scanning every transaction whenever a block dies. The reverse table makes a durably reclaimed block notify only transactions that actually referenced it. Entries are owned by a worker; a foreign block owner sends a cold-path notification containing a generation-checked handle rather than sharing mutable maps between workers.
+
+Watcher installation is an atomic check-and-register operation on the physical
+block owner. If `(block_id, allocation_epoch)` is no longer the currently
+allocated identity when registration runs, that block is already dead and is
+not added to `remaining_birth_blocks`. Otherwise the watcher is installed
+before returning. This closes the race in which a birth block becomes durably
+free before commit flush completion publishes its GC entry; a notification can
+never be lost between the identity check and registration.
+
+The GC entry is published only by the commit record's flush-completion path, after both the commit header and its data are fdatasync'd. Merely returning from `WriteRecordLocked`, appending the commit, or removing a coordinator from an in-flight table is not proof of a durable commit. The staged commit identity retains the birth-block set until that completion callback installs the entry. The commit-only stream's completion path also executes the routed retirements currently attached to the ordinary commit record; moving the record to a separate stream must not drop either responsibility. A crash before installation is harmless because recovery rebuilds it.
+
+Defrag uses positive proof without a random `txid -> coordinator` lookup. Before
+the first tagged append, every coordinator registers an outstanding reservation
+and publishes its oldest outstanding txid in a worker-local atomic. The global
+minimum of those atomics is the unresolved watermark; when no reservation
+exists, the worker publishes the next unallocated txid. Commit flush completion
+or a fully completed abort/rollback releases the reservation. A commit failure
+must retain it for retry or enter fail-stop; it cannot publish progress past an
+undecided tagged write.
+
+After revalidating that the source is still the current index version, defrag
+uses this rule:
+
+```text
+record.txid == 0                         -> destination.txid = 0
+record.txid < global unresolved watermark -> destination.txid = 0
+otherwise                                -> skip relocation and requeue block
+```
+
+An index-current tagged record below the watermark cannot be aborted: aborted
+records have been removed from the index before their reservation is released.
+It therefore has a durable commit and may be detagged. A record at or above the
+watermark may still be in flight. It is not relocated at all--copying it with
+the tag would let a tagged record escape into a destination absent from
+`tagged_birth_blocks`, while detagging it would publish an uncommitted write.
+The short in-flight window may temporarily pin a source block; normal defrag
+requeue handles it.
+
+Once a durable `TxGcEntry` exists, it cannot disappear while one of its tracked
+birth blocks is still allocated. Thus a below-watermark relocation cannot race
+commit removal. The registry remains responsible for birth-block death
+notifications, but defrag does not need to locate the registry owner by txid.
+
+For a relocation that passes the watermark test, the order remains unchanged:
+write the txid=0 destination, make its destination fence durable, then retire
+the tagged source path. A crash before the fence keeps the old allocated source
+and its commit; a crash after the source block's durable retirement may rely on
+the untagged destination.
+
+#### Block retirement ordering
+
+An in-memory `live_bytes == 0`, `DestroyBlockState`, or a newly selected allocation epoch is not sufficient evidence that tagged bytes are gone. Notification occurs only after the allocation bitmap clear for the exact `(block_id, allocation_epoch)` has been persisted:
+
+```text
+destination relocation fences durable
+old block live_bytes reaches zero
+allocation bitmap clear fdatasync completes
+notify block_tx_watchers[old identity]
+remaining_birth_blocks reaches zero
+MarkRecordDead every commit copy
+```
+
+If the process crashes after the bitmap clear but before commit retirement, recovery sees an unnecessary commit and rebuilds conservatively. If it crashes before the bitmap clear, recovery may still scan the tagged block and must still find its commit. This ordering permits only delayed reclamation, never premature reclamation.
+
+A block containing a live commit is skipped rather than forward-copied. It should not be repeatedly requeued while pinned; retiring its last live commit calls the normal defrag/release eligibility hook.
+
+#### Recovery rebuild
+
+Recovery still performs one physical scan. It temporarily collects commit sightings and parks tagged candidates exactly as today, then adjudicates them at the barrier. After final per-key winners are known:
+
+1. A txid with no winning tagged record needs no future commit evidence. None of its commit copies is charged into recovered `live_bytes`; their bytes are dead immediately.
+2. A txid with winning tagged records gets one distinct birth-block identity for each winning tagged record's physical location. Historical non-winning tagged copies are not included: once superseded by a final winner they may safely become invalid when the commit disappears.
+3. Every surviving physical commit copy for that txid is attached to the rebuilt `TxGcEntry` and charged live. Old defrag may have created duplicates; GC must retire all of them, not an arbitrary representative.
+4. A winning txid=0 relocation of the same logical mutation requires no entry. Its older tagged source can be dropped with the commit once no other winning tagged record uses that txid.
+
+The recovery candidate metadata must retain txid until winner selection even though the 48-byte runtime `RecordLocation` does not. After the GC tables are built, the primary index remains unchanged and carries no txid.
+
+#### Bounds and optional draining
+
+The runtime memory bound is the number of `(transaction, tagged birth block)` pairs whose blocks have not been durably retired, plus commit-copy locations. Commit disk usage is consequently bounded by transactions that still have storage pinned in those birth blocks, rather than by all transactions ever executed. Unrelated long-lived records sharing a birth block can delay reclamation, but cannot create unbounded per-record hot-path work.
+
+A low-priority drain is optional: when a sparsely live birth block is held by a few current tagged records, defrag can relocate those records with txid=0 and let normal block reclamation discharge the fence set. Staging-header txid stripping remains another optional optimization. Neither is required for correctness.
+
+#### Required tests
+
+- A commit shares an ordinary active block in the old layout: migration or rejection prevents a self-pinning GC entry.
+- Commit append but not commit flush: defrag encounters the tagged record,
+  skips it, and requeues the source block; a crash drops the transaction
+  atomically.
+- Defrag skips an in-flight tagged record, the commit subsequently becomes
+  durable, its birth block dies, and restart still recovers the committed data.
+- Commit flush completion races defrag: recovery accepts either the tagged
+  source plus commit or the complete txid=0 destination.
+- A birth block becomes durably free before commit flush completion; atomic
+  check-and-register omits the already-dead identity, the commit is reclaimed,
+  and no watcher or commit leaks.
+- One transaction writes multiple records in one block and across workers; the birth set deduplicates per physical block and retires only after every bitmap clear is durable.
+- A large List transaction has untagged collection-object fences; those blocks never enter `tagged_birth_blocks`.
+- A commit block contains many transactions; retiring some commits does not move or lose the others, and the block releases after the final one dies.
+- Recovery sees no winning tag, one winning tag, multiple birth blocks, and duplicate historical commit copies; accounting and the rebuilt reverse table are exact.
+- Crash immediately before and after source bitmap clear and immediately before and after commit `MarkRecordDead`; every restart is atomic and leaks at most conservatively.

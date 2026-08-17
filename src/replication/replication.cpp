@@ -421,11 +421,25 @@ class ReplicationManager::Impl {
     while (begin < records.size()) {
       if (EncodedRecordBytes(records[begin]) + 2 + 8 + 4 > kMaxApplyPayload) {
         const SnapshotRecord& large = records[begin];
+        const bool nonempty_collection =
+            large.value_type_ == storage::ValueType::kList ||
+            large.value_type_ == storage::ValueType::kHash ||
+            large.value_type_ == storage::ValueType::kSet ||
+            large.value_type_ == storage::ValueType::kSortedSet;
         if (large.kind_ != SnapshotRecord::Kind::kValue ||
             (large.value_type_ != storage::ValueType::kString &&
-             large.value_type_ != storage::ValueType::kList) ||
+             large.value_type_ != storage::ValueType::kList &&
+             large.value_type_ != storage::ValueType::kHash &&
+             large.value_type_ != storage::ValueType::kSet &&
+             large.value_type_ != storage::ValueType::kSortedSet &&
+             large.value_type_ != storage::ValueType::kStream) ||
+            (nonempty_collection && large.logical_size_ == 0) ||
             (large.value_type_ == storage::ValueType::kString &&
-             large.value_.size() > storage::kMaxStringBytes)) {
+             large.logical_size_ != large.value_.size()) ||
+            large.value_.size() > storage::kMaxStringBytes ||
+            (large.value_.size() + storage::kExtentPayloadBytes - 1) /
+                    storage::kExtentPayloadBytes >
+                std::numeric_limits<std::uint32_t>::max()) {
           co_return absl::Status(absl::StatusCode::kOutOfRange,
                                  "replicated record exceeds RPC payload limit");
         }

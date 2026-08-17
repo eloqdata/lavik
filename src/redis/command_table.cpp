@@ -4,6 +4,7 @@
 #include <limits>
 
 #include "absl/status/statusor.h"
+#include "absl/strings/str_cat.h"
 
 namespace keylane {
 
@@ -20,6 +21,7 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"scan", CommandKind::kScan, 2, 0, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
+    {"type", CommandKind::kType, 2, 2, 1, 1, 1, kKeyedRead},
     {"flushdb", CommandKind::kFlushDb, 1, 0, 0, 0, 1,
      kCmdWrite | kCmdGlobal | kCmdNoKeys},
     {"flushall", CommandKind::kFlushAll, 1, 0, 0, 0, 1,
@@ -40,8 +42,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"lrem", CommandKind::kLRem, 4, 4, 1, 1, 1, kKeyedWrite},
     {"ltrim", CommandKind::kLTrim, 4, 4, 1, 1, 1, kKeyedWrite},
     {"lpos", CommandKind::kLPos, 3, 0, 1, 1, 1, kKeyedRead},
-    {"lmove", CommandKind::kLMove, 5, 5, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+    {"lmove", CommandKind::kLMove, 5, 5, 1, 2, 1, kKeyedWrite | kCmdMultiShard},
     {"rpoplpush", CommandKind::kRPopLPush, 3, 3, 1, 2, 1,
      kKeyedWrite | kCmdMultiShard},
     // LMPOP/BLMPOP have argument-dependent key ranges. Their handlers build
@@ -49,15 +50,133 @@ constexpr CommandSpec kCommandTable[] = {
     {"lmpop", CommandKind::kLMPop, 4, 0, 2, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"blpop", CommandKind::kBLPop, 3, 0, 1, -2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdMayBlock},
     {"brpop", CommandKind::kBRPop, 3, 0, 1, -2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdMayBlock},
     {"blmove", CommandKind::kBLMove, 6, 6, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdMayBlock},
     {"brpoplpush", CommandKind::kBRPopLPush, 4, 4, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdMayBlock},
     {"blmpop", CommandKind::kBLMPop, 5, 0, 3, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdMayBlock},
+    {"hset", CommandKind::kHSet, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"hmset", CommandKind::kHMSet, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"hsetnx", CommandKind::kHSetNx, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"hget", CommandKind::kHGet, 3, 3, 1, 1, 1, kKeyedRead},
+    {"hmget", CommandKind::kHMGet, 3, 0, 1, 1, 1, kKeyedRead},
+    {"hdel", CommandKind::kHDel, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"hlen", CommandKind::kHLen, 2, 2, 1, 1, 1, kKeyedRead},
+    {"hexists", CommandKind::kHExists, 3, 3, 1, 1, 1, kKeyedRead},
+    {"hgetall", CommandKind::kHGetAll, 2, 2, 1, 1, 1, kKeyedRead},
+    {"hkeys", CommandKind::kHKeys, 2, 2, 1, 1, 1, kKeyedRead},
+    {"hvals", CommandKind::kHVals, 2, 2, 1, 1, 1, kKeyedRead},
+    {"hstrlen", CommandKind::kHStrlen, 3, 3, 1, 1, 1, kKeyedRead},
+    {"hincrby", CommandKind::kHIncrBy, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"hincrbyfloat", CommandKind::kHIncrByFloat, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"hrandfield", CommandKind::kHRandField, 2, 4, 1, 1, 1, kKeyedRead},
+    {"hscan", CommandKind::kHScan, 3, 0, 1, 1, 1, kKeyedRead},
+    {"sadd", CommandKind::kSAdd, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"scard", CommandKind::kSCard, 2, 2, 1, 1, 1, kKeyedRead},
+    {"sdiff", CommandKind::kSDiff, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
+    {"sdiffstore", CommandKind::kSDiffStore, 3, 0, 1, -1, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"sinter", CommandKind::kSInter, 2, 0, 1, -1, 1,
+     kKeyedRead | kCmdMultiShard},
+    {"sintercard", CommandKind::kSInterCard, 3, 0, 2, 0, 1,
+     kKeyedRead | kCmdMultiShard | kCmdMovableKeys},
+    {"sinterstore", CommandKind::kSInterStore, 3, 0, 1, -1, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"sismember", CommandKind::kSIsMember, 3, 3, 1, 1, 1, kKeyedRead},
+    {"smembers", CommandKind::kSMembers, 2, 2, 1, 1, 1, kKeyedRead},
+    {"smismember", CommandKind::kSMIsMember, 3, 0, 1, 1, 1, kKeyedRead},
+    {"smove", CommandKind::kSMove, 4, 4, 1, 2, 1, kKeyedWrite | kCmdMultiShard},
+    {"spop", CommandKind::kSPop, 2, 3, 1, 1, 1, kKeyedWrite},
+    {"srandmember", CommandKind::kSRandMember, 2, 3, 1, 1, 1, kKeyedRead},
+    {"srem", CommandKind::kSRem, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"sscan", CommandKind::kSScan, 3, 0, 1, 1, 1, kKeyedRead},
+    {"sunion", CommandKind::kSUnion, 2, 0, 1, -1, 1,
+     kKeyedRead | kCmdMultiShard},
+    {"sunionstore", CommandKind::kSUnionStore, 3, 0, 1, -1, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"zadd", CommandKind::kZAdd, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"zcard", CommandKind::kZCard, 2, 2, 1, 1, 1, kKeyedRead},
+    {"zcount", CommandKind::kZCount, 4, 4, 1, 1, 1, kKeyedRead},
+    {"zincrby", CommandKind::kZIncrBy, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"zlexcount", CommandKind::kZLexCount, 4, 4, 1, 1, 1, kKeyedRead},
+    {"zmscore", CommandKind::kZMScore, 3, 0, 1, 1, 1, kKeyedRead},
+    {"zpopmax", CommandKind::kZPopMax, 2, 3, 1, 1, 1, kKeyedWrite},
+    {"zpopmin", CommandKind::kZPopMin, 2, 3, 1, 1, 1, kKeyedWrite},
+    {"zrandmember", CommandKind::kZRandMember, 2, 4, 1, 1, 1, kKeyedRead},
+    {"zrange", CommandKind::kZRange, 4, 0, 1, 1, 1, kKeyedRead},
+    {"zrangestore", CommandKind::kZRangeStore, 5, 0, 1, 2, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+    {"zrangebylex", CommandKind::kZRangeByLex, 4, 0, 1, 1, 1, kKeyedRead},
+    {"zrangebyscore", CommandKind::kZRangeByScore, 4, 0, 1, 1, 1, kKeyedRead},
+    {"zrank", CommandKind::kZRank, 3, 0, 1, 1, 1, kKeyedRead},
+    {"zrem", CommandKind::kZRem, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"zremrangebylex", CommandKind::kZRemRangeByLex, 4, 4, 1, 1, 1,
+     kKeyedWrite},
+    {"zremrangebyrank", CommandKind::kZRemRangeByRank, 4, 4, 1, 1, 1,
+     kKeyedWrite},
+    {"zremrangebyscore", CommandKind::kZRemRangeByScore, 4, 4, 1, 1, 1,
+     kKeyedWrite},
+    {"zrevrange", CommandKind::kZRevRange, 4, 0, 1, 1, 1, kKeyedRead},
+    {"zrevrangebylex", CommandKind::kZRevRangeByLex, 4, 0, 1, 1, 1, kKeyedRead},
+    {"zrevrangebyscore", CommandKind::kZRevRangeByScore, 4, 0, 1, 1, 1,
+     kKeyedRead},
+    {"zrevrank", CommandKind::kZRevRank, 3, 0, 1, 1, 1, kKeyedRead},
+    {"zscan", CommandKind::kZScan, 3, 0, 1, 1, 1, kKeyedRead},
+    {"zscore", CommandKind::kZScore, 3, 3, 1, 1, 1, kKeyedRead},
+    {"zdiff", CommandKind::kZDiff, 3, 0, 2, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zdiffstore", CommandKind::kZDiffStore, 4, 0, 3, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zinter", CommandKind::kZInter, 3, 0, 2, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zintercard", CommandKind::kZInterCard, 3, 0, 2, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zinterstore", CommandKind::kZInterStore, 4, 0, 3, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zunion", CommandKind::kZUnion, 3, 0, 2, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"zunionstore", CommandKind::kZUnionStore, 4, 0, 3, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"geoadd", CommandKind::kGeoAdd, 5, 0, 1, 1, 1, kKeyedWrite},
+    {"geodist", CommandKind::kGeoDist, 4, 5, 1, 1, 1, kKeyedRead},
+    {"geohash", CommandKind::kGeoHash, 2, 0, 1, 1, 1, kKeyedRead},
+    {"geopos", CommandKind::kGeoPos, 2, 0, 1, 1, 1, kKeyedRead},
+    {"georadius", CommandKind::kGeoRadius, 6, 0, 1, 1, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"georadius_ro", CommandKind::kGeoRadiusRo, 6, 0, 1, 1, 1, kKeyedRead},
+    {"georadiusbymember", CommandKind::kGeoRadiusByMember, 5, 0, 1, 1, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"georadiusbymember_ro", CommandKind::kGeoRadiusByMemberRo, 5, 0, 1, 1, 1,
+     kKeyedRead},
+    {"geosearch", CommandKind::kGeoSearch, 7, 0, 1, 1, 1, kKeyedRead},
+    {"geosearchstore", CommandKind::kGeoSearchStore, 8, 0, 1, 2, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+    {"xadd", CommandKind::kXAdd, 5, 0, 1, 1, 1, kKeyedWrite},
+    {"xdel", CommandKind::kXDel, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"xlen", CommandKind::kXLen, 2, 2, 1, 1, 1, kKeyedRead},
+    {"xrange", CommandKind::kXRange, 4, 6, 1, 1, 1, kKeyedRead},
+    {"xrevrange", CommandKind::kXRevRange, 4, 6, 1, 1, 1, kKeyedRead},
+    {"xtrim", CommandKind::kXTrim, 4, 7, 1, 1, 1, kKeyedWrite},
+    {"xsetid", CommandKind::kXSetId, 3, 7, 1, 1, 1, kKeyedWrite},
+    {"xgroup", CommandKind::kXGroup, 2, 8, 2, 2, 1,
+     kKeyedWrite | kCmdMovableKeys},
+    {"xack", CommandKind::kXAck, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"xpending", CommandKind::kXPending, 3, 9, 1, 1, 1, kKeyedRead},
+    {"xclaim", CommandKind::kXClaim, 6, 0, 1, 1, 1, kKeyedWrite},
+    {"xautoclaim", CommandKind::kXAutoClaim, 6, 9, 1, 1, 1, kKeyedWrite},
+    {"xinfo", CommandKind::kXInfo, 2, 6, 2, 2, 1,
+     kKeyedRead | kCmdMovableKeys},
+    {"xread", CommandKind::kXRead, 4, 0, 0, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdMayBlock},
+    {"xreadgroup", CommandKind::kXReadGroup, 7, 0, 0, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdMayBlock},
     {"strlen", CommandKind::kStrlen, 2, 2, 1, 1, 1, kKeyedRead},
     {"incr", CommandKind::kIncr, 2, 2, 1, 1, 1, kKeyedWrite},
     {"expire", CommandKind::kExpire, 3, 4, 1, 1, 1, kKeyedWrite},
@@ -80,8 +199,7 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"tombraider", CommandKind::kTombRaider, 2, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal},
-    {"defrag", CommandKind::kDefrag, 2, 3, 0, 0, 1,
-     kCmdNoKeys | kCmdGlobal},
+    {"defrag", CommandKind::kDefrag, 2, 3, 0, 0, 1, kCmdNoKeys | kCmdGlobal},
 };
 
 bool EqualsIgnoreCase(std::string_view name, std::string_view lower) {
@@ -136,30 +254,138 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
   return view;
 }
 
-absl::StatusOr<KeyIndexView> DetermineKeys(
-    const CommandSpec& spec, std::span<const std::string> args) {
+absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
+                                           std::span<const std::string> args) {
   if ((spec.flags_ & kCmdMovableKeys) == 0) {
     return DetermineKeys(spec, args.size());
   }
   if (args.size() < spec.min_args_ ||
       (spec.max_args_ != 0 && args.size() > spec.max_args_)) {
-    return absl::InvalidArgumentError(
-        "wrong number of arguments for '" + std::string(spec.name_) +
-        "' command");
+    return absl::InvalidArgumentError("wrong number of arguments for '" +
+                                      std::string(spec.name_) + "' command");
   }
-  const std::size_t count_arg =
-      spec.kind_ == CommandKind::kBLMPop ? 2 : 1;
+  if (spec.kind_ == CommandKind::kXGroup ||
+      spec.kind_ == CommandKind::kXInfo) {
+    if (args.size() == 2 && EqualsIgnoreCase(args[1], "help")) {
+      return KeyIndexView{};
+    }
+    return DetermineKeys(spec, args.size());
+  }
+  const std::size_t count_arg = spec.kind_ == CommandKind::kBLMPop ? 2 : 1;
+  if (spec.kind_ == CommandKind::kXRead ||
+      spec.kind_ == CommandKind::kXReadGroup) {
+    std::size_t streams = args.size();
+    const std::size_t option_begin =
+        spec.kind_ == CommandKind::kXReadGroup ? 4 : 1;
+    for (std::size_t i = option_begin; i < args.size(); ++i) {
+      if (EqualsIgnoreCase(args[i], "streams")) {
+        streams = i;
+        break;
+      }
+    }
+    const std::size_t remaining =
+        args.size() - std::min(streams + 1, args.size());
+    if (streams == args.size() || remaining < 2 || remaining % 2 != 0) {
+      const std::string_view command =
+          spec.kind_ == CommandKind::kXReadGroup ? "xreadgroup" : "xread";
+      const std::string_view special =
+          spec.kind_ == CommandKind::kXReadGroup ? ">" : "$";
+      return absl::InvalidArgumentError(absl::StrCat(
+          "Unbalanced '", command,
+          "' list of streams: for each stream key an ID or '", special,
+          "' must be specified."));
+    }
+    const std::size_t keys = remaining / 2;
+    const std::size_t max_key_index =
+        std::numeric_limits<std::uint16_t>::max();
+    if (streams + 1 > max_key_index || keys > max_key_index - streams) {
+      return absl::InvalidArgumentError(
+          "too many arguments for stream key routing");
+    }
+    return KeyIndexView{
+        .first_ = static_cast<std::uint16_t>(streams + 1),
+        .last_ = static_cast<std::uint16_t>(streams + keys),
+        .step_ = 1,
+    };
+  }
+  if (spec.kind_ == CommandKind::kGeoRadius ||
+      spec.kind_ == CommandKind::kGeoRadiusByMember) {
+    // The optional STORE/STOREDIST destination is parsed by the GEO
+    // transaction handler.  This view identifies the mandatory source.
+    return KeyIndexView{.first_ = 1, .last_ = 1, .step_ = 1};
+  }
+  const bool zset_aggregate = spec.kind_ == CommandKind::kZDiff ||
+                              spec.kind_ == CommandKind::kZDiffStore ||
+                              spec.kind_ == CommandKind::kZInter ||
+                              spec.kind_ == CommandKind::kZInterCard ||
+                              spec.kind_ == CommandKind::kZInterStore ||
+                              spec.kind_ == CommandKind::kZUnion ||
+                              spec.kind_ == CommandKind::kZUnionStore;
+  if (zset_aggregate) {
+    const bool store = spec.kind_ == CommandKind::kZDiffStore ||
+                       spec.kind_ == CommandKind::kZInterStore ||
+                       spec.kind_ == CommandKind::kZUnionStore;
+    const std::size_t count_index = store ? 2 : 1;
+    std::int64_t parsed_key_count = 0;
+    const std::string_view text = args[count_index];
+    const auto parsed =
+        std::from_chars(text.data(), text.data() + text.size(),
+                        parsed_key_count);
+    const std::size_t first = count_index + 1;
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
+      return absl::InvalidArgumentError(
+          "value is not an integer or out of range");
+    }
+    if (parsed_key_count < 1) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "at least 1 input key is needed for '", spec.name_, "' command"));
+    }
+    const std::uint64_t key_count =
+        static_cast<std::uint64_t>(parsed_key_count);
+    if (key_count > args.size() - first ||
+        first + key_count - 1 > std::numeric_limits<std::uint16_t>::max()) {
+      return absl::InvalidArgumentError("syntax error");
+    }
+    return KeyIndexView{
+        .first_ = static_cast<std::uint16_t>(first),
+        .last_ = static_cast<std::uint16_t>(first + key_count - 1),
+        .step_ = 1,
+    };
+  }
   std::uint64_t count = 0;
   const std::string_view text = args[count_arg];
   const auto parsed =
       std::from_chars(text.data(), text.data() + text.size(), count);
   const std::size_t first = count_arg + 1;
+  const bool sintercard = spec.kind_ == CommandKind::kSInterCard;
+  if (sintercard && (parsed.ec != std::errc{} ||
+                     parsed.ptr != text.data() + text.size() || count == 0)) {
+    return absl::InvalidArgumentError("numkeys should be greater than 0");
+  }
+  const bool enough_arguments =
+      sintercard ? count <= args.size() - first : count < args.size() - first;
+  const std::size_t max_key_index = std::numeric_limits<std::uint16_t>::max();
+  const bool representable_key_range = count != 0 && first <= max_key_index &&
+                                       count - 1 <= max_key_index - first;
   if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
-      count == 0 || count > std::numeric_limits<std::uint16_t>::max() ||
-      count > args.size() - first || first + count >= args.size()) {
-    return absl::InvalidArgumentError(
-        "wrong number of arguments for '" + std::string(spec.name_) +
-        "' command");
+      count == 0 || !representable_key_range || !enough_arguments) {
+    if (sintercard) {
+      return absl::InvalidArgumentError(
+          "Number of keys can't be greater than number of args");
+    }
+    return absl::InvalidArgumentError("wrong number of arguments for '" +
+                                      std::string(spec.name_) + "' command");
+  }
+  if (sintercard) {
+    const std::size_t after_keys = first + count;
+    if ((args.size() - after_keys) % 2 != 0) {
+      return absl::InvalidArgumentError("syntax error");
+    }
+    for (std::size_t option = after_keys; option < args.size(); option += 2) {
+      if (!EqualsIgnoreCase(args[option], "limit")) {
+        return absl::InvalidArgumentError("syntax error");
+      }
+    }
   }
   return KeyIndexView{
       .first_ = static_cast<std::uint16_t>(first),

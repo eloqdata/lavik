@@ -11,7 +11,6 @@
 #include <cstdlib>
 #include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,6 +22,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "keylane/redis_parse.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/transaction.h"
@@ -38,6 +38,7 @@ storage::StorageEngine* g_storage = nullptr;
 struct BlockingKey {
   std::uint8_t db_id_ = 0;
   std::string key_;
+  std::string lane_;
 
   bool operator==(const BlockingKey&) const = default;
 };
@@ -45,10 +46,12 @@ struct BlockingKey {
 struct BlockingKeyView {
   std::uint8_t db_id_ = 0;
   std::string_view key_;
+  std::string_view lane_;
 };
 
 bool operator==(const BlockingKey& left, const BlockingKeyView& right) {
-  return left.db_id_ == right.db_id_ && left.key_ == right.key_;
+  return left.db_id_ == right.db_id_ && left.key_ == right.key_ &&
+         left.lane_ == right.lane_;
 }
 
 bool operator==(const BlockingKeyView& left, const BlockingKey& right) {
@@ -57,22 +60,22 @@ bool operator==(const BlockingKeyView& left, const BlockingKey& right) {
 
 template <typename H>
 H AbslHashValue(H hash, const BlockingKey& value) {
-  return H::combine(std::move(hash), value.db_id_, value.key_);
+  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_);
 }
 
 template <typename H>
 H AbslHashValue(H hash, const BlockingKeyView& value) {
-  return H::combine(std::move(hash), value.db_id_, value.key_);
+  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_);
 }
 
 struct BlockingKeyHash {
   using is_transparent = void;
 
   std::size_t operator()(const BlockingKey& value) const {
-    return absl::HashOf(value.db_id_, value.key_);
+    return absl::HashOf(value.db_id_, value.key_, value.lane_);
   }
   std::size_t operator()(const BlockingKeyView& value) const {
-    return absl::HashOf(value.db_id_, value.key_);
+    return absl::HashOf(value.db_id_, value.key_, value.lane_);
   }
 };
 
@@ -93,15 +96,16 @@ struct BlockingKeyEqual {
 struct WaitRegistration {
   unsigned owner_ = 0;
   BlockingKey key_;
+  BlockingQueuePolicy policy_ = BlockingQueuePolicy::kFifo;
+  std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_after_;
 };
 
-enum class WakeReason : std::uint8_t {
-  kWaiting,
-  kReady,
-  kTimeout,
-  kCancelled,
-};
+using WakeReason = BlockingWakeReason;
 
+// A waiter is simultaneously referenced by the command worker, its timer,
+// and worker-local registries on every key owner. Those references can cross
+// cores, so this is one of the cases where atomic shared_ptr ownership is
+// required rather than worker-local ownership.
 class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
  public:
   BlockingWaiter(celer::Worker* worker, std::uint64_t ticket)
@@ -140,33 +144,39 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
   Awaiter Wait() { return Awaiter(shared_from_this()); }
 
   std::uint64_t ticket() const noexcept { return ticket_; }
+  unsigned worker_id() const noexcept { return worker_->id(); }
 
   WakeReason reason() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     return reason_;
   }
 
   bool ResetReady() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (reason_ != WakeReason::kReady) return false;
     reason_ = WakeReason::kWaiting;
     return true;
   }
 
   bool Signal(WakeReason reason) noexcept {
-    std::coroutine_handle<> handle;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (reason_ != WakeReason::kWaiting) return false;
-      reason_ = reason;
-      handle = std::exchange(handle_, {});
-    }
-    if (handle) Resume(handle);
+    if (reason_ != WakeReason::kWaiting) return false;
+    reason_ = reason;
+    std::coroutine_handle<> handle = std::exchange(handle_, {});
+    if (handle) worker_->Enqueue(handle);
     return true;
   }
 
+  void SignalTimeout() noexcept {
+    if (reason_ != WakeReason::kWaiting && reason_ != WakeReason::kReady) {
+      return;
+    }
+    // Deadline is terminal even if readiness was already latched. If the
+    // woken attempt loses the element to an earlier waiter, it must observe
+    // the expired deadline instead of sleeping after its timer has exited.
+    reason_ = WakeReason::kTimeout;
+    std::coroutine_handle<> handle = std::exchange(handle_, {});
+    if (handle) worker_->Enqueue(handle);
+  }
+
   void Cancel() noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (reason_ == WakeReason::kWaiting || reason_ == WakeReason::kReady) {
       reason_ = WakeReason::kCancelled;
     }
@@ -174,30 +184,7 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
   }
 
  private:
-  static void ResumeRemote(void* context, std::uint64_t value) noexcept {
-    static_cast<celer::Worker*>(context)->Enqueue(
-        std::coroutine_handle<>::from_address(
-            reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
-  }
-
-  void Resume(std::coroutine_handle<> handle) noexcept {
-    const celer::CurrentWorker& current = celer::ThisWorker();
-    if (worker_->id() == current.id_) {
-      worker_->Enqueue(handle);
-      return;
-    }
-    celer::PostNotification(
-        current.cross_core_, worker_->id(),
-        celer::RemoteNotification{
-            .context_ = worker_,
-            .value_ = static_cast<std::uint64_t>(
-                reinterpret_cast<std::uintptr_t>(handle.address())),
-            .run_fn_ = &BlockingWaiter::ResumeRemote,
-        });
-  }
-
   bool Suspend(std::coroutine_handle<> handle) noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
     if (reason_ != WakeReason::kWaiting) return false;
     handle_ = handle;
     return true;
@@ -205,59 +192,153 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
 
   celer::Worker* worker_ = nullptr;
   std::uint64_t ticket_ = 0;
-  mutable std::mutex mutex_;
   WakeReason reason_ = WakeReason::kWaiting;
   std::coroutine_handle<> handle_{};
 };
 
+void RunBlockingReadyNotification(void* context, std::uint64_t) noexcept {
+  std::unique_ptr<std::shared_ptr<BlockingWaiter>> waiter(
+      static_cast<std::shared_ptr<BlockingWaiter>*>(context));
+  (void)(*waiter)->Signal(WakeReason::kReady);
+}
+
+void SignalBlockingReady(const std::shared_ptr<BlockingWaiter>& waiter) {
+  const celer::CurrentWorker& current = celer::ThisWorker();
+  if (waiter->worker_id() == current.id_) {
+    (void)waiter->Signal(WakeReason::kReady);
+    return;
+  }
+  auto context = std::make_unique<std::shared_ptr<BlockingWaiter>>(waiter);
+  celer::PostNotification(
+      current.cross_core_, waiter->worker_id(),
+      celer::RemoteNotification{.context_ = context.release(),
+                                .value_ = 0,
+                                .run_fn_ = &RunBlockingReadyNotification});
+}
+
 class BlockingWaitRegistry {
  public:
-  void Register(const BlockingKey& key,
+  void Register(const WaitRegistration& registration,
                 const std::shared_ptr<BlockingWaiter>& waiter) {
-    auto& queue = queues_[key];
+    auto& state = queues_[registration.key_];
+    auto& queue = state.entries_;
+    std::erase_if(queue,
+                  [](const Entry& current) { return current.waiter_.expired(); });
     const auto position =
-        std::find_if(queue.begin(), queue.end(), [&](const auto& current) {
-          const std::shared_ptr<BlockingWaiter> value = current.lock();
-          return value == nullptr || value->ticket() > waiter->ticket();
+        std::find_if(queue.begin(), queue.end(), [&](const Entry& current) {
+          const std::shared_ptr<BlockingWaiter> value = current.waiter_.lock();
+          return value != nullptr && value->ticket() > waiter->ticket();
         });
-    queue.insert(position, waiter);
+    queue.insert(position,
+                 Entry{waiter, registration.policy_,
+                       registration.stream_after_});
   }
 
-  void Unregister(const BlockingKey& key, const BlockingWaiter* waiter) {
-    Erase(key, waiter);
+  void Unregister(const BlockingKey& key, std::uint64_t ticket) {
+    Erase(key, ticket);
   }
 
-  void Notify(std::uint8_t db_id, std::string_view key) {
-    const BlockingKeyView lookup{db_id, key};
-    auto found = queues_.find(lookup);
+  // Pass FIFO ownership only within the lane whose active waiter completed.
+  // A physical-key notification here would spuriously wake every private
+  // XREAD broadcast lane whenever an unrelated waiter timed out.
+  void NotifyLane(const BlockingKey& key) {
+    auto found = queues_.find(key);
     if (found == queues_.end()) return;
-    auto& queue = found->second;
-    while (!queue.empty()) {
-      const std::shared_ptr<BlockingWaiter> waiter = queue.front().lock();
-      if (waiter == nullptr || (waiter->reason() != WakeReason::kWaiting &&
-                                waiter->reason() != WakeReason::kReady)) {
-        queue.pop_front();
+    auto& queue = found->second.entries_;
+    std::erase_if(queue,
+                  [](const Entry& entry) { return entry.waiter_.expired(); });
+    if (queue.empty()) {
+      queues_.erase(found);
+      return;
+    }
+    if (queue.front().policy_ == BlockingQueuePolicy::kBroadcast) {
+      for (const Entry& entry : queue) {
+        if (const auto waiter = entry.waiter_.lock()) {
+          SignalBlockingReady(waiter);
+        }
+      }
+      return;
+    }
+    if (const auto waiter = queue.front().waiter_.lock()) {
+      SignalBlockingReady(waiter);
+    }
+  }
+
+  void Notify(
+      std::uint8_t db_id, std::string_view key,
+      std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
+          std::nullopt) {
+    for (auto found = queues_.begin(); found != queues_.end();) {
+      if (found->first.db_id_ != db_id || found->first.key_ != key) {
+        ++found;
         continue;
       }
-      // A ready head remains at the front until it consumes or times out.
-      // Consequently a second push cannot wake a younger waiter that might
-      // race ahead of it on another worker.
-      if (waiter->reason() == WakeReason::kWaiting) {
-        (void)waiter->Signal(WakeReason::kReady);
+      auto& state = found->second;
+      auto& queue = state.entries_;
+      std::erase_if(queue,
+                    [](const Entry& entry) { return entry.waiter_.expired(); });
+      if (queue.empty()) {
+        auto empty = found++;
+        queues_.erase(empty);
+        continue;
       }
-      break;
+      auto matches = [&](const Entry& entry) {
+        return !entry.stream_after_.has_value() || !stream_id.has_value() ||
+               *stream_id > *entry.stream_after_;
+      };
+      if (queue.front().policy_ == BlockingQueuePolicy::kBroadcast) {
+        for (const Entry& entry : queue) {
+          if (!matches(entry)) continue;
+          if (const auto waiter = entry.waiter_.lock())
+            SignalBlockingReady(waiter);
+        }
+      } else {
+        for (const Entry& entry : queue) {
+          if (!matches(entry)) continue;
+          if (const auto waiter = entry.waiter_.lock()) {
+            SignalBlockingReady(waiter);
+            break;
+          }
+        }
+      }
+      ++found;
     }
-    if (queue.empty()) queues_.erase(found);
   }
 
  private:
-  void Erase(const BlockingKey& key, const BlockingWaiter* waiter) {
+  struct Entry {
+    std::weak_ptr<BlockingWaiter> waiter_;
+    BlockingQueuePolicy policy_ = BlockingQueuePolicy::kFifo;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_after_;
+  };
+
+  struct QueueState {
+    std::deque<Entry> entries_;
+  };
+
+ public:
+  void NotifyDb(std::uint8_t db_id) {
+    for (auto& [key, state] : queues_) {
+      if (key.db_id_ != db_id) continue;
+      for (const Entry& entry : state.entries_) {
+        if (const auto waiter = entry.waiter_.lock()) {
+          SignalBlockingReady(waiter);
+          if (entry.policy_ == BlockingQueuePolicy::kFifo) break;
+        }
+      }
+    }
+  }
+
+ private:
+
+  void Erase(const BlockingKey& key, std::uint64_t ticket) {
     auto found = queues_.find(key);
     if (found == queues_.end()) return;
-    auto& queue = found->second;
+    auto& state = found->second;
+    auto& queue = state.entries_;
     for (auto it = queue.begin(); it != queue.end();) {
-      const std::shared_ptr<BlockingWaiter> value = it->lock();
-      if (value == nullptr || value.get() == waiter) {
+      const std::shared_ptr<BlockingWaiter> value = it->waiter_.lock();
+      if (value == nullptr || value->ticket() == ticket) {
         it = queue.erase(it);
       } else {
         ++it;
@@ -266,8 +347,8 @@ class BlockingWaitRegistry {
     if (queue.empty()) queues_.erase(found);
   }
 
-  absl::flat_hash_map<BlockingKey, std::deque<std::weak_ptr<BlockingWaiter>>,
-                      BlockingKeyHash, BlockingKeyEqual>
+  absl::flat_hash_map<BlockingKey, QueueState, BlockingKeyHash,
+                      BlockingKeyEqual>
       queues_;
 };
 
@@ -276,10 +357,10 @@ BlockingWaitRegistry& LocalBlockingWaiters() {
   return registry;
 }
 
-Task<absl::Status> TimeoutBlockingWaiter(std::shared_ptr<BlockingWaiter> waiter,
-                                         std::chrono::nanoseconds timeout) {
+Task<absl::Status> TimeoutBlockingWaiter(
+    std::shared_ptr<BlockingWaiter> waiter,
+    std::chrono::steady_clock::time_point deadline) {
   constexpr auto kCancellationGranularity = std::chrono::seconds(1);
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
   for (;;) {
     if (waiter->reason() == WakeReason::kCancelled) {
       co_return absl::OkStatus();
@@ -294,7 +375,7 @@ Task<absl::Status> TimeoutBlockingWaiter(std::shared_ptr<BlockingWaiter> waiter,
                 kCancellationGranularity)));
     if (!slept.ok()) co_return slept;
   }
-  (void)waiter->Signal(WakeReason::kTimeout);
+  waiter->SignalTimeout();
   co_return absl::OkStatus();
 }
 
@@ -310,19 +391,19 @@ unsigned ShardForKey(std::string_view key) {
 
 struct WaiterCleanup {
   BlockingKey key_;
-  const BlockingWaiter* waiter_ = nullptr;
+  std::uint64_t ticket_ = 0;
 };
 
 void RunWaiterCleanup(void* context, std::uint64_t) noexcept {
   std::unique_ptr<WaiterCleanup> cleanup(static_cast<WaiterCleanup*>(context));
-  LocalBlockingWaiters().Unregister(cleanup->key_, cleanup->waiter_);
-  LocalBlockingWaiters().Notify(cleanup->key_.db_id_, cleanup->key_.key_);
+  LocalBlockingWaiters().Unregister(cleanup->key_, cleanup->ticket_);
+  LocalBlockingWaiters().NotifyLane(cleanup->key_);
 }
 
 void PostWaiterCleanup(const WaitRegistration& registration,
-                       const BlockingWaiter* waiter) noexcept {
+                       std::uint64_t ticket) noexcept {
   auto cleanup =
-      std::make_unique<WaiterCleanup>(WaiterCleanup{registration.key_, waiter});
+      std::make_unique<WaiterCleanup>(WaiterCleanup{registration.key_, ticket});
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (registration.owner_ == current.id_) {
     RunWaiterCleanup(cleanup.release(), 0);
@@ -348,7 +429,7 @@ class BlockingRegistrationGuard {
     if (!active_) return;
     waiter_->Cancel();
     for (const WaitRegistration& registration : *registrations_) {
-      PostWaiterCleanup(registration, waiter_.get());
+      PostWaiterCleanup(registration, waiter_->ticket());
     }
   }
 
@@ -365,8 +446,8 @@ Task<absl::Status> RegisterBlockingWaiter(
     const std::vector<WaitRegistration>& registrations) {
   for (const WaitRegistration& registration : registrations) {
     (void)co_await celer::SubmitTo(
-        registration.owner_, [key = registration.key_, waiter] {
-          LocalBlockingWaiters().Register(key, waiter);
+        registration.owner_, [registration, waiter] {
+          LocalBlockingWaiters().Register(registration, waiter);
           return true;
         });
   }
@@ -378,30 +459,36 @@ void UnregisterBlockingWaiter(
     const std::vector<WaitRegistration>& registrations) {
   waiter->Cancel();
   for (const WaitRegistration& registration : registrations) {
-    PostWaiterCleanup(registration, waiter.get());
+    PostWaiterCleanup(registration, waiter->ticket());
   }
 }
 
 struct BlockingKeyNotification {
   BlockingKey key_;
+  std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id_;
 };
 
 void RunBlockingKeyNotification(void* context, std::uint64_t) noexcept {
   std::unique_ptr<BlockingKeyNotification> notification(
       static_cast<BlockingKeyNotification*>(context));
   LocalBlockingWaiters().Notify(notification->key_.db_id_,
-                                notification->key_.key_);
+                                notification->key_.key_,
+                                notification->stream_id_);
 }
 
-void NotifyBlockingKey(std::uint8_t db_id, std::string_view key) {
+void NotifyBlockingKey(
+    std::uint8_t db_id, std::string_view key,
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
+        std::nullopt) {
   const unsigned owner = ShardForKey(key);
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (owner == current.id_) {
-    LocalBlockingWaiters().Notify(db_id, key);
+    LocalBlockingWaiters().Notify(db_id, key, stream_id);
     return;
   }
   auto notification = std::make_unique<BlockingKeyNotification>(
-      BlockingKeyNotification{BlockingKey{db_id, std::string(key)}});
+      BlockingKeyNotification{BlockingKey{db_id, std::string(key), {}},
+                              stream_id});
   celer::PostNotification(current.cross_core_, owner,
                           celer::RemoteNotification{
                               .context_ = notification.release(),
@@ -437,14 +524,14 @@ bool ParseNonNegative(std::string_view text, std::uint64_t* value) {
   return true;
 }
 
-bool ParseRespCount(std::string_view encoded, std::size_t* offset,
-                    char prefix, std::uint64_t* value) {
+bool ParseRespCount(std::string_view encoded, std::size_t* offset, char prefix,
+                    std::uint64_t* value) {
   if (*offset >= encoded.size() || encoded[*offset] != prefix) return false;
   const std::size_t begin = ++*offset;
   const std::size_t end = encoded.find("\r\n", begin);
   if (end == std::string_view::npos || end == begin) return false;
-  const auto parsed = std::from_chars(encoded.data() + begin,
-                                      encoded.data() + end, *value);
+  const auto parsed =
+      std::from_chars(encoded.data() + begin, encoded.data() + end, *value);
   if (parsed.ec != std::errc{} || parsed.ptr != encoded.data() + end) {
     return false;
   }
@@ -601,8 +688,115 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
 
 }  // namespace
 
+struct BlockingWaitHandle::Impl {
+  std::shared_ptr<BlockingWaiter> waiter_;
+  std::vector<WaitRegistration> registrations_;
+  bool active_ = true;
+};
+
+BlockingWaitHandle::BlockingWaitHandle(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+BlockingWaitHandle::BlockingWaitHandle(BlockingWaitHandle&&) noexcept =
+    default;
+
+BlockingWaitHandle& BlockingWaitHandle::operator=(
+    BlockingWaitHandle&& other) noexcept {
+  if (this == &other) return *this;
+  FinishBlockingWait(*this);
+  impl_ = std::move(other.impl_);
+  return *this;
+}
+
+BlockingWaitHandle::~BlockingWaitHandle() { FinishBlockingWait(*this); }
+
+Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
+RegisterBlockingWait(
+    std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+  auto impl = std::make_unique<BlockingWaitHandle::Impl>();
+  impl->waiter_ = std::make_shared<BlockingWaiter>(
+      celer::ThisWorker().self_, storage::StorageEngine::AllocateWriteTxid());
+  impl->registrations_.reserve(specs.size());
+  for (BlockingWaitSpec& spec : specs) {
+    WaitRegistration registration{
+        ShardForKey(spec.key_),
+        BlockingKey{db_id, std::move(spec.key_), std::move(spec.lane_)},
+        spec.policy_, spec.stream_after_};
+    const bool duplicate =
+        std::any_of(impl->registrations_.begin(),
+                    impl->registrations_.end(),
+                    [&](const WaitRegistration& existing) {
+                      return existing.key_ == registration.key_;
+                    });
+    if (!duplicate) impl->registrations_.push_back(std::move(registration));
+  }
+  if (impl->registrations_.empty()) {
+    co_return absl::InvalidArgumentError("blocking wait has no keys");
+  }
+  absl::Status registered =
+      co_await RegisterBlockingWaiter(impl->waiter_, impl->registrations_);
+  if (!registered.ok()) co_return registered;
+  if (deadline.has_value()) {
+    celer::SpawnOnCurrentWorker(
+        TimeoutBlockingWaiter(impl->waiter_, *deadline));
+  }
+  co_return std::unique_ptr<BlockingWaitHandle>(
+      new BlockingWaitHandle(std::move(impl)));
+}
+
+Task<BlockingWakeReason> WaitForBlockingReady(BlockingWaitHandle& handle) {
+  if (!handle.impl_ || !handle.impl_->active_) {
+    co_return BlockingWakeReason::kCancelled;
+  }
+  co_return co_await handle.impl_->waiter_->Wait();
+}
+
+BlockingWakeReason BlockingWaitState(const BlockingWaitHandle& handle) {
+  if (!handle.impl_ || !handle.impl_->active_) {
+    return BlockingWakeReason::kCancelled;
+  }
+  return handle.impl_->waiter_->reason();
+}
+
+bool ResetBlockingReady(BlockingWaitHandle& handle) {
+  return handle.impl_ && handle.impl_->active_ &&
+         handle.impl_->waiter_->ResetReady();
+}
+
+void FinishBlockingWait(BlockingWaitHandle& handle) {
+  if (!handle.impl_ || !handle.impl_->active_) return;
+  handle.impl_->active_ = false;
+  UnregisterBlockingWaiter(handle.impl_->waiter_,
+                           handle.impl_->registrations_);
+}
+
 void InitListCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
+}
+
+void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key) {
+  NotifyBlockingKey(db_id, key);
+}
+
+void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
+                             std::uint64_t id_ms,
+                             std::uint64_t id_seq) {
+  NotifyBlockingKey(db_id, key, std::pair{id_ms, id_seq});
+}
+
+void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key) {
+  NotifyBlockingKey(db_id, key);
+}
+
+Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id) {
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    (void)co_await celer::SubmitTo(worker, [db_id] {
+      LocalBlockingWaiters().NotifyDb(db_id);
+      return true;
+    });
+  }
+  co_return absl::OkStatus();
 }
 
 Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
@@ -694,8 +888,15 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
       op.value_ = args[2];
       for (std::size_t i = 3; i < args.size();) {
         if (CmpCaseInsensitive(args[i], "rank")) {
-          if (++i >= args.size() || !ParseInt64(args[i], &op.rank_) ||
-              op.rank_ == 0) {
+          if (++i >= args.size() || !ParseInt64(args[i], &op.rank_)) {
+            co_return BuiltReply(reply_builder.AppendError(
+                "ERR value is not an integer or out of range"));
+          }
+          if (op.rank_ == std::numeric_limits<std::int64_t>::min()) {
+            co_return BuiltReply(
+                reply_builder.AppendError("ERR value is out of range"));
+          }
+          if (op.rank_ == 0) {
             co_return BuiltReply(reply_builder.AppendError(
                 "ERR RANK can't be zero: use 1 to start from the first "
                 "match, 2 from the second, ..."));
@@ -1072,15 +1273,14 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                                   : request.kind_ == CommandKind::kBRPopLPush
                                       ? 3
                                       : args.size() - 1;
-  std::string timeout_text = args[timeout_arg];
-  char* parsed_end = nullptr;
-  errno = 0;
-  const double timeout_seconds = std::strtod(timeout_text.c_str(), &parsed_end);
-  if (errno == ERANGE ||
-      parsed_end != timeout_text.data() + timeout_text.size() ||
-      !std::isfinite(timeout_seconds) || timeout_seconds < 0) {
+  double timeout_seconds = 0;
+  if (!ParseRedisDouble(args[timeout_arg], &timeout_seconds)) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR timeout is not a float or out of range"));
+  }
+  if (timeout_seconds < 0) {
+    co_return BuiltReply(
+        reply_builder.AppendError("ERR timeout is negative"));
   }
 
   CommandRequest nonblocking = request;
@@ -1112,16 +1312,24 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   }
 
   const bool infinite = timeout_seconds == 0;
-  constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
-  const double timeout_nanoseconds = timeout_seconds * kNanosecondsPerSecond;
-  if (!infinite &&
-      timeout_nanoseconds >
-          static_cast<double>(std::chrono::nanoseconds::max().count())) {
-    co_return BuiltReply(reply_builder.AppendError(
-        "ERR timeout is not a float or out of range"));
+  std::chrono::steady_clock::time_point deadline{};
+  if (!infinite) {
+    constexpr long double kNanosecondsPerSecond = 1'000'000'000.0L;
+    const long double timeout_nanoseconds =
+        static_cast<long double>(timeout_seconds) * kNanosecondsPerSecond;
+    const auto now = std::chrono::steady_clock::now();
+    const auto maximum_delay =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::time_point::max() - now);
+    if (timeout_nanoseconds >
+        static_cast<long double>(maximum_delay.count())) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR timeout is out of range"));
+    }
+    const auto timeout = std::chrono::nanoseconds(
+        static_cast<std::int64_t>(timeout_nanoseconds));
+    deadline = now + timeout;
   }
-  const auto timeout = std::chrono::nanoseconds(
-      infinite ? 0 : static_cast<std::int64_t>(timeout_nanoseconds));
 
   auto is_empty = [](const CommandReply& reply) {
     return reply.encoded_.starts_with("*-1\r\n") ||
@@ -1142,11 +1350,9 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     std::string_view selected_key;
     std::string_view selected_value;
     if (!ParseRespCount(encoded, &offset, '*', &outer_count) ||
-        outer_count != 2 ||
-        !ParseRespBulk(encoded, &offset, &selected_key) ||
+        outer_count != 2 || !ParseRespBulk(encoded, &offset, &selected_key) ||
         !ParseRespCount(encoded, &offset, '*', &inner_count) ||
-        inner_count != 1 ||
-        !ParseRespBulk(encoded, &offset, &selected_value) ||
+        inner_count != 1 || !ParseRespBulk(encoded, &offset, &selected_value) ||
         offset != encoded.size()) {
       return BuiltReply(
           reply_builder.AppendError("ERR invalid internal blocking pop reply"));
@@ -1162,24 +1368,58 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                           ? reply_builder.AppendNullBulkString()
                           : reply_builder.AppendRaw("*-1\r\n"));
   };
+  bool gate_deadline_reached = false;
+  auto execute_attempt = [&](ReplyBuilder& attempt_builder)
+      -> Task<CommandReply> {
+    // FLUSHDB closes the gate only for its short detach window. A blocked
+    // command must not count as an in-flight database operation while it is
+    // waiting, but every actual read/modify/write attempt still participates
+    // in the gate so it cannot race the detach.
+    while (!TryBeginCommandDbOperation(request.db_id_)) {
+      if (!infinite && std::chrono::steady_clock::now() >= deadline) {
+        gate_deadline_reached = true;
+        co_return BuiltReply(
+            (request.kind_ == CommandKind::kBLMove ||
+             request.kind_ == CommandKind::kBRPopLPush)
+                ? attempt_builder.AppendNullBulkString()
+                : attempt_builder.AppendRaw("*-1\r\n"));
+      }
+      absl::Status slept =
+          co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                   std::chrono::milliseconds(1));
+      if (!slept.ok()) {
+        co_return BuiltReply(attempt_builder.AppendError(
+            "ERR ", slept.message()));
+      }
+    }
+    struct AttemptDbGuard {
+      explicit AttemptDbGuard(std::uint8_t db) : db_(db) {}
+      ~AttemptDbGuard() { EndCommandDbOperation(db_); }
+      std::uint8_t db_;
+    } db_guard(request.db_id_);
+    co_return co_await ExecuteListMultiKey(nonblocking, attempt_builder);
+  };
 
   // Preserve Redis's immediate path: a command that can consume now never
   // enters the waiter queue.
   {
     ReplyBuilder attempt_builder;
-    CommandReply attempt =
-        co_await ExecuteListMultiKey(nonblocking, attempt_builder);
+    CommandReply attempt = co_await execute_attempt(attempt_builder);
+    if (gate_deadline_reached) co_return timeout_reply();
     if (!is_empty(attempt)) co_return finish_attempt(attempt);
+    if (!infinite && std::chrono::steady_clock::now() >= deadline)
+      co_return timeout_reply();
   }
 
   std::vector<WaitRegistration> registrations;
   auto register_key = [&](std::string_view key) {
-    const BlockingKey blocking_key{request.db_id_, std::string(key)};
+    const BlockingKey blocking_key{request.db_id_, std::string(key), {}};
     for (const WaitRegistration& registration : registrations) {
       if (registration.key_ == blocking_key) return;
     }
-    registrations.push_back(
-        WaitRegistration{ShardForKey(key), std::move(blocking_key)});
+    registrations.push_back(WaitRegistration{
+        ShardForKey(key), std::move(blocking_key),
+        BlockingQueuePolicy::kFifo, std::nullopt});
   };
   if (nonblocking.kind_ == CommandKind::kLMPop) {
     std::int64_t key_count = 0;
@@ -1191,8 +1431,10 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
       register_key(nonblocking.args_[2 + i]);
     }
   } else {
+    // BLMOVE/BRPOPLPUSH block only on their source. Registering the
+    // destination would put this waiter ahead of legitimate BLPOP waiters
+    // even though a destination push cannot make the move executable.
     register_key(nonblocking.args_[1]);
-    register_key(nonblocking.args_[2]);
   }
 
   auto waiter = std::make_shared<BlockingWaiter>(
@@ -1200,7 +1442,7 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   BlockingRegistrationGuard registration_guard(waiter, &registrations);
   (void)co_await RegisterBlockingWaiter(waiter, registrations);
   if (!infinite) {
-    celer::SpawnOnCurrentWorker(TimeoutBlockingWaiter(waiter, timeout));
+    celer::SpawnOnCurrentWorker(TimeoutBlockingWaiter(waiter, deadline));
   }
 
   // Recheck after registration to close the empty-check/register race. A
@@ -1215,8 +1457,12 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     if (before == WakeReason::kReady) (void)waiter->ResetReady();
 
     ReplyBuilder attempt_builder;
-    CommandReply attempt =
-        co_await ExecuteListMultiKey(nonblocking, attempt_builder);
+    CommandReply attempt = co_await execute_attempt(attempt_builder);
+    if (gate_deadline_reached) {
+      UnregisterBlockingWaiter(waiter, registrations);
+      registration_guard.Release();
+      co_return timeout_reply();
+    }
     if (!is_empty(attempt)) {
       UnregisterBlockingWaiter(waiter, registrations);
       registration_guard.Release();

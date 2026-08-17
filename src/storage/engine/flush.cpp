@@ -189,6 +189,25 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
             : FixedBuffer{.data_ = pending->heap_data_,
                           .size_ = pending->heap_data_size_,
                           .index_ = 0};
+#ifndef NDEBUG
+    // Deterministic regression hook for the dirty-tail ordering window: let a
+    // command append beyond this immutable flush snapshot and roll to a later
+    // block before the snapshot completes. Only the first flush in the
+    // process pauses, and release builds contain no hook.
+    static std::atomic<bool> pause_claimed = false;
+    const char* pause_text = std::getenv("KEYLANE_FLUSH_SNAPSHOT_PAUSE_MS");
+    bool expected_pause = false;
+    if (pause_text != nullptr &&
+        pause_claimed.compare_exchange_strong(expected_pause, true)) {
+      char* end = nullptr;
+      const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
+      if (end != pause_text && *end == '\0' && pause_ms != 0) {
+        absl::Status paused = co_await celer::SleepFor(
+            *store->worker_, std::chrono::milliseconds(pause_ms));
+        if (!paused.ok()) co_return paused;
+      }
+    }
+#endif
     // The first flush of a block starts at the unused header slot, which is
     // still zero in staging. That makes the slot durably zero before the
     // first header lands in the other one, so a torn first header cannot
@@ -378,7 +397,12 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     // report success while acknowledged records remain only in memory.
     if (!IsActiveBlock(*store, pending->block_id_) &&
         state->committed_bytes_ > pending->committed_bytes_) {
-      RequestFlush(*store, pending->block_id_);
+      // This tail contains records appended while the older snapshot was in
+      // flight. It necessarily precedes every block already queued by that
+      // append stream, so reinsert it at the front. Pushing it to the back can
+      // make a later root durable before the COW child records it references.
+      state->flush_queued_ = true;
+      store->flush_queue_.push_front(pending->block_id_);
       continue;
     }
 

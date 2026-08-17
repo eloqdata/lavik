@@ -15,12 +15,15 @@ namespace keylane {
 // participation, and key positions.
 enum CommandFlag : std::uint32_t {
   kCmdWrite = 1u << 0,  // mutates the keyspace; rejected on read-only replicas
-  kCmdReadOnly = 1u << 1,    // never mutates the keyspace
-  kCmdNoKeys = 1u << 2,      // takes no key arguments
-  kCmdMultiShard = 1u << 3,  // key set may span multiple shard owners
-  kCmdGlobal = 1u << 4,      // fans out to every worker
-  kCmdUsesDbGate = 1u << 5,  // holds a DbOperationGuard while executing
-  kCmdMovableKeys = 1u << 6, // key range is derived from command arguments
+  kCmdReadOnly = 1u << 1,     // never mutates the keyspace
+  kCmdNoKeys = 1u << 2,       // takes no key arguments
+  kCmdMultiShard = 1u << 3,   // key set may span multiple shard owners
+  kCmdGlobal = 1u << 4,       // fans out to every worker
+  kCmdUsesDbGate = 1u << 5,   // holds a DbOperationGuard while executing
+  kCmdMovableKeys = 1u << 6,  // key range is derived from command arguments
+  // The handler may wait indefinitely and therefore acquires the DB gate only
+  // around each concrete attempt, never around the wait itself.
+  kCmdMayBlock = 1u << 7,
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the
@@ -68,7 +71,7 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
 
 // Resolves argument-dependent key ranges such as LMPOP/BLMPOP in addition to
 // the static Redis key spec above.
-absl::StatusOr<KeyIndexView> DetermineKeys(
-    const CommandSpec& spec, std::span<const std::string> args);
+absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
+                                           std::span<const std::string> args);
 
 }  // namespace keylane

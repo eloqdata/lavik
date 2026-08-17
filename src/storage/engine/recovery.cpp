@@ -143,7 +143,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
   for (unsigned target = 0; target < worker_count_; ++target) {
     RecoveryBatch& pending = batches->at(target);
     if (pending.blocks_.empty() && pending.records_.empty() &&
-        pending.list_objects_.empty() && pending.commit_records_.empty()) {
+        pending.commit_records_.empty()) {
       continue;
     }
     RecoveryBatch batch;
@@ -356,8 +356,9 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           // databases and partitions whose epochs are unrelated to this
           // record's own header fields.
           committed_txids->insert(record.txid_);
-          batches->at(block_owner).commit_records_.push_back(
-              {block_id, record.total_disk_bytes_});
+          batches->at(block_owner)
+              .commit_records_.push_back({block_id, record.total_disk_bytes_});
+          ++buffered_items;
           record_offset += record.total_disk_bytes_;
           ++records;
           continue;
@@ -375,67 +376,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "record payload checksum mismatch");
         }
-        if (record.kind_ == RecordKind::kCollectionObject) {
-          // Anonymous List directory/segment records become live only after
-          // the winning keyed root is known. The reachability walk after
-          // index merge validates and charges them. Decode only their small
-          // graph metadata during this physical scan: segment value bytes are
-          // never retained and no collection record is read from disk again.
-          const DirectRecordRef reference{
-              .block_id_ = block_id,
-              .allocation_epoch_ = record.allocation_epoch_,
-              .record_offset_ = record_offset,
-              .total_disk_bytes_ = record.total_disk_bytes_,
-              .payload_checksum_ = record.payload_checksum_,
-              .reserved_ = 0,
-          };
-          RecoveryListObject object;
-          object.reference_ = reference;
-          object.logical_size_ = record.logical_size_;
-          if (record.external_) {
-            auto decoded = DecodeManifest(payload_span, record.logical_size_);
-            if (!decoded.ok()) co_return decoded.status();
-            object.extents_ = std::move(*decoded);
-          } else if (payload_span.size() >= sizeof(std::uint64_t)) {
-            std::uint64_t magic = 0;
-            std::memcpy(&magic, payload_span.data(), sizeof(magic));
-            if (magic == kListDirectoryMagic) {
-              auto decoded = DecodeListDirectory(payload_span);
-              if (!decoded.ok()) co_return decoded.status();
-              object.directory_ = std::move(*decoded);
-            } else if (payload_span.size() < 8 ||
-                       std::memcmp(payload_span.data(), "KLL1", 4) != 0) {
-              co_return absl::InternalError(
-                  "invalid inline List collection object");
-            }
-          } else {
-            co_return absl::InternalError("truncated List collection object");
-          }
-          batches->at(block_owner).list_objects_.push_back(std::move(object));
-          record_offset += record.total_disk_bytes_;
-          ++records;
-          continue;
-        }
         ExtentManifest extents;
-        std::optional<ListState> list_state;
-        if (record.kind_ == RecordKind::kValue &&
-            record.value_type_ == ValueType::kList &&
-            record.logical_size_ == kSegmentedCollection) {
-          if (record.external_ ||
-              (record.key_external_ &&
-               record.payload_bytes_ < record.key_bytes_)) {
-            co_return absl::Status(
-                absl::StatusCode::kInternal,
-                "segmented List root must have an inline payload");
-          }
-          const auto root_payload =
-              record.key_external_
-                  ? payload_span.subspan(record.key_bytes_)
-                  : payload_span;
-          auto decoded = DecodeListRoot(root_payload);
-          if (!decoded.ok()) co_return decoded.status();
-          list_state = std::move(*decoded);
-        } else if (record.external_) {
+        if (record.external_) {
           const std::uint64_t extent_bytes =
               record.logical_size_ +
               (record.key_external_ ? record.key_bytes_ : 0);
@@ -505,7 +447,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     .value_type_ = record.value_type_,
                 },
             .extents_ = extents,
-            .list_state_ = std::move(list_state),
         });
         ++buffered_items;
         record_offset += record.total_disk_bytes_;
@@ -551,18 +492,6 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
 
     // Recovered blocks have no staging buffer. Keep partial blocks sealed;
     // appending to one would otherwise dereference an absent in-memory copy.
-  }
-
-  for (RecoveryListObject& object : batch.list_objects_) {
-    const DirectRecordIdentity identity{
-        object.reference_.block_id_, object.reference_.allocation_epoch_,
-        object.reference_.record_offset_};
-    if (!store.recovery_list_objects_
-             .try_emplace(identity, std::move(object))
-             .second) {
-      Fail(absl::InternalError(
-          "duplicate List collection object identity during recovery"));
-    }
   }
 
   for (const RecoveryRecord& recovered : batch.records_) {
@@ -616,18 +545,16 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
     // still-unexpired value remains on disk. Equal sequences are relocated
     // copies of the same version and shield nothing.
     const std::uint64_t current_lsn =
-        found == nullptr
-            ? 0
-            : (store.recovery_lsns_.contains(found)
-                   ? store.recovery_lsns_.at(found)
-                   : 0);
-    const bool candidate_newer =
-        found == nullptr ||
-        recovered.location_.mutation_sequence_ >
-            found->value_.mutation_sequence_ ||
-        (recovered.location_.mutation_sequence_ ==
-             found->value_.mutation_sequence_ &&
-         recovered.lsn_ > current_lsn);
+        found == nullptr ? 0
+                         : (store.recovery_lsns_.contains(found)
+                                ? store.recovery_lsns_.at(found)
+                                : 0);
+    const bool candidate_newer = found == nullptr ||
+                                 recovered.location_.mutation_sequence_ >
+                                     found->value_.mutation_sequence_ ||
+                                 (recovered.location_.mutation_sequence_ ==
+                                      found->value_.mutation_sequence_ &&
+                                  recovered.lsn_ > current_lsn);
     if (candidate_newer) {
       const bool was_live =
           found != nullptr && found->value_.kind_ == RecordKind::kValue;
@@ -659,18 +586,6 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                                    recovered.extents_);
       } else {
         store.external_manifests_.erase(winner_entry);
-      }
-      if (winner.value_type_ == ValueType::kList &&
-          winner.logical_size_ == kSegmentedCollection) {
-        if (!recovered.list_state_.has_value()) {
-          Fail(absl::Status(absl::StatusCode::kInternal,
-                            "segmented List recovery state is missing"));
-          return;
-        }
-        store.list_states_.insert_or_assign(winner_entry,
-                                            *recovered.list_state_);
-      } else {
-        store.list_states_.erase(winner_entry);
       }
       if (winner.key_external_) [[unlikely]] {
         store.recovery_external_keys_.insert_or_assign(winner_entry,

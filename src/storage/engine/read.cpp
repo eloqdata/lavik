@@ -2,215 +2,6 @@
 
 namespace keylane::storage {
 
-Task<absl::StatusOr<std::optional<ListDirectoryNode>>>
-StorageEngine::Impl::LoadListDirectoryMeta(
-    WorkerStore& store, const DirectRecordRef& reference) {
-  const std::uint16_t owner = BlockOwner(reference.block_id_);
-  if (owner >= worker_count_) {
-    co_return absl::InternalError("List directory block has no owner");
-  }
-  auto lookup = [this, owner, reference]()
-      -> absl::StatusOr<std::optional<ListDirectoryNode>> {
-    WorkerStore& object_store = *stores_[owner];
-    const DirectRecordIdentity identity{
-        reference.block_id_, reference.allocation_epoch_,
-        reference.record_offset_};
-    const auto found = object_store.list_objects_.find(identity);
-    if (found == object_store.list_objects_.end() ||
-        found->second.reference_ != reference) {
-      return std::optional<ListDirectoryNode>{};
-    }
-    if (!found->second.directory_.has_value()) {
-      return std::optional<ListDirectoryNode>{};
-    }
-    return std::optional<ListDirectoryNode>{*found->second.directory_};
-  };
-  if (owner == store.worker_->id()) co_return lookup();
-  co_return co_await celer::SubmitTo(owner, std::move(lookup));
-}
-
-Task<absl::StatusOr<std::optional<ListObjectRuntimeMeta>>>
-StorageEngine::Impl::LoadListObjectMeta(
-    WorkerStore& store, const DirectRecordRef& reference) {
-  const std::uint16_t owner = BlockOwner(reference.block_id_);
-  if (owner >= worker_count_) {
-    co_return absl::InternalError("List object block has no owner");
-  }
-  auto lookup = [this, owner, reference]()
-      -> absl::StatusOr<std::optional<ListObjectRuntimeMeta>> {
-    WorkerStore& object_store = *stores_[owner];
-    const DirectRecordIdentity identity{
-        reference.block_id_, reference.allocation_epoch_,
-        reference.record_offset_};
-    const auto found = object_store.list_objects_.find(identity);
-    if (found == object_store.list_objects_.end() ||
-        found->second.reference_ != reference) {
-      return std::optional<ListObjectRuntimeMeta>{};
-    }
-    return std::optional<ListObjectRuntimeMeta>{found->second};
-  };
-  if (owner == store.worker_->id()) co_return lookup();
-  co_return co_await celer::SubmitTo(owner, std::move(lookup));
-}
-
-Task<absl::StatusOr<RetiredRecord>>
-StorageEngine::Impl::ResolveCollectionRetirement(
-    WorkerStore& store, const DirectRecordRef& reference) {
-  const std::uint16_t owner = BlockOwner(reference.block_id_);
-  if (owner >= worker_count_) {
-    co_return absl::InternalError("collection object block has no owner");
-  }
-  if (owner == store.worker_->id()) co_return RetiredRecordOf(reference);
-  co_return co_await celer::SubmitTaskTo(
-      owner, [this, owner,
-              reference]() -> Task<absl::StatusOr<RetiredRecord>> {
-        co_return RetiredRecordOf(reference);
-      });
-}
-
-Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadCollectionObject(
-    WorkerStore& store, const DirectRecordRef& reference,
-    ValueType expected_type) {
-  if (!reference.valid()) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "invalid collection object reference");
-  }
-  const std::uint16_t owner = BlockOwner(reference.block_id_);
-  if (owner >= worker_count_) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "collection object block has no owner");
-  }
-  if (owner == store.worker_->id()) {
-    co_return co_await LoadCollectionObjectLocal(store, reference,
-                                                 expected_type);
-  }
-  co_return co_await celer::SubmitTaskTo(
-      owner, [this, owner, reference,
-              expected_type]() -> Task<absl::StatusOr<std::string>> {
-        WorkerStore& target = *stores_[owner];
-        // This task is already on the block-owning single-threaded worker.
-        // Validation and pinning below happen before its first suspension.
-        // Taking the remote store mutex while the key owner holds its own can
-        // otherwise form an A->B / B->A cycle after worker-count recovery.
-        co_return co_await LoadCollectionObjectLocal(target, reference,
-                                                     expected_type);
-      });
-}
-
-Task<absl::StatusOr<std::string>>
-StorageEngine::Impl::LoadCollectionObjectLocal(
-    WorkerStore& store, const DirectRecordRef& reference,
-    ValueType expected_type) {
-  BlockState* state = FindBlockState(store, reference.block_id_);
-  if (state == nullptr || !state->allocated_ || state->freeing_ ||
-      state->kind_ != BlockKind::kRecords ||
-      state->allocation_epoch_ != reference.allocation_epoch_) {
-    co_return absl::Status(absl::StatusCode::kAborted,
-                           "stale or missing collection object");
-  }
-  ++state->pins_;
-  struct PinGuard {
-    WorkerStore* store_;
-    BlockState* state_;
-    ~PinGuard() {
-      --state_->pins_;
-      if (state_->pins_ == 0 && state_->release_pending_) {
-        ReleaseStagingBuffer(*store_, *state_);
-      }
-    }
-  } pin{&store, state};
-
-  const std::byte* record_data = nullptr;
-  ReadBufferLease lease;
-  if (state->in_memory_) {
-    const FixedBuffer staging = StagingBufferFor(store, *state);
-    if (staging.data_ == nullptr ||
-        reference.record_offset_ > staging.size_ ||
-        reference.total_disk_bytes_ >
-            staging.size_ - reference.record_offset_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "invalid staged collection object");
-    }
-    record_data = staging.data_ + reference.record_offset_;
-  } else {
-    const auto [file_id, block_offset] = FileOffset(reference.block_id_);
-    const std::uint64_t absolute_offset =
-        block_offset + reference.record_offset_;
-    const std::uint64_t mask = direct_io_alignment_ - 1;
-    const std::uint64_t aligned_offset = absolute_offset & ~mask;
-    const std::size_t headroom =
-        static_cast<std::size_t>(absolute_offset - aligned_offset);
-    const std::size_t read_bytes =
-        (headroom + reference.total_disk_bytes_ + direct_io_alignment_ - 1) &
-        ~static_cast<std::size_t>(mask);
-    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-    if (!acquired.ok()) {
-      co_return acquired.status();
-    }
-    lease = std::move(*acquired);
-    FixedBuffer io = lease.io_buffer();
-    io.size_ = read_bytes;
-    auto read = co_await ReadStorageBuffer(
-        *store.worker_, store.files_[file_id], io, lease.registered(),
-        aligned_offset);
-    if (!read.ok()) {
-      co_return read.status();
-    }
-    if (*read != read_bytes) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "short collection object read");
-    }
-    record_data = io.data_ + headroom;
-  }
-
-  RecordHeader record{};
-  std::string_view key;
-  const auto record_bytes =
-      std::span<const std::byte>(record_data, reference.total_disk_bytes_);
-  if (!DecodeRecordHeader(record_bytes, &record, &key) || !key.empty() ||
-      record.kind_ != RecordKind::kCollectionObject ||
-      record.value_type_ != expected_type || record.key_external_ ||
-      record.allocation_epoch_ != reference.allocation_epoch_ ||
-      record.total_disk_bytes_ != reference.total_disk_bytes_ ||
-      record.payload_checksum_ != reference.payload_checksum_) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "collection object identity mismatch");
-  }
-  const auto payload = std::span<const std::byte>(
-      record_data + record.header_bytes_, record.payload_bytes_);
-  if (Crc32c(payload) != reference.payload_checksum_) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "collection object payload checksum mismatch");
-  }
-  if (record.external_) {
-    auto extents = DecodeManifest(payload, record.logical_size_);
-    if (!extents.ok()) co_return extents.status();
-    store.collection_object_manifests_.insert_or_assign(
-        DirectRecordIdentity{reference.block_id_, reference.allocation_epoch_,
-                             reference.record_offset_},
-        *extents);
-    RecordLocation location{
-        .block_id_ = reference.block_id_,
-        .allocation_epoch_ = reference.allocation_epoch_,
-        .logical_size_ = record.logical_size_,
-        .record_offset_ = reference.record_offset_,
-        .total_disk_bytes_ = reference.total_disk_bytes_,
-        .block_owner_ = store.worker_->id(),
-        .external_ = true,
-        .kind_ = RecordKind::kCollectionObject,
-        .value_type_ = expected_type,
-    };
-    auto loaded =
-        co_await LoadExternalValueLocal(store, location, *extents, 0, nullptr);
-    if (!loaded.ok()) co_return loaded.status();
-    const auto bytes = loaded->value();
-    co_return std::string(reinterpret_cast<const char*>(bytes.data()),
-                          bytes.size());
-  }
-  co_return std::string(reinterpret_cast<const char*>(payload.data()),
-                        payload.size());
-}
-
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
     std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace) {
   assert(db_id < kLogicalDatabaseCount);
@@ -340,6 +131,7 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   co_return ExpirationInfo{
       .exists_ = true,
       .expire_at_ms_ = found->value_.expire_at_ms_,
+      .value_type_ = found->value_.value_type_,
   };
 }
 
@@ -1202,7 +994,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
     }
     const std::size_t value_offset =
         static_cast<std::size_t>(io.data_ - lease.bytes().data());
-    co_return LoadedValue{std::move(lease), value_offset, value_bytes};
+    co_return LoadedValue{std::move(lease), value_offset, value_bytes,
+                          record.txid_};
   }
 
   // Only the disk read suspends while holding the BlockState pointer, so it
@@ -1303,7 +1096,8 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   }
   const std::size_t value_offset =
       static_cast<std::size_t>(framed_value - lease.bytes().data());
-  co_return LoadedValue{std::move(lease), value_offset, value_bytes};
+  co_return LoadedValue{std::move(lease), value_offset, value_bytes,
+                        record.txid_};
 }
 
 }  // namespace keylane::storage

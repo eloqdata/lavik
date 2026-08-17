@@ -95,35 +95,21 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       !IsExpired(current->value_, UnixTimeMillis())) {
     co_return absl::OkStatus();
   }
-  std::vector<RetiredRecord> list_tree_retirements;
-  std::uint64_t list_owner_id = 0;
-  if (const std::optional<ListState> state = ListStateFor(store, current);
-      state.has_value()) {
-    list_owner_id = state->owner_id_;
-    unlock.Unlock();
-    auto collected = co_await CollectListTreeRetirements(store, *state);
-    if (!collected.ok()) co_return collected.status();
-    co_await store.store_state_mutex_.Lock();
-    unlock.Adopt();
-    list_tree_retirements = std::move(*collected);
+  // Prefer a durable delete so a later wall-clock rollback cannot expose the
+  // expired value again. If the device has no foreground space left, an
+  // unshielded record is nevertheless safe to retire in memory: there is no
+  // older live version for this record to hide, and recovery still observes
+  // its own expiration timestamp. This is the full-disk escape valve that
+  // lets expiration free blocks which can then accept durable tombstones.
+  absl::Status durable = co_await AppendLocked(
+      store, partition, candidate.db_id_, candidate.key_, {},
+      RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
+  if (durable.ok() ||
+      durable.code() != absl::StatusCode::kResourceExhausted ||
+      current->value_.shielding_) {
+    co_return durable;
   }
-  if (current->value_.shielding_) {
-    // An older, still-unexpired value of this key may survive on disk;
-    // without a durable tombstone above it, recovery would resurrect it
-    // once this record's block is reclaimed. Keep the tombstone path for
-    // exactly this case.
-    co_return co_await AppendLocked(
-        store, partition, candidate.db_id_, candidate.key_, {},
-        RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0,
-        std::make_shared<std::vector<RetiredRecord>>(
-            std::move(list_tree_retirements)));
-  }
-  // Memory-only expiration. Every older on-disk version of this key is
-  // expired or gone, and the record carries its own expire_at_ms, so
-  // recovery and replicas already treat it as absent — nothing needs to be
-  // written. Mirror everything the tombstone append would have done:
-  // invalidate watchers, ship a delete to any capturing replica stream,
-  // settle the block accounting, and drop the entry itself.
+
   tx::CurrentTxShard().MarkWatched(candidate.db_id_,
                                    tx::FingerprintOf(candidate.digest_));
   const RecordLocation dropped = current->value_;
@@ -143,39 +129,22 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
                                .value_ = {},
                            });
   }
-  // The flush completion dereferences staged entries by pointer before it
-  // can match them; detach every identity naming this one before it is
-  // freed. Their retirements still settle — only the marking becomes moot.
   for (auto& [block_id, identities] : store.staged_records_) {
     for (RecordIdentity& identity : identities) {
-      if (identity.entry_ == current) {
-        identity.entry_ = nullptr;
-      }
+      if (identity.entry_ == current) identity.entry_ = nullptr;
     }
   }
   --partition.live_key_count_[candidate.db_id_];
   --store.live_key_count_[candidate.db_id_];
   --partition.expiring_key_count_[candidate.db_id_];
   store.external_manifests_.erase(current);
-  store.list_states_.erase(current);
-  if (list_owner_id != 0) store.list_owners_.erase(list_owner_id);
   partition.indexes_[candidate.db_id_].Erase(current);
   if (dropped.external_ && !dropped.key_external_) {
     SpawnExtentReclaim(store, dropped_extents);
   }
   absl::Status dead = co_await MarkRecordDead(
       RetiredRecordOf(dropped, dropped_dependent_extents));
-  if (!dead.ok()) {
-    store.write_failed_ = true;
-    co_return dead;
-  }
-  for (const RetiredRecord& retired : list_tree_retirements) {
-    dead = co_await MarkRecordDead(retired);
-    if (!dead.ok()) {
-      store.write_failed_ = true;
-      co_return dead;
-    }
-  }
+  if (!dead.ok()) store.write_failed_ = true;
   co_return dead;
 }
 
@@ -197,6 +166,11 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       bool* running_;
       ~CycleGuard() { *running_ = false; }
     } cycle_guard{&store->expiry_cycle_running_};
+#ifndef NDEBUG
+    // Deterministic coverage for lazy-expiration replacement. Production
+    // builds never expose a switch that can disable active expiration.
+    if (std::getenv("KEYLANE_DISABLE_ACTIVE_EXPIRATION") != nullptr) continue;
+#endif
     if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
       continue;  // a stable-keyspace scan (KEYS) is in flight
     }
@@ -262,6 +236,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     }
 
     std::size_t deleted = 0;
+    bool warned_failure = false;
     while (deleted < kDeletesPerCycle && !store->expired_candidates_.empty()) {
       WorkerStore::ExpireCandidate candidate =
           std::move(store->expired_candidates_.front());
@@ -269,7 +244,17 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       absl::Status expired =
           co_await ExpireCandidate(*store, std::move(candidate));
       if (!expired.ok()) {
-        co_return expired;
+        // Do not terminate this worker's lifetime expiration coroutine. The
+        // key remains indexed as expired and a later map pass will enqueue it
+        // again, while the warning keeps persistent write failures visible.
+        if (!warned_failure) {
+          spdlog::warn("worker[{}] active expiration failed: {}",
+                       store->worker_->id(), expired.ToString());
+          warned_failure = true;
+        }
+        ++deleted;
+        co_await celer::Yield(*store->worker_);
+        continue;
       }
       ++deleted;
       co_await celer::Yield(*store->worker_);

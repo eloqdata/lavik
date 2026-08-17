@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -137,6 +138,7 @@ struct StorageMetricsSnapshot {
 struct ScanBatch {
   std::uint64_t cursor_ = 0;
   std::vector<std::string> keys_;
+  std::vector<ValueType> value_types_;
 };
 
 struct SnapshotRecord {
@@ -271,6 +273,75 @@ struct ListResult {
   std::vector<std::int64_t> positions_;
 };
 
+enum class HashOperationKind : std::uint8_t {
+  kSet,
+  kSetIfAbsent,
+  kGet,
+  kGetMany,
+  kDelete,
+  kLength,
+  kExists,
+  kGetAll,
+  kKeys,
+  kValues,
+  kStringLength,
+  kIncrementInteger,
+  kIncrementFloat,
+  kRandomFields,
+  kScan,
+  kPopRandom,
+};
+
+// Views remain owned by the command request for the lifetime of the awaited
+// call. Set operations use parallel fields_/values_ arrays; all other
+// operations use fields_ only.
+struct HashOperation {
+  HashOperationKind kind_ = HashOperationKind::kLength;
+  std::vector<std::string_view> fields_;
+  std::vector<std::string_view> values_;
+  std::int64_t count_ = 0;
+  std::uint64_t cursor_ = 0;
+  std::uint64_t scan_count_ = 10;
+  // Zero uses the current clock. Streamed commands pin one nonzero timestamp
+  // across all batches so a TTL cannot change the announced RESP cardinality.
+  std::uint64_t now_ms_ = 0;
+  std::string_view match_ = "*";
+  bool count_provided_ = false;
+  bool with_values_ = false;
+};
+
+struct HashResult {
+  bool key_exists_ = false;
+  bool changed_ = false;
+  std::uint64_t length_ = 0;
+  std::uint64_t integer_ = 0;
+  std::int64_t signed_integer_ = 0;
+  std::uint64_t cursor_ = 0;
+  std::string scalar_;
+  // HGET/HMGET use nullopt for a missing field. HGETALL returns alternating
+  // field/value entries; HKEYS and HVALS return one entry per element.
+  std::vector<std::optional<std::string>> values_;
+};
+
+// A compact collection is persisted as one type-tagged value record. Sorted
+// sets and Streams use this generic callback path. The callback runs while the
+// key's exclusive/shared intent
+// lock is held, making a decode/modify/encode cycle one atomic Redis command.
+struct CompactValueView {
+  std::string_view encoded_;
+  std::uint64_t logical_size_ = 0;
+};
+
+struct CompactValueUpdate {
+  bool changed_ = false;
+  bool erase_ = false;
+  std::string encoded_;
+  std::uint64_t logical_size_ = 0;
+};
+
+using CompactValueCallback = std::function<absl::StatusOr<CompactValueUpdate>(
+    std::optional<CompactValueView>)>;
+
 enum class ExpirationCondition : std::uint8_t {
   kNone,
   kIfNoExpiration,
@@ -282,6 +353,7 @@ enum class ExpirationCondition : std::uint8_t {
 struct ExpirationInfo {
   bool exists_ = false;
   std::uint64_t expire_at_ms_ = 0;
+  ValueType value_type_ = ValueType::kNone;
 };
 
 // Per-owning-shard accumulator for one multi-key atomic write. The
@@ -302,7 +374,6 @@ struct TxShardWrites {
     std::uint32_t total_disk_bytes_ = 0;
     std::uint16_t block_owner_ = 0;
     std::uint32_t record_offset_ = 0;
-    bool collection_object_ = false;
     std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
     // Value-only extents can be reclaimed as soon as the transaction commit
     // is durable. External-key extents stay dependent on the stale records
@@ -405,8 +476,15 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values);
   celer::Task<absl::StatusOr<ListResult>> ExecuteList(
-      std::uint8_t db_id, std::string_view key,
-      const ListOperation& operation);
+      std::uint8_t db_id, std::string_view key, const ListOperation& operation);
+  celer::Task<absl::StatusOr<HashResult>> ExecuteHash(
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation);
+  celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation);
+  celer::Task<absl::Status> ExecuteCompact(
+      std::uint8_t db_id, std::string_view key, ValueType value_type,
+      bool read_only, const CompactValueCallback& callback,
+      std::uint64_t now_ms = 0);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -449,6 +527,17 @@ class StorageEngine {
   celer::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const HashOperation& operation, TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const HashOperation& operation, TxShardWrites* tx = nullptr);
+  celer::Task<absl::Status> ExecuteCompactLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ValueType value_type, bool read_only,
+      const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
+      std::uint64_t now_ms = 0);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
@@ -487,7 +576,12 @@ class StorageEngine {
   // force a replica re-copy, since aborted values may already have shipped),
   // freshly created keys get a normal tombstone appended. Must run on the
   // owning shard with the transaction's key locks still held.
-  celer::Task<absl::Status> RollbackTxLocal(std::uint64_t txid);
+  // With `compensation`, restore every undo entry by appending a later record
+  // carrying the same transaction id. This is required for command-local
+  // rollback inside EXEC: its outer commit must make the restored state, not
+  // an earlier failed half-write, win again during recovery.
+  celer::Task<absl::Status> RollbackTxLocal(
+      std::uint64_t txid, TxShardWrites* compensation = nullptr);
   // Drop the journal without acting on it (the transaction succeeded).
   celer::Task<absl::Status> DiscardTxUndoLocal(std::uint64_t txid);
 
@@ -495,6 +589,7 @@ class StorageEngine {
   // caller must already exclude client writes (closed database gate).
   celer::Task<absl::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
+  std::uint32_t ExpirationPauseCount() const noexcept;
 
   // Lifetime totals of the tomb raider (rounds run, tombstone entries
   // reaped, stale shielding bits cleared).

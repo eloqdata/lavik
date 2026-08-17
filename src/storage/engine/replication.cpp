@@ -36,6 +36,7 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
             if (entry.key_complete()) [[likely]] {
               bytes += entry.key().size();
               result.keys_.emplace_back(entry.key());
+              result.value_types_.push_back(entry.value_.value_type_);
             } else [[unlikely]] {
               external.push_back(ExternalCandidate{
                   .entry_ = &entry,
@@ -63,6 +64,7 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
           !IsExpired(current->value_, now_ms)) {
         bytes += key->size();
         result.keys_.push_back(std::move(*key));
+        result.value_types_.push_back(current->value_.value_type_);
       }
     }
     ++iterations;
@@ -127,30 +129,6 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
     const RecordLocation location = current->value_;
     if (IsExpired(location, UnixTimeMillis())) {
       QueueExpiredCandidate(store, partition.id_, db_id, *current, key);
-      continue;
-    }
-    if (location.value_type_ == ValueType::kList &&
-        location.logical_size_ == kSegmentedCollection) {
-      co_await store.store_state_mutex_.Lock();
-      UnlockGuard store_unlock(&store.store_state_mutex_, store.worker_);
-      const std::optional<ListState> state = ListStateFor(store, current);
-      if (!state.has_value()) {
-        co_return absl::InternalError(
-            "segmented List side state is missing during snapshot");
-      }
-      auto portable = co_await MaterializeListValueLocked(store, *state);
-      if (!portable.ok()) co_return portable.status();
-      batch.records_.push_back(SnapshotRecord{
-          .kind_ = SnapshotRecord::Kind::kValue,
-          .db_id_ = db_id,
-          .db_epoch_ = DbEpoch(db_id),
-          .mutation_sequence_ = location.mutation_sequence_,
-          .expire_at_ms_ = location.expire_at_ms_,
-          .value_type_ = ValueType::kList,
-          .logical_size_ = state->element_count_,
-          .key_ = key,
-          .value_ = std::move(*portable),
-      });
       continue;
     }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
@@ -246,12 +224,17 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     co_return persisted;
   }
 
-  std::vector<std::pair<std::uint8_t, std::string>> old_keys;
+  struct OldKey {
+    std::uint8_t db_id_ = 0;
+    std::string key_;
+  };
+  std::vector<OldKey> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     std::vector<const RecordIndex::Entry*> external_entries;
     partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
       if (entry.key_complete()) [[likely]] {
-        old_keys.emplace_back(db_id, std::string(entry.key()));
+        old_keys.push_back(
+            OldKey{.db_id_ = db_id, .key_ = std::string(entry.key())});
       } else [[unlikely]] {
         external_entries.push_back(&entry);
       }
@@ -263,7 +246,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
       if (!key.ok()) {
         co_return key.status();
       }
-      old_keys.emplace_back(db_id, std::move(*key));
+      old_keys.push_back(
+          OldKey{.db_id_ = db_id, .key_ = std::move(*key)});
     }
   }
   partition.replication_epoch_ = next_epoch;
@@ -273,7 +257,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   partition.replica_value_stage_.reset();
   partition.delta_floor_ = 0;
   partition.delta_queued_ = false;
-  for (const auto& [db_id, key] : old_keys) {
+  for (const OldKey& old : old_keys) {
+    const std::uint8_t db_id = old.db_id_;
+    const std::string& key = old.key_;
     const Digest digest = ComputeDigest(key);
     const bool key_external = key.size() > options_.inline_key_max_bytes_;
     const bool external =
@@ -292,7 +278,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     }
     absl::Status tombstone = co_await WriteRecordLocked(
         store, db_id, key, manifest, RecordKind::kTombstone, ValueType::kNone,
-        0, digest, 0, 0, false, false, external, key_external, 0, extents);
+        0, digest, 0, 0, false, false, external, key_external, 0, extents,
+        nullptr, nullptr, nullptr);
     if (!tombstone.ok()) {
       if (extents != nullptr) [[unlikely]] {
         SpawnExtentReclaim(store, extents);
@@ -381,19 +368,31 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
       std::uint64_t value_logical_size = 0;
       if (record.value_.size() == sizeof(value_logical_size)) {
         for (std::size_t byte = 0; byte < sizeof(value_logical_size); ++byte) {
-          value_logical_size |= static_cast<std::uint64_t>(
-                                    static_cast<unsigned char>(record.value_[byte]))
-                                << (byte * 8);
+          value_logical_size |=
+              static_cast<std::uint64_t>(
+                  static_cast<unsigned char>(record.value_[byte]))
+              << (byte * 8);
         }
       }
+      const bool nonempty_collection =
+          record.value_type_ == ValueType::kList ||
+          record.value_type_ == ValueType::kHash ||
+          record.value_type_ == ValueType::kSet ||
+          record.value_type_ == ValueType::kSortedSet;
       if (partition.replica_value_stage_.has_value() ||
           (record.value_type_ != ValueType::kString &&
-           record.value_type_ != ValueType::kList) ||
+           record.value_type_ != ValueType::kList &&
+           record.value_type_ != ValueType::kHash &&
+           record.value_type_ != ValueType::kSet &&
+           record.value_type_ != ValueType::kSortedSet &&
+          record.value_type_ != ValueType::kStream) ||
           record.value_.size() != sizeof(value_logical_size) ||
+          (nonempty_collection && value_logical_size == 0) ||
+          (record.value_type_ == ValueType::kString &&
+           value_logical_size != record.logical_size_) ||
           value_logical_size > std::numeric_limits<std::uint32_t>::max() ||
           record.logical_size_ == 0 ||
-          (record.value_type_ == ValueType::kString &&
-           record.logical_size_ > kMaxStringBytes) ||
+          record.logical_size_ > kMaxStringBytes ||
           record.chunk_count_ == 0 ||
           record.chunk_count_ !=
               (record.logical_size_ + kExtentPayloadBytes - 1) /
@@ -498,6 +497,22 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     if (kind == RecordKind::kValue && value_type == ValueType::kNone) {
       co_return absl::Status(absl::StatusCode::kInvalidArgument,
                              "replicated value has no Redis type");
+    }
+    const bool nonempty_collection =
+        value_type == ValueType::kList || value_type == ValueType::kHash ||
+        value_type == ValueType::kSet ||
+        value_type == ValueType::kSortedSet;
+    if (kind == RecordKind::kValue &&
+        ((nonempty_collection && applied.logical_size_ == 0) ||
+         (value_type == ValueType::kString &&
+          applied.logical_size_ != applied.value_.size()))) {
+      co_return absl::InvalidArgumentError(
+          "replicated value has inconsistent logical size");
+    }
+    if (kind == RecordKind::kValue &&
+        applied.logical_size_ > std::numeric_limits<std::uint32_t>::max()) {
+      co_return absl::InvalidArgumentError(
+          "replicated logical size exceeds record metadata");
     }
     absl::Status written;
     const bool key_external =

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "keylane/storage/format.h"
@@ -257,4 +258,35 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   EXPECT_EQ(decoded.key_bytes_, key.size());
   EXPECT_EQ(decoded.header_bytes_, AlignRecord(sizeof(RecordHeader)));
   EXPECT_EQ(decoded.payload_bytes_, key.size());
+}
+
+TEST(StorageFormatTest, RejectsOversizedInlineHeaderBeforeChecksumCopy) {
+  using namespace keylane::storage;
+
+  constexpr std::uint32_t key_bytes = 60'000;
+  const std::size_t header_bytes = RecordHeaderBytes(key_bytes, false);
+  ASSERT_GT(header_bytes, kMaxRecordHeaderBytes);
+  ASSERT_LE(header_bytes, std::numeric_limits<std::uint16_t>::max());
+  std::vector<std::byte> input(header_bytes);
+  RecordHeader corrupt{
+      .magic_ = kRecordMagic,
+      .version_ = kStorageFormatVersion,
+      .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
+      .kind_ = RecordKind::kValue,
+      .db_id_ = 0,
+      .value_type_ = ValueType::kString,
+      .digest_ = ComputeDigest("corrupt"),
+      .key_bytes_ = key_bytes,
+      .logical_size_ = 1,
+      .payload_bytes_ = 0,
+      .total_disk_bytes_ = static_cast<std::uint32_t>(AlignRecord(header_bytes)),
+      .replication_epoch_ = 1,
+      .db_epoch_ = 1,
+      .mutation_sequence_ = 1,
+  };
+  std::memcpy(input.data(), &corrupt, sizeof(corrupt));
+
+  RecordHeader decoded{};
+  std::string_view key;
+  EXPECT_FALSE(DecodeRecordHeader(input, &decoded, &key));
 }

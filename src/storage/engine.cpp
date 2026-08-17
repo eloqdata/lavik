@@ -46,6 +46,10 @@ Task<absl::Status> StorageEngine::QuiesceExpiration() {
 
 void StorageEngine::ResumeExpiration() noexcept { impl_->ResumeExpiration(); }
 
+std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
+  return impl_->ExpirationPauseCount();
+}
+
 TombRaiderTotals StorageEngine::TombRaiderStats() const noexcept {
   return impl_->TombRaiderStats();
 }
@@ -59,8 +63,7 @@ DefragTotals StorageEngine::DefragStats() const noexcept {
   return impl_->DefragStats();
 }
 
-Task<absl::Status> StorageEngine::ConfigureDefrag(
-    DefragConfigUpdate update) {
+Task<absl::Status> StorageEngine::ConfigureDefrag(DefragConfigUpdate update) {
   return impl_->ConfigureDefrag(update);
 }
 
@@ -147,9 +150,26 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteList(
-    std::uint8_t db_id, std::string_view key,
-    const ListOperation& operation) {
+    std::uint8_t db_id, std::string_view key, const ListOperation& operation) {
   return impl_->ExecuteList(db_id, key, operation);
+}
+
+Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteHash(
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
+  return impl_->ExecuteHash(db_id, key, operation);
+}
+
+Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSet(
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
+  return impl_->ExecuteSet(db_id, key, operation);
+}
+
+Task<absl::Status> StorageEngine::ExecuteCompact(
+    std::uint8_t db_id, std::string_view key, ValueType value_type,
+    bool read_only, const CompactValueCallback& callback,
+    std::uint64_t now_ms) {
+  return impl_->ExecuteCompact(db_id, key, value_type, read_only, callback,
+                               now_ms);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
@@ -206,6 +226,27 @@ Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteListLocked(
   return impl_->ExecuteListLocked(db_id, key, digest, operation, tx);
 }
 
+Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteHashLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const HashOperation& operation, TxShardWrites* tx) {
+  return impl_->ExecuteHashLocked(db_id, key, digest, operation, tx);
+}
+
+Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSetLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const HashOperation& operation, TxShardWrites* tx) {
+  return impl_->ExecuteSetLocked(db_id, key, digest, operation, tx);
+}
+
+Task<absl::Status> StorageEngine::ExecuteCompactLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    ValueType value_type, bool read_only,
+    const CompactValueCallback& callback, TxShardWrites* tx,
+    std::uint64_t now_ms) {
+  return impl_->ExecuteCompactLocked(db_id, key, digest, value_type, read_only,
+                                     callback, tx, now_ms);
+}
+
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
                                                         std::string_view key,
                                                         const Digest& digest) {
@@ -256,8 +297,9 @@ void StorageEngine::NoteTxCommitFinished() noexcept {
   impl_->NoteTxCommitFinished();
 }
 
-Task<absl::Status> StorageEngine::RollbackTxLocal(std::uint64_t txid) {
-  return impl_->RollbackTxLocal(txid);
+Task<absl::Status> StorageEngine::RollbackTxLocal(
+    std::uint64_t txid, TxShardWrites* compensation) {
+  return impl_->RollbackTxLocal(txid, compensation);
 }
 
 Task<absl::Status> StorageEngine::DiscardTxUndoLocal(std::uint64_t txid) {

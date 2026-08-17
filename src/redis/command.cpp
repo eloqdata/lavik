@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -15,14 +19,19 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
+#include "hash_command.h"
 #include "keylane/command_table.h"
+#include "keylane/glob.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
+#include "keylane/random_sample.h"
+#include "keylane/redis_parse.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
 #include "keylane/storage/engine.h"
@@ -30,6 +39,9 @@
 #include "keylane/tx/transaction.h"
 #include "keylane/tx/tx_shard.h"
 #include "list_command.h"
+#include "set_command.h"
+#include "stream_command.h"
+#include "zset_command.h"
 
 namespace keylane {
 using namespace celer;
@@ -43,6 +55,8 @@ unsigned g_server_threads = 0;
 std::chrono::steady_clock::time_point g_server_start;
 
 constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
+
+bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 
 std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
   return right > std::numeric_limits<std::size_t>::max() - left
@@ -66,41 +80,50 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kLPushX:
     case CommandKind::kRPush:
     case CommandKind::kRPushX:
-    case CommandKind::kLPop:
-    case CommandKind::kRPop:
     case CommandKind::kLSet:
     case CommandKind::kLInsert:
-    case CommandKind::kLRem:
-    case CommandKind::kLTrim:
+    case CommandKind::kHSet:
+    case CommandKind::kHMSet:
+    case CommandKind::kHSetNx:
+    case CommandKind::kHIncrBy:
+    case CommandKind::kHIncrByFloat:
+    case CommandKind::kSAdd:
+    case CommandKind::kZAdd:
+    case CommandKind::kZIncrBy:
+    case CommandKind::kGeoAdd:
+    case CommandKind::kXAdd:
     case CommandKind::kIncr:
       keys = 1;
+      break;
+    case CommandKind::kXGroup:
+      if (request.args_.size() > 1 &&
+          (CmpCaseInsensitive(request.args_[1], "create") ||
+           CmpCaseInsensitive(request.args_[1], "createconsumer")))
+        keys = 1;
+      else
+        return 0;
       break;
     case CommandKind::kLMove:
     case CommandKind::kRPopLPush:
     case CommandKind::kBLMove:
     case CommandKind::kBRPopLPush:
+    case CommandKind::kSMove:
       keys = 2;
       break;
-    case CommandKind::kBLPop:
-    case CommandKind::kBRPop:
-      keys = request.args_.size() > 2 ? request.args_.size() - 2 : 0;
+    case CommandKind::kSDiffStore:
+    case CommandKind::kSInterStore:
+    case CommandKind::kSUnionStore:
+      keys = request.args_.size() > 1 ? request.args_.size() - 1 : 0;
       break;
-    case CommandKind::kLMPop:
-    case CommandKind::kBLMPop: {
-      const std::size_t count_arg =
-          request.kind_ == CommandKind::kBLMPop ? 2 : 1;
-      if (count_arg >= request.args_.size()) return RequestArgumentBytes(request);
-      std::uint64_t parsed_keys = 0;
-      const std::string_view text = request.args_[count_arg];
-      const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
-                                          parsed_keys);
-      keys = parsed.ec == std::errc{} &&
-                     parsed.ptr == text.data() + text.size()
-                 ? static_cast<std::size_t>(std::min<std::uint64_t>(
-                       parsed_keys, std::numeric_limits<std::size_t>::max()))
-                 : 0;
+    case CommandKind::kZDiffStore:
+    case CommandKind::kZInterStore:
+    case CommandKind::kZUnionStore:
+    case CommandKind::kZRangeStore:
+    case CommandKind::kGeoRadius:
+    case CommandKind::kGeoRadiusByMember:
+    case CommandKind::kGeoSearchStore:
+      keys = 1;
       break;
-    }
     case CommandKind::kMSet:
       keys = request.args_.size() > 1 ? (request.args_.size() - 1) / 2 : 0;
       break;
@@ -379,7 +402,7 @@ Task<CommandReply> ExecuteTombRaider(const CommandRequest& request,
 }
 
 Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
-                                ReplyBuilder& reply_builder) {
+                                 ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
   if (args.size() < 2 || args.size() > 3) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -392,11 +415,11 @@ Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
     }
     const storage::DefragTotals status = g_storage->DefragStats();
     co_return BuiltReply(reply_builder.AppendBulkString(absl::StrCat(
-        "paused=", status.paused_ ? 1 : 0, " max_active_per_device=",
-        status.max_active_per_device_,
-        " block_sleep_ms=", status.block_sleep_ms_, " record_sleep_us=",
-        status.record_sleep_us_, " active_total=", status.active_,
-        " pending_total=", status.pending_)));
+        "paused=", status.paused_ ? 1 : 0,
+        " max_active_per_device=", status.max_active_per_device_,
+        " block_sleep_ms=", status.block_sleep_ms_,
+        " record_sleep_us=", status.record_sleep_us_,
+        " active_total=", status.active_, " pending_total=", status.pending_)));
   }
 
   storage::DefragConfigUpdate update;
@@ -405,8 +428,8 @@ Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
   } else if (CmpCaseInsensitive(args[1], "RESUME") && args.size() == 2) {
     update.action_ = storage::DefragConfigAction::kResume;
   } else if ((CmpCaseInsensitive(args[1], "MAX-ACTIVE") ||
-       CmpCaseInsensitive(args[1], "CONCURRENCY")) &&
-      args.size() == 3) {
+              CmpCaseInsensitive(args[1], "CONCURRENCY")) &&
+             args.size() == 3) {
     update.action_ = storage::DefragConfigAction::kMaxActivePerDevice;
     if (!ParseUint64(args[2], &update.value_) || update.value_ == 0 ||
         update.value_ > 8) {
@@ -489,10 +512,17 @@ class DbOperationGuard {
   explicit DbOperationGuard(std::uint8_t db_id) : db_id_(db_id) {}
   DbOperationGuard(const DbOperationGuard&) = delete;
   DbOperationGuard& operator=(const DbOperationGuard&) = delete;
-  ~DbOperationGuard() { EndDbOperation(db_id_); }
+  ~DbOperationGuard() { Release(); }
+
+  void Release() noexcept {
+    if (!active_) return;
+    active_ = false;
+    EndDbOperation(db_id_);
+  }
 
  private:
   std::uint8_t db_id_;
+  bool active_ = true;
 };
 
 // Gates several databases at once (EXEC spanning databases via SELECT); the
@@ -616,6 +646,13 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     }
   }
 
+  // Blocking commands do not hold the database gate while suspended. Wake
+  // them after the detached database becomes visible so predicates depending
+  // on metadata (notably XREADGROUP's group existence) are re-evaluated.
+  for (const std::uint8_t db_id : dbs) {
+    (void)co_await NotifyBlockingDb(db_id);
+  }
+
   absl::Status reclaimed = co_await g_storage->FlushDbReclaim(wait_for_reclaim);
   if (!detached.ok()) {
     co_return BuiltReply(
@@ -632,6 +669,26 @@ struct ScanOptions {
   std::optional<std::string_view> pattern_;
   std::optional<std::string_view> type_;
 };
+
+std::string_view ValueTypeName(storage::ValueType type) {
+  switch (type) {
+    case storage::ValueType::kString:
+      return "string";
+    case storage::ValueType::kList:
+      return "list";
+    case storage::ValueType::kSet:
+      return "set";
+    case storage::ValueType::kSortedSet:
+      return "zset";
+    case storage::ValueType::kHash:
+      return "hash";
+    case storage::ValueType::kStream:
+      return "stream";
+    case storage::ValueType::kNone:
+      return "none";
+  }
+  return "none";
+}
 
 absl::StatusOr<ScanOptions> ParseScanOptions(
     const std::vector<std::string>& args) {
@@ -676,92 +733,6 @@ absl::StatusOr<ScanOptions> ParseScanOptions(
     return absl::Status(absl::StatusCode::kInvalidArgument, "syntax error");
   }
   return options;
-}
-
-bool MatchCharacterClass(std::string_view pattern, std::size_t open,
-                         unsigned char value, std::size_t* next, bool* valid) {
-  std::size_t i = open + 1;
-  bool negate = false;
-  if (i < pattern.size() && (pattern[i] == '^' || pattern[i] == '!')) {
-    negate = true;
-    ++i;
-  }
-  bool matched = false;
-  bool any = false;
-  while (i < pattern.size() && pattern[i] != ']') {
-    unsigned char first = static_cast<unsigned char>(pattern[i++]);
-    if (first == '\\' && i < pattern.size()) {
-      first = static_cast<unsigned char>(pattern[i++]);
-    }
-    any = true;
-    if (i + 1 < pattern.size() && pattern[i] == '-' && pattern[i + 1] != ']') {
-      ++i;
-      unsigned char last = static_cast<unsigned char>(pattern[i++]);
-      if (last == '\\' && i < pattern.size()) {
-        last = static_cast<unsigned char>(pattern[i++]);
-      }
-      if (first > last) std::swap(first, last);
-      matched = matched || (value >= first && value <= last);
-    } else {
-      matched = matched || value == first;
-    }
-  }
-  if (i >= pattern.size() || pattern[i] != ']' || !any) {
-    *valid = false;
-    *next = open + 1;
-    return value == static_cast<unsigned char>('[');
-  }
-  *valid = true;
-  *next = i + 1;
-  return negate ? !matched : matched;
-}
-
-bool GlobMatch(std::string_view pattern, std::string_view text) {
-  std::size_t p = 0;
-  std::size_t t = 0;
-  std::size_t star_pattern = std::string_view::npos;
-  std::size_t star_text = 0;
-  while (t < text.size()) {
-    if (p < pattern.size() && pattern[p] == '*') {
-      while (p < pattern.size() && pattern[p] == '*') ++p;
-      if (p == pattern.size()) return true;
-      star_pattern = p;
-      star_text = t;
-      continue;
-    }
-
-    bool matched = false;
-    std::size_t next = p;
-    if (p < pattern.size()) {
-      if (pattern[p] == '?') {
-        matched = true;
-        next = p + 1;
-      } else if (pattern[p] == '[') {
-        bool valid = false;
-        matched = MatchCharacterClass(
-            pattern, p, static_cast<unsigned char>(text[t]), &next, &valid);
-        if (!valid) next = p + 1;
-      } else {
-        if (pattern[p] == '\\' && p + 1 < pattern.size()) ++p;
-        matched = static_cast<unsigned char>(pattern[p]) ==
-                  static_cast<unsigned char>(text[t]);
-        next = p + 1;
-      }
-    }
-    if (matched) {
-      p = next;
-      ++t;
-      continue;
-    }
-    if (star_pattern != std::string_view::npos && star_text < text.size()) {
-      p = star_pattern;
-      t = ++star_text;
-      continue;
-    }
-    return false;
-  }
-  while (p < pattern.size() && pattern[p] == '*') ++p;
-  return p == pattern.size();
 }
 
 Task<CommandReply> ExecuteScan(const CommandRequest& request,
@@ -824,12 +795,20 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
     storage::ScanBatch batch = std::move(*scanned);
     ++partitions_examined;
 
+    if (batch.keys_.size() != batch.value_types_.size()) {
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR scan key/type metadata mismatch"));
+    }
     const std::size_t examined = batch.keys_.size();
-    const bool type_matches = !options.type_.has_value() ||
-                              CmpCaseInsensitive(*options.type_, "string");
-    for (std::string& key : batch.keys_) {
-      if (type_matches && (!options.pattern_.has_value() ||
-                           GlobMatch(*options.pattern_, key))) {
+    for (std::size_t i = 0; i < batch.keys_.size(); ++i) {
+      std::string& key = batch.keys_[i];
+      const bool type_matches =
+          !options.type_.has_value() ||
+          CmpCaseInsensitive(*options.type_,
+                             ValueTypeName(batch.value_types_[i]));
+      if (type_matches &&
+          (!options.pattern_.has_value() || *options.pattern_ == "*" ||
+           RedisGlobMatch(*options.pattern_, key))) {
         keys.push_back(std::move(key));
       }
     }
@@ -928,7 +907,7 @@ Task<KeysWorkerBatch> KeysBatchOnWorker(
           }
           storage::ScanBatch step = std::move(*scanned_step);
           for (const std::string& key : step.keys_) {
-            if (*pattern == "*" || GlobMatch(*pattern, key)) {
+            if (*pattern == "*" || RedisGlobMatch(*pattern, key)) {
               if (count_only) {
                 ++batch.matches_;
               } else {
@@ -1050,6 +1029,285 @@ bool ParseInt64(std::string_view text, std::int64_t* value) {
   const char* end = begin + text.size();
   const auto [parsed_end, error] = std::from_chars(begin, end, *value);
   return error == std::errc{} && parsed_end == end;
+}
+
+absl::Status ValidateBlockingTimeout(std::string_view text) {
+  double timeout = 0;
+  if (!ParseRedisDouble(text, &timeout)) {
+    return absl::InvalidArgumentError(
+        "timeout is not a float or out of range");
+  }
+  if (timeout < 0) {
+    return absl::InvalidArgumentError("timeout is negative");
+  }
+  if (static_cast<long double>(timeout) * 1000.0L >
+      static_cast<long double>(std::numeric_limits<std::int64_t>::max())) {
+    return absl::InvalidArgumentError("timeout is out of range");
+  }
+  return absl::OkStatus();
+}
+
+std::string_view AppendStorageError(ReplyBuilder& reply_builder,
+                                    const absl::Status& status);
+
+struct NegativeRandomStreamOptions {
+  bool hash_ = false;
+  bool zset_ = false;
+  bool with_values_ = false;
+  std::uint64_t count_ = 0;
+};
+
+std::optional<NegativeRandomStreamOptions> ParseNegativeRandomStream(
+    const CommandRequest& request) {
+  const auto& args = request.args_;
+  if (request.kind_ == CommandKind::kHRandField) {
+    if (args.size() < 3 || args.size() > 4) return std::nullopt;
+  } else if (request.kind_ == CommandKind::kSRandMember) {
+    if (args.size() != 3) return std::nullopt;
+  } else if (request.kind_ == CommandKind::kZRandMember) {
+    if (args.size() < 3 || args.size() > 4) return std::nullopt;
+  } else {
+    return std::nullopt;
+  }
+
+  std::int64_t count = 0;
+  if (!ParseInt64(args[2], &count) || count >= 0 ||
+      count == std::numeric_limits<std::int64_t>::min()) {
+    return std::nullopt;
+  }
+  const std::uint64_t magnitude = static_cast<std::uint64_t>(-count);
+  if (magnitude <= kRandomSampleBatchLimit) return std::nullopt;
+  NegativeRandomStreamOptions options{
+      .hash_ = request.kind_ == CommandKind::kHRandField,
+      .zset_ = request.kind_ == CommandKind::kZRandMember,
+      .with_values_ = false,
+      .count_ = magnitude,
+  };
+  if (args.size() == 4) {
+    const std::string_view option = options.zset_ ? "WITHSCORES" : "WITHVALUES";
+    if (!CmpCaseInsensitive(args[3], option) ||
+        magnitude > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max()) /
+                        2) {
+      return std::nullopt;
+    }
+    options.with_values_ = true;
+  }
+  return options;
+}
+
+// Keep one immutable command-time view and generate the with-replacement
+// result in bounded batches. This preserves the command's atomic read view
+// without retaining a DB gate or key lock across socket backpressure.
+struct NegativeRandomStreamState {
+  NegativeRandomStreamState(std::uint8_t db_id,
+                            NegativeRandomStreamOptions stream_options,
+                            std::string key, unsigned owner)
+      : db_(db_id),
+        options_(stream_options),
+        remaining_(stream_options.count_),
+        key_(std::move(key)),
+        owner_(owner),
+        digest_(storage::ComputeDigest(key_)) {}
+
+  std::uint8_t db_ = 0;
+  NegativeRandomStreamOptions options_;
+  std::uint64_t remaining_ = 0;
+  std::string key_;
+  unsigned owner_ = 0;
+  storage::Digest digest_{};
+  std::uint64_t now_ms_ = 0;
+  std::uint64_t population_ = 0;
+  std::vector<std::string> values_;
+};
+
+Task<absl::StatusOr<storage::HashResult>> BeginNegativeRandomStream(
+    const std::shared_ptr<NegativeRandomStreamState>& state) {
+  auto begin = [state]() -> Task<absl::StatusOr<storage::HashResult>> {
+    tx::TxShard::Guard guard = co_await tx::CurrentTxShard().AcquireKey(
+        state->db_, tx::FingerprintOf(state->digest_), tx::LockMode::kShared);
+    storage::HashOperation operation;
+    operation.kind_ = state->options_.hash_ && state->options_.with_values_
+                          ? storage::HashOperationKind::kGetAll
+                          : storage::HashOperationKind::kKeys;
+    operation.now_ms_ = state->now_ms_;
+    absl::StatusOr<storage::HashResult> snapshot;
+    if (state->options_.zset_) {
+      snapshot = co_await ZSetRandomSnapshotLocked(
+          state->db_, state->key_, state->digest_,
+          state->options_.with_values_, nullptr, state->now_ms_);
+    } else if (state->options_.hash_) {
+      snapshot = co_await g_storage->ExecuteHashLocked(
+          state->db_, state->key_, state->digest_, operation, nullptr);
+    } else {
+      snapshot = co_await g_storage->ExecuteSetLocked(
+          state->db_, state->key_, state->digest_, operation, nullptr);
+    }
+    if (!snapshot.ok() || snapshot->length_ == 0) co_return snapshot;
+
+    const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
+    if (snapshot->length_ >
+            std::numeric_limits<std::size_t>::max() / tuple_width ||
+        snapshot->values_.size() != snapshot->length_ * tuple_width) {
+      co_return absl::InternalError(
+          "random snapshot disagrees with collection length");
+    }
+    state->population_ = snapshot->length_;
+    state->values_.reserve(snapshot->values_.size());
+    for (auto& value : snapshot->values_) {
+      if (!value.has_value())
+        co_return absl::InternalError("random snapshot contains a missing value");
+      state->values_.push_back(std::move(*value));
+    }
+    co_return snapshot;
+  };
+  if (state->owner_ != ThisWorker().id_) {
+    co_return co_await celer::SubmitTaskTo(state->owner_, std::move(begin));
+  }
+  co_return co_await begin();
+}
+
+Task<absl::StatusOr<std::string>> NextNegativeRandomChunk(
+    std::shared_ptr<NegativeRandomStreamState> state) {
+  if (state->remaining_ == 0) co_return std::string();
+  const std::uint64_t count =
+      std::min(state->remaining_, kRandomSampleBatchLimit);
+  const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
+  std::string payload;
+  for (std::uint64_t i = 0; i < count; ++i) {
+    const std::uint64_t rank =
+        RandomRank(state->population_, RandomSampleGenerator());
+    const std::size_t offset = static_cast<std::size_t>(rank) * tuple_width;
+    for (std::size_t field = 0; field < tuple_width; ++field) {
+      payload += EncodeBulkString(state->values_[offset + field]);
+    }
+  }
+  state->remaining_ -= count;
+  co_return payload;
+}
+
+Task<CommandReply> ExecuteNegativeRandomStream(
+    const CommandRequest& request, NegativeRandomStreamOptions options,
+    ReplyBuilder& reply_builder) {
+  const std::uint8_t db = request.db_id_;
+  const unsigned owner = ShardForKey(request.args_[1]);
+  auto state = std::make_shared<NegativeRandomStreamState>(
+      db, std::move(options), request.args_[1], owner);
+  if (!TryBeginDbOperation(db)) {
+    co_return BuiltReply(
+        reply_builder.AppendError("TRYAGAIN database flush is in progress"));
+  }
+  DbOperationGuard initial_db_guard(db);
+  state->now_ms_ = CommandUnixTimeMillis();
+  absl::StatusOr<storage::HashResult> length =
+      co_await BeginNegativeRandomStream(state);
+  if (!length.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, length.status()));
+  }
+  if (length->length_ == 0) {
+    co_return BuiltReply(reply_builder.AppendArrayHeader(0));
+  }
+  // The initial lookup is complete. Socket backpressure may retain the reply
+  // for an arbitrary duration, so retain neither the DB gate nor the key lock.
+  // Later batches sample only the immutable in-memory view.
+  initial_db_guard.Release();
+
+  std::uint64_t reply_elements = state->remaining_;
+  if (state->options_.with_values_) reply_elements *= 2;
+  CommandReply reply =
+      BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
+  reply.chunks_ = [state]() { return NextNegativeRandomChunk(state); };
+  co_return reply;
+}
+
+// EXEC must preserve the view observed at the command's position in the
+// transaction, but it must not materialize a negative-count reply whose size
+// is controlled by the client. Capture the compact collection once while the
+// transaction owns its locks, then sample that immutable view in bounded
+// chunks after EXEC has released every DB/key guard.
+struct TransactionalRandomStreamState {
+  NegativeRandomStreamOptions options_;
+  std::uint64_t remaining_ = 0;
+  std::uint64_t population_ = 0;
+  std::vector<std::string> values_;
+};
+
+struct OwnedStreamReply {
+  std::string encoded_;
+  ReplyChunkSource chunks_;
+};
+
+Task<absl::StatusOr<std::string>> NextTransactionalRandomChunk(
+    std::shared_ptr<TransactionalRandomStreamState> state) {
+  if (state->remaining_ == 0) co_return std::string();
+  const std::uint64_t count =
+      std::min(state->remaining_, kRandomSampleBatchLimit);
+  const std::size_t tuple_width = state->options_.with_values_ ? 2 : 1;
+  std::string payload;
+  for (std::uint64_t i = 0; i < count; ++i) {
+    const std::uint64_t rank =
+        RandomRank(state->population_, RandomSampleGenerator());
+    const std::size_t offset = static_cast<std::size_t>(rank) * tuple_width;
+    for (std::size_t field = 0; field < tuple_width; ++field) {
+      payload += EncodeBulkString(state->values_[offset + field]);
+    }
+  }
+  state->remaining_ -= count;
+  co_return payload;
+}
+
+Task<absl::StatusOr<OwnedStreamReply>>
+PrepareTransactionalNegativeRandomStreamLocked(
+    const CommandRequest& request, const storage::Digest& digest,
+    storage::TxShardWrites* tx, NegativeRandomStreamOptions options) {
+  storage::HashOperation operation;
+  operation.kind_ = options.hash_ && options.with_values_
+                        ? storage::HashOperationKind::kGetAll
+                        : storage::HashOperationKind::kKeys;
+  operation.now_ms_ = CommandUnixTimeMillis();
+
+  absl::StatusOr<storage::HashResult> snapshot;
+  if (options.zset_) {
+    snapshot = co_await ZSetRandomSnapshotLocked(
+        request.db_id_, request.args_[1], digest, options.with_values_, tx,
+        operation.now_ms_);
+  } else if (options.hash_) {
+    snapshot = co_await g_storage->ExecuteHashLocked(
+        request.db_id_, request.args_[1], digest, operation, tx);
+  } else {
+    snapshot = co_await g_storage->ExecuteSetLocked(
+        request.db_id_, request.args_[1], digest, operation, tx);
+  }
+  if (!snapshot.ok()) co_return snapshot.status();
+  if (snapshot->length_ == 0) {
+    co_return OwnedStreamReply{.encoded_ = "*0\r\n", .chunks_ = {}};
+  }
+
+  const std::size_t tuple_width = options.with_values_ ? 2 : 1;
+  if (snapshot->length_ >
+          std::numeric_limits<std::size_t>::max() / tuple_width ||
+      snapshot->values_.size() != snapshot->length_ * tuple_width) {
+    co_return absl::InternalError(
+        "random snapshot disagrees with collection length");
+  }
+  auto state = std::make_shared<TransactionalRandomStreamState>();
+  state->options_ = options;
+  state->remaining_ = options.count_;
+  state->population_ = snapshot->length_;
+  state->values_.reserve(snapshot->values_.size());
+  for (auto& value : snapshot->values_) {
+    if (!value.has_value()) {
+      co_return absl::InternalError("random snapshot contains a missing value");
+    }
+    state->values_.push_back(std::move(*value));
+  }
+
+  const std::uint64_t elements =
+      options.with_values_ ? options.count_ * 2 : options.count_;
+  OwnedStreamReply reply;
+  reply.encoded_ = "*" + std::to_string(elements) + "\r\n";
+  reply.chunks_ = [state]() { return NextTransactionalRandomChunk(state); };
+  co_return reply;
 }
 
 std::string EncodeStorageError(const absl::Status& status) {
@@ -1199,6 +1457,14 @@ Task<CommandReply> ExecuteStorageCommand(
       co_return reply;
     }
 
+    case CommandKind::kType: {
+      const storage::ExpirationInfo info =
+          co_await g_storage->GetExpiration(request.db_id_, args[1]);
+      reply.encoded_ = reply_builder.AppendSimpleString(
+          info.exists_ ? ValueTypeName(info.value_type_) : "none");
+      co_return reply;
+    }
+
     case CommandKind::kSet: {
       if (args.size() < 3) {
         reply.encoded_ = reply_builder.AppendError(
@@ -1246,6 +1512,84 @@ Task<CommandReply> ExecuteStorageCommand(
     case CommandKind::kLTrim:
     case CommandKind::kLPos:
       co_return co_await ExecuteSingleListCommand(request, reply_builder);
+
+    case CommandKind::kHSet:
+    case CommandKind::kHMSet:
+    case CommandKind::kHSetNx:
+    case CommandKind::kHGet:
+    case CommandKind::kHMGet:
+    case CommandKind::kHDel:
+    case CommandKind::kHLen:
+    case CommandKind::kHExists:
+    case CommandKind::kHGetAll:
+    case CommandKind::kHKeys:
+    case CommandKind::kHVals:
+    case CommandKind::kHStrlen:
+    case CommandKind::kHIncrBy:
+    case CommandKind::kHIncrByFloat:
+    case CommandKind::kHRandField:
+    case CommandKind::kHScan:
+      co_return co_await ExecuteHashCommand(request, reply_builder);
+
+    case CommandKind::kSAdd:
+    case CommandKind::kSCard:
+    case CommandKind::kSIsMember:
+    case CommandKind::kSMembers:
+    case CommandKind::kSMIsMember:
+    case CommandKind::kSPop:
+    case CommandKind::kSRandMember:
+    case CommandKind::kSRem:
+    case CommandKind::kSScan:
+      co_return co_await ExecuteSetCommand(request, reply_builder);
+
+    case CommandKind::kZAdd:
+    case CommandKind::kZCard:
+    case CommandKind::kZCount:
+    case CommandKind::kZIncrBy:
+    case CommandKind::kZLexCount:
+    case CommandKind::kZMScore:
+    case CommandKind::kZPopMax:
+    case CommandKind::kZPopMin:
+    case CommandKind::kZRandMember:
+    case CommandKind::kZRange:
+    case CommandKind::kZRangeByLex:
+    case CommandKind::kZRangeByScore:
+    case CommandKind::kZRank:
+    case CommandKind::kZRem:
+    case CommandKind::kZRemRangeByLex:
+    case CommandKind::kZRemRangeByRank:
+    case CommandKind::kZRemRangeByScore:
+    case CommandKind::kZRevRange:
+    case CommandKind::kZRevRangeByLex:
+    case CommandKind::kZRevRangeByScore:
+    case CommandKind::kZRevRank:
+    case CommandKind::kZScan:
+    case CommandKind::kZScore:
+    case CommandKind::kGeoAdd:
+    case CommandKind::kGeoDist:
+    case CommandKind::kGeoHash:
+    case CommandKind::kGeoPos:
+    case CommandKind::kGeoRadiusRo:
+    case CommandKind::kGeoRadiusByMemberRo:
+    case CommandKind::kGeoSearch:
+      co_return co_await ExecuteZSetCommand(request, reply_builder);
+
+    case CommandKind::kXAdd:
+    case CommandKind::kXDel:
+    case CommandKind::kXLen:
+    case CommandKind::kXRange:
+    case CommandKind::kXRevRange:
+    case CommandKind::kXTrim:
+    case CommandKind::kXSetId:
+    case CommandKind::kXGroup:
+    case CommandKind::kXAck:
+    case CommandKind::kXPending:
+    case CommandKind::kXClaim:
+    case CommandKind::kXAutoClaim:
+    case CommandKind::kXInfo:
+    case CommandKind::kXRead:
+    case CommandKind::kXReadGroup:
+      co_return co_await ExecuteStreamCommand(request, reply_builder);
 
     case CommandKind::kStrlen: {
       if (args.size() != 2) {
@@ -1484,16 +1828,19 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             "\r\n\r\n";
     info += "defrag_max_active_per_device:" +
             std::to_string(defrag.max_active_per_device_) + "\r\n";
-    info += std::string("defrag_paused:") +
-            (defrag.paused_ ? "1\r\n" : "0\r\n");
-    info += "defrag_block_sleep_ms:" +
-            std::to_string(defrag.block_sleep_ms_) + "\r\n";
-    info += "defrag_record_sleep_us:" +
-            std::to_string(defrag.record_sleep_us_) + "\r\n";
+    info +=
+        std::string("defrag_paused:") + (defrag.paused_ ? "1\r\n" : "0\r\n");
+    info += "defrag_block_sleep_ms:" + std::to_string(defrag.block_sleep_ms_) +
+            "\r\n";
+    info +=
+        "defrag_record_sleep_us:" + std::to_string(defrag.record_sleep_us_) +
+        "\r\n";
     info += "defrag_active:" + std::to_string(defrag.active_) + "\r\n";
     info += "defrag_pending:" + std::to_string(defrag.pending_) + "\r\n\r\n";
     info += "storage_dirty_staging_bytes:" +
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
+    info += "storage_expiration_pause_count:" +
+            std::to_string(g_storage->ExpirationPauseCount()) + "\r\n";
     info += "storage_flushes_pending:" +
             std::to_string(durability.flushes_pending_) + "\r\n";
     info += "storage_tx_commits_pending:" +
@@ -1559,8 +1906,19 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
 Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                      const CommandRequest& request,
                                      const storage::Digest& digest,
-                                     storage::TxShardWrites* tx) {
+                                     storage::TxShardWrites* tx,
+                                     ReplyChunkSource* reply_chunks) {
   const auto& args = request.args_;
+  if (auto options = ParseNegativeRandomStream(request);
+      options.has_value()) {
+    auto streamed = co_await PrepareTransactionalNegativeRandomStreamLocked(
+        request, digest, tx, *options);
+    if (!streamed.ok()) co_return EncodeStorageError(streamed.status());
+    if (reply_chunks != nullptr) {
+      *reply_chunks = std::move(streamed->chunks_);
+    }
+    co_return std::move(streamed->encoded_);
+  }
   switch (request.kind_) {
     case CommandKind::kGet: {
       auto value = co_await g_storage->GetLocked(db_id, args[1], digest);
@@ -1572,6 +1930,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       co_return value.status().code() == absl::StatusCode::kNotFound
           ? EncodeNullBulkString()
           : EncodeError(absl::StrCat("ERR ", value.status().message()));
+    }
+
+    case CommandKind::kType: {
+      const storage::ExpirationInfo info =
+          co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
+      co_return EncodeSimpleString(
+          info.exists_ ? ValueTypeName(info.value_type_) : "none");
     }
 
     case CommandKind::kSet: {
@@ -1613,6 +1978,98 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       ReplyBuilder list_reply_builder;
       CommandReply reply = co_await ExecuteSingleListCommandLocked(
           request, digest, tx, list_reply_builder);
+      co_return std::string(reply.encoded_);
+    }
+
+    case CommandKind::kHSet:
+    case CommandKind::kHMSet:
+    case CommandKind::kHSetNx:
+    case CommandKind::kHGet:
+    case CommandKind::kHMGet:
+    case CommandKind::kHDel:
+    case CommandKind::kHLen:
+    case CommandKind::kHExists:
+    case CommandKind::kHGetAll:
+    case CommandKind::kHKeys:
+    case CommandKind::kHVals:
+    case CommandKind::kHStrlen:
+    case CommandKind::kHIncrBy:
+    case CommandKind::kHIncrByFloat:
+    case CommandKind::kHRandField:
+    case CommandKind::kHScan: {
+      ReplyBuilder hash_reply_builder;
+      CommandReply reply = co_await ExecuteHashCommandLocked(
+          request, digest, tx, hash_reply_builder);
+      co_return std::string(reply.encoded_);
+    }
+
+    case CommandKind::kSAdd:
+    case CommandKind::kSCard:
+    case CommandKind::kSIsMember:
+    case CommandKind::kSMembers:
+    case CommandKind::kSMIsMember:
+    case CommandKind::kSPop:
+    case CommandKind::kSRandMember:
+    case CommandKind::kSRem:
+    case CommandKind::kSScan: {
+      ReplyBuilder set_reply_builder;
+      CommandReply reply = co_await ExecuteSetCommandLocked(request, digest, tx,
+                                                            set_reply_builder);
+      co_return std::string(reply.encoded_);
+    }
+
+    case CommandKind::kZAdd:
+    case CommandKind::kZCard:
+    case CommandKind::kZCount:
+    case CommandKind::kZIncrBy:
+    case CommandKind::kZLexCount:
+    case CommandKind::kZMScore:
+    case CommandKind::kZPopMax:
+    case CommandKind::kZPopMin:
+    case CommandKind::kZRandMember:
+    case CommandKind::kZRange:
+    case CommandKind::kZRangeByLex:
+    case CommandKind::kZRangeByScore:
+    case CommandKind::kZRank:
+    case CommandKind::kZRem:
+    case CommandKind::kZRemRangeByLex:
+    case CommandKind::kZRemRangeByRank:
+    case CommandKind::kZRemRangeByScore:
+    case CommandKind::kZRevRange:
+    case CommandKind::kZRevRangeByLex:
+    case CommandKind::kZRevRangeByScore:
+    case CommandKind::kZRevRank:
+    case CommandKind::kZScan:
+    case CommandKind::kZScore:
+    case CommandKind::kGeoAdd:
+    case CommandKind::kGeoDist:
+    case CommandKind::kGeoHash:
+    case CommandKind::kGeoPos:
+    case CommandKind::kGeoRadiusRo:
+    case CommandKind::kGeoRadiusByMemberRo:
+    case CommandKind::kGeoSearch: {
+      ReplyBuilder zset_reply_builder;
+      CommandReply reply = co_await ExecuteZSetCommandLocked(
+          request, digest, tx, zset_reply_builder);
+      co_return std::string(reply.encoded_);
+    }
+
+    case CommandKind::kXAdd:
+    case CommandKind::kXDel:
+    case CommandKind::kXLen:
+    case CommandKind::kXRange:
+    case CommandKind::kXRevRange:
+    case CommandKind::kXTrim:
+    case CommandKind::kXSetId:
+    case CommandKind::kXGroup:
+    case CommandKind::kXAck:
+    case CommandKind::kXPending:
+    case CommandKind::kXClaim:
+    case CommandKind::kXAutoClaim:
+    case CommandKind::kXInfo: {
+      ReplyBuilder stream_reply_builder;
+      CommandReply reply = co_await ExecuteStreamCommandLocked(
+          request, digest, tx, stream_reply_builder);
       co_return std::string(reply.encoded_);
     }
 
@@ -1798,6 +2255,10 @@ Task<absl::Status> RunTxCommit(std::uint64_t txid,
   } commit_done;
   std::vector<storage::TxShardWrites*> shards;
   for (auto& shard : writes) {
+    // Command-local undo must always be settled before the EXEC-wide commit
+    // chain is detached. Committing while this flag is armed means a failure
+    // path forgot to restore its receipt checkpoint.
+    assert(!shard.collect_undo_);
     if (!shard.fences_.empty() || !shard.retirements_.empty()) {
       shards.push_back(&shard);
     }
@@ -1959,6 +2420,23 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
   if (write_txid != 0) {
+    // The two-hop path already discarded these journals in its finish hop;
+    // the single-shard path has no finish hop. Settle both uniformly before
+    // handing the receipts to the detached commit chain.
+    for (unsigned owner = 0; owner < ctx.tx_writes_.size(); ++owner) {
+      storage::TxShardWrites& shard = ctx.tx_writes_[owner];
+      if (!shard.collect_undo_) continue;
+      if (!shard.fences_.empty() || !shard.retirements_.empty()) {
+        absl::Status discarded = co_await SubmitTaskTo(
+            owner, [txid = write_txid] {
+              return g_storage->DiscardTxUndoLocal(txid);
+            });
+        if (!discarded.ok()) {
+          co_return BuiltReply(AppendStorageError(reply_builder, discarded));
+        }
+      }
+      shard.collect_undo_ = false;
+    }
     g_storage->NoteTxCommitStarted();
     SpawnOnCurrentWorker(RunTxCommit(write_txid, std::move(ctx.tx_writes_)));
   }
@@ -1995,6 +2473,367 @@ bool IsExecSequentialListPop(CommandKind kind) {
          kind == CommandKind::kBLPop || kind == CommandKind::kBRPop;
 }
 
+bool IsExecSequentialListMove(CommandKind kind) {
+  return kind == CommandKind::kLMove || kind == CommandKind::kRPopLPush ||
+         kind == CommandKind::kBLMove || kind == CommandKind::kBRPopLPush;
+}
+
+bool IsExecSequentialListCommand(CommandKind kind) {
+  return IsExecSequentialListPop(kind) || IsExecSequentialListMove(kind);
+}
+
+bool IsExecSequentialSetMulti(CommandKind kind) {
+  return kind == CommandKind::kSDiff || kind == CommandKind::kSDiffStore ||
+         kind == CommandKind::kSInter || kind == CommandKind::kSInterCard ||
+         kind == CommandKind::kSInterStore || kind == CommandKind::kSMove ||
+         kind == CommandKind::kSUnion || kind == CommandKind::kSUnionStore;
+}
+
+bool IsExecSequentialZSetMulti(CommandKind kind) {
+  return kind == CommandKind::kZDiff || kind == CommandKind::kZDiffStore ||
+         kind == CommandKind::kZInter || kind == CommandKind::kZInterCard ||
+         kind == CommandKind::kZInterStore || kind == CommandKind::kZUnion ||
+         kind == CommandKind::kZUnionStore ||
+         kind == CommandKind::kZRangeStore ||
+         kind == CommandKind::kGeoRadius ||
+         kind == CommandKind::kGeoRadiusByMember ||
+         kind == CommandKind::kGeoSearchStore;
+}
+
+std::optional<std::uint16_t> GeoStoreDestinationArg(
+    const CommandRequest& command) {
+  if (command.kind_ != CommandKind::kGeoRadius &&
+      command.kind_ != CommandKind::kGeoRadiusByMember) {
+    return std::nullopt;
+  }
+  const std::size_t begin =
+      command.kind_ == CommandKind::kGeoRadius ? 6 : 5;
+  for (std::size_t i = begin; i + 1 < command.args_.size(); ++i) {
+    if (CmpCaseInsensitive(command.args_[i], "store") ||
+        CmpCaseInsensitive(command.args_[i], "storedist")) {
+      if (i + 1 <= std::numeric_limits<std::uint16_t>::max())
+        return static_cast<std::uint16_t>(i + 1);
+      return std::nullopt;
+    }
+  }
+  return std::nullopt;
+}
+
+bool IsExecSequentialStreamRead(CommandKind kind) {
+  return kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup;
+}
+
+Task<std::string> ExecuteExecSequentialZSetMulti(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  std::vector<ZSetExecKey> zset_keys;
+  zset_keys.reserve(keys.size());
+  for (const ExecKey& key : keys) {
+    zset_keys.push_back(ZSetExecKey{
+        .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+  }
+  co_return co_await ExecuteZSetMultiKeyLocked(command, zset_keys, tx_writes);
+}
+
+Task<std::string> ExecuteExecSequentialStreamRead(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  std::vector<StreamExecKey> stream_keys;
+  stream_keys.reserve(keys.size());
+  for (const ExecKey& key : keys) {
+    stream_keys.push_back(StreamExecKey{
+        .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+  }
+  co_return co_await ExecuteStreamReadLocked(command, stream_keys, tx_writes);
+}
+
+// EXEC uses one write receipt per shard for all commands. A command such as
+// LMOVE or SMOVE can still need command-local undo after its first half was
+// staged. Its rollback appends a same-txid compensation record, so the final
+// EXEC commit preserves both earlier successful commands and the restored
+// state across recovery.
+struct ExecWriteCheckpoint {
+  unsigned owner_ = 0;
+};
+
+std::vector<unsigned> UniqueOwners(std::initializer_list<unsigned> owners) {
+  std::vector<unsigned> unique;
+  for (unsigned owner : owners) {
+    if (std::find(unique.begin(), unique.end(), owner) == unique.end())
+      unique.push_back(owner);
+  }
+  return unique;
+}
+
+Task<absl::Status> BeginExecCommandUndo(
+    const std::vector<unsigned>& owners,
+    std::vector<storage::TxShardWrites>& writes,
+    std::vector<ExecWriteCheckpoint>* checkpoints) {
+  checkpoints->clear();
+  checkpoints->reserve(owners.size());
+  for (unsigned owner : owners) {
+    storage::TxShardWrites& shard = writes[owner];
+    checkpoints->push_back(ExecWriteCheckpoint{
+        .owner_ = owner,
+    });
+    absl::Status discarded =
+        co_await SubmitTaskTo(owner, [txid = shard.txid_] {
+          return g_storage->DiscardTxUndoLocal(txid);
+        });
+    if (!discarded.ok()) {
+      for (const ExecWriteCheckpoint& checkpoint : *checkpoints)
+        writes[checkpoint.owner_].collect_undo_ = false;
+      checkpoints->clear();
+      co_return discarded;
+    }
+    shard.collect_undo_ = true;
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> FinishExecCommandUndo(
+    const std::vector<ExecWriteCheckpoint>& checkpoints,
+    std::vector<storage::TxShardWrites>& writes, bool rollback) {
+  absl::Status first_error = absl::OkStatus();
+  for (const ExecWriteCheckpoint& checkpoint : checkpoints) {
+    storage::TxShardWrites& shard = writes[checkpoint.owner_];
+    // Compensation appends must not recursively enter the undo journal.
+    shard.collect_undo_ = false;
+    absl::Status finished =
+        co_await SubmitTaskTo(checkpoint.owner_,
+                              [txid = shard.txid_, rollback, shard = &shard] {
+          return rollback ? g_storage->RollbackTxLocal(txid, shard)
+                          : g_storage->DiscardTxUndoLocal(txid);
+        });
+    if (!finished.ok() && first_error.ok()) first_error = finished;
+  }
+  co_return first_error;
+}
+
+Task<std::string> ExecuteExecSequentialSetMulti(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  const auto& args = command.args_;
+  auto find_key = [&](std::size_t argument) -> const ExecKey* {
+    for (const ExecKey& key : keys) {
+      if (key.arg_ == argument) return &key;
+    }
+    return nullptr;
+  };
+  auto run_set = [&](const ExecKey& key, storage::HashOperation operation,
+                     bool write) -> Task<absl::StatusOr<storage::HashResult>> {
+    auto execute = [&]() {
+      return g_storage->ExecuteSetLocked(
+          command.db_id_, args[key.arg_], key.digest_, operation,
+          write ? &tx_writes[key.owner_] : nullptr);
+    };
+    if (key.owner_ == ThisWorker().id_) {
+      co_return co_await execute();
+    }
+    co_return co_await SubmitTaskTo(key.owner_, execute);
+  };
+  auto read_members = [&](std::size_t argument)
+      -> Task<absl::StatusOr<std::vector<std::string>>> {
+    const ExecKey* key = find_key(argument);
+    if (key == nullptr) co_return absl::InternalError("Set key is missing");
+    storage::HashOperation operation;
+    operation.kind_ = storage::HashOperationKind::kKeys;
+    auto result = co_await run_set(*key, std::move(operation), false);
+    if (!result.ok()) co_return result.status();
+    std::vector<std::string> members;
+    members.reserve(result->values_.size());
+    for (auto& member : result->values_) {
+      members.push_back(std::move(*member));
+    }
+    co_return members;
+  };
+
+  if (command.kind_ == CommandKind::kSMove) {
+    const ExecKey* source_key = find_key(1);
+    if (source_key == nullptr) {
+      co_return EncodeError("ERR Set source key is missing");
+    }
+    storage::HashOperation contains;
+    contains.kind_ = storage::HashOperationKind::kGet;
+    contains.fields_.push_back(args[3]);
+    auto source = co_await run_set(*source_key, std::move(contains), false);
+    if (!source.ok()) co_return EncodeStorageError(source.status());
+    if (!source->key_exists_) co_return EncodeInteger(0);
+    const bool source_contains =
+        !source->values_.empty() && source->values_.front().has_value();
+    if (args[1] == args[2]) co_return EncodeInteger(source_contains ? 1 : 0);
+    const ExecKey* destination = find_key(2);
+    if (destination == nullptr) {
+      co_return EncodeError("ERR Set destination key is missing");
+    }
+    storage::HashOperation validate;
+    validate.kind_ = storage::HashOperationKind::kLength;
+    auto checked = co_await run_set(*destination, std::move(validate), false);
+    if (!checked.ok()) co_return EncodeStorageError(checked.status());
+    if (!source_contains) co_return EncodeInteger(0);
+    const std::vector<unsigned> owners =
+        UniqueOwners({source_key->owner_, destination->owner_});
+    std::vector<ExecWriteCheckpoint> checkpoints;
+    absl::Status undo =
+        co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+    if (!undo.ok()) co_return EncodeStorageError(undo);
+    storage::HashOperation remove;
+    remove.kind_ = storage::HashOperationKind::kDelete;
+    remove.fields_.push_back(args[3]);
+    auto removed = co_await run_set(*source_key, std::move(remove), true);
+    if (!removed.ok()) {
+      absl::Status rolled_back =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+      co_return EncodeStorageError(rolled_back.ok() ? removed.status()
+                                                    : rolled_back);
+    }
+    storage::HashOperation add;
+    add.kind_ = storage::HashOperationKind::kSet;
+    add.fields_.push_back(args[3]);
+    add.values_.push_back({});
+    auto added = co_await run_set(*destination, std::move(add), true);
+    if (!added.ok()) {
+      absl::Status rolled_back =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+      co_return EncodeStorageError(rolled_back.ok() ? added.status()
+                                                    : rolled_back);
+    }
+    absl::Status completed =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+    if (!completed.ok()) co_return EncodeStorageError(completed);
+    co_return EncodeInteger(1);
+  }
+
+  const bool store = command.kind_ == CommandKind::kSDiffStore ||
+                     command.kind_ == CommandKind::kSInterStore ||
+                     command.kind_ == CommandKind::kSUnionStore;
+  const bool intersection = command.kind_ == CommandKind::kSInter ||
+                            command.kind_ == CommandKind::kSInterCard ||
+                            command.kind_ == CommandKind::kSInterStore;
+  const bool difference = command.kind_ == CommandKind::kSDiff ||
+                          command.kind_ == CommandKind::kSDiffStore;
+  const std::size_t first_source =
+      command.kind_ == CommandKind::kSInterCard ? 2 : (store ? 2 : 1);
+  const std::size_t last_source = keys.back().arg_;
+  std::uint64_t cardinality_limit = 0;
+  if (command.kind_ == CommandKind::kSInterCard) {
+    for (std::size_t option = last_source + 1; option < args.size();
+         option += 2) {
+      if (option + 1 >= args.size() ||
+          !CmpCaseInsensitive(args[option], "limit")) {
+        co_return EncodeError("ERR syntax error");
+      }
+      std::int64_t parsed_limit = 0;
+      const std::string_view text = args[option + 1];
+      const auto parsed = std::from_chars(
+          text.data(), text.data() + text.size(), parsed_limit);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != text.data() + text.size() || parsed_limit < 0) {
+        co_return EncodeError("ERR LIMIT can't be negative");
+      }
+      cardinality_limit = static_cast<std::uint64_t>(parsed_limit);
+    }
+  }
+  std::vector<std::vector<std::string>> sources;
+  sources.reserve(last_source - first_source + 1);
+  for (std::size_t argument = first_source; argument <= last_source;
+       ++argument) {
+    auto members = co_await read_members(argument);
+    if (!members.ok()) co_return EncodeStorageError(members.status());
+    sources.push_back(std::move(*members));
+  }
+  absl::flat_hash_set<std::string> output;
+  for (const std::string& member : sources.front()) output.insert(member);
+  if (intersection) {
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      absl::flat_hash_set<std::string_view> current;
+      current.reserve(sources[i].size());
+      for (const std::string& member : sources[i]) current.insert(member);
+      for (auto it = output.begin(); it != output.end();) {
+        if (!current.contains(*it)) {
+          auto remove = it++;
+          output.erase(remove);
+        } else {
+          ++it;
+        }
+      }
+    }
+  } else if (difference) {
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      for (const std::string& member : sources[i]) output.erase(member);
+    }
+  } else {
+    for (std::size_t i = 1; i < sources.size(); ++i) {
+      for (const std::string& member : sources[i]) output.insert(member);
+    }
+  }
+
+  if (command.kind_ == CommandKind::kSInterCard) {
+    const std::uint64_t cardinality = output.size();
+    co_return EncodeInteger(static_cast<long long>(
+        cardinality_limit == 0
+            ? cardinality
+            : std::min(cardinality, cardinality_limit)));
+  }
+
+  if (store) {
+    const ExecKey* destination = find_key(1);
+    if (destination == nullptr) {
+      co_return EncodeError("ERR Set destination key is missing");
+    }
+    const std::vector<unsigned> owners = UniqueOwners({destination->owner_});
+    std::vector<ExecWriteCheckpoint> checkpoints;
+    absl::Status undo =
+        co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+    if (!undo.ok()) co_return EncodeStorageError(undo);
+    auto remove_destination = [&]() {
+      return g_storage->DeleteLocked(command.db_id_, args[1],
+                                     destination->digest_,
+                                     &tx_writes[destination->owner_]);
+    };
+    absl::StatusOr<bool> deleted;
+    if (destination->owner_ == ThisWorker().id_) {
+      deleted = co_await remove_destination();
+    } else {
+      deleted = co_await SubmitTaskTo(destination->owner_, remove_destination);
+    }
+    if (!deleted.ok()) {
+      absl::Status rolled_back =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+      co_return EncodeStorageError(rolled_back.ok() ? deleted.status()
+                                                    : rolled_back);
+    }
+    if (!output.empty()) {
+      storage::HashOperation add;
+      add.kind_ = storage::HashOperationKind::kSet;
+      add.fields_.reserve(output.size());
+      add.values_.reserve(output.size());
+      for (const std::string& member : output) {
+        add.fields_.push_back(member);
+        add.values_.push_back({});
+      }
+      auto added = co_await run_set(*destination, std::move(add), true);
+      if (!added.ok()) {
+        absl::Status rolled_back =
+            co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+        co_return EncodeStorageError(rolled_back.ok() ? added.status()
+                                                      : rolled_back);
+      }
+    }
+    absl::Status completed =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+    if (!completed.ok()) co_return EncodeStorageError(completed);
+    co_return EncodeInteger(static_cast<long long>(output.size()));
+  }
+
+  std::vector<std::string> ordered(output.begin(), output.end());
+  std::sort(ordered.begin(), ordered.end());
+  ReplyBuilder builder;
+  builder.AppendArrayHeader(ordered.size());
+  for (const std::string& member : ordered) builder.AppendBulkString(member);
+  co_return std::string(builder.View());
+}
+
 Task<std::string> ExecuteExecSequentialListPop(
     const CommandRequest& command, const std::vector<ExecKey>& keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
@@ -2004,6 +2843,19 @@ Task<std::string> ExecuteExecSequentialListPop(
   std::uint64_t count = 1;
   const bool nested = command.kind_ == CommandKind::kLMPop ||
                       command.kind_ == CommandKind::kBLMPop;
+  if (command.kind_ == CommandKind::kBLPop ||
+      command.kind_ == CommandKind::kBRPop) {
+    const absl::Status timeout = ValidateBlockingTimeout(args.back());
+    if (!timeout.ok()) {
+      co_return EncodeError(absl::StrCat("ERR ", timeout.message()));
+    }
+  }
+  if (command.kind_ == CommandKind::kBLMPop) {
+    const absl::Status timeout = ValidateBlockingTimeout(args[1]);
+    if (!timeout.ok()) {
+      co_return EncodeError(absl::StrCat("ERR ", timeout.message()));
+    }
+  }
   if (nested) {
     const std::size_t direction = keys.back().arg_ + 1;
     if (direction >= args.size()) co_return EncodeError("ERR syntax error");
@@ -2014,16 +2866,16 @@ Task<std::string> ExecuteExecSequentialListPop(
     } else {
       co_return EncodeError("ERR syntax error");
     }
-    if (direction + 1 < args.size()) {
-      if (direction + 2 >= args.size() ||
-          !CmpCaseInsensitive(args[direction + 1], "count")) {
+    const std::size_t trailing = args.size() - (direction + 1);
+    if (trailing != 0) {
+      if (trailing != 2 || !CmpCaseInsensitive(args[direction + 1], "count")) {
         co_return EncodeError("ERR syntax error");
       }
       const std::string_view text = args[direction + 2];
       const auto parsed =
           std::from_chars(text.data(), text.data() + text.size(), count);
-      if (parsed.ec != std::errc{} ||
-          parsed.ptr != text.data() + text.size() || count == 0) {
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          count == 0) {
         co_return EncodeError("ERR count should be greater than 0");
       }
     }
@@ -2040,9 +2892,12 @@ Task<std::string> ExecuteExecSequentialListPop(
           command.db_id_, args[key.arg_], key.digest_, operation,
           &tx_writes[key.owner_]);
     };
-    absl::StatusOr<storage::ListResult> result =
-        key.owner_ == ThisWorker().id_ ? co_await pop()
-                                      : co_await SubmitTaskTo(key.owner_, pop);
+    absl::StatusOr<storage::ListResult> result;
+    if (key.owner_ == ThisWorker().id_) {
+      result = co_await pop();
+    } else {
+      result = co_await SubmitTaskTo(key.owner_, pop);
+    }
     if (!result.ok()) co_return EncodeStorageError(result.status());
     if (result->values_.empty()) continue;
     ReplyBuilder builder;
@@ -2061,6 +2916,135 @@ Task<std::string> ExecuteExecSequentialListPop(
   co_return "*-1\r\n";
 }
 
+Task<std::string> ExecuteExecSequentialListMove(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  const auto& args = command.args_;
+  if (keys.size() < 2 || args.size() < 3) {
+    co_return EncodeError("ERR syntax error");
+  }
+  auto find_key = [&](std::size_t argument) -> const ExecKey* {
+    for (const ExecKey& key : keys) {
+      if (key.arg_ == argument) return &key;
+    }
+    return nullptr;
+  };
+  const ExecKey* source = find_key(1);
+  const ExecKey* destination = find_key(2);
+  if (source == nullptr || destination == nullptr) {
+    co_return EncodeError("ERR List move key is missing");
+  }
+
+  bool source_left = false;
+  bool destination_left = true;
+  if (command.kind_ == CommandKind::kLMove ||
+      command.kind_ == CommandKind::kBLMove) {
+    if (args.size() < 5) co_return EncodeError("ERR syntax error");
+    if (CmpCaseInsensitive(args[3], "left")) {
+      source_left = true;
+    } else if (!CmpCaseInsensitive(args[3], "right")) {
+      co_return EncodeError("ERR syntax error");
+    }
+    if (CmpCaseInsensitive(args[4], "left")) {
+      destination_left = true;
+    } else if (CmpCaseInsensitive(args[4], "right")) {
+      destination_left = false;
+    } else {
+      co_return EncodeError("ERR syntax error");
+    }
+  }
+
+  if (command.kind_ == CommandKind::kBLMove ||
+      command.kind_ == CommandKind::kBRPopLPush) {
+    const std::size_t timeout_arg =
+        command.kind_ == CommandKind::kBLMove ? 5 : 3;
+    if (timeout_arg >= args.size()) co_return EncodeError("ERR syntax error");
+    const absl::Status timeout = ValidateBlockingTimeout(args[timeout_arg]);
+    if (!timeout.ok()) {
+      co_return EncodeError(absl::StrCat("ERR ", timeout.message()));
+    }
+  }
+
+  auto run_list = [&](const ExecKey& key, storage::ListOperation operation,
+                      bool write) -> Task<absl::StatusOr<storage::ListResult>> {
+    auto execute = [&]() {
+      return g_storage->ExecuteListLocked(
+          command.db_id_, args[key.arg_], key.digest_, operation,
+          write ? &tx_writes[key.owner_] : nullptr);
+    };
+    if (key.owner_ == ThisWorker().id_) {
+      co_return co_await execute();
+    }
+    co_return co_await SubmitTaskTo(key.owner_, execute);
+  };
+
+  if (args[1] == args[2]) {
+    storage::ListOperation move;
+    move.kind_ = storage::ListOperationKind::kMoveWithin;
+    move.first_ = source_left ? 1 : 0;
+    move.second_ = destination_left ? 1 : 0;
+    auto moved = co_await run_list(*source, std::move(move), true);
+    if (!moved.ok()) co_return EncodeStorageError(moved.status());
+    if (moved->values_.empty()) co_return EncodeNullBulkString();
+    NotifyListBlockingKey(command.db_id_, args[1]);
+    co_return EncodeBulkString(moved->values_.front());
+  }
+
+  // Validate the destination before mutating the source.  In particular, a
+  // WRONGTYPE reply must not turn a failed move into a committed pop.
+  storage::ListOperation validate;
+  validate.kind_ = storage::ListOperationKind::kLength;
+  auto checked = co_await run_list(*destination, std::move(validate), false);
+  if (!checked.ok()) co_return EncodeStorageError(checked.status());
+
+  // EXEC normally has no runtime undo because command errors do not roll back
+  // earlier commands. LMOVE is one command spanning two writes, however: keep
+  // undo only for its pop/push pair so a failed destination append restores
+  // the source without touching earlier successful EXEC commands.
+  const std::vector<unsigned> owners =
+      UniqueOwners({source->owner_, destination->owner_});
+  std::vector<ExecWriteCheckpoint> checkpoints;
+  absl::Status undo =
+      co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+  if (!undo.ok()) co_return EncodeStorageError(undo);
+
+  storage::ListOperation pop;
+  pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
+                          : storage::ListOperationKind::kPopRight;
+  pop.count_ = 1;
+  auto popped = co_await run_list(*source, std::move(pop), true);
+  if (!popped.ok()) {
+    absl::Status rolled_back =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    co_return EncodeStorageError(rolled_back.ok() ? popped.status()
+                                                  : rolled_back);
+  }
+  if (popped->values_.empty()) {
+    absl::Status completed =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+    if (!completed.ok()) co_return EncodeStorageError(completed);
+    co_return EncodeNullBulkString();
+  }
+
+  storage::ListOperation push;
+  push.kind_ = destination_left ? storage::ListOperationKind::kPushLeft
+                                : storage::ListOperationKind::kPushRight;
+  push.values_.push_back(popped->values_.front());
+  auto pushed = co_await run_list(*destination, std::move(push), true);
+  if (!pushed.ok()) {
+    absl::Status rolled_back =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    co_return EncodeStorageError(rolled_back.ok() ? pushed.status()
+                                                  : rolled_back);
+  }
+  absl::Status completed =
+      co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+  if (!completed.ok()) co_return EncodeStorageError(completed);
+  NotifyListBlockingKey(command.db_id_, args[1]);
+  NotifyListBlockingKey(command.db_id_, args[2]);
+  co_return EncodeBulkString(popped->values_.front());
+}
+
 // One squashed run of consecutive keyed commands [begin, end): every shard
 // executes its keys of every command in queue order within a single hop.
 // Sinks are per command (indexed by i - begin); shards write disjoint reply
@@ -2073,6 +3057,7 @@ struct ExecRunContext {
   storage::TxShardWrites* tx_writes_ = nullptr;
   const std::vector<std::vector<ExecKey>>* cmd_keys_ = nullptr;
   std::vector<std::string>* replies_ = nullptr;
+  std::vector<ReplyChunkSource>* reply_chunks_ = nullptr;
   std::size_t begin_ = 0;
   std::size_t end_ = 0;
   std::vector<std::vector<std::optional<std::string>>> mget_;
@@ -2117,11 +3102,13 @@ void AssembleRunReplies(ExecRunContext& run) {
 // Prepares the sinks of one squashed run over [begin, end).
 void InitExecRun(ExecRunContext& run, const std::vector<CommandRequest>& queued,
                  const std::vector<std::vector<ExecKey>>& cmd_keys,
-                 std::vector<std::string>& replies, std::size_t begin,
-                 std::size_t end) {
+                 std::vector<std::string>& replies,
+                 std::vector<ReplyChunkSource>& reply_chunks,
+                 std::size_t begin, std::size_t end) {
   run.queued_ = &queued;
   run.cmd_keys_ = &cmd_keys;
   run.replies_ = &replies;
+  run.reply_chunks_ = &reply_chunks;
   run.begin_ = begin;
   run.end_ = end;
   const std::size_t count = end - begin;
@@ -2238,7 +3225,8 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
           // Single-key command: the sole owner runs the full body and writes
           // the reply slot directly (errors self-encode).
           (*ctx->replies_)[i] =
-              co_await RunSingleKeyLocked(cmd.db_id_, cmd, key.digest_, tx);
+              co_await RunSingleKeyLocked(cmd.db_id_, cmd, key.digest_, tx,
+                                          &(*ctx->reply_chunks_)[i]);
           break;
       }
       if (command_failed) {
@@ -2357,6 +3345,33 @@ Task<absl::Status> DropWatches(ConnectionContext& ctx) {
   co_return absl::OkStatus();
 }
 
+struct ExecReplyStreamState {
+  std::vector<std::string> replies_;
+  std::vector<ReplyChunkSource> chunks_;
+  std::size_t index_ = 0;
+  bool reply_header_sent_ = false;
+};
+
+Task<absl::StatusOr<std::string>> NextExecReplyChunk(
+    std::shared_ptr<ExecReplyStreamState> state) {
+  while (state->index_ < state->replies_.size()) {
+    if (!state->reply_header_sent_) {
+      state->reply_header_sent_ = true;
+      co_return std::move(state->replies_[state->index_]);
+    }
+    ReplyChunkSource& source = state->chunks_[state->index_];
+    if (source) {
+      absl::StatusOr<std::string> chunk = co_await source();
+      if (!chunk.ok()) co_return chunk.status();
+      if (!chunk->empty()) co_return chunk;
+      source = {};
+    }
+    ++state->index_;
+    state->reply_header_sent_ = false;
+  }
+  co_return std::string();
+}
+
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                ReplyBuilder& reply_builder) {
   const std::vector<CommandRequest> queued = std::move(ctx.queued_);
@@ -2386,6 +3401,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
 
   // Precompute every queued command's keys: digests, owners, slots, modes.
   std::vector<std::vector<ExecKey>> cmd_keys(queued.size());
+  std::vector<std::string> key_errors(queued.size());
   std::vector<std::uint8_t> dbs;  // distinct databases with keyed commands
   for (std::size_t i = 0; i < queued.size(); ++i) {
     const CommandRequest& cmd = queued[i];
@@ -2394,17 +3410,35 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     }
     auto keys = DetermineKeys(*cmd.spec_, cmd.args_);
     if (!keys.ok()) {
-      // Unreachable today: queueing ran the same check on the same spec and
-      // arity. Kept defensive, and EXEC must consume the connection's
-      // watches whatever its outcome — leaving them registered would
-      // false-abort every later EXEC on this connection.
-      co_await DropWatches(ctx);
-      co_return BuiltReply(reply_builder.AppendError(
-          absl::StrCat("ERR ", keys.status().message())));
+      // Movable-key commands derive their key set from argument values.
+      // Redis queues value errors and reports them in the EXEC result instead
+      // of treating them as queue-time arity failures.
+      key_errors[i] = EncodeError(absl::StrCat("ERR ", keys.status().message()));
+      continue;
     }
     const bool write = (cmd.spec_->flags_ & kCmdWrite) != 0;
     std::uint16_t slot = 0;
+    const bool zset_store = cmd.kind_ == CommandKind::kZDiffStore ||
+                            cmd.kind_ == CommandKind::kZInterStore ||
+                            cmd.kind_ == CommandKind::kZUnionStore ||
+                            cmd.kind_ == CommandKind::kZRangeStore ||
+                            cmd.kind_ == CommandKind::kGeoSearchStore ||
+                            GeoStoreDestinationArg(cmd).has_value();
+    const std::uint16_t zset_destination =
+        GeoStoreDestinationArg(cmd).value_or(1);
+    if (zset_store) {
+      cmd_keys[i].push_back(ExecKey{
+          .digest_ = storage::ComputeDigest(cmd.args_[zset_destination]),
+          .owner_ = static_cast<std::uint16_t>(
+              ShardForKey(cmd.args_[zset_destination])),
+          .arg_ = zset_destination,
+          .slot_ = slot++,
+          .mode_ = tx::LockMode::kExclusive,
+          .db_ = cmd.db_id_,
+      });
+    }
     for (std::size_t a = keys->first_; a <= keys->last_; a += keys->step_) {
+      if (zset_store && a == zset_destination) continue;
       cmd_keys[i].push_back(ExecKey{
           .digest_ = storage::ComputeDigest(cmd.args_[a]),
           .owner_ = static_cast<std::uint16_t>(ShardForKey(cmd.args_[a])),
@@ -2420,14 +3454,23 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   }
 
   std::vector<std::string> replies(queued.size());
+  std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
-  auto run_keyless = [&](const CommandRequest& cmd) {
+  auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
     ReplyBuilder local_builder;
-    CommandReply local = ExecuteSimpleLocalCommand(cmd, local_builder);
+    CommandReply local;
+    if (cmd.kind_ == CommandKind::kInfo) {
+      local = co_await ExecuteInfo(cmd, local_builder);
+    } else if (cmd.kind_ == CommandKind::kXGroup ||
+               cmd.kind_ == CommandKind::kXInfo) {
+      local = co_await ExecuteStreamCommand(cmd, local_builder);
+    } else {
+      local = ExecuteSimpleLocalCommand(cmd, local_builder);
+    }
     if (local.selected_db_.has_value()) {
       select_db = local.selected_db_;
     }
-    return std::string(local.encoded_);
+    co_return std::string(local.encoded_);
   };
 
   if (!dbs.empty()) {
@@ -2477,14 +3520,13 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
             std::size_t i = 0;
             while (i < queued.size()) {
               const CommandRequest& cmd = queued[i];
+              if (!key_errors[i].empty()) {
+                replies[i] = key_errors[i];
+                ++i;
+                continue;
+              }
               if (cmd_keys[i].empty()) {
-                if (cmd.kind_ == CommandKind::kInfo) {
-                  ReplyBuilder info_builder;
-                  replies[i] =
-                      (co_await ExecuteInfo(cmd, info_builder)).encoded_;
-                } else {
-                  replies[i] = run_keyless(cmd);
-                }
+                replies[i] = co_await run_keyless(cmd);
                 ++i;
                 continue;
               }
@@ -2494,13 +3536,41 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                 ++i;
                 continue;
               }
+              if (IsExecSequentialListMove(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialListMove(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
+              if (IsExecSequentialSetMulti(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialSetMulti(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
+              if (IsExecSequentialZSetMulti(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialZSetMulti(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
+              if (IsExecSequentialStreamRead(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialStreamRead(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
               std::size_t end = i + 1;
               while (end < queued.size() && !cmd_keys[end].empty() &&
-                     !IsExecSequentialListPop(queued[end].kind_)) {
+                     !IsExecSequentialListCommand(queued[end].kind_) &&
+                     !IsExecSequentialSetMulti(queued[end].kind_) &&
+                     !IsExecSequentialZSetMulti(queued[end].kind_) &&
+                     !IsExecSequentialStreamRead(queued[end].kind_)) {
                 ++end;
               }
               ExecRunContext run;
-              InitExecRun(run, queued, cmd_keys, replies, i, end);
+              InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i,
+                          end);
               run.tx_writes_ = tx_writes.data();
               (void)co_await ExecRunShardCallback(&run,
                                                   tx::ShardSlice{.keys_ = {}});
@@ -2536,8 +3606,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       }
       // Acquire and retain every shard's holds before the coordinator runs
       // argument-ordered commands such as LMPOP one key at a time.
-      absl::Status armed = co_await txn.Execute(
-          &ArmOnlyShardCallback, nullptr, /*release=*/false);
+      absl::Status armed = co_await txn.Execute(&ArmOnlyShardCallback, nullptr,
+                                                /*release=*/false);
       if (!armed.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
@@ -2558,29 +3628,56 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       std::size_t i = 0;
       while (i < queued.size()) {
         const CommandRequest& cmd = queued[i];
+        if (!key_errors[i].empty()) {
+          replies[i] = key_errors[i];
+          ++i;
+          continue;
+        }
         if (cmd_keys[i].empty()) {
-          if (cmd.kind_ == CommandKind::kInfo) {
-            ReplyBuilder info_builder;
-            replies[i] = (co_await ExecuteInfo(cmd, info_builder)).encoded_;
-          } else {
-            replies[i] = run_keyless(cmd);
-          }
+          replies[i] = co_await run_keyless(cmd);
           ++i;
           continue;
         }
         if (IsExecSequentialListPop(cmd.kind_)) {
-          replies[i] = co_await ExecuteExecSequentialListPop(
+          replies[i] = co_await ExecuteExecSequentialListPop(cmd, cmd_keys[i],
+                                                             tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialListMove(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialListMove(cmd, cmd_keys[i],
+                                                              tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialSetMulti(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialSetMulti(cmd, cmd_keys[i],
+                                                              tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialZSetMulti(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialZSetMulti(cmd, cmd_keys[i],
+                                                               tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialStreamRead(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialStreamRead(
               cmd, cmd_keys[i], tx_writes);
           ++i;
           continue;
         }
         std::size_t end = i + 1;
         while (end < queued.size() && !cmd_keys[end].empty() &&
-               !IsExecSequentialListPop(queued[end].kind_)) {
+               !IsExecSequentialListCommand(queued[end].kind_) &&
+               !IsExecSequentialSetMulti(queued[end].kind_) &&
+               !IsExecSequentialZSetMulti(queued[end].kind_) &&
+               !IsExecSequentialStreamRead(queued[end].kind_)) {
           ++end;
         }
         ExecRunContext run;
-        InitExecRun(run, queued, cmd_keys, replies, i, end);
+        InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end);
         run.tx_writes_ = tx_writes.data();
         absl::Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
                                                 /*release=*/false);
@@ -2613,30 +3710,52 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
     }
     for (std::size_t i = 0; i < queued.size(); ++i) {
-      if (queued[i].kind_ == CommandKind::kInfo) {
-        ReplyBuilder info_builder;
-        replies[i] = (co_await ExecuteInfo(queued[i], info_builder)).encoded_;
+      if (!key_errors[i].empty()) {
+        replies[i] = key_errors[i];
       } else {
-        replies[i] = run_keyless(queued[i]);
+        replies[i] = co_await run_keyless(queued[i]);
       }
     }
   }
 
   co_await DropWatches(ctx);
+  const bool streamed = std::any_of(
+      reply_chunks.begin(), reply_chunks.end(),
+      [](const ReplyChunkSource& source) { return static_cast<bool>(source); });
   reply_builder.AppendArrayHeader(replies.size());
-  for (const std::string& reply : replies) {
-    reply_builder.AppendRaw(reply);
+  if (!streamed) {
+    for (const std::string& reply : replies) {
+      reply_builder.AppendRaw(reply);
+    }
   }
   CommandReply reply = BuiltReply(reply_builder.View());
+  if (streamed) {
+    auto state = std::make_shared<ExecReplyStreamState>();
+    state->replies_ = std::move(replies);
+    state->chunks_ = std::move(reply_chunks);
+    reply.chunks_ = [state]() { return NextExecReplyChunk(state); };
+  }
   reply.selected_db_ = select_db;
   co_return reply;
 }
 
 }  // namespace
 
+bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept {
+  return TryBeginDbOperation(db_id);
+}
+
+void EndCommandDbOperation(std::uint8_t db_id) noexcept {
+  EndDbOperation(db_id);
+}
+
 void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   g_storage = engine;
+  InitHashCommandStorage(engine);
   InitListCommandStorage(engine);
+  InitSetCommandStorage(engine);
+  InitStreamCommandStorage(engine);
+  InitZSetCommandStorage(engine);
   g_replica_read_only = replica_read_only;
 }
 
@@ -2654,6 +3773,17 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
                                        CommandRequest request,
                                        ReplyBuilder& reply_builder) {
   const CommandKind kind = request.kind_;
+  if (request.spec_ != nullptr) {
+    const CommandSpec& spec = *request.spec_;
+    const std::size_t argc = request.args_.size();
+    if (argc < spec.min_args_ ||
+        (spec.max_args_ != 0 && argc > spec.max_args_)) {
+      if (ctx.in_multi_) ctx.multi_dirty_ = true;
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR wrong number of arguments for '" +
+                                    std::string(spec.name_) + "' command"));
+    }
+  }
   if (ctx.in_multi_) {
     switch (kind) {
       case CommandKind::kMulti:
@@ -2671,16 +3801,16 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       default:
         break;
     }
-    // Queue-time validation: errors reply immediately and doom the EXEC.
+    // Queue-time validation is limited to structural errors. Movable-key
+    // commands may have invalid numeric/key-count argument values; Redis
+    // queues those and returns the error as one element of EXEC.
     if (request.spec_ == nullptr) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(reply_builder.AppendError(
           "ERR unknown command '" + request.args_.front() + "'"));
     }
     const CommandSpec& spec = *request.spec_;
-    auto keys = DetermineKeys(spec, request.args_);
-    if (!keys.ok() ||
-        (kind == CommandKind::kMSet && request.args_.size() % 2 != 1)) {
+    if (kind == CommandKind::kMSet && request.args_.size() % 2 != 1) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(
           reply_builder.AppendError("ERR wrong number of arguments for '" +
@@ -2775,13 +3905,22 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   }
 
   const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
-  if (uses_db && !TryBeginDbOperation(request.db_id_)) {
+  const std::optional<NegativeRandomStreamOptions> random_stream =
+      ParseNegativeRandomStream(request);
+  const bool manages_own_db_gate =
+      (cmd_flags & kCmdMayBlock) != 0 || random_stream.has_value();
+  if (uses_db && !manages_own_db_gate && !TryBeginDbOperation(request.db_id_)) {
     co_return BuiltReply(
         reply_builder.AppendError("TRYAGAIN database flush is in progress"));
   }
   std::optional<DbOperationGuard> db_guard;
-  if (uses_db) {
+  if (uses_db && !manages_own_db_gate) {
     db_guard.emplace(request.db_id_);
+  }
+
+  if (random_stream.has_value()) {
+    co_return co_await ExecuteNegativeRandomStream(request, *random_stream,
+                                                   reply_builder);
   }
 
   switch (request.kind_) {
@@ -2809,6 +3948,29 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kMGet:
       co_return co_await ExecuteMultiKey(request, reply_builder);
 
+    case CommandKind::kSDiff:
+    case CommandKind::kSDiffStore:
+    case CommandKind::kSInter:
+    case CommandKind::kSInterCard:
+    case CommandKind::kSInterStore:
+    case CommandKind::kSMove:
+    case CommandKind::kSUnion:
+    case CommandKind::kSUnionStore:
+      co_return co_await ExecuteSetMultiKey(request, reply_builder);
+
+    case CommandKind::kZDiff:
+    case CommandKind::kZDiffStore:
+    case CommandKind::kZInter:
+    case CommandKind::kZInterCard:
+    case CommandKind::kZInterStore:
+    case CommandKind::kZUnion:
+    case CommandKind::kZUnionStore:
+    case CommandKind::kZRangeStore:
+    case CommandKind::kGeoRadius:
+    case CommandKind::kGeoRadiusByMember:
+    case CommandKind::kGeoSearchStore:
+      co_return co_await ExecuteZSetMultiKey(request, reply_builder);
+
     case CommandKind::kLMove:
     case CommandKind::kRPopLPush:
     case CommandKind::kLMPop:
@@ -2820,6 +3982,26 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kBRPopLPush:
     case CommandKind::kBLMPop:
       co_return co_await ExecuteBlockingListCommand(request, reply_builder);
+
+    case CommandKind::kXGroup:
+    case CommandKind::kXInfo:
+      if (args.size() >= 3) {
+        const unsigned target = ShardForKey(args[2]);
+        if (target != ThisWorker().id_) {
+          co_return co_await SubmitTaskTo(
+              target, [&request, &reply_builder]() -> Task<CommandReply> {
+                co_return co_await ExecuteStorageCommand(request,
+                                                         reply_builder);
+              });
+        }
+      }
+      co_return co_await ExecuteStorageCommand(request, reply_builder);
+
+    case CommandKind::kXRead:
+    case CommandKind::kXReadGroup:
+      // The Stream handler parses the movable key list and dispatches each
+      // key to its owner; args[1] is an option (or GROUP), not a key.
+      co_return co_await ExecuteStorageCommand(request, reply_builder);
 
     case CommandKind::kGet:
     case CommandKind::kStrlen:
@@ -2838,12 +4020,79 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kLRem:
     case CommandKind::kLTrim:
     case CommandKind::kLPos:
+    case CommandKind::kHSet:
+    case CommandKind::kHMSet:
+    case CommandKind::kHSetNx:
+    case CommandKind::kHGet:
+    case CommandKind::kHMGet:
+    case CommandKind::kHDel:
+    case CommandKind::kHLen:
+    case CommandKind::kHExists:
+    case CommandKind::kHGetAll:
+    case CommandKind::kHKeys:
+    case CommandKind::kHVals:
+    case CommandKind::kHStrlen:
+    case CommandKind::kHIncrBy:
+    case CommandKind::kHIncrByFloat:
+    case CommandKind::kHRandField:
+    case CommandKind::kHScan:
+    case CommandKind::kSAdd:
+    case CommandKind::kSCard:
+    case CommandKind::kSIsMember:
+    case CommandKind::kSMembers:
+    case CommandKind::kSMIsMember:
+    case CommandKind::kSPop:
+    case CommandKind::kSRandMember:
+    case CommandKind::kSRem:
+    case CommandKind::kSScan:
+    case CommandKind::kZAdd:
+    case CommandKind::kZCard:
+    case CommandKind::kZCount:
+    case CommandKind::kZIncrBy:
+    case CommandKind::kZLexCount:
+    case CommandKind::kZMScore:
+    case CommandKind::kZPopMax:
+    case CommandKind::kZPopMin:
+    case CommandKind::kZRandMember:
+    case CommandKind::kZRange:
+    case CommandKind::kZRangeByLex:
+    case CommandKind::kZRangeByScore:
+    case CommandKind::kZRank:
+    case CommandKind::kZRem:
+    case CommandKind::kZRemRangeByLex:
+    case CommandKind::kZRemRangeByRank:
+    case CommandKind::kZRemRangeByScore:
+    case CommandKind::kZRevRange:
+    case CommandKind::kZRevRangeByLex:
+    case CommandKind::kZRevRangeByScore:
+    case CommandKind::kZRevRank:
+    case CommandKind::kZScan:
+    case CommandKind::kZScore:
+    case CommandKind::kGeoAdd:
+    case CommandKind::kGeoDist:
+    case CommandKind::kGeoHash:
+    case CommandKind::kGeoPos:
+    case CommandKind::kGeoRadiusRo:
+    case CommandKind::kGeoRadiusByMemberRo:
+    case CommandKind::kGeoSearch:
+    case CommandKind::kXAdd:
+    case CommandKind::kXDel:
+    case CommandKind::kXLen:
+    case CommandKind::kXRange:
+    case CommandKind::kXRevRange:
+    case CommandKind::kXTrim:
+    case CommandKind::kXSetId:
+    case CommandKind::kXAck:
+    case CommandKind::kXPending:
+    case CommandKind::kXClaim:
+    case CommandKind::kXAutoClaim:
     case CommandKind::kIncr:
     case CommandKind::kExpire:
     case CommandKind::kPExpire:
     case CommandKind::kPersist:
     case CommandKind::kTtl:
     case CommandKind::kPttl:
+    case CommandKind::kType:
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE

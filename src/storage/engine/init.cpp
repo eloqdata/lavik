@@ -10,8 +10,7 @@ absl::Status InitializeAddedDeviceMetadata(
     const std::string& path, std::uint64_t capacity_blocks,
     const std::vector<std::uint64_t>& epoch_values) {
   std::array<std::byte, kDirectIoAlignment> zero{};
-  absl::Status status =
-      WriteExactlyAt(path, zero, kDeviceLabelOffset, true);
+  absl::Status status = WriteExactlyAt(path, zero, kDeviceLabelOffset, true);
   if (!status.ok()) {
     return status;
   }
@@ -19,11 +18,11 @@ absl::Status InitializeAddedDeviceMetadata(
   for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
        ++page_index) {
     const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
-    const std::size_t payload_bytes = std::min(
-        kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
+    const std::size_t payload_bytes =
+        std::min(kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
     status = WriteExactlyAt(
-        path, zero,
-        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 1), false);
+        path, zero, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 1),
+        false);
     if (!status.ok()) {
       return status;
     }
@@ -36,8 +35,8 @@ absl::Status InitializeAddedDeviceMetadata(
             payload_bytes),
         page);
     status = WriteExactlyAt(
-        path, page,
-        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 0), true);
+        path, page, MetadataPageSlotOffset(kEpochMetadataOffset, page_index, 0),
+        true);
     if (!status.ok()) {
       return status;
     }
@@ -54,8 +53,7 @@ absl::Status InitializeAddedDeviceMetadata(
     }
     status = WriteExactlyAt(
         path, zero,
-        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1),
-        true);
+        MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1), true);
     if (!status.ok()) {
       return status;
     }
@@ -81,8 +79,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                             std::to_string(MaxInlineKeyBytes()) + " bytes");
   }
   if (options_.defrag_max_active_per_device_ == 0 ||
-      options_.defrag_max_active_per_device_ >
-          kDefragReserveBlocksPerDevice) {
+      options_.defrag_max_active_per_device_ > kDefragReserveBlocksPerDevice) {
     return absl::Status(
         absl::StatusCode::kInvalidArgument,
         "defrag concurrency must be between 1 and the per-device reserve");
@@ -140,8 +137,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         minimum_device_count == 0
             ? label.device_count_
             : std::min(minimum_device_count, label.device_count_);
-    maximum_device_count =
-        std::max(maximum_device_count, label.device_count_);
+    maximum_device_count = std::max(maximum_device_count, label.device_count_);
     if (!seen_device_ids.try_emplace(label.device_id_, i).second) {
       return absl::Status(absl::StatusCode::kFailedPrecondition,
                           "duplicate device id in configured storage files");
@@ -150,7 +146,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
 
   const std::uint32_t configured_device_count =
       static_cast<std::uint32_t>(labels.size());
-  std::vector<std::uint64_t> assigned_device_ids(labels.size(), kInvalidBlockId);
+  std::vector<std::uint64_t> assigned_device_ids(labels.size(),
+                                                 kInvalidBlockId);
   std::uint32_t previous_device_count = 0;
   if (has_existing_device) {
     previous_device_count = minimum_device_count;
@@ -334,23 +331,21 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         "a single-device storage set must be at least 80 MiB");
   }
 
-  if (has_existing_device &&
-      configured_device_count > previous_device_count) {
+  if (has_existing_device && configured_device_count > previous_device_count) {
     std::vector<std::uint64_t> canonical_epochs(kEpochValueCount, 1);
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (!labels[i].has_value()) {
         continue;
       }
-      for (std::size_t page_index = 0;
-           page_index < kEpochMetadataPageCount; ++page_index) {
-        const std::size_t byte_offset =
-            page_index * kMetadataPagePayloadBytes;
+      for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
+           ++page_index) {
+        const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
         const std::size_t payload_bytes = std::min(
             kMetadataPagePayloadBytes, kEpochMetadataBytes - byte_offset);
         auto loaded = ReadMetadataPagePair(
             options_.data_files_[i], kEpochMetadataOffset,
-            MetadataPageKind::kEpochs,
-            static_cast<std::uint32_t>(page_index), payload_bytes);
+            MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
+            payload_bytes);
         if (!loaded.ok()) {
           return loaded.status();
         }
@@ -359,10 +354,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         for (std::size_t value_index = 0; value_index < value_count;
              ++value_index) {
           std::uint64_t value = 0;
-          std::memcpy(&value,
-                      loaded->payload_.data() +
-                          value_index * sizeof(std::uint64_t),
-                      sizeof(value));
+          std::memcpy(
+              &value,
+              loaded->payload_.data() + value_index * sizeof(std::uint64_t),
+              sizeof(value));
           canonical_epochs[first_value + value_index] =
               std::max(canonical_epochs[first_value + value_index], value);
         }
@@ -514,8 +509,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           std::min(kMetadataPagePayloadBytes, bitmap_bytes - byte_offset);
       auto loaded = ReadMetadataPagePair(
           device.path_, kScanBitmapMetadataOffset,
-          MetadataPageKind::kScanBitmap,
-          static_cast<std::uint32_t>(page_index), payload_bytes);
+          MetadataPageKind::kScanBitmap, static_cast<std::uint32_t>(page_index),
+          payload_bytes);
       if (!loaded.ok()) {
         load_status = loaded.status();
         break;
@@ -584,7 +579,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (unsigned i = 0; i < worker_count; ++i) {
     stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_.back();
-    store.next_list_owner_id_ = static_cast<std::uint64_t>(i) + 1;
     store.partitions_.reserve((kLogicalStorageShards + worker_count - 1 - i) /
                               worker_count);
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;
@@ -605,6 +599,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   recovery_accounting_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+  orphan_extent_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   return absl::OkStatus();
 }
 
@@ -696,6 +692,72 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       ApplyRecoveredRecord(store, parked);
     }
   }
+
+  // Winner selection must see expired values so a newer expired version
+  // still suppresses every older version. Keep every expired winner charged
+  // until recovery can publish a durable tombstone: dropping an unshielded
+  // winner only in memory is also unsafe if a later boot observes a clock
+  // rollback.
+  struct RecoveryExpiredTombstone {
+    std::uint8_t db_id_ = 0;
+    Digest digest_{};
+    std::string key_;
+    bool shielding_ = false;
+  };
+  std::vector<RecoveryExpiredTombstone> expired_tombstones;
+  std::uint64_t recovery_now_ms = UnixTimeMillis();
+#ifndef NDEBUG
+  // Deterministically emulate a wall-clock rollback in recovery tests. This
+  // must not be used as a correctness mechanism: runtime expiration first
+  // publishes a durable tombstone and only then retires a collection graph,
+  // so an older root can never become the winning recoverable version merely
+  // because this clock moved backwards.
+  if (const char* configured = std::getenv("KEYLANE_RECOVERY_NOW_MS");
+      configured != nullptr) {
+    const char* end = configured + std::strlen(configured);
+    std::uint64_t overridden = 0;
+    const auto parsed = std::from_chars(configured, end, overridden);
+    if (parsed.ec == std::errc{} && parsed.ptr == end) {
+      recovery_now_ms = overridden;
+    }
+  }
+#endif
+  for (auto& partition : store.partitions_) {
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      auto& index = partition.indexes_[db_id];
+      index.ForEach([&](RecordIndex::Entry& entry) {
+        if (entry.value_.kind_ == RecordKind::kValue &&
+            IsExpired(entry.value_, recovery_now_ms)) {
+          std::string key;
+          Digest digest;
+          if (entry.key_complete()) {
+            key = std::string(entry.key());
+            digest = ComputeDigest(key);
+          } else {
+            const auto recovered_key =
+                store.recovery_external_keys_.find(&entry);
+            if (recovered_key == store.recovery_external_keys_.end()) {
+              status = absl::InternalError(
+                  "expired recovered winner has no complete key");
+              return;
+            }
+            key = recovered_key->second;
+            digest = entry.external_key_digest();
+          }
+          expired_tombstones.push_back(RecoveryExpiredTombstone{
+              .db_id_ = db_id,
+              .digest_ = digest,
+              .key_ = std::move(key),
+              .shielding_ = entry.value_.shielding_,
+          });
+        }
+      });
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
+    }
+  }
   store.recovery_tx_records_.clear();
   store.recovery_tx_records_.shrink_to_fit();
   store.recovery_lsns_.clear();
@@ -710,11 +772,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
-  struct RecoveredListRoot {
-    ListState state_;
-    std::uint64_t owner_id_ = 0;
-  };
-  std::vector<RecoveredListRoot> recovered_list_roots;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
@@ -725,244 +782,28 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             .allocation_epoch_ = location.allocation_epoch_,
             .bytes_ = location.total_disk_bytes_,
         });
-        if (const std::optional<ListState> list_state =
-                ListStateFor(store, &entry);
-            list_state.has_value()) {
-          ListState bound = *list_state;
-          const std::uint64_t owner_id = store.next_list_owner_id_;
-          if (owner_id == 0) {
-            Fail(absl::ResourceExhaustedError(
-                "runtime List owner id space is exhausted"));
+        const ExtentManifest extents = ExtentsFor(store, &entry);
+        if (!location.external_ || extents == nullptr) return;
+        for (std::size_t extent_index = 0; extent_index < extents->size();
+             ++extent_index) {
+          const ExtentRef& extent = extents->at(extent_index);
+          const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
+          if (extent_owner >= worker_count_) {
+            Fail(absl::InternalError(
+                "manifest references an unscanned extent"));
             return;
           }
-          store.next_list_owner_id_ =
-              owner_id > std::numeric_limits<std::uint64_t>::max() -
-                             worker_count_
-                  ? 0
-                  : owner_id + worker_count_;
-          bound.owner_id_ = owner_id;
-          store.list_states_.insert_or_assign(&entry, bound);
-          std::string owner_key;
-          if (entry.key_complete()) {
-            owner_key = std::string(entry.key());
-          } else {
-            const auto recovered_key =
-                store.recovery_external_keys_.find(&entry);
-            if (recovered_key == store.recovery_external_keys_.end()) {
-              Fail(absl::InternalError(
-                  "recovered segmented List has no complete key"));
-              return;
-            }
-            owner_key = recovered_key->second;
-          }
-          store.list_owners_.insert_or_assign(
-              owner_id,
-              ListOwnerRuntime{
-                  .db_id_ = db_id,
-                  .key_ = owner_key,
-                  .digest_ = entry.key_complete()
-                                 ? ComputeDigest(owner_key)
-                                 : entry.external_key_digest(),
-                  .index_generation_ = store.index_generations_[db_id],
-              });
-          recovered_list_roots.push_back(
-              RecoveredListRoot{.state_ = bound, .owner_id_ = owner_id});
-        }
-        const ExtentManifest extents = ExtentsFor(store, &entry);
-        if (location.external_ && extents != nullptr) {
-          auto add_extent = [&](const ExtentRef& extent,
-                                std::uint32_t extent_index) {
-            // An extent block's owner is derived from its own block id,
-            // so it is unrelated to the owner of the block holding this
-            // manifest. Charging the reference to the record's owner
-            // sends it to a worker that has no state for the block,
-            // which reads as corruption and fails recovery outright.
-            const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
-            if (extent_owner >= worker_count_) {
-              Fail(absl::Status(absl::StatusCode::kInternal,
-                                "manifest references an unscanned extent"));
-              return false;
-            }
-            live_by_owner[extent_owner].push_back(RecoveryLiveReference{
-                .block_id_ = extent.block_id_,
-                .allocation_epoch_ = extent.allocation_epoch_,
-                .bytes_ = extent.payload_bytes_,
-                .extent_ = true,
-                .extent_index_ = extent_index,
-                .extent_payload_checksum_ = extent.payload_checksum_,
-            });
-            return true;
-          };
-          for (std::size_t extent_index = 0; extent_index < extents->size();
-               ++extent_index) {
-            if (!add_extent(extents->at(extent_index),
-                            static_cast<std::uint32_t>(extent_index))) {
-              return;
-            }
-          }
+          live_by_owner[extent_owner].push_back(RecoveryLiveReference{
+              .block_id_ = extent.block_id_,
+              .allocation_epoch_ = extent.allocation_epoch_,
+              .bytes_ = extent.payload_bytes_,
+              .extent_ = true,
+              .extent_index_ = static_cast<std::uint32_t>(extent_index),
+              .extent_payload_checksum_ = extent.payload_checksum_,
+          });
         }
       });
     }
-  }
-
-  // Collection objects have no index entries of their own. Charge only the
-  // objects reachable from each winning List root; unpublished COW paths and
-  // aborted transaction paths consequently stay at zero live bytes and are
-  // reclaimed without a second disk scan.
-  struct PendingListObject {
-    DirectRecordRef reference_;
-    bool directory_ = false;
-    std::uint64_t owner_id_ = 0;
-    DirectRecordRef parent_{};
-    std::uint32_t parent_slot_ = 0;
-    bool parent_is_leaf_ = false;
-  };
-  std::vector<std::vector<
-      std::pair<DirectRecordIdentity, ExtentManifest>>>
-      collection_manifests_by_owner(worker_count_);
-  std::vector<std::vector<
-      std::pair<DirectRecordIdentity, ListObjectRuntimeMeta>>>
-      runtime_objects_by_owner(worker_count_);
-  absl::flat_hash_set<DirectRecordIdentity> visited_list_objects;
-  std::vector<PendingListObject> pending_list_objects;
-  auto fail_list_recovery = [this](absl::Status failure) {
-    Fail(failure);
-    return failure;
-  };
-  for (const RecoveredListRoot& root : recovered_list_roots) {
-    pending_list_objects.push_back(
-        PendingListObject{root.state_.directory_root_, true,
-                          root.owner_id_, {}, 0, false});
-  }
-  while (!pending_list_objects.empty()) {
-    PendingListObject object = pending_list_objects.back();
-    pending_list_objects.pop_back();
-    const std::uint16_t owner = BlockOwner(object.reference_.block_id_);
-    if (owner >= worker_count_) {
-      co_return fail_list_recovery(absl::Status(
-          absl::StatusCode::kInternal,
-          "List tree references an unscanned block"));
-    }
-    const DirectRecordIdentity identity{
-        object.reference_.block_id_, object.reference_.allocation_epoch_,
-        object.reference_.record_offset_};
-    if (!visited_list_objects.insert(identity).second) {
-      co_return fail_list_recovery(absl::InternalError(
-          "List tree contains a cycle or shared physical object"));
-    }
-    const WorkerStore& object_store = *stores_[owner];
-    const auto recovered = object_store.recovery_list_objects_.find(identity);
-    if (recovered == object_store.recovery_list_objects_.end()) {
-      co_return fail_list_recovery(absl::InternalError(absl::StrCat(
-          "List tree reference was not found by the physical scan: block=",
-          object.reference_.block_id_, " epoch=",
-          object.reference_.allocation_epoch_, " offset=",
-          object.reference_.record_offset_, " owner=", owner)));
-    }
-    if (recovered->second.reference_ != object.reference_ ||
-        object.directory_ != recovered->second.directory_.has_value()) {
-      const DirectRecordRef& scanned = recovered->second.reference_;
-      co_return fail_list_recovery(absl::InternalError(absl::StrCat(
-          "List tree reference does not match the physical scan: block=",
-          object.reference_.block_id_, " epoch=",
-          object.reference_.allocation_epoch_, " offset=",
-          object.reference_.record_offset_, " expected_bytes=",
-          object.reference_.total_disk_bytes_, " scanned_bytes=",
-          scanned.total_disk_bytes_, " expected_crc=",
-          object.reference_.payload_checksum_, " scanned_crc=",
-          scanned.payload_checksum_, " expected_directory=",
-          object.directory_, " scanned_directory=",
-          recovered->second.directory_.has_value())));
-    }
-    live_by_owner[owner].push_back(RecoveryLiveReference{
-        .block_id_ = object.reference_.block_id_,
-        .allocation_epoch_ = object.reference_.allocation_epoch_,
-        .bytes_ = object.reference_.total_disk_bytes_,
-    });
-    runtime_objects_by_owner[owner].push_back(
-        {identity,
-         ListObjectRuntimeMeta{
-             .reference_ = recovered->second.reference_,
-             .directory_ = recovered->second.directory_,
-             .extents_ = recovered->second.extents_,
-             .owner_id_ = object.owner_id_,
-             .logical_size_ = recovered->second.logical_size_,
-             .parent_ = object.parent_,
-             .parent_slot_ = object.parent_slot_,
-             .parent_is_leaf_ = object.parent_is_leaf_,
-         }});
-    if (const ExtentManifest& manifest = recovered->second.extents_;
-        manifest != nullptr) {
-      collection_manifests_by_owner[owner].push_back({identity, manifest});
-      for (std::size_t extent_index = 0;
-           extent_index < manifest->size(); ++extent_index) {
-        const ExtentRef& extent = manifest->at(extent_index);
-        const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
-        if (extent_owner >= worker_count_) {
-          co_return fail_list_recovery(absl::Status(
-              absl::StatusCode::kInternal,
-              "List segment references an unscanned extent"));
-        }
-        live_by_owner[extent_owner].push_back(RecoveryLiveReference{
-            .block_id_ = extent.block_id_,
-            .allocation_epoch_ = extent.allocation_epoch_,
-            .bytes_ = extent.payload_bytes_,
-            .extent_ = true,
-            .extent_index_ = static_cast<std::uint32_t>(extent_index),
-            .extent_payload_checksum_ = extent.payload_checksum_,
-        });
-      }
-    }
-    if (!object.directory_) continue;
-    const ListDirectoryNode& directory = *recovered->second.directory_;
-    if (directory.leaf()) {
-      for (std::size_t slot = 0; slot < directory.segments_.size(); ++slot) {
-        const ListSegmentMeta& segment = directory.segments_[slot];
-        pending_list_objects.push_back(
-            PendingListObject{segment.segment_, false, object.owner_id_,
-                              object.reference_,
-                              static_cast<std::uint32_t>(slot),
-                              true});
-      }
-    } else {
-      for (std::size_t slot = 0; slot < directory.children_.size(); ++slot) {
-        const ListDirectoryChildMeta& child = directory.children_[slot];
-        pending_list_objects.push_back(
-            PendingListObject{child.child_, true, object.owner_id_,
-                              object.reference_,
-                              static_cast<std::uint32_t>(slot), false});
-      }
-    }
-  }
-
-  for (unsigned owner = 0; owner < worker_count_; ++owner) {
-    if (collection_manifests_by_owner[owner].empty() &&
-        runtime_objects_by_owner[owner].empty()) {
-      continue;
-    }
-    auto install_manifests =
-        [this, owner,
-         manifests = std::move(collection_manifests_by_owner[owner]),
-         objects = std::move(runtime_objects_by_owner[owner])]() mutable {
-          WorkerStore& owner_store = *stores_[owner];
-          for (auto& [identity, manifest] : manifests) {
-            owner_store.collection_object_manifests_.insert_or_assign(
-                identity, std::move(manifest));
-          }
-          for (auto& [identity, object] : objects) {
-            owner_store.list_objects_.insert_or_assign(identity,
-                                                        std::move(object));
-          }
-          return absl::OkStatus();
-        };
-    absl::Status installed;
-    if (owner == worker.id()) {
-      installed = install_manifests();
-    } else {
-      installed =
-          co_await celer::SubmitTo(owner, std::move(install_manifests));
-    }
-    if (!installed.ok()) co_return fail_list_recovery(installed);
   }
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     if (live_by_owner[owner].empty()) {
@@ -1016,10 +857,6 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
   store.recovered_extents_.clear();
-  store.recovery_external_keys_.clear();
-  store.recovery_external_keys_.rehash(0);
-  store.recovery_list_objects_.clear();
-  store.recovery_list_objects_.rehash(0);
 
   std::vector<std::vector<std::uint64_t>> free_by_device(devices_.size());
   for (std::uint64_t block_id : zero_blocks) {
@@ -1069,6 +906,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (!status.ok()) {
     co_return status;
   }
+  // Reclaim orphan extents before writing recovery tombstones. On a full
+  // device these may be the only reusable blocks, so deferring this pass
+  // until after DeleteLocked makes every restart fail at the same point.
   auto orphan_extents = std::make_shared<std::vector<ExtentRef>>();
   ForEachOwnedBlock(store, [&](std::uint64_t block_id, BlockState& state) {
     if (state.kind_ == BlockKind::kPayloadExtent && state.live_bytes_ == 0) {
@@ -1084,9 +924,83 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   });
   if (!orphan_extents->empty()) {
-    SpawnExtentReclaim(store, std::shared_ptr<const std::vector<ExtentRef>>(
-                                  std::move(orphan_extents)));
+    status = co_await ReclaimExtents(
+        &store, std::shared_ptr<const std::vector<ExtentRef>>(
+                    std::move(orphan_extents)));
+    if (!status.ok()) {
+      Fail(status);
+      co_return status;
+    }
   }
+  status = co_await orphan_extent_barrier_->Wait(worker);
+  if (!status.ok()) {
+    co_return status;
+  }
+  // The recovered roots above have now been charged exactly once and free
+  // blocks are available. Normal AppendLocked accounting can therefore
+  // replace every expired winner with a tombstone without either
+  // double-charging the new record or exposing a side-state-less collection
+  // to clients.
+  for (const RecoveryExpiredTombstone& expired : expired_tombstones) {
+    auto deleted =
+        co_await DeleteLocked(expired.db_id_, expired.key_, expired.digest_);
+    if (!deleted.ok()) {
+      if (deleted.status().code() !=
+              absl::StatusCode::kResourceExhausted ||
+          expired.shielding_) {
+        Fail(deleted.status());
+        co_return deleted.status();
+      }
+
+      // The same full-device escape valve used by active expiration is safe
+      // for an unshielded recovered winner: no older version can become
+      // visible, and this record remains expired on disk. A shielding winner
+      // must still publish a tombstone before it can be forgotten.
+      auto& partition = PartitionForKey(store, expired.key_);
+      std::optional<RetiredRecord> retired;
+      ExtentManifest value_extents;
+      co_await store.store_state_mutex_.Lock();
+      {
+        UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+        auto resolved = co_await FindVerifiedEntry(
+            store, partition.indexes_[expired.db_id_], expired.digest_,
+            expired.key_);
+        if (!resolved.ok()) {
+          Fail(resolved.status());
+          co_return resolved.status();
+        }
+        RecordIndex::Entry* current = *resolved;
+        if (current == nullptr ||
+            current->value_.kind_ != RecordKind::kValue ||
+            !IsExpired(current->value_, recovery_now_ms)) {
+          continue;
+        }
+        if (current->value_.shielding_) {
+          Fail(deleted.status());
+          co_return deleted.status();
+        }
+        const RecordLocation dropped = current->value_;
+        value_extents = ExtentsFor(store, current);
+        retired = RetiredRecordOf(dropped, DependentExtentsFor(store, current));
+        --partition.live_key_count_[expired.db_id_];
+        --store.live_key_count_[expired.db_id_];
+        --partition.expiring_key_count_[expired.db_id_];
+        store.external_manifests_.erase(current);
+        store.recovery_external_keys_.erase(current);
+        partition.indexes_[expired.db_id_].Erase(current);
+        if (!dropped.external_ || dropped.key_external_) value_extents.reset();
+      }
+      if (value_extents != nullptr) SpawnExtentReclaim(store, value_extents);
+      absl::Status dead = co_await MarkRecordDead(*retired);
+      if (!dead.ok()) {
+        store.write_failed_ = true;
+        Fail(dead);
+        co_return dead;
+      }
+    }
+  }
+  store.recovery_external_keys_.clear();
+  store.recovery_external_keys_.rehash(0);
   worker.SpawnRoot(PeriodicFlush(&store));
   if (options_.expiration_authority_) {
     worker.SpawnBackground(ActiveExpiration(&store));
@@ -1134,6 +1048,7 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   recovery_barrier_->Abort(status);
   recovery_accounting_barrier_->Abort(status);
   free_list_barrier_->Abort(status);
+  orphan_extent_barrier_->Abort(status);
 }
 
 void StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
