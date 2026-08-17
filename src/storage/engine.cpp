@@ -33,6 +33,11 @@ std::size_t StorageEngine::LocalSize(std::uint8_t db_id) const noexcept {
   return impl_->LocalSize(db_id);
 }
 
+Task<absl::StatusOr<std::optional<std::string>>> StorageEngine::RandomKeyLocal(
+    std::uint8_t db_id) {
+  return impl_->RandomKeyLocal(db_id);
+}
+
 Task<absl::StatusOr<ScanBatch>> StorageEngine::ScanPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) {
@@ -192,11 +197,6 @@ Task<bool> StorageEngine::Exists(std::uint8_t db_id, std::string_view key) {
   return impl_->Exists(db_id, key);
 }
 
-Task<absl::StatusOr<std::int64_t>> StorageEngine::Increment(
-    std::uint8_t db_id, std::string_view key) {
-  return impl_->Increment(db_id, key);
-}
-
 Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ReadLatencyTrace* trace) {
@@ -240,9 +240,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSetLocked(
 
 Task<absl::Status> StorageEngine::ExecuteCompactLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    ValueType value_type, bool read_only,
-    const CompactValueCallback& callback, TxShardWrites* tx,
-    std::uint64_t now_ms) {
+    ValueType value_type, bool read_only, const CompactValueCallback& callback,
+    TxShardWrites* tx, std::uint64_t now_ms) {
   return impl_->ExecuteCompactLocked(db_id, key, digest, value_type, read_only,
                                      callback, tx, now_ms);
 }
@@ -251,6 +250,19 @@ Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
                                                         std::string_view key,
                                                         const Digest& digest) {
   return impl_->GetExpirationLocked(db_id, key, digest);
+}
+
+Task<absl::StatusOr<RawValue>> StorageEngine::ReadRawValueLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+  return impl_->ReadRawValueLocked(db_id, key, digest);
+}
+
+Task<absl::Status> StorageEngine::WriteRawValueLocked(std::uint8_t db_id,
+                                                      std::string_view key,
+                                                      const Digest& digest,
+                                                      const RawValue& value,
+                                                      TxShardWrites* tx) {
+  return impl_->WriteRawValueLocked(db_id, key, digest, value, tx);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
@@ -273,12 +285,6 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,
   return impl_->ExistsLocked(db_id, key, digest);
 }
 
-Task<absl::StatusOr<std::int64_t>> StorageEngine::IncrementLocked(
-    std::uint8_t db_id, std::string_view key, const Digest& digest,
-    TxShardWrites* tx) {
-  return impl_->IncrementLocked(db_id, key, digest, tx);
-}
-
 Task<absl::Status> StorageEngine::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards) {
   return impl_->CommitTxWrites(txid, std::move(shards));
@@ -297,8 +303,8 @@ void StorageEngine::NoteTxCommitFinished() noexcept {
   impl_->NoteTxCommitFinished();
 }
 
-Task<absl::Status> StorageEngine::RollbackTxLocal(
-    std::uint64_t txid, TxShardWrites* compensation) {
+Task<absl::Status> StorageEngine::RollbackTxLocal(std::uint64_t txid,
+                                                  TxShardWrites* compensation) {
   return impl_->RollbackTxLocal(txid, compensation);
 }
 

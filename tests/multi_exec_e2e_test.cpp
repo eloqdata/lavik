@@ -330,6 +330,61 @@ int main(int argc, char** argv) {
     Expect(client.Command({"MGET", "xa", "xb", "xc"}),
            "*3\r\n$-1\r\n$-1\r\n" + Bulk("cv"), "state after cross EXEC");
 
+    Expect(client.Command({"MSET", "ua", "1", "ub", "2"}), "+OK",
+           "UNLINK transaction seed");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI unlink");
+    Expect(client.Command({"UNLINK", "ua", "ub", "missing"}), "+QUEUED",
+           "queue UNLINK");
+    Expect(client.Command({"EXEC"}), "*1\r\n:2", "EXEC unlink");
+    Expect(client.Command({"MGET", "ua", "ub"}), "*2\r\n$-1\r\n$-1",
+           "state after EXEC UNLINK");
+
+    Expect(client.Command({"SELECT", "14"}), "+OK", "RANDOMKEY transaction db");
+    Expect(client.Command({"SET", "transaction-random", "v"}), "+OK",
+           "RANDOMKEY transaction seed");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI RANDOMKEY");
+    Expect(client.Command({"RANDOMKEY"}), "+QUEUED", "queue RANDOMKEY");
+    Expect(client.Command({"TOUCH", "transaction-random", "transaction-random",
+                           "missing"}),
+           "+QUEUED", "queue TOUCH");
+    Expect(client.Command({"EXEC"}),
+           "*2\r\n" + Bulk("transaction-random") + "\r\n:2",
+           "EXEC RANDOMKEY and TOUCH");
+    Expect(client.Command({"SELECT", "0"}), "+OK",
+           "RANDOMKEY transaction return db0");
+
+    Expect(client.Command({"SET", "transaction-copy-source", "value"}), "+OK",
+           "COPY transaction seed");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI COPY");
+    Expect(client.Command({"COPY", "transaction-copy-source",
+                           "transaction-copy-destination", "DB", "3"}),
+           "+QUEUED", "queue cross-db COPY");
+    Expect(client.Command(
+               {"PEXPIREAT", "transaction-copy-source", "4102444800000"}),
+           "+QUEUED", "queue PEXPIREAT");
+    Expect(client.Command({"PEXPIRETIME", "transaction-copy-source"}),
+           "+QUEUED", "queue PEXPIRETIME");
+    Expect(client.Command({"EXEC"}), "*3\r\n:1\r\n:1\r\n:4102444800000",
+           "EXEC COPY and absolute expiration");
+    Expect(client.Command({"SELECT", "3"}), "+OK",
+           "COPY transaction destination DB");
+    Expect(client.Command({"GET", "transaction-copy-destination"}),
+           Bulk("value"), "COPY transaction destination value");
+    Expect(client.Command({"SELECT", "0"}), "+OK",
+           "COPY transaction return db0");
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI invalid COPY");
+    Expect(client.Command(
+               {"COPY", "transaction-copy-source", "bad-copy", "DB", "bad"}),
+           "+QUEUED", "queue invalid COPY");
+    Expect(client.Command({"SET", "after-invalid-copy", "ok"}), "+QUEUED",
+           "queue after invalid COPY");
+    Expect(client.Command({"EXEC"}),
+           "*2\r\n-ERR value is not an integer or out of range\r\n+OK",
+           "EXEC invalid COPY remains runtime error");
+    Expect(client.Command({"GET", "after-invalid-copy"}), Bulk("ok"),
+           "command after invalid COPY ran");
+
     // Nested MULTI errors without dooming the transaction.
     Expect(client.Command({"MULTI"}), "+OK", "MULTI nested");
     Expect(client.Command({"MULTI"}), "-ERR MULTI calls can not be nested",

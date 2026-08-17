@@ -172,16 +172,42 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("get", CommandKind::kGet);
   CheckKind("GeT", CommandKind::kGet);
   CheckKind("SET", CommandKind::kSet);
+  CheckKind("APPEND", CommandKind::kAppend);
+  CheckKind("DECR", CommandKind::kDecr);
+  CheckKind("DECRBY", CommandKind::kDecrBy);
+  CheckKind("GETDEL", CommandKind::kGetDel);
+  CheckKind("GETEX", CommandKind::kGetEx);
+  CheckKind("GETRANGE", CommandKind::kGetRange);
+  CheckKind("GETSET", CommandKind::kGetSet);
+  CheckKind("INCRBY", CommandKind::kIncrBy);
+  CheckKind("INCRBYFLOAT", CommandKind::kIncrByFloat);
+  CheckKind("LCS", CommandKind::kLcs);
+  CheckKind("MSETNX", CommandKind::kMSetNx);
+  CheckKind("PSETEX", CommandKind::kPSetEx);
+  CheckKind("SETEX", CommandKind::kSetEx);
+  CheckKind("SETNX", CommandKind::kSetNx);
+  CheckKind("SETRANGE", CommandKind::kSetRange);
+  CheckKind("SUBSTR", CommandKind::kSubstr);
   CheckKind("LPUSH", CommandKind::kLPush);
   CheckKind("DEL", CommandKind::kDel);
+  CheckKind("UNLINK", CommandKind::kUnlink);
+  CheckKind("RENAME", CommandKind::kRename);
+  CheckKind("RENAMENX", CommandKind::kRenameNx);
+  CheckKind("COPY", CommandKind::kCopy);
   CheckKind("EXISTS", CommandKind::kExists);
+  CheckKind("TOUCH", CommandKind::kTouch);
+  CheckKind("RANDOMKEY", CommandKind::kRandomKey);
   CheckKind("INCR", CommandKind::kIncr);
   CheckKind("STRLEN", CommandKind::kStrlen);
   CheckKind("EXPIRE", CommandKind::kExpire);
   CheckKind("PEXPIRE", CommandKind::kPExpire);
+  CheckKind("EXPIREAT", CommandKind::kExpireAt);
+  CheckKind("PEXPIREAT", CommandKind::kPExpireAt);
   CheckKind("PERSIST", CommandKind::kPersist);
   CheckKind("TTL", CommandKind::kTtl);
   CheckKind("PTTL", CommandKind::kPttl);
+  CheckKind("EXPIRETIME", CommandKind::kExpireTime);
+  CheckKind("PEXPIRETIME", CommandKind::kPExpireTime);
   CheckKind("PING", CommandKind::kPing);
   CheckKind("ECHO", CommandKind::kEcho);
   CheckKind("SELECT", CommandKind::kSelect);
@@ -193,6 +219,10 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
   CheckKind("ZADD", CommandKind::kZAdd);
+  CheckKind("ZMPOP", CommandKind::kZMPop);
+  CheckKind("BZMPOP", CommandKind::kBZMPop);
+  CheckKind("BZPOPMIN", CommandKind::kBZPopMin);
+  CheckKind("BZPOPMAX", CommandKind::kBZPopMax);
   CheckKind("ZRANGESTORE", CommandKind::kZRangeStore);
   CheckKind("GEOSEARCH", CommandKind::kGeoSearch);
   CheckKind("GEOSEARCHSTORE", CommandKind::kGeoSearchStore);
@@ -211,8 +241,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   EXPECT_EQ(FindCommand("zrevrangebyscore")->max_args_, 0);
   EXPECT_EQ(FindCommand("geopos")->min_args_, 2);
   EXPECT_EQ(FindCommand("geohash")->min_args_, 2);
-  for (const char* name : {"blpop", "brpop", "blmove", "brpoplpush", "blmpop",
-                           "xread", "xreadgroup"}) {
+  for (const char* name :
+       {"blpop", "brpop", "blmove", "brpoplpush", "blmpop", "bzmpop",
+        "bzpopmin", "bzpopmax", "xread", "xreadgroup"}) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdMayBlock) != 0,
                  std::string(name) + " should have kCmdMayBlock");
@@ -227,11 +258,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
-  const char* write_cmds[] = {"set",     "lpush",   "incr",
-                              "del",     "expire",  "pexpire",
-                              "persist", "flushdb", "flushall"};
-  const char* read_cmds[] = {"get",  "strlen", "ttl",    "pttl",
-                             "type", "exists", "dbsize", "scan"};
+  const char* write_cmds[] = {"set",     "lpush",    "incr",      "del",
+                              "unlink",  "rename",   "renamenx",  "expire",
+                              "pexpire", "expireat", "pexpireat", "copy",
+                              "persist", "flushdb",  "flushall"};
+  const char* read_cmds[] = {"get",        "strlen",      "ttl",    "pttl",
+                             "expiretime", "pexpiretime", "type",   "exists",
+                             "touch",      "randomkey",   "dbsize", "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) != 0,
@@ -247,9 +280,12 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                  std::string(name) + " should not have kCmdWrite");
   }
   {
-    const char* gated[] = {"dbsize", "scan",    "type",  "del",    "exists",
-                           "get",    "strlen",  "set",   "lpush",  "incr",
-                           "expire", "pexpire", "persist", "ttl", "pttl"};
+    const char* gated[] = {
+        "dbsize",     "scan",        "type",    "del",       "unlink",
+        "rename",     "renamenx",    "exists",  "get",       "strlen",
+        "set",        "lpush",       "incr",    "expire",    "pexpire",
+        "expireat",   "pexpireat",   "persist", "ttl",       "pttl",
+        "expiretime", "pexpiretime", "touch",   "randomkey", "copy"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
@@ -266,8 +302,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     }
   }
   {
-    const char* no_keys[] = {"ping", "echo",    "select",   "dbsize",
-                             "scan", "flushdb", "flushall", "tombraider"};
+    const char* no_keys[] = {"ping",    "echo",     "select",
+                             "dbsize",  "scan",     "randomkey",
+                             "flushdb", "flushall", "tombraider"};
     for (const char* name : no_keys) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -275,9 +312,11 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                        spec->first_key_ == 0,
                    std::string(name) + " should be keyless");
     }
-    const char* keyed[] = {"get",     "set",     "lpush",  "del",
-                           "exists",  "incr",    "strlen", "expire",
-                           "pexpire", "persist", "ttl",    "pttl"};
+    const char* keyed[] = {
+        "get",         "set",       "lpush",   "del",    "unlink", "rename",
+        "renamenx",    "exists",    "incr",    "strlen", "expire", "pexpire",
+        "expireat",    "pexpireat", "persist", "ttl",    "pttl",   "expiretime",
+        "pexpiretime", "copy",      "touch"};
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&
@@ -311,8 +350,35 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("del", 1, false);
   CheckArity("del", 2, true);
   CheckArity("del", 100, true);
+  CheckArity("unlink", 1, false);
+  CheckArity("unlink", 2, true);
+  CheckArity("unlink", 100, true);
+  CheckArity("rename", 2, false);
+  CheckArity("rename", 3, true);
+  CheckArity("rename", 4, false);
+  CheckArity("renamenx", 3, true);
+  CheckArity("copy", 2, false);
+  CheckArity("copy", 3, true);
+  CheckArity("copy", 7, true);
+  CheckArity("touch", 1, false);
+  CheckArity("touch", 2, true);
+  CheckArity("touch", 100, true);
+  CheckArity("randomkey", 1, true);
+  CheckArity("randomkey", 2, false);
+  CheckArity("append", 3, true);
+  CheckArity("getex", 2, true);
+  CheckArity("getex", 4, true);
+  CheckArity("getex", 5, true);  // parser reports illegal option shapes
+  CheckArity("lcs", 3, true);
+  CheckArity("lcs", 8, true);
+  CheckArity("msetnx", 3, true);
+  CheckArity("setex", 4, true);
+  CheckArity("setrange", 4, true);
   CheckArity("dbsize", 1, true);
   CheckArity("dbsize", 2, false);
+  CheckArity("expireat", 3, true);
+  CheckArity("expireat", 4, true);
+  CheckArity("pexpiretime", 2, true);
   CheckArity("flushall", 1, true);
   CheckArity("flushall", 2, true);
   CheckArity("tombraider", 1, false);
@@ -333,15 +399,42 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                  "SET key view must cover only the key");
   }
   {
+    KeyIndexView view = Keys("lcs", 7);
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 2 && view.count() == 2,
+                 "LCS key view must cover both strings");
+  }
+  {
+    KeyIndexView view = Keys("msetnx", 7);
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 6 && view.step_ == 2 &&
+                     view.count() == 3,
+                 "MSETNX key view mismatch");
+  }
+  {
     KeyIndexView view = Keys("del", 5);  // DEL k1 k2 k3 k4
     EXPECT_CHECK(view.first_ == 1 && view.last_ == 4 && view.step_ == 1 &&
                      view.count() == 4,
                  "DEL key view mismatch");
   }
   {
+    KeyIndexView view = Keys("unlink", 5);  // UNLINK k1 k2 k3 k4
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 4 && view.step_ == 1 &&
+                     view.count() == 4,
+                 "UNLINK key view mismatch");
+  }
+  {
     KeyIndexView view = Keys("exists", 2);
     EXPECT_CHECK(view.first_ == 1 && view.last_ == 1 && view.count() == 1,
                  "EXISTS single-key view mismatch");
+  }
+  {
+    KeyIndexView view = Keys("copy", 7);
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 2 && view.count() == 2,
+                 "COPY key view mismatch");
+  }
+  {
+    KeyIndexView view = Keys("touch", 5);
+    EXPECT_CHECK(view.first_ == 1 && view.last_ == 4 && view.count() == 4,
+                 "TOUCH key view mismatch");
   }
   {
     KeyIndexView view = Keys("ping", 1);
@@ -372,7 +465,7 @@ TEST(CommandTableTest, ResolvesStreamReadMovableKeys) {
   const CommandSpec* group_read = FindCommand("xreadgroup");
   ASSERT_NE(group_read, nullptr);
   const std::vector<std::string> group_args = {
-      "XREADGROUP", "GROUP", "group", "STREAMS", "COUNT", "1",
+      "XREADGROUP", "GROUP", "group",  "STREAMS", "COUNT", "1",
       "STREAMS",    "first", "second", "0",       ">"};
   auto group_keys = DetermineKeys(*group_read, group_args);
   ASSERT_TRUE(group_keys.ok()) << group_keys.status();
@@ -385,19 +478,17 @@ TEST(CommandTableTest, ResolvesStreamReadMovableKeys) {
   oversized.reserve(2 + 2 * kTooManyStreamKeys);
   for (std::size_t i = 0; i < kTooManyStreamKeys; ++i)
     oversized.push_back("key");
-  for (std::size_t i = 0; i < kTooManyStreamKeys; ++i)
-    oversized.push_back("0");
+  for (std::size_t i = 0; i < kTooManyStreamKeys; ++i) oversized.push_back("0");
   EXPECT_FALSE(DetermineKeys(*read, oversized).ok());
 }
 
 TEST(CommandTableTest, AcceptsExtendedPendingIdleForm) {
   const CommandSpec* pending = FindCommand("xpending");
   ASSERT_NE(pending, nullptr);
-  EXPECT_TRUE(DetermineKeys(
-                  *pending,
-                  std::vector<std::string>{"XPENDING", "stream", "group",
-                                           "IDLE", "1000", "-", "+", "10",
-                                           "consumer"})
+  EXPECT_TRUE(DetermineKeys(*pending,
+                            std::vector<std::string>{
+                                "XPENDING", "stream", "group", "IDLE", "1000",
+                                "-", "+", "10", "consumer"})
                   .ok());
 }
 
@@ -453,8 +544,9 @@ TEST(CommandTableTest, ResolvesSortedSetAndGeoStoreKeys) {
             ? std::vector<std::string>{"ZRANGESTORE", "destination", "source",
                                        "0", "-1"}
             : std::vector<std::string>{
-                  "GEOSEARCHSTORE", "destination", "source", "FROMLONLAT",
-                  "0", "0", "BYRADIUS", "1", "km"};
+                  "GEOSEARCHSTORE", "destination", "source",
+                  "FROMLONLAT",     "0",           "0",
+                  "BYRADIUS",       "1",           "km"};
     auto keys = DetermineKeys(*spec, args);
     ASSERT_TRUE(keys.ok()) << keys.status();
     EXPECT_EQ(keys->first_, 1);
@@ -501,6 +593,33 @@ TEST(CommandTableTest, ResolvesMovableListPopKeys) {
   for (std::size_t i = 0; i < 65535; ++i) overflowing.push_back("key");
   overflowing.push_back("LEFT");
   EXPECT_FALSE(DetermineKeys(*lmpop, overflowing).ok());
+}
+
+TEST(CommandTableTest, ResolvesMovableSortedSetPopKeys) {
+  const CommandSpec* zmpop = FindCommand("zmpop");
+  ASSERT_NE(zmpop, nullptr);
+  const std::vector<std::string> zm_args{"ZMPOP", "2",     "first", "second",
+                                         "MIN",   "COUNT", "3"};
+  auto zm_keys = DetermineKeys(*zmpop, zm_args);
+  ASSERT_TRUE(zm_keys.ok()) << zm_keys.status();
+  EXPECT_EQ(zm_keys->first_, 2);
+  EXPECT_EQ(zm_keys->last_, 3);
+
+  const CommandSpec* bzmpop = FindCommand("bzmpop");
+  ASSERT_NE(bzmpop, nullptr);
+  const std::vector<std::string> bzm_args{"BZMPOP", "1", "3",  "a",
+                                          "b",      "c", "MAX"};
+  auto bzm_keys = DetermineKeys(*bzmpop, bzm_args);
+  ASSERT_TRUE(bzm_keys.ok()) << bzm_keys.status();
+  EXPECT_EQ(bzm_keys->first_, 3);
+  EXPECT_EQ(bzm_keys->last_, 5);
+
+  const CommandSpec* bzpop = FindCommand("bzpopmin");
+  ASSERT_NE(bzpop, nullptr);
+  auto bz_keys = DetermineKeys(*bzpop, std::size_t{4});
+  ASSERT_TRUE(bz_keys.ok()) << bz_keys.status();
+  EXPECT_EQ(bz_keys->first_, 1);
+  EXPECT_EQ(bz_keys->last_, 2);
 }
 
 TEST(CommandTableTest, RedisGlobTrailingHyphenIsRangeEndpoint) {
@@ -571,7 +690,7 @@ TEST(CommandTableTest, ResolvesSInterCardKeysAndRedis72Errors) {
   ASSERT_FALSE(trailing_keys.ok());
   EXPECT_EQ(trailing_keys.status().message(), "syntax error");
 
-  const std::vector<std::string> repeated{
-      "SINTERCARD", "1", "set", "LIMIT", "1", "LIMIT", "2"};
+  const std::vector<std::string> repeated{"SINTERCARD", "1",     "set", "LIMIT",
+                                          "1",          "LIMIT", "2"};
   EXPECT_TRUE(DetermineKeys(*spec, repeated).ok());
 }

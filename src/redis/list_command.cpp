@@ -39,6 +39,7 @@ struct BlockingKey {
   std::uint8_t db_id_ = 0;
   std::string key_;
   std::string lane_;
+  BlockingValueType value_type_ = BlockingValueType::kList;
 
   bool operator==(const BlockingKey&) const = default;
 };
@@ -47,11 +48,12 @@ struct BlockingKeyView {
   std::uint8_t db_id_ = 0;
   std::string_view key_;
   std::string_view lane_;
+  BlockingValueType value_type_ = BlockingValueType::kList;
 };
 
 bool operator==(const BlockingKey& left, const BlockingKeyView& right) {
   return left.db_id_ == right.db_id_ && left.key_ == right.key_ &&
-         left.lane_ == right.lane_;
+         left.lane_ == right.lane_ && left.value_type_ == right.value_type_;
 }
 
 bool operator==(const BlockingKeyView& left, const BlockingKey& right) {
@@ -60,22 +62,26 @@ bool operator==(const BlockingKeyView& left, const BlockingKey& right) {
 
 template <typename H>
 H AbslHashValue(H hash, const BlockingKey& value) {
-  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_);
+  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_,
+                    value.value_type_);
 }
 
 template <typename H>
 H AbslHashValue(H hash, const BlockingKeyView& value) {
-  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_);
+  return H::combine(std::move(hash), value.db_id_, value.key_, value.lane_,
+                    value.value_type_);
 }
 
 struct BlockingKeyHash {
   using is_transparent = void;
 
   std::size_t operator()(const BlockingKey& value) const {
-    return absl::HashOf(value.db_id_, value.key_, value.lane_);
+    return absl::HashOf(value.db_id_, value.key_, value.lane_,
+                        value.value_type_);
   }
   std::size_t operator()(const BlockingKeyView& value) const {
-    return absl::HashOf(value.db_id_, value.key_, value.lane_);
+    return absl::HashOf(value.db_id_, value.key_, value.lane_,
+                        value.value_type_);
   }
 };
 
@@ -146,9 +152,7 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
   std::uint64_t ticket() const noexcept { return ticket_; }
   unsigned worker_id() const noexcept { return worker_->id(); }
 
-  WakeReason reason() const noexcept {
-    return reason_;
-  }
+  WakeReason reason() const noexcept { return reason_; }
 
   bool ResetReady() noexcept {
     if (reason_ != WakeReason::kReady) return false;
@@ -222,16 +226,15 @@ class BlockingWaitRegistry {
                 const std::shared_ptr<BlockingWaiter>& waiter) {
     auto& state = queues_[registration.key_];
     auto& queue = state.entries_;
-    std::erase_if(queue,
-                  [](const Entry& current) { return current.waiter_.expired(); });
+    std::erase_if(
+        queue, [](const Entry& current) { return current.waiter_.expired(); });
     const auto position =
         std::find_if(queue.begin(), queue.end(), [&](const Entry& current) {
           const std::shared_ptr<BlockingWaiter> value = current.waiter_.lock();
           return value != nullptr && value->ticket() > waiter->ticket();
         });
-    queue.insert(position,
-                 Entry{waiter, registration.policy_,
-                       registration.stream_after_});
+    queue.insert(position, Entry{waiter, registration.policy_,
+                                 registration.stream_after_});
   }
 
   void Unregister(const BlockingKey& key, std::uint64_t ticket) {
@@ -264,12 +267,16 @@ class BlockingWaitRegistry {
     }
   }
 
-  void Notify(
-      std::uint8_t db_id, std::string_view key,
-      std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
-          std::nullopt) {
+  void Notify(std::uint8_t db_id, std::string_view key,
+              BlockingValueType value_type,
+              std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
+                  std::nullopt) {
     for (auto found = queues_.begin(); found != queues_.end();) {
       if (found->first.db_id_ != db_id || found->first.key_ != key) {
+        ++found;
+        continue;
+      }
+      if (found->first.value_type_ != value_type) {
         ++found;
         continue;
       }
@@ -330,7 +337,6 @@ class BlockingWaitRegistry {
   }
 
  private:
-
   void Erase(const BlockingKey& key, std::uint64_t ticket) {
     auto found = queues_.find(key);
     if (found == queues_.end()) return;
@@ -445,11 +451,10 @@ Task<absl::Status> RegisterBlockingWaiter(
     const std::shared_ptr<BlockingWaiter>& waiter,
     const std::vector<WaitRegistration>& registrations) {
   for (const WaitRegistration& registration : registrations) {
-    (void)co_await celer::SubmitTo(
-        registration.owner_, [registration, waiter] {
-          LocalBlockingWaiters().Register(registration, waiter);
-          return true;
-        });
+    (void)co_await celer::SubmitTo(registration.owner_, [registration, waiter] {
+      LocalBlockingWaiters().Register(registration, waiter);
+      return true;
+    });
   }
   co_return absl::OkStatus();
 }
@@ -471,24 +476,24 @@ struct BlockingKeyNotification {
 void RunBlockingKeyNotification(void* context, std::uint64_t) noexcept {
   std::unique_ptr<BlockingKeyNotification> notification(
       static_cast<BlockingKeyNotification*>(context));
-  LocalBlockingWaiters().Notify(notification->key_.db_id_,
-                                notification->key_.key_,
-                                notification->stream_id_);
+  LocalBlockingWaiters().Notify(
+      notification->key_.db_id_, notification->key_.key_,
+      notification->key_.value_type_, notification->stream_id_);
 }
 
-void NotifyBlockingKey(
-    std::uint8_t db_id, std::string_view key,
-    std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
-        std::nullopt) {
+void NotifyBlockingKey(std::uint8_t db_id, std::string_view key,
+                       BlockingValueType value_type,
+                       std::optional<std::pair<std::uint64_t, std::uint64_t>>
+                           stream_id = std::nullopt) {
   const unsigned owner = ShardForKey(key);
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (owner == current.id_) {
-    LocalBlockingWaiters().Notify(db_id, key, stream_id);
+    LocalBlockingWaiters().Notify(db_id, key, value_type, stream_id);
     return;
   }
-  auto notification = std::make_unique<BlockingKeyNotification>(
-      BlockingKeyNotification{BlockingKey{db_id, std::string(key), {}},
-                              stream_id});
+  auto notification =
+      std::make_unique<BlockingKeyNotification>(BlockingKeyNotification{
+          BlockingKey{db_id, std::string(key), {}, value_type}, stream_id});
   celer::PostNotification(current.cross_core_, owner,
                           celer::RemoteNotification{
                               .context_ = notification.release(),
@@ -697,8 +702,7 @@ struct BlockingWaitHandle::Impl {
 BlockingWaitHandle::BlockingWaitHandle(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-BlockingWaitHandle::BlockingWaitHandle(BlockingWaitHandle&&) noexcept =
-    default;
+BlockingWaitHandle::BlockingWaitHandle(BlockingWaitHandle&&) noexcept = default;
 
 BlockingWaitHandle& BlockingWaitHandle::operator=(
     BlockingWaitHandle&& other) noexcept {
@@ -710,8 +714,7 @@ BlockingWaitHandle& BlockingWaitHandle::operator=(
 
 BlockingWaitHandle::~BlockingWaitHandle() { FinishBlockingWait(*this); }
 
-Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
-RegisterBlockingWait(
+Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
     std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
   auto impl = std::make_unique<BlockingWaitHandle::Impl>();
@@ -721,11 +724,11 @@ RegisterBlockingWait(
   for (BlockingWaitSpec& spec : specs) {
     WaitRegistration registration{
         ShardForKey(spec.key_),
-        BlockingKey{db_id, std::move(spec.key_), std::move(spec.lane_)},
+        BlockingKey{db_id, std::move(spec.key_), std::move(spec.lane_),
+                    spec.value_type_},
         spec.policy_, spec.stream_after_};
     const bool duplicate =
-        std::any_of(impl->registrations_.begin(),
-                    impl->registrations_.end(),
+        std::any_of(impl->registrations_.begin(), impl->registrations_.end(),
                     [&](const WaitRegistration& existing) {
                       return existing.key_ == registration.key_;
                     });
@@ -767,8 +770,7 @@ bool ResetBlockingReady(BlockingWaitHandle& handle) {
 void FinishBlockingWait(BlockingWaitHandle& handle) {
   if (!handle.impl_ || !handle.impl_->active_) return;
   handle.impl_->active_ = false;
-  UnregisterBlockingWaiter(handle.impl_->waiter_,
-                           handle.impl_->registrations_);
+  UnregisterBlockingWaiter(handle.impl_->waiter_, handle.impl_->registrations_);
 }
 
 void InitListCommandStorage(storage::StorageEngine* engine) {
@@ -776,17 +778,21 @@ void InitListCommandStorage(storage::StorageEngine* engine) {
 }
 
 void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key) {
-  NotifyBlockingKey(db_id, key);
+  NotifyBlockingKey(db_id, key, BlockingValueType::kList);
+}
+
+void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key) {
+  NotifyBlockingKey(db_id, key, BlockingValueType::kSortedSet);
 }
 
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
-                             std::uint64_t id_ms,
-                             std::uint64_t id_seq) {
-  NotifyBlockingKey(db_id, key, std::pair{id_ms, id_seq});
+                             std::uint64_t id_ms, std::uint64_t id_seq) {
+  NotifyBlockingKey(db_id, key, BlockingValueType::kStream,
+                    std::pair{id_ms, id_seq});
 }
 
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key) {
-  NotifyBlockingKey(db_id, key);
+  NotifyBlockingKey(db_id, key, BlockingValueType::kStream);
 }
 
 Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id) {
@@ -950,7 +956,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
     case CommandKind::kLRem:
     case CommandKind::kLTrim:
       if (result->length_ != 0) {
-        NotifyBlockingKey(request.db_id_, args[1]);
+        NotifyListBlockingKey(request.db_id_, args[1]);
       }
       break;
     default:
@@ -1098,7 +1104,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                                 : reply_builder.AppendRaw("*-1\r\n"));
     }
     for (std::size_t arg : key_args) {
-      NotifyBlockingKey(request.db_id_, args[arg]);
+      NotifyListBlockingKey(request.db_id_, args[arg]);
     }
     if (move) {
       co_return BuiltReply(
@@ -1159,7 +1165,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
         reply_builder.AppendBulkString(args[arg]);
         AppendBulkArray(reply_builder, popped->values_);
         for (std::size_t key_arg : key_args) {
-          NotifyBlockingKey(request.db_id_, args[key_arg]);
+          NotifyListBlockingKey(request.db_id_, args[key_arg]);
         }
         co_return BuiltReply(reply_builder.View());
       }
@@ -1260,8 +1266,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (!released.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", released.message()));
   }
-  NotifyBlockingKey(request.db_id_, source_key);
-  NotifyBlockingKey(request.db_id_, destination_key);
+  NotifyListBlockingKey(request.db_id_, source_key);
+  NotifyListBlockingKey(request.db_id_, destination_key);
   co_return BuiltReply(reply_builder.AppendBulkString(popped->values_.front()));
 }
 
@@ -1279,8 +1285,7 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
         "ERR timeout is not a float or out of range"));
   }
   if (timeout_seconds < 0) {
-    co_return BuiltReply(
-        reply_builder.AppendError("ERR timeout is negative"));
+    co_return BuiltReply(reply_builder.AppendError("ERR timeout is negative"));
   }
 
   CommandRequest nonblocking = request;
@@ -1321,10 +1326,9 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     const auto maximum_delay =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::time_point::max() - now);
-    if (timeout_nanoseconds >
-        static_cast<long double>(maximum_delay.count())) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "ERR timeout is out of range"));
+    if (timeout_nanoseconds > static_cast<long double>(maximum_delay.count())) {
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR timeout is out of range"));
     }
     const auto timeout = std::chrono::nanoseconds(
         static_cast<std::int64_t>(timeout_nanoseconds));
@@ -1369,8 +1373,8 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                           : reply_builder.AppendRaw("*-1\r\n"));
   };
   bool gate_deadline_reached = false;
-  auto execute_attempt = [&](ReplyBuilder& attempt_builder)
-      -> Task<CommandReply> {
+  auto execute_attempt =
+      [&](ReplyBuilder& attempt_builder) -> Task<CommandReply> {
     // FLUSHDB closes the gate only for its short detach window. A blocked
     // command must not count as an in-flight database operation while it is
     // waiting, but every actual read/modify/write attempt still participates
@@ -1378,18 +1382,16 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     while (!TryBeginCommandDbOperation(request.db_id_)) {
       if (!infinite && std::chrono::steady_clock::now() >= deadline) {
         gate_deadline_reached = true;
-        co_return BuiltReply(
-            (request.kind_ == CommandKind::kBLMove ||
-             request.kind_ == CommandKind::kBRPopLPush)
-                ? attempt_builder.AppendNullBulkString()
-                : attempt_builder.AppendRaw("*-1\r\n"));
+        co_return BuiltReply((request.kind_ == CommandKind::kBLMove ||
+                              request.kind_ == CommandKind::kBRPopLPush)
+                                 ? attempt_builder.AppendNullBulkString()
+                                 : attempt_builder.AppendRaw("*-1\r\n"));
       }
-      absl::Status slept =
-          co_await celer::SleepFor(*celer::ThisWorker().self_,
-                                   std::chrono::milliseconds(1));
+      absl::Status slept = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) {
-        co_return BuiltReply(attempt_builder.AppendError(
-            "ERR ", slept.message()));
+        co_return BuiltReply(
+            attempt_builder.AppendError("ERR ", slept.message()));
       }
     }
     struct AttemptDbGuard {
@@ -1413,13 +1415,14 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
 
   std::vector<WaitRegistration> registrations;
   auto register_key = [&](std::string_view key) {
-    const BlockingKey blocking_key{request.db_id_, std::string(key), {}};
+    const BlockingKey blocking_key{
+        request.db_id_, std::string(key), {}, BlockingValueType::kList};
     for (const WaitRegistration& registration : registrations) {
       if (registration.key_ == blocking_key) return;
     }
-    registrations.push_back(WaitRegistration{
-        ShardForKey(key), std::move(blocking_key),
-        BlockingQueuePolicy::kFifo, std::nullopt});
+    registrations.push_back(
+        WaitRegistration{ShardForKey(key), std::move(blocking_key),
+                         BlockingQueuePolicy::kFifo, std::nullopt});
   };
   if (nonblocking.kind_ == CommandKind::kLMPop) {
     std::int64_t key_count = 0;

@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -15,6 +16,7 @@
 #include <random>
 
 #include "absl/strings/str_cat.h"
+#include "blocking_wait.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
 #include "keylane/command_table.h"
@@ -70,13 +72,12 @@ std::string FormatDouble(double value) {
   if (std::isnan(value)) return "nan";
   if (std::isinf(value)) return value < 0 ? "-inf" : "inf";
   char buffer[128];
-  constexpr double kSafeIntegerLimit = static_cast<double>(
-      std::numeric_limits<std::int64_t>::max() / 2);
+  constexpr double kSafeIntegerLimit =
+      static_cast<double>(std::numeric_limits<std::int64_t>::max() / 2);
   if (std::isfinite(value) && value >= -kSafeIntegerLimit &&
-      value <= kSafeIntegerLimit &&
-      std::trunc(value) == value) {
-    const auto formatted = std::to_chars(
-        buffer, buffer + sizeof(buffer), static_cast<std::int64_t>(value));
+      value <= kSafeIntegerLimit && std::trunc(value) == value) {
+    const auto formatted = std::to_chars(buffer, buffer + sizeof(buffer),
+                                         static_cast<std::int64_t>(value));
     return formatted.ec == std::errc{} ? std::string(buffer, formatted.ptr)
                                        : std::string("0");
   }
@@ -97,7 +98,8 @@ std::string FormatDouble(double value) {
   if (exponent_at != std::string_view::npos) {
     std::string_view exponent = shortest.substr(exponent_at + 1);
     bool exponent_negative = false;
-    if (!exponent.empty() && (exponent.front() == '+' || exponent.front() == '-')) {
+    if (!exponent.empty() &&
+        (exponent.front() == '+' || exponent.front() == '-')) {
       exponent_negative = exponent.front() == '-';
       exponent.remove_prefix(1);
     }
@@ -124,8 +126,7 @@ std::string FormatDouble(double value) {
   const std::int64_t significant_decimal_position =
       static_cast<std::int64_t>(decimal_position) -
       static_cast<std::int64_t>(leading);
-  int k = explicit_exponent +
-          static_cast<int>(significant_decimal_position) -
+  int k = explicit_exponent + static_cast<int>(significant_decimal_position) -
           static_cast<int>(digits.size());
   while (digits.size() > 1 && digits.back() == '0') {
     digits.pop_back();
@@ -171,8 +172,7 @@ std::string FormatGeoCoordinate(double value) {
   char buffer[128];
   const int formatted = std::snprintf(buffer, sizeof(buffer), "%.17Lf",
                                       static_cast<long double>(value));
-  if (formatted <= 0 ||
-      static_cast<std::size_t>(formatted) >= sizeof(buffer)) {
+  if (formatted <= 0 || static_cast<std::size_t>(formatted) >= sizeof(buffer)) {
     return "0";
   }
   std::size_t length = static_cast<std::size_t>(formatted);
@@ -204,8 +204,8 @@ std::optional<std::uint64_t> DecodeGeoScore(double score) {
   // on implementation-defined floating-to-integer overflow behavior.
   constexpr long double kGeoModulus =
       static_cast<long double>(std::uint64_t{1} << 52);
-  long double wrapped = std::fmod(std::trunc(static_cast<long double>(score)),
-                                 kGeoModulus);
+  long double wrapped =
+      std::fmod(std::trunc(static_cast<long double>(score)), kGeoModulus);
   if (wrapped < 0) wrapped += kGeoModulus;
   return static_cast<std::uint64_t>(wrapped);
 }
@@ -372,16 +372,24 @@ bool BelowMax(std::string_view value, LexBound bound) {
 
 storage::CompactValueUpdate NoChange() { return {}; }
 
-absl::StatusOr<storage::CompactValueUpdate> Changed(ZSet set) {
-  Sort(&set);
+absl::StatusOr<storage::CompactValueUpdate> ChangedSorted(ZSet set) {
   if (set.empty())
-    return storage::CompactValueUpdate{
-        .changed_ = true, .erase_ = true, .encoded_ = {}, .logical_size_ = 0};
+    return storage::CompactValueUpdate{.changed_ = true,
+                                       .erase_ = true,
+                                       .encoded_ = {},
+                                       .logical_size_ = 0,
+                                       .expire_at_ms_ = std::nullopt};
   auto encoded = Encode(set);
   if (!encoded.ok()) return encoded.status();
   return storage::CompactValueUpdate{.changed_ = true,
                                      .encoded_ = std::move(*encoded),
-                                     .logical_size_ = set.size()};
+                                     .logical_size_ = set.size(),
+                                     .expire_at_ms_ = std::nullopt};
+}
+
+absl::StatusOr<storage::CompactValueUpdate> Changed(ZSet set) {
+  Sort(&set);
+  return ChangedSorted(std::move(set));
 }
 
 std::string_view StorageError(ReplyBuilder& builder,
@@ -404,6 +412,237 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kSortedSet, read_only,
       callback, tx);
+}
+
+struct MultiPopShape {
+  std::vector<std::size_t> key_args_;
+  bool maximum_ = false;
+  bool flat_reply_ = false;
+  std::uint64_t count_ = 1;
+};
+
+absl::StatusOr<MultiPopShape> ParseMultiPopShape(
+    const CommandRequest& request) {
+  const auto& args = request.args_;
+  MultiPopShape shape;
+  if (request.kind_ == CommandKind::kBZPopMin ||
+      request.kind_ == CommandKind::kBZPopMax) {
+    if (args.size() < 3) return absl::InvalidArgumentError("syntax error");
+    shape.maximum_ = request.kind_ == CommandKind::kBZPopMax;
+    shape.flat_reply_ = true;
+    for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+      shape.key_args_.push_back(i);
+    }
+    return shape;
+  }
+
+  const std::size_t count_arg = request.kind_ == CommandKind::kBZMPop ? 2 : 1;
+  const std::size_t first_key = count_arg + 1;
+  std::int64_t parsed_keys = 0;
+  if (count_arg >= args.size() || !ParseInt(args[count_arg], &parsed_keys) ||
+      parsed_keys <= 0) {
+    return absl::InvalidArgumentError("numkeys should be greater than 0");
+  }
+  const std::uint64_t key_count = static_cast<std::uint64_t>(parsed_keys);
+  if (key_count > args.size() - std::min(first_key, args.size()) ||
+      first_key + key_count >= args.size()) {
+    return absl::InvalidArgumentError("syntax error");
+  }
+  for (std::uint64_t i = 0; i < key_count; ++i) {
+    shape.key_args_.push_back(first_key + static_cast<std::size_t>(i));
+  }
+  const std::size_t direction = first_key + static_cast<std::size_t>(key_count);
+  if (EqualCi(args[direction], "min")) {
+    shape.maximum_ = false;
+  } else if (EqualCi(args[direction], "max")) {
+    shape.maximum_ = true;
+  } else {
+    return absl::InvalidArgumentError("syntax error");
+  }
+  const std::size_t trailing = args.size() - direction - 1;
+  if (trailing != 0) {
+    if (trailing != 2 || !EqualCi(args[direction + 1], "count")) {
+      return absl::InvalidArgumentError("syntax error");
+    }
+    std::int64_t parsed_count = 0;
+    if (!ParseInt(args[direction + 2], &parsed_count) || parsed_count <= 0) {
+      return absl::InvalidArgumentError("count should be greater than 0");
+    }
+    shape.count_ = static_cast<std::uint64_t>(parsed_count);
+  }
+  return shape;
+}
+
+absl::StatusOr<double> ParseBlockingZSetTimeout(const CommandRequest& request) {
+  const std::size_t timeout_arg =
+      request.kind_ == CommandKind::kBZMPop ? 1 : request.args_.size() - 1;
+  double timeout_seconds = 0;
+  if (!ParseRedisDouble(request.args_[timeout_arg], &timeout_seconds)) {
+    return absl::InvalidArgumentError("timeout is not a float or out of range");
+  }
+  if (timeout_seconds < 0) {
+    return absl::InvalidArgumentError("timeout is negative");
+  }
+  return timeout_seconds;
+}
+
+Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
+    bool maximum, std::uint64_t count, storage::TxShardWrites* tx = nullptr) {
+  std::vector<Element> popped;
+  bool has_remaining = false;
+  auto callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    auto decoded = Decode(value);
+    if (!decoded.ok()) return decoded.status();
+    ZSet set = std::move(*decoded);
+    const std::uint64_t wanted = std::min<std::uint64_t>(count, set.size());
+    popped.reserve(static_cast<std::size_t>(wanted));
+    if (maximum) {
+      for (std::uint64_t i = 0; i < wanted; ++i) {
+        popped.push_back(std::move(set[set.size() - 1 - i]));
+      }
+      set.erase(set.end() - static_cast<std::ptrdiff_t>(wanted), set.end());
+    } else {
+      for (std::uint64_t i = 0; i < wanted; ++i) {
+        popped.push_back(std::move(set[static_cast<std::size_t>(i)]));
+      }
+      set.erase(set.begin(),
+                set.begin() + static_cast<std::ptrdiff_t>(wanted));
+    }
+    has_remaining = !set.empty();
+    return popped.empty()
+               ? absl::StatusOr<storage::CompactValueUpdate>(NoChange())
+               : ChangedSorted(std::move(set));
+  };
+  absl::Status status = co_await g_storage->ExecuteCompactLocked(
+      db_id, key, digest, storage::ValueType::kSortedSet, false, callback, tx);
+  if (!status.ok()) co_return status;
+  if (!popped.empty() && has_remaining) NotifyZSetBlockingKey(db_id, key);
+  co_return popped;
+}
+
+Task<absl::Status> ZSetHoldCallback(void*, const tx::ShardSlice&) {
+  co_return absl::OkStatus();
+}
+
+struct SingleShardPopContext {
+  const CommandRequest* request_ = nullptr;
+  const MultiPopShape* shape_ = nullptr;
+  std::size_t selected_arg_ = 0;
+  std::vector<Element> popped_;
+};
+
+Task<absl::Status> SingleShardPopCallback(void* opaque,
+                                          const tx::ShardSlice& slice) {
+  auto* context = static_cast<SingleShardPopContext*>(opaque);
+  for (std::size_t argument : context->shape_->key_args_) {
+    const tx::TxKey* locked = nullptr;
+    for (const tx::TxKey& key : slice.keys_) {
+      if (key.arg_index_ == argument) {
+        locked = &key;
+        break;
+      }
+    }
+    if (locked == nullptr) {
+      co_return absl::InternalError("Sorted Set pop key routing is incomplete");
+    }
+    auto popped = co_await PopZSetLocked(
+        context->request_->db_id_, context->request_->args_[argument],
+        locked->digest_, context->shape_->maximum_, context->shape_->count_);
+    if (!popped.ok()) co_return popped.status();
+    if (!popped->empty()) {
+      context->selected_arg_ = argument;
+      context->popped_ = std::move(*popped);
+      break;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+void AppendMultiPopReply(ReplyBuilder& builder, std::string_view key,
+                         const std::vector<Element>& popped, bool flat_reply) {
+  if (flat_reply) {
+    builder.AppendArrayHeader(3);
+    builder.AppendBulkString(key);
+    builder.AppendBulkString(popped.front().member_);
+    builder.AppendBulkString(FormatDouble(popped.front().score_));
+    return;
+  }
+  builder.AppendArrayHeader(2);
+  builder.AppendBulkString(key);
+  builder.AppendArrayHeader(popped.size());
+  for (const Element& element : popped) {
+    builder.AppendArrayHeader(2);
+    builder.AppendBulkString(element.member_);
+    builder.AppendBulkString(FormatDouble(element.score_));
+  }
+}
+
+Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
+                                              ReplyBuilder& builder,
+                                              bool* empty = nullptr) {
+  if (empty != nullptr) *empty = false;
+  auto parsed = ParseMultiPopShape(request);
+  if (!parsed.ok()) {
+    co_return Built(
+        builder.AppendError(absl::StrCat("ERR ", parsed.status().message())));
+  }
+  const MultiPopShape shape = std::move(*parsed);
+  tx::Transaction transaction;
+  for (std::size_t argument : shape.key_args_) {
+    transaction.AddKey(
+        g_storage->OwnerForKey(request.args_[argument]), request.db_id_,
+        storage::ComputeDigest(request.args_[argument]),
+        static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive);
+  }
+  transaction.Seal();
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) co_return Built(StorageError(builder, status));
+  if (transaction.single_shard()) {
+    SingleShardPopContext context{
+        .request_ = &request,
+        .shape_ = &shape,
+        .selected_arg_ = 0,
+        .popped_ = {},
+    };
+    status =
+        co_await transaction.Execute(&SingleShardPopCallback, &context, true);
+    if (!status.ok()) co_return Built(StorageError(builder, status));
+    if (context.popped_.empty()) {
+      if (empty != nullptr) *empty = true;
+      co_return Built(builder.AppendRaw("*-1\r\n"));
+    }
+    AppendMultiPopReply(builder, request.args_[context.selected_arg_],
+                        context.popped_, shape.flat_reply_);
+    co_return Built(builder.View());
+  }
+  status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, false);
+  if (!status.ok()) co_return Built(StorageError(builder, status));
+
+  for (std::size_t argument : shape.key_args_) {
+    const std::string& key = request.args_[argument];
+    const storage::Digest digest = storage::ComputeDigest(key);
+    auto popped = co_await celer::SubmitTaskTo(
+        g_storage->OwnerForKey(key),
+        [db = request.db_id_, key = std::string(key), digest,
+         maximum = shape.maximum_, count = shape.count_]() {
+          return PopZSetLocked(db, key, digest, maximum, count);
+        });
+    if (!popped.ok()) {
+      (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
+      co_return Built(StorageError(builder, popped.status()));
+    }
+    if (!popped->empty()) {
+      status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
+      if (!status.ok()) co_return Built(StorageError(builder, status));
+      AppendMultiPopReply(builder, key, *popped, shape.flat_reply_);
+      co_return Built(builder.View());
+    }
+  }
+  (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
+  if (empty != nullptr) *empty = true;
+  co_return Built(builder.AppendRaw("*-1\r\n"));
 }
 
 std::uint64_t Interleave26(std::uint32_t lon, std::uint32_t lat) {
@@ -659,8 +898,8 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
       return absl::InvalidArgumentError(
           "value is not an integer or out of range");
     const bool with_scores = args.size() == 4;
-    const std::uint64_t magnitude = static_cast<std::uint64_t>(
-        count < 0 ? -count : count);
+    const std::uint64_t magnitude =
+        static_cast<std::uint64_t>(count < 0 ? -count : count);
     if (with_scores &&
         magnitude > static_cast<std::uint64_t>(
                         std::numeric_limits<std::int64_t>::max()) /
@@ -755,8 +994,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           "ERR GT, LT, and/or NX options at the same time are not compatible"));
     }
     if (request.kind_ == CommandKind::kZAdd && incr && index < a.size() &&
-        (a.size() - index) % tuple == 0 &&
-        (a.size() - index) != tuple) {
+        (a.size() - index) % tuple == 0 && (a.size() - index) != tuple) {
       co_return Built(builder.AppendError(
           "ERR INCR option supports a single increment-element pair"));
     }
@@ -833,6 +1071,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     absl::Status status =
         co_await RunCompact(request, digest, tx, false, callback);
     if (!status.ok()) co_return Built(StorageError(builder, status));
+    if (changed != 0) NotifyZSetBlockingKey(request.db_id_, a[1]);
     if (incr) {
       co_return Built(incremented.has_value()
                           ? builder.AppendBulkString(FormatDouble(*incremented))
@@ -1565,12 +1804,10 @@ absl::StatusOr<std::optional<StoreShape>> ParseStoreShape(
     return std::optional<StoreShape>{};
   }
   const auto& args = request.args_;
-  const std::size_t begin =
-      request.kind_ == CommandKind::kGeoRadius ? 6 : 5;
+  const std::size_t begin = request.kind_ == CommandKind::kGeoRadius ? 6 : 5;
   std::optional<StoreShape> result;
   for (std::size_t i = begin; i < args.size(); ++i) {
-    if (!EqualCi(args[i], "store") && !EqualCi(args[i], "storedist"))
-      continue;
+    if (!EqualCi(args[i], "store") && !EqualCi(args[i], "storedist")) continue;
     if (result.has_value() || i + 1 >= args.size())
       return absl::InvalidArgumentError("syntax error");
     result = StoreShape{.destination_arg_ = i + 1,
@@ -1626,8 +1863,7 @@ absl::Status ComputeRangeStore(const CommandRequest& request,
     if (!min.ok()) return min.status();
     if (!max.ok()) return max.status();
     for (std::size_t i = 0; i < source.size(); ++i)
-      if (AboveMin(source[i].score_, *min) &&
-          BelowMax(source[i].score_, *max))
+      if (AboveMin(source[i].score_, *min) && BelowMax(source[i].score_, *max))
         selected.push_back(i);
     if (options.reverse_) std::reverse(selected.begin(), selected.end());
   } else {
@@ -1636,10 +1872,10 @@ absl::Status ComputeRangeStore(const CommandRequest& request,
     if (!max.ok()) return max.status();
     selected.resize(source.size());
     std::iota(selected.begin(), selected.end(), 0);
-    std::sort(selected.begin(), selected.end(), [&](std::size_t x,
-                                                    std::size_t y) {
-      return source[x].member_ < source[y].member_;
-    });
+    std::sort(selected.begin(), selected.end(),
+              [&](std::size_t x, std::size_t y) {
+                return source[x].member_ < source[y].member_;
+              });
     std::erase_if(selected, [&](std::size_t i) {
       return !AboveMin(source[i].member_, *min) ||
              !BelowMax(source[i].member_, *max);
@@ -1682,8 +1918,8 @@ struct GeoStoreQuery {
   bool distance_scores_ = false;
 };
 
-absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(
-    const CommandRequest& request, const StoreShape& shape) {
+absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(const CommandRequest& request,
+                                                 const StoreShape& shape) {
   const auto& args = request.args_;
   GeoStoreQuery query;
   query.distance_scores_ = shape.distance_scores_;
@@ -1740,8 +1976,7 @@ absl::StatusOr<GeoStoreQuery> ParseGeoStoreQuery(
         return absl::InvalidArgumentError("invalid longitude,latitude pair");
       center = true;
       i += 3;
-    } else if (EqualCi(args[i], "byradius") && !area &&
-               i + 2 < args.size()) {
+    } else if (EqualCi(args[i], "byradius") && !area && i + 2 < args.size()) {
       double radius = 0;
       auto unit = UnitMeters(args[i + 2]);
       if (!ParseRedisDouble(args[i + 1], &radius) || radius < 0 || !unit.ok())
@@ -1821,27 +2056,26 @@ absl::Status ComputeGeoStore(const ZSet& source, GeoStoreQuery query,
       const double north = GeoDistance(query.center_lon_, query.center_lat_,
                                        query.center_lon_, lat);
       const double east = GeoDistance(query.center_lon_, lat, lon, lat);
-      inside = east <= query.box_width_m_ / 2 &&
-               north <= query.box_height_m_ / 2;
+      inside =
+          east <= query.box_width_m_ / 2 && north <= query.box_height_m_ / 2;
     }
     if (inside) matches.push_back(Match{&element, distance});
   }
-  if (query.ascending_ || query.descending_ ||
-      (query.count_ && !query.any_)) {
-    std::sort(matches.begin(), matches.end(), [&](const Match& x,
-                                                  const Match& y) {
-      return query.descending_ ? x.distance_ > y.distance_
-                               : x.distance_ < y.distance_;
-    });
+  if (query.ascending_ || query.descending_ || (query.count_ && !query.any_)) {
+    std::sort(matches.begin(), matches.end(),
+              [&](const Match& x, const Match& y) {
+                return query.descending_ ? x.distance_ > y.distance_
+                                         : x.distance_ < y.distance_;
+              });
   }
   if (query.count_ && matches.size() > *query.count_)
     matches.resize(*query.count_);
   output->reserve(matches.size());
   for (const Match& match : matches) {
-    output->push_back(Element{
-        match.element_->member_,
-        query.distance_scores_ ? match.distance_ / query.unit_meters_
-                               : match.element_->score_});
+    output->push_back(Element{match.element_->member_,
+                              query.distance_scores_
+                                  ? match.distance_ / query.unit_meters_
+                                  : match.element_->score_});
   }
   Sort(output);
   return absl::OkStatus();
@@ -2011,8 +2245,9 @@ Task<absl::StatusOr<ZSet>> ReadAggregateInputLocked(
   co_return input;
 }
 
-Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(
-    std::uint8_t db_id, std::string_view key, const storage::Digest& digest) {
+Task<absl::StatusOr<ZSet>> ReadZSetOnlyLocked(std::uint8_t db_id,
+                                              std::string_view key,
+                                              const storage::Digest& digest) {
   ZSet input;
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
@@ -2038,22 +2273,20 @@ Task<absl::Status> MultiReadShard(void* opaque, const tx::ShardSlice& slice) {
                            request.kind_ == CommandKind::kGeoSearchStore ||
                            request.kind_ == CommandKind::kGeoRadius ||
                            request.kind_ == CommandKind::kGeoRadiusByMember;
-    auto input = zset_only
-                     ? co_await ReadZSetOnlyLocked(
-                           request.db_id_, request.args_[key.arg_index_],
-                           key.digest_)
-                     : co_await ReadAggregateInputLocked(
-                           request.db_id_, request.args_[key.arg_index_],
-                           key.digest_);
+    auto input =
+        zset_only
+            ? co_await ReadZSetOnlyLocked(
+                  request.db_id_, request.args_[key.arg_index_], key.digest_)
+            : co_await ReadAggregateInputLocked(
+                  request.db_id_, request.args_[key.arg_index_], key.digest_);
     if (!input.ok()) co_return input.status();
     context->inputs_[key.arg_index_] = std::move(*input);
   }
   if (context->single_shard_ && context->store_) {
     absl::Status computed = ComputeMulti(context);
     if (!computed.ok()) co_return computed;
-    const storage::Digest destination =
-        storage::ComputeDigest(
-            request.args_[context->store_shape_->destination_arg_]);
+    const storage::Digest destination = storage::ComputeDigest(
+        request.args_[context->store_shape_->destination_arg_]);
     absl::Status replaced =
         co_await ReplaceMultiDestination(context, destination);
     if (!replaced.ok()) {
@@ -2146,6 +2379,9 @@ Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
 
 Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                                        ReplyBuilder& builder) {
+  if (request.kind_ == CommandKind::kZMPop) {
+    co_return co_await ExecuteZSetMultiPopAttempt(request, builder);
+  }
   const auto& args = request.args_;
   auto parsed_store = ParseStoreShape(request);
   if (!parsed_store.ok())
@@ -2166,15 +2402,15 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     ZSet ignored;
     absl::Status syntax = ComputeRangeStore(request, ZSet{}, &ignored);
     if (!syntax.ok())
-      co_return Built(builder.AppendError(
-          absl::StrCat("ERR ", syntax.message())));
+      co_return Built(
+          builder.AppendError(absl::StrCat("ERR ", syntax.message())));
   } else if (request.kind_ == CommandKind::kGeoSearchStore ||
              request.kind_ == CommandKind::kGeoRadius ||
              request.kind_ == CommandKind::kGeoRadiusByMember) {
     auto syntax = ParseGeoStoreQuery(request, **parsed_store);
     if (!syntax.ok())
-      co_return Built(builder.AppendError(
-          absl::StrCat("ERR ", syntax.status().message())));
+      co_return Built(
+          builder.AppendError(absl::StrCat("ERR ", syntax.status().message())));
   }
   auto keys = DetermineKeys(*request.spec_, args);
   if (!keys.ok())
@@ -2211,17 +2447,17 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
            request.kind_ == CommandKind::kZInterStore)
     context.aggregate_ = MultiAggregate::kIntersection;
 
-  const bool specialized_store = request.kind_ == CommandKind::kZRangeStore ||
-                                 request.kind_ == CommandKind::kGeoSearchStore ||
-                                 request.kind_ == CommandKind::kGeoRadius ||
-                                 request.kind_ == CommandKind::kGeoRadiusByMember;
+  const bool specialized_store =
+      request.kind_ == CommandKind::kZRangeStore ||
+      request.kind_ == CommandKind::kGeoSearchStore ||
+      request.kind_ == CommandKind::kGeoRadius ||
+      request.kind_ == CommandKind::kGeoRadiusByMember;
   const std::size_t key_count = specialized_store ? 1 : keys->count();
   context.weights_.assign(key_count, 1.0);
   bool with_scores = false;
   std::uint64_t limit = 0;
-  for (std::size_t i = aggregate_store || !context.store_
-                           ? keys->last_ + 1
-                           : args.size();
+  for (std::size_t i = aggregate_store || !context.store_ ? keys->last_ + 1
+                                                          : args.size();
        i < args.size();) {
     if (EqualCi(args[i], "withscores") && !context.store_ &&
         request.kind_ != CommandKind::kZInterCard) {
@@ -2253,8 +2489,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                EqualCi(args[i], "limit") && i + 1 < args.size()) {
       std::int64_t parsed_limit = 0;
       if (!ParseInt(args[i + 1], &parsed_limit)) {
-        co_return Built(builder.AppendError(
-            "ERR value is not an integer or out of range"));
+        co_return Built(
+            builder.AppendError("ERR value is not an integer or out of range"));
       }
       if (parsed_limit < 0) {
         co_return Built(builder.AppendError("ERR LIMIT can't be negative"));
@@ -2269,7 +2505,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   tx::Transaction transaction;
   if (context.store_) {
     const std::size_t destination = context.store_shape_->destination_arg_;
-    transaction.AddKey(g_storage->OwnerForKey(args[destination]), request.db_id_,
+    transaction.AddKey(g_storage->OwnerForKey(args[destination]),
+                       request.db_id_,
                        storage::ComputeDigest(args[destination]), destination,
                        tx::LockMode::kExclusive);
   }
@@ -2311,6 +2548,12 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   if (context.store_) {
     g_storage->NoteTxCommitStarted();
     celer::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
+    if (!context.output_.empty()) {
+      NotifyZSetBlockingKey(
+          request.db_id_,
+          args[context.store_shape_ ? context.store_shape_->destination_arg_
+                                    : 1]);
+    }
     co_return Built(builder.AppendInteger(context.output_.size()));
   }
   if (request.kind_ == CommandKind::kZInterCard) {
@@ -2353,7 +2596,8 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       !parsed_store->has_value()) {
     const ZSetExecKey* source = find_key(1);
     if (!source)
-      co_return std::string(builder.AppendError("ERR GEO source key is missing"));
+      co_return std::string(
+          builder.AppendError("ERR GEO source key is missing"));
     CommandReply reply = co_await ExecuteZSetCommandLocked(
         request, source->digest_, &tx_writes[source->owner_], builder);
     co_return std::string(reply.encoded_);
@@ -2362,15 +2606,15 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     ZSet ignored;
     absl::Status syntax = ComputeRangeStore(request, ZSet{}, &ignored);
     if (!syntax.ok())
-      co_return std::string(builder.AppendError(
-          absl::StrCat("ERR ", syntax.message())));
+      co_return std::string(
+          builder.AppendError(absl::StrCat("ERR ", syntax.message())));
   } else if (request.kind_ == CommandKind::kGeoSearchStore ||
              request.kind_ == CommandKind::kGeoRadius ||
              request.kind_ == CommandKind::kGeoRadiusByMember) {
     auto syntax = ParseGeoStoreQuery(request, **parsed_store);
     if (!syntax.ok())
-      co_return std::string(builder.AppendError(
-          absl::StrCat("ERR ", syntax.status().message())));
+      co_return std::string(
+          builder.AppendError(absl::StrCat("ERR ", syntax.status().message())));
   }
 
   MultiContext context;
@@ -2404,17 +2648,17 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     context.aggregate_ = MultiAggregate::kIntersection;
   }
 
-  const bool specialized_store = request.kind_ == CommandKind::kZRangeStore ||
-                                 request.kind_ == CommandKind::kGeoSearchStore ||
-                                 request.kind_ == CommandKind::kGeoRadius ||
-                                 request.kind_ == CommandKind::kGeoRadiusByMember;
+  const bool specialized_store =
+      request.kind_ == CommandKind::kZRangeStore ||
+      request.kind_ == CommandKind::kGeoSearchStore ||
+      request.kind_ == CommandKind::kGeoRadius ||
+      request.kind_ == CommandKind::kGeoRadiusByMember;
   const std::size_t key_count = specialized_store ? 1 : keys->count();
   context.weights_.assign(key_count, 1.0);
   bool with_scores = false;
   std::uint64_t limit = 0;
-  for (std::size_t i = aggregate_store || !context.store_
-                           ? keys->last_ + 1
-                           : args.size();
+  for (std::size_t i = aggregate_store || !context.store_ ? keys->last_ + 1
+                                                          : args.size();
        i < args.size();) {
     if (EqualCi(args[i], "withscores") && !context.store_ &&
         request.kind_ != CommandKind::kZInterCard) {
@@ -2447,8 +2691,8 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                EqualCi(args[i], "limit") && i + 1 < args.size()) {
       std::int64_t parsed_limit = 0;
       if (!ParseInt(args[i + 1], &parsed_limit)) {
-        co_return std::string(builder.AppendError(
-            "ERR value is not an integer or out of range"));
+        co_return std::string(
+            builder.AppendError("ERR value is not an integer or out of range"));
       }
       if (parsed_limit < 0) {
         co_return std::string(
@@ -2462,8 +2706,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
   }
 
   for (std::size_t argument = context.first_source_;
-       argument <= context.last_source_;
-       ++argument) {
+       argument <= context.last_source_; ++argument) {
     const ZSetExecKey* key = find_key(argument);
     if (key == nullptr) {
       co_return std::string(
@@ -2494,15 +2737,13 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
   absl::Status computed = ComputeMulti(&context);
   if (!computed.ok()) co_return std::string(StorageError(builder, computed));
   if (context.store_) {
-    const std::size_t destination_arg =
-        context.store_shape_->destination_arg_;
+    const std::size_t destination_arg = context.store_shape_->destination_arg_;
     const ZSetExecKey* destination = find_key(destination_arg);
     if (destination == nullptr) {
       co_return std::string(
           builder.AppendError("ERR Sorted Set destination key is missing"));
     }
-    storage::TxShardWrites& destination_writes =
-        tx_writes[destination->owner_];
+    storage::TxShardWrites& destination_writes = tx_writes[destination->owner_];
     absl::Status undo_ready = co_await celer::SubmitTaskTo(
         destination->owner_, [txid = destination_writes.txid_] {
           return g_storage->DiscardTxUndoLocal(txid);
@@ -2534,9 +2775,9 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
             : co_await celer::SubmitTaskTo(destination->owner_, write);
     destination_writes.collect_undo_ = false;
     absl::Status undo_finished = co_await celer::SubmitTaskTo(
-        destination->owner_, [txid = destination_writes.txid_,
-                              rollback = !status.ok(),
-                              writes = &destination_writes] {
+        destination->owner_,
+        [txid = destination_writes.txid_, rollback = !status.ok(),
+         writes = &destination_writes] {
           return rollback ? g_storage->RollbackTxLocal(txid, writes)
                           : g_storage->DiscardTxUndoLocal(txid);
         });
@@ -2546,6 +2787,9 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     }
     if (!undo_finished.ok())
       co_return std::string(StorageError(builder, undo_finished));
+    if (!context.output_.empty()) {
+      NotifyZSetBlockingKey(request.db_id_, args[destination_arg]);
+    }
     co_return EncodeInteger(static_cast<long long>(context.output_.size()));
   }
   if (request.kind_ == CommandKind::kZInterCard) {
@@ -2559,6 +2803,165 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     if (with_scores) builder.AppendBulkString(FormatDouble(element.score_));
   }
   co_return std::string(builder.View());
+}
+
+Task<std::string> ExecuteZSetMultiPopLocked(
+    const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  ReplyBuilder builder;
+  if (request.kind_ != CommandKind::kZMPop) {
+    auto timeout = ParseBlockingZSetTimeout(request);
+    if (!timeout.ok()) {
+      co_return std::string(builder.AppendError(
+          absl::StrCat("ERR ", timeout.status().message())));
+    }
+  }
+  auto parsed = ParseMultiPopShape(request);
+  if (!parsed.ok()) {
+    co_return std::string(
+        builder.AppendError(absl::StrCat("ERR ", parsed.status().message())));
+  }
+  const MultiPopShape shape = std::move(*parsed);
+  for (std::size_t argument : shape.key_args_) {
+    const ZSetExecKey* key = nullptr;
+    for (const ZSetExecKey& candidate : locked_keys) {
+      if (candidate.arg_ == argument) {
+        key = &candidate;
+        break;
+      }
+    }
+    if (key == nullptr) {
+      co_return std::string(
+          builder.AppendError("ERR Sorted Set key is missing"));
+    }
+    auto pop = [&]() {
+      return PopZSetLocked(request.db_id_, request.args_[argument],
+                           key->digest_, shape.maximum_, shape.count_,
+                           &tx_writes[key->owner_]);
+    };
+    auto popped = key->owner_ == celer::ThisWorker().id_
+                      ? co_await pop()
+                      : co_await celer::SubmitTaskTo(key->owner_, pop);
+    if (!popped.ok()) {
+      co_return std::string(StorageError(builder, popped.status()));
+    }
+    if (!popped->empty()) {
+      AppendMultiPopReply(builder, request.args_[argument], *popped,
+                          shape.flat_reply_);
+      co_return std::string(builder.View());
+    }
+  }
+  co_return "*-1\r\n";
+}
+
+Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
+                                              ReplyBuilder& builder) {
+  const auto& args = request.args_;
+  auto parsed_timeout = ParseBlockingZSetTimeout(request);
+  if (!parsed_timeout.ok()) {
+    co_return Built(builder.AppendError(
+        absl::StrCat("ERR ", parsed_timeout.status().message())));
+  }
+  const double timeout_seconds = *parsed_timeout;
+  auto shape = ParseMultiPopShape(request);
+  if (!shape.ok()) {
+    co_return Built(
+        builder.AppendError(absl::StrCat("ERR ", shape.status().message())));
+  }
+
+  const bool infinite = timeout_seconds == 0;
+  const auto started = std::chrono::steady_clock::now();
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  if (!infinite) {
+    constexpr long double kNanosecondsPerSecond = 1'000'000'000.0L;
+    const long double nanoseconds =
+        static_cast<long double>(timeout_seconds) * kNanosecondsPerSecond;
+    const auto maximum = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::time_point::max() - started);
+    if (!std::isfinite(timeout_seconds) ||
+        nanoseconds > static_cast<long double>(maximum.count())) {
+      co_return Built(builder.AppendError("ERR timeout is out of range"));
+    }
+    deadline = started +
+               std::chrono::nanoseconds(static_cast<std::int64_t>(nanoseconds));
+  }
+
+  std::unique_ptr<BlockingWaitHandle> waiter;
+  while (true) {
+    if (waiter) {
+      const BlockingWakeReason state = BlockingWaitState(*waiter);
+      if (state == BlockingWakeReason::kTimeout) {
+        co_return Built(builder.AppendRaw("*-1\r\n"));
+      }
+      if (state == BlockingWakeReason::kCancelled) {
+        co_return Built(
+            builder.AppendError("ERR blocking Sorted Set wait cancelled"));
+      }
+      if (state == BlockingWakeReason::kReady)
+        (void)ResetBlockingReady(*waiter);
+    }
+
+    while (!TryBeginCommandDbOperation(request.db_id_)) {
+      if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+        co_return Built(builder.AppendRaw("*-1\r\n"));
+      }
+      absl::Status slept = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!slept.ok()) co_return Built(StorageError(builder, slept));
+    }
+    struct AttemptGuard {
+      explicit AttemptGuard(std::uint8_t db) : db_(db) {}
+      ~AttemptGuard() { Release(); }
+      void Release() {
+        if (!active_) return;
+        EndCommandDbOperation(db_);
+        active_ = false;
+      }
+      std::uint8_t db_;
+      bool active_ = true;
+    } gate(request.db_id_);
+    ReplyBuilder attempt_builder;
+    bool empty = false;
+    CommandReply attempt = co_await ExecuteZSetMultiPopAttempt(
+        request, attempt_builder, &empty);
+    if (!empty) co_return Built(builder.AppendRaw(attempt.encoded_));
+    if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+      co_return Built(builder.AppendRaw("*-1\r\n"));
+    }
+
+    if (!waiter) {
+      std::vector<BlockingWaitSpec> specs;
+      specs.reserve(shape->key_args_.size());
+      for (std::size_t argument : shape->key_args_) {
+        specs.push_back(BlockingWaitSpec{
+            .key_ = args[argument],
+            .lane_ = {},
+            .value_type_ = BlockingValueType::kSortedSet,
+            .policy_ = BlockingQueuePolicy::kFifo,
+            .stream_after_ = std::nullopt,
+        });
+      }
+      // Do not count registration or suspension as an active DB operation.
+      gate.Release();
+      auto registered = co_await RegisterBlockingWait(
+          request.db_id_, std::move(specs), deadline);
+      if (!registered.ok()) {
+        co_return Built(StorageError(builder, registered.status()));
+      }
+      waiter = std::move(*registered);
+      continue;  // closes the empty-check/register race
+    }
+
+    gate.Release();
+    const BlockingWakeReason woke = co_await WaitForBlockingReady(*waiter);
+    if (woke == BlockingWakeReason::kTimeout) {
+      co_return Built(builder.AppendRaw("*-1\r\n"));
+    }
+    if (woke == BlockingWakeReason::kCancelled) {
+      co_return Built(
+          builder.AppendError("ERR blocking Sorted Set wait cancelled"));
+    }
+  }
 }
 
 }  // namespace keylane

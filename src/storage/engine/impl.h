@@ -174,9 +174,8 @@ inline bool MaybeFailTxWrite(std::string_view key) noexcept {
     const char* begin = after_text;
     const char* end = begin + std::strlen(begin);
     const auto result = std::from_chars(begin, end, parsed);
-    return result.ec == std::errc{} && result.ptr == end
-               ? parsed
-               : std::uint64_t{0};
+    return result.ec == std::errc{} && result.ptr == end ? parsed
+                                                         : std::uint64_t{0};
   }();
   static std::atomic<std::uint64_t> matches{0};
   return matches.fetch_add(1, std::memory_order_relaxed) == fail_index;
@@ -1094,15 +1093,17 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr);
 
-  Task<absl::Status> ExecuteCompact(
-      std::uint8_t db_id, std::string_view key, ValueType value_type,
-      bool read_only, const CompactValueCallback& callback,
-      std::uint64_t now_ms = 0);
-  Task<absl::Status> ExecuteCompactLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      ValueType value_type, bool read_only,
-      const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
-      std::uint64_t now_ms = 0);
+  Task<absl::Status> ExecuteCompact(std::uint8_t db_id, std::string_view key,
+                                    ValueType value_type, bool read_only,
+                                    const CompactValueCallback& callback,
+                                    std::uint64_t now_ms = 0);
+  Task<absl::Status> ExecuteCompactLocked(std::uint8_t db_id,
+                                          std::string_view key,
+                                          const Digest& digest,
+                                          ValueType value_type, bool read_only,
+                                          const CompactValueCallback& callback,
+                                          TxShardWrites* tx = nullptr,
+                                          std::uint64_t now_ms = 0);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1115,6 +1116,16 @@ class StorageEngine::Impl {
   Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                            std::string_view key,
                                            const Digest& digest);
+
+  Task<absl::StatusOr<RawValue>> ReadRawValueLocked(std::uint8_t db_id,
+                                                    std::string_view key,
+                                                    const Digest& digest);
+
+  Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
+                                         std::string_view key,
+                                         const Digest& digest,
+                                         const RawValue& value,
+                                         TxShardWrites* tx = nullptr);
 
   Task<absl::StatusOr<bool>> UpdateExpiration(std::uint8_t db_id,
                                               std::string_view key,
@@ -1210,14 +1221,6 @@ class StorageEngine::Impl {
   Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                           const Digest& digest);
 
-  Task<absl::StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
-                                               std::string_view key);
-
-  // Caller holds the key lock (exclusive); takes store_state_mutex internally.
-  Task<absl::StatusOr<std::int64_t>> IncrementLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      TxShardWrites* tx = nullptr);
-
   Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                     std::vector<TxShardWrites*> shards);
 
@@ -1239,6 +1242,9 @@ class StorageEngine::Impl {
     assert(db_id < kLogicalDatabaseCount);
     return CurrentStore().live_key_count_[db_id];
   }
+
+  Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(
+      std::uint8_t db_id);
 
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept {
     assert(db_id < kLogicalDatabaseCount);

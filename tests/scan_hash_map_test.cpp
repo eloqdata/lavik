@@ -215,3 +215,25 @@ TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
   EXPECT_TRUE(map.Erase(inserted.entry_));
   EXPECT_TRUE(map.empty());
 }
+
+TEST(ScanHashMapTest, ForEachWhileStopsImmediately) {
+  ScanHashMap<std::uint64_t> map;
+  for (std::uint64_t i = 0; i < 100; ++i) {
+    const std::string key = "key-" + std::to_string(i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+
+  std::size_t visited = 0;
+  EXPECT_FALSE(map.ForEachWhile([&](const auto&) {
+    ++visited;
+    return visited < 7;
+  }));
+  EXPECT_EQ(visited, 7u);
+
+  visited = 0;
+  EXPECT_TRUE(map.ForEachWhile([&](const auto&) {
+    ++visited;
+    return true;
+  }));
+  EXPECT_EQ(visited, map.size());
+}

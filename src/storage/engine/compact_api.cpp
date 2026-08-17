@@ -20,7 +20,8 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
     TxShardWrites* tx, std::uint64_t now_ms) {
   assert(db_id < kLogicalDatabaseCount);
-  if (value_type != ValueType::kSortedSet && value_type != ValueType::kStream) {
+  if (value_type != ValueType::kString && value_type != ValueType::kSortedSet &&
+      value_type != ValueType::kStream) {
     co_return absl::InvalidArgumentError("unsupported compact value type");
   }
 
@@ -48,8 +49,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   const std::uint64_t observed_index_generation =
       store.index_generations_[db_id];
   const std::uint64_t observed_db_epoch = DbEpoch(db_id);
-  const std::uint64_t observed_replication_epoch =
-      partition.replication_epoch_;
+  const std::uint64_t observed_replication_epoch = partition.replication_epoch_;
   auto read_epoch_changed = [&]() {
     return read_only &&
            (store.index_generations_[db_id] != observed_index_generation ||
@@ -74,6 +74,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
           .encoded_ = std::string_view(
               reinterpret_cast<const char*>(bytes.data()), bytes.size()),
           .logical_size_ = location.logical_size_,
+          .expire_at_ms_ = location.expire_at_ms_,
       };
     }
   }
@@ -99,7 +100,9 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   const ValueType published_type =
       update->erase_ ? ValueType::kNone : value_type;
   const std::uint64_t expire_at_ms =
-      !update->erase_ && exists ? location.expire_at_ms_ : 0;
+      update->erase_
+          ? 0
+          : update->expire_at_ms_.value_or(exists ? location.expire_at_ms_ : 0);
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key,
       update->erase_ ? std::string_view{} : std::string_view(update->encoded_),

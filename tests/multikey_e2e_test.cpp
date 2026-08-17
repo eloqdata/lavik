@@ -304,6 +304,76 @@ int main(int argc, char** argv) {
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
 
+    Expect(client.Command({"RANDOMKEY"}), "$-1", "RANDOMKEY empty database");
+    Expect(client.Command({"SELECT", "15"}), "+OK", "RANDOMKEY select db15");
+    Expect(client.Command({"SET", "only-random-key", "v"}), "+OK",
+           "RANDOMKEY seed");
+    Expect(client.Command({"RANDOMKEY"}), Bulk("only-random-key"),
+           "RANDOMKEY single key");
+    Expect(client.Command({"PEXPIRE", "only-random-key", "0"}), ":1",
+           "RANDOMKEY expire seed");
+    Expect(client.Command({"RANDOMKEY"}), "$-1",
+           "RANDOMKEY ignores expired key");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "RANDOMKEY back to db0");
+
+    Expect(client.Command({"MSET", "touch-a", "1", "touch-b", "2"}), "+OK",
+           "TOUCH seed");
+    Expect(
+        client.Command({"TOUCH", "touch-a", "missing", "touch-a", "touch-b"}),
+        ":3", "TOUCH counts duplicate live keys");
+
+    Expect(client.Command({"SET", "copy-source", "source", "EX", "60"}), "+OK",
+           "COPY string seed");
+    Expect(client.Command({"COPY", "copy-source", "copy-destination"}), ":1",
+           "COPY string");
+    Expect(client.Command({"GET", "copy-destination"}), Bulk("source"),
+           "COPY string value");
+    Expect(client.Command({"PERSIST", "copy-destination"}), ":1",
+           "COPY preserves TTL");
+    Expect(client.Command({"SET", "copy-destination", "old"}), "+OK",
+           "COPY existing destination");
+    Expect(client.Command({"COPY", "copy-source", "copy-destination"}), ":0",
+           "COPY without REPLACE");
+    Expect(client.Command({"GET", "copy-destination"}), Bulk("old"),
+           "COPY leaves destination without REPLACE");
+    Expect(
+        client.Command({"COPY", "copy-source", "copy-destination", "REPLACE"}),
+        ":1", "COPY REPLACE");
+    Expect(client.Command({"GET", "copy-destination"}), Bulk("source"),
+           "COPY REPLACE value");
+    Expect(
+        client.Command({"COPY", "missing-copy", "copy-destination", "REPLACE"}),
+        ":0", "COPY missing source");
+    Expect(client.Command({"COPY", "copy-source", "copy-source"}),
+           "-ERR source and destination objects are the same",
+           "COPY same object");
+
+    Expect(client.Command({"LPUSH", "copy-list", "a", "b"}), ":2",
+           "COPY list seed");
+    Expect(client.Command({"COPY", "copy-list", "copy-list-destination"}), ":1",
+           "COPY list");
+    Expect(client.Command({"LLEN", "copy-list-destination"}), ":2",
+           "COPY preserves collection type");
+
+    Expect(client.Command({"COPY", "copy-source", "copy-db", "DB", "2"}), ":1",
+           "COPY cross database");
+    Expect(client.Command({"SELECT", "2"}), "+OK", "COPY select destination");
+    Expect(client.Command({"GET", "copy-db"}), Bulk("source"),
+           "COPY cross database value");
+    Expect(client.Command({"PERSIST", "copy-db"}), ":1",
+           "COPY cross database TTL");
+    Expect(client.Command({"SELECT", "0"}), "+OK", "COPY return to db0");
+    Expect(client.Command({"COPY", "copy-source", "x", "DB", "16"}),
+           "-ERR DB index is out of range", "COPY invalid DB");
+    Expect(client.Command({"COPY", "copy-source", "x", "DB", "01"}),
+           "-ERR value is not an integer or out of range",
+           "COPY rejects a non-canonical DB index");
+    Expect(client.Command({"COPY", "copy-source", "x", "DB", "+1"}),
+           "-ERR value is not an integer or out of range",
+           "COPY rejects a signed positive DB index");
+    Expect(client.Command({"COPY", "copy-source", "x", "UNKNOWN"}),
+           "-ERR syntax error", "COPY invalid option");
+
     // Cross-shard MSET/MGET: values come back in request order regardless of
     // which worker owns each key.
     Expect(client.Command({"MSET", "mk0", "v0", "mk1", "v1", "mk2", "v2", "mk3",
@@ -342,6 +412,16 @@ int main(int argc, char** argv) {
            "cross-shard DEL");
     Expect(client.Command({"MGET", "mk0", "mk5", "mk7", "mk1"}),
            "*4\r\n$-1\r\n$-1\r\n$-1\r\n" + Bulk("v1"), "MGET after DEL");
+
+    // UNLINK shares DEL's deferred tombstone retirement but remains a
+    // distinct command at dispatch and metrics boundaries.
+    Expect(client.Command({"MSET", "unlink-a", "1", "unlink-b", "2"}), "+OK",
+           "UNLINK seed");
+    Expect(client.Command(
+               {"UNLINK", "unlink-a", "missing", "unlink-b", "unlink-b"}),
+           ":2", "cross-shard UNLINK");
+    Expect(client.Command({"MGET", "unlink-a", "unlink-b"}), "*2\r\n$-1\r\n$-1",
+           "MGET after UNLINK");
 
     // Hashtag keys share one slot: the whole command stays on a single shard
     // (fast path) and must behave identically.

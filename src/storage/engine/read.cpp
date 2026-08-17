@@ -1,6 +1,116 @@
 #include "impl.h"
+#include "keylane/random_sample.h"
 
 namespace keylane::storage {
+
+Task<absl::StatusOr<std::optional<std::string>>>
+StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
+  assert(db_id < kLogicalDatabaseCount);
+  WorkerStore& store = CurrentStore();
+  auto materialize = [&](WorkerStore::PartitionStore& partition,
+                         RecordIndex& index,
+                         RecordIndex::Entry* selected)
+      -> Task<absl::StatusOr<std::optional<std::string>>> {
+    if (selected->key_complete()) {
+      co_return std::optional<std::string>(std::string(selected->key()));
+    }
+    const RecordIndex::Entry* identity = selected;
+    const std::uint64_t hash = selected->hash_;
+    const RecordLocation location = selected->value_;
+    const ExtentManifest extents = ExtentsFor(store, selected);
+    const std::uint32_t key_bytes = selected->logical_key_size();
+    const std::uint64_t index_generation = store.index_generations_[db_id];
+    const std::uint64_t replication_epoch = partition.replication_epoch_;
+    auto loaded =
+        co_await LoadOutOfIndexKey(store, location, extents, key_bytes);
+    if (!loaded.ok()) co_return loaded.status();
+    if (store.index_generations_[db_id] != index_generation ||
+        partition.replication_epoch_ != replication_epoch ||
+        !index.Contains(identity, hash) ||
+        !identity->value_.SamePhysicalRecord(location) ||
+        identity->value_.kind_ != RecordKind::kValue ||
+        IsExpired(identity->value_, UnixTimeMillis())) {
+      co_return std::optional<std::string>{};
+    }
+    co_return std::optional<std::string>(std::move(*loaded));
+  };
+
+  // The counters include keys whose deadline passed but whose tombstone has
+  // not been appended yet. Rejection sampling preserves a uniform choice
+  // among live keys in the usual case; after enough expired hits, fall back
+  // to a bounded-memory scan so a database with many stale expirations cannot
+  // incorrectly look empty.
+  constexpr unsigned kRandomAttempts = 100;
+  for (unsigned attempt = 0; attempt < kRandomAttempts; ++attempt) {
+    const std::size_t population = store.live_key_count_[db_id];
+    if (population == 0) {
+      co_return std::optional<std::string>{};
+    }
+    std::uint64_t rank = RandomRank(population, RandomSampleGenerator());
+    WorkerStore::PartitionStore* selected_partition = nullptr;
+    for (WorkerStore::PartitionStore& partition : store.partitions_) {
+      const std::size_t size = partition.live_key_count_[db_id];
+      if (rank < size) {
+        selected_partition = &partition;
+        break;
+      }
+      rank -= size;
+    }
+    if (selected_partition == nullptr) {
+      continue;
+    }
+
+    RecordIndex& index = selected_partition->indexes_[db_id];
+    RecordIndex::Entry* selected = nullptr;
+    index.ForEachWhile([&](RecordIndex::Entry& entry) {
+      if (entry.value_.kind_ != RecordKind::kValue) return true;
+      if (rank == 0) {
+        selected = &entry;
+        return false;
+      } else {
+        --rank;
+      }
+      return true;
+    });
+    if (selected == nullptr) {
+      continue;
+    }
+
+    const std::uint64_t now_ms = UnixTimeMillis();
+    if (IsExpired(selected->value_, now_ms)) {
+      QueueExpiredCandidate(store, selected_partition->id_, db_id, *selected,
+                            selected->key());
+      continue;
+    }
+    auto key = co_await materialize(*selected_partition, index, selected);
+    if (!key.ok()) co_return key.status();
+    if (key->has_value()) co_return std::move(*key);
+  }
+
+  // Scan the worker's indexes directly on the pathological fallback. Calling
+  // ScanPartition once per empty logical partition would create thousands of
+  // coroutine round trips when the only counted records are expired.
+  for (WorkerStore::PartitionStore& partition : store.partitions_) {
+    RecordIndex& index = partition.indexes_[db_id];
+    RecordIndex::Entry* selected = nullptr;
+    const std::uint64_t now_ms = UnixTimeMillis();
+    index.ForEachWhile([&](RecordIndex::Entry& entry) {
+      if (entry.value_.kind_ != RecordKind::kValue) return true;
+      if (IsExpired(entry.value_, now_ms)) {
+        QueueExpiredCandidate(store, partition.id_, db_id, entry, entry.key());
+      } else {
+        selected = &entry;
+        return false;
+      }
+      return true;
+    });
+    if (selected == nullptr) continue;
+    auto key = co_await materialize(partition, index, selected);
+    if (!key.ok()) co_return key.status();
+    if (key->has_value()) co_return std::move(*key);
+  }
+  co_return std::optional<std::string>{};
+}
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
     std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace) {
@@ -132,6 +242,54 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
       .exists_ = true,
       .expire_at_ms_ = found->value_.expire_at_ms_,
       .value_type_ = found->value_.value_type_,
+  };
+}
+
+Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest) {
+  assert(db_id < kLogicalDatabaseCount);
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionForKey(store, key);
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+
+  auto& index = partition.indexes_[db_id];
+  auto* found = index.Find(digest, key);
+  if (found != nullptr && !found->key_complete()) [[unlikely]] {
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+    if (!resolved.ok()) co_return resolved.status();
+    found = *resolved;
+  }
+  if (found == nullptr || found->value_.kind_ != RecordKind::kValue ||
+      IsExpired(found->value_, UnixTimeMillis())) {
+    if (found != nullptr && found->value_.kind_ == RecordKind::kValue) {
+      QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
+    }
+    co_return absl::NotFoundError("key not found");
+  }
+
+  const RecordLocation location = found->value_;
+  const ExtentManifest extents = ExtentsFor(store, found);
+  const std::uint64_t index_generation = store.index_generations_[db_id];
+  const std::uint64_t db_epoch = DbEpoch(db_id);
+  const std::uint64_t replication_epoch = partition.replication_epoch_;
+  unlock.Unlock();
+
+  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                   location, extents);
+  if (!loaded.ok()) co_return loaded.status();
+  if (store.index_generations_[db_id] != index_generation ||
+      DbEpoch(db_id) != db_epoch ||
+      partition.replication_epoch_ != replication_epoch) {
+    co_return absl::NotFoundError("key not found");
+  }
+  const auto bytes = loaded->value();
+  co_return RawValue{
+      .encoded_ = std::string(reinterpret_cast<const char*>(bytes.data()),
+                              bytes.size()),
+      .logical_size_ = location.logical_size_,
+      .expire_at_ms_ = location.expire_at_ms_,
+      .value_type_ = location.value_type_,
   };
 }
 

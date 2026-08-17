@@ -8,12 +8,12 @@
 #include <optional>
 #include <span>
 
+#include "absl/strings/str_cat.h"
+#include "blocking_wait.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
-#include "absl/strings/str_cat.h"
 #include "keylane/resp.h"
-#include "blocking_wait.h"
 
 namespace keylane {
 namespace {
@@ -61,11 +61,9 @@ struct Stream {
   std::vector<Group> groups_;
 };
 
-std::size_t XInfoLimitedCount(std::size_t available,
-                              std::uint64_t requested) {
-  return requested == 0
-             ? available
-             : std::min<std::uint64_t>(available, requested);
+std::size_t XInfoLimitedCount(std::size_t available, std::uint64_t requested) {
+  return requested == 0 ? available
+                        : std::min<std::uint64_t>(available, requested);
 }
 
 struct SubcommandShape {
@@ -75,12 +73,13 @@ struct SubcommandShape {
 };
 
 constexpr SubcommandShape kXGroupShapes[] = {
-    {"create", 5, 8},          {"setid", 5, 7},
-    {"destroy", 4, 4},         {"createconsumer", 5, 5},
-    {"delconsumer", 5, 5},     {"help", 2, 2},
+    {"create", 5, 8},         {"setid", 5, 7},       {"destroy", 4, 4},
+    {"createconsumer", 5, 5}, {"delconsumer", 5, 5}, {"help", 2, 2},
 };
 constexpr SubcommandShape kXInfoShapes[] = {
-    {"consumers", 4, 4}, {"groups", 3, 3}, {"stream", 3, 6},
+    {"consumers", 4, 4},
+    {"groups", 3, 3},
+    {"stream", 3, 6},
     {"help", 2, std::numeric_limits<std::size_t>::max()},
 };
 
@@ -101,7 +100,7 @@ bool EqualCi(std::string_view a, std::string_view b) {
 }
 
 const SubcommandShape* FindSubcommandShape(CommandKind kind,
-                                            std::string_view name) {
+                                           std::string_view name) {
   const std::span<const SubcommandShape> shapes =
       kind == CommandKind::kXGroup
           ? std::span<const SubcommandShape>(kXGroupShapes)
@@ -113,9 +112,8 @@ const SubcommandShape* FindSubcommandShape(CommandKind kind,
 }
 
 std::string SubcommandSyntaxError(const CommandRequest& request) {
-  const std::string command = request.kind_ == CommandKind::kXGroup
-                                  ? "XGROUP"
-                                  : "XINFO";
+  const std::string command =
+      request.kind_ == CommandKind::kXGroup ? "XGROUP" : "XINFO";
   return "ERR unknown subcommand or wrong number of arguments for '" +
          request.args_[1].substr(0, 128) + "'. Try " + command + " HELP.";
 }
@@ -227,8 +225,8 @@ absl::StatusOr<Stream> Decode(
   for (std::uint32_t i = 0; i < entry_count; ++i) {
     Entry entry;
     std::uint32_t fields = 0;
-    if (!GetId(in, &at, &entry.id_) || !Get32(in, &at, &fields) ||
-        fields % 2 || fields > (in.size() - at) / sizeof(std::uint32_t))
+    if (!GetId(in, &at, &entry.id_) || !Get32(in, &at, &fields) || fields % 2 ||
+        fields > (in.size() - at) / sizeof(std::uint32_t))
       return absl::InternalError("invalid persisted Stream entry");
     entry.fields_.reserve(fields);
     for (std::uint32_t f = 0; f < fields; ++f) {
@@ -253,8 +251,7 @@ absl::StatusOr<Stream> Decode(
     if (!GetString(in, &at, &group.name_) || !GetId(in, &at, &group.last_id_) ||
         !Get64(in, &at, &entries_read) || !Get32(in, &at, &consumers))
       return absl::InternalError("invalid persisted Stream group");
-    constexpr std::size_t kMinimumConsumerBytes =
-        4 + 2 * sizeof(std::uint64_t);
+    constexpr std::size_t kMinimumConsumerBytes = 4 + 2 * sizeof(std::uint64_t);
     if (consumers > (in.size() - at) / kMinimumConsumerBytes)
       return absl::InternalError("invalid persisted Stream consumer count");
     group.entries_read_ = std::bit_cast<std::int64_t>(entries_read);
@@ -314,13 +311,13 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
   for (const Group& group : stream.groups_) {
     if (!fits32(group.name_.size()) || !fits32(group.consumers_.size()) ||
         !fits32(group.pending_.size()) ||
-        !add_bytes(4 + static_cast<std::uint64_t>(group.name_.size()) + 16 +
-                   8 + 4))
+        !add_bytes(4 + static_cast<std::uint64_t>(group.name_.size()) + 16 + 8 +
+                   4))
       return absl::OutOfRangeError("Stream group is too large");
     for (const Consumer& consumer : group.consumers_) {
       if (!fits32(consumer.name_.size()) ||
-          !add_bytes(4 + static_cast<std::uint64_t>(consumer.name_.size()) +
-                     8 + 8))
+          !add_bytes(4 + static_cast<std::uint64_t>(consumer.name_.size()) + 8 +
+                     8))
         return absl::OutOfRangeError("Stream consumer is too large");
     }
     if (!add_bytes(4))
@@ -328,8 +325,8 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
     for (const Pending& pending : group.pending_) {
       if (!fits32(pending.consumer_.size()) ||
           !add_bytes(16 + 4 +
-                     static_cast<std::uint64_t>(pending.consumer_.size()) +
-                     8 + 8))
+                     static_cast<std::uint64_t>(pending.consumer_.size()) + 8 +
+                     8))
         return absl::OutOfRangeError("Stream pending entry is too large");
     }
   }
@@ -381,7 +378,8 @@ absl::StatusOr<storage::CompactValueUpdate> Changed(Stream stream) {
   if (!encoded.ok()) return encoded.status();
   return storage::CompactValueUpdate{.changed_ = true,
                                      .encoded_ = std::move(*encoded),
-                                     .logical_size_ = stream.entries_.size()};
+                                     .logical_size_ = stream.entries_.size(),
+                                     .expire_at_ms_ = std::nullopt};
 }
 
 Group* FindGroup(Stream* stream, std::string_view name) {
@@ -418,8 +416,7 @@ std::int64_t EstimateEntriesRead(const Stream& stream, Id id) {
     const std::uint64_t before_first =
         stream.entries_added_ - stream.entries_.size();
     if (id < first) return static_cast<std::int64_t>(before_first);
-    if (id == first)
-      return static_cast<std::int64_t>(before_first + 1);
+    if (id == first) return static_cast<std::int64_t>(before_first + 1);
   }
   return -1;
 }
@@ -556,8 +553,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
             pending->delivery_ms_ = now;
             pending->deliveries_ = 1;
           } else {
-            group->pending_.insert(
-                pending, Pending{entry.id_, consumer_name, now, 1});
+            group->pending_.insert(pending,
+                                   Pending{entry.id_, consumer_name, now, 1});
           }
         }
         if (result.entries_.size() == count) break;
@@ -620,8 +617,8 @@ Task<CommandReply> ExecuteRead(
     if (EqualCi(a[i], "count") && i + 1 < a.size()) {
       std::int64_t parsed_count = 0;
       if (!ParseInt(a[i + 1], &parsed_count))
-        co_return Built(builder.AppendError(
-            "ERR value is not an integer or out of range"));
+        co_return Built(
+            builder.AppendError("ERR value is not an integer or out of range"));
       count = parsed_count <= 0 ? UINT64_MAX
                                 : static_cast<std::uint64_t>(parsed_count);
       i += 2;
@@ -648,10 +645,10 @@ Task<CommandReply> ExecuteRead(
   const std::size_t first_key = ++i;
   const std::size_t remaining = a.size() - first_key;
   if (remaining < 2 || remaining % 2)
-    co_return Built(builder.AppendError(absl::StrCat(
-        "ERR Unbalanced '", group_read ? "xreadgroup" : "xread",
-        "' list of streams: for each stream key an ID or '",
-        group_read ? ">" : "$", "' must be specified.")));
+    co_return Built(builder.AppendError(
+        absl::StrCat("ERR Unbalanced '", group_read ? "xreadgroup" : "xread",
+                     "' list of streams: for each stream key an ID or '",
+                     group_read ? ">" : "$", "' must be specified.")));
   const std::size_t key_count = remaining / 2;
   std::vector<Id> cursors(key_count);
   std::vector<bool> dollar(key_count, false), new_messages(key_count, false);
@@ -673,8 +670,9 @@ Task<CommandReply> ExecuteRead(
   if (!locked_keys.empty()) block = false;
   const auto started = std::chrono::steady_clock::now();
   if (block && block_ms != 0) {
-    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::time_point::max() - started);
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - started);
     if (block_ms > static_cast<std::uint64_t>(remaining.count())) {
       co_return Built(builder.AppendError("ERR timeout is out of range"));
     }
@@ -803,8 +801,8 @@ Task<CommandReply> ExecuteRead(
       const std::string lane =
           group_read
               ? "xreadgroup:" + group_name
-              : "xread:" + std::to_string(
-                               storage::StorageEngine::AllocateWriteTxid());
+              : "xread:" +
+                    std::to_string(storage::StorageEngine::AllocateWriteTxid());
       std::vector<BlockingWaitSpec> specs;
       specs.reserve(key_count);
       for (std::size_t k = 0; k < key_count; ++k) {
@@ -812,6 +810,7 @@ Task<CommandReply> ExecuteRead(
         BlockingWaitSpec spec{
             .key_ = a[first_key + k],
             .lane_ = lane,
+            .value_type_ = BlockingValueType::kStream,
             .policy_ = group_read ? BlockingQueuePolicy::kFifo
                                   : BlockingQueuePolicy::kBroadcast,
             .stream_after_ = std::nullopt,
@@ -830,8 +829,7 @@ Task<CommandReply> ExecuteRead(
       // Close the empty-check/register race before suspending.
       continue;
     }
-    const BlockingWakeReason woke =
-        co_await WaitForBlockingReady(*wait_handle);
+    const BlockingWakeReason woke = co_await WaitForBlockingReady(*wait_handle);
     if (woke == BlockingWakeReason::kTimeout) {
       co_return Built(builder.AppendRaw("*-1\r\n"));
     }
@@ -1077,8 +1075,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           std::size_t remove = stream.entries_.size() - maxlen;
           if (trim_limit != 0)
             remove = std::min<std::uint64_t>(remove, trim_limit);
-          stream.entries_.erase(
-              stream.entries_.begin(), stream.entries_.begin() + remove);
+          stream.entries_.erase(stream.entries_.begin(),
+                                stream.entries_.begin() + remove);
         } else if (trim == Trim::kMinId) {
           auto end = std::lower_bound(
               stream.entries_.begin(), stream.entries_.end(), minid,
@@ -1172,8 +1170,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         ++i;
         std::uint64_t limit = 0;
         if (i < a.size()) {
-          if (!approximate || i + 2 != a.size() ||
-              !EqualCi(a[i], "limit") || !ParseInt(a[i + 1], &limit))
+          if (!approximate || i + 2 != a.size() || !EqualCi(a[i], "limit") ||
+              !ParseInt(a[i + 1], &limit))
             return absl::InvalidArgumentError("syntax error");
           i += 2;
         }
@@ -1183,16 +1181,15 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           if (stream.entries_.size() > maxlen) {
             std::size_t remove = stream.entries_.size() - maxlen;
             if (limit != 0) remove = std::min<std::uint64_t>(remove, limit);
-            stream.entries_.erase(
-                stream.entries_.begin(), stream.entries_.begin() + remove);
+            stream.entries_.erase(stream.entries_.begin(),
+                                  stream.entries_.begin() + remove);
           }
         } else {
           auto end = std::lower_bound(
               stream.entries_.begin(), stream.entries_.end(), minid,
               [](const Entry& entry, Id wanted) { return entry.id_ < wanted; });
           if (limit != 0 &&
-              static_cast<std::uint64_t>(end - stream.entries_.begin()) >
-                  limit)
+              static_cast<std::uint64_t>(end - stream.entries_.begin()) > limit)
             end = stream.entries_.begin() + limit;
           stream.entries_.erase(stream.entries_.begin(), end);
         }
@@ -1637,8 +1634,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     // Metadata changes such as XGROUP SETID can make a consumer-group read
     // ready without appending a new stream ID. Wake candidates and let them
     // recheck their command-specific condition under the normal key lock.
-    const std::size_t key_arg =
-        request.kind_ == CommandKind::kXGroup ? 2 : 1;
+    const std::size_t key_arg = request.kind_ == CommandKind::kXGroup ? 2 : 1;
     NotifyStreamBlockingKey(request.db_id_, a[key_arg]);
   }
   switch (request.kind_) {
@@ -1744,8 +1740,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                   ? "0-0"
                   : FormatId(info_stream.entries_.front().id_));
           builder.AppendBulkString("entries");
-          const std::size_t entry_count = XInfoLimitedCount(
-              info_stream.entries_.size(), xinfo_count);
+          const std::size_t entry_count =
+              XInfoLimitedCount(info_stream.entries_.size(), xinfo_count);
           builder.AppendArrayHeader(entry_count);
           for (std::size_t i = 0; i < entry_count; ++i)
             AppendEntry(builder, info_stream.entries_[i]);
@@ -1863,8 +1859,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           else
             builder.AppendInteger(group.entries_read_);
           builder.AppendBulkString("lag");
-          const std::optional<std::uint64_t> lag =
-              GroupLag(info_stream, group);
+          const std::optional<std::uint64_t> lag = GroupLag(info_stream, group);
           if (!lag.has_value())
             builder.AppendNullBulkString();
           else

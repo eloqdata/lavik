@@ -24,12 +24,18 @@ enum class BlockingWakeReason : std::uint8_t {
 
 enum class BlockingQueuePolicy : std::uint8_t { kFifo, kBroadcast };
 
+// Blocking readiness is type-specific. A write of a different Redis type to
+// the same physical key must not wake a waiter and turn an otherwise valid
+// block into a spurious WRONGTYPE reply.
+enum class BlockingValueType : std::uint8_t { kList, kSortedSet, kStream };
+
 // A wait lane distinguishes independent consumers of the same physical key.
 // List waits use an empty lane, XREAD uses a connection-unique lane, and
 // XREADGROUP uses the group name so consumers in one group remain FIFO.
 struct BlockingWaitSpec {
   std::string key_;
   std::string lane_;
+  BlockingValueType value_type_ = BlockingValueType::kList;
   BlockingQueuePolicy policy_ = BlockingQueuePolicy::kFifo;
   std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_after_;
 };
@@ -49,11 +55,10 @@ class BlockingWaitHandle {
 
   std::unique_ptr<Impl> impl_;
 
-  friend celer::Task<
-      absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
-  RegisterBlockingWait(
-      std::uint8_t, std::vector<BlockingWaitSpec>,
-      std::optional<std::chrono::steady_clock::time_point>);
+  friend celer::Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
+      RegisterBlockingWait(
+          std::uint8_t, std::vector<BlockingWaitSpec>,
+          std::optional<std::chrono::steady_clock::time_point>);
   friend celer::Task<BlockingWakeReason> WaitForBlockingReady(
       BlockingWaitHandle&);
   friend BlockingWakeReason BlockingWaitState(const BlockingWaitHandle&);
@@ -72,6 +77,7 @@ bool ResetBlockingReady(BlockingWaitHandle& handle);
 void FinishBlockingWait(BlockingWaitHandle& handle);
 
 void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
                              std::uint64_t id_ms, std::uint64_t id_seq);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key);

@@ -119,6 +119,7 @@ add_library(keylane_module
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
   src/redis/set_command.cpp
+  src/redis/string_command.cpp
   src/redis/stream_command.cpp
   src/redis/zset_command.cpp
   src/redis/command_table.cpp

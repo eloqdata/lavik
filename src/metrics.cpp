@@ -163,28 +163,78 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "dbsize";
     case CommandKind::kDel:
       return "del";
+    case CommandKind::kUnlink:
+      return "unlink";
+    case CommandKind::kRename:
+      return "rename";
+    case CommandKind::kRenameNx:
+      return "renamenx";
+    case CommandKind::kCopy:
+      return "copy";
     case CommandKind::kExists:
       return "exists";
+    case CommandKind::kTouch:
+      return "touch";
+    case CommandKind::kRandomKey:
+      return "randomkey";
     case CommandKind::kFlushDb:
       return "flushdb";
     case CommandKind::kFlushAll:
       return "flushall";
     case CommandKind::kGet:
       return "get";
+    case CommandKind::kGetDel:
+      return "getdel";
+    case CommandKind::kGetEx:
+      return "getex";
+    case CommandKind::kGetRange:
+      return "getrange";
+    case CommandKind::kGetSet:
+      return "getset";
+    case CommandKind::kAppend:
+      return "append";
     case CommandKind::kStrlen:
       return "strlen";
     case CommandKind::kIncr:
       return "incr";
+    case CommandKind::kIncrBy:
+      return "incrby";
+    case CommandKind::kIncrByFloat:
+      return "incrbyfloat";
+    case CommandKind::kDecr:
+      return "decr";
+    case CommandKind::kDecrBy:
+      return "decrby";
+    case CommandKind::kSetEx:
+      return "setex";
+    case CommandKind::kPSetEx:
+      return "psetex";
+    case CommandKind::kSetNx:
+      return "setnx";
+    case CommandKind::kSetRange:
+      return "setrange";
+    case CommandKind::kSubstr:
+      return "substr";
+    case CommandKind::kLcs:
+      return "lcs";
     case CommandKind::kExpire:
       return "expire";
     case CommandKind::kPExpire:
       return "pexpire";
+    case CommandKind::kExpireAt:
+      return "expireat";
+    case CommandKind::kPExpireAt:
+      return "pexpireat";
     case CommandKind::kPersist:
       return "persist";
     case CommandKind::kTtl:
       return "ttl";
     case CommandKind::kPttl:
       return "pttl";
+    case CommandKind::kExpireTime:
+      return "expiretime";
+    case CommandKind::kPExpireTime:
+      return "pexpiretime";
     case CommandKind::kScan:
       return "scan";
     case CommandKind::kType:
@@ -303,6 +353,12 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "sunion";
     case CommandKind::kSUnionStore:
       return "sunionstore";
+    case CommandKind::kBZMPop:
+      return "bzmpop";
+    case CommandKind::kBZPopMax:
+      return "bzpopmax";
+    case CommandKind::kBZPopMin:
+      return "bzpopmin";
     case CommandKind::kZAdd:
       return "zadd";
     case CommandKind::kZCard:
@@ -313,6 +369,8 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "zincrby";
     case CommandKind::kZLexCount:
       return "zlexcount";
+    case CommandKind::kZMPop:
+      return "zmpop";
     case CommandKind::kZMScore:
       return "zmscore";
     case CommandKind::kZPopMax:
@@ -417,6 +475,8 @@ std::string_view CommandMetricName(CommandKind kind) noexcept {
       return "xreadgroup";
     case CommandKind::kMSet:
       return "mset";
+    case CommandKind::kMSetNx:
+      return "msetnx";
     case CommandKind::kMGet:
       return "mget";
     case CommandKind::kMulti:

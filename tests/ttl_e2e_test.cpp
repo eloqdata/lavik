@@ -336,6 +336,46 @@ int main(int argc, char** argv) {
              "SET past PXAT");
       Expect(client.Command({"GET", "past"}), "$-1", "past PXAT hidden");
 
+      const std::string expireat_seconds = std::to_string(unix_ms / 1000 + 60);
+      Expect(client.Command({"SET", "expireat", "v"}), "+OK", "EXPIREAT seed");
+      Expect(client.Command({"EXPIREAT", "expireat", expireat_seconds}), ":1",
+             "EXPIREAT");
+      Expect(client.Command({"EXPIRETIME", "expireat"}), ":" + expireat_seconds,
+             "EXPIRETIME");
+      Expect(client.Command({"PEXPIRETIME", "expireat"}),
+             ":" + std::to_string(std::stoll(expireat_seconds) * 1000),
+             "PEXPIRETIME after EXPIREAT");
+
+      const std::string pexpireat_ms = std::to_string(unix_ms + 61'234);
+      Expect(client.Command({"SET", "pexpireat", "v"}), "+OK",
+             "PEXPIREAT seed");
+      Expect(client.Command({"PEXPIREAT", "pexpireat", pexpireat_ms}), ":1",
+             "PEXPIREAT");
+      Expect(client.Command({"PEXPIRETIME", "pexpireat"}), ":" + pexpireat_ms,
+             "PEXPIRETIME exact milliseconds");
+      Expect(client.Command({"EXPIRETIME", "pexpireat"}),
+             ":" + std::to_string((std::stoll(pexpireat_ms) + 500) / 1000),
+             "EXPIRETIME rounded seconds");
+      Expect(client.Command({"EXPIRETIME", "missing-expiretime"}), ":-2",
+             "EXPIRETIME missing");
+      Expect(client.Command({"PEXPIRETIME", "conditional"}), ":-1",
+             "PEXPIRETIME persistent");
+
+      Expect(client.Command({"SET", "expireat-past", "v"}), "+OK",
+             "past EXPIREAT seed");
+      Expect(client.Command({"EXPIREAT", "expireat-past", "1"}), ":1",
+             "past EXPIREAT deletes");
+      Expect(client.Command({"GET", "expireat-past"}), "$-1",
+             "past EXPIREAT hidden");
+      Expect(client.Command({"EXPIREAT", "missing-expireat", "1"}), ":0",
+             "EXPIREAT missing");
+      Expect(client.Command({"EXPIREAT", "expireat", "9223372036854775807"}),
+             "-ERR invalid expire time in 'expireat' command",
+             "EXPIREAT seconds overflow");
+      Expect(client.Command({"PEXPIREAT", "expireat", "bad"}),
+             "-ERR value is not an integer or out of range",
+             "PEXPIREAT invalid integer");
+
       Expect(client.Command({"SET", "persistent-conditions", "v"}), "+OK",
              "SET persistent-conditions");
       Expect(client.Command({"EXPIRE", "persistent-conditions", "10", "GT"}),

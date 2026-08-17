@@ -93,9 +93,8 @@ std::string ReadRespBulk(int fd) {
   std::string payload(size + 2, '\0');
   std::size_t received_total = 0;
   while (received_total < payload.size()) {
-    const ssize_t received =
-        ::recv(fd, payload.data() + received_total,
-               payload.size() - received_total, 0);
+    const ssize_t received = ::recv(fd, payload.data() + received_total,
+                                    payload.size() - received_total, 0);
     if (received < 0 && errno == EINTR) continue;
     if (received <= 0) throw std::runtime_error("failed to read RESP bulk");
     received_total += static_cast<std::size_t>(received);
@@ -766,33 +765,30 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   auto first_reader = std::async(std::launch::async, xread);
   auto second_reader = std::async(std::launch::async, xread);
   std::this_thread::sleep_for(50ms);
-  EXPECT_EQ(client.Command(
-                {"XADD", "broadcast-stream", "1-0", "field", "value"}),
-            Bulk("1-0"));
+  EXPECT_EQ(
+      client.Command({"XADD", "broadcast-stream", "1-0", "field", "value"}),
+      Bulk("1-0"));
   ASSERT_EQ(first_reader.wait_for(1s), std::future_status::ready);
   ASSERT_EQ(second_reader.wait_for(1s), std::future_status::ready);
   const std::string broadcast_reply =
-      "*1\r\n*2\r\n" + Bulk("broadcast-stream") +
-      "\r\n*1\r\n*2\r\n" + Bulk("1-0") + "\r\n*2\r\n" +
-      Bulk("field") + "\r\n" + Bulk("value");
+      "*1\r\n*2\r\n" + Bulk("broadcast-stream") + "\r\n*1\r\n*2\r\n" +
+      Bulk("1-0") + "\r\n*2\r\n" + Bulk("field") + "\r\n" + Bulk("value");
   EXPECT_EQ(first_reader.get(), broadcast_reply);
   EXPECT_EQ(second_reader.get(), broadcast_reply);
 
-  EXPECT_EQ(client.Command(
-                {"XGROUP", "CREATE", "fifo-stream", "g", "$", "MKSTREAM"}),
-            "+OK");
+  EXPECT_EQ(
+      client.Command({"XGROUP", "CREATE", "fifo-stream", "g", "$", "MKSTREAM"}),
+      "+OK");
   auto first_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
-    return waiting.Command({"XREADGROUP", "GROUP", "g", "first", "COUNT",
-                            "1", "BLOCK", "1000", "STREAMS", "fifo-stream",
-                            ">"});
+    return waiting.Command({"XREADGROUP", "GROUP", "g", "first", "COUNT", "1",
+                            "BLOCK", "1000", "STREAMS", "fifo-stream", ">"});
   });
   std::this_thread::sleep_for(30ms);
   auto second_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
-    return waiting.Command({"XREADGROUP", "GROUP", "g", "second", "COUNT",
-                            "1", "BLOCK", "1000", "STREAMS", "fifo-stream",
-                            ">"});
+    return waiting.Command({"XREADGROUP", "GROUP", "g", "second", "COUNT", "1",
+                            "BLOCK", "1000", "STREAMS", "fifo-stream", ">"});
   });
   std::this_thread::sleep_for(50ms);
   EXPECT_EQ(client.Command({"XADD", "fifo-stream", "1-0", "f", "one"}),
@@ -807,18 +803,18 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
 
   EXPECT_EQ(client.Command({"XADD", "rewind-wake", "1-0", "f", "v"}),
             Bulk("1-0"));
-  EXPECT_EQ(client.Command(
-                {"XGROUP", "CREATE", "rewind-wake", "rewind-group", "$"}),
-            "+OK");
+  EXPECT_EQ(
+      client.Command({"XGROUP", "CREATE", "rewind-wake", "rewind-group", "$"}),
+      "+OK");
   auto rewound_group = std::async(std::launch::async, [port] {
     RespClient waiting(port);
     return waiting.Command({"XREADGROUP", "GROUP", "rewind-group", "reader",
                             "BLOCK", "1000", "STREAMS", "rewind-wake", ">"});
   });
   std::this_thread::sleep_for(50ms);
-  EXPECT_EQ(client.Command(
-                {"XGROUP", "SETID", "rewind-wake", "rewind-group", "0"}),
-            "+OK");
+  EXPECT_EQ(
+      client.Command({"XGROUP", "SETID", "rewind-wake", "rewind-group", "0"}),
+      "+OK");
   ASSERT_EQ(rewound_group.wait_for(1s), std::future_status::ready);
   EXPECT_TRUE(rewound_group.get().starts_with("*1\r\n"));
 
@@ -1644,13 +1640,11 @@ TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
     EXPECT_EQ(
         client.Command({"HINCRBYFLOAT", "numeric-hash", "counter", "1.5"}),
         Bulk("4.5"));
-    EXPECT_EQ(client.Command({"HSET", "empty-field-hash", "", "value"}),
-              ":1");
+    EXPECT_EQ(client.Command({"HSET", "empty-field-hash", "", "value"}), ":1");
     auto [empty_hash_cursor, empty_hash_scan] = ParseScanReply(
         client.Command({"HSCAN", "empty-field-hash", "0", "COUNT", "100"}));
     EXPECT_EQ(empty_hash_cursor, "0");
-    EXPECT_EQ(empty_hash_scan,
-              (std::vector<std::string>{"", "value"}));
+    EXPECT_EQ(empty_hash_scan, (std::vector<std::string>{"", "value"}));
     EXPECT_EQ(client.Command({"HSET", "numeric-hash", "plus-counter", "+1.5"}),
               ":1");
     EXPECT_EQ(client.Command(
@@ -1682,9 +1676,9 @@ TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
         "*9223372036854775807");
     EXPECT_TRUE(WaitForReply(client, {"HLEN", "large-hash"}, ":180"));
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command(
-                  {"HRANDFIELD", "numeric-hash", "-2001", "WITHVALUES"}),
-              "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"HRANDFIELD", "numeric-hash", "-2001", "WITHVALUES"}),
+        "+QUEUED");
     EXPECT_EQ(client.Command({"SET", "after-random-oom", "alive"}), "+QUEUED");
     const std::string hash_exec_random = client.Command({"EXEC"});
     EXPECT_TRUE(hash_exec_random.starts_with("*2\r\n*4002\r\n"));
@@ -1846,8 +1840,7 @@ TEST(SetE2eTest, Redis72CommandsTransactionsAndRecovery) {
         "*9223372036854775807");
     EXPECT_TRUE(WaitForReply(client, {"SCARD", "basic"}, ":2"));
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command({"SRANDMEMBER", "basic", "-1001"}),
-              "+QUEUED");
+    EXPECT_EQ(client.Command({"SRANDMEMBER", "basic", "-1001"}), "+QUEUED");
     EXPECT_TRUE(client.Command({"EXEC"}).starts_with("*1\r\n*1001\r\n"));
     CloseExecStreamingReplyAfterHeader(
         port, {"SRANDMEMBER", "basic", "-9223372036854775807"},
@@ -1866,8 +1859,7 @@ TEST(SetE2eTest, Redis72CommandsTransactionsAndRecovery) {
         client.Command({"SMEMBERS", "not-set"}).starts_with("-WRONGTYPE"));
     EXPECT_TRUE(client.Command({"SMOVE", "basic", "not-set", "missing"})
                     .starts_with("-WRONGTYPE"));
-    EXPECT_EQ(client.Command(
-                  {"SMOVE", "missing-source", "not-set", "member"}),
+    EXPECT_EQ(client.Command({"SMOVE", "missing-source", "not-set", "member"}),
               ":0");
     EXPECT_TRUE(client.Command({"SMOVE", "basic", "not-set", "c"})
                     .starts_with("-WRONGTYPE"));
@@ -2027,9 +2019,8 @@ TEST(HashE2eTest, ExpiredShieldedWinnerDoesNotResurrectOlderString) {
     server.Kill();
   }
   {
-    ServerProcess server(
-        g_keylane_binary, port, data_path, log_path, 2, {}, {},
-        {{"KEYLANE_RECOVERY_NOW_MS", "1"}});
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2, {}, {},
+                         {{"KEYLANE_RECOVERY_NOW_MS", "1"}});
     RespClient client(port);
     EXPECT_EQ(client.Command({"GET", "shielded"}), "$-1");
     EXPECT_EQ(client.Command({"GET", "unshielded"}), "$-1");
@@ -2060,14 +2051,12 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     EXPECT_EQ(client.Command({"HSET", "h", "f", "v"}), ":1");
     EXPECT_EQ(client.Command({"SADD", "s", "m"}), ":1");
     EXPECT_EQ(client.Command({"ZADD", "z", "1", "m"}), ":1");
-    EXPECT_EQ(client.Command({"XADD", "x", "1-0", "f", "v"}),
-              Bulk("1-0"));
-    EXPECT_EQ(client.Command({"XADD", "x", "2-0", "f", "v"}),
-              Bulk("2-0"));
-    EXPECT_EQ(client.Command({"XGROUP", "CREATE", "x", "g", "0"}),
-              "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "g", "c", "COUNT",
-                                "1", "STREAMS", "x", ">"})
+    EXPECT_EQ(client.Command({"XADD", "x", "1-0", "f", "v"}), Bulk("1-0"));
+    EXPECT_EQ(client.Command({"XADD", "x", "2-0", "f", "v"}), Bulk("2-0"));
+    EXPECT_EQ(client.Command({"XGROUP", "CREATE", "x", "g", "0"}), "+OK");
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
+                              "STREAMS", "x", ">"})
                     .starts_with("*1\r\n"));
     ASSERT_TRUE(WaitForDurability(client));
     server.Stop();
@@ -2109,21 +2098,17 @@ TEST(CollectionE2eTest, ExecPartialWritesRollbackDurably) {
 
   const std::uint16_t port = FindFreePort();
   {
-    ServerProcess server(
-        g_keylane_binary, port, data_path, log_path, 3, {}, {},
-        {{"KEYLANE_FAIL_TX_WRITE", "exec-fail-dst"}});
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 3, {}, {},
+                         {{"KEYLANE_FAIL_TX_WRITE", "exec-fail-dst"}});
     RespClient client(port);
     EXPECT_EQ(client.Command({"RPUSH", "exec-list-src", "source"}), ":1");
-    EXPECT_EQ(client.Command({"RPUSH", "exec-fail-dst", "destination"}),
-              ":1");
+    EXPECT_EQ(client.Command({"RPUSH", "exec-fail-dst", "destination"}), ":1");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command({"SET", "exec-before-list", "kept"}),
+    EXPECT_EQ(client.Command({"SET", "exec-before-list", "kept"}), "+QUEUED");
+    EXPECT_EQ(client.Command(
+                  {"LMOVE", "exec-list-src", "exec-fail-dst", "LEFT", "RIGHT"}),
               "+QUEUED");
-    EXPECT_EQ(client.Command({"LMOVE", "exec-list-src", "exec-fail-dst",
-                              "LEFT", "RIGHT"}),
-              "+QUEUED");
-    EXPECT_EQ(client.Command({"SET", "exec-after-list", "kept"}),
-              "+QUEUED");
+    EXPECT_EQ(client.Command({"SET", "exec-after-list", "kept"}), "+QUEUED");
     const std::string list_exec = client.Command({"EXEC"});
     EXPECT_TRUE(list_exec.starts_with("*3\r\n+OK\r\n-ERR injected"))
         << list_exec;
@@ -2136,14 +2121,12 @@ TEST(CollectionE2eTest, ExecPartialWritesRollbackDurably) {
     EXPECT_EQ(client.Command({"SADD", "exec-set-src", "member"}), ":1");
     EXPECT_EQ(client.Command({"SADD", "exec-fail-dst", "existing"}), ":1");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command({"SET", "exec-before-set", "kept"}),
-              "+QUEUED");
-    EXPECT_EQ(client.Command(
-                  {"SMOVE", "exec-set-src", "exec-fail-dst", "member"}),
-              "+QUEUED");
+    EXPECT_EQ(client.Command({"SET", "exec-before-set", "kept"}), "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"SMOVE", "exec-set-src", "exec-fail-dst", "member"}),
+        "+QUEUED");
     const std::string set_exec = client.Command({"EXEC"});
-    EXPECT_TRUE(set_exec.starts_with("*2\r\n+OK\r\n-ERR injected"))
-        << set_exec;
+    EXPECT_TRUE(set_exec.starts_with("*2\r\n+OK\r\n-ERR injected")) << set_exec;
     EXPECT_EQ(client.Command({"SISMEMBER", "exec-set-src", "member"}), ":1");
     EXPECT_EQ(client.Command({"SMEMBERS", "exec-fail-dst"}),
               "*1\r\n" + Bulk("existing"));
@@ -2184,9 +2167,10 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();
-  const auto fault_environment = std::vector<std::pair<std::string, std::string>>{
-      {"KEYLANE_FAIL_TX_WRITE", "exec-store-dst"},
-      {"KEYLANE_FAIL_TX_WRITE_AFTER", "1"}};
+  const auto fault_environment =
+      std::vector<std::pair<std::string, std::string>>{
+          {"KEYLANE_FAIL_TX_WRITE", "exec-store-dst"},
+          {"KEYLANE_FAIL_TX_WRITE_AFTER", "1"}};
   {
     ServerProcess server(g_keylane_binary, port, data_path, log_path, 3, {}, {},
                          fault_environment);
@@ -2196,12 +2180,11 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"SET", "exec-before-set-store", "kept"}),
               "+QUEUED");
-    EXPECT_EQ(client.Command(
-                  {"SINTERSTORE", "exec-store-dst", "exec-store-source"}),
-              "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"SINTERSTORE", "exec-store-dst", "exec-store-source"}),
+        "+QUEUED");
     const std::string executed = client.Command({"EXEC"});
-    EXPECT_TRUE(executed.starts_with("*2\r\n+OK\r\n-ERR injected"))
-        << executed;
+    EXPECT_TRUE(executed.starts_with("*2\r\n+OK\r\n-ERR injected")) << executed;
     EXPECT_EQ(client.Command({"GET", "exec-store-dst"}), Bulk("old-set"));
     ASSERT_TRUE(WaitForDurability(client));
     server.Kill();
@@ -2218,12 +2201,11 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"SET", "exec-before-zset-store", "kept"}),
               "+QUEUED");
-    EXPECT_EQ(client.Command({"ZUNIONSTORE", "exec-store-dst", "1",
-                              "exec-zstore-source"}),
+    EXPECT_EQ(client.Command(
+                  {"ZUNIONSTORE", "exec-store-dst", "1", "exec-zstore-source"}),
               "+QUEUED");
     const std::string executed = client.Command({"EXEC"});
-    EXPECT_TRUE(executed.starts_with("*2\r\n+OK\r\n-ERR injected"))
-        << executed;
+    EXPECT_TRUE(executed.starts_with("*2\r\n+OK\r\n-ERR injected")) << executed;
     EXPECT_EQ(client.Command({"GET", "exec-store-dst"}), Bulk("old-zset"));
     ASSERT_TRUE(WaitForDurability(client));
     server.Kill();
@@ -2273,6 +2255,54 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"TYPE", "z"}), "+zset");
     EXPECT_EQ(client.Command({"TYPE", "type-stream"}), "+stream");
     EXPECT_EQ(client.Command({"TYPE", "missing-type"}), "+none");
+
+    const std::string rename_source = KeyForWorker("rename-source", 0, 2);
+    const std::string rename_destination =
+        KeyForWorker("rename-destination", 1, 2);
+    EXPECT_EQ(
+        client.Command({"SET", rename_source, "renamed-value", "PX", "60000"}),
+        "+OK");
+    EXPECT_EQ(client.Command({"SET", rename_destination, "overwritten"}),
+              "+OK");
+    EXPECT_EQ(client.Command({"RENAME", rename_source, rename_destination}),
+              "+OK");
+    EXPECT_EQ(client.Command({"GET", rename_source}), "$-1");
+    EXPECT_EQ(client.Command({"GET", rename_destination}),
+              Bulk("renamed-value"));
+    const std::string renamed_ttl =
+        client.Command({"PTTL", rename_destination});
+    ASSERT_TRUE(renamed_ttl.starts_with(":"));
+    EXPECT_GT(std::stoll(renamed_ttl.substr(1)), 0);
+
+    EXPECT_EQ(client.Command({"HSET", "rename-hash", "field", "value"}), ":1");
+    EXPECT_EQ(client.Command({"RPUSH", "rename-list-target", "old"}), ":1");
+    EXPECT_EQ(client.Command({"RENAME", "rename-hash", "rename-list-target"}),
+              "+OK");
+    EXPECT_EQ(client.Command({"TYPE", "rename-list-target"}), "+hash");
+    EXPECT_EQ(client.Command({"HGET", "rename-list-target", "field"}),
+              Bulk("value"));
+    EXPECT_EQ(client.Command({"SET", "rename-nx-source", "source"}), "+OK");
+    EXPECT_EQ(client.Command({"SET", "rename-nx-target", "target"}), "+OK");
+    EXPECT_EQ(
+        client.Command({"RENAMENX", "rename-nx-source", "rename-nx-target"}),
+        ":0");
+    EXPECT_EQ(client.Command({"GET", "rename-nx-source"}), Bulk("source"));
+    EXPECT_EQ(
+        client.Command({"RENAME", "rename-nx-source", "rename-nx-source"}),
+        "+OK");
+    EXPECT_EQ(
+        client.Command({"RENAMENX", "rename-nx-source", "rename-nx-source"}),
+        ":0");
+    EXPECT_EQ(client.Command({"RENAME", "missing-rename", "destination"}),
+              "-ERR no such key");
+    EXPECT_EQ(client.Command({"SET", "rename-exec-source", "exec-value"}),
+              "+OK");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(
+        client.Command({"RENAME", "rename-exec-source", "rename-persisted"}),
+        "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n+OK");
+    EXPECT_EQ(client.Command({"GET", "rename-persisted"}), Bulk("exec-value"));
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"TYPE", "type-hash"}), "+QUEUED");
     EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n+hash");
@@ -2300,13 +2330,120 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               "*6\r\n" + Bulk("one") + "\r\n" + Bulk("1") + "\r\n" +
                   Bulk("mid") + "\r\n" + Bulk("1.5") + "\r\n" + Bulk("two") +
                   "\r\n" + Bulk("2"));
+    EXPECT_EQ(client.Command({"ZADD", "zmpop-second", "1", "one", "2", "two",
+                              "3", "three"}),
+              ":3");
+    EXPECT_EQ(client.Command({"ZMPOP", "2", "zmpop-empty", "zmpop-second",
+                              "MIN", "COUNT", "2"}),
+              "*2\r\n" + Bulk("zmpop-second") + "\r\n*2\r\n*2\r\n" +
+                  Bulk("one") + "\r\n" + Bulk("1") + "\r\n*2\r\n" +
+                  Bulk("two") + "\r\n" + Bulk("2"));
+    EXPECT_EQ(client.Command({"BZPOPMAX", "zmpop-second", "1"}),
+              "*3\r\n" + Bulk("zmpop-second") + "\r\n" + Bulk("three") +
+                  "\r\n" + Bulk("3"));
+    const std::string cross_zm_empty = KeyForWorker("cross-zm-empty", 0, 2);
+    const std::string cross_zm_ready = KeyForWorker("cross-zm-ready", 1, 2);
+    EXPECT_EQ(client.Command({"ZADD", cross_zm_ready, "8", "eight"}), ":1");
+    EXPECT_EQ(
+        client.Command({"ZMPOP", "2", cross_zm_empty, cross_zm_ready, "MIN"}),
+        "*2\r\n" + Bulk(cross_zm_ready) + "\r\n*1\r\n*2\r\n" + Bulk("eight") +
+            "\r\n" + Bulk("8"));
+    EXPECT_EQ(client.Command({"BZPOPMIN", "zmpop-timeout", "0.01"}), "*-1");
+    EXPECT_EQ(client.Command({"ZMPOP", "1", "zmpop-empty", "MIN", "garbage"}),
+              "-ERR syntax error");
+    EXPECT_EQ(
+        client.Command({"ZMPOP", "1", "zmpop-empty", "MIN", "COUNT", "bad"}),
+        "-ERR count should be greater than 0");
+
+    auto zset_waiting_on_list = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BZPOPMIN", "cross-type-zset-wait", "0.15"});
+    });
+    std::this_thread::sleep_for(30ms);
+    EXPECT_EQ(client.Command({"RPUSH", "cross-type-zset-wait", "list"}), ":1");
+    EXPECT_EQ(zset_waiting_on_list.get(), "*-1");
+    EXPECT_EQ(client.Command({"DEL", "cross-type-zset-wait"}), ":1");
+
+    auto list_waiting_on_zset = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BLPOP", "cross-type-list-wait", "0.15"});
+    });
+    std::this_thread::sleep_for(30ms);
+    EXPECT_EQ(client.Command({"ZADD", "cross-type-list-wait", "1", "zset"}),
+              ":1");
+    EXPECT_EQ(list_waiting_on_zset.get(), "*-1");
+    EXPECT_EQ(client.Command({"DEL", "cross-type-list-wait"}), ":1");
+
+    auto blocked_zpop = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BZPOPMIN", "blocking-zset", "2"});
+    });
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(client.Command({"ZADD", "blocking-zset", "4", "ready"}), ":1");
+    EXPECT_EQ(blocked_zpop.get(), "*3\r\n" + Bulk("blocking-zset") + "\r\n" +
+                                      Bulk("ready") + "\r\n" + Bulk("4"));
+
+    auto first_chained_zpop = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BZPOPMIN", "blocking-zset-chain", "2"});
+    });
+    std::this_thread::sleep_for(30ms);
+    auto second_chained_zpop = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BZPOPMIN", "blocking-zset-chain", "2"});
+    });
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(client.Command(
+                  {"ZADD", "blocking-zset-chain", "1", "first", "2", "second"}),
+              ":2");
+    EXPECT_EQ(first_chained_zpop.get(),
+              "*3\r\n" + Bulk("blocking-zset-chain") + "\r\n" + Bulk("first") +
+                  "\r\n" + Bulk("1"));
+    EXPECT_EQ(second_chained_zpop.get(),
+              "*3\r\n" + Bulk("blocking-zset-chain") + "\r\n" + Bulk("second") +
+                  "\r\n" + Bulk("2"));
+
+    auto blocked_zmpop = std::async(std::launch::async, [port] {
+      RespClient blocked(port);
+      return blocked.Command({"BZMPOP", "2", "2", "blocking-zm-a",
+                              "blocking-zm-b", "MAX", "COUNT", "2"});
+    });
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(
+        client.Command({"ZADD", "blocking-zm-b", "5", "five", "6", "six"}),
+        ":2");
+    EXPECT_EQ(blocked_zmpop.get(), "*2\r\n" + Bulk("blocking-zm-b") +
+                                       "\r\n*2\r\n*2\r\n" + Bulk("six") +
+                                       "\r\n" + Bulk("6") + "\r\n*2\r\n" +
+                                       Bulk("five") + "\r\n" + Bulk("5"));
+
+    EXPECT_EQ(client.Command({"ZADD", "exec-zmpop", "7", "seven"}), ":1");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"ZMPOP", "1", "exec-zmpop", "MIN"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"BZPOPMIN", "missing-exec-zpop", "100"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*2\r\n*2\r\n" + Bulk("exec-zmpop") +
+                                            "\r\n*1\r\n*2\r\n" + Bulk("seven") +
+                                            "\r\n" + Bulk("7") + "\r\n*-1");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"ZMPOP", "0", "ignored", "MIN"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}),
+              "*1\r\n-ERR numkeys should be greater than 0");
+    EXPECT_EQ(client.Command({"ZADD", "bad-timeout-zpop", "1", "member"}),
+              ":1");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"BZPOPMIN", "bad-timeout-zpop", "bad"}),
+              "+QUEUED");
+    EXPECT_TRUE(client.Command({"EXEC"}).starts_with(
+        "*1\r\n-ERR timeout is not a float or out of range"));
+    EXPECT_EQ(client.Command({"ZCARD", "bad-timeout-zpop"}), ":1");
     EXPECT_EQ(client.Command({"ZADD", "z2", "4", "one", "5", "four"}), ":2");
     EXPECT_EQ(client.Command({"ZINTER", "2", "z", "z2", "WITHSCORES"}),
               "*2\r\n" + Bulk("one") + "\r\n" + Bulk("5"));
     EXPECT_EQ(client.Command({"ZUNIONSTORE", "zout", "2", "z", "z2"}), ":4");
-    EXPECT_TRUE(client.Command(
-                  {"ZINTERCARD", "2", "z", "z2", "AGGREGATE", "MAX"})
-                    .starts_with("-ERR syntax error"));
+    EXPECT_TRUE(
+        client.Command({"ZINTERCARD", "2", "z", "z2", "AGGREGATE", "MAX"})
+            .starts_with("-ERR syntax error"));
     EXPECT_EQ(client.Command({"ZINTERCARD", "2", "z", "z2", "LIMIT", "-1"}),
               "-ERR LIMIT can't be negative");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
@@ -2323,11 +2460,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
                   Bulk("one") + "\r\n:1\r\n:4");
     EXPECT_EQ(client.Command({"ZCARD", "exec-z"}), ":4");
     EXPECT_EQ(client.Command({"SET", "exec-replace-zset", "string"}), "+OK");
-    EXPECT_EQ(client.Command({"PEXPIRE", "exec-replace-zset", "60000"}),
-              ":1");
+    EXPECT_EQ(client.Command({"PEXPIRE", "exec-replace-zset", "60000"}), ":1");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command(
-                  {"ZUNIONSTORE", "exec-replace-zset", "1", "z"}),
+    EXPECT_EQ(client.Command({"ZUNIONSTORE", "exec-replace-zset", "1", "z"}),
               "+QUEUED");
     EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n:3");
     EXPECT_EQ(client.Command({"PTTL", "exec-replace-zset"}), ":-1");
@@ -2338,23 +2473,20 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"ZADD", "z", "GT", "LT", "1", "member"}),
               "-ERR GT, LT, and/or NX options at the same time are not "
               "compatible");
-    EXPECT_EQ(client.Command(
-                  {"ZADD", "z", "INCR", "1", "one", "2", "two"}),
+    EXPECT_EQ(client.Command({"ZADD", "z", "INCR", "1", "one", "2", "two"}),
               "-ERR INCR option supports a single increment-element pair");
-    EXPECT_TRUE(client.Command(
-                  {"ZINCRBY", "malformed-score", "+-5", "member"})
+    EXPECT_TRUE(client.Command({"ZINCRBY", "malformed-score", "+-5", "member"})
                     .starts_with("-ERR value is not a valid float"));
-    EXPECT_TRUE(client.Command(
-                  {"ZRANGEBYSCORE", "z", "+-5", "10"})
+    EXPECT_TRUE(client.Command({"ZRANGEBYSCORE", "z", "+-5", "10"})
                     .starts_with("-ERR min or max is not a float"));
     EXPECT_EQ(client.Command({"RPUSH", "zset-syntax-wrongtype", "value"}),
               ":1");
-    EXPECT_TRUE(client.Command({"ZRANGEBYSCORE", "zset-syntax-wrongtype",
-                                "+-5", "10"})
-                    .starts_with("-ERR min or max is not a float"));
-    EXPECT_TRUE(client.Command(
-                  {"ZSCAN", "zset-syntax-wrongtype", "not-a-cursor"})
-                    .starts_with("-ERR invalid cursor"));
+    EXPECT_TRUE(
+        client.Command({"ZRANGEBYSCORE", "zset-syntax-wrongtype", "+-5", "10"})
+            .starts_with("-ERR min or max is not a float"));
+    EXPECT_TRUE(
+        client.Command({"ZSCAN", "zset-syntax-wrongtype", "not-a-cursor"})
+            .starts_with("-ERR invalid cursor"));
     EXPECT_EQ(client.Command({"ZADD", "decimal-z", "1.1", "one", "2.3", "two"}),
               ":2");
     EXPECT_EQ(client.Command({"ZSCORE", "decimal-z", "one"}), Bulk("1.1"));
@@ -2389,15 +2521,14 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               Bulk("1e-7"));
     EXPECT_EQ(client.Command({"ZRANK", "decimal-z", "missing", "WITHSCORE"}),
               "*-1");
+    EXPECT_EQ(
+        client.Command({"ZRANK", "decimal-z", "one", "WITHSCORE", "extra"}),
+        "-ERR syntax error");
+    EXPECT_EQ(
+        client.Command({"ZREVRANK", "decimal-z", "one", "WITHSCORE", "extra"}),
+        "-ERR syntax error");
     EXPECT_EQ(client.Command(
-                  {"ZRANK", "decimal-z", "one", "WITHSCORE", "extra"}),
-              "-ERR syntax error");
-    EXPECT_EQ(client.Command(
-                  {"ZREVRANK", "decimal-z", "one", "WITHSCORE", "extra"}),
-              "-ERR syntax error");
-    EXPECT_EQ(client.Command(
-                  {"ZREVRANGE", "decimal-z", "0", "-1", "WITHSCORES",
-                   "extra"}),
+                  {"ZREVRANGE", "decimal-z", "0", "-1", "WITHSCORES", "extra"}),
               "-ERR syntax error");
     EXPECT_TRUE(client.Command({"ZRANK", "missing-z", "member", "bad"})
                     .starts_with("-ERR syntax error"));
@@ -2420,32 +2551,31 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
                               "positive-infinity", "negative-infinity"}),
               ":1");
     EXPECT_EQ(client.Command({"ZSCORE", "nan-union", "same"}), Bulk("0"));
-    EXPECT_EQ(client.Command({"ZUNION", "2", "positive-infinity",
-                              "positive-infinity", "WEIGHTS", "0.5", "0",
-                              "WITHSCORES"}),
-              "*2\r\n" + Bulk("same") + "\r\n" + Bulk("inf"));
+    EXPECT_EQ(
+        client.Command({"ZUNION", "2", "positive-infinity", "positive-infinity",
+                        "WEIGHTS", "0.5", "0", "WITHSCORES"}),
+        "*2\r\n" + Bulk("same") + "\r\n" + Bulk("inf"));
     EXPECT_EQ(client.Command({"ZUNION", "2", "positive-infinity",
                               "positive-infinity", "WEIGHTS", "0.5", "0",
                               "AGGREGATE", "MIN", "WITHSCORES"}),
               "*2\r\n" + Bulk("same") + "\r\n" + Bulk("0"));
-    EXPECT_EQ(client.Command({"ZINTER", "2", "positive-infinity",
-                              "positive-infinity", "WEIGHTS", "0.5", "0",
-                              "WITHSCORES"}),
-              "*2\r\n" + Bulk("same") + "\r\n" + Bulk("0"));
+    EXPECT_EQ(
+        client.Command({"ZINTER", "2", "positive-infinity", "positive-infinity",
+                        "WEIGHTS", "0.5", "0", "WITHSCORES"}),
+        "*2\r\n" + Bulk("same") + "\r\n" + Bulk("0"));
     EXPECT_EQ(client.Command({"ZINTER", "2", "positive-infinity",
                               "positive-infinity", "WEIGHTS", "0.5", "0",
                               "AGGREGATE", "MIN", "WITHSCORES"}),
               "*2\r\n" + Bulk("same") + "\r\n" + Bulk("inf"));
     EXPECT_EQ(client.Command({"SADD", "aggregate-set", "set-only", "same"}),
               ":2");
-    EXPECT_EQ(client.Command(
-                  {"ZUNION", "2", "positive-infinity", "aggregate-set"}),
-              "*2\r\n" + Bulk("set-only") + "\r\n" + Bulk("same"));
-    EXPECT_EQ(client.Command({"ZADD", "pop-overflow", "1", "member"}),
-              ":1");
-    EXPECT_TRUE(client.Command({"ZPOPMIN", "pop-overflow",
-                                "9223372036854775808"})
-                    .starts_with("-ERR value is out of range"));
+    EXPECT_EQ(
+        client.Command({"ZUNION", "2", "positive-infinity", "aggregate-set"}),
+        "*2\r\n" + Bulk("set-only") + "\r\n" + Bulk("same"));
+    EXPECT_EQ(client.Command({"ZADD", "pop-overflow", "1", "member"}), ":1");
+    EXPECT_TRUE(
+        client.Command({"ZPOPMIN", "pop-overflow", "9223372036854775808"})
+            .starts_with("-ERR value is out of range"));
     EXPECT_EQ(client.Command({"ZCARD", "pop-overflow"}), ":1");
     EXPECT_EQ(client.Command({"ZRANGEBYLEX", "z", "-", "+", "WITHSCORES"}),
               "-ERR syntax error, WITHSCORES not supported in combination "
@@ -2456,18 +2586,17 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command(
                   {"ZRANGE", "z", "0", "10", "BYSCORE", "LIMIT", "bad", "1"}),
               "-ERR value is not an integer or out of range");
-    EXPECT_EQ(client.Command(
-                  {"ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "0", "bad"}),
-              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(
+        client.Command({"ZRANGEBYSCORE", "z", "0", "10", "LIMIT", "0", "bad"}),
+        "-ERR value is not an integer or out of range");
     EXPECT_EQ(client.Command({"ZADD", "empty-member-zset", "1", ""}), ":1");
-    auto [empty_zset_cursor, empty_zset_scan] = ParseScanReply(client.Command(
-        {"ZSCAN", "empty-member-zset", "0", "COUNT", "100"}));
+    auto [empty_zset_cursor, empty_zset_scan] = ParseScanReply(
+        client.Command({"ZSCAN", "empty-member-zset", "0", "COUNT", "100"}));
     EXPECT_EQ(empty_zset_cursor, "0");
     EXPECT_EQ(empty_zset_scan, (std::vector<std::string>{"", "1"}));
     EXPECT_EQ(client.Command({"SET", "replace-zset", "string"}), "+OK");
     EXPECT_EQ(client.Command({"PEXPIRE", "replace-zset", "60000"}), ":1");
-    EXPECT_EQ(client.Command({"ZUNIONSTORE", "replace-zset", "1", "z"}),
-              ":3");
+    EXPECT_EQ(client.Command({"ZUNIONSTORE", "replace-zset", "1", "z"}), ":3");
     EXPECT_EQ(client.Command({"PTTL", "replace-zset"}), ":-1");
     EXPECT_EQ(client.Command({"ZRANDMEMBER", "z", "-9223372036854775808"}),
               "-ERR value is not an integer or out of range");
@@ -2493,19 +2622,19 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_TRUE(zset_exec_random.starts_with("*2\r\n*4002\r\n"));
     EXPECT_TRUE(zset_exec_random.ends_with("+OK"));
     EXPECT_EQ(client.Command({"GET", "after-zrand-oom"}), Bulk("alive"));
-    EXPECT_EQ(client.Command({"RPUSH", "sintercard-wrongtype", "value"}),
-              ":1");
-    EXPECT_TRUE(client.Command({"SINTERCARD", "1", "sintercard-wrongtype",
-                                "LIMIT", "-1"})
-                    .starts_with("-ERR LIMIT can't be negative"));
+    EXPECT_EQ(client.Command({"RPUSH", "sintercard-wrongtype", "value"}), ":1");
+    EXPECT_TRUE(
+        client
+            .Command({"SINTERCARD", "1", "sintercard-wrongtype", "LIMIT", "-1"})
+            .starts_with("-ERR LIMIT can't be negative"));
     EXPECT_EQ(client.Command({"SADD", "sintercard-repeat", "a", "b", "c"}),
               ":3");
-    EXPECT_EQ(client.Command({"SINTERCARD", "1", "sintercard-repeat",
-                              "LIMIT", "1", "LIMIT", "2"}),
+    EXPECT_EQ(client.Command({"SINTERCARD", "1", "sintercard-repeat", "LIMIT",
+                              "1", "LIMIT", "2"}),
               ":2");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command({"SINTERCARD", "1", "sintercard-repeat",
-                              "LIMIT", "1", "LIMIT", "2"}),
+    EXPECT_EQ(client.Command({"SINTERCARD", "1", "sintercard-repeat", "LIMIT",
+                              "1", "LIMIT", "2"}),
               "+QUEUED");
     EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n:2");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
@@ -2528,21 +2657,21 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command(
                   {"GEORADIUS", "geo", "15", "37", "200", "km", "COUNT", "1"}),
               "*1\r\n" + Bulk("Catania"));
-    EXPECT_TRUE(client.Command(
-                  {"GEORADIUS", "geo", "200", "100", "10", "km"})
+    EXPECT_TRUE(client.Command({"GEORADIUS", "geo", "200", "100", "10", "km"})
                     .starts_with("-ERR invalid longitude,latitude pair"));
-    EXPECT_TRUE(client.Command({"GEORADIUS", "zset-syntax-wrongtype", "200",
-                                "100", "10", "km"})
+    EXPECT_TRUE(client
+                    .Command({"GEORADIUS", "zset-syntax-wrongtype", "200",
+                              "100", "10", "km"})
                     .starts_with("-ERR invalid longitude,latitude pair"));
-    EXPECT_TRUE(client.Command(
-                  {"GEOSEARCH", "geo", "FROMLONLAT", "200", "100",
-                   "BYRADIUS", "10", "km"})
+    EXPECT_TRUE(client
+                    .Command({"GEOSEARCH", "geo", "FROMLONLAT", "200", "100",
+                              "BYRADIUS", "10", "km"})
                     .starts_with("-ERR invalid longitude,latitude pair"));
+    EXPECT_EQ(
+        client.Command({"GEORADIUSBYMEMBER", "geo", "missing", "10", "km"}),
+        "-ERR could not decode requested zset member");
     EXPECT_EQ(client.Command(
-                  {"GEORADIUSBYMEMBER", "geo", "missing", "10", "km"}),
-              "-ERR could not decode requested zset member");
-    EXPECT_EQ(client.Command({"GEORADIUSBYMEMBER", "missing-geo", "member",
-                              "10", "km"}),
+                  {"GEORADIUSBYMEMBER", "missing-geo", "member", "10", "km"}),
               "*0");
     EXPECT_EQ(client.Command({"GEOPOS", "geo", "missing"}), "*1\r\n*-1");
     EXPECT_EQ(client.Command({"GEOHASH", "geo", "Palermo", "Catania"}),
@@ -2557,58 +2686,60 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"GEOHASH", "geo"}), "*0");
     EXPECT_TRUE(client.Command({"GEOADD", "bad-geo", "+-100", "+-50", "m"})
                     .starts_with("-ERR invalid longitude"));
-    EXPECT_EQ(client.Command({"GEOADD", "geo-empty", "13", "38", ""}),
-              ":1");
+    EXPECT_EQ(client.Command({"GEOADD", "geo-empty", "13", "38", ""}), ":1");
     EXPECT_EQ(client.Command({"GEOSEARCH", "geo-empty", "FROMMEMBER", "",
                               "BYRADIUS", "1", "km"}),
               "*1\r\n" + Bulk(""));
-    EXPECT_EQ(client.Command({"GEOSEARCH", "geo", "WITHCOORD", "COUNT", "1",
-                              "ANY", "FROMLONLAT", "15", "37", "BYRADIUS",
-                              "200", "km"})
-                  .substr(0, 8),
-              "*1\r\n*2\r\n");
+    EXPECT_EQ(
+        client
+            .Command({"GEOSEARCH", "geo", "WITHCOORD", "COUNT", "1", "ANY",
+                      "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"})
+            .substr(0, 8),
+        "*1\r\n*2\r\n");
     EXPECT_EQ(client.Command({"GEOADD", "geo-dateline", "179.9", "0", "east",
                               "-179.9", "0", "west"}),
               ":2");
-    const std::string dateline = client.Command(
-        {"GEOSEARCH", "geo-dateline", "FROMLONLAT", "179.95", "0", "BYBOX",
-         "40", "10", "km"});
+    const std::string dateline =
+        client.Command({"GEOSEARCH", "geo-dateline", "FROMLONLAT", "179.95",
+                        "0", "BYBOX", "40", "10", "km"});
     EXPECT_NE(dateline.find(Bulk("east")), std::string::npos) << dateline;
     EXPECT_NE(dateline.find(Bulk("west")), std::string::npos) << dateline;
 
     EXPECT_EQ(client.Command({"ZRANGESTORE", "range-store", "z", "1", "2"}),
               ":2");
-    EXPECT_EQ(client.Command({"ZRANGE", "range-store", "0", "-1",
-                              "WITHSCORES"}),
-              "*4\r\n" + Bulk("mid") + "\r\n" + Bulk("1.5") + "\r\n" +
-                  Bulk("two") + "\r\n" + Bulk("2"));
-    EXPECT_TRUE(client.Command({"ZRANGESTORE", "wrong-range-store",
-                                "aggregate-set", "0", "-1"})
+    EXPECT_EQ(
+        client.Command({"ZRANGE", "range-store", "0", "-1", "WITHSCORES"}),
+        "*4\r\n" + Bulk("mid") + "\r\n" + Bulk("1.5") + "\r\n" + Bulk("two") +
+            "\r\n" + Bulk("2"));
+    EXPECT_TRUE(client
+                    .Command({"ZRANGESTORE", "wrong-range-store",
+                              "aggregate-set", "0", "-1"})
                     .starts_with("-WRONGTYPE"));
-    EXPECT_EQ(client.Command({"GEOSEARCHSTORE", "geo-store", "geo",
-                              "WITHCOORD", "FROMLONLAT", "15", "37",
-                              "BYRADIUS", "200", "km"}),
-              "-ERR syntax error");
-    EXPECT_EQ(client.Command({"GEOSEARCHSTORE", "geo-store", "geo",
-                              "STOREDIST", "FROMLONLAT", "15", "37",
-                              "BYRADIUS", "200", "km"}),
-              ":2");
+    EXPECT_EQ(
+        client.Command({"GEOSEARCHSTORE", "geo-store", "geo", "WITHCOORD",
+                        "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"}),
+        "-ERR syntax error");
+    EXPECT_EQ(
+        client.Command({"GEOSEARCHSTORE", "geo-store", "geo", "STOREDIST",
+                        "FROMLONLAT", "15", "37", "BYRADIUS", "200", "km"}),
+        ":2");
     EXPECT_EQ(client.Command({"ZCARD", "geo-store"}), ":2");
     EXPECT_EQ(client.Command({"GEORADIUS", "geo", "15", "37", "200", "km",
                               "STORE", "radius-store"}),
               ":2");
     EXPECT_EQ(client.Command({"ZCARD", "radius-store"}), ":2");
-    EXPECT_TRUE(client.Command({"GEORADIUS_RO", "geo", "15", "37", "200",
-                                "km", "STORE", "forbidden"})
+    EXPECT_TRUE(client
+                    .Command({"GEORADIUS_RO", "geo", "15", "37", "200", "km",
+                              "STORE", "forbidden"})
                     .starts_with("-ERR syntax error"));
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
-    EXPECT_EQ(client.Command({"ZRANGESTORE", "exec-range-store", "z", "0",
-                              "0"}),
-              "+QUEUED");
-    EXPECT_EQ(client.Command({"GEOSEARCHSTORE", "exec-geo-store", "geo",
-                              "FROMMEMBER", "Palermo", "BYRADIUS", "200",
-                              "km"}),
-              "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"ZRANGESTORE", "exec-range-store", "z", "0", "0"}),
+        "+QUEUED");
+    EXPECT_EQ(
+        client.Command({"GEOSEARCHSTORE", "exec-geo-store", "geo", "FROMMEMBER",
+                        "Palermo", "BYRADIUS", "200", "km"}),
+        "+QUEUED");
     EXPECT_EQ(client.Command({"EXEC"}), "*2\r\n:1\r\n:2");
 
     EXPECT_EQ(client.Command({"SET", "", "empty-key-value"}), "+OK");
@@ -2628,36 +2759,38 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"XADD", "bare-ms", "1", "f", "v"}), Bulk("1-0"));
     EXPECT_TRUE(client.Command({"XADD", "bare-ms", "1", "f", "v2"})
                     .starts_with("-ERR The ID specified in XADD"));
-    EXPECT_EQ(client.Command({"XADD", "bare-ms", "2", "f", "v2"}),
-              Bulk("2-0"));
+    EXPECT_EQ(client.Command({"XADD", "bare-ms", "2", "f", "v2"}), Bulk("2-0"));
     EXPECT_TRUE(client.Command({"XADD", "zero-ms", "0", "f", "v"})
                     .starts_with("-ERR The ID specified in XADD"));
-    EXPECT_TRUE(client.Command(
-                  {"XADD", "missing-nomk", "NOMKSTREAM", "bad-id", "f", "v"})
-                    .starts_with("-ERR Invalid stream ID"));
+    EXPECT_TRUE(
+        client
+            .Command({"XADD", "missing-nomk", "NOMKSTREAM", "bad-id", "f", "v"})
+            .starts_with("-ERR Invalid stream ID"));
     EXPECT_TRUE(client.Command({"XTRIM", "bare-ms", "MAXLEN", "1", "junk"})
                     .starts_with("-ERR syntax error"));
-    EXPECT_EQ(client.Command(
-                  {"XTRIM", "bare-ms", "MAXLEN", "~", "1", "LIMIT", "1"}),
-              ":1");
+    EXPECT_EQ(
+        client.Command({"XTRIM", "bare-ms", "MAXLEN", "~", "1", "LIMIT", "1"}),
+        ":1");
     EXPECT_EQ(client.Command({"XADD", "xadd-limit", "1-0", "f", "1"}),
               Bulk("1-0"));
     EXPECT_EQ(client.Command({"XADD", "xadd-limit", "2-0", "f", "2"}),
               Bulk("2-0"));
     EXPECT_EQ(client.Command({"XADD", "xadd-limit", "3-0", "f", "3"}),
               Bulk("3-0"));
-    EXPECT_EQ(client.Command({"XADD", "xadd-limit", "MAXLEN", "~", "1",
-                              "LIMIT", "1", "4-0", "f", "4"}),
+    EXPECT_EQ(client.Command({"XADD", "xadd-limit", "MAXLEN", "~", "1", "LIMIT",
+                              "1", "4-0", "f", "4"}),
               Bulk("4-0"));
     EXPECT_EQ(client.Command({"XLEN", "xadd-limit"}), ":3");
-    EXPECT_TRUE(client.Command({"XADD", "xadd-limit", "MAXLEN", "=", "1",
-                                "LIMIT", "1", "5-0", "f", "5"})
+    EXPECT_TRUE(client
+                    .Command({"XADD", "xadd-limit", "MAXLEN", "=", "1", "LIMIT",
+                              "1", "5-0", "f", "5"})
                     .starts_with("-ERR syntax error"));
-    EXPECT_TRUE(client.Command({"XADD", "xadd-limit", "MAXLEN", "1",
-                                "MINID", "2-0", "6-0", "f", "6"})
-                    .starts_with(
-                        "-ERR syntax error, MAXLEN and MINID options at the "
-                        "same time are not compatible"));
+    EXPECT_TRUE(
+        client
+            .Command({"XADD", "xadd-limit", "MAXLEN", "1", "MINID", "2-0",
+                      "6-0", "f", "6"})
+            .starts_with("-ERR syntax error, MAXLEN and MINID options at the "
+                         "same time are not compatible"));
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "xgroup-options", "g", "0",
                               "MKSTREAM", "ENTRIESREAD", "0"}),
               "+OK");
@@ -2669,8 +2802,8 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"XGROUP", "HELP"}), "+QUEUED");
     EXPECT_EQ(client.Command({"XINFO", "HELP"}), "+QUEUED");
     const std::string exec_stream_help = client.Command({"EXEC"});
-    EXPECT_TRUE(exec_stream_help.starts_with(
-        "*2\r\n*17\r\n+XGROUP <subcommand>"))
+    EXPECT_TRUE(
+        exec_stream_help.starts_with("*2\r\n*17\r\n+XGROUP <subcommand>"))
         << exec_stream_help;
     EXPECT_NE(exec_stream_help.find("\r\n*9\r\n+XINFO <subcommand>"),
               std::string::npos)
@@ -2693,8 +2826,7 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               "*4\r\n:0\r\n$-1\r\n$-1\r\n*-1");
     const std::string empty_group_info =
         client.Command({"XINFO", "GROUPS", "xgroup-options"});
-    EXPECT_NE(empty_group_info.find(Bulk("lag") + "\r\n:0"),
-              std::string::npos)
+    EXPECT_NE(empty_group_info.find(Bulk("lag") + "\r\n:0"), std::string::npos)
         << empty_group_info;
     EXPECT_EQ(client.Command({"XACK", "xgroup-options", "missing", "1-0"}),
               ":0");
@@ -2703,15 +2835,15 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"XADD", "stream", "2-0", "f2", "v2"}),
               Bulk("2-0"));
     EXPECT_EQ(client.Command({"XREAD", "STREAMS", "stream", "$"}), "*-1");
-    EXPECT_EQ(client.Command(
-                  {"XREAD", "BLOCK", "10", "STREAMS", "stream", "$"}),
-              "*-1");
+    EXPECT_EQ(
+        client.Command({"XREAD", "BLOCK", "10", "STREAMS", "stream", "$"}),
+        "*-1");
     EXPECT_TRUE(
         client.Command({"XREAD", "COUNT", "-1", "STREAMS", "stream", "0-0"})
             .starts_with("*1\r\n"));
-    EXPECT_EQ(client.Command({"XREAD", "BLOCK", "-1", "STREAMS", "stream",
-                              "$"}),
-              "-ERR timeout is negative");
+    EXPECT_EQ(
+        client.Command({"XREAD", "BLOCK", "-1", "STREAMS", "stream", "$"}),
+        "-ERR timeout is negative");
     EXPECT_EQ(client.Command({"XREAD", "BLOCK", "18446744073709551615",
                               "STREAMS", "stream", "$"}),
               "-ERR timeout is not an integer or out of range");
@@ -2727,26 +2859,25 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               "*-1");
     EXPECT_EQ(client.Command({"XRANGE", "stream", "-", "+", "COUNT", "-1"}),
               "*-1");
-    EXPECT_TRUE(client.Command({"XSETID", "stream", "2-0", "ENTRIESADDED",
-                                "9223372036854775808"})
+    EXPECT_TRUE(client
+                    .Command({"XSETID", "stream", "2-0", "ENTRIESADDED",
+                              "9223372036854775808"})
                     .starts_with("-ERR value is not an integer"));
-    EXPECT_TRUE(client.Command(
-                  {"XSETID", "stream", "2-0", "ENTRIESADDED", "1"})
-                    .starts_with(
-                        "-ERR The entries_added specified in XSETID is "
-                        "smaller than the target stream length"));
-    EXPECT_TRUE(client.Command(
-                  {"XSETID", "stream", "2-0", "MAXDELETEDID", "3-0"})
-                    .starts_with(
-                        "-ERR The ID specified in XSETID is smaller than the "
-                        "provided max_deleted_entry_id"));
+    EXPECT_TRUE(
+        client.Command({"XSETID", "stream", "2-0", "ENTRIESADDED", "1"})
+            .starts_with("-ERR The entries_added specified in XSETID is "
+                         "smaller than the target stream length"));
+    EXPECT_TRUE(
+        client.Command({"XSETID", "stream", "2-0", "MAXDELETEDID", "3-0"})
+            .starts_with("-ERR The ID specified in XSETID is smaller than the "
+                         "provided max_deleted_entry_id"));
     EXPECT_EQ(client.Command({"XADD", "xsetid-deleted", "5-0", "f", "v"}),
               Bulk("5-0"));
     EXPECT_EQ(client.Command({"XDEL", "xsetid-deleted", "5-0"}), ":1");
-    EXPECT_TRUE(client.Command({"XSETID", "xsetid-deleted", "4-0"})
-                    .starts_with(
-                        "-ERR The ID specified in XSETID is smaller than "
-                        "current max_deleted_entry_id"));
+    EXPECT_TRUE(
+        client.Command({"XSETID", "xsetid-deleted", "4-0"})
+            .starts_with("-ERR The ID specified in XSETID is smaller than "
+                         "current max_deleted_entry_id"));
     EXPECT_EQ(
         client.Command({"XADD", "overflow-stream",
                         "18446744073709551615-18446744073709551615", "f", "v"}),
@@ -2778,22 +2909,24 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command(
                   {"XCLAIM", "stream", "g", "other", "0", "1-0", "JUSTID"}),
               "*1\r\n" + Bulk("1-0"));
-    EXPECT_TRUE(client.Command(
-                  {"XCLAIM", "stream", "g", "other", "0", "JUSTID"})
-                    .starts_with("-ERR syntax error"));
+    EXPECT_TRUE(
+        client.Command({"XCLAIM", "stream", "g", "other", "0", "JUSTID"})
+            .starts_with("-ERR syntax error"));
     EXPECT_EQ(client.Command(
                   {"XAUTOCLAIM", "stream", "g", "third", "0", "0-0", "JUSTID"}),
               "*3\r\n" + Bulk("0-0") + "\r\n*2\r\n" + Bulk("1-0") + "\r\n" +
                   Bulk("2-0") + "\r\n*0");
-    EXPECT_FALSE(client.Command({"XAUTOCLAIM", "stream", "g",
-                                 "special-minus", "0", "-", "JUSTID"})
+    EXPECT_FALSE(client
+                     .Command({"XAUTOCLAIM", "stream", "g", "special-minus",
+                               "0", "-", "JUSTID"})
                      .starts_with("-ERR"));
-    EXPECT_FALSE(client.Command({"XAUTOCLAIM", "stream", "g",
-                                 "special-plus", "0", "+", "JUSTID"})
+    EXPECT_FALSE(client
+                     .Command({"XAUTOCLAIM", "stream", "g", "special-plus", "0",
+                               "+", "JUSTID"})
                      .starts_with("-ERR"));
-    EXPECT_FALSE(client.Command({"XAUTOCLAIM", "stream", "g",
-                                 "special-exclusive", "0", "(0-0",
-                                 "JUSTID"})
+    EXPECT_FALSE(client
+                     .Command({"XAUTOCLAIM", "stream", "g", "special-exclusive",
+                               "0", "(0-0", "JUSTID"})
                      .starts_with("-ERR"));
     EXPECT_EQ(client.Command({"XREADGROUP", "GROUP", "g", "nobody", "STREAMS",
                               "stream", "0-0"}),
@@ -2817,30 +2950,31 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
 
     EXPECT_EQ(client.Command({"XADD", "force-count", "1-0", "f", "v"}),
               Bulk("1-0"));
-    EXPECT_EQ(client.Command(
-                  {"XGROUP", "CREATE", "force-count", "force-group", "$"}),
-              "+OK");
-    EXPECT_TRUE(client.Command({"XCLAIM", "force-count", "force-group",
-                                "forced", "0", "1-0", "FORCE"})
+    EXPECT_EQ(
+        client.Command({"XGROUP", "CREATE", "force-count", "force-group", "$"}),
+        "+OK");
+    EXPECT_TRUE(client
+                    .Command({"XCLAIM", "force-count", "force-group", "forced",
+                              "0", "1-0", "FORCE"})
                     .starts_with("*1\r\n"));
-    EXPECT_TRUE(client.Command({"XPENDING", "force-count", "force-group",
-                                "1-0", "1-0", "1"})
+    EXPECT_TRUE(client
+                    .Command({"XPENDING", "force-count", "force-group", "1-0",
+                              "1-0", "1"})
                     .ends_with("\r\n:2"));
 
     EXPECT_EQ(client.Command({"XADD", "autoclean", "1-0", "f", "v"}),
               Bulk("1-0"));
-    EXPECT_EQ(client.Command(
-                  {"XGROUP", "CREATE", "autoclean", "auto-group", "0"}),
-              "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "auto-group", "old",
-                                "STREAMS", "autoclean", ">"})
+    EXPECT_EQ(
+        client.Command({"XGROUP", "CREATE", "autoclean", "auto-group", "0"}),
+        "+OK");
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "auto-group", "old",
+                              "STREAMS", "autoclean", ">"})
                     .starts_with("*1\r\n"));
     EXPECT_EQ(client.Command({"XDEL", "autoclean", "1-0"}), ":1");
-    EXPECT_EQ(client.Command({"XAUTOCLAIM", "autoclean", "auto-group",
-                              "new", "999999999", "0-0", "COUNT", "10",
-                              "JUSTID"}),
-              "*3\r\n" + Bulk("0-0") + "\r\n*0\r\n*1\r\n" +
-                  Bulk("1-0"));
+    EXPECT_EQ(client.Command({"XAUTOCLAIM", "autoclean", "auto-group", "new",
+                              "999999999", "0-0", "COUNT", "10", "JUSTID"}),
+              "*3\r\n" + Bulk("0-0") + "\r\n*0\r\n*1\r\n" + Bulk("1-0"));
     EXPECT_TRUE(client.Command({"XPENDING", "autoclean", "auto-group"})
                     .starts_with("*4\r\n:0"));
 
@@ -2851,17 +2985,16 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command(
                   {"XGROUP", "CREATE", "auto-cursor", "cursor-group", "0"}),
               "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "cursor-group", "old",
-                                "COUNT", "2", "STREAMS", "auto-cursor", ">"})
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "cursor-group", "old",
+                              "COUNT", "2", "STREAMS", "auto-cursor", ">"})
                     .starts_with("*1\r\n"));
     EXPECT_EQ(client.Command({"XAUTOCLAIM", "auto-cursor", "cursor-group",
                               "new", "0", "0-0", "COUNT", "1", "JUSTID"}),
-              "*3\r\n" + Bulk("2-0") + "\r\n*1\r\n" + Bulk("1-0") +
-                  "\r\n*0");
+              "*3\r\n" + Bulk("2-0") + "\r\n*1\r\n" + Bulk("1-0") + "\r\n*0");
     EXPECT_EQ(client.Command({"XAUTOCLAIM", "auto-cursor", "cursor-group",
                               "new", "0", "2-0", "COUNT", "1", "JUSTID"}),
-              "*3\r\n" + Bulk("0-0") + "\r\n*1\r\n" + Bulk("2-0") +
-                  "\r\n*0");
+              "*3\r\n" + Bulk("0-0") + "\r\n*1\r\n" + Bulk("2-0") + "\r\n*0");
 
     EXPECT_EQ(client.Command({"XADD", "lag-tombstone", "1-0", "f", "1"}),
               Bulk("1-0"));
@@ -2869,22 +3002,21 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               Bulk("2-0"));
     EXPECT_EQ(client.Command({"XADD", "lag-tombstone", "3-0", "f", "3"}),
               Bulk("3-0"));
-    EXPECT_EQ(client.Command(
-                  {"XGROUP", "CREATE", "lag-tombstone", "lag-group", "0"}),
-              "+OK");
+    EXPECT_EQ(
+        client.Command({"XGROUP", "CREATE", "lag-tombstone", "lag-group", "0"}),
+        "+OK");
     EXPECT_EQ(client.Command({"XDEL", "lag-tombstone", "2-0"}), ":1");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "lag-group", "reader",
-                                "COUNT", "1", "STREAMS", "lag-tombstone",
-                                ">"})
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "lag-group", "reader",
+                              "COUNT", "1", "STREAMS", "lag-tombstone", ">"})
                     .starts_with("*1\r\n"));
     const std::string fragmented_lag =
         client.Command({"XINFO", "GROUPS", "lag-tombstone"});
-    EXPECT_NE(fragmented_lag.find(Bulk("lag") + "\r\n$-1"),
-              std::string::npos)
+    EXPECT_NE(fragmented_lag.find(Bulk("lag") + "\r\n$-1"), std::string::npos)
         << fragmented_lag;
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "lag-group", "reader",
-                                "COUNT", "1", "STREAMS", "lag-tombstone",
-                                ">"})
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "lag-group", "reader",
+                              "COUNT", "1", "STREAMS", "lag-tombstone", ">"})
                     .starts_with("*1\r\n"));
     const std::string complete_lag =
         client.Command({"XINFO", "GROUPS", "lag-tombstone"});
@@ -2915,26 +3047,27 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               Bulk("1-0"));
     EXPECT_EQ(client.Command({"XADD", "history-data", "1-0", "f", "data"}),
               Bulk("1-0"));
-    EXPECT_EQ(client.Command(
-                  {"XGROUP", "CREATE", "history-empty", "mixed", "$"}),
-              "+OK");
-    EXPECT_EQ(client.Command(
-                  {"XGROUP", "CREATE", "history-data", "mixed", "0"}),
-              "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "mixed", "reader",
-                                "STREAMS", "history-data", ">"})
+    EXPECT_EQ(
+        client.Command({"XGROUP", "CREATE", "history-empty", "mixed", "$"}),
+        "+OK");
+    EXPECT_EQ(
+        client.Command({"XGROUP", "CREATE", "history-data", "mixed", "0"}),
+        "+OK");
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "mixed", "reader",
+                              "STREAMS", "history-data", ">"})
                     .starts_with("*1\r\n"));
     const std::string mixed_history =
         "*2\r\n*2\r\n" + Bulk("history-empty") + "\r\n*0\r\n*2\r\n" +
-        Bulk("history-data") + "\r\n*1\r\n*2\r\n" + Bulk("1-0") +
-        "\r\n*2\r\n" + Bulk("f") + "\r\n" + Bulk("data");
-    EXPECT_EQ(client.Command({"XREADGROUP", "GROUP", "mixed", "reader",
-                              "STREAMS", "history-empty", "history-data",
-                              "0", "0"}),
-              mixed_history);
+        Bulk("history-data") + "\r\n*1\r\n*2\r\n" + Bulk("1-0") + "\r\n*2\r\n" +
+        Bulk("f") + "\r\n" + Bulk("data");
+    EXPECT_EQ(
+        client.Command({"XREADGROUP", "GROUP", "mixed", "reader", "STREAMS",
+                        "history-empty", "history-data", "0", "0"}),
+        mixed_history);
     const auto mixed_started = std::chrono::steady_clock::now();
-    EXPECT_EQ(client.Command({"XREADGROUP", "GROUP", "mixed", "reader",
-                              "BLOCK", "1000", "STREAMS", "history-empty",
+    EXPECT_EQ(client.Command({"XREADGROUP", "GROUP", "mixed", "reader", "BLOCK",
+                              "1000", "STREAMS", "history-empty",
                               "history-data", "0", ">"}),
               "*1\r\n*2\r\n" + Bulk("history-empty") + "\r\n*0");
     EXPECT_LT(std::chrono::steady_clock::now() - mixed_started, 500ms);
@@ -2962,9 +3095,10 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_TRUE(ordered_summary.starts_with("*4\r\n:3\r\n" + Bulk("1-0") +
                                             "\r\n" + Bulk("3-0")))
         << ordered_summary;
-    EXPECT_TRUE(client.Command({"XPENDING", "claim-order", "ordered",
-                                "(1-0", "+", "10"})
-                    .starts_with("*2\r\n"));
+    EXPECT_TRUE(
+        client
+            .Command({"XPENDING", "claim-order", "ordered", "(1-0", "+", "10"})
+            .starts_with("*2\r\n"));
     const std::string forced_pending = client.Command(
         {"XPENDING", "claim-order", "ordered", "2-0", "2-0", "1"});
     ASSERT_TRUE(forced_pending.ends_with("\r\n:7")) << forced_pending;
@@ -2976,16 +3110,17 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     const std::string idle = forced_pending.substr(
         idle_separator + 3, count_separator - idle_separator - 3);
     EXPECT_GE(std::stoull(idle), 49000u);
-    EXPECT_TRUE(client.Command({"XPENDING", "claim-order", "ordered", "IDLE",
-                                "49000", "-", "+", "10"})
+    EXPECT_TRUE(client
+                    .Command({"XPENDING", "claim-order", "ordered", "IDLE",
+                              "49000", "-", "+", "10"})
                     .starts_with("*1\r\n"));
     EXPECT_EQ(client.Command({"XPENDING", "claim-order", "ordered", "IDLE",
                               "100000", "-", "+", "10"}),
               "*0");
-    EXPECT_EQ(client.Command({"XCLAIM", "claim-order", "ordered",
-                              "huge-idle", "0", "1-0", "IDLE",
-                              "18446744073709551615", "JUSTID"}),
-              "*1\r\n" + Bulk("1-0"));
+    EXPECT_EQ(
+        client.Command({"XCLAIM", "claim-order", "ordered", "huge-idle", "0",
+                        "1-0", "IDLE", "18446744073709551615", "JUSTID"}),
+        "*1\r\n" + Bulk("1-0"));
     const std::string huge_idle_pending = client.Command(
         {"XPENDING", "claim-order", "ordered", "1-0", "1-0", "1"});
     const std::size_t huge_idle_count = huge_idle_pending.rfind("\r\n:");
@@ -2994,12 +3129,11 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
         huge_idle_pending.rfind("\r\n:", huge_idle_count - 1);
     ASSERT_NE(huge_idle_field, std::string::npos);
     EXPECT_LT(std::stoull(huge_idle_pending.substr(
-                  huge_idle_field + 3,
-                  huge_idle_count - huge_idle_field - 3)),
+                  huge_idle_field + 3, huge_idle_count - huge_idle_field - 3)),
               1000u);
-    EXPECT_TRUE(client.Command({"XAUTOCLAIM", "claim-order", "ordered",
-                                "exclusive", "0", "(1-0", "COUNT", "1",
-                                "JUSTID"})
+    EXPECT_TRUE(client
+                    .Command({"XAUTOCLAIM", "claim-order", "ordered",
+                              "exclusive", "0", "(1-0", "COUNT", "1", "JUSTID"})
                     .starts_with("*3\r\n"));
     EXPECT_TRUE(client.Command({"XINFO", "GROUPS", "missing-stream"})
                     .starts_with("-ERR no such key"));
@@ -3009,10 +3143,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               std::string::npos);
     const std::string consumer_info =
         client.Command({"XINFO", "CONSUMERS", "claim-order", "ordered"});
-    EXPECT_NE(consumer_info.find("*8\r\n"), std::string::npos)
-        << consumer_info;
-    const std::string full_info =
-        client.Command({"XINFO", "STREAM", "claim-order", "FULL", "COUNT", "1"});
+    EXPECT_NE(consumer_info.find("*8\r\n"), std::string::npos) << consumer_info;
+    const std::string full_info = client.Command(
+        {"XINFO", "STREAM", "claim-order", "FULL", "COUNT", "1"});
     EXPECT_TRUE(full_info.starts_with("*18\r\n")) << full_info;
     EXPECT_NE(full_info.find(Bulk("entries")), std::string::npos);
     EXPECT_NE(full_info.find(Bulk("pending")), std::string::npos);
@@ -3031,32 +3164,36 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_NE(unlimited_full_count.find(Bulk("entries") + "\r\n*12\r\n"),
               std::string::npos)
         << unlimited_full_count;
-    EXPECT_TRUE(client.Command({"XINFO", "STREAM", "claim-order", "FULL",
-                                "garbage"})
-                    .starts_with("-ERR syntax error"));
-    EXPECT_TRUE(client.Command(
-                  {"XINFO", "CONSUMERS", "missing-stream", "missing-group"})
-                    .starts_with("-ERR no such key"));
+    EXPECT_TRUE(
+        client.Command({"XINFO", "STREAM", "claim-order", "FULL", "garbage"})
+            .starts_with("-ERR syntax error"));
+    EXPECT_TRUE(
+        client
+            .Command({"XINFO", "CONSUMERS", "missing-stream", "missing-group"})
+            .starts_with("-ERR no such key"));
 
-    EXPECT_EQ(client.Command({"XADD", "empty-consumer-stream", "1-0", "f",
-                              "v"}),
-              Bulk("1-0"));
+    EXPECT_EQ(
+        client.Command({"XADD", "empty-consumer-stream", "1-0", "f", "v"}),
+        Bulk("1-0"));
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "empty-consumer-stream",
                               "empty-group", "$"}),
               "+OK");
-    EXPECT_EQ(client.Command({"XREADGROUP", "GROUP", "empty-group",
-                              "read-empty", "STREAMS",
-                              "empty-consumer-stream", ">"}),
-              "*-1");
-    EXPECT_NE(client.Command({"XINFO", "CONSUMERS", "empty-consumer-stream",
-                              "empty-group"})
+    EXPECT_EQ(
+        client.Command({"XREADGROUP", "GROUP", "empty-group", "read-empty",
+                        "STREAMS", "empty-consumer-stream", ">"}),
+        "*-1");
+    EXPECT_NE(client
+                  .Command({"XINFO", "CONSUMERS", "empty-consumer-stream",
+                            "empty-group"})
                   .find(Bulk("read-empty")),
               std::string::npos);
-    EXPECT_TRUE(client.Command({"XAUTOCLAIM", "empty-consumer-stream",
-                                "empty-group", "claim-empty", "0", "0-0"})
+    EXPECT_TRUE(client
+                    .Command({"XAUTOCLAIM", "empty-consumer-stream",
+                              "empty-group", "claim-empty", "0", "0-0"})
                     .starts_with("*3\r\n"));
-    EXPECT_NE(client.Command({"XINFO", "CONSUMERS", "empty-consumer-stream",
-                              "empty-group"})
+    EXPECT_NE(client
+                  .Command({"XINFO", "CONSUMERS", "empty-consumer-stream",
+                            "empty-group"})
                   .find(Bulk("claim-empty")),
               std::string::npos);
 
@@ -3066,16 +3203,18 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               Bulk("2-0"));
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "rewind-pel", "g", "0"}),
               "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "g", "first",
-                                "STREAMS", "rewind-pel", ">"})
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "g", "first", "STREAMS",
+                              "rewind-pel", ">"})
                     .starts_with("*1\r\n"));
     EXPECT_EQ(client.Command({"XGROUP", "SETID", "rewind-pel", "g", "0"}),
               "+OK");
-    EXPECT_TRUE(client.Command({"XREADGROUP", "GROUP", "g", "second",
-                                "STREAMS", "rewind-pel", ">"})
+    EXPECT_TRUE(client
+                    .Command({"XREADGROUP", "GROUP", "g", "second", "STREAMS",
+                              "rewind-pel", ">"})
                     .starts_with("*1\r\n"));
-    const std::string rewind_pending = client.Command(
-        {"XPENDING", "rewind-pel", "g", "1-0", "1-0", "1"});
+    const std::string rewind_pending =
+        client.Command({"XPENDING", "rewind-pel", "g", "1-0", "1-0", "1"});
     EXPECT_TRUE(rewind_pending.ends_with("\r\n:1")) << rewind_pending;
     EXPECT_TRUE(client.Command({"XPENDING", "rewind-pel", "g"})
                     .starts_with("*4\r\n:2\r\n"));
@@ -3091,9 +3230,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
               "+QUEUED");
     {
       RespClient concurrent(port);
-      EXPECT_EQ(concurrent.Command(
-                    {"HSET", "watched-same-hash", "field", "value"}),
-                ":0");
+      EXPECT_EQ(
+          concurrent.Command({"HSET", "watched-same-hash", "field", "value"}),
+          ":0");
     }
     EXPECT_EQ(client.Command({"EXEC"}), "*-1");
 
@@ -3110,9 +3249,166 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
     RespClient client(port);
     EXPECT_EQ(client.Command({"ZCARD", "zout"}), ":4");
+    EXPECT_EQ(client.Command({"GET", "rename-persisted"}), Bulk("exec-value"));
     EXPECT_EQ(client.Command({"XLEN", "stream"}), ":2");
     EXPECT_TRUE(
         client.Command({"XINFO", "GROUPS", "stream"}).starts_with("*1\r\n"));
+    server.Stop();
+  }
+}
+
+TEST(CollectionE2eTest, StringCommandsRecover) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-string-commands-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  const std::string cross_a = KeyForWorker("string-cross-a", 0, 2);
+  const std::string cross_b = KeyForWorker("string-cross-b", 1, 2);
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+
+    EXPECT_EQ(client.Command({"APPEND", "append", "abc"}), ":3");
+    EXPECT_EQ(client.Command({"PEXPIRE", "append", "60000"}), ":1");
+    EXPECT_EQ(client.Command({"APPEND", "append", "def"}), ":6");
+    EXPECT_EQ(client.Command({"GET", "append"}), Bulk("abcdef"));
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "append"}).substr(1)), 0);
+    EXPECT_EQ(client.Command({"GETRANGE", "append", "1", "-2"}), Bulk("bcde"));
+    EXPECT_EQ(client.Command({"SUBSTR", "append", "-3", "-1"}), Bulk("def"));
+    EXPECT_EQ(client.Command({"GETRANGE", "missing", "0", "-1"}), Bulk(""));
+
+    EXPECT_EQ(client.Command({"SETRANGE", "range", "3", "x"}), ":4");
+    const std::string zero_padded("\0\0\0x", 4);
+    EXPECT_EQ(client.Command({"GET", "range"}), Bulk(zero_padded));
+    EXPECT_EQ(client.Command({"SETRANGE", "range", "1", "yz"}), ":4");
+    const std::string overwritten("\0yzx", 4);
+    EXPECT_EQ(client.Command({"GET", "range"}), Bulk(overwritten));
+    EXPECT_EQ(client.Command({"SETRANGE", "range", "2", ""}), ":4");
+    EXPECT_EQ(client.Command({"SETRANGE", "range", "-1", "x"}),
+              "-ERR offset is out of range");
+
+    EXPECT_EQ(client.Command({"SETNX", "nx", "first"}), ":1");
+    EXPECT_EQ(client.Command({"SETNX", "nx", "second"}), ":0");
+    EXPECT_EQ(client.Command({"GET", "nx"}), Bulk("first"));
+    EXPECT_EQ(client.Command({"SETEX", "seconds", "30", "value"}), "+OK");
+    EXPECT_EQ(client.Command({"PSETEX", "millis", "30000", "value"}), "+OK");
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "seconds"}).substr(1)), 0);
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "millis"}).substr(1)), 0);
+    EXPECT_EQ(client.Command({"SETEX", "bad-expire", "0", "value"}),
+              "-ERR invalid expire time in 'setex' command");
+
+    EXPECT_EQ(client.Command({"SET", "swap", "old", "PX", "60000"}), "+OK");
+    EXPECT_EQ(client.Command({"GETSET", "swap", "new"}), Bulk("old"));
+    EXPECT_EQ(client.Command({"GET", "swap"}), Bulk("new"));
+    EXPECT_EQ(client.Command({"PTTL", "swap"}), ":-1");
+    EXPECT_EQ(client.Command({"GETEX", "swap", "EX", "30"}), Bulk("new"));
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "swap"}).substr(1)), 0);
+    EXPECT_EQ(client.Command({"GETEX", "swap", "PERSIST"}), Bulk("new"));
+    EXPECT_EQ(client.Command({"PTTL", "swap"}), ":-1");
+    EXPECT_EQ(client.Command({"GETDEL", "swap"}), Bulk("new"));
+    EXPECT_EQ(client.Command({"GETDEL", "swap"}), "$-1");
+    EXPECT_EQ(client.Command({"GETEX", "missing", "PX", "not-an-integer"}),
+              "$-1");
+    EXPECT_EQ(client.Command({"GETEX", "missing", "UNKNOWN"}),
+              "-ERR syntax error");
+    EXPECT_EQ(client.Command({"GETEX", "missing", "EX", "1", "PERSIST"}),
+              "-ERR syntax error");
+    EXPECT_EQ(client.Command({"SET", "past-expiry", "old"}), "+OK");
+    EXPECT_EQ(client.Command({"GETEX", "past-expiry", "PXAT", "1"}),
+              Bulk("old"));
+    EXPECT_EQ(client.Command({"GET", "past-expiry"}), "$-1");
+    EXPECT_EQ(client.Command({"RPUSH", "getset-list", "x"}), ":1");
+    EXPECT_EQ(
+        client.Command({"GETSET", "getset-list", "replacement"}),
+        "-WRONGTYPE Operation against a key holding the wrong kind of value");
+    EXPECT_EQ(client.Command({"SETNX", "getset-list", "replacement"}), ":0");
+
+    EXPECT_EQ(client.Command({"DECR", "integer"}), ":-1");
+    EXPECT_EQ(client.Command({"INCRBY", "integer", "11"}), ":10");
+    EXPECT_EQ(client.Command({"DECRBY", "integer", "3"}), ":7");
+    EXPECT_EQ(client.Command({"INCRBY", "integer", "+5"}),
+              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(client.Command({"INCRBY", "integer", "01"}),
+              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(client.Command({"INCRBY", "integer", "-0"}),
+              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(client.Command({"SET", "noncanonical-integer", "01"}), "+OK");
+    EXPECT_EQ(client.Command({"DECR", "noncanonical-integer"}),
+              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(client.Command({"INCR", "noncanonical-integer"}),
+              "-ERR value is not an integer or out of range");
+    EXPECT_EQ(client.Command({"INCRBYFLOAT", "floating", "0.1"}), Bulk("0.1"));
+    EXPECT_EQ(client.Command({"INCRBYFLOAT", "floating", "1.25"}),
+              Bulk("1.35"));
+    EXPECT_EQ(client.Command({"SET", "overflow", "9223372036854775807"}),
+              "+OK");
+    EXPECT_EQ(client.Command({"INCRBY", "overflow", "1"}),
+              "-ERR increment or decrement would overflow");
+    EXPECT_EQ(client.Command({"INCRBYFLOAT", "floating", "inf"}),
+              "-ERR increment would produce NaN or Infinity");
+
+    EXPECT_EQ(client.Command({"MSETNX", cross_a, "one", cross_b, "two"}), ":1");
+    EXPECT_EQ(
+        client.Command({"MSETNX", cross_a, "changed", "new-msetnx", "new"}),
+        ":0");
+    EXPECT_EQ(client.Command({"GET", cross_a}), Bulk("one"));
+    EXPECT_EQ(client.Command({"GET", "new-msetnx"}), "$-1");
+    EXPECT_EQ(client.Command({"MSETNX", "duplicate-msetnx", "first",
+                              "duplicate-msetnx", "last"}),
+              ":1");
+    EXPECT_EQ(client.Command({"GET", "duplicate-msetnx"}), Bulk("last"));
+
+    EXPECT_EQ(client.Command({"SET", cross_a, "abcXYZ"}), "+OK");
+    EXPECT_EQ(client.Command({"SET", cross_b, "123XYZ"}), "+OK");
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_b}), Bulk("XYZ"));
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_b, "LEN"}), ":3");
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_b, "IDX", "MINMATCHLEN",
+                              "2", "WITHMATCHLEN"}),
+              "*4\r\n" + Bulk("matches") +
+                  "\r\n*1\r\n*3\r\n*2\r\n:3\r\n:5\r\n*2\r\n:3\r\n:5\r\n:3\r\n" +
+                  Bulk("len") + "\r\n:3");
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_a}), Bulk("abcXYZ"));
+    EXPECT_EQ(client.Command({"LCS", "missing-a", "missing-b"}), Bulk(""));
+    EXPECT_EQ(client.Command({"RPUSH", "not-string", "x"}), ":1");
+    EXPECT_EQ(client.Command({"LCS", "not-string", cross_b}),
+              "-ERR The specified keys must contain string values");
+
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"APPEND", "exec-string", "a"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"INCRBY", "exec-number", "4"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"MSETNX", "exec-nx-a", "a", "exec-nx-b", "b"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_b, "LEN"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*4\r\n:1\r\n:4\r\n:1\r\n:3");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"MSETNX", "exec-duplicate", "first",
+                              "exec-duplicate", "last"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"LCS", cross_a, cross_a, "LEN"}), "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*2\r\n:1\r\n:6");
+    EXPECT_EQ(client.Command({"GET", "exec-duplicate"}), Bulk("last"));
+    ASSERT_TRUE(WaitForDurability(client));
+    server.Stop();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"GET", cross_a}), Bulk("abcXYZ"));
+    EXPECT_EQ(client.Command({"GET", cross_b}), Bulk("123XYZ"));
+    EXPECT_EQ(client.Command({"GET", "duplicate-msetnx"}), Bulk("last"));
+    EXPECT_EQ(client.Command({"GET", "exec-string"}), Bulk("a"));
+    EXPECT_EQ(client.Command({"GET", "exec-nx-b"}), Bulk("b"));
+    EXPECT_GT(std::stoll(client.Command({"PTTL", "append"}).substr(1)), 0);
     server.Stop();
   }
 }

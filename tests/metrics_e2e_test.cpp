@@ -309,6 +309,26 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_EQ(client.Command({"PING"}), "+PONG");
   EXPECT_EQ(client.Command({"SET", "metrics-key", "metrics-value"}), "+OK");
   EXPECT_EQ(client.Command({"GET", "metrics-key"}), "$13\r\nmetrics-value");
+  EXPECT_EQ(client.Command({"SET", "del-metric-key", "value"}), "+OK");
+  EXPECT_EQ(client.Command({"SET", "unlink-metric-key", "value"}), "+OK");
+  EXPECT_EQ(client.Command({"DEL", "del-metric-key"}), ":1");
+  EXPECT_EQ(client.Command({"UNLINK", "unlink-metric-key"}), ":1");
+  EXPECT_EQ(client.Command({"APPEND", "append-metric-key", "abc"}), ":3");
+  EXPECT_EQ(client.Command({"DECR", "decr-metric-key"}), ":-1");
+  EXPECT_EQ(
+      client.Command({"MSETNX", "lcs-metric-a", "abc", "lcs-metric-b", "xbc"}),
+      ":1");
+  EXPECT_EQ(client.Command({"LCS", "lcs-metric-a", "lcs-metric-b"}),
+            "$2\r\nbc");
+  EXPECT_EQ(client.Command({"TOUCH", "metrics-key", "missing"}), ":1");
+  EXPECT_TRUE(client.Command({"RANDOMKEY"}).starts_with('$'));
+  EXPECT_EQ(client.Command({"COPY", "metrics-key", "copy-metric-key"}), ":1");
+  EXPECT_EQ(client.Command({"EXPIREAT", "metrics-key", "4102444800"}), ":1");
+  EXPECT_EQ(client.Command({"EXPIRETIME", "metrics-key"}), ":4102444800");
+  EXPECT_EQ(client.Command({"PEXPIREAT", "copy-metric-key", "4102444800000"}),
+            ":1");
+  EXPECT_EQ(client.Command({"PEXPIRETIME", "copy-metric-key"}),
+            ":4102444800000");
   const std::string memory_info = client.Command({"INFO", "memory"});
   EXPECT_NE(memory_info.find("# Memory\r\n"), std::string::npos);
   EXPECT_NE(memory_info.find("maxmemory:1073741824\r\n"), std::string::npos);
@@ -337,10 +357,28 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_GT(MetricValue(body, "keylane_filesystem_available_bytes"), 0);
   EXPECT_NE(body.find("keylane_command_calls_total{command=\"ping\"} 1"),
             std::string_view::npos);
-  EXPECT_NE(body.find("keylane_command_calls_total{command=\"set\"} 1"),
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"set\"} 3"),
             std::string_view::npos);
   EXPECT_NE(body.find("keylane_command_calls_total{command=\"get\"} 1"),
             std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"del\"} 1"),
+            std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"unlink\"} 1"),
+            std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"append\"} 1"),
+            std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"decr\"} 1"),
+            std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"msetnx\"} 1"),
+            std::string_view::npos);
+  EXPECT_NE(body.find("keylane_command_calls_total{command=\"lcs\"} 1"),
+            std::string_view::npos);
+  for (const char* command : {"touch", "randomkey", "copy", "expireat",
+                              "expiretime", "pexpireat", "pexpiretime"}) {
+    EXPECT_NE(body.find("keylane_command_calls_total{command=\"" +
+                        std::string(command) + "\"} 1"),
+              std::string_view::npos);
+  }
   EXPECT_NE(
       body.find("keylane_command_duration_seconds_bucket{command=\"get\""),
       std::string_view::npos);

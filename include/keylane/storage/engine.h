@@ -330,6 +330,7 @@ struct HashResult {
 struct CompactValueView {
   std::string_view encoded_;
   std::uint64_t logical_size_ = 0;
+  std::uint64_t expire_at_ms_ = 0;
 };
 
 struct CompactValueUpdate {
@@ -337,6 +338,8 @@ struct CompactValueUpdate {
   bool erase_ = false;
   std::string encoded_;
   std::uint64_t logical_size_ = 0;
+  // nullopt preserves the current deadline (or persistence for a new key).
+  std::optional<std::uint64_t> expire_at_ms_;
 };
 
 using CompactValueCallback = std::function<absl::StatusOr<CompactValueUpdate>(
@@ -352,6 +355,16 @@ enum class ExpirationCondition : std::uint8_t {
 
 struct ExpirationInfo {
   bool exists_ = false;
+  std::uint64_t expire_at_ms_ = 0;
+  ValueType value_type_ = ValueType::kNone;
+};
+
+// Type-agnostic persisted representation used by keyspace operations such as
+// RENAME. Collection payloads remain encoded and are never materialized into
+// their command-layer element structures.
+struct RawValue {
+  std::string encoded_;
+  std::uint64_t logical_size_ = 0;
   std::uint64_t expire_at_ms_ = 0;
   ValueType value_type_ = ValueType::kNone;
 };
@@ -410,6 +423,10 @@ class StorageEngine {
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
   std::size_t LocalSize(std::uint8_t db_id) const noexcept;
+  // Runs on one worker and returns a random live key owned by that worker.
+  // Nullopt means this worker currently has no live key in the database.
+  celer::Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(
+      std::uint8_t db_id);
   // Must run on the worker owning partition_id. The cursor is stateless and
   // may return duplicate keys while the partition index is changing.
   // now_ms fixes the expiration filter timestamp (0 = current time), so a
@@ -481,10 +498,11 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const HashOperation& operation);
   celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation);
-  celer::Task<absl::Status> ExecuteCompact(
-      std::uint8_t db_id, std::string_view key, ValueType value_type,
-      bool read_only, const CompactValueCallback& callback,
-      std::uint64_t now_ms = 0);
+  celer::Task<absl::Status> ExecuteCompact(std::uint8_t db_id,
+                                           std::string_view key,
+                                           ValueType value_type, bool read_only,
+                                           const CompactValueCallback& callback,
+                                           std::uint64_t now_ms = 0);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -493,8 +511,6 @@ class StorageEngine {
   celer::Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id,
                                            std::string_view key);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
-  celer::Task<absl::StatusOr<std::int64_t>> Increment(std::uint8_t db_id,
-                                                      std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
   // hold this worker's key lock for `digest` in the required mode (shared for
@@ -541,6 +557,13 @@ class StorageEngine {
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
+  celer::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  celer::Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
+                                                std::string_view key,
+                                                const Digest& digest,
+                                                const RawValue& value,
+                                                TxShardWrites* tx = nullptr);
   celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
@@ -551,9 +574,6 @@ class StorageEngine {
                                                  TxShardWrites* tx = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
-  celer::Task<absl::StatusOr<std::int64_t>> IncrementLocked(
-      std::uint8_t db_id, std::string_view key, const Digest& digest,
-      TxShardWrites* tx = nullptr);
 
   // Appends the commit record for a transaction whose shard writes all
   // succeeded. Runs on any worker; fences and retirements come from the

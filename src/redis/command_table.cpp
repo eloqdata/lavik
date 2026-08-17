@@ -22,12 +22,25 @@ constexpr CommandSpec kCommandTable[] = {
     {"scan", CommandKind::kScan, 2, 0, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"type", CommandKind::kType, 2, 2, 1, 1, 1, kKeyedRead},
+    {"randomkey", CommandKind::kRandomKey, 1, 1, 0, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdNoKeys},
     {"flushdb", CommandKind::kFlushDb, 1, 0, 0, 0, 1,
      kCmdWrite | kCmdGlobal | kCmdNoKeys},
     {"flushall", CommandKind::kFlushAll, 1, 0, 0, 0, 1,
      kCmdWrite | kCmdGlobal | kCmdNoKeys},
     {"get", CommandKind::kGet, 2, 2, 1, 1, 1, kKeyedRead},
+    {"getdel", CommandKind::kGetDel, 2, 2, 1, 1, 1, kKeyedWrite},
+    {"getex", CommandKind::kGetEx, 2, 0, 1, 1, 1, kKeyedWrite},
+    {"getrange", CommandKind::kGetRange, 4, 4, 1, 1, 1, kKeyedRead},
+    {"getset", CommandKind::kGetSet, 3, 3, 1, 1, 1, kKeyedWrite},
+    {"append", CommandKind::kAppend, 3, 3, 1, 1, 1, kKeyedWrite},
     {"set", CommandKind::kSet, 3, 0, 1, 1, 1, kKeyedWrite},
+    {"setex", CommandKind::kSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"psetex", CommandKind::kPSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"setnx", CommandKind::kSetNx, 3, 3, 1, 1, 1, kKeyedWrite},
+    {"setrange", CommandKind::kSetRange, 4, 4, 1, 1, 1, kKeyedWrite},
+    {"substr", CommandKind::kSubstr, 4, 4, 1, 1, 1, kKeyedRead},
+    {"lcs", CommandKind::kLcs, 3, 0, 1, 2, 1, kKeyedRead | kCmdMultiShard},
     {"lpush", CommandKind::kLPush, 3, 0, 1, 1, 1, kKeyedWrite},
     {"lpushx", CommandKind::kLPushX, 3, 0, 1, 1, 1, kKeyedWrite},
     {"rpush", CommandKind::kRPush, 3, 0, 1, 1, 1, kKeyedWrite},
@@ -99,11 +112,20 @@ constexpr CommandSpec kCommandTable[] = {
      kKeyedRead | kCmdMultiShard},
     {"sunionstore", CommandKind::kSUnionStore, 3, 0, 1, -1, 1,
      kKeyedWrite | kCmdMultiShard},
+    {"bzmpop", CommandKind::kBZMPop, 5, 0, 3, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdMayBlock},
+    {"bzpopmax", CommandKind::kBZPopMax, 3, 0, 1, -2, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMayBlock},
+    {"bzpopmin", CommandKind::kBZPopMin, 3, 0, 1, -2, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMayBlock},
     {"zadd", CommandKind::kZAdd, 4, 0, 1, 1, 1, kKeyedWrite},
     {"zcard", CommandKind::kZCard, 2, 2, 1, 1, 1, kKeyedRead},
     {"zcount", CommandKind::kZCount, 4, 4, 1, 1, 1, kKeyedRead},
     {"zincrby", CommandKind::kZIncrBy, 4, 4, 1, 1, 1, kKeyedWrite},
     {"zlexcount", CommandKind::kZLexCount, 4, 4, 1, 1, 1, kKeyedRead},
+    {"zmpop", CommandKind::kZMPop, 4, 0, 2, 0, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"zmscore", CommandKind::kZMScore, 3, 0, 1, 1, 1, kKeyedRead},
     {"zpopmax", CommandKind::kZPopMax, 2, 3, 1, 1, 1, kKeyedWrite},
     {"zpopmin", CommandKind::kZPopMin, 2, 3, 1, 1, 1, kKeyedWrite},
@@ -169,8 +191,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"xpending", CommandKind::kXPending, 3, 9, 1, 1, 1, kKeyedRead},
     {"xclaim", CommandKind::kXClaim, 6, 0, 1, 1, 1, kKeyedWrite},
     {"xautoclaim", CommandKind::kXAutoClaim, 6, 9, 1, 1, 1, kKeyedWrite},
-    {"xinfo", CommandKind::kXInfo, 2, 6, 2, 2, 1,
-     kKeyedRead | kCmdMovableKeys},
+    {"xinfo", CommandKind::kXInfo, 2, 6, 2, 2, 1, kKeyedRead | kCmdMovableKeys},
     {"xread", CommandKind::kXRead, 4, 0, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
          kCmdMayBlock},
@@ -179,15 +200,34 @@ constexpr CommandSpec kCommandTable[] = {
          kCmdMayBlock},
     {"strlen", CommandKind::kStrlen, 2, 2, 1, 1, 1, kKeyedRead},
     {"incr", CommandKind::kIncr, 2, 2, 1, 1, 1, kKeyedWrite},
+    {"incrby", CommandKind::kIncrBy, 3, 3, 1, 1, 1, kKeyedWrite},
+    {"incrbyfloat", CommandKind::kIncrByFloat, 3, 3, 1, 1, 1, kKeyedWrite},
+    {"decr", CommandKind::kDecr, 2, 2, 1, 1, 1, kKeyedWrite},
+    {"decrby", CommandKind::kDecrBy, 3, 3, 1, 1, 1, kKeyedWrite},
     {"expire", CommandKind::kExpire, 3, 4, 1, 1, 1, kKeyedWrite},
     {"pexpire", CommandKind::kPExpire, 3, 4, 1, 1, 1, kKeyedWrite},
+    {"expireat", CommandKind::kExpireAt, 3, 4, 1, 1, 1, kKeyedWrite},
+    {"pexpireat", CommandKind::kPExpireAt, 3, 4, 1, 1, 1, kKeyedWrite},
     {"persist", CommandKind::kPersist, 2, 2, 1, 1, 1, kKeyedWrite},
     {"ttl", CommandKind::kTtl, 2, 2, 1, 1, 1, kKeyedRead},
     {"pttl", CommandKind::kPttl, 2, 2, 1, 1, 1, kKeyedRead},
+    {"expiretime", CommandKind::kExpireTime, 2, 2, 1, 1, 1, kKeyedRead},
+    {"pexpiretime", CommandKind::kPExpireTime, 2, 2, 1, 1, 1, kKeyedRead},
     {"del", CommandKind::kDel, 2, 0, 1, -1, 1, kKeyedWrite | kCmdMultiShard},
+    {"unlink", CommandKind::kUnlink, 2, 0, 1, -1, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"rename", CommandKind::kRename, 3, 3, 1, 2, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"renamenx", CommandKind::kRenameNx, 3, 3, 1, 2, 1,
+     kKeyedWrite | kCmdMultiShard},
+    {"copy", CommandKind::kCopy, 3, 0, 1, 2, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
     {"exists", CommandKind::kExists, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
+    {"touch", CommandKind::kTouch, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
     {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2, kKeyedWrite | kCmdMultiShard},
+    {"msetnx", CommandKind::kMSetNx, 3, 0, 1, -1, 2,
+     kKeyedWrite | kCmdMultiShard},
     {"mget", CommandKind::kMGet, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
     {"multi", CommandKind::kMulti, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"exec", CommandKind::kExec, 1, 1, 0, 0, 1, kCmdNoKeys},
@@ -264,14 +304,16 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
     return absl::InvalidArgumentError("wrong number of arguments for '" +
                                       std::string(spec.name_) + "' command");
   }
-  if (spec.kind_ == CommandKind::kXGroup ||
-      spec.kind_ == CommandKind::kXInfo) {
+  if (spec.kind_ == CommandKind::kXGroup || spec.kind_ == CommandKind::kXInfo) {
     if (args.size() == 2 && EqualsIgnoreCase(args[1], "help")) {
       return KeyIndexView{};
     }
     return DetermineKeys(spec, args.size());
   }
-  const std::size_t count_arg = spec.kind_ == CommandKind::kBLMPop ? 2 : 1;
+  const std::size_t count_arg =
+      spec.kind_ == CommandKind::kBLMPop || spec.kind_ == CommandKind::kBZMPop
+          ? 2
+          : 1;
   if (spec.kind_ == CommandKind::kXRead ||
       spec.kind_ == CommandKind::kXReadGroup) {
     std::size_t streams = args.size();
@@ -290,14 +332,13 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
           spec.kind_ == CommandKind::kXReadGroup ? "xreadgroup" : "xread";
       const std::string_view special =
           spec.kind_ == CommandKind::kXReadGroup ? ">" : "$";
-      return absl::InvalidArgumentError(absl::StrCat(
-          "Unbalanced '", command,
-          "' list of streams: for each stream key an ID or '", special,
-          "' must be specified."));
+      return absl::InvalidArgumentError(
+          absl::StrCat("Unbalanced '", command,
+                       "' list of streams: for each stream key an ID or '",
+                       special, "' must be specified."));
     }
     const std::size_t keys = remaining / 2;
-    const std::size_t max_key_index =
-        std::numeric_limits<std::uint16_t>::max();
+    const std::size_t max_key_index = std::numeric_limits<std::uint16_t>::max();
     if (streams + 1 > max_key_index || keys > max_key_index - streams) {
       return absl::InvalidArgumentError(
           "too many arguments for stream key routing");
@@ -328,9 +369,8 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
     const std::size_t count_index = store ? 2 : 1;
     std::int64_t parsed_key_count = 0;
     const std::string_view text = args[count_index];
-    const auto parsed =
-        std::from_chars(text.data(), text.data() + text.size(),
-                        parsed_key_count);
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(),
+                                        parsed_key_count);
     const std::size_t first = count_index + 1;
     if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) {
       return absl::InvalidArgumentError(
@@ -354,6 +394,17 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
   }
   std::uint64_t count = 0;
   const std::string_view text = args[count_arg];
+  const bool zset_mpop = spec.kind_ == CommandKind::kZMPop ||
+                         spec.kind_ == CommandKind::kBZMPop;
+  if (zset_mpop) {
+    std::int64_t signed_count = 0;
+    const auto signed_parsed = std::from_chars(
+        text.data(), text.data() + text.size(), signed_count);
+    if (signed_parsed.ec != std::errc{} ||
+        signed_parsed.ptr != text.data() + text.size() || signed_count <= 0) {
+      return absl::InvalidArgumentError("numkeys should be greater than 0");
+    }
+  }
   const auto parsed =
       std::from_chars(text.data(), text.data() + text.size(), count);
   const std::size_t first = count_arg + 1;

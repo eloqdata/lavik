@@ -28,7 +28,12 @@ Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
                                             ReplyBuilder& reply_builder);
 Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                                        ReplyBuilder& reply_builder);
+Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
+                                              ReplyBuilder& reply_builder);
 Task<std::string> ExecuteZSetMultiKeyLocked(
+    const CommandRequest& request, std::span<const ZSetExecKey> keys,
+    std::vector<storage::TxShardWrites>& tx_writes);
+Task<std::string> ExecuteZSetMultiPopLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes);
 

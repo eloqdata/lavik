@@ -294,6 +294,14 @@ class ScanHashMap {
     ForEachTable(tables_[1], fn);
   }
 
+  // Visits entries until the callback returns false. Returns true when both
+  // tables were exhausted and false when the callback stopped traversal.
+  template <typename Fn>
+  bool ForEachWhile(Fn&& fn) {
+    return ForEachTableWhile(tables_[0], fn) &&
+           ForEachTableWhile(tables_[1], fn);
+  }
+
   // A cursor of zero starts and completes a full scan. The callback may be
   // invoked more than once for an entry if the table changes between calls.
   template <typename Fn>
@@ -687,6 +695,32 @@ class ScanHashMap {
     for (std::size_t index = 0; index < count; ++index) {
       EmitBucket(table, index, fn);
     }
+  }
+
+  template <typename Fn>
+  static bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) {
+    if (table.buckets_ == nullptr) return true;
+    const Bucket* bucket = &table.buckets_[index];
+    while (bucket != nullptr) {
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+      for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (Occupied(*bucket, slot) && !fn(*bucket->entries_[slot])) {
+          return false;
+        }
+      }
+      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+    }
+    return true;
+  }
+
+  template <typename Fn>
+  static bool ForEachTableWhile(Table& table, Fn& fn) {
+    const std::size_t count = BucketCount(table);
+    for (std::size_t index = 0; index < count; ++index) {
+      if (!EmitBucketWhile(table, index, fn)) return false;
+    }
+    return true;
   }
 
   static void DestroyTable(Table& table, bool destroy_entries) noexcept {

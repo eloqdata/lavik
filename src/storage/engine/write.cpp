@@ -217,70 +217,23 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   co_return !expired;
 }
 
-Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::Increment(
-    std::uint8_t db_id, std::string_view key) {
-  assert(db_id < kLogicalDatabaseCount);
-  const Digest digest = ComputeDigest(key);
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  co_return co_await IncrementLocked(db_id, key, digest);
-}
-
-Task<absl::StatusOr<std::int64_t>> StorageEngine::Impl::IncrementLocked(
+Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    TxShardWrites* tx) {
+    const RawValue& value, TxShardWrites* tx) {
   assert(db_id < kLogicalDatabaseCount);
+  if (digest != ComputeDigest(key)) {
+    co_return absl::InvalidArgumentError("raw value digest mismatch");
+  }
+  if (value.value_type_ == ValueType::kNone) {
+    co_return absl::InvalidArgumentError("raw value has no type");
+  }
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-
-  std::int64_t value = 0;
-  std::uint64_t expire_at_ms = 0;
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
-  if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
-    }
-    found = *resolved;
-  }
-  const bool exists = found != nullptr &&
-                      found->value_.kind_ == RecordKind::kValue &&
-                      !IsExpired(found->value_, UnixTimeMillis());
-  if (exists) {
-    if (found->value_.value_type_ != ValueType::kString) {
-      co_return absl::Status(
-          absl::StatusCode::kInvalidArgument,
-          "WRONGTYPE Operation against a key holding the wrong kind of value");
-    }
-    expire_at_ms = found->value_.expire_at_ms_;
-    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     found->value_, ExtentsFor(store, found));
-    if (!loaded.ok()) {
-      co_return loaded.status();
-    }
-    const std::span<const std::byte> value_bytes = loaded->value();
-    std::string_view text(reinterpret_cast<const char*>(value_bytes.data()),
-                          value_bytes.size());
-    auto [end, error] =
-        std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() ||
-        value == std::numeric_limits<std::int64_t>::max()) {
-      co_return absl::Status(absl::StatusCode::kInvalidArgument,
-                             "value is not an integer or out of range");
-    }
-  }
-  ++value;
-  const std::string encoded = std::to_string(value);
-  absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key, encoded, RecordKind::kValue,
-      ValueType::kString, expire_at_ms, tx);
-  if (!status.ok()) {
-    co_return status;
-  }
-  co_return value;
+  co_return co_await AppendLocked(store, partition, db_id, key, value.encoded_,
+                                  RecordKind::kValue, value.value_type_,
+                                  value.expire_at_ms_, tx, value.logical_size_);
 }
 
 StagingSlot* StorageEngine::Impl::StagingFor(WorkerStore& store,

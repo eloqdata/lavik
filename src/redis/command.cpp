@@ -41,6 +41,7 @@
 #include "list_command.h"
 #include "set_command.h"
 #include "stream_command.h"
+#include "string_command.h"
 #include "zset_command.h"
 
 namespace keylane {
@@ -57,6 +58,8 @@ std::chrono::steady_clock::time_point g_server_start;
 constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
+std::string_view AppendStorageError(ReplyBuilder& reply_builder,
+                                    const absl::Status& status);
 
 std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
   return right > std::numeric_limits<std::size_t>::max() - left
@@ -76,6 +79,16 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
   std::size_t keys = 0;
   switch (request.kind_) {
     case CommandKind::kSet:
+    case CommandKind::kSetEx:
+    case CommandKind::kPSetEx:
+    case CommandKind::kSetNx:
+    case CommandKind::kSetRange:
+    case CommandKind::kGetSet:
+    case CommandKind::kAppend:
+    case CommandKind::kIncrBy:
+    case CommandKind::kIncrByFloat:
+    case CommandKind::kDecr:
+    case CommandKind::kDecrBy:
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
     case CommandKind::kRPush:
@@ -93,6 +106,7 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kGeoAdd:
     case CommandKind::kXAdd:
     case CommandKind::kIncr:
+    case CommandKind::kCopy:
       keys = 1;
       break;
     case CommandKind::kXGroup:
@@ -125,6 +139,7 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
       keys = 1;
       break;
     case CommandKind::kMSet:
+    case CommandKind::kMSetNx:
       keys = request.args_.size() > 1 ? (request.args_.size() - 1) / 2 : 0;
       break;
     default:
@@ -279,6 +294,46 @@ Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
   }
   co_return BuiltReply(
       reply_builder.AppendInteger(static_cast<long long>(total)));
+}
+
+Task<CommandReply> ExecuteRandomKey(const CommandRequest& request,
+                                    ReplyBuilder& reply_builder) {
+  std::vector<std::uint64_t> populations(g_storage->worker_count());
+  std::uint64_t total = 0;
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    const std::size_t local = co_await SubmitTo(
+        worker, [db = request.db_id_] { return g_storage->LocalSize(db); });
+    populations[worker] = local;
+    if (local > std::numeric_limits<std::uint64_t>::max() - total) {
+      co_return BuiltReply(reply_builder.AppendError("ERR db size overflow"));
+    }
+    total += local;
+  }
+
+  // A worker's live count can temporarily include expired records awaiting
+  // their tombstone. Remove an empty result from this draw and retry the
+  // remaining workers; RandomKeyLocal itself filters those stale entries.
+  while (total != 0) {
+    std::uint64_t rank = RandomRank(total, RandomSampleGenerator());
+    unsigned selected = 0;
+    for (; selected < populations.size(); ++selected) {
+      if (rank < populations[selected]) break;
+      rank -= populations[selected];
+    }
+    if (selected == populations.size()) break;
+    auto key = co_await SubmitTaskTo(selected, [db = request.db_id_] {
+      return g_storage->RandomKeyLocal(db);
+    });
+    if (!key.ok()) {
+      co_return BuiltReply(AppendStorageError(reply_builder, key.status()));
+    }
+    if (key->has_value()) {
+      co_return BuiltReply(reply_builder.AppendBulkString(**key));
+    }
+    total -= populations[selected];
+    populations[selected] = 0;
+  }
+  co_return BuiltReply(reply_builder.AppendNullBulkString());
 }
 
 bool ParseUint64(std::string_view text, std::uint64_t* value) {
@@ -1034,8 +1089,7 @@ bool ParseInt64(std::string_view text, std::int64_t* value) {
 absl::Status ValidateBlockingTimeout(std::string_view text) {
   double timeout = 0;
   if (!ParseRedisDouble(text, &timeout)) {
-    return absl::InvalidArgumentError(
-        "timeout is not a float or out of range");
+    return absl::InvalidArgumentError("timeout is not a float or out of range");
   }
   if (timeout < 0) {
     return absl::InvalidArgumentError("timeout is negative");
@@ -1134,8 +1188,8 @@ Task<absl::StatusOr<storage::HashResult>> BeginNegativeRandomStream(
     absl::StatusOr<storage::HashResult> snapshot;
     if (state->options_.zset_) {
       snapshot = co_await ZSetRandomSnapshotLocked(
-          state->db_, state->key_, state->digest_,
-          state->options_.with_values_, nullptr, state->now_ms_);
+          state->db_, state->key_, state->digest_, state->options_.with_values_,
+          nullptr, state->now_ms_);
     } else if (state->options_.hash_) {
       snapshot = co_await g_storage->ExecuteHashLocked(
           state->db_, state->key_, state->digest_, operation, nullptr);
@@ -1156,7 +1210,8 @@ Task<absl::StatusOr<storage::HashResult>> BeginNegativeRandomStream(
     state->values_.reserve(snapshot->values_.size());
     for (auto& value : snapshot->values_) {
       if (!value.has_value())
-        co_return absl::InternalError("random snapshot contains a missing value");
+        co_return absl::InternalError(
+            "random snapshot contains a missing value");
       state->values_.push_back(std::move(*value));
     }
     co_return snapshot;
@@ -1432,6 +1487,50 @@ absl::StatusOr<storage::ExpirationCondition> ParseExpirationCondition(
   return absl::Status(absl::StatusCode::kInvalidArgument, "syntax error");
 }
 
+absl::StatusOr<std::uint64_t> ParseExpirationDeadline(CommandKind kind,
+                                                      std::string_view text) {
+  std::int64_t value = 0;
+  if (!ParseInt64(text, &value)) {
+    return absl::InvalidArgumentError(
+        "value is not an integer or out of range");
+  }
+  const bool seconds =
+      kind == CommandKind::kExpire || kind == CommandKind::kExpireAt;
+  const bool absolute =
+      kind == CommandKind::kExpireAt || kind == CommandKind::kPExpireAt;
+  const std::string_view command = kind == CommandKind::kExpire    ? "expire"
+                                   : kind == CommandKind::kPExpire ? "pexpire"
+                                   : kind == CommandKind::kExpireAt
+                                       ? "expireat"
+                                       : "pexpireat";
+  if (seconds && (value > std::numeric_limits<std::int64_t>::max() / 1000 ||
+                  value < std::numeric_limits<std::int64_t>::min() / 1000)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid expire time in '", command, "' command"));
+  }
+  if (seconds) value *= 1000;
+
+  const std::uint64_t now_ms = CommandUnixTimeMillis();
+  const std::int64_t signed_now = static_cast<std::int64_t>(now_ms);
+  if (!absolute) {
+    if (value > std::numeric_limits<std::int64_t>::max() - signed_now) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("invalid expire time in '", command, "' command"));
+    }
+    value += signed_now;
+  }
+  // The storage API uses zero for persistence. Map every already-expired
+  // signed timestamp to a positive sentinel which UpdateExpiration converts
+  // to a tombstone immediately.
+  return value <= signed_now ? 1 : static_cast<std::uint64_t>(value);
+}
+
+long long ExpirationReplySeconds(std::uint64_t milliseconds) {
+  const std::uint64_t rounded =
+      milliseconds / 1000 + (milliseconds % 1000 >= 500 ? 1 : 0);
+  return static_cast<long long>(rounded);
+}
+
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     ReadLatencyTrace* read_trace = nullptr) {
@@ -1496,6 +1595,23 @@ Task<CommandReply> ExecuteStorageCommand(
       }
       co_return reply;
     }
+
+    case CommandKind::kAppend:
+    case CommandKind::kDecr:
+    case CommandKind::kDecrBy:
+    case CommandKind::kGetDel:
+    case CommandKind::kGetEx:
+    case CommandKind::kGetRange:
+    case CommandKind::kGetSet:
+    case CommandKind::kIncr:
+    case CommandKind::kIncrBy:
+    case CommandKind::kIncrByFloat:
+    case CommandKind::kPSetEx:
+    case CommandKind::kSetEx:
+    case CommandKind::kSetNx:
+    case CommandKind::kSetRange:
+    case CommandKind::kSubstr:
+      co_return co_await ExecuteStringCommand(request, reply_builder);
 
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
@@ -1616,12 +1732,17 @@ Task<CommandReply> ExecuteStorageCommand(
     }
 
     case CommandKind::kTtl:
-    case CommandKind::kPttl: {
-      const bool milliseconds = request.kind_ == CommandKind::kPttl;
+    case CommandKind::kPttl:
+    case CommandKind::kExpireTime:
+    case CommandKind::kPExpireTime: {
+      const bool milliseconds = request.kind_ == CommandKind::kPttl ||
+                                request.kind_ == CommandKind::kPExpireTime;
+      const bool absolute = request.kind_ == CommandKind::kExpireTime ||
+                            request.kind_ == CommandKind::kPExpireTime;
       if (args.size() != 2) {
         reply.encoded_ = reply_builder.AppendError(
             std::string("ERR wrong number of arguments for '") +
-            (milliseconds ? "pttl" : "ttl") + "' command");
+            std::string(request.spec_->name_) + "' command");
         co_return reply;
       }
       const storage::ExpirationInfo info =
@@ -1632,29 +1753,26 @@ Task<CommandReply> ExecuteStorageCommand(
         reply.encoded_ = reply_builder.AppendInteger(-1);
       } else {
         const std::uint64_t now_ms = CommandUnixTimeMillis();
-        const std::uint64_t remaining =
-            info.expire_at_ms_ > now_ms ? info.expire_at_ms_ - now_ms : 0;
-        const std::uint64_t output =
-            milliseconds ? remaining : remaining / 1000;
-        reply.encoded_ =
-            reply_builder.AppendInteger(static_cast<long long>(output));
+        const std::uint64_t value =
+            absolute
+                ? info.expire_at_ms_
+                : (info.expire_at_ms_ > now_ms ? info.expire_at_ms_ - now_ms
+                                               : 0);
+        reply.encoded_ = reply_builder.AppendInteger(
+            milliseconds ? static_cast<long long>(value)
+                         : ExpirationReplySeconds(value));
       }
       co_return reply;
     }
 
     case CommandKind::kExpire:
-    case CommandKind::kPExpire: {
-      const bool milliseconds = request.kind_ == CommandKind::kPExpire;
+    case CommandKind::kPExpire:
+    case CommandKind::kExpireAt:
+    case CommandKind::kPExpireAt: {
       if (args.size() < 3 || args.size() > 4) {
         reply.encoded_ = reply_builder.AppendError(
             std::string("ERR wrong number of arguments for '") +
-            (milliseconds ? "pexpire" : "expire") + "' command");
-        co_return reply;
-      }
-      std::int64_t duration = 0;
-      if (!ParseInt64(args[2], &duration)) {
-        reply.encoded_ = reply_builder.AppendError(
-            "ERR value is not an integer or out of range");
+            std::string(request.spec_->name_) + "' command");
         co_return reply;
       }
       auto condition = ParseExpirationCondition(args);
@@ -1662,22 +1780,14 @@ Task<CommandReply> ExecuteStorageCommand(
         reply.encoded_ = reply_builder.AppendError("ERR syntax error");
         co_return reply;
       }
-      const std::uint64_t now_ms = CommandUnixTimeMillis();
-      constexpr std::uint64_t kMaxTimestamp =
-          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-      std::uint64_t expire_at_ms = 1;
-      if (duration > 0) {
-        const std::uint64_t amount = static_cast<std::uint64_t>(duration);
-        const std::uint64_t factor = milliseconds ? 1 : 1000;
-        if (amount > (kMaxTimestamp - now_ms) / factor) {
-          reply.encoded_ = reply_builder.AppendError(
-              "ERR invalid expire time in 'expire' command");
-          co_return reply;
-        }
-        expire_at_ms = now_ms + amount * factor;
+      auto expire_at_ms = ParseExpirationDeadline(request.kind_, args[2]);
+      if (!expire_at_ms.ok()) {
+        reply.encoded_ = reply_builder.AppendError(
+            absl::StrCat("ERR ", expire_at_ms.status().message()));
+        co_return reply;
       }
       auto updated = co_await g_storage->UpdateExpiration(
-          request.db_id_, args[1], expire_at_ms, *condition);
+          request.db_id_, args[1], *expire_at_ms, *condition);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -1696,30 +1806,6 @@ Task<CommandReply> ExecuteStorageCommand(
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
-      co_return reply;
-    }
-
-    case CommandKind::kIncr: {
-      if (args.size() != 2) {
-        reply.encoded_ = reply_builder.AppendError(
-            "ERR wrong number of arguments for 'incr' command");
-        co_return reply;
-      }
-      auto value = co_await g_storage->Increment(request.db_id_, args[1]);
-      if (!value.ok()) {
-        if (value.status().message().starts_with("WRONGTYPE ")) {
-          reply.encoded_ = reply_builder.AppendError(value.status().message());
-        } else {
-          reply.encoded_ =
-              value.status().code() == absl::StatusCode::kInvalidArgument
-                  ? reply_builder.AppendError(
-                        "ERR value is not an integer or out of range")
-                  : reply_builder.AppendError(
-                        absl::StrCat("ERR ", value.status().message()));
-        }
-      } else {
-        reply.encoded_ = reply_builder.AppendInteger(*value);
-      }
       co_return reply;
     }
 
@@ -1909,8 +1995,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                      storage::TxShardWrites* tx,
                                      ReplyChunkSource* reply_chunks) {
   const auto& args = request.args_;
-  if (auto options = ParseNegativeRandomStream(request);
-      options.has_value()) {
+  if (auto options = ParseNegativeRandomStream(request); options.has_value()) {
     auto streamed = co_await PrepareTransactionalNegativeRandomStreamLocked(
         request, digest, tx, *options);
     if (!streamed.ok()) co_return EncodeStorageError(streamed.status());
@@ -1959,6 +2044,27 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       }
       co_return result->applied_ ? EncodeSimpleString("OK")
                                  : EncodeNullBulkString();
+    }
+
+    case CommandKind::kAppend:
+    case CommandKind::kDecr:
+    case CommandKind::kDecrBy:
+    case CommandKind::kGetDel:
+    case CommandKind::kGetEx:
+    case CommandKind::kGetRange:
+    case CommandKind::kGetSet:
+    case CommandKind::kIncr:
+    case CommandKind::kIncrBy:
+    case CommandKind::kIncrByFloat:
+    case CommandKind::kPSetEx:
+    case CommandKind::kSetEx:
+    case CommandKind::kSetNx:
+    case CommandKind::kSetRange:
+    case CommandKind::kSubstr: {
+      ReplyBuilder string_reply_builder;
+      CommandReply reply = co_await ExecuteStringCommandLocked(
+          request, digest, tx, string_reply_builder);
+      co_return std::string(reply.encoded_);
     }
 
     case CommandKind::kLPush:
@@ -2089,8 +2195,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kTtl:
-    case CommandKind::kPttl: {
-      const bool milliseconds = request.kind_ == CommandKind::kPttl;
+    case CommandKind::kPttl:
+    case CommandKind::kExpireTime:
+    case CommandKind::kPExpireTime: {
+      const bool milliseconds = request.kind_ == CommandKind::kPttl ||
+                                request.kind_ == CommandKind::kPExpireTime;
+      const bool absolute = request.kind_ == CommandKind::kExpireTime ||
+                            request.kind_ == CommandKind::kPExpireTime;
       const storage::ExpirationInfo info =
           co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
       if (!info.exists_) {
@@ -2100,37 +2211,29 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
         co_return EncodeInteger(-1);
       }
       const std::uint64_t now_ms = CommandUnixTimeMillis();
-      const std::uint64_t remaining =
-          info.expire_at_ms_ > now_ms ? info.expire_at_ms_ - now_ms : 0;
-      co_return EncodeInteger(
-          static_cast<long long>(milliseconds ? remaining : remaining / 1000));
+      const std::uint64_t value =
+          absolute
+              ? info.expire_at_ms_
+              : (info.expire_at_ms_ > now_ms ? info.expire_at_ms_ - now_ms : 0);
+      co_return EncodeInteger(milliseconds ? static_cast<long long>(value)
+                                           : ExpirationReplySeconds(value));
     }
 
     case CommandKind::kExpire:
-    case CommandKind::kPExpire: {
-      const bool milliseconds = request.kind_ == CommandKind::kPExpire;
-      std::int64_t duration = 0;
-      if (!ParseInt64(args[2], &duration)) {
-        co_return EncodeError("ERR value is not an integer or out of range");
-      }
+    case CommandKind::kPExpire:
+    case CommandKind::kExpireAt:
+    case CommandKind::kPExpireAt: {
       auto condition = ParseExpirationCondition(args);
       if (!condition.ok()) {
         co_return EncodeError("ERR syntax error");
       }
-      const std::uint64_t now_ms = CommandUnixTimeMillis();
-      constexpr std::uint64_t kMaxTimestamp =
-          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
-      std::uint64_t expire_at_ms = 1;
-      if (duration > 0) {
-        const std::uint64_t amount = static_cast<std::uint64_t>(duration);
-        const std::uint64_t factor = milliseconds ? 1 : 1000;
-        if (amount > (kMaxTimestamp - now_ms) / factor) {
-          co_return EncodeError("ERR invalid expire time in 'expire' command");
-        }
-        expire_at_ms = now_ms + amount * factor;
+      auto expire_at_ms = ParseExpirationDeadline(request.kind_, args[2]);
+      if (!expire_at_ms.ok()) {
+        co_return EncodeError(
+            absl::StrCat("ERR ", expire_at_ms.status().message()));
       }
       auto updated = co_await g_storage->UpdateExpirationLocked(
-          db_id, args[1], digest, expire_at_ms, *condition, tx);
+          db_id, args[1], digest, *expire_at_ms, *condition, tx);
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
     }
@@ -2141,20 +2244,6 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
           storage::ExpirationCondition::kIfHasExpiration, tx);
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
-    }
-
-    case CommandKind::kIncr: {
-      auto value =
-          co_await g_storage->IncrementLocked(db_id, args[1], digest, tx);
-      if (value.ok()) {
-        co_return EncodeInteger(*value);
-      }
-      if (value.status().message().starts_with("WRONGTYPE ")) {
-        co_return EncodeError(value.status().message());
-      }
-      co_return value.status().code() == absl::StatusCode::kInvalidArgument
-          ? EncodeError("ERR value is not an integer or out of range")
-          : EncodeError(absl::StrCat("ERR ", value.status().message()));
     }
 
     default:
@@ -2275,6 +2364,519 @@ Task<absl::Status> RunTxCommit(std::uint64_t txid,
   co_return absl::OkStatus();
 }
 
+struct RenameContext {
+  const CommandRequest* request_ = nullptr;
+  storage::RawValue source_;
+  bool destination_exists_ = false;
+  bool rollback_ = false;
+  std::vector<storage::TxShardWrites> writes_;
+};
+
+Task<absl::Status> RenameReadCallback(void* opaque,
+                                      const tx::ShardSlice& slice) {
+  auto* context = static_cast<RenameContext*>(opaque);
+  for (const tx::TxKey& key : slice.keys_) {
+    const std::string& name = context->request_->args_[key.arg_index_];
+    if (key.arg_index_ == 1) {
+      auto source = co_await g_storage->ReadRawValueLocked(
+          context->request_->db_id_, name, key.digest_);
+      if (!source.ok()) co_return source.status();
+      context->source_ = std::move(*source);
+    } else if (key.arg_index_ == 2) {
+      context->destination_exists_ = co_await g_storage->ExistsLocked(
+          context->request_->db_id_, name, key.digest_);
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> RenameWriteCallback(void* opaque,
+                                       const tx::ShardSlice& slice) {
+  auto* context = static_cast<RenameContext*>(opaque);
+  for (const tx::TxKey& key : slice.keys_) {
+    const std::string& name = context->request_->args_[key.arg_index_];
+    storage::TxShardWrites* writes = &context->writes_[celer::ThisWorker().id_];
+    if (key.arg_index_ == 1) {
+      auto deleted = co_await g_storage->DeleteLocked(
+          context->request_->db_id_, name, key.digest_, writes);
+      if (!deleted.ok()) co_return deleted.status();
+      if (!*deleted) co_return absl::NotFoundError("no such key");
+    } else if (key.arg_index_ == 2) {
+      absl::Status written = co_await g_storage->WriteRawValueLocked(
+          context->request_->db_id_, name, key.digest_, context->source_,
+          writes);
+      if (!written.ok()) co_return written;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> RenameFinishCallback(void* opaque, const tx::ShardSlice&) {
+  auto* context = static_cast<RenameContext*>(opaque);
+  const std::uint64_t txid = context->writes_.front().txid_;
+  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
+  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+}
+
+Task<absl::Status> RenameSingleShardCallback(void* opaque,
+                                             const tx::ShardSlice& slice) {
+  auto* context = static_cast<RenameContext*>(opaque);
+  const tx::TxKey* source_key = nullptr;
+  const tx::TxKey* destination_key = nullptr;
+  for (const tx::TxKey& key : slice.keys_) {
+    if (key.arg_index_ == 1) source_key = &key;
+    if (key.arg_index_ == 2) destination_key = &key;
+  }
+  if (source_key == nullptr || destination_key == nullptr) {
+    co_return absl::InternalError("RENAME key routing is incomplete");
+  }
+  const auto& args = context->request_->args_;
+  auto source = co_await g_storage->ReadRawValueLocked(
+      context->request_->db_id_, args[1], source_key->digest_);
+  if (!source.ok()) co_return source.status();
+  context->source_ = std::move(*source);
+  context->destination_exists_ = co_await g_storage->ExistsLocked(
+      context->request_->db_id_, args[2], destination_key->digest_);
+  if (context->request_->kind_ == CommandKind::kRenameNx &&
+      context->destination_exists_) {
+    co_return absl::OkStatus();
+  }
+
+  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  absl::Status written = co_await g_storage->WriteRawValueLocked(
+      context->request_->db_id_, args[2], destination_key->digest_,
+      context->source_, &writes);
+  if (written.ok()) {
+    auto deleted = co_await g_storage->DeleteLocked(
+        context->request_->db_id_, args[1], source_key->digest_, &writes);
+    if (!deleted.ok()) {
+      written = deleted.status();
+    } else if (!*deleted) {
+      written = absl::NotFoundError("no such key");
+    }
+  }
+  writes.collect_undo_ = false;
+  absl::Status finished =
+      written.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
+                   : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  co_return written.ok() ? finished : (finished.ok() ? written : finished);
+}
+
+Task<absl::Status> ReleaseHeldKeys(void*, const tx::ShardSlice&) {
+  co_return absl::OkStatus();
+}
+
+void NotifyRenamedValue(std::uint8_t db_id, std::string_view key,
+                        storage::ValueType type) {
+  if (type == storage::ValueType::kList) {
+    NotifyListBlockingKey(db_id, key);
+  } else if (type == storage::ValueType::kSortedSet) {
+    NotifyZSetBlockingKey(db_id, key);
+  } else if (type == storage::ValueType::kStream) {
+    NotifyStreamBlockingKey(db_id, key);
+  }
+}
+
+Task<CommandReply> ExecuteRename(const CommandRequest& request,
+                                 ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  const bool nx = request.kind_ == CommandKind::kRenameNx;
+  if (args[1] == args[2]) {
+    const unsigned owner = ShardForKey(args[1]);
+    const storage::ExpirationInfo info = co_await SubmitTaskTo(
+        owner, [db = request.db_id_, key = std::string(args[1])]() {
+          return g_storage->GetExpiration(db, key);
+        });
+    if (!info.exists_) {
+      co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
+    }
+    co_return BuiltReply(nx ? reply_builder.AppendInteger(0)
+                            : reply_builder.AppendSimpleString("OK"));
+  }
+
+  tx::Transaction transaction;
+  for (std::size_t argument = 1; argument <= 2; ++argument) {
+    transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
+                       storage::ComputeDigest(args[argument]),
+                       static_cast<std::uint32_t>(argument),
+                       tx::LockMode::kExclusive);
+  }
+  transaction.Seal();
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) {
+    if (status.code() == absl::StatusCode::kNotFound) {
+      co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
+    }
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+
+  RenameContext context;
+  context.request_ = &request;
+  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+  context.writes_.resize(g_storage->worker_count());
+  for (auto& writes : context.writes_) {
+    writes.txid_ = txid;
+    writes.collect_undo_ = true;
+  }
+
+  if (transaction.single_shard()) {
+    status = co_await transaction.Execute(&RenameSingleShardCallback, &context,
+                                          true);
+    for (auto& writes : context.writes_) writes.collect_undo_ = false;
+    if (!status.ok()) {
+      if (status.code() == absl::StatusCode::kNotFound) {
+        co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
+      }
+      co_return BuiltReply(AppendStorageError(reply_builder, status));
+    }
+    if (nx && context.destination_exists_) {
+      co_return BuiltReply(reply_builder.AppendInteger(0));
+    }
+    g_storage->NoteTxCommitStarted();
+    SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+    NotifyRenamedValue(request.db_id_, args[2], context.source_.value_type_);
+    co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
+                            : reply_builder.AppendSimpleString("OK"));
+  }
+
+  status = co_await transaction.Execute(&RenameReadCallback, &context, false);
+  if (!status.ok() || (nx && context.destination_exists_)) {
+    (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
+    if (!status.ok()) {
+      if (status.code() == absl::StatusCode::kNotFound) {
+        co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
+      }
+      co_return BuiltReply(AppendStorageError(reply_builder, status));
+    }
+    co_return BuiltReply(reply_builder.AppendInteger(0));
+  }
+
+  status = co_await transaction.Execute(&RenameWriteCallback, &context, false);
+  context.rollback_ = !status.ok();
+  absl::Status finished =
+      co_await transaction.Execute(&RenameFinishCallback, &context, true);
+  if (status.ok() && !finished.ok()) status = finished;
+  for (auto& writes : context.writes_) writes.collect_undo_ = false;
+  if (!status.ok()) {
+    if (status.code() == absl::StatusCode::kNotFound) {
+      co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
+    }
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+
+  g_storage->NoteTxCommitStarted();
+  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  NotifyRenamedValue(request.db_id_, args[2], context.source_.value_type_);
+  co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
+                          : reply_builder.AppendSimpleString("OK"));
+}
+
+struct CopyOptions {
+  std::uint8_t destination_db_ = 0;
+  bool replace_ = false;
+};
+
+absl::StatusOr<CopyOptions> ParseCopyOptions(const CommandRequest& request) {
+  CopyOptions options{.destination_db_ = request.db_id_};
+  const auto& args = request.args_;
+  for (std::size_t i = 3; i < args.size();) {
+    if (CmpCaseInsensitive(args[i], "replace")) {
+      options.replace_ = true;
+      ++i;
+      continue;
+    }
+    if (CmpCaseInsensitive(args[i], "db") && i + 1 < args.size()) {
+      std::int64_t db = 0;
+      if (!ParseRedisInt64(args[i + 1], &db) ||
+          db < std::numeric_limits<int>::min() ||
+          db > std::numeric_limits<int>::max()) {
+        return absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      }
+      if (db < 0 || db >= storage::kLogicalDatabaseCount) {
+        return absl::InvalidArgumentError("DB index is out of range");
+      }
+      options.destination_db_ = static_cast<std::uint8_t>(db);
+      i += 2;
+      continue;
+    }
+    return absl::InvalidArgumentError("syntax error");
+  }
+  return options;
+}
+
+struct CopyContext {
+  const CommandRequest* request_ = nullptr;
+  CopyOptions options_;
+  std::optional<storage::RawValue> source_;
+  bool destination_exists_ = false;
+  bool copied_ = false;
+  bool rollback_ = false;
+  std::vector<storage::TxShardWrites> writes_;
+};
+
+Task<absl::Status> CopyReadCallback(void* opaque, const tx::ShardSlice& slice) {
+  auto* context = static_cast<CopyContext*>(opaque);
+  for (const tx::TxKey& key : slice.keys_) {
+    const std::string& name = context->request_->args_[key.arg_index_];
+    if (key.arg_index_ == 1) {
+      auto source =
+          co_await g_storage->ReadRawValueLocked(key.db_, name, key.digest_);
+      if (source.ok()) {
+        context->source_.emplace(std::move(*source));
+      } else if (source.status().code() != absl::StatusCode::kNotFound) {
+        co_return source.status();
+      }
+    } else if (key.arg_index_ == 2) {
+      context->destination_exists_ =
+          co_await g_storage->ExistsLocked(key.db_, name, key.digest_);
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> CopyWriteCallback(void* opaque,
+                                     const tx::ShardSlice& slice) {
+  auto* context = static_cast<CopyContext*>(opaque);
+  for (const tx::TxKey& key : slice.keys_) {
+    if (key.arg_index_ != 2) continue;
+    storage::TxShardWrites* writes = &context->writes_[celer::ThisWorker().id_];
+    absl::Status status = co_await g_storage->WriteRawValueLocked(
+        key.db_, context->request_->args_[2], key.digest_, *context->source_,
+        writes);
+    if (!status.ok()) co_return status;
+    context->copied_ = true;
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> CopyFinishCallback(void* opaque, const tx::ShardSlice&) {
+  auto* context = static_cast<CopyContext*>(opaque);
+  const std::uint64_t txid = context->writes_.front().txid_;
+  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
+  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+}
+
+Task<absl::Status> CopySingleShardCallback(void* opaque,
+                                           const tx::ShardSlice& slice) {
+  auto* context = static_cast<CopyContext*>(opaque);
+  absl::Status status = co_await CopyReadCallback(opaque, slice);
+  if (status.ok() && context->source_.has_value() &&
+      (!context->destination_exists_ || context->options_.replace_)) {
+    status = co_await CopyWriteCallback(opaque, slice);
+  }
+  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  writes.collect_undo_ = false;
+  absl::Status finished =
+      status.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
+                  : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  co_return status.ok() ? finished : (finished.ok() ? status : finished);
+}
+
+Task<CommandReply> ExecuteCopy(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
+  auto options = ParseCopyOptions(request);
+  if (!options.ok()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", options.status().message())));
+  }
+  const auto& args = request.args_;
+  if (request.db_id_ == options->destination_db_ && args[1] == args[2]) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR source and destination objects are the same"));
+  }
+
+  MultiDbOperationGuard db_guard;
+  if (!db_guard.Add(request.db_id_) ||
+      (options->destination_db_ != request.db_id_ &&
+       !db_guard.Add(options->destination_db_))) {
+    co_return BuiltReply(
+        reply_builder.AppendError("TRYAGAIN database flush is in progress"));
+  }
+
+  tx::Transaction transaction;
+  transaction.AddKey(ShardForKey(args[1]), request.db_id_,
+                     storage::ComputeDigest(args[1]), 1, tx::LockMode::kShared);
+  transaction.AddKey(ShardForKey(args[2]), options->destination_db_,
+                     storage::ComputeDigest(args[2]), 2,
+                     tx::LockMode::kExclusive);
+  transaction.Seal();
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+
+  CopyContext context;
+  context.request_ = &request;
+  context.options_ = *options;
+  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+  context.writes_.resize(g_storage->worker_count());
+  for (storage::TxShardWrites& writes : context.writes_) {
+    writes.txid_ = txid;
+    writes.collect_undo_ = true;
+  }
+
+  if (transaction.single_shard()) {
+    status =
+        co_await transaction.Execute(&CopySingleShardCallback, &context, true);
+    for (auto& writes : context.writes_) writes.collect_undo_ = false;
+  } else {
+    status = co_await transaction.Execute(&CopyReadCallback, &context, false);
+    if (!status.ok() || !context.source_.has_value() ||
+        (context.destination_exists_ && !options->replace_)) {
+      (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
+      for (auto& writes : context.writes_) writes.collect_undo_ = false;
+    } else {
+      status =
+          co_await transaction.Execute(&CopyWriteCallback, &context, false);
+      context.rollback_ = !status.ok();
+      absl::Status finished =
+          co_await transaction.Execute(&CopyFinishCallback, &context, true);
+      if (status.ok() && !finished.ok()) status = finished;
+      for (auto& writes : context.writes_) writes.collect_undo_ = false;
+    }
+  }
+  if (!status.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+  if (!context.copied_) {
+    co_return BuiltReply(reply_builder.AppendInteger(0));
+  }
+
+  g_storage->NoteTxCommitStarted();
+  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  NotifyRenamedValue(options->destination_db_, args[2],
+                     context.source_->value_type_);
+  co_return BuiltReply(reply_builder.AppendInteger(1));
+}
+
+struct MSetNxContext {
+  const CommandRequest* request_ = nullptr;
+  std::atomic<bool> exists_{false};
+  bool rollback_ = false;
+  std::vector<storage::TxShardWrites> writes_;
+};
+
+Task<absl::Status> MSetNxCheckCallback(void* opaque,
+                                       const tx::ShardSlice& slice) {
+  auto* context = static_cast<MSetNxContext*>(opaque);
+  for (const tx::TxKey& key : slice.keys_) {
+    if (co_await g_storage->ExistsLocked(
+            context->request_->db_id_, context->request_->args_[key.arg_index_],
+            key.digest_)) {
+      context->exists_.store(true, std::memory_order_relaxed);
+    }
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> MSetNxWriteLocal(MSetNxContext* context) {
+  const auto& args = context->request_->args_;
+  const unsigned owner = ThisWorker().id_;
+  for (std::size_t argument = 1; argument < args.size(); argument += 2) {
+    if (ShardForKey(args[argument]) != owner) continue;
+    const storage::Digest digest = storage::ComputeDigest(args[argument]);
+    auto result = co_await g_storage->SetLocked(
+        context->request_->db_id_, args[argument], digest, args[argument + 1],
+        {}, &context->writes_[owner]);
+    if (!result.ok()) co_return result.status();
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> MSetNxWriteCallback(void* opaque, const tx::ShardSlice&) {
+  co_return co_await MSetNxWriteLocal(static_cast<MSetNxContext*>(opaque));
+}
+
+Task<absl::Status> MSetNxFinishCallback(void* opaque, const tx::ShardSlice&) {
+  auto* context = static_cast<MSetNxContext*>(opaque);
+  const std::uint64_t txid = context->writes_.front().txid_;
+  if (context->rollback_) co_return co_await g_storage->RollbackTxLocal(txid);
+  co_return co_await g_storage->DiscardTxUndoLocal(txid);
+}
+
+Task<absl::Status> MSetNxSingleShardCallback(void* opaque,
+                                             const tx::ShardSlice& slice) {
+  auto* context = static_cast<MSetNxContext*>(opaque);
+  absl::Status checked = co_await MSetNxCheckCallback(opaque, slice);
+  if (!checked.ok() || context->exists_.load(std::memory_order_relaxed)) {
+    co_return checked;
+  }
+  absl::Status written = co_await MSetNxWriteLocal(context);
+  storage::TxShardWrites& writes = context->writes_[celer::ThisWorker().id_];
+  writes.collect_undo_ = false;
+  absl::Status finished =
+      written.ok() ? co_await g_storage->DiscardTxUndoLocal(writes.txid_)
+                   : co_await g_storage->RollbackTxLocal(writes.txid_, &writes);
+  co_return written.ok() ? finished : (finished.ok() ? written : finished);
+}
+
+Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
+                                 ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  if (args.size() < 3 || args.size() % 2 == 0) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'msetnx' command"));
+  }
+  tx::Transaction transaction;
+  for (std::size_t argument = 1; argument < args.size(); argument += 2) {
+    transaction.AddKey(ShardForKey(args[argument]), request.db_id_,
+                       storage::ComputeDigest(args[argument]),
+                       static_cast<std::uint32_t>(argument),
+                       tx::LockMode::kExclusive);
+  }
+  transaction.Seal();
+  absl::Status status = co_await transaction.Schedule();
+  if (!status.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+
+  MSetNxContext context;
+  context.request_ = &request;
+  const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+  context.writes_.resize(g_storage->worker_count());
+  for (storage::TxShardWrites& writes : context.writes_) {
+    writes.txid_ = txid;
+    writes.collect_undo_ = true;
+  }
+
+  if (transaction.single_shard()) {
+    status = co_await transaction.Execute(&MSetNxSingleShardCallback, &context,
+                                          true);
+    for (auto& writes : context.writes_) writes.collect_undo_ = false;
+    if (!status.ok()) {
+      co_return BuiltReply(AppendStorageError(reply_builder, status));
+    }
+    if (context.exists_.load(std::memory_order_relaxed)) {
+      co_return BuiltReply(reply_builder.AppendInteger(0));
+    }
+    g_storage->NoteTxCommitStarted();
+    SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+    co_return BuiltReply(reply_builder.AppendInteger(1));
+  }
+
+  status = co_await transaction.Execute(&MSetNxCheckCallback, &context, false);
+  if (!status.ok() || context.exists_.load(std::memory_order_relaxed)) {
+    (void)co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
+    co_return status.ok()
+        ? BuiltReply(reply_builder.AppendInteger(0))
+        : BuiltReply(AppendStorageError(reply_builder, status));
+  }
+
+  status = co_await transaction.Execute(&MSetNxWriteCallback, &context, false);
+  context.rollback_ = !status.ok();
+  absl::Status finished =
+      co_await transaction.Execute(&MSetNxFinishCallback, &context, true);
+  if (status.ok() && !finished.ok()) status = finished;
+  for (auto& writes : context.writes_) writes.collect_undo_ = false;
+  if (!status.ok()) {
+    co_return BuiltReply(AppendStorageError(reply_builder, status));
+  }
+  g_storage->NoteTxCommitStarted();
+  SpawnOnCurrentWorker(RunTxCommit(txid, std::move(context.writes_)));
+  co_return BuiltReply(reply_builder.AppendInteger(1));
+}
+
 Task<absl::Status> MultiKeyShardCallback(void* context,
                                          const tx::ShardSlice& slice) {
   auto* ctx = static_cast<MultiKeyContext*>(context);
@@ -2321,7 +2923,8 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
         }
         break;
       }
-      case CommandKind::kDel: {
+      case CommandKind::kDel:
+      case CommandKind::kUnlink: {
         auto deleted = co_await g_storage->DeleteLocked(
             ctx->request_->db_id_, name, key.digest_,
             ctx->tx_writes_.empty() ? nullptr
@@ -2339,6 +2942,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
         break;
       }
       case CommandKind::kExists:
+      case CommandKind::kTouch:
       default: {
         if (co_await g_storage->ExistsLocked(ctx->request_->db_id_, name,
                                              key.digest_)) {
@@ -2427,8 +3031,8 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
       storage::TxShardWrites& shard = ctx.tx_writes_[owner];
       if (!shard.collect_undo_) continue;
       if (!shard.fences_.empty() || !shard.retirements_.empty()) {
-        absl::Status discarded = co_await SubmitTaskTo(
-            owner, [txid = write_txid] {
+        absl::Status discarded =
+            co_await SubmitTaskTo(owner, [txid = write_txid] {
               return g_storage->DiscardTxUndoLocal(txid);
             });
         if (!discarded.ok()) {
@@ -2490,14 +3094,27 @@ bool IsExecSequentialSetMulti(CommandKind kind) {
 }
 
 bool IsExecSequentialZSetMulti(CommandKind kind) {
-  return kind == CommandKind::kZDiff || kind == CommandKind::kZDiffStore ||
+  return kind == CommandKind::kZMPop || kind == CommandKind::kBZMPop ||
+         kind == CommandKind::kBZPopMin || kind == CommandKind::kBZPopMax ||
+         kind == CommandKind::kZDiff || kind == CommandKind::kZDiffStore ||
          kind == CommandKind::kZInter || kind == CommandKind::kZInterCard ||
          kind == CommandKind::kZInterStore || kind == CommandKind::kZUnion ||
          kind == CommandKind::kZUnionStore ||
-         kind == CommandKind::kZRangeStore ||
-         kind == CommandKind::kGeoRadius ||
+         kind == CommandKind::kZRangeStore || kind == CommandKind::kGeoRadius ||
          kind == CommandKind::kGeoRadiusByMember ||
          kind == CommandKind::kGeoSearchStore;
+}
+
+bool IsExecSequentialRename(CommandKind kind) {
+  return kind == CommandKind::kRename || kind == CommandKind::kRenameNx;
+}
+
+bool IsExecSequentialCopy(CommandKind kind) {
+  return kind == CommandKind::kCopy;
+}
+
+bool IsExecSequentialStringMulti(CommandKind kind) {
+  return kind == CommandKind::kMSetNx || kind == CommandKind::kLcs;
 }
 
 std::optional<std::uint16_t> GeoStoreDestinationArg(
@@ -2506,8 +3123,7 @@ std::optional<std::uint16_t> GeoStoreDestinationArg(
       command.kind_ != CommandKind::kGeoRadiusByMember) {
     return std::nullopt;
   }
-  const std::size_t begin =
-      command.kind_ == CommandKind::kGeoRadius ? 6 : 5;
+  const std::size_t begin = command.kind_ == CommandKind::kGeoRadius ? 6 : 5;
   for (std::size_t i = begin; i + 1 < command.args_.size(); ++i) {
     if (CmpCaseInsensitive(command.args_[i], "store") ||
         CmpCaseInsensitive(command.args_[i], "storedist")) {
@@ -2531,6 +3147,12 @@ Task<std::string> ExecuteExecSequentialZSetMulti(
   for (const ExecKey& key : keys) {
     zset_keys.push_back(ZSetExecKey{
         .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+  }
+  if (command.kind_ == CommandKind::kZMPop ||
+      command.kind_ == CommandKind::kBZMPop ||
+      command.kind_ == CommandKind::kBZPopMin ||
+      command.kind_ == CommandKind::kBZPopMax) {
+    co_return co_await ExecuteZSetMultiPopLocked(command, zset_keys, tx_writes);
   }
   co_return co_await ExecuteZSetMultiKeyLocked(command, zset_keys, tx_writes);
 }
@@ -2576,10 +3198,9 @@ Task<absl::Status> BeginExecCommandUndo(
     checkpoints->push_back(ExecWriteCheckpoint{
         .owner_ = owner,
     });
-    absl::Status discarded =
-        co_await SubmitTaskTo(owner, [txid = shard.txid_] {
-          return g_storage->DiscardTxUndoLocal(txid);
-        });
+    absl::Status discarded = co_await SubmitTaskTo(owner, [txid = shard.txid_] {
+      return g_storage->DiscardTxUndoLocal(txid);
+    });
     if (!discarded.ok()) {
       for (const ExecWriteCheckpoint& checkpoint : *checkpoints)
         writes[checkpoint.owner_].collect_undo_ = false;
@@ -2599,15 +3220,236 @@ Task<absl::Status> FinishExecCommandUndo(
     storage::TxShardWrites& shard = writes[checkpoint.owner_];
     // Compensation appends must not recursively enter the undo journal.
     shard.collect_undo_ = false;
-    absl::Status finished =
-        co_await SubmitTaskTo(checkpoint.owner_,
-                              [txid = shard.txid_, rollback, shard = &shard] {
+    absl::Status finished = co_await SubmitTaskTo(
+        checkpoint.owner_, [txid = shard.txid_, rollback, shard = &shard] {
           return rollback ? g_storage->RollbackTxLocal(txid, shard)
                           : g_storage->DiscardTxUndoLocal(txid);
         });
     if (!finished.ok() && first_error.ok()) first_error = finished;
   }
   co_return first_error;
+}
+
+Task<std::string> ExecuteExecSequentialRename(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  const auto& args = command.args_;
+  const bool nx = command.kind_ == CommandKind::kRenameNx;
+  auto find_key = [&](std::size_t argument) -> const ExecKey* {
+    for (const ExecKey& key : keys) {
+      if (key.arg_ == argument) return &key;
+    }
+    return nullptr;
+  };
+  const ExecKey* source = find_key(1);
+  const ExecKey* destination = find_key(2);
+  if (source == nullptr) co_return EncodeError("ERR no such key");
+  if (args[1] == args[2]) {
+    auto info = co_await SubmitTaskTo(
+        source->owner_, [db = command.db_id_, key = std::string(args[1]),
+                         digest = source->digest_]() {
+          return g_storage->GetExpirationLocked(db, key, digest);
+        });
+    if (!info.exists_) co_return EncodeError("ERR no such key");
+    co_return nx ? EncodeInteger(0) : EncodeSimpleString("OK");
+  }
+  if (destination == nullptr) {
+    co_return EncodeError("ERR RENAME destination key is missing");
+  }
+
+  auto raw = co_await SubmitTaskTo(
+      source->owner_, [db = command.db_id_, key = std::string(args[1]),
+                       digest = source->digest_]() {
+        return g_storage->ReadRawValueLocked(db, key, digest);
+      });
+  if (!raw.ok()) {
+    if (raw.status().code() == absl::StatusCode::kNotFound)
+      co_return EncodeError("ERR no such key");
+    co_return EncodeStorageError(raw.status());
+  }
+  if (nx) {
+    const bool destination_exists = co_await SubmitTaskTo(
+        destination->owner_, [db = command.db_id_, key = std::string(args[2]),
+                              digest = destination->digest_]() {
+          return g_storage->ExistsLocked(db, key, digest);
+        });
+    if (destination_exists) co_return EncodeInteger(0);
+  }
+
+  const std::vector<unsigned> owners =
+      UniqueOwners({source->owner_, destination->owner_});
+  std::vector<ExecWriteCheckpoint> checkpoints;
+  absl::Status undo =
+      co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+  if (!undo.ok()) co_return EncodeStorageError(undo);
+
+  absl::Status written = co_await SubmitTaskTo(
+      destination->owner_, [db = command.db_id_, key = std::string(args[2]),
+                            digest = destination->digest_, value = &*raw,
+                            writes = &tx_writes[destination->owner_]] {
+        return g_storage->WriteRawValueLocked(db, key, digest, *value, writes);
+      });
+  if (!written.ok()) {
+    absl::Status rolled_back =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    co_return EncodeStorageError(rolled_back.ok() ? written : rolled_back);
+  }
+  auto deleted = co_await SubmitTaskTo(
+      source->owner_,
+      [db = command.db_id_, key = std::string(args[1]),
+       digest = source->digest_, writes = &tx_writes[source->owner_]] {
+        return g_storage->DeleteLocked(db, key, digest, writes);
+      });
+  if (!deleted.ok() || !*deleted) {
+    const absl::Status failure =
+        deleted.ok() ? absl::NotFoundError("key not found") : deleted.status();
+    absl::Status rolled_back =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    co_return EncodeStorageError(rolled_back.ok() ? failure : rolled_back);
+  }
+  absl::Status completed =
+      co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+  if (!completed.ok()) co_return EncodeStorageError(completed);
+  NotifyRenamedValue(command.db_id_, args[2], raw->value_type_);
+  co_return nx ? EncodeInteger(1) : EncodeSimpleString("OK");
+}
+
+Task<std::string> ExecuteExecSequentialCopy(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  auto options = ParseCopyOptions(command);
+  if (!options.ok()) {
+    co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
+  }
+  const auto& args = command.args_;
+  auto find_key = [&](std::size_t argument) -> const ExecKey* {
+    for (const ExecKey& key : keys) {
+      if (key.arg_ == argument) return &key;
+    }
+    return nullptr;
+  };
+  const ExecKey* source = find_key(1);
+  const ExecKey* destination = find_key(2);
+  if (source == nullptr || destination == nullptr) {
+    co_return EncodeError("ERR syntax error");
+  }
+  if (source->db_ == destination->db_ && args[1] == args[2]) {
+    co_return EncodeError("ERR source and destination objects are the same");
+  }
+
+  auto raw = co_await SubmitTaskTo(
+      source->owner_, [db = source->db_, key = std::string(args[1]),
+                       digest = source->digest_]() {
+        return g_storage->ReadRawValueLocked(db, key, digest);
+      });
+  if (!raw.ok()) {
+    if (raw.status().code() == absl::StatusCode::kNotFound) {
+      co_return EncodeInteger(0);
+    }
+    co_return EncodeStorageError(raw.status());
+  }
+  const bool destination_exists = co_await SubmitTaskTo(
+      destination->owner_, [db = destination->db_, key = std::string(args[2]),
+                            digest = destination->digest_]() {
+        return g_storage->ExistsLocked(db, key, digest);
+      });
+  if (destination_exists && !options->replace_) {
+    co_return EncodeInteger(0);
+  }
+
+  const std::vector<unsigned> owners =
+      UniqueOwners({source->owner_, destination->owner_});
+  std::vector<ExecWriteCheckpoint> checkpoints;
+  absl::Status undo =
+      co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+  if (!undo.ok()) co_return EncodeStorageError(undo);
+  absl::Status written = co_await SubmitTaskTo(
+      destination->owner_, [db = destination->db_, key = std::string(args[2]),
+                            digest = destination->digest_, value = &*raw,
+                            writes = &tx_writes[destination->owner_]] {
+        return g_storage->WriteRawValueLocked(db, key, digest, *value, writes);
+      });
+  if (!written.ok()) {
+    absl::Status rolled_back =
+        co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+    co_return EncodeStorageError(rolled_back.ok() ? written : rolled_back);
+  }
+  absl::Status completed =
+      co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+  if (!completed.ok()) co_return EncodeStorageError(completed);
+  NotifyRenamedValue(destination->db_, args[2], raw->value_type_);
+  co_return EncodeInteger(1);
+}
+
+Task<std::string> ExecuteExecSequentialStringMulti(
+    const CommandRequest& command, const std::vector<ExecKey>& keys,
+    std::vector<storage::TxShardWrites>& tx_writes) {
+  if (command.kind_ == CommandKind::kLcs) {
+    std::vector<StringExecKey> string_keys;
+    string_keys.reserve(keys.size());
+    for (const ExecKey& key : keys) {
+      string_keys.push_back(StringExecKey{
+          .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
+    }
+    co_return co_await ExecuteLcsLocked(command, string_keys);
+  }
+
+  const auto& args = command.args_;
+  auto find_key = [&](std::size_t argument) -> const ExecKey* {
+    for (const ExecKey& key : keys) {
+      if (key.arg_ == argument) return &key;
+    }
+    return nullptr;
+  };
+  for (std::size_t argument = 1; argument < args.size(); argument += 2) {
+    const ExecKey* key = find_key(argument);
+    if (key == nullptr) co_return EncodeError("ERR MSETNX key is missing");
+    auto exists = [db = command.db_id_, name = std::string(args[argument]),
+                   digest = key->digest_]() {
+      return g_storage->ExistsLocked(db, name, digest);
+    };
+    const bool present = key->owner_ == ThisWorker().id_
+                             ? co_await exists()
+                             : co_await SubmitTaskTo(key->owner_, exists);
+    if (present) co_return EncodeInteger(0);
+  }
+
+  std::vector<unsigned> owners;
+  owners.reserve(keys.size());
+  for (const ExecKey& key : keys) owners.push_back(key.owner_);
+  std::sort(owners.begin(), owners.end());
+  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+  std::vector<ExecWriteCheckpoint> checkpoints;
+  absl::Status undo =
+      co_await BeginExecCommandUndo(owners, tx_writes, &checkpoints);
+  if (!undo.ok()) co_return EncodeStorageError(undo);
+
+  for (std::size_t argument = 1; argument < args.size(); argument += 2) {
+    const ExecKey* key = find_key(argument);
+    if (key == nullptr) {
+      absl::Status rolled_back =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+      co_return rolled_back.ok() ? EncodeError("ERR MSETNX key is missing")
+                                 : EncodeStorageError(rolled_back);
+    }
+    auto write = [db = command.db_id_, name = std::string(args[argument]),
+                  value = std::string(args[argument + 1]),
+                  digest = key->digest_, writes = &tx_writes[key->owner_]]() {
+      return g_storage->SetLocked(db, name, digest, value, {}, writes);
+    };
+    auto result = key->owner_ == ThisWorker().id_
+                      ? co_await write()
+                      : co_await SubmitTaskTo(key->owner_, write);
+    if (!result.ok()) {
+      absl::Status rolled_back =
+          co_await FinishExecCommandUndo(checkpoints, tx_writes, true);
+      co_return EncodeStorageError(rolled_back.ok() ? result.status()
+                                                    : rolled_back);
+    }
+  }
+  absl::Status completed =
+      co_await FinishExecCommandUndo(checkpoints, tx_writes, false);
+  co_return completed.ok() ? EncodeInteger(1) : EncodeStorageError(completed);
 }
 
 Task<std::string> ExecuteExecSequentialSetMulti(
@@ -2725,10 +3567,10 @@ Task<std::string> ExecuteExecSequentialSetMulti(
       }
       std::int64_t parsed_limit = 0;
       const std::string_view text = args[option + 1];
-      const auto parsed = std::from_chars(
-          text.data(), text.data() + text.size(), parsed_limit);
-      if (parsed.ec != std::errc{} ||
-          parsed.ptr != text.data() + text.size() || parsed_limit < 0) {
+      const auto parsed =
+          std::from_chars(text.data(), text.data() + text.size(), parsed_limit);
+      if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+          parsed_limit < 0) {
         co_return EncodeError("ERR LIMIT can't be negative");
       }
       cardinality_limit = static_cast<std::uint64_t>(parsed_limit);
@@ -2771,9 +3613,8 @@ Task<std::string> ExecuteExecSequentialSetMulti(
   if (command.kind_ == CommandKind::kSInterCard) {
     const std::uint64_t cardinality = output.size();
     co_return EncodeInteger(static_cast<long long>(
-        cardinality_limit == 0
-            ? cardinality
-            : std::min(cardinality, cardinality_limit)));
+        cardinality_limit == 0 ? cardinality
+                               : std::min(cardinality, cardinality_limit)));
   }
 
   if (store) {
@@ -3089,7 +3930,9 @@ void AssembleRunReplies(ExecRunContext& run) {
         break;
       }
       case CommandKind::kDel:
+      case CommandKind::kUnlink:
       case CommandKind::kExists:
+      case CommandKind::kTouch:
         (*run.replies_)[i] =
             EncodeInteger(run.counters_[local].load(std::memory_order_relaxed));
         break;
@@ -3103,8 +3946,8 @@ void AssembleRunReplies(ExecRunContext& run) {
 void InitExecRun(ExecRunContext& run, const std::vector<CommandRequest>& queued,
                  const std::vector<std::vector<ExecKey>>& cmd_keys,
                  std::vector<std::string>& replies,
-                 std::vector<ReplyChunkSource>& reply_chunks,
-                 std::size_t begin, std::size_t end) {
+                 std::vector<ReplyChunkSource>& reply_chunks, std::size_t begin,
+                 std::size_t end) {
   run.queued_ = &queued;
   run.cmd_keys_ = &cmd_keys;
   run.replies_ = &replies;
@@ -3203,7 +4046,8 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
           }
           break;
         }
-        case CommandKind::kDel: {
+        case CommandKind::kDel:
+        case CommandKind::kUnlink: {
           auto deleted = co_await g_storage->DeleteLocked(
               cmd.db_id_, args[key.arg_], key.digest_, tx);
           if (!deleted.ok()) {
@@ -3214,7 +4058,8 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
           }
           break;
         }
-        case CommandKind::kExists: {
+        case CommandKind::kExists:
+        case CommandKind::kTouch: {
           if (co_await g_storage->ExistsLocked(cmd.db_id_, args[key.arg_],
                                                key.digest_)) {
             ctx->counters_[local].fetch_add(1, std::memory_order_relaxed);
@@ -3224,9 +4069,8 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         default:
           // Single-key command: the sole owner runs the full body and writes
           // the reply slot directly (errors self-encode).
-          (*ctx->replies_)[i] =
-              co_await RunSingleKeyLocked(cmd.db_id_, cmd, key.digest_, tx,
-                                          &(*ctx->reply_chunks_)[i]);
+          (*ctx->replies_)[i] = co_await RunSingleKeyLocked(
+              cmd.db_id_, cmd, key.digest_, tx, &(*ctx->reply_chunks_)[i]);
           break;
       }
       if (command_failed) {
@@ -3406,6 +4250,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   for (std::size_t i = 0; i < queued.size(); ++i) {
     const CommandRequest& cmd = queued[i];
     if (cmd.spec_ == nullptr || (cmd.spec_->flags_ & kCmdNoKeys) != 0) {
+      if (cmd.kind_ == CommandKind::kRandomKey &&
+          std::find(dbs.begin(), dbs.end(), cmd.db_id_) == dbs.end()) {
+        dbs.push_back(cmd.db_id_);
+      }
       continue;
     }
     auto keys = DetermineKeys(*cmd.spec_, cmd.args_);
@@ -3413,11 +4261,42 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       // Movable-key commands derive their key set from argument values.
       // Redis queues value errors and reports them in the EXEC result instead
       // of treating them as queue-time arity failures.
-      key_errors[i] = EncodeError(absl::StrCat("ERR ", keys.status().message()));
+      key_errors[i] =
+          EncodeError(absl::StrCat("ERR ", keys.status().message()));
       continue;
     }
     const bool write = (cmd.spec_->flags_ & kCmdWrite) != 0;
     std::uint16_t slot = 0;
+    if (cmd.kind_ == CommandKind::kCopy) {
+      auto options = ParseCopyOptions(cmd);
+      if (!options.ok()) {
+        key_errors[i] =
+            EncodeError(absl::StrCat("ERR ", options.status().message()));
+        continue;
+      }
+      cmd_keys[i].push_back(ExecKey{
+          .digest_ = storage::ComputeDigest(cmd.args_[1]),
+          .owner_ = static_cast<std::uint16_t>(ShardForKey(cmd.args_[1])),
+          .arg_ = 1,
+          .slot_ = slot++,
+          .mode_ = tx::LockMode::kShared,
+          .db_ = cmd.db_id_,
+      });
+      cmd_keys[i].push_back(ExecKey{
+          .digest_ = storage::ComputeDigest(cmd.args_[2]),
+          .owner_ = static_cast<std::uint16_t>(ShardForKey(cmd.args_[2])),
+          .arg_ = 2,
+          .slot_ = slot++,
+          .mode_ = tx::LockMode::kExclusive,
+          .db_ = options->destination_db_,
+      });
+      for (const std::uint8_t db : {cmd.db_id_, options->destination_db_}) {
+        if (std::find(dbs.begin(), dbs.end(), db) == dbs.end()) {
+          dbs.push_back(db);
+        }
+      }
+      continue;
+    }
     const bool zset_store = cmd.kind_ == CommandKind::kZDiffStore ||
                             cmd.kind_ == CommandKind::kZInterStore ||
                             cmd.kind_ == CommandKind::kZUnionStore ||
@@ -3461,6 +4340,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     CommandReply local;
     if (cmd.kind_ == CommandKind::kInfo) {
       local = co_await ExecuteInfo(cmd, local_builder);
+    } else if (cmd.kind_ == CommandKind::kRandomKey) {
+      local = co_await ExecuteRandomKey(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kXGroup ||
                cmd.kind_ == CommandKind::kXInfo) {
       local = co_await ExecuteStreamCommand(cmd, local_builder);
@@ -3542,6 +4423,24 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                 ++i;
                 continue;
               }
+              if (IsExecSequentialRename(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialRename(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
+              if (IsExecSequentialCopy(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialCopy(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
+              if (IsExecSequentialStringMulti(cmd.kind_)) {
+                replies[i] = co_await ExecuteExecSequentialStringMulti(
+                    cmd, cmd_keys[i], tx_writes);
+                ++i;
+                continue;
+              }
               if (IsExecSequentialSetMulti(cmd.kind_)) {
                 replies[i] = co_await ExecuteExecSequentialSetMulti(
                     cmd, cmd_keys[i], tx_writes);
@@ -3563,14 +4462,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
               std::size_t end = i + 1;
               while (end < queued.size() && !cmd_keys[end].empty() &&
                      !IsExecSequentialListCommand(queued[end].kind_) &&
+                     !IsExecSequentialRename(queued[end].kind_) &&
+                     !IsExecSequentialCopy(queued[end].kind_) &&
+                     !IsExecSequentialStringMulti(queued[end].kind_) &&
                      !IsExecSequentialSetMulti(queued[end].kind_) &&
                      !IsExecSequentialZSetMulti(queued[end].kind_) &&
                      !IsExecSequentialStreamRead(queued[end].kind_)) {
                 ++end;
               }
               ExecRunContext run;
-              InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i,
-                          end);
+              InitExecRun(run, queued, cmd_keys, replies, reply_chunks, i, end);
               run.tx_writes_ = tx_writes.data();
               (void)co_await ExecRunShardCallback(&run,
                                                   tx::ShardSlice{.keys_ = {}});
@@ -3650,6 +4551,24 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
           ++i;
           continue;
         }
+        if (IsExecSequentialRename(cmd.kind_)) {
+          replies[i] =
+              co_await ExecuteExecSequentialRename(cmd, cmd_keys[i], tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialCopy(cmd.kind_)) {
+          replies[i] =
+              co_await ExecuteExecSequentialCopy(cmd, cmd_keys[i], tx_writes);
+          ++i;
+          continue;
+        }
+        if (IsExecSequentialStringMulti(cmd.kind_)) {
+          replies[i] = co_await ExecuteExecSequentialStringMulti(
+              cmd, cmd_keys[i], tx_writes);
+          ++i;
+          continue;
+        }
         if (IsExecSequentialSetMulti(cmd.kind_)) {
           replies[i] = co_await ExecuteExecSequentialSetMulti(cmd, cmd_keys[i],
                                                               tx_writes);
@@ -3671,6 +4590,9 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         std::size_t end = i + 1;
         while (end < queued.size() && !cmd_keys[end].empty() &&
                !IsExecSequentialListCommand(queued[end].kind_) &&
+               !IsExecSequentialRename(queued[end].kind_) &&
+               !IsExecSequentialCopy(queued[end].kind_) &&
+               !IsExecSequentialStringMulti(queued[end].kind_) &&
                !IsExecSequentialSetMulti(queued[end].kind_) &&
                !IsExecSequentialZSetMulti(queued[end].kind_) &&
                !IsExecSequentialStreamRead(queued[end].kind_)) {
@@ -3754,6 +4676,7 @@ void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   InitHashCommandStorage(engine);
   InitListCommandStorage(engine);
   InitSetCommandStorage(engine);
+  InitStringCommandStorage(engine);
   InitStreamCommandStorage(engine);
   InitZSetCommandStorage(engine);
   g_replica_read_only = replica_read_only;
@@ -3810,7 +4733,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           "ERR unknown command '" + request.args_.front() + "'"));
     }
     const CommandSpec& spec = *request.spec_;
-    if (kind == CommandKind::kMSet && request.args_.size() % 2 != 1) {
+    if ((kind == CommandKind::kMSet || kind == CommandKind::kMSetNx) &&
+        request.args_.size() % 2 != 1) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(
           reply_builder.AppendError("ERR wrong number of arguments for '" +
@@ -3907,8 +4831,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
   const std::optional<NegativeRandomStreamOptions> random_stream =
       ParseNegativeRandomStream(request);
-  const bool manages_own_db_gate =
-      (cmd_flags & kCmdMayBlock) != 0 || random_stream.has_value();
+  const bool manages_own_db_gate = (cmd_flags & kCmdMayBlock) != 0 ||
+                                   random_stream.has_value() ||
+                                   request.kind_ == CommandKind::kCopy;
   if (uses_db && !manages_own_db_gate && !TryBeginDbOperation(request.db_id_)) {
     co_return BuiltReply(
         reply_builder.AppendError("TRYAGAIN database flush is in progress"));
@@ -3933,6 +4858,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request, reply_builder);
 
+    case CommandKind::kRandomKey:
+      co_return co_await ExecuteRandomKey(request, reply_builder);
+
     case CommandKind::kScan:
       co_return co_await ExecuteScan(request, reply_builder);
 
@@ -3942,8 +4870,23 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kDefrag:
       co_return co_await ExecuteDefrag(request, reply_builder);
 
+    case CommandKind::kRename:
+    case CommandKind::kRenameNx:
+      co_return co_await ExecuteRename(request, reply_builder);
+
+    case CommandKind::kCopy:
+      co_return co_await ExecuteCopy(request, reply_builder);
+
+    case CommandKind::kMSetNx:
+      co_return co_await ExecuteMSetNx(request, reply_builder);
+
+    case CommandKind::kLcs:
+      co_return co_await ExecuteLcsCommand(request, reply_builder);
+
     case CommandKind::kDel:
+    case CommandKind::kUnlink:
     case CommandKind::kExists:
+    case CommandKind::kTouch:
     case CommandKind::kMSet:
     case CommandKind::kMGet:
       co_return co_await ExecuteMultiKey(request, reply_builder);
@@ -3969,6 +4912,7 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kGeoRadius:
     case CommandKind::kGeoRadiusByMember:
     case CommandKind::kGeoSearchStore:
+    case CommandKind::kZMPop:
       co_return co_await ExecuteZSetMultiKey(request, reply_builder);
 
     case CommandKind::kLMove:
@@ -3982,6 +4926,11 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kBRPopLPush:
     case CommandKind::kBLMPop:
       co_return co_await ExecuteBlockingListCommand(request, reply_builder);
+
+    case CommandKind::kBZMPop:
+    case CommandKind::kBZPopMax:
+    case CommandKind::kBZPopMin:
+      co_return co_await ExecuteBlockingZSetCommand(request, reply_builder);
 
     case CommandKind::kXGroup:
     case CommandKind::kXInfo:
@@ -4004,8 +4953,18 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
       co_return co_await ExecuteStorageCommand(request, reply_builder);
 
     case CommandKind::kGet:
+    case CommandKind::kGetDel:
+    case CommandKind::kGetEx:
+    case CommandKind::kGetRange:
+    case CommandKind::kGetSet:
+    case CommandKind::kAppend:
     case CommandKind::kStrlen:
     case CommandKind::kSet:
+    case CommandKind::kSetEx:
+    case CommandKind::kPSetEx:
+    case CommandKind::kSetNx:
+    case CommandKind::kSetRange:
+    case CommandKind::kSubstr:
     case CommandKind::kLPush:
     case CommandKind::kLPushX:
     case CommandKind::kRPush:
@@ -4087,11 +5046,19 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kXClaim:
     case CommandKind::kXAutoClaim:
     case CommandKind::kIncr:
+    case CommandKind::kIncrBy:
+    case CommandKind::kIncrByFloat:
+    case CommandKind::kDecr:
+    case CommandKind::kDecrBy:
     case CommandKind::kExpire:
     case CommandKind::kPExpire:
+    case CommandKind::kExpireAt:
+    case CommandKind::kPExpireAt:
     case CommandKind::kPersist:
     case CommandKind::kTtl:
     case CommandKind::kPttl:
+    case CommandKind::kExpireTime:
+    case CommandKind::kPExpireTime:
     case CommandKind::kType:
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);

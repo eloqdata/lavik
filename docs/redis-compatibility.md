@@ -5,11 +5,18 @@ This is a command-level compatibility promise: unsupported Redis 7.2 commands
 remain unsupported, while supported commands must match Redis 7.2 syntax,
 atomicity, errors, and RESP2 replies.
 
-The current string and expiration surface is:
+The Redis 7.2 String command group is complete: `APPEND`, `DECR`, `DECRBY`,
+`GET`, `GETDEL`, `GETEX`, `GETRANGE`, `GETSET`, `INCR`, `INCRBY`,
+`INCRBYFLOAT`, `LCS`, `MGET`, `MSET`, `MSETNX`, `PSETEX`, `SET`, `SETEX`,
+`SETNX`, `SETRANGE`, `STRLEN`, and `SUBSTR`. `SET` supports
+`NX`/`XX`, `GET`, `EX`/`PX`/`EXAT`/`PXAT`, and `KEEPTTL`.
 
-- `SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT|KEEPTTL]`
-- `GET`, `INCR`, `DEL`, `EXISTS`, `TYPE`, and `SCAN` with `TYPE` filtering
-- `TTL`, `PTTL`, `EXPIRE`, `PEXPIRE`, and `PERSIST`
+The current key and expiration surface includes:
+
+- `DEL`, `UNLINK`, `RENAME`, `RENAMENX`, `COPY`, `EXISTS`, `TOUCH`,
+  `RANDOMKEY`, `TYPE`, and `SCAN` with `TYPE` filtering
+- `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `EXPIRE`, `PEXPIRE`,
+  `EXPIREAT`, `PEXPIREAT`, and `PERSIST`
 - Redis 7.2 `EXPIRE`/`PEXPIRE` conditions: `NX`, `XX`, `GT`, and `LT`
 
 Redis 8.4 comparison options (`IFEQ`, `IFNE`, `IFDEQ`, and `IFDNE`) are not
@@ -39,9 +46,10 @@ key while holding its intent lock. Large-key splitting is not currently
 implemented; `large-key-design.md` records constraints for a future redesign.
 
 The implemented Sorted Set surface is `ZADD`, `ZCARD`, `ZCOUNT`, `ZINCRBY`,
-`ZLEXCOUNT`, `ZMSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`, `ZRANGE`,
-`ZRANGESTORE`, and the legacy range aliases, `ZRANK`, `ZREVRANK`, `ZREM`, the three `ZREMRANGE*`
-commands, `ZSCAN`, and `ZSCORE`.
+`ZLEXCOUNT`, `ZMPOP`, `ZMSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`,
+`ZRANGE`, `ZRANGESTORE`, and the legacy range aliases, `ZRANK`, `ZREVRANK`,
+`ZREM`, the three `ZREMRANGE*` commands, `ZSCAN`, and `ZSCORE`. Blocking pops
+are available through `BZMPOP`, `BZPOPMIN`, and `BZPOPMAX`.
 Cross-key `ZDIFF`, `ZINTER`, `ZINTERCARD`, and `ZUNION`, including their
 `*STORE` forms, use the same distributed intent-lock transaction path as Set
 algebra commands.

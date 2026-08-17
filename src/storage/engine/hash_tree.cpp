@@ -1,15 +1,12 @@
-#include <cctype>
-#include <cerrno>
 #include <charconv>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <random>
 
 #include "impl.h"
 #include "keylane/glob.h"
 #include "keylane/memory.h"
 #include "keylane/random_sample.h"
+#include "keylane/redis_parse.h"
 
 namespace keylane::storage {
 
@@ -24,23 +21,6 @@ bool EntryLess(const HashEntry& left, const HashEntry& right) {
   if (left.digest_ != right.digest_)
     return DigestLess(left.digest_, right.digest_);
   return left.field_ < right.field_;
-}
-
-bool ParseRedisLongDouble(std::string_view text, long double* output) {
-  if (text.empty() ||
-      std::isspace(static_cast<unsigned char>(text.front())) != 0) {
-    return false;
-  }
-  std::string terminated(text);
-  char* end = nullptr;
-  errno = 0;
-  const long double parsed = std::strtold(terminated.c_str(), &end);
-  if (errno == ERANGE || end != terminated.data() + terminated.size() ||
-      !std::isfinite(parsed)) {
-    return false;
-  }
-  *output = parsed;
-  return true;
 }
 
 bool IsWrite(const HashOperation& operation) {
@@ -224,18 +204,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     const long double updated = previous + increment;
     if (!std::isfinite(updated))
       return absl::OutOfRangeError("increment would produce NaN or Infinity");
-    char output[std::numeric_limits<long double>::max_exponent10 + 128];
-    const int formatted =
-        std::snprintf(output, sizeof(output), "%.17Lf", updated);
-    if (formatted < 0 ||
-        static_cast<std::size_t>(formatted) >= sizeof(output)) {
+    if (!FormatRedisLongDouble(updated, &result.scalar_)) {
       return absl::InternalError("failed to format Hash float");
     }
-    std::size_t length = static_cast<std::size_t>(formatted);
-    while (length > 0 && output[length - 1] == '0') --length;
-    if (length > 0 && output[length - 1] == '.') --length;
-    result.scalar_.assign(output, length);
-    if (result.scalar_ == "-0") result.scalar_ = "0";
     return result.scalar_;
   };
 
