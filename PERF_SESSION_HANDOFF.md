@@ -2,6 +2,103 @@
 
 Updated: 2026-08-18 UTC
 
+## 2026-08-18 two-host 1-TB primary/replica controlled-load results
+
+The current `main` build at `ec22e4f` was tested with a primary on `10.0.0.4`
+and a replica on `10.0.0.7`. Each Keylane process used 12 workers on CPUs
+0-11 and both local NVMe devices through SPDK; CPUs 12-15 were reserved for
+network IRQ/softirq work. The primary and replica each contained exactly
+400,000,000 `kv_` keys with random 1,000-4,000 byte values. Both nodes remained
+at 400,000,000 keys after the test.
+
+Memtier 2.5.1 cluster mode does not currently provide a deterministic weighted
+split across the primary and replica: `primary` sends all reads to the primary,
+`secondary` sends all reads to replicas, and `--replica-clients` is parsed but
+not wired. The test therefore ran two memtier processes concurrently on
+`10.0.0.5`. Each used eight threads, ten clients per thread, one request in
+flight per connection, and `--rate-limiting=1250`, producing a 100,000-op/s
+target per process. The primary process was pinned to CPUs 0-7 with
+`--read-preference=primary`; the replica read process was pinned to CPUs 8-15
+with `--read-preference=secondary`. Each workload ran for 300 seconds.
+
+Primary workload results while the replica simultaneously served 100,000
+GET/s:
+
+    Primary load  SET/s       GET/s       Total/s      Avg       p50       p99       p99.9     p99.99
+    100% GET       0           99,996.85   99,996.85    0.267 ms  0.255 ms  0.511 ms  0.815 ms  1.551 ms
+    1:1 SET:GET    49,996.65   49,996.45   99,993.10    0.259 ms  0.231 ms  0.791 ms  2.607 ms  4.095 ms
+    100% SET       99,999.77   0           99,999.77    0.229 ms  0.199 ms  0.831 ms  1.671 ms  2.431 ms
+
+Concurrent replica-only GET results:
+
+    Primary load  Replica GET/s  Avg       p50       p99       p99.9     p99.99
+    100% GET       99,999.28      0.261 ms  0.255 ms  0.455 ms  0.647 ms  0.935 ms
+    1:1 SET:GET    99,986.19      0.269 ms  0.255 ms  0.543 ms  1.319 ms  2.303 ms
+    100% SET       99,999.76      0.289 ms  0.271 ms  0.663 ms  1.671 ms  3.503 ms
+
+Average Keylane process CPU usage, where 100% is one logical CPU:
+
+    Primary load  Primary CPU  Replica CPU
+    100% GET       542.66%      557.62%
+    1:1 SET:GET    486.52%      630.30%
+    100% SET       457.44%      703.37%
+
+All six memtier processes exited successfully with zero error responses,
+warnings, misses, MOVED, or ASK replies. Replication remained online with 12
+data flows and `lag=0`; neither Keylane log gained a new warning or error. The
+replica CPU increase from 5.58 cores in the read/read workload to 7.03 cores
+while the primary wrote at 100,000 SET/s measures the extra replication-apply
+cost while it continued serving the same 100,000 GET/s.
+
+Raw memtier logs are on `10.0.0.5` as
+`/tmp/keylane-100k-{read,mixed,write}-{primary,secondary}-300s.memtier`.
+Per-second Keylane CPU samples and before/after Prometheus snapshots are on the
+primary as `/tmp/keylane-100k-{read,mixed,write}-{master,replica}.pidstat` and
+`/tmp/keylane-100k-{read,mixed,write}-{master,replica}-{before,after}.metrics`.
+
+The identical six tests were repeated at a 50,000-op/s target per process by
+changing only the per-connection rate limit from 1,250 to 625. Memtier's
+achieved rate was about 49,920 op/s because of its rate-timer granularity.
+
+Primary workload results while the replica simultaneously served 50,000
+GET/s:
+
+    Primary load  SET/s       GET/s       Total/s      Avg       p50       p99       p99.9     p99.99
+    100% GET       0           49,920.86   49,920.86    0.271 ms  0.255 ms  0.639 ms  1.199 ms  1.791 ms
+    1:1 SET:GET    24,958.41   24,958.19   49,916.61    0.255 ms  0.239 ms  0.703 ms  1.279 ms  3.199 ms
+    100% SET       49,920.27   0           49,920.27    0.234 ms  0.207 ms  0.791 ms  1.375 ms  2.127 ms
+
+Concurrent replica-only GET results:
+
+    Primary load  Replica GET/s  Avg       p50       p99       p99.9     p99.99
+    100% GET       49,920.43      0.262 ms  0.247 ms  0.543 ms  0.863 ms  1.263 ms
+    1:1 SET:GET    49,919.15      0.262 ms  0.247 ms  0.527 ms  0.863 ms  1.711 ms
+    100% SET       49,920.41      0.263 ms  0.247 ms  0.575 ms  1.167 ms  2.415 ms
+
+Average Keylane process CPU usage at the 50,000-op/s target:
+
+    Primary load  Primary CPU  Replica CPU
+    100% GET       304.79%      320.84%
+    1:1 SET:GET    272.18%      391.99%
+    100% SET       252.50%      423.93%
+
+The replica's cost increases with primary writes even though its foreground
+read rate is fixed: it used 3.21 cores with no incoming replication writes,
+3.92 cores while applying about 25,000 SET/s, and 4.24 cores while applying
+about 50,000 SET/s. Halving both client targets reduced the replica's 100%-SET
+case from 7.03 to 4.24 cores. The mixed and write-heavy tails also improved:
+relative to the 100,000-op/s tests, replica p99.9 fell from 1.319 to 0.863 ms
+for the mixed case and from 1.671 to 1.167 ms for the write case. The pure
+read p99/p99.9 did not improve at the lower rate, so its small tail difference
+is not caused by replication apply pressure.
+
+All six 50,000-op/s clients also completed with zero errors, warnings, misses,
+MOVED, or ASK replies. Replication remained online with 12 flows and `lag=0`,
+and both nodes still reported 400,000,000 keys. The raw logs use the matching
+`/tmp/keylane-50k-{read,mixed,write}-{primary,secondary}-300s.memtier` names on
+`10.0.0.5`; CPU and metrics files on the primary use the same `keylane-50k-`
+prefix.
+
 ## 2026-08-18 replication throughput and IRQ session
 
 This session ran from uncommitted changes on Keylane `main` at
