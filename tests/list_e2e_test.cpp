@@ -1498,8 +1498,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ASSERT_TRUE(wait_value(first_client, "startup", "ready"));
 
   ServerProcess second(g_keylane_binary, second_port, second_data, second_log,
-                        2, {}, {},
-                        {{"KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND", "0"}});
+                        2);
   RespClient second_client(second_port);
   ASSERT_EQ(second_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),

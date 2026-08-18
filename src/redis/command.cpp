@@ -33,6 +33,7 @@
 #include "keylane/metrics.h"
 #include "keylane/random_sample.h"
 #include "keylane/redis_parse.h"
+#include "keylane/replication.h"
 #include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
@@ -52,6 +53,7 @@ using namespace celer;
 namespace {
 
 storage::StorageEngine* g_storage = nullptr;
+ReplicationManager* g_replication = nullptr;
 bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
@@ -213,6 +215,28 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
   return request;
 }
 
+absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
+    std::span<const std::string> args) {
+  if (args.size() != 3) {
+    return absl::InvalidArgumentError(
+        "wrong number of arguments for 'replicaof' command");
+  }
+  if (CmpCaseInsensitive(args[1], "NO") &&
+      CmpCaseInsensitive(args[2], "ONE")) {
+    return ReplicaOfRequest{};
+  }
+  std::uint64_t port = 0;
+  const auto* begin = args[2].data();
+  const auto* end = begin + args[2].size();
+  const auto parsed = std::from_chars(begin, end, port);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || port == 0 ||
+      port > 65535 || args[1].empty()) {
+    return absl::InvalidArgumentError("invalid upstream host or port");
+  }
+  return ReplicaOfRequest{std::string(args[1]),
+                          static_cast<std::uint16_t>(port)};
+}
+
 namespace {
 
 CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
@@ -273,6 +297,30 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
                                                  args.front() + "'");
       return reply;
   }
+}
+
+Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
+                                    ReplyBuilder& reply_builder) {
+  auto parsed = ParseReplicaOfRequest(request.args_);
+  if (!parsed.ok()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", parsed.status().message())));
+  }
+  if (g_replication == nullptr) {
+    co_return BuiltReply(
+        reply_builder.AppendError("ERR replication backend is unavailable"));
+  }
+  std::optional<ReplicaOfConfig> upstream;
+  if (parsed->host_.has_value()) {
+    upstream = ReplicaOfConfig{*parsed->host_, parsed->port_};
+  }
+  absl::Status configured =
+      co_await g_replication->SetUpstream(std::move(upstream));
+  if (!configured.ok()) {
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", configured.message())));
+  }
+  co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
 }
 
 Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
@@ -708,6 +756,11 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
       detached = co_await g_storage->FlushDbDetach(db_id);
       if (!detached.ok()) {
         break;
+      }
+      if (!request.replication_origin_ && g_storage->ReplicationLogActive()) {
+        detached = co_await g_storage->PublishFlushDbReplication(
+            db_id, g_storage->DbEpoch(db_id));
+        if (!detached.ok()) break;
       }
     }
   }
@@ -1556,8 +1609,14 @@ Task<CommandReply> ExecuteStorageCommand(
             absl::StrCat("ERR ", options.status().message()));
         co_return reply;
       }
-      auto result =
-          co_await g_storage->Set(request.db_id_, args[1], args[2], *options);
+      std::optional<storage::ReplicationCommandAppend> replication;
+      if (!request.replication_origin_ && g_storage->ReplicationLogActive()) {
+        replication.emplace();
+        replication->args_ = {"SET", args[1], args[2]};
+      }
+      auto result = co_await g_storage->Set(
+          request.db_id_, args[1], args[2], *options,
+          replication ? &*replication : nullptr);
       if (!result.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, result.status());
         co_return reply;
@@ -1923,9 +1982,32 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             (durability.pending() ? "1\r\n\r\n" : "0\r\n\r\n");
   }
   if (wants("replication")) {
+    const ReplicationStatus replication =
+        g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
     info += "# Replication\r\n";
-    info += std::string("role:") + (g_replica_read_only ? "slave" : "master") +
-            "\r\n\r\n";
+    info += "role:" +
+            std::string(replication.role_ == ReplicationRole::kMaster
+                            ? "master"
+                            : "slave") +
+            "\r\n";
+    info += "keylane_replication_state:" +
+            std::string(ReplicationRoleName(replication.role_)) + "\r\n";
+    info += "keylane_replication_generation:" +
+            std::to_string(replication.generation_) + "\r\n";
+    if (replication.upstream_.has_value()) {
+      info += "master_host:" + replication.upstream_->host_ + "\r\n";
+      info += "master_port:" + std::to_string(replication.upstream_->port_) +
+              "\r\n";
+      info += "master_link_status:" +
+              std::string(replication.role_ == ReplicationRole::kOnline
+                              ? "up\r\n"
+                              : "down\r\n");
+      info += "keylane_source_workers:" +
+              std::to_string(replication.source_worker_count_) + "\r\n";
+      info += "keylane_connected_flows:" +
+              std::to_string(replication.connected_flows_) + "\r\n";
+    }
+    info += "\r\n";
   }
   if (wants("transactions")) {
     struct ShardStats {
@@ -2873,10 +2955,17 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
       }
       case CommandKind::kDel:
       case CommandKind::kUnlink: {
+        std::optional<storage::ReplicationCommandAppend> replication;
+        if (!ctx->request_->replication_origin_ &&
+            ctx->tx_writes_.empty() && g_storage->ReplicationLogActive()) {
+          replication.emplace();
+          replication->args_ = {"DEL", name};
+        }
         auto deleted = co_await g_storage->DeleteLocked(
             ctx->request_->db_id_, name, key.digest_,
             ctx->tx_writes_.empty() ? nullptr
-                                    : &ctx->tx_writes_[ThisWorker().id_]);
+                                    : &ctx->tx_writes_[ThisWorker().id_],
+            replication ? &*replication : nullptr);
         if (!deleted.ok()) {
           if (!ctx->tx_writes_.empty()) {
             (void)co_await g_storage->RollbackTxLocal(
@@ -4602,7 +4691,7 @@ void EndCommandDbOperation(std::uint8_t db_id) noexcept {
   EndDbOperation(db_id);
 }
 
-void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
+void InitStorage(storage::StorageEngine* engine, ReplicationManager* replication) {
   g_storage = engine;
   InitBlockingWaitStorage(engine);
   InitHashCommandStorage(engine);
@@ -4611,7 +4700,8 @@ void InitStorage(storage::StorageEngine* engine, bool replica_read_only) {
   InitStringCommandStorage(engine);
   InitStreamCommandStorage(engine);
   InitZSetCommandStorage(engine);
-  g_replica_read_only = replica_read_only;
+  g_replication = replication;
+  g_replica_read_only = replication != nullptr && replication->is_replica();
 }
 
 void SetServerInfo(std::uint16_t port, unsigned thread_count) {
@@ -4672,7 +4762,10 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           reply_builder.AppendError("ERR wrong number of arguments for '" +
                                     std::string(spec.name_) + "' command"));
     }
-    if (g_replica_read_only && (spec.flags_ & kCmdWrite) != 0) {
+    const bool reject_writes =
+        g_replication != nullptr ? g_replication->reject_writes()
+                                 : g_replica_read_only;
+    if (reject_writes && (spec.flags_ & kCmdWrite) != 0) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
@@ -4749,7 +4842,10 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   const auto& args = request.args_;
   const std::uint32_t cmd_flags =
       request.spec_ != nullptr ? request.spec_->flags_ : 0u;
-  if (!replication_origin && g_replica_read_only &&
+  const bool reject_writes =
+      g_replication != nullptr ? g_replication->reject_writes()
+                               : g_replica_read_only;
+  if (!replication_origin && reject_writes &&
       (cmd_flags & kCmdWrite) != 0) {
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
@@ -4783,6 +4879,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   }
 
   switch (request.kind_) {
+    case CommandKind::kReplicaOf:
+      co_return co_await ExecuteReplicaOf(request, reply_builder);
+
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request, reply_builder);
 
@@ -5064,10 +5163,25 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
                                CmpCaseInsensitive(request->args_[3], "PXAT")));
   const bool canonical_del =
       request->kind_ == CommandKind::kDel && request->args_.size() == 2;
-  if (!canonical_set && !canonical_del) {
+  const bool canonical_flush_db =
+      request->kind_ == CommandKind::kFlushDb && request->args_.size() == 2;
+  if (!canonical_set && !canonical_del && !canonical_flush_db) {
     co_return absl::Status(
         absl::StatusCode::kInvalidArgument,
-        "replication command is not a canonical SET or single-key DEL");
+        "replication command is not a canonical SET, DEL, or FLUSHDB");
+  }
+
+  if (canonical_flush_db) {
+    std::uint64_t epoch = 0;
+    const auto* begin = request->args_[1].data();
+    const auto* end = begin + request->args_[1].size();
+    const auto parsed = std::from_chars(begin, end, epoch);
+    if (parsed.ec != std::errc{} || parsed.ptr != end || epoch == 0) {
+      co_return absl::InvalidArgumentError(
+          "invalid FLUSHDB replication epoch");
+    }
+    co_return co_await g_storage->ApplyReplicatedFlushDb(request->db_id_,
+                                                         epoch);
   }
 
   ReplyBuilder reply_builder;

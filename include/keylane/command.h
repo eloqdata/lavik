@@ -211,6 +211,9 @@ struct CommandSpec;
 struct CommandRequest {
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
+  // Set only for commands applied from the replication stream. Such commands
+  // bypass replica read-only checks and must not be published again.
+  bool replication_origin_ = false;
   const CommandSpec* spec_ = nullptr;
   std::vector<std::string> args_;
 };
@@ -279,7 +282,7 @@ void EndCommandDbOperation(std::uint8_t db_id) noexcept;
 // Route `request` to the worker owning its Redis hash-slot partition. Async
 // disk operations use SubmitTaskTo and return on the connection's original
 // worker.
-Task<CommandReply> ExecuteCommand(CommandRequest& request,
+Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                                   ReplyBuilder& reply_builder);
 
 // Replays one trusted command from the native replication stream directly
