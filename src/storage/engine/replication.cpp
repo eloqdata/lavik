@@ -234,12 +234,15 @@ void StorageEngine::Impl::AcknowledgePartitionDeltas(
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::uint16_t partition_id,
-    std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs) {
-  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    absl::Status advanced =
-        co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
-    if (!advanced.ok()) {
-      co_return advanced;
+    std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
+    std::uint64_t persisted_replication_epoch) {
+  if (persisted_replication_epoch == 0) {
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      absl::Status advanced =
+          co_await AdvanceDbEpoch(db_id, source_db_epochs[db_id]);
+      if (!advanced.ok()) {
+        co_return advanced;
+      }
     }
   }
 
@@ -256,10 +259,17 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   const std::uint64_t next_epoch = partition.replication_epoch_ + 1;
-  absl::Status persisted = co_await PersistEpochValue(
-      kLogicalDatabaseCount + partition_id, next_epoch);
-  if (!persisted.ok()) {
-    co_return persisted;
+  if (persisted_replication_epoch != 0 &&
+      persisted_replication_epoch != next_epoch) {
+    co_return absl::Status(absl::StatusCode::kAborted,
+                           "replica reset superseded by another session");
+  }
+  if (persisted_replication_epoch == 0) {
+    absl::Status persisted = co_await PersistEpochValue(
+        kLogicalDatabaseCount + partition_id, next_epoch);
+    if (!persisted.ok()) {
+      co_return persisted;
+    }
   }
 
   struct OldKey {
@@ -331,6 +341,71 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     }
   }
   co_return next_epoch;
+}
+
+Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+StorageEngine::Impl::ResetReplicaPartitions(
+    std::span<const ReplicaPartitionReset> resets) {
+  if (resets.empty()) {
+    co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                           "replica reset batch is empty");
+  }
+  std::array<bool, kLogicalStorageShards> seen{};
+  std::array<std::uint64_t, kLogicalDatabaseCount> newest_db_epochs{};
+  std::vector<std::pair<std::size_t, std::uint64_t>> epoch_updates;
+  epoch_updates.reserve(resets.size());
+  for (const ReplicaPartitionReset& reset : resets) {
+    if (reset.partition_id_ >= kLogicalStorageShards ||
+        reset.partition_id_ % worker_count_ != celer::ThisWorker().id_ ||
+        seen[reset.partition_id_]) {
+      co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                             "invalid replica reset batch partition");
+    }
+    seen[reset.partition_id_] = true;
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      if (reset.db_epochs_[db_id] == 0) {
+        co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                               "invalid replica reset batch database epoch");
+      }
+      newest_db_epochs[db_id] =
+          std::max(newest_db_epochs[db_id], reset.db_epochs_[db_id]);
+    }
+    const auto& partition =
+        PartitionFor(CurrentStore(), reset.partition_id_);
+    if (partition.replication_epoch_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      co_return absl::Status(absl::StatusCode::kOutOfRange,
+                             "partition replication epoch exhausted");
+    }
+    epoch_updates.emplace_back(
+        kLogicalDatabaseCount + reset.partition_id_,
+        partition.replication_epoch_ + 1);
+  }
+
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    absl::Status advanced =
+        co_await AdvanceDbEpoch(db_id, newest_db_epochs[db_id]);
+    if (!advanced.ok()) co_return advanced;
+  }
+  // Coalesce all partition epoch updates into metadata pages. The individual
+  // reset below reuses these durable values and therefore performs no epoch
+  // page IO or fdatasync of its own.
+  absl::Status persisted = co_await PersistEpochValues(epoch_updates);
+  if (!persisted.ok()) co_return persisted;
+
+  std::vector<ReplicaPartitionEpoch> result;
+  result.reserve(resets.size());
+  for (std::size_t index = 0; index < resets.size(); ++index) {
+    const ReplicaPartitionReset& reset = resets[index];
+    auto epoch = co_await ResetReplicaPartition(
+        reset.partition_id_, reset.db_epochs_, epoch_updates[index].second);
+    if (!epoch.ok()) co_return epoch.status();
+    result.push_back(ReplicaPartitionEpoch{
+        .partition_id_ = reset.partition_id_,
+        .replication_epoch_ = *epoch,
+    });
+  }
+  co_return result;
 }
 
 // TODO(replication): the epoch is validated only here at entry, but the loop

@@ -51,10 +51,13 @@ using storage::SnapshotRecord;
 
 constexpr std::string_view kProtocolVersion = "1";
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
+constexpr auto kFullSyncTimeout = std::chrono::minutes(10);
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
 constexpr std::size_t kSnapshotKeysPerBatch = 16;
 constexpr std::size_t kDeltaRecordsPerBatch = 256;
 constexpr std::size_t kMaxDataFrame = 12U * 1024U * 1024U;
+constexpr std::uint16_t kResetBatchAckPartition =
+    std::numeric_limits<std::uint16_t>::max();
 
 enum class DataFrameKind : std::uint8_t {
   kReset = 1,
@@ -516,6 +519,55 @@ struct ReplicaSession {
   SocketSet sockets_;
 };
 
+enum class ReplicationPhase : std::uint8_t {
+  kConnecting,
+  kReset,
+  kSnapshot,
+  kDeltaCatchup,
+  kBacklog,
+  kReady,
+  kFailed,
+};
+
+std::string_view ReplicationPhaseName(ReplicationPhase phase) noexcept {
+  switch (phase) {
+    case ReplicationPhase::kConnecting:
+      return "connecting";
+    case ReplicationPhase::kReset:
+      return "reset";
+    case ReplicationPhase::kSnapshot:
+      return "snapshot";
+    case ReplicationPhase::kDeltaCatchup:
+      return "delta_catchup";
+    case ReplicationPhase::kBacklog:
+      return "backlog";
+    case ReplicationPhase::kReady:
+      return "ready";
+    case ReplicationPhase::kFailed:
+      return "failed";
+  }
+  return "unknown";
+}
+
+struct ReplicaFlowProgress {
+  std::atomic<ReplicationPhase> phase_{ReplicationPhase::kConnecting};
+  // The next backlog frame required by this replica. Keeping a next cursor,
+  // rather than the last ACK itself, makes the value directly usable by both
+  // partial resync and shared-backlog retention.
+  std::atomic<std::uint64_t> lsn_{1};
+  std::atomic<std::uint32_t> fragment_index_{0};
+  std::atomic<std::uint16_t> current_partition_{0};
+  std::atomic<std::uint64_t> partition_sequence_{0};
+};
+
+struct ReplicaFlowProgressSnapshot {
+  ReplicationPhase phase_ = ReplicationPhase::kConnecting;
+  std::uint64_t lsn_ = 1;
+  std::uint32_t fragment_index_ = 0;
+  std::uint16_t current_partition_ = 0;
+  std::uint64_t partition_sequence_ = 0;
+};
+
 class ReplicationConnectionMetricGuard {
  public:
   explicit ReplicationConnectionMetricGuard(ReplicationConnectionKind kind)
@@ -536,22 +588,25 @@ class ReplicationConnectionMetricGuard {
 
 struct MasterSession {
   MasterSession(std::uint64_t id, unsigned worker_count)
-      : id_(id), flow_fds_(worker_count, -1) {}
+      : id_(id), flow_fds_(worker_count, -1), flows_(worker_count) {}
 
   bool SetControl(int fd) {
     std::lock_guard lock(mutex_);
-    if (cancelled_ || control_fd_ >= 0) return false;
+    if (cancelled_.load(std::memory_order_acquire) || control_fd_ >= 0) {
+      return false;
+    }
     control_fd_ = fd;
     return true;
   }
 
   bool SetFlow(unsigned flow_id, int fd) {
     std::lock_guard lock(mutex_);
-    if (cancelled_ || flow_id >= flow_fds_.size() || flow_fds_[flow_id] >= 0) {
+    if (cancelled_.load(std::memory_order_acquire) ||
+        flow_id >= flow_fds_.size() || flow_fds_[flow_id] >= 0) {
       return false;
     }
     flow_fds_[flow_id] = fd;
-    ++connected_flows_;
+    connected_flows_.fetch_add(1, std::memory_order_release);
     return true;
   }
 
@@ -559,13 +614,91 @@ struct MasterSession {
     std::lock_guard lock(mutex_);
     if (flow_id < flow_fds_.size() && flow_fds_[flow_id] == fd) {
       flow_fds_[flow_id] = -1;
-      if (connected_flows_ != 0) --connected_flows_;
+      connected_flows_.fetch_sub(1, std::memory_order_acq_rel);
     }
   }
 
   unsigned connected_flows() const {
-    std::lock_guard lock(mutex_);
-    return connected_flows_;
+    return connected_flows_.load(std::memory_order_acquire);
+  }
+
+  void SetProgress(unsigned flow_id, ReplicationPhase phase,
+                   std::uint64_t lsn, std::uint32_t fragment_index,
+                   std::uint16_t partition_id,
+                   std::uint64_t partition_sequence) {
+    if (cancelled_.load(std::memory_order_acquire) ||
+        flow_id >= flows_.size()) {
+      return;
+    }
+    ReplicaFlowProgress& progress = flows_[flow_id];
+    progress.lsn_.store(lsn, std::memory_order_relaxed);
+    progress.fragment_index_.store(fragment_index, std::memory_order_relaxed);
+    progress.current_partition_.store(partition_id,
+                                      std::memory_order_relaxed);
+    progress.partition_sequence_.store(partition_sequence,
+                                       std::memory_order_relaxed);
+    progress.phase_.store(phase, std::memory_order_release);
+  }
+
+  void SetBacklogCursor(unsigned flow_id, ReplicationPhase phase,
+                        storage::ReplicationLogCursor cursor) {
+    if (cancelled_.load(std::memory_order_acquire) ||
+        flow_id >= flows_.size()) {
+      return;
+    }
+    ReplicaFlowProgress& progress = flows_[flow_id];
+    progress.lsn_.store(cursor.lsn_, std::memory_order_relaxed);
+    progress.fragment_index_.store(cursor.fragment_index_,
+                                   std::memory_order_relaxed);
+    progress.phase_.store(phase, std::memory_order_release);
+  }
+
+  void MarkFailed(unsigned flow_id) {
+    if (flow_id < flows_.size()) {
+      flows_[flow_id].phase_.store(ReplicationPhase::kFailed,
+                                   std::memory_order_release);
+    }
+  }
+
+  bool all_flows_ready() const {
+    if (cancelled_.load(std::memory_order_acquire) ||
+        connected_flows_.load(std::memory_order_acquire) != flows_.size()) {
+      return false;
+    }
+    return std::all_of(flows_.begin(), flows_.end(), [](const auto& flow) {
+      return flow.phase_.load(std::memory_order_acquire) ==
+             ReplicationPhase::kReady;
+    });
+  }
+
+  std::optional<std::uint64_t> RetainedLsn(unsigned flow_id) const {
+    if (cancelled_.load(std::memory_order_acquire) ||
+        flow_id >= flows_.size()) {
+      return std::nullopt;
+    }
+    const ReplicationPhase phase =
+        flows_[flow_id].phase_.load(std::memory_order_acquire);
+    if (phase == ReplicationPhase::kConnecting ||
+        phase == ReplicationPhase::kFailed) {
+      return std::nullopt;
+    }
+    return flows_[flow_id].lsn_.load(std::memory_order_acquire);
+  }
+
+  std::optional<ReplicaFlowProgressSnapshot> Progress(
+      unsigned flow_id) const {
+    if (flow_id >= flows_.size()) return std::nullopt;
+    const ReplicaFlowProgress& progress = flows_[flow_id];
+    return ReplicaFlowProgressSnapshot{
+        .phase_ = progress.phase_.load(std::memory_order_acquire),
+        .lsn_ = progress.lsn_.load(std::memory_order_relaxed),
+        .fragment_index_ =
+            progress.fragment_index_.load(std::memory_order_relaxed),
+        .current_partition_ =
+            progress.current_partition_.load(std::memory_order_relaxed),
+        .partition_sequence_ =
+            progress.partition_sequence_.load(std::memory_order_relaxed),
+    };
   }
 
   unsigned worker_count() const noexcept {
@@ -574,8 +707,7 @@ struct MasterSession {
 
   void Cancel() {
     std::lock_guard lock(mutex_);
-    if (cancelled_) return;
-    cancelled_ = true;
+    if (cancelled_.exchange(true, std::memory_order_acq_rel)) return;
     if (control_fd_ >= 0) ::shutdown(control_fd_, SHUT_RDWR);
     for (int fd : flow_fds_) {
       if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
@@ -583,8 +715,7 @@ struct MasterSession {
   }
 
   bool cancelled() const {
-    std::lock_guard lock(mutex_);
-    return cancelled_;
+    return cancelled_.load(std::memory_order_acquire);
   }
 
   std::uint64_t id_ = 0;
@@ -593,8 +724,9 @@ struct MasterSession {
   mutable std::mutex mutex_;
   int control_fd_ = -1;
   std::vector<int> flow_fds_;
-  unsigned connected_flows_ = 0;
-  bool cancelled_ = false;
+  std::vector<ReplicaFlowProgress> flows_;
+  std::atomic<unsigned> connected_flows_{0};
+  std::atomic<bool> cancelled_{false};
 };
 
 }  // namespace
@@ -672,16 +804,23 @@ class ReplicationManager::Impl {
 
   Task<absl::Status> ServeNativeConnection(TcpStream& stream,
                                            std::vector<std::string> args) {
-  unsigned owner = 0;
-  if (EqualCaseInsensitive(args.front(), "KLFLOW")) {
-    unsigned flow_id = 0;
-    if (args.size() != 6 || !ParseUnsigned(args[3], &flow_id)) {
-      co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
+    // Accepted Redis sockets are normally optimized for batched replies, but
+    // replication is an ACK-driven stream whose frame header and payload are
+    // written separately. Without TCP_NODELAY on the source endpoint, Nagle
+    // can hold every payload behind the tiny header until the peer's delayed
+    // ACK fires (about 40 ms per sparse snapshot partition on Linux).
+    absl::Status accepted_config = ConfigureConnectedFd(stream.NativeFd());
+    if (!accepted_config.ok()) co_return accepted_config;
+    unsigned owner = 0;
+    if (EqualCaseInsensitive(args.front(), "KLFLOW")) {
+      unsigned flow_id = 0;
+      if (args.size() != 6 || !ParseUnsigned(args[3], &flow_id)) {
+        co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
+      }
+      // flow_id belongs to the upstream worker set. Multiple upstream flows
+      // may share one local worker when the worker counts differ.
+      owner = flow_id % storage_->worker_count();
     }
-    // flow_id belongs to the upstream worker set. Multiple upstream flows
-    // may share one local worker when the worker counts differ.
-    owner = flow_id % storage_->worker_count();
-  }
     if (owner == celer::ThisWorker().id_) {
       co_return co_await ServeOwnedNativeConnection(stream, std::move(args));
     }
@@ -970,6 +1109,9 @@ class ReplicationManager::Impl {
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
       unsigned flow_id) {
     std::unordered_map<std::uint16_t, std::uint64_t> epochs;
+    std::uint64_t staged_command_lsn = 0;
+    std::uint32_t next_command_fragment = 0;
+    std::string staged_command;
     auto send_ack = [&stream](std::uint16_t partition_id,
                               std::uint64_t sequence) -> Task<absl::Status> {
       std::string payload;
@@ -983,29 +1125,57 @@ class ReplicationManager::Impl {
       if (!frame.ok()) co_return frame.status();
       if (frame->first == DataFrameKind::kReset) {
         DataReader reader(frame->second);
-        std::uint16_t partition_id = 0;
-        std::array<std::uint64_t, storage::kLogicalDatabaseCount> db_epochs{};
-        if (!reader.U16(&partition_id)) {
+        std::uint32_t reset_count = 0;
+        if (!reader.U32(&reset_count) || reset_count == 0 ||
+            reset_count > storage::kLogicalStorageShards) {
           co_return absl::InvalidArgumentError("malformed replication reset");
         }
-        for (std::uint64_t& epoch : db_epochs) {
-          if (!reader.U64(&epoch)) {
+        std::vector<std::vector<storage::ReplicaPartitionReset>> by_owner(
+            storage_->worker_count());
+        std::array<bool, storage::kLogicalStorageShards> seen{};
+        for (std::uint32_t index = 0; index < reset_count; ++index) {
+          storage::ReplicaPartitionReset reset;
+          if (!reader.U16(&reset.partition_id_) ||
+              reset.partition_id_ >= storage::kLogicalStorageShards ||
+              seen[reset.partition_id_]) {
             co_return absl::InvalidArgumentError("malformed replication reset");
           }
+          seen[reset.partition_id_] = true;
+          for (std::uint64_t& epoch : reset.db_epochs_) {
+            if (!reader.U64(&epoch) || epoch == 0) {
+              co_return absl::InvalidArgumentError(
+                  "malformed replication reset");
+            }
+          }
+          by_owner[reset.partition_id_ % storage_->worker_count()].push_back(
+              std::move(reset));
         }
         if (reader.remaining() != 0) {
           co_return absl::InvalidArgumentError("trailing replication reset");
         }
-        const unsigned owner = partition_id % storage_->worker_count();
-        auto reset = co_await celer::SubmitTaskTo(
-            owner, [this, partition_id, db_epochs]()
-                -> Task<absl::StatusOr<std::uint64_t>> {
-              co_return co_await storage_->ResetReplicaPartition(
-                  partition_id, db_epochs);
-            });
-        if (!reset.ok()) co_return reset.status();
-        epochs[partition_id] = *reset;
-        absl::Status acknowledged = co_await send_ack(partition_id, 0);
+        for (unsigned owner = 0; owner < by_owner.size(); ++owner) {
+          if (by_owner[owner].empty()) continue;
+          if (owner == celer::ThisWorker().id_) {
+            auto reset =
+                co_await storage_->ResetReplicaPartitions(by_owner[owner]);
+            if (!reset.ok()) co_return reset.status();
+            for (const storage::ReplicaPartitionEpoch& result : *reset) {
+              epochs[result.partition_id_] = result.replication_epoch_;
+            }
+          } else {
+            auto reset = co_await celer::SubmitTaskTo(
+                owner,
+                [this, resets = std::move(by_owner[owner])]() mutable {
+                  return storage_->ResetReplicaPartitions(resets);
+                });
+            if (!reset.ok()) co_return reset.status();
+            for (const storage::ReplicaPartitionEpoch& result : *reset) {
+              epochs[result.partition_id_] = result.replication_epoch_;
+            }
+          }
+        }
+        absl::Status acknowledged =
+            co_await send_ack(kResetBatchAckPartition, 0);
         if (!acknowledged.ok()) co_return acknowledged;
       } else if (frame->first == DataFrameKind::kCommand) {
         if (ShouldInjectFlowDrop(flow_id)) {
@@ -1015,19 +1185,48 @@ class ReplicationManager::Impl {
         DataReader reader(frame->second);
         std::uint64_t lsn = 0;
         std::uint32_t fragment = 0;
+        std::uint8_t flags = 0;
         if (!reader.U64(&lsn) || !reader.U32(&fragment) ||
-            reader.remaining() == 0) {
-          co_return absl::InvalidArgumentError("malformed replication command frame");
+            !reader.U8(&flags) || reader.remaining() == 0) {
+          co_return absl::InvalidArgumentError(
+              "malformed replication command frame");
         }
-        const std::string encoded(frame->second.data() + 12,
-                                  reader.remaining());
-        auto command = DecodeReplicationCommand(encoded);
+        const auto first_flag = static_cast<std::uint8_t>(
+            storage::ReplicationFrameFlag::kFirst);
+        const auto last_flag = static_cast<std::uint8_t>(
+            storage::ReplicationFrameFlag::kLast);
+        if ((flags & ~(first_flag | last_flag)) != 0) {
+          co_return absl::InvalidArgumentError(
+              "invalid replication command flags");
+        }
+        const bool first = (flags & first_flag) != 0;
+        const bool last = (flags & last_flag) != 0;
+        if (first) {
+          if (fragment != 0 || staged_command_lsn != 0) {
+            co_return absl::InvalidArgumentError(
+                "replication command fragments overlap");
+          }
+          staged_command_lsn = lsn;
+          next_command_fragment = 0;
+          staged_command.clear();
+        }
+        if (staged_command_lsn != lsn || fragment != next_command_fragment) {
+          co_return absl::InvalidArgumentError(
+              "replication command fragment is out of order");
+        }
+        staged_command.append(frame->second.data() + 13, reader.remaining());
+        ++next_command_fragment;
+        if (!last) continue;
+        auto command = DecodeReplicationCommand(staged_command);
         if (!command.ok()) co_return command.status();
         absl::Status applied = co_await ApplyReplicatedCommand(*command);
         if (!applied.ok()) co_return applied;
         absl::Status acknowledged = co_await send_ack(0, lsn);
         if (!acknowledged.ok()) co_return acknowledged;
-        session->cursors_->Store(flow_id, lsn, fragment + 1);
+        session->cursors_->Store(flow_id, lsn + 1, 0);
+        staged_command_lsn = 0;
+        next_command_fragment = 0;
+        staged_command.clear();
       } else if (frame->first == DataFrameKind::kCursor) {
         DataReader reader(frame->second);
         std::uint64_t lsn = 0;
@@ -1037,6 +1236,8 @@ class ReplicationManager::Impl {
           co_return absl::InvalidArgumentError("malformed replication cursor");
         }
         session->cursors_->Store(flow_id, lsn, fragment);
+        absl::Status acknowledged = co_await send_ack(0, lsn);
+        if (!acknowledged.ok()) co_return acknowledged;
       } else {
         auto records = DecodeRecords(frame->second);
         if (!records.ok()) co_return records.status();
@@ -1082,7 +1283,30 @@ class ReplicationManager::Impl {
                                                    std::memory_order_acq_rel);
   }
 
-  Task<absl::Status> RunMasterFlowData(TcpStream& stream, unsigned flow_id) {
+  Task<absl::Status> TrimBacklogForFlow(unsigned flow_id) {
+    std::optional<std::uint64_t> minimum;
+    {
+      std::lock_guard lock(master_mutex_);
+      for (const auto& [id, session] : master_sessions_) {
+        (void)id;
+        const auto retained = session->RetainedLsn(flow_id);
+        if (retained.has_value()) {
+          if (!minimum.has_value() || *retained < *minimum) {
+            minimum = *retained;
+          }
+        }
+      }
+    }
+    // With no active consumer, retain the bounded backlog for a reconnecting
+    // replica. Capacity eviction remains the upper bound; a future partial
+    // sync can continue while its cursor is still above the resulting floor.
+    if (!minimum.has_value()) co_return absl::OkStatus();
+    co_return co_await storage_->TrimReplicationLog(*minimum);
+  }
+
+  Task<absl::Status> RunMasterFlowData(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id) {
     // Keep the command-log fence from before the snapshot. Commands in this
     // range may also have been applied as partition deltas, but replaying the
     // canonical commands is idempotent and closes the race between the final
@@ -1090,32 +1314,65 @@ class ReplicationManager::Impl {
     const auto initial_log = storage_->LocalReplicationLogInfo();
     const std::uint64_t backlog_start_lsn =
         initial_log.tail_lsn_ == 0 ? 1 : initial_log.tail_lsn_ + 1;
-    std::vector<std::uint16_t> captured;
+    session->SetProgress(flow_id, ReplicationPhase::kReset,
+                         backlog_start_lsn, 0, 0, 0);
+    struct CapturedPartition {
+      std::uint16_t partition_id_ = 0;
+      PartitionReplicationStart start_;
+    };
+    std::vector<CapturedPartition> captured;
+    captured.reserve((storage::kLogicalStorageShards +
+                      storage_->worker_count() - 1) /
+                     storage_->worker_count());
     std::unordered_map<std::uint16_t, std::uint64_t> next_sequence;
     auto cleanup = [&]() {
-      for (std::uint16_t partition_id : captured) {
-        storage_->EndPartitionReplication(partition_id);
+      for (const CapturedPartition& partition : captured) {
+        storage_->EndPartitionReplication(partition.partition_id_);
       }
     };
 
-    std::size_t processed_partitions = 0;
+    // Fence every partition owned by this source flow first, then reset the
+    // target with one frame. This removes one network round trip and one
+    // metadata fdatasync boundary per partition while preserving the
+    // per-partition snapshot/delta sequence captured below.
     for (std::uint32_t value = flow_id; value < storage::kLogicalStorageShards;
          value += storage_->worker_count()) {
       const auto partition_id = static_cast<std::uint16_t>(value);
-      const PartitionReplicationStart start =
+      PartitionReplicationStart start =
           storage_->BeginPartitionReplication(partition_id);
-      captured.push_back(partition_id);
       next_sequence[partition_id] = start.snapshot_sequence_;
-      std::string reset;
-      reset.reserve(2 + 8 * storage::kLogicalDatabaseCount);
-      PutU16(reset, partition_id);
-      for (std::uint64_t epoch : start.db_epochs_) PutU64(reset, epoch);
-      absl::Status sent = co_await WriteFrameAndWaitAck(
-          stream, DataFrameKind::kReset, reset, partition_id);
-      if (!sent.ok()) {
-        cleanup();
-        co_return sent;
+      session->SetProgress(flow_id, ReplicationPhase::kReset,
+                           backlog_start_lsn, 0, partition_id,
+                           start.snapshot_sequence_);
+      captured.push_back(CapturedPartition{
+          .partition_id_ = partition_id,
+          .start_ = std::move(start),
+      });
+    }
+    std::string reset;
+    reset.reserve(4 + captured.size() *
+                          (2 + 8 * storage::kLogicalDatabaseCount));
+    PutU32(reset, static_cast<std::uint32_t>(captured.size()));
+    for (const CapturedPartition& partition : captured) {
+      PutU16(reset, partition.partition_id_);
+      for (std::uint64_t epoch : partition.start_.db_epochs_) {
+        PutU64(reset, epoch);
       }
+    }
+    absl::Status sent = co_await WriteFrameAndWaitAck(
+        stream, DataFrameKind::kReset, reset, kResetBatchAckPartition);
+    if (!sent.ok()) {
+      cleanup();
+      co_return sent;
+    }
+
+    std::size_t processed_partitions = 0;
+    for (const CapturedPartition& partition : captured) {
+      const std::uint16_t partition_id = partition.partition_id_;
+      const PartitionReplicationStart& start = partition.start_;
+      session->SetProgress(flow_id, ReplicationPhase::kSnapshot,
+                           backlog_start_lsn, 0, partition_id,
+                           start.snapshot_sequence_);
       for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
            ++db_id) {
         if ((start.nonempty_db_mask_ & (std::uint16_t{1} << db_id)) == 0)
@@ -1145,6 +1402,9 @@ class ReplicationManager::Impl {
           cursor = batch->cursor_;
         } while (cursor != 0);
       }
+      session->SetProgress(flow_id, ReplicationPhase::kDeltaCatchup,
+                           backlog_start_lsn, 0, partition_id,
+                           next_sequence[partition_id]);
       while (true) {
         PartitionDeltaBatch batch = storage_->ReadPartitionDeltas(
             partition_id, next_sequence[partition_id], kDeltaRecordsPerBatch);
@@ -1167,10 +1427,16 @@ class ReplicationManager::Impl {
           }
           next_sequence[partition_id] =
               batch.records_.back().mutation_sequence_;
+          session->SetProgress(flow_id, ReplicationPhase::kDeltaCatchup,
+                               backlog_start_lsn, 0, partition_id,
+                               next_sequence[partition_id]);
           storage_->AcknowledgePartitionDeltas(
               partition_id, next_sequence[partition_id]);
         } else {
           next_sequence[partition_id] = batch.watermark_;
+          session->SetProgress(flow_id, ReplicationPhase::kDeltaCatchup,
+                               backlog_start_lsn, 0, partition_id,
+                               next_sequence[partition_id]);
           storage_->AcknowledgePartitionDeltas(partition_id,
                                                 next_sequence[partition_id]);
           break;
@@ -1213,6 +1479,9 @@ class ReplicationManager::Impl {
         }
         next_sequence[partition_id] =
             batch.records_.back().mutation_sequence_;
+        session->SetProgress(flow_id, ReplicationPhase::kDeltaCatchup,
+                             backlog_start_lsn, 0, partition_id,
+                             next_sequence[partition_id]);
         storage_->AcknowledgePartitionDeltas(
             partition_id, next_sequence[partition_id]);
         sent_any = true;
@@ -1222,38 +1491,65 @@ class ReplicationManager::Impl {
 
     // The snapshot/delta fence is complete. From this point on, canonical
     // commands in the per-worker backlog are the live replication stream.
-    std::string cursor_payload;
-    PutU64(cursor_payload, backlog_start_lsn);
-    PutU32(cursor_payload, 0);
-    absl::Status cursor_sent =
-        co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload);
-    if (!cursor_sent.ok()) {
-      cleanup();
-      co_return cursor_sent;
-    }
     cleanup();
-    co_return co_await RunMasterFlowBacklog(
-        stream, backlog_start_lsn, 0);
+    co_return co_await EnterMasterFlowBacklog(
+        stream, session, flow_id, backlog_start_lsn, 0);
   }
 
-  Task<absl::Status> RunMasterFlowBacklog(TcpStream& stream,
-                                          std::uint64_t next_lsn,
-                                          std::uint32_t fragment_index) {
+  Task<absl::Status> EnterMasterFlowBacklog(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id, std::uint64_t next_lsn,
+      std::uint32_t fragment_index) {
     storage::ReplicationLogCursor cursor{.lsn_ = next_lsn,
                                          .fragment_index_ = fragment_index};
+    session->SetBacklogCursor(flow_id, ReplicationPhase::kBacklog, cursor);
+    std::string cursor_payload;
+    PutU64(cursor_payload, next_lsn);
+    PutU32(cursor_payload, fragment_index);
+    absl::Status cursor_sent =
+        co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload);
+    if (!cursor_sent.ok()) co_return cursor_sent;
+    auto cursor_ack = co_await ReadDataFrame(stream);
+    if (!cursor_ack.ok()) co_return cursor_ack.status();
+    DataReader ack_reader(cursor_ack->second);
+    std::uint16_t ignored_partition = 0;
+    std::uint64_t acknowledged_lsn = 0;
+    if (cursor_ack->first != DataFrameKind::kAck ||
+        !ack_reader.U16(&ignored_partition) ||
+        !ack_reader.U64(&acknowledged_lsn) || ack_reader.remaining() != 0 ||
+        acknowledged_lsn != next_lsn) {
+      co_return absl::InvalidArgumentError(
+          "malformed replication backlog cursor ACK");
+    }
+    session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, cursor);
+    co_return co_await RunMasterFlowBacklog(stream, session, flow_id, cursor);
+  }
+
+  Task<absl::Status> RunMasterFlowBacklog(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id, storage::ReplicationLogCursor cursor) {
     while (stream.IsOpen()) {
       auto batch = co_await storage_->ReadReplicationLog(
           cursor, 4 * 1024 * 1024, 128);
       if (!batch.ok()) co_return batch.status();
       for (const auto& frame : batch->frames_) {
         std::string payload;
-        payload.reserve(12 + frame.payload_.size());
+        payload.reserve(13 + frame.payload_.size());
         PutU64(payload, frame.header_.lsn_);
         PutU32(payload, frame.header_.fragment_index_);
+        PutU8(payload, frame.header_.flags_);
         payload.append(frame.payload_);
         absl::Status sent = co_await WriteDataFrame(
             stream, DataFrameKind::kCommand, payload);
         if (!sent.ok()) co_return sent;
+        const bool last =
+            (frame.header_.flags_ &
+             static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast)) !=
+            0;
+        cursor = storage::ReplicationLogCursor{
+            .lsn_ = frame.header_.lsn_,
+            .fragment_index_ = frame.header_.fragment_index_ + 1};
+        if (!last) continue;
         auto ack = co_await ReadDataFrame(stream);
         if (!ack.ok()) co_return ack.status();
         if (ack->first != DataFrameKind::kAck) {
@@ -1268,14 +1564,10 @@ class ReplicationManager::Impl {
           co_return absl::InvalidArgumentError("malformed replication command ACK");
         }
         cursor = storage::ReplicationLogCursor{
-            .lsn_ = frame.header_.lsn_,
-            .fragment_index_ = frame.header_.fragment_index_ + 1};
-        if ((frame.header_.flags_ &
-             static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast)) !=
-            0) {
-          cursor = storage::ReplicationLogCursor{
-              .lsn_ = frame.header_.lsn_ + 1, .fragment_index_ = 0};
-        }
+            .lsn_ = frame.header_.lsn_ + 1, .fragment_index_ = 0};
+        session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, cursor);
+        absl::Status trimmed = co_await TrimBacklogForFlow(flow_id);
+        if (!trimmed.ok()) co_return trimmed;
       }
       if (batch->at_tail_) {
         absl::Status slept = co_await celer::SleepFor(
@@ -1353,9 +1645,11 @@ class ReplicationManager::Impl {
       co_return sent;
     }
 
-    const auto deadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
+    const auto deadline = std::chrono::steady_clock::now() + kFullSyncTimeout;
+    auto next_progress_log =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!session->cancelled() &&
-           session->connected_flows() != session->worker_count() &&
+           !session->all_flows_ready() &&
            std::chrono::steady_clock::now() < deadline) {
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -1363,12 +1657,25 @@ class ReplicationManager::Impl {
         RemoveMasterSession(session);
         co_return slept;
       }
+      if (std::chrono::steady_clock::now() >= next_progress_log) {
+        for (unsigned flow = 0; flow < session->worker_count(); ++flow) {
+          const auto progress = session->Progress(flow);
+          if (!progress.has_value()) continue;
+          spdlog::info(
+              "replication session {} flow {} phase={} partition={} "
+              "sequence={} cursor={}:{}",
+              session_id, flow, ReplicationPhaseName(progress->phase_),
+              progress->current_partition_, progress->partition_sequence_,
+              progress->lsn_, progress->fragment_index_);
+        }
+        next_progress_log =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      }
     }
-    if (session->cancelled() ||
-        session->connected_flows() != session->worker_count()) {
+    if (session->cancelled() || !session->all_flows_ready()) {
       RemoveMasterSession(session);
       co_return absl::DeadlineExceededError(
-          "replica did not open every source-worker flow");
+          "replica flows did not complete full synchronization");
     }
     sent = co_await WriteText(stream, "+KLONLINE\r\n");
     if (!sent.ok()) {
@@ -1420,13 +1727,16 @@ class ReplicationManager::Impl {
       co_return sent;
     }
     absl::Status waited = continue_mode
-                              ? co_await RunMasterFlowBacklog(
-                                    stream, next_lsn, fragment_index)
-                              : co_await RunMasterFlowData(stream, flow_id);
+                              ? co_await EnterMasterFlowBacklog(
+                                    stream, session, flow_id, next_lsn,
+                                    fragment_index)
+                              : co_await RunMasterFlowData(stream, session,
+                                                           flow_id);
     if (!waited.ok()) {
       spdlog::warn("replication source flow {} ended: {}", flow_id,
                    waited.message());
     }
+    session->MarkFailed(flow_id);
     session->ClearFlow(flow_id, stream.NativeFd());
     session->Cancel();
     co_return waited;

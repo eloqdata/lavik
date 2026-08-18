@@ -1338,7 +1338,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   ASSERT_EQ(replica_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
             "+OK");
-  const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+  const auto online_deadline = std::chrono::steady_clock::now() + 600s;
   std::string replication_info;
   do {
     replication_info = replica_client.Command({"INFO", "replication"});
@@ -1357,14 +1357,10 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
             std::string::npos);
   EXPECT_NE(replication_info.find("keylane_connected_flows:3"),
             std::string::npos);
-  std::string snapshot_value;
-  const auto snapshot_deadline = std::chrono::steady_clock::now() + 10s;
-  do {
-    snapshot_value = replica_client.Command({"GET", "replicated-before{mvp}"});
-    if (snapshot_value == Bulk("snapshot")) break;
-    std::this_thread::sleep_for(10ms);
-  } while (std::chrono::steady_clock::now() < snapshot_deadline);
-  EXPECT_EQ(snapshot_value, Bulk("snapshot"));
+  // ONLINE is a completed full-sync barrier, not merely an indication that
+  // every data socket connected. Snapshot state must already be visible.
+  EXPECT_EQ(replica_client.Command({"GET", "replicated-before{mvp}"}),
+            Bulk("snapshot"));
   ASSERT_EQ(source_client.Command({"SET", "replicated-after{mvp}", "delta"}),
             "+OK");
   std::string delta_value;
@@ -1408,7 +1404,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
     ServerProcess startup_replica(g_keylane_binary, replica_port, replica_data,
                                   replica_log, 2, {}, {}, {}, config_path);
     RespClient startup_client(replica_port);
-    const auto startup_deadline = std::chrono::steady_clock::now() + 30s;
+    const auto startup_deadline = std::chrono::steady_clock::now() + 600s;
     do {
       replication_info = startup_client.Command({"INFO", "replication"});
       if (replication_info.find("master_link_status:up") != std::string::npos) {
@@ -1472,7 +1468,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
                       {}, {}, {}, first_conf);
   RespClient source_client(source_port);
   RespClient first_client(first_port);
-  const auto online_deadline = std::chrono::steady_clock::now() + 20s;
+  const auto online_deadline = std::chrono::steady_clock::now() + 600s;
   std::string first_info;
   do {
     first_info = first_client.Command({"INFO", "replication"});
@@ -1503,7 +1499,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ASSERT_EQ(second_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
             "+OK");
-  const auto second_online_deadline = std::chrono::steady_clock::now() + 20s;
+  const auto second_online_deadline = std::chrono::steady_clock::now() + 600s;
   std::string second_info;
   do {
     second_info = second_client.Command({"INFO", "replication"});
@@ -1515,6 +1511,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   } while (std::chrono::steady_clock::now() < second_online_deadline);
   ASSERT_NE(second_info.find("keylane_replication_state:online"),
             std::string::npos);
+  EXPECT_EQ(second_client.Command({"GET", "startup"}), Bulk("ready"));
   for (int i = 0; i < 200; ++i) {
     ASSERT_EQ(source_client.Command({"SET", "bulk:" + std::to_string(i),
                                      "value:" + std::to_string(i)}),

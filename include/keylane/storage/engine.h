@@ -181,6 +181,16 @@ struct PartitionDeltaBatch {
   std::vector<SnapshotRecord> records_;
 };
 
+struct ReplicaPartitionReset {
+  std::uint16_t partition_id_ = 0;
+  std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
+};
+
+struct ReplicaPartitionEpoch {
+  std::uint16_t partition_id_ = 0;
+  std::uint64_t replication_epoch_ = 0;
+};
+
 enum class ReplicationLogState : std::uint8_t {
   kDisabled,
   kActive,
@@ -572,6 +582,11 @@ class StorageEngine {
   celer::Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
       std::span<const std::uint64_t, 16> source_db_epochs);
+  // Resets partitions owned by the current worker. Epoch metadata pages are
+  // coalesced and persisted once for the whole batch before any new-epoch
+  // replica records can be applied.
+  celer::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+  ResetReplicaPartitions(std::span<const ReplicaPartitionReset> resets);
   celer::Task<absl::Status> ApplyReplicaRecords(
       std::uint16_t partition_id, std::uint64_t replication_epoch,
       std::span<const SnapshotRecord> records);

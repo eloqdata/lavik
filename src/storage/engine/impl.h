@@ -1392,7 +1392,10 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
-      std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs);
+      std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
+      std::uint64_t persisted_replication_epoch = 0);
+  Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+  ResetReplicaPartitions(std::span<const ReplicaPartitionReset> resets);
 
   Task<absl::Status> ApplyReplicaRecords(
       std::uint16_t partition_id, std::uint64_t replication_epoch,
@@ -1596,8 +1599,15 @@ class StorageEngine::Impl {
                                                     std::size_t value_index,
                                                     std::uint64_t epoch);
 
+  Task<absl::Status> PersistEpochValuesOnDeviceLocal(
+      std::size_t device_index,
+      std::span<const std::pair<std::size_t, std::uint64_t>> values);
+
   Task<absl::Status> PersistEpochValue(std::size_t value_index,
                                        std::uint64_t epoch);
+
+  Task<absl::Status> PersistEpochValues(
+      std::span<const std::pair<std::size_t, std::uint64_t>> values);
 
   // Takes the database out of service on this worker. Everything here is O(the
   // partition count) and runs without suspending, so the caller's FLUSHDB gate

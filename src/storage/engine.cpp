@@ -175,6 +175,12 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
   return impl_->ResetReplicaPartition(partition_id, source_db_epochs);
 }
 
+Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
+StorageEngine::ResetReplicaPartitions(
+    std::span<const ReplicaPartitionReset> resets) {
+  return impl_->ResetReplicaPartitions(resets);
+}
+
 Task<absl::Status> StorageEngine::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {

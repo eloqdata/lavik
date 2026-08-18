@@ -438,6 +438,118 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValueOnDeviceLocal(
   co_return absl::OkStatus();
 }
 
+Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
+    std::size_t device_index,
+    std::span<const std::pair<std::size_t, std::uint64_t>> values) {
+  DeviceAllocator& allocator = *device_allocators_[device_index];
+  assert(celer::ThisWorker().id_ == allocator.owner_);
+  if (values.empty()) co_return absl::OkStatus();
+  if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
+    co_return absl::Status(
+        absl::StatusCode::kFailedPrecondition,
+        "epoch metadata writer is stopped after an IO failure");
+  }
+  for (const auto& [value_index, epoch] : values) {
+    if (value_index >= allocator.epoch_values_.size() || epoch == 0) {
+      co_return absl::Status(absl::StatusCode::kOutOfRange,
+                             "epoch metadata update is out of range");
+    }
+  }
+
+  co_await allocator.mutex_.Lock();
+  UnlockGuard allocator_unlock(&allocator.mutex_,
+                               stores_[allocator.owner_]->worker_);
+  if (epoch_metadata_failed_.load(std::memory_order_acquire)) {
+    co_return absl::Status(
+        absl::StatusCode::kFailedPrecondition,
+        "epoch metadata writer is stopped after an IO failure");
+  }
+
+  std::vector<bool> dirty_pages(allocator.epoch_pages_.size(), false);
+  for (const auto& [value_index, epoch] : values) {
+    const std::uint64_t desired =
+        std::max(epoch, allocator.epoch_values_[value_index]);
+    allocator.epoch_values_[value_index] = desired;
+    if (allocator.durable_epoch_values_[value_index] < desired) {
+      const std::size_t byte_offset = value_index * sizeof(std::uint64_t);
+      dirty_pages[byte_offset / kMetadataPagePayloadBytes] = true;
+    }
+  }
+  if (std::none_of(dirty_pages.begin(), dirty_pages.end(),
+                   [](bool dirty) { return dirty; })) {
+    co_return absl::OkStatus();
+  }
+
+  WorkerStore& store = *stores_[allocator.owner_];
+  auto acquired = co_await store.buffers_.AcquireReadBuffer();
+  if (!acquired.ok()) co_return acquired.status();
+  ReadBufferLease lease = std::move(*acquired);
+  FixedBuffer buffer = lease.io_buffer();
+  buffer.size_ = kDirectIoAlignment;
+  std::vector<MetadataPageState> next_states = allocator.epoch_pages_;
+  const StorageDevice& device = devices_[device_index];
+  for (std::size_t page_index = 0; page_index < dirty_pages.size();
+       ++page_index) {
+    if (!dirty_pages[page_index]) continue;
+    const std::size_t page_byte_offset =
+        page_index * kMetadataPagePayloadBytes;
+    const std::size_t payload_bytes = std::min(
+        kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
+    const MetadataPageState current = allocator.epoch_pages_[page_index];
+    const std::uint8_t next_slot = current.active_slot_ == 0 ? 1 : 0;
+    const std::uint64_t next_generation = current.generation_ + 1;
+    std::span<std::byte, kDirectIoAlignment> output(buffer.data_,
+                                                    kDirectIoAlignment);
+    EncodeMetadataPage(
+        MetadataPageKind::kEpochs, static_cast<std::uint32_t>(page_index),
+        next_generation,
+        std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(allocator.epoch_values_.data()) +
+                page_byte_offset,
+            payload_bytes),
+        output);
+    auto written = co_await WriteStorageBuffer(
+        *store.worker_, store.files_[device.file_index_], output,
+        lease.registered(), buffer,
+        MetadataPageSlotOffset(kEpochMetadataOffset, page_index, next_slot));
+    if (!written.ok() || *written != kDirectIoAlignment) {
+      epoch_metadata_failed_.store(true, std::memory_order_release);
+      co_return written.ok()
+          ? absl::Status(absl::StatusCode::kInternal,
+                         "short write of device epoch metadata batch")
+          : written.status();
+    }
+    next_states[page_index] = MetadataPageState{
+        .generation_ = next_generation,
+        .active_slot_ = next_slot,
+    };
+  }
+
+  absl::Status synced = co_await celer::Fdatasync(
+      *store.worker_, store.files_[device.file_index_]);
+  if (!synced.ok()) {
+    epoch_metadata_failed_.store(true, std::memory_order_release);
+    co_return synced;
+  }
+  for (std::size_t page_index = 0; page_index < dirty_pages.size();
+       ++page_index) {
+    if (!dirty_pages[page_index]) continue;
+    allocator.epoch_pages_[page_index] = next_states[page_index];
+    const std::size_t page_byte_offset =
+        page_index * kMetadataPagePayloadBytes;
+    const std::size_t payload_bytes = std::min(
+        kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
+    const std::size_t first_value =
+        page_byte_offset / sizeof(std::uint64_t);
+    const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
+    for (std::size_t i = 0; i < value_count; ++i) {
+      allocator.durable_epoch_values_[first_value + i] =
+          allocator.epoch_values_[first_value + i];
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
     std::size_t value_index, std::uint64_t epoch) {
   if (value_index >= kEpochValueCount) {
@@ -462,6 +574,37 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValue(
     if (!persisted.ok()) {
       co_return persisted;
     }
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
+    std::span<const std::pair<std::size_t, std::uint64_t>> values) {
+  for (const auto& [value_index, epoch] : values) {
+    if (value_index >= kEpochValueCount || epoch == 0) {
+      co_return absl::Status(absl::StatusCode::kOutOfRange,
+                             "epoch metadata update is out of range");
+    }
+  }
+  for (std::size_t device_index = 0; device_index < devices_.size();
+       ++device_index) {
+    const celer::WorkerId owner = device_allocators_[device_index]->owner_;
+    absl::Status persisted;
+    if (owner == celer::ThisWorker().id_) {
+      persisted =
+          co_await PersistEpochValuesOnDeviceLocal(device_index, values);
+    } else {
+      std::vector<std::pair<std::size_t, std::uint64_t>> copied(values.begin(),
+                                                                values.end());
+      persisted = co_await celer::SubmitTaskTo(
+          owner,
+          [this, device_index, copied = std::move(copied)]()
+              -> Task<absl::Status> {
+            co_return co_await PersistEpochValuesOnDeviceLocal(device_index,
+                                                                copied);
+          });
+    }
+    if (!persisted.ok()) co_return persisted;
   }
   co_return absl::OkStatus();
 }
