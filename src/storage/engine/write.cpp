@@ -1,5 +1,4 @@
 #include "absl/strings/str_cat.h"
-#include "keylane/replication_command.h"
 #include "impl.h"
 
 namespace keylane::storage {
@@ -25,39 +24,21 @@ ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
 
 }  // namespace
 
-Task<absl::Status> StorageEngine::Impl::PublishReplicationCommand(
-    std::uint16_t partition_id, std::uint64_t partition_sequence,
-    std::uint8_t db_id, std::span<const std::string_view> args) {
-  if (LocalReplicationLogInfo().state_ != ReplicationLogState::kActive) {
-    co_return absl::OkStatus();
-  }
-  auto source = ReplicationCommandPayloadSource::Create(db_id, args);
-  if (!source.ok()) co_return source.status();
-  auto appended = co_await AppendReplicationLog(ReplicationLogAppend{
-      .kind_ = ReplicationEventKind::kMutation,
-      .partition_id_ = partition_id,
-      .partition_sequence_ = partition_sequence,
-      .payload_ = {},
-      .payload_source_ = &*source,
-  });
-  if (!appended.ok()) co_return appended.status();
-  co_return absl::OkStatus();
-}
-
-Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(std::uint8_t db_id,
-                                                         std::string_view key,
-                                                         std::string_view value,
-                                                         SetOptions options) {
+Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
+    std::uint8_t db_id, std::string_view key, std::string_view value,
+    SetOptions options, ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  co_return co_await SetLocked(db_id, key, digest, value, options);
+  co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
+                               replication);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::string_view value, SetOptions options, TxShardWrites* tx) {
+    std::string_view value, SetOptions options, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -111,27 +92,19 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
-      std::numeric_limits<std::uint64_t>::max(), nullptr, &mutation_sequence);
+      std::numeric_limits<std::uint64_t>::max(), nullptr,
+      replication != nullptr ? &mutation_sequence : nullptr);
   if (!status.ok()) co_return status;
   result.applied_ = true;
-  if (tx == nullptr) {
-    const std::uint16_t partition_id = partition.id_;
-    unlock.Unlock();
-    std::string expire_text;
-    std::array<std::string_view, 5> args{"SET", key, value, {}, {}};
-    std::size_t argc = 3;
+  if (replication != nullptr) {
+    replication->db_id_ = db_id;
+    replication->partition_id_ = partition.id_;
+    replication->partition_sequence_ = mutation_sequence;
     if (expire_at_ms != 0) {
-      expire_text = std::to_string(expire_at_ms);
-      args[3] = "PXAT";
-      args[4] = expire_text;
-      argc = 5;
+      replication->args_.emplace_back("PXAT");
+      replication->args_.emplace_back(std::to_string(expire_at_ms));
     }
-    absl::Status published = co_await PublishReplicationCommand(
-        partition_id, mutation_sequence, db_id,
-        std::span<const std::string_view>(args.data(), argc));
-    if (!published.ok()) {
-      spdlog::warn("replication SET publish failed: {}", published.message());
-    }
+    (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
   co_return result;
 }
@@ -219,18 +192,19 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   co_return true;
 }
 
-Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(std::uint8_t db_id,
-                                                       std::string_view key) {
+Task<absl::StatusOr<bool>> StorageEngine::Impl::Delete(
+    std::uint8_t db_id, std::string_view key,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
-  co_return co_await DeleteLocked(db_id, key, digest);
+  co_return co_await DeleteLocked(db_id, key, digest, nullptr, replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    TxShardWrites* tx) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -253,17 +227,14 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   std::uint64_t mutation_sequence = 0;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, {}, RecordKind::kTombstone,
-      ValueType::kNone, 0, tx, 0, nullptr, &mutation_sequence);
+      ValueType::kNone, 0, tx, 0, nullptr,
+      replication != nullptr ? &mutation_sequence : nullptr);
   if (!status.ok()) co_return status;
-  if (!expired && tx == nullptr) {
-    const std::uint16_t partition_id = partition.id_;
-    unlock.Unlock();
-    const std::array<std::string_view, 2> args{"DEL", key};
-    absl::Status published = co_await PublishReplicationCommand(
-        partition_id, mutation_sequence, db_id, args);
-    if (!published.ok()) {
-      spdlog::warn("replication DEL publish failed: {}", published.message());
-    }
+  if (!expired && replication != nullptr) {
+    replication->db_id_ = db_id;
+    replication->partition_id_ = partition.id_;
+    replication->partition_sequence_ = mutation_sequence;
+    (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
   co_return !expired;
 }
@@ -588,8 +559,12 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       // The aborted value may already have shipped; there is no delta that
       // can express "go back", so force the replica to re-copy the
       // partition.
+      assert(store.replication_delta_bytes_ >= partition.delta_bytes_);
+      store.replication_delta_bytes_ -= partition.delta_bytes_;
       partition.deltas_.clear();
+      partition.delta_bytes_ = 0;
       partition.delta_floor_ = partition.mutation_sequence_;
+      partition.delta_overflow_ = true;
     }
   }
   co_return absl::OkStatus();
@@ -914,7 +889,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   }
   if (status.ok() && partition.capture_deltas_) {
     std::string replicated_value(value);
-    AppendDelta(partition, SnapshotRecord{
+    AppendDelta(store, partition, SnapshotRecord{
                                .kind_ = kind == RecordKind::kValue
                                             ? SnapshotRecord::Kind::kValue
                                             : SnapshotRecord::Kind::kDelete,
@@ -931,9 +906,32 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   co_return status;
 }
 
-void StorageEngine::Impl::AppendDelta(WorkerStore::PartitionStore& partition,
-                                      SnapshotRecord record) {
+void StorageEngine::Impl::AppendDelta(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    SnapshotRecord record) {
   constexpr std::size_t kMaxRetainedMutations = 65536;
+  constexpr std::size_t kMaxRetainedBytesPerWorker = 64U * 1024U * 1024U;
+  const std::size_t record_bytes =
+      sizeof(SnapshotRecord) + record.key_.size() + record.value_.size();
+  if (partition.delta_overflow_) return;
+  if (record_bytes > kMaxRetainedBytesPerWorker ||
+      store.replication_delta_bytes_ >
+          kMaxRetainedBytesPerWorker - record_bytes) {
+    // This compatibility queue is intentionally lossy at its hard bound. A
+    // flow observing any affected partition must restart its full sync; the
+    // primary write remains independent of replica speed.
+    for (auto& candidate : store.partitions_) {
+      if (!candidate.capture_deltas_) continue;
+      candidate.delta_floor_ = candidate.mutation_sequence_;
+      candidate.delta_bytes_ = 0;
+      candidate.deltas_.clear();
+      candidate.delta_overflow_ = true;
+    }
+    store.replication_delta_bytes_ = 0;
+    return;
+  }
+  partition.delta_bytes_ += record_bytes;
+  store.replication_delta_bytes_ += record_bytes;
   partition.deltas_.push_back(std::move(record));
   if (!partition.delta_queued_) {
     partition.delta_queued_ = true;
@@ -942,6 +940,13 @@ void StorageEngine::Impl::AppendDelta(WorkerStore::PartitionStore& partition,
   while (partition.deltas_.size() > kMaxRetainedMutations) {
     partition.delta_floor_ = std::max(
         partition.delta_floor_, partition.deltas_.front().mutation_sequence_);
+    const SnapshotRecord& removed = partition.deltas_.front();
+    const std::size_t removed_bytes =
+        sizeof(SnapshotRecord) + removed.key_.size() + removed.value_.size();
+    assert(partition.delta_bytes_ >= removed_bytes);
+    assert(store.replication_delta_bytes_ >= removed_bytes);
+    partition.delta_bytes_ -= removed_bytes;
+    store.replication_delta_bytes_ -= removed_bytes;
     partition.deltas_.pop_front();
   }
 }

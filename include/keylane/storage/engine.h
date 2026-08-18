@@ -235,6 +235,8 @@ struct ReplicationLogInfo {
   std::uint64_t tail_lsn_ = 0;
   std::size_t block_count_ = 0;
   std::size_t capacity_bytes_ = 0;
+  std::size_t publish_queue_bytes_ = 0;
+  std::size_t publish_queue_capacity_bytes_ = 0;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -283,6 +285,17 @@ struct SetOptions {
 struct SetResult {
   bool applied_ = false;
   std::optional<DiskValue> old_value_;
+};
+
+// An owned command handed from command dispatch to the per-worker asynchronous
+// replication publisher. Moving request arguments into this object avoids a
+// second copy of large values.
+struct ReplicationCommandAppend {
+  ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
+  std::uint8_t db_id_ = 0;
+  std::uint16_t partition_id_ = 0;
+  std::uint64_t partition_sequence_ = 0;
+  std::vector<std::string> args_;
 };
 
 enum class ListOperationKind : std::uint8_t {
@@ -512,12 +525,23 @@ class StorageEngine {
   // either way, and only the caller's completion differs.
   celer::Task<absl::Status> FlushDbReclaim(bool wait);
   std::uint64_t DbEpoch(std::uint8_t db_id) const noexcept;
+  // Broadcasts one DB-epoch control barrier to every active source-worker
+  // flow. The caller keeps the DB gate closed until this completes.
+  celer::Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
+                                                      std::uint64_t db_epoch);
+  // Replica-side application after the receiver has collected this barrier
+  // from every source flow.
+  celer::Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
+                                                   std::uint64_t db_epoch);
 
   // Source-side per-partition migration primitives. Begin captures
   // a sequence fence, Snapshot reads the baseline tree, and ReadDeltas returns
   // every mutation after that fence until acknowledged.
   PartitionReplicationStart BeginPartitionReplication(
       std::uint16_t partition_id);
+  // Releases the full-sync delta fence for one source partition. Must execute
+  // on the owning worker and is idempotent.
+  void EndPartitionReplication(std::uint16_t partition_id);
   celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
       std::size_t count);
@@ -540,6 +564,8 @@ class StorageEngine {
   celer::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   celer::Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
+  bool ReplicationLogActive() const noexcept;
+  bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
 
   // Replica-side primitives. Reset returns a new local replication epoch that
   // fences every record from an earlier copy of this partition.
@@ -557,10 +583,9 @@ class StorageEngine {
                                              ReadLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
                                                           std::string_view key);
-  celer::Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id,
-                                             std::string_view key,
-                                             std::string_view value,
-                                             SetOptions options = {});
+  celer::Task<absl::StatusOr<SetResult>> Set(
+      std::uint8_t db_id, std::string_view key, std::string_view value,
+      SetOptions options = {}, ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values);
@@ -580,8 +605,9 @@ class StorageEngine {
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
       ExpirationCondition condition);
-  celer::Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id,
-                                           std::string_view key);
+  celer::Task<absl::StatusOr<bool>> Delete(
+      std::uint8_t db_id, std::string_view key,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<bool> Exists(std::uint8_t db_id, std::string_view key);
 
   // Pre-locked variants for the transaction layer. The caller must already
@@ -603,12 +629,11 @@ class StorageEngine {
       ReadLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
-  celer::Task<absl::StatusOr<SetResult>> SetLocked(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   const Digest& digest,
-                                                   std::string_view value,
-                                                   SetOptions options = {},
-                                                   TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<SetResult>> SetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::string_view value, SetOptions options = {},
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
@@ -640,10 +665,10 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr);
-  celer::Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
-                                                 std::string_view key,
-                                                 const Digest& digest,
-                                                 TxShardWrites* tx = nullptr);
+  celer::Task<absl::StatusOr<bool>> DeleteLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<bool> ExistsLocked(std::uint8_t db_id, std::string_view key,
                                  const Digest& digest);
 

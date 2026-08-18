@@ -75,11 +75,18 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
 
 PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
     std::uint16_t partition_id) {
-  auto& partition = PartitionFor(CurrentStore(), partition_id);
-  partition.capture_deltas_ = true;
-  partition.deltas_.clear();
-  partition.delta_floor_ = partition.mutation_sequence_;
-  partition.delta_queued_ = false;
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  if (partition.replication_capture_users_++ == 0) {
+    assert(store.replication_delta_bytes_ >= partition.delta_bytes_);
+    store.replication_delta_bytes_ -= partition.delta_bytes_;
+    partition.capture_deltas_ = true;
+    partition.deltas_.clear();
+    partition.delta_bytes_ = 0;
+    partition.delta_floor_ = partition.mutation_sequence_;
+    partition.delta_queued_ = false;
+    partition.delta_overflow_ = false;
+  }
   PartitionReplicationStart result;
   result.snapshot_sequence_ = partition.mutation_sequence_;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
@@ -89,6 +96,23 @@ PartitionReplicationStart StorageEngine::Impl::BeginPartitionReplication(
     }
   }
   return result;
+}
+
+void StorageEngine::Impl::EndPartitionReplication(
+    std::uint16_t partition_id) {
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  if (partition.replication_capture_users_ == 0) return;
+  if (--partition.replication_capture_users_ == 0) {
+    assert(store.replication_delta_bytes_ >= partition.delta_bytes_);
+    store.replication_delta_bytes_ -= partition.delta_bytes_;
+    partition.capture_deltas_ = false;
+    partition.deltas_.clear();
+    partition.delta_bytes_ = 0;
+    partition.delta_floor_ = partition.mutation_sequence_;
+    partition.delta_queued_ = false;
+    partition.delta_overflow_ = false;
+  }
 }
 
 Task<absl::StatusOr<PartitionSnapshotBatch>>
@@ -163,7 +187,8 @@ PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
   partition.delta_queued_ = false;
   PartitionDeltaBatch batch;
   batch.watermark_ = partition.mutation_sequence_;
-  batch.overflow_ = after_sequence < partition.delta_floor_;
+  batch.overflow_ = partition.delta_overflow_ ||
+                    after_sequence < partition.delta_floor_;
   if (batch.overflow_ || count == 0) {
     return batch;
   }
@@ -181,11 +206,24 @@ PartitionDeltaBatch StorageEngine::Impl::ReadPartitionDeltas(
 
 void StorageEngine::Impl::AcknowledgePartitionDeltas(
     std::uint16_t partition_id, std::uint64_t through_sequence) {
-  auto& partition = PartitionFor(CurrentStore(), partition_id);
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  // The API does not carry a session id, so an ACK from one replica cannot
+  // safely trim records another replica may still need. Keep the shared
+  // history until the last capture user leaves; overflow will request a new
+  // full sync rather than risking data loss.
+  if (partition.replication_capture_users_ > 1) return;
   while (!partition.deltas_.empty() &&
          partition.deltas_.front().mutation_sequence_ <= through_sequence) {
     partition.delta_floor_ = std::max(
         partition.delta_floor_, partition.deltas_.front().mutation_sequence_);
+    const SnapshotRecord& record = partition.deltas_.front();
+    const std::size_t bytes = sizeof(SnapshotRecord) + record.key_.size() +
+                              record.value_.size();
+    assert(partition.delta_bytes_ >= bytes);
+    assert(store.replication_delta_bytes_ >= bytes);
+    partition.delta_bytes_ -= bytes;
+    store.replication_delta_bytes_ -= bytes;
     partition.deltas_.pop_front();
   }
   if (!partition.deltas_.empty() && !partition.delta_queued_) {
@@ -253,10 +291,15 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   partition.replication_epoch_ = next_epoch;
   partition.mutation_sequence_ = 0;
   partition.capture_deltas_ = false;
+  partition.replication_capture_users_ = 0;
+  assert(store.replication_delta_bytes_ >= partition.delta_bytes_);
+  store.replication_delta_bytes_ -= partition.delta_bytes_;
   partition.deltas_.clear();
+  partition.delta_bytes_ = 0;
   partition.replica_value_stage_.reset();
   partition.delta_floor_ = 0;
   partition.delta_queued_ = false;
+  partition.delta_overflow_ = false;
   for (const OldKey& old : old_keys) {
     const std::uint8_t db_id = old.db_id_;
     const std::string& key = old.key_;

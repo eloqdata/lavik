@@ -118,7 +118,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       DependentExtentsFor(store, current);
   const std::uint64_t sequence = ++partition.mutation_sequence_;
   if (partition.capture_deltas_) {
-    AppendDelta(partition, SnapshotRecord{
+    AppendDelta(store, partition, SnapshotRecord{
                                .kind_ = SnapshotRecord::Kind::kDelete,
                                .db_id_ = candidate.db_id_,
                                .db_epoch_ = DbEpoch(candidate.db_id_),

@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication_command.h"
+#include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
 
@@ -80,6 +82,7 @@ class ReplicationLogService final : public celer::Service {
 
   celer::Task<absl::Status> Run(celer::Worker& worker,
                                 celer::ServiceContext) override {
+    worker_ = &worker;
     keylane::BindMemoryAccountingShard(worker.id());
     keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
     result_ = co_await storage_->InitializeWorker(worker);
@@ -95,6 +98,43 @@ class ReplicationLogService final : public celer::Service {
   const absl::Status& result() const noexcept { return result_; }
 
  private:
+  celer::Task<absl::Status> ExecuteClientCommand(
+      std::uint8_t db_id, std::vector<std::string> args,
+      std::string_view expected_reply) {
+    auto request = keylane::BuildCommandRequest(
+        keylane::RespCommand{.args_ = std::move(args)}, db_id);
+    if (!request.ok()) co_return request.status();
+    keylane::ReplyBuilder reply_builder;
+    keylane::CommandReply reply =
+        co_await keylane::ExecuteCommand(*request, reply_builder);
+    if (reply.disk_value_.has_value() || reply.chunks_ ||
+        reply.encoded_ != expected_reply) {
+      co_return absl::Status(absl::StatusCode::kFailedPrecondition,
+                             "client replication command returned '" +
+                                 std::string(reply.encoded_) +
+                                 "' instead of '" +
+                                 std::string(expected_reply) + "'");
+    }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> WaitForReplicationTail(
+      std::uint64_t expected_tail) {
+    for (unsigned attempt = 0; attempt < 5'000; ++attempt) {
+      const auto info = storage_->LocalReplicationLogInfo();
+      if (info.state_ != ReplicationLogState::kActive) {
+        co_return absl::Status(absl::StatusCode::kFailedPrecondition,
+                               "replication publisher invalidated the log");
+      }
+      if (info.tail_lsn_ >= expected_tail) co_return absl::OkStatus();
+      absl::Status slept =
+          co_await celer::SleepFor(*worker_, std::chrono::milliseconds(1));
+      if (!slept.ok()) co_return slept;
+    }
+    co_return absl::Status(absl::StatusCode::kDeadlineExceeded,
+                           "replication publisher did not reach the tail");
+  }
+
   celer::Task<absl::Status> Exercise() {
     absl::Status status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
     if (!status.ok()) co_return status;
@@ -117,6 +157,26 @@ class ReplicationLogService final : public celer::Service {
     if (!primary_length.ok()) co_return primary_length.status();
     Check(*primary_length == 2,
           "replication backlog failure affected primary storage");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    status = co_await storage_->EnableReplicationLog(4, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    std::vector<std::string> overflow_args;
+    overflow_args.emplace_back("SET");
+    overflow_args.emplace_back("publisher-overflow");
+    overflow_args.emplace_back(9 * kMiB, 'Q');
+    status =
+        co_await ExecuteClientCommand(0, std::move(overflow_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    Check(storage_->LocalReplicationLogInfo().state_ ==
+              ReplicationLogState::kInvalid,
+          "publisher overflow did not invalidate the replication flow");
+    auto overflow_length =
+        co_await storage_->StringLength(0, "publisher-overflow");
+    if (!overflow_length.ok()) co_return overflow_length.status();
+    Check(*overflow_length == 9 * kMiB,
+          "publisher overflow backpressured the primary write");
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
@@ -235,34 +295,36 @@ class ReplicationLogService final : public celer::Service {
               storage_->LocalReplicationLogInfo().block_count_ == 0,
           "disable did not reclaim the replication log");
 
-    // The storage commit path emits deterministic commands. Large arguments
-    // may span replication frames, but decode and apply still see one command
-    // and one LSN.
+    // Client command dispatch transfers committed writes to the asynchronous
+    // publisher. Large arguments may span replication frames, but decode and
+    // apply still see one command and one LSN.
     status = co_await storage_->EnableReplicationLog(19, 3 * 8 * kMiB);
     if (!status.ok()) co_return status;
     constexpr std::uint64_t kExpireAt = 4'102'444'800'000ULL;
-    auto set = co_await storage_->Set(
-        2, "replication-set", "value",
-        {.condition_ = keylane::storage::SetCondition::kNone,
-         .expire_at_ms_ = kExpireAt});
-    if (!set.ok()) co_return set.status();
-    Check(set->applied_ && storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
-          "committed SET did not publish exactly one command");
-    auto skipped = co_await storage_->Set(
-        2, "replication-set", "ignored",
-        {.condition_ = keylane::storage::SetCondition::kIfAbsent});
-    if (!skipped.ok()) co_return skipped.status();
-    Check(!skipped->applied_ &&
-              storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
+    std::vector<std::string> set_args{"SET", "replication-set", "value", "PXAT",
+                                      std::to_string(kExpireAt)};
+    status = co_await ExecuteClientCommand(2, std::move(set_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    std::vector<std::string> skipped_args{"SET", "replication-set", "ignored",
+                                          "NX"};
+    status =
+        co_await ExecuteClientCommand(2, std::move(skipped_args), "$-1\r\n");
+    if (!status.ok()) co_return status;
+    co_await celer::Yield(*worker_);
+    Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
           "conditional SET no-op published a replication command");
 
     std::string large_value(9 * kMiB, 'V');
-    auto large_set =
-        co_await storage_->Set(2, "replication-large", large_value, {});
-    if (!large_set.ok()) co_return large_set.status();
-    Check(large_set->applied_ &&
-              storage_->LocalReplicationLogInfo().tail_lsn_ == 2,
-          "large SET did not retain one logical LSN");
+    std::vector<std::string> large_args;
+    large_args.emplace_back("SET");
+    large_args.emplace_back("replication-large");
+    large_args.emplace_back(std::move(large_value));
+    status = co_await ExecuteClientCommand(2, std::move(large_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(2);
+    if (!status.ok()) co_return status;
 
     std::vector<ReplicatedCommand> commands;
     cursor = {};
@@ -297,7 +359,9 @@ class ReplicationLogService final : public celer::Service {
         Check(fragments > 1 && decoded->db_id_ == 2 &&
                   decoded->args_.size() == 3 && decoded->args_[0] == "SET" &&
                   decoded->args_[1] == "replication-large" &&
-                  decoded->args_[2] == large_value,
+                  decoded->args_[2].size() == 9 * kMiB &&
+                  decoded->args_[2].front() == 'V' &&
+                  decoded->args_[2].back() == 'V',
               "large SET was not reconstructed as one logical command");
       }
       commands.push_back(std::move(*decoded));
@@ -305,6 +369,9 @@ class ReplicationLogService final : public celer::Service {
 
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
+    auto db_zero_sentinel =
+        co_await storage_->Set(0, "replication-set", "db-zero-sentinel", {});
+    if (!db_zero_sentinel.ok()) co_return db_zero_sentinel.status();
     auto removed_set = co_await storage_->Delete(2, "replication-set");
     auto removed_large = co_await storage_->Delete(2, "replication-large");
     if (!removed_set.ok()) co_return removed_set.status();
@@ -317,24 +384,33 @@ class ReplicationLogService final : public celer::Service {
         co_await storage_->StringLength(2, "replication-set");
     auto restored_large_length =
         co_await storage_->StringLength(2, "replication-large");
+    auto db_zero_sentinel_length =
+        co_await storage_->StringLength(0, "replication-set");
     if (!restored_length.ok()) co_return restored_length.status();
     if (!restored_large_length.ok()) co_return restored_large_length.status();
+    if (!db_zero_sentinel_length.ok()) {
+      co_return db_zero_sentinel_length.status();
+    }
     const auto restored_expiry =
         co_await storage_->GetExpiration(2, "replication-set");
-    Check(*restored_length == 5 &&
-              *restored_large_length == large_value.size() &&
-              restored_expiry.exists_ &&
+    Check(*restored_length == 5 && *restored_large_length == 9 * kMiB &&
+              *db_zero_sentinel_length == 16 && restored_expiry.exists_ &&
               restored_expiry.expire_at_ms_ == kExpireAt,
-          "replica command apply changed SET state");
+          "replica SET did not preserve its logical database");
 
     status = co_await storage_->EnableReplicationLog(20, 8 * kMiB);
     if (!status.ok()) co_return status;
-    auto deleted = co_await storage_->Delete(2, "replication-set");
-    if (!deleted.ok()) co_return deleted.status();
-    auto missing = co_await storage_->Delete(2, "replication-missing");
-    if (!missing.ok()) co_return missing.status();
-    Check(*deleted && !*missing &&
-              storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
+    std::vector<std::string> delete_args{"DEL", "replication-set"};
+    status = co_await ExecuteClientCommand(2, std::move(delete_args), ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    std::vector<std::string> missing_args{"DEL", "replication-missing"};
+    status =
+        co_await ExecuteClientCommand(2, std::move(missing_args), ":0\r\n");
+    if (!status.ok()) co_return status;
+    co_await celer::Yield(*worker_);
+    Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
           "DEL publication did not follow its logical result");
     auto del_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
     if (!del_batch.ok()) co_return del_batch.status();
@@ -356,6 +432,47 @@ class ReplicationLogService final : public celer::Service {
     Check(!co_await storage_->Exists(2, "replication-set"),
           "replica DEL did not remove the key");
 
+    auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
+    auto flush_survivor =
+        co_await storage_->Set(3, "flush-survivor", "kept", {});
+    if (!flush_victim.ok()) co_return flush_victim.status();
+    if (!flush_survivor.ok()) co_return flush_survivor.status();
+    status = co_await storage_->EnableReplicationLog(21, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    std::vector<std::string> flush_args{"FLUSHDB"};
+    status = co_await ExecuteClientCommand(2, std::move(flush_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(2, "flush-victim") &&
+              co_await storage_->Exists(3, "flush-survivor"),
+          "source FLUSHDB affected the wrong database");
+    auto flush_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
+    if (!flush_batch.ok()) co_return flush_batch.status();
+    Check(flush_batch->frames_.size() == 1 && flush_batch->at_tail_ &&
+              flush_batch->frames_.front().header_.kind_ ==
+                  ReplicationEventKind::kControl,
+          "FLUSHDB did not produce one control frame");
+    auto flush_command = keylane::DecodeReplicationCommand(
+        flush_batch->frames_.front().payload_);
+    if (!flush_command.ok()) co_return flush_command.status();
+    Check(flush_command->db_id_ == 2 && flush_command->args_.size() == 2 &&
+              flush_command->args_[0] == "FLUSHDB" &&
+              flush_command->args_[1] == std::to_string(storage_->DbEpoch(2)),
+          "FLUSHDB barrier did not carry its installed database epoch");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    auto replica_victim =
+        co_await storage_->Set(2, "replica-flush-victim", "gone", {});
+    if (!replica_victim.ok()) co_return replica_victim.status();
+    flush_command->args_[1] = std::to_string(storage_->DbEpoch(2) + 1);
+    status = co_await keylane::ApplyReplicatedCommand(*flush_command);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(2, "replica-flush-victim") &&
+              co_await storage_->Exists(3, "flush-survivor"),
+          "replica FLUSHDB barrier affected the wrong database");
+
     // Leave one sealed block and one active block behind. A fresh process must
     // recognize both as runtime-only backlog and recover without parsing them
     // as primary records.
@@ -375,6 +492,7 @@ class ReplicationLogService final : public celer::Service {
   }
 
   StorageEngine* storage_ = nullptr;
+  celer::Worker* worker_ = nullptr;
   bool exercise_ = false;
   absl::Status result_ = absl::UnknownError("test service did not run");
 };
@@ -385,7 +503,12 @@ int RunOnce(const std::string& path, bool exercise) {
   options.buffers_.registered_bytes_ = 64 * kMiB;
   StorageEngine storage(std::move(options));
   keylane::InitWorkerMetrics(1);
-  keylane::InitStorage(&storage, true);
+  const absl::Status memory = keylane::InitMemoryLimit(512 * kMiB, 1);
+  if (!memory.ok()) {
+    std::cerr << memory << '\n';
+    return 1;
+  }
+  keylane::InitStorage(&storage, nullptr);
   const absl::Status prepared = storage.Prepare(1);
   if (!prepared.ok()) {
     std::cerr << prepared << '\n';

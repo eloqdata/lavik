@@ -31,6 +31,8 @@ constexpr std::size_t ToIndex(CommandKind kind) noexcept {
 struct alignas(64) WorkerMetricsShard {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   std::uint64_t connected_clients_ = 0;
+  std::uint64_t replication_control_connections_ = 0;
+  std::uint64_t replication_flow_connections_ = 0;
   std::uint64_t defrag_successes_ = 0;
   std::uint64_t defrag_resource_exhausted_ = 0;
   std::uint64_t defrag_failures_ = 0;
@@ -77,6 +79,26 @@ void RecordConnectionOpened() noexcept {
 
 void RecordConnectionClosed() noexcept {
   --g_worker_metrics[celer::ThisWorker().id_].connected_clients_;
+}
+
+void RecordReplicationConnectionOpened(
+    ReplicationConnectionKind kind) noexcept {
+  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  if (kind == ReplicationConnectionKind::kControl) {
+    ++shard.replication_control_connections_;
+  } else {
+    ++shard.replication_flow_connections_;
+  }
+}
+
+void RecordReplicationConnectionClosed(
+    ReplicationConnectionKind kind) noexcept {
+  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  if (kind == ReplicationConnectionKind::kControl) {
+    --shard.replication_control_connections_;
+  } else {
+    --shard.replication_flow_connections_;
+  }
 }
 
 void RecordDefragMetric(DefragMetricResult result) noexcept {
@@ -135,6 +157,9 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
         });
     result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
+    result.replication_control_connections_ +=
+        shard.replication_control_connections_;
+    result.replication_flow_connections_ += shard.replication_flow_connections_;
     result.defrag_successes_ += shard.defrag_successes_;
     result.defrag_resource_exhausted_ += shard.defrag_resource_exhausted_;
     result.defrag_failures_ += shard.defrag_failures_;
@@ -273,6 +298,16 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_connected_clients gauge\n"
       "keylane_connected_clients ",
       worker_metrics.connected_clients_, "\n",
+      "# HELP keylane_replication_control_connections Current native "
+      "replication control connections.\n"
+      "# TYPE keylane_replication_control_connections gauge\n"
+      "keylane_replication_control_connections ",
+      worker_metrics.replication_control_connections_, "\n",
+      "# HELP keylane_replication_flow_connections Current native replication "
+      "data-flow connections.\n"
+      "# TYPE keylane_replication_flow_connections gauge\n"
+      "keylane_replication_flow_connections ",
+      worker_metrics.replication_flow_connections_, "\n",
       "# HELP keylane_storage_defrag_runs_total Completed defrag attempts.\n"
       "# TYPE keylane_storage_defrag_runs_total counter\n"
       "keylane_storage_defrag_runs_total{result=\"success\"} ",

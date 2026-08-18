@@ -13,13 +13,6 @@ namespace keylane {
 
 inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
 
-struct ReplicaOfConfig {
-  std::string host_;
-  std::uint16_t port_ = 0;
-
-  bool operator==(const ReplicaOfConfig&) const = default;
-};
-
 struct ServerOptions {
   std::string config_file_;
   std::string bind_ip_ = "127.0.0.1";

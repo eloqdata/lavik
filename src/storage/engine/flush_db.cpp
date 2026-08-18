@@ -120,7 +120,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     partition.expiring_key_count_[db_id] = 0;
     const std::uint64_t sequence = ++partition.mutation_sequence_;
     if (partition.capture_deltas_) {
-      AppendDelta(partition, SnapshotRecord{
+      AppendDelta(store, partition, SnapshotRecord{
                                  .kind_ = SnapshotRecord::Kind::kFlushDb,
                                  .db_id_ = db_id,
                                  .db_epoch_ = DbEpoch(db_id),

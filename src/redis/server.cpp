@@ -134,8 +134,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
     // Keep worker reports out of the same logger critical section. Synchronous
     // bursts from every worker otherwise become an artificial tail-latency
     // event in the trace build itself.
-    stats.next_report_ns_ = now + 10'000'000'000ULL +
-                            100'000'000ULL * ThisWorker().id_;
+    stats.next_report_ns_ =
+        now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
     return;
   }
   if (now < stats.next_report_ns_) {
@@ -222,8 +222,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
       p9999(stats.route_back_), p9999(stats.send_));
   stats = ReadLatencyStats{};
-  stats.next_report_ns_ = now + 10'000'000'000ULL +
-                          100'000'000ULL * ThisWorker().id_;
+  stats.next_report_ns_ =
+      now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
 }
 
 std::atomic<bool> g_shutdown_requested = false;
@@ -514,7 +514,7 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
   co_await ReleaseConnectionWatches(ctx);
-  ConnectionClosed();
+  if (ctx.counted_as_client_) ConnectionClosed();
   co_return status;
 }
 
@@ -580,6 +580,17 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return write_status;
       }
       co_return command_result.status();
+    }
+
+    if (ReplicationManager::IsNativeHandshake(command_result->args_)) {
+      if (!pending.empty()) {
+        co_return absl::InvalidArgumentError(
+            "replication handshake must be the first isolated command");
+      }
+      ConnectionClosed();
+      ctx.counted_as_client_ = false;
+      co_return co_await replication_->ServeNativeConnection(
+          stream, std::move(command_result->args_));
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
@@ -705,15 +716,15 @@ int RunServer(ServerOptions options) {
       "defrag_record_sleep_us={} defrag_paused={}",
       options.bind_ip_, options.port_, options.metrics_port_,
       options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
-      options.busy_poll_us_,
-      options.background_budget_us_, options.background_warrant_percent_,
+      options.busy_poll_us_, options.background_budget_us_,
+      options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
-      options.spdk_foreground_pre_poll_us_,
-      options.registered_buffer_bytes_, options.max_memory_bytes_,
-      options.flush_max_ms_, options.flush_size_bytes_,
-      options.inline_key_max_bytes_, options.verify_read_crc_,
-      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
-      options.defrag_record_sleep_us_, options.defrag_paused_);
+      options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
+      options.max_memory_bytes_, options.flush_max_ms_,
+      options.flush_size_bytes_, options.inline_key_max_bytes_,
+      options.verify_read_crc_, options.defrag_max_active_per_device_,
+      options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
+      options.defrag_paused_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
@@ -739,18 +750,16 @@ int RunServer(ServerOptions options) {
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.verify_read_crc_ = options.verify_read_crc_;
   storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
-  // A node accepting an upstream replication stream must not create local
+  // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority_ =
-      options.replication_options_.listen_port_ == 0;
+  storage_options.expiration_authority_ = !options.replicaof_.has_value();
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
   storage_options.tomb_raider_sleep_ms_ = options.tomb_raider_sleep_ms_;
   storage_options.defrag_max_active_per_device_ =
       options.defrag_max_active_per_device_;
   storage_options.defrag_sleep_ms_ = options.defrag_sleep_ms_;
-  storage_options.defrag_record_sleep_us_ =
-      options.defrag_record_sleep_us_;
+  storage_options.defrag_record_sleep_us_ = options.defrag_record_sleep_us_;
   storage_options.defrag_paused_ = options.defrag_paused_;
   storage_options.buffers_.registered_bytes_ = options.registered_buffer_bytes_;
   storage::StorageEngine storage(std::move(storage_options));
@@ -761,8 +770,9 @@ int RunServer(ServerOptions options) {
     return 1;
   }
   ReplicationManager replication(&storage,
-                                 std::move(options.replication_options_));
-  InitStorage(&storage, replication.replica_read_only());
+                                 std::move(options.replication_options_),
+                                 std::move(options.replicaof_));
+  InitStorage(&storage, &replication);
   InitWorkerMetrics(options.thread_count_);
   SetServerInfo(options.port_, options.thread_count_);
   tx::TxRuntime::Create(options.thread_count_);
@@ -790,10 +800,6 @@ int RunServer(ServerOptions options) {
   if (options.metrics_port_ != 0) {
     metrics = CreateMetricsService(options.metrics_port_, &storage);
     server.AddService(metrics.get());
-  }
-  if (celer::Service* replication_service = replication.service();
-      replication_service != nullptr) {
-    server.AddService(replication_service);
   }
   auto start_status = server.Start(runtime_options);
   if (!start_status.ok()) [[unlikely]] {

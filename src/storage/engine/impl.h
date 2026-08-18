@@ -943,6 +943,12 @@ class StorageEngine::Impl {
     };
 
     struct ReplicationLogRuntime {
+      struct PendingCommand {
+        std::uint64_t log_epoch_ = 0;
+        std::size_t logical_bytes_ = 0;
+        ReplicationCommandAppend append_;
+      };
+
       AsyncMutex mutex_;
       ReplicationLogState state_ = ReplicationLogState::kDisabled;
       std::uint64_t log_epoch_ = 0;
@@ -950,6 +956,14 @@ class StorageEngine::Impl {
       std::size_t max_blocks_ = 0;
       std::deque<ReplicationLogBlock> blocks_;
       std::byte* active_buffer_ = nullptr;
+      std::deque<PendingCommand> publish_queue_;
+      std::size_t publish_queue_bytes_ = 0;
+      std::size_t max_publish_queue_bytes_ = 0;
+      // Reserved per-worker replication memory. Mutations enter this bounded
+      // queue first; the publisher spills them to the disk backlog in the
+      // background. Keep this separate from the normal client buffers.
+      std::size_t reserved_memory_bytes_ = 0;
+      bool publisher_running_ = false;
 
       ~ReplicationLogRuntime() {
         if (active_buffer_ != nullptr) {
@@ -966,8 +980,14 @@ class StorageEngine::Impl {
       std::uint64_t mutation_sequence_ = 0;
       std::uint64_t replication_epoch_ = 1;
       std::uint64_t delta_floor_ = 0;
+      std::size_t delta_bytes_ = 0;
       bool capture_deltas_ = false;
+      // Number of concurrent source replication sessions capturing this
+      // partition.  The delta buffer is shared by sessions; a later replica
+      // must not reset the buffer used by an earlier replica.
+      std::uint32_t replication_capture_users_ = 0;
       bool delta_queued_ = false;
+      bool delta_overflow_ = false;
       std::deque<SnapshotRecord> deltas_;
       std::optional<ReplicaValueStage> replica_value_stage_;
     };
@@ -989,6 +1009,10 @@ class StorageEngine::Impl {
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
     std::vector<PartitionStore> partitions_;
+    // Full-sync deltas are still an in-memory compatibility layer until they
+    // move onto pinned replication-log blocks. Keep the aggregate strictly
+    // bounded so a stalled snapshot can never grow the worker without limit.
+    std::size_t replication_delta_bytes_ = 0;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records_;
     // External manifests are exceptional and relatively large. Keeping them
@@ -1096,12 +1120,14 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
                                       std::string_view value,
-                                      SetOptions options);
+                                      SetOptions options,
+                                      ReplicationCommandAppend* replication);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::string_view value, SetOptions options, TxShardWrites* tx = nullptr);
+      std::string_view value, SetOptions options, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
@@ -1181,13 +1207,14 @@ class StorageEngine::Impl {
       std::uint64_t expire_at_ms, ExpirationCondition condition,
       TxShardWrites* tx = nullptr);
 
-  Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key);
+  Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key,
+                                    ReplicationCommandAppend* replication);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
-  Task<absl::StatusOr<bool>> DeleteLocked(std::uint8_t db_id,
-                                          std::string_view key,
-                                          const Digest& digest,
-                                          TxShardWrites* tx = nullptr);
+  Task<absl::StatusOr<bool>> DeleteLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   // Freezes the keyspace against expiration writes for stable-count scans
   // (KEYS): client writes are already excluded by the closed database gate;
@@ -1300,6 +1327,14 @@ class StorageEngine::Impl {
     co_return co_await ReclaimDetachedAllWorkers(wait);
   }
 
+  Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
+                                               std::uint64_t db_epoch);
+
+  Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
+                                            std::uint64_t db_epoch) {
+    co_return co_await AdvanceDbEpoch(db_id, db_epoch);
+  }
+
   // Persists the new epoch, then takes the database out of service on every
   // worker. Callers hold the database gate across this and can drop it as soon
   // as it returns: the keyspace is empty and durably so, and what remains is
@@ -1325,6 +1360,8 @@ class StorageEngine::Impl {
   PartitionReplicationStart BeginPartitionReplication(
       std::uint16_t partition_id);
 
+  void EndPartitionReplication(std::uint16_t partition_id);
+
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
       std::size_t count);
@@ -1342,6 +1379,8 @@ class StorageEngine::Impl {
   Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
+  bool ReplicationLogActive() const noexcept;
+  bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
 
   void AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                   std::uint64_t through_sequence);
@@ -1368,9 +1407,7 @@ class StorageEngine::Impl {
   Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
                                                  std::uint64_t keep_from_lsn,
                                                  bool force_all = false);
-  Task<absl::Status> PublishReplicationCommand(
-      std::uint16_t partition_id, std::uint64_t partition_sequence,
-      std::uint8_t db_id, std::span<const std::string_view> args);
+  Task<absl::Status> DrainReplicationPublishQueue(WorkerStore* store);
 
   static StagingSlot* StagingFor(WorkerStore& store, const BlockState& state);
 
@@ -1763,7 +1800,8 @@ class StorageEngine::Impl {
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr);
 
-  void AppendDelta(WorkerStore::PartitionStore& partition,
+  void AppendDelta(WorkerStore& store,
+                   WorkerStore::PartitionStore& partition,
                    SnapshotRecord record);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,

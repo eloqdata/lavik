@@ -92,9 +92,23 @@ std::uint64_t StorageEngine::DbEpoch(std::uint8_t db_id) const noexcept {
   return impl_->DbEpoch(db_id);
 }
 
+Task<absl::Status> StorageEngine::PublishFlushDbReplication(
+    std::uint8_t db_id, std::uint64_t db_epoch) {
+  return impl_->PublishFlushDbReplication(db_id, db_epoch);
+}
+
+Task<absl::Status> StorageEngine::ApplyReplicatedFlushDb(
+    std::uint8_t db_id, std::uint64_t db_epoch) {
+  return impl_->ApplyReplicatedFlushDb(db_id, db_epoch);
+}
+
 PartitionReplicationStart StorageEngine::BeginPartitionReplication(
     std::uint16_t partition_id) {
   return impl_->BeginPartitionReplication(partition_id);
+}
+
+void StorageEngine::EndPartitionReplication(std::uint16_t partition_id) {
+  impl_->EndPartitionReplication(partition_id);
 }
 
 Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
@@ -141,6 +155,15 @@ ReplicationLogInfo StorageEngine::LocalReplicationLogInfo() const {
   return impl_->LocalReplicationLogInfo();
 }
 
+bool StorageEngine::ReplicationLogActive() const noexcept {
+  return impl_->ReplicationLogActive();
+}
+
+bool StorageEngine::TryEnqueueReplicationCommand(
+    ReplicationCommandAppend command) {
+  return impl_->TryEnqueueReplicationCommand(std::move(command));
+}
+
 void StorageEngine::AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                                std::uint64_t through_sequence) {
   impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
@@ -169,11 +192,10 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
   return impl_->StringLength(db_id, key);
 }
 
-Task<absl::StatusOr<SetResult>> StorageEngine::Set(std::uint8_t db_id,
-                                                   std::string_view key,
-                                                   std::string_view value,
-                                                   SetOptions options) {
-  return impl_->Set(db_id, key, value, options);
+Task<absl::StatusOr<SetResult>> StorageEngine::Set(
+    std::uint8_t db_id, std::string_view key, std::string_view value,
+    SetOptions options, ReplicationCommandAppend* replication) {
+  return impl_->Set(db_id, key, value, options, replication);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
@@ -216,9 +238,10 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
   return impl_->UpdateExpiration(db_id, key, expire_at_ms, condition);
 }
 
-Task<absl::StatusOr<bool>> StorageEngine::Delete(std::uint8_t db_id,
-                                                 std::string_view key) {
-  return impl_->Delete(db_id, key);
+Task<absl::StatusOr<bool>> StorageEngine::Delete(
+    std::uint8_t db_id, std::string_view key,
+    ReplicationCommandAppend* replication) {
+  return impl_->Delete(db_id, key, replication);
 }
 
 Task<bool> StorageEngine::Exists(std::uint8_t db_id, std::string_view key) {
@@ -238,8 +261,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
 
 Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::string_view value, SetOptions options, TxShardWrites* tx) {
-  return impl_->SetLocked(db_id, key, digest, value, options, tx);
+    std::string_view value, SetOptions options, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->SetLocked(db_id, key, digest, value, options, tx, replication);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPushLocked(
@@ -301,11 +325,10 @@ Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
                                        condition, tx);
 }
 
-Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(std::uint8_t db_id,
-                                                       std::string_view key,
-                                                       const Digest& digest,
-                                                       TxShardWrites* tx) {
-  return impl_->DeleteLocked(db_id, key, digest, tx);
+Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    TxShardWrites* tx, ReplicationCommandAppend* replication) {
+  return impl_->DeleteLocked(db_id, key, digest, tx, replication);
 }
 
 Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,

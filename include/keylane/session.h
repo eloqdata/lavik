@@ -16,6 +16,7 @@ namespace keylane {
 // end of RedisService::Serve.
 struct ConnectionContext {
   std::uint8_t selected_db_ = 0;
+  bool counted_as_client_ = true;
   ReplyBuilder reply_builder_;
 
   // MULTI/EXEC queueing. `multi_db` tracks SELECTs issued while queueing so

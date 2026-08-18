@@ -183,6 +183,23 @@ master  -> replica: FULLSYNC 或 CONTINUE
 KLFLOW <session-id> <flow-id> <next-lsn>
 ```
 
+稳态连接数固定为 `1 + source_worker_count`：一条 control/session 连接，加上每个 source
+worker 一条 data-flow 连接。每条 data socket 只由所属 worker 访问，不使用 MPMC，也不把
+大 Value 跨核搬到统一 sender；target worker 数量可以不同，接收后再按 `partition_id`
+路由。
+
+当前 connection-control slice 已实现协议版本 1 的连接骨架：replica 在普通 Redis 端口
+发送 `KLPSYNC 1 ?`，master 返回 session id、40 字节 replid 和 source worker 数；随后
+replica 发送 `KLFLOW 1 <session-id> <flow-id> <next-lsn>` 建立所有 data flow。master 将
+接错 worker 的已握手 socket adopt 到对应 source worker，target worker 较少时允许一个
+target worker 持有多个 flow。所有 flow 建立后状态机进入 ONLINE。snapshot/backlog frame
+尚未接入这些 socket，因此此时 ONLINE 只表示连接组完整，不表示数据已经同步。
+
+升级后的 socket 不计入 `connected_clients`，另由
+`keylane_replication_control_connections` 和
+`keylane_replication_flow_connections` 两个 gauge 统计；`keylane_connections` 仍表示进程
+当前所有 TCP 连接。
+
 协议帧至少包含：
 
 ```text
@@ -268,8 +285,15 @@ WorkerReplicationLog
 - 同时限制 backlog block bytes、frame count、logical bytes 和 age；
 - 没有 replica 时可以不保留 backlog，首个 replica 直接 full sync；
 - 写路径只向有界后台发布器提交 committed event，不等待 backlog IO 或任何网络发送；
+- 稳态复制先写入每个 worker 预留的有界内存 queue，由后台 publisher 异步 spill 到 disk backlog；当前预留上限为 8 MiB/worker；
 - backlog 分配或 IO 失败只将该 flow 标记为 invalid，主写继续，replica 改走 full sync；
 - master 重启更换 replid，恢复只识别并回收旧 replication blocks。
+
+当前 command-journal slice 的每 worker 发布队列上限是
+`min(backlog capacity, 64 MiB)`，并且把正在写 backlog 的 event 计入上限。队列满或单条
+event 超限时不反压客户端，而是立即 invalid 当前 flow；后续以 full sync 恢复。未来主数据
+支持外部大 Value 后，发布项改为带生命周期保护的 record/extent source，避免为了排队长期
+持有整条 Value，同时保留同样的有界和不反压语义。
 
 每个 mutation 记录 `partition_id`，per-partition index 用于 full sync 期间按
 `partition_sequence` 查找 delta。稳定阶段按 flow LSN 顺序发送。
@@ -284,7 +308,7 @@ backlog block 保存自包含的逻辑 event，不引用可能被 defrag/覆盖�
 - 一个 event 要么完整保留，要么整体位于 floor 之前，不能只留下中间 fragment；
 - receiver 收到 last frame 并完成命令校验后才发布结果；
 - 内存只保存 active block、block LSN 范围和每 64 frame 一个稀疏 offset；
-- sealed block 只要求运行期 IO 完成，不进入主写 fdatasync durability boundary；
+- sealed block 只要求运行期 IO 完成，不进入主写 fdatasync durability boundary；后续 TODO 是增加可选的 durable replication ACK；
 - output window 仍然独立有界，连接不能无限预取 backlog frame。
 
 这会增加一次顺序写放大，但消除了 replication pin 对 defrag 和主数据回收的长期阻塞，
@@ -313,7 +337,33 @@ Master 正常处理写入。`BeginPartitionReplication` 必须先建立 fence �
 已完成 partition 的 delta 在复制其他 partition 时继续转发。某 partition 的 delta
 已被 backlog 覆盖时，只 reset 并重抄这个 partition。
 
-### 9.1 Target reset 重构
+### 9.1 Full-sync delta 容量与溢出
+
+全量同步不能只依赖会循环覆盖的稳态 backlog。对每个正在扫描的 partition，
+source 必须从 fence 开始为该 session 保留 delta，直到 target 完成 baseline apply
+并 ACK 到 watermark。这些 delta 可以与稳态 backlog 共用 frame block，但必须拥有
+独立的 session/partition 引用和容量计费，不能因稳态 floor 前进而被回收。
+
+保留量估算至少要考虑：
+
+```text
+required_delta_bytes ~= snapshot_generation_and_transfer_time * peak_write_bytes_per_second
+```
+
+硬性规则：
+
+- full-sync delta 落盘，内存只保留有界的 active block、索引和网络 window；
+- 同时限制 per-session、per-partition 和全局 pinned delta bytes；
+- 一个 partition 完成 catch-up 后立即释放它的 full-sync pin；
+- 任一容量上限溢出时，终止该 session/generation，或只 reset 受影响的
+  partition 并重新建立 fence；绝不允许覆盖后继续声称同步成功；
+- 不因慢 replica 反压客户端写入；持续超限会导致该 replica 重试后仍失败，
+  并通过 metrics 和错误状态暴露，由运维增加配额、降低写入速率或先离线预热。
+
+这个限制同样适用于未来拆分的大 Value：frame 可以分块，但整个 logical event
+在 last frame 收到前都必须可重放，并且所有 fragment 都计入同一个有界配额。
+
+### 9.2 Target reset 重构
 
 当前 `ResetReplicaPartition` 为旧 key 逐个写 tombstone，并在持有
 `store_state_mutex` 时可能等待空间回收，存在死锁风险。新实现应：
@@ -328,7 +378,7 @@ Master 正常处理写入。`BeginPartitionReplication` 必须先建立 fence �
 恢复只接受 metadata 中最新 replication epoch 的记录，因此不需要为每个旧 key 写
 tombstone。旧 generation 的回收必须受 pin 和 index generation 保护。
 
-### 9.2 全量同步结束屏障
+### 9.3 全量同步结束屏障
 
 所有 partition 标记 SYNCED 后不能立即声明 ONLINE。每个 source flow 需要：
 
@@ -349,6 +399,10 @@ Replica 定期发送：
 ```text
 FLOW_ACK(flow_id, applied_lsn, durable_lsn)
 ```
+
+当前 native flow 已先实现有序的 frame ACK：每个 RESET/RECORDS frame 在 target apply 成功后回传
+partition 和最后的 mutation sequence。这个 ACK 是 applied ACK，不是 durable ACK；它为后续
+partial sync cursor 和 durable fence 提供了连续进度。
 
 - `applied_lsn`：已经写入 replica index；
 - `durable_lsn`：对应 storage durability fence 已完成。
@@ -457,6 +511,12 @@ Full sync snapshot 在 key lock 下等待正在提交的 transaction，因此只
   detach 旧索引并放行 barrier 后的命令；
 - DB epoch 必须在该 DB 后续 mutation 之前安装并持久化；
 - full sync 的 target reset 和 DB epoch advance 使用统一 gate/generation 机制。
+
+当前 command-journal slice 已实现 FLUSHDB source 广播和 replica epoch-detach apply
+primitive：每个 worker 产生一个 `kControl` frame，payload 为内部命令
+`FLUSHDB <new_db_epoch>`。网络 receiver 必须先按 `(db, epoch)` 收齐所有 source flow，暂停
+这些 flow 的 barrier 后命令，然后只调用一次 apply primitive；不能在收到第一条 frame 时就
+清库。FLUSHALL 的 16-epoch 原子 barrier 尚未实现，因此不会降级成 16 条 FLUSHDB 传播。
 
 ## 15. 多 replica 和慢 replica
 
@@ -584,6 +644,11 @@ bytes 和 replication pin 导致的不可回收 bytes。
 - replica pull/initiated full sync；
 - 一个 master 多个 full-sync replica；
 - 删除 source 静态 target 假设。
+
+当前已完成 M1 中启动/动态 `REPLICAOF`、`NO ONE`、generation、read-only 和 INFO 状态，
+以及 M2 中 replica 主动连接、普通端口握手、master session registry 和
+`1 + source_worker_count` socket ownership。`ROLE`、`CONFIG REWRITE`、动态 expiration
+authority、full sync 数据面和多 replica full-sync 调度仍未完成。
 
 ### M3：安全的 target apply
 

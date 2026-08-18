@@ -1,9 +1,14 @@
 #include "impl.h"
+#include "keylane/replication_command.h"
 
 namespace keylane::storage {
 namespace {
 
 constexpr std::size_t kSparseFrameStride = 64;
+// TODO(replication): make this configurable and benchmark the SET/GET impact
+// of different memory-vs-backlog spill thresholds. This is a reserved,
+// per-worker budget, not an unbounded extension of the process cache.
+constexpr std::size_t kReservedReplicationMemoryBytes = 8ULL * 1024 * 1024;
 
 bool CursorBefore(const ReplicationLogCursor& left,
                   const ReplicationLogCursor& right) noexcept {
@@ -37,6 +42,9 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   co_await log.mutex_.Lock();
   UnlockGuard unlock(&log.mutex_, store.worker_);
   if (log.state_ != ReplicationLogState::kDisabled) {
+    if (log.state_ == ReplicationLogState::kActive) {
+      co_return absl::OkStatus();
+    }
     co_return InvalidState("replication log is already enabled");
   }
   if (log_epoch == 0 || capacity_bytes == 0) {
@@ -49,6 +57,144 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.next_lsn_ = 1;
   log.max_blocks_ =
       std::max<std::size_t>(1, capacity_bytes / kStorageBlockBytes);
+  log.publish_queue_.clear();
+  log.publish_queue_bytes_ = 0;
+  log.reserved_memory_bytes_ = std::min(
+      log.max_blocks_ * kStorageBlockBytes, kReservedReplicationMemoryBytes);
+  log.max_publish_queue_bytes_ = log.reserved_memory_bytes_;
+  co_return absl::OkStatus();
+}
+
+bool StorageEngine::Impl::ReplicationLogActive() const noexcept {
+  return CurrentStore().replication_log_.state_ == ReplicationLogState::kActive;
+}
+
+bool StorageEngine::Impl::TryEnqueueReplicationCommand(
+    ReplicationCommandAppend command) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (log.state_ != ReplicationLogState::kActive) return false;
+
+  std::size_t logical_bytes = sizeof(command.kind_) + sizeof(command.db_id_) +
+                              sizeof(command.partition_id_) +
+                              sizeof(command.partition_sequence_);
+  for (const std::string& arg : command.args_) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
+        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
+                                    logical_bytes - arg.size()) {
+      log.state_ = ReplicationLogState::kInvalid;
+      log.publish_queue_.clear();
+      log.publish_queue_bytes_ = 0;
+      spdlog::warn("replication publisher queue size overflow");
+      return false;
+    }
+    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  }
+  if (command.args_.empty() || logical_bytes > log.max_publish_queue_bytes_ ||
+      log.publish_queue_bytes_ > log.max_publish_queue_bytes_ - logical_bytes) {
+    log.state_ = ReplicationLogState::kInvalid;
+    log.publish_queue_.clear();
+    log.publish_queue_bytes_ = 0;
+    spdlog::warn(
+        "replication publisher cannot keep up; invalidating backlog for full "
+        "resynchronization");
+    return false;
+  }
+
+  log.publish_queue_bytes_ += logical_bytes;
+  log.publish_queue_.push_back(
+      WorkerStore::ReplicationLogRuntime::PendingCommand{
+          .log_epoch_ = log.log_epoch_,
+          .logical_bytes_ = logical_bytes,
+          .append_ = std::move(command),
+      });
+  if (!log.publisher_running_) {
+    log.publisher_running_ = true;
+    store.worker_->Spawn(DrainReplicationPublishQueue(&store));
+  }
+  return true;
+}
+
+Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
+    WorkerStore* store) {
+  auto& log = store->replication_log_;
+  while (!log.publish_queue_.empty()) {
+    auto pending = std::move(log.publish_queue_.front());
+    log.publish_queue_.pop_front();
+    if (log.state_ != ReplicationLogState::kActive ||
+        pending.log_epoch_ != log.log_epoch_) {
+      if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
+        log.publish_queue_bytes_ -= pending.logical_bytes_;
+      }
+      continue;
+    }
+
+    std::vector<std::string_view> args;
+    args.reserve(pending.append_.args_.size());
+    for (const std::string& arg : pending.append_.args_) args.push_back(arg);
+    auto source =
+        ReplicationCommandPayloadSource::Create(pending.append_.db_id_, args);
+    if (!source.ok()) {
+      log.state_ = ReplicationLogState::kInvalid;
+      spdlog::warn("replication command encoding failed: {}",
+                   source.status().message());
+      break;
+    }
+    auto appended = co_await AppendReplicationLog(ReplicationLogAppend{
+        .kind_ = pending.append_.kind_,
+        .partition_id_ = pending.append_.partition_id_,
+        .partition_sequence_ = pending.append_.partition_sequence_,
+        .payload_ = {},
+        .payload_source_ = &*source,
+    });
+    if (!appended.ok()) {
+      log.state_ = ReplicationLogState::kInvalid;
+      spdlog::warn("replication backlog append failed: {}",
+                   appended.status().message());
+      break;
+    }
+    if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
+      log.publish_queue_bytes_ -= pending.logical_bytes_;
+    }
+  }
+  if (log.state_ != ReplicationLogState::kActive) {
+    log.publish_queue_.clear();
+    log.publish_queue_bytes_ = 0;
+  }
+  log.publisher_running_ = false;
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
+    std::uint8_t db_id, std::uint64_t db_epoch) {
+  if (db_id >= kLogicalDatabaseCount || db_epoch == 0) {
+    co_return absl::Status(absl::StatusCode::kInvalidArgument,
+                           "invalid FLUSHDB replication barrier");
+  }
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto publish = [this, db_id, db_epoch]() -> Task<absl::Status> {
+      if (ReplicationLogActive()) {
+        (void)TryEnqueueReplicationCommand(ReplicationCommandAppend{
+            .kind_ = ReplicationEventKind::kControl,
+            .db_id_ = db_id,
+            // Control events do not belong to a partition. Zero is the
+            // canonical transport placeholder; receivers key the barrier by
+            // (db_id, db_epoch) carried in the command payload.
+            .partition_id_ = 0,
+            .partition_sequence_ = db_epoch,
+            .args_ = {"FLUSHDB", std::to_string(db_epoch)},
+        });
+      }
+      co_return absl::OkStatus();
+    };
+    absl::Status published;
+    if (target == celer::ThisWorker().id_) {
+      published = co_await publish();
+    } else {
+      published = co_await celer::SubmitTaskTo(target, publish);
+    }
+    if (!published.ok()) co_return published;
+  }
   co_return absl::OkStatus();
 }
 
@@ -210,7 +356,10 @@ Task<absl::Status> StorageEngine::Impl::SealReplicationLogActiveBlock(
   }
   state->committed_bytes_ = block.committed_bytes_;
   state->live_bytes_ = block.committed_bytes_ - kBlockHeaderBytes;
-  state->in_memory_ = false;
+    // Runtime backlog persistence is intentionally write-through to the
+    // storage block but does not enter the foreground fdatasync boundary.
+    // TODO(replication): add an explicit durable-replication policy/ACK mode.
+    state->in_memory_ = false;
   store.store_state_mutex_.Unlock(*store.worker_);
   celer::FreeStorageBuffer(log.active_buffer_, kDirectIoAlignment);
   log.active_buffer_ = nullptr;
@@ -569,6 +718,10 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   log.log_epoch_ = 0;
   log.next_lsn_ = 1;
   log.max_blocks_ = 0;
+  log.publish_queue_.clear();
+  log.publish_queue_bytes_ = 0;
+  log.max_publish_queue_bytes_ = 0;
+  log.reserved_memory_bytes_ = 0;
   co_return absl::OkStatus();
 }
 
@@ -582,6 +735,8 @@ ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
       .tail_lsn_ = log.next_lsn_ - 1,
       .block_count_ = log.blocks_.size(),
       .capacity_bytes_ = log.max_blocks_ * kStorageBlockBytes,
+      .publish_queue_bytes_ = log.publish_queue_bytes_,
+      .publish_queue_capacity_bytes_ = log.reserved_memory_bytes_,
   };
 }
 

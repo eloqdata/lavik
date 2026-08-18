@@ -1,7 +1,6 @@
 #include <mimalloc.h>
 #include <sched.h>
 
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -56,7 +55,6 @@ int main(int argc, char** argv) {
   unsigned registered_buffer_mb = 256;
   unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
-  std::string replicate_to;
 
   app.add_option("config", config_file,
                  "Redis-style configuration file (must be the first argument)");
@@ -89,14 +87,15 @@ int main(int argc, char** argv) {
                  "Maximum worker background slice in microseconds")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_option("--background-warrant-percent",
-                 options.background_warrant_percent_,
-                 "Maximum rolling worker CPU share guaranteed to background tasks")
+  app.add_option(
+         "--background-warrant-percent", options.background_warrant_percent_,
+         "Maximum rolling worker CPU share guaranteed to background tasks")
       ->capture_default_str()
       ->check(CLI::Range(1U, 100U));
-  app.add_option("--spdk-max-completions-per-poll",
-                 options.spdk_max_completions_per_poll_,
-                 "Maximum SPDK completions processed per worker poll (0 = unlimited)")
+  app.add_option(
+         "--spdk-max-completions-per-poll",
+         options.spdk_max_completions_per_poll_,
+         "Maximum SPDK completions processed per worker poll (0 = unlimited)")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
   app.add_option("--spdk-foreground-pre-poll-us",
@@ -144,8 +143,7 @@ int main(int argc, char** argv) {
                  "Asynchronous cooldown after each relocated block")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
-  app.add_option("--defrag-record-sleep-us",
-                 options.defrag_record_sleep_us_,
+  app.add_option("--defrag-record-sleep-us", options.defrag_record_sleep_us_,
                  "Asynchronous pause after each record examined by defrag")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
@@ -159,17 +157,6 @@ int main(int argc, char** argv) {
                  "Largest key retained complete in the in-memory index")
       ->check(CLI::Range(std::size_t{1}, keylane::storage::MaxInlineKeyBytes()))
       ->capture_default_str();
-  app.add_option("--replication-port",
-                 options.replication_options_.listen_port_,
-                 "Internal replication listen port (0 disables receiver)")
-      ->capture_default_str()
-      ->check(CLI::NonNegativeNumber);
-  app.add_option("--replicate-to", replicate_to,
-                 "Static replica endpoint as IPv4:port");
-  app.add_flag("--replica-read-only",
-               options.replication_options_.replica_read_only_,
-               "Reject mutating Redis commands on this replica");
-
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
@@ -191,23 +178,5 @@ int main(int argc, char** argv) {
       static_cast<std::size_t>(registered_buffer_mb) * kMiB;
   options.flush_size_bytes_ = static_cast<std::size_t>(flush_size_kb) * kKiB;
   options.verify_read_crc_ = !disable_read_crc;
-  if (!replicate_to.empty()) {
-    const std::size_t separator = replicate_to.rfind(':');
-    unsigned parsed_port = 0;
-    if (separator == std::string::npos || separator == 0 ||
-        separator + 1 == replicate_to.size()) {
-      return 2;
-    }
-    const char* begin = replicate_to.data() + separator + 1;
-    const char* end = replicate_to.data() + replicate_to.size();
-    auto [parsed_end, error] = std::from_chars(begin, end, parsed_port);
-    if (error != std::errc{} || parsed_end != end || parsed_port == 0 ||
-        parsed_port > std::numeric_limits<std::uint16_t>::max()) {
-      return 2;
-    }
-    options.replication_options_.target_ip_ = replicate_to.substr(0, separator);
-    options.replication_options_.target_port_ =
-        static_cast<std::uint16_t>(parsed_port);
-  }
   return keylane::RunServer(std::move(options));
 }
