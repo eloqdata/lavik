@@ -1055,11 +1055,51 @@ Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
 
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
 constexpr std::uint64_t kDbGateCountMask = ~kDbGateClosed;
-std::array<std::atomic<std::uint64_t>, storage::kLogicalDatabaseCount>
+struct alignas(64) DbWorkerGate {
+  std::atomic<std::uint64_t> state_{0};
+};
+
+static_assert(alignof(DbWorkerGate) == 64);
+static_assert(sizeof(DbWorkerGate) == 64);
+
+std::array<std::array<DbWorkerGate, storage::kLogicalStorageShards>,
+           storage::kLogicalDatabaseCount>
     g_db_gates{};
 
+unsigned DbGateWorkerCount() noexcept {
+  constexpr unsigned kMaxDbGateWorkers = storage::kLogicalStorageShards;
+  if (g_storage != nullptr) {
+    return std::max(1U, std::min(g_storage->worker_count(),
+                                  kMaxDbGateWorkers));
+  }
+  return std::max(1U, std::min(g_server_threads, kMaxDbGateWorkers));
+}
+
+DbWorkerGate& LocalDbGate(std::uint8_t db_id) noexcept {
+  const unsigned worker = ThisWorker().id_;
+  assert(worker < DbGateWorkerCount());
+  assert(worker < storage::kLogicalStorageShards);
+  return g_db_gates[db_id][worker];
+}
+
+void OpenDbGateWorker(std::uint8_t db_id, unsigned worker) noexcept {
+  g_db_gates[db_id][worker].state_.fetch_and(~kDbGateClosed,
+                                             std::memory_order_acq_rel);
+}
+
+bool DbGateHasActiveOperations(std::uint8_t db_id) noexcept {
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    if ((g_db_gates[db_id][worker].state_.load(std::memory_order_acquire) &
+         kDbGateCountMask) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
-  auto& gate = g_db_gates[db_id];
+  auto& gate = LocalDbGate(db_id).state_;
   std::uint64_t state = gate.load(std::memory_order_acquire);
   while ((state & kDbGateClosed) == 0) {
     if (gate.compare_exchange_weak(state, state + 1, std::memory_order_acq_rel,
@@ -1071,20 +1111,32 @@ bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
 }
 
 void EndDbOperation(std::uint8_t db_id) noexcept {
-  g_db_gates[db_id].fetch_sub(1, std::memory_order_acq_rel);
+  LocalDbGate(db_id).state_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 bool CloseDbGate(std::uint8_t db_id) noexcept {
-  auto& gate = g_db_gates[db_id];
-  std::uint64_t expected = gate.load(std::memory_order_acquire);
-  while ((expected & kDbGateClosed) == 0) {
-    if (gate.compare_exchange_weak(expected, expected | kDbGateClosed,
-                                   std::memory_order_acq_rel,
-                                   std::memory_order_acquire)) {
-      return true;
+  std::array<unsigned, storage::kLogicalStorageShards> closed{};
+  std::size_t closed_count = 0;
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    auto& gate = g_db_gates[db_id][worker].state_;
+    std::uint64_t expected = gate.load(std::memory_order_acquire);
+    while ((expected & kDbGateClosed) == 0) {
+      if (gate.compare_exchange_weak(expected, expected | kDbGateClosed,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+        closed[closed_count++] = worker;
+        break;
+      }
+    }
+    if ((expected & kDbGateClosed) != 0) {
+      for (std::size_t i = 0; i < closed_count; ++i) {
+        OpenDbGateWorker(db_id, closed[i]);
+      }
+      return false;
     }
   }
-  return false;
+  return true;
 }
 
 void OpenDbGate(std::uint8_t db_id) noexcept {
@@ -1092,7 +1144,10 @@ void OpenDbGate(std::uint8_t db_id) noexcept {
   // zero anyway; on an early exit (today only worker shutdown) in-flight
   // operations still hold their counts, and zeroing those would let their
   // EndDbOperation underflow the gate into a permanently-closed value.
-  g_db_gates[db_id].fetch_and(~kDbGateClosed, std::memory_order_acq_rel);
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    OpenDbGateWorker(db_id, worker);
+  }
 }
 
 class DbOperationGuard {
@@ -1215,8 +1270,7 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     }
 
     for (const std::uint8_t db_id : dbs) {
-      while ((g_db_gates[db_id].load(std::memory_order_acquire) &
-              kDbGateCountMask) != 0) {
+      while (DbGateHasActiveOperations(db_id)) {
         absl::Status waited = co_await celer::SleepFor(
             *ThisWorker().self_, std::chrono::milliseconds(1));
         if (!waited.ok()) {
@@ -1562,8 +1616,7 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   state->now_ms_ = RedisUnixTimeMillis();
   // Drain in-flight commands, then freeze expiration writes: from here to the
   // end of the stream the keyspace cannot change, so the counted N is exact.
-  while ((g_db_gates[db].load(std::memory_order_acquire) & kDbGateCountMask) !=
-         0) {
+  while (DbGateHasActiveOperations(db)) {
     absl::Status waited = co_await celer::SleepFor(
         *ThisWorker().self_, std::chrono::milliseconds(1));
     if (!waited.ok()) {
