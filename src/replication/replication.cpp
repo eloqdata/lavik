@@ -448,6 +448,28 @@ std::string NewReplicationId() {
   return result;
 }
 
+bool IsReplicationId(std::string_view value) {
+  return value.size() == 40 &&
+         std::all_of(value.begin(), value.end(), [](unsigned char digit) {
+           return (digit >= '0' && digit <= '9') ||
+                  (digit >= 'a' && digit <= 'f');
+         });
+}
+
+std::string PeerHost(int fd) {
+  sockaddr_storage address{};
+  socklen_t size = sizeof(address);
+  if (::getpeername(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+    return {};
+  }
+  char host[NI_MAXHOST]{};
+  if (::getnameinfo(reinterpret_cast<const sockaddr*>(&address), size, host,
+                    sizeof(host), nullptr, 0, NI_NUMERICHOST) != 0) {
+    return {};
+  }
+  return host;
+}
+
 class SocketSet {
  public:
   bool Add(int fd) {
@@ -587,8 +609,14 @@ class ReplicationConnectionMetricGuard {
 };
 
 struct MasterSession {
-  MasterSession(std::uint64_t id, unsigned worker_count)
-      : id_(id), flow_fds_(worker_count, -1), flows_(worker_count) {}
+  MasterSession(std::uint64_t id, unsigned worker_count, std::string node_id,
+                std::string host, std::uint16_t port)
+      : id_(id),
+        node_id_(std::move(node_id)),
+        host_(std::move(host)),
+        port_(port),
+        flow_fds_(worker_count, -1),
+        flows_(worker_count) {}
 
   bool SetControl(int fd) {
     std::lock_guard lock(mutex_);
@@ -705,9 +733,26 @@ struct MasterSession {
     return static_cast<unsigned>(flow_fds_.size());
   }
 
+  std::uint64_t min_lsn() const noexcept {
+    std::uint64_t result = std::numeric_limits<std::uint64_t>::max();
+    for (const ReplicaFlowProgress& flow : flows_) {
+      result = std::min(result, flow.lsn_.load(std::memory_order_acquire));
+    }
+    return result == std::numeric_limits<std::uint64_t>::max() ? 0 : result;
+  }
+
+  void MarkOnline() noexcept {
+    online_.store(true, std::memory_order_release);
+  }
+
+  bool online() const noexcept {
+    return online_.load(std::memory_order_acquire) && !cancelled();
+  }
+
   void Cancel() {
     std::lock_guard lock(mutex_);
     if (cancelled_.exchange(true, std::memory_order_acq_rel)) return;
+    online_.store(false, std::memory_order_release);
     if (control_fd_ >= 0) ::shutdown(control_fd_, SHUT_RDWR);
     for (int fd : flow_fds_) {
       if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
@@ -719,6 +764,9 @@ struct MasterSession {
   }
 
   std::uint64_t id_ = 0;
+  const std::string node_id_;
+  const std::string host_;
+  const std::uint16_t port_ = 0;
 
  private:
   mutable std::mutex mutex_;
@@ -726,6 +774,7 @@ struct MasterSession {
   std::vector<int> flow_fds_;
   std::vector<ReplicaFlowProgress> flows_;
   std::atomic<unsigned> connected_flows_{0};
+  std::atomic<bool> online_{false};
   std::atomic<bool> cancelled_{false};
 };
 
@@ -734,11 +783,13 @@ struct MasterSession {
 class ReplicationManager::Impl {
  public:
   Impl(storage::StorageEngine* storage,
-       std::optional<ReplicaOfConfig> initial_upstream)
+       std::optional<ReplicaOfConfig> initial_upstream,
+       std::uint16_t listen_port)
       : storage_(storage),
         upstream_(std::move(initial_upstream)),
         cursor_state_(std::make_shared<ReplicaCursorState>(storage->worker_count())),
-        replid_(NewReplicationId()) {
+        replid_(NewReplicationId()),
+        listen_port_(listen_port) {
     if (upstream_.has_value()) {
       role_.store(ReplicationRole::kConnecting, std::memory_order_relaxed);
       generation_.store(1, std::memory_order_relaxed);
@@ -773,6 +824,7 @@ class ReplicationManager::Impl {
       cancelled = std::move(active_replica_session_);
       replica_session_id_ = 0;
       source_worker_count_ = 0;
+      upstream_replid_.reset();
       generation_.fetch_add(1, std::memory_order_acq_rel);
       role_.store(upstream_.has_value() ? ReplicationRole::kConnecting
                                         : ReplicationRole::kMaster,
@@ -787,14 +839,42 @@ class ReplicationManager::Impl {
     ReplicationStatus result;
     result.role_ = role_.load(std::memory_order_acquire);
     result.generation_ = generation_.load(std::memory_order_acquire);
-    std::lock_guard lock(state_mutex_);
-    result.upstream_ = upstream_;
-    result.session_id_ = replica_session_id_;
-    result.source_worker_count_ = source_worker_count_;
-    if (active_replica_session_ != nullptr) {
-      result.connected_flows_ = active_replica_session_->connected_flows_.load(
-          std::memory_order_acquire);
+    result.local_node_id_ = replid_;
+    {
+      std::lock_guard lock(state_mutex_);
+      result.upstream_ = upstream_;
+      result.upstream_node_id_ = upstream_replid_;
+      result.session_id_ = replica_session_id_;
+      result.source_worker_count_ = source_worker_count_;
+      if (active_replica_session_ != nullptr) {
+        result.connected_flows_ =
+            active_replica_session_->connected_flows_.load(
+                std::memory_order_acquire);
+      }
     }
+    {
+      std::lock_guard lock(master_mutex_);
+      result.downstream_replicas_.reserve(master_sessions_.size());
+      for (const auto& [session_id, session] : master_sessions_) {
+        (void)session_id;
+        if (session->node_id_.empty() || session->host_.empty() ||
+            session->port_ == 0 || session->cancelled()) {
+          continue;
+        }
+        result.downstream_replicas_.push_back(DownstreamReplicaStatus{
+            .node_id_ = session->node_id_,
+            .host_ = session->host_,
+            .port_ = session->port_,
+            .online_ = session->online(),
+            .min_lsn_ = session->min_lsn(),
+        });
+      }
+    }
+    std::sort(result.downstream_replicas_.begin(),
+              result.downstream_replicas_.end(),
+              [](const auto& left, const auto& right) {
+                return left.node_id_ < right.node_id_;
+              });
     return result;
   }
 
@@ -943,8 +1023,12 @@ class ReplicationManager::Impl {
         ReplicationConnectionKind::kControl);
 
     role_.store(ReplicationRole::kHandshake, std::memory_order_release);
+    // Protocol version and argument count remain 1 and 3. Older sources ignore
+    // the third token, while newer sources decode the optional identity after
+    // '?', which keeps rolling upgrades compatible in both directions.
     const std::vector<std::string> sync_args{
-        "KLPSYNC", std::string(kProtocolVersion), "?"};
+        "KLPSYNC", std::string(kProtocolVersion),
+        absl::StrCat("?", replid_, ":", listen_port_)};
     absl::Status sent =
         co_await WriteText(control, EncodeRespCommand(sync_args));
     if (!sent.ok()) {
@@ -994,6 +1078,7 @@ class ReplicationManager::Impl {
       cursor_state_ = next_cursors;
       session->cursors_ = std::move(next_cursors);
       if (active_replica_session_ == session) {
+        upstream_replid_ = std::string(words[2]);
         replica_session_id_ = session_id;
         source_worker_count_ = source_workers;
       }
@@ -1616,10 +1701,32 @@ class ReplicationManager::Impl {
     if (args.size() != 3 || args[1] != kProtocolVersion) {
       co_return absl::InvalidArgumentError("invalid KLPSYNC handshake");
     }
+    std::string replica_node_id;
+    std::uint16_t replica_port = 0;
+    std::string replica_host;
+    if (args[2] != "?") {
+      const std::string_view identity = args[2];
+      constexpr std::size_t kNodeIdEnd = 1 + 40;
+      if (identity.size() <= kNodeIdEnd + 1 || identity.front() != '?' ||
+          identity[kNodeIdEnd] != ':' ||
+          !IsReplicationId(identity.substr(1, 40)) ||
+          !ParseUnsigned(identity.substr(kNodeIdEnd + 1), &replica_port) ||
+          replica_port == 0) {
+        co_return absl::InvalidArgumentError(
+            "invalid KLPSYNC replica identity");
+      }
+      replica_node_id = std::string(identity.substr(1, 40));
+      replica_host = PeerHost(stream.NativeFd());
+      if (replica_host.empty()) {
+        co_return absl::InternalError(
+            "failed to identify KLPSYNC replica endpoint");
+      }
+    }
     const std::uint64_t session_id =
         next_master_session_id_.fetch_add(1, std::memory_order_relaxed);
-    auto session =
-        std::make_shared<MasterSession>(session_id, storage_->worker_count());
+    auto session = std::make_shared<MasterSession>(
+        session_id, storage_->worker_count(), std::move(replica_node_id),
+        std::move(replica_host), replica_port);
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       absl::Status enabled = co_await celer::SubmitTaskTo(
           worker, [this, session_id]() -> Task<absl::Status> {
@@ -1682,6 +1789,7 @@ class ReplicationManager::Impl {
       RemoveMasterSession(session);
       co_return sent;
     }
+    session->MarkOnline();
     spdlog::info("accepted replication session {} with {} data flows",
                  session_id, session->worker_count());
     absl::Status waited = co_await WaitForClose(stream);
@@ -1765,11 +1873,13 @@ class ReplicationManager::Impl {
   bool ready_waiter_started_ = false;  // worker 0 only
   bool coordinator_started_ = false;   // worker 0 only
   std::shared_ptr<ReplicaCursorState> cursor_state_;
+  std::optional<std::string> upstream_replid_;
   std::atomic<bool> replication_fault_drop_used_{false};
 
   const std::string replid_;
+  const std::uint16_t listen_port_;
   std::atomic<std::uint64_t> next_master_session_id_{1};
-  std::mutex master_mutex_;
+  mutable std::mutex master_mutex_;
   std::unordered_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
 };
@@ -1777,7 +1887,8 @@ class ReplicationManager::Impl {
 ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
-    : impl_(std::make_unique<Impl>(storage, std::move(initial_upstream))),
+    : impl_(std::make_unique<Impl>(storage, std::move(initial_upstream),
+                                  options.listen_port_)),
       options_(options) {}
 
 ReplicationManager::~ReplicationManager() = default;

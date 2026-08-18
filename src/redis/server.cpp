@@ -769,12 +769,13 @@ int RunServer(ServerOptions options) {
     CleanupShutdownSignalHandler();
     return 1;
   }
+  options.replication_options_.listen_port_ = options.port_;
   ReplicationManager replication(&storage,
                                  std::move(options.replication_options_),
                                  std::move(options.replicaof_));
   InitStorage(&storage, &replication);
   InitWorkerMetrics(options.thread_count_);
-  SetServerInfo(options.port_, options.thread_count_);
+  SetServerInfo(options.bind_ip_, options.port_, options.thread_count_);
   tx::TxRuntime::Create(options.thread_count_);
 
   celer::ServerOptions runtime_options;

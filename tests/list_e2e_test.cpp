@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -22,6 +23,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/command_table.h"
 #include "keylane/storage/format.h"
 
 namespace {
@@ -341,9 +343,12 @@ ParsedRespValue ParseEncodedResp(std::string_view input, std::size_t* offset) {
   const char type = input[*offset];
   const std::string_view body =
       input.substr(*offset + 1, line_end - *offset - 1);
-  *offset = line_end == input.size() ? line_end : line_end + 2;
   ParsedRespValue result;
   if (type == '$') {
+    if (line_end == input.size()) {
+      throw std::runtime_error("RESP bulk string lacks payload separator");
+    }
+    *offset = line_end + 2;
     std::size_t length = 0;
     const auto parsed =
         std::from_chars(body.data(), body.data() + body.size(), length);
@@ -357,6 +362,9 @@ ParsedRespValue ParseEncodedResp(std::string_view input, std::size_t* offset) {
   }
   if (type != '*') {
     result.scalar_.assign(body);
+    // Scalar replies have no bytes after their value in RespClient's encoded
+    // representation. Leave the inter-element CRLF for the parent array.
+    *offset = line_end;
     return result;
   }
   std::size_t count = 0;
@@ -365,6 +373,14 @@ ParsedRespValue ParseEncodedResp(std::string_view input, std::size_t* offset) {
   if (parsed.ec != std::errc{} || parsed.ptr != body.data() + body.size()) {
     throw std::runtime_error("malformed encoded RESP array");
   }
+  if (count == 0) {
+    *offset = line_end;
+    return result;
+  }
+  if (line_end == input.size()) {
+    throw std::runtime_error("RESP array lacks element separator");
+  }
+  *offset = line_end + 2;
   result.elements_.reserve(count);
   for (std::size_t i = 0; i < count; ++i) {
     result.elements_.push_back(ParseEncodedResp(input, offset));
@@ -532,6 +548,11 @@ class ServerProcess {
 
 std::string Bulk(std::string_view value) {
   return "$" + std::to_string(value.size()) + "\r\n" + std::string(value);
+}
+
+std::string Moved(std::string_view key, std::uint16_t master_port) {
+  return "-MOVED " + std::to_string(keylane::storage::RedisSlot(key)) +
+         " 127.0.0.1:" + std::to_string(master_port);
 }
 
 std::string BulkArray(const std::vector<std::string_view>& values) {
@@ -1357,6 +1378,103 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
             std::string::npos);
   EXPECT_NE(replication_info.find("keylane_connected_flows:3"),
             std::string::npos);
+  EXPECT_NE(replication_info.find("role:slave"), std::string::npos);
+  EXPECT_NE(replication_info.find("slave_read_only:1"), std::string::npos);
+  EXPECT_NE(replication_info.find("master_replid:"), std::string::npos);
+  const std::string source_replication =
+      source_client.Command({"INFO", "replication"});
+  EXPECT_NE(source_replication.find("role:master"), std::string::npos);
+  EXPECT_NE(source_replication.find("connected_slaves:1"), std::string::npos);
+  EXPECT_NE(source_replication.find("port=" + std::to_string(replica_port)),
+            std::string::npos);
+  EXPECT_NE(source_replication.find("state=online"), std::string::npos);
+  const std::string source_nodes =
+      source_client.Command({"CLUSTER", "NODES"});
+  EXPECT_NE(source_nodes.find("myself,master"), std::string::npos);
+  EXPECT_NE(source_nodes.find(" slave "), std::string::npos);
+  EXPECT_NE(source_nodes.find(":" + std::to_string(replica_port) + "@0"),
+            std::string::npos);
+  const std::string source_slots =
+      source_client.Command({"CLUSTER", "SLOTS"});
+  std::size_t source_slots_offset = 0;
+  const ParsedRespValue parsed_source_slots =
+      ParseEncodedResp(source_slots, &source_slots_offset);
+  ASSERT_EQ(source_slots_offset, source_slots.size());
+  ASSERT_EQ(parsed_source_slots.elements_.size(), 1);
+  const ParsedRespValue& source_slot = parsed_source_slots.elements_.front();
+  ASSERT_EQ(source_slot.elements_.size(), 4);
+  EXPECT_EQ(source_slot.elements_[0].scalar_, "0");
+  EXPECT_EQ(source_slot.elements_[1].scalar_, "16383");
+  ASSERT_EQ(source_slot.elements_[2].elements_.size(), 3);
+  EXPECT_EQ(source_slot.elements_[2].elements_[0].scalar_, "127.0.0.1");
+  EXPECT_EQ(source_slot.elements_[2].elements_[1].scalar_,
+            std::to_string(source_port));
+  EXPECT_EQ(source_slot.elements_[2].elements_[2].scalar_.size(), 40);
+  ASSERT_EQ(source_slot.elements_[3].elements_.size(), 3);
+  EXPECT_EQ(source_slot.elements_[3].elements_[0].scalar_, "127.0.0.1");
+  EXPECT_EQ(source_slot.elements_[3].elements_[1].scalar_,
+            std::to_string(replica_port));
+  EXPECT_EQ(source_slot.elements_[3].elements_[2].scalar_.size(), 40);
+  EXPECT_EQ(source_client.Command({"COMMAND", "COUNT"}),
+            ":" + std::to_string(keylane::CommandSpecs().size()));
+  EXPECT_EQ(source_client.Command({"COMMAND", "GETKEYS", "SET",
+                                   "command-key", "value"}),
+            "*1\r\n$11\r\ncommand-key");
+  const std::string command_metadata = source_client.Command({"COMMAND"});
+  std::size_t command_metadata_offset = 0;
+  const ParsedRespValue parsed_command_metadata =
+      ParseEncodedResp(command_metadata, &command_metadata_offset);
+  ASSERT_EQ(command_metadata_offset, command_metadata.size());
+  EXPECT_EQ(parsed_command_metadata.elements_.size(),
+            keylane::CommandSpecs().size());
+  EXPECT_TRUE(std::any_of(
+      parsed_command_metadata.elements_.begin(),
+      parsed_command_metadata.elements_.end(), [](const ParsedRespValue& value) {
+        return !value.elements_.empty() && value.elements_[0].scalar_ == "set";
+      }));
+  const std::string replica_nodes =
+      replica_client.Command({"CLUSTER", "NODES"});
+  EXPECT_NE(replica_nodes.find(" master - "), std::string::npos);
+  EXPECT_NE(replica_nodes.find("myself,slave"), std::string::npos);
+  EXPECT_NE(replica_nodes.find(":" + std::to_string(source_port) + "@0"),
+            std::string::npos);
+  const std::string replica_slots =
+      replica_client.Command({"CLUSTER", "SLOTS"});
+  std::size_t replica_slots_offset = 0;
+  const ParsedRespValue parsed_replica_slots =
+      ParseEncodedResp(replica_slots, &replica_slots_offset);
+  ASSERT_EQ(replica_slots_offset, replica_slots.size());
+  ASSERT_EQ(parsed_replica_slots.elements_.size(), 1);
+  const ParsedRespValue& replica_slot = parsed_replica_slots.elements_.front();
+  ASSERT_EQ(replica_slot.elements_.size(), 4);
+  EXPECT_EQ(replica_slot.elements_[0].scalar_, "0");
+  EXPECT_EQ(replica_slot.elements_[1].scalar_, "16383");
+  ASSERT_EQ(replica_slot.elements_[2].elements_.size(), 3);
+  EXPECT_EQ(replica_slot.elements_[2].elements_[0].scalar_, "127.0.0.1");
+  EXPECT_EQ(replica_slot.elements_[2].elements_[1].scalar_,
+            std::to_string(source_port));
+  ASSERT_EQ(replica_slot.elements_[3].elements_.size(), 3);
+  EXPECT_EQ(replica_slot.elements_[3].elements_[0].scalar_, "127.0.0.1");
+  EXPECT_EQ(replica_slot.elements_[3].elements_[1].scalar_,
+            std::to_string(replica_port));
+  {
+    RespClient default_replica_client(replica_port);
+    EXPECT_EQ(default_replica_client.Command(
+                  {"GET", "replicated-before{mvp}"}),
+              Moved("replicated-before{mvp}", source_port));
+    EXPECT_EQ(default_replica_client.Command({"READONLY"}), "+OK");
+    EXPECT_EQ(default_replica_client.Command(
+                  {"GET", "replicated-before{mvp}"}),
+              Bulk("snapshot"));
+    // READONLY is connection-local and must not affect replica_client.
+    EXPECT_EQ(replica_client.Command({"GET", "replicated-before{mvp}"}),
+              Moved("replicated-before{mvp}", source_port));
+    EXPECT_EQ(default_replica_client.Command({"READWRITE"}), "+OK");
+    EXPECT_EQ(default_replica_client.Command(
+                  {"GET", "replicated-before{mvp}"}),
+              Moved("replicated-before{mvp}", source_port));
+  }
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
   // ONLINE is a completed full-sync barrier, not merely an indication that
   // every data socket connected. Snapshot state must already be visible.
   EXPECT_EQ(replica_client.Command({"GET", "replicated-before{mvp}"}),
@@ -1377,14 +1495,18 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_NE(
       replica_client.Command({"INFO", "clients"}).find("connected_clients:1"),
       std::string::npos);
-  EXPECT_TRUE(replica_client.Command({"SET", "blocked", "value"})
-                  .starts_with("-READONLY"));
+  EXPECT_EQ(replica_client.Command({"SET", "blocked", "value"}),
+            Moved("blocked", source_port));
 
   ASSERT_EQ(replica_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
   replication_info = replica_client.Command({"INFO", "replication"});
   EXPECT_NE(replication_info.find("role:master"), std::string::npos);
   EXPECT_NE(replication_info.find("keylane_replication_state:master"),
             std::string::npos);
+  const std::string promoted_nodes =
+      replica_client.Command({"CLUSTER", "NODES"});
+  EXPECT_NE(promoted_nodes.find("myself,master"), std::string::npos);
+  EXPECT_EQ(promoted_nodes.find("myself,slave"), std::string::npos);
   EXPECT_EQ(replica_client.Command({"SET", "writable", "again"}), "+OK");
   EXPECT_EQ(source_client.Command({"PING"}), "+PONG");
   replica.Stop();
@@ -1468,6 +1590,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
                       {}, {}, {}, first_conf);
   RespClient source_client(source_port);
   RespClient first_client(first_port);
+  ASSERT_EQ(first_client.Command({"READONLY"}), "+OK");
   const auto online_deadline = std::chrono::steady_clock::now() + 600s;
   std::string first_info;
   do {
@@ -1496,6 +1619,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ServerProcess second(g_keylane_binary, second_port, second_data, second_log,
                         2);
   RespClient second_client(second_port);
+  ASSERT_EQ(second_client.Command({"READONLY"}), "+OK");
   ASSERT_EQ(second_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
             "+OK");
@@ -1510,6 +1634,20 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < second_online_deadline);
   ASSERT_NE(second_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  const std::string source_replication =
+      source_client.Command({"INFO", "replication"});
+  EXPECT_NE(source_replication.find("connected_slaves:2"), std::string::npos);
+  EXPECT_NE(source_replication.find("port=" + std::to_string(first_port)),
+            std::string::npos);
+  EXPECT_NE(source_replication.find("port=" + std::to_string(second_port)),
+            std::string::npos);
+  const std::string source_nodes =
+      source_client.Command({"CLUSTER", "NODES"});
+  EXPECT_NE(source_nodes.find("myself,master"), std::string::npos);
+  EXPECT_NE(source_nodes.find(":" + std::to_string(first_port) + "@0"),
+            std::string::npos);
+  EXPECT_NE(source_nodes.find(":" + std::to_string(second_port) + "@0"),
             std::string::npos);
   EXPECT_EQ(second_client.Command({"GET", "startup"}), Bulk("ready"));
   for (int i = 0; i < 200; ++i) {

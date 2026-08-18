@@ -57,6 +57,7 @@ ReplicationManager* g_replication = nullptr;
 bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
+std::string g_server_bind_ip = "127.0.0.1";
 std::chrono::steady_clock::time_point g_server_start;
 
 constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
@@ -321,6 +322,228 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
         reply_builder.AppendError(absl::StrCat("ERR ", configured.message())));
   }
   co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+}
+
+std::string ClusterNodeAddress(std::string_view host, std::uint16_t port) {
+  if (host.find(':') != std::string_view::npos &&
+      !(host.starts_with('[') && host.ends_with(']'))) {
+    return absl::StrCat("[", host, "]:", port, "@0");
+  }
+  return absl::StrCat(host, ":", port, "@0");
+}
+
+std::string_view ClusterSlotsHost(std::string_view host) {
+  // A wildcard bind address is not a routable endpoint. Redis clients treat an
+  // empty primary host as "use the address of the startup node".
+  return host == "0.0.0.0" || host == "::" ? std::string_view{} : host;
+}
+
+void AppendClusterSlotsNode(ReplyBuilder& reply_builder, std::string_view host,
+                            std::uint16_t port, std::string_view node_id) {
+  reply_builder.AppendArrayHeader(3);
+  reply_builder.AppendBulkString(host);
+  reply_builder.AppendInteger(port);
+  reply_builder.AppendBulkString(node_id);
+}
+
+CommandReply BuildClusterSlotsReply(const ReplicationStatus& replication,
+                                    ReplyBuilder& reply_builder) {
+  constexpr long long kFirstClusterSlot = 0;
+  constexpr long long kLastClusterSlot = 16383;
+
+  if (replication.role_ == ReplicationRole::kMaster) {
+    std::size_t online_replicas = 0;
+    for (const DownstreamReplicaStatus& replica :
+         replication.downstream_replicas_) {
+      online_replicas += replica.online_ ? 1 : 0;
+    }
+    reply_builder.AppendArrayHeader(1);
+    reply_builder.AppendArrayHeader(3 + online_replicas);
+    reply_builder.AppendInteger(kFirstClusterSlot);
+    reply_builder.AppendInteger(kLastClusterSlot);
+    AppendClusterSlotsNode(reply_builder, ClusterSlotsHost(g_server_bind_ip),
+                           g_server_port, replication.local_node_id_);
+    for (const DownstreamReplicaStatus& replica :
+         replication.downstream_replicas_) {
+      if (!replica.online_) continue;
+      AppendClusterSlotsNode(reply_builder, replica.host_, replica.port_,
+                             replica.node_id_);
+    }
+    return BuiltReply(reply_builder.View());
+  }
+
+  if (!replication.upstream_.has_value()) {
+    return BuiltReply(reply_builder.AppendArrayHeader(0));
+  }
+
+  const bool advertise_local_replica =
+      replication.role_ == ReplicationRole::kOnline &&
+      g_server_bind_ip != "0.0.0.0" && g_server_bind_ip != "::";
+  reply_builder.AppendArrayHeader(1);
+  reply_builder.AppendArrayHeader(advertise_local_replica ? 4 : 3);
+  reply_builder.AppendInteger(kFirstClusterSlot);
+  reply_builder.AppendInteger(kLastClusterSlot);
+  AppendClusterSlotsNode(
+      reply_builder, replication.upstream_->host_,
+      replication.upstream_->port_,
+      replication.upstream_node_id_.value_or(std::string{}));
+  if (advertise_local_replica) {
+    AppendClusterSlotsNode(reply_builder, g_server_bind_ip, g_server_port,
+                           replication.local_node_id_);
+  }
+  return BuiltReply(reply_builder.View());
+}
+
+std::optional<std::string> ReplicaMovedError(
+    const ConnectionContext& ctx, const CommandRequest& request) {
+  if (g_replication == nullptr || !g_replication->is_replica() ||
+      request.spec_ == nullptr ||
+      (request.spec_->flags_ & kCmdNoKeys) != 0) {
+    return std::nullopt;
+  }
+  const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
+  if (!write && ctx.cluster_readonly_) {
+    return std::nullopt;
+  }
+  absl::StatusOr<KeyIndexView> keys =
+      DetermineKeys(*request.spec_, request.args_);
+  if (!keys.ok() || keys->empty()) {
+    return std::nullopt;
+  }
+  const ReplicationStatus replication = g_replication->status();
+  if (!replication.upstream_.has_value()) {
+    return std::nullopt;
+  }
+  const std::uint16_t slot =
+      storage::RedisSlot(request.args_[keys->first_]);
+  return absl::StrCat("MOVED ", slot, " ", replication.upstream_->host_, ":",
+                      replication.upstream_->port_);
+}
+
+Task<CommandReply> ExecuteCluster(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
+  if (request.args_.size() != 2) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR wrong number of arguments for 'cluster' command"));
+  }
+  const ReplicationStatus replication =
+      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
+  if (CmpCaseInsensitive(request.args_[1], "SLOTS")) {
+    co_return BuildClusterSlotsReply(replication, reply_builder);
+  }
+  if (!CmpCaseInsensitive(request.args_[1], "NODES")) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR only CLUSTER NODES and CLUSTER SLOTS are supported"));
+  }
+  std::string nodes;
+  const std::string local_address =
+      ClusterNodeAddress(g_server_bind_ip, g_server_port);
+  if (replication.role_ == ReplicationRole::kMaster) {
+    nodes += replication.local_node_id_ + " " + local_address +
+             " myself,master - 0 0 1 connected 0-16383\n";
+    for (const DownstreamReplicaStatus& replica :
+         replication.downstream_replicas_) {
+      nodes += replica.node_id_ + " " +
+               ClusterNodeAddress(replica.host_, replica.port_) + " slave " +
+               replication.local_node_id_ + " 0 0 1 " +
+               (replica.online_ ? "connected\n" : "disconnected\n");
+    }
+  } else {
+    const std::string master_id =
+        replication.upstream_node_id_.value_or("-");
+    if (replication.upstream_.has_value() &&
+        replication.upstream_node_id_.has_value()) {
+      nodes += *replication.upstream_node_id_ + " " +
+               ClusterNodeAddress(replication.upstream_->host_,
+                                  replication.upstream_->port_) +
+               " master - 0 0 1 " +
+               (replication.role_ == ReplicationRole::kOnline
+                    ? "connected 0-16383\n"
+                    : "disconnected 0-16383\n");
+    }
+    nodes += replication.local_node_id_ + " " + local_address +
+             " myself,slave " + master_id + " 0 0 1 " +
+             (replication.role_ == ReplicationRole::kOnline ? "connected\n"
+                                                             : "disconnected\n");
+  }
+  co_return BuiltReply(reply_builder.AppendBulkString(nodes));
+}
+
+void AppendCommandFlags(ReplyBuilder& reply_builder,
+                        const CommandSpec& command) {
+  std::uint64_t count = 0;
+  count += (command.flags_ & kCmdWrite) != 0 ? 1 : 0;
+  count += (command.flags_ & kCmdReadOnly) != 0 ? 1 : 0;
+  count += (command.flags_ & kCmdMovableKeys) != 0 ? 1 : 0;
+  count += (command.flags_ & kCmdMayBlock) != 0 ? 1 : 0;
+  reply_builder.AppendArrayHeader(count);
+  if ((command.flags_ & kCmdWrite) != 0) {
+    reply_builder.AppendBulkString("write");
+  }
+  if ((command.flags_ & kCmdReadOnly) != 0) {
+    reply_builder.AppendBulkString("readonly");
+  }
+  if ((command.flags_ & kCmdMovableKeys) != 0) {
+    reply_builder.AppendBulkString("movablekeys");
+  }
+  if ((command.flags_ & kCmdMayBlock) != 0) {
+    reply_builder.AppendBulkString("blocking");
+  }
+}
+
+CommandReply BuildCommandMetadataReply(ReplyBuilder& reply_builder) {
+  const std::span<const CommandSpec> commands = CommandSpecs();
+  reply_builder.AppendArrayHeader(commands.size());
+  for (const CommandSpec& command : commands) {
+    reply_builder.AppendArrayHeader(7);
+    reply_builder.AppendBulkString(command.name_);
+    const bool fixed_arity = command.max_args_ == command.min_args_;
+    const long long arity = fixed_arity
+                                ? static_cast<long long>(command.min_args_)
+                                : -static_cast<long long>(command.min_args_);
+    reply_builder.AppendInteger(arity);
+    AppendCommandFlags(reply_builder, command);
+    reply_builder.AppendInteger(command.first_key_);
+    reply_builder.AppendInteger(command.last_key_);
+    reply_builder.AppendInteger(command.key_step_);
+    reply_builder.AppendArrayHeader(0);  // ACL categories
+  }
+  return BuiltReply(reply_builder.View());
+}
+
+Task<CommandReply> ExecuteCommandIntrospection(const CommandRequest& request,
+                                               ReplyBuilder& reply_builder) {
+  if (request.args_.size() == 1) {
+    co_return BuildCommandMetadataReply(reply_builder);
+  }
+  if (CmpCaseInsensitive(request.args_[1], "COUNT") &&
+      request.args_.size() == 2) {
+    co_return BuiltReply(reply_builder.AppendInteger(CommandSpecs().size()));
+  }
+  if (CmpCaseInsensitive(request.args_[1], "GETKEYS") &&
+      request.args_.size() >= 3) {
+    const std::span<const std::string> command_args(request.args_.data() + 2,
+                                                    request.args_.size() - 2);
+    const CommandSpec* command = FindCommand(command_args.front());
+    if (command == nullptr) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR Invalid arguments specified for command"));
+    }
+    absl::StatusOr<KeyIndexView> keys = DetermineKeys(*command, command_args);
+    if (!keys.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR Invalid arguments specified for command"));
+    }
+    reply_builder.AppendArrayHeader(keys->count());
+    for (std::uint16_t index = keys->first_; !keys->empty() && index <= keys->last_;
+         index = static_cast<std::uint16_t>(index + keys->step_)) {
+      reply_builder.AppendBulkString(command_args[index]);
+      if (keys->last_ - index < keys->step_) break;
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+  co_return BuiltReply(reply_builder.AppendError(
+      "ERR unknown subcommand or wrong number of arguments for 'command'"));
 }
 
 Task<CommandReply> ExecuteDbSize(const CommandRequest& request,
@@ -1994,6 +2217,25 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::string(ReplicationRoleName(replication.role_)) + "\r\n";
     info += "keylane_replication_generation:" +
             std::to_string(replication.generation_) + "\r\n";
+    info += "master_replid:" +
+            (replication.upstream_node_id_.has_value()
+                 ? *replication.upstream_node_id_
+                 : replication.local_node_id_) +
+            "\r\n";
+    if (replication.role_ == ReplicationRole::kMaster) {
+      info += "connected_slaves:" +
+              std::to_string(replication.downstream_replicas_.size()) +
+              "\r\n";
+      for (std::size_t index = 0;
+           index < replication.downstream_replicas_.size(); ++index) {
+        const DownstreamReplicaStatus& replica =
+            replication.downstream_replicas_[index];
+        info += "slave" + std::to_string(index) + ":ip=" + replica.host_ +
+                ",port=" + std::to_string(replica.port_) + ",state=" +
+                (replica.online_ ? "online" : "sync") + ",offset=" +
+                std::to_string(replica.min_lsn_) + ",lag=0\r\n";
+      }
+    }
     if (replication.upstream_.has_value()) {
       info += "master_host:" + replication.upstream_->host_ + "\r\n";
       info += "master_port:" + std::to_string(replication.upstream_->port_) +
@@ -2006,6 +2248,14 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
               std::to_string(replication.source_worker_count_) + "\r\n";
       info += "keylane_connected_flows:" +
               std::to_string(replication.connected_flows_) + "\r\n";
+      info += std::string("slave_read_only:") +
+              (g_replication != nullptr &&
+                       g_replication->replica_read_only()
+                   ? "1\r\n"
+                   : "0\r\n");
+      info += std::string("master_sync_in_progress:") +
+              (replication.role_ == ReplicationRole::kOnline ? "0\r\n"
+                                                              : "1\r\n");
     }
     info += "\r\n";
   }
@@ -4704,7 +4954,9 @@ void InitStorage(storage::StorageEngine* engine, ReplicationManager* replication
   g_replica_read_only = replication != nullptr && replication->is_replica();
 }
 
-void SetServerInfo(std::uint16_t port, unsigned thread_count) {
+void SetServerInfo(std::string bind_ip, std::uint16_t port,
+                   unsigned thread_count) {
+  g_server_bind_ip = std::move(bind_ip);
   g_server_port = port;
   g_server_threads = thread_count;
   g_server_start = std::chrono::steady_clock::now();
@@ -4728,6 +4980,11 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           reply_builder.AppendError("ERR wrong number of arguments for '" +
                                     std::string(spec.name_) + "' command"));
     }
+  }
+  if (std::optional<std::string> moved = ReplicaMovedError(ctx, request);
+      moved.has_value()) {
+    if (ctx.in_multi_) ctx.multi_dirty_ = true;
+    co_return BuiltReply(reply_builder.AppendError(*moved));
   }
   if (ctx.in_multi_) {
     switch (kind) {
@@ -4815,6 +5072,12 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     case CommandKind::kUnwatch:
       co_await DropWatches(ctx);
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+    case CommandKind::kReadOnly:
+      ctx.cluster_readonly_ = true;
+      co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+    case CommandKind::kReadWrite:
+      ctx.cluster_readonly_ = false;
+      co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     default:
       break;
   }
@@ -4884,6 +5147,12 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
 
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request, reply_builder);
+
+    case CommandKind::kCluster:
+      co_return co_await ExecuteCluster(request, reply_builder);
+
+    case CommandKind::kCommand:
+      co_return co_await ExecuteCommandIntrospection(request, reply_builder);
 
     case CommandKind::kKeys:
       co_return co_await ExecuteKeys(request, reply_builder);

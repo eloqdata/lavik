@@ -48,6 +48,9 @@ struct CommandSpec {
 // Case-insensitive lookup; nullptr when the command is unknown.
 const CommandSpec* FindCommand(std::string_view name);
 
+// Complete canonical command metadata, used by Redis-compatible COMMAND.
+std::span<const CommandSpec> CommandSpecs() noexcept;
+
 // Canonical lowercase spelling for metrics and diagnostics. Every supported
 // CommandKind is checked against the table at compile time.
 std::string_view CommandCanonicalName(CommandKind kind) noexcept;

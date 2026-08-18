@@ -33,6 +33,9 @@ struct ReplicationOptions {
   // Consulted only while this node has an upstream. REPLICAOF NO ONE makes
   // the node writable immediately.
   bool replica_read_only_ = true;
+  // Advertised to the source during the version-1 control handshake so INFO
+  // and CLUSTER NODES can identify the replica's Redis endpoint.
+  std::uint16_t listen_port_ = 6379;
 };
 
 enum class ReplicationRole : std::uint8_t {
@@ -42,6 +45,14 @@ enum class ReplicationRole : std::uint8_t {
   kOnline,
 };
 
+struct DownstreamReplicaStatus {
+  std::string node_id_;
+  std::string host_;
+  std::uint16_t port_ = 0;
+  bool online_ = false;
+  std::uint64_t min_lsn_ = 0;
+};
+
 struct ReplicationStatus {
   ReplicationRole role_ = ReplicationRole::kMaster;
   std::optional<ReplicaOfConfig> upstream_;
@@ -49,6 +60,9 @@ struct ReplicationStatus {
   std::uint64_t session_id_ = 0;
   unsigned source_worker_count_ = 0;
   unsigned connected_flows_ = 0;
+  std::string local_node_id_;
+  std::optional<std::string> upstream_node_id_;
+  std::vector<DownstreamReplicaStatus> downstream_replicas_;
 };
 
 // Owns replication role and connection lifetime. Replica connections are

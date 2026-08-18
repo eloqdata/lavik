@@ -199,6 +199,10 @@ enum class CommandKind {
   kUnwatch,
   kReplicaOf,
   kInfo,
+  kCluster,
+  kCommand,
+  kReadOnly,
+  kReadWrite,
   kKeys,
   kTombRaider,
   kDefrag,
@@ -267,7 +271,8 @@ void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication = nullptr);
 
 // Static facts INFO reports. Call once before the server starts.
-void SetServerInfo(std::uint16_t port, unsigned thread_count);
+void SetServerInfo(std::string bind_ip, std::uint16_t port,
+                   unsigned thread_count);
 
 // Connection accounting for INFO's Clients section.
 void ConnectionOpened() noexcept;

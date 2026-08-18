@@ -246,6 +246,14 @@ constexpr CommandSpec kCommandTable[] = {
     {"replicaof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
+    {"cluster", CommandKind::kCluster, 2, 2, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
+    {"command", CommandKind::kCommand, 1, 0, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
+    {"readonly", CommandKind::kReadOnly, 1, 1, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
+    {"readwrite", CommandKind::kReadWrite, 1, 1, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"keys", CommandKind::kKeys, 2, 2, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"tombraider", CommandKind::kTombRaider, 2, 3, 0, 0, 1,
@@ -296,6 +304,8 @@ const CommandSpec* FindCommand(std::string_view name) {
   }
   return nullptr;
 }
+
+std::span<const CommandSpec> CommandSpecs() noexcept { return kCommandTable; }
 
 std::string_view CommandCanonicalName(CommandKind kind) noexcept {
   for (const CommandSpec& spec : kCommandTable) {
