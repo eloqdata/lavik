@@ -13,6 +13,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
+option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
 option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
 
 set(KEYLANE_ASAN_BUILD OFF)
@@ -146,6 +147,7 @@ target_precompile_headers(keylane_module PRIVATE
 target_compile_features(keylane_module PUBLIC cxx_std_23)
 target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_READ_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_READ_LATENCY_TRACE}>
+  KEYLANE_ENABLE_SET_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_SET_LATENCY_TRACE}>
 )
 target_link_libraries(keylane_module PUBLIC
   celer::core

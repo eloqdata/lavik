@@ -161,6 +161,20 @@ absl::Status ApplyRedisConfigDirective(
     options->replication_options_.replica_read_only_ = *read_only;
     return absl::OkStatus();
   }
+  if (name == "replication-publish-queue-mb") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    std::size_t megabytes = 0;
+    absl::Status parsed =
+        ParseUnsigned(directive[1], name, &megabytes, false);
+    if (!parsed.ok()) return parsed;
+    constexpr std::size_t kMiB = 1024 * 1024;
+    if (megabytes > std::numeric_limits<std::size_t>::max() / kMiB) {
+      return absl::OutOfRangeError(
+          "replication publish queue size is too large");
+    }
+    options->replication_publish_queue_bytes_ = megabytes * kMiB;
+    return absl::OkStatus();
+  }
   return absl::InvalidArgumentError(
       absl::StrCat("unsupported configuration directive '", name, "'"));
 }

@@ -113,8 +113,9 @@ void StorageEngine::EndPartitionReplication(std::uint16_t partition_id) {
 
 Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-    std::size_t count) {
-  return impl_->SnapshotPartition(partition_id, db_id, cursor, count);
+    std::size_t count, std::size_t read_concurrency) {
+  return impl_->SnapshotPartition(partition_id, db_id, cursor, count,
+                                  read_concurrency);
 }
 
 PartitionDeltaBatch StorageEngine::ReadPartitionDeltas(
@@ -200,8 +201,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Set(
     std::uint8_t db_id, std::string_view key, std::string_view value,
-    SetOptions options, ReplicationCommandAppend* replication) {
-  return impl_->Set(db_id, key, value, options, replication);
+    SetOptions options, ReplicationCommandAppend* replication,
+    SetLatencyTrace* trace) {
+  return impl_->Set(db_id, key, value, options, replication, trace);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
@@ -268,8 +270,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
 Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::string_view value, SetOptions options, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
-  return impl_->SetLocked(db_id, key, digest, value, options, tx, replication);
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace) {
+  return impl_->SetLocked(db_id, key, digest, value, options, tx, replication,
+                          trace);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPushLocked(

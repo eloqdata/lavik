@@ -628,6 +628,257 @@ bool ParseUint64(std::string_view text, std::uint64_t* value) {
   return error == std::errc{} && parsed_end == end;
 }
 
+constexpr std::string_view kSnapshotReadConcurrencyConfig =
+    "replication-snapshot-read-concurrency";
+constexpr std::string_view kDefragPausedConfig = "defrag-paused";
+constexpr std::string_view kDefragMaxActiveConfig =
+    "defrag-max-active-per-device";
+constexpr std::string_view kDefragSleepConfig = "defrag-sleep-ms";
+constexpr std::string_view kDefragRecordSleepConfig =
+    "defrag-record-sleep-us";
+constexpr std::string_view kTombRaiderModeConfig = "tomb-raider-mode";
+constexpr std::string_view kTombRaiderIntervalConfig =
+    "tomb-raider-interval-ms";
+constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
+constexpr std::string_view kTombRaiderDailyTimeConfig =
+    "tomb-raider-daily-time";
+
+enum class RuntimeConfigKey : std::uint8_t {
+  kSnapshotReadConcurrency,
+  kDefragPaused,
+  kDefragMaxActive,
+  kDefragSleep,
+  kDefragRecordSleep,
+  kTombRaiderMode,
+  kTombRaiderInterval,
+  kTombRaiderSleep,
+  kTombRaiderDailyTime,
+};
+
+struct RuntimeConfigDescriptor {
+  std::string_view name_;
+  RuntimeConfigKey key_;
+};
+
+// CONFIG command metadata only. Execution paths never consult this table;
+// replication, defrag, and tomb-raider load their owning atomics directly.
+constexpr std::array kRuntimeConfigs{
+    RuntimeConfigDescriptor{kSnapshotReadConcurrencyConfig,
+                            RuntimeConfigKey::kSnapshotReadConcurrency},
+    RuntimeConfigDescriptor{kDefragPausedConfig,
+                            RuntimeConfigKey::kDefragPaused},
+    RuntimeConfigDescriptor{kDefragMaxActiveConfig,
+                            RuntimeConfigKey::kDefragMaxActive},
+    RuntimeConfigDescriptor{kDefragSleepConfig,
+                            RuntimeConfigKey::kDefragSleep},
+    RuntimeConfigDescriptor{kDefragRecordSleepConfig,
+                            RuntimeConfigKey::kDefragRecordSleep},
+    RuntimeConfigDescriptor{kTombRaiderModeConfig,
+                            RuntimeConfigKey::kTombRaiderMode},
+    RuntimeConfigDescriptor{kTombRaiderIntervalConfig,
+                            RuntimeConfigKey::kTombRaiderInterval},
+    RuntimeConfigDescriptor{kTombRaiderSleepConfig,
+                            RuntimeConfigKey::kTombRaiderSleep},
+    RuntimeConfigDescriptor{kTombRaiderDailyTimeConfig,
+                            RuntimeConfigKey::kTombRaiderDailyTime},
+};
+
+absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
+std::string FormatDailySecond(std::uint32_t daily_second);
+std::string_view TombRaiderModeName(storage::TombRaiderMode mode);
+
+std::optional<bool> ParseConfigYesNo(std::string_view value) {
+  if (CmpCaseInsensitive(value, "yes")) return true;
+  if (CmpCaseInsensitive(value, "no")) return false;
+  return std::nullopt;
+}
+
+std::string NormalizeConfigPattern(std::string_view pattern) {
+  std::string lower(pattern);
+  for (char& value : lower) {
+    if (value >= 'A' && value <= 'Z') value += 'a' - 'A';
+  }
+  return lower;
+}
+
+Task<CommandReply> ExecuteConfig(const CommandRequest& request,
+                                 ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  if (CmpCaseInsensitive(args[1], "GET") && args.size() == 3) {
+    const std::string pattern = NormalizeConfigPattern(args[2]);
+    std::vector<const RuntimeConfigDescriptor*> matches;
+    matches.reserve(kRuntimeConfigs.size());
+    for (const RuntimeConfigDescriptor& config : kRuntimeConfigs) {
+      if (config.key_ == RuntimeConfigKey::kSnapshotReadConcurrency &&
+          g_replication == nullptr) {
+        continue;
+      }
+      if (RedisGlobMatch(pattern, config.name_)) {
+        matches.push_back(&config);
+      }
+    }
+    std::optional<storage::DefragTotals> defrag;
+    std::optional<storage::TombRaiderTotals> tomb_raider;
+    auto value_of = [&](RuntimeConfigKey key) -> std::string {
+      switch (key) {
+        case RuntimeConfigKey::kSnapshotReadConcurrency:
+          return std::to_string(g_replication->snapshot_read_concurrency());
+        case RuntimeConfigKey::kDefragPaused:
+        case RuntimeConfigKey::kDefragMaxActive:
+        case RuntimeConfigKey::kDefragSleep:
+        case RuntimeConfigKey::kDefragRecordSleep:
+          if (!defrag.has_value()) defrag.emplace(g_storage->DefragStats());
+          if (key == RuntimeConfigKey::kDefragPaused)
+            return defrag->paused_ ? "yes" : "no";
+          if (key == RuntimeConfigKey::kDefragMaxActive)
+            return std::to_string(defrag->max_active_per_device_);
+          if (key == RuntimeConfigKey::kDefragSleep)
+            return std::to_string(defrag->block_sleep_ms_);
+          return std::to_string(defrag->record_sleep_us_);
+        case RuntimeConfigKey::kTombRaiderMode:
+        case RuntimeConfigKey::kTombRaiderInterval:
+        case RuntimeConfigKey::kTombRaiderSleep:
+        case RuntimeConfigKey::kTombRaiderDailyTime:
+          if (!tomb_raider.has_value())
+            tomb_raider.emplace(g_storage->TombRaiderStats());
+          if (key == RuntimeConfigKey::kTombRaiderMode)
+            return std::string(TombRaiderModeName(tomb_raider->mode_));
+          if (key == RuntimeConfigKey::kTombRaiderInterval)
+            return std::to_string(tomb_raider->interval_ms_);
+          if (key == RuntimeConfigKey::kTombRaiderSleep)
+            return std::to_string(tomb_raider->block_sleep_ms_);
+          return FormatDailySecond(tomb_raider->daily_second_);
+      }
+      return {};
+    };
+    reply_builder.AppendArrayHeader(matches.size() * 2);
+    for (const RuntimeConfigDescriptor* config : matches) {
+      reply_builder.AppendBulkString(config->name_);
+      reply_builder.AppendBulkString(value_of(config->key_));
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+  if (CmpCaseInsensitive(args[1], "SET") && args.size() == 4) {
+    const RuntimeConfigDescriptor* config = nullptr;
+    for (const RuntimeConfigDescriptor& candidate : kRuntimeConfigs) {
+      if (CmpCaseInsensitive(args[2], candidate.name_)) {
+        config = &candidate;
+        break;
+      }
+    }
+    if (config == nullptr) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR Unsupported CONFIG parameter: ", args[2])));
+    }
+    absl::Status configured;
+    std::uint64_t value = 0;
+    if (config->key_ == RuntimeConfigKey::kSnapshotReadConcurrency) {
+      if (g_replication == nullptr) {
+        configured = absl::FailedPreconditionError(
+            "replication backend is unavailable");
+      } else if (!ParseUint64(args[3], &value) ||
+                 value > std::numeric_limits<unsigned>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = g_replication->SetSnapshotReadConcurrency(
+            static_cast<unsigned>(value));
+      }
+    } else if (config->key_ == RuntimeConfigKey::kDefragPaused) {
+      const std::optional<bool> paused = ParseConfigYesNo(args[3]);
+      if (!paused.has_value()) {
+        configured = absl::InvalidArgumentError("value must be 'yes' or 'no'");
+      } else {
+        configured = co_await g_storage->ConfigureDefrag(storage::DefragConfigUpdate{
+            .action_ = *paused ? storage::DefragConfigAction::kPause
+                               : storage::DefragConfigAction::kResume});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kDefragMaxActive) {
+      if (!ParseUint64(args[3], &value)) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await g_storage->ConfigureDefrag(
+            storage::DefragConfigUpdate{
+                .action_ = storage::DefragConfigAction::kMaxActivePerDevice,
+                .value_ = value});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kDefragSleep ||
+               config->key_ == RuntimeConfigKey::kDefragRecordSleep) {
+      if (!ParseUint64(args[3], &value) ||
+          value > std::numeric_limits<std::uint32_t>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await g_storage->ConfigureDefrag(
+            storage::DefragConfigUpdate{
+                .action_ = config->key_ == RuntimeConfigKey::kDefragSleep
+                               ? storage::DefragConfigAction::kBlockSleep
+                               : storage::DefragConfigAction::kRecordSleep,
+                .value_ = value});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTombRaiderInterval) {
+      if (!ParseUint64(args[3], &value)) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await g_storage->ConfigureTombRaider(
+            storage::TombRaiderConfigUpdate{
+                .action_ = value == 0
+                               ? storage::TombRaiderConfigAction::kOff
+                               : storage::TombRaiderConfigAction::kInterval,
+                .value_ = value});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTombRaiderSleep) {
+      if (!ParseUint64(args[3], &value) ||
+          value > std::numeric_limits<std::uint32_t>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await g_storage->ConfigureTombRaider(
+            storage::TombRaiderConfigUpdate{
+                .action_ = storage::TombRaiderConfigAction::kBlockSleep,
+                .value_ = value});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTombRaiderDailyTime) {
+      auto daily_second = ParseDailySecond(args[3]);
+      if (!daily_second.ok()) {
+        configured = daily_second.status();
+      } else {
+        configured = co_await g_storage->ConfigureTombRaider(
+            storage::TombRaiderConfigUpdate{
+                .action_ = storage::TombRaiderConfigAction::kDaily,
+                .value_ = *daily_second});
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTombRaiderMode) {
+      storage::TombRaiderConfigUpdate update;
+      const storage::TombRaiderTotals current = g_storage->TombRaiderStats();
+      if (CmpCaseInsensitive(args[3], "off")) {
+        update.action_ = storage::TombRaiderConfigAction::kOff;
+      } else if (CmpCaseInsensitive(args[3], "on")) {
+        update.action_ = storage::TombRaiderConfigAction::kOn;
+      } else if (CmpCaseInsensitive(args[3], "interval")) {
+        update.action_ = storage::TombRaiderConfigAction::kInterval;
+        update.value_ = current.interval_ms_;
+      } else if (CmpCaseInsensitive(args[3], "daily")) {
+        update.action_ = storage::TombRaiderConfigAction::kDaily;
+        update.value_ = current.daily_second_;
+      } else {
+        configured = absl::InvalidArgumentError(
+            "value must be 'off', 'on', 'interval', or 'daily'");
+      }
+      if (configured.ok()) {
+        configured = co_await g_storage->ConfigureTombRaider(update);
+      }
+    }
+    co_return configured.ok()
+                  ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+                  : BuiltReply(reply_builder.AppendError(
+                        absl::StrCat("ERR ", configured.message())));
+  }
+  co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+}
+
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text) {
   std::array<std::uint64_t, 3> parts{};
   std::size_t count = 0;
@@ -1789,7 +2040,8 @@ long long ExpirationReplySeconds(std::uint64_t milliseconds) {
 
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
-    ReadLatencyTrace* read_trace = nullptr) {
+    ReadLatencyTrace* read_trace = nullptr,
+    SetLatencyTrace* set_trace = nullptr) {
   CommandReply reply;
   const auto& args = request.args_;
   switch (request.kind_) {
@@ -1837,9 +2089,12 @@ Task<CommandReply> ExecuteStorageCommand(
         replication.emplace();
         replication->args_ = {"SET", args[1], args[2]};
       }
+      if (set_trace != nullptr) {
+        set_trace->replication_ = replication.has_value();
+      }
       auto result = co_await g_storage->Set(
           request.db_id_, args[1], args[2], *options,
-          replication ? &*replication : nullptr);
+          replication ? &*replication : nullptr, set_trace);
       if (!result.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, result.status());
         co_return reply;
@@ -5145,6 +5400,9 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kReplicaOf:
       co_return co_await ExecuteReplicaOf(request, reply_builder);
 
+    case CommandKind::kConfig:
+      co_return co_await ExecuteConfig(request, reply_builder);
+
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request, reply_builder);
 
@@ -5397,6 +5655,33 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
           }
           trace.origin_resume_ns_ = ReadTraceNowNanos();
           reply.read_trace_ = trace;
+          co_return reply;
+        }
+#endif
+#if KEYLANE_ENABLE_SET_LATENCY_TRACE
+        if (request.kind_ == CommandKind::kSet) {
+          SetLatencyTrace trace;
+          trace.request_start_ns_ = SetTraceNowNanos();
+          trace.remote_ = target != ThisWorker().id_;
+          CommandReply reply;
+          if (trace.remote_) {
+            reply = co_await SubmitTaskTo(
+                target,
+                [&request, &reply_builder, &trace]() -> Task<CommandReply> {
+                  trace.owner_start_ns_ = SetTraceNowNanos();
+                  CommandReply result = co_await ExecuteStorageCommand(
+                      request, reply_builder, nullptr, &trace);
+                  trace.owner_done_ns_ = SetTraceNowNanos();
+                  co_return result;
+                });
+          } else {
+            trace.owner_start_ns_ = trace.request_start_ns_;
+            reply = co_await ExecuteStorageCommand(request, reply_builder,
+                                                   nullptr, &trace);
+            trace.owner_done_ns_ = SetTraceNowNanos();
+          }
+          trace.origin_resume_ns_ = SetTraceNowNanos();
+          reply.set_trace_ = trace;
           co_return reply;
         }
 #endif

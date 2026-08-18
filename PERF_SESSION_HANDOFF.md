@@ -1,6 +1,185 @@
 # Keylane Performance Session Handoff
 
-Updated: 2026-08-11 UTC
+Updated: 2026-08-18 UTC
+
+## 2026-08-18 replication throughput and IRQ session
+
+This session ran from uncommitted changes on Keylane `main` at
+`fcb06253ef54`. The source and replica use separate Microsoft NVMe Direct
+Disks through SPDK: the source is `spdk://43bc:00:00.0/1` on port 6379 and the
+replica is `spdk://58bf:00:00.0/1` on port 6380. Only the first 8 MiB of each
+device was zeroed between clean runs.
+
+The original live-replication path allowed only one unacknowledged command per
+flow. At about 120k 2-KiB SET/s it fell below the 64-MiB on-disk backlog floor
+after roughly eight seconds, disconnected all flows, and required another full
+sync. The optimized path now:
+
+- pipelines up to 128 frames or 2 MiB per source flow before reading ordered
+  per-command ACKs;
+- sends each batch with io_uring `sendmsg` and iovecs, referencing replication
+  frame payloads directly instead of copying them into a combined string;
+- stores all 18-byte wire headers in one contiguous allocation per batch;
+- combines the header and payload of non-backlog data frames into one send;
+- retains the existing per-command ACK wire protocol and acknowledged cursor,
+  including batches that end in the middle of a fragmented command.
+
+The celer submodule has an uncommitted vectored `TcpStream::WriteAllV` path and
+the earlier multishot-recv pause/drain handoff fix. The replication publisher
+staging queue is configurable through
+`--replication-publish-queue-mb`; these tests used 64 MiB per worker. The
+default remains 8 MiB. Increasing that queue fixed publisher staging
+invalidation but did not by itself prevent a sustained consumer from falling
+below the on-disk backlog floor.
+
+With 8 source cores and 8 replica cores, the optimized path sustained a warm
+10-second unlimited run at 222,064 SET/s (about 434 MiB/s), with 0.360 ms
+average, 2.655 ms p99, and 4.991 ms p99.9. Source and replica were immediately
+equal and all flows remained online; neither log contained backlog, overflow,
+or disconnect warnings. A 30-second pre-iovec coalesced-send run also sustained
+219,547 SET/s without lag, proving that the 64-MiB queue was not hiding a slow
+consumer.
+
+The final runtime layout is 6+6+4 on the 16-vCPU server:
+
+- source Keylane: CPUs 0-5, `--threads=6`;
+- replica Keylane: CPUs 6-11, `--threads=6`;
+- mlx5 IRQs 58-74: CPUs 12-15, with completion IRQs round-robin;
+- memtier remains remote on 10.0.0.5, pinned to its CPUs 8-15.
+
+At a controlled 120k SET/s, a warm same-process IRQ A/B gave:
+
+    IRQ placement       SET/s       Average     p99        p99.9
+    mixed CPU 0-15      119,938     0.368 ms    2.007 ms   4.223 ms
+    isolated CPU 12-15  119,983     0.313 ms    1.567 ms   3.759 ms
+
+IRQ isolation therefore improved average latency by about 15%, p99 by 22%,
+and p99.9 by 11% in the warm A/B. The four IRQ CPUs were only about 3-7% busy.
+An unlimited 6+6+4 run sustained 219,931 SET/s with 0.363 ms average, 2.271 ms
+p99, and 5.151 ms p99.9, about 1% below the 8+8 peak. The source used nearly
+all six cores while the replica used about 2.8 cores.
+
+### SET latency trace
+
+An independent `KEYLANE_ENABLE_SET_LATENCY_TRACE` CMake option now instruments
+the SET path. It is off by default. The trace reports per-worker 10-second
+distributions for cross-worker routing, key and store locks, lookup, append,
+new-block wait/allocation, encoding, index update, replication publication,
+route-back, and response send. Percentiles are histogram bucket upper bounds,
+and phase percentiles are independent rather than additive.
+
+With tracing enabled, the 120k SET/s run produced 119,966 SET/s, 0.322 ms
+average, 1.639 ms p99, and 3.823 ms p99.9. Across all six workers the internal
+SET p99 was <=1.5 ms. The dominant p99 phase was the origin-to-owner worker
+handoff (`route-out`) at <=0.75-1.0 ms; `route-back` and response send were each
+<=0.3 ms. The actual owner storage path was <=30 us, append <=15 us, and
+replication publication <=1 us. Thus the 120k p99 is scheduler/handoff latency,
+not NVMe append or replication-queue latency.
+
+At unlimited load, the trace build sustained 212,578 SET/s with 0.376 ms
+average, 2.383 ms p99, and 4.031 ms p99.9. Its trace instrumentation overhead
+means this throughput must not be compared directly with the 219,931 SET/s
+non-trace result. Internal p99 was <=2-3 ms: `route-out` rose to <=2 ms while
+the owner path remained <=30-75 us, append <=8-15 us, replication publication
+<=1 us, route-back <=0.3-0.5 ms, and send <=0.5 ms. The same cross-worker
+handoff remains the p99 bottleneck near saturation.
+
+Disconnecting the replica while keeping the same trace-enabled six-worker
+source showed that replication did not qualitatively change the tail shape:
+
+    Load       Replica  p50       p99/p50  p99.9/p50
+    120k/s     yes      0.263 ms     6.23      14.54
+    120k/s     no       0.239 ms     6.46      12.51
+    unlimited  yes      0.295 ms     8.08      13.66
+    unlimited  no       0.263 ms     7.30      13.75
+
+The p99 ratios differ by 3.6% at 120k/s and 10.7% at unlimited load; the p99.9
+ratios differ by 16.2% and 0.6%. Connected replication therefore shifts
+latency and lowers throughput but does not create a new order-of-magnitude
+scheduler tail. The historical fresh-fill result used eight source workers,
+no trace, and sequential append. It is not directly comparable to the current
+six-worker replicated path.
+
+### Replica session cleanup fix
+
+Promoting the replica with `REPLICAOF NO ONE` and attaching it again exposed a
+detached-flow lifetime bug. On a failed full sync the coordinator cancelled
+sockets but waited for flow exit only after an already-online session, and it
+tracked only flows past handshake. Old flow coroutines could still be inside
+storage apply when the replacement session started. Repeated failures left 126
+flow connections and eventually exhausted storage write buffers.
+
+`ReplicaSession` now tracks every detached flow from spawn through connect,
+handshake, storage apply, and teardown. Every failed or closed session shuts
+down its sockets and waits without a retry timeout for `active_flows` to reach
+zero before the coordinator can create another session. The same-process
+promote/reattach path was added to the e2e regression.
+
+After zeroing only the replica device's first 8 MiB, the patched replica
+completed a clean full sync of 27,237,851 keys in about 7.5 minutes. The live
+flow metric stayed exactly six throughout, source and replica ended with the
+same key count, and the patched replica log had no buffer, flow, or connection
+warning. Full-sync throughput was about 60.5k keys/s. Profiling showed the
+source at 575% CPU and the replica at only 44%: snapshot batches contain 16
+keys and load their values serially, leaving only one random NVMe read in
+flight per source worker. The full-sync bottleneck is therefore source-side
+snapshot random-read queue depth, not replica apply or network throughput.
+
+### Configurable full-sync snapshot read concurrency
+
+The source snapshot path now overlaps value reads within each 16-key batch.
+The maximum in-flight reads per source flow is runtime configurable from 1 to
+16 and is sampled again for every batch, so it can be changed during a full
+sync without reconnecting either node:
+
+    CONFIG GET replication-snapshot-read-concurrency
+    CONFIG SET replication-snapshot-read-concurrency 8
+
+The default remains 1. Snapshot read children run in celer's background task
+class, so ordinary client work retains scheduler priority. Their shared key
+locks are explicitly released before the parent snapshot coroutine is woken;
+completed background frames therefore cannot hold up foreground writes while
+waiting for a later cleanup slice. The file-backend replication regression ran
+with concurrency 8 over 32 same-partition snapshot keys, including a
+promote/reattach full sync, and verified every copied value.
+
+The SPDK validation used the same 6+6+4 CPU/IRQ layout, preserved the source
+disk, zeroed only the replica disk's first 8 MiB, and set the source concurrency
+to 8 before attaching the empty replica. Full sync copied 27,991,053 keys in
+157.275 seconds, averaging 177,976 keys/s. This is 2.94x the previous roughly
+60.5k keys/s and reduced the full-sync duration from about 7.5 minutes to 2
+minutes 37 seconds. Source CPU averaged about 543% and replica CPU about 117%
+during the middle of the snapshot. Both nodes ended at 27,991,053 keys with
+six flows online, and neither log contained warnings, errors, overflow, or
+disconnects. Logs are `/tmp/keylane-snapshot-q8-{master,replica}.log`.
+
+One independent recovery anomaly preceded the test: immediately before the
+source restart its live DBSIZE was 27,237,851, while the new process recovered
+27,991,053 keys from the unchanged source disk, an increase of 753,202. This
+happened before the replica was started or any parallel snapshot read ran, so
+it is not caused by the concurrency change, but it requires separate recovery
+correctness investigation.
+
+The same runtime CONFIG table also exposes defrag and tomb-raider controls.
+`CONFIG GET` applies its glob pattern once across the static descriptor table
+and reads only matched values. Supported names are `defrag-paused`,
+`defrag-max-active-per-device`, `defrag-sleep-ms`,
+`defrag-record-sleep-us`, `tomb-raider-mode`,
+`tomb-raider-interval-ms`, `tomb-raider-sleep-ms`, and
+`tomb-raider-daily-time`. For example:
+
+    CONFIG GET defrag-*
+    CONFIG SET defrag-paused yes
+    CONFIG GET tomb-raider-*
+    CONFIG SET tomb-raider-interval-ms 60000
+
+The trace-run logs are
+`/tmp/keylane-fcb0625-settrace-6c-{master,replica}.log`; the clean patched
+replica log is `/tmp/keylane-fcb0625-sessionfix-replica.log`. The final live
+state is 27,237,851 keys on both nodes,
+`keylane_replication_state:online`, and six connected flows. `irqbalance` is
+not installed or active, but the manual IRQ affinity is runtime state and must
+be reapplied after a reboot or NIC driver rebind.
 
 ## Current source state
 

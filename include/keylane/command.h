@@ -11,6 +11,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/read_trace.h"
+#include "keylane/set_trace.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
@@ -198,6 +199,7 @@ enum class CommandKind {
   kWatch,
   kUnwatch,
   kReplicaOf,
+  kConfig,
   kInfo,
   kCluster,
   kCommand,
@@ -248,6 +250,7 @@ struct CommandReply {
   ReplyChunkSource chunks_;  // drained after `encoded` when set
   bool close_connection_ = false;
   ReadLatencyTrace read_trace_;
+  SetLatencyTrace set_trace_;
   std::optional<std::uint8_t> selected_db_;
 };
 

@@ -450,12 +450,18 @@ class ServerProcess {
         ::close(log_fd);
       }
       std::string max_memory = "8589934592";
-      for (std::size_t i = 0; i + 1 < extra_arguments.size(); ++i) {
-        if (extra_arguments[i] != "--max-memory") continue;
-        max_memory = std::move(extra_arguments[i + 1]);
+      std::string recv_buffers = "0";
+      for (std::size_t i = 0; i + 1 < extra_arguments.size();) {
+        if (extra_arguments[i] == "--max-memory") {
+          max_memory = std::move(extra_arguments[i + 1]);
+        } else if (extra_arguments[i] == "--recv-buffers") {
+          recv_buffers = std::move(extra_arguments[i + 1]);
+        } else {
+          ++i;
+          continue;
+        }
         extra_arguments.erase(extra_arguments.begin() + i,
                               extra_arguments.begin() + i + 2);
-        break;
       }
       std::vector<std::string> arguments{
           std::string(binary),
@@ -464,7 +470,7 @@ class ServerProcess {
           "--threads",
           std::to_string(threads),
           "--recv-buffers",
-          "0",
+          std::move(recv_buffers),
           "--max-memory",
           std::move(max_memory),
           "--flush-max-ms",
@@ -1347,14 +1353,32 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   std::uint16_t replica_port = FindFreePort();
   while (replica_port == source_port) replica_port = FindFreePort();
   ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
-                       3);
+                       3, {}, {"--recv-buffers", "1024"});
   ServerProcess replica(g_keylane_binary, replica_port, replica_data,
-                        replica_log, 2);
+                        replica_log, 2, {}, {"--recv-buffers", "1024"});
   RespClient source_client(source_port);
   RespClient replica_client(replica_port);
 
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "replication-snapshot-read-concurrency",
+                 "8"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command(
+                {"CONFIG", "GET", "replication-snapshot-read-concurrency"}),
+            BulkArray({"replication-snapshot-read-concurrency", "8"}));
+  EXPECT_EQ(source_client.Command({"CONFIG", "GET", "defrag-*"}),
+            BulkArray({"defrag-paused", "no",
+                       "defrag-max-active-per-device", "8",
+                       "defrag-sleep-ms", "0",
+                       "defrag-record-sleep-us", "0"}));
   ASSERT_EQ(source_client.Command({"SET", "replicated-before{mvp}", "snapshot"}),
             "+OK");
+  for (unsigned i = 0; i < 32; ++i) {
+    ASSERT_EQ(source_client.Command(
+                  {"SET", "parallel:" + std::to_string(i) + "{snapshot}",
+                   "value:" + std::to_string(i)}),
+              "+OK");
+  }
 
   ASSERT_EQ(replica_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
@@ -1479,6 +1503,11 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   // every data socket connected. Snapshot state must already be visible.
   EXPECT_EQ(replica_client.Command({"GET", "replicated-before{mvp}"}),
             Bulk("snapshot"));
+  for (unsigned i = 0; i < 32; ++i) {
+    EXPECT_EQ(replica_client.Command(
+                  {"GET", "parallel:" + std::to_string(i) + "{snapshot}"}),
+              Bulk("value:" + std::to_string(i)));
+  }
   ASSERT_EQ(source_client.Command({"SET", "replicated-after{mvp}", "delta"}),
             "+OK");
   std::string delta_value;
@@ -1509,6 +1538,29 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(promoted_nodes.find("myself,slave"), std::string::npos);
   EXPECT_EQ(replica_client.Command({"SET", "writable", "again"}), "+OK");
   EXPECT_EQ(source_client.Command({"PING"}), "+PONG");
+
+  // Reusing the same process after promotion must not overlap the replacement
+  // full sync with flow coroutines from the old session. In production that
+  // overlap retained connection metrics and storage buffers across retries.
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto reattach_deadline = std::chrono::steady_clock::now() + 600s;
+  do {
+    replication_info = replica_client.Command({"INFO", "replication"});
+    if (replication_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < reattach_deadline);
+  ASSERT_NE(replication_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  EXPECT_NE(replication_info.find("keylane_connected_flows:3"),
+            std::string::npos);
+  EXPECT_EQ(replica_client.Command({"GET", "replicated-after{mvp}"}),
+            Bulk("delta"));
+  EXPECT_EQ(replica_client.Command({"GET", "writable"}), "$-1");
   replica.Stop();
 
   const std::string config_path = prefix + "-replica.conf";
@@ -1583,11 +1635,11 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   }
 
   ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
-                       2);
+                       2, {}, {"--recv-buffers", "1024"});
   RespClient source_before(source_port);
   ASSERT_EQ(source_before.Command({"SET", "startup", "ready"}), "+OK");
   ServerProcess first(g_keylane_binary, first_port, first_data, first_log, 2,
-                      {}, {}, {}, first_conf);
+                      {}, {"--recv-buffers", "1024"}, {}, first_conf);
   RespClient source_client(source_port);
   RespClient first_client(first_port);
   ASSERT_EQ(first_client.Command({"READONLY"}), "+OK");
@@ -1617,7 +1669,7 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ASSERT_TRUE(wait_value(first_client, "startup", "ready"));
 
   ServerProcess second(g_keylane_binary, second_port, second_data, second_log,
-                        2);
+                        2, {}, {"--recv-buffers", "1024"});
   RespClient second_client(second_port);
   ASSERT_EQ(second_client.Command({"READONLY"}), "+OK");
   ASSERT_EQ(second_client.Command(

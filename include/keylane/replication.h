@@ -38,6 +38,8 @@ struct ReplicationOptions {
   std::uint16_t listen_port_ = 6379;
 };
 
+inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 16;
+
 enum class ReplicationRole : std::uint8_t {
   kMaster,
   kConnecting,
@@ -83,6 +85,12 @@ class ReplicationManager {
   // REPLICAOF NO ONE. Connection establishment continues asynchronously.
   celer::Task<absl::Status> SetUpstream(
       std::optional<ReplicaOfConfig> upstream);
+
+  // Controls the number of snapshot value reads each source flow may keep in
+  // flight during a full sync. The value is sampled for every snapshot batch,
+  // so CONFIG SET takes effect without reconnecting the replica.
+  absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
+  unsigned snapshot_read_concurrency() const noexcept;
 
   // KLPSYNC and KLFLOW arrive as RESP commands on the ordinary Redis port.
   static bool IsNativeHandshake(std::span<const std::string> args) noexcept;

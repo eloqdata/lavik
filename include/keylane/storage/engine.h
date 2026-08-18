@@ -14,6 +14,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/read_trace.h"
+#include "keylane/set_trace.h"
 #include "keylane/storage/buffer_pool.h"
 #include "keylane/storage/format.h"
 
@@ -27,6 +28,9 @@ struct StorageEngineOptions {
   std::vector<std::string> data_files_{"keylane.data"};
   std::uint32_t flush_max_ms_ = 1000;
   std::size_t flush_size_bytes_ = 128 * 1024;
+  // Bounded, per-worker staging memory for commands waiting to enter the
+  // on-disk replication backlog.
+  std::size_t replication_publish_queue_bytes_ = 8ULL * 1024 * 1024;
   bool verify_read_crc_ = true;
   bool expiration_authority_ = true;
   // Keys at or below this size stay complete in the in-memory index. Larger
@@ -554,7 +558,7 @@ class StorageEngine {
   void EndPartitionReplication(std::uint16_t partition_id);
   celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count);
+      std::size_t count, std::size_t read_concurrency = 1);
   PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
                                           std::uint64_t after_sequence,
                                           std::size_t count);
@@ -600,7 +604,8 @@ class StorageEngine {
                                                           std::string_view key);
   celer::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
-      SetOptions options = {}, ReplicationCommandAppend* replication = nullptr);
+      SetOptions options = {}, ReplicationCommandAppend* replication = nullptr,
+      SetLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values);
@@ -648,7 +653,8 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options = {},
       TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      SetLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr);

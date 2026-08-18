@@ -5,10 +5,6 @@ namespace keylane::storage {
 namespace {
 
 constexpr std::size_t kSparseFrameStride = 64;
-// TODO(replication): make this configurable and benchmark the SET/GET impact
-// of different memory-vs-backlog spill thresholds. This is a reserved,
-// per-worker budget, not an unbounded extension of the process cache.
-constexpr std::size_t kReservedReplicationMemoryBytes = 8ULL * 1024 * 1024;
 
 bool CursorBefore(const ReplicationLogCursor& left,
                   const ReplicationLogCursor& right) noexcept {
@@ -60,7 +56,8 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.publish_queue_.clear();
   log.publish_queue_bytes_ = 0;
   log.reserved_memory_bytes_ = std::min(
-      log.max_blocks_ * kStorageBlockBytes, kReservedReplicationMemoryBytes);
+      log.max_blocks_ * kStorageBlockBytes,
+      options_.replication_publish_queue_bytes_);
   log.max_publish_queue_bytes_ = log.reserved_memory_bytes_;
   co_return absl::OkStatus();
 }

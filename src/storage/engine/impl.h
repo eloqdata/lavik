@@ -1009,6 +1009,10 @@ class StorageEngine::Impl {
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
     std::vector<PartitionStore> partitions_;
+    // Serializes replica apply/reset work on this worker across sessions. A
+    // disconnected session may still be suspended in storage IO; a new full
+    // sync must not reset a partition until that stale apply has completed.
+    AsyncMutex replica_apply_mutex_;
     // Full-sync deltas are still an in-memory compatibility layer until they
     // move onto pinned replication-log blocks. Keep the aggregate strictly
     // bounded so a stalled snapshot can never grow the worker without limit.
@@ -1121,13 +1125,15 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
                                       std::string_view value,
                                       SetOptions options,
-                                      ReplicationCommandAppend* replication);
+                                      ReplicationCommandAppend* replication,
+                                      SetLatencyTrace* trace);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options, TxShardWrites* tx = nullptr,
-      ReplicationCommandAppend* replication = nullptr);
+      ReplicationCommandAppend* replication = nullptr,
+      SetLatencyTrace* trace = nullptr);
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
@@ -1364,7 +1370,7 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count);
+      std::size_t count, std::size_t read_concurrency);
 
   PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
                                           std::uint64_t after_sequence,
@@ -1393,7 +1399,8 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
       std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
-      std::uint64_t persisted_replication_epoch = 0);
+      std::uint64_t persisted_replication_epoch = 0,
+      bool replica_lock_held = false);
   Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::span<const ReplicaPartitionReset> resets);
 
@@ -1404,6 +1411,12 @@ class StorageEngine::Impl {
   absl::Status FlushForShutdown();
 
  private:
+  struct SnapshotReadJoin;
+  Task<absl::Status> ReadSnapshotRecord(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      RecordIndex& index, std::uint8_t db_id, const std::string* key,
+      std::optional<SnapshotRecord>* output, SnapshotReadJoin* join);
+
   Task<absl::Status> EnsureReplicationLogActiveBlock(
       WorkerStore& store, std::uint64_t protected_lsn);
   Task<absl::Status> SealReplicationLogActiveBlock(WorkerStore& store);
@@ -1808,7 +1821,8 @@ class StorageEngine::Impl {
       TxShardWrites* tx = nullptr,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
-      std::uint64_t* committed_sequence = nullptr);
+      std::uint64_t* committed_sequence = nullptr,
+      SetLatencyTrace* trace = nullptr);
 
   void AppendDelta(WorkerStore& store,
                    WorkerStore::PartitionStore& partition,
@@ -1831,7 +1845,8 @@ class StorageEngine::Impl {
       std::shared_ptr<const std::vector<ExtentRef>> extents = nullptr,
       RecordLocation* written_location = nullptr,
       const RelocationSource* relocation = nullptr, TxShardWrites* tx = nullptr,
-      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr);
+      std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
+      SetLatencyTrace* trace = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 

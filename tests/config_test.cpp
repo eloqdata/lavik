@@ -69,6 +69,9 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
                   .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"replica-read-only", "no"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"replication-publish-queue-mb", "64"}, &options)
+                  .ok());
 
   EXPECT_EQ(options.bind_ip_, "0.0.0.0");
   EXPECT_EQ(options.port_, 6380);
@@ -77,6 +80,7 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.replicaof_->host_, "redis.internal");
   EXPECT_EQ(options.replicaof_->port_, 6379);
   EXPECT_FALSE(options.replication_options_.replica_read_only_);
+  EXPECT_EQ(options.replication_publish_queue_bytes_, 64ULL * 1024 * 1024);
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
@@ -86,6 +90,9 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
       ApplyRedisConfigDirective({"replicaof", "host", "zero"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"replica-read-only", "maybe"}, &options).ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"replication-publish-queue-mb", "0"}, &options)
+                   .ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
 }
 

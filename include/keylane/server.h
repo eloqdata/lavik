@@ -29,6 +29,7 @@ struct ServerOptions {
   unsigned spdk_foreground_pre_poll_us_ = 5;
   long mimalloc_purge_delay_ms_ = kDefaultMimallocPurgeDelayMs;
   std::size_t registered_buffer_bytes_ = 256ULL * 1024 * 1024;
+  std::size_t replication_publish_queue_bytes_ = 8ULL * 1024 * 1024;
   std::uint64_t max_memory_bytes_ = 0;
   std::size_t inline_key_max_bytes_ = storage::kDefaultInlineKeyBytes;
   std::uint32_t flush_max_ms_ = 1000;

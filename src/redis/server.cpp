@@ -226,6 +226,117 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
 }
 
+struct SetLatencyStats {
+  std::uint64_t count_ = 0;
+  std::uint64_t remote_ = 0;
+  std::uint64_t replication_ = 0;
+  std::uint64_t allocated_blocks_ = 0;
+  std::uint64_t next_report_ns_ = 0;
+  LatencyDistribution total_;
+  LatencyDistribution non_network_;
+  LatencyDistribution route_out_;
+  LatencyDistribution owner_;
+  LatencyDistribution key_lock_;
+  LatencyDistribution store_lock_;
+  LatencyDistribution lookup_;
+  LatencyDistribution append_;
+  LatencyDistribution block_;
+  LatencyDistribution encode_;
+  LatencyDistribution index_;
+  LatencyDistribution replication_publish_;
+  LatencyDistribution route_back_;
+  LatencyDistribution send_;
+};
+
+void RecordSetLatency(const SetLatencyTrace& trace) {
+  static thread_local SetLatencyStats stats;
+  if (trace.request_start_ns_ == 0 || trace.send_complete_ns_ == 0) return;
+  ++stats.count_;
+  stats.remote_ += trace.remote_;
+  stats.replication_ += trace.replication_;
+  stats.allocated_blocks_ += trace.allocated_block_;
+  stats.total_.Add(Elapsed(trace.send_complete_ns_, trace.request_start_ns_));
+  stats.non_network_.Add(
+      Elapsed(trace.send_start_ns_, trace.request_start_ns_));
+  stats.route_out_.Add(Elapsed(trace.owner_start_ns_, trace.request_start_ns_));
+  stats.owner_.Add(Elapsed(trace.owner_done_ns_, trace.owner_start_ns_));
+  stats.key_lock_.Add(
+      Elapsed(trace.key_lock_acquired_ns_, trace.key_lock_start_ns_));
+  stats.store_lock_.Add(
+      Elapsed(trace.store_lock_acquired_ns_, trace.store_lock_start_ns_));
+  stats.lookup_.Add(
+      Elapsed(trace.lookup_done_ns_, trace.store_lock_acquired_ns_));
+  stats.append_.Add(Elapsed(trace.append_done_ns_, trace.append_start_ns_));
+  stats.block_.Add(
+      Elapsed(trace.block_ready_ns_, trace.block_wait_start_ns_));
+  stats.encode_.Add(Elapsed(trace.encode_done_ns_, trace.block_ready_ns_));
+  stats.index_.Add(Elapsed(trace.index_done_ns_, trace.encode_done_ns_));
+  stats.replication_publish_.Add(
+      Elapsed(trace.replication_done_ns_, trace.append_done_ns_));
+  stats.route_back_.Add(
+      Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
+  stats.send_.Add(Elapsed(trace.send_complete_ns_, trace.send_start_ns_));
+
+  const std::uint64_t now = trace.send_complete_ns_;
+  if (stats.next_report_ns_ == 0) {
+    stats.next_report_ns_ =
+        now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
+    return;
+  }
+  if (now < stats.next_report_ns_) return;
+
+  const auto avg = [&](const LatencyDistribution& value) {
+    return value.AverageUs(stats.count_);
+  };
+  const auto percentile = [&](const LatencyDistribution& value,
+                              double requested) {
+    return value.PercentileUpperUs(stats.count_, requested);
+  };
+  spdlog::info(
+      "set-latency worker={} n={} remote={:.1f}% replication={:.1f}% "
+      "block-alloc={:.3f}% avg-us total={:.1f} non-network={:.1f} "
+      "route-out={:.1f} owner={:.1f} key-lock={:.1f} store-lock={:.1f} "
+      "lookup={:.1f} append={:.1f} block={:.1f} encode={:.1f} index={:.1f} "
+      "repl-publish={:.1f} route-back={:.1f} send={:.1f}",
+      ThisWorker().id_, stats.count_,
+      100.0 * static_cast<double>(stats.remote_) / stats.count_,
+      100.0 * static_cast<double>(stats.replication_) / stats.count_,
+      100.0 * static_cast<double>(stats.allocated_blocks_) / stats.count_,
+      avg(stats.total_), avg(stats.non_network_), avg(stats.route_out_),
+      avg(stats.owner_), avg(stats.key_lock_), avg(stats.store_lock_),
+      avg(stats.lookup_), avg(stats.append_), avg(stats.block_),
+      avg(stats.encode_), avg(stats.index_), avg(stats.replication_publish_),
+      avg(stats.route_back_), avg(stats.send_));
+  const auto log_percentile = [&](std::string_view label, double requested) {
+    spdlog::info(
+        "set-latency-{} worker={} n={} total-us<={} non-network-us<={} "
+        "route-out-us<={} owner-us<={} key-lock-us<={} store-lock-us<={} "
+        "lookup-us<={} append-us<={} block-us<={} encode-us<={} "
+        "index-us<={} repl-publish-us<={} route-back-us<={} send-us<={}",
+        label, ThisWorker().id_, stats.count_,
+        percentile(stats.total_, requested),
+        percentile(stats.non_network_, requested),
+        percentile(stats.route_out_, requested),
+        percentile(stats.owner_, requested),
+        percentile(stats.key_lock_, requested),
+        percentile(stats.store_lock_, requested),
+        percentile(stats.lookup_, requested),
+        percentile(stats.append_, requested),
+        percentile(stats.block_, requested),
+        percentile(stats.encode_, requested),
+        percentile(stats.index_, requested),
+        percentile(stats.replication_publish_, requested),
+        percentile(stats.route_back_, requested),
+        percentile(stats.send_, requested));
+  };
+  log_percentile("p99", 0.99);
+  log_percentile("p99.9", 0.999);
+  log_percentile("p99.99", 0.9999);
+  stats = SetLatencyStats{};
+  stats.next_report_ns_ =
+      now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
+}
+
 std::atomic<bool> g_shutdown_requested = false;
 volatile sig_atomic_t g_last_shutdown_signal = 0;
 int g_signal_event_fd = -1;
@@ -640,6 +751,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (reply.read_trace_.request_start_ns_ != 0) {
       reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
     }
+    if (reply.set_trace_.request_start_ns_ != 0) {
+      reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
+    }
     if (reply.disk_value_.has_value()) {
       write_status =
           co_await stream.WriteAll(reply.disk_value_->network_bytes());
@@ -682,6 +796,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       reply.read_trace_.send_complete_ns_ = ReadTraceNowNanos();
       RecordReadLatency(reply.read_trace_);
     }
+    if (reply.set_trace_.request_start_ns_ != 0) {
+      reply.set_trace_.send_complete_ns_ = SetTraceNowNanos();
+      RecordSetLatency(reply.set_trace_);
+    }
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
     }
@@ -709,7 +827,9 @@ int RunServer(ServerOptions options) {
       "busy_poll_us={} background_budget_us={} "
       "background_warrant_percent={} "
       "spdk_max_completions_per_poll={} spdk_foreground_pre_poll_us={} "
-      "registered_buffer_bytes={} per worker max_memory={} flush_max_ms={} "
+      "registered_buffer_bytes={} per worker "
+      "replication_publish_queue_bytes={} per worker max_memory={} "
+      "flush_max_ms={} "
       "flush_size_bytes={} "
       "inline_key_max_bytes={} verify_read_crc={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
@@ -720,7 +840,8 @@ int RunServer(ServerOptions options) {
       options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
-      options.max_memory_bytes_, options.flush_max_ms_,
+      options.replication_publish_queue_bytes_, options.max_memory_bytes_,
+      options.flush_max_ms_,
       options.flush_size_bytes_, options.inline_key_max_bytes_,
       options.verify_read_crc_, options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
@@ -748,6 +869,8 @@ int RunServer(ServerOptions options) {
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.flush_max_ms_ = options.flush_max_ms_;
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
+  storage_options.replication_publish_queue_bytes_ =
+      options.replication_publish_queue_bytes_;
   storage_options.verify_read_crc_ = options.verify_read_crc_;
   storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
   // A node configured with an upstream must not create local

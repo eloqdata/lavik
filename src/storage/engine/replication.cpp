@@ -2,6 +2,89 @@
 
 namespace keylane::storage {
 
+struct StorageEngine::Impl::SnapshotReadJoin {
+  std::size_t pending_ = 0;
+  std::coroutine_handle<> waiter_;
+  absl::Status error_;
+
+  void Complete(absl::Status status) {
+    if (!status.ok() && error_.ok()) {
+      error_ = std::move(status);
+    }
+    assert(pending_ != 0);
+    if (--pending_ == 0 && waiter_) {
+      const auto waiter = std::exchange(waiter_, {});
+      celer::ThisWorker().self_->Enqueue(waiter);
+    }
+  }
+
+  auto Join() {
+    struct Awaiter {
+      SnapshotReadJoin* join_;
+      bool await_ready() const noexcept { return join_->pending_ == 0; }
+      void await_suspend(std::coroutine_handle<> waiter) const noexcept {
+        join_->waiter_ = waiter;
+      }
+      void await_resume() const noexcept {}
+    };
+    return Awaiter{this};
+  }
+};
+
+Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    RecordIndex& index, std::uint8_t db_id, const std::string* key,
+    std::optional<SnapshotRecord>* output, SnapshotReadJoin* join) {
+  absl::Status status;
+  {
+    const Digest digest = ComputeDigest(*key);
+    auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+    auto resolved = co_await FindVerifiedEntry(store, index, digest, *key);
+    if (!resolved.ok()) {
+      status = resolved.status();
+    } else {
+      auto* current = *resolved;
+      if (current != nullptr && current->value_.kind_ == RecordKind::kValue) {
+        const RecordLocation location = current->value_;
+        if (IsExpired(location, UnixTimeMillis())) {
+          QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
+        } else {
+          auto loaded = co_await LoadValue(store, partition, db_id, *key,
+                                           digest, location,
+                                           ExtentsFor(store, current));
+          if (!loaded.ok()) {
+            if (loaded.status().code() != absl::StatusCode::kNotFound) {
+              status = loaded.status();
+            }
+          } else {
+            const std::span<const std::byte> value = loaded->value();
+            output->emplace(SnapshotRecord{
+                .kind_ = SnapshotRecord::Kind::kValue,
+                .db_id_ = db_id,
+                .db_epoch_ = DbEpoch(db_id),
+                .mutation_sequence_ = location.mutation_sequence_,
+                .expire_at_ms_ = location.expire_at_ms_,
+                .value_type_ = location.value_type_,
+                .logical_size_ = location.logical_size_,
+                .key_ = *key,
+                .value_ = std::string(
+                    reinterpret_cast<const char*>(value.data()),
+                    value.size()),
+            });
+          }
+        }
+      }
+    }
+    // A completed detached background frame may not be destroyed until the
+    // next background scheduler slice. Release the shared key hold before
+    // waking the parent so foreground writes never wait for frame cleanup.
+    key_lock.Reset();
+  }
+  join->Complete(std::move(status));
+  co_return absl::OkStatus();
+}
+
 Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) {
@@ -118,8 +201,10 @@ void StorageEngine::Impl::EndPartitionReplication(
 Task<absl::StatusOr<PartitionSnapshotBatch>>
 StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
                                        std::uint8_t db_id, std::uint64_t cursor,
-                                       std::size_t count) {
-  if (db_id >= kLogicalDatabaseCount || count == 0) {
+                                       std::size_t count,
+                                       std::size_t read_concurrency) {
+  if (db_id >= kLogicalDatabaseCount || count == 0 ||
+      read_concurrency == 0) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid partition snapshot request");
   }
@@ -138,44 +223,26 @@ StorageEngine::Impl::SnapshotPartition(std::uint16_t partition_id,
   PartitionSnapshotBatch batch;
   batch.cursor_ = next;
   batch.records_.reserve(keys.size());
-  for (const std::string& key : keys) {
-    const Digest digest = ComputeDigest(key);
-    auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
+  std::vector<std::optional<SnapshotRecord>> records(keys.size());
+  for (std::size_t first = 0; first < keys.size();) {
+    const std::size_t last =
+        first + std::min(read_concurrency, keys.size() - first);
+    SnapshotReadJoin join;
+    join.pending_ = last - first;
+    for (std::size_t i = first; i < last; ++i) {
+      store.worker_->SpawnBackground(ReadSnapshotRecord(
+          store, partition, index, db_id, &keys[i], &records[i], &join));
     }
-    auto* current = *resolved;
-    if (current == nullptr || current->value_.kind_ != RecordKind::kValue) {
-      continue;
+    co_await join.Join();
+    if (!join.error_.ok()) {
+      co_return join.error_;
     }
-    const RecordLocation location = current->value_;
-    if (IsExpired(location, UnixTimeMillis())) {
-      QueueExpiredCandidate(store, partition.id_, db_id, *current, key);
-      continue;
+    first = last;
+  }
+  for (std::optional<SnapshotRecord>& record : records) {
+    if (record.has_value()) {
+      batch.records_.push_back(std::move(*record));
     }
-    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     location, ExtentsFor(store, current));
-    if (!loaded.ok()) {
-      if (loaded.status().code() == absl::StatusCode::kNotFound) {
-        continue;
-      }
-      co_return loaded.status();
-    }
-    const std::span<const std::byte> value = loaded->value();
-    batch.records_.push_back(SnapshotRecord{
-        .kind_ = SnapshotRecord::Kind::kValue,
-        .db_id_ = db_id,
-        .db_epoch_ = DbEpoch(db_id),
-        .mutation_sequence_ = location.mutation_sequence_,
-        .expire_at_ms_ = location.expire_at_ms_,
-        .value_type_ = location.value_type_,
-        .logical_size_ = location.logical_size_,
-        .key_ = key,
-        .value_ = std::string(reinterpret_cast<const char*>(value.data()),
-                              value.size()),
-    });
   }
   co_return batch;
 }
@@ -235,7 +302,14 @@ void StorageEngine::Impl::AcknowledgePartitionDeltas(
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     std::uint16_t partition_id,
     std::span<const std::uint64_t, kLogicalDatabaseCount> source_db_epochs,
-    std::uint64_t persisted_replication_epoch) {
+    std::uint64_t persisted_replication_epoch, bool replica_lock_held) {
+  WorkerStore& store = CurrentStore();
+  std::unique_ptr<UnlockGuard> replica_unlock;
+  if (!replica_lock_held) {
+    co_await store.replica_apply_mutex_.Lock();
+    replica_unlock = std::make_unique<UnlockGuard>(&store.replica_apply_mutex_,
+                                                   store.worker_);
+  }
   if (persisted_replication_epoch == 0) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       absl::Status advanced =
@@ -246,7 +320,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
     }
   }
 
-  WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   if (partition.replication_epoch_ ==
       std::numeric_limits<std::uint64_t>::max()) {
@@ -350,6 +423,9 @@ StorageEngine::Impl::ResetReplicaPartitions(
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "replica reset batch is empty");
   }
+  WorkerStore& store = CurrentStore();
+  co_await store.replica_apply_mutex_.Lock();
+  UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
   std::array<bool, kLogicalStorageShards> seen{};
   std::array<std::uint64_t, kLogicalDatabaseCount> newest_db_epochs{};
   std::vector<std::pair<std::size_t, std::uint64_t>> epoch_updates;
@@ -398,7 +474,8 @@ StorageEngine::Impl::ResetReplicaPartitions(
   for (std::size_t index = 0; index < resets.size(); ++index) {
     const ReplicaPartitionReset& reset = resets[index];
     auto epoch = co_await ResetReplicaPartition(
-        reset.partition_id_, reset.db_epochs_, epoch_updates[index].second);
+        reset.partition_id_, reset.db_epochs_, epoch_updates[index].second,
+        /*replica_lock_held=*/true);
     if (!epoch.ok()) co_return epoch.status();
     result.push_back(ReplicaPartitionEpoch{
         .partition_id_ = reset.partition_id_,
@@ -408,19 +485,6 @@ StorageEngine::Impl::ResetReplicaPartitions(
   co_return result;
 }
 
-// TODO(replication): the epoch is validated only here at entry, but the loop
-// below suspends repeatedly (key lock, store_state_mutex, extent IO, and
-// AdvanceDbEpoch's reclaim wait in the kFlushDb branch), and a handler whose
-// connection died is not cancelled. A reconnecting session's
-// ResetReplicaPartition can run inside such a gap; the stale handler then
-// resumes and keeps writing its old batch, stamped with the post-reset
-// replication_epoch (WriteRecordLocked reads it at write time), overriding
-// the reset tombstones — the replica keeps a key the primary deleted, and no
-// future delta ever corrects it. Design pending: re-validate the epoch after
-// every suspension point (including WriteRecordLocked's allocation wait,
-// via the defrag-style expected-version handoff), or serialize per-partition
-// application across sessions.
-//
 // TODO(replication): ResetReplicaPartition above holds store_state_mutex across
 // its whole tombstone loop (unlock_writer_while_waiting=false), so on a full
 // device its inline block allocation waits for reclaim progress while the
@@ -449,6 +513,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
     std::uint16_t partition_id, std::uint64_t replication_epoch,
     std::span<const SnapshotRecord> records) {
   WorkerStore& store = CurrentStore();
+  co_await store.replica_apply_mutex_.Lock();
+  UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
   auto& partition = PartitionFor(store, partition_id);
   if (replication_epoch != partition.replication_epoch_) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,

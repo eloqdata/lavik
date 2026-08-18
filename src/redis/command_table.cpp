@@ -245,6 +245,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"unwatch", CommandKind::kUnwatch, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"replicaof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal},
+    {"config", CommandKind::kConfig, 3, 4, 0, 0, 1,
+     kCmdNoKeys | kCmdGlobal},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"cluster", CommandKind::kCluster, 2, 2, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},

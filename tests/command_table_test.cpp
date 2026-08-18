@@ -224,6 +224,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("TYPE", CommandKind::kType);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
+  CheckKind("CONFIG", CommandKind::kConfig);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
   CheckKind("ZADD", CommandKind::kZAdd);
@@ -248,6 +249,10 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
     EXPECT_NE(CommandCanonicalName(static_cast<CommandKind>(value)), "unknown");
   }
   EXPECT_EQ(CommandCanonicalName(CommandKind::kUnknown), "unknown");
+  CheckArity("config", 2, false);
+  CheckArity("config", 3, true);
+  CheckArity("config", 4, true);
+  CheckArity("config", 5, false);
   // Leave the upper arity open so the option parser can report Redis's
   // syntax error for trailing tokens instead of the global arity error.
   EXPECT_EQ(FindCommand("zrangebyscore")->max_args_, 0);

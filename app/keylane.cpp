@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
     }
   }
   unsigned registered_buffer_mb = 256;
+  unsigned replication_publish_queue_mb = static_cast<unsigned>(
+      options.replication_publish_queue_bytes_ / (1024ULL * 1024));
   unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
 
@@ -110,6 +112,11 @@ int main(int argc, char** argv) {
       ->check(CLI::Range(-1L, std::numeric_limits<long>::max()));
   app.add_option("--registered-buffer-mb", registered_buffer_mb,
                  "Registered storage buffer budget in MiB per worker")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--replication-publish-queue-mb",
+                 replication_publish_queue_mb,
+                 "Replication publisher staging budget in MiB per worker")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
   app.add_option("--max-memory,--maxmemory", options.max_memory_bytes_,
@@ -171,11 +178,15 @@ int main(int argc, char** argv) {
   constexpr std::size_t kMiB = 1024 * 1024;
   constexpr std::size_t kKiB = 1024;
   if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
+      replication_publish_queue_mb >
+          std::numeric_limits<std::size_t>::max() / kMiB ||
       flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB) {
     return 2;
   }
   options.registered_buffer_bytes_ =
       static_cast<std::size_t>(registered_buffer_mb) * kMiB;
+  options.replication_publish_queue_bytes_ =
+      static_cast<std::size_t>(replication_publish_queue_mb) * kMiB;
   options.flush_size_bytes_ = static_cast<std::size_t>(flush_size_kb) * kKiB;
   options.verify_read_crc_ = !disable_read_crc;
   return keylane::RunServer(std::move(options));

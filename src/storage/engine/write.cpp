@@ -26,23 +26,28 @@ ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
     std::uint8_t db_id, std::string_view key, std::string_view value,
-    SetOptions options, ReplicationCommandAppend* replication) {
+    SetOptions options, ReplicationCommandAppend* replication,
+    SetLatencyTrace* trace) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  if (trace != nullptr) trace->key_lock_start_ns_ = SetTraceNowNanos();
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+  if (trace != nullptr) trace->key_lock_acquired_ns_ = SetTraceNowNanos();
   co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
-                               replication);
+                               replication, trace);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::string_view value, SetOptions options, TxShardWrites* tx,
-    ReplicationCommandAppend* replication) {
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
+  if (trace != nullptr) trace->store_lock_start_ns_ = SetTraceNowNanos();
   co_await store.store_state_mutex_.Lock();
+  if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
 
   auto& index = partition.indexes_[db_id];
@@ -58,6 +63,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   const bool exists = found != nullptr &&
                       found->value_.kind_ == RecordKind::kValue &&
                       !IsExpired(found->value_, now_ms);
+  if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
   SetResult result;
   if (options.return_old_value_ && exists) {
     if (found->value_.value_type_ != ValueType::kString) {
@@ -89,11 +95,13 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
                                          ? found->value_.expire_at_ms_
                                          : options.expire_at_ms_;
   std::uint64_t mutation_sequence = 0;
+  if (trace != nullptr) trace->append_start_ns_ = SetTraceNowNanos();
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr,
-      replication != nullptr ? &mutation_sequence : nullptr);
+      replication != nullptr ? &mutation_sequence : nullptr, trace);
+  if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
   if (replication != nullptr) {
@@ -106,6 +114,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     }
     (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
+  if (trace != nullptr) trace->replication_done_ns_ = SetTraceNowNanos();
   co_return result;
 }
 
@@ -845,7 +854,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
     TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    std::uint64_t* committed_sequence) {
+    std::uint64_t* committed_sequence, SetLatencyTrace* trace) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -873,7 +882,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, false, true, true, key_external,
         logical_size, *extents, nullptr, nullptr, tx,
-        std::move(commit_retirements));
+        std::move(commit_retirements), trace);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -882,7 +891,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, false, true, false, key_external,
         logical_size, nullptr, nullptr, nullptr, tx,
-        std::move(commit_retirements));
+        std::move(commit_retirements), trace);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -961,7 +970,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     std::shared_ptr<const std::vector<ExtentRef>> extents,
     RecordLocation* written_location, const RelocationSource* relocation,
     TxShardWrites* tx,
-    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements) {
+    std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
+    SetLatencyTrace* trace) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1053,8 +1063,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const std::uint64_t lsn = *allocated_lsn;
 
   auto& active = store.active_block_;
+  if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active.has_value() ||
          active->committed_bytes_ + total_disk_bytes > kStorageBlockBytes) {
+    if (trace != nullptr) trace->allocated_block_ = true;
     if (active.has_value()) {
       RequestFlush(store, active->block_id_);
       active.reset();
@@ -1136,6 +1148,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       // append, would race the flush that is reading the same page.
     }
   }
+  if (trace != nullptr) trace->block_ready_ns_ = SetTraceNowNanos();
 
   // Block allocation may have released the store-state lock. A client write
   // can replace this key, or FLUSHDB/replica reset can replace its index,
@@ -1248,6 +1261,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::Status(absl::StatusCode::kInternal,
                            "record checksum encoding failed");
   }
+  if (trace != nullptr) trace->encode_done_ns_ = SetTraceNowNanos();
 
   // The staging slot already holds this block's buffer; it is fixed for the
   // life of the allocation, so only the flush counters need syncing below.
@@ -1424,6 +1438,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if (written_location != nullptr) {
     *written_location = location;
   }
+  if (trace != nullptr) trace->index_done_ns_ = SetTraceNowNanos();
   co_return absl::OkStatus();
 }
 
