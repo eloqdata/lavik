@@ -317,16 +317,22 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
        decoded.kind_ != BlockKind::kPayloadExtent &&
-       decoded.kind_ != BlockKind::kReplicationLog) ||
+       decoded.kind_ != BlockKind::kReplicationLog &&
+       decoded.kind_ != BlockKind::kTransaction) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
   }
-  if (decoded.kind_ == BlockKind::kRecords) {
+  if (decoded.kind_ == BlockKind::kRecords ||
+      decoded.kind_ == BlockKind::kTransaction) {
     if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
         decoded.extent_payload_checksum_ != 0 ||
         decoded.replication_log_epoch_ != 0 ||
         decoded.first_replication_lsn_ != 0 ||
-        decoded.last_replication_lsn_ != 0) {
+        decoded.last_replication_lsn_ != 0 ||
+        (decoded.kind_ == BlockKind::kRecords &&
+         decoded.tx_generation_ != 0) ||
+        (decoded.kind_ == BlockKind::kTransaction &&
+         decoded.tx_generation_ == 0)) {
       return false;
     }
   } else if (decoded.kind_ == BlockKind::kPayloadExtent) {
@@ -336,7 +342,7 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
             kBlockHeaderBytes + decoded.extent_payload_bytes_ ||
         decoded.replication_log_epoch_ != 0 ||
         decoded.first_replication_lsn_ != 0 ||
-        decoded.last_replication_lsn_ != 0) {
+        decoded.last_replication_lsn_ != 0 || decoded.tx_generation_ != 0) {
       return false;
     }
   } else if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
@@ -344,7 +350,8 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
              decoded.replication_log_epoch_ == 0 ||
              decoded.record_count_ == 0 ||
              decoded.first_replication_lsn_ == 0 ||
-             decoded.last_replication_lsn_ < decoded.first_replication_lsn_) {
+             decoded.last_replication_lsn_ < decoded.first_replication_lsn_ ||
+             decoded.tx_generation_ != 0) {
     return false;
   }
   const std::uint32_t expected = decoded.checksum_;

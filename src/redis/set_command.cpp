@@ -558,8 +558,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   if (write) {
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.tx_writes_.resize(g_storage->worker_count());
+    g_storage->InitializeTxWrites(txid, context.tx_writes_);
     for (auto& shard : context.tx_writes_) {
-      shard.txid_ = txid;
       shard.collect_undo_ = true;
     }
   }

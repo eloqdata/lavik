@@ -112,6 +112,7 @@ add_library(keylane_module
   src/storage/engine/replication.cpp
   src/storage/engine/replication_log.cpp
   src/storage/engine/tomb_raider.cpp
+  src/storage/engine/tx_cleaner.cpp
   src/storage/engine/write.cpp
   src/storage/format.cpp
   src/memory.cpp
@@ -203,6 +204,7 @@ if (BUILD_TESTING)
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp
+    tests/tx_cleaner_test.cpp
   )
   target_link_libraries(keylane_unit_tests
     PRIVATE keylane::module GTest::gtest_main

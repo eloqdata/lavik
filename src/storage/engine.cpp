@@ -72,6 +72,19 @@ Task<absl::Status> StorageEngine::ConfigureDefrag(DefragConfigUpdate update) {
   return impl_->ConfigureDefrag(update);
 }
 
+TxCleanerTotals StorageEngine::TxCleanerStats() const noexcept {
+  return impl_->TxCleanerStats();
+}
+
+std::uint32_t StorageEngine::TxCleanerCooldownMs() const noexcept {
+  return impl_->TxCleanerCooldownMs();
+}
+
+absl::Status StorageEngine::ConfigureTxCleanerCooldown(
+    std::uint64_t cooldown_ms) {
+  return impl_->ConfigureTxCleanerCooldown(cooldown_ms);
+}
+
 Task<StorageDurabilityStats> StorageEngine::DurabilityStats() const {
   return impl_->DurabilityStats();
 }
@@ -377,6 +390,11 @@ Task<absl::Status> StorageEngine::CommitTxWrites(
 std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {
   return tx::TxRuntime::Get()->next_txid_.fetch_add(1,
                                                     std::memory_order_relaxed);
+}
+
+void StorageEngine::InitializeTxWrites(std::uint64_t txid,
+                                       std::span<TxShardWrites> writes) {
+  impl_->InitializeTxWrites(txid, writes);
 }
 
 void StorageEngine::NoteTxCommitStarted() noexcept {

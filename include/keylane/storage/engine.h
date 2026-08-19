@@ -28,6 +28,9 @@ namespace keylane::storage {
 struct StorageEngineOptions {
   std::vector<std::string> data_files_{"keylane.data"};
   std::uint32_t flush_max_ms_ = 1000;
+  // Minimum delay between transaction-generation rotations/cleaning rounds.
+  // Zero disables the cleaner; it can be changed at runtime through CONFIG.
+  std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
   // on-disk replication backlog.
@@ -124,6 +127,15 @@ struct TombRaiderTotals {
   std::uint32_t daily_second_ = 0;
   TombRaiderMode mode_ = TombRaiderMode::kOff;
   bool enabled_ = false;
+  bool running_ = false;
+};
+
+struct TxCleanerTotals {
+  std::uint64_t rounds_ = 0;
+  std::uint64_t failures_ = 0;
+  std::uint64_t retired_generations_ = 0;
+  std::uint64_t retired_blocks_ = 0;
+  std::uint32_t cooldown_ms_ = 0;
   bool running_ = false;
 };
 
@@ -480,6 +492,11 @@ struct RawValue {
 // no synchronization is needed.
 struct TxShardWrites {
   std::uint64_t txid_ = 0;  // input: stamped into every record written
+  // All shards of one transaction share the same generation and lease. The
+  // opaque lease keeps that generation open until the last shard receipt is
+  // destroyed after commit or rollback processing.
+  std::uint64_t generation_ = 0;
+  std::shared_ptr<void> generation_lease_;
 
   struct ExpirationEffect {
     std::string key_;
@@ -500,6 +517,8 @@ struct TxShardWrites {
     std::uint32_t total_disk_bytes_ = 0;
     std::uint16_t block_owner_ = 0;
     std::uint32_t record_offset_ = 0;
+    bool tx_tagged_ = false;
+    bool dependency_pinned_ = false;
     std::shared_ptr<const std::vector<ExtentRef>> dependent_extents_;
     // Value-only extents can be reclaimed as soon as the transaction commit
     // is durable. External-key extents stay dependent on the stale records
@@ -752,6 +771,11 @@ class StorageEngine {
   // Allocates a transaction id for tagging a multi-key write. Never zero.
   static std::uint64_t AllocateWriteTxid() noexcept;
 
+  // Binds every shard receipt of one storage transaction to the current
+  // transaction generation and holds one shared generation lease.
+  void InitializeTxWrites(std::uint64_t txid,
+                          std::span<TxShardWrites> writes);
+
   // Bracket a detached commit chain: Started before spawning it (so a
   // graceful shutdown that already drained client requests still waits for
   // it), Finished when the chain ends whatever its outcome.
@@ -789,6 +813,9 @@ class StorageEngine {
   // limit. Sleep changes take effect at the next checkpoint.
   DefragTotals DefragStats() const noexcept;
   celer::Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
+  TxCleanerTotals TxCleanerStats() const noexcept;
+  std::uint32_t TxCleanerCooldownMs() const noexcept;
+  absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
   celer::Task<StorageDurabilityStats> DurabilityStats() const;
   celer::Task<StorageMetricsSnapshot> CollectMetrics() const;
 

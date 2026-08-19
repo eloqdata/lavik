@@ -141,6 +141,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
 
     struct BlockDelta {
       std::uint64_t bytes_ = 0;
+      std::uint64_t tagged_bytes_ = 0;
       std::uint16_t block_owner_ = 0;
       std::vector<ExtentManifest> dependent_extents_;
     };
@@ -162,6 +163,9 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           entry.value_.block_id_, entry.value_.allocation_epoch_)];
       delta.block_owner_ = entry.value_.block_owner_;
       delta.bytes_ += entry.value_.total_disk_bytes_;
+      if (entry.value_.tx_tagged_) {
+        delta.tagged_bytes_ += entry.value_.total_disk_bytes_;
+      }
       if (entry.value_.external_) {
         auto manifest = store.external_manifests_.find(&entry);
         if (manifest != store.external_manifests_.end()) {
@@ -183,12 +187,24 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       // A block holds at most kStorageBlockBytes, so the sum still fits the
       // per-record width.
       assert(delta.bytes_ <= kStorageBlockBytes);
+      // The storage format keeps tagged records in transaction blocks and
+      // untagged records in ordinary blocks. Preserve that distinction while
+      // batching detached entries: transaction-generation accounting must
+      // lose the same bytes as the block's ordinary live-byte accounting.
+      if (delta.tagged_bytes_ != 0 &&
+          delta.tagged_bytes_ != delta.bytes_) [[unlikely]] {
+        store.write_failed_ = true;
+        co_return absl::InternalError(
+            "FLUSHDB detached mixed tagged and untagged records from one "
+            "block");
+      }
       RetiredRecord aggregate{
           .block_id_ = block.first,
           .allocation_epoch_ = block.second,
           .total_disk_bytes_ = static_cast<std::uint32_t>(delta.bytes_),
           .block_owner_ = delta.block_owner_,
           .record_offset_ = 0,
+          .tx_tagged_ = delta.tagged_bytes_ != 0,
           .dependent_extents_ = nullptr,
           .immediate_extents_ = nullptr,
           .extra_dependent_extents_ =

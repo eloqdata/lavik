@@ -420,6 +420,37 @@ bool WaitForDurability(RespClient& client) {
   return false;
 }
 
+std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
+  constexpr std::string_view marker = "tx_cleaner_retired_generations:";
+  const std::string info = client.Command({"INFO", "STATS"});
+  const std::size_t begin = info.find(marker);
+  if (begin == std::string::npos) {
+    throw std::runtime_error("tx cleaner INFO field is missing");
+  }
+  const std::size_t value_begin = begin + marker.size();
+  const std::size_t value_end = info.find("\r\n", value_begin);
+  if (value_end == std::string::npos) {
+    throw std::runtime_error("malformed tx cleaner INFO field");
+  }
+  std::uint64_t retired = 0;
+  const char* first = info.data() + value_begin;
+  const char* last = info.data() + value_end;
+  const auto [parsed, error] = std::from_chars(first, last, retired);
+  if (error != std::errc{} || parsed != last) {
+    throw std::runtime_error("invalid tx cleaner INFO counter");
+  }
+  return retired;
+}
+
+bool WaitForTxCleanerRetirement(RespClient& client, std::uint64_t baseline) {
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (TxCleanerRetiredGenerations(client) > baseline) return true;
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
+}
+
 class ServerProcess {
  public:
   ServerProcess(
@@ -1527,6 +1558,16 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
       KeyForWorker("repl-worker-mismatch", 1, 3);
   const std::string mismatch_key_2 =
       KeyForWorker("repl-worker-mismatch", 2, 3);
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+            "+OK");
+  ASSERT_EQ(replica_client.Command(
+                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+            "+OK");
+  const std::uint64_t source_cleaner_baseline =
+      TxCleanerRetiredGenerations(source_client);
+  const std::uint64_t replica_cleaner_baseline =
+      TxCleanerRetiredGenerations(replica_client);
   ASSERT_EQ(source_client.Command({"MSET", mismatch_key_0, "zero",
                                    mismatch_key_1, "one", mismatch_key_2,
                                    "two"}),
@@ -1539,6 +1580,12 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(replica_client.Command({"GET", mismatch_key_0}), Bulk("zero"));
   EXPECT_EQ(replica_client.Command({"GET", mismatch_key_1}), Bulk("one"));
   EXPECT_EQ(replica_client.Command({"GET", mismatch_key_2}), Bulk("two"));
+  // Canonical replication executes the same transaction path on the replica,
+  // so both processes independently rotate and retire their local generation.
+  EXPECT_TRUE(
+      WaitForTxCleanerRetirement(source_client, source_cleaner_baseline));
+  EXPECT_TRUE(
+      WaitForTxCleanerRetirement(replica_client, replica_cleaner_baseline));
   EXPECT_NE(
       source_client.Command({"INFO", "clients"}).find("connected_clients:1"),
       std::string::npos);

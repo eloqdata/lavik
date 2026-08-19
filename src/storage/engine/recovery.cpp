@@ -305,6 +305,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .record_count_ = block.record_count_,
               .max_lsn_ = block.max_lsn_,
               .kind_ = block.kind_,
+              .tx_generation_ = block.tx_generation_,
               .extent_index_ = block.extent_index_,
               .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
@@ -359,6 +360,17 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         }
         AtomicMax(&recovery_max_lsn_, record.lsn_);
         AtomicMax(&recovery_max_txid_, record.txid_);
+        if ((block.kind_ == BlockKind::kTransaction) != (record.txid_ != 0)) {
+          co_return absl::Status(
+              absl::StatusCode::kInternal,
+              "record txid does not match its physical block kind");
+        }
+        if (record.kind_ == RecordKind::kTxCommit &&
+            block.kind_ != BlockKind::kTransaction) {
+          co_return absl::Status(
+              absl::StatusCode::kInternal,
+              "TxCommit appears outside a transaction block");
+        }
         if (record.kind_ == RecordKind::kTxCommit) {
           // A commit decision, not a keyed record: exempt from the key and
           // epoch filters below — the transaction it commits may span
@@ -366,7 +378,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           // record's own header fields.
           committed_txids->insert(record.txid_);
           batches->at(block_owner)
-              .commit_records_.push_back({block_id, record.total_disk_bytes_});
+              .commit_records_.push_back(RecoveryBatch::CommitRecord{
+                  .block_id_ = block_id,
+                  .txid_ = record.txid_,
+                  .bytes_ = record.total_disk_bytes_,
+              });
           ++buffered_items;
           record_offset += record.total_disk_bytes_;
           ++records;
@@ -492,6 +508,15 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
     state.committed_bytes_ = block.committed_bytes_;
     state.allocated_ = true;
     state.kind_ = block.kind_;
+    if (block.kind_ == BlockKind::kTransaction) {
+      RegisterRecoveredTxGeneration(store, block.tx_generation_);
+      store.tx_blocks_.insert_or_assign(
+          block.block_id_,
+          WorkerStore::TxBlockRuntime{
+              .allocation_epoch_ = block.allocation_epoch_,
+              .generation_ = block.tx_generation_,
+          });
+    }
     if (block.kind_ == BlockKind::kPayloadExtent) {
       store.recovered_extents_[block.block_id_] = ExtentIdentity{
           .extent_index_ = block.extent_index_,
@@ -513,14 +538,24 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
     }
     ApplyRecoveredRecord(store, recovered);
   }
-  for (const auto& [block_id, bytes] : batch.commit_records_) {
-    BlockState* state = FindBlockState(store, block_id);
+  for (const RecoveryBatch::CommitRecord& commit : batch.commit_records_) {
+    BlockState* state = FindBlockState(store, commit.block_id_);
     if (state == nullptr || !state->allocated_) {
       Fail(absl::Status(absl::StatusCode::kInternal,
                         "recovered commit record has no owning block"));
       continue;
     }
-    state->live_bytes_ += bytes;
+    state->live_bytes_ += commit.bytes_;
+    if (state->kind_ == BlockKind::kTransaction) {
+      const auto tx_block = store.tx_blocks_.find(commit.block_id_);
+      if (tx_block == store.tx_blocks_.end()) {
+        Fail(absl::InternalError("recovered transaction block is untracked"));
+        continue;
+      }
+      NoteTxRecordLocal(store, commit.block_id_, state->allocation_epoch_,
+                        tx_block->second.generation_, commit.txid_,
+                        commit.bytes_, true);
+    }
   }
 }
 
@@ -582,6 +617,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                   std::max(recovered.location_.expire_at_ms_,
                                            UnixTimeMillis())));
       }
+      winner.tx_tagged_ = recovered.txid_ != 0;
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
         winner_entry->value_ = winner;
@@ -590,6 +626,11 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                        winner, !winner.key_external_);
       }
       store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
+      if (recovered.txid_ != 0) {
+        store.recovery_txids_.insert_or_assign(winner_entry, recovered.txid_);
+      } else {
+        store.recovery_txids_.erase(winner_entry);
+      }
       if (winner.external_) {
         store.external_manifests_.insert_or_assign(winner_entry,
                                                    recovered.extents_);

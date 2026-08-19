@@ -204,7 +204,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   if (source == destination) {
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     storage::TxShardWrites writes;
-    writes.txid_ = txid;
+    g_storage->InitializeTxWrites(txid, std::span(&writes, 1));
     writes.collect_undo_ = true;
     storage::ListOperation operation;
     operation.kind_ = storage::ListOperationKind::kMoveWithin;
@@ -239,7 +239,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   storage::TxShardWrites writes;
-  writes.txid_ = txid;
+  g_storage->InitializeTxWrites(txid, std::span(&writes, 1));
   writes.collect_undo_ = true;
   storage::ListOperation pop;
   pop.kind_ = source_left ? storage::ListOperationKind::kPopLeft
@@ -737,8 +737,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
+  g_storage->InitializeTxWrites(txid, writes);
   for (auto& write : writes) {
-    write.txid_ = txid;
     write.collect_undo_ = true;
   }
   storage::ListOperation pop;

@@ -440,6 +440,11 @@ int main(int argc, char** argv) {
       ServerProcess server(argv[1], port, data_path, log_path);
       {
         RespClient seed = Connect(port);
+        if (seed.Command(
+                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "1"}) !=
+            "+OK") {
+          Fail("enabling transaction cleaner failed");
+        }
         if (seed.Command({"MSET", "sa", "W1:0", "sb", "W1:0", "ha", "H0", "hb",
                           "H0"}) != "+OK") {
           Fail("seed MSET failed");

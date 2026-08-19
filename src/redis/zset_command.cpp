@@ -2587,8 +2587,8 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   if (context.store_) {
     txid = storage::StorageEngine::AllocateWriteTxid();
     context.writes_.resize(g_storage->worker_count());
+    g_storage->InitializeTxWrites(txid, context.writes_);
     for (auto& write : context.writes_) {
-      write.txid_ = txid;
       write.collect_undo_ = true;
     }
   }

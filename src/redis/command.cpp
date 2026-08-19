@@ -645,6 +645,8 @@ constexpr std::string_view kTombRaiderIntervalConfig =
 constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
+constexpr std::string_view kTxCleanerCooldownConfig =
+    "tx-cleaner-cooldown-ms";
 
 enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
@@ -656,6 +658,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderInterval,
   kTombRaiderSleep,
   kTombRaiderDailyTime,
+  kTxCleanerCooldown,
 };
 
 struct RuntimeConfigDescriptor {
@@ -684,6 +687,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderSleep},
     RuntimeConfigDescriptor{kTombRaiderDailyTimeConfig,
                             RuntimeConfigKey::kTombRaiderDailyTime},
+    RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
+                            RuntimeConfigKey::kTxCleanerCooldown},
 };
 
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
@@ -751,6 +756,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           if (key == RuntimeConfigKey::kTombRaiderSleep)
             return std::to_string(tomb_raider->block_sleep_ms_);
           return FormatDailySecond(tomb_raider->daily_second_);
+        case RuntimeConfigKey::kTxCleanerCooldown:
+          return std::to_string(g_storage->TxCleanerCooldownMs());
       }
       return {};
     };
@@ -872,6 +879,14 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       }
       if (configured.ok()) {
         configured = co_await g_storage->ConfigureTombRaider(update);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kTxCleanerCooldown) {
+      if (!ParseUint64(args[3], &value) ||
+          value > std::numeric_limits<std::uint32_t>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = g_storage->ConfigureTxCleanerCooldown(value);
       }
     }
     co_return configured.ok()
@@ -2548,6 +2563,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   if (wants("stats")) {
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     const storage::DefragTotals defrag = g_storage->DefragStats();
+    const storage::TxCleanerTotals tx_cleaner = g_storage->TxCleanerStats();
     const storage::StorageDurabilityStats durability =
         co_await g_storage->DurabilityStats();
     info += "# Stats\r\n";
@@ -2582,6 +2598,18 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "\r\n";
     info += "defrag_active:" + std::to_string(defrag.active_) + "\r\n";
     info += "defrag_pending:" + std::to_string(defrag.pending_) + "\r\n\r\n";
+    info +=
+        "tx_cleaner_rounds:" + std::to_string(tx_cleaner.rounds_) + "\r\n";
+    info += "tx_cleaner_failures:" + std::to_string(tx_cleaner.failures_) +
+            "\r\n";
+    info += "tx_cleaner_retired_generations:" +
+            std::to_string(tx_cleaner.retired_generations_) + "\r\n";
+    info += "tx_cleaner_retired_blocks:" +
+            std::to_string(tx_cleaner.retired_blocks_) + "\r\n";
+    info += "tx_cleaner_cooldown_ms:" +
+            std::to_string(tx_cleaner.cooldown_ms_) + "\r\n";
+    info += std::string("tx_cleaner_running:") +
+            (tx_cleaner.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
     info += "storage_dirty_staging_bytes:" +
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
     info += "storage_expiration_pause_count:" +
@@ -3135,8 +3163,8 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
 
   const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
   context->writes_.resize(g_storage->worker_count());
+  g_storage->InitializeTxWrites(txid, context->writes_);
   for (storage::TxShardWrites& writes : context->writes_) {
-    writes.txid_ = txid;
     writes.collect_undo_ = true;
   }
   auto disarm_undo = [&] {
@@ -3703,8 +3731,8 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
   if (write && keys->count() > 1) {
     write_txid = storage::StorageEngine::AllocateWriteTxid();
     ctx.tx_writes_.resize(g_storage->worker_count());
+    g_storage->InitializeTxWrites(write_txid, ctx.tx_writes_);
     for (auto& shard : ctx.tx_writes_) {
-      shard.txid_ = write_txid;
       shard.collect_undo_ = true;
     }
   }
@@ -5247,9 +5275,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     // Read-only transactions collect no fences and append no commit.
     const std::uint64_t exec_txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> tx_writes(g_storage->worker_count());
-    for (auto& shard : tx_writes) {
-      shard.txid_ = exec_txid;
-    }
+    g_storage->InitializeTxWrites(exec_txid, tx_writes);
 
     // Every read and write owner participates in the replication barrier.
     // Any command that has not yet been reduced to an independent after-image

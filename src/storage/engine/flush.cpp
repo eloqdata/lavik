@@ -20,9 +20,21 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
       co_return status;
     }
 
-    co_await store->store_state_mutex_.Lock();
-    UnlockGuard guard(&store->store_state_mutex_, store->worker_);
-    FlushActiveBlock(*store);
+    {
+      co_await store->store_state_mutex_.Lock();
+      UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+      FlushActiveBlock(*store);
+    }
+    status = co_await MaybeRunTxCleaner();
+    if (!status.ok()) {
+      // Cleaner races (pins, foreground replacement) and allocation pressure
+      // are retryable background-maintenance failures. They must never stop
+      // this worker's periodic flush loop or masquerade as completion of a
+      // shutdown drain. MaybeRunTxCleaner has already re-armed dirty state;
+      // record the failure and retry after the configured cooldown.
+      spdlog::warn("worker[{}] transaction cleaner round failed; retrying: {}",
+                   store->worker_->id(), status.message());
+    }
   }
   co_return absl::OkStatus();
 }
@@ -139,6 +151,14 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (store->active_block_.has_value() &&
           store->active_block_->block_id_ == block_id) {
         store->active_block_->committed_bytes_ = padded;
+      } else {
+        for (auto& [generation, active] : store->active_tx_blocks_) {
+          (void)generation;
+          if (active.has_value() && active->block_id_ == block_id) {
+            active->committed_bytes_ = padded;
+            break;
+          }
+        }
       }
       ++staging_state.header_sequence_;
       const std::uint8_t slot = HeaderSlot(staging_state.header_sequence_);
@@ -157,6 +177,10 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           .header_sequence_ = staging_state.header_sequence_,
           .checksum_ = 0,
           .layout_worker_count_ = state->layout_worker_count_,
+          .kind_ = state->kind_,
+          .tx_generation_ = state->kind_ == BlockKind::kTransaction
+                                ? store->tx_blocks_.at(block_id).generation_
+                                : 0,
       };
       EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
                                     buffer.data_ + slot * kBlockHeaderSlotBytes,
@@ -415,6 +439,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
     }
 
     state->in_memory_ = false;
+    if (state->kind_ == BlockKind::kTransaction) {
+      tx_cleaner_dirty_.store(true, std::memory_order_release);
+    }
     if (state->pins_ > 0) {
       state->release_pending_ = true;
       continue;
@@ -426,8 +453,15 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
 
 bool StorageEngine::Impl::IsActiveBlock(const WorkerStore& store,
                                         std::uint64_t block_id) const noexcept {
-  return store.active_block_.has_value() &&
-         store.active_block_->block_id_ == block_id;
+  if (store.active_block_.has_value() &&
+      store.active_block_->block_id_ == block_id) {
+    return true;
+  }
+  for (const auto& [generation, active] : store.active_tx_blocks_) {
+    (void)generation;
+    if (active.has_value() && active->block_id_ == block_id) return true;
+  }
+  return false;
 }
 
 }  // namespace keylane::storage

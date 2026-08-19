@@ -153,6 +153,24 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(decoded_header.extent_payload_checksum_ ==
               extent_header.extent_payload_checksum_);
 
+  BlockHeader transaction_header = header;
+  transaction_header.kind_ = BlockKind::kTransaction;
+  transaction_header.tx_generation_ = 17;
+  transaction_header.record_count_ = 3;
+  transaction_header.committed_bytes_ = kBlockHeaderBytes + 3 * 120;
+  EncodeBlockHeader(transaction_header, block_page);
+  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_EQ(decoded_header.kind_, BlockKind::kTransaction);
+  EXPECT_EQ(decoded_header.tx_generation_, 17);
+
+  transaction_header.tx_generation_ = 0;
+  EncodeBlockHeader(transaction_header, block_page);
+  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+  BlockHeader records_with_generation = header;
+  records_with_generation.tx_generation_ = 17;
+  EncodeBlockHeader(records_with_generation, block_page);
+  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+
   constexpr std::string_view key = "typed-expiring-key";
   constexpr std::string_view value = "value";
   const std::size_t record_header_bytes = RecordHeaderBytes(key.size());

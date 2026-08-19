@@ -363,7 +363,8 @@ Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>>
 StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
                                        std::string_view value,
                                        const RecordHeader& record,
-                                       const RecordLocation& source_location) {
+                                       const RecordLocation& source_location,
+                                       bool clear_txid) {
   WorkerStore& key_store = *stores_[key_owner];
   co_await key_store.store_state_mutex_.Lock();
   UnlockGuard write_unlock(&key_store.store_state_mutex_, key_store.worker_);
@@ -383,9 +384,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   }
   // A source from a flushed database epoch is already condemned: FLUSHDB has
   // published the new epoch and this worker's detach just has not run yet.
-  // Rewriting it would stamp the new epoch into the copy, turning a record
-  // recovery must drop into one it must keep. Skip it; the detach reclaim
-  // settles its accounting.
+  // There is no value in copying it; relocation would retain the source epoch
+  // for crash safety and detached-index reclaim will settle its accounting.
   if (DbEpoch(record.db_id_) != record.db_epoch_) {
     co_return std::optional<RelocationDurabilityFence>{};
   }
@@ -400,7 +400,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   RecordLocation relocated;
   absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
-      record.expire_at_ms_, record.digest_, record.txid_,
+      record.expire_at_ms_, record.digest_, clear_txid ? 0 : record.txid_,
       record.mutation_sequence_, true, true, record.external_,
       record.key_external_, record.logical_size_,
       ExtentsFor(key_store, current), &relocated, &source);
@@ -577,7 +577,9 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
 
 Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     WorkerStore& store, std::uint64_t block_id, BlockState& source,
-    std::uint32_t source_file_id, std::uint64_t source_block_offset) {
+    std::uint32_t source_file_id, std::uint64_t source_block_offset,
+    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
+        committed_txids) {
   struct DefragBuffer {
     RegisteredBufferPool* pool_ = nullptr;
     std::uint16_t buffer_id_ = 0;
@@ -738,6 +740,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         .block_owner_ = store.worker_->id(),
         .external_ = record.external_,
         .key_external_ = record.key_external_,
+        .tx_tagged_ =
+            record.txid_ != 0 && record.kind_ != RecordKind::kTxCommit,
         .kind_ = record.kind_,
         .value_type_ = record.value_type_,
     };
@@ -755,48 +759,23 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     }
 
     if (record.kind_ == RecordKind::kTxCommit) {
-      // Commit records live outside the index, so RelocateIfCurrent cannot
-      // move them, yet one must survive as long as any of its transaction's
-      // records might be recovery-newest. Copy it forward, fence the copy,
-      // and retire the original so the block can still empty. Duplicate
-      // commit sightings are harmless at recovery (set semantics).
-      // TODO(tx-gc): replace forward-copying with the tagged-birth-block
-      // fence-set GC in docs/transaction-design.md M10.1.
-      co_await store.store_state_mutex_.Lock();
-      RecordLocation relocated_commit;
-      absl::Status commit_written = absl::OkStatus();
-      {
-        UnlockGuard commit_unlock(&store.store_state_mutex_, store.worker_);
-        commit_written = co_await WriteRecordLocked(
-            store, record.db_id_, {}, {}, RecordKind::kTxCommit,
-            ValueType::kNone, 0, record.digest_, record.txid_, 0, true, true,
-            false, false, std::numeric_limits<std::uint64_t>::max(), nullptr,
-            &relocated_commit);
-      }
-      if (!commit_written.ok()) {
+      if (committed_txids == nullptr) {
         source.defragging_ = false;
-        co_return commit_written;
+        co_return absl::InternalError(
+            "ordinary records block contains a TxCommit");
       }
-      durability_fences.push_back(RelocationDurabilityFence{
-          .block_id_ = relocated_commit.block_id_,
-          .allocation_epoch_ = relocated_commit.allocation_epoch_,
-          .block_owner_ = relocated_commit.block_owner_,
-          .committed_bytes_ =
-              static_cast<std::uint32_t>(relocated_commit.record_offset_ +
-                                         relocated_commit.total_disk_bytes_),
-      });
-      absl::Status commit_dead =
-          co_await MarkRecordDead(RetiredRecordOf(source_location));
-      if (!commit_dead.ok()) {
-        source.defragging_ = false;
-        co_return commit_dead;
-      }
+      // Keep decision records in place until every tagged winner in the
+      // generation has a durable untagged copy. Whole-generation retirement
+      // then removes the decisions and sources together.
       record_offset += record.total_disk_bytes_;
-      absl::Status paced = co_await DefragRecordCheckpoint(store);
-      if (!paced.ok()) {
-        source.defragging_ = false;
-        co_return paced;
-      }
+      continue;
+    }
+    if (committed_txids != nullptr &&
+        !committed_txids->contains(record.txid_)) {
+      // No durable decision: never turn this record into an unconditional
+      // txid-zero recovery winner. Rollback/accounting will make it dead; if
+      // it is still charged, the generation remains unreclaimable.
+      record_offset += record.total_disk_bytes_;
       continue;
     }
     const unsigned key_owner = OwnerForKey(disk_key);
@@ -810,14 +789,16 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
         std::optional<RelocationDurabilityFence>{});
     if (key_owner == store.worker_->id()) {
       relocated = co_await RelocateIfCurrent(key_owner, key, value, record,
-                                             source_location);
+                                             source_location,
+                                             committed_txids != nullptr);
     } else {
       relocated = co_await celer::SubmitTaskTo(
           key_owner,
-          [this, key_owner, key, value, record, source_location]() mutable
+          [this, key_owner, key, value, record, source_location,
+           promote = committed_txids != nullptr]() mutable
           -> Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(key_owner, key, value, record,
-                                                 source_location);
+                                                 source_location, promote);
           });
     }
     if (!relocated.ok()) {

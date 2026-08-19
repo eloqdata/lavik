@@ -19,7 +19,9 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// Version 2 makes transaction generations a physical block invariant. There
+// is intentionally no reader for version-1 mixed records/TxCommit blocks.
+inline constexpr std::uint32_t kStorageFormatVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -166,6 +168,10 @@ enum class BlockKind : std::uint8_t {
   // Runtime-only replication backlog. Recovery recognizes and reclaims these
   // blocks instead of treating them as primary data.
   kReplicationLog = 3,
+  // Short-lived transaction generation: tagged keyed records and their
+  // TxCommit decisions share this block class until the cleaner promotes the
+  // committed winners to ordinary kRecords blocks with txid zero.
+  kTransaction = 4,
 };
 
 enum class ReplicationEventKind : std::uint8_t {
@@ -225,6 +231,8 @@ struct BlockHeader {
   std::uint64_t replication_log_epoch_ = 0;
   std::uint64_t first_replication_lsn_ = 0;
   std::uint64_t last_replication_lsn_ = 0;
+  // Nonzero only for kTransaction.
+  std::uint64_t tx_generation_ = 0;
 };
 
 // A logical replication event may span multiple frames and blocks. Every

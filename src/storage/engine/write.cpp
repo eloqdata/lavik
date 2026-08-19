@@ -339,6 +339,13 @@ absl::Status StorageEngine::Impl::MarkRecordDeadLocal(
   if (record.immediate_extents_ != nullptr) [[unlikely]] {
     SpawnExtentReclaim(store, record.immediate_extents_);
   }
+  if (record.tx_tagged_) {
+    DropTaggedRecordLocal(store, record.block_id_, record.allocation_epoch_,
+                          record.total_disk_bytes_);
+  }
+  if (record.dependency_pinned_) {
+    UnpinTxDependencyLocal(store, record.block_id_, record.allocation_epoch_);
+  }
   state->live_bytes_ -= record.total_disk_bytes_;
   MaybeQueueDefrag(store, record.block_id_);
   return absl::OkStatus();
@@ -362,9 +369,16 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // durable: recovery treats "commit without data" as impossible, and
   // "data without commit" as an aborted transaction.
   auto retirements = std::make_unique<std::vector<RetiredRecord>>();
+  TxShardWrites* generation_receipt = nullptr;
   for (TxShardWrites* shard : shards) {
     if (shard == nullptr) {
       continue;
+    }
+    if (generation_receipt == nullptr) {
+      generation_receipt = shard;
+    } else if (shard->generation_ != generation_receipt->generation_) {
+      co_return absl::InvalidArgumentError(
+          "transaction shards span multiple generations");
     }
     for (const TxShardWrites::Fence& fence : shard->fences_) {
       absl::Status durable =
@@ -388,6 +402,8 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
           .total_disk_bytes_ = retired.total_disk_bytes_,
           .block_owner_ = retired.block_owner_,
           .record_offset_ = retired.record_offset_,
+          .tx_tagged_ = retired.tx_tagged_,
+          .dependency_pinned_ = retired.dependency_pinned_,
           .dependent_extents_ = retired.dependent_extents_,
           .immediate_extents_ = retired.immediate_extents_,
           .extra_dependent_extents_ = nullptr,
@@ -406,7 +422,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
       store, 0, {}, {}, RecordKind::kTxCommit, ValueType::kNone, 0,
       ComputeDigest({}), txid, 0, false, true, false, false,
       std::numeric_limits<std::uint64_t>::max(), nullptr, &commit_location,
-      nullptr, nullptr, std::move(retirements));
+      nullptr, generation_receipt, std::move(retirements));
   if (!written.ok()) {
     co_return written;
   }
@@ -553,6 +569,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       store.write_failed_ = true;
       co_return dead;
     }
+    UnpinTxDependencyLocal(store, entry.previous_->block_id_,
+                           entry.previous_->allocation_epoch_);
     if (partition.capture_deltas_) {
       // The aborted value may already have shipped; there is no delta that
       // can express "go back", so force the replica to re-copy the
@@ -606,6 +624,30 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   if (unlock_writer) {
     store.store_state_mutex_.Unlock(*store.worker_);
   }
+#ifndef NDEBUG
+  // Deterministically expose the active_tx_blocks_ rehash window: another
+  // transaction generation may install its append stream while this writer
+  // owns no store-state lock. Only the first foreground allocation pauses.
+  static std::atomic<bool> tx_active_pause_claimed = false;
+  const char* tx_active_pause_text =
+      std::getenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS");
+  bool expected_tx_active_pause = false;
+  if (!for_defrag && unlock_writer && tx_active_pause_text != nullptr &&
+      tx_active_pause_claimed.compare_exchange_strong(
+          expected_tx_active_pause, true, std::memory_order_acq_rel)) {
+    char* end = nullptr;
+    const unsigned long pause_ms =
+        std::strtoul(tx_active_pause_text, &end, 10);
+    if (end != tx_active_pause_text && *end == '\0' && pause_ms != 0) {
+      absl::Status paused = co_await celer::SleepFor(
+          *store.worker_, std::chrono::milliseconds(pause_ms));
+      if (!paused.ok()) {
+        co_await store.store_state_mutex_.Lock();
+        co_return paused;
+      }
+    }
+  }
+#endif
   absl::StatusOr<ReservedBlock> allocated{
       absl::Status(absl::StatusCode::kUnavailable, "storage is shutting down")};
   // A writer racing shutdown must not park behind an allocation the shutdown
@@ -996,6 +1038,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                              "injected transaction write fault");
     }
   }
+  if ((txid != 0 && (tx == nullptr || for_defrag)) ||
+      (kind == RecordKind::kTxCommit && txid == 0)) {
+    co_return absl::InvalidArgumentError(
+        "tagged records require a live transaction generation");
+  }
   if ((kind == RecordKind::kValue && value_type == ValueType::kNone) ||
       (kind == RecordKind::kTombstone &&
        (value_type != ValueType::kNone || expire_at_ms != 0 ||
@@ -1070,14 +1117,33 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   const std::uint64_t lsn = *allocated_lsn;
 
-  auto& active = store.active_block_;
+  const bool transaction_append = txid != 0;
+  const std::uint64_t tx_generation = transaction_append && tx != nullptr
+                                          ? tx->generation_
+                                          : 0;
+  if (transaction_append && tx_generation == 0) {
+    co_return absl::InvalidArgumentError(
+        "transaction record has no generation lease");
+  }
+  const BlockKind append_block_kind = transaction_append
+                                          ? BlockKind::kTransaction
+                                          : BlockKind::kRecords;
+  // Never keep a flat_hash_map value reference across an await that can
+  // release store_state_mutex_. Another transaction may install a different
+  // generation and rehash active_tx_blocks_ while block allocation is in
+  // flight. Re-resolve the entry on every use; active_block_ itself is stable.
+  auto active_stream = [&]() -> std::optional<ActiveBlock>& {
+    return transaction_append ? store.active_tx_blocks_[tx_generation]
+                              : store.active_block_;
+  };
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
-  while (!active.has_value() ||
-         active->committed_bytes_ + total_disk_bytes > kStorageBlockBytes) {
+  while (!active_stream().has_value() ||
+         active_stream()->committed_bytes_ + total_disk_bytes >
+             kStorageBlockBytes) {
     if (trace != nullptr) trace->allocated_block_ = true;
-    if (active.has_value()) {
-      RequestFlush(store, active->block_id_);
-      active.reset();
+    if (active_stream().has_value()) {
+      RequestFlush(store, active_stream()->block_id_);
+      active_stream().reset();
     }
     auto allocated = co_await AcquireWriteBlock(store, for_defrag,
                                                 unlock_writer_while_waiting);
@@ -1087,7 +1153,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     // Another writer may have installed an active block while this coroutine
     // had store_state_mutex released. Keep that one and hand the spare back to
     // the pool instead of overwriting it; the loop re-checks the fit.
-    if (active.has_value()) {
+    if (active_stream().has_value()) {
       co_await ReturnReservedBlock(*allocated);
       continue;
     }
@@ -1119,7 +1185,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       }
       const std::uint64_t block_id = allocated->block_id_;
       std::fill_n(staging_buffer.data_, staging_buffer.size_, std::byte{0});
-      active = ActiveBlock{
+      active_stream() = ActiveBlock{
           .block_id_ = block_id,
           .writer_id_ = writer_id,
           .layout_worker_count_ = worker_count_,
@@ -1130,11 +1196,13 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
           .write_buffer_id_ = write_buffer_id,
           .heap_buffer_ = heap_buffer,
           .heap_buffer_size_ = options_.buffers_.write_buffer_bytes_,
+          .kind_ = append_block_kind,
+          .tx_generation_ = tx_generation,
       };
       BlockState& state = CreateBlockState(store, block_id);
       state.writer_id_ = writer_id;
       state.layout_worker_count_ = worker_count_;
-      state.allocation_epoch_ = active->allocation_epoch_;
+      state.allocation_epoch_ = active_stream()->allocation_epoch_;
       state.committed_bytes_ = kBlockHeaderBytes;
       state.live_bytes_ = 0;
       state.pins_ = 0;
@@ -1143,6 +1211,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       state.in_memory_ = true;
       state.flush_queued_ = false;
       state.flush_in_progress_ = false;
+      state.kind_ = append_block_kind;
+      if (transaction_append) {
+        store.tx_blocks_.insert_or_assign(
+            block_id,
+            WorkerStore::TxBlockRuntime{
+                .allocation_epoch_ = allocated->allocation_epoch_,
+                .generation_ = tx_generation,
+            });
+      }
       state.staging_slot_ = AcquireStagingSlot(store);
       StagingSlot& staging_state = store.staging_slots_[state.staging_slot_];
       staging_state.write_buffer_id_ = write_buffer_id;
@@ -1193,7 +1270,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       previous_extents, external && !key_external ? extents : nullptr);
   const ExtentManifest previous_dependent_extents =
       DependentExtentsFor(store, previous_entry);
-  ActiveBlock updated = *active;
+  ActiveBlock updated = *active_stream();
   const std::uint32_t record_offset = updated.committed_bytes_;
   updated.committed_bytes_ += static_cast<std::uint32_t>(total_disk_bytes);
   ++updated.record_count_;
@@ -1276,9 +1353,9 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   if (updated.committed_bytes_ == kStorageBlockBytes) {
     state.in_memory_ = true;
     RequestFlush(store, updated.block_id_);
-    active.reset();
+    active_stream().reset();
   } else {
-    *active = updated;
+    active_stream() = updated;
   }
 
   const RecordLocation location{
@@ -1309,9 +1386,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                              (previous->expire_at_ms_ == 0 ||
                               previous->expire_at_ms_ >
                                   std::max(expire_at_ms, UnixTimeMillis()))))),
+      .tx_tagged_ = txid != 0 && kind != RecordKind::kTxCommit,
       .kind_ = kind,
       .value_type_ = value_type,
   };
+  if (transaction_append) {
+    NoteTxRecordLocal(store, updated.block_id_, updated.allocation_epoch_,
+                      tx_generation, txid, location.total_disk_bytes_,
+                      kind == RecordKind::kTxCommit);
+  }
   const bool was_live =
       previous.has_value() && previous->kind_ == RecordKind::kValue;
   const bool is_live = kind == RecordKind::kValue;
@@ -1333,6 +1416,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     }
   }
   const bool route_to_commit = tx != nullptr && previous.has_value();
+  const bool dependency_pinned =
+      route_to_commit && PinTxDependencyLocal(store, *previous);
   const bool defer_defrag_retirement =
       for_defrag && commit_retirements != nullptr;
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
@@ -1371,6 +1456,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         .total_disk_bytes_ = previous->total_disk_bytes_,
         .block_owner_ = previous->block_owner_,
         .record_offset_ = previous->record_offset_,
+        .tx_tagged_ = previous->tx_tagged_,
+        .dependency_pinned_ = dependency_pinned,
         .dependent_extents_ =
             previous->key_external_ ? previous_dependent_extents : nullptr,
         .immediate_extents_ =
@@ -1438,9 +1525,9 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   if (!for_defrag && previous.has_value() && previous->external_) {
     RequestFlush(store, updated.block_id_);
-    if (store.active_block_.has_value() &&
-        store.active_block_->block_id_ == updated.block_id_) {
-      store.active_block_.reset();
+    if (active_stream().has_value() &&
+        active_stream()->block_id_ == updated.block_id_) {
+      active_stream().reset();
     }
   }
   if (written_location != nullptr) {
@@ -1451,17 +1538,30 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
 }
 
 void StorageEngine::Impl::SealActiveBlocks(WorkerStore& store) {
-  if (store.active_block_.has_value() &&
-      store.active_block_->committed_bytes_ > kBlockHeaderBytes) {
-    RequestFlush(store, store.active_block_->block_id_);
-    store.active_block_.reset();
+  auto seal = [&](std::optional<ActiveBlock>& active) {
+    if (!active.has_value() || active->committed_bytes_ <= kBlockHeaderBytes) {
+      return;
+    }
+    RequestFlush(store, active->block_id_);
+    active.reset();
+  };
+  seal(store.active_block_);
+  for (auto& [generation, active] : store.active_tx_blocks_) {
+    (void)generation;
+    seal(active);
   }
 }
 
 void StorageEngine::Impl::FlushActiveBlock(WorkerStore& store) {
-  if (store.active_block_.has_value() &&
-      store.active_block_->committed_bytes_ > kBlockHeaderBytes) {
-    RequestFlush(store, store.active_block_->block_id_);
+  auto flush = [&](const std::optional<ActiveBlock>& active) {
+    if (active.has_value() && active->committed_bytes_ > kBlockHeaderBytes) {
+      RequestFlush(store, active->block_id_);
+    }
+  };
+  flush(store.active_block_);
+  for (const auto& [generation, active] : store.active_tx_blocks_) {
+    (void)generation;
+    flush(active);
   }
 }
 

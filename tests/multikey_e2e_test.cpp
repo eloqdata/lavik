@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <stdexcept>
@@ -198,7 +199,10 @@ RespClient Connect(std::uint16_t port) {
 class ServerProcess {
  public:
   ServerProcess(const std::string& binary, std::uint16_t port,
-                const std::string& data_path, const std::string& log_path) {
+                const std::string& data_path, const std::string& log_path,
+                std::string_view fail_tx_write = {},
+                std::string_view tx_active_pause_ms = {},
+                bool fail_tx_cleaner_once = false) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -208,6 +212,17 @@ class ServerProcess {
         (void)::dup2(log_fd, STDOUT_FILENO);
         (void)::dup2(log_fd, STDERR_FILENO);
         ::close(log_fd);
+      }
+      if (!fail_tx_write.empty()) {
+        (void)::setenv("KEYLANE_FAIL_TX_WRITE",
+                       std::string(fail_tx_write).c_str(), 1);
+      }
+      if (!tx_active_pause_ms.empty()) {
+        (void)::setenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS",
+                       std::string(tx_active_pause_ms).c_str(), 1);
+      }
+      if (fail_tx_cleaner_once) {
+        (void)::setenv("KEYLANE_FAIL_TX_CLEANER_ONCE", "1", 1);
       }
       std::vector<std::string> arguments{
           binary,
@@ -281,6 +296,43 @@ std::string ReadFile(const std::string& path) {
   std::ifstream input(path);
   return std::string(std::istreambuf_iterator<char>(input),
                      std::istreambuf_iterator<char>());
+}
+
+std::uint64_t TxCleanerStat(RespClient& client, std::string_view marker) {
+  const std::string info = client.Command({"INFO", "STATS"});
+  const std::size_t begin = info.find(marker);
+  if (begin == std::string::npos) Fail("tx cleaner INFO field is missing");
+  const std::size_t value_begin = begin + marker.size();
+  const std::size_t value_end = info.find("\r\n", value_begin);
+  if (value_end == std::string::npos) Fail("malformed tx cleaner INFO field");
+  std::uint64_t retired = 0;
+  const char* first = info.data() + value_begin;
+  const char* last = info.data() + value_end;
+  const auto [parsed, error] = std::from_chars(first, last, retired);
+  if (error != std::errc{} || parsed != last) {
+    Fail("invalid tx cleaner INFO counter");
+  }
+  return retired;
+}
+
+std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
+  return TxCleanerStat(client, "tx_cleaner_retired_generations:");
+}
+
+bool WaitForCleanerStat(RespClient& client, std::string_view marker,
+                        std::uint64_t baseline,
+                        std::chrono::seconds timeout = 30s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (TxCleanerStat(client, marker) > baseline) return true;
+    std::this_thread::sleep_for(20ms);
+  }
+  return false;
+}
+
+bool WaitForCleanerRetirement(RespClient& client, std::uint64_t baseline) {
+  return WaitForCleanerStat(client, "tx_cleaner_retired_generations:",
+                            baseline);
 }
 
 }  // namespace
@@ -583,7 +635,217 @@ int main(int argc, char** argv) {
       }
     }
 
+    // Transaction generations are rotated and cleaned by whichever periodic
+    // worker wins the process-wide guard. Wait for an observed retirement so
+    // this verifies the cleaner itself rather than merely sleeping.
+    Expect(client.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable tx cleaner");
+    Expect(client.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
+           "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("20"),
+           "read tx cleaner cooldown");
+    const std::uint64_t cleaner_baseline =
+        TxCleanerRetiredGenerations(client);
+    Expect(client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b",
+                           "after-b", "cleaner-c", "after-c", "cleaner-d",
+                           "after-d"}),
+           "+OK", "tx cleaner seed");
+    if (!WaitForCleanerRetirement(client, cleaner_baseline)) {
+      Fail("transaction cleaner did not retire a generation");
+    }
+    Expect(client.Command({"MGET", "cleaner-d", "cleaner-a", "cleaner-c",
+                           "cleaner-b"}),
+           "*4\r\n" + Bulk("after-d") + "\r\n" + Bulk("after-a") +
+               "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-b"),
+           "values after tx cleaner retirement");
+
     server.Stop();
+    ServerProcess recovered_server(argv[1], port, data_path, log_path);
+    RespClient recovered = Connect(port);
+    Expect(recovered.Command({"MGET", "cleaner-a", "cleaner-b", "cleaner-c",
+                              "cleaner-d"}),
+           "*4\r\n" + Bulk("after-a") + "\r\n" + Bulk("after-b") +
+               "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-d"),
+           "promoted values after restart");
+    Expect(recovered.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+           "+OK", "disable tx cleaner before recovery fixture");
+    Expect(recovered.Command({"MSET", "cleaner-recovery-a", "disk-a",
+                              "cleaner-recovery-b", "disk-b"}),
+           "+OK", "persist a closed generation for recovery");
+    recovered_server.Stop();
+
+    ServerProcess generation_recovery_server(argv[1], port, data_path,
+                                             log_path);
+    RespClient generation_recovery = Connect(port);
+    const std::uint64_t recovered_cleaner_baseline =
+        TxCleanerRetiredGenerations(generation_recovery);
+    Expect(generation_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable tx cleaner after generation recovery");
+    if (!WaitForCleanerRetirement(generation_recovery,
+                                  recovered_cleaner_baseline)) {
+      Fail("recovered transaction generation was not retired");
+    }
+    Expect(generation_recovery.Command(
+               {"MGET", "cleaner-recovery-a", "cleaner-recovery-b"}),
+           "*2\r\n" + Bulk("disk-a") + "\r\n" + Bulk("disk-b"),
+           "recovered generation values after retirement");
+
+    // FLUSHDB invalidates tagged winners by advancing the database epoch.
+    // The cleaner must not promote them into the new epoch; detached-index
+    // reclaim instead drops their tagged-byte accounting so the complete
+    // transaction generation can still be retired.
+    Expect(generation_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+           "+OK", "disable tx cleaner before FLUSHDB fixture");
+    Expect(generation_recovery.Command(
+               {"MSET", "cleaner-flush-a", "old-a", "cleaner-flush-b",
+                "old-b"}),
+           "+OK", "persist tagged values before FLUSHDB");
+    Expect(generation_recovery.Command({"FLUSHDB", "SYNC"}), "+OK",
+           "flush tagged transaction generation");
+    const std::uint64_t flushed_cleaner_baseline =
+        TxCleanerRetiredGenerations(generation_recovery);
+    Expect(generation_recovery.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable tx cleaner after FLUSHDB");
+    if (!WaitForCleanerRetirement(generation_recovery,
+                                  flushed_cleaner_baseline)) {
+      Fail("FLUSHDB-invalidated transaction generation was not retired");
+    }
+    Expect(generation_recovery.Command(
+               {"EXISTS", "cleaner-flush-a", "cleaner-flush-b"}),
+           ":0", "FLUSHDB values after transaction generation retirement");
+    generation_recovery_server.Stop();
+
+#ifndef NDEBUG
+    // A failed transaction keeps its generation lease through rollback. Once
+    // UNDO has restored every old value, dependency pins drop and the same
+    // cleaner can retire the aborted tagged records safely.
+    ServerProcess rollback_server(argv[1], port, data_path, log_path,
+                                  "cleaner-undo-d");
+    RespClient rollback = Connect(port);
+    Expect(rollback.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable tx cleaner during rollback");
+    for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",
+                                 "cleaner-undo-c", "cleaner-undo-d"}) {
+      Expect(rollback.Command({"SET", key, "old"}), "+OK",
+             "tx cleaner rollback seed");
+    }
+    const std::uint64_t rollback_cleaner_baseline =
+        TxCleanerRetiredGenerations(rollback);
+    const std::string failed = rollback.Command(
+        {"MSET", "cleaner-undo-a", "new-a", "cleaner-undo-b", "new-b",
+         "cleaner-undo-c", "new-c", "cleaner-undo-d", "new-d"});
+    if (!failed.starts_with("-ERR injected transaction write fault")) {
+      Fail("fault-injected MSET unexpectedly returned: " + failed);
+    }
+    Expect(rollback.Command({"MGET", "cleaner-undo-a", "cleaner-undo-b",
+                             "cleaner-undo-c", "cleaner-undo-d"}),
+           "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
+               Bulk("old") + "\r\n" + Bulk("old"),
+           "UNDO values while tx cleaner is enabled");
+    if (!WaitForCleanerRetirement(rollback, rollback_cleaner_baseline)) {
+      Fail("transaction cleaner did not retire the rolled-back generation");
+    }
+    rollback_server.Stop();
+
+    ServerProcess rollback_recovered_server(argv[1], port, data_path,
+                                            log_path);
+    RespClient rollback_recovered = Connect(port);
+    Expect(rollback_recovered.Command(
+               {"MGET", "cleaner-undo-a", "cleaner-undo-b",
+                "cleaner-undo-c", "cleaner-undo-d"}),
+           "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
+               Bulk("old") + "\r\n" + Bulk("old"),
+           "UNDO values after cleaner restart");
+    rollback_recovered_server.Stop();
+
+    // The first transaction suspends after selecting the current generation's
+    // append stream and releasing store_state_mutex for block allocation. A
+    // completed peer write lets the cleaner rotate, then the next generation
+    // inserts into the same flat_hash_map while the first writer is suspended.
+    // The resumed writer must re-find the old generation rather than
+    // dereference storage invalidated by that insertion's rehash.
+    ServerProcess rehash_server(argv[1], port, data_path, log_path, {}, "3000");
+    RespClient rehash_control = Connect(port);
+    Expect(rehash_control.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable cleaner for active transaction map rehash");
+    std::this_thread::sleep_for(100ms);
+    const std::uint64_t rehash_round_baseline =
+        TxCleanerStat(rehash_control, "tx_cleaner_rounds:");
+    auto paused_write = std::async(std::launch::async, [port] {
+      RespClient client = Connect(port);
+      return client.Command({"MSET", "rehash-paused-a{tx-map}", "paused-a",
+                             "rehash-paused-b{tx-map}", "paused-b"});
+    });
+    std::this_thread::sleep_for(100ms);
+    Expect(rehash_control.Command(
+               {"MSET", "rehash-seed-a{tx-map}", "seed-a",
+                "rehash-seed-b{tx-map}", "seed-b"}),
+           "+OK", "seed generation while allocation is paused");
+    if (!WaitForCleanerStat(rehash_control, "tx_cleaner_rounds:",
+                            rehash_round_baseline)) {
+      Fail("cleaner did not rotate the paused transaction generation");
+    }
+    Expect(rehash_control.Command(
+               {"MSET", "rehash-trigger-a{tx-map}", "trigger-a",
+                "rehash-trigger-b{tx-map}", "trigger-b"}),
+           "+OK", "insert a new active transaction generation");
+    if (paused_write.wait_for(5s) != std::future_status::ready) {
+      Fail("paused transaction did not resume after active map rehash");
+    }
+    Expect(paused_write.get(), "+OK", "paused transaction after map rehash");
+    Expect(rehash_control.Command(
+               {"MGET", "rehash-paused-a{tx-map}",
+                "rehash-paused-b{tx-map}", "rehash-seed-a{tx-map}",
+                "rehash-seed-b{tx-map}", "rehash-trigger-a{tx-map}",
+                "rehash-trigger-b{tx-map}"}),
+           "*6\r\n" + Bulk("paused-a") + "\r\n" + Bulk("paused-b") +
+               "\r\n" + Bulk("seed-a") + "\r\n" + Bulk("seed-b") +
+               "\r\n" + Bulk("trigger-a") + "\r\n" + Bulk("trigger-b"),
+           "values after active transaction map rehash");
+    rehash_server.Stop();
+
+    // A retryable cleaner failure is observable but must not terminate the
+    // periodic flush coroutine or report a shutdown drain as complete. The
+    // same process must run a later round and retire the generation.
+    ServerProcess retry_server(argv[1], port, data_path, log_path, {}, {},
+                               true);
+    RespClient retry = Connect(port);
+    const std::uint64_t failure_baseline =
+        TxCleanerStat(retry, "tx_cleaner_failures:");
+    const std::uint64_t retry_retired_baseline =
+        TxCleanerRetiredGenerations(retry);
+    Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
+                          "cleaner-retry-b{tx}", "durable-b"}), "+OK",
+           "seed retryable cleaner failure");
+    Expect(retry.Command(
+               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+           "+OK", "enable retryable cleaner fixture");
+    if (!WaitForCleanerStat(retry, "tx_cleaner_failures:",
+                            failure_baseline, 10s)) {
+      Fail("injected cleaner failure was not recorded");
+    }
+    if (!WaitForCleanerRetirement(retry, retry_retired_baseline)) {
+      Fail("periodic flush stopped after a retryable cleaner failure");
+    }
+    Expect(retry.Command({"MGET", "cleaner-retry-a{tx}",
+                          "cleaner-retry-b{tx}"}),
+           "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),
+           "value after cleaner retry");
+    retry_server.Stop();
+
+    ServerProcess retry_recovered_server(argv[1], port, data_path, log_path);
+    RespClient retry_recovered = Connect(port);
+    Expect(retry_recovered.Command({"MGET", "cleaner-retry-a{tx}",
+                                    "cleaner-retry-b{tx}"}),
+           "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),
+           "cleaner retry value after graceful shutdown");
+    retry_recovered_server.Stop();
+#endif
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
               << ReadFile(log_path) << std::flush;

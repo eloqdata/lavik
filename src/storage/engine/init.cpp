@@ -780,6 +780,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         live_by_owner[location.block_owner_].push_back(RecoveryLiveReference{
             .block_id_ = location.block_id_,
             .allocation_epoch_ = location.allocation_epoch_,
+            .txid_ = store.recovery_txids_.contains(&entry)
+                         ? store.recovery_txids_.at(&entry)
+                         : 0,
             .bytes_ = location.total_disk_bytes_,
         });
         const ExtentManifest extents = ExtentsFor(store, &entry);
@@ -833,6 +836,15 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           }
         }
         state->live_bytes_ += reference.bytes_;
+        if (reference.txid_ != 0) {
+          const auto tx_block = owner_store.tx_blocks_.find(reference.block_id_);
+          if (tx_block != owner_store.tx_blocks_.end()) {
+            NoteTxRecordLocal(owner_store, reference.block_id_,
+                              reference.allocation_epoch_,
+                              tx_block->second.generation_, reference.txid_,
+                              reference.bytes_, false);
+          }
+        }
       }
       return absl::OkStatus();
     };
@@ -857,6 +869,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // Every worker's live-reference pass has run, so no manifest still needs
   // to be matched against a recovered extent header.
   store.recovered_extents_.clear();
+  store.recovery_txids_.clear();
+  store.recovery_txids_.rehash(0);
 
   std::vector<std::vector<std::uint64_t>> free_by_device(devices_.size());
   for (std::uint64_t block_id : zero_blocks) {
