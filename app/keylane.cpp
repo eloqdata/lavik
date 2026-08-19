@@ -60,10 +60,36 @@ int main(int argc, char** argv) {
 
   app.add_option("config", config_file,
                  "Redis-style configuration file (must be the first argument)");
-  app.add_option("-b,--bind", options.bind_ip_, "Bind address")
+  app.add_option("-b,--bind", options.bind_addresses_,
+                 "Bind address or hostname; repeat for multiple addresses")
       ->capture_default_str();
   app.add_option("-p,--port", options.port_, "Listen port")
       ->capture_default_str();
+  app.add_option("--tls-port", options.tls_port_,
+                 "TLS listen port (0 disables)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--tls-cert-file", options.tls_cert_file_,
+                 "TLS certificate chain PEM file");
+  app.add_option("--tls-key-file", options.tls_key_file_,
+                 "TLS private key PEM file");
+  app.add_option("--tls-ca-cert-file", options.tls_ca_cert_file_,
+                 "TLS trusted CA PEM file");
+  app.add_option("--tls-auth-clients", options.tls_auth_clients_,
+                 "TLS client certificate authentication: no, optional, yes")
+      ->capture_default_str()
+      ->check(CLI::IsMember({"no", "optional", "yes"}));
+  app.add_flag("--tls-replication,!--no-tls-replication",
+               options.tls_replication_,
+               "Use TLS for outgoing replication connections")
+      ->capture_default_str();
+  app.add_option("--requirepass", options.requirepass_,
+                 "Password required by AUTH");
+  app.add_option("--masteruser", options.masteruser_,
+                 "Username used to authenticate to the replication source")
+      ->capture_default_str();
+  app.add_option("--masterauth", options.masterauth_,
+                 "Password used to authenticate to the replication source");
   app.add_option("--metrics-port", options.metrics_port_,
                  "Prometheus HTTP listen port (0 disables)")
       ->capture_default_str()
@@ -172,6 +198,11 @@ int main(int argc, char** argv) {
   if (!config_file.empty() && config_file != options.config_file_) {
     std::cerr << "Configuration error: the configuration file must be the "
                  "first argument\n";
+    return 2;
+  }
+  const absl::Status validated = keylane::ValidateServerOptions(options);
+  if (!validated.ok()) {
+    std::cerr << "Configuration error: " << validated.message() << '\n';
     return 2;
   }
 

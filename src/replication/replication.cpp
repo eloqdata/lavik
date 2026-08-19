@@ -31,6 +31,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "celer/net/connection.h"
+#include "celer/net/tls.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
@@ -365,6 +366,24 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
       "replication handshake line exceeds 64 KiB");
 }
 
+Task<absl::Status> AuthenticateUpstream(TcpStream& stream,
+                                        std::string_view username,
+                                        std::string_view password) {
+  if (password.empty()) co_return absl::OkStatus();
+  std::vector<std::string> args{"AUTH"};
+  if (username != "default") args.emplace_back(username);
+  args.emplace_back(password);
+  absl::Status sent = co_await WriteText(stream, EncodeRespCommand(args));
+  if (!sent.ok()) co_return sent;
+  auto response = co_await ReadLine(stream);
+  if (!response.ok()) co_return response.status();
+  if (*response != "+OK") {
+    co_return absl::PermissionDeniedError(
+        absl::StrCat("replication AUTH failed: ", *response));
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> WaitForClose(TcpStream& stream) {
   std::array<std::byte, 1024> input{};
   while (stream.IsOpen()) {
@@ -397,8 +416,9 @@ absl::Status ConfigureConnectedFd(int fd) {
   return absl::OkStatus();
 }
 
-Task<absl::StatusOr<TcpStream>> ConnectTcp(std::string_view host,
-                                           std::uint16_t port) {
+Task<absl::StatusOr<TcpStream>> ConnectTcp(
+    std::string_view host, std::uint16_t port,
+    const std::shared_ptr<celer::TlsContext>& tls_context) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -446,7 +466,15 @@ Task<absl::StatusOr<TcpStream>> ConnectTcp(std::string_view host,
     ::close(connected_fd);
     co_return absl::InternalError("failed to register replication connection");
   }
-  co_return TcpStream(registered);
+  TcpStream stream(registered);
+  if (tls_context != nullptr) {
+    absl::Status started = co_await stream.StartTls(tls_context, false, host);
+    if (!started.ok()) {
+      stream.Close().IgnoreError();
+      co_return started;
+    }
+  }
+  co_return stream;
 }
 
 std::string NewReplicationId() {
@@ -915,12 +943,15 @@ class ReplicationManager::Impl {
  public:
   Impl(storage::StorageEngine* storage,
        std::optional<ReplicaOfConfig> initial_upstream,
-       std::uint16_t listen_port)
+       const ReplicationOptions& options)
       : storage_(storage),
         upstream_(std::move(initial_upstream)),
         cursor_state_(std::make_shared<ReplicaCursorState>(storage->worker_count())),
         replid_(NewReplicationId()),
-        listen_port_(listen_port) {
+        listen_port_(options.listen_port_),
+        tls_context_(options.use_tls_ ? options.tls_context_ : nullptr),
+        masteruser_(options.masteruser_),
+        masterauth_(options.masterauth_) {
     if (upstream_.has_value()) {
       role_.store(ReplicationRole::kConnecting, std::memory_order_relaxed);
       generation_.store(1, std::memory_order_relaxed);
@@ -1057,6 +1088,7 @@ class ReplicationManager::Impl {
 
     absl::Status paused = co_await stream.PauseRead();
     if (!paused.ok()) co_return paused;
+    std::shared_ptr<celer::TlsState> tls_state = stream.TakeTlsState();
     const int duplicate = ::fcntl(stream.NativeFd(), F_DUPFD_CLOEXEC, 0);
     if (duplicate < 0) {
       co_return absl::InternalError(
@@ -1069,11 +1101,16 @@ class ReplicationManager::Impl {
     }
     stream.Close().IgnoreError();
     co_return co_await celer::SubmitTo(
-        owner, [this, duplicate, args = std::move(args)]() mutable {
+        owner, [this, duplicate, tls_state = std::move(tls_state),
+                args = std::move(args)]() mutable {
           Connection connection;
           connection.worker_ = celer::ThisWorker().self_;
           connection.file_.fd_ = duplicate;
           connection.closed_ = false;
+          if (tls_state != nullptr) {
+            connection.recv_mode_ = celer::RecvMode::kOneShot;
+            connection.tls_state_ = std::move(tls_state);
+          }
           Connection* registered =
               celer::ThisWorker().self_->AddConnection(std::move(connection));
           if (registered == nullptr) {
@@ -1163,7 +1200,8 @@ class ReplicationManager::Impl {
   Task<absl::Status> RunReplicaSession(
       const ReplicaOfConfig& upstream, std::uint64_t generation,
       const std::shared_ptr<ReplicaSession>& session) {
-    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_);
+    auto connected =
+        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
     if (!connected.ok()) co_return connected.status();
     TcpStream control = std::move(*connected);
     const int control_fd = control.NativeFd();
@@ -1173,6 +1211,14 @@ class ReplicationManager::Impl {
     }
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kControl);
+
+    absl::Status authenticated =
+        co_await AuthenticateUpstream(control, masteruser_, masterauth_);
+    if (!authenticated.ok()) {
+      session->sockets_.Remove(control_fd);
+      control.Close().IgnoreError();
+      co_return authenticated;
+    }
 
     role_.store(ReplicationRole::kHandshake, std::memory_order_release);
     // Protocol version and argument count remain 1 and 3. Older sources ignore
@@ -1305,7 +1351,8 @@ class ReplicationManager::Impl {
                                     std::shared_ptr<ReplicaSession> session,
                                     unsigned flow_id) {
     ReplicaFlowActivityGuard activity(&session->active_flows_);
-    auto connected = co_await ConnectTcp(upstream.host_, upstream.port_);
+    auto connected =
+        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
     if (!connected.ok()) {
       session->Cancel();
       co_return connected.status();
@@ -1318,6 +1365,14 @@ class ReplicationManager::Impl {
     }
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kFlow);
+    absl::Status authenticated =
+        co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+    if (!authenticated.ok()) {
+      session->sockets_.Remove(fd);
+      stream.Close().IgnoreError();
+      session->Cancel();
+      co_return authenticated;
+    }
     const auto cursor = session->cursors_->Load(flow_id);
     const std::vector<std::string> flow_args{
         "KLFLOW", std::string(kProtocolVersion),
@@ -2382,6 +2437,9 @@ class ReplicationManager::Impl {
 
   const std::string replid_;
   const std::uint16_t listen_port_;
+  const std::shared_ptr<celer::TlsContext> tls_context_;
+  const std::string masteruser_;
+  const std::string masterauth_;
   std::atomic<std::uint64_t> next_master_session_id_{1};
   mutable std::mutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
@@ -2392,8 +2450,8 @@ ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
     : impl_(std::make_unique<Impl>(storage, std::move(initial_upstream),
-                                  options.listen_port_)),
-      options_(options) {}
+                                  options)),
+      options_(std::move(options)) {}
 
 ReplicationManager::~ReplicationManager() = default;
 

@@ -20,12 +20,19 @@
 #include <string_view>
 #include <utility>
 
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
+
 #include "absl/strings/str_cat.h"
+#include "absl/strings/match.h"
+#include "absl/strings/str_join.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
+#include "celer/net/tls.h"
 #include "celer/runtime/sync.h"
 #include "keylane/command.h"
+#include "keylane/config.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication.h"
@@ -390,6 +397,31 @@ enum class WaitResult {
 
 Task<absl::Status> SampleMemory(Worker& worker);
 
+class PasswordAuthenticator {
+ public:
+  explicit PasswordAuthenticator(std::string_view password)
+      : required_(!password.empty()) {
+    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
+           password.size(), digest_.data());
+  }
+
+  bool required() const noexcept { return required_; }
+
+  bool Authenticate(std::string_view username,
+                    std::string_view password) const noexcept {
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> candidate{};
+    SHA256(reinterpret_cast<const unsigned char*>(password.data()),
+           password.size(), candidate.data());
+    const bool password_matches =
+        CRYPTO_memcmp(candidate.data(), digest_.data(), digest_.size()) == 0;
+    return required_ && username == "default" && password_matches;
+  }
+
+ private:
+  bool required_ = false;
+  std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_{};
+};
+
 template <typename Server>
 WaitResult WaitForSignalOrServerStop(const Server& server) {
   pollfd fds[2] = {
@@ -431,11 +463,13 @@ class RedisService final : public TcpService {
  public:
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
                ReplicationManager* replication,
-               long online_mimalloc_purge_delay_ms)
+               long online_mimalloc_purge_delay_ms,
+               std::string_view requirepass)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
-        online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms) {}
+        online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms),
+        authenticator_(requirepass) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -470,6 +504,7 @@ class RedisService final : public TcpService {
   storage::StorageEngine* storage_;
   ReplicationManager* replication_;
   long online_mimalloc_purge_delay_ms_;
+  PasswordAuthenticator authenticator_;
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
   std::unique_ptr<CoroutineBarrier> online_allocator_barrier_;
@@ -619,6 +654,7 @@ Task<absl::Status> SampleMemory(Worker& worker) {
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
+  ctx.authenticated_ = !authenticator_.required();
   ctx.conn_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed);
   ConnectionOpened();
   const absl::Status status = co_await Serve(stream, ctx);
@@ -691,6 +727,48 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return write_status;
       }
       co_return command_result.status();
+    }
+
+    const auto& args = command_result->args_;
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "AUTH")) {
+      std::string_view encoded;
+      if (args.size() != 2 && args.size() != 3) {
+        encoded = ctx.reply_builder_.AppendError(
+            "ERR wrong number of arguments for 'auth' command");
+      } else if (!authenticator_.required()) {
+        encoded = ctx.reply_builder_.AppendError(
+            "ERR AUTH called without any password configured for the default "
+            "user. Are you sure your configuration is correct?");
+      } else {
+        const std::string_view username =
+            args.size() == 2 ? std::string_view("default") : args[1];
+        const std::string_view password = args.back();
+        if (authenticator_.Authenticate(username, password)) {
+          ctx.authenticated_ = true;
+          encoded = ctx.reply_builder_.AppendSimpleString("OK");
+        } else {
+          encoded = ctx.reply_builder_.AppendError(
+              "WRONGPASS invalid username-password pair or user is "
+              "disabled.");
+        }
+      }
+      absl::Status written = co_await stream.WriteAll(
+          std::span<const std::byte>(
+              reinterpret_cast<const std::byte*>(encoded.data()),
+              encoded.size()));
+      if (!written.ok()) co_return written;
+      continue;
+    }
+
+    if (!ctx.authenticated_) {
+      const std::string_view encoded =
+          ctx.reply_builder_.AppendError("NOAUTH Authentication required.");
+      absl::Status written = co_await stream.WriteAll(
+          std::span<const std::byte>(
+              reinterpret_cast<const std::byte*>(encoded.data()),
+              encoded.size()));
+      if (!written.ok()) co_return written;
+      continue;
     }
 
     if (ReplicationManager::IsNativeHandshake(command_result->args_)) {
@@ -815,6 +893,52 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 }  // namespace
 
 int RunServer(ServerOptions options) {
+  const absl::Status validated = ValidateServerOptions(options);
+  if (!validated.ok()) {
+    spdlog::error("configuration error: {}", validated.message());
+    return 1;
+  }
+  const std::string bind_display = absl::StrJoin(options.bind_addresses_, ",");
+  std::string advertised_bind = options.bind_addresses_.front();
+  if (advertised_bind == "*") advertised_bind = "0.0.0.0";
+  const std::uint16_t advertised_port =
+      options.port_ != 0 ? options.port_ : options.tls_port_;
+
+  std::shared_ptr<celer::TlsContext> tls_server_context;
+  if (options.tls_port_ != 0) {
+    celer::TlsClientAuth client_auth = celer::TlsClientAuth::kNo;
+    if (options.tls_auth_clients_ == "optional") {
+      client_auth = celer::TlsClientAuth::kOptional;
+    } else if (options.tls_auth_clients_ == "yes") {
+      client_auth = celer::TlsClientAuth::kRequired;
+    }
+    auto created = celer::TlsContext::CreateServer(celer::TlsServerOptions{
+        .cert_file_ = options.tls_cert_file_,
+        .key_file_ = options.tls_key_file_,
+        .ca_cert_file_ = options.tls_ca_cert_file_,
+        .client_auth_ = client_auth,
+    });
+    if (!created.ok()) {
+      spdlog::error("TLS server setup failed: {}", created.status().message());
+      return 1;
+    }
+    tls_server_context = std::move(*created);
+  }
+
+  std::shared_ptr<celer::TlsContext> tls_client_context;
+  if (options.tls_replication_) {
+    auto created = celer::TlsContext::CreateClient(celer::TlsClientOptions{
+        .ca_cert_file_ = options.tls_ca_cert_file_,
+        .cert_file_ = options.tls_cert_file_,
+        .key_file_ = options.tls_key_file_,
+    });
+    if (!created.ok()) {
+      spdlog::error("TLS replication setup failed: {}",
+                    created.status().message());
+      return 1;
+    }
+    tls_client_context = std::move(*created);
+  }
   spdlog::info(
       "mimalloc recovery_purge_delay={} online_purge_delay={} "
       "arena_eager_commit={} allow_thp={}",
@@ -822,7 +946,8 @@ int RunServer(ServerOptions options) {
       mi_option_get(mi_option_arena_eager_commit),
       mi_option_get(mi_option_allow_thp));
   spdlog::info(
-      "keylane listening on {}:{} metrics_port={} threads={} pin_workers={} "
+      "keylane listening on {}:{} tls_port={} metrics_port={} threads={} "
+      "pin_workers={} "
       "idle_timeout_ms={} "
       "busy_poll_us={} background_budget_us={} "
       "background_warrant_percent={} "
@@ -834,7 +959,7 @@ int RunServer(ServerOptions options) {
       "inline_key_max_bytes={} verify_read_crc={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={}",
-      options.bind_ip_, options.port_, options.metrics_port_,
+      bind_display, options.port_, options.tls_port_, options.metrics_port_,
       options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
       options.busy_poll_us_, options.background_budget_us_,
       options.background_warrant_percent_,
@@ -893,16 +1018,24 @@ int RunServer(ServerOptions options) {
     return 1;
   }
   options.replication_options_.listen_port_ = options.port_;
+  if (options.tls_replication_ && options.tls_port_ != 0) {
+    options.replication_options_.listen_port_ = options.tls_port_;
+  }
+  options.replication_options_.use_tls_ = options.tls_replication_;
+  options.replication_options_.tls_context_ = std::move(tls_client_context);
+  options.replication_options_.masteruser_ = options.masteruser_;
+  options.replication_options_.masterauth_ = options.masterauth_;
   ReplicationManager replication(&storage,
                                  std::move(options.replication_options_),
                                  std::move(options.replicaof_));
   InitStorage(&storage, &replication);
   InitWorkerMetrics(options.thread_count_);
-  SetServerInfo(options.bind_ip_, options.port_, options.thread_count_);
+  SetServerInfo(std::move(advertised_bind), advertised_port,
+                options.thread_count_);
   tx::TxRuntime::Create(options.thread_count_);
 
   celer::ServerOptions runtime_options;
-  runtime_options.bind_ip_ = options.bind_ip_;
+  runtime_options.bind_addresses_ = options.bind_addresses_;
   runtime_options.thread_count_ = options.thread_count_;
   runtime_options.pin_workers_ = options.pin_workers_;
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
@@ -917,7 +1050,10 @@ int RunServer(ServerOptions options) {
       options.spdk_foreground_pre_poll_us_;
 
   RedisService redis(options.port_, &storage, &replication,
-                     options.mimalloc_purge_delay_ms_);
+                     options.mimalloc_purge_delay_ms_, options.requirepass_);
+  if (tls_server_context != nullptr) {
+    redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));
+  }
   std::unique_ptr<Service> metrics;
   Server server;
   server.AddService(&redis);

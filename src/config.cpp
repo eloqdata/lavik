@@ -127,16 +127,54 @@ absl::Status ApplyRedisConfigDirective(
 
   const std::string name = absl::AsciiStrToLower(directive.front());
   if (name == "bind") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    if (directive[1].empty()) {
-      return absl::InvalidArgumentError("bind address must not be empty");
+    if (directive.size() < 2) return WrongArgumentCount(name);
+    std::vector<std::string> addresses(directive.begin() + 1,
+                                       directive.end());
+    for (const std::string& address : addresses) {
+      if (address.empty()) {
+        return absl::InvalidArgumentError("bind address must not be empty");
+      }
     }
-    options->bind_ip_ = directive[1];
+    options->bind_addresses_ = std::move(addresses);
     return absl::OkStatus();
   }
   if (name == "port") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], "port", &options->port_, true);
+  }
+  if (name == "tls-port") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->tls_port_, true);
+  }
+  if (name == "tls-cert-file" || name == "tls-key-file" ||
+      name == "tls-ca-cert-file" || name == "requirepass" ||
+      name == "masteruser" || name == "masterauth") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    if (name == "tls-cert-file") options->tls_cert_file_ = directive[1];
+    if (name == "tls-key-file") options->tls_key_file_ = directive[1];
+    if (name == "tls-ca-cert-file")
+      options->tls_ca_cert_file_ = directive[1];
+    if (name == "requirepass") options->requirepass_ = directive[1];
+    if (name == "masteruser") options->masteruser_ = directive[1];
+    if (name == "masterauth") options->masterauth_ = directive[1];
+    return absl::OkStatus();
+  }
+  if (name == "tls-auth-clients") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    const std::string value = absl::AsciiStrToLower(directive[1]);
+    if (value != "no" && value != "optional" && value != "yes") {
+      return absl::InvalidArgumentError(
+          "tls-auth-clients must be 'no', 'optional', or 'yes'");
+    }
+    options->tls_auth_clients_ = value;
+    return absl::OkStatus();
+  }
+  if (name == "tls-replication") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->tls_replication_ = *enabled;
+    return absl::OkStatus();
   }
   if (name == "threads" || name == "io-threads") {
     if (directive.size() != 2) return WrongArgumentCount(name);
@@ -177,6 +215,54 @@ absl::Status ApplyRedisConfigDirective(
   }
   return absl::InvalidArgumentError(
       absl::StrCat("unsupported configuration directive '", name, "'"));
+}
+
+absl::Status ValidateServerOptions(const ServerOptions& options) {
+  if (options.bind_addresses_.empty()) {
+    return absl::InvalidArgumentError("at least one bind address is required");
+  }
+  for (const std::string& address : options.bind_addresses_) {
+    if (address.empty()) {
+      return absl::InvalidArgumentError("bind address must not be empty");
+    }
+  }
+  if (options.port_ == 0 && options.tls_port_ == 0) {
+    return absl::InvalidArgumentError(
+        "port and tls-port cannot both be disabled");
+  }
+  if (options.port_ != 0 && options.port_ == options.tls_port_) {
+    return absl::InvalidArgumentError("port and tls-port must be different");
+  }
+  if (options.tls_port_ != 0 &&
+      (options.tls_cert_file_.empty() || options.tls_key_file_.empty())) {
+    return absl::InvalidArgumentError(
+        "tls-port requires tls-cert-file and tls-key-file");
+  }
+  if ((options.tls_cert_file_.empty() != options.tls_key_file_.empty())) {
+    return absl::InvalidArgumentError(
+        "tls-cert-file and tls-key-file must be configured together");
+  }
+  if (options.tls_auth_clients_ != "no" &&
+      options.tls_auth_clients_ != "optional" &&
+      options.tls_auth_clients_ != "yes") {
+    return absl::InvalidArgumentError(
+        "tls-auth-clients must be 'no', 'optional', or 'yes'");
+  }
+  if ((options.tls_auth_clients_ == "yes" ||
+       options.tls_auth_clients_ == "optional") &&
+      options.tls_ca_cert_file_.empty()) {
+    return absl::InvalidArgumentError(
+        "TLS client authentication requires tls-ca-cert-file");
+  }
+  if (options.tls_replication_ && options.tls_ca_cert_file_.empty()) {
+    return absl::InvalidArgumentError(
+        "tls-replication requires tls-ca-cert-file");
+  }
+  if (options.masteruser_ != "default") {
+    return absl::InvalidArgumentError(
+        "only the default replication user is currently supported");
+  }
+  return absl::OkStatus();
 }
 
 absl::Status LoadRedisConfigFile(const std::string& path,

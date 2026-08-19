@@ -16,6 +16,7 @@ namespace keylane {
 // end of RedisService::Serve.
 struct ConnectionContext {
   std::uint8_t selected_db_ = 0;
+  bool authenticated_ = true;
   bool counted_as_client_ = true;
   // Redis Cluster replica reads are opt-in per connection. READONLY enables
   // them and READWRITE restores the default MOVED-to-primary behavior.

@@ -13,6 +13,7 @@
 #include "celer/runtime/task.h"
 
 namespace celer {
+class TlsContext;
 class Worker;
 }  // namespace celer
 
@@ -36,6 +37,10 @@ struct ReplicationOptions {
   // Advertised to the source during the version-1 control handshake so INFO
   // and CLUSTER NODES can identify the replica's Redis endpoint.
   std::uint16_t listen_port_ = 6379;
+  bool use_tls_ = false;
+  std::shared_ptr<celer::TlsContext> tls_context_;
+  std::string masteruser_ = "default";
+  std::string masterauth_;
 };
 
 inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 16;

@@ -15,9 +15,18 @@ inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
 
 struct ServerOptions {
   std::string config_file_;
-  std::string bind_ip_ = "127.0.0.1";
+  std::vector<std::string> bind_addresses_{"127.0.0.1"};
   std::uint16_t port_ = 6379;
+  std::uint16_t tls_port_ = 0;
   std::uint16_t metrics_port_ = 0;
+  std::string tls_cert_file_;
+  std::string tls_key_file_;
+  std::string tls_ca_cert_file_;
+  std::string tls_auth_clients_ = "no";
+  bool tls_replication_ = false;
+  std::string requirepass_;
+  std::string masteruser_ = "default";
+  std::string masterauth_;
   unsigned thread_count_ = 1;
   bool pin_workers_ = true;
   int idle_timeout_ms_ = -1;

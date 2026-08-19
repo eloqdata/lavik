@@ -17,6 +17,7 @@ constexpr std::uint32_t kKeyedWrite = kCmdWrite | kCmdUsesDbGate;
 constexpr CommandSpec kCommandTable[] = {
     {"ping", CommandKind::kPing, 1, 2, 0, 0, 1, kCmdNoKeys},
     {"echo", CommandKind::kEcho, 2, 2, 0, 0, 1, kCmdNoKeys},
+    {"auth", CommandKind::kAuth, 2, 3, 0, 0, 1, kCmdNoKeys},
     {"select", CommandKind::kSelect, 2, 2, 0, 0, 1, kCmdNoKeys},
     {"dbsize", CommandKind::kDbSize, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},

@@ -19,6 +19,7 @@ using keylane::LoadRedisConfigFile;
 using keylane::ParseRedisConfigLine;
 using keylane::ParseReplicaOfRequest;
 using keylane::ServerOptions;
+using keylane::ValidateServerOptions;
 
 class TempConfigFile {
  public:
@@ -61,7 +62,9 @@ TEST(RedisConfigTest, TokenizesQuotesEscapesAndComments) {
 
 TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ServerOptions options;
-  ASSERT_TRUE(ApplyRedisConfigDirective({"bind", "0.0.0.0"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"bind", "0.0.0.0", "::1", "redis.internal"}, &options)
+                  .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"port", "6380"}, &options).ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"io-threads", "4"}, &options).ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"replicaof", "redis.internal", "6379"},
@@ -73,7 +76,8 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
                   {"replication-publish-queue-mb", "64"}, &options)
                   .ok());
 
-  EXPECT_EQ(options.bind_ip_, "0.0.0.0");
+  EXPECT_EQ(options.bind_addresses_,
+            (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
   EXPECT_EQ(options.port_, 6380);
   EXPECT_EQ(options.thread_count_, 4u);
   ASSERT_TRUE(options.replicaof_.has_value());
@@ -94,6 +98,44 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
                    {"replication-publish-queue-mb", "0"}, &options)
                    .ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
+}
+
+TEST(RedisConfigTest, AppliesAndValidatesTlsAndPasswordDirectives) {
+  ServerOptions options;
+  ASSERT_TRUE(ApplyRedisConfigDirective({"port", "0"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"tls-port", "6380"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"tls-cert-file", "server.crt"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"tls-key-file", "server.key"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"tls-ca-cert-file", "ca.crt"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"tls-auth-clients", "optional"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"tls-replication", "yes"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"requirepass", "client-secret"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"masteruser", "default"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"masterauth", "source-secret"}, &options)
+          .ok());
+
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+  EXPECT_EQ(options.tls_port_, 6380);
+  EXPECT_EQ(options.tls_auth_clients_, "optional");
+  EXPECT_TRUE(options.tls_replication_);
+  EXPECT_EQ(options.requirepass_, "client-secret");
+  EXPECT_EQ(options.masterauth_, "source-secret");
+
+  options.tls_auth_clients_ = "invalid";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
 TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {
