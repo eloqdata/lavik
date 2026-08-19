@@ -656,6 +656,23 @@ celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
 celer::Task<std::string> RunStringLocked(const CommandRequest& request,
                                          const storage::Digest& digest,
                                          storage::TxShardWrites* tx) {
+  switch (request.kind_) {
+    case CommandKind::kSetEx:
+    case CommandKind::kPSetEx:
+    case CommandKind::kSetNx:
+    case CommandKind::kGetSet:
+    case CommandKind::kGetDel:
+    case CommandKind::kGetEx:
+    case CommandKind::kIncr:
+    case CommandKind::kIncrBy:
+    case CommandKind::kIncrByFloat:
+    case CommandKind::kDecr:
+    case CommandKind::kDecrBy:
+      MarkReplicationCommandHandled(request);
+      break;
+    default:
+      break;
+  }
   const auto& args = request.args_;
   const std::uint8_t db = request.db_id_;
   const std::string_view key = args[1];
@@ -694,6 +711,11 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     auto result =
         co_await g_storage->SetLocked(db, key, digest, args[3], options, tx,
                                       replication ? &*replication : nullptr);
+    if (result.ok() && result->applied_) {
+      CaptureReplicationCommand(
+          request, {"SET", args[1], args[3], "PXAT",
+                    std::to_string(*expire_at)});
+    }
     co_return result.ok() ? EncodeSimpleString("OK")
                           : StorageError(result.status());
   }
@@ -704,6 +726,9 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     auto result =
         co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
                                       replication ? &*replication : nullptr);
+    if (result.ok() && result->applied_) {
+      CaptureReplicationCommand(request, {"SET", args[1], args[2]});
+    }
     co_return result.ok() ? EncodeInteger(result->applied_ ? 1 : 0)
                           : StorageError(result.status());
   }
@@ -715,6 +740,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
         co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
                                       replication ? &*replication : nullptr);
     if (!result.ok()) co_return StorageError(result.status());
+    CaptureReplicationCommand(request, {"SET", args[1], args[2]});
     if (!result->old_value_) co_return EncodeNullBulkString();
     const auto bytes = result->old_value_->network_bytes();
     co_return std::string(reinterpret_cast<const char*>(bytes.data()),
@@ -763,6 +789,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
   }
 
   std::string reply;
+  std::vector<std::string> captured_args;
   auto callback = [&](std::optional<storage::CompactValueView> current)
       -> absl::StatusOr<storage::CompactValueUpdate> {
     const bool exists = current.has_value();
@@ -782,6 +809,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
 
     if (request.kind_ == CommandKind::kGetDel) {
       reply = exists ? EncodeBulkString(old) : EncodeNullBulkString();
+      if (exists) captured_args = {"DEL", args[1]};
       return exists ? storage::CompactValueUpdate{.changed_ = true,
                                                   .erase_ = true,
                                                   .encoded_ = {},
@@ -799,6 +827,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       if (args.size() == 2) return storage::CompactValueUpdate{};
       if (args.size() == 3) {
         if (ttl == 0) return storage::CompactValueUpdate{};
+        captured_args = {"PERSIST", args[1]};
         return storage::CompactValueUpdate{
             .changed_ = true,
             .reuse_encoded_ = true,
@@ -810,6 +839,8 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       if (!getex_deadline.has_value()) {
         return absl::InternalError("GETEX deadline was not parsed");
       }
+      captured_args = {"PEXPIREAT", args[1],
+                       std::to_string(*getex_deadline)};
       if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{.changed_ = true,
                                            .erase_ = true,
@@ -878,6 +909,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       if (replication.has_value()) {
         replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
       }
+      captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
       return changed(std::move(formatted));
     }
 
@@ -916,12 +948,16 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     if (replication.has_value()) {
       replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
     }
+    captured_args = {"SET", std::string(key), formatted, "KEEPTTL"};
     return changed(std::move(formatted));
   };
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db, key, digest, storage::ValueType::kString, false, callback, tx, 0,
       replication ? &*replication : nullptr);
+  if (status.ok() && !captured_args.empty()) {
+    CaptureReplicationCommand(request, std::move(captured_args));
+  }
   co_return status.ok() ? reply : StorageError(status);
 }
 

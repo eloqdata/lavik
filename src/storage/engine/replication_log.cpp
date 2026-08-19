@@ -1,4 +1,7 @@
 #include "impl.h"
+
+#include <optional>
+
 #include "keylane/replication_command.h"
 
 namespace keylane::storage {
@@ -27,6 +30,22 @@ ReplicationLogCursor CursorAfter(const ReplicationFrameHeader& frame) {
 
 absl::Status InvalidState(std::string_view message) {
   return absl::Status(absl::StatusCode::kFailedPrecondition, message);
+}
+
+std::optional<std::size_t> TransactionLogicalBytes(
+    const ReplicationTransaction& transaction) {
+  std::size_t logical_bytes = sizeof(ReplicationEventKind) +
+                              sizeof(transaction.db_id_) +
+                              sizeof(std::uint16_t) + sizeof(std::uint64_t);
+  for (const std::string& arg : transaction.envelope_args_) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
+        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
+                                    logical_bytes - arg.size()) {
+      return std::nullopt;
+    }
+    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  }
+  return logical_bytes;
 }
 
 }  // namespace
@@ -221,6 +240,31 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         }
         continue;
       }
+      const auto final_logical_bytes =
+          TransactionLogicalBytes(*pending.transaction_);
+      if (!final_logical_bytes.has_value()) {
+        log.state_ = ReplicationLogState::kInvalid;
+        spdlog::warn("replication transaction queue size overflow");
+        break;
+      }
+      if (*final_logical_bytes > pending.logical_bytes_) {
+        const std::size_t growth =
+            *final_logical_bytes - pending.logical_bytes_;
+        if (growth > log.max_publish_queue_bytes_ -
+                         std::min(log.publish_queue_bytes_,
+                                  log.max_publish_queue_bytes_)) {
+          log.state_ = ReplicationLogState::kInvalid;
+          spdlog::warn(
+              "canonical replication transaction exceeds publisher queue");
+          break;
+        }
+        log.publish_queue_bytes_ += growth;
+      } else {
+        log.publish_queue_bytes_ -=
+            std::min(log.publish_queue_bytes_,
+                     pending.logical_bytes_ - *final_logical_bytes);
+      }
+      pending.logical_bytes_ = *final_logical_bytes;
       pending.append_ = ReplicationCommandAppend{
           .kind_ = ReplicationEventKind::kTransaction,
           .db_id_ = pending.transaction_->db_id_,

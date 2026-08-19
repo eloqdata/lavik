@@ -73,6 +73,9 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
                                          storage::TxShardWrites* tx,
                                          ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
+  if (request.kind_ == CommandKind::kSPop) {
+    MarkReplicationCommandHandled(request);
+  }
   storage::HashOperation operation;
   switch (request.kind_) {
     case CommandKind::kSAdd:
@@ -169,6 +172,14 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
+  }
+  if (request.kind_ == CommandKind::kSPop && !result->values_.empty()) {
+    std::vector<std::string> canonical{"SREM", args[1]};
+    canonical.reserve(result->values_.size() + 2);
+    for (const auto& member : result->values_) {
+      if (member.has_value()) canonical.push_back(*member);
+    }
+    CaptureReplicationCommand(request, std::move(canonical));
   }
 
   switch (request.kind_) {

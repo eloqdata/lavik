@@ -1768,6 +1768,185 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ASSERT_TRUE(wait_value(second_client, mset_key_0, "left"));
   ASSERT_TRUE(wait_value(second_client, mset_key_1, "right"));
 
+  // EXEC publishes the committed effects, not timing/random inputs. The
+  // replica must receive the master's absolute deadline, selected Set
+  // members, and generated Stream ID.
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command(
+                {"SET", "repl-exec-ttl", "alive", "PX", "600000"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"SETEX", "repl-exec-setex", "600", "alive"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"PSETEX", "repl-exec-psetex", "600000", "alive"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}),
+            "*3\r\n+OK\r\n+OK\r\n+OK");
+  ASSERT_TRUE(wait_value(first_client, "repl-exec-ttl", "alive"));
+  ASSERT_TRUE(wait_value(second_client, "repl-exec-ttl", "alive"));
+  ASSERT_TRUE(wait_value(first_client, "repl-exec-setex", "alive"));
+  ASSERT_TRUE(wait_value(second_client, "repl-exec-setex", "alive"));
+  ASSERT_TRUE(wait_value(first_client, "repl-exec-psetex", "alive"));
+  ASSERT_TRUE(wait_value(second_client, "repl-exec-psetex", "alive"));
+  const auto ttl_value = [](RespClient& client, std::string_view key) {
+    const std::string encoded =
+        client.Command({"PTTL", std::string(key)});
+    return encoded.starts_with(':') ? std::stoll(encoded.substr(1)) : -2LL;
+  };
+  for (std::string_view key : {"repl-exec-ttl", "repl-exec-setex",
+                               "repl-exec-psetex"}) {
+    EXPECT_GT(ttl_value(first_client, key), 500000);
+    EXPECT_GT(ttl_value(second_client, key), 500000);
+  }
+
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SPOP", "repl-exec-empty"}), "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}), "*1\r\n$-1");
+
+  std::vector<std::string> members;
+  members.reserve(40);
+  for (int member = 0; member < 40; ++member) {
+    members.push_back("member-" + std::to_string(member));
+  }
+  std::vector<std::string_view> sadd{"SADD", "repl-exec-spop"};
+  sadd.insert(sadd.end(), members.begin(), members.end());
+  ASSERT_EQ(source_client.Command(sadd), ":40");
+  const auto wait_card = [](RespClient& client, std::string_view key,
+                            std::string_view expected) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    do {
+      if (client.Command({"SCARD", std::string(key)}) == expected) return true;
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  };
+  ASSERT_TRUE(wait_card(first_client, "repl-exec-spop", ":40"));
+  ASSERT_TRUE(wait_card(second_client, "repl-exec-spop", ":40"));
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SPOP", "repl-exec-spop", "20"}),
+            "+QUEUED");
+  ASSERT_TRUE(source_client.Command({"EXEC"}).starts_with("*1\r\n*20\r\n"));
+  ASSERT_TRUE(wait_card(first_client, "repl-exec-spop", ":20"));
+  ASSERT_TRUE(wait_card(second_client, "repl-exec-spop", ":20"));
+  const std::string remaining_members =
+      source_client.Command({"SMEMBERS", "repl-exec-spop"});
+  EXPECT_EQ(first_client.Command({"SMEMBERS", "repl-exec-spop"}),
+            remaining_members);
+  EXPECT_EQ(second_client.Command({"SMEMBERS", "repl-exec-spop"}),
+            remaining_members);
+
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command(
+                {"XADD", "repl-exec-stream", "*", "field", "value"}),
+            "+QUEUED");
+  ASSERT_TRUE(source_client.Command({"EXEC"}).starts_with("*1\r\n$"));
+  const std::string source_stream = source_client.Command(
+      {"XRANGE", "repl-exec-stream", "-", "+"});
+  const auto wait_stream = [&](RespClient& client) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    do {
+      if (client.Command({"XRANGE", "repl-exec-stream", "-", "+"}) ==
+          source_stream) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  };
+  EXPECT_TRUE(wait_stream(first_client));
+  EXPECT_TRUE(wait_stream(second_client));
+
+  // Consumer-group mutations carry an exact group after-image, including
+  // delivery timestamps/counters. This covers direct XREADGROUP, XCLAIM, and
+  // XAUTOCLAIM rather than relying on replica wall clocks.
+  ASSERT_EQ(source_client.Command(
+                {"XADD", "repl-group-stream", "1-0", "field", "value"}),
+            Bulk("1-0"));
+  ASSERT_EQ(source_client.Command(
+                {"XGROUP", "CREATE", "repl-group-stream", "group", "0-0"}),
+            "+OK");
+  const auto group_info = [](RespClient& client) {
+    return client.Command(
+        {"XINFO", "STREAM", "repl-group-stream", "FULL", "COUNT", "10"});
+  };
+  const auto wait_group_info = [&](RespClient& client,
+                                   const std::string& expected) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    do {
+      if (group_info(client) == expected) return true;
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  };
+  const std::string initial_group = group_info(source_client);
+  if (!wait_group_info(first_client, initial_group)) {
+    EXPECT_EQ(group_info(first_client), initial_group);
+    FAIL() << "first replica did not receive initial Stream group";
+  }
+  if (!wait_group_info(second_client, initial_group)) {
+    EXPECT_EQ(group_info(second_client), initial_group);
+    FAIL() << "second replica did not receive initial Stream group";
+  }
+  ASSERT_TRUE(source_client
+                  .Command({"XREADGROUP", "GROUP", "group", "consumer-1",
+                            "COUNT", "1", "STREAMS", "repl-group-stream",
+                            ">"})
+                  .starts_with("*1\r\n"));
+  std::string expected_group = group_info(source_client);
+  ASSERT_TRUE(wait_group_info(first_client, expected_group));
+  ASSERT_TRUE(wait_group_info(second_client, expected_group));
+  ASSERT_EQ(source_client.Command(
+                {"XCLAIM", "repl-group-stream", "group", "consumer-2", "0",
+                 "1-0", "TIME", "123456", "RETRYCOUNT", "9", "JUSTID"}),
+            "*1\r\n" + Bulk("1-0"));
+  expected_group = group_info(source_client);
+  ASSERT_TRUE(wait_group_info(first_client, expected_group));
+  ASSERT_TRUE(wait_group_info(second_client, expected_group));
+  ASSERT_TRUE(source_client
+                  .Command({"XAUTOCLAIM", "repl-group-stream", "group",
+                            "consumer-3", "0", "0-0", "COUNT", "1",
+                            "JUSTID"})
+                  .starts_with("*3\r\n"));
+  expected_group = group_info(source_client);
+  ASSERT_TRUE(wait_group_info(first_client, expected_group));
+  ASSERT_TRUE(wait_group_info(second_client, expected_group));
+  ASSERT_EQ(source_client.Command(
+                {"XADD", "repl-group-stream", "2-0", "field", "second"}),
+            Bulk("2-0"));
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command(
+                {"XREADGROUP", "GROUP", "group", "exec-reader", "COUNT",
+                 "1", "STREAMS", "repl-group-stream", ">"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"XCLAIM", "repl-group-stream", "group", "exec-claim", "0",
+                 "1-0", "TIME", "234567", "RETRYCOUNT", "11", "JUSTID"}),
+            "+QUEUED");
+  ASSERT_TRUE(source_client.Command({"EXEC"}).starts_with("*2\r\n"));
+  expected_group = group_info(source_client);
+  ASSERT_TRUE(wait_group_info(first_client, expected_group));
+  ASSERT_TRUE(wait_group_info(second_client, expected_group));
+
+  ASSERT_EQ(source_client.Command({"XGROUP", "CREATE", "repl-empty-group",
+                                   "empty", "$", "MKSTREAM"}),
+            "+OK");
+  const std::string empty_group = source_client.Command(
+      {"XINFO", "STREAM", "repl-empty-group", "FULL", "COUNT", "10"});
+  const auto wait_empty_group = [&](RespClient& client) {
+    const auto deadline = std::chrono::steady_clock::now() + 20s;
+    do {
+      if (client.Command({"XINFO", "STREAM", "repl-empty-group", "FULL",
+                          "COUNT", "10"}) == empty_group) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  };
+  ASSERT_TRUE(wait_empty_group(first_client));
+  ASSERT_TRUE(wait_empty_group(second_client));
+
   for (int i = 0; i < 200; ++i) {
     ASSERT_EQ(source_client.Command({"SET", "bulk:" + std::to_string(i),
                                      "value:" + std::to_string(i)}),

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -26,6 +28,32 @@ class ReplyBuilder;
 class ReplicationManager;
 
 using celer::Task;
+
+struct CapturedReplicationCommand {
+  std::uint8_t db_id_ = 0;
+  std::vector<std::string> args_;
+};
+
+struct CapturedReplicationEffects {
+  bool handled_ = false;
+  std::vector<CapturedReplicationCommand> commands_;
+};
+
+// EXEC handlers record outcome-dependent commands here (absolute deadlines,
+// selected random members, generated stream IDs, consumer-group after-images).
+// A command normally writes from one worker, while XREADGROUP may visit
+// several owners, so recording is safe from any participant worker.
+class ReplicationCommandCapture {
+ public:
+  void MarkHandled();
+  void Record(std::uint8_t db_id, std::vector<std::string> args);
+  CapturedReplicationEffects Take();
+
+ private:
+  mutable std::mutex mutex_;
+  bool handled_ = false;
+  std::vector<CapturedReplicationCommand> commands_;
+};
 
 enum class CommandKind {
   kPing,
@@ -226,6 +254,7 @@ struct CommandRequest {
   bool replication_origin_ = false;
   const CommandSpec* spec_ = nullptr;
   std::vector<std::string> args_;
+  std::shared_ptr<ReplicationCommandCapture> replication_capture_;
 };
 
 struct ReplicaOfRequest {
@@ -286,6 +315,13 @@ std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
     const CommandRequest& request,
     std::vector<std::string> canonical_args = {});
 
+void CaptureReplicationCommand(const CommandRequest& request,
+                               std::vector<std::string> canonical_args);
+void CaptureReplicationCommand(const CommandRequest& request,
+                               std::uint8_t db_id,
+                               std::vector<std::string> canonical_args);
+void MarkReplicationCommandHandled(const CommandRequest& request);
+
 // Reserves one ordered replication marker on every shard participating in a
 // standalone cross-key command. Destruction aborts an unresolved marker.
 class ReplicationTransactionGuard {
@@ -302,6 +338,7 @@ class ReplicationTransactionGuard {
   ~ReplicationTransactionGuard();
 
   void Commit() noexcept;
+  void SetCommandArgs(std::vector<std::string> canonical_args);
   void EnterCurrentShard() noexcept;
   bool active() const noexcept { return transaction_ != nullptr; }
 
@@ -351,10 +388,9 @@ void EndReplicationTransactionOrder() noexcept;
 Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                                   ReplyBuilder& reply_builder);
 
-// Replays one trusted command from the native replication stream directly
-// against storage. The first replication vertical slice accepts deterministic
-// SET, single-key DEL, and a FLUSHDB epoch barrier collected across all source
-// flows by the receiver before this apply primitive is called.
+// Replays one trusted canonical command from the native replication stream.
+// Transaction envelopes rendezvous on every source flow before this primitive
+// applies their ordered effects atomically on the replica.
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command);
 
 }  // namespace keylane

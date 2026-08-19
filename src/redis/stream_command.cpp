@@ -19,6 +19,9 @@ namespace keylane {
 namespace {
 
 constexpr std::string_view kMagic = "KXS1";
+constexpr std::string_view kGroupStateMagic = "KXG1";
+constexpr std::string_view kRestoreGroupSubcommand =
+    "__keylane_restore_group_v1";
 storage::StorageEngine* g_storage = nullptr;
 
 struct Id {
@@ -372,6 +375,114 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
   return out;
 }
 
+absl::StatusOr<std::string> EncodeGroupState(const Group& group) {
+  if (group.name_.size() > UINT32_MAX || group.consumers_.size() > UINT32_MAX ||
+      group.pending_.size() > UINT32_MAX) {
+    return absl::OutOfRangeError("Stream group exceeds storage limits");
+  }
+  std::string out(kGroupStateMagic);
+  PutString(&out, group.name_);
+  PutId(&out, group.last_id_);
+  Put64(&out, std::bit_cast<std::uint64_t>(group.entries_read_));
+  Put32(&out, group.consumers_.size());
+  for (const Consumer& consumer : group.consumers_) {
+    if (consumer.name_.size() > UINT32_MAX) {
+      return absl::OutOfRangeError("Stream consumer exceeds storage limits");
+    }
+    PutString(&out, consumer.name_);
+    Put64(&out, consumer.seen_ms_);
+    Put64(&out, consumer.active_ms_);
+  }
+  Put32(&out, group.pending_.size());
+  for (const Pending& pending : group.pending_) {
+    if (pending.consumer_.size() > UINT32_MAX) {
+      return absl::OutOfRangeError("Stream pending entry exceeds limits");
+    }
+    PutId(&out, pending.id_);
+    PutString(&out, pending.consumer_);
+    Put64(&out, pending.delivery_ms_);
+    Put64(&out, pending.deliveries_);
+  }
+  if (out.size() > storage::kMaxStringBytes) {
+    return absl::OutOfRangeError("Stream group exceeds storage limits");
+  }
+  return out;
+}
+
+absl::StatusOr<Group> DecodeGroupState(std::string_view in) {
+  if (!in.starts_with(kGroupStateMagic)) {
+    return absl::InvalidArgumentError("invalid replicated Stream group");
+  }
+  std::size_t at = kGroupStateMagic.size();
+  Group group;
+  std::uint64_t entries_read = 0;
+  std::uint32_t consumers = 0;
+  if (!GetString(in, &at, &group.name_) ||
+      !GetId(in, &at, &group.last_id_) ||
+      !Get64(in, &at, &entries_read) || !Get32(in, &at, &consumers)) {
+    return absl::InvalidArgumentError("truncated replicated Stream group");
+  }
+  group.entries_read_ = std::bit_cast<std::int64_t>(entries_read);
+  constexpr std::size_t kMinConsumerBytes = 4 + 2 * sizeof(std::uint64_t);
+  if (consumers > (in.size() - at) / kMinConsumerBytes) {
+    return absl::InvalidArgumentError("invalid replicated Stream consumers");
+  }
+  group.consumers_.reserve(consumers);
+  for (std::uint32_t index = 0; index < consumers; ++index) {
+    Consumer consumer;
+    if (!GetString(in, &at, &consumer.name_) ||
+        !Get64(in, &at, &consumer.seen_ms_) ||
+        !Get64(in, &at, &consumer.active_ms_)) {
+      return absl::InvalidArgumentError(
+          "truncated replicated Stream consumer");
+    }
+    group.consumers_.push_back(std::move(consumer));
+  }
+  std::uint32_t pending = 0;
+  if (!Get32(in, &at, &pending)) {
+    return absl::InvalidArgumentError("truncated replicated Stream PEL");
+  }
+  constexpr std::size_t kMinPendingBytes =
+      2 * sizeof(std::uint64_t) + 4 + 2 * sizeof(std::uint64_t);
+  if (pending > (in.size() - at) / kMinPendingBytes) {
+    return absl::InvalidArgumentError("invalid replicated Stream PEL");
+  }
+  group.pending_.reserve(pending);
+  for (std::uint32_t index = 0; index < pending; ++index) {
+    Pending item;
+    if (!GetId(in, &at, &item.id_) ||
+        !GetString(in, &at, &item.consumer_) ||
+        !Get64(in, &at, &item.delivery_ms_) ||
+        !Get64(in, &at, &item.deliveries_)) {
+      return absl::InvalidArgumentError(
+          "truncated replicated Stream pending entry");
+    }
+    if (!group.pending_.empty() &&
+        !(group.pending_.back().id_ < item.id_)) {
+      return absl::InvalidArgumentError(
+          "invalid replicated Stream pending order");
+    }
+    group.pending_.push_back(std::move(item));
+  }
+  if (at != in.size()) {
+    return absl::InvalidArgumentError("trailing replicated Stream group data");
+  }
+  return group;
+}
+
+absl::StatusOr<std::vector<std::string>> RestoreGroupArgs(
+    std::string_view key, std::string_view group_name, const Group* group) {
+  std::vector<std::string> args{
+      "XGROUP", std::string(kRestoreGroupSubcommand), std::string(key),
+      std::string(group_name), group == nullptr ? "0" : "1"};
+  if (group != nullptr) {
+    auto encoded = EncodeGroupState(*group);
+    if (!encoded.ok()) return encoded.status();
+    args.push_back(std::move(*encoded));
+  }
+  return args;
+}
+
 storage::CompactValueUpdate NoChange() { return {}; }
 absl::StatusOr<storage::CompactValueUpdate> Changed(Stream stream) {
   auto encoded = Encode(stream);
@@ -496,9 +607,15 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     bool group_read, std::string group_name, std::string consumer_name,
     bool new_messages, bool noack, std::uint64_t count,
     const storage::Digest* locked_digest = nullptr,
-    storage::TxShardWrites* tx = nullptr) {
+    storage::TxShardWrites* tx = nullptr,
+    const CommandRequest* request = nullptr) {
   ReadOneResult result{.entries_ = {}, .cursor_ = cursor};
   const std::uint64_t now = NowMs();
+  std::optional<storage::ReplicationCommandAppend> replication;
+  std::vector<std::string> captured_group_args;
+  if (group_read && tx == nullptr && request != nullptr) {
+    replication = PrepareReplicationCommand(*request);
+  }
   auto callback = [&](std::optional<storage::CompactValueView> value)
       -> absl::StatusOr<storage::CompactValueUpdate> {
     auto decoded = Decode(value);
@@ -581,19 +698,29 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
     }
     if (successful_delivery && consumer->active_ms_ != now) changed = true;
     if (successful_delivery) consumer->active_ms_ = now;
-    return changed ? Changed(std::move(stream))
-                   : absl::StatusOr<storage::CompactValueUpdate>(NoChange());
+    if (!changed) return NoChange();
+    auto canonical = RestoreGroupArgs(key, group_name, group);
+    if (!canonical.ok()) return canonical.status();
+    if (replication.has_value()) replication->args_ = *canonical;
+    captured_group_args = std::move(*canonical);
+    return Changed(std::move(stream));
   };
   absl::Status status;
   if (locked_digest == nullptr) {
     status = co_await g_storage->ExecuteCompact(
-        db_id, key, storage::ValueType::kStream, !group_read, callback);
+        db_id, key, storage::ValueType::kStream, !group_read, callback, 0,
+        replication ? &*replication : nullptr);
   } else {
     status = co_await g_storage->ExecuteCompactLocked(
         db_id, key, *locked_digest, storage::ValueType::kStream, !group_read,
-        callback, group_read ? tx : nullptr);
+        callback, group_read ? tx : nullptr, 0,
+        replication ? &*replication : nullptr);
   }
   if (!status.ok()) co_return status;
+  if (request != nullptr && !captured_group_args.empty()) {
+    CaptureReplicationCommand(*request, db_id,
+                              std::move(captured_group_args));
+  }
   co_return result;
 }
 
@@ -603,6 +730,7 @@ Task<CommandReply> ExecuteRead(
     std::vector<storage::TxShardWrites>* tx_writes = nullptr) {
   const auto& a = request.args_;
   const bool group_read = request.kind_ == CommandKind::kXReadGroup;
+  if (group_read) MarkReplicationCommandHandled(request);
   std::string group_name, consumer_name;
   std::uint64_t count = UINT64_MAX;
   std::uint64_t block_ms = 0;
@@ -753,19 +881,20 @@ Task<CommandReply> ExecuteRead(
         one = co_await ReadOneLocal(
             request.db_id_, key, cursors[k], initialize, group_read, group_name,
             consumer_name, new_messages[k], noack, count,
-            locked_digest ? &*locked_digest : nullptr, local_tx);
+            locked_digest ? &*locked_digest : nullptr, local_tx, &request);
       } else {
         one = co_await celer::SubmitTaskTo(
             owner,
             [db = request.db_id_, key = std::move(key), cursor = cursors[k],
              initialize, group_read, group_name, consumer_name,
              is_new = new_messages[k], noack, count, locked_digest,
-             local_tx]() mutable -> Task<absl::StatusOr<ReadOneResult>> {
+             local_tx, request_ptr = &request]() mutable
+            -> Task<absl::StatusOr<ReadOneResult>> {
               co_return co_await ReadOneLocal(
                   db, std::move(key), cursor, initialize, group_read,
                   std::move(group_name), std::move(consumer_name), is_new,
                   noack, count, locked_digest ? &*locked_digest : nullptr,
-                  local_tx);
+                  local_tx, request_ptr);
             });
       }
       if (!one.ok()) co_return Built(StorageError(builder, one.status()));
@@ -847,6 +976,53 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                                storage::TxShardWrites* tx,
                                ReplyBuilder& builder) {
   const auto& a = request.args_;
+  if (request.kind_ == CommandKind::kXGroup && a.size() >= 2 &&
+      EqualCi(a[1], kRestoreGroupSubcommand)) {
+    if (!request.replication_origin_ || (a.size() != 5 && a.size() != 6) ||
+        (a[4] != "0" && a[4] != "1") ||
+        (a[4] == "0" && a.size() != 5) ||
+        (a[4] == "1" && a.size() != 6)) {
+      co_return Built(builder.AppendError(
+          "ERR invalid replicated Stream group state"));
+    }
+    std::optional<Group> restored;
+    if (a[4] == "1") {
+      auto decoded = DecodeGroupState(a[5]);
+      if (!decoded.ok() || decoded->name_ != a[3]) {
+        co_return Built(builder.AppendError(
+            "ERR invalid replicated Stream group payload"));
+      }
+      restored = std::move(*decoded);
+    }
+    auto restore = [&](std::optional<storage::CompactValueView> value)
+        -> absl::StatusOr<storage::CompactValueUpdate> {
+      auto decoded = Decode(value);
+      if (!decoded.ok()) return decoded.status();
+      if (!value && !restored.has_value()) {
+        return absl::NotFoundError(
+            "NOGROUP No such key or consumer group");
+      }
+      Stream stream = std::move(*decoded);
+      auto found = std::find_if(
+          stream.groups_.begin(), stream.groups_.end(),
+          [&](const Group& group) { return group.name_ == a[3]; });
+      if (restored.has_value()) {
+        if (found == stream.groups_.end()) {
+          stream.groups_.push_back(*restored);
+        } else {
+          *found = *restored;
+        }
+      } else if (found != stream.groups_.end()) {
+        stream.groups_.erase(found);
+      }
+      return Changed(std::move(stream));
+    };
+    absl::Status restored_status =
+        co_await RunCompact(request, digest, tx, false, restore, nullptr);
+    co_return restored_status.ok()
+                  ? Built(builder.AppendSimpleString("OK"))
+                  : Built(StorageError(builder, restored_status));
+  }
   if (request.kind_ == CommandKind::kXGroup ||
       request.kind_ == CommandKind::kXInfo) {
     const SubcommandShape* shape = FindSubcommandShape(request.kind_, a[1]);
@@ -921,13 +1097,22 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   bool null_range = false;
   bool xinfo_full = false;
   std::uint64_t xinfo_count = 10;
+  std::vector<std::string> captured_xadd;
+  std::vector<std::string> captured_group_args;
+  const bool group_state_write =
+      request.kind_ == CommandKind::kXGroup ||
+      request.kind_ == CommandKind::kXAck ||
+      request.kind_ == CommandKind::kXClaim ||
+      request.kind_ == CommandKind::kXAutoClaim;
+  if (request.kind_ == CommandKind::kXAdd || group_state_write) {
+    MarkReplicationCommandHandled(request);
+  }
   const bool directly_replayable_write =
       request.kind_ == CommandKind::kXAdd ||
       request.kind_ == CommandKind::kXDel ||
       request.kind_ == CommandKind::kXTrim ||
       request.kind_ == CommandKind::kXSetId ||
-      request.kind_ == CommandKind::kXGroup ||
-      request.kind_ == CommandKind::kXAck;
+      group_state_write;
   auto replication = tx == nullptr && directly_replayable_write
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
@@ -1087,6 +1272,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         if (replication.has_value()) {
           replication->args_[id_arg] = FormatId(id);
         }
+        captured_xadd = request.args_;
+        captured_xadd[id_arg] = FormatId(id);
         if (trim == Trim::kMaxLen && stream.entries_.size() > maxlen) {
           std::size_t remove = stream.entries_.size() - maxlen;
           if (trim_limit != 0)
@@ -1640,10 +1827,45 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     }
   };
 
+  auto canonical_callback = [&](std::optional<storage::CompactValueView> value)
+      -> absl::StatusOr<storage::CompactValueUpdate> {
+    auto update = callback(value);
+    if (!update.ok() || !update->changed_ || !group_state_write) return update;
+    std::optional<storage::CompactValueView> next(
+        std::in_place, storage::CompactValueView{
+                           .encoded_ = update->encoded_,
+                           .logical_size_ = update->logical_size_,
+                           .expire_at_ms_ =
+                               value.has_value() ? value->expire_at_ms_ : 0});
+    auto stream = Decode(next);
+    if (!stream.ok()) return stream.status();
+    const std::string_view group_name =
+        request.kind_ == CommandKind::kXGroup ? a[3] : a[2];
+    const Group* group = nullptr;
+    for (const Group& candidate : stream->groups_) {
+      if (candidate.name_ == group_name) {
+        group = &candidate;
+        break;
+      }
+    }
+    auto canonical = RestoreGroupArgs(
+        a[request.kind_ == CommandKind::kXGroup ? 2 : 1], group_name, group);
+    if (!canonical.ok()) return canonical.status();
+    if (replication.has_value()) replication->args_ = *canonical;
+    captured_group_args = std::move(*canonical);
+    return update;
+  };
+
   absl::Status status =
-      co_await RunCompact(request, digest, tx, read_only, callback,
+      co_await RunCompact(request, digest, tx, read_only, canonical_callback,
                           replication ? &*replication : nullptr);
   if (!status.ok()) co_return Built(StorageError(builder, status));
+  if (!captured_group_args.empty()) {
+    CaptureReplicationCommand(request, std::move(captured_group_args));
+  }
+  if (!captured_xadd.empty()) {
+    CaptureReplicationCommand(request, std::move(captured_xadd));
+  }
   if (request.kind_ == CommandKind::kXAdd && !nil && appended_id.has_value()) {
     NotifyStreamBlockingKey(request.db_id_, a[1], appended_id->ms_,
                             appended_id->seq_);

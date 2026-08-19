@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -2734,6 +2735,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     }
 
     case CommandKind::kSet: {
+      MarkReplicationCommandHandled(request);
       auto options = ParseSetOptions(args);
       if (!options.ok()) {
         co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
@@ -2742,6 +2744,16 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
                                                   args[2], *options, tx);
       if (!result.ok()) {
         co_return EncodeStorageError(result.status());
+      }
+      if (result->applied_) {
+        std::vector<std::string> canonical{"SET", args[1], args[2]};
+        if (options->expire_at_ms_ != 0) {
+          canonical.emplace_back("PXAT");
+          canonical.push_back(std::to_string(options->expire_at_ms_));
+        } else if (options->keep_ttl_) {
+          canonical.emplace_back("KEEPTTL");
+        }
+        CaptureReplicationCommand(request, std::move(canonical));
       }
       if (options->return_old_value_) {
         if (result->old_value_.has_value()) {
@@ -2944,6 +2956,7 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
     case CommandKind::kPExpire:
     case CommandKind::kExpireAt:
     case CommandKind::kPExpireAt: {
+      MarkReplicationCommandHandled(request);
       auto condition = ParseExpirationCondition(args);
       if (!condition.ok()) {
         co_return EncodeError("ERR syntax error");
@@ -2955,14 +2968,22 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
       }
       auto updated = co_await g_storage->UpdateExpirationLocked(
           db_id, args[1], digest, *expire_at_ms, *condition, tx);
+      if (updated.ok() && *updated) {
+        CaptureReplicationCommand(
+            request, {"PEXPIREAT", args[1], std::to_string(*expire_at_ms)});
+      }
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
     }
 
     case CommandKind::kPersist: {
+      MarkReplicationCommandHandled(request);
       auto updated = co_await g_storage->UpdateExpirationLocked(
           db_id, args[1], digest, 0,
           storage::ExpirationCondition::kIfHasExpiration, tx);
+      if (updated.ok() && *updated) {
+        CaptureReplicationCommand(request, {"PERSIST", args[1]});
+      }
       co_return updated.ok() ? EncodeInteger(*updated ? 1 : 0)
                              : EncodeStorageError(updated.status());
     }
@@ -4962,7 +4983,7 @@ Task<absl::StatusOr<std::string>> NextExecReplyChunk(
 
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                ReplyBuilder& reply_builder) {
-  const std::vector<CommandRequest> queued = std::move(ctx.queued_);
+  std::vector<CommandRequest> queued = std::move(ctx.queued_);
   const bool dirty = ctx.multi_dirty_;
   ctx.ResetMulti();
   if (dirty) {
@@ -5006,6 +5027,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       co_await DropWatches(ctx);
       co_return BuiltReply(reply_builder.AppendError(
           absl::StrCat("ERR ", entered.message())));
+    }
+  }
+  if (source_write && g_storage != nullptr &&
+      g_storage->ReplicationLogActive()) {
+    for (CommandRequest& command : queued) {
+      if (command.spec_ != nullptr &&
+          (command.spec_->flags_ & kCmdWrite) != 0) {
+        command.replication_capture_ =
+            std::make_shared<ReplicationCommandCapture>();
+      }
     }
   }
   SnapshotTransactionOperationGuard snapshot_transaction_guard;
@@ -5195,6 +5226,36 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                 command.args_.end());
       }
     }
+    auto resolved_replication_args = [&]() {
+      std::vector<CapturedReplicationCommand> commands;
+      for (const CommandRequest& command : queued) {
+        CapturedReplicationEffects captured;
+        if (command.replication_capture_ != nullptr) {
+          captured = command.replication_capture_->Take();
+        }
+        if (!captured.handled_) {
+          commands.push_back(
+              CapturedReplicationCommand{command.db_id_, command.args_});
+        } else {
+          commands.insert(
+              commands.end(),
+              std::make_move_iterator(captured.commands_.begin()),
+              std::make_move_iterator(captured.commands_.end()));
+        }
+      }
+      std::vector<std::string> args;
+      args.reserve(2 + commands.size() * 3);
+      args.emplace_back(kReplicatedExecCommand);
+      args.push_back(std::to_string(commands.size()));
+      for (auto& command : commands) {
+        args.push_back(std::to_string(command.db_id_));
+        args.push_back(std::to_string(command.args_.size()));
+        args.insert(args.end(),
+                    std::make_move_iterator(command.args_.begin()),
+                    std::make_move_iterator(command.args_.end()));
+      }
+      return args;
+    };
 
     if (owners.size() == 1) {
       std::unique_ptr<ReplicationTransactionGuard> replication;
@@ -5264,7 +5325,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         co_await DropWatches(ctx);
         co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
       }
-      if (replication != nullptr) replication->Commit();
+      if (replication != nullptr) {
+        replication->SetCommandArgs(resolved_replication_args());
+        replication->Commit();
+      }
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     } else {
@@ -5358,7 +5422,10 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         co_return BuiltReply(reply_builder.AppendError(
             absl::StrCat("ERR ", released.message())));
       }
-      if (replication != nullptr) replication->Commit();
+      if (replication != nullptr) {
+        replication->SetCommandArgs(resolved_replication_args());
+        replication->Commit();
+      }
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     }
@@ -5494,6 +5561,45 @@ void InitStorage(storage::StorageEngine* engine, ReplicationManager* replication
   g_replica_read_only = replication != nullptr && replication->is_replica();
 }
 
+void ReplicationCommandCapture::MarkHandled() {
+  std::lock_guard lock(mutex_);
+  handled_ = true;
+}
+
+void ReplicationCommandCapture::Record(std::uint8_t db_id,
+                                       std::vector<std::string> args) {
+  if (args.empty()) return;
+  std::lock_guard lock(mutex_);
+  handled_ = true;
+  commands_.push_back(
+      CapturedReplicationCommand{db_id, std::move(args)});
+}
+
+CapturedReplicationEffects ReplicationCommandCapture::Take() {
+  std::lock_guard lock(mutex_);
+  return CapturedReplicationEffects{handled_, std::move(commands_)};
+}
+
+void CaptureReplicationCommand(const CommandRequest& request,
+                               std::vector<std::string> canonical_args) {
+  CaptureReplicationCommand(request, request.db_id_,
+                            std::move(canonical_args));
+}
+
+void CaptureReplicationCommand(const CommandRequest& request,
+                               std::uint8_t db_id,
+                               std::vector<std::string> canonical_args) {
+  if (request.replication_capture_ != nullptr) {
+    request.replication_capture_->Record(db_id, std::move(canonical_args));
+  }
+}
+
+void MarkReplicationCommandHandled(const CommandRequest& request) {
+  if (request.replication_capture_ != nullptr) {
+    request.replication_capture_->MarkHandled();
+  }
+}
+
 std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
     const CommandRequest& request, std::vector<std::string> canonical_args) {
   if (request.replication_origin_ || g_storage == nullptr ||
@@ -5578,6 +5684,22 @@ void ReplicationTransactionGuard::Commit() noexcept {
         expected, storage::ReplicationTransactionResolution::kPublish,
         std::memory_order_release, std::memory_order_relaxed);
   }
+}
+
+void ReplicationTransactionGuard::SetCommandArgs(
+    std::vector<std::string> canonical_args) {
+  if (transaction_ == nullptr || canonical_args.empty() ||
+      transaction_->resolution_.load(std::memory_order_acquire) !=
+          storage::ReplicationTransactionResolution::kPending) {
+    return;
+  }
+  auto& envelope = transaction_->envelope_args_;
+  const std::size_t prefix = 3 + transaction_->participants_.size();
+  envelope.resize(prefix);
+  envelope.reserve(prefix + canonical_args.size());
+  envelope.insert(envelope.end(),
+                  std::make_move_iterator(canonical_args.begin()),
+                  std::make_move_iterator(canonical_args.end()));
 }
 
 void ReplicationTransactionGuard::EnterCurrentShard() noexcept {
@@ -6143,7 +6265,7 @@ Task<absl::Status> ApplyReplicatedExec(
     return parsed.ec == std::errc{} && parsed.ptr == end;
   };
   std::uint64_t command_count = 0;
-  if (!parse_size(args[1], &command_count) || command_count == 0 ||
+  if (!parse_size(args[1], &command_count) ||
       command_count > args.size() - 2) {
     co_return absl::InvalidArgumentError("invalid replicated EXEC count");
   }

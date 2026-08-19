@@ -47,6 +47,10 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
                                           storage::TxShardWrites* tx,
                                           ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
+  if (request.kind_ == CommandKind::kHIncrBy ||
+      request.kind_ == CommandKind::kHIncrByFloat) {
+    MarkReplicationCommandHandled(request);
+  }
   storage::HashOperation operation;
   switch (request.kind_) {
     case CommandKind::kHSet:
@@ -183,6 +187,14 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
+  }
+  if (request.kind_ == CommandKind::kHIncrBy) {
+    CaptureReplicationCommand(
+        request, {"HSET", args[1], args[2],
+                  std::to_string(result->signed_integer_)});
+  } else if (request.kind_ == CommandKind::kHIncrByFloat) {
+    CaptureReplicationCommand(request,
+                              {"HSET", args[1], args[2], result->scalar_});
   }
   switch (request.kind_) {
     case CommandKind::kHSet:

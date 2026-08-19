@@ -541,6 +541,9 @@ struct ReplicaCursorState {
 };
 
 struct ReplicaTransactionArrival {
+  explicit ReplicaTransactionArrival(unsigned participants)
+      : completion_(participants) {}
+
   std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
   std::vector<std::string> command_args_;
@@ -549,9 +552,9 @@ struct ReplicaTransactionArrival {
   std::size_t arrival_count_ = 0;
   std::size_t departure_count_ = 0;
   bool applying_ = false;
-  bool complete_ = false;
   absl::Status status_ = absl::UnknownError(
       "replicated transaction has not completed");
+  celer::CoroutineBarrier completion_;
 };
 
 struct ReplicaSession {
@@ -578,8 +581,20 @@ struct ReplicaSession {
   void Cancel() {
     if (cancelled_.exchange(true, std::memory_order_acq_rel)) return;
     sockets_.Cancel();
-    std::lock_guard lock(transaction_mutex_);
-    transactions_.clear();
+    std::vector<std::shared_ptr<ReplicaTransactionArrival>> arrivals;
+    {
+      std::lock_guard lock(transaction_mutex_);
+      arrivals.reserve(transactions_.size());
+      for (auto& [_, arrival] : transactions_) {
+        arrivals.push_back(std::move(arrival));
+      }
+      transactions_.clear();
+    }
+    const absl::Status cancelled =
+        absl::CancelledError("replication session cancelled");
+    for (const auto& arrival : arrivals) {
+      arrival->completion_.Abort(cancelled);
+    }
   }
 
   bool cancelled() const noexcept {
@@ -1410,7 +1425,8 @@ class ReplicationManager::Impl {
       }
       auto [it, inserted] = session->transactions_.try_emplace(txid);
       if (inserted) {
-        it->second = std::make_shared<ReplicaTransactionArrival>();
+        it->second = std::make_shared<ReplicaTransactionArrival>(
+            static_cast<unsigned>(participants.size()));
         it->second->db_id_ = envelope.db_id_;
         it->second->participants_ = participants;
         it->second->command_args_ = std::move(command_args);
@@ -1452,22 +1468,15 @@ class ReplicationManager::Impl {
                                    arrival->lsns_[participant] + 1, 0);
         }
       }
-      arrival->complete_ = true;
-    } else {
-      for (;;) {
-        {
-          std::lock_guard lock(session->transaction_mutex_);
-          if (arrival->complete_) break;
-        }
-        if (session->cancelled()) {
-          co_return absl::CancelledError(
-              "replication session ended while waiting for a transaction");
-        }
-        absl::Status yielded = co_await celer::SleepFor(
-            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
-        if (!yielded.ok()) co_return yielded;
-      }
     }
+
+    // Every participant arrives exactly once. Non-executing flows suspend
+    // here immediately; the elected flow only arrives after apply and cursor
+    // publication complete. CoroutineBarrier resumes each waiter on its
+    // original worker, without polling the session mutex.
+    absl::Status completed =
+        co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
+    if (!completed.ok()) co_return completed;
 
     absl::Status result;
     {
