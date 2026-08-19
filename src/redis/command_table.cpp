@@ -23,6 +23,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"scan", CommandKind::kScan, 2, 0, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"type", CommandKind::kType, 2, 2, 1, 1, 1, kKeyedRead},
+    {"dump", CommandKind::kDump, 2, 2, 1, 1, 1, kKeyedRead},
+    {"restore", CommandKind::kRestore, 4, 0, 1, 1, 1, kKeyedWrite},
     {"randomkey", CommandKind::kRandomKey, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdNoKeys},
     {"flushdb", CommandKind::kFlushDb, 1, 0, 0, 0, 1,

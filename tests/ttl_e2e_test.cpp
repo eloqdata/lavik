@@ -255,6 +255,24 @@ long long IntegerReply(std::string_view reply, std::string_view operation) {
   return value;
 }
 
+std::string BulkPayload(std::string_view reply, std::string_view operation) {
+  if (!reply.starts_with('$')) {
+    Fail(std::string(operation) + " was not a bulk string");
+  }
+  const std::size_t separator = reply.find("\r\n");
+  if (separator == std::string_view::npos) {
+    Fail(std::string(operation) + " was malformed");
+  }
+  std::size_t size = 0;
+  const auto [parsed_end, error] =
+      std::from_chars(reply.data() + 1, reply.data() + separator, size);
+  if (error != std::errc{} || parsed_end != reply.data() + separator ||
+      reply.size() - separator - 2 != size) {
+    Fail(std::string(operation) + " had an invalid bulk length");
+  }
+  return std::string(reply.substr(separator + 2));
+}
+
 void ExpectRange(long long actual, long long minimum, long long maximum,
                  std::string_view operation) {
   if (actual < minimum || actual > maximum) {
@@ -438,6 +456,59 @@ int main(int argc, char** argv) {
       Expect(client.Command({"SET", "bad", "v", "EX", "0"}),
              "-ERR invalid expire time in 'set' command",
              "invalid SET expiration");
+
+      Expect(client.Command({"DUMP", "missing-dump"}), "$-1",
+             "DUMP missing key");
+      Expect(
+          client.Command({"SET", "dump-source", "serialized", "PX", "60000"}),
+          "+OK", "DUMP source SET");
+      const std::string dump =
+          BulkPayload(client.Command({"DUMP", "dump-source"}), "DUMP");
+      Expect(client.Command({"RESTORE", "restored-persistent", "0", dump}),
+             "+OK", "RESTORE persistent");
+      Expect(client.Command({"GET", "restored-persistent"}),
+             "$10\r\nserialized", "RESTORE value");
+      Expect(client.Command({"PTTL", "restored-persistent"}), ":-1",
+             "DUMP excludes TTL");
+      Expect(client.Command({"RESTORE", "restored-relative", "60000", dump}),
+             "+OK", "RESTORE relative TTL");
+      ExpectRange(IntegerReply(client.Command({"PTTL", "restored-relative"}),
+                               "RESTORE relative PTTL"),
+                  1, 60000, "RESTORE relative TTL");
+      Expect(client.Command(
+                 {"RESTORE", "restored-persistent", "invalid", "invalid"}),
+             "-BUSYKEY Target key name already exists.",
+             "RESTORE BUSYKEY precedence");
+      Expect(client.Command(
+                 {"RESTORE", "restored-persistent", "0", dump, "REPLACE"}),
+             "+OK", "RESTORE REPLACE");
+      std::string corrupt_dump = dump;
+      corrupt_dump.back() ^= 1;
+      Expect(client.Command({"RESTORE", "restore-corrupt", "0", corrupt_dump}),
+             "-ERR DUMP payload version or checksum are wrong",
+             "RESTORE checksum");
+      Expect(client.Command(
+                 {"RESTORE", "restore-idle", "0", dump, "IDLETIME", "1"}),
+             "-ERR RESTORE IDLETIME and FREQ are not supported",
+             "RESTORE unsupported IDLETIME");
+      Expect(client.Command({"SET", "restore-expired", "old"}), "+OK",
+             "RESTORE expired seed");
+      Expect(client.Command({"RESTORE", "restore-expired", "1", dump, "REPLACE",
+                             "ABSTTL"}),
+             "+OK", "RESTORE expired ABSTTL");
+      Expect(client.Command({"GET", "restore-expired"}), "$-1",
+             "RESTORE expired replacement deletes");
+
+      Expect(client.Command({"RPUSH", "dump-list", "a", "b", "c"}), ":3",
+             "DUMP List seed");
+      const std::string list_dump =
+          BulkPayload(client.Command({"DUMP", "dump-list"}), "DUMP List");
+      Expect(client.Command({"RESTORE", "restored-list", "0", list_dump}),
+             "+OK", "RESTORE List");
+      Expect(client.Command({"LLEN", "restored-list"}), ":3",
+             "RESTORE List length");
+      Expect(client.Command({"LINDEX", "restored-list", "1"}), "$1\r\nb",
+             "RESTORE List contents");
 
       // TTL updates rewrite the record with the value loaded back from
       // storage. Wait out the periodic flush (20ms here) so the records are

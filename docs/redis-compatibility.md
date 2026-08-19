@@ -20,13 +20,28 @@ commands.
 The current key and expiration surface includes:
 
 - `DEL`, `UNLINK`, `RENAME`, `RENAMENX`, `COPY`, `EXISTS`, `TOUCH`,
-  `RANDOMKEY`, `TYPE`, and `SCAN` with `TYPE` filtering
+  `RANDOMKEY`, `TYPE`, `DUMP`, `RESTORE`, and `SCAN` with `TYPE` filtering
 - `TTL`, `PTTL`, `EXPIRETIME`, `PEXPIRETIME`, `EXPIRE`, `PEXPIRE`,
   `EXPIREAT`, `PEXPIREAT`, and `PERSIST`
 - Redis 7.2 `EXPIRE`/`PEXPIRE` conditions: `NX`, `XX`, `GT`, and `LT`
 
 Redis 8.4 comparison options (`IFEQ`, `IFNE`, `IFDEQ`, and `IFDNE`) are not
 part of this target.
+
+`DUMP` emits a Redis RDB version 11 object payload and, like Redis, does not
+include the key TTL. `RESTORE` accepts RDB payload versions 1 through 11 and
+the historical Redis encodings needed by String, List, Set, Hash, Sorted Set,
+and Stream values (integer/LZF strings, zipmap, ziplist, intset, quicklist,
+listpack, and all three Stream listpack layouts). The `ttl` argument supplies
+the new relative deadline; `ABSTTL` makes it an absolute Unix millisecond
+deadline, and `REPLACE` is atomic with the write. Redis Module values and RDB
+types introduced after Redis 7.2 are unsupported. `IDLETIME` and `FREQ` are
+rejected explicitly because Keylane does not persist Redis eviction metadata.
+
+Successful `RESTORE` mutations use the normal Keylane replication log. A
+relative TTL is rewritten to `RESTORE ... REPLACE ABSTTL` before publication,
+so replica delay cannot extend the key lifetime; an already elapsed replacement
+is propagated as a deletion. `DUMP` is read-only and is never replicated.
 
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
 scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s

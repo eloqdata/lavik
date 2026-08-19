@@ -120,6 +120,7 @@ add_library(keylane_module
   src/replication/command.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
+  src/redis/rdb.cpp
   src/redis/blocking_wait.cpp
   src/redis/command.cpp
   src/redis/hash_command.cpp
@@ -201,6 +202,7 @@ if (BUILD_TESTING)
     tests/scan_hash_map_test.cpp
     tests/command_table_test.cpp
     tests/random_sample_test.cpp
+    tests/rdb_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp

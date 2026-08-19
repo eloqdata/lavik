@@ -1287,6 +1287,15 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<RawValue>> ReadRawValueLocked(std::uint8_t db_id,
                                                     std::string_view key,
                                                     const Digest& digest);
+  Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
+                                              std::string_view key);
+  Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
+      std::uint8_t db_id, std::string_view key, const RawValue& value,
+      bool replace, ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const RawValue& value, bool replace, TxShardWrites* tx,
+      ReplicationCommandAppend* replication);
 
   Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
                                          std::string_view key,

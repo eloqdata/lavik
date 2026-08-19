@@ -105,6 +105,8 @@ enum class CommandKind {
   kPExpireTime,
   kScan,
   kType,
+  kDump,
+  kRestore,
   kSelect,
   kSet,
   kLPush,

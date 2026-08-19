@@ -294,6 +294,15 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
   };
 }
 
+Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValue(
+    std::uint8_t db_id, std::string_view key) {
+  assert(db_id < kLogicalDatabaseCount);
+  const Digest digest = ComputeDigest(key);
+  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+  co_return co_await ReadRawValueLocked(db_id, key, digest);
+}
+
 Task<bool> StorageEngine::Impl::KeyLive(std::uint8_t db_id,
                                         std::string_view key,
                                         const Digest& digest) {

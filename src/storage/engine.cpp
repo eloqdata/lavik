@@ -353,6 +353,25 @@ Task<absl::StatusOr<RawValue>> StorageEngine::ReadRawValueLocked(
   return impl_->ReadRawValueLocked(db_id, key, digest);
 }
 
+Task<absl::StatusOr<RawValue>> StorageEngine::ReadRawValue(
+    std::uint8_t db_id, std::string_view key) {
+  return impl_->ReadRawValue(db_id, key);
+}
+
+Task<absl::StatusOr<RestoreRawResult>> StorageEngine::RestoreRawValue(
+    std::uint8_t db_id, std::string_view key, const RawValue& value,
+    bool replace, ReplicationCommandAppend* replication) {
+  return impl_->RestoreRawValue(db_id, key, value, replace, replication);
+}
+
+Task<absl::StatusOr<RestoreRawResult>> StorageEngine::RestoreRawValueLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const RawValue& value, bool replace, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->RestoreRawValueLocked(db_id, key, digest, value, replace, tx,
+                                      replication);
+}
+
 Task<absl::Status> StorageEngine::WriteRawValueLocked(std::uint8_t db_id,
                                                       std::string_view key,
                                                       const Digest& digest,

@@ -487,6 +487,12 @@ struct RawValue {
   ValueType value_type_ = ValueType::kNone;
 };
 
+struct RestoreRawResult {
+  bool busy_ = false;
+  bool changed_ = false;
+  bool deleted_ = false;
+};
+
 // Per-owning-shard accumulator for one multi-key atomic write. The
 // coordinator owns one per shard; each shard writes only its own entry, so
 // no synchronization is needed.
@@ -743,6 +749,15 @@ class StorageEngine {
                                                   const Digest& digest);
   celer::Task<absl::StatusOr<RawValue>> ReadRawValueLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
+  celer::Task<absl::StatusOr<RawValue>> ReadRawValue(std::uint8_t db_id,
+                                                     std::string_view key);
+  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValue(
+      std::uint8_t db_id, std::string_view key, const RawValue& value,
+      bool replace, ReplicationCommandAppend* replication = nullptr);
+  celer::Task<absl::StatusOr<RestoreRawResult>> RestoreRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const RawValue& value, bool replace, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
                                                 std::string_view key,
                                                 const Digest& digest,

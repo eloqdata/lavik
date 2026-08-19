@@ -222,6 +222,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("DBSIZE", CommandKind::kDbSize);
   CheckKind("SCAN", CommandKind::kScan);
   CheckKind("TYPE", CommandKind::kType);
+  CheckKind("DUMP", CommandKind::kDump);
+  CheckKind("RESTORE", CommandKind::kRestore);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("CONFIG", CommandKind::kConfig);
@@ -253,6 +255,20 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("config", 3, true);
   CheckArity("config", 4, true);
   CheckArity("config", 5, false);
+  CheckArity("dump", 1, false);
+  CheckArity("dump", 2, true);
+  CheckArity("dump", 3, false);
+  CheckArity("restore", 3, false);
+  CheckArity("restore", 4, true);
+  CheckArity("restore", 8, true);
+  {
+    const KeyIndexView dump = Keys("dump", 2);
+    const KeyIndexView restore = Keys("restore", 6);
+    EXPECT_EQ(dump.first_, 1);
+    EXPECT_EQ(dump.last_, 1);
+    EXPECT_EQ(restore.first_, 1);
+    EXPECT_EQ(restore.last_, 1);
+  }
   // Leave the upper arity open so the option parser can report Redis's
   // syntax error for trailing tokens instead of the global arity error.
   EXPECT_EQ(FindCommand("zrangebyscore")->max_args_, 0);
@@ -276,14 +292,15 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
 
   // Flag consistency: the write set must match the read-only replica check,
   // the gate set must match today's uses_db list, and NoKeys <=> first_key==0.
-  const char* write_cmds[] = {
-      "set",      "setbit",    "bitfield", "bitop",    "lpush",   "incr",
-      "del",      "unlink",    "rename",   "renamenx", "expire",  "pexpire",
-      "expireat", "pexpireat", "copy",     "persist",  "flushdb", "flushall"};
-  const char* read_cmds[] = {"get",         "getbit",      "bitcount", "bitpos",
-                             "bitfield_ro", "strlen",      "ttl",      "pttl",
-                             "expiretime",  "pexpiretime", "type",     "exists",
-                             "touch",       "randomkey",   "dbsize",   "scan"};
+  const char* write_cmds[] = {"set",      "setbit",    "bitfield", "bitop",
+                              "lpush",    "incr",      "del",      "unlink",
+                              "rename",   "renamenx",  "expire",   "pexpire",
+                              "expireat", "pexpireat", "copy",     "persist",
+                              "restore",  "flushdb",   "flushall"};
+  const char* read_cmds[] = {
+      "get",    "getbit", "bitcount",   "bitpos",      "bitfield_ro", "strlen",
+      "ttl",    "pttl",   "expiretime", "pexpiretime", "type",        "dump",
+      "exists", "touch",  "randomkey",  "dbsize",      "scan"};
   for (const char* name : write_cmds) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdWrite) != 0,
@@ -300,13 +317,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   }
   {
     const char* gated[] = {
-        "dbsize",      "scan",        "type",     "del",       "unlink",
-        "rename",      "renamenx",    "exists",   "get",       "strlen",
-        "set",         "lpush",       "incr",     "expire",    "pexpire",
-        "expireat",    "pexpireat",   "persist",  "ttl",       "pttl",
-        "expiretime",  "pexpiretime", "touch",    "randomkey", "copy",
-        "getbit",      "setbit",      "bitcount", "bitpos",    "bitfield",
-        "bitfield_ro", "bitop"};
+        "dbsize",    "scan",     "type",        "dump",        "restore",
+        "del",       "unlink",   "rename",      "renamenx",    "exists",
+        "get",       "strlen",   "set",         "lpush",       "incr",
+        "expire",    "pexpire",  "expireat",    "pexpireat",   "persist",
+        "ttl",       "pttl",     "expiretime",  "pexpiretime", "touch",
+        "randomkey", "copy",     "getbit",      "setbit",      "bitcount",
+        "bitpos",    "bitfield", "bitfield_ro", "bitop"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
@@ -333,13 +350,13 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
                        spec->first_key_ == 0,
                    std::string(name) + " should be keyless");
     }
-    const char* keyed[] = {"get",      "set",        "lpush",       "del",
-                           "unlink",   "rename",     "renamenx",    "exists",
-                           "incr",     "strlen",     "expire",      "pexpire",
-                           "expireat", "pexpireat",  "persist",     "ttl",
-                           "pttl",     "expiretime", "pexpiretime", "copy",
-                           "touch",    "getbit",     "setbit",      "bitcount",
-                           "bitpos",   "bitfield",   "bitfield_ro"};
+    const char* keyed[] = {
+        "get",         "set",     "dump",     "restore",    "lpush",
+        "del",         "unlink",  "rename",   "renamenx",   "exists",
+        "incr",        "strlen",  "expire",   "pexpire",    "expireat",
+        "pexpireat",   "persist", "ttl",      "pttl",       "expiretime",
+        "pexpiretime", "copy",    "touch",    "getbit",     "setbit",
+        "bitcount",    "bitpos",  "bitfield", "bitfield_ro"};
     for (const char* name : keyed) {
       const CommandSpec* spec = FindCommand(name);
       EXPECT_CHECK(spec != nullptr &&

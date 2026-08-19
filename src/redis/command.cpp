@@ -33,6 +33,7 @@
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/random_sample.h"
+#include "keylane/rdb.h"
 #include "keylane/redis_parse.h"
 #include "keylane/replication.h"
 #include "keylane/replication_command.h"
@@ -68,6 +69,8 @@ constexpr std::string_view kReplicationTransactionEnvelope =
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
                                     const absl::Status& status);
+void NotifyRenamedValue(std::uint8_t db_id, std::string_view key,
+                        storage::ValueType type);
 
 std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
   return right > std::numeric_limits<std::size_t>::max() - left
@@ -118,6 +121,7 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kXAdd:
     case CommandKind::kIncr:
     case CommandKind::kCopy:
+    case CommandKind::kRestore:
       keys = 1;
       break;
     case CommandKind::kXGroup:
@@ -2182,6 +2186,104 @@ long long ExpirationReplySeconds(std::uint64_t milliseconds) {
   return static_cast<long long>(rounded);
 }
 
+struct RestoreOptions {
+  bool replace_ = false;
+  bool absttl_ = false;
+  std::uint64_t expire_at_ms_ = 0;
+};
+
+absl::StatusOr<RestoreOptions> ParseRestoreOptions(
+    const std::vector<std::string>& args) {
+  RestoreOptions options;
+  for (std::size_t i = 4; i < args.size(); ++i) {
+    if (CmpCaseInsensitive(args[i], "REPLACE")) {
+      options.replace_ = true;
+    } else if (CmpCaseInsensitive(args[i], "ABSTTL")) {
+      options.absttl_ = true;
+    } else if (CmpCaseInsensitive(args[i], "IDLETIME") ||
+               CmpCaseInsensitive(args[i], "FREQ")) {
+      return absl::UnimplementedError(
+          "RESTORE IDLETIME and FREQ are not supported");
+    } else {
+      return absl::InvalidArgumentError("syntax error");
+    }
+  }
+
+  return options;
+}
+
+absl::Status ParseRestoreTtl(std::string_view text, RestoreOptions* options) {
+  std::int64_t ttl = 0;
+  if (!ParseRedisInt64(text, &ttl) || ttl < 0) {
+    return absl::InvalidArgumentError("Invalid TTL value, must be >= 0");
+  }
+  if (ttl == 0) return absl::OkStatus();
+  const std::uint64_t unsigned_ttl = static_cast<std::uint64_t>(ttl);
+  if (options->absttl_) {
+    options->expire_at_ms_ = unsigned_ttl;
+  } else {
+    const std::uint64_t now_ms = RedisUnixTimeMillis();
+    if (unsigned_ttl > std::numeric_limits<std::uint64_t>::max() - now_ms) {
+      return absl::InvalidArgumentError("Invalid TTL value, must be >= 0");
+    }
+    options->expire_at_ms_ = now_ms + unsigned_ttl;
+  }
+  return absl::OkStatus();
+}
+
+std::string RestoreDecodeError(const absl::Status& status) {
+  if (status.message() == "DUMP payload version or checksum are wrong") {
+    return absl::StrCat("ERR ", status.message());
+  }
+  return "ERR Bad data format";
+}
+
+std::vector<std::string> CanonicalRestoreCommand(std::string_view key,
+                                                 std::string_view payload,
+                                                 std::uint64_t expire_at_ms) {
+  if (expire_at_ms != 0 && expire_at_ms <= RedisUnixTimeMillis()) {
+    return {"DEL", std::string(key)};
+  }
+  std::vector<std::string> result{
+      "RESTORE", std::string(key),
+      expire_at_ms == 0 ? "0" : std::to_string(expire_at_ms),
+      std::string(payload), "REPLACE"};
+  if (expire_at_ms != 0) result.emplace_back("ABSTTL");
+  return result;
+}
+
+struct DumpReplyState {
+  std::string payload_;
+  std::size_t offset_ = 0;
+};
+
+struct PreparedDumpReply {
+  std::string header_;
+  ReplyChunkSource chunks_;
+};
+
+Task<absl::StatusOr<std::string>> NextDumpReplyChunk(
+    std::shared_ptr<DumpReplyState> state) {
+  if (state->offset_ == state->payload_.size()) co_return std::string();
+  constexpr std::size_t kChunkBytes = 256 * 1024;
+  const std::size_t size =
+      std::min(kChunkBytes, state->payload_.size() - state->offset_);
+  std::string chunk = state->payload_.substr(state->offset_, size);
+  state->offset_ += size;
+  if (state->offset_ == state->payload_.size()) chunk += "\r\n";
+  co_return chunk;
+}
+
+PreparedDumpReply PrepareDumpReply(std::string payload) {
+  const std::size_t size = payload.size();
+  auto state = std::make_shared<DumpReplyState>();
+  state->payload_ = std::move(payload);
+  return PreparedDumpReply{
+      .header_ = "$" + std::to_string(size) + "\r\n",
+      .chunks_ = [state]() { return NextDumpReplyChunk(state); },
+  };
+}
+
 Task<CommandReply> ExecuteStorageCommand(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     ReadLatencyTrace* read_trace = nullptr,
@@ -2213,6 +2315,73 @@ Task<CommandReply> ExecuteStorageCommand(
           co_await g_storage->GetExpiration(request.db_id_, args[1]);
       reply.encoded_ = reply_builder.AppendSimpleString(
           info.exists_ ? ValueTypeName(info.value_type_) : "none");
+      co_return reply;
+    }
+
+    case CommandKind::kDump: {
+      auto value = co_await g_storage->ReadRawValue(request.db_id_, args[1]);
+      if (!value.ok()) {
+        reply.encoded_ =
+            value.status().code() == absl::StatusCode::kNotFound
+                ? reply_builder.AppendNullBulkString()
+                : AppendStorageError(reply_builder, value.status());
+        co_return reply;
+      }
+      auto payload = rdb::EncodeDump(*value);
+      if (!payload.ok()) {
+        reply.encoded_ = reply_builder.AppendError(
+            absl::StrCat("ERR ", payload.status().message()));
+        co_return reply;
+      }
+      PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
+      reply.encoded_ = reply_builder.AppendRaw(prepared.header_);
+      reply.chunks_ = std::move(prepared.chunks_);
+      co_return reply;
+    }
+
+    case CommandKind::kRestore: {
+      auto options = ParseRestoreOptions(args);
+      if (!options.ok()) {
+        reply.encoded_ = reply_builder.AppendError(
+            absl::StrCat("ERR ", options.status().message()));
+        co_return reply;
+      }
+      if (!options->replace_ &&
+          co_await g_storage->Exists(request.db_id_, args[1])) {
+        reply.encoded_ = reply_builder.AppendError(
+            "BUSYKEY Target key name already exists.");
+        co_return reply;
+      }
+      const absl::Status ttl_status = ParseRestoreTtl(args[2], &*options);
+      if (!ttl_status.ok()) {
+        reply.encoded_ = reply_builder.AppendError(
+            absl::StrCat("ERR ", ttl_status.message()));
+        co_return reply;
+      }
+      auto value = rdb::DecodeDump(args[3]);
+      if (!value.ok()) {
+        reply.encoded_ =
+            reply_builder.AppendError(RestoreDecodeError(value.status()));
+        co_return reply;
+      }
+      value->expire_at_ms_ = options->expire_at_ms_;
+      auto replication = PrepareReplicationCommand(
+          request,
+          CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_));
+      auto restored = co_await g_storage->RestoreRawValue(
+          request.db_id_, args[1], *value, options->replace_,
+          replication ? &*replication : nullptr);
+      if (!restored.ok()) {
+        reply.encoded_ = AppendStorageError(reply_builder, restored.status());
+      } else if (restored->busy_) {
+        reply.encoded_ = reply_builder.AppendError(
+            "BUSYKEY Target key name already exists.");
+      } else {
+        if (restored->changed_ && !restored->deleted_) {
+          NotifyRenamedValue(request.db_id_, args[1], value->value_type_);
+        }
+        reply.encoded_ = reply_builder.AppendSimpleString("OK");
+      }
       co_return reply;
     }
 
@@ -2759,6 +2928,62 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
           co_await g_storage->GetExpirationLocked(db_id, args[1], digest);
       co_return EncodeSimpleString(
           info.exists_ ? ValueTypeName(info.value_type_) : "none");
+    }
+
+    case CommandKind::kDump: {
+      auto value =
+          co_await g_storage->ReadRawValueLocked(db_id, args[1], digest);
+      if (!value.ok()) {
+        co_return value.status().code() == absl::StatusCode::kNotFound
+            ? EncodeNullBulkString()
+            : EncodeStorageError(value.status());
+      }
+      auto payload = rdb::EncodeDump(*value);
+      if (!payload.ok()) {
+        co_return EncodeError(
+            absl::StrCat("ERR ", payload.status().message()));
+      }
+      PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
+      if (reply_chunks != nullptr) {
+        *reply_chunks = std::move(prepared.chunks_);
+      }
+      co_return std::move(prepared.header_);
+    }
+
+    case CommandKind::kRestore: {
+      MarkReplicationCommandHandled(request);
+      auto options = ParseRestoreOptions(args);
+      if (!options.ok()) {
+        co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
+      }
+      if (!options->replace_ &&
+          co_await g_storage->ExistsLocked(db_id, args[1], digest)) {
+        co_return EncodeError("BUSYKEY Target key name already exists.");
+      }
+      const absl::Status ttl_status = ParseRestoreTtl(args[2], &*options);
+      if (!ttl_status.ok()) {
+        co_return EncodeError(absl::StrCat("ERR ", ttl_status.message()));
+      }
+      auto value = rdb::DecodeDump(args[3]);
+      if (!value.ok()) {
+        co_return EncodeError(RestoreDecodeError(value.status()));
+      }
+      value->expire_at_ms_ = options->expire_at_ms_;
+      auto restored = co_await g_storage->RestoreRawValueLocked(
+          db_id, args[1], digest, *value, options->replace_, tx);
+      if (!restored.ok()) co_return EncodeStorageError(restored.status());
+      if (restored->busy_) {
+        co_return EncodeError("BUSYKEY Target key name already exists.");
+      }
+      if (restored->changed_) {
+        CaptureReplicationCommand(
+            request,
+            CanonicalRestoreCommand(args[1], args[3], options->expire_at_ms_));
+        if (!restored->deleted_) {
+          NotifyRenamedValue(db_id, args[1], value->value_type_);
+        }
+      }
+      co_return EncodeSimpleString("OK");
     }
 
     case CommandKind::kSet: {
@@ -6337,6 +6562,8 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
     case CommandKind::kPttl:
     case CommandKind::kExpireTime:
     case CommandKind::kPExpireTime:
+    case CommandKind::kDump:
+    case CommandKind::kRestore:
     case CommandKind::kType:
       if (args.size() >= 2) {
         const unsigned target = ShardForKey(args[1]);

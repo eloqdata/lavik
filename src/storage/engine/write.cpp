@@ -256,6 +256,36 @@ Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
                                   nullptr, nullptr, replication);
 }
 
+Task<absl::StatusOr<RestoreRawResult>> StorageEngine::Impl::RestoreRawValue(
+    std::uint8_t db_id, std::string_view key, const RawValue& value,
+    bool replace, ReplicationCommandAppend* replication) {
+  assert(db_id < kLogicalDatabaseCount);
+  const Digest digest = ComputeDigest(key);
+  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
+      db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
+  co_return co_await RestoreRawValueLocked(db_id, key, digest, value, replace,
+                                           nullptr, replication);
+}
+
+Task<absl::StatusOr<RestoreRawResult>>
+StorageEngine::Impl::RestoreRawValueLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const RawValue& value, bool replace, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  const bool exists = co_await ExistsLocked(db_id, key, digest);
+  if (exists && !replace) co_return RestoreRawResult{.busy_ = true};
+  if (value.expire_at_ms_ != 0 && value.expire_at_ms_ <= UnixTimeMillis()) {
+    if (!exists) co_return RestoreRawResult{};
+    auto deleted = co_await DeleteLocked(db_id, key, digest, tx, replication);
+    if (!deleted.ok()) co_return deleted.status();
+    co_return RestoreRawResult{.changed_ = *deleted, .deleted_ = *deleted};
+  }
+  absl::Status written =
+      co_await WriteRawValueLocked(db_id, key, digest, value, tx, replication);
+  if (!written.ok()) co_return written;
+  co_return RestoreRawResult{.changed_ = true};
+}
+
 StagingSlot* StorageEngine::Impl::StagingFor(WorkerStore& store,
                                              const BlockState& state) {
   return state.staging_slot_ == 0 ? nullptr
