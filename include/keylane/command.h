@@ -322,6 +322,12 @@ void CaptureReplicationCommand(const CommandRequest& request,
                                std::vector<std::string> canonical_args);
 void MarkReplicationCommandHandled(const CommandRequest& request);
 
+// Encodes several deterministic write effects as one replication command.
+// Standalone multi-key commands use the same envelope as replicated EXEC so
+// all effects are replayed atomically by every participant flow.
+std::vector<std::string> EncodeReplicationCommandEffects(
+    std::vector<CapturedReplicationCommand> commands);
+
 // Reserves one ordered replication marker on every shard participating in a
 // standalone cross-key command. Destruction aborts an unresolved marker.
 class ReplicationTransactionGuard {
@@ -339,6 +345,8 @@ class ReplicationTransactionGuard {
 
   void Commit() noexcept;
   void SetCommandArgs(std::vector<std::string> canonical_args);
+  void SetFinalExpirations(
+      std::span<const storage::TxShardWrites> shard_writes);
   void EnterCurrentShard() noexcept;
   bool active() const noexcept { return transaction_ != nullptr; }
 

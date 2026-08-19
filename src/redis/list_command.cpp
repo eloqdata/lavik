@@ -122,6 +122,27 @@ absl::StatusOr<bool> ParseListLeft(std::string_view value) {
   return absl::Status(absl::StatusCode::kInvalidArgument, "syntax error");
 }
 
+std::vector<std::string> EncodeListMoveEffects(
+    std::uint8_t db_id, std::string_view source,
+    std::string_view destination, bool source_left, bool destination_left,
+    std::string_view value) {
+  std::vector<CapturedReplicationCommand> effects;
+  effects.reserve(2);
+  effects.push_back(CapturedReplicationCommand{
+      db_id, {source_left ? "LPOP" : "RPOP", std::string(source)}});
+  effects.push_back(CapturedReplicationCommand{
+      db_id,
+      {destination_left ? "LPUSH" : "RPUSH", std::string(destination),
+       std::string(value)}});
+  return EncodeReplicationCommandEffects(std::move(effects));
+}
+
+std::vector<std::string> EncodeListPopEffect(std::string_view key,
+                                             bool left,
+                                             std::size_t count) {
+  return {left ? "LPOP" : "RPOP", std::string(key), std::to_string(count)};
+}
+
 struct SingleShardListOutcome {
   explicit SingleShardListOutcome(absl::Status status, std::string key = {},
                                   std::vector<std::string> values = {})
@@ -181,14 +202,36 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   const std::string& source = keys[0];
   const std::string& destination = keys[1];
   if (source == destination) {
+    const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+    storage::TxShardWrites writes;
+    writes.txid_ = txid;
+    writes.collect_undo_ = true;
     storage::ListOperation operation;
     operation.kind_ = storage::ListOperationKind::kMoveWithin;
     operation.first_ = source_left ? 1 : 0;
     operation.second_ = destination_left ? 1 : 0;
     auto result = co_await g_storage->ExecuteListLocked(
-        db_id, source, storage::ComputeDigest(source), operation);
+        db_id, source, storage::ComputeDigest(source), operation, &writes);
     if (!result.ok()) {
       co_return SingleShardListOutcome(result.status());
+    }
+    if (result->values_.empty()) {
+      co_return SingleShardListOutcome(absl::OkStatus());
+    }
+    std::vector<storage::TxShardWrites*> write_refs{&writes};
+    absl::Status committed =
+        co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
+    if (!committed.ok()) {
+      (void)co_await g_storage->RollbackTxLocal(txid);
+      co_return SingleShardListOutcome(std::move(committed));
+    }
+    (void)co_await g_storage->DiscardTxUndoLocal(txid);
+    if (replication != nullptr) {
+      replication->SetCommandArgs(EncodeListMoveEffects(
+          db_id, source, destination, source_left, destination_left,
+          result->values_.front()));
+      replication->SetFinalExpirations(
+          std::span<const storage::TxShardWrites>(&writes, 1));
     }
     co_return SingleShardListOutcome(absl::OkStatus(), {},
                                      std::move(result->values_));
@@ -229,6 +272,13 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     co_return SingleShardListOutcome(std::move(committed));
   }
   (void)co_await g_storage->DiscardTxUndoLocal(txid);
+  if (replication != nullptr) {
+    replication->SetCommandArgs(EncodeListMoveEffects(
+        db_id, source, destination, source_left, destination_left,
+        popped->values_.front()));
+    replication->SetFinalExpirations(
+        std::span<const storage::TxShardWrites>(&writes, 1));
+  }
   co_return SingleShardListOutcome(absl::OkStatus(), {},
                                    std::move(popped->values_));
 }
@@ -579,6 +629,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return BuiltReply(move ? reply_builder.AppendNullBulkString()
                                 : reply_builder.AppendRaw("*-1\r\n"));
     }
+    if (!move) {
+      replication.SetCommandArgs(EncodeListPopEffect(
+          outcome.key_, pop_left, outcome.values_.size()));
+    }
     replication.Commit();
     for (std::size_t arg : key_args) {
       NotifyListBlockingKey(request.db_id_, args[arg]);
@@ -639,6 +693,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           co_return BuiltReply(
               reply_builder.AppendError("ERR ", status.message()));
         }
+        replication.SetCommandArgs(EncodeListPopEffect(
+            args[arg], pop_left, popped->values_.size()));
         replication.Commit();
         reply_builder.AppendArrayHeader(2);
         reply_builder.AppendBulkString(args[arg]);
@@ -749,6 +805,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (!released.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", released.message()));
   }
+  replication.SetCommandArgs(EncodeListMoveEffects(
+      request.db_id_, source_key, destination_key, source_left,
+      destination_left, popped->values_.front()));
+  replication.SetFinalExpirations(writes);
   replication.Commit();
   NotifyListBlockingKey(request.db_id_, source_key);
   NotifyListBlockingKey(request.db_id_, destination_key);

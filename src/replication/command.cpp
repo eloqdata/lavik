@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <charconv>
 #include <cstring>
+#include <iterator>
 #include <limits>
 
 #include "keylane/replication_command.h"
@@ -170,6 +172,46 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     offset += length;
   }
   return command;
+}
+
+void AppendReplicationExpirationEffect(
+    std::vector<std::string>* args, std::uint8_t command_db_id,
+    std::uint8_t effect_db_id, std::string_view key, bool exists,
+    std::uint64_t expire_at_ms) {
+  if (args == nullptr || args->empty() || !exists) return;
+  if ((*args)[0] == kReplicatedExecCommand) {
+    if (args->size() < 2) return;
+    std::uint64_t count = 0;
+    const std::string& encoded_count = (*args)[1];
+    const char* begin = encoded_count.data();
+    const char* end = begin + encoded_count.size();
+    const auto parsed = std::from_chars(begin, end, count);
+    if (parsed.ec != std::errc{} || parsed.ptr != end) {
+      return;
+    }
+    (*args)[1] = std::to_string(count + 1);
+  } else {
+    std::vector<std::string> command = std::move(*args);
+    args->clear();
+    args->reserve(command.size() + 8);
+    args->emplace_back(kReplicatedExecCommand);
+    args->emplace_back("2");
+    args->push_back(std::to_string(command_db_id));
+    args->push_back(std::to_string(command.size()));
+    args->insert(args->end(), std::make_move_iterator(command.begin()),
+                 std::make_move_iterator(command.end()));
+  }
+  args->push_back(std::to_string(effect_db_id));
+  if (expire_at_ms == 0) {
+    args->emplace_back("2");
+    args->emplace_back("PERSIST");
+    args->emplace_back(key);
+  } else {
+    args->emplace_back("3");
+    args->emplace_back("PEXPIREAT");
+    args->emplace_back(key);
+    args->push_back(std::to_string(expire_at_ms));
+  }
 }
 
 }  // namespace keylane

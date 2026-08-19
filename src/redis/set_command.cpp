@@ -307,6 +307,31 @@ void ComputeAggregate(SetMultiContext* context) {
   std::sort(context->output_.begin(), context->output_.end());
 }
 
+std::vector<std::string> EncodeSetMoveEffects(const CommandRequest& request) {
+  std::vector<CapturedReplicationCommand> effects;
+  effects.reserve(2);
+  effects.push_back(CapturedReplicationCommand{
+      request.db_id_, {"SREM", request.args_[1], request.args_[3]}});
+  effects.push_back(CapturedReplicationCommand{
+      request.db_id_, {"SADD", request.args_[2], request.args_[3]}});
+  return EncodeReplicationCommandEffects(std::move(effects));
+}
+
+std::vector<std::string> EncodeSetReplacement(
+    const CommandRequest& request, const std::vector<std::string>& members) {
+  std::vector<CapturedReplicationCommand> effects;
+  effects.reserve(members.empty() ? 1 : 2);
+  effects.push_back(
+      CapturedReplicationCommand{request.db_id_, {"DEL", request.args_[1]}});
+  if (!members.empty()) {
+    std::vector<std::string> add{"SADD", request.args_[1]};
+    add.insert(add.end(), members.begin(), members.end());
+    effects.push_back(
+        CapturedReplicationCommand{request.db_id_, std::move(add)});
+  }
+  return EncodeReplicationCommandEffects(std::move(effects));
+}
+
 Task<absl::Status> ReplaceDestination(SetMultiContext* context) {
   const auto& request = *context->request_;
   const std::string& destination = request.args_[1];
@@ -633,6 +658,10 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   }
 
   if (write) {
+    replication.SetCommandArgs(move ? EncodeSetMoveEffects(request)
+                                    : EncodeSetReplacement(request,
+                                                           context.output_));
+    replication.SetFinalExpirations(context.tx_writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
     SpawnOnCurrentWorker(RunSetTxCommit(txid, std::move(context.tx_writes_)));

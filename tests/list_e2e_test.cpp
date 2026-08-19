@@ -1663,7 +1663,9 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
                       {}, {"--recv-buffers", "1024"},
                       {{"KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND", "0"},
                        {"KEYLANE_REPLICATION_DROP_FLOW_AFTER_TRANSACTION_APPLY",
-                        "1"}},
+                        "1"},
+                       {"KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND_APPLY",
+                        "0"}},
                       first_conf);
   RespClient source_client(source_port);
   RespClient first_client(first_port);
@@ -1758,6 +1760,36 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   EXPECT_EQ(first_client.Command({"GET", tx_counter_0}), Bulk("1"));
   EXPECT_EQ(first_client.Command({"GET", tx_counter_1}), Bulk("1"));
 
+  // An ordinary non-idempotent command must publish its cursor before trying
+  // to ACK. Replica one disconnects after apply and must not APPEND twice when
+  // the source resends from its last acknowledged LSN.
+  ASSERT_EQ(source_client.Command({"APPEND", "repl-ordinary-append", "x"}),
+            ":1");
+  ASSERT_TRUE(wait_value(first_client, "repl-ordinary-append", "x"));
+  ASSERT_TRUE(wait_value(second_client, "repl-ordinary-append", "x"));
+  std::this_thread::sleep_for(500ms);
+  EXPECT_EQ(first_client.Command({"GET", "repl-ordinary-append"}), Bulk("x"));
+
+  // Redis EXEC may legitimately return a child error while committing other
+  // children. The failed child is not a replication effect; replay remains
+  // strict for unexpected target-side failures without breaking this case.
+  ASSERT_EQ(source_client.Command({"SET", "repl-exec-wrongtype", "string"}),
+            "+OK");
+  ASSERT_TRUE(wait_value(first_client, "repl-exec-wrongtype", "string"));
+  ASSERT_TRUE(wait_value(second_client, "repl-exec-wrongtype", "string"));
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SET", "repl-exec-survivor", "written"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"HSET", "repl-exec-wrongtype", "field", "value"}),
+            "+QUEUED");
+  const std::string partial_exec = source_client.Command({"EXEC"});
+  ASSERT_TRUE(partial_exec.starts_with("*2\r\n+OK\r\n-WRONGTYPE"));
+  ASSERT_TRUE(wait_value(first_client, "repl-exec-survivor", "written"));
+  ASSERT_TRUE(wait_value(second_client, "repl-exec-survivor", "written"));
+  EXPECT_EQ(first_client.Command({"GET", "repl-exec-wrongtype"}),
+            Bulk("string"));
+
   const std::string mset_key_0 = KeyForWorker("repl-mset", 0, 2);
   const std::string mset_key_1 = KeyForWorker("repl-mset", 1, 2);
   ASSERT_EQ(source_client.Command(
@@ -1767,6 +1799,36 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   ASSERT_TRUE(wait_value(first_client, mset_key_1, "right"));
   ASSERT_TRUE(wait_value(second_client, mset_key_0, "left"));
   ASSERT_TRUE(wait_value(second_client, mset_key_1, "right"));
+
+  // COPY still replays from its source key, so the read-only source flow must
+  // participate in the EXEC barrier with the destination flow. This SET is
+  // immediately followed by a cross-flow COPY to exercise that dependency.
+  const std::string copy_source =
+      KeyForWorker("repl-copy-source", 1, 2);
+  const std::string copy_destination =
+      KeyForWorker("repl-copy-destination", 0, 2);
+  ASSERT_EQ(source_client.Command({"SET", copy_source, "copy-value"}), "+OK");
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"COPY", copy_source, copy_destination}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}), "*1\r\n:1");
+  ASSERT_TRUE(wait_value(first_client, copy_destination, "copy-value"));
+  ASSERT_TRUE(wait_value(second_client, copy_destination, "copy-value"));
+
+  // Successful/no-op outcome-dependent commands publish no raw command that
+  // could turn into a write after a TTL or timing difference on the replica.
+  ASSERT_EQ(source_client.Command({"SET", "repl-renamenx-source", "source"}),
+            "+OK");
+  ASSERT_EQ(source_client.Command(
+                {"SET", "repl-renamenx-destination", "destination"}),
+            "+OK");
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"RENAMENX", "repl-renamenx-source",
+                                   "repl-renamenx-destination"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}), "*1\r\n:0");
+  ASSERT_TRUE(wait_value(first_client, "repl-renamenx-source", "source"));
+  ASSERT_TRUE(wait_value(second_client, "repl-renamenx-source", "source"));
 
   // EXEC publishes the committed effects, not timing/random inputs. The
   // replica must receive the master's absolute deadline, selected Set

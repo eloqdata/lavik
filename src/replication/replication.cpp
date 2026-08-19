@@ -1614,14 +1614,24 @@ class ReplicationManager::Impl {
         } else {
           applied = co_await ApplyReplicatedCommand(*command);
         }
-        if (!applied.ok()) co_return applied;
+        if (!applied.ok()) {
+          InvalidateReplicaContinuation(session);
+          co_return applied;
+        }
+        // Publish progress before the ACK write. A peer disconnect is only
+        // observed by that write; retaining the old cursor until afterwards
+        // would replay non-idempotent commands such as APPEND on reconnect.
+        session->cursors_->Store(flow_id, lsn + 1, 0);
         if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
           co_return absl::UnavailableError(
               "injected replication flow disconnect after transaction");
         }
+        if (!transaction && ShouldInjectFlowDropAfterCommandApply(flow_id)) {
+          co_return absl::UnavailableError(
+              "injected replication flow disconnect after command apply");
+        }
         absl::Status acknowledged = co_await send_ack(0, lsn);
         if (!acknowledged.ok()) co_return acknowledged;
-        session->cursors_->Store(flow_id, lsn + 1, 0);
         staged_command_lsn = 0;
         next_command_fragment = 0;
         staged_command.clear();
@@ -1681,6 +1691,21 @@ class ReplicationManager::Impl {
                                                    std::memory_order_acq_rel);
   }
 
+  void InvalidateReplicaContinuation(
+      const std::shared_ptr<ReplicaSession>& session) {
+    std::lock_guard lock(state_mutex_);
+    if (active_replica_session_ != session ||
+        cursor_state_ != session->cursors_) {
+      return;
+    }
+    // Replay may already have committed a successful non-idempotent prefix
+    // before a later strict EXEC child failed. Dropping the shared cursor
+    // state makes every flow request LSN 1 in the replacement session, which
+    // forces one coordinated full sync instead of retrying that prefix.
+    cursor_state_.reset();
+    upstream_replid_.reset();
+  }
+
   bool ShouldInjectFlowDropAfterTransaction(unsigned flow_id) {
     const char* configured = std::getenv(
         "KEYLANE_REPLICATION_DROP_FLOW_AFTER_TRANSACTION_APPLY");
@@ -1693,6 +1718,21 @@ class ReplicationManager::Impl {
       return false;
     }
     return !replication_transaction_fault_drop_used_.exchange(
+        true, std::memory_order_acq_rel);
+  }
+
+  bool ShouldInjectFlowDropAfterCommandApply(unsigned flow_id) {
+    const char* configured = std::getenv(
+        "KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND_APPLY");
+    if (configured == nullptr) return false;
+    unsigned target = 0;
+    const std::size_t length = std::strlen(configured);
+    const auto parsed = std::from_chars(configured, configured + length, target);
+    if (parsed.ec != std::errc{} || parsed.ptr != configured + length ||
+        target != flow_id) {
+      return false;
+    }
+    return !replication_command_apply_fault_drop_used_.exchange(
         true, std::memory_order_acq_rel);
   }
 
@@ -2337,6 +2377,7 @@ class ReplicationManager::Impl {
   std::optional<std::string> upstream_replid_;
   std::atomic<bool> replication_fault_drop_used_{false};
   std::atomic<bool> replication_transaction_fault_drop_used_{false};
+  std::atomic<bool> replication_command_apply_fault_drop_used_{false};
   std::atomic<unsigned> snapshot_read_concurrency_{1};
 
   const std::string replid_;

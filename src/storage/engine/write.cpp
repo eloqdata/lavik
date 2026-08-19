@@ -1,5 +1,6 @@
 #include "absl/strings/str_cat.h"
 #include "impl.h"
+#include "keylane/replication_command.h"
 
 namespace keylane::storage {
 
@@ -885,7 +886,19 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
   }
+  if (status.ok() && tx != nullptr) {
+    tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
+        .key_ = std::string(key),
+        .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
+        .db_id_ = db_id,
+        .exists_ = kind == RecordKind::kValue,
+    });
+  }
   if (status.ok() && replication != nullptr) {
+    AppendReplicationExpirationEffect(
+        &replication->args_, db_id, db_id, key,
+        kind == RecordKind::kValue,
+        kind == RecordKind::kValue ? expire_at_ms : 0);
     replication->db_id_ = db_id;
     replication->partition_id_ = partition.id_;
     replication->partition_sequence_ = mutation_sequence;

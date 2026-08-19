@@ -1407,6 +1407,11 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   if (!status.ok()) {
     co_return Built(reply_builder.AppendRaw(StorageError(status)));
   }
+  replication.SetCommandArgs(
+      context.output_.empty()
+          ? std::vector<std::string>{"DEL", request.args_[2]}
+          : std::vector<std::string>{"SET", request.args_[2],
+                                     context.output_});
   replication.Commit();
   co_return Built(reply_builder.AppendInteger(context.output_.size()));
 }
@@ -1414,6 +1419,7 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
 celer::Task<std::string> ExecuteBitOpLocked(
     const CommandRequest& request, std::span<const StringExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
+  MarkReplicationCommandHandled(request);
   auto operation = ParseBitOp(request);
   if (!operation.ok())
     co_return EncodeError(absl::StrCat("ERR ", operation.status().message()));
@@ -1456,8 +1462,13 @@ celer::Task<std::string> ExecuteBitOpLocked(
       destination->owner_ == celer::ThisWorker().id_
           ? co_await write()
           : co_await celer::SubmitTaskTo(destination->owner_, write);
-  co_return status.ok() ? EncodeInteger(context.output_.size())
-                        : StorageError(status);
+  if (!status.ok()) co_return StorageError(status);
+  CaptureReplicationCommand(
+      request, context.output_.empty()
+                   ? std::vector<std::string>{"DEL", request.args_[2]}
+                   : std::vector<std::string>{"SET", request.args_[2],
+                                              context.output_});
+  co_return EncodeInteger(context.output_.size());
 }
 
 celer::Task<CommandReply> ExecuteLcsCommand(const CommandRequest& request,

@@ -11,6 +11,9 @@
 
 namespace keylane {
 
+inline constexpr std::string_view kReplicatedExecCommand =
+    "__KEYLANE_EXEC_V1";
+
 // A committed, deterministic Redis command. The database is carried on every
 // record so replay does not depend on connection-local SELECT state.
 struct ReplicatedCommand {
@@ -50,5 +53,13 @@ class ReplicationCommandPayloadSource final
 // of the source worker count and the target's physical value layout.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     std::string_view encoded);
+
+// Turns one journaled mutation into a strict replicated EXEC and appends the
+// exact committed after-image for the key's expiration metadata. A past
+// absolute deadline intentionally deletes the value on a delayed replica.
+void AppendReplicationExpirationEffect(
+    std::vector<std::string>* args, std::uint8_t command_db_id,
+    std::uint8_t effect_db_id, std::string_view key, bool exists,
+    std::uint64_t expire_at_ms);
 
 }  // namespace keylane

@@ -3,6 +3,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -38,6 +39,51 @@ void Check(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+std::vector<std::string> ReplicatedEffectAt(const ReplicatedCommand& command,
+                                            std::size_t wanted,
+                                            std::uint8_t* db_id = nullptr) {
+  if (command.args_.empty() ||
+      command.args_.front() != keylane::kReplicatedExecCommand) {
+    Check(wanted == 0, "replication effect index is out of range");
+    if (db_id != nullptr) *db_id = command.db_id_;
+    return command.args_;
+  }
+  Check(command.args_.size() >= 2, "replicated EXEC header is truncated");
+  const std::size_t count = std::stoull(command.args_[1]);
+  Check(wanted < count, "replication effect index is out of range");
+  std::size_t offset = 2;
+  for (std::size_t index = 0; index < count; ++index) {
+    Check(offset + 2 <= command.args_.size(),
+          "replicated EXEC command header is truncated");
+    const auto effect_db = static_cast<std::uint8_t>(
+        std::stoull(command.args_[offset++]));
+    const std::size_t argc = std::stoull(command.args_[offset++]);
+    Check(argc != 0 && argc <= command.args_.size() - offset,
+          "replicated EXEC command is truncated");
+    if (index == wanted) {
+      if (db_id != nullptr) *db_id = effect_db;
+      return std::vector<std::string>(command.args_.begin() + offset,
+                                      command.args_.begin() + offset + argc);
+    }
+    offset += argc;
+  }
+  throw std::runtime_error("replication effect was not found");
+}
+
+ReplicatedCommand ReplicationTransactionBody(ReplicatedCommand command) {
+  if (command.args_.empty() || command.args_.front() != "__KEYLANE_TX_V1") {
+    return command;
+  }
+  Check(command.args_.size() >= 3,
+        "replication transaction envelope is truncated");
+  const std::size_t participants = std::stoull(command.args_[2]);
+  const std::size_t body = 3 + participants;
+  Check(body < command.args_.size(),
+        "replication transaction command body is missing");
+  command.args_.erase(command.args_.begin(), command.args_.begin() + body);
+  return command;
 }
 
 void CreateDataFile(const std::string& path) {
@@ -137,6 +183,249 @@ class ReplicationLogService final : public celer::Service {
     }
     co_return absl::Status(absl::StatusCode::kDeadlineExceeded,
                            "replication publisher did not reach the tail");
+  }
+
+  celer::Task<absl::Status> PrepareSourceAfterImagesPartOne() {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status = co_await ExecuteClientCommand(
+        kDb, {"RPUSH", "late-list-source", "left", "moved"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"SADD", "late-smove-source", "kept", "moved"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    std::vector<std::string> bit_a{"SET", "late-bit-a",
+                                   std::string(1, '\x0f')};
+    status = co_await ExecuteClientCommand(kDb, std::move(bit_a), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    std::vector<std::string> bit_b{"SET", "late-bit-b",
+                                   std::string(1, '\xf0')};
+    status = co_await ExecuteClientCommand(kDb, std::move(bit_b), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> PrepareSourceAfterImagesPartTwo() {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status = co_await ExecuteClientCommand(
+        kDb, {"SADD", "late-set-a", "a", "b"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"SADD", "late-set-b", "b", "c"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"ZADD", "late-zset-a", "1", "a"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    co_return co_await ExecuteClientCommand(
+        kDb, {"ZADD", "late-zset-b", "2", "a", "4", "b"}, ":2\r\n");
+  }
+
+  celer::Task<absl::Status> PrepareMultiPopAfterImages() {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status = co_await ExecuteClientCommand(
+        kDb, {"RPUSH", "late-pop-first", "a", "b"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"RPUSH", "late-pop-second", "x"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"ZADD", "late-zpop-first", "1", "a", "2", "b"},
+        ":2\r\n");
+    if (!status.ok()) co_return status;
+    co_return co_await ExecuteClientCommand(
+        kDb, {"ZADD", "late-zpop-second", "1", "x"}, ":1\r\n");
+  }
+
+  celer::Task<absl::Status> ExpireSourceAfterImages() {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status;
+    constexpr std::array<std::string_view, 10> kSources{
+        "late-list-source", "late-smove-source", "late-bit-a", "late-bit-b",
+        "late-set-a",       "late-set-b",          "late-zset-a",
+        "late-zset-b",      "late-pop-first",      "late-zpop-first"};
+    for (std::string_view key : kSources) {
+      std::vector<std::string> expiry{"PEXPIRE", std::string(key), "2000"};
+      status =
+          co_await ExecuteClientCommand(kDb, std::move(expiry), ":1\r\n");
+      if (!status.ok()) co_return status;
+    }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> PrepareSourceAfterImages() {
+    absl::Status status = co_await PrepareSourceAfterImagesPartOne();
+    if (!status.ok()) co_return status;
+    status = co_await PrepareSourceAfterImagesPartTwo();
+    if (!status.ok()) co_return status;
+    status = co_await PrepareMultiPopAfterImages();
+    if (!status.ok()) co_return status;
+    co_return co_await ExpireSourceAfterImages();
+  }
+
+  celer::Task<absl::StatusOr<std::vector<ReplicatedCommand>>>
+  JournalSourceAfterImages() {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status =
+        co_await storage_->EnableReplicationLog(25, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"LMOVE", "late-list-source", "late-list-destination", "RIGHT",
+         "LEFT"},
+        "$5\r\nmoved\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"SMOVE", "late-smove-source", "late-smove-destination", "moved"},
+        ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"BITOP", "OR", "late-bit-destination", "late-bit-a", "late-bit-b"},
+        ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"SUNIONSTORE", "late-set-destination", "late-set-a", "late-set-b"},
+        ":3\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"ZUNIONSTORE", "late-zset-destination", "2", "late-zset-a",
+         "late-zset-b"},
+        ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"LMPOP", "2", "late-pop-first", "late-pop-second", "LEFT",
+         "COUNT", "1"},
+        "*2\r\n$14\r\nlate-pop-first\r\n*1\r\n$1\r\na\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb,
+        {"ZMPOP", "2", "late-zpop-first", "late-zpop-second", "MIN",
+         "COUNT", "1"},
+        "*2\r\n$15\r\nlate-zpop-first\r\n*1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+    if (!status.ok()) co_return status;
+    auto fence = co_await storage_->FenceReplicationLog();
+    if (!fence.ok()) co_return fence.status();
+    Check(*fence == 8,
+          "source-dependent writes did not publish seven commands");
+
+    std::vector<ReplicatedCommand> commands;
+    ReplicationLogCursor cursor;
+    while (cursor.lsn_ <= 7) {
+      const std::uint64_t lsn = cursor.lsn_;
+      std::string encoded;
+      do {
+        auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+        if (!batch.ok()) co_return batch.status();
+        Check(batch->frames_.size() == 1 &&
+                  batch->frames_.front().header_.lsn_ == lsn,
+              "after-image command crossed an LSN boundary");
+        encoded.append(batch->frames_.front().payload_);
+        cursor = batch->next_;
+      } while (cursor.lsn_ == lsn);
+      auto decoded = keylane::DecodeReplicationCommand(encoded);
+      if (!decoded.ok()) co_return decoded.status();
+      commands.push_back(ReplicationTransactionBody(std::move(*decoded)));
+    }
+
+    const auto list_source_effect = ReplicatedEffectAt(commands[0], 0);
+    Check(list_source_effect ==
+              std::vector<std::string>({"RPOP", "late-list-source"}),
+          "LMOVE source effect was not deterministic");
+    Check(ReplicatedEffectAt(commands[0], 1) ==
+              std::vector<std::string>(
+                  {"LPUSH", "late-list-destination", "moved"}),
+          "LMOVE destination effect omitted the moved value");
+    Check(ReplicatedEffectAt(commands[1], 0) ==
+              std::vector<std::string>(
+                  {"SREM", "late-smove-source", "moved"}),
+          "SMOVE source effect was not deterministic");
+    Check(ReplicatedEffectAt(commands[1], 1) ==
+              std::vector<std::string>(
+                  {"SADD", "late-smove-destination", "moved"}),
+          "SMOVE destination effect omitted the moved member");
+    Check(ReplicatedEffectAt(commands[2], 0) ==
+              std::vector<std::string>({"SET", "late-bit-destination",
+                                        std::string(1, '\xff')}),
+          "BITOP did not publish its destination after-image");
+    Check(ReplicatedEffectAt(commands[3], 0) ==
+                  std::vector<std::string>(
+                      {"DEL", "late-set-destination"}) &&
+              ReplicatedEffectAt(commands[3], 1).front() == "SADD",
+          "Set STORE did not publish its destination after-image");
+    Check(ReplicatedEffectAt(commands[4], 0) ==
+                  std::vector<std::string>(
+                      {"DEL", "late-zset-destination"}) &&
+              ReplicatedEffectAt(commands[4], 1).front() == "ZADD",
+          "Sorted Set STORE did not publish its destination after-image");
+    Check(ReplicatedEffectAt(commands[5], 0) ==
+              std::vector<std::string>({"LPOP", "late-pop-first", "1"}),
+          "LMPOP retained the original key-selection command");
+    Check(ReplicatedEffectAt(commands[6], 0) ==
+              std::vector<std::string>(
+                  {"ZPOPMIN", "late-zpop-first", "1"}),
+          "ZMPOP retained the original key-selection command");
+    co_return commands;
+  }
+
+  celer::Task<absl::Status> ReplaySourceAfterImages(
+      std::vector<ReplicatedCommand> commands) {
+    constexpr std::uint8_t kDb = 7;
+    absl::Status status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    constexpr std::array<std::string_view, 5> kDestinations{
+        "late-list-destination", "late-smove-destination",
+        "late-bit-destination", "late-set-destination",
+        "late-zset-destination"};
+    for (std::string_view key : kDestinations) {
+      auto removed = co_await storage_->Delete(kDb, key);
+      if (!removed.ok()) co_return removed.status();
+    }
+    status =
+        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(2100));
+    if (!status.ok()) co_return status;
+    for (const ReplicatedCommand& command : commands) {
+      status = co_await keylane::ApplyReplicatedCommand(command);
+      if (!status.ok()) co_return status;
+    }
+    status = co_await ExecuteClientCommand(
+        kDb, {"LINDEX", "late-list-destination", "0"},
+        "$5\r\nmoved\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"SISMEMBER", "late-smove-destination", "moved"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    std::string expected_bit = "$1\r\n";
+    expected_bit.push_back(static_cast<char>(0xff));
+    expected_bit.append("\r\n");
+    status = co_await ExecuteClientCommand(
+        kDb, {"GET", "late-bit-destination"}, expected_bit);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"SCARD", "late-set-destination"}, ":3\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"ZSCORE", "late-zset-destination", "a"},
+        "$1\r\n3\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        kDb, {"LINDEX", "late-pop-second", "0"}, "$1\r\nx\r\n");
+    if (!status.ok()) co_return status;
+    co_return co_await ExecuteClientCommand(
+        kDb, {"ZSCORE", "late-zpop-second", "x"}, "$1\r\n1\r\n");
+  }
+
+  celer::Task<absl::Status> ExerciseSourceAfterImages() {
+    // Source-dependent writes publish deterministic destination after-images.
+    // Replay after every source deadline has passed must still reproduce the
+    // committed destination instead of silently becoming a replica no-op.
+    absl::Status status = co_await PrepareSourceAfterImages();
+    if (!status.ok()) co_return status;
+    auto commands = co_await JournalSourceAfterImages();
+    if (!commands.ok()) co_return commands.status();
+    co_return co_await ReplaySourceAfterImages(std::move(*commands));
   }
 
   celer::Task<absl::Status> Exercise() {
@@ -382,18 +671,25 @@ class ReplicationLogService final : public celer::Service {
                      .ok(),
             "truncated replication command was accepted");
       if (command_lsn == 1) {
-        Check(fragments == 1 && decoded->db_id_ == 2 &&
-                  decoded->args_ == std::vector<std::string>(
-                                        {"SET", "replication-set", "value",
-                                         "PXAT", std::to_string(kExpireAt)}),
+        std::uint8_t effect_db = 0;
+        const auto set_effect = ReplicatedEffectAt(*decoded, 0, &effect_db);
+        const auto ttl_effect = ReplicatedEffectAt(*decoded, 1);
+        Check(fragments == 1 && decoded->db_id_ == 2 && effect_db == 2 &&
+                  set_effect == std::vector<std::string>(
+                                    {"SET", "replication-set", "value",
+                                     "PXAT", std::to_string(kExpireAt)}) &&
+                  ttl_effect == std::vector<std::string>(
+                                    {"PEXPIREAT", "replication-set",
+                                     std::to_string(kExpireAt)}),
               "SET was not normalized with its absolute expiry");
       } else {
+        const auto set_effect = ReplicatedEffectAt(*decoded, 0);
         Check(fragments > 1 && decoded->db_id_ == 2 &&
-                  decoded->args_.size() == 3 && decoded->args_[0] == "SET" &&
-                  decoded->args_[1] == "replication-large" &&
-                  decoded->args_[2].size() == 9 * kMiB &&
-                  decoded->args_[2].front() == 'V' &&
-                  decoded->args_[2].back() == 'V',
+                  set_effect.size() == 3 && set_effect[0] == "SET" &&
+                  set_effect[1] == "replication-large" &&
+                  set_effect[2].size() == 9 * kMiB &&
+                  set_effect[2].front() == 'V' &&
+                  set_effect[2].back() == 'V',
               "large SET was not reconstructed as one logical command");
       }
       commands.push_back(std::move(*decoded));
@@ -511,17 +807,18 @@ class ReplicationLogService final : public celer::Service {
       family_commands.push_back(std::move(*decoded));
     }
     const std::vector<std::string> expected_names{
-        "LPUSH", "HSET", "SADD", "ZADD", "INCR", "PEXPIREAT"};
+        "LPUSH", "HSET", "SADD", "ZADD", "SET", "PEXPIREAT"};
     Check(family_commands.size() == expected_names.size(),
           "single-key command journal count changed");
     for (std::size_t i = 0; i < expected_names.size(); ++i) {
+      const auto effect = ReplicatedEffectAt(family_commands[i], 0);
       Check(family_commands[i].db_id_ == 4 &&
-                !family_commands[i].args_.empty() &&
-                family_commands[i].args_.front() == expected_names[i],
+                !effect.empty() && effect.front() == expected_names[i],
             "single-key command journal order changed");
     }
-    Check(family_commands.back().args_.size() == 3 &&
-              family_commands.back().args_[1] == "journal-counter",
+    const auto expiry_effect = ReplicatedEffectAt(family_commands.back(), 0);
+    Check(expiry_effect.size() == 3 &&
+              expiry_effect[1] == "journal-counter",
           "relative expiry was not normalized to PEXPIREAT");
 
     status = co_await storage_->DisableReplicationLog();
@@ -554,6 +851,70 @@ class ReplicationLogService final : public celer::Service {
         co_await storage_->GetExpiration(4, "journal-counter");
     Check(journal_expiry.exists_ && journal_expiry.expire_at_ms_ != 0,
           "replayed PEXPIREAT did not preserve the expiration");
+
+    // A collection mutation keeps the source key's absolute deadline in its
+    // replication effect. If replay happens after that deadline, the command
+    // may transiently recreate the key but the trailing PEXPIREAT must remove
+    // it instead of leaving a permanent value behind.
+    status = co_await storage_->EnableReplicationLog(24, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "a"},
+                                           ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(5, {"PEXPIRE", "late-ttl", "200"},
+                                           ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "b"},
+                                           ":2\r\n");
+    if (!status.ok()) co_return status;
+    auto late_fence = co_await storage_->FenceReplicationLog();
+    if (!late_fence.ok()) co_return late_fence.status();
+    Check(*late_fence == 4, "late TTL journal did not publish three commands");
+    ReplicatedCommand late_command;
+    cursor = {};
+    for (unsigned index = 0; index < 3; ++index) {
+      auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+      if (!batch.ok()) co_return batch.status();
+      Check(batch->frames_.size() == 1,
+            "late TTL journal command was not readable");
+      auto decoded = keylane::DecodeReplicationCommand(
+          batch->frames_.front().payload_);
+      if (!decoded.ok()) co_return decoded.status();
+      if (index == 2) late_command = std::move(*decoded);
+      cursor = batch->next_;
+    }
+    const auto late_ttl_effect = ReplicatedEffectAt(late_command, 1);
+    Check(late_ttl_effect.size() == 3 &&
+              late_ttl_effect[0] == "PEXPIREAT" &&
+              late_ttl_effect[1] == "late-ttl",
+          "collection mutation omitted its final absolute expiration");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    status = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(250));
+    if (!status.ok()) co_return status;
+    status = co_await keylane::ApplyReplicatedCommand(late_command);
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(5, "late-ttl"),
+          "delayed collection replay resurrected an expired key");
+
+    status = co_await ExerciseSourceAfterImages();
+    if (!status.ok()) co_return status;
+
+    // Replica replay is strict: an error in any EXEC child fails the apply
+    // instead of returning a successful RESP array that the flow would ACK.
+    auto wrong_type = co_await storage_->Set(6, "strict-wrongtype", "string", {});
+    if (!wrong_type.ok()) co_return wrong_type.status();
+    ReplicatedCommand strict_exec{
+        .db_id_ = 6,
+        .args_ = {std::string(keylane::kReplicatedExecCommand), "2", "6", "2",
+                  "INCR", "strict-counter", "6", "4", "HSET",
+                  "strict-wrongtype", "field", "value"},
+    };
+    status = co_await keylane::ApplyReplicatedCommand(strict_exec);
+    Check(!status.ok(), "replicated EXEC acknowledged a child command error");
+    status = co_await ExecuteClientCommand(6, {"GET", "strict-counter"},
+                                           "$1\r\n1\r\n");
+    if (!status.ok()) co_return status;
 
     auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
     auto flush_survivor =
@@ -624,6 +985,7 @@ int RunOnce(const std::string& path, bool exercise) {
   StorageEngineOptions options;
   options.data_files_ = {path};
   options.buffers_.registered_bytes_ = 64 * kMiB;
+  options.replication_publish_queue_bytes_ = 16 * kMiB;
   StorageEngine storage(std::move(options));
   keylane::InitWorkerMetrics(1);
   const absl::Status memory = keylane::InitMemoryLimit(512 * kMiB, 1);

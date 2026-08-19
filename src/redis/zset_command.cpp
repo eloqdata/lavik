@@ -426,24 +426,10 @@ struct MultiPopShape {
   std::uint64_t count_ = 1;
 };
 
-std::vector<std::string> CanonicalMultiPopReplicationArgs(
-    const CommandRequest& request, const MultiPopShape& shape) {
-  if (request.kind_ != CommandKind::kBZMPop &&
-      request.kind_ != CommandKind::kBZPopMin &&
-      request.kind_ != CommandKind::kBZPopMax) {
-    return {};
-  }
-  std::vector<std::string> result;
-  result.reserve(5 + shape.key_args_.size());
-  result.emplace_back("ZMPOP");
-  result.push_back(std::to_string(shape.key_args_.size()));
-  for (std::size_t argument : shape.key_args_) {
-    result.push_back(request.args_[argument]);
-  }
-  result.emplace_back(shape.maximum_ ? "MAX" : "MIN");
-  result.emplace_back("COUNT");
-  result.push_back(std::to_string(shape.count_));
-  return result;
+std::vector<std::string> CanonicalSelectedZSetPop(
+    std::string_view key, bool maximum, std::size_t count) {
+  return {maximum ? "ZPOPMAX" : "ZPOPMIN", std::string(key),
+          std::to_string(count)};
 }
 
 absl::StatusOr<MultiPopShape> ParseMultiPopShape(
@@ -648,8 +634,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive);
   }
   transaction.Seal();
-  ReplicationTransactionGuard replication(
-      request, &transaction, CanonicalMultiPopReplicationArgs(request, shape));
+  ReplicationTransactionGuard replication(request, &transaction);
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return Built(StorageError(builder, status));
   if (transaction.single_shard()) {
@@ -666,6 +651,9 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendRaw("*-1\r\n"));
     }
+    replication.SetCommandArgs(CanonicalSelectedZSetPop(
+        request.args_[context.selected_arg_], shape.maximum_,
+        context.popped_.size()));
     replication.Commit();
     AppendMultiPopReply(builder, request.args_[context.selected_arg_],
                         context.popped_, shape.flat_reply_);
@@ -690,6 +678,8 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     if (!popped->empty()) {
       status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
       if (!status.ok()) co_return Built(StorageError(builder, status));
+      replication.SetCommandArgs(
+          CanonicalSelectedZSetPop(key, shape.maximum_, popped->size()));
       replication.Commit();
       AppendMultiPopReply(builder, key, *popped, shape.flat_reply_);
       co_return Built(builder.View());
@@ -2152,6 +2142,26 @@ struct MultiContext {
   std::optional<StoreShape> store_shape_;
 };
 
+std::vector<CapturedReplicationCommand> BuildZSetReplacement(
+    const CommandRequest& request, std::size_t destination_arg,
+    const ZSet& output) {
+  std::vector<CapturedReplicationCommand> effects;
+  effects.reserve(output.empty() ? 1 : 2);
+  effects.push_back(CapturedReplicationCommand{
+      request.db_id_, {"DEL", request.args_[destination_arg]}});
+  if (!output.empty()) {
+    std::vector<std::string> add{"ZADD", request.args_[destination_arg]};
+    add.reserve(2 + output.size() * 2);
+    for (const Element& element : output) {
+      add.push_back(FormatDouble(element.score_));
+      add.push_back(element.member_);
+    }
+    effects.push_back(
+        CapturedReplicationCommand{request.db_id_, std::move(add)});
+  }
+  return effects;
+}
+
 storage::TxShardWrites* LocalWrites(MultiContext& context) {
   return context.writes_.empty() ? nullptr
                                  : &context.writes_[celer::ThisWorker().id_];
@@ -2602,6 +2612,11 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(StorageError(builder, status));
   }
   if (context.store_) {
+    replication.SetCommandArgs(EncodeReplicationCommandEffects(
+        BuildZSetReplacement(request,
+                             context.store_shape_->destination_arg_,
+                             context.output_)));
+    replication.SetFinalExpirations(context.writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
     celer::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
@@ -2696,6 +2711,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                    request.kind_ == CommandKind::kZInterStore ||
                    request.kind_ == CommandKind::kZUnionStore ||
                    context.store_shape_.has_value();
+  if (context.store_) MarkReplicationCommandHandled(request);
   if (request.kind_ == CommandKind::kZDiff ||
       request.kind_ == CommandKind::kZDiffStore) {
     context.aggregate_ = MultiAggregate::kDifference;
@@ -2844,6 +2860,11 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     }
     if (!undo_finished.ok())
       co_return std::string(StorageError(builder, undo_finished));
+    for (auto& effect :
+         BuildZSetReplacement(request, destination_arg, context.output_)) {
+      CaptureReplicationCommand(request, effect.db_id_,
+                                std::move(effect.args_));
+    }
     if (!context.output_.empty()) {
       NotifyZSetBlockingKey(request.db_id_, args[destination_arg]);
     }
@@ -2865,6 +2886,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
 Task<std::string> ExecuteZSetMultiPopLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
+  MarkReplicationCommandHandled(request);
   ReplyBuilder builder;
   if (request.kind_ != CommandKind::kZMPop) {
     auto timeout = ParseBlockingZSetDeadline(request);
@@ -2903,6 +2925,9 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       co_return std::string(StorageError(builder, popped.status()));
     }
     if (!popped->empty()) {
+      CaptureReplicationCommand(
+          request, CanonicalSelectedZSetPop(request.args_[argument],
+                                            shape.maximum_, popped->size()));
       AppendMultiPopReply(builder, request.args_[argument], *popped,
                           shape.flat_reply_);
       co_return std::string(builder.View());

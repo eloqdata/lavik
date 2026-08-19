@@ -27,6 +27,9 @@ struct ConnectionContext {
   // `multi_dirty` marks queue-time errors that turn EXEC into EXECABORT.
   bool in_multi_ = false;
   bool multi_dirty_ = false;
+  // Internal replica replay turns any child command error into a top-level
+  // failure so the flow cannot ACK a partially applied EXEC.
+  bool strict_replication_apply_ = false;
   std::uint8_t multi_db_ = 0;
   std::vector<CommandRequest> queued_;
 

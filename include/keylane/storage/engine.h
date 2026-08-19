@@ -481,6 +481,13 @@ struct RawValue {
 struct TxShardWrites {
   std::uint64_t txid_ = 0;  // input: stamped into every record written
 
+  struct ExpirationEffect {
+    std::string key_;
+    std::uint64_t expire_at_ms_ = 0;
+    std::uint8_t db_id_ = 0;
+    bool exists_ = false;
+  };
+
   struct Fence {  // highest staged offset per destination block
     std::uint64_t block_id_ = 0;
     std::uint64_t allocation_epoch_ = 0;
@@ -501,6 +508,9 @@ struct TxShardWrites {
   };
   std::vector<Fence> fences_;
   std::vector<Retired> retirements_;
+  // Final metadata is collected while the key lock is held. Replication
+  // collapses repeated writes to the same key before publishing the command.
+  std::vector<ExpirationEffect> expiration_effects_;
   // Journal undo state for runtime rollback (standalone MSET / multi-key
   // DEL). EXEC leaves this off: its commands report errors individually and
   // never roll back (Redis semantics), while recovery still treats the
