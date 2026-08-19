@@ -107,11 +107,15 @@ class ReplicationLogService final : public celer::Service {
     keylane::ReplyBuilder reply_builder;
     keylane::CommandReply reply =
         co_await keylane::ExecuteCommand(*request, reply_builder);
-    if (reply.disk_value_.has_value() || reply.chunks_ ||
-        reply.encoded_ != expected_reply) {
+    std::string actual(reply.encoded_);
+    if (reply.disk_value_.has_value()) {
+      const auto bytes = reply.disk_value_->network_bytes();
+      actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    if (reply.chunks_ || actual != expected_reply) {
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                              "client replication command returned '" +
-                                 std::string(reply.encoded_) +
+                                 actual +
                                  "' instead of '" +
                                  std::string(expected_reply) + "'");
     }
@@ -136,6 +140,34 @@ class ReplicationLogService final : public celer::Service {
   }
 
   celer::Task<absl::Status> Exercise() {
+    // Snapshot handoff closes every worker's transaction admission word while
+    // retaining the count that was already admitted on that worker.
+    Check(keylane::TryBeginSnapshotTransaction(),
+          "open snapshot transaction gate rejected an operation");
+    Check(keylane::SnapshotTransactionsActive(),
+          "snapshot transaction gate lost its local active count");
+    Check(keylane::CloseSnapshotTransactionGate(),
+          "snapshot transaction gate did not close");
+    Check(!keylane::TryBeginSnapshotTransaction(),
+          "closed snapshot transaction gate admitted an operation");
+    Check(!keylane::CloseSnapshotTransactionGate(),
+          "snapshot transaction gate allowed two cut owners");
+    keylane::EndSnapshotTransaction();
+    Check(!keylane::SnapshotTransactionsActive(),
+          "snapshot transaction gate did not drain");
+    keylane::OpenSnapshotTransactionGate();
+    Check(keylane::TryBeginSnapshotTransaction(),
+          "reopened snapshot transaction gate rejected an operation");
+    keylane::EndSnapshotTransaction();
+    Check(keylane::TryBeginReplicationTransactionOrder(),
+          "replication transaction order did not admit first owner");
+    Check(!keylane::TryBeginReplicationTransactionOrder(),
+          "replication transaction order admitted two owners");
+    keylane::EndReplicationTransactionOrder();
+    Check(keylane::TryBeginReplicationTransactionOrder(),
+          "replication transaction order did not reopen");
+    keylane::EndReplicationTransactionOrder();
+
     absl::Status status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
     if (!status.ok()) co_return status;
     RepeatedByteSource too_large(9 * kMiB, 'x');
@@ -431,6 +463,97 @@ class ReplicationLogService final : public celer::Service {
     if (!status.ok()) co_return status;
     Check(!co_await storage_->Exists(2, "replication-set"),
           "replica DEL did not remove the key");
+
+    // Single-key writes from every value family are journaled at the storage
+    // mutation ordering point and replay through the normal command path.
+    status = co_await storage_->EnableReplicationLog(22, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"LPUSH", "journal-list", "a", "b"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HSET", "journal-hash", "field", "value"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"SADD", "journal-set", "one", "two"}, ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"ZADD", "journal-zset", "1", "member"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(4, {"INCR", "journal-counter"},
+                                           ":1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"PEXPIRE", "journal-counter", "600000"}, ":1\r\n");
+    if (!status.ok()) co_return status;
+    auto family_fence = co_await storage_->FenceReplicationLog();
+    if (!family_fence.ok()) co_return family_fence.status();
+    Check(*family_fence == 7 &&
+              storage_->LocalReplicationLogInfo().tail_lsn_ == 6,
+          "publisher fence did not separate prior and future commands");
+
+    std::vector<ReplicatedCommand> family_commands;
+    cursor = {};
+    while (cursor.lsn_ <= 6) {
+      const std::uint64_t lsn = cursor.lsn_;
+      std::string encoded;
+      do {
+        auto batch = co_await storage_->ReadReplicationLog(cursor, kMiB, 1);
+        if (!batch.ok()) co_return batch.status();
+        Check(batch->frames_.size() == 1 &&
+                  batch->frames_.front().header_.lsn_ == lsn,
+              "single-key command crossed an LSN boundary");
+        encoded.append(batch->frames_.front().payload_);
+        cursor = batch->next_;
+      } while (cursor.lsn_ == lsn);
+      auto decoded = keylane::DecodeReplicationCommand(encoded);
+      if (!decoded.ok()) co_return decoded.status();
+      family_commands.push_back(std::move(*decoded));
+    }
+    const std::vector<std::string> expected_names{
+        "LPUSH", "HSET", "SADD", "ZADD", "INCR", "PEXPIREAT"};
+    Check(family_commands.size() == expected_names.size(),
+          "single-key command journal count changed");
+    for (std::size_t i = 0; i < expected_names.size(); ++i) {
+      Check(family_commands[i].db_id_ == 4 &&
+                !family_commands[i].args_.empty() &&
+                family_commands[i].args_.front() == expected_names[i],
+            "single-key command journal order changed");
+    }
+    Check(family_commands.back().args_.size() == 3 &&
+              family_commands.back().args_[1] == "journal-counter",
+          "relative expiry was not normalized to PEXPIREAT");
+
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    for (std::string_view key : {"journal-list", "journal-hash", "journal-set",
+                                 "journal-zset", "journal-counter"}) {
+      auto removed = co_await storage_->Delete(4, key);
+      if (!removed.ok()) co_return removed.status();
+    }
+    for (const ReplicatedCommand& command : family_commands) {
+      status = co_await keylane::ApplyReplicatedCommand(command);
+      if (!status.ok()) co_return status;
+    }
+    status = co_await ExecuteClientCommand(4, {"LLEN", "journal-list"},
+                                           ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"HGET", "journal-hash", "field"}, "$5\r\nvalue\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(4, {"SCARD", "journal-set"},
+                                           ":2\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        4, {"ZSCORE", "journal-zset", "member"}, "$1\r\n1\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(4, {"GET", "journal-counter"},
+                                           "$1\r\n1\r\n");
+    if (!status.ok()) co_return status;
+    const auto journal_expiry =
+        co_await storage_->GetExpiration(4, "journal-counter");
+    Check(journal_expiry.exists_ && journal_expiry.expire_at_ms_ != 0,
+          "replayed PEXPIREAT did not preserve the expiration");
 
     auto flush_victim = co_await storage_->Set(2, "flush-victim", "gone", {});
     auto flush_survivor =

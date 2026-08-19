@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -312,6 +313,25 @@ struct ReplicationCommandAppend {
   std::vector<std::string> args_;
 };
 
+enum class ReplicationTransactionResolution : std::uint8_t {
+  kPending,
+  kPublish,
+  kDiscard,
+};
+
+// Shared by the source workers participating in one cross-key command. Each
+// worker queues the same immutable envelope while the command holds its shard
+// locks; resolution decides whether that queued envelope is published after
+// the command's atomic outcome is known. It is not a wire-level commit state.
+struct ReplicationTransaction {
+  std::uint64_t id_ = 0;
+  std::uint8_t db_id_ = 0;
+  std::vector<unsigned> participants_;
+  std::vector<std::string> envelope_args_;
+  std::atomic<ReplicationTransactionResolution> resolution_{
+      ReplicationTransactionResolution::kPending};
+};
+
 enum class ListOperationKind : std::uint8_t {
   kPushLeft,
   kPushRight,
@@ -573,6 +593,10 @@ class StorageEngine {
                                                  std::size_t capacity_bytes);
   celer::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
+  // Inserts an ordered publisher fence and returns the first LSN assigned
+  // after it. All commands enqueued before the fence have reached the log;
+  // commands enqueued afterwards receive an LSN at or above the result.
+  celer::Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   celer::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
   celer::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
@@ -580,6 +604,8 @@ class StorageEngine {
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
+  bool TryEnqueueReplicationTransaction(
+      std::shared_ptr<ReplicationTransaction> transaction);
 
   // Replica-side primitives. Reset returns a new local replication epoch that
   // fences every record from an earlier copy of this partition.
@@ -608,23 +634,29 @@ class StorageEngine {
       SetLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
-      std::span<const std::string_view> values);
+      std::span<const std::string_view> values,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<ListResult>> ExecuteList(
-      std::uint8_t db_id, std::string_view key, const ListOperation& operation);
+      std::uint8_t db_id, std::string_view key, const ListOperation& operation,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteHash(
-      std::uint8_t db_id, std::string_view key, const HashOperation& operation);
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
-      std::uint8_t db_id, std::string_view key, const HashOperation& operation);
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::Status> ExecuteCompact(std::uint8_t db_id,
                                            std::string_view key,
                                            ValueType value_type, bool read_only,
                                            const CompactValueCallback& callback,
-                                           std::uint64_t now_ms = 0);
+                                           std::uint64_t now_ms = 0,
+                                           ReplicationCommandAppend* replication = nullptr);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
       std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
-      ExpirationCondition condition);
+      ExpirationCondition condition,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<bool>> Delete(
       std::uint8_t db_id, std::string_view key,
       ReplicationCommandAppend* replication = nullptr);
@@ -657,21 +689,26 @@ class StorageEngine {
       SetLatencyTrace* trace = nullptr);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
+      std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const ListOperation& operation, TxShardWrites* tx = nullptr);
+      const ListOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const HashOperation& operation, TxShardWrites* tx = nullptr);
+      const HashOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const HashOperation& operation, TxShardWrites* tx = nullptr);
+      const HashOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::Status> ExecuteCompactLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ValueType value_type, bool read_only,
       const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
-      std::uint64_t now_ms = 0);
+      std::uint64_t now_ms = 0,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<ExpirationInfo> GetExpirationLocked(std::uint8_t db_id,
                                                   std::string_view key,
                                                   const Digest& digest);
@@ -681,11 +718,13 @@ class StorageEngine {
                                                 std::string_view key,
                                                 const Digest& digest,
                                                 const RawValue& value,
-                                                TxShardWrites* tx = nullptr);
+                                                TxShardWrites* tx = nullptr,
+                                                ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
-      TxShardWrites* tx = nullptr);
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<bool>> DeleteLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       TxShardWrites* tx = nullptr,

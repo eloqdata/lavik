@@ -104,6 +104,8 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
           .log_epoch_ = log.log_epoch_,
           .logical_bytes_ = logical_bytes,
           .append_ = std::move(command),
+          .fence_ = nullptr,
+          .transaction_ = nullptr,
       });
   if (!log.publisher_running_) {
     log.publisher_running_ = true;
@@ -112,12 +114,122 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
   return true;
 }
 
+bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
+    std::shared_ptr<ReplicationTransaction> transaction) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (log.state_ != ReplicationLogState::kActive || transaction == nullptr ||
+      transaction->envelope_args_.empty()) {
+    return false;
+  }
+
+  std::size_t logical_bytes = sizeof(ReplicationEventKind) +
+                              sizeof(transaction->db_id_) +
+                              sizeof(std::uint16_t) + sizeof(std::uint64_t);
+  for (const std::string& arg : transaction->envelope_args_) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
+        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
+                                    logical_bytes - arg.size()) {
+      log.state_ = ReplicationLogState::kInvalid;
+      spdlog::warn("replication transaction queue size overflow");
+      return false;
+    }
+    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  }
+  if (logical_bytes > log.max_publish_queue_bytes_ ||
+      log.publish_queue_bytes_ > log.max_publish_queue_bytes_ - logical_bytes) {
+    log.state_ = ReplicationLogState::kInvalid;
+    spdlog::warn(
+        "replication transaction publisher cannot keep up; invalidating "
+        "backlog for full resynchronization");
+    return false;
+  }
+
+  log.publish_queue_bytes_ += logical_bytes;
+  log.publish_queue_.push_back(
+      WorkerStore::ReplicationLogRuntime::PendingCommand{
+          .log_epoch_ = log.log_epoch_,
+          .logical_bytes_ = logical_bytes,
+          .append_ = {},
+          .fence_ = nullptr,
+          .transaction_ = std::move(transaction),
+      });
+  if (!log.publisher_running_) {
+    log.publisher_running_ = true;
+    store.worker_->Spawn(DrainReplicationPublishQueue(&store));
+  }
+  return true;
+}
+
+Task<absl::StatusOr<std::uint64_t>>
+StorageEngine::Impl::FenceReplicationLog() {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (log.state_ != ReplicationLogState::kActive) {
+    co_return InvalidState("replication log is not active");
+  }
+
+  auto fence = std::make_shared<WorkerStore::ReplicationLogRuntime::PublishFence>();
+  log.publish_queue_.push_back(
+      WorkerStore::ReplicationLogRuntime::PendingCommand{
+          .log_epoch_ = log.log_epoch_,
+          .logical_bytes_ = 0,
+          .append_ = {},
+          .fence_ = fence,
+          .transaction_ = nullptr,
+      });
+  if (!log.publisher_running_) {
+    log.publisher_running_ = true;
+    store.worker_->Spawn(DrainReplicationPublishQueue(&store));
+  }
+  while (!fence->complete_) {
+    co_await fence->ready_.Wait();
+  }
+  if (!fence->status_.ok()) co_return fence->status_;
+  co_return fence->next_lsn_;
+}
+
 Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     WorkerStore* store) {
   auto& log = store->replication_log_;
   while (!log.publish_queue_.empty()) {
     auto pending = std::move(log.publish_queue_.front());
     log.publish_queue_.pop_front();
+    if (pending.fence_ != nullptr) {
+      if (log.state_ == ReplicationLogState::kActive &&
+          pending.log_epoch_ == log.log_epoch_) {
+        pending.fence_->next_lsn_ = log.next_lsn_;
+        pending.fence_->status_ = absl::OkStatus();
+      } else {
+        pending.fence_->status_ =
+            InvalidState("replication log changed before publisher fence");
+      }
+      pending.fence_->complete_ = true;
+      pending.fence_->ready_.NotifyAll(*store->worker_);
+      continue;
+    }
+    if (pending.transaction_ != nullptr) {
+      while (pending.transaction_->resolution_.load(
+                 std::memory_order_acquire) ==
+             ReplicationTransactionResolution::kPending) {
+        co_await celer::Yield(*store->worker_);
+      }
+      if (pending.transaction_->resolution_.load(std::memory_order_acquire) ==
+          ReplicationTransactionResolution::kDiscard) {
+        if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
+          log.publish_queue_bytes_ -= pending.logical_bytes_;
+        }
+        continue;
+      }
+      pending.append_ = ReplicationCommandAppend{
+          .kind_ = ReplicationEventKind::kTransaction,
+          .db_id_ = pending.transaction_->db_id_,
+          .partition_id_ =
+              static_cast<std::uint16_t>(celer::ThisWorker().id_),
+          .partition_sequence_ = pending.transaction_->id_,
+          .args_ = pending.transaction_->envelope_args_,
+      };
+    }
     if (log.state_ != ReplicationLogState::kActive ||
         pending.log_epoch_ != log.log_epoch_) {
       if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
@@ -155,6 +267,13 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     }
   }
   if (log.state_ != ReplicationLogState::kActive) {
+    for (auto& pending : log.publish_queue_) {
+      if (pending.fence_ == nullptr) continue;
+      pending.fence_->status_ =
+          InvalidState("replication publisher failed before fence");
+      pending.fence_->complete_ = true;
+      pending.fence_->ready_.NotifyAll(*store->worker_);
+    }
     log.publish_queue_.clear();
     log.publish_queue_bytes_ = 0;
   }
@@ -715,6 +834,13 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   log.log_epoch_ = 0;
   log.next_lsn_ = 1;
   log.max_blocks_ = 0;
+  for (auto& pending : log.publish_queue_) {
+    if (pending.fence_ == nullptr) continue;
+    pending.fence_->status_ =
+        InvalidState("replication log disabled before publisher fence");
+    pending.fence_->complete_ = true;
+    pending.fence_->ready_.NotifyAll(*store.worker_);
+  }
   log.publish_queue_.clear();
   log.publish_queue_bytes_ = 0;
   log.max_publish_queue_bytes_ = 0;

@@ -61,6 +61,9 @@ std::string g_server_bind_ip = "127.0.0.1";
 std::chrono::steady_clock::time_point g_server_start;
 
 constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
+constexpr std::string_view kReplicationTransactionEnvelope =
+    "__KEYLANE_TX_V1";
+constexpr std::string_view kReplicatedExecCommand = "__KEYLANE_EXEC_V1";
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
@@ -1055,16 +1058,19 @@ Task<CommandReply> ExecuteDefrag(const CommandRequest& request,
 
 constexpr std::uint64_t kDbGateClosed = std::uint64_t{1} << 63;
 constexpr std::uint64_t kDbGateCountMask = ~kDbGateClosed;
-struct alignas(64) DbWorkerGate {
-  std::atomic<std::uint64_t> state_{0};
+struct alignas(64) WorkerCommandGates {
+  std::array<std::atomic<std::uint64_t>,
+             storage::kLogicalDatabaseCount>
+      db_states_{};
+  std::atomic<std::uint64_t> snapshot_transaction_state_{0};
 };
 
-static_assert(alignof(DbWorkerGate) == 64);
-static_assert(sizeof(DbWorkerGate) == 64);
+static_assert(alignof(WorkerCommandGates) == 64);
+static_assert(sizeof(WorkerCommandGates) % 64 == 0);
 
-std::array<std::array<DbWorkerGate, storage::kLogicalStorageShards>,
-           storage::kLogicalDatabaseCount>
-    g_db_gates{};
+std::array<WorkerCommandGates, storage::kLogicalStorageShards>
+    g_worker_command_gates{};
+std::atomic<bool> g_replication_transaction_order{false};
 
 unsigned DbGateWorkerCount() noexcept {
   constexpr unsigned kMaxDbGateWorkers = storage::kLogicalStorageShards;
@@ -1075,22 +1081,23 @@ unsigned DbGateWorkerCount() noexcept {
   return std::max(1U, std::min(g_server_threads, kMaxDbGateWorkers));
 }
 
-DbWorkerGate& LocalDbGate(std::uint8_t db_id) noexcept {
+std::atomic<std::uint64_t>& LocalDbGate(std::uint8_t db_id) noexcept {
   const unsigned worker = ThisWorker().id_;
   assert(worker < DbGateWorkerCount());
   assert(worker < storage::kLogicalStorageShards);
-  return g_db_gates[db_id][worker];
+  return g_worker_command_gates[worker].db_states_[db_id];
 }
 
 void OpenDbGateWorker(std::uint8_t db_id, unsigned worker) noexcept {
-  g_db_gates[db_id][worker].state_.fetch_and(~kDbGateClosed,
-                                             std::memory_order_acq_rel);
+  g_worker_command_gates[worker].db_states_[db_id].fetch_and(
+      ~kDbGateClosed, std::memory_order_acq_rel);
 }
 
 bool DbGateHasActiveOperations(std::uint8_t db_id) noexcept {
   const unsigned workers = DbGateWorkerCount();
   for (unsigned worker = 0; worker < workers; ++worker) {
-    if ((g_db_gates[db_id][worker].state_.load(std::memory_order_acquire) &
+    if ((g_worker_command_gates[worker].db_states_[db_id].load(
+             std::memory_order_acquire) &
          kDbGateCountMask) != 0) {
       return true;
     }
@@ -1099,7 +1106,7 @@ bool DbGateHasActiveOperations(std::uint8_t db_id) noexcept {
 }
 
 bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
-  auto& gate = LocalDbGate(db_id).state_;
+  auto& gate = LocalDbGate(db_id);
   std::uint64_t state = gate.load(std::memory_order_acquire);
   while ((state & kDbGateClosed) == 0) {
     if (gate.compare_exchange_weak(state, state + 1, std::memory_order_acq_rel,
@@ -1111,7 +1118,7 @@ bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
 }
 
 void EndDbOperation(std::uint8_t db_id) noexcept {
-  LocalDbGate(db_id).state_.fetch_sub(1, std::memory_order_acq_rel);
+  LocalDbGate(db_id).fetch_sub(1, std::memory_order_acq_rel);
 }
 
 bool CloseDbGate(std::uint8_t db_id) noexcept {
@@ -1119,7 +1126,7 @@ bool CloseDbGate(std::uint8_t db_id) noexcept {
   std::size_t closed_count = 0;
   const unsigned workers = DbGateWorkerCount();
   for (unsigned worker = 0; worker < workers; ++worker) {
-    auto& gate = g_db_gates[db_id][worker].state_;
+    auto& gate = g_worker_command_gates[worker].db_states_[db_id];
     std::uint64_t expected = gate.load(std::memory_order_acquire);
     while ((expected & kDbGateClosed) == 0) {
       if (gate.compare_exchange_weak(expected, expected | kDbGateClosed,
@@ -1148,6 +1155,75 @@ void OpenDbGate(std::uint8_t db_id) noexcept {
   for (unsigned worker = 0; worker < workers; ++worker) {
     OpenDbGateWorker(db_id, worker);
   }
+}
+
+std::atomic<std::uint64_t>& LocalSnapshotTransactionGate() noexcept {
+  const unsigned worker = ThisWorker().id_;
+  assert(worker < DbGateWorkerCount());
+  assert(worker < storage::kLogicalStorageShards);
+  return g_worker_command_gates[worker].snapshot_transaction_state_;
+}
+
+void OpenSnapshotTransactionGateWorker(unsigned worker) noexcept {
+  g_worker_command_gates[worker]
+      .snapshot_transaction_state_
+      .fetch_and(~kDbGateClosed, std::memory_order_acq_rel);
+}
+
+class SnapshotTransactionOperationGuard {
+ public:
+  SnapshotTransactionOperationGuard() = default;
+  SnapshotTransactionOperationGuard(
+      const SnapshotTransactionOperationGuard&) = delete;
+  SnapshotTransactionOperationGuard& operator=(
+      const SnapshotTransactionOperationGuard&) = delete;
+  ~SnapshotTransactionOperationGuard() {
+    if (active_) EndSnapshotTransaction();
+  }
+
+  void Activate() noexcept { active_ = true; }
+
+ private:
+  bool active_ = false;
+};
+
+class ReplicationTransactionOrderGuard {
+ public:
+  ReplicationTransactionOrderGuard() = default;
+  ReplicationTransactionOrderGuard(const ReplicationTransactionOrderGuard&) =
+      delete;
+  ReplicationTransactionOrderGuard& operator=(
+      const ReplicationTransactionOrderGuard&) = delete;
+  ~ReplicationTransactionOrderGuard() {
+    if (active_) EndReplicationTransactionOrder();
+  }
+
+  void Activate() noexcept { active_ = true; }
+
+ private:
+  bool active_ = false;
+};
+
+Task<absl::Status> BeginReplicationTransactionOrder(
+    ReplicationTransactionOrderGuard* guard) {
+  while (!TryBeginReplicationTransactionOrder()) {
+    absl::Status waited = co_await celer::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  }
+  guard->Activate();
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> BeginSnapshotTransaction(
+    SnapshotTransactionOperationGuard* guard) {
+  while (!TryBeginSnapshotTransaction()) {
+    absl::Status waited = co_await celer::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
+  }
+  guard->Activate();
+  co_return absl::OkStatus();
 }
 
 class DbOperationGuard {
@@ -2364,8 +2440,11 @@ Task<CommandReply> ExecuteStorageCommand(
             absl::StrCat("ERR ", expire_at_ms.status().message()));
         co_return reply;
       }
+      auto replication = PrepareReplicationCommand(
+          request, {"PEXPIREAT", args[1], std::to_string(*expire_at_ms)});
       auto updated = co_await g_storage->UpdateExpiration(
-          request.db_id_, args[1], *expire_at_ms, *condition);
+          request.db_id_, args[1], *expire_at_ms, *condition,
+          replication ? &*replication : nullptr);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -2378,9 +2457,11 @@ Task<CommandReply> ExecuteStorageCommand(
             "ERR wrong number of arguments for 'persist' command");
         co_return reply;
       }
+      auto replication = PrepareReplicationCommand(request);
       auto updated = co_await g_storage->UpdateExpiration(
           request.db_id_, args[1], 0,
-          storage::ExpirationCondition::kIfHasExpiration);
+          storage::ExpirationCondition::kIfHasExpiration,
+          replication ? &*replication : nullptr);
       reply.encoded_ =
           updated.ok() ? reply_builder.AppendInteger(*updated ? 1 : 0)
                        : AppendStorageError(reply_builder, updated.status());
@@ -3201,6 +3282,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   RenameContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
@@ -3220,6 +3302,7 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
 
+  replication.Commit();
   g_storage->NoteTxCommitStarted();
   SpawnOnCurrentWorker(
       RunTxCommit(execution.txid_, std::move(context.writes_)));
@@ -3351,6 +3434,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
                      storage::ComputeDigest(args[2]), 2,
                      tx::LockMode::kExclusive);
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   CopyContext context;
   context.request_ = &request;
   context.options_ = *options;
@@ -3368,6 +3452,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
 
+  replication.Commit();
   g_storage->NoteTxCommitStarted();
   SpawnOnCurrentWorker(
       RunTxCommit(execution.txid_, std::move(context.writes_)));
@@ -3445,6 +3530,7 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   MSetNxContext context;
   context.request_ = &request;
   TwoPhaseResult execution = co_await ExecuteTwoPhaseWrite(
@@ -3459,6 +3545,7 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   if (execution.skipped_) {
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
+  replication.Commit();
   g_storage->NoteTxCommitStarted();
   SpawnOnCurrentWorker(
       RunTxCommit(execution.txid_, std::move(context.writes_)));
@@ -3574,6 +3661,7 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
                write ? tx::LockMode::kExclusive : tx::LockMode::kShared);
   }
   txn.Seal();
+  ReplicationTransactionGuard replication(request, &txn);
 
   MultiKeyContext ctx;
   ctx.request_ = &request;
@@ -3639,6 +3727,8 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
     g_storage->NoteTxCommitStarted();
     SpawnOnCurrentWorker(RunTxCommit(write_txid, std::move(ctx.tx_writes_)));
   }
+
+  if (write) replication.Commit();
 
   switch (request.kind_) {
     case CommandKind::kMSet:
@@ -4897,6 +4987,39 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
     co_return BuiltReply(AppendOomError(reply_builder));
   }
 
+  const bool has_write = std::any_of(
+      queued.begin(), queued.end(), [](const CommandRequest& command) {
+        return command.spec_ != nullptr &&
+               (command.spec_->flags_ & kCmdWrite) != 0;
+      });
+  const bool source_write = has_write && std::any_of(
+      queued.begin(), queued.end(), [](const CommandRequest& command) {
+        return !command.replication_origin_ && command.spec_ != nullptr &&
+               (command.spec_->flags_ & kCmdWrite) != 0;
+      });
+  ReplicationTransactionOrderGuard replication_order_guard;
+  if (source_write && g_storage != nullptr &&
+      g_storage->ReplicationLogActive()) {
+    absl::Status entered =
+        co_await BeginReplicationTransactionOrder(&replication_order_guard);
+    if (!entered.ok()) {
+      co_await DropWatches(ctx);
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", entered.message())));
+    }
+  }
+  SnapshotTransactionOperationGuard snapshot_transaction_guard;
+  if (source_write && g_replication != nullptr && g_storage != nullptr &&
+      g_storage->ReplicationLogActive()) {
+    absl::Status entered =
+        co_await BeginSnapshotTransaction(&snapshot_transaction_guard);
+    if (!entered.ok()) {
+      co_await DropWatches(ctx);
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", entered.message())));
+    }
+  }
+
   // Precompute every queued command's keys: digests, owners, slots, modes.
   std::vector<std::vector<ExecKey>> cmd_keys(queued.size());
   std::vector<std::string> key_errors(queued.size());
@@ -5052,7 +5175,35 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       }
     }
 
+    const CommandRequest* replication_request = nullptr;
+    for (const CommandRequest& command : queued) {
+      if (command.spec_ != nullptr &&
+          (command.spec_->flags_ & kCmdWrite) != 0) {
+        replication_request = &command;
+        break;
+      }
+    }
+    std::vector<std::string> replication_args;
+    if (replication_request != nullptr && !owners.empty()) {
+      replication_args.reserve(2 + queued.size() * 3);
+      replication_args.emplace_back(kReplicatedExecCommand);
+      replication_args.push_back(std::to_string(queued.size()));
+      for (const CommandRequest& command : queued) {
+        replication_args.push_back(std::to_string(command.db_id_));
+        replication_args.push_back(std::to_string(command.args_.size()));
+        replication_args.insert(replication_args.end(), command.args_.begin(),
+                                command.args_.end());
+      }
+    }
+
     if (owners.size() == 1) {
+      std::unique_ptr<ReplicationTransactionGuard> replication;
+      if (replication_request != nullptr) {
+        replication = std::make_unique<ReplicationTransactionGuard>(
+            *replication_request,
+            std::vector<unsigned>{static_cast<unsigned>(owners.front())},
+            std::move(replication_args));
+      }
       // Whole transaction on one shard: hop once, take the fast-path guard
       // over the union lock set, run every command inline.
       const std::vector<tx::KeyRef> refs = DedupExecLocks(cmd_keys);
@@ -5061,6 +5212,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
           co_await SubmitTaskTo(owners.front(), [&]() -> Task<absl::Status> {
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
                 std::span<const tx::KeyRef>(refs));
+            if (replication != nullptr) replication->EnterCurrentShard();
             if (!ctx.watched_.empty() &&
                 !co_await CheckConnectionWatches(ctx)) {
               watch_aborted = true;
@@ -5112,6 +5264,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         co_await DropWatches(ctx);
         co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
       }
+      if (replication != nullptr) replication->Commit();
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     } else {
@@ -5122,6 +5275,11 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         }
       }
       txn.Seal();
+      std::unique_ptr<ReplicationTransactionGuard> replication;
+      if (replication_request != nullptr) {
+        replication = std::make_unique<ReplicationTransactionGuard>(
+            *replication_request, &txn, std::move(replication_args));
+      }
       absl::Status scheduled = co_await txn.Schedule();
       if (!scheduled.ok()) {
         co_await DropWatches(ctx);
@@ -5200,6 +5358,7 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         co_return BuiltReply(reply_builder.AppendError(
             absl::StrCat("ERR ", released.message())));
       }
+      if (replication != nullptr) replication->Commit();
       g_storage->NoteTxCommitStarted();
       SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
     }
@@ -5249,6 +5408,79 @@ void EndCommandDbOperation(std::uint8_t db_id) noexcept {
   EndDbOperation(db_id);
 }
 
+bool TryBeginSnapshotTransaction() noexcept {
+  auto& gate = LocalSnapshotTransactionGate();
+  std::uint64_t state = gate.load(std::memory_order_acquire);
+  while ((state & kDbGateClosed) == 0) {
+    if (gate.compare_exchange_weak(state, state + 1,
+                                   std::memory_order_acq_rel,
+                                   std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void EndSnapshotTransaction() noexcept {
+  LocalSnapshotTransactionGate().fetch_sub(1, std::memory_order_acq_rel);
+}
+
+bool CloseSnapshotTransactionGate() noexcept {
+  std::array<unsigned, storage::kLogicalStorageShards> closed{};
+  std::size_t closed_count = 0;
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    auto& gate =
+        g_worker_command_gates[worker].snapshot_transaction_state_;
+    std::uint64_t expected = gate.load(std::memory_order_acquire);
+    while ((expected & kDbGateClosed) == 0) {
+      if (gate.compare_exchange_weak(expected, expected | kDbGateClosed,
+                                     std::memory_order_acq_rel,
+                                     std::memory_order_acquire)) {
+        closed[closed_count++] = worker;
+        break;
+      }
+    }
+    if ((expected & kDbGateClosed) != 0) {
+      for (std::size_t i = 0; i < closed_count; ++i) {
+        OpenSnapshotTransactionGateWorker(closed[i]);
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+void OpenSnapshotTransactionGate() noexcept {
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    OpenSnapshotTransactionGateWorker(worker);
+  }
+}
+
+bool SnapshotTransactionsActive() noexcept {
+  const unsigned workers = DbGateWorkerCount();
+  for (unsigned worker = 0; worker < workers; ++worker) {
+    if ((g_worker_command_gates[worker]
+             .snapshot_transaction_state_
+             .load(std::memory_order_acquire) &
+         kDbGateCountMask) != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool TryBeginReplicationTransactionOrder() noexcept {
+  bool expected = false;
+  return g_replication_transaction_order.compare_exchange_strong(
+      expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void EndReplicationTransactionOrder() noexcept {
+  g_replication_transaction_order.store(false, std::memory_order_release);
+}
+
 void InitStorage(storage::StorageEngine* engine, ReplicationManager* replication) {
   g_storage = engine;
   InitBlockingWaitStorage(engine);
@@ -5260,6 +5492,120 @@ void InitStorage(storage::StorageEngine* engine, ReplicationManager* replication
   InitZSetCommandStorage(engine);
   g_replication = replication;
   g_replica_read_only = replication != nullptr && replication->is_replica();
+}
+
+std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
+    const CommandRequest& request, std::vector<std::string> canonical_args) {
+  if (request.replication_origin_ || g_storage == nullptr ||
+      !g_storage->ReplicationLogActive()) {
+    return std::nullopt;
+  }
+  storage::ReplicationCommandAppend append;
+  append.args_ = canonical_args.empty() ? request.args_
+                                        : std::move(canonical_args);
+  return append;
+}
+
+namespace {
+
+std::atomic<std::uint64_t> g_next_replication_transaction_id{1};
+
+}  // namespace
+
+ReplicationTransactionGuard::ReplicationTransactionGuard(
+    const CommandRequest& request, tx::Transaction* transaction,
+    std::vector<std::string> canonical_args) {
+  if (transaction == nullptr) return;
+  Initialize(request, transaction->shard_ids(), std::move(canonical_args));
+  if (transaction_ != nullptr) {
+    transaction->SetShardEntryHook(
+        &ReplicationTransactionGuard::EnterShardHook, this);
+  }
+}
+
+ReplicationTransactionGuard::ReplicationTransactionGuard(
+    const CommandRequest& request, std::vector<unsigned> participants,
+    std::vector<std::string> canonical_args) {
+  Initialize(request, std::move(participants), std::move(canonical_args));
+}
+
+void ReplicationTransactionGuard::Initialize(
+    const CommandRequest& request, std::vector<unsigned> participants,
+    std::vector<std::string> canonical_args) {
+  if (request.replication_origin_ || g_storage == nullptr ||
+      !g_storage->ReplicationLogActive() || request.spec_ == nullptr ||
+      (request.spec_->flags_ & kCmdWrite) == 0 || participants.empty()) {
+    return;
+  }
+  const std::uint64_t id =
+      g_next_replication_transaction_id.fetch_add(1,
+                                                  std::memory_order_relaxed);
+  if (id == 0) return;
+
+  transaction_ = std::make_shared<storage::ReplicationTransaction>();
+  transaction_->id_ = id;
+  transaction_->db_id_ = request.db_id_;
+  transaction_->participants_ = std::move(participants);
+  auto& envelope = transaction_->envelope_args_;
+  const auto& command_args =
+      canonical_args.empty() ? request.args_ : canonical_args;
+  envelope.reserve(3 + transaction_->participants_.size() +
+                   command_args.size());
+  envelope.emplace_back(kReplicationTransactionEnvelope);
+  envelope.push_back(std::to_string(id));
+  envelope.push_back(std::to_string(transaction_->participants_.size()));
+  for (unsigned participant : transaction_->participants_) {
+    envelope.push_back(std::to_string(participant));
+  }
+  envelope.insert(envelope.end(), command_args.begin(), command_args.end());
+}
+
+ReplicationTransactionGuard::~ReplicationTransactionGuard() {
+  if (transaction_ != nullptr) {
+    storage::ReplicationTransactionResolution expected =
+        storage::ReplicationTransactionResolution::kPending;
+    transaction_->resolution_.compare_exchange_strong(
+        expected, storage::ReplicationTransactionResolution::kDiscard,
+        std::memory_order_release, std::memory_order_relaxed);
+  }
+}
+
+void ReplicationTransactionGuard::Commit() noexcept {
+  if (transaction_ != nullptr) {
+    storage::ReplicationTransactionResolution expected =
+        storage::ReplicationTransactionResolution::kPending;
+    transaction_->resolution_.compare_exchange_strong(
+        expected, storage::ReplicationTransactionResolution::kPublish,
+        std::memory_order_release, std::memory_order_relaxed);
+  }
+}
+
+void ReplicationTransactionGuard::EnterCurrentShard() noexcept {
+  EnterShard(celer::ThisWorker().id_);
+}
+
+void ReplicationTransactionGuard::EnterShard(unsigned shard_id) noexcept {
+  if (transaction_ == nullptr) return;
+  const auto& participants = transaction_->participants_;
+  if (std::find(participants.begin(), participants.end(), shard_id) ==
+      participants.end()) {
+    transaction_->resolution_.store(
+        storage::ReplicationTransactionResolution::kDiscard,
+        std::memory_order_release);
+    return;
+  }
+  if (!g_storage->TryEnqueueReplicationTransaction(transaction_)) {
+    storage::ReplicationTransactionResolution expected =
+        storage::ReplicationTransactionResolution::kPending;
+    transaction_->resolution_.compare_exchange_strong(
+        expected, storage::ReplicationTransactionResolution::kDiscard,
+        std::memory_order_release, std::memory_order_relaxed);
+  }
+}
+
+void ReplicationTransactionGuard::EnterShardHook(void* context,
+                                                 unsigned shard_id) {
+  static_cast<ReplicationTransactionGuard*>(context)->EnterShard(shard_id);
 }
 
 void SetServerInfo(std::string bind_ip, std::uint16_t port,
@@ -5427,6 +5773,31 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   if (request.kind_ == CommandKind::kFlushDb ||
       request.kind_ == CommandKind::kFlushAll) {
     co_return co_await ExecuteFlush(request, reply_builder);
+  }
+
+  const bool snapshot_transaction =
+      !replication_origin && g_replication != nullptr &&
+      g_storage != nullptr && g_storage->ReplicationLogActive() &&
+      (cmd_flags & (kCmdWrite | kCmdMultiShard)) ==
+          (kCmdWrite | kCmdMultiShard) &&
+      (cmd_flags & kCmdMayBlock) == 0;
+  ReplicationTransactionOrderGuard replication_order_guard;
+  if (snapshot_transaction) {
+    absl::Status entered =
+        co_await BeginReplicationTransactionOrder(&replication_order_guard);
+    if (!entered.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", entered.message())));
+    }
+  }
+  SnapshotTransactionOperationGuard snapshot_transaction_guard;
+  if (snapshot_transaction) {
+    absl::Status entered =
+        co_await BeginSnapshotTransaction(&snapshot_transaction_guard);
+    if (!entered.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR ", entered.message())));
+    }
   }
 
   const bool uses_db = (cmd_flags & kCmdUsesDbGate) != 0;
@@ -5759,23 +6130,91 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
   }
 }
 
+Task<absl::Status> ApplyReplicatedExec(
+    const std::vector<std::string>& args) {
+  if (args.size() < 2 || args[0] != kReplicatedExecCommand) {
+    co_return absl::InvalidArgumentError("malformed replicated EXEC");
+  }
+  auto parse_size = [](std::string_view text,
+                       std::uint64_t* output) noexcept {
+    const char* begin = text.data();
+    const char* end = begin + text.size();
+    const auto parsed = std::from_chars(begin, end, *output);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
+  };
+  std::uint64_t command_count = 0;
+  if (!parse_size(args[1], &command_count) || command_count == 0 ||
+      command_count > args.size() - 2) {
+    co_return absl::InvalidArgumentError("invalid replicated EXEC count");
+  }
+  ConnectionContext context;
+  context.queued_.reserve(static_cast<std::size_t>(command_count));
+  std::size_t offset = 2;
+  for (std::uint64_t index = 0; index < command_count; ++index) {
+    if (offset + 2 > args.size()) {
+      co_return absl::InvalidArgumentError("truncated replicated EXEC");
+    }
+    std::uint64_t db_id = 0;
+    std::uint64_t argc = 0;
+    if (!parse_size(args[offset++], &db_id) ||
+        db_id >= storage::kLogicalDatabaseCount ||
+        !parse_size(args[offset++], &argc) || argc == 0 ||
+        argc > args.size() - offset) {
+      co_return absl::InvalidArgumentError("invalid replicated EXEC command");
+    }
+    RespCommand wire;
+    wire.args_.insert(wire.args_.end(), args.begin() + offset,
+                      args.begin() + offset + static_cast<std::size_t>(argc));
+    offset += static_cast<std::size_t>(argc);
+    auto request = BuildCommandRequest(std::move(wire),
+                                       static_cast<std::uint8_t>(db_id));
+    if (!request.ok()) co_return request.status();
+    if (request->spec_ == nullptr ||
+        (request->spec_->flags_ & kCmdGlobal) != 0 ||
+        request->kind_ == CommandKind::kMulti ||
+        request->kind_ == CommandKind::kExec ||
+        request->kind_ == CommandKind::kDiscard ||
+        request->kind_ == CommandKind::kWatch ||
+        request->kind_ == CommandKind::kUnwatch) {
+      co_return absl::InvalidArgumentError(
+          "unsupported command in replicated EXEC");
+    }
+    request->replication_origin_ = true;
+    context.queued_.push_back(std::move(*request));
+  }
+  if (offset != args.size()) {
+    co_return absl::InvalidArgumentError("trailing replicated EXEC data");
+  }
+  ReplyBuilder reply_builder;
+  CommandReply reply = co_await ExecuteExec(context, reply_builder);
+  if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
+    co_return absl::FailedPreconditionError(std::string(reply.encoded_));
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
+  if (!command.args_.empty() &&
+      command.args_[0] == kReplicatedExecCommand) {
+    co_return co_await ApplyReplicatedExec(command.args_);
+  }
   RespCommand wire{.args_ = command.args_};
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
   if (!request.ok()) co_return request.status();
   request->replication_origin_ = true;
-  const bool canonical_set = request->kind_ == CommandKind::kSet &&
-                             (request->args_.size() == 3 ||
-                              (request->args_.size() == 5 &&
-                               CmpCaseInsensitive(request->args_[3], "PXAT")));
-  const bool canonical_del =
-      request->kind_ == CommandKind::kDel && request->args_.size() == 2;
   const bool canonical_flush_db =
       request->kind_ == CommandKind::kFlushDb && request->args_.size() == 2;
-  if (!canonical_set && !canonical_del && !canonical_flush_db) {
+  bool replayable_write = false;
+  if (request->spec_ != nullptr &&
+      (request->spec_->flags_ & kCmdWrite) != 0 &&
+      (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) == 0) {
+    auto keys = DetermineKeys(*request->spec_, request->args_);
+    replayable_write = keys.ok() && keys->count() != 0;
+  }
+  if (!replayable_write && !canonical_flush_db) {
     co_return absl::Status(
         absl::StatusCode::kInvalidArgument,
-        "replication command is not a canonical SET, DEL, or FLUSHDB");
+        "replication command is not a replayable write or FLUSHDB barrier");
   }
 
   if (canonical_flush_db) {

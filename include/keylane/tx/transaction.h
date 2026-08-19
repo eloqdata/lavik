@@ -5,6 +5,7 @@
 #include <coroutine>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 #include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
@@ -41,6 +42,10 @@ struct ShardSlice {
 using ShardCallback = celer::Task<absl::Status> (*)(void* ctx,
                                                     const ShardSlice& slice);
 
+// Runs once on every participating shard after this transaction has acquired
+// its holds and before its first shard callback. The hook must not suspend.
+using ShardEntryHook = void (*)(void* ctx, unsigned shard_id);
+
 // A multi-key transaction, embedded in the coordinator coroutine's frame.
 //
 // Lifecycle: Begin -> AddKey... -> Seal -> [Schedule ->] Execute(release).
@@ -71,6 +76,13 @@ class Transaction {
 
   bool single_shard() const { return shards_.size() == 1; }
   std::size_t shard_count() const { return shards_.size(); }
+
+  std::vector<unsigned> shard_ids() const;
+
+  void SetShardEntryHook(ShardEntryHook hook, void* ctx) noexcept {
+    entry_hook_ = hook;
+    entry_hook_ctx_ = ctx;
+  }
 
   // Multi-shard only; no-op for single-shard transactions.
   celer::Task<absl::Status> Schedule();
@@ -112,6 +124,7 @@ class Transaction {
     Phase phase_ = Phase::kSchedule;
     bool schedule_failed_ = false;
     bool granted_ = false;
+    bool entry_hook_invoked_ = false;
   };
 
   struct RoundAwaiter {
@@ -141,6 +154,8 @@ class Transaction {
   std::uint64_t txid_ = 0;
   ShardCallback cb_ = nullptr;
   void* cb_ctx_ = nullptr;
+  ShardEntryHook entry_hook_ = nullptr;
+  void* entry_hook_ctx_ = nullptr;
   absl::InlinedVector<TxKey, 4> keys_;
   absl::InlinedVector<std::uint16_t, 4> owners_;
   absl::InlinedVector<KeyRef, 4> lock_refs_;

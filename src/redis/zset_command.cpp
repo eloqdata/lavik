@@ -404,14 +404,19 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
                               storage::TxShardWrites* tx, bool read_only,
                               const storage::CompactValueCallback& callback) {
   const std::string_view key = request.args_[1];
+  auto replication = tx == nullptr && !read_only
+                         ? PrepareReplicationCommand(request)
+                         : std::nullopt;
   if (digest == nullptr) {
     co_return co_await g_storage->ExecuteCompact(request.db_id_, key,
                                                  storage::ValueType::kSortedSet,
-                                                 read_only, callback);
+                                                 read_only, callback, 0,
+                                                 replication ? &*replication
+                                                             : nullptr);
   }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kSortedSet, read_only,
-      callback, tx);
+      callback, tx, 0, replication ? &*replication : nullptr);
 }
 
 struct MultiPopShape {
@@ -420,6 +425,26 @@ struct MultiPopShape {
   bool flat_reply_ = false;
   std::uint64_t count_ = 1;
 };
+
+std::vector<std::string> CanonicalMultiPopReplicationArgs(
+    const CommandRequest& request, const MultiPopShape& shape) {
+  if (request.kind_ != CommandKind::kBZMPop &&
+      request.kind_ != CommandKind::kBZPopMin &&
+      request.kind_ != CommandKind::kBZPopMax) {
+    return {};
+  }
+  std::vector<std::string> result;
+  result.reserve(5 + shape.key_args_.size());
+  result.emplace_back("ZMPOP");
+  result.push_back(std::to_string(shape.key_args_.size()));
+  for (std::size_t argument : shape.key_args_) {
+    result.push_back(request.args_[argument]);
+  }
+  result.emplace_back(shape.maximum_ ? "MAX" : "MIN");
+  result.emplace_back("COUNT");
+  result.push_back(std::to_string(shape.count_));
+  return result;
+}
 
 absl::StatusOr<MultiPopShape> ParseMultiPopShape(
     const CommandRequest& request) {
@@ -591,6 +616,30 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
         builder.AppendError(absl::StrCat("ERR ", parsed.status().message())));
   }
   const MultiPopShape shape = std::move(*parsed);
+  struct SnapshotAttemptGuard {
+    bool snapshot_active_ = false;
+    bool order_active_ = false;
+    ~SnapshotAttemptGuard() {
+      if (snapshot_active_) EndSnapshotTransaction();
+      if (order_active_) EndReplicationTransactionOrder();
+    }
+  } snapshot_attempt;
+  if (!request.replication_origin_ && request.spec_ != nullptr &&
+      (request.spec_->flags_ & kCmdMayBlock) != 0 &&
+      g_storage->ReplicationLogActive()) {
+    while (!TryBeginReplicationTransactionOrder()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return Built(StorageError(builder, waited));
+    }
+    snapshot_attempt.order_active_ = true;
+    while (!TryBeginSnapshotTransaction()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return Built(StorageError(builder, waited));
+    }
+    snapshot_attempt.snapshot_active_ = true;
+  }
   tx::Transaction transaction;
   for (std::size_t argument : shape.key_args_) {
     transaction.AddKey(
@@ -599,6 +648,8 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(
+      request, &transaction, CanonicalMultiPopReplicationArgs(request, shape));
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return Built(StorageError(builder, status));
   if (transaction.single_shard()) {
@@ -615,6 +666,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendRaw("*-1\r\n"));
     }
+    replication.Commit();
     AppendMultiPopReply(builder, request.args_[context.selected_arg_],
                         context.popped_, shape.flat_reply_);
     co_return Built(builder.View());
@@ -638,6 +690,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     if (!popped->empty()) {
       status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
       if (!status.ok()) co_return Built(StorageError(builder, status));
+      replication.Commit();
       AppendMultiPopReply(builder, key, *popped, shape.flat_reply_);
       co_return Built(builder.View());
     }
@@ -2518,6 +2571,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                        tx::LockMode::kShared);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   context.single_shard_ = transaction.single_shard();
   std::uint64_t txid = 0;
   if (context.store_) {
@@ -2548,6 +2602,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(StorageError(builder, status));
   }
   if (context.store_) {
+    replication.Commit();
     g_storage->NoteTxCommitStarted();
     celer::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
     if (!context.output_.empty()) {

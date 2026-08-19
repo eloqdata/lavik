@@ -463,6 +463,8 @@ absl::StatusOr<bool> ParseBitmapUnit(std::string_view unit) {
 celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
                                          const storage::Digest& digest,
                                          storage::TxShardWrites* tx) {
+  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
+                                   : std::nullopt;
   const auto& args = request.args_;
   const std::uint8_t db = request.db_id_;
   const std::string_view key = args[1];
@@ -646,7 +648,8 @@ celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
   };
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db, key, digest, storage::ValueType::kString, read_only, callback, tx);
+      db, key, digest, storage::ValueType::kString, read_only, callback, tx, 0,
+      replication ? &*replication : nullptr);
   co_return status.ok() ? reply : StorageError(status);
 }
 
@@ -656,6 +659,27 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
   const auto& args = request.args_;
   const std::uint8_t db = request.db_id_;
   const std::string_view key = args[1];
+  std::vector<std::string> canonical_args;
+  switch (request.kind_) {
+    case CommandKind::kSetEx:
+    case CommandKind::kPSetEx:
+      canonical_args = {"SET", args[1], args[3]};
+      break;
+    case CommandKind::kSetNx:
+    case CommandKind::kGetSet:
+      canonical_args = {"SET", args[1], args[2]};
+      break;
+    case CommandKind::kGetDel:
+      canonical_args = {"DEL", args[1]};
+      break;
+    default:
+      break;
+  }
+  auto replication = tx == nullptr && request.kind_ != CommandKind::kGetEx
+                         ? PrepareReplicationCommand(request,
+                                                     std::move(canonical_args))
+                         : std::nullopt;
+  std::optional<std::uint64_t> getex_deadline;
 
   if (request.kind_ == CommandKind::kSetEx ||
       request.kind_ == CommandKind::kPSetEx) {
@@ -668,7 +692,8 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     storage::SetOptions options;
     options.expire_at_ms_ = *expire_at;
     auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[3], options, tx);
+        co_await g_storage->SetLocked(db, key, digest, args[3], options, tx,
+                                      replication ? &*replication : nullptr);
     co_return result.ok() ? EncodeSimpleString("OK")
                           : StorageError(result.status());
   }
@@ -677,7 +702,8 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     storage::SetOptions options;
     options.condition_ = storage::SetCondition::kIfAbsent;
     auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx);
+        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
+                                      replication ? &*replication : nullptr);
     co_return result.ok() ? EncodeInteger(result->applied_ ? 1 : 0)
                           : StorageError(result.status());
   }
@@ -686,7 +712,8 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     storage::SetOptions options;
     options.return_old_value_ = true;
     auto result =
-        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx);
+        co_await g_storage->SetLocked(db, key, digest, args[2], options, tx,
+                                      replication ? &*replication : nullptr);
     if (!result.ok()) co_return StorageError(result.status());
     if (!result->old_value_) co_return EncodeNullBulkString();
     const auto bytes = result->old_value_->network_bytes();
@@ -714,6 +741,24 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
                              RedisEqualsIgnoreCase(args[2], "pxat"));
     if (args.size() != 2 && !persist && !expiration) {
       co_return EncodeError("ERR syntax error");
+    }
+    if (tx == nullptr && persist) {
+      replication =
+          PrepareReplicationCommand(request, {"PERSIST", args[1]});
+    } else if (expiration) {
+      const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
+      const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
+      const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
+      auto parsed =
+          ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
+      if (!parsed.ok()) {
+        co_return EncodeError(absl::StrCat("ERR ", parsed.status().message()));
+      }
+      getex_deadline = *parsed;
+      if (tx == nullptr) {
+        replication = PrepareReplicationCommand(
+            request, {"PEXPIREAT", args[1], std::to_string(*parsed)});
+      }
     }
   }
 
@@ -762,12 +807,10 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
             .expire_at_ms_ = 0,
         };
       }
-      const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
-      const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
-      const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
-      auto parsed = ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
-      if (!parsed.ok()) return parsed.status();
-      if (*parsed <= RedisUnixTimeMillis()) {
+      if (!getex_deadline.has_value()) {
+        return absl::InternalError("GETEX deadline was not parsed");
+      }
+      if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{.changed_ = true,
                                            .erase_ = true,
                                            .encoded_ = {},
@@ -779,7 +822,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
           .reuse_encoded_ = true,
           .encoded_ = {},
           .logical_size_ = old.size(),
-          .expire_at_ms_ = *parsed,
+          .expire_at_ms_ = *getex_deadline,
       };
     }
 
@@ -832,6 +875,9 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
         return absl::InternalError("failed to format String float");
       }
       reply = EncodeBulkString(formatted);
+      if (replication.has_value()) {
+        replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
+      }
       return changed(std::move(formatted));
     }
 
@@ -866,11 +912,16 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
           "increment or decrement would overflow");
     }
     reply = EncodeInteger(result);
-    return changed(std::to_string(result));
+    std::string formatted = std::to_string(result);
+    if (replication.has_value()) {
+      replication->args_ = {"SET", std::string(key), formatted, "KEEPTTL"};
+    }
+    return changed(std::move(formatted));
   };
 
   const absl::Status status = co_await g_storage->ExecuteCompactLocked(
-      db, key, digest, storage::ValueType::kString, false, callback, tx);
+      db, key, digest, storage::ValueType::kString, false, callback, tx, 0,
+      replication ? &*replication : nullptr);
   co_return status.ok() ? reply : StorageError(status);
 }
 
@@ -1292,6 +1343,7 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kShared);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) {
     co_return Built(
@@ -1316,9 +1368,11 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
       (void)co_await transaction.Release();
     }
   }
-  co_return status.ok()
-      ? Built(reply_builder.AppendInteger(context.output_.size()))
-      : Built(reply_builder.AppendRaw(StorageError(status)));
+  if (!status.ok()) {
+    co_return Built(reply_builder.AppendRaw(StorageError(status)));
+  }
+  replication.Commit();
+  co_return Built(reply_builder.AppendInteger(context.output_.size()));
 }
 
 celer::Task<std::string> ExecuteBitOpLocked(

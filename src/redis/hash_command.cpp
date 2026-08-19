@@ -169,12 +169,17 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
 
   absl::StatusOr<storage::HashResult> result =
       absl::UnknownError("Hash command was not dispatched");
+  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
+                                   : std::nullopt;
   if (digest == nullptr) {
-    result =
-        co_await g_storage->ExecuteHash(request.db_id_, args[1], operation);
+    result = co_await g_storage->ExecuteHash(
+        request.db_id_, args[1], operation,
+        replication ? &*replication : nullptr);
   } else {
     result = co_await g_storage->ExecuteHashLocked(request.db_id_, args[1],
-                                                   *digest, operation, tx);
+                                                   *digest, operation, tx,
+                                                   replication ? &*replication
+                                                               : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));

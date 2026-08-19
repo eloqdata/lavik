@@ -102,6 +102,10 @@ Task<absl::Status> StorageEngine::ApplyReplicatedFlushDb(
   return impl_->ApplyReplicatedFlushDb(db_id, db_epoch);
 }
 
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::FenceReplicationLog() {
+  return impl_->FenceReplicationLog();
+}
+
 PartitionReplicationStart StorageEngine::BeginPartitionReplication(
     std::uint16_t partition_id) {
   return impl_->BeginPartitionReplication(partition_id);
@@ -165,6 +169,11 @@ bool StorageEngine::TryEnqueueReplicationCommand(
   return impl_->TryEnqueueReplicationCommand(std::move(command));
 }
 
+bool StorageEngine::TryEnqueueReplicationTransaction(
+    std::shared_ptr<ReplicationTransaction> transaction) {
+  return impl_->TryEnqueueReplicationTransaction(std::move(transaction));
+}
+
 void StorageEngine::AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                                std::uint64_t through_sequence) {
   impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
@@ -208,31 +217,35 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Set(
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(
     std::uint8_t db_id, std::string_view key,
-    std::span<const std::string_view> values) {
-  return impl_->ListPush(db_id, key, values);
+    std::span<const std::string_view> values,
+    ReplicationCommandAppend* replication) {
+  return impl_->ListPush(db_id, key, values, replication);
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteList(
-    std::uint8_t db_id, std::string_view key, const ListOperation& operation) {
-  return impl_->ExecuteList(db_id, key, operation);
+    std::uint8_t db_id, std::string_view key, const ListOperation& operation,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteList(db_id, key, operation, replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteHash(
-    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
-  return impl_->ExecuteHash(db_id, key, operation);
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteHash(db_id, key, operation, replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSet(
-    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
-  return impl_->ExecuteSet(db_id, key, operation);
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteSet(db_id, key, operation, replication);
 }
 
 Task<absl::Status> StorageEngine::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback,
-    std::uint64_t now_ms) {
+    std::uint64_t now_ms, ReplicationCommandAppend* replication) {
   return impl_->ExecuteCompact(db_id, key, value_type, read_only, callback,
-                               now_ms);
+                               now_ms, replication);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
@@ -242,8 +255,9 @@ Task<ExpirationInfo> StorageEngine::GetExpiration(std::uint8_t db_id,
 
 Task<absl::StatusOr<bool>> StorageEngine::UpdateExpiration(
     std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
-    ExpirationCondition condition) {
-  return impl_->UpdateExpiration(db_id, key, expire_at_ms, condition);
+    ExpirationCondition condition, ReplicationCommandAppend* replication) {
+  return impl_->UpdateExpiration(db_id, key, expire_at_ms, condition,
+                                 replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Delete(
@@ -277,34 +291,42 @@ Task<absl::StatusOr<SetResult>> StorageEngine::SetLocked(
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPushLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    std::span<const std::string_view> values, TxShardWrites* tx) {
-  return impl_->ListPushLocked(db_id, key, digest, values, tx);
+    std::span<const std::string_view> values, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->ListPushLocked(db_id, key, digest, values, tx, replication);
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::ExecuteListLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const ListOperation& operation, TxShardWrites* tx) {
-  return impl_->ExecuteListLocked(db_id, key, digest, operation, tx);
+    const ListOperation& operation, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteListLocked(db_id, key, digest, operation, tx,
+                                  replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteHashLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, TxShardWrites* tx) {
-  return impl_->ExecuteHashLocked(db_id, key, digest, operation, tx);
+    const HashOperation& operation, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteHashLocked(db_id, key, digest, operation, tx,
+                                  replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, TxShardWrites* tx) {
-  return impl_->ExecuteSetLocked(db_id, key, digest, operation, tx);
+    const HashOperation& operation, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->ExecuteSetLocked(db_id, key, digest, operation, tx,
+                                 replication);
 }
 
 Task<absl::Status> StorageEngine::ExecuteCompactLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
-    TxShardWrites* tx, std::uint64_t now_ms) {
+    TxShardWrites* tx, std::uint64_t now_ms,
+    ReplicationCommandAppend* replication) {
   return impl_->ExecuteCompactLocked(db_id, key, digest, value_type, read_only,
-                                     callback, tx, now_ms);
+                                     callback, tx, now_ms, replication);
 }
 
 Task<ExpirationInfo> StorageEngine::GetExpirationLocked(std::uint8_t db_id,
@@ -322,16 +344,18 @@ Task<absl::Status> StorageEngine::WriteRawValueLocked(std::uint8_t db_id,
                                                       std::string_view key,
                                                       const Digest& digest,
                                                       const RawValue& value,
-                                                      TxShardWrites* tx) {
-  return impl_->WriteRawValueLocked(db_id, key, digest, value, tx);
+                                                      TxShardWrites* tx,
+                                                      ReplicationCommandAppend* replication) {
+  return impl_->WriteRawValueLocked(db_id, key, digest, value, tx,
+                                    replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::uint64_t expire_at_ms, ExpirationCondition condition,
-    TxShardWrites* tx) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication) {
   return impl_->UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
-                                       condition, tx);
+                                       condition, tx, replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::DeleteLocked(

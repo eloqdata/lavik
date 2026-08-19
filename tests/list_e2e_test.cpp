@@ -1518,6 +1518,27 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < delta_deadline);
   EXPECT_EQ(delta_value, Bulk("delta"));
+
+  // Source flow ids are independent from the replica's local worker ids.
+  // Exercise a three-flow transaction while the replica has only two workers.
+  const std::string mismatch_key_0 =
+      KeyForWorker("repl-worker-mismatch", 0, 3);
+  const std::string mismatch_key_1 =
+      KeyForWorker("repl-worker-mismatch", 1, 3);
+  const std::string mismatch_key_2 =
+      KeyForWorker("repl-worker-mismatch", 2, 3);
+  ASSERT_EQ(source_client.Command({"MSET", mismatch_key_0, "zero",
+                                   mismatch_key_1, "one", mismatch_key_2,
+                                   "two"}),
+            "+OK");
+  const auto mismatch_deadline = std::chrono::steady_clock::now() + 20s;
+  while (std::chrono::steady_clock::now() < mismatch_deadline &&
+         replica_client.Command({"GET", mismatch_key_2}) != Bulk("two")) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_EQ(replica_client.Command({"GET", mismatch_key_0}), Bulk("zero"));
+  EXPECT_EQ(replica_client.Command({"GET", mismatch_key_1}), Bulk("one"));
+  EXPECT_EQ(replica_client.Command({"GET", mismatch_key_2}), Bulk("two"));
   EXPECT_NE(
       source_client.Command({"INFO", "clients"}).find("connected_clients:1"),
       std::string::npos);
@@ -1639,7 +1660,11 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   RespClient source_before(source_port);
   ASSERT_EQ(source_before.Command({"SET", "startup", "ready"}), "+OK");
   ServerProcess first(g_keylane_binary, first_port, first_data, first_log, 2,
-                      {}, {"--recv-buffers", "1024"}, {}, first_conf);
+                      {}, {"--recv-buffers", "1024"},
+                      {{"KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND", "0"},
+                       {"KEYLANE_REPLICATION_DROP_FLOW_AFTER_TRANSACTION_APPLY",
+                        "1"}},
+                      first_conf);
   RespClient source_client(source_port);
   RespClient first_client(first_port);
   ASSERT_EQ(first_client.Command({"READONLY"}), "+OK");
@@ -1702,6 +1727,47 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   EXPECT_NE(source_nodes.find(":" + std::to_string(second_port) + "@0"),
             std::string::npos);
   EXPECT_EQ(second_client.Command({"GET", "startup"}), Bulk("ready"));
+
+  // The first online transaction is copied to both flows. Replica one first
+  // drops flow 0 before apply, exercising cleanup of the unmatched arrival.
+  // On retry it drops flow 1 after apply but before that flow ACKed. Reconnect
+  // must advance both cursors together: replaying only the missing ACK side
+  // would increment these counters twice.
+  const std::string tx_counter_0 = KeyForWorker("repl-exec-counter", 0, 2);
+  const std::string tx_counter_1 = KeyForWorker("repl-exec-counter", 1, 2);
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"INCR", tx_counter_0}), "+QUEUED");
+  ASSERT_EQ(source_client.Command({"INCR", tx_counter_1}), "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}), "*2\r\n:1\r\n:1");
+  ASSERT_TRUE(wait_value(first_client, tx_counter_0, "1"));
+  ASSERT_TRUE(wait_value(first_client, tx_counter_1, "1"));
+  ASSERT_TRUE(wait_value(second_client, tx_counter_0, "1"));
+  ASSERT_TRUE(wait_value(second_client, tx_counter_1, "1"));
+  std::this_thread::sleep_for(500ms);
+  const auto reconnected_deadline = std::chrono::steady_clock::now() + 20s;
+  do {
+    first_info = first_client.Command({"INFO", "replication"});
+    if (first_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < reconnected_deadline);
+  ASSERT_NE(first_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  EXPECT_EQ(first_client.Command({"GET", tx_counter_0}), Bulk("1"));
+  EXPECT_EQ(first_client.Command({"GET", tx_counter_1}), Bulk("1"));
+
+  const std::string mset_key_0 = KeyForWorker("repl-mset", 0, 2);
+  const std::string mset_key_1 = KeyForWorker("repl-mset", 1, 2);
+  ASSERT_EQ(source_client.Command(
+                {"MSET", mset_key_0, "left", mset_key_1, "right"}),
+            "+OK");
+  ASSERT_TRUE(wait_value(first_client, mset_key_0, "left"));
+  ASSERT_TRUE(wait_value(first_client, mset_key_1, "right"));
+  ASSERT_TRUE(wait_value(second_client, mset_key_0, "left"));
+  ASSERT_TRUE(wait_value(second_client, mset_key_1, "right"));
+
   for (int i = 0; i < 200; ++i) {
     ASSERT_EQ(source_client.Command({"SET", "bulk:" + std::to_string(i),
                                      "value:" + std::to_string(i)}),

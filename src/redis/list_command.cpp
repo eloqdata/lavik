@@ -18,6 +18,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "keylane/command_table.h"
 #include "keylane/redis_parse.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
@@ -136,7 +137,8 @@ struct SingleShardListOutcome {
 Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     std::uint8_t db_id, std::vector<std::string> keys, bool move,
     bool source_left, bool destination_left, bool pop_left,
-    std::uint64_t pop_count) {
+    std::uint64_t pop_count,
+    ReplicationTransactionGuard* replication) {
   std::vector<tx::KeyRef> locks;
   locks.reserve(keys.size());
   for (const std::string& key : keys) {
@@ -154,6 +156,7 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     }
   }
   auto guard = co_await tx::CurrentTxShard().AcquireKeys(locks);
+  if (replication != nullptr) replication->EnterCurrentShard();
 
   if (!move) {
     for (const std::string& key : keys) {
@@ -366,11 +369,17 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
   }
 
   absl::StatusOr<storage::ListResult> result;
+  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
+                                   : std::nullopt;
   if (digest == nullptr) {
-    result = co_await g_storage->ExecuteList(request.db_id_, args[1], op);
+    result = co_await g_storage->ExecuteList(
+        request.db_id_, args[1], op,
+        replication ? &*replication : nullptr);
   } else {
     result = co_await g_storage->ExecuteListLocked(request.db_id_, args[1],
-                                                   *digest, op, tx);
+                                                   *digest, op, tx,
+                                                   replication ? &*replication
+                                                               : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
@@ -520,14 +529,47 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     single_shard &= ShardForKey(args[arg]) == first_owner;
     keys.push_back(args[arg]);
   }
+  struct SnapshotAttemptGuard {
+    bool snapshot_active_ = false;
+    bool order_active_ = false;
+    ~SnapshotAttemptGuard() {
+      if (snapshot_active_) EndSnapshotTransaction();
+      if (order_active_) EndReplicationTransactionOrder();
+    }
+  } snapshot_attempt;
+  if (!request.replication_origin_ && request.spec_ != nullptr &&
+      (request.spec_->flags_ & kCmdMayBlock) != 0 &&
+      g_storage->ReplicationLogActive()) {
+    while (!TryBeginReplicationTransactionOrder()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR ", waited.message()));
+      }
+    }
+    snapshot_attempt.order_active_ = true;
+    while (!TryBeginSnapshotTransaction()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR ", waited.message()));
+      }
+    }
+    snapshot_attempt.snapshot_active_ = true;
+  }
   if (single_shard) {
+    ReplicationTransactionGuard replication(request,
+                                            std::vector<unsigned>{first_owner});
     SingleShardListOutcome outcome = co_await celer::SubmitTaskTo(
         first_owner,
         [db_id = request.db_id_, keys = std::move(keys), move, source_left,
-         destination_left, pop_left, pop_count]() mutable {
+         destination_left, pop_left, pop_count,
+         replication = &replication]() mutable {
           return ExecuteSingleShardListMulti(db_id, std::move(keys), move,
                                              source_left, destination_left,
-                                             pop_left, pop_count);
+                                             pop_left, pop_count, replication);
         });
     if (!outcome.status_.ok()) {
       co_return BuiltReply(AppendStorageError(reply_builder, outcome.status_));
@@ -537,6 +579,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return BuiltReply(move ? reply_builder.AppendNullBulkString()
                                 : reply_builder.AppendRaw("*-1\r\n"));
     }
+    replication.Commit();
     for (std::size_t arg : key_args) {
       NotifyListBlockingKey(request.db_id_, args[arg]);
     }
@@ -557,6 +600,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                static_cast<std::uint32_t>(arg), tx::LockMode::kExclusive);
   }
   txn.Seal();
+  ReplicationTransactionGuard replication(request, &txn);
   absl::Status status = co_await txn.Schedule();
   if (!status.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
@@ -595,6 +639,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           co_return BuiltReply(
               reply_builder.AppendError("ERR ", status.message()));
         }
+        replication.Commit();
         reply_builder.AppendArrayHeader(2);
         reply_builder.AppendBulkString(args[arg]);
         AppendBulkArray(reply_builder, popped->values_);
@@ -627,6 +672,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return BuiltReply(AppendStorageError(reply_builder, moved.status()));
     }
     if (moved->values_.empty() && unavailable != nullptr) *unavailable = true;
+    if (!moved->values_.empty()) replication.Commit();
     co_return BuiltReply(
         moved->values_.empty()
             ? reply_builder.AppendNullBulkString()
@@ -703,6 +749,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (!released.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", released.message()));
   }
+  replication.Commit();
   NotifyListBlockingKey(request.db_id_, source_key);
   NotifyListBlockingKey(request.db_id_, destination_key);
   co_return BuiltReply(reply_builder.AppendBulkString(popped->values_.front()));

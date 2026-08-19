@@ -462,14 +462,16 @@ std::size_t KeyIndex(CommandKind kind) {
 Task<absl::Status> RunCompact(const CommandRequest& request,
                               const storage::Digest* digest,
                               storage::TxShardWrites* tx, bool read_only,
-                              const storage::CompactValueCallback& callback) {
+                              const storage::CompactValueCallback& callback,
+                              storage::ReplicationCommandAppend* replication) {
   const std::string_view key = request.args_[KeyIndex(request.kind_)];
   if (!digest)
     co_return co_await g_storage->ExecuteCompact(
-        request.db_id_, key, storage::ValueType::kStream, read_only, callback);
+        request.db_id_, key, storage::ValueType::kStream, read_only, callback,
+        0, replication);
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kStream, read_only,
-      callback, tx);
+      callback, tx, 0, replication);
 }
 
 void AppendEntry(ReplyBuilder& builder, const Entry& entry) {
@@ -919,6 +921,16 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   bool null_range = false;
   bool xinfo_full = false;
   std::uint64_t xinfo_count = 10;
+  const bool directly_replayable_write =
+      request.kind_ == CommandKind::kXAdd ||
+      request.kind_ == CommandKind::kXDel ||
+      request.kind_ == CommandKind::kXTrim ||
+      request.kind_ == CommandKind::kXSetId ||
+      request.kind_ == CommandKind::kXGroup ||
+      request.kind_ == CommandKind::kXAck;
+  auto replication = tx == nullptr && directly_replayable_write
+                         ? PrepareReplicationCommand(request)
+                         : std::nullopt;
 
   if (request.kind_ == CommandKind::kXInfo) {
     if (EqualCi(a[1], "stream")) {
@@ -996,6 +1008,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             break;
         }
         if (i >= a.size()) return absl::InvalidArgumentError("syntax error");
+        const std::size_t id_arg = i;
         const std::string_view id_text = a[i++];
         if ((a.size() - i) == 0 || (a.size() - i) % 2)
           return absl::InvalidArgumentError(
@@ -1071,6 +1084,9 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         ++stream.entries_added_;
         simple = FormatId(id);
         appended_id = id;
+        if (replication.has_value()) {
+          replication->args_[id_arg] = FormatId(id);
+        }
         if (trim == Trim::kMaxLen && stream.entries_.size() > maxlen) {
           std::size_t remove = stream.entries_.size() - maxlen;
           if (trim_limit != 0)
@@ -1625,7 +1641,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   };
 
   absl::Status status =
-      co_await RunCompact(request, digest, tx, read_only, callback);
+      co_await RunCompact(request, digest, tx, read_only, callback,
+                          replication ? &*replication : nullptr);
   if (!status.ok()) co_return Built(StorageError(builder, status));
   if (request.kind_ == CommandKind::kXAdd && !nil && appended_id.has_value()) {
     NotifyStreamBlockingKey(request.db_id_, a[1], appended_id->ms_,

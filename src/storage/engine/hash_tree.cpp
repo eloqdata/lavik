@@ -36,14 +36,16 @@ bool IsWrite(const HashOperation& operation) {
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, TxShardWrites* tx) {
+    const HashOperation& operation, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
   co_return co_await ExecuteHashLikeLocked(db_id, key, digest, operation,
-                                           ValueType::kHash, tx);
+                                           ValueType::kHash, tx, replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, ValueType value_type, TxShardWrites* tx) {
+    const HashOperation& operation, ValueType value_type, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   if (operation.kind_ == HashOperationKind::kScan &&
       operation.scan_count_ == 0) {
@@ -439,10 +441,29 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     if (!encoded.ok()) co_return encoded.status();
     payload = std::move(*encoded);
   }
+  if (replication != nullptr && value_type == ValueType::kSet &&
+      operation.kind_ == HashOperationKind::kPopRandom) {
+    replication->args_.clear();
+    replication->args_.reserve(result.values_.size() + 2);
+    replication->args_.emplace_back("SREM");
+    replication->args_.emplace_back(key);
+    for (const std::optional<std::string>& member : result.values_) {
+      if (member.has_value()) replication->args_.push_back(*member);
+    }
+  } else if (replication != nullptr && value_type == ValueType::kHash &&
+             (operation.kind_ == HashOperationKind::kIncrementInteger ||
+              operation.kind_ == HashOperationKind::kIncrementFloat)) {
+    replication->args_ = {
+        "HSET", std::string(key), std::string(operation.fields_.front()),
+        operation.kind_ == HashOperationKind::kIncrementInteger
+            ? std::to_string(result.signed_integer_)
+            : result.scalar_};
+  }
   absl::Status written = co_await AppendLocked(
       store, partition, db_id, key, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
-      kind == RecordKind::kValue ? compact.entries_.size() : 0);
+      kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
+      nullptr, replication);
   if (!written.ok()) co_return written;
   co_return result;
 }

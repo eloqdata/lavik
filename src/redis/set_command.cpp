@@ -155,11 +155,17 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
 
   absl::StatusOr<storage::HashResult> result =
       absl::UnknownError("Set command was not dispatched");
+  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
+                                   : std::nullopt;
   if (digest == nullptr) {
-    result = co_await g_storage->ExecuteSet(request.db_id_, args[1], operation);
+    result = co_await g_storage->ExecuteSet(
+        request.db_id_, args[1], operation,
+        replication ? &*replication : nullptr);
   } else {
     result = co_await g_storage->ExecuteSetLocked(request.db_id_, args[1],
-                                                  *digest, operation, tx);
+                                                  *digest, operation, tx,
+                                                  replication ? &*replication
+                                                              : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
@@ -509,6 +515,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
         lock_mode);
   }
   transaction.Seal();
+  ReplicationTransactionGuard replication(request, &transaction);
   context.single_shard_ = transaction.single_shard();
 
   std::uint64_t txid = 0;
@@ -615,6 +622,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   }
 
   if (write) {
+    replication.Commit();
     g_storage->NoteTxCommitStarted();
     SpawnOnCurrentWorker(RunSetTxCommit(txid, std::move(context.tx_writes_)));
   }

@@ -94,45 +94,38 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   const std::uint64_t expire_at_ms = options.keep_ttl_ && exists
                                          ? found->value_.expire_at_ms_
                                          : options.expire_at_ms_;
-  std::uint64_t mutation_sequence = 0;
+  if (replication != nullptr && expire_at_ms != 0) {
+    replication->args_.emplace_back("PXAT");
+    replication->args_.emplace_back(std::to_string(expire_at_ms));
+  }
   if (trace != nullptr) trace->append_start_ns_ = SetTraceNowNanos();
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
-      std::numeric_limits<std::uint64_t>::max(), nullptr,
-      replication != nullptr ? &mutation_sequence : nullptr, trace);
+      std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
+      trace);
   if (trace != nullptr) trace->append_done_ns_ = SetTraceNowNanos();
   if (!status.ok()) co_return status;
   result.applied_ = true;
-  if (replication != nullptr) {
-    replication->db_id_ = db_id;
-    replication->partition_id_ = partition.id_;
-    replication->partition_sequence_ = mutation_sequence;
-    if (expire_at_ms != 0) {
-      replication->args_.emplace_back("PXAT");
-      replication->args_.emplace_back(std::to_string(expire_at_ms));
-    }
-    (void)TryEnqueueReplicationCommand(std::move(*replication));
-  }
   if (trace != nullptr) trace->replication_done_ns_ = SetTraceNowNanos();
   co_return result;
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpiration(
     std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
-    ExpirationCondition condition) {
+    ExpirationCondition condition, ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   co_return co_await UpdateExpirationLocked(db_id, key, digest, expire_at_ms,
-                                            condition);
+                                            condition, nullptr, replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::uint64_t expire_at_ms, ExpirationCondition condition,
-    TxShardWrites* tx) {
+    TxShardWrites* tx, ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionForKey(store, key);
@@ -178,7 +171,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
     absl::Status status = co_await AppendLocked(
         store, partition, db_id, key, {}, RecordKind::kTombstone,
-        ValueType::kNone, 0, tx, 0);
+        ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
     if (!status.ok()) co_return status;
     co_return true;
   }
@@ -194,7 +187,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                          value_bytes.size());
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, value, RecordKind::kValue,
-      previous.value_type_, expire_at_ms, tx, previous.logical_size_);
+      previous.value_type_, expire_at_ms, tx, previous.logical_size_, nullptr,
+      nullptr, replication);
   if (!status.ok()) {
     co_return status;
   }
@@ -233,24 +227,17 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     co_return false;
   }
   const bool expired = IsExpired(found->value_, UnixTimeMillis());
-  std::uint64_t mutation_sequence = 0;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, {}, RecordKind::kTombstone,
-      ValueType::kNone, 0, tx, 0, nullptr,
-      replication != nullptr ? &mutation_sequence : nullptr);
+      ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
   if (!status.ok()) co_return status;
-  if (!expired && replication != nullptr) {
-    replication->db_id_ = db_id;
-    replication->partition_id_ = partition.id_;
-    replication->partition_sequence_ = mutation_sequence;
-    (void)TryEnqueueReplicationCommand(std::move(*replication));
-  }
   co_return !expired;
 }
 
 Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const RawValue& value, TxShardWrites* tx) {
+    const RawValue& value, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   if (digest != ComputeDigest(key)) {
     co_return absl::InvalidArgumentError("raw value digest mismatch");
@@ -264,7 +251,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   co_return co_await AppendLocked(store, partition, db_id, key, value.encoded_,
                                   RecordKind::kValue, value.value_type_,
-                                  value.expire_at_ms_, tx, value.logical_size_);
+                                  value.expire_at_ms_, tx, value.logical_size_,
+                                  nullptr, nullptr, replication);
 }
 
 StagingSlot* StorageEngine::Impl::StagingFor(WorkerStore& store,
@@ -854,7 +842,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
     TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    std::uint64_t* committed_sequence, SetLatencyTrace* trace) {
+    std::uint64_t* committed_sequence,
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -895,6 +884,12 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
+  }
+  if (status.ok() && replication != nullptr) {
+    replication->db_id_ = db_id;
+    replication->partition_id_ = partition.id_;
+    replication->partition_sequence_ = mutation_sequence;
+    (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
   if (status.ok() && partition.capture_deltas_) {
     std::string replicated_value(value);

@@ -943,10 +943,20 @@ class StorageEngine::Impl {
     };
 
     struct ReplicationLogRuntime {
+      struct PublishFence {
+        AsyncNotification ready_;
+        absl::Status status_ =
+            absl::UnknownError("replication publisher fence is pending");
+        std::uint64_t next_lsn_ = 0;
+        bool complete_ = false;
+      };
+
       struct PendingCommand {
         std::uint64_t log_epoch_ = 0;
         std::size_t logical_bytes_ = 0;
         ReplicationCommandAppend append_;
+        std::shared_ptr<PublishFence> fence_;
+        std::shared_ptr<ReplicationTransaction> transaction_;
       };
 
       AsyncMutex mutex_;
@@ -1137,53 +1147,64 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
-      std::span<const std::string_view> values);
+      std::span<const std::string_view> values,
+      ReplicationCommandAppend* replication);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<std::uint64_t>> ListPushLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      std::span<const std::string_view> values, TxShardWrites* tx = nullptr);
+      std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<ListResult>> ExecuteList(std::uint8_t db_id,
                                                std::string_view key,
-                                               const ListOperation& operation);
+                                               const ListOperation& operation,
+                                               ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const ListOperation& operation, TxShardWrites* tx = nullptr);
+      const ListOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHash(std::uint8_t db_id,
                                                std::string_view key,
-                                               const HashOperation& operation);
+                                               const HashOperation& operation,
+                                               ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const HashOperation& operation, TxShardWrites* tx = nullptr);
+      const HashOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteSet(std::uint8_t db_id,
                                               std::string_view key,
-                                              const HashOperation& operation);
+                                              const HashOperation& operation,
+                                              ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
-      const HashOperation& operation, TxShardWrites* tx = nullptr);
+      const HashOperation& operation, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::Status> ExecuteCompact(std::uint8_t db_id, std::string_view key,
                                     ValueType value_type, bool read_only,
                                     const CompactValueCallback& callback,
-                                    std::uint64_t now_ms = 0);
+                                    std::uint64_t now_ms,
+                                    ReplicationCommandAppend* replication);
   Task<absl::Status> ExecuteCompactLocked(std::uint8_t db_id,
                                           std::string_view key,
                                           const Digest& digest,
                                           ValueType value_type, bool read_only,
                                           const CompactValueCallback& callback,
                                           TxShardWrites* tx = nullptr,
-                                          std::uint64_t now_ms = 0);
+                                          std::uint64_t now_ms = 0,
+                                          ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, ValueType value_type,
-      TxShardWrites* tx = nullptr);
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<ExpirationInfo> GetExpiration(std::uint8_t db_id, std::string_view key);
 
@@ -1200,18 +1221,21 @@ class StorageEngine::Impl {
                                          std::string_view key,
                                          const Digest& digest,
                                          const RawValue& value,
-                                         TxShardWrites* tx = nullptr);
+                                         TxShardWrites* tx = nullptr,
+                                         ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<bool>> UpdateExpiration(std::uint8_t db_id,
                                               std::string_view key,
                                               std::uint64_t expire_at_ms,
-                                              ExpirationCondition condition);
+                                              ExpirationCondition condition,
+                                              ReplicationCommandAppend* replication);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
-      TxShardWrites* tx = nullptr);
+      TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<bool>> Delete(std::uint8_t db_id, std::string_view key,
                                     ReplicationCommandAppend* replication);
@@ -1380,6 +1404,7 @@ class StorageEngine::Impl {
                                           std::size_t capacity_bytes);
   Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
+  Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
   Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
@@ -1387,6 +1412,8 @@ class StorageEngine::Impl {
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
+  bool TryEnqueueReplicationTransaction(
+      std::shared_ptr<ReplicationTransaction> transaction);
 
   void AcknowledgePartitionDeltas(std::uint16_t partition_id,
                                   std::uint64_t through_sequence);
@@ -1822,6 +1849,7 @@ class StorageEngine::Impl {
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr,
+      ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr);
 
   void AppendDelta(WorkerStore& store,

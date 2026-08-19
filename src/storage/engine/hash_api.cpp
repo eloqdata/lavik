@@ -16,32 +16,37 @@ bool IsHashLikeWrite(const HashOperation& operation) {
 }  // namespace
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHash(
-    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared);
-  co_return co_await ExecuteHashLocked(db_id, key, digest, operation);
+  co_return co_await ExecuteHashLocked(db_id, key, digest, operation, nullptr,
+                                       replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSet(
-    std::uint8_t db_id, std::string_view key, const HashOperation& operation) {
+    std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       IsHashLikeWrite(operation) ? tx::LockMode::kExclusive
                                  : tx::LockMode::kShared);
-  co_return co_await ExecuteSetLocked(db_id, key, digest, operation);
+  co_return co_await ExecuteSetLocked(db_id, key, digest, operation, nullptr,
+                                      replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteSetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    const HashOperation& operation, TxShardWrites* tx) {
+    const HashOperation& operation, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
   co_return co_await ExecuteHashLikeLocked(db_id, key, digest, operation,
-                                           ValueType::kSet, tx);
+                                           ValueType::kSet, tx, replication);
 }
 
 }  // namespace keylane::storage

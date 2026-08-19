@@ -183,7 +183,19 @@ void Transaction::ArmInShard(ShardData* sd) {
 }
 
 Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
-  co_return co_await cb_(cb_ctx_, Slice(shards_[shard_slot]));
+  ShardData& shard = shards_[shard_slot];
+  if (!shard.entry_hook_invoked_ && entry_hook_ != nullptr) {
+    shard.entry_hook_invoked_ = true;
+    entry_hook_(entry_hook_ctx_, shard.shard_id_);
+  }
+  co_return co_await cb_(cb_ctx_, Slice(shard));
+}
+
+std::vector<unsigned> Transaction::shard_ids() const {
+  std::vector<unsigned> result;
+  result.reserve(shards_.size());
+  for (const ShardData& shard : shards_) result.push_back(shard.shard_id_);
+  return result;
 }
 
 void Transaction::SetShardStatus(std::uint16_t shard_slot,
@@ -242,6 +254,10 @@ Task<absl::Status> Transaction::ExecuteSingleShard() {
   co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<absl::Status> {
     ShardData& sd = shards_[0];
     auto guard = co_await CurrentTxShard().AcquireKeys(sd.node_.keys_);
+    if (!sd.entry_hook_invoked_ && entry_hook_ != nullptr) {
+      sd.entry_hook_invoked_ = true;
+      entry_hook_(entry_hook_ctx_, sd.shard_id_);
+    }
     co_return co_await cb_(cb_ctx_, Slice(sd));
   });
 }

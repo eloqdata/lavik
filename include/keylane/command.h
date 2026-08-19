@@ -16,6 +16,10 @@
 
 namespace keylane {
 
+namespace tx {
+class Transaction;
+}
+
 struct RespCommand;
 struct ReplicatedCommand;
 class ReplyBuilder;
@@ -273,6 +277,44 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx);
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication = nullptr);
 
+// Builds an owned command for the current worker's replication journal. The
+// storage mutation consumes it at the same ordering point that assigns the
+// partition mutation sequence. Returns null for replayed commands or while
+// the online replication log is inactive. An empty canonical_args vector
+// means to journal the original request arguments.
+std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
+    const CommandRequest& request,
+    std::vector<std::string> canonical_args = {});
+
+// Reserves one ordered replication marker on every shard participating in a
+// standalone cross-key command. Destruction aborts an unresolved marker.
+class ReplicationTransactionGuard {
+ public:
+  ReplicationTransactionGuard(const CommandRequest& request,
+                              tx::Transaction* transaction,
+                              std::vector<std::string> canonical_args = {});
+  ReplicationTransactionGuard(const CommandRequest& request,
+                              std::vector<unsigned> participants,
+                              std::vector<std::string> canonical_args = {});
+  ReplicationTransactionGuard(const ReplicationTransactionGuard&) = delete;
+  ReplicationTransactionGuard& operator=(const ReplicationTransactionGuard&) =
+      delete;
+  ~ReplicationTransactionGuard();
+
+  void Commit() noexcept;
+  void EnterCurrentShard() noexcept;
+  bool active() const noexcept { return transaction_ != nullptr; }
+
+ private:
+  void Initialize(const CommandRequest& request,
+                  std::vector<unsigned> participants,
+                  std::vector<std::string> canonical_args);
+  void EnterShard(unsigned shard_id) noexcept;
+  static void EnterShardHook(void* context, unsigned shard_id);
+
+  std::shared_ptr<storage::ReplicationTransaction> transaction_;
+};
+
 // Static facts INFO reports. Call once before the server starts.
 void SetServerInfo(std::string bind_ip, std::uint16_t port,
                    unsigned thread_count);
@@ -286,6 +328,22 @@ void ConnectionClosed() noexcept;
 // FLUSHDB from draining in-flight database operations.
 bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept;
 void EndCommandDbOperation(std::uint8_t db_id) noexcept;
+
+// Full-sync snapshot handoff uses the same sharded gate shape as FLUSHDB:
+// commands update only their coordinator worker's counter, while the rare
+// snapshot cut closes and scans every worker. These functions are internal to
+// command dispatch and ReplicationManager.
+bool TryBeginSnapshotTransaction() noexcept;
+void EndSnapshotTransaction() noexcept;
+bool CloseSnapshotTransactionGate() noexcept;
+void OpenSnapshotTransactionGate() noexcept;
+bool SnapshotTransactionsActive() noexcept;
+
+// Replication flows wait for an ACK before sending their next command. Keep
+// cross-flow transactions in one global source order so overlapping flow
+// subsets cannot form an arrival/ACK cycle on the replica.
+bool TryBeginReplicationTransactionOrder() noexcept;
+void EndReplicationTransactionOrder() noexcept;
 
 // Route `request` to the worker owning its Redis hash-slot partition. Async
 // disk operations use SubmitTaskTo and return on the connection's original

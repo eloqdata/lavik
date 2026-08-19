@@ -5,20 +5,22 @@ namespace keylane::storage {
 Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
     bool read_only, const CompactValueCallback& callback,
-    std::uint64_t now_ms) {
+    std::uint64_t now_ms, ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest),
       read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
   co_return co_await ExecuteCompactLocked(db_id, key, digest, value_type,
-                                          read_only, callback, nullptr, now_ms);
+                                          read_only, callback, nullptr, now_ms,
+                                          replication);
 }
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     ValueType value_type, bool read_only, const CompactValueCallback& callback,
-    TxShardWrites* tx, std::uint64_t now_ms) {
+    TxShardWrites* tx, std::uint64_t now_ms,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   if (value_type != ValueType::kString && value_type != ValueType::kSortedSet &&
       value_type != ValueType::kStream) {
@@ -115,7 +117,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       store, partition, db_id, key,
       update->erase_ ? std::string_view{} : encoded,
       kind, published_type, expire_at_ms, tx,
-      update->erase_ ? 0 : logical_size);
+      update->erase_ ? 0 : logical_size, nullptr, nullptr, replication);
   co_return status;
 }
 
