@@ -12,6 +12,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
+option(KEYLANE_STATIC_OPENSSL "Link OpenSSL statically" ON)
+option(KEYLANE_STATIC_CXX_RUNTIME
+  "Link the GNU C++ and compiler runtimes statically" OFF)
+set(KEYLANE_MARCH "native" CACHE STRING
+  "Value passed to -march for optimized local builds (empty disables it)")
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
 option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
 option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
@@ -51,6 +56,19 @@ endif()
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(CELER_WITH_SPDK_STORAGE ${KEYLANE_WITH_SPDK} CACHE BOOL "" FORCE)
+# This must be set before Celer's first find_package(OpenSSL). Static release
+# artifacts can then run without libssl.so or libcrypto.so on the target.
+set(OPENSSL_USE_STATIC_LIBS ${KEYLANE_STATIC_OPENSSL} CACHE BOOL
+  "Use static OpenSSL libraries" FORCE)
+foreach(open_ssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
+  if (KEYLANE_STATIC_OPENSSL AND DEFINED ${open_ssl_cache_var} AND
+      NOT "${${open_ssl_cache_var}}" MATCHES "\\${CMAKE_STATIC_LIBRARY_SUFFIX}$")
+    unset(${open_ssl_cache_var} CACHE)
+  elseif (NOT KEYLANE_STATIC_OPENSSL AND DEFINED ${open_ssl_cache_var} AND
+          "${${open_ssl_cache_var}}" MATCHES "\\${CMAKE_STATIC_LIBRARY_SUFFIX}$")
+    unset(${open_ssl_cache_var} CACHE)
+  endif()
+endforeach()
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
@@ -69,6 +87,9 @@ set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
 set(MI_GUARDED OFF CACHE BOOL "" FORCE)
 set(MI_NO_THP ON CACHE BOOL "" FORCE)
+# Apply Keylane's explicit CPU target below. This prevents mimalloc from
+# silently raising packaged arm64 builds to armv8.1-a or x86_64 to Haswell.
+set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
 set(MI_TRACK_ASAN ${KEYLANE_ASAN_BUILD} CACHE BOOL "" FORCE)
 set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
@@ -165,9 +186,6 @@ target_link_libraries(keylane_module PUBLIC
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(keylane_module PRIVATE -Wall -Wextra -Wpedantic)
-  if (KEYLANE_ENABLE_OPT)
-    target_compile_options(keylane_module PRIVATE -O3 -march=native -flto=auto)
-  endif()
   if (KEYLANE_ENABLE_WERROR)
     target_compile_options(keylane_module PRIVATE -Werror)
   endif()
@@ -177,12 +195,29 @@ add_executable(keylane
   app/keylane.cpp
   app/mimalloc_new_delete.cpp
 )
-if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU" AND KEYLANE_ENABLE_OPT)
-  target_compile_options(keylane PRIVATE -O3 -march=native -flto=auto)
-  target_link_options(keylane PRIVATE -flto=auto)
-endif()
 target_precompile_headers(keylane REUSE_FROM keylane_module)
 target_link_libraries(keylane PRIVATE keylane::module)
+
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  if (KEYLANE_ENABLE_OPT)
+    set(KEYLANE_OPT_COMPILE_OPTIONS -O3 -flto=auto)
+    if (NOT KEYLANE_MARCH STREQUAL "")
+      list(APPEND KEYLANE_OPT_COMPILE_OPTIONS "-march=${KEYLANE_MARCH}")
+    endif()
+    # Celer is compiled as part of Keylane, so local native builds should tune
+    # the transport and runtime too, not only the Redis/storage layer.
+    foreach(target IN ITEMS celer celer_rpc keylane_module keylane)
+      target_compile_options(${target} PRIVATE ${KEYLANE_OPT_COMPILE_OPTIONS})
+    endforeach()
+    if (NOT KEYLANE_MARCH STREQUAL "")
+      target_compile_options(mimalloc-static PRIVATE "-march=${KEYLANE_MARCH}")
+    endif()
+    target_link_options(keylane PRIVATE -flto=auto)
+  endif()
+  if (KEYLANE_STATIC_CXX_RUNTIME)
+    target_link_options(keylane PRIVATE -static-libstdc++ -static-libgcc)
+  endif()
+endif()
 
 if (BUILD_TESTING)
   include(FetchContent)

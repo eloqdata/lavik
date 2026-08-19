@@ -3,6 +3,7 @@
 /build_*/
 /cmake-build-*/
 /out/
+/dist/
 
 # CMake / build system generated files
 /CMakeCache.txt
