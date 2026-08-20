@@ -55,6 +55,29 @@ class ReplicationCommandCapture {
   std::vector<CapturedReplicationCommand> commands_;
 };
 
+struct CapturedBlockingNotification {
+  std::uint8_t db_id_ = 0;
+  std::string key_;
+  storage::ValueType value_type_ = storage::ValueType::kNone;
+};
+
+// EXEC handlers can run on several workers and must not expose readiness from
+// an intermediate command. They record candidate keys here; the coordinator
+// filters them by the transaction's final value type before waking waiters.
+class BlockingNotificationCapture {
+ public:
+  explicit BlockingNotificationCapture(unsigned worker_count);
+
+  void Record(std::uint8_t db_id, std::string key,
+              storage::ValueType value_type);
+  std::vector<CapturedBlockingNotification> Take();
+
+ private:
+  // Each runtime worker only appends to its own slot. EXEC consumes the slots
+  // after all shard callbacks have joined, so this needs no cross-worker lock.
+  std::vector<std::vector<CapturedBlockingNotification>> per_worker_;
+};
+
 enum class CommandKind {
   kPing,
   kEcho,
@@ -108,6 +131,8 @@ enum class CommandKind {
   kType,
   kDump,
   kRestore,
+  kSort,
+  kSortRo,
   kSelect,
   kSet,
   kLPush,
@@ -258,6 +283,7 @@ struct CommandRequest {
   const CommandSpec* spec_ = nullptr;
   std::vector<std::string> args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
+  std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;
 };
 
 struct ReplicaOfRequest {

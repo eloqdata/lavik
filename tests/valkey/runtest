@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+
+TCL_VERSIONS="8.5 8.6 8.7"
+TCLSH=""
+
+for VERSION in $TCL_VERSIONS; do
+	TCL=$(command -v "tclsh$VERSION" 2>/dev/null) && TCLSH=$TCL
+done
+
+if [ -z "$TCLSH" ]
+then
+    echo "Tcl 8.5 or newer is required to run the Valkey tests" >&2
+    exit 1
+fi
+
+exec "$TCLSH" tests/test_helper.tcl \
+    --host "${KEYLANE_HOST:-127.0.0.1}" \
+    --port "${KEYLANE_PORT:-16379}" \
+    --singledb \
+    --ignore-encoding \
+    --durable \
+    --tags "-slow -needs:debug -needs:repl -large-memory -resp3" \
+    --skiptest "/RESP3" \
+    "$@"

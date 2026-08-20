@@ -224,6 +224,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("TYPE", CommandKind::kType);
   CheckKind("DUMP", CommandKind::kDump);
   CheckKind("RESTORE", CommandKind::kRestore);
+  CheckKind("SORT", CommandKind::kSort);
+  CheckKind("SORT_RO", CommandKind::kSortRo);
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("CONFIG", CommandKind::kConfig);
@@ -543,6 +545,35 @@ TEST(CommandTableTest, ResolvesStreamReadMovableKeys) {
     oversized.push_back("key");
   for (std::size_t i = 0; i < kTooManyStreamKeys; ++i) oversized.push_back("0");
   EXPECT_FALSE(DetermineKeys(*read, oversized).ok());
+}
+
+TEST(CommandTableTest, ResolvesSortStoreDestination) {
+  const CommandSpec* sort = FindCommand("sort");
+  ASSERT_NE(sort, nullptr);
+  const std::vector<std::string> args = {
+      "SORT", "abc", "STORE", "invalid", "STORE", "stillbad",
+      "STORE", "def"};
+  auto keys = DetermineKeys(*sort, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 1);
+  EXPECT_EQ(keys->last_, 7);
+  EXPECT_EQ(keys->step_, 6);
+  EXPECT_EQ(keys->count(), 2);
+
+  const std::vector<std::string> no_store = {"SORT", "abc", "BY", "nosort"};
+  keys = DetermineKeys(*sort, no_store);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 1);
+  EXPECT_EQ(keys->last_, 1);
+  EXPECT_EQ(keys->count(), 1);
+
+  const CommandSpec* sort_ro = FindCommand("sort_ro");
+  ASSERT_NE(sort_ro, nullptr);
+  keys = DetermineKeys(*sort_ro,
+                       std::vector<std::string>{"SORT_RO", "abc", "DESC"});
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 1);
+  EXPECT_EQ(keys->last_, 1);
 }
 
 TEST(CommandTableTest, AcceptsExtendedPendingIdleForm) {

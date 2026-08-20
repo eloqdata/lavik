@@ -31,6 +31,7 @@ constexpr std::size_t ToIndex(CommandKind kind) noexcept {
 struct alignas(64) WorkerMetricsShard {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   std::uint64_t connected_clients_ = 0;
+  std::uint64_t blocked_clients_ = 0;
   std::uint64_t replication_control_connections_ = 0;
   std::uint64_t replication_flow_connections_ = 0;
   std::uint64_t defrag_successes_ = 0;
@@ -79,6 +80,16 @@ void RecordConnectionOpened() noexcept {
 
 void RecordConnectionClosed() noexcept {
   --g_worker_metrics[celer::ThisWorker().id_].connected_clients_;
+}
+
+void RecordClientBlocked() noexcept {
+  ++g_worker_metrics[celer::ThisWorker().id_].blocked_clients_;
+}
+
+void RecordClientUnblocked() noexcept {
+  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  assert(shard.blocked_clients_ != 0);
+  --shard.blocked_clients_;
 }
 
 void RecordReplicationConnectionOpened(
@@ -157,6 +168,7 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
         });
     result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
+    result.blocked_clients_ += shard.blocked_clients_;
     result.replication_control_connections_ +=
         shard.replication_control_connections_;
     result.replication_flow_connections_ += shard.replication_flow_connections_;
@@ -298,6 +310,11 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_connected_clients gauge\n"
       "keylane_connected_clients ",
       worker_metrics.connected_clients_, "\n",
+      "# HELP keylane_blocked_clients Redis clients waiting in blocking "
+      "commands.\n"
+      "# TYPE keylane_blocked_clients gauge\n"
+      "keylane_blocked_clients ",
+      worker_metrics.blocked_clients_, "\n",
       "# HELP keylane_replication_control_connections Current native "
       "replication control connections.\n"
       "# TYPE keylane_replication_control_connections gauge\n"

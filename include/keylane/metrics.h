@@ -38,6 +38,7 @@ struct WorkerMetricsSnapshot {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   std::uint64_t connections_ = 0;
   std::uint64_t connected_clients_ = 0;
+  std::uint64_t blocked_clients_ = 0;
   std::uint64_t replication_control_connections_ = 0;
   std::uint64_t replication_flow_connections_ = 0;
   std::uint64_t defrag_successes_ = 0;
@@ -55,6 +56,8 @@ void RecordCommandMetric(CommandKind kind,
                          std::uint64_t elapsed_ticks) noexcept;
 void RecordConnectionOpened() noexcept;
 void RecordConnectionClosed() noexcept;
+void RecordClientBlocked() noexcept;
+void RecordClientUnblocked() noexcept;
 
 enum class ReplicationConnectionKind : std::uint8_t {
   kControl,

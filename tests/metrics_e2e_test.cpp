@@ -348,6 +348,7 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_GE(connections, 2);
   EXPECT_EQ(connected_clients, 1);
   EXPECT_LE(connected_clients, connections);
+  EXPECT_EQ(MetricValue(body, "keylane_blocked_clients"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_control_connections"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_flow_connections"), 0);
   EXPECT_GT(MetricValue(body, "keylane_memory_current_bytes"), 0);

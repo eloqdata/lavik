@@ -1,16 +1,19 @@
 #include "blocking_wait.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -20,10 +23,39 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "keylane/metrics.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
 using namespace celer;
+
+BlockingNotificationCapture::BlockingNotificationCapture(
+    unsigned worker_count)
+    : per_worker_(worker_count) {}
+
+void BlockingNotificationCapture::Record(std::uint8_t db_id, std::string key,
+                                         storage::ValueType value_type) {
+  const unsigned worker_id = celer::ThisWorker().id_;
+  assert(worker_id < per_worker_.size());
+  per_worker_[worker_id].push_back(
+      CapturedBlockingNotification{db_id, std::move(key), value_type});
+}
+
+std::vector<CapturedBlockingNotification>
+BlockingNotificationCapture::Take() {
+  std::size_t count = 0;
+  for (const auto& slot : per_worker_) count += slot.size();
+
+  std::vector<CapturedBlockingNotification> notifications;
+  notifications.reserve(count);
+  for (auto& slot : per_worker_) {
+    notifications.insert(notifications.end(),
+                         std::make_move_iterator(slot.begin()),
+                         std::make_move_iterator(slot.end()));
+    slot.clear();
+  }
+  return notifications;
+}
 
 namespace {
 
@@ -518,6 +550,7 @@ Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
   absl::Status registered =
       co_await RegisterBlockingWaiter(impl->waiter_, impl->registrations_);
   if (!registered.ok()) co_return registered;
+  RecordClientBlocked();
   if (deadline.has_value()) {
     celer::SpawnOnCurrentWorker(
         TimeoutBlockingWaiter(impl->waiter_, *deadline));
@@ -548,6 +581,7 @@ bool ResetBlockingReady(BlockingWaitHandle& handle) {
 void FinishBlockingWait(BlockingWaitHandle& handle) {
   if (!handle.impl_ || !handle.impl_->active_) return;
   handle.impl_->active_ = false;
+  RecordClientUnblocked();
   UnregisterBlockingWaiter(handle.impl_->waiter_, handle.impl_->registrations_);
 }
 
@@ -648,8 +682,28 @@ void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key) {
   NotifyBlockingKey(db_id, key, BlockingValueType::kList);
 }
 
+void NotifyListBlockingKey(const CommandRequest& request,
+                           std::string_view key) {
+  if (request.blocking_notification_capture_ != nullptr) {
+    request.blocking_notification_capture_->Record(
+        request.db_id_, std::string(key), storage::ValueType::kList);
+    return;
+  }
+  NotifyListBlockingKey(request.db_id_, key);
+}
+
 void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key) {
   NotifyBlockingKey(db_id, key, BlockingValueType::kSortedSet);
+}
+
+void NotifyZSetBlockingKey(const CommandRequest& request,
+                           std::string_view key) {
+  if (request.blocking_notification_capture_ != nullptr) {
+    request.blocking_notification_capture_->Record(
+        request.db_id_, std::string(key), storage::ValueType::kSortedSet);
+    return;
+  }
+  NotifyZSetBlockingKey(request.db_id_, key);
 }
 
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
@@ -658,8 +712,84 @@ void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
                     std::pair{id_ms, id_seq});
 }
 
+void NotifyStreamBlockingKey(const CommandRequest& request,
+                             std::string_view key, std::uint64_t id_ms,
+                             std::uint64_t id_seq) {
+  if (request.blocking_notification_capture_ != nullptr) {
+    request.blocking_notification_capture_->Record(
+        request.db_id_, std::string(key), storage::ValueType::kStream);
+    return;
+  }
+  NotifyStreamBlockingKey(request.db_id_, key, id_ms, id_seq);
+}
+
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key) {
   NotifyBlockingKey(db_id, key, BlockingValueType::kStream);
+}
+
+void NotifyStreamBlockingKey(const CommandRequest& request,
+                             std::string_view key) {
+  if (request.blocking_notification_capture_ != nullptr) {
+    request.blocking_notification_capture_->Record(
+        request.db_id_, std::string(key), storage::ValueType::kStream);
+    return;
+  }
+  NotifyStreamBlockingKey(request.db_id_, key);
+}
+
+Task<absl::Status> FlushBlockingNotifications(
+    BlockingNotificationCapture& capture) {
+  std::vector<CapturedBlockingNotification> notifications = capture.Take();
+  std::sort(notifications.begin(), notifications.end(),
+            [](const CapturedBlockingNotification& left,
+               const CapturedBlockingNotification& right) {
+              return std::tie(left.db_id_, left.key_, left.value_type_) <
+                     std::tie(right.db_id_, right.key_, right.value_type_);
+            });
+  notifications.erase(
+      std::unique(notifications.begin(), notifications.end(),
+                  [](const CapturedBlockingNotification& left,
+                     const CapturedBlockingNotification& right) {
+                    return left.db_id_ == right.db_id_ &&
+                           left.key_ == right.key_ &&
+                           left.value_type_ == right.value_type_;
+                  }),
+      notifications.end());
+
+  for (std::size_t begin = 0; begin < notifications.size();) {
+    std::size_t end = begin + 1;
+    while (end < notifications.size() &&
+           notifications[end].db_id_ == notifications[begin].db_id_ &&
+           notifications[end].key_ == notifications[begin].key_) {
+      ++end;
+    }
+    const std::uint8_t db_id = notifications[begin].db_id_;
+    const std::string& key = notifications[begin].key_;
+    const storage::ExpirationInfo info = co_await celer::SubmitTaskTo(
+        ShardForKey(key), [db_id, key] {
+          return g_storage->GetExpiration(db_id, key);
+        });
+    if (info.exists_) {
+      const auto matching = std::find_if(
+          notifications.begin() + static_cast<std::ptrdiff_t>(begin),
+          notifications.begin() + static_cast<std::ptrdiff_t>(end),
+          [&](const CapturedBlockingNotification& notification) {
+            return notification.value_type_ == info.value_type_;
+          });
+      if (matching !=
+          notifications.begin() + static_cast<std::ptrdiff_t>(end)) {
+        if (info.value_type_ == storage::ValueType::kList) {
+          NotifyListBlockingKey(db_id, key);
+        } else if (info.value_type_ == storage::ValueType::kSortedSet) {
+          NotifyZSetBlockingKey(db_id, key);
+        } else if (info.value_type_ == storage::ValueType::kStream) {
+          NotifyStreamBlockingKey(db_id, key);
+        }
+      }
+    }
+    begin = end;
+  }
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id) {

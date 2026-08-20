@@ -147,6 +147,7 @@ add_library(keylane_module
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
   src/redis/set_command.cpp
+  src/redis/sort_command.cpp
   src/redis/string_command.cpp
   src/redis/stream_command.cpp
   src/redis/zset_command.cpp
@@ -217,6 +218,17 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   if (KEYLANE_STATIC_CXX_RUNTIME)
     target_link_options(keylane PRIVATE -static-libstdc++ -static-libgcc)
   endif()
+endif()
+
+if (UNIX)
+  add_custom_target(valkey-tcl-tests
+    COMMAND ${CMAKE_COMMAND} -E env
+            KEYLANE_BIN=$<TARGET_FILE:keylane>
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/valkey/run-keylane
+    DEPENDS keylane
+    USES_TERMINAL
+    COMMENT "Running vendored Valkey TCL data-structure tests"
+  )
 endif()
 
 if (BUILD_TESTING)

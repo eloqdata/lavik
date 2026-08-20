@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <limits>
+#include <optional>
 
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -26,6 +27,9 @@ constexpr CommandSpec kCommandTable[] = {
     {"type", CommandKind::kType, 2, 2, 1, 1, 1, kKeyedRead},
     {"dump", CommandKind::kDump, 2, 2, 1, 1, 1, kKeyedRead},
     {"restore", CommandKind::kRestore, 4, 0, 1, 1, 1, kKeyedWrite},
+    {"sort", CommandKind::kSort, 2, 0, 1, 1, 1,
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"sort_ro", CommandKind::kSortRo, 2, 0, 1, 1, 1, kKeyedRead},
     {"randomkey", CommandKind::kRandomKey, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdNoKeys},
     {"flushdb", CommandKind::kFlushDb, 1, 0, 0, 0, 1,
@@ -359,6 +363,23 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
       return KeyIndexView{};
     }
     return DetermineKeys(spec, args.size());
+  }
+  if (spec.kind_ == CommandKind::kSort) {
+    std::optional<std::size_t> destination;
+    for (std::size_t i = 2; i + 1 < args.size(); ++i) {
+      if (EqualsIgnoreCase(args[i], "store")) destination = i + 1;
+    }
+    if (!destination.has_value()) {
+      return KeyIndexView{.first_ = 1, .last_ = 1, .step_ = 1};
+    }
+    if (*destination - 1 > std::numeric_limits<std::uint8_t>::max()) {
+      return absl::InvalidArgumentError("too many arguments for SORT routing");
+    }
+    return KeyIndexView{
+        .first_ = 1,
+        .last_ = static_cast<std::uint16_t>(*destination),
+        .step_ = static_cast<std::uint8_t>(*destination - 1),
+    };
   }
   const std::size_t count_arg =
       spec.kind_ == CommandKind::kBLMPop || spec.kind_ == CommandKind::kBZMPop

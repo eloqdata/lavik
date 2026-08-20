@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
+KEYLANE_BIN=${KEYLANE_BIN:-$REPO_ROOT/build/keylane}
+KEYLANE_HOST=${KEYLANE_HOST:-127.0.0.1}
+KEYLANE_PORT=${KEYLANE_PORT:-16379}
+DATA_FILE=$(mktemp "${TMPDIR:-/tmp}/keylane-valkey.XXXXXX.data")
+LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/keylane-valkey.XXXXXX.log")
+SERVER_PID=
+
+cleanup() {
+    status=$?
+    trap - EXIT INT TERM
+    if [ -n "$SERVER_PID" ]; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        attempts=0
+        while kill -0 "$SERVER_PID" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+            attempts=$((attempts + 1))
+            sleep 0.1
+        done
+        if kill -0 "$SERVER_PID" 2>/dev/null; then
+            kill -KILL "$SERVER_PID" 2>/dev/null || true
+        fi
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    rm -f "$DATA_FILE" "$LOG_FILE"
+    exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+if [ ! -x "$KEYLANE_BIN" ]; then
+    echo "Keylane binary is not executable: $KEYLANE_BIN" >&2
+    exit 1
+fi
+
+truncate -s "${KEYLANE_TEST_DATA_SIZE:-8G}" "$DATA_FILE"
+"$KEYLANE_BIN" \
+    --bind "$KEYLANE_HOST" \
+    --port "$KEYLANE_PORT" \
+    --threads "${KEYLANE_TEST_THREADS:-2}" \
+    --no-pin-workers \
+    --registered-buffer-mb "${KEYLANE_TEST_BUFFER_MB:-32}" \
+    --replication-publish-queue-mb "${KEYLANE_TEST_REPLICATION_QUEUE_MB:-8}" \
+    --max-memory "${KEYLANE_TEST_MAX_MEMORY:-2147483648}" \
+    --data-file "$DATA_FILE" >"$LOG_FILE" 2>&1 &
+SERVER_PID=$!
+
+ready=0
+attempt=0
+while [ "$attempt" -lt 300 ]; do
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "Keylane exited before becoming ready:" >&2
+        sed -n '1,240p' "$LOG_FILE" >&2
+        exit 1
+    fi
+    if redis-cli -h "$KEYLANE_HOST" -p "$KEYLANE_PORT" PING 2>/dev/null \
+        | grep -qx PONG; then
+        ready=1
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+
+if [ "$ready" -ne 1 ]; then
+    echo "Timed out waiting for Keylane on $KEYLANE_HOST:$KEYLANE_PORT" >&2
+    sed -n '1,240p' "$LOG_FILE" >&2
+    exit 1
+fi
+
+KEYLANE_HOST=$KEYLANE_HOST KEYLANE_PORT=$KEYLANE_PORT \
+    "$SCRIPT_DIR/runtest" "$@"

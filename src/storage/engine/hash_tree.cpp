@@ -353,7 +353,6 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     case HashOperationKind::kGetAll:
     case HashOperationKind::kKeys:
     case HashOperationKind::kValues:
-      std::sort(compact.entries_.begin(), compact.entries_.end(), EntryLess);
       for (const HashEntry& entry : compact.entries_) {
         if (operation.kind_ != HashOperationKind::kValues)
           result.values_.push_back(entry.field_);
@@ -381,6 +380,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       break;
     }
     case HashOperationKind::kScan: {
+      // HSCAN cursors encode a digest prefix, so only this path requires
+      // digest order. Full reads preserve the stored order and avoid sorting.
       std::sort(compact.entries_.begin(), compact.entries_.end(), EntryLess);
       const auto begin_it = std::lower_bound(
           compact.entries_.begin(), compact.entries_.end(), operation.cursor_,

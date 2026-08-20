@@ -2,10 +2,50 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <string>
 #include <string_view>
 
 namespace keylane {
 namespace {
+
+TEST(RespParserTest, AcceptsMoreThan1024ArrayElements) {
+  constexpr std::size_t kArgumentCount = 2048;
+  std::string request = "*" + std::to_string(kArgumentCount) + "\r\n";
+  for (std::size_t i = 0; i < kArgumentCount; ++i) {
+    request.append("$0\r\n\r\n");
+  }
+
+  RespParseResult result = ParseRespCommand(request);
+
+  EXPECT_EQ(result.state_, RespParseState::kOk);
+  EXPECT_EQ(result.consumed_, request.size());
+  ASSERT_EQ(result.command_.args_.size(), kArgumentCount);
+  EXPECT_EQ(result.command_.args_.front(), "");
+  EXPECT_EQ(result.command_.args_.back(), "");
+}
+
+TEST(RespParserTest, RejectsArrayLengthsAboveValkeyLimit) {
+  const auto too_many =
+      static_cast<unsigned long long>(std::numeric_limits<int>::max()) + 1;
+  const std::string request = "*" + std::to_string(too_many) + "\r\n";
+
+  RespParseResult result = ParseRespCommand(request);
+
+  EXPECT_EQ(result.state_, RespParseState::kError);
+  EXPECT_EQ(result.status_.code(), absl::StatusCode::kInvalidArgument);
+  EXPECT_EQ(result.status_.message(), "invalid RESP array length");
+}
+
+TEST(RespParserTest, DoesNotEagerlyAllocateDeclaredArrayLength) {
+  const std::string request =
+      "*" + std::to_string(std::numeric_limits<int>::max()) + "\r\n";
+
+  RespParseResult result = ParseRespCommand(request);
+
+  EXPECT_EQ(result.state_, RespParseState::kNeedMoreData);
+  EXPECT_TRUE(result.command_.args_.empty());
+}
 
 TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {
   ReplyBuilder builder;

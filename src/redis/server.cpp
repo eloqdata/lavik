@@ -595,7 +595,7 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
 Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream,
                                                   std::string* pending) {
   // Hard ceiling on one connection's accumulated request bytes. The per-frame
-  // limits (1024 args of up to 512 MiB each) still admit a claimed frame far
+  // limits (INT_MAX args of up to 512 MiB each) still admit a claimed frame far
   // larger than RAM, and the buffer grows until the frame completes — without
   // a cap, one client streaming an oversized frame runs the process out of
   // memory. 1 GiB matches Redis's query buffer limit and comfortably fits

@@ -20,6 +20,11 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
     bool with_scores, storage::TxShardWrites* tx, std::uint64_t now_ms);
 
+// Returns members in the sorted set's native score/member order. SORT uses
+// this for BY nosort while already holding the key's transaction lock.
+Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest);
+
 Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
                                       ReplyBuilder& reply_builder);
 Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,

@@ -107,10 +107,19 @@ celer::Task<CommandReply> ExecuteBlockingWaitLoop(
 
 void InitBlockingWaitStorage(storage::StorageEngine* engine);
 void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyListBlockingKey(const CommandRequest& request, std::string_view key);
 void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyZSetBlockingKey(const CommandRequest& request, std::string_view key);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
                              std::uint64_t id_ms, std::uint64_t id_seq);
+void NotifyStreamBlockingKey(const CommandRequest& request,
+                             std::string_view key, std::uint64_t id_ms,
+                             std::uint64_t id_seq);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyStreamBlockingKey(const CommandRequest& request,
+                             std::string_view key);
+celer::Task<absl::Status> FlushBlockingNotifications(
+    BlockingNotificationCapture& capture);
 celer::Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id);
 
 }  // namespace keylane

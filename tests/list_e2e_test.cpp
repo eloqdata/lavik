@@ -634,6 +634,10 @@ TEST(ListE2eTest, PersistsLogicalLengthSeparatelyFromSerializedBytes) {
     EXPECT_EQ(
         client.Command({"LPOS", "list", "", "RANK", "-9223372036854775808"}),
         "-ERR value is out of range");
+    EXPECT_EQ(client.Command({"LPOS", "list", "", "RANK", "0"}),
+              "-ERR RANK can't be zero: use 1 to start from the first match, "
+              "2 from the second ... or use negative to start from the end "
+              "of the list");
     EXPECT_EQ(client.Command({"PEXPIRE", "list", "600000"}), ":1");
     EXPECT_EQ(client.Command({"LPUSH", "list", "keeps-ttl"}), ":7");
     const std::string ttl = client.Command({"PTTL", "list"});
@@ -883,6 +887,108 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   server.Stop();
 }
 
+TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-exec-final-type-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  constexpr unsigned kWorkerCount = 3;
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path,
+                       kWorkerCount);
+  RespClient client(port);
+  const std::string list_key = KeyForWorker("exec-final-list", 0, kWorkerCount);
+  const std::string extra_list_key =
+      KeyForWorker("exec-final-list-extra", 1, kWorkerCount);
+  const std::string zset_key = KeyForWorker("exec-final-zset", 1, kWorkerCount);
+  const std::string stream_key =
+      KeyForWorker("exec-final-stream", 2, kWorkerCount);
+  auto wait_for_blocked_clients = [&](std::uint64_t expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (client.Command({"INFO", "CLIENTS"}).find(field) !=
+          std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  };
+
+  auto list_waiter =
+      std::async(std::launch::async, [port, list_key, extra_list_key] {
+        RespClient waiting(port);
+        return waiting.Command({"BLPOP", list_key, extra_list_key, "2"});
+      });
+  auto zset_waiter = std::async(std::launch::async, [port, zset_key] {
+    RespClient waiting(port);
+    return waiting.Command({"BZPOPMIN", zset_key, "2"});
+  });
+  auto stream_waiter = std::async(std::launch::async, [port, stream_key] {
+    RespClient waiting(port);
+    return waiting.Command(
+        {"XREAD", "BLOCK", "2000", "STREAMS", stream_key, "0-0"});
+  });
+  ASSERT_TRUE(wait_for_blocked_clients(3));
+
+  EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command({"RPUSH", list_key, "transient"}), "+QUEUED");
+  EXPECT_EQ(client.Command({"DEL", list_key}), "+QUEUED");
+  EXPECT_EQ(client.Command({"SET", list_key, "final-string"}), "+QUEUED");
+  EXPECT_EQ(client.Command({"ZADD", zset_key, "1", "transient"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"DEL", zset_key}), "+QUEUED");
+  EXPECT_EQ(client.Command({"SET", zset_key, "final-string"}), "+QUEUED");
+  EXPECT_EQ(client.Command(
+                {"XADD", stream_key, "1-0", "field", "transient"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"DEL", stream_key}), "+QUEUED");
+  EXPECT_EQ(client.Command({"SET", stream_key, "final-string"}), "+QUEUED");
+  EXPECT_EQ(client.Command({"EXEC"}),
+            "*9\r\n:1\r\n:1\r\n+OK\r\n:1\r\n:1\r\n+OK\r\n" +
+                Bulk("1-0") + "\r\n:1\r\n+OK");
+
+  EXPECT_EQ(list_waiter.wait_for(100ms), std::future_status::timeout);
+  EXPECT_EQ(zset_waiter.wait_for(100ms), std::future_status::timeout);
+  EXPECT_EQ(stream_waiter.wait_for(100ms), std::future_status::timeout);
+
+  EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command({"DEL", list_key, zset_key, stream_key}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"RPUSH", list_key, "ready"}), "+QUEUED");
+  EXPECT_EQ(client.Command({"ZADD", zset_key, "2", "ready"}), "+QUEUED");
+  EXPECT_EQ(client.Command({"XADD", stream_key, "2-0", "field", "ready"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"EXEC"}),
+            "*4\r\n:3\r\n:1\r\n:1\r\n" + Bulk("2-0"));
+
+  ASSERT_EQ(list_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(list_waiter.get(),
+            "*2\r\n" + Bulk(list_key) + "\r\n" + Bulk("ready"));
+  ASSERT_EQ(zset_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(zset_waiter.get(), "*3\r\n" + Bulk(zset_key) + "\r\n" +
+                                   Bulk("ready") + "\r\n" + Bulk("2"));
+  ASSERT_EQ(stream_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(stream_waiter.get(),
+            "*1\r\n*2\r\n" + Bulk(stream_key) + "\r\n*1\r\n*2\r\n" +
+                Bulk("2-0") + "\r\n*2\r\n" + Bulk("field") + "\r\n" +
+                Bulk("ready"));
+  EXPECT_TRUE(wait_for_blocked_clients(0));
+
+  server.Stop();
+}
+
 TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -989,6 +1095,8 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
     EXPECT_EQ(
         client.Command({"BLPOP", "blocking-missing", "9223372036.854776"}),
         "-ERR timeout is out of range");
+    EXPECT_EQ(client.Command({"BLPOP", "blocking-missing", "0x7FFFFFFFFFFFFF"}),
+              "-ERR timeout is out of range");
     auto blocked = std::async(std::launch::async, [port] {
       RespClient waiting(port);
       return waiting.Command({"BLPOP", "blocking-wakeup", "1"});
@@ -1094,6 +1202,8 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
                                             "\r\n" + BulkArray({"1", "2"}));
 
     EXPECT_EQ(client.Command({"RPUSH", "tx-mpop", "a", "b", "c"}), ":3");
+    EXPECT_EQ(client.Command({"LMPOP", "1", "tx-mpop", "LEFT", "COUNT", "0"}),
+              "-ERR count should be greater than 0");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"LMPOP", "2", "tx-missing", "tx-mpop", "LEFT",
                               "COUNT", "2"}),
@@ -1358,6 +1468,119 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
     EXPECT_EQ(client.Command({"LLEN", "large-list"}), ":0");
     server.Stop();
   }
+}
+
+TEST(ListE2eTest, SortsCollectionsAndStoresResultsAtomically) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-sort-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient client(port);
+
+  EXPECT_EQ(client.Command({"RPUSH", "numbers", "3", "10", "2", "1"}),
+            ":4");
+  EXPECT_EQ(client.Command({"SORT", "numbers"}),
+            BulkArray({"1", "2", "3", "10"}));
+  EXPECT_EQ(client.Command(
+                {"SORT", "numbers", "ALPHA", "DESC", "LIMIT", "1", "2"}),
+            BulkArray({"2", "10"}));
+  EXPECT_EQ(client.Command({"SORT_RO", "numbers", "DESC"}),
+            BulkArray({"10", "3", "2", "1"}));
+  EXPECT_EQ(client.Command({"SORT_RO", "numbers", "STORE", "forbidden"}),
+            "-ERR syntax error");
+  EXPECT_EQ(client.Command({"SORT", "numbers", "DESC", "STORE", "numbers"}),
+            ":4");
+  EXPECT_EQ(client.Command({"LRANGE", "numbers", "0", "-1"}),
+            BulkArray({"10", "3", "2", "1"}));
+
+  EXPECT_EQ(client.Command({"ZADD", "ranked", "1", "a", "5", "b", "2",
+                            "c", "10", "d", "3", "e"}),
+            ":5");
+  EXPECT_EQ(client.Command({"SORT", "ranked", "BY", "nosort", "ASC"}),
+            BulkArray({"a", "c", "e", "b", "d"}));
+  EXPECT_EQ(client.Command({"SORT", "ranked", "BY", "nosort", "DESC"}),
+            BulkArray({"d", "b", "e", "c", "a"}));
+  EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command({"SORT", "ranked", "BY", "nosort", "ASC"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"SORT", "ranked", "BY", "nosort", "DESC"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"EXEC"}),
+            "*2\r\n" + BulkArray({"a", "c", "e", "b", "d"}) +
+                "\r\n" + BulkArray({"d", "b", "e", "c", "a"}));
+
+  EXPECT_EQ(client.Command({"RPUSH", "ids", "a", "b", "c"}), ":3");
+  EXPECT_EQ(client.Command({"MSET", "weight_a", "2", "weight_b", "1",
+                            "weight_c", "3", "label_a", "A", "label_b",
+                            "B"}),
+            "+OK");
+  EXPECT_EQ(client.Command(
+                {"SORT", "ids", "BY", "weight_*", "GET", "#", "GET",
+                 "label_*"}),
+            "*6\r\n" + Bulk("b") + "\r\n" + Bulk("B") + "\r\n" +
+                Bulk("a") + "\r\n" + Bulk("A") + "\r\n" + Bulk("c") +
+                "\r\n$-1");
+  EXPECT_EQ(client.Command({"HSET", "object_a", "weight", "20", "label",
+                            "hash-a"}),
+            ":2");
+  EXPECT_EQ(client.Command({"HSET", "object_b", "weight", "10", "label",
+                            "hash-b"}),
+            ":2");
+  EXPECT_EQ(client.Command(
+                {"SORT", "ids", "BY", "object_*->weight", "GET", "#",
+                 "GET", "object_*->label"}),
+            "*6\r\n" + Bulk("c") + "\r\n$-1\r\n" + Bulk("b") + "\r\n" +
+                Bulk("hash-b") + "\r\n" + Bulk("a") + "\r\n" +
+                Bulk("hash-a"));
+
+  EXPECT_EQ(client.Command({"SORT", "ids", "BY", "weight_*", "STORE",
+                            "stored"}),
+            ":3");
+  EXPECT_EQ(client.Command({"LRANGE", "stored", "0", "-1"}),
+            BulkArray({"b", "a", "c"}));
+  EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+  EXPECT_EQ(client.Command(
+                {"SORT", "ids", "BY", "nosort", "STORE", "exec-stored"}),
+            "+QUEUED");
+  EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n:3");
+  EXPECT_EQ(client.Command({"LRANGE", "exec-stored", "0", "-1"}),
+            BulkArray({"a", "b", "c"}));
+  EXPECT_EQ(client.Command({"SORT", "missing", "STORE", "stored"}), ":0");
+  EXPECT_EQ(client.Command({"EXISTS", "stored"}), ":0");
+
+  EXPECT_EQ(client.Command({"SET", "wrong-type", "value"}), "+OK");
+  EXPECT_EQ(client.Command({"SORT", "wrong-type"}),
+            "-WRONGTYPE Operation against a key holding the wrong kind of "
+            "value");
+  EXPECT_EQ(client.Command({"RPUSH", "bad-number", "1", "not-a-double"}),
+            ":2");
+  EXPECT_EQ(client.Command({"SORT", "bad-number"}),
+            "-ERR One or more scores can't be converted into double");
+
+  auto blocked = std::async(std::launch::async, [port] {
+    RespClient waiter(port);
+    return waiter.Command({"BLPOP", "sort-wakeup", "5"});
+  });
+  std::this_thread::sleep_for(100ms);
+  EXPECT_EQ(client.Command({"SORT", "numbers", "STORE", "sort-wakeup"}),
+            ":4");
+  ASSERT_EQ(blocked.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(blocked.get(),
+            "*2\r\n" + Bulk("sort-wakeup") + "\r\n" + Bulk("1"));
+  EXPECT_EQ(client.Command({"LRANGE", "sort-wakeup", "0", "-1"}),
+            BulkArray({"2", "3", "10"}));
+  server.Stop();
 }
 
 TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
@@ -3249,6 +3472,8 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
             .starts_with("-ERR syntax error"));
     EXPECT_EQ(client.Command({"ZINTERCARD", "2", "z", "z2", "LIMIT", "-1"}),
               "-ERR LIMIT can't be negative");
+    EXPECT_EQ(client.Command({"ZINTERCARD", "2", "z", "z2", "LIMIT", "bad"}),
+              "-ERR LIMIT can't be negative");
     EXPECT_EQ(client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(client.Command({"ZDIFF", "2", "z", "z2"}), "+QUEUED");
     EXPECT_EQ(client.Command({"ZINTER", "2", "z", "z2"}), "+QUEUED");
@@ -3402,10 +3627,10 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"ZUNIONSTORE", "replace-zset", "1", "z"}), ":3");
     EXPECT_EQ(client.Command({"PTTL", "replace-zset"}), ":-1");
     EXPECT_EQ(client.Command({"ZRANDMEMBER", "z", "-9223372036854775808"}),
-              "-ERR value is not an integer or out of range");
+              "-ERR value is out of range");
     EXPECT_EQ(client.Command(
                   {"ZRANDMEMBER", "z", "9223372036854775807", "WITHSCORES"}),
-              "-ERR value is not an integer or out of range");
+              "-ERR value is out of range");
     EXPECT_EQ(client.Command({"ZRANDMEMBER", "missing-zset", "invalid"}),
               "-ERR value is not an integer or out of range");
     EXPECT_EQ(
@@ -3614,11 +3839,15 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     EXPECT_EQ(client.Command({"XINFO", "FOO"}),
               "-ERR unknown subcommand or wrong number of arguments for "
               "'FOO'. Try XINFO HELP.");
+    EXPECT_EQ(client.Command({"XGROUP", "HELP", "unexpected"}),
+              "-ERR wrong number of arguments for 'xgroup|help' command");
+    EXPECT_EQ(client.Command({"XINFO", "HELP", "unexpected"}),
+              "-ERR wrong number of arguments for 'xinfo|help' command");
     EXPECT_EQ(client.Command({"PING"}), "+PONG");
-    EXPECT_TRUE(client.Command({"XGROUP", "DESTROY", "xgroup-options"})
-                    .starts_with("-ERR unknown subcommand or wrong number"));
-    EXPECT_TRUE(client.Command({"XGROUP", "SETID", "xgroup-options"})
-                    .starts_with("-ERR unknown subcommand or wrong number"));
+    EXPECT_EQ(client.Command({"XGROUP", "DESTROY", "xgroup-options"}),
+              "-ERR wrong number of arguments for 'xgroup|destroy' command");
+    EXPECT_EQ(client.Command({"XGROUP", "SETID", "xgroup-options"}),
+              "-ERR wrong number of arguments for 'xgroup|setid' command");
     EXPECT_EQ(client.Command({"XLEN", "xgroup-options"}), ":0");
     EXPECT_EQ(
         client.Command({"XGROUP", "DESTROY", "missing-stream", "g"}),

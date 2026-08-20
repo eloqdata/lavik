@@ -613,6 +613,7 @@ int main(int argc, char** argv) {
     contains(info, "worker_threads:4", "threads field");
     contains(info, "# Clients", "clients section");
     contains(info, "connected_clients:", "clients field");
+    contains(info, "blocked_clients:0", "blocked clients field");
     contains(info, "# Transactions", "transactions section");
     contains(info, "tx_fastpath_runs:", "fastpath counter");
     contains(info, "tx_queued_runs:", "queued counter");

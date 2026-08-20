@@ -389,7 +389,8 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
           if (op.rank_ == 0) {
             co_return BuiltReply(reply_builder.AppendError(
                 "ERR RANK can't be zero: use 1 to start from the first "
-                "match, 2 from the second, ..."));
+                "match, 2 from the second ... or use negative to start from "
+                "the end of the list"));
           }
           ++i;
         } else if (CmpCaseInsensitive(args[i], "count")) {
@@ -446,7 +447,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
     case CommandKind::kLRem:
     case CommandKind::kLTrim:
       if (result->length_ != 0) {
-        NotifyListBlockingKey(request.db_id_, args[1]);
+        NotifyListBlockingKey(request, args[1]);
       }
       break;
     default:
@@ -564,10 +565,15 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     pop_left = *direction;
     std::size_t next = direction_arg + 1;
     if (next < args.size()) {
-      if (!CmpCaseInsensitive(args[next], "count") || next + 2 != args.size() ||
-          !ParseNonNegative(args[next + 1], &pop_count) || pop_count == 0) {
+      if (!CmpCaseInsensitive(args[next], "count") || next + 2 != args.size()) {
         co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
       }
+      std::int64_t parsed_count = 0;
+      if (!ParseInt64(args[next + 1], &parsed_count) || parsed_count <= 0) {
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR count should be greater than 0"));
+      }
+      pop_count = static_cast<std::uint64_t>(parsed_count);
     }
   }
 
@@ -635,7 +641,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     replication.Commit();
     for (std::size_t arg : key_args) {
-      NotifyListBlockingKey(request.db_id_, args[arg]);
+      NotifyListBlockingKey(request, args[arg]);
     }
     if (move) {
       co_return BuiltReply(
@@ -700,7 +706,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
         reply_builder.AppendBulkString(args[arg]);
         AppendBulkArray(reply_builder, popped->values_);
         for (std::size_t key_arg : key_args) {
-          NotifyListBlockingKey(request.db_id_, args[key_arg]);
+          NotifyListBlockingKey(request, args[key_arg]);
         }
         co_return BuiltReply(reply_builder.View());
       }
@@ -810,8 +816,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       destination_left, popped->values_.front()));
   replication.SetFinalExpirations(writes);
   replication.Commit();
-  NotifyListBlockingKey(request.db_id_, source_key);
-  NotifyListBlockingKey(request.db_id_, destination_key);
+  NotifyListBlockingKey(request, source_key);
+  NotifyListBlockingKey(request, destination_key);
   co_return BuiltReply(reply_builder.AppendBulkString(popped->values_.front()));
 }
 
@@ -825,6 +831,14 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
                                       : args.size() - 1;
   double timeout_seconds = 0;
   if (!ParseRedisDouble(args[timeout_arg], &timeout_seconds)) {
+    long double extended_timeout = 0;
+    if (ParseRedisLongDouble(args[timeout_arg], &extended_timeout) &&
+        extended_timeout * 1000.0L >
+            static_cast<long double>(
+                std::numeric_limits<std::int64_t>::max())) {
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR timeout is out of range"));
+    }
     co_return BuiltReply(reply_builder.AppendError(
         "ERR timeout is not a float or out of range"));
   }

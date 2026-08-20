@@ -83,7 +83,7 @@ constexpr SubcommandShape kXInfoShapes[] = {
     {"consumers", 4, 4},
     {"groups", 3, 3},
     {"stream", 3, 6},
-    {"help", 2, std::numeric_limits<std::size_t>::max()},
+    {"help", 2, 2},
 };
 
 CommandReply Built(std::string_view encoded) {
@@ -1026,9 +1026,15 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   if (request.kind_ == CommandKind::kXGroup ||
       request.kind_ == CommandKind::kXInfo) {
     const SubcommandShape* shape = FindSubcommandShape(request.kind_, a[1]);
-    if (shape == nullptr || a.size() < shape->min_args_ ||
-        a.size() > shape->max_args_) {
+    if (shape == nullptr) {
       co_return Built(builder.AppendError(SubcommandSyntaxError(request)));
+    }
+    if (a.size() < shape->min_args_ || a.size() > shape->max_args_) {
+      const std::string command =
+          request.kind_ == CommandKind::kXGroup ? "xgroup|" : "xinfo|";
+      co_return Built(
+          builder.AppendError("ERR wrong number of arguments for '" + command +
+                              std::string(shape->name_) + "' command"));
     }
   }
   if ((request.kind_ == CommandKind::kXGroup ||
@@ -1867,14 +1873,14 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     CaptureReplicationCommand(request, std::move(captured_xadd));
   }
   if (request.kind_ == CommandKind::kXAdd && !nil && appended_id.has_value()) {
-    NotifyStreamBlockingKey(request.db_id_, a[1], appended_id->ms_,
+    NotifyStreamBlockingKey(request, a[1], appended_id->ms_,
                             appended_id->seq_);
   } else if (!read_only) {
     // Metadata changes such as XGROUP SETID can make a consumer-group read
     // ready without appending a new stream ID. Wake candidates and let them
     // recheck their command-specific condition under the normal key lock.
     const std::size_t key_arg = request.kind_ == CommandKind::kXGroup ? 2 : 1;
-    NotifyStreamBlockingKey(request.db_id_, a[key_arg]);
+    NotifyStreamBlockingKey(request, a[key_arg]);
   }
   switch (request.kind_) {
     case CommandKind::kXAdd:

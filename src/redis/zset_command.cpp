@@ -501,7 +501,8 @@ ParseBlockingZSetDeadline(const CommandRequest& request) {
 
 Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
     std::uint8_t db_id, std::string_view key, const storage::Digest& digest,
-    bool maximum, std::uint64_t count, storage::TxShardWrites* tx = nullptr) {
+    bool maximum, std::uint64_t count, storage::TxShardWrites* tx = nullptr,
+    const CommandRequest* request = nullptr) {
   std::vector<Element> popped;
   bool has_remaining = false;
   auto callback = [&](std::optional<storage::CompactValueView> value)
@@ -531,7 +532,13 @@ Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
   absl::Status status = co_await g_storage->ExecuteCompactLocked(
       db_id, key, digest, storage::ValueType::kSortedSet, false, callback, tx);
   if (!status.ok()) co_return status;
-  if (!popped.empty() && has_remaining) NotifyZSetBlockingKey(db_id, key);
+  if (!popped.empty() && has_remaining) {
+    if (request != nullptr) {
+      NotifyZSetBlockingKey(*request, key);
+    } else {
+      NotifyZSetBlockingKey(db_id, key);
+    }
+  }
   co_return popped;
 }
 
@@ -562,7 +569,8 @@ Task<absl::Status> SingleShardPopCallback(void* opaque,
     }
     auto popped = co_await PopZSetLocked(
         context->request_->db_id_, context->request_->args_[argument],
-        locked->digest_, context->shape_->maximum_, context->shape_->count_);
+        locked->digest_, context->shape_->maximum_, context->shape_->count_,
+        nullptr, context->request_);
     if (!popped.ok()) co_return popped.status();
     if (!popped->empty()) {
       context->selected_arg_ = argument;
@@ -668,8 +676,10 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     auto popped = co_await celer::SubmitTaskTo(
         g_storage->OwnerForKey(key),
         [db = request.db_id_, key = std::string(key), digest,
-         maximum = shape.maximum_, count = shape.count_]() {
-          return PopZSetLocked(db, key, digest, maximum, count);
+         maximum = shape.maximum_, count = shape.count_,
+         request_ptr = &request]() {
+          return PopZSetLocked(db, key, digest, maximum, count, nullptr,
+                               request_ptr);
         });
     if (!popped.ok()) {
       (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
@@ -940,8 +950,7 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
     if (args.size() == 4 && !EqualCi(args[3], "withscores"))
       return absl::InvalidArgumentError("syntax error");
     if (count == std::numeric_limits<std::int64_t>::min())
-      return absl::InvalidArgumentError(
-          "value is not an integer or out of range");
+      return absl::InvalidArgumentError("value is out of range");
     const bool with_scores = args.size() == 4;
     const std::uint64_t magnitude =
         static_cast<std::uint64_t>(count < 0 ? -count : count);
@@ -949,8 +958,7 @@ absl::Status ValidateZSetSyntax(const CommandRequest& request) {
         magnitude > static_cast<std::uint64_t>(
                         std::numeric_limits<std::int64_t>::max()) /
                         2) {
-      return absl::InvalidArgumentError(
-          "value is not an integer or out of range");
+      return absl::InvalidArgumentError("value is out of range");
     }
   } else if (request.kind_ == CommandKind::kZScan) {
     std::uint64_t cursor = 0, count = 10;
@@ -1116,7 +1124,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     absl::Status status =
         co_await RunCompact(request, digest, tx, false, callback);
     if (!status.ok()) co_return Built(StorageError(builder, status));
-    if (changed != 0) NotifyZSetBlockingKey(request.db_id_, a[1]);
+    if (changed != 0) NotifyZSetBlockingKey(request, a[1]);
     if (incr) {
       co_return Built(incremented.has_value()
                           ? builder.AppendBulkString(FormatDouble(*incremented))
@@ -1526,15 +1534,13 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         if (a.size() == 4 && !with_scores)
           return absl::InvalidArgumentError("syntax error");
         if (count == std::numeric_limits<std::int64_t>::min())
-          return absl::InvalidArgumentError(
-              "value is not an integer or out of range");
+          return absl::InvalidArgumentError("value is out of range");
         if (count < 0 && with_scores &&
             static_cast<std::uint64_t>(-count) >
                 static_cast<std::uint64_t>(
                     std::numeric_limits<std::int64_t>::max()) /
                     2) {
-          return absl::InvalidArgumentError(
-              "value is not an integer or out of range");
+          return absl::InvalidArgumentError("value is out of range");
         }
         if (set.empty()) return NoChange();
         if (tx != nullptr && count < 0) {
@@ -2435,6 +2441,20 @@ Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
   co_return co_await ExecuteImpl(request, nullptr, nullptr, reply_builder);
 }
 
+Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
+    std::uint8_t db_id, std::string_view key,
+    const storage::Digest& digest) {
+  auto elements = co_await ReadZSetOnlyLocked(db_id, key, digest);
+  if (!elements.ok()) co_return elements.status();
+  Sort(&*elements);
+  std::vector<std::string> members;
+  members.reserve(elements->size());
+  for (auto& element : *elements) {
+    members.push_back(std::move(element.member_));
+  }
+  co_return members;
+}
+
 Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
                                             const storage::Digest& digest,
                                             storage::TxShardWrites* tx,
@@ -2554,8 +2574,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                EqualCi(args[i], "limit") && i + 1 < args.size()) {
       std::int64_t parsed_limit = 0;
       if (!ParseInt(args[i + 1], &parsed_limit)) {
-        co_return Built(
-            builder.AppendError("ERR value is not an integer or out of range"));
+        co_return Built(builder.AppendError("ERR LIMIT can't be negative"));
       }
       if (parsed_limit < 0) {
         co_return Built(builder.AppendError("ERR LIMIT can't be negative"));
@@ -2622,7 +2641,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     celer::SpawnOnCurrentWorker(CommitMulti(txid, std::move(context.writes_)));
     if (!context.output_.empty()) {
       NotifyZSetBlockingKey(
-          request.db_id_,
+          request,
           args[context.store_shape_ ? context.store_shape_->destination_arg_
                                     : 1]);
     }
@@ -2765,7 +2784,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
       std::int64_t parsed_limit = 0;
       if (!ParseInt(args[i + 1], &parsed_limit)) {
         co_return std::string(
-            builder.AppendError("ERR value is not an integer or out of range"));
+            builder.AppendError("ERR LIMIT can't be negative"));
       }
       if (parsed_limit < 0) {
         co_return std::string(
@@ -2866,7 +2885,7 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
                                 std::move(effect.args_));
     }
     if (!context.output_.empty()) {
-      NotifyZSetBlockingKey(request.db_id_, args[destination_arg]);
+      NotifyZSetBlockingKey(request, args[destination_arg]);
     }
     co_return EncodeInteger(static_cast<long long>(context.output_.size()));
   }
@@ -2916,7 +2935,7 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     auto pop = [&]() {
       return PopZSetLocked(request.db_id_, request.args_[argument],
                            key->digest_, shape.maximum_, shape.count_,
-                           &tx_writes[key->owner_]);
+                           &tx_writes[key->owner_], &request);
     };
     auto popped = key->owner_ == celer::ThisWorker().id_
                       ? co_await pop()

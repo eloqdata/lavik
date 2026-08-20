@@ -1,5 +1,6 @@
 #include "keylane/resp.h"
 
+#include <algorithm>
 #include <cassert>
 #include <charconv>
 #include <limits>
@@ -10,7 +11,11 @@ using namespace celer;
 
 namespace {
 
-constexpr std::size_t kMaxArrayLen = 1024;
+// Valkey accepts multibulk lengths up to INT_MAX. Its parser uses 1024 only
+// as the initial argv capacity and grows the array as arguments arrive; it is
+// not a protocol limit.
+constexpr long long kMaxArrayLen = std::numeric_limits<int>::max();
+constexpr std::size_t kInitialArgCapacity = 1024;
 constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 
 }  // namespace
@@ -66,10 +71,10 @@ RespParseResult ParseRespCommand(std::string_view input) {
                                     "invalid RESP array length");
       return result;
     }
-    if (array_len > static_cast<long long>(kMaxArrayLen)) {
+    if (array_len > kMaxArrayLen) {
       result.state_ = RespParseState::kError;
-      result.status_ = absl::Status(absl::StatusCode::kOutOfRange,
-                                    "too many RESP array elements");
+      result.status_ = absl::Status(absl::StatusCode::kInvalidArgument,
+                                    "invalid RESP array length");
       return result;
     }
     // An empty multibulk is a command that does nothing: real Redis consumes
@@ -87,7 +92,11 @@ RespParseResult ParseRespCommand(std::string_view input) {
     pos = crlf + 2;
     break;
   }
-  result.command_.args_.reserve(count);
+  // Do not trust the declared count for an eager allocation. A client can
+  // send only "*2147483647\r\n"; reserving that count would consume enormous
+  // memory before any arguments arrive. Match Valkey's bounded initial
+  // allocation and let the vector grow with the parsed payload.
+  result.command_.args_.reserve(std::min(count, kInitialArgCapacity));
   // From here on, a truncated command still reports the skipped prefix as
   // consumed: the filler can be dropped while the rest is awaited.
   result.consumed_ = skipped;
