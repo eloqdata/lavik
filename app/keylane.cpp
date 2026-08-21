@@ -204,6 +204,11 @@ int main(int argc, char** argv) {
          "--data-file", options.data_files_,
          "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
+  app.add_option("--load-rdb", options.load_rdb_file_,
+                 "Import a complete Redis RDB into an empty dataset before "
+                 "opening listeners");
+  app.add_flag("--load-rdb-replace", options.load_rdb_replace_,
+               "Erase all configured data files before importing --load-rdb");
   app.add_option("--inline-key-max-bytes", options.inline_key_max_bytes_,
                  "Largest key retained complete in the in-memory index")
       ->check(CLI::Range(std::size_t{1}, keylane::storage::MaxInlineKeyBytes()))

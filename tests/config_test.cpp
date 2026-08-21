@@ -99,6 +99,11 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
           .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"repl-backlog-size", "2gb"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"load-rdb", "/backup/dump.rdb"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"load-rdb-replace", "yes"}, &options).ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -115,6 +120,8 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.storage_read_buffer_bytes_, 2ULL * 1024 * 1024);
   EXPECT_EQ(options.replication_options_.backlog_size_bytes_,
             2ULL * 1024 * 1024 * 1024);
+  EXPECT_EQ(options.load_rdb_file_, "/backup/dump.rdb");
+  EXPECT_TRUE(options.load_rdb_replace_);
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
@@ -177,6 +184,21 @@ TEST(RedisConfigTest, AppliesAndValidatesTlsAndPasswordDirectives) {
 
   options.tls_auth_clients_ = "invalid";
   EXPECT_FALSE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, RejectsLoadRdbWithReplicaOf) {
+  ServerOptions options;
+  options.load_rdb_file_ = "/backup/dump.rdb";
+  options.replicaof_ = keylane::ReplicaOfConfig{"redis.local", 6379};
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, RejectsLoadRdbReplaceWithoutSource) {
+  ServerOptions options;
+  options.load_rdb_replace_ = true;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"load-rdb-replace", "maybe"}, &options).ok());
 }
 
 TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {

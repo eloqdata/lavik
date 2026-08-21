@@ -43,6 +43,35 @@ relative TTL is rewritten to `RESTORE ... REPLACE ABSTTL` before publication,
 so replica delay cannot extend the key lifetime; an already elapsed replacement
 is propagated as a deletion. `DUMP` is read-only and is never replicated.
 
+## Startup RDB import
+
+`--load-rdb <path>` (or the Redis-style `load-rdb <path>` configuration
+directive) imports one complete Redis RDB after Keylane storage recovery and
+before network listeners open. The target Keylane dataset must be empty. This
+is a one-shot migration option: remove it after the first successful startup,
+because a later restart recovers the imported Keylane records and therefore no
+longer has an empty target.
+
+`--load-rdb-replace` explicitly discards the contents of every configured
+`--data-file` before importing. Its configuration-file equivalent is
+`load-rdb-replace yes`. Replacement first validates the complete RDB and all
+storage paths; only then does it erase Keylane's fixed storage metadata and
+assign a new storage-set identity. Old data blocks are made unreachable, not
+securely overwritten. The reset is destructive and cannot be atomic across
+multiple devices, so retain the source RDB until startup succeeds and remove
+both RDB options afterward.
+
+The complete-file reader accepts RDB versions 1 through 11, including the
+historical object encodings supported by `RESTORE`, logical databases 0 through
+15, absolute expirations, AUX fields, resize hints, and LRU/LFU metadata. It
+validates the file checksum before writing any keys and performs a complete
+object-validation pass before the import pass. Self-describing Redis Function
+libraries, Module 2 values, and Module auxiliary records are skipped with a
+warning because Keylane cannot represent them. Pre-release Module/Function
+formats, databases above 15, malformed records, and unknown object types whose
+boundaries cannot be determined safely are rejected. Expired keys are
+validated but not inserted.
+
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
 scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s
 fixed-versus-scientific notation and unpadded exponent spelling.

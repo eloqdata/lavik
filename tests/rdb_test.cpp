@@ -1,6 +1,9 @@
 #include "keylane/rdb.h"
 
+#include <unistd.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,6 +66,44 @@ std::string RdbString(std::string_view value) {
   return result;
 }
 
+std::string RdbFile(std::string body, unsigned version) {
+  char header[10];
+  std::snprintf(header, sizeof(header), "REDIS%04u", version);
+  std::string result(header, 9);
+  result += body;
+  result.push_back(static_cast<char>(0xff));
+  if (version >= 5) PutLe64(&result, RedisCrc64(result));
+  return result;
+}
+
+class TempFile {
+ public:
+  explicit TempFile(std::string_view contents) {
+    char path[] = "/tmp/keylane-rdb-test-XXXXXX";
+    const int fd = ::mkstemp(path);
+    EXPECT_GE(fd, 0);
+    path_ = path;
+    std::size_t written = 0;
+    while (fd >= 0 && written < contents.size()) {
+      const ssize_t count =
+          ::write(fd, contents.data() + written, contents.size() - written);
+      EXPECT_GT(count, 0);
+      if (count <= 0) break;
+      written += static_cast<std::size_t>(count);
+    }
+    if (fd >= 0) ::close(fd);
+  }
+
+  ~TempFile() {
+    if (!path_.empty()) ::unlink(path_.c_str());
+  }
+
+  const std::string& path() const { return path_; }
+
+ private:
+  std::string path_;
+};
+
 std::string Ziplist(const std::vector<std::string_view>& values) {
   std::string entries;
   std::uint32_t previous_size = 0;
@@ -110,6 +151,182 @@ TEST(RdbTest, AcceptsRedisDumpVersionsOneThroughEleven) {
   }
 
   EXPECT_FALSE(DecodeDump(Dump(Hex("0003666f6f"), 12)).ok());
+}
+
+TEST(RdbTest, ReadsCompleteFilesVersionsOneThroughEleven) {
+  for (unsigned version = 1; version <= 11; ++version) {
+    TempFile file(
+        RdbFile(Hex("00") + RdbString("key") + RdbString("value"), version));
+    auto reader = FileReader::Open(file.path());
+    ASSERT_TRUE(reader.ok()) << reader.status();
+    EXPECT_EQ(reader->version(), version);
+    auto entry = reader->Next();
+    ASSERT_TRUE(entry.ok()) << entry.status();
+    ASSERT_TRUE(entry->has_value());
+    EXPECT_EQ((*entry)->db_id_, 0);
+    EXPECT_EQ((*entry)->key_, "key");
+    EXPECT_EQ((*entry)->value_.value_type_, storage::ValueType::kString);
+    EXPECT_EQ((*entry)->value_.encoded_, "value");
+    EXPECT_EQ((*entry)->value_.expire_at_ms_, 0);
+    auto eof = reader->Next();
+    ASSERT_TRUE(eof.ok()) << eof.status();
+    EXPECT_FALSE(eof->has_value());
+  }
+}
+
+TEST(RdbTest, ReadsFileMetadataDatabasesAndExpirations) {
+  std::string body;
+  body.push_back(static_cast<char>(0xfa));  // AUX
+  body += RdbString("redis-ver");
+  body += RdbString("7.2.0");
+  body.push_back(static_cast<char>(0xfe));  // SELECTDB
+  body.push_back(2);
+  body.push_back(static_cast<char>(0xfb));  // RESIZEDB
+  body.push_back(2);
+  body.push_back(1);
+  body.push_back(static_cast<char>(0xfc));  // EXPIRETIME_MS
+  PutLe64(&body, 4'102'444'800'123ULL);
+  body.push_back(static_cast<char>(0xf8));  // IDLE
+  body.push_back(7);
+  body.push_back(0);  // String
+  body += RdbString("future");
+  body += RdbString("alive");
+  body.push_back(static_cast<char>(0xf9));  // FREQ
+  body.push_back(9);
+  body.push_back(0);  // String
+  body += RdbString("persistent");
+  body += RdbString("value");
+
+  TempFile file(RdbFile(std::move(body), 11));
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+
+  auto future = reader->Next();
+  ASSERT_TRUE(future.ok()) << future.status();
+  ASSERT_TRUE(future->has_value());
+  EXPECT_EQ((*future)->db_id_, 2);
+  EXPECT_EQ((*future)->key_, "future");
+  EXPECT_EQ((*future)->value_.encoded_, "alive");
+  EXPECT_EQ((*future)->value_.expire_at_ms_, 4'102'444'800'123ULL);
+
+  auto persistent = reader->Next();
+  ASSERT_TRUE(persistent.ok()) << persistent.status();
+  ASSERT_TRUE(persistent->has_value());
+  EXPECT_EQ((*persistent)->db_id_, 2);
+  EXPECT_EQ((*persistent)->key_, "persistent");
+  EXPECT_EQ((*persistent)->value_.expire_at_ms_, 0);
+  auto eof = reader->Next();
+  ASSERT_TRUE(eof.ok()) << eof.status();
+  EXPECT_FALSE(eof->has_value());
+
+  reader->Rewind();
+  auto rewound = reader->Next();
+  ASSERT_TRUE(rewound.ok()) << rewound.status();
+  EXPECT_TRUE(rewound->has_value());
+}
+
+TEST(RdbTest, ReadsHistoricalSecondExpirationWithoutChecksum) {
+  std::string body;
+  body.push_back(static_cast<char>(0xfd));
+  PutLe32(&body, 2'000'000'000U);
+  body.push_back(0);
+  body += RdbString("old");
+  body += RdbString("value");
+  TempFile file(RdbFile(std::move(body), 1));
+
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  auto entry = reader->Next();
+  ASSERT_TRUE(entry.ok()) << entry.status();
+  ASSERT_TRUE(entry->has_value());
+  EXPECT_EQ((*entry)->value_.expire_at_ms_, 2'000'000'000'000ULL);
+}
+
+TEST(RdbTest, SkipsSelfDescribingUnsupportedRedisData) {
+  std::string body;
+  body.push_back(static_cast<char>(0xf5));  // FUNCTION2
+  body += RdbString("#!lua name=library");
+
+  body.push_back(static_cast<char>(0xf7));  // MODULE_AUX
+  body.push_back(11);                       // Module id
+  body.push_back(2);                        // UINT opcode for 'when'
+  body.push_back(0);                        // Before-RDB phase
+  body.push_back(1);                        // SINT opcode
+  body.push_back(7);
+  body.push_back(3);  // FLOAT opcode
+  body.append(4, '\0');
+  body.push_back(4);  // DOUBLE opcode
+  body.append(8, '\0');
+  body.push_back(5);  // STRING opcode
+  body += RdbString("aux-data");
+  body.push_back(0);  // Module EOF
+
+  body.push_back(7);  // MODULE_2 object
+  body += RdbString("module-key");
+  body.push_back(12);  // Module id
+  body.push_back(2);   // UINT opcode
+  body.push_back(9);
+  body.push_back(5);  // STRING opcode
+  body += RdbString("module-data");
+  body.push_back(0);  // Module EOF
+
+  body.push_back(0);  // String object
+  body += RdbString("kept");
+  body += RdbString("value");
+
+  TempFile file(RdbFile(std::move(body), 11));
+  auto reader = FileReader::Open(file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+
+  auto function = reader->Next();
+  ASSERT_TRUE(function.ok()) << function.status();
+  ASSERT_TRUE(function->has_value());
+  EXPECT_EQ((**function).kind_, FileEntryKind::kSkippedFunction);
+
+  auto module_aux = reader->Next();
+  ASSERT_TRUE(module_aux.ok()) << module_aux.status();
+  ASSERT_TRUE(module_aux->has_value());
+  EXPECT_EQ((**module_aux).kind_, FileEntryKind::kSkippedModuleAux);
+
+  auto module_value = reader->Next();
+  ASSERT_TRUE(module_value.ok()) << module_value.status();
+  ASSERT_TRUE(module_value->has_value());
+  EXPECT_EQ((**module_value).kind_, FileEntryKind::kSkippedModuleValue);
+  EXPECT_EQ((**module_value).key_, "module-key");
+
+  auto kept = reader->Next();
+  ASSERT_TRUE(kept.ok()) << kept.status();
+  ASSERT_TRUE(kept->has_value());
+  EXPECT_EQ((**kept).kind_, FileEntryKind::kValue);
+  EXPECT_EQ((**kept).key_, "kept");
+  EXPECT_EQ((**kept).value_.encoded_, "value");
+}
+
+TEST(RdbTest, RejectsCorruptAndUnsupportedCompleteFiles) {
+  std::string corrupt =
+      RdbFile(Hex("00") + RdbString("k") + RdbString("v"), 11);
+  corrupt.back() ^= 1;
+  TempFile corrupt_file(corrupt);
+  EXPECT_FALSE(FileReader::Open(corrupt_file.path()).ok());
+
+  TempFile future_file(RdbFile({}, 12));
+  EXPECT_FALSE(FileReader::Open(future_file.path()).ok());
+
+  std::string outside_db;
+  outside_db.push_back(static_cast<char>(0xfe));
+  outside_db.push_back(16);
+  TempFile outside_file(RdbFile(std::move(outside_db), 11));
+  auto reader = FileReader::Open(outside_file.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  EXPECT_FALSE(reader->Next().ok());
+
+  std::string pre_ga_module;
+  pre_ga_module.push_back(6);
+  pre_ga_module += RdbString("legacy-module");
+  TempFile pre_ga_file(RdbFile(std::move(pre_ga_module), 11));
+  auto pre_ga_reader = FileReader::Open(pre_ga_file.path());
+  ASSERT_TRUE(pre_ga_reader.ok()) << pre_ga_reader.status();
+  EXPECT_FALSE(pre_ga_reader->Next().ok());
 }
 
 TEST(RdbTest, AcceptsRedis72PackedFixturesAndEmitsVersionEleven) {

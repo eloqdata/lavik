@@ -47,6 +47,12 @@ struct ServerOptions {
   std::size_t flush_size_bytes_ = 128ULL * 1024;
   bool verify_read_crc_ = true;
   std::vector<std::string> data_files_{"keylane.data"};
+  // One-shot logical import performed after storage recovery and before any
+  // listener opens. The target Keylane dataset must be empty.
+  std::string load_rdb_file_;
+  // Explicitly discard every configured storage device before load-rdb.
+  // This is destructive and is valid only when load_rdb_file_ is set.
+  bool load_rdb_replace_ = false;
   std::uint32_t tomb_raider_interval_ms_ = 86'400'000;
   std::uint32_t tomb_raider_sleep_ms_ = 10;
   unsigned defrag_max_active_per_device_ = 8;

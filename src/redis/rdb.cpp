@@ -1,14 +1,21 @@
 #include "keylane/rdb.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -46,6 +53,18 @@ constexpr std::uint8_t kListQuicklist2 = 18;
 constexpr std::uint8_t kStreamListpacks2 = 19;
 constexpr std::uint8_t kSetListpack = 20;
 constexpr std::uint8_t kStreamListpacks3 = 21;
+
+constexpr std::uint8_t kFunction2 = 245;
+constexpr std::uint8_t kFunctionPreGa = 246;
+constexpr std::uint8_t kModuleAux = 247;
+constexpr std::uint8_t kIdle = 248;
+constexpr std::uint8_t kFreq = 249;
+constexpr std::uint8_t kAux = 250;
+constexpr std::uint8_t kResizeDb = 251;
+constexpr std::uint8_t kExpireTimeMs = 252;
+constexpr std::uint8_t kExpireTime = 253;
+constexpr std::uint8_t kSelectDb = 254;
+constexpr std::uint8_t kEof = 255;
 
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
 constexpr std::string_view kListMagic = "KLL1";
@@ -108,6 +127,7 @@ class Reader {
     expanded_bytes_ += bytes;
     return true;
   }
+  void ResetExpandedAccounting() { expanded_bytes_ = 0; }
 
   bool Byte(std::uint8_t* value) {
     if (at_ == input_.size()) return false;
@@ -297,6 +317,57 @@ absl::StatusOr<std::string> ReadString(Reader* reader) {
   std::string output(static_cast<std::size_t>(output_size->value), '\0');
   if (!LzfDecompress(compressed, &output)) return Bad("invalid LZF data");
   return output;
+}
+
+absl::Status SkipModuleBody(Reader* reader) {
+  while (true) {
+    auto opcode = ReadLength(reader);
+    if (!opcode.ok()) return opcode.status();
+    if (opcode->encoded) return Bad("encoded Redis Module opcode");
+    if (opcode->value == 0) return absl::OkStatus();
+    if (opcode->value == 1 || opcode->value == 2) {
+      auto value = ReadLength(reader);
+      if (!value.ok()) return value.status();
+      if (value->encoded) return Bad("encoded Redis Module integer");
+      continue;
+    }
+    if (opcode->value == 3 || opcode->value == 4) {
+      const std::size_t bytes = opcode->value == 3 ? 4 : 8;
+      std::string_view ignored;
+      if (!reader->Bytes(bytes, &ignored)) {
+        return Bad("truncated Redis Module floating-point value");
+      }
+      continue;
+    }
+    if (opcode->value == 5) {
+      reader->ResetExpandedAccounting();
+      auto value = ReadString(reader);
+      if (!value.ok()) return value.status();
+      continue;
+    }
+    return Bad("unknown Redis Module opcode");
+  }
+}
+
+absl::Status SkipModuleValue(Reader* reader) {
+  auto module_id = ReadLength(reader);
+  if (!module_id.ok()) return module_id.status();
+  if (module_id->encoded) return Bad("encoded Redis Module id");
+  return SkipModuleBody(reader);
+}
+
+absl::Status SkipModuleAux(Reader* reader) {
+  auto module_id = ReadLength(reader);
+  auto when_opcode = ReadLength(reader);
+  auto when = ReadLength(reader);
+  if (!module_id.ok()) return module_id.status();
+  if (!when_opcode.ok()) return when_opcode.status();
+  if (!when.ok()) return when.status();
+  if (module_id->encoded || when_opcode->encoded || when->encoded ||
+      when_opcode->value != 2) {
+    return Bad("invalid Redis Module auxiliary header");
+  }
+  return SkipModuleBody(reader);
 }
 
 void WriteString(std::string* out, std::string_view value) {
@@ -1512,6 +1583,272 @@ absl::StatusOr<std::string> EncodeRdbObject(const LogicalValue& logical) {
 }
 
 }  // namespace
+
+struct FileReader::Impl {
+  Impl(void* mapping, std::size_t size, unsigned version)
+      : mapping_(mapping),
+        size_(size),
+        input_(static_cast<const char*>(mapping), size),
+        version_(version),
+        reader_(input_.substr(9)) {}
+
+  ~Impl() {
+    if (mapping_ != MAP_FAILED) {
+      ::munmap(mapping_, size_);
+    }
+  }
+
+  void Rewind() {
+    reader_ = Reader(input_.substr(9));
+    db_id_ = 0;
+    expire_at_ms_.reset();
+    entry_metadata_ = false;
+    finished_ = false;
+  }
+
+  void* mapping_ = MAP_FAILED;
+  std::size_t size_ = 0;
+  std::string_view input_;
+  unsigned version_ = 0;
+  Reader reader_;
+  std::uint8_t db_id_ = 0;
+  std::optional<std::uint64_t> expire_at_ms_;
+  bool entry_metadata_ = false;
+  bool finished_ = false;
+};
+
+FileReader::FileReader(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+FileReader::FileReader(FileReader&&) noexcept = default;
+FileReader& FileReader::operator=(FileReader&&) noexcept = default;
+FileReader::~FileReader() = default;
+
+absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    const int error = errno;
+    const std::string message = absl::StrCat("cannot open RDB file '", path,
+                                             "': ", std::strerror(error));
+    return error == ENOENT ? absl::NotFoundError(message)
+                           : absl::InternalError(message);
+  }
+
+  struct stat info {};
+  if (::fstat(fd, &info) != 0) {
+    const int error = errno;
+    ::close(fd);
+    return absl::InternalError(absl::StrCat("cannot stat RDB file '", path,
+                                            "': ", std::strerror(error)));
+  }
+  if (!S_ISREG(info.st_mode) || info.st_size <= 0 ||
+      static_cast<std::uintmax_t>(info.st_size) >
+          std::numeric_limits<std::size_t>::max()) {
+    ::close(fd);
+    return absl::InvalidArgumentError(
+        absl::StrCat("RDB path is not a nonempty regular file: '", path, "'"));
+  }
+
+  const std::size_t size = static_cast<std::size_t>(info.st_size);
+  void* mapping = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  const int map_error = errno;
+  ::close(fd);
+  if (mapping == MAP_FAILED) {
+    return absl::InternalError(absl::StrCat("cannot map RDB file '", path,
+                                            "': ", std::strerror(map_error)));
+  }
+
+  auto unmap_on_error = [&] { ::munmap(mapping, size); };
+  const std::string_view input(static_cast<const char*>(mapping), size);
+  if (input.size() < 10 || !input.starts_with("REDIS")) {
+    unmap_on_error();
+    return absl::InvalidArgumentError("invalid RDB file header");
+  }
+  unsigned version = 0;
+  const char* version_begin = input.data() + 5;
+  const char* version_end = version_begin + 4;
+  const auto parsed = std::from_chars(version_begin, version_end, version);
+  if (parsed.ec != std::errc{} || parsed.ptr != version_end || version == 0 ||
+      version > kVersion) {
+    const std::string version_text(input.substr(5, 4));
+    unmap_on_error();
+    return absl::InvalidArgumentError(
+        absl::StrCat("unsupported RDB file version '", version_text, "'"));
+  }
+
+  // The checksum footer was introduced with RDB version 5. Redis writes a
+  // zero checksum when checksum generation is disabled, which loaders accept.
+  if (version >= 5) {
+    if (input.size() < 18) {
+      unmap_on_error();
+      return absl::InvalidArgumentError("truncated RDB checksum footer");
+    }
+    Reader footer(input.substr(input.size() - 8));
+    std::uint64_t expected = 0;
+    footer.Le64(&expected);
+    if (expected != 0 && Crc64(input.substr(0, input.size() - 8)) != expected) {
+      unmap_on_error();
+      return absl::InvalidArgumentError("RDB file checksum is invalid");
+    }
+  }
+
+  return FileReader(std::make_unique<Impl>(mapping, size, version));
+}
+
+absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
+  if (impl_->finished_) return std::optional<FileEntry>();
+
+  while (true) {
+    std::uint8_t type = 0;
+    if (!impl_->reader_.Byte(&type)) return Bad("RDB file has no EOF opcode");
+
+    if (type == kEof) {
+      const std::size_t footer_bytes = impl_->version_ >= 5 ? 8 : 0;
+      if (impl_->entry_metadata_ ||
+          impl_->reader_.remaining() != footer_bytes) {
+        return Bad("trailing data or incomplete key before RDB EOF");
+      }
+      impl_->finished_ = true;
+      return std::optional<FileEntry>();
+    }
+
+    if (type == kExpireTimeMs) {
+      if (impl_->expire_at_ms_.has_value()) {
+        return Bad("duplicate RDB expiration metadata");
+      }
+      std::uint64_t raw = 0;
+      if (!impl_->reader_.Le64(&raw)) {
+        return Bad("truncated millisecond expiration");
+      }
+      const std::int64_t deadline = std::bit_cast<std::int64_t>(raw);
+      impl_->expire_at_ms_ =
+          deadline <= 0 ? 1 : static_cast<std::uint64_t>(deadline);
+      impl_->entry_metadata_ = true;
+      continue;
+    }
+    if (type == kExpireTime) {
+      if (impl_->expire_at_ms_.has_value()) {
+        return Bad("duplicate RDB expiration metadata");
+      }
+      std::uint32_t raw = 0;
+      if (!impl_->reader_.Le32(&raw)) {
+        return Bad("truncated second expiration");
+      }
+      const std::int32_t deadline = std::bit_cast<std::int32_t>(raw);
+      impl_->expire_at_ms_ =
+          deadline <= 0 ? 1 : static_cast<std::uint64_t>(deadline) * 1000;
+      impl_->entry_metadata_ = true;
+      continue;
+    }
+    if (type == kIdle) {
+      auto idle = ReadLength(&impl_->reader_);
+      if (!idle.ok() || idle->encoded) return Bad("invalid RDB idle time");
+      impl_->entry_metadata_ = true;
+      continue;
+    }
+    if (type == kFreq) {
+      std::uint8_t ignored = 0;
+      if (!impl_->reader_.Byte(&ignored)) return Bad("truncated RDB frequency");
+      impl_->entry_metadata_ = true;
+      continue;
+    }
+
+    if (impl_->entry_metadata_) {
+      // Expiry/LRU/LFU metadata must be followed immediately by an object.
+      if (type >= kAux) return Bad("RDB key metadata is not followed by a key");
+    }
+    if (type == kAux) {
+      impl_->reader_.ResetExpandedAccounting();
+      auto key = ReadString(&impl_->reader_);
+      impl_->reader_.ResetExpandedAccounting();
+      auto value = ReadString(&impl_->reader_);
+      if (!key.ok()) return key.status();
+      if (!value.ok()) return value.status();
+      continue;
+    }
+    if (type == kResizeDb) {
+      auto keys = ReadLength(&impl_->reader_);
+      auto expires = ReadLength(&impl_->reader_);
+      if (!keys.ok()) return keys.status();
+      if (!expires.ok()) return expires.status();
+      if (keys->encoded || expires->encoded) {
+        return Bad("invalid RDB resize hint");
+      }
+      continue;
+    }
+    if (type == kSelectDb) {
+      auto db = ReadLength(&impl_->reader_);
+      if (!db.ok()) return db.status();
+      if (db->encoded || db->value >= storage::kLogicalDatabaseCount) {
+        return Bad("RDB database is outside Keylane's DB range");
+      }
+      impl_->db_id_ = static_cast<std::uint8_t>(db->value);
+      continue;
+    }
+    if (type == kFunction2) {
+      impl_->reader_.ResetExpandedAccounting();
+      auto code = ReadString(&impl_->reader_);
+      if (!code.ok()) return code.status();
+      return std::optional<FileEntry>(FileEntry{
+          .kind_ = FileEntryKind::kSkippedFunction,
+          .db_id_ = impl_->db_id_,
+          .key_ = {},
+          .value_ = {},
+      });
+    }
+    if (type == kFunctionPreGa) {
+      return Bad("pre-release Redis Function format is not skippable");
+    }
+    if (type == kModuleAux) {
+      absl::Status skipped = SkipModuleAux(&impl_->reader_);
+      if (!skipped.ok()) return skipped;
+      return std::optional<FileEntry>(FileEntry{
+          .kind_ = FileEntryKind::kSkippedModuleAux,
+          .db_id_ = impl_->db_id_,
+          .key_ = {},
+          .value_ = {},
+      });
+    }
+
+    impl_->reader_.ResetExpandedAccounting();
+    auto key = ReadString(&impl_->reader_);
+    if (!key.ok()) return key.status();
+    if (type == kModule2) {
+      absl::Status skipped = SkipModuleValue(&impl_->reader_);
+      if (!skipped.ok()) return skipped;
+      FileEntry entry{.kind_ = FileEntryKind::kSkippedModuleValue,
+                      .db_id_ = impl_->db_id_,
+                      .key_ = std::move(*key),
+                      .value_ = {}};
+      impl_->expire_at_ms_.reset();
+      impl_->entry_metadata_ = false;
+      return std::optional<FileEntry>(std::move(entry));
+    }
+    if (type == kModulePreGa) {
+      return Bad("pre-release Redis Module format is not skippable");
+    }
+    if (key->size() > storage::MaxKeyBytes()) {
+      return Bad("RDB key exceeds Keylane limits");
+    }
+    impl_->reader_.ResetExpandedAccounting();
+    auto logical = DecodeRdbObject(&impl_->reader_, type);
+    if (!logical.ok()) return logical.status();
+    auto value = EncodeRaw(std::move(*logical));
+    if (!value.ok()) return value.status();
+    value->expire_at_ms_ = impl_->expire_at_ms_.value_or(0);
+
+    FileEntry entry{.kind_ = FileEntryKind::kValue,
+                    .db_id_ = impl_->db_id_,
+                    .key_ = std::move(*key),
+                    .value_ = std::move(*value)};
+    impl_->expire_at_ms_.reset();
+    impl_->entry_metadata_ = false;
+    return std::optional<FileEntry>(std::move(entry));
+  }
+}
+
+void FileReader::Rewind() { impl_->Rewind(); }
+
+unsigned FileReader::version() const noexcept { return impl_->version_; }
 
 absl::StatusOr<std::string> EncodeDump(const storage::RawValue& value) {
   auto logical = DecodeRaw(value);

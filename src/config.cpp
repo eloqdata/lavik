@@ -189,7 +189,7 @@ absl::Status ApplyRedisConfigDirective(
   }
   if (name == "tls-cert-file" || name == "tls-key-file" ||
       name == "tls-ca-cert-file" || name == "requirepass" ||
-      name == "masteruser" || name == "masterauth") {
+      name == "masteruser" || name == "masterauth" || name == "load-rdb") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     if (name == "tls-cert-file") options->tls_cert_file_ = directive[1];
     if (name == "tls-key-file") options->tls_key_file_ = directive[1];
@@ -197,6 +197,7 @@ absl::Status ApplyRedisConfigDirective(
     if (name == "requirepass") options->requirepass_ = directive[1];
     if (name == "masteruser") options->masteruser_ = directive[1];
     if (name == "masterauth") options->masterauth_ = directive[1];
+    if (name == "load-rdb") options->load_rdb_file_ = directive[1];
     return absl::OkStatus();
   }
   if (name == "tls-auth-clients") {
@@ -214,6 +215,13 @@ absl::Status ApplyRedisConfigDirective(
     auto enabled = ParseYesNo(directive[1], name);
     if (!enabled.ok()) return enabled.status();
     options->tls_replication_ = *enabled;
+    return absl::OkStatus();
+  }
+  if (name == "load-rdb-replace") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->load_rdb_replace_ = *enabled;
     return absl::OkStatus();
   }
   if (name == "threads" || name == "io-threads") {
@@ -340,6 +348,14 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (options.masteruser_ != "default") {
     return absl::InvalidArgumentError(
         "only the default replication user is currently supported");
+  }
+  if (!options.load_rdb_file_.empty() && options.replicaof_.has_value()) {
+    return absl::InvalidArgumentError(
+        "load-rdb and replicaof cannot be configured together");
+  }
+  if (options.load_rdb_replace_ && options.load_rdb_file_.empty()) {
+    return absl::InvalidArgumentError(
+        "load-rdb-replace requires load-rdb to be configured");
   }
   if (options.storage_write_buffer_count_ == 0) {
     return absl::InvalidArgumentError(

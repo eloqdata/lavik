@@ -6,6 +6,52 @@
 namespace keylane::storage {
 namespace {
 
+absl::Status ResetStorageMetadata(const std::string& path,
+                                  std::uint64_t capacity_blocks) {
+  constexpr std::size_t kResetChunkBytes = 128 * 1024;
+  const std::uint64_t bytes =
+      static_cast<std::uint64_t>(DataBlockBegin(capacity_blocks)) *
+      kStorageBlockBytes;
+  std::vector<std::byte> zero(kResetChunkBytes, std::byte{0});
+
+  if (celer::IsSpdkStoragePath(path)) {
+    for (std::uint64_t offset = 0; offset < bytes; offset += kResetChunkBytes) {
+      const std::size_t chunk = static_cast<std::size_t>(
+          std::min<std::uint64_t>(kResetChunkBytes, bytes - offset));
+      absl::Status status = celer::WriteSpdkStorage(
+          path, std::span<const std::byte>(zero.data(), chunk), offset,
+          offset + chunk == bytes);
+      if (!status.ok()) return status;
+    }
+    return absl::OkStatus();
+  }
+
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    return absl::InternalError(
+        absl::StrCat("open storage path for reset failed: ", path, ": ",
+                     std::strerror(errno)));
+  }
+  absl::Status status = absl::OkStatus();
+  for (std::uint64_t offset = 0; offset < bytes; offset += kResetChunkBytes) {
+    const std::size_t chunk = static_cast<std::size_t>(
+        std::min<std::uint64_t>(kResetChunkBytes, bytes - offset));
+    status = WriteExactlyAt(fd, std::span<const std::byte>(zero.data(), chunk),
+                            offset);
+    if (!status.ok()) break;
+  }
+  if (status.ok() && ::fdatasync(fd) != 0) {
+    status = absl::InternalError(absl::StrCat(
+        "storage reset fdatasync failed: ", path, ": ", std::strerror(errno)));
+  }
+  const int close_error = ::close(fd);
+  if (status.ok() && close_error != 0) {
+    status = absl::InternalError(
+        absl::StrCat("close storage path after reset failed: ", path));
+  }
+  return status;
+}
+
 absl::Status InitializeAddedDeviceMetadata(
     const std::string& path, std::uint64_t capacity_blocks,
     const std::vector<std::uint64_t>& epoch_values) {
@@ -92,7 +138,6 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   std::vector<StoragePathInfo> path_info;
   path_info.reserve(options_.data_files_.size());
   std::vector<std::optional<DeviceLabel>> labels;
-  labels.reserve(options_.data_files_.size());
   for (const std::string& path : options_.data_files_) {
     auto probed = ProbeStoragePath(path);
     if (!probed.ok()) {
@@ -105,12 +150,58 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     }
     direct_io_alignment = std::max(direct_io_alignment, probed->io_alignment_);
     path_info.push_back(*probed);
+  }
 
-    auto label = ReadDeviceLabel(path);
-    if (!label.ok()) {
-      return label.status();
+  labels.resize(options_.data_files_.size());
+  if (options_.reset_data_files_) {
+    // Validate the complete target set before the first destructive write.
+    // The normal preparation below repeats these checks while constructing
+    // device state, but this preflight prevents avoidable partial resets.
+    for (std::size_t i = 0; i < path_info.size(); ++i) {
+      for (std::size_t previous = 0; previous < i; ++previous) {
+        if (options_.data_files_[previous] == options_.data_files_[i]) {
+          return absl::FailedPreconditionError(
+              "duplicate storage path configured for reset: " +
+              options_.data_files_[i]);
+        }
+      }
+      const StoragePathInfo& probed = path_info[i];
+      if (!probed.is_block_device_ &&
+          probed.size_bytes_ % kStorageBlockBytes != 0) {
+        return absl::InvalidArgumentError(
+            "new regular storage file size must be a multiple of 8 MiB: " +
+            options_.data_files_[i]);
+      }
+      const std::uint64_t capacity_blocks =
+          probed.size_bytes_ / kStorageBlockBytes;
+      if (capacity_blocks > kLocalBlockIdLimit) {
+        return absl::OutOfRangeError(
+            "each data file or device is limited to 1 PiB: " +
+            options_.data_files_[i]);
+      }
+      const std::uint32_t data_block_begin = DataBlockBegin(capacity_blocks);
+      if (data_block_begin >= capacity_blocks ||
+          capacity_blocks - data_block_begin <= kDefragReserveBlocksPerDevice) {
+        return absl::OutOfRangeError(
+            "storage path has no foreground block after its per-device "
+            "defrag reserve; each device must be at least 80 MiB: " +
+            options_.data_files_[i]);
+      }
     }
-    labels.push_back(std::move(*label));
+    for (std::size_t i = 0; i < path_info.size(); ++i) {
+      spdlog::warn("resetting all Keylane data on storage path {}",
+                   options_.data_files_[i]);
+      absl::Status reset =
+          ResetStorageMetadata(options_.data_files_[i],
+                               path_info[i].size_bytes_ / kStorageBlockBytes);
+      if (!reset.ok()) return reset;
+    }
+  } else {
+    for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
+      auto label = ReadDeviceLabel(options_.data_files_[i]);
+      if (!label.ok()) return label.status();
+      labels[i] = std::move(*label);
+    }
   }
 
   std::uint64_t storage_set_id = 0;

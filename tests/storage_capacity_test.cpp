@@ -43,9 +43,11 @@ std::uint64_t FileSize(const std::string& path) {
              : 0;
 }
 
-absl::Status Prepare(const std::vector<std::string>& paths) {
+absl::Status Prepare(const std::vector<std::string>& paths,
+                     bool reset = false) {
   keylane::storage::StorageEngineOptions options;
   options.data_files_ = paths;
+  options.reset_data_files_ = reset;
   keylane::storage::StorageEngine engine(std::move(options));
   return engine.Prepare(1);
 }
@@ -138,11 +140,14 @@ TEST(StorageCapacityTest, RejectsForeignDeviceDuringExpansion) {
   const std::string foreign = prefix + "-foreign.data";
   cleanup.paths_ = {first, foreign};
 
-  ASSERT_CHECK(CreateFile(first, 80 * kMiB) &&
-                   CreateFile(foreign, 80 * kMiB),
+  ASSERT_CHECK(CreateFile(first, 80 * kMiB) && CreateFile(foreign, 80 * kMiB),
                "failed to create foreign-device test files");
   ASSERT_CHECK(Prepare({first}).ok() && Prepare({foreign}).ok(),
                "failed to initialize independent storage sets");
   ASSERT_CHECK(!Prepare({first, foreign}).ok(),
                "foreign initialized device was accepted as an expansion");
+  ASSERT_CHECK(Prepare({first, foreign}, true).ok(),
+               "explicit storage reset did not replace foreign device sets");
+  ASSERT_CHECK(Prepare({foreign, first}).ok(),
+               "reset storage set could not be reopened");
 }

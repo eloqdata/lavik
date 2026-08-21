@@ -6,17 +6,21 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -34,6 +38,7 @@
 #include "keylane/config.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
+#include "keylane/rdb.h"
 #include "keylane/replication.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
@@ -461,12 +466,13 @@ class RedisService final : public TcpService {
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
                ReplicationManager* replication,
                long online_mimalloc_purge_delay_ms,
-               std::string_view requirepass)
+               std::string_view requirepass, std::string load_rdb_file)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
         online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms),
-        authenticator_(requirepass) {}
+        authenticator_(requirepass),
+        load_rdb_file_(std::move(load_rdb_file)) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -481,6 +487,7 @@ class RedisService final : public TcpService {
 
  private:
   Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
+  Task<absl::Status> ImportRdb();
 
   class RequestGuard {
    public:
@@ -502,9 +509,13 @@ class RedisService final : public TcpService {
   ReplicationManager* replication_;
   long online_mimalloc_purge_delay_ms_;
   PasswordAuthenticator authenticator_;
+  std::string load_rdb_file_;
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
   std::unique_ptr<CoroutineBarrier> online_allocator_barrier_;
+  std::unique_ptr<CoroutineBarrier> rdb_import_barrier_;
+  std::mutex rdb_import_status_mutex_;
+  absl::Status rdb_import_status_;
   std::atomic<bool> startup_failed_{false};
   std::atomic<std::uint64_t> request_gate_{0};
 };
@@ -514,6 +525,7 @@ void RedisService::Prepare(unsigned thread_count) {
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   recovery_collect_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   online_allocator_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
+  rdb_import_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
 }
 
 void RedisService::StopAcceptingRequests() noexcept {
@@ -544,6 +556,101 @@ bool RedisService::TryBeginRequest() noexcept {
 void RedisService::EndRequest() noexcept {
   request_gate_.fetch_sub(1, std::memory_order_acq_rel);
   request_gate_.notify_all();
+}
+
+Task<absl::Status> RedisService::ImportRdb() {
+  for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
+       ++db_id) {
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      const std::size_t keys = co_await SubmitTo(
+          worker, [this, db_id] { return storage_->LocalSize(db_id); });
+      if (keys != 0) {
+        co_return absl::FailedPreconditionError(
+            "load-rdb requires an empty Keylane dataset");
+      }
+    }
+  }
+
+  auto reader = rdb::FileReader::Open(load_rdb_file_);
+  if (!reader.ok()) co_return reader.status();
+
+  // Validate every object before mutating storage. The mapped file is then
+  // rewound and decoded a second time one entry at a time during application.
+  std::uint64_t entry_count = 0;
+  std::uint64_t skipped_count = 0;
+  while (true) {
+    auto entry = reader->Next();
+    if (!entry.ok()) co_return entry.status();
+    if (!entry->has_value()) break;
+    if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
+      ++entry_count;
+    } else {
+      ++skipped_count;
+    }
+  }
+  reader->Rewind();
+
+  std::uint64_t imported = 0;
+  std::uint64_t expired = 0;
+  while (true) {
+    auto next = reader->Next();
+    if (!next.ok()) co_return next.status();
+    if (!next->has_value()) break;
+    rdb::FileEntry entry = std::move(**next);
+    if (entry.kind_ != rdb::FileEntryKind::kValue) {
+      if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
+        spdlog::warn(
+            "skipping unsupported Redis Module value from RDB db={} "
+            "key-bytes={}",
+            entry.db_id_, entry.key_.size());
+      } else if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleAux) {
+        spdlog::warn(
+            "skipping unsupported Redis Module auxiliary data from "
+            "RDB");
+      } else {
+        spdlog::warn("skipping unsupported Redis Function library from RDB");
+      }
+      continue;
+    }
+    const unsigned owner = storage_->OwnerForKey(entry.key_);
+    auto apply = [this, entry = std::move(entry)]() mutable
+        -> Task<absl::StatusOr<storage::RestoreRawResult>> {
+      co_return co_await storage_->RestoreRawValue(
+          entry.db_id_, entry.key_, entry.value_, /*replace=*/false, nullptr);
+    };
+    absl::StatusOr<storage::RestoreRawResult> result;
+    if (owner == ThisWorker().id_) {
+      result = co_await apply();
+    } else {
+      result = co_await SubmitTaskTo(owner, std::move(apply));
+    }
+    if (!result.ok() || result->busy_) {
+      absl::Status failure =
+          result.ok() ? absl::AlreadyExistsError("duplicate key in RDB file")
+                      : result.status();
+      // Advancing all DB epochs makes any records written by this failed
+      // attempt unreachable and keeps a retry from recovering half an import.
+      absl::Status discarded = co_await storage_->FlushAllDetach();
+      if (!discarded.ok()) {
+        co_return absl::InternalError(absl::StrCat(
+            "RDB import failed: ", failure.message(),
+            "; failed to discard partial import: ", discarded.message()));
+      }
+      co_return failure;
+    }
+    if (result->changed_) {
+      ++imported;
+    } else {
+      ++expired;
+    }
+  }
+
+  spdlog::info(
+      "loaded RDB file '{}' version={} entries={} imported={} expired={} "
+      "unsupported-skipped={}",
+      load_rdb_file_, reader->version(), entry_count, imported, expired,
+      skipped_count);
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
@@ -578,6 +685,28 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   }
   status = co_await online_allocator_barrier_->Wait(worker);
   if (!status.ok()) [[unlikely]] {
+    co_return status;
+  }
+
+  if (worker.id() == 0 && !load_rdb_file_.empty()) {
+    absl::Status imported = co_await ImportRdb();
+    std::lock_guard lock(rdb_import_status_mutex_);
+    rdb_import_status_ = std::move(imported);
+  }
+  status = co_await rdb_import_barrier_->Wait(worker);
+  if (!status.ok()) [[unlikely]] {
+    co_return status;
+  }
+  {
+    std::lock_guard lock(rdb_import_status_mutex_);
+    status = rdb_import_status_;
+  }
+  if (!status.ok()) [[unlikely]] {
+    startup_failed_.store(true, std::memory_order_release);
+    if (worker.id() == 0) {
+      spdlog::error("RDB startup import failed: {}", status.message());
+    }
+    worker.RequestStop();
     co_return status;
   }
 
@@ -906,6 +1035,84 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
+  if (options.load_rdb_replace_) {
+    // Never erase storage for a missing, corrupt, or unsupported source.
+    // ImportRdb validates again immediately before application so a source
+    // changed during startup cannot silently produce a partial dataset.
+    auto reader = rdb::FileReader::Open(options.load_rdb_file_);
+    if (!reader.ok()) {
+      spdlog::error("RDB replacement preflight failed: {}",
+                    reader.status().message());
+      return 1;
+    }
+    std::uint64_t entries = 0;
+    std::uint64_t skipped = 0;
+    while (true) {
+      auto entry = reader->Next();
+      if (!entry.ok()) {
+        spdlog::error("RDB replacement preflight failed: {}",
+                      entry.status().message());
+        return 1;
+      }
+      if (!entry->has_value()) break;
+      if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
+        ++entries;
+      } else {
+        ++skipped;
+      }
+    }
+    struct stat rdb_info {};
+    if (::stat(options.load_rdb_file_.c_str(), &rdb_info) != 0) {
+      spdlog::error("cannot identify replacement RDB '{}': {}",
+                    options.load_rdb_file_, std::strerror(errno));
+      return 1;
+    }
+    std::vector<struct stat> storage_identities;
+    storage_identities.reserve(options.data_files_.size());
+    for (std::size_t i = 0; i < options.data_files_.size(); ++i) {
+      const std::string& path = options.data_files_[i];
+      if (celer::IsSpdkStoragePath(path)) {
+        if (std::find(options.data_files_.begin(),
+                      options.data_files_.begin() + i,
+                      path) != options.data_files_.begin() + i) {
+          spdlog::error(
+              "duplicate storage path configured for replacement: '{}'", path);
+          return 1;
+        }
+        continue;
+      }
+      struct stat info {};
+      if (::stat(path.c_str(), &info) != 0) {
+        spdlog::error("cannot identify replacement storage path '{}': {}", path,
+                      std::strerror(errno));
+        return 1;
+      }
+      if (info.st_dev == rdb_info.st_dev && info.st_ino == rdb_info.st_ino) {
+        spdlog::error(
+            "replacement RDB and data-file resolve to the same file: '{}'",
+            path);
+        return 1;
+      }
+      const auto duplicate = std::find_if(
+          storage_identities.begin(), storage_identities.end(),
+          [&info](const struct stat& prior) {
+            if (S_ISBLK(info.st_mode) && S_ISBLK(prior.st_mode)) {
+              return info.st_rdev == prior.st_rdev;
+            }
+            return info.st_dev == prior.st_dev && info.st_ino == prior.st_ino;
+          });
+      if (duplicate != storage_identities.end()) {
+        spdlog::error(
+            "duplicate storage target configured for replacement: '{}'", path);
+        return 1;
+      }
+      storage_identities.push_back(info);
+    }
+    spdlog::info(
+        "validated replacement RDB '{}' version={} entries={} "
+        "unsupported-skipped={}",
+        options.load_rdb_file_, reader->version(), entries, skipped);
+  }
   const std::string bind_display = absl::StrJoin(options.bind_addresses_, ",");
   std::string advertised_bind = options.bind_addresses_.front();
   if (advertised_bind == "*") advertised_bind = "0.0.0.0";
@@ -1002,6 +1209,7 @@ int RunServer(ServerOptions options) {
 
   storage::StorageEngineOptions storage_options;
   storage_options.data_files_ = std::move(options.data_files_);
+  storage_options.reset_data_files_ = options.load_rdb_replace_;
   storage_options.flush_max_ms_ = options.flush_max_ms_;
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.replication_publish_queue_bytes_ =
@@ -1066,7 +1274,8 @@ int RunServer(ServerOptions options) {
       options.spdk_foreground_pre_poll_us_;
 
   RedisService redis(options.port_, &storage, &replication,
-                     options.mimalloc_purge_delay_ms_, options.requirepass_);
+                     options.mimalloc_purge_delay_ms_, options.requirepass_,
+                     std::move(options.load_rdb_file_));
   if (tls_server_context != nullptr) {
     redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));
   }
