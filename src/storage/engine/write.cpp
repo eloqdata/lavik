@@ -935,10 +935,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .reject_older_sequence_ = true,
     });
   }
-  const std::uint64_t mutation_sequence =
-      replica_mutation_sequence.has_value()
-          ? *replica_mutation_sequence
-          : ++partition.mutation_sequence_;
+  const std::uint64_t mutation_sequence = replica_mutation_sequence.has_value()
+                                              ? *replica_mutation_sequence
+                                              : ++partition.mutation_sequence_;
   absl::Status status = absl::OkStatus();
   const bool key_external = key.size() > options_.inline_key_max_bytes_;
   const std::uint64_t logical_payload_bytes =
@@ -1044,8 +1043,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   co_return status;
 }
 
-std::string StorageEngine::Impl::FullSyncOverrideKey(
-    std::uint8_t db_id, std::string_view key) {
+std::string StorageEngine::Impl::FullSyncOverrideKey(std::uint8_t db_id,
+                                                     std::string_view key) {
   std::string result;
   result.reserve(key.size() + 1);
   result.push_back(static_cast<char>(db_id));
@@ -1055,10 +1054,16 @@ std::string StorageEngine::Impl::FullSyncOverrideKey(
 
 void StorageEngine::Impl::ClearFullSyncCapture(
     WorkerStore& store, WorkerStore::FullSyncCapture& capture) {
-  (void)store;
+  for (auto& [_, pinned] : capture.pinned_values_) {
+    store.worker_->Spawn(ReleaseFullSyncExtents(std::move(pinned.extents_)));
+  }
+  capture.pinned_values_.clear();
   capture.overrides_.clear();
   capture.latest_by_key_.clear();
+  capture.replacement_credit_bytes_ = 0;
   capture.key_phases_.Clear();
+  capture.pending_snapshot_keys_.clear();
+  capture.pending_snapshot_cursor_ = 0;
 }
 
 void StorageEngine::Impl::FullSyncOnCommit(
@@ -1075,16 +1080,25 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
     const Digest& digest,
-    std::shared_ptr<const ReplicationCommandAppend> command) {
+    std::shared_ptr<const ReplicationCommandAppend> command,
+    bool transaction_effect) {
   const auto db_phase = capture.db_phases_[record.db_id_];
   if (db_phase == WorkerStore::FullSyncCapture::DbPhase::kUnstarted) {
     return;
   }
   auto* phase = capture.key_phases_.Find(digest, record.key_);
-  if (command != nullptr &&
-      (db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing ||
-       phase != nullptr)) {
-    (void)TryEnqueueFullSyncCommand(store, session_id, std::move(command));
+  const bool has_ordered_base =
+      db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing ||
+      phase != nullptr;
+  if (has_ordered_base && (command != nullptr || transaction_effect)) {
+    if (command != nullptr) {
+      (void)TryEnqueueFullSyncCommand(store, session_id, std::move(command));
+    } else {
+      // Transaction participants have no independently replayable command.
+      // Put their after-image identity in the same FIFO so a later ordinary
+      // command can never overtake it.
+      (void)TryEnqueueFullSyncRecord(store, session_id, record);
+    }
     return;
   }
   // An unseen key, or a committed transaction participant for which there is
@@ -1095,12 +1109,39 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
     capture.key_phases_.Erase(phase);
   }
   const std::string key = FullSyncOverrideKey(record.db_id_, record.key_);
+  const bool replacing = capture.latest_by_key_.contains(key);
   if (auto found = capture.latest_by_key_.find(key);
       found != capture.latest_by_key_.end()) {
     auto previous = capture.overrides_.find(found->second);
     assert(previous != capture.overrides_.end());
     capture.overrides_.erase(previous);
     capture.latest_by_key_.erase(found);
+  }
+  if (!replacing) {
+    auto session = store.fullsync_sessions_.find(session_id);
+    std::size_t credit = kFullSyncReplacementMetadataBytes;
+    if (record.key_.size() >
+        (std::numeric_limits<std::size_t>::max() - credit) / 2) {
+      if (session != store.fullsync_sessions_.end()) {
+        session->second.db_epoch_invalidated_ = true;
+      }
+      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+      return;
+    }
+    credit += record.key_.size() * 2;
+    if (session == store.fullsync_sessions_.end() ||
+        credit > std::numeric_limits<std::size_t>::max() -
+                     session->second.publish_queue_bytes_ ||
+        credit > std::numeric_limits<std::size_t>::max() -
+                     capture.replacement_credit_bytes_) {
+      if (session != store.fullsync_sessions_.end()) {
+        session->second.db_epoch_invalidated_ = true;
+      }
+      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+      return;
+    }
+    session->second.publish_queue_bytes_ += credit;
+    capture.replacement_credit_bytes_ += credit;
   }
   capture.overrides_.emplace(record.mutation_sequence_, record);
   capture.latest_by_key_.emplace(std::move(key), record.mutation_sequence_);
@@ -1120,9 +1161,8 @@ bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
                               sizeof(command->partition_sequence_);
   for (const std::string& arg : command->args_) {
     if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
-        sizeof(std::uint32_t) >
-            std::numeric_limits<std::size_t>::max() - logical_bytes -
-                arg.size()) {
+        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
+                                    logical_bytes - arg.size()) {
       session->second.db_epoch_invalidated_ = true;
       store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
       return false;
@@ -1135,8 +1175,8 @@ bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
     store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
     return false;
   }
-  if (logical_bytes > std::numeric_limits<std::size_t>::max() -
-                          state.publish_queue_bytes_) {
+  if (logical_bytes >
+      std::numeric_limits<std::size_t>::max() - state.publish_queue_bytes_) {
     state.db_epoch_invalidated_ = true;
     store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
     return false;
@@ -1148,6 +1188,43 @@ bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
           .id_ = id,
           .logical_bytes_ = logical_bytes,
           .command_ = std::move(command),
+          .record_ = std::nullopt,
+      });
+  return true;
+}
+
+bool StorageEngine::Impl::TryEnqueueFullSyncRecord(
+    WorkerStore& store, std::uint64_t session_id,
+    const SnapshotRecord& record) {
+  auto session = store.fullsync_sessions_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_) {
+    return false;
+  }
+  auto& state = session->second;
+  std::size_t logical_bytes = kFullSyncReplacementMetadataBytes;
+  if (record.key_.size() >
+          (std::numeric_limits<std::size_t>::max() - logical_bytes) / 2 ||
+      state.next_publish_id_ == 0) {
+    state.db_epoch_invalidated_ = true;
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  logical_bytes += record.key_.size() * 2;
+  if (logical_bytes >
+      std::numeric_limits<std::size_t>::max() - state.publish_queue_bytes_) {
+    state.db_epoch_invalidated_ = true;
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  const std::uint64_t id = state.next_publish_id_++;
+  state.publish_queue_bytes_ += logical_bytes;
+  state.publish_queue_.push_back(
+      WorkerStore::FullSyncSessionState::PendingCommand{
+          .id_ = id,
+          .logical_bytes_ = logical_bytes,
+          .command_ = nullptr,
+          .record_ = record,
       });
   return true;
 }
@@ -1161,8 +1238,9 @@ void StorageEngine::Impl::PublishCommittedFullSyncEffects(
     for (std::uint64_t session_id : effect.session_ids_) {
       auto capture = partition.fullsync_subscribers_.find(session_id);
       if (capture == partition.fullsync_subscribers_.end()) continue;
-      FullSyncCaptureOnCommit(store, session_id, capture->second,
-                              effect.record_, ComputeDigest(effect.record_.key_));
+      FullSyncCaptureOnCommit(
+          store, session_id, capture->second, effect.record_,
+          ComputeDigest(effect.record_.key_), nullptr, true);
     }
   }
   shard->fullsync_effects_.clear();

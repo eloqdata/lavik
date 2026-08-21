@@ -191,7 +191,10 @@ UNSTARTED -> SCANNING -> TAILING
 只有当前 `SCANNING` DB 保留 `map<key, state>`，所以 coverage key 不需要包含 DB id；
 replacement/transaction 元数据的逻辑身份仍是 `(db_id,key)`。状态只保存 key identity、
 mutation sequence 和 ACK 状态，不在内存保存 Value。Value 在发送时从当前内存/磁盘 record
-materialize；大 Value 使用内存 staging 和 2 MiB 网络 chunk。
+materialize。Snapshot/replacement batch 同时受 key count 和 2 MiB 总字节预算限制；单条超过
+预算的 external Value 独占当前 flow，锁内固定 immutable extent manifest 和 block pin，随后按
+2 MiB 网络 chunk 读取，完整 Value 不进入 batch vector。固定 8 MiB storage extent 的读取和 CRC
+校验也始终只保留当前一个 extent scratch。
 
 Source 启动 partition：
 
@@ -215,13 +218,14 @@ ABSENT -> BASELINE_INFLIGHT -> TAILING
 
 scanner 和写提交都在同一 key lock 排序边界内检查 map：
 
-- scanner 看到 map 不存在，读取完整 live record，以 `baseline_version=S` 登记
-  `BASELINE_INFLIGHT` 后才释放 key lock；frame ACK 后该 key 进入 `TAILING`；
+- scanner 看到 map 不存在，在锁内捕获当时的 immutable record/value（大 external Value 捕获
+  extent pin），以 `baseline_version=S` 登记 `BASELINE_INFLIGHT` 后才释放 key lock；frame ACK
+  后该 key 进入 `TAILING`；baseline 不会在发送时重读“当前值”；
 - 写先看到 map 不存在，说明 target 没有可靠 base；commit 后登记 metadata-only 最新
   after-image/tombstone，scanner 以后看到该 key 直接跳过；
 - map 已存在时，完整 base 已经可靠占有发送顺序，后续普通写将 canonical command 放进同一个
   session/worker FIFO；base frame 总在对应命令之前发送；
-- replacement sender 根据 identity 从存储读取最新 Value，携带实际 mutation sequence `V`；
+- 只有 replacement sender 根据 identity 从存储读取最新 Value，携带实际 mutation sequence `V`；
 - target 只应用版本更高的 record/command，旧 ACK 不能删除更新的 replacement。
 
 因此 scanner 不会把一个已经在它之前提交的新值误标为 S：写若先取得 key lock，就一定先登记
@@ -232,7 +236,8 @@ DB phase 的写规则：
 
 - `UNSTARTED`：不捕获、不发送；稍后的 live scan 会读到提交后状态；
 - `SCANNING`：未覆盖 key 发 after-image，已覆盖 key 发 command；
-- `TAILING`：所有普通写直接发 command，新 key 也可由命令创建。
+- `TAILING`：所有普通写直接发 command，新 key 也可由命令创建；已提交事务 participant 的
+  after-image 作为 record item 进入同一个 FIFO，不能被后续普通 command 越过。
 
 Full-sync reservation 是逻辑空间/内存 admission，不预先把所有 Value 复制进 RAM。无法取得
 所需 reservation 时拒绝开始同步；每个 DB handoff 后立即释放 scan batch、record pin、临时
@@ -255,6 +260,10 @@ TAILING: session publish queue commands
 credit。单个大于 queue limit 的 command 可以独占一个 heap staging item；它会阻止其他 item，
 直到 ACK 或 session 取消。
 
+首次出现的 pending replacement 也持有 `(metadata + 两份 key identity)` 的 queue credit；同 key
+覆盖复用这份 credit，replacement ACK、partition 结束或 session 取消时释放。因此持续创建并删除
+不同 key 会触发与 command FIFO 相同的反压，不能靠稳定的 live-key 数绕过容量上限。
+
 单 key 命令只向实际 owner worker 申请 credit，并把 `(partition,DB)` 传给 admission：尚未为该
 session 启动的 partition/DB 不预留 full-sync queue 空间，也不会被另一个正在扫描或已经 tailing
 的 partition 反压。跨 key/事务在执行前一次性、按 worker 顺序为全部 participant 保守预留，
@@ -273,10 +282,12 @@ LOADING，允许 record 和 command 按版本交错写入当前唯一 root；该
 未开始的 DB/partition 不进入 full-sync queue。Full sync wire frame 使用 session-local、从 1
 连续增长的 frame sequence ACK；command item id 只标识该 worker FIFO 的重发/ACK 顺序，不是
 ONLINE flow LSN。增量 command 与 ONLINE backlog 使用相同的批量发送窗口：每批最多 2 MiB、
-128 frames，以一次 `WriteAllV` 发出。一个 command 的中间 fragment 只推进接收端 sequence，
+128 frames，以一次 `WriteAllV` 发出。编码器直接从 immutable command arguments 按 fragment
+读取，不创建完整 encoded command 副本。一个 command 的中间 fragment 只推进接收端 sequence，
 不产生 stop-and-wait ACK；完整 command apply 后由最后一个 fragment ACK，source 此时才按 FIFO
-释放 item 和对应 credit。断线时未完成 session 整体取消，因此不会把只有部分 fragment 的命令
-带入下一次 full sync。
+释放 item 和对应 credit。每次 `WriteAllV` 成功都更新 session progress，所以持续传输的大命令
+不会因最终 ACK 尚未到达而被 stall monitor 误杀。断线时未完成 session 整体取消，因此不会把
+只有部分 fragment 的命令带入下一次 full sync。
 
 Prometheus 按 worker 暴露 `keylane_fullsync_publish_queue_bytes`、
 `keylane_fullsync_publish_queue_admitted_bytes`、
@@ -295,10 +306,12 @@ full-sync credit 等待误判为 backlog 没有反压。
 3. drain 所有 replacement 和 full-sync publish queue，等待 target ACK；
 4. 每个 flow 向共享 backlog publisher 插入 fence，得到 `stable_next_lsn`；
 5. 在重新开放写 admission 前，为本 session pin 每个 flow 的 `stable_next_lsn`；
-6. 所有 flow 的 fence 和 pin 都已安装后立即重新开放 master admission，不等待 target 换根；
-7. 发送 `FULLSYNC_CUT(stable_next_lsn)`；
-8. target 等所有 flow cut 到齐，drain storage writes，持久发布 DB epochs，删除临时 sync state；
-9. control connection 收到所有 flow ready 后发布 `ONLINE`，随后从 stable cursor 消费 backlog。
+6. 所有 flow 停止该 session 的 full-sync capture 并经过 owner-local barrier；
+7. barrier 完成后立即重新开放 master admission，不等待任何网络 ACK；此后的写只进入已 pin 的
+   ONLINE backlog，不再填充已排空的 full-sync queue；
+8. 发送 `FULLSYNC_CUT(stable_next_lsn)`；
+9. target 等所有 flow cut 到齐，drain storage writes，持久发布 DB epochs，删除临时 sync state；
+10. control connection 收到所有 flow ready 后发布 `ONLINE`，随后从 stable cursor 消费 backlog。
 
 因此慢 replica 不会在最终网络追平阶段长时间阻塞 master 事务。Fence 后的新写位于稳定 cursor
 之后，等 cut 完成后通过普通 ONLINE backlog 发送。Full sync 不保留从扫描开始的 backlog
@@ -312,7 +325,9 @@ ONLINE 稳态事务使用事务 envelope。共同 participant 上必须有一致
 
 Full sync 隐藏期间不发送 pre-cut transaction envelope。事务只在 commit decision 为
 `Publish` 后，才把每个 participant 的最终 after-image/tombstone 登记到对应 session；abort
-participant 不发送。Target 可以逐 participant apply，因为 LOADING root 对客户端不可见。
+participant 不发送。对于已经有 baseline 或进入 `TAILING` 的 key，这个 after-image 是与普通
+command 同 FIFO 的 record item；对于尚无 base 的 key，它仍是 coalesced replacement。Target
+可以逐 participant apply，因为 LOADING root 对客户端不可见。
 
 事务身份仍用于 final cut 完整性：cut 必须等待 cut 前所有 committed participant 全部发送并
 ACK，不能让一笔事务一半进入 full-sync queue、一半落到 stable cursor 以后。Gates 重新开放后

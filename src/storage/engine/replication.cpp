@@ -31,6 +31,108 @@ struct StorageEngine::Impl::SnapshotReadJoin {
   }
 };
 
+Task<absl::Status> StorageEngine::Impl::PinFullSyncExtents(
+    ExtentManifest extents) {
+  if (extents == nullptr) {
+    co_return absl::InvalidArgumentError("full-sync value has no extents");
+  }
+  std::size_t pinned = 0;
+  for (const ExtentRef& ref : *extents) {
+    const unsigned owner = BlockOwner(ref.block_id_);
+    if (owner >= worker_count_) break;
+    auto pin = [this, owner, ref]() -> Task<absl::Status> {
+      WorkerStore& extent_store = *stores_[owner];
+      co_await extent_store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&extent_store.store_state_mutex_,
+                         extent_store.worker_);
+      BlockState* state = FindBlockState(extent_store, ref.block_id_);
+      if (state == nullptr || !state->allocated_ || state->freeing_ ||
+          state->kind_ != BlockKind::kPayloadExtent ||
+          state->allocation_epoch_ != ref.allocation_epoch_) {
+        co_return absl::AbortedError("stale full-sync value extent");
+      }
+      ++state->pins_;
+      co_return absl::OkStatus();
+    };
+    absl::Status status = owner == celer::ThisWorker().id_
+                              ? co_await pin()
+                              : co_await celer::SubmitTaskTo(owner, pin);
+    if (!status.ok()) break;
+    ++pinned;
+  }
+  if (pinned == extents->size()) co_return absl::OkStatus();
+  auto partial = std::make_shared<std::vector<ExtentRef>>(
+      extents->begin(), extents->begin() + pinned);
+  (void)co_await ReleaseFullSyncExtents(
+      std::shared_ptr<const std::vector<ExtentRef>>(std::move(partial)));
+  co_return absl::AbortedError("failed to pin full-sync value extents");
+}
+
+Task<absl::Status> StorageEngine::Impl::ReleaseFullSyncExtents(
+    ExtentManifest extents) {
+  if (extents == nullptr) co_return absl::OkStatus();
+  for (const ExtentRef& ref : *extents) {
+    const unsigned owner = BlockOwner(ref.block_id_);
+    if (owner >= worker_count_) continue;
+    auto release = [this, owner, ref]() -> Task<absl::Status> {
+      WorkerStore& extent_store = *stores_[owner];
+      co_await extent_store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&extent_store.store_state_mutex_,
+                         extent_store.worker_);
+      BlockState* state = FindBlockState(extent_store, ref.block_id_);
+      if (state != nullptr && state->allocated_ &&
+          state->allocation_epoch_ == ref.allocation_epoch_ &&
+          state->pins_ != 0) {
+        --state->pins_;
+      }
+      co_return absl::OkStatus();
+    };
+    absl::Status status = owner == celer::ThisWorker().id_
+                              ? co_await release()
+                              : co_await celer::SubmitTaskTo(owner, release);
+    if (!status.ok()) co_return status;
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::PartitionStore& partition, RecordLocation location,
+    ExtentManifest extents, std::size_t key_bytes) {
+  if (!location.external_ || extents == nullptr) {
+    co_return absl::InvalidArgumentError(
+        "only external full-sync values can be pinned");
+  }
+  std::uint64_t extent_bytes = 0;
+  for (const ExtentRef& ref : *extents) {
+    if (ref.payload_bytes_ > kMaxRecordPayloadBytes - extent_bytes) {
+      co_return absl::InternalError("invalid full-sync extent manifest");
+    }
+    extent_bytes += ref.payload_bytes_;
+  }
+  const std::size_t key_prefix = location.key_external_ ? key_bytes : 0;
+  if (extent_bytes < key_prefix) {
+    co_return absl::InternalError("full-sync extent manifest is truncated");
+  }
+  absl::Status pinned = co_await PinFullSyncExtents(extents);
+  if (!pinned.ok()) co_return pinned;
+  auto capture = partition.fullsync_subscribers_.find(session_id);
+  if (capture == partition.fullsync_subscribers_.end() ||
+      capture->second.next_pinned_value_id_ == 0) {
+    store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
+    co_return absl::FailedPreconditionError(
+        "full-sync capture ended while pinning value");
+  }
+  const std::uint64_t id = capture->second.next_pinned_value_id_++;
+  capture->second.pinned_values_.emplace(
+      id, WorkerStore::FullSyncCapture::PinnedValue{
+              .extents_ = std::move(extents),
+              .key_bytes_ = key_prefix,
+              .value_bytes_ = extent_bytes - key_prefix,
+          });
+  co_return id;
+}
+
 Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     RecordIndex& index, std::uint8_t db_id, const std::string* key,
@@ -65,27 +167,60 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
         if (IsExpired(location, UnixTimeMillis())) {
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else {
-          auto loaded =
-              co_await LoadValue(store, partition, db_id, *key, digest,
-                                 location, ExtentsFor(store, current));
-          if (!loaded.ok()) {
-            if (loaded.status().code() != absl::StatusCode::kNotFound) {
-              status = loaded.status();
+          const ExtentManifest extents = ExtentsFor(store, current);
+          std::uint64_t value_bytes = location.logical_size_;
+          if (location.external_) {
+            value_bytes = 0;
+            for (const ExtentRef& ref : *extents) {
+              value_bytes += ref.payload_bytes_;
+            }
+            if (location.key_external_) {
+              value_bytes -= std::min<std::uint64_t>(value_bytes, key->size());
+            }
+          }
+          if (location.external_ && value_bytes > kReplicationTransferBytes) {
+            auto source_id = co_await PinFullSyncValue(
+                store, session_id, partition, location, extents, key->size());
+            if (!source_id.ok()) {
+              status = source_id.status();
+            } else {
+              output->emplace(SnapshotRecord{
+                  .kind_ = SnapshotRecord::Kind::kValue,
+                  .db_id_ = db_id,
+                  .db_epoch_ = DbEpoch(db_id),
+                  .mutation_sequence_ = baseline_version,
+                  .expire_at_ms_ = location.expire_at_ms_,
+                  .value_type_ = location.value_type_,
+                  .logical_size_ = location.logical_size_,
+                  .source_id_ = *source_id,
+                  .source_value_bytes_ = value_bytes,
+                  .key_ = *key,
+                  .value_ = {},
+              });
             }
           } else {
-            const std::span<const std::byte> value = loaded->value();
-            output->emplace(SnapshotRecord{
-                .kind_ = SnapshotRecord::Kind::kValue,
-                .db_id_ = db_id,
-                .db_epoch_ = DbEpoch(db_id),
-                .mutation_sequence_ = baseline_version,
-                .expire_at_ms_ = location.expire_at_ms_,
-                .value_type_ = location.value_type_,
-                .logical_size_ = location.logical_size_,
-                .key_ = *key,
-                .value_ = std::string(
-                    reinterpret_cast<const char*>(value.data()), value.size()),
-            });
+            auto loaded = co_await LoadValue(store, partition, db_id, *key,
+                                             digest, location, extents);
+            if (!loaded.ok()) {
+              if (loaded.status().code() != absl::StatusCode::kNotFound) {
+                status = loaded.status();
+              }
+            } else {
+              const std::span<const std::byte> value = loaded->value();
+              output->emplace(SnapshotRecord{
+                  .kind_ = SnapshotRecord::Kind::kValue,
+                  .db_id_ = db_id,
+                  .db_epoch_ = DbEpoch(db_id),
+                  .mutation_sequence_ = baseline_version,
+                  .expire_at_ms_ = location.expire_at_ms_,
+                  .value_type_ = location.value_type_,
+                  .logical_size_ = location.logical_size_,
+                  .key_ = *key,
+                  .value_ =
+                      std::string(reinterpret_cast<const char*>(value.data()),
+                                  value.size()),
+              });
+            }
           }
         }
       }
@@ -95,6 +230,11 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
       if (capture == partition.fullsync_subscribers_.end() ||
           capture->second.phase_ !=
               WorkerStore::FullSyncCapture::Phase::kCapturing) {
+        if ((*output)->source_id_ != 0 &&
+            capture != partition.fullsync_subscribers_.end()) {
+          ReleaseFullSyncValue(session_id, partition.id_,
+                               (*output)->source_id_);
+        }
         output->reset();
       } else {
         capture->second.key_phases_.InsertOrAssign(
@@ -114,7 +254,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
 Task<absl::StatusOr<SnapshotRecord>>
 StorageEngine::Impl::ReadFullSyncOverrideRecord(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
-    const SnapshotRecord& requested) {
+    std::uint64_t session_id, const SnapshotRecord& requested) {
   const Digest digest = ComputeDigest(requested.key_);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       requested.db_id_, tx::FingerprintOf(digest), tx::LockMode::kShared);
@@ -142,9 +282,38 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   }
 
   const RecordLocation location = current->value_;
-  auto loaded =
-      co_await LoadValue(store, partition, requested.db_id_, requested.key_,
-                         digest, location, ExtentsFor(store, current));
+  const ExtentManifest extents = ExtentsFor(store, current);
+  std::uint64_t value_bytes = location.logical_size_;
+  if (location.external_) {
+    value_bytes = 0;
+    for (const ExtentRef& ref : *extents) value_bytes += ref.payload_bytes_;
+    if (location.key_external_) {
+      value_bytes -=
+          std::min<std::uint64_t>(value_bytes, requested.key_.size());
+    }
+  }
+  if (location.external_ && value_bytes > kReplicationTransferBytes) {
+    auto source_id = co_await PinFullSyncValue(
+        store, session_id, partition, location, extents, requested.key_.size());
+    if (!source_id.ok()) co_return source_id.status();
+    key_lock.Reset();
+    co_return SnapshotRecord{
+        .kind_ = SnapshotRecord::Kind::kValue,
+        .db_id_ = requested.db_id_,
+        .db_epoch_ = DbEpoch(requested.db_id_),
+        .mutation_sequence_ =
+            std::max(requested.mutation_sequence_, location.mutation_sequence_),
+        .expire_at_ms_ = location.expire_at_ms_,
+        .value_type_ = location.value_type_,
+        .logical_size_ = location.logical_size_,
+        .source_id_ = *source_id,
+        .source_value_bytes_ = value_bytes,
+        .key_ = requested.key_,
+        .value_ = {},
+    };
+  }
+  auto loaded = co_await LoadValue(store, partition, requested.db_id_,
+                                   requested.key_, digest, location, extents);
   if (!loaded.ok()) co_return loaded.status();
   const std::span<const std::byte> value = loaded->value();
   SnapshotRecord result{
@@ -182,6 +351,11 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
           : count * 10;
   std::size_t iterations = 0;
   std::size_t bytes = 0;
+  auto add_bytes = [&bytes](std::size_t value) {
+    bytes = value > std::numeric_limits<std::size_t>::max() - bytes
+                ? std::numeric_limits<std::size_t>::max()
+                : bytes + value;
+  };
   do {
     struct ExternalCandidate {
       const RecordIndex::Entry* entry_ = nullptr;
@@ -196,9 +370,27 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
           if (entry.value_.kind_ == RecordKind::kValue &&
               !IsExpired(entry.value_, now_ms)) {
             if (entry.key_complete()) [[likely]] {
-              bytes += entry.key().size();
+              add_bytes(entry.key().size());
               result.keys_.emplace_back(entry.key());
               result.value_types_.push_back(entry.value_.value_type_);
+              std::size_t value_bytes = entry.value_.logical_size_;
+              if (entry.value_.value_type_ != ValueType::kString) {
+                value_bytes = entry.value_.total_disk_bytes_;
+              }
+              if (entry.value_.external_) {
+                value_bytes = 0;
+                const ExtentManifest extents =
+                    ExtentsFor(CurrentStore(), &entry);
+                for (const ExtentRef& ref : *extents) {
+                  value_bytes += ref.payload_bytes_;
+                }
+                value_bytes -=
+                    std::min(value_bytes, entry.value_.key_external_
+                                              ? entry.logical_key_size()
+                                              : std::size_t{0});
+              }
+              result.value_bytes_.push_back(value_bytes);
+              add_bytes(value_bytes);
             } else [[unlikely]] {
               external.push_back(ExternalCandidate{
                   .entry_ = &entry,
@@ -224,9 +416,18 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
       if (current->value_.SamePhysicalRecord(candidate.location_) &&
           current->value_.kind_ == RecordKind::kValue &&
           !IsExpired(current->value_, now_ms)) {
-        bytes += key->size();
+        add_bytes(key->size());
         result.keys_.push_back(std::move(*key));
         result.value_types_.push_back(current->value_.value_type_);
+        std::size_t value_bytes = 0;
+        for (const ExtentRef& ref : *candidate.extents_) {
+          value_bytes += ref.payload_bytes_;
+        }
+        value_bytes -= std::min<std::size_t>(
+            value_bytes,
+            current->value_.key_external_ ? candidate.key_bytes_ : 0);
+        result.value_bytes_.push_back(value_bytes);
+        add_bytes(value_bytes);
       }
     }
     ++iterations;
@@ -412,8 +613,15 @@ void StorageEngine::Impl::EndPartitionReplication(std::uint64_t session_id,
   auto& partition = PartitionFor(store, partition_id);
   auto capture = partition.fullsync_subscribers_.find(session_id);
   if (capture == partition.fullsync_subscribers_.end()) return;
+  auto session = store.fullsync_sessions_.find(session_id);
+  if (session != store.fullsync_sessions_.end()) {
+    session->second.publish_queue_bytes_ -=
+        std::min(session->second.publish_queue_bytes_,
+                 capture->second.replacement_credit_bytes_);
+  }
   ClearFullSyncCapture(store, capture->second);
   partition.fullsync_subscribers_.erase(capture);
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
 Task<absl::StatusOr<PartitionSnapshotBatch>>
@@ -421,22 +629,22 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
                                        std::uint16_t partition_id,
                                        std::uint8_t db_id, std::uint64_t cursor,
                                        std::size_t count,
-                                       std::size_t read_concurrency) {
-  if (db_id >= kLogicalDatabaseCount || count == 0 || read_concurrency == 0) {
+                                       std::size_t read_concurrency,
+                                       std::size_t max_bytes) {
+  if (db_id >= kLogicalDatabaseCount || count == 0 || read_concurrency == 0 ||
+      max_bytes == 0) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid partition snapshot request");
   }
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   const auto session = store.fullsync_sessions_.find(session_id);
-  const auto capture = partition.fullsync_subscribers_.find(session_id);
+  auto capture = partition.fullsync_subscribers_.find(session_id);
   if (session == store.fullsync_sessions_.end() ||
       session->second.db_epoch_invalidated_ ||
       capture == partition.fullsync_subscribers_.end() ||
       capture->second.phase_ !=
           WorkerStore::FullSyncCapture::Phase::kCapturing ||
-      capture->second.db_phases_[db_id] !=
-          WorkerStore::FullSyncCapture::DbPhase::kScanning ||
       capture->second.db_phases_[db_id] !=
           WorkerStore::FullSyncCapture::DbPhase::kScanning) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -445,13 +653,64 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
   const std::uint64_t baseline_version = capture->second.baseline_version_;
   auto& index = partition.indexes_[db_id];
   const std::uint64_t now_ms = UnixTimeMillis();
-  auto scanned = co_await ScanPartition(partition_id, db_id, cursor, count,
-                                        now_ms, SIZE_MAX);
-  if (!scanned.ok()) {
-    co_return scanned.status();
+  if (capture->second.pending_snapshot_keys_.empty()) {
+    auto scanned = co_await ScanPartition(partition_id, db_id, cursor, count,
+                                          now_ms, max_bytes);
+    if (!scanned.ok()) {
+      co_return scanned.status();
+    }
+    capture = partition.fullsync_subscribers_.find(session_id);
+    if (capture == partition.fullsync_subscribers_.end()) {
+      co_return absl::FailedPreconditionError(
+          "full-sync partition capture ended during scan");
+    }
+    assert(scanned->keys_.size() == scanned->value_types_.size());
+    assert(scanned->keys_.size() == scanned->value_bytes_.size());
+    for (std::size_t i = 0; i < scanned->keys_.size(); ++i) {
+      capture->second.pending_snapshot_keys_.push_back(
+          WorkerStore::FullSyncCapture::PendingSnapshotKey{
+              .key_ = std::move(scanned->keys_[i]),
+              .value_type_ = scanned->value_types_[i],
+              .value_bytes_ = scanned->value_bytes_[i],
+          });
+    }
+    capture->second.pending_snapshot_cursor_ = scanned->cursor_;
   }
-  std::vector<std::string> keys = std::move(scanned->keys_);
-  const std::uint64_t next = scanned->cursor_;
+
+  std::vector<std::string> keys;
+  keys.reserve(std::min(count, capture->second.pending_snapshot_keys_.size()));
+  std::size_t selected_bytes = 0;
+  while (!capture->second.pending_snapshot_keys_.empty() &&
+         keys.size() < count) {
+    const auto& pending = capture->second.pending_snapshot_keys_.front();
+    constexpr std::size_t kRecordMetadataBytes = 128;
+    std::size_t record_bytes = pending.value_bytes_;
+    record_bytes = record_bytes > std::numeric_limits<std::size_t>::max() -
+                                      pending.key_.size()
+                       ? std::numeric_limits<std::size_t>::max()
+                       : record_bytes + pending.key_.size();
+    record_bytes = record_bytes > std::numeric_limits<std::size_t>::max() -
+                                      kRecordMetadataBytes
+                       ? std::numeric_limits<std::size_t>::max()
+                       : record_bytes + kRecordMetadataBytes;
+    if (!keys.empty() && (selected_bytes >= max_bytes ||
+                          record_bytes > max_bytes - selected_bytes)) {
+      break;
+    }
+    selected_bytes =
+        record_bytes > std::numeric_limits<std::size_t>::max() - selected_bytes
+            ? std::numeric_limits<std::size_t>::max()
+            : selected_bytes + record_bytes;
+    keys.push_back(
+        std::move(capture->second.pending_snapshot_keys_.front().key_));
+    capture->second.pending_snapshot_keys_.pop_front();
+  }
+  const bool has_pending = !capture->second.pending_snapshot_keys_.empty();
+  const std::uint64_t next =
+      has_pending && capture->second.pending_snapshot_cursor_ == 0
+          ? std::numeric_limits<std::uint64_t>::max()
+          : capture->second.pending_snapshot_cursor_;
+  if (!has_pending) capture->second.pending_snapshot_cursor_ = 0;
 
   PartitionSnapshotBatch batch;
   batch.cursor_ = next;
@@ -488,7 +747,8 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
 Task<absl::StatusOr<PartitionFullSyncBatch>>
 StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
                                                     std::uint16_t partition_id,
-                                                    std::size_t count) {
+                                                    std::size_t count,
+                                                    std::size_t max_bytes) {
   WorkerStore& store = CurrentStore();
   auto& partition = PartitionFor(store, partition_id);
   const auto session = store.fullsync_sessions_.find(session_id);
@@ -500,21 +760,167 @@ StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
         "full-sync partition capture is not active");
   }
   PartitionFullSyncBatch batch;
-  if (count == 0) co_return batch;
+  if (count == 0 || max_bytes == 0) co_return batch;
   std::vector<SnapshotRecord> requested;
   requested.reserve(std::min(count, capture->second.overrides_.size()));
+  std::size_t requested_bytes = 0;
   for (const auto& [sequence, record] : capture->second.overrides_) {
     (void)sequence;
+    constexpr std::size_t kRecordMetadataBytes = 128;
+    const bool predictable = record.kind_ == SnapshotRecord::Kind::kDelete ||
+                             record.value_type_ == ValueType::kString;
+    std::size_t estimated =
+        record.key_.size() >
+                std::numeric_limits<std::size_t>::max() - kRecordMetadataBytes
+            ? std::numeric_limits<std::size_t>::max()
+            : kRecordMetadataBytes + record.key_.size();
+    if (record.kind_ == SnapshotRecord::Kind::kValue) {
+      estimated = record.logical_size_ >
+                          std::numeric_limits<std::size_t>::max() - estimated
+                      ? std::numeric_limits<std::size_t>::max()
+                      : estimated + record.logical_size_;
+    }
+    if (!requested.empty() && (!predictable || requested_bytes >= max_bytes ||
+                               estimated > max_bytes - requested_bytes)) {
+      break;
+    }
     requested.push_back(record);
+    requested_bytes =
+        estimated > std::numeric_limits<std::size_t>::max() - requested_bytes
+            ? std::numeric_limits<std::size_t>::max()
+            : requested_bytes + estimated;
     if (requested.size() == count) break;
+    // Collection logical_size is cardinality, not encoded bytes. Keep such a
+    // value exclusive because its materialized size cannot be predicted from
+    // replacement metadata.
+    if (!predictable) break;
   }
   batch.records_.reserve(requested.size());
+  std::size_t batch_bytes = 0;
   for (const SnapshotRecord& record : requested) {
-    auto loaded = co_await ReadFullSyncOverrideRecord(store, partition, record);
+    auto loaded = co_await ReadFullSyncOverrideRecord(store, partition,
+                                                      session_id, record);
     if (!loaded.ok()) co_return loaded.status();
+    constexpr std::size_t kRecordMetadataBytes = 128;
+    std::size_t record_bytes = loaded->key_.size();
+    record_bytes =
+        loaded->value_.size() >
+                std::numeric_limits<std::size_t>::max() - record_bytes
+            ? std::numeric_limits<std::size_t>::max()
+            : record_bytes + loaded->value_.size();
+    record_bytes = record_bytes > std::numeric_limits<std::size_t>::max() -
+                                      kRecordMetadataBytes
+                       ? std::numeric_limits<std::size_t>::max()
+                       : record_bytes + kRecordMetadataBytes;
+    if (!batch.records_.empty() &&
+        (batch_bytes >= max_bytes || record_bytes > max_bytes - batch_bytes)) {
+      ReleaseFullSyncValue(session_id, partition_id, loaded->source_id_);
+      break;
+    }
+    batch_bytes =
+        record_bytes > std::numeric_limits<std::size_t>::max() - batch_bytes
+            ? std::numeric_limits<std::size_t>::max()
+            : batch_bytes + record_bytes;
     batch.records_.push_back(std::move(*loaded));
   }
   co_return batch;
+}
+
+Task<absl::StatusOr<SnapshotRecord>>
+StorageEngine::Impl::MaterializeFullSyncPublishRecord(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    const SnapshotRecord& requested) {
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  const auto session = store.fullsync_sessions_.find(session_id);
+  const auto capture = partition.fullsync_subscribers_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_ ||
+      capture == partition.fullsync_subscribers_.end()) {
+    co_return absl::FailedPreconditionError(
+        "full-sync publish session is not active");
+  }
+  co_return co_await ReadFullSyncOverrideRecord(store, partition, session_id,
+                                                requested);
+}
+
+Task<absl::StatusOr<std::string>> StorageEngine::Impl::ReadFullSyncValueChunk(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t source_id, std::uint64_t offset, std::size_t max_bytes) {
+  if (source_id == 0 || max_bytes == 0) {
+    co_return absl::InvalidArgumentError("invalid full-sync value chunk");
+  }
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  auto capture = partition.fullsync_subscribers_.find(session_id);
+  if (capture == partition.fullsync_subscribers_.end()) {
+    co_return absl::FailedPreconditionError(
+        "full-sync value capture is not active");
+  }
+  auto pinned = capture->second.pinned_values_.find(source_id);
+  if (pinned == capture->second.pinned_values_.end() ||
+      offset >= pinned->second.value_bytes_) {
+    co_return absl::OutOfRangeError("full-sync value chunk is out of range");
+  }
+  const ExtentManifest extents = pinned->second.extents_;
+  const std::size_t key_bytes = pinned->second.key_bytes_;
+  const std::size_t count = static_cast<std::size_t>(
+      std::min<std::uint64_t>(max_bytes, pinned->second.value_bytes_ - offset));
+  std::string result(count, '\0');
+  std::uint64_t absolute = key_bytes + offset;
+  std::size_t written = 0;
+  std::uint64_t extent_start = 0;
+  for (std::size_t index = 0; index < extents->size() && written < count;
+       ++index) {
+    const ExtentRef ref = extents->at(index);
+    const std::uint64_t extent_end = extent_start + ref.payload_bytes_;
+    if (absolute >= extent_end) {
+      extent_start = extent_end;
+      continue;
+    }
+    const std::size_t source_offset = static_cast<std::size_t>(
+        absolute > extent_start ? absolute - extent_start : 0);
+    const std::size_t slice = std::min<std::size_t>(
+        count - written, ref.payload_bytes_ - source_offset);
+    const unsigned owner = BlockOwner(ref.block_id_);
+    if (owner >= worker_count_) {
+      co_return absl::InternalError("full-sync extent owner is invalid");
+    }
+    auto read = [this, owner, ref, index, source_offset,
+                 destination =
+                     reinterpret_cast<std::byte*>(result.data()) + written,
+                 slice]() -> Task<absl::Status> {
+      co_return co_await ReadExtentSlice(
+          *stores_[owner], ref, static_cast<std::uint32_t>(index),
+          source_offset, std::span(destination, slice));
+    };
+    absl::Status status = owner == store.worker_->id()
+                              ? co_await read()
+                              : co_await celer::SubmitTaskTo(owner, read);
+    if (!status.ok()) co_return status;
+    written += slice;
+    absolute += slice;
+    extent_start = extent_end;
+  }
+  if (written != count) {
+    co_return absl::InternalError("full-sync value manifest is truncated");
+  }
+  co_return result;
+}
+
+void StorageEngine::Impl::ReleaseFullSyncValue(std::uint64_t session_id,
+                                               std::uint16_t partition_id,
+                                               std::uint64_t source_id) {
+  if (source_id == 0) return;
+  WorkerStore& store = CurrentStore();
+  auto& partition = PartitionFor(store, partition_id);
+  auto capture = partition.fullsync_subscribers_.find(session_id);
+  if (capture == partition.fullsync_subscribers_.end()) return;
+  auto pinned = capture->second.pinned_values_.find(source_id);
+  if (pinned == capture->second.pinned_values_.end()) return;
+  ExtentManifest extents = std::move(pinned->second.extents_);
+  capture->second.pinned_values_.erase(pinned);
+  store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
 }
 
 void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
@@ -530,6 +936,7 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
     return;
   }
   for (const SnapshotRecord& acknowledged : records) {
+    ReleaseFullSyncValue(session_id, partition_id, acknowledged.source_id_);
     const std::string key =
         FullSyncOverrideKey(acknowledged.db_id_, acknowledged.key_);
     auto latest = capture->second.latest_by_key_.find(key);
@@ -539,8 +946,19 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
     }
     auto current = capture->second.overrides_.find(latest->second);
     if (current == capture->second.overrides_.end()) continue;
+    std::size_t credit = kFullSyncReplacementMetadataBytes;
+    if (acknowledged.key_.size() <=
+        (std::numeric_limits<std::size_t>::max() - credit) / 2) {
+      credit += acknowledged.key_.size() * 2;
+    } else {
+      credit = capture->second.replacement_credit_bytes_;
+    }
     capture->second.latest_by_key_.erase(latest);
     capture->second.overrides_.erase(current);
+    capture->second.replacement_credit_bytes_ -=
+        std::min(capture->second.replacement_credit_bytes_, credit);
+    session->second.publish_queue_bytes_ -=
+        std::min(session->second.publish_queue_bytes_, credit);
     if (capture->second.phase_ ==
             WorkerStore::FullSyncCapture::Phase::kCapturing &&
         capture->second.db_phases_[acknowledged.db_id_] ==
@@ -558,6 +976,7 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
     capture->second.latest_by_key_.clear();
     capture->second.latest_by_key_.rehash(0);
   }
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
 void StorageEngine::Impl::AcknowledgePartitionSnapshotRecords(
@@ -572,6 +991,7 @@ void StorageEngine::Impl::AcknowledgePartitionSnapshotRecords(
     return;
   }
   for (const SnapshotRecord& record : records) {
+    ReleaseFullSyncValue(session_id, partition_id, record.source_id_);
     const std::string& key = record.key_;
     const Digest digest = ComputeDigest(key);
     auto* phase = capture->second.key_phases_.Find(digest, key);
@@ -644,6 +1064,8 @@ absl::Status StorageEngine::Impl::CompletePartitionDbReplication(
   capture->second.db_phases_[db_id] =
       WorkerStore::FullSyncCapture::DbPhase::kTailing;
   capture->second.key_phases_.Clear();
+  capture->second.pending_snapshot_keys_.clear();
+  capture->second.pending_snapshot_cursor_ = 0;
   return absl::OkStatus();
 }
 
@@ -665,8 +1087,9 @@ StorageEngine::Impl::PeekFullSyncPublishItems(std::uint64_t session_id,
   result.reserve(std::min(max_items, session->second.publish_queue_.size()));
   for (const auto& pending : session->second.publish_queue_) {
     if (result.size() == max_items) break;
-    result.push_back(
-        FullSyncPublishItem{.id_ = pending.id_, .command_ = pending.command_});
+    result.push_back(FullSyncPublishItem{.id_ = pending.id_,
+                                         .command_ = pending.command_,
+                                         .record_ = pending.record_});
   }
   return result;
 }
