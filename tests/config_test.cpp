@@ -193,6 +193,31 @@ TEST(RedisConfigTest, RejectsLoadRdbWithReplicaOf) {
   EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
+TEST(RedisConfigTest, ParsesPermanentRedisPsyncFollower) {
+  ServerOptions options;
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"redis-replicaof", "redis.local", "6380"}, &options)
+                  .ok());
+  ASSERT_TRUE(options.redis_replicaof_.has_value());
+  EXPECT_EQ(options.redis_replicaof_->host_, "redis.local");
+  EXPECT_EQ(options.redis_replicaof_->port_, 6380);
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+
+  options.replication_options_.replica_read_only_ = false;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, RejectsConflictingRedisPsyncSources) {
+  ServerOptions options;
+  options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
+  options.redis_replicaof_ = keylane::ReplicaOfConfig{"redis.local", 6380};
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+
+  options.replicaof_.reset();
+  options.load_rdb_file_ = "/backup/dump.rdb";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+}
+
 TEST(RedisConfigTest, RejectsLoadRdbReplaceWithoutSource) {
   ServerOptions options;
   options.load_rdb_replace_ = true;

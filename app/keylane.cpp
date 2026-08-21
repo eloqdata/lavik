@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "keylane/CLI11.hpp"
 #include "keylane/config.h"
@@ -60,6 +61,7 @@ int main(int argc, char** argv) {
       static_cast<unsigned>(options.storage_read_buffer_bytes_ / 1024ULL);
   unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
+  std::vector<std::string> redis_replicaof_cli;
 
   app.add_option("config", config_file,
                  "Redis-style configuration file (must be the first argument)");
@@ -93,6 +95,9 @@ int main(int argc, char** argv) {
       ->capture_default_str();
   app.add_option("--masterauth", options.masterauth_,
                  "Password used to authenticate to the replication source");
+  app.add_option("--redis-replicaof", redis_replicaof_cli,
+                 "Permanently follow a standalone Redis server: HOST PORT")
+      ->expected(2);
   app.add_option("--metrics-port", options.metrics_port_,
                  "Prometheus HTTP listen port (0 disables)")
       ->capture_default_str()
@@ -222,6 +227,15 @@ int main(int argc, char** argv) {
     std::cerr << "Configuration error: the configuration file must be the "
                  "first argument\n";
     return 2;
+  }
+  if (!redis_replicaof_cli.empty()) {
+    const absl::Status configured = keylane::ApplyRedisConfigDirective(
+        {"redis-replicaof", redis_replicaof_cli[0], redis_replicaof_cli[1]},
+        &options);
+    if (!configured.ok()) {
+      std::cerr << "Configuration error: " << configured.message() << '\n';
+      return 2;
+    }
   }
   const absl::Status validated = keylane::ValidateServerOptions(options);
   if (!validated.ok()) {

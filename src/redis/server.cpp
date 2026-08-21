@@ -1219,7 +1219,8 @@ int RunServer(ServerOptions options) {
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
-  storage_options.expiration_authority_ = !options.replicaof_.has_value();
+  storage_options.expiration_authority_ =
+      !options.replicaof_.has_value() && !options.redis_replicaof_.has_value();
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
   storage_options.tomb_raider_sleep_ms_ = options.tomb_raider_sleep_ms_;
   storage_options.defrag_max_active_per_device_ =
@@ -1249,9 +1250,14 @@ int RunServer(ServerOptions options) {
   options.replication_options_.masterauth_ = options.masterauth_;
   options.replication_options_.publish_queue_bytes_per_worker_ =
       options.replication_publish_queue_bytes_;
+  options.replication_options_.redis_psync_ =
+      options.redis_replicaof_.has_value();
+  std::optional<ReplicaOfConfig> replication_upstream =
+      options.redis_replicaof_.has_value() ? std::move(options.redis_replicaof_)
+                                           : std::move(options.replicaof_);
   ReplicationManager replication(&storage,
                                  std::move(options.replication_options_),
-                                 std::move(options.replicaof_));
+                                 std::move(replication_upstream));
   InitStorage(&storage, &replication);
   InitWorkerMetrics(options.thread_count_);
   SetServerInfo(std::move(advertised_bind), advertised_port,

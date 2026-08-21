@@ -443,4 +443,12 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
 // applies their ordered effects atomically on the replica.
 Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command);
 
+// Replays Redis's ordinary single-connection replication stream. Redis emits
+// raw FLUSH commands and groups MULTI/EXEC commands without Keylane's native
+// epoch/envelope metadata, so these need a distinct trusted apply path.
+Task<absl::Status> ApplyRedisReplicatedCommand(
+    const ReplicatedCommand& command);
+Task<absl::Status> ApplyRedisReplicatedTransaction(
+    std::span<const ReplicatedCommand> commands);
+
 }  // namespace keylane

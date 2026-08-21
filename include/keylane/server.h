@@ -60,6 +60,9 @@ struct ServerOptions {
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
   std::optional<ReplicaOfConfig> replicaof_;
+  // Permanently follows a standalone Redis server using PSYNC. Unlike the
+  // native Keylane replicaof mode, this node cannot be promoted at runtime.
+  std::optional<ReplicaOfConfig> redis_replicaof_;
   ReplicationOptions replication_options_;
 };
 

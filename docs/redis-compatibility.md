@@ -72,6 +72,30 @@ formats, databases above 15, malformed records, and unknown object types whose
 boundaries cannot be determined safely are rejected. Expired keys are
 validated but not inserted.
 
+## Standalone Redis PSYNC follower
+
+`--redis-replicaof <host> <port>` (or `redis-replicaof <host> <port>` in the
+configuration file) makes Keylane a permanent read-only follower of one
+standalone Redis server. This mode is separate from Keylane's native
+`replicaof` protocol. It performs the Redis `PSYNC` handshake, imports a
+length-delimited FULLRESYNC RDB, and then applies the single RESP replication
+stream directly to storage. `SELECT`, keepalive `PING`, `REPLCONF GETACK`, and
+`MULTI`/`EXEC` streams are handled explicitly.
+
+Transient reconnects retain the Redis replication id and applied byte offset
+in memory and request partial resynchronization. The cursor is deliberately
+not recovered after a Keylane process restart, because it is not yet committed
+atomically with storage writes; a restart therefore requests a new FULLRESYNC.
+The node continues serving its last complete dataset read-only while retrying
+a transient connection. If Redis requires another FULLRESYNC, reads return
+`LOADING` while the replacement RDB is validated and imported.
+
+This mode cannot be promoted with `REPLICAOF NO ONE`, cannot change upstream at
+runtime, and does not accept downstream Keylane replication sessions. RDB
+Module and Function records have the same skip-and-warn behavior as startup
+import. Incremental commands that Keylane cannot replay stop the session and
+force a retry instead of silently diverging.
+
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
 scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s
 fixed-versus-scientific notation and unpadded exponent spelling.

@@ -228,16 +228,20 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->thread_count_, false);
   }
-  if (name == "replicaof") {
+  if (name == "replicaof" || name == "redis-replicaof") {
     if (directive.size() != 3) return WrongArgumentCount(name);
     if (directive[1].empty()) {
       return absl::InvalidArgumentError("replicaof host must not be empty");
     }
     std::uint16_t port = 0;
     absl::Status parsed =
-        ParseUnsigned(directive[2], "replicaof port", &port, false);
+        ParseUnsigned(directive[2], absl::StrCat(name, " port"), &port, false);
     if (!parsed.ok()) return parsed;
-    options->replicaof_ = ReplicaOfConfig{directive[1], port};
+    if (name == "replicaof") {
+      options->replicaof_ = ReplicaOfConfig{directive[1], port};
+    } else {
+      options->redis_replicaof_ = ReplicaOfConfig{directive[1], port};
+    }
     return absl::OkStatus();
   }
   if (name == "replica-read-only") {
@@ -352,6 +356,19 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (!options.load_rdb_file_.empty() && options.replicaof_.has_value()) {
     return absl::InvalidArgumentError(
         "load-rdb and replicaof cannot be configured together");
+  }
+  if (!options.load_rdb_file_.empty() && options.redis_replicaof_.has_value()) {
+    return absl::InvalidArgumentError(
+        "load-rdb and redis-replicaof cannot be configured together");
+  }
+  if (options.replicaof_.has_value() && options.redis_replicaof_.has_value()) {
+    return absl::InvalidArgumentError(
+        "replicaof and redis-replicaof cannot be configured together");
+  }
+  if (options.redis_replicaof_.has_value() &&
+      !options.replication_options_.replica_read_only_) {
+    return absl::InvalidArgumentError(
+        "redis-replicaof is permanently read-only");
   }
   if (options.load_rdb_replace_ && options.load_rdb_file_.empty()) {
     return absl::InvalidArgumentError(

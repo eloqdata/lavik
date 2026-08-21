@@ -38,7 +38,9 @@
 #include "keylane/command.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
+#include "keylane/rdb.h"
 #include "keylane/replication_command.h"
+#include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 #include "spdlog/spdlog.h"
 
@@ -421,6 +423,203 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
   }
   co_return absl::ResourceExhaustedError(
       "replication handshake line exceeds 64 KiB");
+}
+
+class TemporaryRedisRdb {
+ public:
+  TemporaryRedisRdb() = default;
+  TemporaryRedisRdb(int fd, std::string path)
+      : fd_(fd), path_(std::move(path)) {}
+  TemporaryRedisRdb(const TemporaryRedisRdb&) = delete;
+  TemporaryRedisRdb& operator=(const TemporaryRedisRdb&) = delete;
+  TemporaryRedisRdb(TemporaryRedisRdb&& other) noexcept
+      : fd_(std::exchange(other.fd_, -1)), path_(std::move(other.path_)) {}
+  TemporaryRedisRdb& operator=(TemporaryRedisRdb&& other) noexcept {
+    if (this == &other) return *this;
+    Reset();
+    fd_ = std::exchange(other.fd_, -1);
+    path_ = std::move(other.path_);
+    return *this;
+  }
+  ~TemporaryRedisRdb() { Reset(); }
+
+  int fd() const noexcept { return fd_; }
+  const std::string& path() const noexcept { return path_; }
+  std::string ReleasePath() noexcept { return std::exchange(path_, {}); }
+  absl::Status Close() {
+    if (fd_ < 0) return absl::OkStatus();
+    const int fd = std::exchange(fd_, -1);
+    if (::close(fd) == 0) return absl::OkStatus();
+    return absl::InternalError(absl::StrCat(
+        "failed to close temporary Redis RDB: ", std::strerror(errno)));
+  }
+
+ private:
+  void Reset() noexcept {
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+    if (!path_.empty()) ::unlink(path_.c_str());
+    path_.clear();
+  }
+
+  int fd_ = -1;
+  std::string path_;
+};
+
+absl::Status WriteFileAll(int fd, std::span<const std::byte> bytes) {
+  while (!bytes.empty()) {
+    const ssize_t written = ::write(fd, bytes.data(), bytes.size());
+    if (written < 0) {
+      if (errno == EINTR) continue;
+      return absl::InternalError(absl::StrCat(
+          "failed to write temporary Redis RDB: ", std::strerror(errno)));
+    }
+    if (written == 0) {
+      return absl::InternalError("short write to temporary Redis RDB");
+    }
+    bytes = bytes.subspan(static_cast<std::size_t>(written));
+  }
+  return absl::OkStatus();
+}
+
+Task<absl::StatusOr<std::string>> ReceiveRedisRdb(TcpStream& stream) {
+  auto header = co_await ReadLine(stream);
+  if (!header.ok()) co_return header.status();
+  if (header->empty() || header->front() != '$' ||
+      header->starts_with("$EOF:")) {
+    co_return absl::InvalidArgumentError(absl::StrCat(
+        "Redis PSYNC did not provide a length-delimited RDB: ", *header));
+  }
+  std::uint64_t length = 0;
+  if (!ParseUnsigned(std::string_view(*header).substr(1), &length) ||
+      length == 0 || length > std::numeric_limits<std::size_t>::max()) {
+    co_return absl::InvalidArgumentError("invalid Redis RDB bulk length");
+  }
+
+  std::array<char, 64> path_template{};
+  constexpr std::string_view prefix = "/tmp/keylane-redis-rdb-XXXXXX";
+  std::copy(prefix.begin(), prefix.end(), path_template.begin());
+  const int fd = ::mkstemp(path_template.data());
+  if (fd < 0) {
+    co_return absl::InternalError(absl::StrCat(
+        "cannot create temporary Redis RDB: ", std::strerror(errno)));
+  }
+  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  TemporaryRedisRdb file(fd, path_template.data());
+
+  std::array<std::byte, 256 * 1024> buffer{};
+  std::uint64_t remaining = length;
+  while (remaining != 0) {
+    const std::size_t wanted = static_cast<std::size_t>(
+        std::min<std::uint64_t>(remaining, buffer.size()));
+    auto read =
+        co_await stream.ReadSome(std::span<std::byte>(buffer).first(wanted));
+    if (!read.ok()) co_return read.status();
+    if (*read == 0) {
+      co_return absl::UnavailableError(
+          "Redis closed connection during RDB transfer");
+    }
+    absl::Status written = WriteFileAll(
+        file.fd(), std::span<const std::byte>(buffer).first(*read));
+    if (!written.ok()) co_return written;
+    remaining -= *read;
+  }
+  // Redis replication uses a bulk-style length header but does not append the
+  // RESP bulk string CRLF after the RDB payload. The next byte is already the
+  // first byte of the incremental command stream.
+  absl::Status closed = file.Close();
+  if (!closed.ok()) co_return closed;
+  co_return file.ReleasePath();
+}
+
+struct RedisWireCommand {
+  RespCommand command_;
+  std::uint64_t bytes_ = 0;
+};
+
+class RedisCommandStream {
+ public:
+  explicit RedisCommandStream(TcpStream* stream) : stream_(stream) {}
+
+  Task<absl::StatusOr<RedisWireCommand>> Next() {
+    constexpr std::size_t kMaxPendingBytes = 1ULL * 1024 * 1024 * 1024;
+    std::uint64_t prefix_bytes = 0;
+    std::array<std::byte, 64 * 1024> input{};
+    while (true) {
+      RespParseResult parsed = ParseRespCommand(pending_);
+      if (parsed.state_ == RespParseState::kOk) {
+        RedisWireCommand result{.command_ = std::move(parsed.command_),
+                                .bytes_ = prefix_bytes + parsed.consumed_};
+        pending_.erase(0, parsed.consumed_);
+        co_return result;
+      }
+      if (parsed.state_ == RespParseState::kError) {
+        co_return parsed.status_;
+      }
+      if (parsed.consumed_ != 0) {
+        prefix_bytes += parsed.consumed_;
+        pending_.erase(0, parsed.consumed_);
+      }
+      if (pending_.size() >= kMaxPendingBytes) {
+        co_return absl::ResourceExhaustedError(
+            "Redis replication command exceeds 1 GiB");
+      }
+      const std::size_t wanted =
+          std::min(input.size(), kMaxPendingBytes - pending_.size());
+      auto read =
+          co_await stream_->ReadSome(std::span<std::byte>(input).first(wanted));
+      if (!read.ok()) co_return read.status();
+      if (*read == 0) {
+        co_return absl::UnavailableError("Redis replication connection closed");
+      }
+      pending_.append(reinterpret_cast<const char*>(input.data()), *read);
+    }
+  }
+
+ private:
+  TcpStream* stream_;
+  std::string pending_;
+};
+
+struct RedisPsyncReply {
+  bool full_ = false;
+  std::optional<std::string> replid_;
+  std::uint64_t offset_ = 0;
+};
+
+bool IsReplicationId(std::string_view value);
+
+absl::StatusOr<RedisPsyncReply> ParseRedisPsyncReply(std::string_view line) {
+  const std::vector<std::string_view> words = SplitWords(line);
+  if (words.empty()) {
+    return absl::InvalidArgumentError("empty Redis PSYNC response");
+  }
+  if (words[0] == "+FULLRESYNC") {
+    RedisPsyncReply reply;
+    reply.full_ = true;
+    if (words.size() != 3 || !IsReplicationId(words[1]) ||
+        !ParseUnsigned(words[2], &reply.offset_)) {
+      return absl::InvalidArgumentError(
+          "invalid FULLRESYNC response from Redis");
+    }
+    reply.replid_ = std::string(words[1]);
+    return reply;
+  }
+  if (words[0] == "+CONTINUE") {
+    RedisPsyncReply reply;
+    if (words.size() == 2) {
+      if (!IsReplicationId(words[1])) {
+        return absl::InvalidArgumentError(
+            "invalid replid in Redis CONTINUE response");
+      }
+      reply.replid_ = std::string(words[1]);
+    } else if (words.size() != 1) {
+      return absl::InvalidArgumentError("invalid CONTINUE response from Redis");
+    }
+    return reply;
+  }
+  return absl::FailedPreconditionError(
+      absl::StrCat("Redis PSYNC failed: ", line));
 }
 
 Task<absl::Status> AuthenticateUpstream(TcpStream& stream,
@@ -1056,7 +1255,8 @@ class ReplicationManager::Impl {
         listen_port_(options.listen_port_),
         tls_context_(options.use_tls_ ? options.tls_context_ : nullptr),
         masteruser_(options.masteruser_),
-        masterauth_(options.masterauth_) {
+        masterauth_(options.masterauth_),
+        redis_psync_(options.redis_psync_) {
     const std::size_t minimum_blocks = storage_->worker_count();
     const std::size_t configured_blocks =
         options.backlog_size_bytes_ / storage::kStorageBlockBytes;
@@ -1085,6 +1285,10 @@ class ReplicationManager::Impl {
           0, [this, upstream = std::move(upstream)]() mutable {
             return SetUpstream(std::move(upstream));
           });
+    }
+    if (redis_psync_) {
+      co_return absl::FailedPreconditionError(
+          "redis-replicaof is permanent and cannot be changed at runtime");
     }
     if (upstream.has_value() &&
         (upstream->host_.empty() || upstream->port_ == 0)) {
@@ -1326,6 +1530,10 @@ class ReplicationManager::Impl {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls) {
+    if (redis_psync_) {
+      co_return absl::FailedPreconditionError(
+          "a redis-replicaof follower cannot serve downstream replicas");
+    }
     // Accepted Redis sockets are normally optimized for batched replies, but
     // replication is an ACK-driven stream whose frame header and payload are
     // written separately. Without TCP_NODELAY on the source endpoint, Nagle
@@ -1443,11 +1651,16 @@ class ReplicationManager::Impl {
         session = std::make_shared<ReplicaSession>();
         active_replica_session_ = session;
       }
-      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
+      role_.store(redis_psync_ && redis_dataset_valid_
+                      ? ReplicationRole::kOnline
+                      : ReplicationRole::kConnecting,
+                  std::memory_order_release);
       absl::Status connected =
-          co_await RunReplicaSession(upstream, role_epoch, session);
+          redis_psync_
+              ? co_await RunRedisReplicaSession(upstream, role_epoch, session)
+              : co_await RunReplicaSession(upstream, role_epoch, session);
       session->Cancel();
-      if (session->session_id_ != 0) {
+      if (!redis_psync_ && session->session_id_ != 0) {
         absl::Status discarded =
             co_await storage_->AbortReplicaRoot(session->session_id_);
         if (!discarded.ok()) {
@@ -1468,7 +1681,10 @@ class ReplicationManager::Impl {
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch;
       }
       if (!retry) continue;
-      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
+      role_.store(redis_psync_ && redis_dataset_valid_
+                      ? ReplicationRole::kOnline
+                      : ReplicationRole::kConnecting,
+                  std::memory_order_release);
       spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
                    upstream.port_, connected.message());
       absl::Status slept =
@@ -1480,6 +1696,342 @@ class ReplicationManager::Impl {
     }
     coordinator_started_ = false;
     co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> ImportRedisRdb(const std::string& path) {
+    auto reader = rdb::FileReader::Open(path);
+    if (!reader.ok()) co_return reader.status();
+
+    std::uint64_t entries = 0;
+    std::uint64_t skipped = 0;
+    while (true) {
+      auto next = reader->Next();
+      if (!next.ok()) co_return next.status();
+      if (!next->has_value()) break;
+      if ((**next).kind_ == rdb::FileEntryKind::kValue) {
+        ++entries;
+      } else {
+        ++skipped;
+      }
+    }
+    reader->Rewind();
+
+    while (!CloseAllCommandDbGates()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    struct CommandGateGuard {
+      ~CommandGateGuard() { OpenAllCommandDbGates(); }
+    } command_gate_guard;
+    while (CommandDbOperationsActive()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+
+    absl::Status cleared = co_await storage_->FlushAllDetach();
+    if (!cleared.ok()) co_return cleared;
+
+    std::uint64_t imported = 0;
+    std::uint64_t expired = 0;
+    while (true) {
+      auto next = reader->Next();
+      if (!next.ok()) {
+        (void)co_await storage_->FlushAllDetach();
+        co_return next.status();
+      }
+      if (!next->has_value()) break;
+      rdb::FileEntry entry = std::move(**next);
+      if (entry.kind_ != rdb::FileEntryKind::kValue) {
+        if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
+          spdlog::warn(
+              "Redis PSYNC skipped unsupported Module value db={} "
+              "key-bytes={}",
+              entry.db_id_, entry.key_.size());
+        } else if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleAux) {
+          spdlog::warn("Redis PSYNC skipped unsupported Module auxiliary data");
+        } else {
+          spdlog::warn("Redis PSYNC skipped unsupported Function library data");
+        }
+        continue;
+      }
+      const unsigned owner = storage_->OwnerForKey(entry.key_);
+      auto apply = [this, entry = std::move(entry)]() mutable
+          -> Task<absl::StatusOr<storage::RestoreRawResult>> {
+        co_return co_await storage_->RestoreRawValue(
+            entry.db_id_, entry.key_, entry.value_, /*replace=*/false, nullptr);
+      };
+      absl::StatusOr<storage::RestoreRawResult> result;
+      if (owner == celer::ThisWorker().id_) {
+        result = co_await apply();
+      } else {
+        result = co_await celer::SubmitTaskTo(owner, std::move(apply));
+      }
+      if (!result.ok() || result->busy_) {
+        const absl::Status failure =
+            result.ok() ? absl::AlreadyExistsError("duplicate key in Redis RDB")
+                        : result.status();
+        absl::Status discarded = co_await storage_->FlushAllDetach();
+        if (!discarded.ok()) {
+          co_return absl::InternalError(absl::StrCat(
+              "Redis RDB import failed: ", failure.message(),
+              "; failed to discard partial import: ", discarded.message()));
+        }
+        co_return failure;
+      }
+      if (result->changed_) {
+        ++imported;
+      } else {
+        ++expired;
+      }
+    }
+    spdlog::info(
+        "Redis PSYNC loaded RDB version={} entries={} imported={} expired={} "
+        "unsupported-skipped={}",
+        reader->version(), entries, imported, expired, skipped);
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> ExpectRedisReply(TcpStream& stream,
+                                      std::vector<std::string> command,
+                                      std::string_view expected) {
+    const std::string encoded = EncodeRespCommand(command);
+    absl::Status sent = co_await WriteText(stream, encoded);
+    if (!sent.ok()) co_return sent;
+    auto reply = co_await ReadLine(stream);
+    if (!reply.ok()) co_return reply.status();
+    if (*reply != expected) {
+      co_return absl::FailedPreconditionError(
+          absl::StrCat("Redis replication handshake failed: ", *reply));
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> SendRedisAck(TcpStream& stream) {
+    const std::vector<std::string> command{"REPLCONF", "ACK",
+                                           absl::StrCat(redis_offset_)};
+    const std::string encoded = EncodeRespCommand(command);
+    co_return co_await WriteText(stream, encoded);
+  }
+
+  Task<absl::Status> ConsumeRedisCommandStream(TcpStream& stream) {
+    RedisCommandStream commands(&stream);
+    std::uint8_t db_id = 0;
+    bool in_multi = false;
+    std::uint64_t transaction_bytes = 0;
+    std::vector<ReplicatedCommand> transaction;
+    while (true) {
+      auto wire = co_await commands.Next();
+      if (!wire.ok()) co_return wire.status();
+      if (wire->command_.args_.empty()) {
+        co_return absl::InvalidArgumentError(
+            "empty command in Redis replication stream");
+      }
+      const std::string name = wire->command_.args_.front();
+      if (EqualCaseInsensitive(name, "SELECT")) {
+        unsigned selected = 0;
+        if (in_multi || wire->command_.args_.size() != 2 ||
+            !ParseUnsigned(wire->command_.args_[1], &selected) ||
+            selected >= storage::kLogicalDatabaseCount) {
+          co_return absl::InvalidArgumentError(
+              "invalid SELECT in Redis replication stream");
+        }
+        db_id = static_cast<std::uint8_t>(selected);
+        redis_offset_ += wire->bytes_;
+        continue;
+      }
+      if (EqualCaseInsensitive(name, "PING")) {
+        if (in_multi) {
+          co_return absl::InvalidArgumentError(
+              "PING inside Redis replicated transaction");
+        }
+        redis_offset_ += wire->bytes_;
+        absl::Status acked = co_await SendRedisAck(stream);
+        if (!acked.ok()) co_return acked;
+        continue;
+      }
+      if (EqualCaseInsensitive(name, "REPLCONF")) {
+        if (in_multi || wire->command_.args_.size() != 3 ||
+            !EqualCaseInsensitive(wire->command_.args_[1], "GETACK")) {
+          co_return absl::InvalidArgumentError(
+              "unsupported REPLCONF in Redis replication stream");
+        }
+        redis_offset_ += wire->bytes_;
+        absl::Status acked = co_await SendRedisAck(stream);
+        if (!acked.ok()) co_return acked;
+        continue;
+      }
+      if (EqualCaseInsensitive(name, "MULTI")) {
+        if (in_multi || wire->command_.args_.size() != 1) {
+          co_return absl::InvalidArgumentError(
+              "invalid MULTI in Redis replication stream");
+        }
+        in_multi = true;
+        transaction.clear();
+        transaction_bytes = wire->bytes_;
+        continue;
+      }
+      if (EqualCaseInsensitive(name, "EXEC")) {
+        if (!in_multi || wire->command_.args_.size() != 1) {
+          co_return absl::InvalidArgumentError(
+              "EXEC without MULTI in Redis replication stream");
+        }
+        transaction_bytes += wire->bytes_;
+        absl::Status applied =
+            co_await ApplyRedisReplicatedTransaction(transaction);
+        if (!applied.ok()) co_return applied;
+        redis_offset_ += transaction_bytes;
+        transaction.clear();
+        transaction_bytes = 0;
+        in_multi = false;
+        continue;
+      }
+      ReplicatedCommand command{.db_id_ = db_id,
+                                .args_ = std::move(wire->command_.args_)};
+      if (in_multi) {
+        transaction_bytes += wire->bytes_;
+        transaction.push_back(std::move(command));
+        continue;
+      }
+      absl::Status applied = co_await ApplyRedisReplicatedCommand(command);
+      if (!applied.ok()) {
+        co_return absl::Status(applied.code(),
+                               absl::StrCat("failed to apply Redis command '",
+                                            name, "': ", applied.message()));
+      }
+      redis_offset_ += wire->bytes_;
+    }
+  }
+
+  Task<absl::StatusOr<RedisPsyncReply>> StartRedisPsync(TcpStream& stream) {
+    absl::Status status =
+        co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+    if (!status.ok()) co_return status;
+    {
+      std::vector<std::string> command{"PING"};
+      status = co_await ExpectRedisReply(stream, std::move(command), "+PONG");
+      if (!status.ok()) co_return status;
+    }
+    {
+      std::vector<std::string> command{"REPLCONF", "listening-port",
+                                       absl::StrCat(listen_port_)};
+      status = co_await ExpectRedisReply(stream, std::move(command), "+OK");
+      if (!status.ok()) co_return status;
+    }
+    // Do not advertise the EOF capability: length-delimited RDB transfer lets
+    // us consume exactly the snapshot bytes without scanning for a delimiter.
+    {
+      std::vector<std::string> command{"REPLCONF", "capa", "psync2"};
+      status = co_await ExpectRedisReply(stream, std::move(command), "+OK");
+      if (!status.ok()) co_return status;
+    }
+
+    const bool can_continue = redis_dataset_valid_ && redis_replid_.has_value();
+    std::vector<std::string> command;
+    command.reserve(3);
+    command.emplace_back("PSYNC");
+    if (can_continue) {
+      command.push_back(*redis_replid_);
+      command.push_back(absl::StrCat(redis_offset_));
+    } else {
+      command.emplace_back("?");
+      command.emplace_back("-1");
+    }
+    const std::string encoded = EncodeRespCommand(command);
+    status = co_await WriteText(stream, encoded);
+    if (!status.ok()) co_return status;
+    auto response = co_await ReadLine(stream);
+    if (!response.ok()) co_return response.status();
+    auto parsed = ParseRedisPsyncReply(*response);
+    if (!parsed.ok()) co_return parsed.status();
+    co_return std::move(*parsed);
+  }
+
+  Task<absl::Status> RedisFollowerOnline(const ReplicaOfConfig& upstream,
+                                         std::uint64_t role_epoch,
+                                         TcpStream& stream) {
+    if (role_epoch_.load(std::memory_order_acquire) != role_epoch) {
+      co_return absl::CancelledError("replication role epoch was replaced");
+    }
+    role_.store(ReplicationRole::kOnline, std::memory_order_release);
+    absl::Status status = co_await SendRedisAck(stream);
+    if (!status.ok()) co_return status;
+    spdlog::info("Redis PSYNC follower online with {}:{}", upstream.host_,
+                 upstream.port_);
+    co_return co_await ConsumeRedisCommandStream(stream);
+  }
+
+  Task<absl::Status> CompleteRedisFullSync(const ReplicaOfConfig& upstream,
+                                           std::uint64_t role_epoch,
+                                           TcpStream& stream,
+                                           std::string replid,
+                                           std::uint64_t offset) {
+    role_.store(ReplicationRole::kSyncing, std::memory_order_release);
+    redis_dataset_valid_ = false;
+    auto rdb_path = co_await ReceiveRedisRdb(stream);
+    if (!rdb_path.ok()) co_return rdb_path.status();
+    absl::Status status = co_await ImportRedisRdb(*rdb_path);
+    (void)::unlink(rdb_path->c_str());
+    if (!status.ok()) co_return status;
+    redis_replid_ = std::move(replid);
+    redis_offset_ = offset;
+    redis_dataset_valid_ = true;
+    {
+      std::lock_guard lock(state_mutex_);
+      upstream_node_id_ = redis_replid_;
+      upstream_history_id_ = redis_replid_;
+      source_worker_count_ = 1;
+    }
+    spdlog::info("Redis FULLRESYNC completed from {}:{} at offset {}",
+                 upstream.host_, upstream.port_, redis_offset_);
+    co_return co_await RedisFollowerOnline(upstream, role_epoch, stream);
+  }
+
+  Task<absl::Status> RunRedisReplicaSession(
+      const ReplicaOfConfig& upstream, std::uint64_t role_epoch,
+      const std::shared_ptr<ReplicaSession>& session) {
+    auto connected =
+        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    if (!connected.ok()) co_return connected.status();
+    TcpStream stream = std::move(*connected);
+    const int fd = stream.NativeFd();
+    if (!session->sockets_.Add(fd)) {
+      stream.Close().IgnoreError();
+      co_return absl::CancelledError("replication session was cancelled");
+    }
+    session->connected_flows_.store(1, std::memory_order_release);
+    ReplicationConnectionMetricGuard connection_metric(
+        ReplicationConnectionKind::kControl);
+    absl::Status result =
+        co_await RunRedisConnectedSession(upstream, role_epoch, stream);
+    session->connected_flows_.store(0, std::memory_order_release);
+    session->sockets_.Remove(fd);
+    stream.Close().IgnoreError();
+    co_return result;
+  }
+
+  Task<absl::Status> RunRedisConnectedSession(const ReplicaOfConfig& upstream,
+                                              std::uint64_t role_epoch,
+                                              TcpStream& stream) {
+    auto reply = co_await StartRedisPsync(stream);
+    if (!reply.ok()) co_return reply.status();
+
+    if (reply->full_) {
+      co_return co_await CompleteRedisFullSync(upstream, role_epoch, stream,
+                                               std::move(*reply->replid_),
+                                               reply->offset_);
+    }
+    if (!redis_dataset_valid_ || !redis_replid_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "Redis accepted partial sync without a valid local dataset");
+    }
+    if (reply->replid_.has_value()) {
+      redis_replid_ = std::move(reply->replid_);
+    }
+    spdlog::info("Redis partial resynchronization continued from offset {}",
+                 redis_offset_);
+    co_return co_await RedisFollowerOnline(upstream, role_epoch, stream);
   }
 
   Task<absl::Status> RunReplicaSession(
@@ -3554,6 +4106,14 @@ class ReplicationManager::Impl {
   const std::shared_ptr<celer::TlsContext> tls_context_;
   const std::string masteruser_;
   const std::string masterauth_;
+  const bool redis_psync_;
+  // Redis's offset is retained across transient reconnects, enabling PSYNC
+  // partial resynchronization. It is intentionally not persisted yet: after a
+  // process restart we request a fresh RDB because storage and cursor updates
+  // do not share one crash-atomic commit record.
+  bool redis_dataset_valid_ = false;         // worker 0 only
+  std::optional<std::string> redis_replid_;  // worker 0 only
+  std::uint64_t redis_offset_ = 0;           // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   mutable std::mutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
@@ -3633,7 +4193,7 @@ bool ReplicationManager::is_loading() const noexcept {
 }
 
 bool ReplicationManager::reject_writes() const noexcept {
-  return options_.replica_read_only_ && is_replica();
+  return options_.redis_psync_ || (options_.replica_read_only_ && is_replica());
 }
 
 std::string_view ReplicationRoleName(ReplicationRole role) noexcept {

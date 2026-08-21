@@ -425,6 +425,7 @@ CommandReply BuildClusterSlotsReply(const ReplicationStatus& replication,
 std::optional<std::string> ReplicaMovedError(const ConnectionContext& ctx,
                                              const CommandRequest& request) {
   if (g_replication == nullptr || !g_replication->is_replica() ||
+      !g_replication->redirects_clients_to_upstream() ||
       request.spec_ == nullptr || (request.spec_->flags_ & kCmdNoKeys) != 0) {
     return std::nullopt;
   }
@@ -7470,6 +7471,92 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
   if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            std::string(reply.encoded_));
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> ApplyRedisReplicatedCommand(
+    const ReplicatedCommand& command) {
+  if (command.args_.empty()) {
+    co_return absl::InvalidArgumentError("empty Redis replication command");
+  }
+  RespCommand wire{.args_ = command.args_};
+  auto request = BuildCommandRequest(std::move(wire), command.db_id_);
+  if (!request.ok()) co_return request.status();
+  request->replication_origin_ = true;
+
+  bool replayable = false;
+  if (request->spec_ != nullptr && (request->spec_->flags_ & kCmdWrite) != 0 &&
+      (request->spec_->flags_ & kCmdMayBlock) == 0) {
+    if (request->kind_ == CommandKind::kFlushDb ||
+        request->kind_ == CommandKind::kFlushAll) {
+      replayable = true;
+    } else if ((request->spec_->flags_ & kCmdGlobal) == 0) {
+      auto keys = DetermineKeys(*request->spec_, request->args_);
+      replayable = keys.ok() && keys->count() != 0;
+    }
+  }
+  if (!replayable) {
+    co_return absl::InvalidArgumentError(
+        "Redis replication command is not a replayable write");
+  }
+
+  ReplyBuilder reply_builder;
+  CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
+  if (reply.disk_value_.has_value() || reply.chunks_) {
+    co_return absl::InternalError(
+        "Redis replication write produced a streamed reply");
+  }
+  if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
+    co_return absl::FailedPreconditionError(std::string(reply.encoded_));
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> ApplyRedisReplicatedTransaction(
+    std::span<const ReplicatedCommand> commands) {
+  if (commands.empty()) co_return absl::OkStatus();
+  ConnectionContext context;
+  context.strict_replication_apply_ = true;
+  context.queued_.reserve(commands.size());
+  for (const ReplicatedCommand& command : commands) {
+    if (command.args_.empty() ||
+        command.db_id_ >= storage::kLogicalDatabaseCount) {
+      co_return absl::InvalidArgumentError(
+          "malformed Redis replicated transaction command");
+    }
+    RespCommand wire{.args_ = command.args_};
+    auto request = BuildCommandRequest(std::move(wire), command.db_id_);
+    if (!request.ok()) co_return request.status();
+    if (request->spec_ == nullptr ||
+        (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) != 0 ||
+        (request->spec_->flags_ & kCmdWrite) == 0 ||
+        request->kind_ == CommandKind::kMulti ||
+        request->kind_ == CommandKind::kExec ||
+        request->kind_ == CommandKind::kDiscard ||
+        request->kind_ == CommandKind::kWatch ||
+        request->kind_ == CommandKind::kUnwatch ||
+        request->kind_ == CommandKind::kSelect) {
+      co_return absl::InvalidArgumentError(
+          "unsupported command in Redis replicated transaction");
+    }
+    auto keys = DetermineKeys(*request->spec_, request->args_);
+    if (!keys.ok() || keys->count() == 0) {
+      co_return absl::InvalidArgumentError(
+          "Redis transaction command has no replayable key");
+    }
+    request->replication_origin_ = true;
+    context.queued_.push_back(std::move(*request));
+  }
+
+  ReplyBuilder reply_builder;
+  CommandReply reply = co_await ExecuteExec(context, reply_builder);
+  if (reply.disk_value_.has_value() || reply.chunks_) {
+    co_return absl::InternalError(
+        "Redis replicated transaction produced a streamed reply");
+  }
+  if (!reply.encoded_.empty() && reply.encoded_.front() == '-') {
+    co_return absl::FailedPreconditionError(std::string(reply.encoded_));
   }
   co_return absl::OkStatus();
 }
