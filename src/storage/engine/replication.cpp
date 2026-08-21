@@ -802,18 +802,21 @@ StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
                                                       session_id, record);
     if (!loaded.ok()) co_return loaded.status();
     constexpr std::size_t kRecordMetadataBytes = 128;
+    const bool streamed = loaded->source_id_ != 0;
+    const std::uint64_t effective_value_bytes =
+        streamed ? loaded->source_value_bytes_ : loaded->value_.size();
     std::size_t record_bytes = loaded->key_.size();
     record_bytes =
-        loaded->value_.size() >
+        effective_value_bytes >
                 std::numeric_limits<std::size_t>::max() - record_bytes
             ? std::numeric_limits<std::size_t>::max()
-            : record_bytes + loaded->value_.size();
+            : record_bytes + static_cast<std::size_t>(effective_value_bytes);
     record_bytes = record_bytes > std::numeric_limits<std::size_t>::max() -
                                       kRecordMetadataBytes
                        ? std::numeric_limits<std::size_t>::max()
                        : record_bytes + kRecordMetadataBytes;
-    if (!batch.records_.empty() &&
-        (batch_bytes >= max_bytes || record_bytes > max_bytes - batch_bytes)) {
+    if (!batch.records_.empty() && (streamed || batch_bytes >= max_bytes ||
+                                    record_bytes > max_bytes - batch_bytes)) {
       ReleaseFullSyncValue(session_id, partition_id, loaded->source_id_);
       break;
     }
@@ -822,6 +825,10 @@ StorageEngine::Impl::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
             ? std::numeric_limits<std::size_t>::max()
             : batch_bytes + record_bytes;
     batch.records_.push_back(std::move(*loaded));
+    // A streamed record owns the flow's single large-value staging slot until
+    // it is sent and ACKed. Do not materialize (and pin) another record in the
+    // same batch, even if its stale replacement metadata looked small.
+    if (streamed) break;
   }
   co_return batch;
 }

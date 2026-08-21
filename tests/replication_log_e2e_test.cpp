@@ -670,6 +670,75 @@ class ReplicationLogService final : public celer::Service {
     storage_->EndPartitionReplication(kDiskBackedOverrideSession, partition_id);
     storage_->EndFullSyncSession(kDiskBackedOverrideSession);
 
+    constexpr std::uint64_t kReplacementRaceSession = 305;
+    const std::string race_first = "fullsync-race-a{materialize-race}";
+    const std::string race_second = "fullsync-race-b{materialize-race}";
+    const std::uint16_t race_partition =
+        keylane::storage::RedisSlot(race_first);
+    Check(keylane::storage::RedisSlot(race_second) == race_partition,
+          "replacement race keys do not share a partition");
+    auto race_session = storage_->BeginFullSyncSession(kReplacementRaceSession);
+    if (!race_session.ok()) co_return race_session.status();
+    auto race_start = storage_->BeginPartitionReplication(
+        kReplacementRaceSession, race_partition);
+    if (!race_start.ok()) co_return race_start.status();
+    absl::Status race_db = storage_->BeginPartitionDbReplication(
+        kReplacementRaceSession, race_partition, kDb);
+    if (!race_db.ok()) co_return race_db;
+    auto race_first_small = co_await storage_->Set(kDb, race_first, "a", {});
+    if (!race_first_small.ok()) co_return race_first_small.status();
+    auto race_second_small = co_await storage_->Set(kDb, race_second, "b", {});
+    if (!race_second_small.ok()) co_return race_second_small.status();
+
+    auto race_lock = co_await keylane::tx::CurrentTxShard().AcquireKey(
+        kDb,
+        keylane::tx::FingerprintOf(keylane::storage::ComputeDigest(race_first)),
+        keylane::tx::LockMode::kExclusive);
+    bool race_read_finished = false;
+    absl::Status race_read_status = absl::UnknownError("not started");
+    std::optional<PartitionFullSyncBatch> race_batch;
+    auto read_racing_batch = [&]() -> celer::Task<absl::Status> {
+      auto read = co_await storage_->ReadPartitionFullSyncOverrides(
+          kReplacementRaceSession, race_partition, 16,
+          keylane::storage::kReplicationTransferBytes);
+      if (read.ok()) race_batch.emplace(std::move(*read));
+      race_read_status = read.status();
+      race_read_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(read_racing_batch());
+    for (unsigned spin = 0; spin < 32; ++spin) {
+      co_await celer::Yield(*worker_);
+    }
+    Check(!race_read_finished,
+          "replacement race reader did not wait on the first key");
+    auto race_second_large = co_await storage_->Set(
+        kDb, race_second, std::string(10 * kMiB, 'r'), {});
+    if (!race_second_large.ok()) co_return race_second_large.status();
+    race_lock.Reset();
+    while (!race_read_finished) co_await celer::Yield(*worker_);
+    if (!race_read_status.ok()) co_return race_read_status;
+    Check(race_batch.has_value() && race_batch->records_.size() == 1 &&
+              race_batch->records_.front().key_ == race_first &&
+              race_batch->records_.front().source_id_ == 0,
+          "replacement materialization retained a raced large-value pin in a "
+          "non-exclusive batch");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, race_batch->records_);
+    auto raced_large = co_await storage_->ReadPartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, 16,
+        keylane::storage::kReplicationTransferBytes);
+    if (!raced_large.ok()) co_return raced_large.status();
+    Check(raced_large->records_.size() == 1 &&
+              raced_large->records_.front().key_ == race_second &&
+              raced_large->records_.front().source_id_ != 0 &&
+              raced_large->records_.front().source_value_bytes_ == 10 * kMiB,
+          "raced large replacement was not deferred to an exclusive batch");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, raced_large->records_);
+    storage_->EndPartitionReplication(kReplacementRaceSession, race_partition);
+    storage_->EndFullSyncSession(kReplacementRaceSession);
+
     constexpr std::uint64_t kEpochSession = 304;
     auto epoch_session = storage_->BeginFullSyncSession(kEpochSession);
     if (!epoch_session.ok()) co_return epoch_session.status();
