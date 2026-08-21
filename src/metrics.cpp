@@ -438,7 +438,23 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_replication_publish_queue_bytes gauge\n"
       "# HELP keylane_replication_publish_queue_capacity_bytes Configured "
       "publisher staging capacity.\n"
-      "# TYPE keylane_replication_publish_queue_capacity_bytes gauge\n");
+      "# TYPE keylane_replication_publish_queue_capacity_bytes gauge\n"
+      "# HELP keylane_fullsync_publish_queue_bytes Commands awaiting durable "
+      "target ACK in active full-sync sessions.\n"
+      "# TYPE keylane_fullsync_publish_queue_bytes gauge\n"
+      "# HELP keylane_fullsync_publish_queue_admitted_bytes Bytes reserved by "
+      "writes that have not finished publication.\n"
+      "# TYPE keylane_fullsync_publish_queue_admitted_bytes gauge\n"
+      "# HELP keylane_fullsync_publish_queue_capacity_bytes Aggregate "
+      "configured capacity of active full-sync session queues.\n"
+      "# TYPE keylane_fullsync_publish_queue_capacity_bytes gauge\n"
+      "# HELP keylane_fullsync_sessions Active full-sync sessions on this "
+      "worker.\n"
+      "# TYPE keylane_fullsync_sessions gauge\n"
+      "# HELP keylane_fullsync_publish_queue_backpressure_waits_total Writes "
+      "that waited for full-sync queue credit.\n"
+      "# TYPE keylane_fullsync_publish_queue_backpressure_waits_total "
+      "counter\n");
   for (const storage::StorageReplicationLogMetrics& log :
        storage_metrics.replication_logs_) {
     const std::string labels = absl::StrCat("worker=\"", log.worker_id_, "\"");
@@ -461,7 +477,16 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
         "keylane_replication_publish_queue_bytes{", labels, "} ",
         log.publish_queue_bytes_, "\n",
         "keylane_replication_publish_queue_capacity_bytes{", labels, "} ",
-        log.publish_queue_capacity_bytes_, "\n");
+        log.publish_queue_capacity_bytes_, "\n",
+        "keylane_fullsync_publish_queue_bytes{", labels, "} ",
+        log.fullsync_publish_queue_bytes_, "\n",
+        "keylane_fullsync_publish_queue_admitted_bytes{", labels, "} ",
+        log.fullsync_publisher_admitted_bytes_, "\n",
+        "keylane_fullsync_publish_queue_capacity_bytes{", labels, "} ",
+        log.fullsync_publish_queue_capacity_bytes_, "\n",
+        "keylane_fullsync_sessions{", labels, "} ", log.fullsync_session_count_,
+        "\n", "keylane_fullsync_publish_queue_backpressure_waits_total{",
+        labels, "} ", log.fullsync_backpressure_waits_, "\n");
   }
   for (const storage::StorageDeviceMetrics& device : storage_metrics.devices_) {
     std::string labels =

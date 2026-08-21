@@ -104,7 +104,15 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
               .publish_queue_bytes_ = log.publish_queue_bytes_,
               .publish_queue_capacity_bytes_ =
                   log.publish_queue_capacity_bytes_,
+              .fullsync_publish_queue_bytes_ =
+                  log.fullsync_publish_queue_bytes_,
+              .fullsync_publisher_admitted_bytes_ =
+                  log.fullsync_publisher_admitted_bytes_,
+              .fullsync_publish_queue_capacity_bytes_ =
+                  log.fullsync_publish_queue_capacity_bytes_,
+              .fullsync_session_count_ = log.fullsync_session_count_,
               .pinned_cursors_ = log.retained_cursor_count_,
+              .fullsync_backpressure_waits_ = log.fullsync_backpressure_waits_,
               .active_ = log.state_ == ReplicationLogState::kActive,
               .capacity_backpressured_ = log.capacity_backpressured_,
           };

@@ -277,9 +277,10 @@ absl::Status StorageEngine::CompletePartitionDbReplication(
   return impl_->CompletePartitionDbReplication(session_id, partition_id, db_id);
 }
 
-absl::StatusOr<std::optional<FullSyncPublishItem>>
-StorageEngine::PeekFullSyncPublishItem(std::uint64_t session_id) {
-  return impl_->PeekFullSyncPublishItem(session_id);
+absl::StatusOr<std::vector<FullSyncPublishItem>>
+StorageEngine::PeekFullSyncPublishItems(std::uint64_t session_id,
+                                        std::size_t max_items) {
+  return impl_->PeekFullSyncPublishItems(session_id, max_items);
 }
 
 void StorageEngine::AcknowledgeFullSyncPublishItem(std::uint64_t session_id,

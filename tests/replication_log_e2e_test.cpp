@@ -703,12 +703,27 @@ class ReplicationLogService final : public celer::Service {
     written =
         co_await ExecuteClientCommand(kDb, std::move(after_args), "+OK\r\n");
     if (!written.ok()) co_return written;
-    auto queued = storage_->PeekFullSyncPublishItem(kSession);
+    auto queued = storage_->PeekFullSyncPublishItems(kSession, 1);
     if (!queued.ok()) co_return queued.status();
-    Check(queued->has_value() && (**queued).command_ != nullptr &&
-              (**queued).command_->partition_id_ == partition_id,
+    Check(queued->size() == 1 && queued->front().command_ != nullptr &&
+              queued->front().command_->partition_id_ == partition_id,
           "covered key did not enter the full-sync publish queue");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, (**queued).id_);
+    std::vector<std::string> batched_args{"SET", key, "batched-handoff"};
+    written =
+        co_await ExecuteClientCommand(kDb, std::move(batched_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto batched = storage_->PeekFullSyncPublishItems(kSession, 2);
+    if (!batched.ok()) co_return batched.status();
+    Check(batched->size() == 2 && (*batched)[0].id_ == queued->front().id_ &&
+              (*batched)[1].id_ == (*batched)[0].id_ + 1,
+          "full-sync publish batch did not preserve FIFO item order");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, (*batched)[0].id_);
+    auto batch_tail = storage_->PeekFullSyncPublishItems(kSession, 2);
+    if (!batch_tail.ok()) co_return batch_tail.status();
+    Check(
+        batch_tail->size() == 1 && batch_tail->front().id_ == (*batched)[1].id_,
+        "full-sync publish ACK did not release exactly one FIFO item");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, batch_tail->front().id_);
 
     absl::Status queue_capacity =
         co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
@@ -718,10 +733,16 @@ class ReplicationLogService final : public celer::Service {
     written =
         co_await ExecuteClientCommand(kDb, std::move(large_args), "+OK\r\n");
     if (!written.ok()) co_return written;
-    auto large_queued = storage_->PeekFullSyncPublishItem(kSession);
+    auto large_queued = storage_->PeekFullSyncPublishItems(kSession, 1);
     if (!large_queued.ok()) co_return large_queued.status();
-    Check(large_queued->has_value(),
+    Check(large_queued->size() == 1,
           "large covered-key command did not enter full-sync queue");
+    const auto queued_info = storage_->LocalReplicationLogInfo();
+    Check(queued_info.fullsync_session_count_ == 1 &&
+              queued_info.fullsync_publish_queue_bytes_ >= 700 * 1024 &&
+              queued_info.fullsync_publish_queue_capacity_bytes_ == kMiB,
+          "full-sync queue occupancy metrics do not describe the active "
+          "session");
     std::uint16_t unstarted_partition =
         static_cast<std::uint16_t>((partition_id + storage_->worker_count()) %
                                    keylane::storage::kLogicalStorageShards);
@@ -760,9 +781,12 @@ class ReplicationLogService final : public celer::Service {
     }
     Check(!admission_finished,
           "full-sync queue capacity did not backpressure the next writer");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, (**large_queued).id_);
+    storage_->AcknowledgeFullSyncPublishItem(kSession,
+                                             large_queued->front().id_);
     while (!admission_finished) co_await celer::Yield(*worker_);
     if (!admission_status.ok()) co_return admission_status;
+    Check(storage_->LocalReplicationLogInfo().fullsync_backpressure_waits_ > 0,
+          "full-sync queue backpressure wait was not observed");
 
     // Once an oversized request reaches the head of admission it must exclude
     // later small requests. Otherwise sustained small writes can keep the
@@ -772,9 +796,9 @@ class ReplicationLogService final : public celer::Service {
     written =
         co_await ExecuteClientCommand(kDb, std::move(refill_args), "+OK\r\n");
     if (!written.ok()) co_return written;
-    auto refill = storage_->PeekFullSyncPublishItem(kSession);
+    auto refill = storage_->PeekFullSyncPublishItems(kSession, 1);
     if (!refill.ok()) co_return refill.status();
-    Check(refill->has_value(), "failed to refill full-sync publish queue");
+    Check(refill->size() == 1, "failed to refill full-sync publish queue");
 
     bool oversized_finished = false;
     bool small_finished = false;
@@ -809,7 +833,7 @@ class ReplicationLogService final : public celer::Service {
     }
     Check(!oversized_finished && !small_finished,
           "publisher waiters bypassed occupied queue capacity");
-    storage_->AcknowledgeFullSyncPublishItem(kSession, (**refill).id_);
+    storage_->AcknowledgeFullSyncPublishItem(kSession, refill->front().id_);
     while (!oversized_finished) co_await celer::Yield(*worker_);
     if (!oversized_status.ok()) co_return oversized_status;
     Check(!small_finished,

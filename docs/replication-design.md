@@ -272,7 +272,17 @@ LOADING，允许 record 和 command 按版本交错写入当前唯一 root；该
 
 未开始的 DB/partition 不进入 full-sync queue。Full sync wire frame 使用 session-local、从 1
 连续增长的 frame sequence ACK；command item id 只标识该 worker FIFO 的重发/ACK 顺序，不是
-ONLINE flow LSN。
+ONLINE flow LSN。增量 command 与 ONLINE backlog 使用相同的批量发送窗口：每批最多 2 MiB、
+128 frames，以一次 `WriteAllV` 发出。一个 command 的中间 fragment 只推进接收端 sequence，
+不产生 stop-and-wait ACK；完整 command apply 后由最后一个 fragment ACK，source 此时才按 FIFO
+释放 item 和对应 credit。断线时未完成 session 整体取消，因此不会把只有部分 fragment 的命令
+带入下一次 full sync。
+
+Prometheus 按 worker 暴露 `keylane_fullsync_publish_queue_bytes`、
+`keylane_fullsync_publish_queue_admitted_bytes`、
+`keylane_fullsync_publish_queue_capacity_bytes`、`keylane_fullsync_sessions` 和
+`keylane_fullsync_publish_queue_backpressure_waits_total`，与普通 ONLINE backlog 指标分开，避免把
+full-sync credit 等待误判为 backlog 没有反压。
 
 ## 9. 最终 cut
 

@@ -1131,6 +1131,7 @@ class StorageEngine::Impl {
     // objects themselves may be erased on disconnect, so waiters must never
     // suspend on a notification owned by one session.
     AsyncNotification fullsync_publisher_capacity_ready_;
+    std::uint64_t fullsync_publisher_capacity_waits_ = 0;
     // FIFO admission prevents an oversized command from starving while later
     // small commands continuously refill the publisher queues.
     std::uint64_t replication_publisher_next_ticket_ = 1;
@@ -1617,8 +1618,8 @@ class StorageEngine::Impl {
                                               std::uint16_t partition_id,
                                               std::uint8_t db_id);
 
-  absl::StatusOr<std::optional<FullSyncPublishItem>> PeekFullSyncPublishItem(
-      std::uint64_t session_id);
+  absl::StatusOr<std::vector<FullSyncPublishItem>> PeekFullSyncPublishItems(
+      std::uint64_t session_id, std::size_t max_items);
 
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);

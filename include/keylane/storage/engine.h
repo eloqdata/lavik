@@ -157,7 +157,12 @@ struct StorageReplicationLogMetrics {
   std::size_t capacity_bytes_ = 0;
   std::size_t publish_queue_bytes_ = 0;
   std::size_t publish_queue_capacity_bytes_ = 0;
+  std::size_t fullsync_publish_queue_bytes_ = 0;
+  std::size_t fullsync_publisher_admitted_bytes_ = 0;
+  std::size_t fullsync_publish_queue_capacity_bytes_ = 0;
+  std::size_t fullsync_session_count_ = 0;
   std::size_t pinned_cursors_ = 0;
+  std::uint64_t fullsync_backpressure_waits_ = 0;
   bool active_ = false;
   bool capacity_backpressured_ = false;
 };
@@ -284,8 +289,13 @@ struct ReplicationLogInfo {
   std::size_t capacity_bytes_ = 0;
   std::size_t publish_queue_bytes_ = 0;
   std::size_t publish_queue_capacity_bytes_ = 0;
+  std::size_t fullsync_publish_queue_bytes_ = 0;
+  std::size_t fullsync_publisher_admitted_bytes_ = 0;
+  std::size_t fullsync_publish_queue_capacity_bytes_ = 0;
+  std::size_t fullsync_session_count_ = 0;
   std::size_t retained_cursor_count_ = 0;
   std::uint64_t backpressure_waits_ = 0;
+  std::uint64_t fullsync_backpressure_waits_ = 0;
   bool capacity_backpressured_ = false;
 };
 
@@ -714,8 +724,8 @@ class StorageEngine {
   absl::Status CompletePartitionDbReplication(std::uint64_t session_id,
                                               std::uint16_t partition_id,
                                               std::uint8_t db_id);
-  absl::StatusOr<std::optional<FullSyncPublishItem>> PeekFullSyncPublishItem(
-      std::uint64_t session_id);
+  absl::StatusOr<std::vector<FullSyncPublishItem>> PeekFullSyncPublishItems(
+      std::uint64_t session_id, std::size_t max_items);
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);
   // Runtime-only source replication backlog for the current storage worker.

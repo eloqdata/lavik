@@ -192,6 +192,7 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
         "replication publisher admission ticket space exhausted");
   }
   const std::uint64_t ticket = store.replication_publisher_next_ticket_++;
+  bool recorded_fullsync_wait = false;
   for (;;) {
     if (ticket != store.replication_publisher_serving_ticket_) {
       co_await store.replication_publisher_admission_ready_.Wait();
@@ -265,6 +266,10 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
     if (!log_available) {
       co_await log.publisher_capacity_ready_.Wait();
     } else {
+      if (!recorded_fullsync_wait) {
+        ++store.fullsync_publisher_capacity_waits_;
+        recorded_fullsync_wait = true;
+      }
       co_await store.fullsync_publisher_capacity_ready_.Wait();
     }
   }
@@ -1138,7 +1143,31 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
 }
 
 ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
-  const auto& log = CurrentStore().replication_log_;
+  const WorkerStore& store = CurrentStore();
+  const auto& log = store.replication_log_;
+  std::size_t fullsync_queue_bytes = 0;
+  std::size_t fullsync_admitted_bytes = 0;
+  auto saturating_add = [](std::size_t left, std::size_t right) {
+    return right > std::numeric_limits<std::size_t>::max() - left
+               ? std::numeric_limits<std::size_t>::max()
+               : left + right;
+  };
+  for (const auto& [session_id, session] : store.fullsync_sessions_) {
+    (void)session_id;
+    fullsync_queue_bytes =
+        saturating_add(fullsync_queue_bytes, session.publish_queue_bytes_);
+    fullsync_admitted_bytes = saturating_add(fullsync_admitted_bytes,
+                                             session.publisher_admitted_bytes_);
+  }
+  const std::size_t per_session_capacity =
+      replication_publish_queue_bytes_.load(std::memory_order_acquire);
+  const std::size_t fullsync_capacity =
+      store.fullsync_sessions_.empty()
+          ? 0
+          : (per_session_capacity > std::numeric_limits<std::size_t>::max() /
+                                        store.fullsync_sessions_.size()
+                 ? std::numeric_limits<std::size_t>::max()
+                 : per_session_capacity * store.fullsync_sessions_.size());
   return ReplicationLogInfo{
       .state_ = log.state_,
       .log_epoch_ = log.log_epoch_,
@@ -1150,8 +1179,13 @@ ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
       .publish_queue_bytes_ = log.publish_queue_bytes_,
       .publish_queue_capacity_bytes_ =
           replication_publish_queue_bytes_.load(std::memory_order_acquire),
+      .fullsync_publish_queue_bytes_ = fullsync_queue_bytes,
+      .fullsync_publisher_admitted_bytes_ = fullsync_admitted_bytes,
+      .fullsync_publish_queue_capacity_bytes_ = fullsync_capacity,
+      .fullsync_session_count_ = store.fullsync_sessions_.size(),
       .retained_cursor_count_ = log.retained_lsn_by_session_.size(),
       .backpressure_waits_ = log.capacity_waits_,
+      .fullsync_backpressure_waits_ = store.fullsync_publisher_capacity_waits_,
       .capacity_backpressured_ = log.capacity_backpressured_,
   };
 }

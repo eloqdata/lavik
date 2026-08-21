@@ -647,8 +647,9 @@ absl::Status StorageEngine::Impl::CompletePartitionDbReplication(
   return absl::OkStatus();
 }
 
-absl::StatusOr<std::optional<FullSyncPublishItem>>
-StorageEngine::Impl::PeekFullSyncPublishItem(std::uint64_t session_id) {
+absl::StatusOr<std::vector<FullSyncPublishItem>>
+StorageEngine::Impl::PeekFullSyncPublishItems(std::uint64_t session_id,
+                                              std::size_t max_items) {
   WorkerStore& store = CurrentStore();
   auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end() ||
@@ -656,12 +657,18 @@ StorageEngine::Impl::PeekFullSyncPublishItem(std::uint64_t session_id) {
     return absl::FailedPreconditionError(
         "full-sync publish session is not active");
   }
-  if (session->second.publish_queue_.empty()) {
-    return std::optional<FullSyncPublishItem>{};
+  if (max_items == 0) {
+    return absl::InvalidArgumentError(
+        "full-sync publish batch size must be nonzero");
   }
-  const auto& front = session->second.publish_queue_.front();
-  return std::optional<FullSyncPublishItem>(
-      FullSyncPublishItem{.id_ = front.id_, .command_ = front.command_});
+  std::vector<FullSyncPublishItem> result;
+  result.reserve(std::min(max_items, session->second.publish_queue_.size()));
+  for (const auto& pending : session->second.publish_queue_) {
+    if (result.size() == max_items) break;
+    result.push_back(
+        FullSyncPublishItem{.id_ = pending.id_, .command_ = pending.command_});
+  }
+  return result;
 }
 
 void StorageEngine::Impl::AcknowledgeFullSyncPublishItem(

@@ -2093,9 +2093,14 @@ class ReplicationManager::Impl {
           staged_command_lsn = 0;
           next_command_fragment = 0;
           staged_command.clear();
+          // Full-sync command fragments are pipelined like ONLINE backlog
+          // fragments. Intermediate fragments carry sequence ordering but do
+          // not force a stop-and-wait round trip; the final ACK proves that
+          // the complete logical command was applied and releases its queue
+          // credit on the source.
+          absl::Status acknowledged = co_await send_ack(partition_id, sequence);
+          if (!acknowledged.ok()) co_return acknowledged;
         }
-        absl::Status acknowledged = co_await send_ack(partition_id, sequence);
-        if (!acknowledged.ok()) co_return acknowledged;
         ++expected_fullsync_sequence;
       } else if (frame->first == DataFrameKind::kFullSyncCut) {
         DataReader reader(frame->second);
@@ -2487,70 +2492,150 @@ class ReplicationManager::Impl {
         [&](std::size_t max_items) -> Task<absl::Status> {
       std::size_t drained_items = 0;
       while (drained_items < max_items) {
-        auto pending = storage_->PeekFullSyncPublishItem(session->id_);
+        const std::size_t remaining_items = max_items - drained_items;
+        auto pending = storage_->PeekFullSyncPublishItems(
+            session->id_, std::min(remaining_items, kBacklogBatchFrames));
         if (!pending.ok()) co_return pending.status();
-        if (!pending->has_value()) co_return absl::OkStatus();
-        const storage::FullSyncPublishItem item = **pending;
-        if (item.command_ == nullptr || item.command_->args_.empty() ||
-            item.command_->partition_id_ >= storage::kLogicalStorageShards ||
-            item.command_->partition_sequence_ == 0) {
-          co_return absl::InvalidArgumentError(
-              "invalid command in full-sync publish queue");
-        }
-        std::vector<std::string_view> args;
-        args.reserve(item.command_->args_.size());
-        for (const std::string& arg : item.command_->args_) {
-          args.push_back(arg);
-        }
-        auto source = ReplicationCommandPayloadSource::Create(
-            item.command_->db_id_, args);
-        if (!source.ok()) co_return source.status();
-        if (source->size() > std::numeric_limits<std::size_t>::max()) {
-          co_return absl::ResourceExhaustedError(
-              "full-sync command is too large for this process");
-        }
-        std::string encoded(static_cast<std::size_t>(source->size()), '\0');
-        absl::Status encoded_status = co_await source->Read(
-            0, std::span(reinterpret_cast<std::byte*>(encoded.data()),
-                         encoded.size()));
-        if (!encoded_status.ok()) co_return encoded_status;
+        if (pending->empty()) co_return absl::OkStatus();
 
+        struct EncodedFullSyncCommand {
+          storage::FullSyncPublishItem item_;
+          std::string payload_;
+        };
+        std::vector<EncodedFullSyncCommand> commands;
+        commands.reserve(pending->size());
+        for (storage::FullSyncPublishItem& item : *pending) {
+          if (item.command_ == nullptr || item.command_->args_.empty() ||
+              item.command_->partition_id_ >= storage::kLogicalStorageShards ||
+              item.command_->partition_sequence_ == 0) {
+            co_return absl::InvalidArgumentError(
+                "invalid command in full-sync publish queue");
+          }
+          std::vector<std::string_view> args;
+          args.reserve(item.command_->args_.size());
+          for (const std::string& arg : item.command_->args_) {
+            args.push_back(arg);
+          }
+          auto source = ReplicationCommandPayloadSource::Create(
+              item.command_->db_id_, args);
+          if (!source.ok()) co_return source.status();
+          if (source->size() > std::numeric_limits<std::size_t>::max()) {
+            co_return absl::ResourceExhaustedError(
+                "full-sync command is too large for this process");
+          }
+          std::string encoded(static_cast<std::size_t>(source->size()), '\0');
+          absl::Status encoded_status = co_await source->Read(
+              0, std::span(reinterpret_cast<std::byte*>(encoded.data()),
+                           encoded.size()));
+          if (!encoded_status.ok()) co_return encoded_status;
+          commands.push_back(EncodedFullSyncCommand{
+              .item_ = std::move(item), .payload_ = std::move(encoded)});
+        }
+
+        struct PendingFullSyncAck {
+          std::uint16_t partition_id_ = 0;
+          std::uint64_t sequence_ = 0;
+          std::uint64_t item_id_ = 0;
+        };
+        constexpr std::size_t kDataFrameHeaderBytes = 5;
+        constexpr std::size_t kFullSyncSequenceBytes = 8;
         constexpr std::size_t kCommandHeaderBytes = 2 + 8 + 8 + 4 + 1;
-        const std::size_t fragment_bytes =
-            kBacklogBatchBytes - kCommandHeaderBytes;
-        std::size_t offset = 0;
-        std::uint32_t fragment = 0;
-        do {
-          const std::size_t count =
-              std::min(fragment_bytes, encoded.size() - offset);
-          std::uint8_t flags = 0;
-          if (offset == 0) {
-            flags |= static_cast<std::uint8_t>(
-                storage::ReplicationFrameFlag::kFirst);
+        constexpr std::size_t kWireOverhead = kDataFrameHeaderBytes +
+                                              kFullSyncSequenceBytes +
+                                              kCommandHeaderBytes;
+        static_assert(kBacklogBatchBytes > kWireOverhead);
+        constexpr std::size_t kFragmentBytes =
+            kBacklogBatchBytes - kWireOverhead;
+
+        std::size_t command_index = 0;
+        std::size_t command_offset = 0;
+        std::uint32_t command_fragment = 0;
+        while (command_index < commands.size()) {
+          std::string frame_headers;
+          std::vector<std::string> frame_payloads;
+          std::vector<PendingFullSyncAck> pending_acks;
+          frame_headers.reserve(kBacklogBatchFrames * kDataFrameHeaderBytes);
+          frame_payloads.reserve(kBacklogBatchFrames);
+          pending_acks.reserve(kBacklogBatchFrames);
+          std::size_t batch_bytes = 0;
+
+          while (command_index < commands.size() &&
+                 frame_payloads.size() < kBacklogBatchFrames) {
+            EncodedFullSyncCommand& encoded = commands[command_index];
+            const std::size_t count = std::min(
+                kFragmentBytes, encoded.payload_.size() - command_offset);
+            const std::size_t wire_bytes = kWireOverhead + count;
+            if (!frame_payloads.empty() &&
+                wire_bytes > kBacklogBatchBytes - batch_bytes) {
+              break;
+            }
+            const bool first = command_offset == 0;
+            const bool last = command_offset + count == encoded.payload_.size();
+            std::uint8_t flags = 0;
+            if (first) {
+              flags |= static_cast<std::uint8_t>(
+                  storage::ReplicationFrameFlag::kFirst);
+            }
+            if (last) {
+              flags |= static_cast<std::uint8_t>(
+                  storage::ReplicationFrameFlag::kLast);
+            }
+            std::string payload;
+            payload.reserve(kFullSyncSequenceBytes + kCommandHeaderBytes +
+                            count);
+            PutU64(payload, fullsync_sequence);
+            PutU16(payload, encoded.item_.command_->partition_id_);
+            PutU64(payload, encoded.item_.command_->partition_sequence_);
+            PutU64(payload, encoded.item_.id_);
+            PutU32(payload, command_fragment);
+            PutU8(payload, flags);
+            payload.append(encoded.payload_.data() + command_offset, count);
+            PutU32(frame_headers,
+                   static_cast<std::uint32_t>(1 + payload.size()));
+            PutU8(frame_headers,
+                  static_cast<std::uint8_t>(DataFrameKind::kFullSyncCommand));
+            if (last) {
+              pending_acks.push_back(PendingFullSyncAck{
+                  .partition_id_ = encoded.item_.command_->partition_id_,
+                  .sequence_ = fullsync_sequence,
+                  .item_id_ = encoded.item_.id_,
+              });
+            }
+            frame_payloads.push_back(std::move(payload));
+            batch_bytes += wire_bytes;
+            ++fullsync_sequence;
+            command_offset += count;
+            ++command_fragment;
+            if (last) {
+              ++command_index;
+              command_offset = 0;
+              command_fragment = 0;
+            }
           }
-          if (offset + count == encoded.size()) {
-            flags |=
-                static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast);
+
+          std::vector<iovec> wire_batch;
+          wire_batch.reserve(frame_payloads.size() * 2);
+          for (std::size_t index = 0; index < frame_payloads.size(); ++index) {
+            wire_batch.push_back(
+                iovec{.iov_base =
+                          frame_headers.data() + index * kDataFrameHeaderBytes,
+                      .iov_len = kDataFrameHeaderBytes});
+            wire_batch.push_back(
+                iovec{.iov_base = frame_payloads[index].data(),
+                      .iov_len = frame_payloads[index].size()});
           }
-          std::string body;
-          body.reserve(kCommandHeaderBytes + count);
-          PutU16(body, item.command_->partition_id_);
-          PutU64(body, item.command_->partition_sequence_);
-          PutU64(body, item.id_);
-          PutU32(body, fragment);
-          PutU8(body, flags);
-          body.append(encoded.data() + offset, count);
-          absl::Status sent = co_await WriteFullSyncFrameAndWaitAck(
-              stream, DataFrameKind::kFullSyncCommand, body,
-              item.command_->partition_id_, fullsync_sequence);
+          absl::Status sent = co_await stream.WriteAllV(wire_batch);
           if (!sent.ok()) co_return sent;
-          ++fullsync_sequence;
-          offset += count;
-          ++fragment;
-        } while (offset != encoded.size());
-        storage_->AcknowledgeFullSyncPublishItem(session->id_, item.id_);
-        session->TouchProgress(flow_id);
-        ++drained_items;
+          for (const PendingFullSyncAck& expected : pending_acks) {
+            absl::Status acknowledged = co_await WaitFullSyncAck(
+                stream, expected.partition_id_, expected.sequence_);
+            if (!acknowledged.ok()) co_return acknowledged;
+            storage_->AcknowledgeFullSyncPublishItem(session->id_,
+                                                     expected.item_id_);
+            session->TouchProgress(flow_id);
+            ++drained_items;
+          }
+        }
       }
       co_return absl::OkStatus();
     };

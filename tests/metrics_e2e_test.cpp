@@ -359,6 +359,16 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_pinned_cursors"), 0);
   EXPECT_GT(
       MetricValue(body, "keylane_replication_publish_queue_capacity_bytes"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_fullsync_publish_queue_bytes"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_fullsync_publish_queue_admitted_bytes"),
+            0);
+  EXPECT_EQ(MetricValue(body, "keylane_fullsync_publish_queue_capacity_bytes"),
+            0);
+  EXPECT_EQ(MetricValue(body, "keylane_fullsync_sessions"), 0);
+  EXPECT_EQ(
+      MetricValue(body,
+                  "keylane_fullsync_publish_queue_backpressure_waits_total"),
+      0);
   EXPECT_GT(MetricValue(body, "keylane_memory_current_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_memory_rss_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_memory_max_bytes"), 1073741824);
