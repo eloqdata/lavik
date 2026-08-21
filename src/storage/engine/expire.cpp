@@ -36,7 +36,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
                                                 const RecordIndex::Entry& entry,
                                                 std::string_view known_key) {
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
-  if (!options_.expiration_authority_ ||
+  if (!expiration_authority_.load(std::memory_order_acquire) ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
       entry.value_.kind_ != RecordKind::kValue ||
       entry.value_.expire_at_ms_ == 0) {
@@ -117,17 +117,19 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   const ExtentManifest dropped_dependent_extents =
       DependentExtentsFor(store, current);
   const std::uint64_t sequence = ++partition.mutation_sequence_;
-  if (partition.capture_deltas_) {
-    AppendDelta(store, partition, SnapshotRecord{
-                               .kind_ = SnapshotRecord::Kind::kDelete,
-                               .db_id_ = candidate.db_id_,
-                               .db_epoch_ = DbEpoch(candidate.db_id_),
-                               .mutation_sequence_ = sequence,
-                               .expire_at_ms_ = 0,
-                               .value_type_ = ValueType::kNone,
-                               .key_ = candidate.key_,
-                               .value_ = {},
-                           });
+  if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
+    FullSyncOnCommit(store, partition,
+                     SnapshotRecord{
+                         .kind_ = SnapshotRecord::Kind::kDelete,
+                         .db_id_ = candidate.db_id_,
+                         .db_epoch_ = DbEpoch(candidate.db_id_),
+                         .mutation_sequence_ = sequence,
+                         .expire_at_ms_ = 0,
+                         .value_type_ = ValueType::kNone,
+                         .key_ = candidate.key_,
+                         .value_ = {},
+                     },
+                     candidate.digest_);
   }
   for (auto& [block_id, identities] : store.staged_records_) {
     for (RecordIdentity& identity : identities) {
@@ -174,6 +176,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     if (expiration_pause_count_.load(std::memory_order_acquire) != 0) {
       continue;  // a stable-keyspace scan (KEYS) is in flight
     }
+    if (!expiration_authority_.load(std::memory_order_acquire)) continue;
     if (store->worker_->stop_requested() ||
         shutdown_flush_requested_.load(std::memory_order_acquire)) {
       break;

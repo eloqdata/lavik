@@ -11,6 +11,7 @@
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace keylane::storage;
+  static_assert(kStorageFormatVersion == 1);
 
   constexpr std::uint64_t device_id = kDeviceIdLimit - 2;
   constexpr std::uint32_t local_block =
@@ -293,40 +294,8 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   EXPECT_EQ(decoded.payload_bytes_, key.size());
 }
 
-TEST(StorageFormatTest, EncodesRuntimeReplicationBlocksAndFrames) {
+TEST(StorageFormatTest, EncodesMemoryReplicationFrames) {
   using namespace keylane::storage;
-
-  constexpr std::uint64_t block_id = MakeBlockId(3, 9);
-  BlockHeader block{
-      .block_id_ = block_id,
-      .writer_id_ = 2,
-      .allocation_epoch_ = 17,
-      .committed_bytes_ = static_cast<std::uint32_t>(
-          kBlockHeaderBytes + sizeof(ReplicationFrameHeader)),
-      .record_count_ = 1,
-      .layout_worker_count_ = 4,
-      .kind_ = BlockKind::kReplicationLog,
-      .replication_log_epoch_ = 23,
-      .first_replication_lsn_ = 41,
-      .last_replication_lsn_ = 41,
-  };
-  std::array<std::byte, kBlockHeaderSlotBytes> block_page{};
-  EncodeBlockHeader(block, block_page);
-  BlockHeader decoded_block{};
-  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_block));
-  EXPECT_EQ(decoded_block.kind_, BlockKind::kReplicationLog);
-  EXPECT_EQ(decoded_block.replication_log_epoch_, 23);
-  EXPECT_EQ(decoded_block.first_replication_lsn_, 41);
-  EXPECT_EQ(decoded_block.last_replication_lsn_, 41);
-
-  BlockHeader invalid = block;
-  invalid.max_lsn_ = 1;
-  EncodeBlockHeader(invalid, block_page);
-  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_block));
-  invalid = block;
-  invalid.first_replication_lsn_ = 42;
-  EncodeBlockHeader(invalid, block_page);
-  EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_block));
 
   constexpr std::string_view payload = "replication-payload";
   ReplicationFrameHeader frame{
@@ -380,7 +349,8 @@ TEST(StorageFormatTest, RejectsOversizedInlineHeaderBeforeChecksumCopy) {
       .key_bytes_ = key_bytes,
       .logical_size_ = 1,
       .payload_bytes_ = 0,
-      .total_disk_bytes_ = static_cast<std::uint32_t>(AlignRecord(header_bytes)),
+      .total_disk_bytes_ =
+          static_cast<std::uint32_t>(AlignRecord(header_bytes)),
       .replication_epoch_ = 1,
       .db_epoch_ = 1,
       .mutation_sequence_ = 1,

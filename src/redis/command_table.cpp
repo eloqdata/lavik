@@ -250,10 +250,11 @@ constexpr CommandSpec kCommandTable[] = {
     {"discard", CommandKind::kDiscard, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"watch", CommandKind::kWatch, 2, 0, 1, -1, 1, kCmdReadOnly},
     {"unwatch", CommandKind::kUnwatch, 1, 1, 0, 0, 1, kCmdNoKeys},
+    {"client", CommandKind::kClient, 2, 0, 0, 0, 1,
+     kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"replicaof", CommandKind::kReplicaOf, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal},
-    {"config", CommandKind::kConfig, 3, 4, 0, 0, 1,
-     kCmdNoKeys | kCmdGlobal},
+    {"config", CommandKind::kConfig, 3, 4, 0, 0, 1, kCmdNoKeys | kCmdGlobal},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"cluster", CommandKind::kCluster, 2, 2, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
@@ -465,8 +466,8 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
   }
   std::uint64_t count = 0;
   const std::string_view text = args[count_arg];
-  const bool zset_mpop = spec.kind_ == CommandKind::kZMPop ||
-                         spec.kind_ == CommandKind::kBZMPop;
+  const bool zset_mpop =
+      spec.kind_ == CommandKind::kZMPop || spec.kind_ == CommandKind::kBZMPop;
   if (zset_mpop) {
     std::int64_t signed_count = 0;
     if (!ParseRedisInt64(text, &signed_count) || signed_count <= 0) {

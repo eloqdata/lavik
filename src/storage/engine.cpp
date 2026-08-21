@@ -51,6 +51,10 @@ Task<absl::Status> StorageEngine::QuiesceExpiration() {
 
 void StorageEngine::ResumeExpiration() noexcept { impl_->ResumeExpiration(); }
 
+void StorageEngine::SetExpirationAuthority(bool authority) noexcept {
+  impl_->SetExpirationAuthority(authority);
+}
+
 std::uint32_t StorageEngine::ExpirationPauseCount() const noexcept {
   return impl_->ExpirationPauseCount();
 }
@@ -97,6 +101,10 @@ Task<absl::Status> StorageEngine::FlushDbDetach(std::uint8_t db_id) {
   return impl_->FlushDbDetach(db_id);
 }
 
+Task<absl::Status> StorageEngine::FlushAllDetach() {
+  return impl_->FlushAllDetach();
+}
+
 Task<absl::Status> StorageEngine::FlushDbReclaim(bool wait) {
   return impl_->FlushDbReclaim(wait);
 }
@@ -110,44 +118,82 @@ Task<absl::Status> StorageEngine::PublishFlushDbReplication(
   return impl_->PublishFlushDbReplication(db_id, db_epoch);
 }
 
+Task<absl::Status> StorageEngine::PublishFlushAllReplication(
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
+  return impl_->PublishFlushAllReplication(db_epochs);
+}
+
 Task<absl::Status> StorageEngine::ApplyReplicatedFlushDb(
     std::uint8_t db_id, std::uint64_t db_epoch) {
   return impl_->ApplyReplicatedFlushDb(db_id, db_epoch);
+}
+
+Task<absl::Status> StorageEngine::ApplyReplicatedFlushAll(
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
+  return impl_->ApplyReplicatedFlushAll(db_epochs);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::FenceReplicationLog() {
   return impl_->FenceReplicationLog();
 }
 
-PartitionReplicationStart StorageEngine::BeginPartitionReplication(
-    std::uint16_t partition_id) {
-  return impl_->BeginPartitionReplication(partition_id);
+absl::StatusOr<FullSyncSessionStart> StorageEngine::BeginFullSyncSession(
+    std::uint64_t session_id) {
+  return impl_->BeginFullSyncSession(session_id);
 }
 
-void StorageEngine::EndPartitionReplication(std::uint16_t partition_id) {
-  impl_->EndPartitionReplication(partition_id);
+bool StorageEngine::FullSyncSessionValid(
+    std::uint64_t session_id) const noexcept {
+  return impl_->FullSyncSessionValid(session_id);
+}
+
+void StorageEngine::EndFullSyncSession(std::uint64_t session_id) {
+  impl_->EndFullSyncSession(session_id);
+}
+
+absl::StatusOr<PartitionReplicationStart>
+StorageEngine::BeginPartitionReplication(std::uint64_t session_id,
+                                         std::uint16_t partition_id) {
+  return impl_->BeginPartitionReplication(session_id, partition_id);
+}
+
+absl::Status StorageEngine::BeginPartitionDbReplication(
+    std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
+  return impl_->BeginPartitionDbReplication(session_id, partition_id, db_id);
+}
+
+void StorageEngine::EndPartitionReplication(std::uint64_t session_id,
+                                            std::uint16_t partition_id) {
+  impl_->EndPartitionReplication(session_id, partition_id);
 }
 
 Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
-    std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-    std::size_t count, std::size_t read_concurrency) {
-  return impl_->SnapshotPartition(partition_id, db_id, cursor, count,
-                                  read_concurrency);
+    std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
+    std::uint64_t cursor, std::size_t count, std::size_t read_concurrency) {
+  return impl_->SnapshotPartition(session_id, partition_id, db_id, cursor,
+                                  count, read_concurrency);
 }
 
-PartitionDeltaBatch StorageEngine::ReadPartitionDeltas(
-    std::uint16_t partition_id, std::uint64_t after_sequence,
-    std::size_t count) {
-  return impl_->ReadPartitionDeltas(partition_id, after_sequence, count);
-}
-
-bool StorageEngine::TryTakeReplicationReady(std::uint16_t* partition_id) {
-  return impl_->TryTakeReplicationReady(partition_id);
+Task<absl::StatusOr<PartitionFullSyncBatch>>
+StorageEngine::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
+                                              std::uint16_t partition_id,
+                                              std::size_t count) {
+  return impl_->ReadPartitionFullSyncOverrides(session_id, partition_id, count);
 }
 
 Task<absl::Status> StorageEngine::EnableReplicationLog(
     std::uint64_t log_epoch, std::size_t capacity_bytes) {
   return impl_->EnableReplicationLog(log_epoch, capacity_bytes);
+}
+
+Task<absl::Status> StorageEngine::SetReplicationLogCapacity(
+    std::size_t capacity_bytes) {
+  return impl_->SetReplicationLogCapacity(capacity_bytes);
+}
+
+Task<absl::Status> StorageEngine::SetReplicationPublishQueueCapacity(
+    std::size_t capacity_bytes) {
+  return impl_->SetReplicationPublishQueueCapacity(capacity_bytes);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::AppendReplicationLog(
@@ -158,6 +204,15 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::AppendReplicationLog(
 Task<absl::StatusOr<ReplicationLogBatch>> StorageEngine::ReadReplicationLog(
     ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames) {
   return impl_->ReadReplicationLog(next, max_bytes, max_frames);
+}
+
+absl::Status StorageEngine::RetainReplicationLog(std::uint64_t session_id,
+                                                 std::uint64_t keep_from_lsn) {
+  return impl_->RetainReplicationLog(session_id, keep_from_lsn);
+}
+
+void StorageEngine::ReleaseReplicationLogRetention(std::uint64_t session_id) {
+  impl_->ReleaseReplicationLogRetention(session_id);
 }
 
 Task<absl::Status> StorageEngine::TrimReplicationLog(
@@ -177,6 +232,18 @@ bool StorageEngine::ReplicationLogActive() const noexcept {
   return impl_->ReplicationLogActive();
 }
 
+Task<absl::StatusOr<ReplicationPublisherAdmission>>
+StorageEngine::AcquireReplicationPublisherAdmission(
+    std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  return impl_->AcquireReplicationPublisherAdmission(logical_bytes, target);
+}
+
+void StorageEngine::ReleaseReplicationPublisherAdmission(
+    const ReplicationPublisherAdmission& admission, std::size_t logical_bytes) {
+  impl_->ReleaseReplicationPublisherAdmission(admission, logical_bytes);
+}
+
 bool StorageEngine::TryEnqueueReplicationCommand(
     ReplicationCommandAppend command) {
   return impl_->TryEnqueueReplicationCommand(std::move(command));
@@ -187,9 +254,37 @@ bool StorageEngine::TryEnqueueReplicationTransaction(
   return impl_->TryEnqueueReplicationTransaction(std::move(transaction));
 }
 
-void StorageEngine::AcknowledgePartitionDeltas(std::uint16_t partition_id,
-                                               std::uint64_t through_sequence) {
-  impl_->AcknowledgePartitionDeltas(partition_id, through_sequence);
+void StorageEngine::AcknowledgePartitionFullSyncOverrides(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::span<const SnapshotRecord> records) {
+  impl_->AcknowledgePartitionFullSyncOverrides(session_id, partition_id,
+                                               records);
+}
+
+void StorageEngine::AcknowledgePartitionSnapshotRecords(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::span<const SnapshotRecord> records) {
+  impl_->AcknowledgePartitionSnapshotRecords(session_id, partition_id, records);
+}
+
+absl::Status StorageEngine::CompletePartitionReplication(
+    std::uint64_t session_id, std::uint16_t partition_id) {
+  return impl_->CompletePartitionReplication(session_id, partition_id);
+}
+
+absl::Status StorageEngine::CompletePartitionDbReplication(
+    std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id) {
+  return impl_->CompletePartitionDbReplication(session_id, partition_id, db_id);
+}
+
+absl::StatusOr<std::optional<FullSyncPublishItem>>
+StorageEngine::PeekFullSyncPublishItem(std::uint64_t session_id) {
+  return impl_->PeekFullSyncPublishItem(session_id);
+}
+
+void StorageEngine::AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
+                                                   std::uint64_t item_id) {
+  impl_->AcknowledgeFullSyncPublishItem(session_id, item_id);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
@@ -200,14 +295,48 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::ResetReplicaPartition(
 
 Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
 StorageEngine::ResetReplicaPartitions(
-    std::span<const ReplicaPartitionReset> resets) {
-  return impl_->ResetReplicaPartitions(resets);
+    std::uint64_t session_id, std::span<const ReplicaPartitionReset> resets) {
+  return impl_->ResetReplicaPartitions(session_id, resets);
+}
+
+Task<absl::Status> StorageEngine::HandoffReplicaPartition(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t replication_epoch) {
+  return impl_->HandoffReplicaPartition(session_id, partition_id,
+                                        replication_epoch);
+}
+
+Task<absl::Status> StorageEngine::BeginReplicaTailCommand(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t partition_sequence) {
+  return impl_->BeginReplicaTailCommand(session_id, partition_id,
+                                        partition_sequence);
+}
+
+Task<absl::Status> StorageEngine::EndReplicaTailCommand(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t partition_sequence) {
+  return impl_->EndReplicaTailCommand(session_id, partition_id,
+                                      partition_sequence);
 }
 
 Task<absl::Status> StorageEngine::ApplyReplicaRecords(
-    std::uint16_t partition_id, std::uint64_t replication_epoch,
-    std::span<const SnapshotRecord> records) {
-  return impl_->ApplyReplicaRecords(partition_id, replication_epoch, records);
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t replication_epoch, std::span<const SnapshotRecord> records) {
+  return impl_->ApplyReplicaRecords(session_id, partition_id, replication_epoch,
+                                    records);
+}
+
+Task<absl::Status> StorageEngine::PromoteReplicaRoot(std::uint64_t session_id) {
+  return impl_->PromoteReplicaRoot(session_id);
+}
+
+Task<absl::Status> StorageEngine::AbortReplicaRoot(std::uint64_t session_id) {
+  return impl_->AbortReplicaRoot(session_id);
+}
+
+void StorageEngine::SetReplicaLoading(bool loading) noexcept {
+  impl_->SetReplicaLoading(loading);
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
@@ -255,8 +384,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::ExecuteSet(
 
 Task<absl::Status> StorageEngine::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
-    bool read_only, const CompactValueCallback& callback,
-    std::uint64_t now_ms, ReplicationCommandAppend* replication) {
+    bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,
+    ReplicationCommandAppend* replication) {
   return impl_->ExecuteCompact(db_id, key, value_type, read_only, callback,
                                now_ms, replication);
 }
@@ -372,14 +501,11 @@ Task<absl::StatusOr<RestoreRawResult>> StorageEngine::RestoreRawValueLocked(
                                       replication);
 }
 
-Task<absl::Status> StorageEngine::WriteRawValueLocked(std::uint8_t db_id,
-                                                      std::string_view key,
-                                                      const Digest& digest,
-                                                      const RawValue& value,
-                                                      TxShardWrites* tx,
-                                                      ReplicationCommandAppend* replication) {
-  return impl_->WriteRawValueLocked(db_id, key, digest, value, tx,
-                                    replication);
+Task<absl::Status> StorageEngine::WriteRawValueLocked(
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    const RawValue& value, TxShardWrites* tx,
+    ReplicationCommandAppend* replication) {
+  return impl_->WriteRawValueLocked(db_id, key, digest, value, tx, replication);
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::UpdateExpirationLocked(
@@ -404,6 +530,10 @@ Task<bool> StorageEngine::ExistsLocked(std::uint8_t db_id, std::string_view key,
 Task<absl::Status> StorageEngine::CommitTxWrites(
     std::uint64_t txid, std::vector<TxShardWrites*> shards) {
   return impl_->CommitTxWrites(txid, std::move(shards));
+}
+
+void StorageEngine::PublishCommittedFullSyncEffects(TxShardWrites* shard) {
+  impl_->PublishCommittedFullSyncEffects(shard);
 }
 
 std::uint64_t StorageEngine::AllocateWriteTxid() noexcept {

@@ -25,6 +25,8 @@
 namespace {
 
 using keylane::ReplicatedCommand;
+using keylane::storage::PartitionFullSyncBatch;
+using keylane::storage::PartitionReplicationStart;
 using keylane::storage::ReplicationEventKind;
 using keylane::storage::ReplicationLogAppend;
 using keylane::storage::ReplicationLogCursor;
@@ -57,8 +59,8 @@ std::vector<std::string> ReplicatedEffectAt(const ReplicatedCommand& command,
   for (std::size_t index = 0; index < count; ++index) {
     Check(offset + 2 <= command.args_.size(),
           "replicated EXEC command header is truncated");
-    const auto effect_db = static_cast<std::uint8_t>(
-        std::stoull(command.args_[offset++]));
+    const auto effect_db =
+        static_cast<std::uint8_t>(std::stoull(command.args_[offset++]));
     const std::size_t argc = std::stoull(command.args_[offset++]);
     Check(argc != 0 && argc <= command.args_.size() - offset,
           "replicated EXEC command is truncated");
@@ -160,8 +162,7 @@ class ReplicationLogService final : public celer::Service {
     }
     if (reply.chunks_ || actual != expected_reply) {
       co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                             "client replication command returned '" +
-                                 actual +
+                             "client replication command returned '" + actual +
                                  "' instead of '" +
                                  std::string(expected_reply) + "'");
     }
@@ -193,12 +194,10 @@ class ReplicationLogService final : public celer::Service {
     status = co_await ExecuteClientCommand(
         kDb, {"SADD", "late-smove-source", "kept", "moved"}, ":2\r\n");
     if (!status.ok()) co_return status;
-    std::vector<std::string> bit_a{"SET", "late-bit-a",
-                                   std::string(1, '\x0f')};
+    std::vector<std::string> bit_a{"SET", "late-bit-a", std::string(1, '\x0f')};
     status = co_await ExecuteClientCommand(kDb, std::move(bit_a), "+OK\r\n");
     if (!status.ok()) co_return status;
-    std::vector<std::string> bit_b{"SET", "late-bit-b",
-                                   std::string(1, '\xf0')};
+    std::vector<std::string> bit_b{"SET", "late-bit-b", std::string(1, '\xf0')};
     status = co_await ExecuteClientCommand(kDb, std::move(bit_b), "+OK\r\n");
     if (!status.ok()) co_return status;
     co_return absl::OkStatus();
@@ -228,8 +227,7 @@ class ReplicationLogService final : public celer::Service {
         kDb, {"RPUSH", "late-pop-second", "x"}, ":1\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
-        kDb, {"ZADD", "late-zpop-first", "1", "a", "2", "b"},
-        ":2\r\n");
+        kDb, {"ZADD", "late-zpop-first", "1", "a", "2", "b"}, ":2\r\n");
     if (!status.ok()) co_return status;
     co_return co_await ExecuteClientCommand(
         kDb, {"ZADD", "late-zpop-second", "1", "x"}, ":1\r\n");
@@ -239,13 +237,12 @@ class ReplicationLogService final : public celer::Service {
     constexpr std::uint8_t kDb = 7;
     absl::Status status;
     constexpr std::array<std::string_view, 10> kSources{
-        "late-list-source", "late-smove-source", "late-bit-a", "late-bit-b",
-        "late-set-a",       "late-set-b",          "late-zset-a",
-        "late-zset-b",      "late-pop-first",      "late-zpop-first"};
+        "late-list-source", "late-smove-source", "late-bit-a",  "late-bit-b",
+        "late-set-a",       "late-set-b",        "late-zset-a", "late-zset-b",
+        "late-pop-first",   "late-zpop-first"};
     for (std::string_view key : kSources) {
       std::vector<std::string> expiry{"PEXPIRE", std::string(key), "2000"};
-      status =
-          co_await ExecuteClientCommand(kDb, std::move(expiry), ":1\r\n");
+      status = co_await ExecuteClientCommand(kDb, std::move(expiry), ":1\r\n");
       if (!status.ok()) co_return status;
     }
     co_return absl::OkStatus();
@@ -264,18 +261,15 @@ class ReplicationLogService final : public celer::Service {
   celer::Task<absl::StatusOr<std::vector<ReplicatedCommand>>>
   JournalSourceAfterImages() {
     constexpr std::uint8_t kDb = 7;
-    absl::Status status =
-        co_await storage_->EnableReplicationLog(25, 8 * kMiB);
+    absl::Status status = co_await storage_->EnableReplicationLog(25, 8 * kMiB);
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb,
-        {"LMOVE", "late-list-source", "late-list-destination", "RIGHT",
-         "LEFT"},
+        {"LMOVE", "late-list-source", "late-list-destination", "RIGHT", "LEFT"},
         "$5\r\nmoved\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
-        kDb,
-        {"SMOVE", "late-smove-source", "late-smove-destination", "moved"},
+        kDb, {"SMOVE", "late-smove-source", "late-smove-destination", "moved"},
         ":1\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
@@ -288,22 +282,22 @@ class ReplicationLogService final : public celer::Service {
         {"SUNIONSTORE", "late-set-destination", "late-set-a", "late-set-b"},
         ":3\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(
-        kDb,
-        {"ZUNIONSTORE", "late-zset-destination", "2", "late-zset-a",
-         "late-zset-b"},
-        ":2\r\n");
+    status =
+        co_await ExecuteClientCommand(kDb,
+                                      {"ZUNIONSTORE", "late-zset-destination",
+                                       "2", "late-zset-a", "late-zset-b"},
+                                      ":2\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb,
-        {"LMPOP", "2", "late-pop-first", "late-pop-second", "LEFT",
-         "COUNT", "1"},
+        {"LMPOP", "2", "late-pop-first", "late-pop-second", "LEFT", "COUNT",
+         "1"},
         "*2\r\n$14\r\nlate-pop-first\r\n*1\r\n$1\r\na\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb,
-        {"ZMPOP", "2", "late-zpop-first", "late-zpop-second", "MIN",
-         "COUNT", "1"},
+        {"ZMPOP", "2", "late-zpop-first", "late-zpop-second", "MIN", "COUNT",
+         "1"},
         "*2\r\n$15\r\nlate-zpop-first\r\n*1\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n");
     if (!status.ok()) co_return status;
     auto fence = co_await storage_->FenceReplicationLog();
@@ -339,33 +333,29 @@ class ReplicationLogService final : public celer::Service {
                   {"LPUSH", "late-list-destination", "moved"}),
           "LMOVE destination effect omitted the moved value");
     Check(ReplicatedEffectAt(commands[1], 0) ==
-              std::vector<std::string>(
-                  {"SREM", "late-smove-source", "moved"}),
+              std::vector<std::string>({"SREM", "late-smove-source", "moved"}),
           "SMOVE source effect was not deterministic");
     Check(ReplicatedEffectAt(commands[1], 1) ==
               std::vector<std::string>(
                   {"SADD", "late-smove-destination", "moved"}),
           "SMOVE destination effect omitted the moved member");
     Check(ReplicatedEffectAt(commands[2], 0) ==
-              std::vector<std::string>({"SET", "late-bit-destination",
-                                        std::string(1, '\xff')}),
+              std::vector<std::string>(
+                  {"SET", "late-bit-destination", std::string(1, '\xff')}),
           "BITOP did not publish its destination after-image");
     Check(ReplicatedEffectAt(commands[3], 0) ==
-                  std::vector<std::string>(
-                      {"DEL", "late-set-destination"}) &&
+                  std::vector<std::string>({"DEL", "late-set-destination"}) &&
               ReplicatedEffectAt(commands[3], 1).front() == "SADD",
           "Set STORE did not publish its destination after-image");
     Check(ReplicatedEffectAt(commands[4], 0) ==
-                  std::vector<std::string>(
-                      {"DEL", "late-zset-destination"}) &&
+                  std::vector<std::string>({"DEL", "late-zset-destination"}) &&
               ReplicatedEffectAt(commands[4], 1).front() == "ZADD",
           "Sorted Set STORE did not publish its destination after-image");
     Check(ReplicatedEffectAt(commands[5], 0) ==
               std::vector<std::string>({"LPOP", "late-pop-first", "1"}),
           "LMPOP retained the original key-selection command");
     Check(ReplicatedEffectAt(commands[6], 0) ==
-              std::vector<std::string>(
-                  {"ZPOPMIN", "late-zpop-first", "1"}),
+              std::vector<std::string>({"ZPOPMIN", "late-zpop-first", "1"}),
           "ZMPOP retained the original key-selection command");
     co_return commands;
   }
@@ -391,8 +381,7 @@ class ReplicationLogService final : public celer::Service {
       if (!status.ok()) co_return status;
     }
     status = co_await ExecuteClientCommand(
-        kDb, {"LINDEX", "late-list-destination", "0"},
-        "$5\r\nmoved\r\n");
+        kDb, {"LINDEX", "late-list-destination", "0"}, "$5\r\nmoved\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb, {"SISMEMBER", "late-smove-destination", "moved"}, ":1\r\n");
@@ -400,15 +389,14 @@ class ReplicationLogService final : public celer::Service {
     std::string expected_bit = "$1\r\n";
     expected_bit.push_back(static_cast<char>(0xff));
     expected_bit.append("\r\n");
-    status = co_await ExecuteClientCommand(
-        kDb, {"GET", "late-bit-destination"}, expected_bit);
+    status = co_await ExecuteClientCommand(kDb, {"GET", "late-bit-destination"},
+                                           expected_bit);
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb, {"SCARD", "late-set-destination"}, ":3\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
-        kDb, {"ZSCORE", "late-zset-destination", "a"},
-        "$1\r\n3\r\n");
+        kDb, {"ZSCORE", "late-zset-destination", "a"}, "$1\r\n3\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         kDb, {"LINDEX", "late-pop-second", "0"}, "$1\r\nx\r\n");
@@ -428,7 +416,470 @@ class ReplicationLogService final : public celer::Service {
     co_return co_await ReplaySourceAfterImages(std::move(*commands));
   }
 
+  celer::Task<absl::Status> ExerciseFullSyncOverrides() {
+    constexpr std::uint64_t kFirstSession = 101;
+    constexpr std::uint64_t kSecondSession = 202;
+    constexpr std::uint8_t kDb = 3;
+    const std::string key = "fullsync-override{coalesce}";
+    const std::string sequence_bump = "fullsync-sequence{coalesce}";
+    const std::uint16_t partition_id = keylane::storage::RedisSlot(key);
+    const std::uint64_t reserved_before =
+        keylane::GetMemoryStats().fullsync_reserved_bytes_;
+
+    auto old_record = co_await storage_->Set(kDb, key, "before-fence", {});
+    if (!old_record.ok()) co_return old_record.status();
+    auto bumped = co_await storage_->Set(kDb, sequence_bump, "bump", {});
+    if (!bumped.ok()) co_return bumped.status();
+
+    auto first_session = storage_->BeginFullSyncSession(kFirstSession);
+    if (!first_session.ok()) co_return first_session.status();
+    auto second_session = storage_->BeginFullSyncSession(kSecondSession);
+    if (!second_session.ok()) co_return second_session.status();
+    Check(keylane::GetMemoryStats().fullsync_reserved_bytes_ > reserved_before,
+          "full-sync sessions did not reserve coverage headroom");
+    auto first_start_result =
+        storage_->BeginPartitionReplication(kFirstSession, partition_id);
+    if (!first_start_result.ok()) co_return first_start_result.status();
+    absl::Status first_db =
+        storage_->BeginPartitionDbReplication(kFirstSession, partition_id, kDb);
+    if (!first_db.ok()) co_return first_db;
+    const PartitionReplicationStart first_start = *first_start_result;
+    auto second_start_result =
+        storage_->BeginPartitionReplication(kSecondSession, partition_id);
+    if (!second_start_result.ok()) co_return second_start_result.status();
+    absl::Status second_db = storage_->BeginPartitionDbReplication(
+        kSecondSession, partition_id, kDb);
+    if (!second_db.ok()) co_return second_db;
+    const PartitionReplicationStart second_start = *second_start_result;
+    Check(first_start.baseline_version_ == second_start.baseline_version_ &&
+              first_start.baseline_version_ >= 2,
+          "full-sync sessions did not fence the current runtime version");
+
+    bool found_old_record = false;
+    std::uint64_t cursor = 0;
+    do {
+      auto snapshot = co_await storage_->SnapshotPartition(
+          kFirstSession, partition_id, kDb, cursor, 16, 2);
+      if (!snapshot.ok()) co_return snapshot.status();
+      for (const auto& record : snapshot->records_) {
+        if (record.key_ != key) continue;
+        found_old_record = true;
+        Check(record.value_ == "before-fence" &&
+                  record.mutation_sequence_ == first_start.baseline_version_,
+              "baseline exposed a record's historical mutation sequence");
+      }
+      cursor = snapshot->cursor_;
+    } while (cursor != 0);
+    Check(found_old_record, "full-sync baseline did not enumerate the old key");
+
+    auto first = co_await storage_->Set(kDb, key, "first", {});
+    if (!first.ok()) co_return first.status();
+    auto stale_result = co_await storage_->ReadPartitionFullSyncOverrides(
+        kFirstSession, partition_id, 16);
+    if (!stale_result.ok()) co_return stale_result.status();
+    PartitionFullSyncBatch stale = std::move(*stale_result);
+    Check(
+        stale.records_.size() == 1 && stale.records_.front().value_ == "first",
+        "full-sync subscriber did not capture the first committed value");
+
+    auto second = co_await storage_->Set(kDb, key, "second", {});
+    if (!second.ok()) co_return second.status();
+    storage_->AcknowledgePartitionFullSyncOverrides(kFirstSession, partition_id,
+                                                    stale.records_);
+
+    auto first_latest_result =
+        co_await storage_->ReadPartitionFullSyncOverrides(kFirstSession,
+                                                          partition_id, 16);
+    if (!first_latest_result.ok()) co_return first_latest_result.status();
+    auto second_latest_result =
+        co_await storage_->ReadPartitionFullSyncOverrides(kSecondSession,
+                                                          partition_id, 16);
+    if (!second_latest_result.ok()) co_return second_latest_result.status();
+    PartitionFullSyncBatch first_latest = std::move(*first_latest_result);
+    PartitionFullSyncBatch second_latest = std::move(*second_latest_result);
+    Check(first_latest.records_.size() == 1 &&
+              first_latest.records_.front().value_ == "second",
+          "an old full-sync ACK removed a newer override");
+    Check(second_latest.records_.size() == 1 &&
+              second_latest.records_.front().value_ == "second",
+          "full-sync sessions did not coalesce independently");
+
+    storage_->AcknowledgePartitionFullSyncOverrides(kFirstSession, partition_id,
+                                                    first_latest.records_);
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kSecondSession, partition_id, second_latest.records_);
+    auto first_empty = co_await storage_->ReadPartitionFullSyncOverrides(
+        kFirstSession, partition_id, 16);
+    if (!first_empty.ok()) co_return first_empty.status();
+    Check(first_empty->records_.empty(),
+          "full-sync ACK did not release the first session override");
+    auto second_empty = co_await storage_->ReadPartitionFullSyncOverrides(
+        kSecondSession, partition_id, 16);
+    if (!second_empty.ok()) co_return second_empty.status();
+    Check(second_empty->records_.empty(),
+          "full-sync ACK did not release the second session override");
+
+    storage_->EndPartitionReplication(kFirstSession, partition_id);
+    auto third = co_await storage_->Set(kDb, key, "third", {});
+    if (!third.ok()) co_return third.status();
+    auto ended = co_await storage_->ReadPartitionFullSyncOverrides(
+        kFirstSession, partition_id, 16);
+    Check(!ended.ok(), "ended full-sync session remained subscribed");
+    auto remaining_result = co_await storage_->ReadPartitionFullSyncOverrides(
+        kSecondSession, partition_id, 16);
+    if (!remaining_result.ok()) co_return remaining_result.status();
+    PartitionFullSyncBatch remaining = std::move(*remaining_result);
+    Check(remaining.records_.size() == 1 &&
+              remaining.records_.front().value_ == "third",
+          "ending one full-sync session affected another subscriber");
+    storage_->EndPartitionReplication(kSecondSession, partition_id);
+    storage_->EndFullSyncSession(kFirstSession);
+    storage_->EndFullSyncSession(kSecondSession);
+    Check(keylane::GetMemoryStats().fullsync_reserved_bytes_ == reserved_before,
+          "full-sync coverage reservation was not released");
+
+    constexpr std::uint64_t kTxSession = 250;
+    const std::string tx_key = "fullsync-tx{coalesce}";
+    const auto tx_digest = keylane::storage::ComputeDigest(tx_key);
+    const std::uint16_t tx_partition = keylane::storage::RedisSlot(tx_key);
+    auto tx_session = storage_->BeginFullSyncSession(kTxSession);
+    if (!tx_session.ok()) co_return tx_session.status();
+    auto tx_start =
+        storage_->BeginPartitionReplication(kTxSession, tx_partition);
+    if (!tx_start.ok()) co_return tx_start.status();
+    absl::Status tx_db =
+        storage_->BeginPartitionDbReplication(kTxSession, tx_partition, kDb);
+    if (!tx_db.ok()) co_return tx_db;
+    keylane::storage::TxShardWrites committed_tx;
+    const std::uint64_t committed_txid = StorageEngine::AllocateWriteTxid();
+    storage_->InitializeTxWrites(committed_txid, std::span(&committed_tx, 1));
+    committed_tx.collect_undo_ = true;
+    {
+      auto key_lock = co_await keylane::tx::CurrentTxShard().AcquireKey(
+          kDb, keylane::tx::FingerprintOf(tx_digest),
+          keylane::tx::LockMode::kExclusive);
+      auto staged = co_await storage_->SetLocked(
+          kDb, tx_key, tx_digest, "committed", {}, &committed_tx);
+      if (!staged.ok()) co_return staged.status();
+      auto before_commit = co_await storage_->ReadPartitionFullSyncOverrides(
+          kTxSession, tx_partition, 16);
+      if (!before_commit.ok()) co_return before_commit.status();
+      Check(before_commit->records_.empty(),
+            "transaction participant leaked before the commit decision");
+      storage_->PublishCommittedFullSyncEffects(&committed_tx);
+      key_lock.Reset();
+    }
+    auto committed_effect_result =
+        co_await storage_->ReadPartitionFullSyncOverrides(kTxSession,
+                                                          tx_partition, 16);
+    if (!committed_effect_result.ok())
+      co_return committed_effect_result.status();
+    PartitionFullSyncBatch committed_effect =
+        std::move(*committed_effect_result);
+    Check(committed_effect.records_.size() == 1 &&
+              committed_effect.records_.front().value_ == "committed",
+          "committed transaction effect was not published");
+    storage_->AcknowledgePartitionFullSyncOverrides(kTxSession, tx_partition,
+                                                    committed_effect.records_);
+    absl::Status discarded =
+        co_await storage_->DiscardTxUndoLocal(committed_tx.txid_);
+    if (!discarded.ok()) co_return discarded;
+    std::vector<keylane::storage::TxShardWrites*> committed_shards{
+        &committed_tx};
+    absl::Status durable = co_await storage_->CommitTxWrites(
+        committed_tx.txid_, std::move(committed_shards));
+    if (!durable.ok()) co_return durable;
+
+    const std::string rollback_key = "fullsync-rollback{coalesce}";
+    const auto rollback_digest = keylane::storage::ComputeDigest(rollback_key);
+    keylane::storage::TxShardWrites rolled_back_tx;
+    const std::uint64_t rolled_back_txid = StorageEngine::AllocateWriteTxid();
+    storage_->InitializeTxWrites(rolled_back_txid,
+                                 std::span(&rolled_back_tx, 1));
+    rolled_back_tx.collect_undo_ = true;
+    {
+      auto key_lock = co_await keylane::tx::CurrentTxShard().AcquireKey(
+          kDb, keylane::tx::FingerprintOf(rollback_digest),
+          keylane::tx::LockMode::kExclusive);
+      auto staged = co_await storage_->SetLocked(
+          kDb, rollback_key, rollback_digest, "aborted", {}, &rolled_back_tx);
+      if (!staged.ok()) co_return staged.status();
+      absl::Status rolled =
+          co_await storage_->RollbackTxLocal(rolled_back_tx.txid_);
+      if (!rolled.ok()) co_return rolled;
+      key_lock.Reset();
+    }
+    auto after_rollback = co_await storage_->ReadPartitionFullSyncOverrides(
+        kTxSession, tx_partition, 16);
+    if (!after_rollback.ok()) co_return after_rollback.status();
+    Check(after_rollback->records_.empty(),
+          "rolled-back transaction emitted a full-sync effect");
+    storage_->EndPartitionReplication(kTxSession, tx_partition);
+    storage_->EndFullSyncSession(kTxSession);
+
+    constexpr std::uint64_t kDiskBackedOverrideSession = 303;
+    auto disk_backed_session =
+        storage_->BeginFullSyncSession(kDiskBackedOverrideSession);
+    if (!disk_backed_session.ok()) co_return disk_backed_session.status();
+    auto disk_backed_start = storage_->BeginPartitionReplication(
+        kDiskBackedOverrideSession, partition_id);
+    if (!disk_backed_start.ok()) co_return disk_backed_start.status();
+    absl::Status disk_backed_db = storage_->BeginPartitionDbReplication(
+        kDiskBackedOverrideSession, partition_id, kDb);
+    if (!disk_backed_db.ok()) co_return disk_backed_db;
+    auto oversized =
+        co_await storage_->Set(kDb, key, std::string(2048, 'x'), {});
+    if (!oversized.ok()) co_return oversized.status();
+    auto oversized_override = co_await storage_->ReadPartitionFullSyncOverrides(
+        kDiskBackedOverrideSession, partition_id, 16);
+    if (!oversized_override.ok()) co_return oversized_override.status();
+    Check(oversized_override->records_.size() == 1 &&
+              oversized_override->records_.front().value_.size() == 2048,
+          "full-sync override did not materialize the current disk value");
+    auto oversized_length = co_await storage_->StringLength(kDb, key);
+    if (!oversized_length.ok()) co_return oversized_length.status();
+    Check(*oversized_length == 2048,
+          "disk-backed full-sync override changed the primary value");
+    storage_->EndPartitionReplication(kDiskBackedOverrideSession, partition_id);
+    storage_->EndFullSyncSession(kDiskBackedOverrideSession);
+
+    constexpr std::uint64_t kEpochSession = 304;
+    auto epoch_session = storage_->BeginFullSyncSession(kEpochSession);
+    if (!epoch_session.ok()) co_return epoch_session.status();
+    auto epoch_start =
+        storage_->BeginPartitionReplication(kEpochSession, partition_id);
+    if (!epoch_start.ok()) co_return epoch_start.status();
+    absl::Status epoch_db =
+        storage_->BeginPartitionDbReplication(kEpochSession, partition_id, kDb);
+    if (!epoch_db.ok()) co_return epoch_db;
+    absl::Status flushed = co_await storage_->FlushDbDetach(kDb);
+    if (!flushed.ok()) co_return flushed;
+    auto invalidated = co_await storage_->ReadPartitionFullSyncOverrides(
+        kEpochSession, partition_id, 16);
+    Check(!invalidated.ok(),
+          "database epoch advance did not invalidate full sync");
+    auto invalid_partition =
+        storage_->BeginPartitionReplication(kEpochSession, partition_id);
+    Check(!invalid_partition.ok() && invalid_partition.status().code() ==
+                                         absl::StatusCode::kFailedPrecondition,
+          "invalidated full sync accepted another partition");
+    storage_->EndFullSyncSession(kEpochSession);
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ExercisePartitionHandoff() {
+    constexpr std::uint64_t kSession = 404;
+    constexpr std::uint8_t kDb = 4;
+    const std::string key = "fullsync-handoff{ordered}";
+    const std::uint16_t partition_id = keylane::storage::RedisSlot(key);
+
+    auto fullsync_session = storage_->BeginFullSyncSession(kSession);
+    if (!fullsync_session.ok()) co_return fullsync_session.status();
+    auto start_result =
+        storage_->BeginPartitionReplication(kSession, partition_id);
+    if (!start_result.ok()) co_return start_result.status();
+    absl::Status started_db =
+        storage_->BeginPartitionDbReplication(kSession, partition_id, kDb);
+    if (!started_db.ok()) co_return started_db;
+    const PartitionReplicationStart start = *start_result;
+    std::vector<std::string> before_args{"SET", key, "before-handoff"};
+    absl::Status written =
+        co_await ExecuteClientCommand(kDb, std::move(before_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto replacement_result = co_await storage_->ReadPartitionFullSyncOverrides(
+        kSession, partition_id, 16);
+    if (!replacement_result.ok()) co_return replacement_result.status();
+    PartitionFullSyncBatch replacement = std::move(*replacement_result);
+    Check(replacement.records_.size() == 1 &&
+              replacement.records_.front().mutation_sequence_ >
+                  start.baseline_version_,
+          "pre-handoff mutation was not captured as a replacement");
+
+    PartitionFullSyncBatch frozen = std::move(replacement);
+    storage_->AcknowledgePartitionFullSyncOverrides(kSession, partition_id,
+                                                    frozen.records_);
+
+    std::vector<std::string> after_args{"SET", key, "after-handoff"};
+    written =
+        co_await ExecuteClientCommand(kDb, std::move(after_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto queued = storage_->PeekFullSyncPublishItem(kSession);
+    if (!queued.ok()) co_return queued.status();
+    Check(queued->has_value() && (**queued).command_ != nullptr &&
+              (**queued).command_->partition_id_ == partition_id,
+          "covered key did not enter the full-sync publish queue");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, (**queued).id_);
+
+    absl::Status queue_capacity =
+        co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+    if (!queue_capacity.ok()) co_return queue_capacity;
+    std::vector<std::string> large_args{"SET", key,
+                                        std::string(700 * 1024, 'q')};
+    written =
+        co_await ExecuteClientCommand(kDb, std::move(large_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto large_queued = storage_->PeekFullSyncPublishItem(kSession);
+    if (!large_queued.ok()) co_return large_queued.status();
+    Check(large_queued->has_value(),
+          "large covered-key command did not enter full-sync queue");
+    std::uint16_t unstarted_partition =
+        static_cast<std::uint16_t>((partition_id + storage_->worker_count()) %
+                                   keylane::storage::kLogicalStorageShards);
+    if (unstarted_partition == partition_id) {
+      unstarted_partition = static_cast<std::uint16_t>(
+          (partition_id + 1) % keylane::storage::kLogicalStorageShards);
+    }
+    auto unrelated = co_await storage_->AcquireReplicationPublisherAdmission(
+        700 * 1024, keylane::storage::ReplicationPublisherTarget{
+                        .partition_id_ = unstarted_partition, .db_id_ = kDb});
+    if (!unrelated.ok()) co_return unrelated.status();
+    Check(unrelated->fullsync_session_ids_.empty() &&
+              unrelated->fullsync_unstarted_guards_.size() == 1,
+          "UNSTARTED partition reserved queue credit or lost its phase guard");
+    storage_->ReleaseReplicationPublisherAdmission(*unrelated, 700 * 1024);
+
+    bool admission_finished = false;
+    absl::Status admission_status =
+        absl::UnknownError("full-sync admission waiter did not run");
+    auto wait_for_fullsync_admission = [&]() -> celer::Task<absl::Status> {
+      auto admission = co_await storage_->AcquireReplicationPublisherAdmission(
+          700 * 1024, keylane::storage::ReplicationPublisherTarget{
+                          .partition_id_ = partition_id, .db_id_ = kDb});
+      if (!admission.ok()) {
+        admission_status = admission.status();
+      } else {
+        storage_->ReleaseReplicationPublisherAdmission(*admission, 700 * 1024);
+        admission_status = absl::OkStatus();
+      }
+      admission_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(wait_for_fullsync_admission());
+    for (unsigned spin = 0; spin < 32; ++spin) {
+      co_await celer::Yield(*worker_);
+    }
+    Check(!admission_finished,
+          "full-sync queue capacity did not backpressure the next writer");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, (**large_queued).id_);
+    while (!admission_finished) co_await celer::Yield(*worker_);
+    if (!admission_status.ok()) co_return admission_status;
+
+    // Once an oversized request reaches the head of admission it must exclude
+    // later small requests. Otherwise sustained small writes can keep the
+    // queue nonempty and starve a large key forever.
+    std::vector<std::string> refill_args{"SET", key,
+                                         std::string(700 * 1024, 'r')};
+    written =
+        co_await ExecuteClientCommand(kDb, std::move(refill_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto refill = storage_->PeekFullSyncPublishItem(kSession);
+    if (!refill.ok()) co_return refill.status();
+    Check(refill->has_value(), "failed to refill full-sync publish queue");
+
+    bool oversized_finished = false;
+    bool small_finished = false;
+    std::optional<keylane::storage::ReplicationPublisherAdmission>
+        oversized_admission;
+    std::optional<keylane::storage::ReplicationPublisherAdmission>
+        small_admission;
+    absl::Status oversized_status = absl::UnknownError("not started");
+    absl::Status small_status = absl::UnknownError("not started");
+    auto wait_oversized = [&]() -> celer::Task<absl::Status> {
+      auto result = co_await storage_->AcquireReplicationPublisherAdmission(
+          2 * kMiB, keylane::storage::ReplicationPublisherTarget{
+                        .partition_id_ = partition_id, .db_id_ = kDb});
+      if (result.ok()) oversized_admission = std::move(*result);
+      oversized_status = result.status();
+      oversized_finished = true;
+      co_return absl::OkStatus();
+    };
+    auto wait_small = [&]() -> celer::Task<absl::Status> {
+      auto result = co_await storage_->AcquireReplicationPublisherAdmission(
+          1, keylane::storage::ReplicationPublisherTarget{
+                 .partition_id_ = partition_id, .db_id_ = kDb});
+      if (result.ok()) small_admission = std::move(*result);
+      small_status = result.status();
+      small_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(wait_oversized());
+    worker_->Spawn(wait_small());
+    for (unsigned spin = 0; spin < 32; ++spin) {
+      co_await celer::Yield(*worker_);
+    }
+    Check(!oversized_finished && !small_finished,
+          "publisher waiters bypassed occupied queue capacity");
+    storage_->AcknowledgeFullSyncPublishItem(kSession, (**refill).id_);
+    while (!oversized_finished) co_await celer::Yield(*worker_);
+    if (!oversized_status.ok()) co_return oversized_status;
+    Check(!small_finished,
+          "small publisher admission bypassed an earlier oversized waiter");
+    storage_->ReleaseReplicationPublisherAdmission(*oversized_admission,
+                                                   2 * kMiB);
+    while (!small_finished) co_await celer::Yield(*worker_);
+    if (!small_status.ok()) co_return small_status;
+    storage_->ReleaseReplicationPublisherAdmission(*small_admission, 1);
+
+    absl::Status completed_db =
+        storage_->CompletePartitionDbReplication(kSession, partition_id, kDb);
+    if (!completed_db.ok()) co_return completed_db;
+    storage_->EndPartitionReplication(kSession, partition_id);
+    storage_->EndFullSyncSession(kSession);
+
+    constexpr std::uint64_t kPendingTxSession = 405;
+    const std::string pending_key = "fullsync-handoff-tx{ordered}";
+    const auto pending_digest = keylane::storage::ComputeDigest(pending_key);
+    auto pending_session = storage_->BeginFullSyncSession(kPendingTxSession);
+    if (!pending_session.ok()) co_return pending_session.status();
+    auto pending_start =
+        storage_->BeginPartitionReplication(kPendingTxSession, partition_id);
+    if (!pending_start.ok()) co_return pending_start.status();
+    absl::Status pending_db = storage_->BeginPartitionDbReplication(
+        kPendingTxSession, partition_id, kDb);
+    if (!pending_db.ok()) co_return pending_db;
+    keylane::storage::TxShardWrites pending_tx;
+    const std::uint64_t pending_txid = StorageEngine::AllocateWriteTxid();
+    storage_->InitializeTxWrites(pending_txid, std::span(&pending_tx, 1));
+    pending_tx.collect_undo_ = true;
+    {
+      auto key_lock = co_await keylane::tx::CurrentTxShard().AcquireKey(
+          kDb, keylane::tx::FingerprintOf(pending_digest),
+          keylane::tx::LockMode::kExclusive);
+      auto staged = co_await storage_->SetLocked(
+          kDb, pending_key, pending_digest, "committed-before-marker", {},
+          &pending_tx);
+      if (!staged.ok()) co_return staged.status();
+      key_lock.Reset();
+    }
+    absl::Status pending_completed = storage_->CompletePartitionDbReplication(
+        kPendingTxSession, partition_id, kDb);
+    if (!pending_completed.ok()) co_return pending_completed;
+    storage_->PublishCommittedFullSyncEffects(&pending_tx);
+    auto late_commit_result = co_await storage_->ReadPartitionFullSyncOverrides(
+        kPendingTxSession, partition_id, 16);
+    if (!late_commit_result.ok()) co_return late_commit_result.status();
+    PartitionFullSyncBatch late_commit = std::move(*late_commit_result);
+    Check(late_commit.records_.size() == 1 &&
+              late_commit.records_.front().key_ == pending_key,
+          "pre-marker transaction was lost when commit arrived in TAILING");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kPendingTxSession, partition_id, late_commit.records_);
+    storage_->EndPartitionReplication(kPendingTxSession, partition_id);
+    storage_->EndFullSyncSession(kPendingTxSession);
+    absl::Status pending_discarded =
+        co_await storage_->DiscardTxUndoLocal(pending_tx.txid_);
+    if (!pending_discarded.ok()) co_return pending_discarded;
+    std::vector<keylane::storage::TxShardWrites*> pending_shards{&pending_tx};
+    absl::Status pending_durable = co_await storage_->CommitTxWrites(
+        pending_tx.txid_, std::move(pending_shards));
+    if (!pending_durable.ok()) co_return pending_durable;
+    co_return absl::OkStatus();
+  }
+
   celer::Task<absl::Status> Exercise() {
+    absl::Status status = co_await ExerciseFullSyncOverrides();
+    if (!status.ok()) co_return status;
+
     // Snapshot handoff closes every worker's transaction admission word while
     // retaining the count that was already admitted on that worker.
     Check(keylane::TryBeginSnapshotTransaction(),
@@ -457,19 +908,40 @@ class ReplicationLogService final : public celer::Service {
           "replication transaction order did not reopen");
     keylane::EndReplicationTransactionOrder();
 
-    absl::Status status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
+    status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExercisePartitionHandoff();
     if (!status.ok()) co_return status;
     RepeatedByteSource too_large(9 * kMiB, 'x');
-    auto rejected =
+    auto oversized =
         co_await storage_->AppendReplicationLog(ReplicationLogAppend{
             .partition_id_ = 3,
             .partition_sequence_ = 1,
             .payload_ = {},
             .payload_source_ = &too_large,
         });
-    Check(!rejected.ok() && storage_->LocalReplicationLogInfo().state_ ==
-                                ReplicationLogState::kInvalid,
-          "oversized event did not invalidate the bounded backlog");
+    if (!oversized.ok()) co_return oversized.status();
+    Check(storage_->LocalReplicationLogInfo().state_ ==
+                  ReplicationLogState::kActive &&
+              storage_->LocalReplicationLogInfo().block_count_ == 2,
+          "one oversized event could not temporarily exceed the backlog");
+    auto after_oversized =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .partition_id_ = 3,
+            .partition_sequence_ = 2,
+            .payload_ = "next",
+            .payload_source_ = nullptr,
+        });
+    if (!after_oversized.ok()) co_return after_oversized.status();
+    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == *after_oversized,
+          "the complete oversized event was not evicted atomically");
+    status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    Check(
+        storage_->LocalReplicationLogInfo().state_ ==
+                ReplicationLogState::kActive &&
+            storage_->LocalReplicationLogInfo().capacity_bytes_ == 2 * 8 * kMiB,
+        "runtime backlog growth changed history state or lost capacity");
     auto primary_write =
         co_await storage_->Set(0, "primary-survives", "ok", {});
     if (!primary_write.ok()) co_return primary_write.status();
@@ -481,23 +953,111 @@ class ReplicationLogService final : public celer::Service {
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
-    status = co_await storage_->EnableReplicationLog(4, 8 * kMiB);
+    status = co_await storage_->EnableReplicationLog(4, 3 * 8 * kMiB);
     if (!status.ok()) co_return status;
     std::vector<std::string> overflow_args;
     overflow_args.emplace_back("SET");
     overflow_args.emplace_back("publisher-overflow");
-    overflow_args.emplace_back(9 * kMiB, 'Q');
+    overflow_args.emplace_back(17 * kMiB, 'Q');
     status =
         co_await ExecuteClientCommand(0, std::move(overflow_args), "+OK\r\n");
     if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
     Check(storage_->LocalReplicationLogInfo().state_ ==
-              ReplicationLogState::kInvalid,
-          "publisher overflow did not invalidate the replication flow");
+              ReplicationLogState::kActive,
+          "oversized publisher staging invalidated the replication flow");
     auto overflow_length =
         co_await storage_->StringLength(0, "publisher-overflow");
     if (!overflow_length.ok()) co_return overflow_length.status();
-    Check(*overflow_length == 9 * kMiB,
-          "publisher overflow backpressured the primary write");
+    Check(*overflow_length == 17 * kMiB,
+          "oversized publisher staging lost the primary write");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    status = co_await storage_->EnableReplicationLog(15, 3 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    RepeatedByteSource resize_large(9 * kMiB, 'M');
+    auto resize_large_lsn =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 5,
+            .partition_sequence_ = 1,
+            .payload_ = {},
+            .payload_source_ = &resize_large,
+        });
+    if (!resize_large_lsn.ok()) co_return resize_large_lsn.status();
+    auto resize_survivor =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 5,
+            .partition_sequence_ = 2,
+            .payload_ = "survivor",
+            .payload_source_ = nullptr,
+        });
+    if (!resize_survivor.ok()) co_return resize_survivor.status();
+    Check(storage_->LocalReplicationLogInfo().block_count_ == 3,
+          "fragmented resize fixture did not span three blocks");
+    status = co_await storage_->SetReplicationLogCapacity(8 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto fragmented_shrink = storage_->LocalReplicationLogInfo();
+    Check(fragmented_shrink.block_count_ == 1 &&
+              fragmented_shrink.floor_lsn_ == *resize_survivor,
+          "runtime shrink retained a trailing fragmented-event block");
+    auto fragmented_evicted = co_await storage_->ReadReplicationLog(
+        ReplicationLogCursor{.lsn_ = *resize_large_lsn}, kMiB, 1);
+    Check(!fragmented_evicted.ok() && fragmented_evicted.status().code() ==
+                                          absl::StatusCode::kOutOfRange,
+          "fragmented event remained partially resumable after shrink");
+    auto surviving_batch = co_await storage_->ReadReplicationLog(
+        ReplicationLogCursor{.lsn_ = *resize_survivor}, kMiB, 1);
+    Check(surviving_batch.ok() && surviving_batch->frames_.size() == 1 &&
+              surviving_batch->frames_.front().payload_ == "survivor",
+          "runtime shrink removed the event after a fragmented eviction");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    status = co_await storage_->EnableReplicationLog(16, 3 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    std::string resize_payload(kMiB, 'r');
+    for (std::uint64_t sequence = 1; sequence <= 18; ++sequence) {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 6,
+              .partition_sequence_ = sequence,
+              .payload_ = resize_payload,
+              .payload_source_ = nullptr,
+          });
+      if (!appended.ok()) co_return appended.status();
+    }
+    const auto before_resize = storage_->LocalReplicationLogInfo();
+    Check(before_resize.capacity_bytes_ == 3 * 8 * kMiB &&
+              before_resize.block_count_ == 3,
+          "replication backlog did not fill the configured blocks");
+    status = co_await storage_->SetReplicationLogCapacity(8 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto after_shrink = storage_->LocalReplicationLogInfo();
+    Check(after_shrink.capacity_bytes_ == 8 * kMiB &&
+              after_shrink.block_count_ == 1 &&
+              after_shrink.floor_lsn_ > before_resize.floor_lsn_,
+          "runtime backlog shrink did not evict sealed history");
+    auto evicted_cursor = co_await storage_->ReadReplicationLog(
+        ReplicationLogCursor{.lsn_ = before_resize.floor_lsn_}, kMiB, 1);
+    Check(!evicted_cursor.ok() &&
+              evicted_cursor.status().code() == absl::StatusCode::kOutOfRange,
+          "runtime backlog shrink left an evicted cursor resumable");
+    status = co_await storage_->SetReplicationLogCapacity(3 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    const auto after_growth = storage_->LocalReplicationLogInfo();
+    Check(after_growth.capacity_bytes_ == 3 * 8 * kMiB &&
+              after_growth.block_count_ == after_shrink.block_count_ &&
+              after_growth.floor_lsn_ == after_shrink.floor_lsn_,
+          "runtime backlog growth allocated blocks or rewrote history");
+    status = co_await storage_->SetReplicationLogCapacity(kMiB);
+    Check(!status.ok() && storage_->LocalReplicationLogInfo().capacity_bytes_ ==
+                              3 * 8 * kMiB,
+          "invalid runtime backlog size changed the active capacity");
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
@@ -616,11 +1176,243 @@ class ReplicationLogService final : public celer::Service {
               storage_->LocalReplicationLogInfo().block_count_ == 0,
           "disable did not reclaim the replication log");
 
+    // A connected consumer pins its first unacknowledged LSN. Filling the
+    // memory backlog must suspend the publisher instead of silently evicting
+    // that LSN; advancing the ACK cursor releases it without invalidating the
+    // history.
+    status = co_await storage_->EnableReplicationLog(17, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(77, 1);
+    if (!status.ok()) co_return status;
+    RepeatedByteSource pinned_payload(7 * kMiB, 'P');
+    auto pinned_first =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 1,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!pinned_first.ok()) co_return pinned_first.status();
+    bool pinned_append_finished = false;
+    absl::Status pinned_append_status =
+        absl::UnknownError("pinned backlog append did not run");
+    auto append_while_pinned = [&]() -> celer::Task<absl::Status> {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = 2,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      pinned_append_status = appended.status();
+      pinned_append_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(append_while_pinned());
+    co_await celer::Yield(*worker_);
+    Check(!pinned_append_finished,
+          "backlog capacity evicted history below a connected consumer");
+    const auto pinned_info = storage_->LocalReplicationLogInfo();
+    Check(pinned_info.capacity_backpressured_ &&
+              pinned_info.retained_cursor_count_ == 1 &&
+              pinned_info.backpressure_waits_ == 1,
+          "backlog pressure or ACK pin metrics did not reflect the waiter");
+    status = storage_->RetainReplicationLog(77, 2);
+    if (!status.ok()) co_return status;
+    while (!pinned_append_finished) co_await celer::Yield(*worker_);
+    if (!pinned_append_status.ok()) co_return pinned_append_status;
+    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 2 &&
+              !storage_->LocalReplicationLogInfo().capacity_backpressured_,
+          "consumer ACK did not release the acknowledged backlog block");
+    bool disconnected_append_finished = false;
+    absl::Status disconnected_append_status =
+        absl::UnknownError("disconnected backlog append did not run");
+    auto append_until_disconnect = [&]() -> celer::Task<absl::Status> {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = 3,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      disconnected_append_status = appended.status();
+      disconnected_append_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(append_until_disconnect());
+    co_await celer::Yield(*worker_);
+    Check(!disconnected_append_finished,
+          "backlog did not wait for the second unacknowledged LSN");
+    storage_->ReleaseReplicationLogRetention(77);
+    while (!disconnected_append_finished) co_await celer::Yield(*worker_);
+    if (!disconnected_append_status.ok()) {
+      co_return disconnected_append_status;
+    }
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    // Releasing the final disconnected-replica pin must leave a full circular
+    // reconnect window. The connected-consumer low-water hysteresis would
+    // otherwise discard a second block even though only one block of space is
+    // needed by the waiting append.
+    status = co_await storage_->EnableReplicationLog(20, 8 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(79, 1);
+    if (!status.ok()) co_return status;
+    for (std::uint64_t lsn = 1; lsn <= 8; ++lsn) {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = lsn,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      if (!appended.ok()) co_return appended.status();
+    }
+    bool reconnect_append_finished = false;
+    absl::Status reconnect_append_status =
+        absl::UnknownError("reconnect-window append did not run");
+    auto append_for_reconnect = [&]() -> celer::Task<absl::Status> {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = 9,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      reconnect_append_status = appended.status();
+      reconnect_append_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(append_for_reconnect());
+    co_await celer::Yield(*worker_);
+    Check(!reconnect_append_finished,
+          "full backlog did not wait for its retained cursor");
+    status = storage_->RetainReplicationLog(79, 2);
+    if (!status.ok()) co_return status;
+    for (unsigned spin = 0; spin < 32; ++spin) {
+      co_await celer::Yield(*worker_);
+    }
+    Check(!reconnect_append_finished,
+          "connected pin ignored low-water backpressure hysteresis");
+    storage_->ReleaseReplicationLogRetention(79);
+    while (!reconnect_append_finished) co_await celer::Yield(*worker_);
+    if (!reconnect_append_status.ok()) co_return reconnect_append_status;
+    const auto reconnect_info = storage_->LocalReplicationLogInfo();
+    Check(reconnect_info.floor_lsn_ == 2,
+          "disconnect eagerly discarded part of the reconnect window");
+    auto reconnect_cursor = co_await storage_->ReadReplicationLog(
+        ReplicationLogCursor{.lsn_ = 2}, kMiB, 1);
+    if (!reconnect_cursor.ok()) co_return reconnect_cursor.status();
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    // Runtime growth must be able to release an ACK-capacity wait. It cannot
+    // queue behind the append mutex held by the suspended publisher.
+    status = co_await storage_->EnableReplicationLog(18, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(78, 1);
+    if (!status.ok()) co_return status;
+    auto resize_first =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 1,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!resize_first.ok()) co_return resize_first.status();
+    bool resize_append_finished = false;
+    absl::Status resize_append_status =
+        absl::UnknownError("resized backlog append did not run");
+    auto append_until_resize = [&]() -> celer::Task<absl::Status> {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = 2,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      resize_append_status = appended.status();
+      resize_append_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(append_until_resize());
+    co_await celer::Yield(*worker_);
+    Check(!resize_append_finished,
+          "resize test did not reach backlog capacity pressure");
+    status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    while (!resize_append_finished) co_await celer::Yield(*worker_);
+    if (!resize_append_status.ok()) co_return resize_append_status;
+    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 1,
+          "backlog growth discarded live retained history");
+    storage_->ReleaseReplicationLogRetention(78);
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and
     // apply still see one command and one LSN.
-    status = co_await storage_->EnableReplicationLog(19, 3 * 8 * kMiB);
+    status = co_await storage_->EnableReplicationLog(19, 4 * 8 * kMiB);
     if (!status.ok()) co_return status;
+    status = co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+    if (!status.ok()) co_return status;
+    Check(storage_->LocalReplicationLogInfo().publish_queue_capacity_bytes_ ==
+              kMiB,
+          "dynamic publisher shrink was not installed");
+
+    // The configured publisher high-water mark admits one larger command only
+    // as an exclusive staging item. A following writer must remain suspended
+    // until that admission is released, then wake without invalidating the
+    // replication history.
+    auto exclusive_admission =
+        co_await storage_->AcquireReplicationPublisherAdmission(17 * kMiB);
+    if (!exclusive_admission.ok()) co_return exclusive_admission.status();
+    Check(exclusive_admission->log_epoch_ != 0,
+          "oversized publisher admission did not bind to the active history");
+    bool waiter_finished = false;
+    absl::Status waiter_status =
+        absl::UnknownError("publisher admission waiter did not run");
+    auto wait_for_publisher_admission = [&]() -> celer::Task<absl::Status> {
+      auto admitted =
+          co_await storage_->AcquireReplicationPublisherAdmission(1);
+      if (!admitted.ok()) {
+        waiter_status = admitted.status();
+      } else {
+        storage_->ReleaseReplicationPublisherAdmission(*admitted, 1);
+        waiter_status = absl::OkStatus();
+      }
+      waiter_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(wait_for_publisher_admission());
+    co_await celer::Yield(*worker_);
+    Check(!waiter_finished,
+          "publisher admission did not apply backpressure at the high-water "
+          "mark");
+    storage_->ReleaseReplicationPublisherAdmission(*exclusive_admission,
+                                                   17 * kMiB);
+    while (!waiter_finished) co_await celer::Yield(*worker_);
+    if (!waiter_status.ok()) co_return waiter_status;
+
+    status = co_await storage_->SetReplicationPublishQueueCapacity(32 * kMiB);
+    if (!status.ok()) co_return status;
+    auto grown_first =
+        co_await storage_->AcquireReplicationPublisherAdmission(17 * kMiB);
+    if (!grown_first.ok()) co_return grown_first.status();
+    auto grown_second =
+        co_await storage_->AcquireReplicationPublisherAdmission(kMiB);
+    if (!grown_second.ok()) co_return grown_second.status();
+    storage_->ReleaseReplicationPublisherAdmission(*grown_second, kMiB);
+    storage_->ReleaseReplicationPublisherAdmission(*grown_first, 17 * kMiB);
+
     constexpr std::uint64_t kExpireAt = 4'102'444'800'000ULL;
     std::vector<std::string> set_args{"SET", "replication-set", "value", "PXAT",
                                       std::to_string(kExpireAt)};
@@ -637,7 +1429,10 @@ class ReplicationLogService final : public celer::Service {
     Check(storage_->LocalReplicationLogInfo().tail_lsn_ == 1,
           "conditional SET no-op published a replication command");
 
-    std::string large_value(9 * kMiB, 'V');
+    // This value is larger than the publisher queue's normal 16 MiB bound.
+    // It must still be forwarded as one logical command via exclusive heap
+    // staging and fragmented only by the memory backlog frame format.
+    std::string large_value(17 * kMiB, 'V');
     std::vector<std::string> large_args;
     large_args.emplace_back("SET");
     large_args.emplace_back("replication-large");
@@ -676,20 +1471,19 @@ class ReplicationLogService final : public celer::Service {
         const auto ttl_effect = ReplicatedEffectAt(*decoded, 1);
         Check(fragments == 1 && decoded->db_id_ == 2 && effect_db == 2 &&
                   set_effect == std::vector<std::string>(
-                                    {"SET", "replication-set", "value",
-                                     "PXAT", std::to_string(kExpireAt)}) &&
-                  ttl_effect == std::vector<std::string>(
-                                    {"PEXPIREAT", "replication-set",
-                                     std::to_string(kExpireAt)}),
+                                    {"SET", "replication-set", "value", "PXAT",
+                                     std::to_string(kExpireAt)}) &&
+                  ttl_effect ==
+                      std::vector<std::string>({"PEXPIREAT", "replication-set",
+                                                std::to_string(kExpireAt)}),
               "SET was not normalized with its absolute expiry");
       } else {
         const auto set_effect = ReplicatedEffectAt(*decoded, 0);
-        Check(fragments > 1 && decoded->db_id_ == 2 &&
-                  set_effect.size() == 3 && set_effect[0] == "SET" &&
+        Check(fragments > 1 && decoded->db_id_ == 2 && set_effect.size() == 3 &&
+                  set_effect[0] == "SET" &&
                   set_effect[1] == "replication-large" &&
-                  set_effect[2].size() == 9 * kMiB &&
-                  set_effect[2].front() == 'V' &&
-                  set_effect[2].back() == 'V',
+                  set_effect[2].size() == 17 * kMiB &&
+                  set_effect[2].front() == 'V' && set_effect[2].back() == 'V',
               "large SET was not reconstructed as one logical command");
       }
       commands.push_back(std::move(*decoded));
@@ -721,7 +1515,7 @@ class ReplicationLogService final : public celer::Service {
     }
     const auto restored_expiry =
         co_await storage_->GetExpiration(2, "replication-set");
-    Check(*restored_length == 5 && *restored_large_length == 9 * kMiB &&
+    Check(*restored_length == 5 && *restored_large_length == 17 * kMiB &&
               *db_zero_sentinel_length == 16 && restored_expiry.exists_ &&
               restored_expiry.expire_at_ms_ == kExpireAt,
           "replica SET did not preserve its logical database");
@@ -776,8 +1570,8 @@ class ReplicationLogService final : public celer::Service {
     status = co_await ExecuteClientCommand(
         4, {"ZADD", "journal-zset", "1", "member"}, ":1\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(4, {"INCR", "journal-counter"},
-                                           ":1\r\n");
+    status =
+        co_await ExecuteClientCommand(4, {"INCR", "journal-counter"}, ":1\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         4, {"PEXPIRE", "journal-counter", "600000"}, ":1\r\n");
@@ -806,19 +1600,18 @@ class ReplicationLogService final : public celer::Service {
       if (!decoded.ok()) co_return decoded.status();
       family_commands.push_back(std::move(*decoded));
     }
-    const std::vector<std::string> expected_names{
-        "LPUSH", "HSET", "SADD", "ZADD", "SET", "PEXPIREAT"};
+    const std::vector<std::string> expected_names{"LPUSH", "HSET", "SADD",
+                                                  "ZADD",  "SET",  "PEXPIREAT"};
     Check(family_commands.size() == expected_names.size(),
           "single-key command journal count changed");
     for (std::size_t i = 0; i < expected_names.size(); ++i) {
       const auto effect = ReplicatedEffectAt(family_commands[i], 0);
-      Check(family_commands[i].db_id_ == 4 &&
-                !effect.empty() && effect.front() == expected_names[i],
+      Check(family_commands[i].db_id_ == 4 && !effect.empty() &&
+                effect.front() == expected_names[i],
             "single-key command journal order changed");
     }
     const auto expiry_effect = ReplicatedEffectAt(family_commands.back(), 0);
-    Check(expiry_effect.size() == 3 &&
-              expiry_effect[1] == "journal-counter",
+    Check(expiry_effect.size() == 3 && expiry_effect[1] == "journal-counter",
           "relative expiry was not normalized to PEXPIREAT");
 
     status = co_await storage_->DisableReplicationLog();
@@ -832,14 +1625,14 @@ class ReplicationLogService final : public celer::Service {
       status = co_await keylane::ApplyReplicatedCommand(command);
       if (!status.ok()) co_return status;
     }
-    status = co_await ExecuteClientCommand(4, {"LLEN", "journal-list"},
-                                           ":2\r\n");
+    status =
+        co_await ExecuteClientCommand(4, {"LLEN", "journal-list"}, ":2\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(
-        4, {"HGET", "journal-hash", "field"}, "$5\r\nvalue\r\n");
+    status = co_await ExecuteClientCommand(4, {"HGET", "journal-hash", "field"},
+                                           "$5\r\nvalue\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(4, {"SCARD", "journal-set"},
-                                           ":2\r\n");
+    status =
+        co_await ExecuteClientCommand(4, {"SCARD", "journal-set"}, ":2\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(
         4, {"ZSCORE", "journal-zset", "member"}, "$1\r\n1\r\n");
@@ -858,14 +1651,14 @@ class ReplicationLogService final : public celer::Service {
     // it instead of leaving a permanent value behind.
     status = co_await storage_->EnableReplicationLog(24, 8 * kMiB);
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "a"},
-                                           ":1\r\n");
+    status =
+        co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "a"}, ":1\r\n");
     if (!status.ok()) co_return status;
     status = co_await ExecuteClientCommand(5, {"PEXPIRE", "late-ttl", "200"},
                                            ":1\r\n");
     if (!status.ok()) co_return status;
-    status = co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "b"},
-                                           ":2\r\n");
+    status =
+        co_await ExecuteClientCommand(5, {"LPUSH", "late-ttl", "b"}, ":2\r\n");
     if (!status.ok()) co_return status;
     auto late_fence = co_await storage_->FenceReplicationLog();
     if (!late_fence.ok()) co_return late_fence.status();
@@ -877,15 +1670,14 @@ class ReplicationLogService final : public celer::Service {
       if (!batch.ok()) co_return batch.status();
       Check(batch->frames_.size() == 1,
             "late TTL journal command was not readable");
-      auto decoded = keylane::DecodeReplicationCommand(
-          batch->frames_.front().payload_);
+      auto decoded =
+          keylane::DecodeReplicationCommand(batch->frames_.front().payload_);
       if (!decoded.ok()) co_return decoded.status();
       if (index == 2) late_command = std::move(*decoded);
       cursor = batch->next_;
     }
     const auto late_ttl_effect = ReplicatedEffectAt(late_command, 1);
-    Check(late_ttl_effect.size() == 3 &&
-              late_ttl_effect[0] == "PEXPIREAT" &&
+    Check(late_ttl_effect.size() == 3 && late_ttl_effect[0] == "PEXPIREAT" &&
               late_ttl_effect[1] == "late-ttl",
           "collection mutation omitted its final absolute expiration");
     status = co_await storage_->DisableReplicationLog();
@@ -902,7 +1694,8 @@ class ReplicationLogService final : public celer::Service {
 
     // Replica replay is strict: an error in any EXEC child fails the apply
     // instead of returning a successful RESP array that the flow would ACK.
-    auto wrong_type = co_await storage_->Set(6, "strict-wrongtype", "string", {});
+    auto wrong_type =
+        co_await storage_->Set(6, "strict-wrongtype", "string", {});
     if (!wrong_type.ok()) co_return wrong_type.status();
     ReplicatedCommand strict_exec{
         .db_id_ = 6,
@@ -940,9 +1733,10 @@ class ReplicationLogService final : public celer::Service {
     auto flush_command = keylane::DecodeReplicationCommand(
         flush_batch->frames_.front().payload_);
     if (!flush_command.ok()) co_return flush_command.status();
-    Check(flush_command->db_id_ == 2 && flush_command->args_.size() == 2 &&
+    Check(flush_command->db_id_ == 2 && flush_command->args_.size() == 3 &&
               flush_command->args_[0] == "FLUSHDB" &&
-              flush_command->args_[1] == std::to_string(storage_->DbEpoch(2)),
+              flush_command->args_[1] != "0" &&
+              flush_command->args_[2] == std::to_string(storage_->DbEpoch(2)),
           "FLUSHDB barrier did not carry its installed database epoch");
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
@@ -950,28 +1744,72 @@ class ReplicationLogService final : public celer::Service {
     auto replica_victim =
         co_await storage_->Set(2, "replica-flush-victim", "gone", {});
     if (!replica_victim.ok()) co_return replica_victim.status();
-    flush_command->args_[1] = std::to_string(storage_->DbEpoch(2) + 1);
+    flush_command->args_[2] = std::to_string(storage_->DbEpoch(2) + 1);
     status = co_await keylane::ApplyReplicatedCommand(*flush_command);
     if (!status.ok()) co_return status;
     Check(!co_await storage_->Exists(2, "replica-flush-victim") &&
               co_await storage_->Exists(3, "flush-survivor"),
           "replica FLUSHDB barrier affected the wrong database");
 
-    // Leave one sealed block and one active block behind. A fresh process must
-    // recognize both as runtime-only backlog and recover without parsing them
-    // as primary records.
-    status = co_await storage_->EnableReplicationLog(23, 2 * 8 * kMiB);
-    if (!status.ok()) co_return status;
-    for (std::uint64_t sequence = 1; sequence <= 8; ++sequence) {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .partition_id_ = 11,
-              .partition_sequence_ = sequence,
-              .payload_ = payload,
-              .payload_source_ = nullptr,
-          });
-      if (!appended.ok()) co_return appended.status();
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      auto seeded = co_await storage_->Set(
+          db_id, "flushall-victim-" + std::to_string(db_id), "gone", {});
+      if (!seeded.ok()) co_return seeded.status();
     }
+    status = co_await storage_->EnableReplicationLog(26, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(0, {"FLUSHALL"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await WaitForReplicationTail(1);
+    if (!status.ok()) co_return status;
+    auto flushall_batch = co_await storage_->ReadReplicationLog({}, kMiB, 1);
+    if (!flushall_batch.ok()) co_return flushall_batch.status();
+    Check(flushall_batch->frames_.size() == 1 && flushall_batch->at_tail_ &&
+              flushall_batch->frames_.front().header_.kind_ ==
+                  ReplicationEventKind::kControl,
+          "FLUSHALL did not produce one control frame");
+    auto flushall_command = keylane::DecodeReplicationCommand(
+        flushall_batch->frames_.front().payload_);
+    if (!flushall_command.ok()) co_return flushall_command.status();
+    Check(flushall_command->db_id_ == 0 &&
+              flushall_command->args_.size() ==
+                  2 + keylane::storage::kLogicalDatabaseCount &&
+              flushall_command->args_[0] == "FLUSHALL" &&
+              flushall_command->args_[1] != "0",
+          "FLUSHALL barrier did not carry one complete epoch vector");
+    for (std::uint8_t db_id = 0;
+         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
+      Check(flushall_command->args_[2 + db_id] ==
+                std::to_string(storage_->DbEpoch(db_id)),
+            "FLUSHALL barrier epoch vector changed");
+    }
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      auto seeded = co_await storage_->Set(
+          db_id, "replica-flushall-victim-" + std::to_string(db_id), "gone",
+          {});
+      if (!seeded.ok()) co_return seeded.status();
+    }
+    for (std::uint8_t db_id = 0;
+         db_id < keylane::storage::kLogicalDatabaseCount; ++db_id) {
+      flushall_command->args_[2 + db_id] =
+          std::to_string(storage_->DbEpoch(db_id) + 1);
+    }
+    status = co_await keylane::ApplyReplicatedCommand(*flushall_command);
+    if (!status.ok()) co_return status;
+    for (const std::uint8_t db_id :
+         {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{15}}) {
+      Check(!co_await storage_->Exists(
+                db_id, "replica-flushall-victim-" + std::to_string(db_id)),
+            "replica FLUSHALL left one database visible");
+    }
+
+    // The backlog is process memory only. Restart recovers primary records and
+    // establishes a fresh replication history without any backlog cleanup.
     co_return absl::OkStatus();
   }
 
@@ -1047,7 +1885,7 @@ int main(int argc, char** argv) {
           "failed to wait for recovery verifier");
     (void)::unlink(path.c_str());
     Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
-          "recovery verifier rejected the old replication backlog");
+          "recovery verifier rejected primary data after memory-backlog use");
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

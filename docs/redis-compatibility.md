@@ -59,6 +59,16 @@ bulk string, precise error text, and state after rejected commands. A newer
 Redis server is not an interchangeable oracle: floating-point replies and
 some Stream result shapes changed after 7.2.
 
+The implemented connection-management subset is `CLIENT ID`, `CLIENT LIST`
+with optional `TYPE NORMAL|REPLICA`, and `CLIENT KILL` using the legacy address
+form or `ID`, `ADDR`, `TYPE NORMAL|REPLICA`, and `SKIPME YES|NO` filters.
+Replication control and per-source-worker data-flow sockets have `flags=S` and
+type `REPLICA`; their numeric peer endpoint remains attached when a socket is
+adopted by another worker. Killing any replication socket expands to all
+sockets carrying the same replication session, but does not change
+`REPLICAOF`, so the replica reconnects normally.
+Other Redis `CLIENT` subcommands and client types are not yet exposed.
+
 ## Collection storage
 
 List, Hash, Set, Sorted Set, geospatial index, and Stream values are stored as

@@ -317,7 +317,6 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
        decoded.kind_ != BlockKind::kPayloadExtent &&
-       decoded.kind_ != BlockKind::kReplicationLog &&
        decoded.kind_ != BlockKind::kTransaction) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
@@ -326,11 +325,8 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
       decoded.kind_ == BlockKind::kTransaction) {
     if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
         decoded.extent_payload_checksum_ != 0 ||
-        decoded.replication_log_epoch_ != 0 ||
-        decoded.first_replication_lsn_ != 0 ||
-        decoded.last_replication_lsn_ != 0 ||
-        (decoded.kind_ == BlockKind::kRecords &&
-         decoded.tx_generation_ != 0) ||
+        decoded.reserved_runtime_ != std::array<std::uint64_t, 3>{} ||
+        (decoded.kind_ == BlockKind::kRecords && decoded.tx_generation_ != 0) ||
         (decoded.kind_ == BlockKind::kTransaction &&
          decoded.tx_generation_ == 0)) {
       return false;
@@ -340,19 +336,10 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
         decoded.extent_payload_bytes_ > kExtentPayloadBytes ||
         decoded.committed_bytes_ !=
             kBlockHeaderBytes + decoded.extent_payload_bytes_ ||
-        decoded.replication_log_epoch_ != 0 ||
-        decoded.first_replication_lsn_ != 0 ||
-        decoded.last_replication_lsn_ != 0 || decoded.tx_generation_ != 0) {
+        decoded.reserved_runtime_ != std::array<std::uint64_t, 3>{} ||
+        decoded.tx_generation_ != 0) {
       return false;
     }
-  } else if (decoded.extent_index_ != 0 || decoded.extent_payload_bytes_ != 0 ||
-             decoded.extent_payload_checksum_ != 0 || decoded.max_lsn_ != 0 ||
-             decoded.replication_log_epoch_ == 0 ||
-             decoded.record_count_ == 0 ||
-             decoded.first_replication_lsn_ == 0 ||
-             decoded.last_replication_lsn_ < decoded.first_replication_lsn_ ||
-             decoded.tx_generation_ != 0) {
-    return false;
   }
   const std::uint32_t expected = decoded.checksum_;
   std::array<std::byte, kBlockHeaderSlotBytes> copy{};
@@ -504,8 +491,8 @@ bool EncodeReplicationFrameHeader(
       header.header_bytes_ != sizeof(ReplicationFrameHeader) ||
       header.lsn_ == 0 || header.partition_id_ >= kLogicalStorageShards ||
       header.reserved_ != 0 ||
-      header.payload_bytes_ > kStorageBlockBytes - kBlockHeaderBytes -
-                                  sizeof(ReplicationFrameHeader) ||
+      header.payload_bytes_ >
+          kStorageBlockBytes - sizeof(ReplicationFrameHeader) ||
       header.total_disk_bytes_ !=
           AlignRecord(sizeof(ReplicationFrameHeader) + header.payload_bytes_)) {
     return false;

@@ -15,6 +15,7 @@ struct MemoryStats {
   std::uint64_t reserved_bytes_ = 0;
   std::uint64_t peak_used_bytes_ = 0;
   std::uint64_t max_bytes_ = 0;
+  std::uint64_t fullsync_reserved_bytes_ = 0;
   std::uint64_t rejected_commands_ = 0;
 };
 
@@ -37,6 +38,12 @@ MemoryStats GetMemoryStats() noexcept;
 // Conservative preflight for commands that may increase retained memory.
 // It never calls into mimalloc and performs only relaxed atomic loads.
 bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept;
+// Reserves process-memory headroom for a full-sync coverage map. The
+// reservation is logical: each partition releases its actual scan structures
+// after handoff, while ordinary writes cannot consume the reusable headroom
+// until the session ends.
+bool TryReserveFullSyncMemory(std::size_t bytes) noexcept;
+void ReleaseFullSyncMemory(std::size_t bytes) noexcept;
 void RecordMemoryRejection() noexcept;
 
 std::string HumanReadableMemory(std::uint64_t bytes);

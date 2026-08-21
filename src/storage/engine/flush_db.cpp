@@ -19,6 +19,154 @@ Task<absl::Status> StorageEngine::Impl::FlushDbDetach(std::uint8_t db_id) {
   co_return co_await DetachDbEpoch(db_id, current + 1);
 }
 
+Task<absl::Status> StorageEngine::Impl::FlushAllDetach() {
+  if (celer::ThisWorker().id_ != 0) {
+    co_return co_await celer::SubmitTaskTo(0, [this]() -> Task<absl::Status> {
+      co_return co_await FlushAllDetach();
+    });
+  }
+  std::array<std::uint64_t, kLogicalDatabaseCount> next{};
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    const std::uint64_t current = DbEpoch(db_id);
+    if (current == std::numeric_limits<std::uint64_t>::max()) {
+      co_return absl::OutOfRangeError("database epoch exhausted");
+    }
+    next[db_id] = current + 1;
+  }
+  co_return co_await DetachDbEpochs(next);
+}
+
+Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushDb(
+    std::uint8_t db_id, std::uint64_t source_db_epoch) {
+  if (db_id >= kLogicalDatabaseCount || source_db_epoch == 0) {
+    co_return absl::InvalidArgumentError("invalid replicated database epoch");
+  }
+  if (celer::ThisWorker().id_ != 0) {
+    co_return co_await celer::SubmitTaskTo(0, [this, db_id, source_db_epoch]() {
+      return ApplyReplicatedFlushDb(db_id, source_db_epoch);
+    });
+  }
+  AsyncMutex& mutex = replica_db_epoch_mutexes_[db_id];
+  co_await mutex.Lock();
+  UnlockGuard unlock(&mutex, celer::ThisWorker().self_);
+  const std::uint64_t installed_source =
+      replica_source_db_epochs_[db_id].load(std::memory_order_acquire);
+  // Before a foreign root is promoted there is no source/local translation.
+  // Keep the original identity semantics used by direct replay and recovery.
+  if (installed_source == 0) {
+    co_return co_await AdvanceDbEpoch(db_id, source_db_epoch);
+  }
+  if (source_db_epoch < installed_source) {
+    co_return absl::FailedPreconditionError(
+        "replicated database epoch is outside the installed source root");
+  }
+  if (source_db_epoch == installed_source) {
+    co_return absl::OkStatus();
+  }
+  const std::uint64_t delta = source_db_epoch - installed_source;
+  const std::uint64_t local = DbEpoch(db_id);
+  if (delta > std::numeric_limits<std::uint64_t>::max() - local) {
+    co_return absl::OutOfRangeError("database epoch exhausted");
+  }
+  absl::Status advanced = co_await AdvanceDbEpoch(db_id, local + delta);
+  if (!advanced.ok()) co_return advanced;
+  replica_source_db_epochs_[db_id].store(source_db_epoch,
+                                         std::memory_order_release);
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::ApplyReplicatedFlushAll(
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& source_epochs) {
+  if (std::any_of(source_epochs.begin(), source_epochs.end(),
+                  [](std::uint64_t epoch) { return epoch == 0; })) {
+    co_return absl::InvalidArgumentError(
+        "invalid replicated FLUSHALL database epochs");
+  }
+  if (celer::ThisWorker().id_ != 0) {
+    co_return co_await celer::SubmitTaskTo(0, [this, source_epochs]() {
+      return ApplyReplicatedFlushAll(source_epochs);
+    });
+  }
+  std::array<std::uint64_t, kLogicalDatabaseCount> next{};
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    const std::uint64_t installed_source =
+        replica_source_db_epochs_[db_id].load(std::memory_order_acquire);
+    if (installed_source == 0) {
+      next[db_id] = source_epochs[db_id];
+      continue;
+    }
+    if (source_epochs[db_id] < installed_source) {
+      co_return absl::FailedPreconditionError(
+          "replicated FLUSHALL epoch is outside the installed source root");
+    }
+    const std::uint64_t delta = source_epochs[db_id] - installed_source;
+    const std::uint64_t local = DbEpoch(db_id);
+    if (delta > std::numeric_limits<std::uint64_t>::max() - local) {
+      co_return absl::OutOfRangeError("database epoch exhausted");
+    }
+    next[db_id] = local + delta;
+  }
+  // The caller holds every command DB gate. The 16 DB epochs occupy one
+  // metadata page, so persist them as one vector before detaching any index.
+  absl::Status detached = co_await DetachDbEpochs(next);
+  if (!detached.ok()) co_return detached;
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    replica_source_db_epochs_[db_id].store(source_epochs[db_id],
+                                           std::memory_order_release);
+  }
+  co_return co_await ReclaimDetachedAllWorkers(/*wait=*/true);
+}
+
+Task<absl::Status> StorageEngine::Impl::DetachDbEpochs(
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& next) {
+  if (celer::ThisWorker().id_ != 0) {
+    co_return co_await celer::SubmitTaskTo(
+        0, [this, next]() -> Task<absl::Status> {
+          co_return co_await DetachDbEpochs(next);
+        });
+  }
+  std::array<bool, kLogicalDatabaseCount> changed{};
+  std::vector<std::pair<std::size_t, std::uint64_t>> updates;
+  updates.reserve(kLogicalDatabaseCount);
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    const std::uint64_t current = DbEpoch(db_id);
+    if (next[db_id] == 0 || next[db_id] < current) {
+      co_return absl::FailedPreconditionError(
+          "replica database epoch vector is behind the local root");
+    }
+    if (next[db_id] == current) continue;
+    changed[db_id] = true;
+    updates.emplace_back(db_id, next[db_id]);
+  }
+  if (updates.empty()) co_return absl::OkStatus();
+
+  absl::Status persisted = co_await PersistEpochValues(updates);
+  if (!persisted.ok()) co_return persisted;
+  for (const auto& [index, epoch] : updates) {
+    db_epochs_[index].store(epoch, std::memory_order_release);
+  }
+
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto detach = [this, target, changed]() -> Task<absl::Status> {
+      WorkerStore& store = *stores_[target];
+      co_await store.store_state_mutex_.Lock();
+      UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        if (changed[db_id]) DetachDbLocal(store, db_id);
+      }
+      co_return absl::OkStatus();
+    };
+    absl::Status detached;
+    if (target == 0) {
+      detached = co_await detach();
+    } else {
+      detached = co_await celer::SubmitTaskTo(target, detach);
+    }
+    if (!detached.ok()) co_return detached;
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::DetachDbEpoch(std::uint8_t db_id,
                                                       std::uint64_t next) {
   if (celer::ThisWorker().id_ != 0) {
@@ -107,6 +255,20 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   // FLUSHDB invalidates every watcher of this database, including watches
   // on keys that never existed (Redis semantics).
   tx::CurrentTxShard().MarkAllWatched(db_id);
+  // The first full-sync implementation treats a DB epoch change as a session
+  // boundary. A partially built root may already contain keys from this DB,
+  // including partitions whose capture has not started, so a per-partition
+  // replacement cannot make the in-place rebuild correct. Invalidate every local
+  // session synchronously with detach; its next snapshot/override/DB handoff
+  // operation aborts the whole full sync.
+  for (auto& [session_id, session] : store.fullsync_sessions_) {
+    (void)session_id;
+    session.db_epoch_invalidated_ = true;
+    session.publish_queue_.clear();
+    session.publish_queue_bytes_ = 0;
+    session.publisher_admitted_bytes_ = 0;
+  }
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
   ++store.index_generations_[db_id];
   for (auto& partition : store.partitions_) {
     auto& index = partition.indexes_[db_id];
@@ -118,16 +280,12 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     }
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;
-    const std::uint64_t sequence = ++partition.mutation_sequence_;
-    if (partition.capture_deltas_) {
-      AppendDelta(store, partition, SnapshotRecord{
-                                 .kind_ = SnapshotRecord::Kind::kFlushDb,
-                                 .db_id_ = db_id,
-                                 .db_epoch_ = DbEpoch(db_id),
-                                 .mutation_sequence_ = sequence,
-                                 .key_ = {},
-                                 .value_ = {},
-                             });
+    ++partition.mutation_sequence_;
+    if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
+      for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
+        (void)session_id;
+        ClearFullSyncCapture(store, capture);
+      }
     }
   }
   store.live_key_count_[db_id] = 0;
@@ -191,8 +349,8 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
       // untagged records in ordinary blocks. Preserve that distinction while
       // batching detached entries: transaction-generation accounting must
       // lose the same bytes as the block's ordinary live-byte accounting.
-      if (delta.tagged_bytes_ != 0 &&
-          delta.tagged_bytes_ != delta.bytes_) [[unlikely]] {
+      if (delta.tagged_bytes_ != 0 && delta.tagged_bytes_ != delta.bytes_)
+          [[unlikely]] {
         store.write_failed_ = true;
         co_return absl::InternalError(
             "FLUSHDB detached mixed tagged and untagged records from one "
@@ -219,7 +377,6 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
         co_return dead;
       }
     }
-
 
     // Freeing the entries is the expensive part of this loop, and it happens
     // as `detached` goes out of scope. Yield so online work is polled between

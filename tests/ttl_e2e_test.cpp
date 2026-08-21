@@ -184,7 +184,7 @@ class ServerProcess {
           std::to_string(port),
           "--threads",
           "1",
-          "--recv-buffers",
+          "--recv-buffers-per-worker",
           "0",
           "--flush-max-ms",
           "20",

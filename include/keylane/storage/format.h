@@ -19,9 +19,7 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Version 2 makes transaction generations a physical block invariant. There
-// is intentionally no reader for version-1 mixed records/TxCommit blocks.
-inline constexpr std::uint32_t kStorageFormatVersion = 2;
+inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -38,7 +36,7 @@ inline constexpr std::uint64_t kRecordMagic =
 inline constexpr std::uint64_t kReplicationFrameMagic =
     0x314c5045524c4bULL;  // KLREPL1
 inline constexpr std::uint64_t kExtentManifestMagic =
-    0x3154464e4d4c4bULL;                                              // KLMNFT1
+    0x3154464e4d4c4bULL;  // KLMNFT1
 inline constexpr std::uint64_t kHashValueMagic =
     0x3145554c4156484bULL;  // KHVALUE1
 inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
@@ -165,9 +163,8 @@ enum class RecordKind : std::uint8_t {
 enum class BlockKind : std::uint8_t {
   kRecords = 1,
   kPayloadExtent = 2,
-  // Runtime-only replication backlog. Recovery recognizes and reclaims these
-  // blocks instead of treating them as primary data.
-  kReplicationLog = 3,
+  // Value 3 was used by an unreleased runtime-backlog experiment. It remains
+  // unassigned so the version-1 on-disk enum values do not move.
   // Short-lived transaction generation: tagged keyed records and their
   // TxCommit decisions share this block class until the cleaner promotes the
   // committed winners to ordinary kRecords blocks with txid zero.
@@ -226,11 +223,7 @@ struct BlockHeader {
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
-  // Replication-log coordinates are deliberately separate from max_lsn_,
-  // which is the physical primary-storage append order.
-  std::uint64_t replication_log_epoch_ = 0;
-  std::uint64_t first_replication_lsn_ = 0;
-  std::uint64_t last_replication_lsn_ = 0;
+  std::array<std::uint64_t, 3> reserved_runtime_{};
   // Nonzero only for kTransaction.
   std::uint64_t tx_generation_ = 0;
 };
@@ -321,7 +314,6 @@ struct ExtentRef {
   std::uint32_t payload_bytes_ = 0;
   std::uint32_t payload_checksum_ = 0;
 };
-
 
 inline constexpr std::size_t kExtentPayloadBytes =
     kStorageBlockBytes - kBlockHeaderBytes;

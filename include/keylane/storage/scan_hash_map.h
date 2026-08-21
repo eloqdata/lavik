@@ -221,10 +221,12 @@ class ScanHashMap {
   // Deletes the matching entry, compacting its bucket chain the way Valkey's
   // hashtablePop does so chains stay dense and emptied child buckets are
   // freed. Compaction moves entries only within their own chain, and Scan
-  // emits a whole chain per cursor position, so a concurrent scan never
-  // misses an entry that existed throughout. The table itself never shrinks
-  // (the port dropped shrinking with deletion); slots are reused by later
-  // inserts, so footprint is bounded by the peak live count.
+  // emits a whole chain per cursor position, so an owner-serialized cursor
+  // scan does not miss an entry that exists throughout while erases occur
+  // between Scan calls. Scan and mutation are not thread-safe concurrently.
+  // The table itself never shrinks (the port dropped shrinking with deletion);
+  // slots are reused by later inserts, so footprint is bounded by the peak
+  // live count.
   bool Erase(const Digest& digest, std::string_view key) {
     RehashStep();
     const std::uint64_t hash = Hash(digest);
@@ -330,8 +332,10 @@ class ScanHashMap {
     return sampled[entropy % count];
   }
 
-  // A cursor of zero starts and completes a full scan. The callback may be
-  // invoked more than once for an entry if the table changes between calls.
+  // A cursor of zero starts and completes a full scan. The owner may mutate,
+  // rehash, or compact the map between Scan calls, and the callback may then
+  // be invoked more than once for an entry. Mutation from another thread
+  // during this call, or from inside the callback, is unsupported.
   template <typename Fn>
   std::uint64_t Scan(std::uint64_t cursor, Fn&& fn) const {
     if (empty()) {

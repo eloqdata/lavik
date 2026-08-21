@@ -73,7 +73,8 @@ absl::Status StorageEngine::Impl::ApplyTombRaiderConfig(
       update.action_ == TombRaiderConfigAction::kOn ||
       update.action_ == TombRaiderConfigAction::kInterval ||
       update.action_ == TombRaiderConfigAction::kDaily;
-  if (needs_authority && !options_.expiration_authority_) {
+  if (needs_authority &&
+      !expiration_authority_.load(std::memory_order_acquire)) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "tomb raider is unavailable on this server");
   }

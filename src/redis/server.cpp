@@ -1,6 +1,8 @@
 #include "keylane/server.h"
 
 #include <mimalloc.h>
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -20,11 +22,8 @@
 #include <string_view>
 #include <utility>
 
-#include <openssl/crypto.h>
-#include <openssl/sha.h>
-
-#include "absl/strings/str_cat.h"
 #include "absl/strings/match.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
@@ -274,14 +273,12 @@ void RecordSetLatency(const SetLatencyTrace& trace) {
   stats.lookup_.Add(
       Elapsed(trace.lookup_done_ns_, trace.store_lock_acquired_ns_));
   stats.append_.Add(Elapsed(trace.append_done_ns_, trace.append_start_ns_));
-  stats.block_.Add(
-      Elapsed(trace.block_ready_ns_, trace.block_wait_start_ns_));
+  stats.block_.Add(Elapsed(trace.block_ready_ns_, trace.block_wait_start_ns_));
   stats.encode_.Add(Elapsed(trace.encode_done_ns_, trace.block_ready_ns_));
   stats.index_.Add(Elapsed(trace.index_done_ns_, trace.encode_done_ns_));
   stats.replication_publish_.Add(
       Elapsed(trace.replication_done_ns_, trace.append_done_ns_));
-  stats.route_back_.Add(
-      Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
+  stats.route_back_.Add(Elapsed(trace.origin_resume_ns_, trace.owner_done_ns_));
   stats.send_.Add(Elapsed(trace.send_complete_ns_, trace.send_start_ns_));
 
   const std::uint64_t now = trace.send_complete_ns_;
@@ -656,10 +653,16 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   ConnectionContext ctx;
   ctx.authenticated_ = !authenticator_.required();
   ctx.conn_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed);
+  auto peer_address = stream.PeerAddress();
+  const std::string address =
+      peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+  const bool tls = stream.IsTls();
+  RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
   ConnectionOpened();
   const absl::Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
+  UnregisterClientConnection(ctx.conn_id_);
   co_await ReleaseConnectionWatches(ctx);
   if (ctx.counted_as_client_) ConnectionClosed();
   co_return status;
@@ -752,8 +755,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
               "disabled.");
         }
       }
-      absl::Status written = co_await stream.WriteAll(
-          std::span<const std::byte>(
+      absl::Status written =
+          co_await stream.WriteAll(std::span<const std::byte>(
               reinterpret_cast<const std::byte*>(encoded.data()),
               encoded.size()));
       if (!written.ok()) co_return written;
@@ -763,8 +766,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (!ctx.authenticated_) {
       const std::string_view encoded =
           ctx.reply_builder_.AppendError("NOAUTH Authentication required.");
-      absl::Status written = co_await stream.WriteAll(
-          std::span<const std::byte>(
+      absl::Status written =
+          co_await stream.WriteAll(std::span<const std::byte>(
               reinterpret_cast<const std::byte*>(encoded.data()),
               encoded.size()));
       if (!written.ok()) co_return written;
@@ -778,8 +781,13 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       }
       ConnectionClosed();
       ctx.counted_as_client_ = false;
+      auto peer_address = stream.PeerAddress();
+      const std::string address =
+          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+      const bool tls = stream.IsTls();
+      UnregisterClientConnection(ctx.conn_id_);
       co_return co_await replication_->ServeNativeConnection(
-          stream, std::move(command_result->args_));
+          stream, std::move(command_result->args_), ctx.conn_id_, address, tls);
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
@@ -953,6 +961,8 @@ int RunServer(ServerOptions options) {
       "background_warrant_percent={} "
       "spdk_max_completions_per_poll={} spdk_foreground_pre_poll_us={} "
       "registered_buffer_bytes={} per worker "
+      "storage_write_buffers={} "
+      "storage_read_buffer_bytes={} "
       "replication_publish_queue_bytes={} per worker max_memory={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
@@ -965,12 +975,12 @@ int RunServer(ServerOptions options) {
       options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
+      options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
-      options.flush_max_ms_,
-      options.flush_size_bytes_, options.inline_key_max_bytes_,
-      options.verify_read_crc_, options.defrag_max_active_per_device_,
-      options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
-      options.defrag_paused_);
+      options.flush_max_ms_, options.flush_size_bytes_,
+      options.inline_key_max_bytes_, options.verify_read_crc_,
+      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
+      options.defrag_record_sleep_us_, options.defrag_paused_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
@@ -1010,6 +1020,10 @@ int RunServer(ServerOptions options) {
   storage_options.defrag_record_sleep_us_ = options.defrag_record_sleep_us_;
   storage_options.defrag_paused_ = options.defrag_paused_;
   storage_options.buffers_.registered_bytes_ = options.registered_buffer_bytes_;
+  storage_options.buffers_.storage_write_buffer_count_ =
+      options.storage_write_buffer_count_;
+  storage_options.buffers_.read_payload_bytes_ =
+      options.storage_read_buffer_bytes_;
   storage::StorageEngine storage(std::move(storage_options));
   absl::Status storage_status = storage.Prepare(options.thread_count_);
   if (!storage_status.ok()) [[unlikely]] {
@@ -1025,6 +1039,8 @@ int RunServer(ServerOptions options) {
   options.replication_options_.tls_context_ = std::move(tls_client_context);
   options.replication_options_.masteruser_ = options.masteruser_;
   options.replication_options_.masterauth_ = options.masterauth_;
+  options.replication_options_.publish_queue_bytes_per_worker_ =
+      options.replication_publish_queue_bytes_;
   ReplicationManager replication(&storage,
                                  std::move(options.replication_options_),
                                  std::move(options.replicaof_));

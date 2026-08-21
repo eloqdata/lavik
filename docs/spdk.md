@@ -103,7 +103,7 @@ Size hugepage memory for all simultaneously running SPDK processes. A useful
 starting point is:
 
 ```text
-sum(registered-buffer-mb × worker-count per process)
+sum(registered-buffer-mb-per-worker × worker-count per process)
 + expected adaptive overflow high-water memory
 + SPDK/DPDK overhead
 + safety margin
@@ -180,11 +180,27 @@ a fresh process. Defrag remains enabled with its default runtime controls. Read
 CRC verification remains enabled unless `--disable-read-crc` is explicitly
 passed.
 
-`--registered-buffer-mb` is a budget **per worker**. With 256 MiB and eight
+`--registered-buffer-mb-per-worker` is a budget **per worker**. With 256 MiB and eight
 workers, a process can reserve roughly 2 GiB of fixed storage buffers, before
 adaptive overflow and other memory. The overflow read pool grows to the
 observed per-worker concurrency high-water mark when fixed read buffers are
 busy, then reuses those DMA buffers instead of allocating on every later miss.
+Within each worker budget, `--storage-write-buffers-per-worker` reserves the
+8 MiB storage write buffers and defaults to four. Replication backlog chunks
+are ordinary process memory and do not consume registered or DMA buffers.
+`--storage-read-buffer-kb` controls the registered read
+payload size and defaults to 1024 KiB (each slot also has 4 KiB of headroom and
+tailroom). The remaining budget determines the registered read-slot count.
+Startup fails if the budget cannot fit the configured storage write pool.
+
+On io_uring, buffer registration itself is probed at runtime. Kernels before
+5.12 normally charge it to the process `RLIMIT_MEMLOCK`; if registration fails,
+Keylane logs the requested per-worker bytes plus the runtime soft/hard limits
+and keeps the same fixed-size reusable pools on the unregistered-I/O path.
+Linux 5.12+ with native io_uring workers uses cgroup memory accounting instead,
+so Keylane does not incorrectly cap those machines from `ulimit -l`. SPDK uses
+its DMA-addressability check and fails startup if a pool buffer is not DMA
+addressable; no SPDK source modification is required.
 
 A finite purge delay is recommended for recovery-heavy deployments. A 60-second
 delay retains recently freed pages for reuse while allowing recovery's arena
@@ -219,7 +235,7 @@ sudo env \
   --port=6379 \
   --metrics-port=9100 \
   --threads=8 \
-  --registered-buffer-mb=256 \
+  --registered-buffer-mb-per-worker=256 \
   --data-file=spdk://0000:01:00.0/1 \
   --data-file=spdk://0000:02:00.0/1
 ```
@@ -262,7 +278,7 @@ sudo env \
   --port=6379 \
   --metrics-port=9100 \
   --threads=8 \
-  --registered-buffer-mb=256 \
+  --registered-buffer-mb-per-worker=256 \
   --data-file=spdk://0000:01:00.0/1 \
   --data-file=spdk://0000:02:00.0/1
 ```

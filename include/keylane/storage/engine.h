@@ -33,8 +33,8 @@ struct StorageEngineOptions {
   std::uint32_t tx_cleaner_cooldown_ms_ = 60'000;
   std::size_t flush_size_bytes_ = 128 * 1024;
   // Bounded, per-worker staging memory for commands waiting to enter the
-  // on-disk replication backlog.
-  std::size_t replication_publish_queue_bytes_ = 8ULL * 1024 * 1024;
+  // shared in-memory replication backlog.
+  std::size_t replication_publish_queue_bytes_ = 16ULL * 1024 * 1024;
   bool verify_read_crc_ = true;
   bool expiration_authority_ = true;
   // Keys at or below this size stay complete in the in-memory index. Larger
@@ -148,8 +148,23 @@ struct StorageDeviceMetrics {
   std::optional<std::uint64_t> filesystem_available_bytes_;
 };
 
+struct StorageReplicationLogMetrics {
+  unsigned worker_id_ = 0;
+  std::uint64_t floor_lsn_ = 1;
+  std::uint64_t tail_lsn_ = 0;
+  std::uint64_t backpressure_waits_ = 0;
+  std::size_t chunk_count_ = 0;
+  std::size_t capacity_bytes_ = 0;
+  std::size_t publish_queue_bytes_ = 0;
+  std::size_t publish_queue_capacity_bytes_ = 0;
+  std::size_t pinned_cursors_ = 0;
+  bool active_ = false;
+  bool capacity_backpressured_ = false;
+};
+
 struct StorageMetricsSnapshot {
   std::vector<StorageDeviceMetrics> devices_;
+  std::vector<StorageReplicationLogMetrics> replication_logs_;
 };
 
 struct ScanBatch {
@@ -162,10 +177,9 @@ struct SnapshotRecord {
   enum class Kind : std::uint8_t {
     kValue = 1,
     kDelete = 2,
-    kFlushDb = 3,
-    kValueBegin = 4,
-    kValueChunk = 5,
-    kValueCommit = 6,
+    kValueBegin = 3,
+    kValueChunk = 4,
+    kValueCommit = 5,
   };
 
   Kind kind_ = Kind::kValue;
@@ -181,10 +195,18 @@ struct SnapshotRecord {
   std::string value_;
 };
 
+// Full-sync values use the same 2 MiB transfer granularity as the ONLINE
+// backlog reader. kMaxDataFrame remains only a protocol validation ceiling.
+inline constexpr std::size_t kReplicationTransferBytes = 2ULL * 1024 * 1024;
+
 struct PartitionReplicationStart {
-  std::uint64_t snapshot_sequence_ = 0;
+  std::uint64_t baseline_version_ = 0;
   std::uint16_t nonempty_db_mask_ = 0;
   std::array<std::uint64_t, 16> db_epochs_{};
+};
+
+struct FullSyncSessionStart {
+  std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
 };
 
 struct PartitionSnapshotBatch {
@@ -192,9 +214,7 @@ struct PartitionSnapshotBatch {
   std::vector<SnapshotRecord> records_;
 };
 
-struct PartitionDeltaBatch {
-  std::uint64_t watermark_ = 0;
-  bool overflow_ = false;
+struct PartitionFullSyncBatch {
   std::vector<SnapshotRecord> records_;
 };
 
@@ -211,8 +231,8 @@ struct ReplicaPartitionEpoch {
 enum class ReplicationLogState : std::uint8_t {
   kDisabled,
   kActive,
-  // The backlog has a gap or an I/O/allocation failure. Primary storage may
-  // continue serving, but replicas must use a new full synchronization.
+  // The backlog has a gap or an encoding/allocation failure. Primary storage
+  // may continue serving, but replicas must use a new full synchronization.
   kInvalid,
 };
 
@@ -264,6 +284,9 @@ struct ReplicationLogInfo {
   std::size_t capacity_bytes_ = 0;
   std::size_t publish_queue_bytes_ = 0;
   std::size_t publish_queue_capacity_bytes_ = 0;
+  std::size_t retained_cursor_count_ = 0;
+  std::uint64_t backpressure_waits_ = 0;
+  bool capacity_backpressured_ = false;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -315,14 +338,40 @@ struct SetResult {
 };
 
 // An owned command handed from command dispatch to the per-worker asynchronous
-// replication publisher. Moving request arguments into this object avoids a
-// second copy of large values.
+// replication publisher. A large canonical argument may require one owned
+// staging string; that string is subsequently moved into the queue.
 struct ReplicationCommandAppend {
   ReplicationEventKind kind_ = ReplicationEventKind::kMutation;
   std::uint8_t db_id_ = 0;
   std::uint16_t partition_id_ = 0;
   std::uint64_t partition_sequence_ = 0;
   std::vector<std::string> args_;
+};
+
+struct FullSyncPublishItem {
+  std::uint64_t id_ = 0;
+  std::shared_ptr<const ReplicationCommandAppend> command_;
+};
+
+struct ReplicationPublisherAdmission {
+  struct UnstartedGuard {
+    std::uint64_t session_id_ = 0;
+    std::uint16_t partition_id_ = 0;
+    std::uint8_t db_id_ = 0;
+  };
+
+  std::uint64_t log_epoch_ = 0;
+  std::vector<std::uint64_t> fullsync_session_ids_;
+  std::vector<UnstartedGuard> fullsync_unstarted_guards_;
+};
+
+// Optional owner-local scope for publisher admission. A simple keyed command
+// supplies its exact logical destination so full-sync sessions that have not
+// started that (partition, DB) do not backpressure an unrelated write. Complex
+// multi-key/control operations omit the scope and reserve conservatively.
+struct ReplicationPublisherTarget {
+  std::uint16_t partition_id_ = 0;
+  std::uint8_t db_id_ = 0;
 };
 
 enum class ReplicationTransactionResolution : std::uint8_t {
@@ -503,6 +552,14 @@ struct TxShardWrites {
   // destroyed after commit or rollback processing.
   std::uint64_t generation_ = 0;
   std::shared_ptr<void> generation_lease_;
+  struct FullSyncEffect {
+    std::uint16_t partition_id_ = 0;
+    SnapshotRecord record_;
+    // Sessions for which this participant was linearized before their
+    // PARTITION_HANDOFF marker. The commit hook targets this frozen set even
+    // if the session phase changes before the global transaction decision.
+    std::vector<std::uint64_t> session_ids_;
+  };
 
   struct ExpirationEffect {
     std::string key_;
@@ -536,6 +593,9 @@ struct TxShardWrites {
   // Final metadata is collected while the key lock is held. Replication
   // collapses repeated writes to the same key before publishing the command.
   std::vector<ExpirationEffect> expiration_effects_;
+  // Collected under participant key locks, but invisible to full-sync
+  // sessions until the coordinator has made the global commit decision.
+  std::vector<FullSyncEffect> fullsync_effects_;
   // Journal undo state for runtime rollback (standalone MSET / multi-key
   // DEL). EXEC leaves this off: its commands report errors individually and
   // never roll back (Redis semantics), while recovery still treats the
@@ -587,6 +647,10 @@ class StorageEngine {
   // them again as soon as it returns: the DB is observably empty from here on.
   // Cost is bounded by the partition count, not by the number of keys.
   celer::Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
+  // Advances all 16 DB epochs in one metadata-page update and detaches every
+  // database under one per-worker store critical section. The caller holds
+  // all command DB gates.
+  celer::Task<absl::Status> FlushAllDetach();
 
   // Retires what FlushDbDetach took out of service, subtracting it from the
   // block accounting and freeing it. Safe to run with the DB open and serving.
@@ -598,34 +662,78 @@ class StorageEngine {
   // flow. The caller keeps the DB gate closed until this completes.
   celer::Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
                                                       std::uint64_t db_epoch);
+  // Broadcasts one control barrier carrying the complete database-epoch
+  // vector. It is one logical event on every source flow, not sixteen
+  // independent FLUSHDB barriers.
+  celer::Task<absl::Status> PublishFlushAllReplication(
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
   // Replica-side application after the receiver has collected this barrier
   // from every source flow.
   celer::Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
                                                    std::uint64_t db_epoch);
+  celer::Task<absl::Status> ApplyReplicatedFlushAll(
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
 
-  // Source-side per-partition migration primitives. Begin captures
-  // a sequence fence, Snapshot reads the baseline tree, and ReadDeltas returns
-  // every mutation after that fence until acknowledged.
-  PartitionReplicationStart BeginPartitionReplication(
-      std::uint16_t partition_id);
-  // Releases the full-sync delta fence for one source partition. Must execute
-  // on the owning worker and is idempotent.
-  void EndPartitionReplication(std::uint16_t partition_id);
+  // Source-side full-sync lifetime. Begin fixes this worker's initial database
+  // epoch vector before any partition scan. Any later DB epoch advance
+  // invalidates the whole session; the first implementation restarts full
+  // sync instead of trying to apply FLUSHDB inside a partially built root.
+  absl::StatusOr<FullSyncSessionStart> BeginFullSyncSession(
+      std::uint64_t session_id);
+  bool FullSyncSessionValid(std::uint64_t session_id) const noexcept;
+  void EndFullSyncSession(std::uint64_t session_id);
+
+  // Source-side full-sync primitives. A partition scans one DB at a time;
+  // only that DB owns a temporary ScanHashMap<KeyPhase>. Writes to an unseen
+  // key coalesce a metadata-only replacement, while covered/completed keys
+  // enter the session/worker publish FIFO.
+  absl::StatusOr<PartitionReplicationStart> BeginPartitionReplication(
+      std::uint64_t session_id, std::uint16_t partition_id);
+  absl::Status BeginPartitionDbReplication(std::uint64_t session_id,
+                                           std::uint16_t partition_id,
+                                           std::uint8_t db_id);
+  // Releases one session's full-sync subscriber. Must execute on the owning
+  // worker and is idempotent.
+  void EndPartitionReplication(std::uint64_t session_id,
+                               std::uint16_t partition_id);
   celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
-      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count, std::size_t read_concurrency = 1);
-  PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
-                                          std::uint64_t after_sequence,
-                                          std::size_t count);
-  void AcknowledgePartitionDeltas(std::uint16_t partition_id,
-                                  std::uint64_t through_sequence);
-  bool TryTakeReplicationReady(std::uint16_t* partition_id);
-
+      std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
+      std::uint64_t cursor, std::size_t count,
+      std::size_t read_concurrency = 1);
+  celer::Task<absl::StatusOr<PartitionFullSyncBatch>>
+  ReadPartitionFullSyncOverrides(std::uint64_t session_id,
+                                 std::uint16_t partition_id, std::size_t count);
+  void AcknowledgePartitionFullSyncOverrides(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::span<const SnapshotRecord> records);
+  void AcknowledgePartitionSnapshotRecords(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::span<const SnapshotRecord> records);
+  absl::Status CompletePartitionReplication(std::uint64_t session_id,
+                                            std::uint16_t partition_id);
+  absl::Status CompletePartitionDbReplication(std::uint64_t session_id,
+                                              std::uint16_t partition_id,
+                                              std::uint8_t db_id);
+  absl::StatusOr<std::optional<FullSyncPublishItem>> PeekFullSyncPublishItem(
+      std::uint64_t session_id);
+  void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
+                                      std::uint64_t item_id);
   // Runtime-only source replication backlog for the current storage worker.
   // These calls must execute on that worker. The log is shared by every
   // downstream replica; each replica owns only a ReplicationLogCursor.
   celer::Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                                  std::size_t capacity_bytes);
+  // Updates this worker flow's lazy block quota. Shrinkage drops complete
+  // oldest events until the retained block count fits, except that live
+  // consumer cursors stay pinned and make the smaller value a target quota;
+  // growth allocates nothing until a later append needs another block.
+  celer::Task<absl::Status> SetReplicationLogCapacity(
+      std::size_t capacity_bytes);
+  // Changes the worker-local in-memory publisher admission waterline. A
+  // shrink never drops queued commands; new admissions wait for occupancy to
+  // fall below the new limit. A growth wakes waiters immediately.
+  celer::Task<absl::Status> SetReplicationPublishQueueCapacity(
+      std::size_t capacity_bytes);
   celer::Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
   // Inserts an ordered publisher fence and returns the first LSN assigned
@@ -634,10 +742,28 @@ class StorageEngine {
   celer::Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   celer::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  // Pins history needed by one ONLINE/downstream session. The cursor is the
+  // first LSN not yet acknowledged by that session. Capacity pressure waits
+  // for the slowest retained cursor instead of evicting required history.
+  // Both calls are worker-local and never perform IO.
+  absl::Status RetainReplicationLog(std::uint64_t session_id,
+                                    std::uint64_t keep_from_lsn);
+  void ReleaseReplicationLogRetention(std::uint64_t session_id);
   celer::Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   celer::Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
+  // Worker-local high-water admission acquired before a source write enters
+  // command/transaction gates. It reserves the shared backlog publisher and
+  // every active full-sync session FIFO. A request larger than the normal
+  // limit is admitted only when it can be the sole staged item.
+  celer::Task<absl::StatusOr<ReplicationPublisherAdmission>>
+  AcquireReplicationPublisherAdmission(
+      std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target = std::nullopt);
+  void ReleaseReplicationPublisherAdmission(
+      const ReplicationPublisherAdmission& admission,
+      std::size_t logical_bytes);
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
@@ -651,10 +777,25 @@ class StorageEngine {
   // coalesced and persisted once for the whole batch before any new-epoch
   // replica records can be applied.
   celer::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
-  ResetReplicaPartitions(std::span<const ReplicaPartitionReset> resets);
+  ResetReplicaPartitions(std::uint64_t session_id,
+                         std::span<const ReplicaPartitionReset> resets);
+  celer::Task<absl::Status> HandoffReplicaPartition(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t replication_epoch);
+  celer::Task<absl::Status> BeginReplicaTailCommand(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence);
+  celer::Task<absl::Status> EndReplicaTailCommand(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t partition_sequence);
   celer::Task<absl::Status> ApplyReplicaRecords(
-      std::uint16_t partition_id, std::uint64_t replication_epoch,
-      std::span<const SnapshotRecord> records);
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
+  // Publishes a completed in-place rebuild at the final cut. Abort drains
+  // staged writes before detaching and reclaiming the partial population.
+  celer::Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
+  celer::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
+  void SetReplicaLoading(bool loading) noexcept;
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
@@ -680,12 +821,11 @@ class StorageEngine {
   celer::Task<absl::StatusOr<HashResult>> ExecuteSet(
       std::uint8_t db_id, std::string_view key, const HashOperation& operation,
       ReplicationCommandAppend* replication = nullptr);
-  celer::Task<absl::Status> ExecuteCompact(std::uint8_t db_id,
-                                           std::string_view key,
-                                           ValueType value_type, bool read_only,
-                                           const CompactValueCallback& callback,
-                                           std::uint64_t now_ms = 0,
-                                           ReplicationCommandAppend* replication = nullptr);
+  celer::Task<absl::Status> ExecuteCompact(
+      std::uint8_t db_id, std::string_view key, ValueType value_type,
+      bool read_only, const CompactValueCallback& callback,
+      std::uint64_t now_ms = 0,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<ExpirationInfo> GetExpiration(std::uint8_t db_id,
                                             std::string_view key);
   celer::Task<absl::StatusOr<bool>> UpdateExpiration(
@@ -758,12 +898,10 @@ class StorageEngine {
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const RawValue& value, bool replace, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr);
-  celer::Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
-                                                std::string_view key,
-                                                const Digest& digest,
-                                                const RawValue& value,
-                                                TxShardWrites* tx = nullptr,
-                                                ReplicationCommandAppend* replication = nullptr);
+  celer::Task<absl::Status> WriteRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const RawValue& value, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
   celer::Task<absl::StatusOr<bool>> UpdateExpirationLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::uint64_t expire_at_ms, ExpirationCondition condition,
@@ -782,14 +920,15 @@ class StorageEngine {
   // reply never waits for durability.
   celer::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                            std::vector<TxShardWrites*> shards);
+  // Must run on the owning worker before participant locks are released.
+  void PublishCommittedFullSyncEffects(TxShardWrites* shard);
 
   // Allocates a transaction id for tagging a multi-key write. Never zero.
   static std::uint64_t AllocateWriteTxid() noexcept;
 
   // Binds every shard receipt of one storage transaction to the current
   // transaction generation and holds one shared generation lease.
-  void InitializeTxWrites(std::uint64_t txid,
-                          std::span<TxShardWrites> writes);
+  void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes);
 
   // Bracket a detached commit chain: Started before spawning it (so a
   // graceful shutdown that already drained client requests still waits for
@@ -815,6 +954,7 @@ class StorageEngine {
   // caller must already exclude client writes (closed database gate).
   celer::Task<absl::Status> QuiesceExpiration();
   void ResumeExpiration() noexcept;
+  void SetExpirationAuthority(bool authority) noexcept;
   std::uint32_t ExpirationPauseCount() const noexcept;
 
   // Lifetime totals of the tomb raider (rounds run, tombstone entries

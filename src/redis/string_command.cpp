@@ -772,18 +772,11 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       replication =
           PrepareReplicationCommand(request, {"PERSIST", args[1]});
     } else if (expiration) {
-      const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
-      const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
-      const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
-      auto parsed =
-          ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
-      if (!parsed.ok()) {
-        co_return EncodeError(absl::StrCat("ERR ", parsed.status().message()));
-      }
-      getex_deadline = *parsed;
       if (tx == nullptr) {
-        replication = PrepareReplicationCommand(
-            request, {"PEXPIREAT", args[1], std::to_string(*parsed)});
+        // Redis validates the option shape before lookup, but parses the TTL
+        // number only for an existing key. Keep a publisher receipt ready;
+        // the callback fills its canonical PEXPIREAT arguments after parsing.
+        replication = PrepareReplicationCommand(request);
       }
     }
   }
@@ -836,11 +829,18 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
             .expire_at_ms_ = 0,
         };
       }
-      if (!getex_deadline.has_value()) {
-        return absl::InternalError("GETEX deadline was not parsed");
+      const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
+      const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
+      const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
+      auto parsed =
+          ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
+      if (!parsed.ok()) {
+        return parsed.status();
       }
+      getex_deadline = *parsed;
       captured_args = {"PEXPIREAT", args[1],
                        std::to_string(*getex_deadline)};
+      if (replication.has_value()) replication->args_ = captured_args;
       if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{.changed_ = true,
                                            .erase_ = true,

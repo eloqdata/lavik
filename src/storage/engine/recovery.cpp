@@ -283,15 +283,6 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 static_cast<std::uint64_t>(local_block) + 1);
       AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch_,
                 block.allocation_epoch_ + 1);
-      if (block.kind_ == BlockKind::kReplicationLog) {
-        // A backlog is valid only for the master's in-memory replid/log epoch.
-        // Restart establishes a new replid, so retaining or parsing this block
-        // could only offer a false partial-sync promise. Return it to the
-        // runtime ready pool while preserving its allocation-epoch high water.
-        zero_blocks->push_back(block_id);
-        ReportRecoveryProgress(0, /*allocated=*/true);
-        continue;
-      }
       AtomicMax(&recovery_max_lsn_, block.max_lsn_);
 
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
@@ -511,11 +502,10 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
     if (block.kind_ == BlockKind::kTransaction) {
       RegisterRecoveredTxGeneration(store, block.tx_generation_);
       store.tx_blocks_.insert_or_assign(
-          block.block_id_,
-          WorkerStore::TxBlockRuntime{
-              .allocation_epoch_ = block.allocation_epoch_,
-              .generation_ = block.tx_generation_,
-          });
+          block.block_id_, WorkerStore::TxBlockRuntime{
+                               .allocation_epoch_ = block.allocation_epoch_,
+                               .generation_ = block.tx_generation_,
+                           });
     }
     if (block.kind_ == BlockKind::kPayloadExtent) {
       store.recovered_extents_[block.block_id_] = ExtentIdentity{

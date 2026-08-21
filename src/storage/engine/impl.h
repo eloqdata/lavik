@@ -24,6 +24,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <new>
 #include <optional>
@@ -39,6 +40,7 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
+#include "keylane/memory.h"
 #include "keylane/storage/format.h"
 #include "keylane/storage/scan_hash_map.h"
 #include "keylane/storage/tx_cleaner.h"
@@ -771,10 +773,6 @@ struct ReservedBlock {
 enum class AllocationPurpose : std::uint8_t {
   kForeground,
   kDefrag,
-  // Best-effort runtime backlog allocation. It preserves the defrag reserve
-  // and reports exhaustion immediately instead of waiting for primary-data
-  // reclamation.
-  kReplication,
 };
 
 struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
@@ -929,6 +927,10 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
 class StorageEngine::Impl {
  public:
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
+    replication_publish_queue_bytes_.store(
+        options_.replication_publish_queue_bytes_, std::memory_order_relaxed);
+    expiration_authority_.store(options_.expiration_authority_,
+                                std::memory_order_relaxed);
     const TombRaiderMode mode =
         options_.expiration_authority_ && options_.tomb_raider_interval_ms_ != 0
             ? TombRaiderMode::kInterval
@@ -950,10 +952,10 @@ class StorageEngine::Impl {
                                  std::memory_order_relaxed);
     tx_cleaner_cooldown_ms_.store(options_.tx_cleaner_cooldown_ms_,
                                   std::memory_order_relaxed);
-    const auto cleaner_now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::steady_clock::now()
-                                     .time_since_epoch())
-                                 .count();
+    const auto cleaner_now =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     tx_cleaner_next_run_ms_.store(
         cleaner_now + options_.tx_cleaner_cooldown_ms_,
         std::memory_order_relaxed);
@@ -973,15 +975,14 @@ class StorageEngine::Impl {
     struct ReplicationSparseOffset {
       std::uint64_t lsn_ = 0;
       std::uint32_t fragment_index_ = 0;
-      std::uint32_t byte_offset_ = kBlockHeaderBytes;
+      std::uint32_t byte_offset_ = 0;
     };
 
     struct ReplicationLogBlock {
-      std::uint64_t block_id_ = kInvalidBlockId;
-      std::uint64_t allocation_epoch_ = 0;
+      std::unique_ptr<std::byte[]> bytes_;
       std::uint64_t first_lsn_ = 0;
       std::uint64_t last_lsn_ = 0;
-      std::uint32_t committed_bytes_ = kBlockHeaderBytes;
+      std::uint32_t committed_bytes_ = 0;
       std::uint32_t frame_count_ = 0;
       bool sealed_ = false;
       std::vector<ReplicationSparseOffset> sparse_offsets_;
@@ -1010,41 +1011,95 @@ class StorageEngine::Impl {
       std::uint64_t next_lsn_ = 1;
       std::size_t max_blocks_ = 0;
       std::deque<ReplicationLogBlock> blocks_;
-      std::byte* active_buffer_ = nullptr;
+      bool capacity_backpressured_ = false;
+      std::uint64_t capacity_waits_ = 0;
       std::deque<PendingCommand> publish_queue_;
       std::size_t publish_queue_bytes_ = 0;
-      std::size_t max_publish_queue_bytes_ = 0;
-      // Reserved per-worker replication memory. Mutations enter this bounded
-      // queue first; the publisher spills them to the disk backlog in the
-      // background. Keep this separate from the normal client buffers.
-      std::size_t reserved_memory_bytes_ = 0;
+      std::size_t publisher_admitted_bytes_ = 0;
       bool publisher_running_ = false;
+      AsyncNotification publisher_capacity_ready_;
+      absl::flat_hash_map<std::uint64_t, std::uint64_t>
+          retained_lsn_by_session_;
+      AsyncNotification retention_advanced_;
 
-      ~ReplicationLogRuntime() {
-        if (active_buffer_ != nullptr) {
-          celer::FreeStorageBuffer(active_buffer_, kDirectIoAlignment);
-        }
-      }
+      // Backlog chunks are process-local and intentionally disappear on
+      // restart together with the replication history id.
+    };
+
+    struct FullSyncCapture {
+      enum class Phase : std::uint8_t {
+        kCapturing,
+        kTailing,
+      };
+
+      enum class KeyPhase : std::uint8_t {
+        kBaselineInflight,
+        kTailing,
+      };
+
+      enum class DbPhase : std::uint8_t {
+        kUnstarted,
+        kScanning,
+        kTailing,
+      };
+
+      std::uint64_t baseline_version_ = 0;
+      std::map<std::uint64_t, SnapshotRecord> overrides_;
+      absl::flat_hash_map<std::string, std::uint64_t> latest_by_key_;
+      ScanHashMap<KeyPhase> key_phases_;
+      std::array<DbPhase, kLogicalDatabaseCount> db_phases_{};
+      Phase phase_ = Phase::kCapturing;
+    };
+
+    struct FullSyncSessionState {
+      struct PendingCommand {
+        std::uint64_t id_ = 0;
+        std::size_t logical_bytes_ = 0;
+        std::shared_ptr<const ReplicationCommandAppend> command_;
+      };
+
+      std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
+      std::size_t reserved_memory_bytes_ = 0;
+      std::deque<PendingCommand> publish_queue_;
+      std::size_t publish_queue_bytes_ = 0;
+      std::size_t publisher_admitted_bytes_ = 0;
+      std::uint64_t next_publish_id_ = 1;
+      // Exact keyed admissions that observed this (partition,DB) before scan
+      // start. BeginPartitionDbReplication waits for them to finish before
+      // changing UNSTARTED to SCANNING, so a write can neither be skipped nor
+      // enqueue without having reserved queue credit.
+      absl::flat_hash_map<std::uint32_t, std::uint32_t> unstarted_admissions_;
+      AsyncNotification publisher_capacity_ready_;
+      bool db_epoch_invalidated_ = false;
     };
 
     struct PartitionStore {
+      struct ReplicaSyncState {
+        std::array<std::uint64_t, kLogicalDatabaseCount> source_db_epochs_{};
+        std::array<std::uint64_t, kLogicalDatabaseCount> local_db_epochs_{};
+        std::uint64_t session_id_ = 0;
+        std::uint64_t replication_epoch_ = 0;
+        std::optional<std::uint64_t> command_sequence_;
+        bool tailing_ = false;
+      };
+
       std::uint16_t id_ = 0;
       std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
       std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
       std::array<std::size_t, kLogicalDatabaseCount> expiring_key_count_{};
       std::uint64_t mutation_sequence_ = 0;
       std::uint64_t replication_epoch_ = 1;
-      std::uint64_t delta_floor_ = 0;
-      std::size_t delta_bytes_ = 0;
-      bool capture_deltas_ = false;
-      // Number of concurrent source replication sessions capturing this
-      // partition.  The delta buffer is shared by sessions; a later replica
-      // must not reset the buffer used by an earlier replica.
-      std::uint32_t replication_capture_users_ = 0;
-      bool delta_queued_ = false;
-      bool delta_overflow_ = false;
-      std::deque<SnapshotRecord> deltas_;
+      // Highest epoch reserved for an in-place replica rebuild. It may be
+      // ahead after an aborted full sync and is never reused.
+      std::uint64_t replica_candidate_epoch_ = 1;
+      // Owner-local subscribers keyed by replication session. Writes inspect
+      // this map through one [[unlikely]] branch and synchronously coalesce
+      // the latest committed record for each (db,key).
+      absl::flat_hash_map<std::uint64_t, FullSyncCapture> fullsync_subscribers_;
       std::optional<ReplicaValueStage> replica_value_stage_;
+      // Small protocol state only. Full sync destructively rebuilds indexes_
+      // in place; no second data root is retained in the first version.
+      std::unique_ptr<ReplicaSyncState> replica_sync_;
     };
 
     struct ExpireCandidate {
@@ -1068,10 +1123,19 @@ class StorageEngine::Impl {
     // disconnected session may still be suspended in storage IO; a new full
     // sync must not reset a partition until that stale apply has completed.
     AsyncMutex replica_apply_mutex_;
-    // Full-sync deltas are still an in-memory compatibility layer until they
-    // move onto pinned replication-log blocks. Keep the aggregate strictly
-    // bounded so a stalled snapshot can never grow the worker without limit.
-    std::size_t replication_delta_bytes_ = 0;
+    // Owner-local full-sync lifetimes. FLUSHDB marks every active lifetime
+    // invalid synchronously with the local epoch detach, including sessions
+    // whose current partition has not yet installed a capture map.
+    absl::flat_hash_map<std::uint64_t, FullSyncSessionState> fullsync_sessions_;
+    // Stable worker-lifetime notification used by admission waiters. Session
+    // objects themselves may be erased on disconnect, so waiters must never
+    // suspend on a notification owned by one session.
+    AsyncNotification fullsync_publisher_capacity_ready_;
+    // FIFO admission prevents an oversized command from starving while later
+    // small commands continuously refill the publisher queues.
+    std::uint64_t replication_publisher_next_ticket_ = 1;
+    std::uint64_t replication_publisher_serving_ticket_ = 1;
+    AsyncNotification replication_publisher_admission_ready_;
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records_;
     // External manifests are exceptional and relatively large. Keeping them
@@ -1140,8 +1204,7 @@ class StorageEngine::Impl {
     // worker's map; cleaner coordination reads it through owner tasks. The
     // shared runtime lets the last receipt decrement its atomic lease count on
     // any worker without touching the map that owns the entry.
-    absl::flat_hash_map<std::uint64_t,
-                        std::shared_ptr<TxGenerationRuntime>>
+    absl::flat_hash_map<std::uint64_t, std::shared_ptr<TxGenerationRuntime>>
         tx_generations_;
     // A retired root record's shared key/value extents remain needed by
     // recovery until the whole records block is durably removed from the
@@ -1227,30 +1290,27 @@ class StorageEngine::Impl {
       std::span<const std::string_view> values, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr);
 
-  Task<absl::StatusOr<ListResult>> ExecuteList(std::uint8_t db_id,
-                                               std::string_view key,
-                                               const ListOperation& operation,
-                                               ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<ListResult>> ExecuteList(
+      std::uint8_t db_id, std::string_view key, const ListOperation& operation,
+      ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<ListResult>> ExecuteListLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const ListOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr);
 
-  Task<absl::StatusOr<HashResult>> ExecuteHash(std::uint8_t db_id,
-                                               std::string_view key,
-                                               const HashOperation& operation,
-                                               ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<HashResult>> ExecuteHash(
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+      ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       const HashOperation& operation, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr);
 
-  Task<absl::StatusOr<HashResult>> ExecuteSet(std::uint8_t db_id,
-                                              std::string_view key,
-                                              const HashOperation& operation,
-                                              ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<HashResult>> ExecuteSet(
+      std::uint8_t db_id, std::string_view key, const HashOperation& operation,
+      ReplicationCommandAppend* replication);
 
   Task<absl::StatusOr<HashResult>> ExecuteSetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1262,14 +1322,12 @@ class StorageEngine::Impl {
                                     const CompactValueCallback& callback,
                                     std::uint64_t now_ms,
                                     ReplicationCommandAppend* replication);
-  Task<absl::Status> ExecuteCompactLocked(std::uint8_t db_id,
-                                          std::string_view key,
-                                          const Digest& digest,
-                                          ValueType value_type, bool read_only,
-                                          const CompactValueCallback& callback,
-                                          TxShardWrites* tx = nullptr,
-                                          std::uint64_t now_ms = 0,
-                                          ReplicationCommandAppend* replication = nullptr);
+  Task<absl::Status> ExecuteCompactLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ValueType value_type, bool read_only,
+      const CompactValueCallback& callback, TxShardWrites* tx = nullptr,
+      std::uint64_t now_ms = 0,
+      ReplicationCommandAppend* replication = nullptr);
 
   Task<absl::StatusOr<HashResult>> ExecuteHashLikeLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
@@ -1297,18 +1355,14 @@ class StorageEngine::Impl {
       const RawValue& value, bool replace, TxShardWrites* tx,
       ReplicationCommandAppend* replication);
 
-  Task<absl::Status> WriteRawValueLocked(std::uint8_t db_id,
-                                         std::string_view key,
-                                         const Digest& digest,
-                                         const RawValue& value,
-                                         TxShardWrites* tx = nullptr,
-                                         ReplicationCommandAppend* replication = nullptr);
+  Task<absl::Status> WriteRawValueLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      const RawValue& value, TxShardWrites* tx = nullptr,
+      ReplicationCommandAppend* replication = nullptr);
 
-  Task<absl::StatusOr<bool>> UpdateExpiration(std::uint8_t db_id,
-                                              std::string_view key,
-                                              std::uint64_t expire_at_ms,
-                                              ExpirationCondition condition,
-                                              ReplicationCommandAppend* replication);
+  Task<absl::StatusOr<bool>> UpdateExpiration(
+      std::uint8_t db_id, std::string_view key, std::uint64_t expire_at_ms,
+      ExpirationCondition condition, ReplicationCommandAppend* replication);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<bool>> UpdateExpirationLocked(
@@ -1388,8 +1442,7 @@ class StorageEngine::Impl {
             tx_cleaner_retired_generations_.load(std::memory_order_acquire),
         .retired_blocks_ =
             tx_cleaner_retired_blocks_.load(std::memory_order_acquire),
-        .cooldown_ms_ =
-            tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
+        .cooldown_ms_ = tx_cleaner_cooldown_ms_.load(std::memory_order_acquire),
         .running_ = tx_cleaner_running_.load(std::memory_order_acquire),
     };
   }
@@ -1397,8 +1450,7 @@ class StorageEngine::Impl {
     return tx_cleaner_cooldown_ms_.load(std::memory_order_acquire);
   }
   absl::Status ConfigureTxCleanerCooldown(std::uint64_t cooldown_ms);
-  void InitializeTxWrites(std::uint64_t txid,
-                          std::span<TxShardWrites> writes);
+  void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes);
   void RegisterRecoveredTxGeneration(WorkerStore& store,
                                      std::uint64_t generation);
 
@@ -1408,6 +1460,10 @@ class StorageEngine::Impl {
 
   void ResumeExpiration() noexcept {
     expiration_pause_count_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  void SetExpirationAuthority(bool authority) noexcept {
+    expiration_authority_.store(authority, std::memory_order_release);
   }
 
   std::uint32_t ExpirationPauseCount() const noexcept {
@@ -1425,6 +1481,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                     std::vector<TxShardWrites*> shards);
+
+  void PublishCommittedFullSyncEffects(TxShardWrites* shard);
 
   void NoteTxCommitStarted() noexcept {
     active_tx_commits_.fetch_add(1, std::memory_order_acq_rel);
@@ -1454,6 +1512,7 @@ class StorageEngine::Impl {
   }
 
   Task<absl::Status> FlushDbDetach(std::uint8_t db_id);
+  Task<absl::Status> FlushAllDetach();
 
   Task<absl::Status> FlushDbReclaim(bool wait) {
     co_return co_await ReclaimDetachedAllWorkers(wait);
@@ -1461,11 +1520,13 @@ class StorageEngine::Impl {
 
   Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,
                                                std::uint64_t db_epoch);
+  Task<absl::Status> PublishFlushAllReplication(
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs);
 
   Task<absl::Status> ApplyReplicatedFlushDb(std::uint8_t db_id,
-                                            std::uint64_t db_epoch) {
-    co_return co_await AdvanceDbEpoch(db_id, db_epoch);
-  }
+                                            std::uint64_t source_db_epoch);
+  Task<absl::Status> ApplyReplicatedFlushAll(
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& source_epochs);
 
   // Persists the new epoch, then takes the database out of service on every
   // worker. Callers hold the database gate across this and can drop it as soon
@@ -1476,6 +1537,8 @@ class StorageEngine::Impl {
   // the other order leaves records on disk whose epoch still matches, and
   // recovery would resurrect the whole flushed database.
   Task<absl::Status> DetachDbEpoch(std::uint8_t db_id, std::uint64_t next);
+  Task<absl::Status> DetachDbEpochs(
+      const std::array<std::uint64_t, kLogicalDatabaseCount>& next);
 
   // Retires what DetachDbEpoch took out of service. Runs with the gate open and
   // ordinary traffic flowing. `wait` is the difference between FLUSHDB SYNC and
@@ -1489,41 +1552,76 @@ class StorageEngine::Impl {
       std::size_t count, std::uint64_t now_ms,
       std::size_t max_bytes = SIZE_MAX);
 
-  PartitionReplicationStart BeginPartitionReplication(
-      std::uint16_t partition_id);
+  absl::StatusOr<FullSyncSessionStart> BeginFullSyncSession(
+      std::uint64_t session_id);
+  bool FullSyncSessionValid(std::uint64_t session_id) const noexcept;
+  void EndFullSyncSession(std::uint64_t session_id);
 
-  void EndPartitionReplication(std::uint16_t partition_id);
+  absl::StatusOr<PartitionReplicationStart> BeginPartitionReplication(
+      std::uint64_t session_id, std::uint16_t partition_id);
+
+  absl::Status BeginPartitionDbReplication(std::uint64_t session_id,
+                                           std::uint16_t partition_id,
+                                           std::uint8_t db_id);
+
+  void EndPartitionReplication(std::uint64_t session_id,
+                               std::uint16_t partition_id);
 
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
-      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count, std::size_t read_concurrency);
+      std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
+      std::uint64_t cursor, std::size_t count, std::size_t read_concurrency);
 
-  PartitionDeltaBatch ReadPartitionDeltas(std::uint16_t partition_id,
-                                          std::uint64_t after_sequence,
-                                          std::size_t count);
+  Task<absl::StatusOr<PartitionFullSyncBatch>> ReadPartitionFullSyncOverrides(
+      std::uint64_t session_id, std::uint16_t partition_id, std::size_t count);
 
   Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                           std::size_t capacity_bytes);
+  Task<absl::Status> SetReplicationLogCapacity(std::size_t capacity_bytes);
+  Task<absl::Status> SetReplicationPublishQueueCapacity(
+      std::size_t capacity_bytes);
   Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
       ReplicationLogAppend event);
   Task<absl::StatusOr<std::uint64_t>> FenceReplicationLog();
   Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
+  absl::Status RetainReplicationLog(std::uint64_t session_id,
+                                    std::uint64_t keep_from_lsn);
+  void ReleaseReplicationLogRetention(std::uint64_t session_id);
   Task<absl::Status> TrimReplicationLog(std::uint64_t keep_from_lsn);
   Task<absl::Status> DisableReplicationLog();
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
+  Task<absl::StatusOr<ReplicationPublisherAdmission>>
+  AcquireReplicationPublisherAdmission(
+      std::size_t logical_bytes,
+      std::optional<ReplicationPublisherTarget> target);
+  void ReleaseReplicationPublisherAdmission(
+      const ReplicationPublisherAdmission& admission,
+      std::size_t logical_bytes);
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 
-  void AcknowledgePartitionDeltas(std::uint16_t partition_id,
-                                  std::uint64_t through_sequence);
+  void AcknowledgePartitionFullSyncOverrides(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::span<const SnapshotRecord> records);
 
-  bool TryTakeReplicationReady(std::uint16_t* partition_id) {
-    return partition_id != nullptr &&
-           replication_ready_.try_dequeue(*partition_id);
-  }
+  void AcknowledgePartitionSnapshotRecords(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::span<const SnapshotRecord> records);
+
+  absl::Status CompletePartitionReplication(std::uint64_t session_id,
+                                            std::uint16_t partition_id);
+
+  absl::Status CompletePartitionDbReplication(std::uint64_t session_id,
+                                              std::uint16_t partition_id,
+                                              std::uint8_t db_id);
+
+  absl::StatusOr<std::optional<FullSyncPublishItem>> PeekFullSyncPublishItem(
+      std::uint64_t session_id);
+
+  void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
+                                      std::uint64_t item_id);
 
   Task<absl::StatusOr<std::uint64_t>> ResetReplicaPartition(
       std::uint16_t partition_id,
@@ -1531,11 +1629,27 @@ class StorageEngine::Impl {
       std::uint64_t persisted_replication_epoch = 0,
       bool replica_lock_held = false);
   Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
-  ResetReplicaPartitions(std::span<const ReplicaPartitionReset> resets);
+  ResetReplicaPartitions(std::uint64_t session_id,
+                         std::span<const ReplicaPartitionReset> resets);
+  Task<absl::Status> HandoffReplicaPartition(std::uint64_t session_id,
+                                             std::uint16_t partition_id,
+                                             std::uint64_t replication_epoch);
+  Task<absl::Status> BeginReplicaTailCommand(std::uint64_t session_id,
+                                             std::uint16_t partition_id,
+                                             std::uint64_t partition_sequence);
+  Task<absl::Status> EndReplicaTailCommand(std::uint64_t session_id,
+                                           std::uint16_t partition_id,
+                                           std::uint64_t partition_sequence);
 
   Task<absl::Status> ApplyReplicaRecords(
-      std::uint16_t partition_id, std::uint64_t replication_epoch,
-      std::span<const SnapshotRecord> records);
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
+  Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
+  Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
+  void SetReplicaLoading(bool loading) noexcept {
+    replica_loading_.store(loading, std::memory_order_release);
+  }
+  Task<absl::Status> DrainReplicaRootWritesLocal(WorkerStore& store);
 
   absl::Status FlushForShutdown();
 
@@ -1544,7 +1658,11 @@ class StorageEngine::Impl {
   Task<absl::Status> ReadSnapshotRecord(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
       RecordIndex& index, std::uint8_t db_id, const std::string* key,
+      std::uint64_t session_id, std::uint64_t baseline_version,
       std::optional<SnapshotRecord>* output, SnapshotReadJoin* join);
+  Task<absl::StatusOr<SnapshotRecord>> ReadFullSyncOverrideRecord(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      const SnapshotRecord& requested);
 
   Task<absl::Status> EnsureReplicationLogActiveBlock(
       WorkerStore& store, std::uint64_t protected_lsn);
@@ -1968,17 +2086,40 @@ class StorageEngine::Impl {
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr, bool capture_fullsync = true);
 
-  void AppendDelta(WorkerStore& store,
-                   WorkerStore::PartitionStore& partition,
-                   SnapshotRecord record);
+  void FullSyncOnCommit(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      const SnapshotRecord& record, const Digest& digest,
+      std::shared_ptr<const ReplicationCommandAppend> command = nullptr);
+  void FullSyncCaptureOnCommit(
+      WorkerStore& store, std::uint64_t session_id,
+      WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
+      const Digest& digest,
+      std::shared_ptr<const ReplicationCommandAppend> command = nullptr);
+  bool TryEnqueueFullSyncCommand(
+      WorkerStore& store, std::uint64_t session_id,
+      std::shared_ptr<const ReplicationCommandAppend> command);
+  static std::string FullSyncOverrideKey(std::uint8_t db_id,
+                                         std::string_view key);
+  static void ClearFullSyncCapture(WorkerStore& store,
+                                   WorkerStore::FullSyncCapture& capture);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
                                                         bool for_defrag,
                                                         bool unlock_writer);
 
   Task<absl::Status> ReturnReservedBlock(ReservedBlock block);
+
+  struct ExplicitWriteRoot {
+    RecordIndex* index_ = nullptr;
+    std::size_t* live_key_count_ = nullptr;
+    std::size_t* store_live_key_count_ = nullptr;
+    std::size_t* expiring_key_count_ = nullptr;
+    std::uint64_t replication_epoch_ = 0;
+    std::uint64_t db_epoch_ = 0;
+    bool reject_older_sequence_ = false;
+  };
 
   Task<absl::Status> WriteRecordLocked(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
@@ -1992,7 +2133,8 @@ class StorageEngine::Impl {
       RecordLocation* written_location = nullptr,
       const RelocationSource* relocation = nullptr, TxShardWrites* tx = nullptr,
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      const ExplicitWriteRoot* explicit_root = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 
@@ -2131,14 +2273,11 @@ class StorageEngine::Impl {
   // Rewrites every record in the block that is still current, so the block ends
   // up with no reachable data and the caller can free it. Clears `defragging`
   // on each failure path so the block stays eligible for a later pass.
-  Task<absl::Status> SalvageBlockRecords(WorkerStore& store,
-                                         std::uint64_t block_id,
-                                         BlockState& source,
-                                         std::uint32_t source_file_id,
-                                         std::uint64_t source_block_offset,
-                                         std::shared_ptr<const
-                                             absl::flat_hash_set<std::uint64_t>>
-                                             committed_txids = nullptr);
+  Task<absl::Status> SalvageBlockRecords(
+      WorkerStore& store, std::uint64_t block_id, BlockState& source,
+      std::uint32_t source_file_id, std::uint64_t source_block_offset,
+      std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
+          committed_txids = nullptr);
 
   // Drains readers and hands the block back to the allocator. The caller must
   // have observed live_bytes == 0 under store_state_mutex and set `freeing`,
@@ -2148,6 +2287,10 @@ class StorageEngine::Impl {
                                        BlockState& source);
 
   StorageEngineOptions options_;
+  // One runtime setting shared by all workers. Queue occupancy and waiters
+  // remain worker-local; CONFIG SET stores this atomically and then visits each
+  // worker only to wake publishers that may now fit under a larger limit.
+  std::atomic<std::size_t> replication_publish_queue_bytes_{0};
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
@@ -2168,6 +2311,11 @@ class StorageEngine::Impl {
   std::unique_ptr<RecoveryDeviceCursor[]> recovery_device_cursors_;
   std::vector<std::uint64_t> epoch_values_;
   std::atomic<bool> epoch_metadata_failed_{false};
+  // Cold branch on every logical write. It is set only while this node is
+  // destructively rebuilding its single data root; foreground commands are
+  // rejected above the engine, while tail commands stamp the pending epochs.
+  std::atomic<bool> replica_loading_{false};
+  std::atomic<bool> expiration_authority_{true};
   std::atomic<std::uint32_t> expiration_pause_count_{0};
   // Background tasks that settle accounting through cross-worker hops
   // (retired-record settlement, detached-index reclaim, a tomb raider
@@ -2229,6 +2377,19 @@ class StorageEngine::Impl {
   std::int64_t recovery_started_ms_ = 0;
   static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};
+  // Runtime translation installed with a promoted replica root. Source DB
+  // epochs can be lower than this node's pre-existing local epoch.
+  std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount>
+      replica_source_db_epochs_{};
+  // Allocates one identity for each cross-flow DB control barrier. It is
+  // scoped to the in-memory replication history; a restart changes history
+  // id, so it does not need persistence.
+  std::atomic<std::uint64_t> next_replication_control_id_{1};
+  // Replica control rendezvous collapses all source-flow copies before
+  // entering storage. Per-DB async gates serialize the resulting epoch
+  // installation against another control apply; they are cold-path and not a
+  // global mutex.
+  std::array<AsyncMutex, kLogicalDatabaseCount> replica_db_epoch_mutexes_;
   std::atomic<unsigned> active_defrags_{0};
   std::atomic<unsigned> pending_defrags_{0};
   std::atomic<unsigned> active_flushes_{0};
@@ -2248,7 +2409,6 @@ class StorageEngine::Impl {
   std::atomic<bool> shutdown_flush_requested_{false};
   std::atomic<unsigned> shutdown_flush_completed_{0};
   std::atomic<bool> shutdown_flush_failed_{false};
-  moodycamel::ConcurrentQueue<std::uint16_t> replication_ready_;
 };
 
 }  // namespace keylane::storage

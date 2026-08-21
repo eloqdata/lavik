@@ -258,6 +258,7 @@ enum class CommandKind {
   kDiscard,
   kWatch,
   kUnwatch,
+  kClient,
   kReplicaOf,
   kConfig,
   kInfo,
@@ -397,11 +398,23 @@ void SetServerInfo(std::string bind_ip, std::uint16_t port,
 void ConnectionOpened() noexcept;
 void ConnectionClosed() noexcept;
 
+// CLIENT metadata is worker-local. Replication socket handoff unregisters on
+// the accepting worker and registers the same identity on the owning worker.
+void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
+                              bool tls, bool replica = false,
+                              std::uint64_t replication_session_id = 0);
+void SetClientReplicationSession(std::uint64_t id,
+                                 std::uint64_t replication_session_id) noexcept;
+void UnregisterClientConnection(std::uint64_t id) noexcept;
+
 // Commands marked kCmdMayBlock hold the database gate only while performing
 // one concrete attempt. Their potentially unbounded wait must not prevent
 // FLUSHDB from draining in-flight database operations.
 bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept;
 void EndCommandDbOperation(std::uint8_t db_id) noexcept;
+bool CloseAllCommandDbGates() noexcept;
+void OpenAllCommandDbGates() noexcept;
+bool CommandDbOperationsActive() noexcept;
 
 // Full-sync snapshot handoff uses the same sharded gate shape as FLUSHDB:
 // commands update only their coordinator worker's counter, while the rare

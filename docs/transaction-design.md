@@ -120,7 +120,12 @@ ShardView exposes the shard's slice as **original argument indices**. MSET: each
 - Transaction exposes: `InitKeys` / `Schedule()` / `Execute(cb, release)` / `Release()` (renamed from Conclude, 2026-08-08). (Dual-hop RENAME is the validation command for this API, kept as an optional extension.)
 
 ### Replication and FLUSHDB (decisions for this milestone)
-- Replication: keep per-key deltas unchanged (written under the key lock; multi-key transactions naturally emit per key). **Recorded gap: replicas can observe a torn MSET/EXEC** (consistent with today's DEL behavior); atomic journaling deferred to a dedicated milestone. The replica read-only check also runs during MULTI queueing.
+- Replication: this milestone's per-key-delta design has been superseded by
+  `docs/replication-design.md`. Transactions publish only after commit. During
+  hidden full sync their participant after-images may apply independently, but
+  `FULLSYNC_CUT` cannot split a transaction; ONLINE uses one transaction
+  envelope and advances all participant cursors atomically. The replica
+  read-only check also runs during MULTI queueing.
 - FLUSHDB/DBSIZE/SCAN: stay behind g_db_gates; every VLL transaction holds a DbOperationGuard for its whole lifetime; all three are kNotQueueable (a documented deviation from Redis); migrating them to shard-level global transactions is a later milestone.
 
 ## 3. Implementation order — small milestones, each independently compiling, all tests green, individually mergeable
@@ -169,7 +174,7 @@ Modified: `src/redis/command.cpp` (routing rewrite), `src/redis/server.cpp` (ctx
 
 **Scheme (proposed by the user)**: presumed-abort 2PC. Data records are the prepare; the initiating worker appends a commit record locally **after** every participating shard's data is durable; at recovery, a txid-tagged data record is kept only if its commit record is found.
 
-**Representation**: `RecordHeader::generation` is repurposed and renamed `txid` (a fossil field: the original newest-wins ordinal, left without any reader after 04f10f4 introduced replication_epoch/mutation_sequence; it merely mirrored mutation_sequence). txid==0 means a non-transactional record (the fast path is always 0; next_txid starts at 1), so **no flag bit is needed**. The generation cleaner clears it only while promoting a positively committed winner into an ordinary records block. Storage format version 2 makes this physical separation mandatory and deliberately does not read the old mixed-block layout.
+**Representation**: `RecordHeader::generation` is repurposed and renamed `txid` (a fossil field: the original newest-wins ordinal, left without any reader after 04f10f4 introduced replication_epoch/mutation_sequence; it merely mirrored mutation_sequence). txid==0 means a non-transactional record (the fast path is always 0; next_txid starts at 1), so **no flag bit is needed**. The generation cleaner clears it only while promoting a positively committed winner into an ordinary records block. The earlier version-2 proposal was not adopted; the current storage format version remains 1.
 
 **The commit record**: new `RecordKind::kTxCommit`, header-only with no payload, the txid field holding the committed id. It uses the transaction's generation block stream, riding the existing staging/flush/recovery-scan machinery. Flush ordering uses the same fence as RelocationDurabilityFence: the coordinator gathers each participating shard's (block, committed) high-water marks and appends the commit only after all are durable. Losing the commit itself = the whole transaction is dropped at recovery, which falls within the relaxed-durability promise; the only forbidden outcome is "half of it survives". Generation cleaning removes the tagged records and their commits as one closed block group, avoiding self-pinning.
 
@@ -179,7 +184,10 @@ Modified: `src/redis/command.cpp` (routing rewrite), `src/redis/server.cpp` (ctx
 
 **Runtime rollback (preserving "readers never see half")**: multi-key **write** commands (MSET/DEL) change from a concluding single hop to "execute hop (release=false) → coordinator checks every shard's status → Release()/rollback hop", 1→2 hops; read commands (MGET/EXISTS) stay at 1 hop. EXEC is already multi-hop, structure unchanged. Rollback = each successful shard, still holding the locks, restores the previous index entries + MarkRecordDead on the new records + counter corrections; the dirty records stay in staging and recovery drops them naturally for lack of a commit.
 
-**Replication interplay**: rolled-back partitions are marked delta-overflow to force a replica re-copy (existing machinery, paid only on the failure path); transactional deltas are neither buffered nor rerouted.
+**Replication interplay**: rollback publishes nothing. Replication publisher
+placeholders resolve to `Discard`, and full-sync participant effects are made
+visible only by `PublishCommittedFullSyncEffects` after commit; the old
+overflow/re-copy compatibility path no longer exists.
 
 **Stages**: ① rename the txid field + thread it through (all writers pass 0, behavior-neutral) → ② kTxCommit + recovery filtering + seeding (nobody writes txids yet, neutral) → ③ transactional tagging + the commit chain + retirement routing → ④ 2-hop + runtime rollback + replication overflow → ⑤ crash tests (crash with data durable but commit not ⇒ all dropped; commit durable ⇒ all present) + a disk-full-triggered runtime rollback e2e (genuine ENOSPC on a small data file).
 
@@ -196,7 +204,7 @@ Stage ③ shipped with (a) as a correctness-first stopgap. The generation-block 
 
 ### M10 complete (2026-08-09; commits 143f5a6/33601dd/288da01/6d627f4)
 
-All four stages landed: ① the txid field; ② kTxCommit + recovery filtering + seeding; ③ tagging + the commit chain + retirement routing (pitfalls: commit records must not enter partitions; shutdown drains commit chains first; standby errors out waiters during shutdown); ④ runtime rollback — TxShardWrites.collect_undo enables the per-shard undo journal (WorkerStore.tx_undo, keyed by txid); single-shard transactions self-roll-back inside their callback keeping 1 hop, multi-shard goes through a second finish hop (rollback/discard under the still-held locks); overwritten keys restore the previous location + MarkRecordDead the new record + force the partition's delta overflow for a replica re-copy, freshly created keys get a normal tombstone append; EXEC does not enable undo (per-command error reporting is Redis semantics; crash atomicity is still guaranteed by the commit record). KEYLANE_FAIL_TX_WRITE injects test faults. Verified: injected mid-transaction failures roll back fully (overwrites / fresh keys / DBSIZE / consistency across restart) + the tx-commit-append crash matrix in both directions.
+All four stages landed: ① the txid field; ② kTxCommit + recovery filtering + seeding; ③ tagging + the commit chain + retirement routing (pitfalls: commit records must not enter partitions; shutdown drains commit chains first; standby errors out waiters during shutdown); ④ runtime rollback — TxShardWrites.collect_undo enables the per-shard undo journal (WorkerStore.tx_undo, keyed by txid); single-shard transactions self-roll-back inside their callback keeping 1 hop, multi-shard goes through a second finish hop (rollback/discard under the still-held locks); overwritten keys restore the previous location + MarkRecordDead the new record + counter corrections, freshly created keys get a normal tombstone append; rolled-back writes publish no replication event; EXEC does not enable undo (per-command error reporting is Redis semantics; crash atomicity is still guaranteed by the commit record). KEYLANE_FAIL_TX_WRITE injects test faults. Verified: injected mid-transaction failures roll back fully (overwrites / fresh keys / DBSIZE / consistency across restart) + the tx-commit-append crash matrix in both directions.
 
 **Deferred follow-ups**: mid-transaction disk errors of a single command inside
 EXEC (e.g. an embedded MSET) remain partially visible (command-level); a full

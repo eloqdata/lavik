@@ -88,10 +88,10 @@ checksum、节点类型、层级、聚合计数、排序边界、无环和共享
 
 - 所有无大小上限的类型都进入同一套 begin/chunk/commit 分帧；
 - 类型白名单不能遗漏 ZSet、Stream 或未来新增类型；
-- snapshot 和 delta 使用相同的可移植表示；
+- full-sync baseline/after-image 和 ONLINE command 都只传输可移植的逻辑表示；
 - replica apply 不能接受只含 root marker、却没有本地 side state 的记录；
 - reset/FLUSHDB 与正在进行的 apply 必须用 replication epoch 和 DB gate 隔离；
-- 多级复制要么明确支持并转发 delta，要么配置时拒绝。
+- 多级复制要么明确支持并转发已提交的复制 event，要么配置时拒绝。
 
 大 Key 拆分与网络回复流式化是两个问题。即使存储已经分段，HGETALL、SMEMBERS、
 ZRANDMEMBER 等仍可能把完整回复物化到内存；回复层必须独立提供有界批次和背压。
@@ -180,7 +180,7 @@ extent，不能只处理另外两个错误出口。
 - 每个 publication 阶段的 crash-point 矩阵；
 - append、extent、父链接、tx commit 和 retirement 的故障注入；
 - TTL + 时钟回拨 + shielding + block reuse 恢复测试；
-- 复制 snapshot/delta 超过 RPC chunk 阈值的全类型测试；
+- 复制 baseline/after-image/ONLINE command 超过传输 chunk 阈值的全类型测试；
 - defrag 与 4 worker 并发读写、FLUSHDB、replica reset 竞态；
 - ASan/UBSan 运行，并为大模型测试设置现实的独立超时；
 - 物理写放大、峰值 RSS、节点数量和回复流式化的资源断言。

@@ -243,6 +243,7 @@ if (BUILD_TESTING)
   FetchContent_MakeAvailable(googletest)
 
   add_executable(keylane_unit_tests
+    tests/buffer_pool_test.cpp
     tests/config_test.cpp
     tests/cross_core_active_sender_test.cpp
     tests/resp_test.cpp
@@ -364,6 +365,9 @@ if (BUILD_TESTING)
     )
     target_link_libraries(keylane_list_e2e_test
       PRIVATE keylane::module GTest::gtest
+    )
+    target_compile_definitions(keylane_list_e2e_test PRIVATE
+      KEYLANE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
     )
     add_test(
       NAME keylane_list_e2e

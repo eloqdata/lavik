@@ -587,6 +587,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       store.partitions_.back().id_ = static_cast<std::uint16_t>(partition);
       store.partitions_.back().replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
+      store.partitions_.back().replica_candidate_epoch_ =
+          store.partitions_.back().replication_epoch_;
     }
   }
   ConfigureWorkerDeviceAffinity();
@@ -599,8 +601,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   recovery_accounting_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
-  orphan_extent_barrier_ =
-      std::make_unique<CoroutineBarrier>(worker_count);
+  orphan_extent_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   return absl::OkStatus();
 }
 
@@ -792,8 +793,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           const ExtentRef& extent = extents->at(extent_index);
           const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
           if (extent_owner >= worker_count_) {
-            Fail(absl::InternalError(
-                "manifest references an unscanned extent"));
+            Fail(
+                absl::InternalError("manifest references an unscanned extent"));
             return;
           }
           live_by_owner[extent_owner].push_back(RecoveryLiveReference{
@@ -837,7 +838,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         }
         state->live_bytes_ += reference.bytes_;
         if (reference.txid_ != 0) {
-          const auto tx_block = owner_store.tx_blocks_.find(reference.block_id_);
+          const auto tx_block =
+              owner_store.tx_blocks_.find(reference.block_id_);
           if (tx_block != owner_store.tx_blocks_.end()) {
             NoteTxRecordLocal(owner_store, reference.block_id_,
                               reference.allocation_epoch_,
@@ -959,8 +961,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     auto deleted =
         co_await DeleteLocked(expired.db_id_, expired.key_, expired.digest_);
     if (!deleted.ok()) {
-      if (deleted.status().code() !=
-              absl::StatusCode::kResourceExhausted ||
+      if (deleted.status().code() != absl::StatusCode::kResourceExhausted ||
           expired.shielding_) {
         Fail(deleted.status());
         co_return deleted.status();
@@ -984,8 +985,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           co_return resolved.status();
         }
         RecordIndex::Entry* current = *resolved;
-        if (current == nullptr ||
-            current->value_.kind_ != RecordKind::kValue ||
+        if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
             !IsExpired(current->value_, recovery_now_ms)) {
           continue;
         }
@@ -1016,8 +1016,8 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   store.recovery_external_keys_.clear();
   store.recovery_external_keys_.rehash(0);
   worker.SpawnRoot(PeriodicFlush(&store));
+  worker.SpawnBackground(ActiveExpiration(&store));
   if (options_.expiration_authority_) {
-    worker.SpawnBackground(ActiveExpiration(&store));
     // One coordinator drives the whole-engine round; worker 0 hosts it.
     if (worker.id() == 0 &&
         tomb_raider_config_.mode_.load(std::memory_order_relaxed) !=

@@ -27,6 +27,7 @@ struct alignas(64) MemoryGaugeCache {
   std::atomic<std::uint64_t> reserved_bytes_{0};
   std::atomic<std::uint64_t> peak_used_bytes_{0};
   std::atomic<std::uint64_t> max_bytes_{0};
+  std::atomic<std::uint64_t> fullsync_reserved_bytes_{0};
 };
 
 struct alignas(64) MemoryCounterCache {
@@ -259,6 +260,8 @@ MemoryStats GetMemoryStats() noexcept {
       .peak_used_bytes_ =
           g_memory_gauges.peak_used_bytes_.load(std::memory_order_relaxed),
       .max_bytes_ = g_memory_gauges.max_bytes_.load(std::memory_order_relaxed),
+      .fullsync_reserved_bytes_ = g_memory_gauges.fullsync_reserved_bytes_.load(
+          std::memory_order_relaxed),
       .rejected_commands_ =
           g_memory_counters.rejected_commands_.load(std::memory_order_relaxed),
   };
@@ -269,7 +272,38 @@ bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept {
       g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
   const std::uint64_t used =
       g_memory_gauges.used_bytes_.load(std::memory_order_relaxed);
-  return used >= maximum || additional_bytes > maximum - used;
+  const std::uint64_t reserved =
+      g_memory_gauges.fullsync_reserved_bytes_.load(std::memory_order_relaxed);
+  return used >= maximum || reserved > maximum - used ||
+         additional_bytes > maximum - used - reserved;
+}
+
+bool TryReserveFullSyncMemory(std::size_t bytes) noexcept {
+  if (bytes == 0) return true;
+  const std::uint64_t maximum =
+      g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
+  const std::uint64_t used = AllocatorUsed();
+  std::uint64_t reserved =
+      g_memory_gauges.fullsync_reserved_bytes_.load(std::memory_order_relaxed);
+  for (;;) {
+    if (used >= maximum || reserved > maximum - used ||
+        bytes > maximum - used - reserved) {
+      return false;
+    }
+    if (g_memory_gauges.fullsync_reserved_bytes_.compare_exchange_weak(
+            reserved, reserved + bytes, std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+}
+
+void ReleaseFullSyncMemory(std::size_t bytes) noexcept {
+  if (bytes == 0) return;
+  const std::uint64_t previous =
+      g_memory_gauges.fullsync_reserved_bytes_.fetch_sub(
+          bytes, std::memory_order_relaxed);
+  (void)previous;
+  assert(previous >= bytes);
 }
 
 void RecordMemoryRejection() noexcept {

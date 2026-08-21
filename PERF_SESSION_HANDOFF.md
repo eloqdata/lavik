@@ -1,6 +1,68 @@
 # Keylane Performance Session Handoff
 
-Updated: 2026-08-18 UTC
+Updated: 2026-08-20 UTC
+
+## 2026-08-20 local 20-GB continuous-write full-sync validation
+
+The final verification reran the Release binary from 20:13:08 to 20:33:08
+UTC against the same 8,000,000-key, roughly 20-GB source while 16 threads and
+160 memtier connections continuously replaced random 1,000-4,000-byte values.
+One full-sync session reached ONLINE in exactly 20 minutes without a history
+gap, reconnect, OOM rejection, or backlog invalidation. At ONLINE the source
+reported offset 8,950,064 and `lag=0`; the 1,275.7-second workload completed
+13.32 million successful SETs at 10,444.54 SET/s and 25,977.99 KiB/s, with
+15.29-ms mean, 173.055-ms p99.9, and 438.271-ms p99.99 latency.
+
+The run exposed one final admission issue at the cut itself: while the source
+drained the command gate, some attempted SETs received `TRYAGAIN database
+flush is in progress`. The cut now closes and drains transaction admission
+before the DB gates, and ordinary DB admission suspends the coroutine instead
+of returning a transient error. The complete 66-test Debug matrix, including
+the replication E2Es, passed after that correction. A post-ONLINE 24-MiB
+exclusive command then had exact `STRLEN=25,165,824` on both nodes; source and
+replica both reported `DBSIZE=8,000,001` and `lag=0`.
+
+### Earlier capacity-resize and reconnect run
+
+The final in-memory-backlog Release build was exercised with one source worker
+and one replica worker against 64-GiB file-backed devices. The source began
+with 8,000,000 `kv_` keys whose random values were 1,000-4,000 bytes (roughly
+20 GB of live values). During full sync, memtier continuously replaced random
+keys using 16 threads, 10 clients per thread, the same value-size range, and a
+nominal per-client rate limit of 625.
+
+Full sync started at 18:55:10 UTC and reached ONLINE at 19:11:23, or about 16
+minutes 13 seconds. It stayed on one replication session through runtime
+changes of `repl-backlog-size` from 1 GiB to 512 MiB and back, and
+`replication-publish-queue-mb-per-worker` from 16 MiB to 8 MiB and back. Source
+and replica ended with 8,000,001 keys; the extra key was a 24-MiB value written
+after its partition entered TAILING. That command exceeded the 16-MiB queue
+waterline, obtained an exclusive FIFO admission, completed in 2.25 seconds,
+and had an exact source length of 25,165,824 bytes. The large-value E2E covers
+byte-exact transfer; this performance run additionally verified equal final
+source/replica key counts. Source RSS was about 2.16 GiB, full-sync coverage
+reservation was about 248 KiB, and no command was rejected for OOM.
+
+After ONLINE, the replica ACK cursor advanced from 9,400,968 to 9,862,934 in
+30 seconds with `lag=0`. The interrupted 1,298.7-second memtier run completed
+about 15.95 million SETs at 12,287 SET/s and 30,530 KiB/s overall, with 13.01
+ms average, 81.41 ms p99, and 172.03 ms p99.9. Early in the scan it sustained
+roughly 30-50k SET/s; as more partitions entered TAILING, target apply
+throughput became the bound and source admission correctly applied
+backpressure instead of dropping replication history.
+
+The first forced disconnect exposed an eager low-water trim: releasing the
+last ACK pin cut an otherwise valid reconnect window from 100% to 75%, making
+the requested cursor 19,035 LSNs older than the new floor. The final patch
+limits low-water hysteresis to connected pinned consumers; an unpinned circular
+log now evicts only the chunks required by new writes. A dedicated chunk-log
+test covers that boundary. A post-fix Release integration run then requested
+cursor 32,504 with floor 12,557 and tail 35,290, explicitly selected
+`CONTINUE`, and returned ONLINE in about one second. The final regression set
+passed the replication-log E2E, all 55 unit tests, nine replication E2Es
+(multi-replica, reconnect, TLS, transactions, FLUSHDB/FLUSHALL, backpressure,
+and destructive full sync), the metrics E2E, and both file and SPDK Release
+builds.
 
 ## 2026-08-18 two-host 1-TB primary/replica controlled-load results
 
@@ -108,7 +170,7 @@ replica is `spdk://58bf:00:00.0/1` on port 6380. Only the first 8 MiB of each
 device was zeroed between clean runs.
 
 The original live-replication path allowed only one unacknowledged command per
-flow. At about 120k 2-KiB SET/s it fell below the 64-MiB on-disk backlog floor
+flow. At about 120k 2-KiB SET/s it fell below the legacy 64-MiB history floor
 after roughly eight seconds, disconnected all flows, and required another full
 sync. The optimized path now:
 
@@ -124,10 +186,10 @@ sync. The optimized path now:
 The celer submodule has an uncommitted vectored `TcpStream::WriteAllV` path and
 the earlier multishot-recv pause/drain handoff fix. The replication publisher
 staging queue is configurable through
-`--replication-publish-queue-mb`; these tests used 64 MiB per worker. The
-default remains 8 MiB. Increasing that queue fixed publisher staging
+`--replication-publish-queue-mb-per-worker`; these tests used 64 MiB per worker. The
+default at that time was 8 MiB (the current default is 16 MiB). Increasing that queue fixed publisher staging
 invalidation but did not by itself prevent a sustained consumer from falling
-below the on-disk backlog floor.
+below that legacy history floor.
 
 With 8 source cores and 8 replica cores, the optimized path sustained a warm
 10-second unlimited run at 222,064 SET/s (about 434 MiB/s), with 0.360 ms
@@ -413,8 +475,8 @@ The current SPDK server uses:
       --bind=10.0.0.4 \
       --port=6379 \
       --metrics-port=9100 \
-      --recv-buffers=1024 \
-      --registered-buffer-mb=256 \
+      --recv-buffers-per-worker=1024 \
+      --registered-buffer-mb-per-worker=256 \
       --busy-poll-us=20 \
       --background-budget-us=10 \
       --background-warrant-percent=1 \
@@ -460,8 +522,8 @@ The comparable io_uring launch is:
       --bind=10.0.0.4 \
       --port=6380 \
       --metrics-port=9101 \
-      --recv-buffers 1024 \
-      --registered-buffer-mb=256 \
+      --recv-buffers-per-worker 1024 \
+      --registered-buffer-mb-per-worker=256 \
       --busy-poll-us=20 \
       --background-budget-us=10 \
       --background-warrant-percent=1 \
@@ -580,8 +642,8 @@ current process and not supported by current CMake):
       --bind=10.0.0.4 \
       --port=6379 \
       --metrics-port=9100 \
-      --recv-buffers=1024 \
-      --registered-buffer-mb=64 \
+      --recv-buffers-per-worker=1024 \
+      --registered-buffer-mb-per-worker=64 \
       --busy-poll-us=20 \
       --data-file=/dev/nvme1n1 \
       --threads=8 \

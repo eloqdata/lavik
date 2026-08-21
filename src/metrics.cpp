@@ -389,6 +389,11 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_memory_max_bytes gauge\n"
       "keylane_memory_max_bytes ",
       memory_metrics.max_bytes_, "\n",
+      "# HELP keylane_fullsync_reserved_memory_bytes Memory headroom "
+      "reserved for active full-sync coverage maps.\n"
+      "# TYPE keylane_fullsync_reserved_memory_bytes gauge\n"
+      "keylane_fullsync_reserved_memory_bytes ",
+      memory_metrics.fullsync_reserved_bytes_, "\n",
       "# HELP keylane_memory_rejected_commands_total Commands rejected by "
       "the memory limit.\n"
       "# TYPE keylane_memory_rejected_commands_total counter\n"
@@ -402,6 +407,62 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# HELP keylane_filesystem_available_bytes Space available on the data "
       "file's filesystem.\n"
       "# TYPE keylane_filesystem_available_bytes gauge\n");
+  output.append(
+      "# HELP keylane_replication_backlog_bytes Allocated shared in-memory "
+      "replication backlog bytes.\n"
+      "# TYPE keylane_replication_backlog_bytes gauge\n"
+      "# HELP keylane_replication_backlog_capacity_bytes Configured shared "
+      "in-memory replication backlog capacity.\n"
+      "# TYPE keylane_replication_backlog_capacity_bytes gauge\n"
+      "# HELP keylane_replication_backlog_chunks Allocated 8 MiB replication "
+      "backlog chunks.\n"
+      "# TYPE keylane_replication_backlog_chunks gauge\n"
+      "# HELP keylane_replication_backlog_floor_lsn Oldest retained flow LSN.\n"
+      "# TYPE keylane_replication_backlog_floor_lsn gauge\n"
+      "# HELP keylane_replication_backlog_tail_lsn Newest published flow LSN.\n"
+      "# TYPE keylane_replication_backlog_tail_lsn gauge\n"
+      "# HELP keylane_replication_backlog_pinned_cursors Live replica ACK "
+      "cursors pinning history.\n"
+      "# TYPE keylane_replication_backlog_pinned_cursors gauge\n"
+      "# HELP keylane_replication_backlog_backpressured Whether the worker is "
+      "waiting for ACK progress below the low watermark.\n"
+      "# TYPE keylane_replication_backlog_backpressured gauge\n"
+      "# HELP keylane_replication_backlog_active Whether this worker's shared "
+      "replication history is active.\n"
+      "# TYPE keylane_replication_backlog_active gauge\n"
+      "# HELP keylane_replication_backlog_backpressure_waits_total Backlog "
+      "high-watermark backpressure episodes.\n"
+      "# TYPE keylane_replication_backlog_backpressure_waits_total counter\n"
+      "# HELP keylane_replication_publish_queue_bytes Commands staged before "
+      "the shared backlog.\n"
+      "# TYPE keylane_replication_publish_queue_bytes gauge\n"
+      "# HELP keylane_replication_publish_queue_capacity_bytes Configured "
+      "publisher staging capacity.\n"
+      "# TYPE keylane_replication_publish_queue_capacity_bytes gauge\n");
+  for (const storage::StorageReplicationLogMetrics& log :
+       storage_metrics.replication_logs_) {
+    const std::string labels = absl::StrCat("worker=\"", log.worker_id_, "\"");
+    absl::StrAppend(
+        &output, "keylane_replication_backlog_bytes{", labels, "} ",
+        log.chunk_count_ * storage::kStorageBlockBytes, "\n",
+        "keylane_replication_backlog_capacity_bytes{", labels, "} ",
+        log.capacity_bytes_, "\n", "keylane_replication_backlog_chunks{",
+        labels, "} ", log.chunk_count_, "\n",
+        "keylane_replication_backlog_floor_lsn{", labels, "} ", log.floor_lsn_,
+        "\n", "keylane_replication_backlog_tail_lsn{", labels, "} ",
+        log.tail_lsn_, "\n", "keylane_replication_backlog_pinned_cursors{",
+        labels, "} ", log.pinned_cursors_, "\n",
+        "keylane_replication_backlog_backpressured{", labels, "} ",
+        log.capacity_backpressured_ ? 1 : 0, "\n",
+        "keylane_replication_backlog_active{", labels, "} ",
+        log.active_ ? 1 : 0, "\n",
+        "keylane_replication_backlog_backpressure_waits_total{", labels, "} ",
+        log.backpressure_waits_, "\n",
+        "keylane_replication_publish_queue_bytes{", labels, "} ",
+        log.publish_queue_bytes_, "\n",
+        "keylane_replication_publish_queue_capacity_bytes{", labels, "} ",
+        log.publish_queue_capacity_bytes_, "\n");
+  }
   for (const storage::StorageDeviceMetrics& device : storage_metrics.devices_) {
     std::string labels =
         absl::StrCat("device=\"", device.device_id_, "\",path=\"");

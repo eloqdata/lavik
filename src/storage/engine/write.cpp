@@ -506,8 +506,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       if (entry.previous_.has_value() &&
           entry.previous_->kind_ == RecordKind::kValue) {
         auto loaded = co_await LoadValue(
-            store, partition, entry.db_id_, undo_key,
-            ComputeDigest(undo_key), *entry.previous_, entry.previous_extents_);
+            store, partition, entry.db_id_, undo_key, ComputeDigest(undo_key),
+            *entry.previous_, entry.previous_extents_);
         if (!loaded.ok()) {
           store.write_failed_ = true;
           co_return loaded.status();
@@ -517,25 +517,22 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         restored_payload = std::string_view(
             reinterpret_cast<const char*>(bytes.data()), bytes.size());
       }
-      const RecordKind restored_kind =
-          entry.previous_.has_value() ? entry.previous_->kind_
-                                      : RecordKind::kTombstone;
-      const ValueType restored_type =
-          restored_kind == RecordKind::kValue
-              ? entry.previous_->value_type_
-              : ValueType::kNone;
-      const std::uint64_t restored_expiry =
-          restored_kind == RecordKind::kValue
-              ? entry.previous_->expire_at_ms_
-              : 0;
-      const std::uint64_t restored_size =
-          restored_kind == RecordKind::kValue
-              ? entry.previous_->logical_size_
-              : 0;
-      absl::Status appended = co_await AppendLocked(
-          store, partition, entry.db_id_, undo_key, restored_payload,
-          restored_kind, restored_type, restored_expiry, compensation,
-          restored_size);
+      const RecordKind restored_kind = entry.previous_.has_value()
+                                           ? entry.previous_->kind_
+                                           : RecordKind::kTombstone;
+      const ValueType restored_type = restored_kind == RecordKind::kValue
+                                          ? entry.previous_->value_type_
+                                          : ValueType::kNone;
+      const std::uint64_t restored_expiry = restored_kind == RecordKind::kValue
+                                                ? entry.previous_->expire_at_ms_
+                                                : 0;
+      const std::uint64_t restored_size = restored_kind == RecordKind::kValue
+                                              ? entry.previous_->logical_size_
+                                              : 0;
+      absl::Status appended =
+          co_await AppendLocked(store, partition, entry.db_id_, undo_key,
+                                restored_payload, restored_kind, restored_type,
+                                restored_expiry, compensation, restored_size);
       if (!appended.ok()) {
         store.write_failed_ = true;
         co_return appended;
@@ -543,12 +540,16 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       continue;
     }
     if (!entry.previous_.has_value()) {
-      // The key did not exist: a normal tombstone append restores absence
-      // with every side effect handled (accounting, watchers, and the
-      // replica delta that supersedes the aborted value).
-      absl::Status tombstone =
-          co_await AppendLocked(store, partition, entry.db_id_, undo_key, {},
-                                RecordKind::kTombstone, ValueType::kNone, 0);
+      // The key did not exist: append a tombstone to restore runtime and
+      // recovery state. The aborted transaction was never published to a
+      // full-sync session, so this internal rollback must not publish either.
+      absl::Status tombstone = co_await AppendLocked(
+          store, partition, entry.db_id_, undo_key, {}, RecordKind::kTombstone,
+          ValueType::kNone, 0,
+          /*tx=*/nullptr, /*logical_size=*/0,
+          /*commit_retirements=*/nullptr, /*committed_sequence=*/nullptr,
+          /*replication=*/nullptr, /*trace=*/nullptr,
+          /*capture_fullsync=*/false);
       if (!tombstone.ok()) {
         store.write_failed_ = true;
         co_return tombstone;
@@ -601,17 +602,6 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     }
     UnpinTxDependencyLocal(store, entry.previous_->block_id_,
                            entry.previous_->allocation_epoch_);
-    if (partition.capture_deltas_) {
-      // The aborted value may already have shipped; there is no delta that
-      // can express "go back", so force the replica to re-copy the
-      // partition.
-      assert(store.replication_delta_bytes_ >= partition.delta_bytes_);
-      store.replication_delta_bytes_ -= partition.delta_bytes_;
-      partition.deltas_.clear();
-      partition.delta_bytes_ = 0;
-      partition.delta_floor_ = partition.mutation_sequence_;
-      partition.delta_overflow_ = true;
-    }
   }
   co_return absl::OkStatus();
 }
@@ -666,8 +656,7 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
       tx_active_pause_claimed.compare_exchange_strong(
           expected_tx_active_pause, true, std::memory_order_acq_rel)) {
     char* end = nullptr;
-    const unsigned long pause_ms =
-        std::strtoul(tx_active_pause_text, &end, 10);
+    const unsigned long pause_ms = std::strtoul(tx_active_pause_text, &end, 10);
     if (end != tx_active_pause_text && *end == '\0' && pause_ms != 0) {
       absl::Status paused = co_await celer::SleepFor(
           *store.worker_, std::chrono::milliseconds(pause_ms));
@@ -770,11 +759,14 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
     });
     std::uint16_t write_buffer_id = 0;
     std::byte* heap_buffer = nullptr;
-    if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id) &&
-        !store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
-      reclaim_allocated();
-      co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                             "no extent write buffer is available");
+    while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
+      // Extent construction is part of a foreground write. Do not let it
+      // bypass the configured storage pool with an unbounded 8 MiB heap
+      // allocation. The caller holds store_state_mutex_; release it so the
+      // flush completion that returns a buffer can make progress.
+      store.store_state_mutex_.Unlock(*store.worker_);
+      co_await store.buffers_.WaitForWriteBuffer();
+      co_await store.store_state_mutex_.Lock();
     }
     auto release_buffer = [&]() {
       if (write_buffer_id != 0) {
@@ -915,8 +907,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
     TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    std::uint64_t* committed_sequence,
-    ReplicationCommandAppend* replication, SetLatencyTrace* trace) {
+    std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
+    SetLatencyTrace* trace, bool capture_fullsync) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -924,7 +916,29 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   // Every real keyspace modification funnels through here (client writes,
   // deletes, expiration rewrites, active expiry): invalidate watchers.
   tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
-  const std::uint64_t mutation_sequence = ++partition.mutation_sequence_;
+  std::optional<ExplicitWriteRoot> replica_write_root;
+  std::optional<std::uint64_t> replica_mutation_sequence;
+  if (replica_loading_.load(std::memory_order_acquire)) [[unlikely]] {
+    auto* sync = partition.replica_sync_.get();
+    if (sync == nullptr || !sync->command_sequence_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "replica command arrived outside its apply context");
+    }
+    replica_mutation_sequence = *sync->command_sequence_;
+    replica_write_root.emplace(ExplicitWriteRoot{
+        .index_ = &partition.indexes_[db_id],
+        .live_key_count_ = &partition.live_key_count_[db_id],
+        .store_live_key_count_ = &store.live_key_count_[db_id],
+        .expiring_key_count_ = &partition.expiring_key_count_[db_id],
+        .replication_epoch_ = sync->replication_epoch_,
+        .db_epoch_ = sync->local_db_epochs_[db_id],
+        .reject_older_sequence_ = true,
+    });
+  }
+  const std::uint64_t mutation_sequence =
+      replica_mutation_sequence.has_value()
+          ? *replica_mutation_sequence
+          : ++partition.mutation_sequence_;
   absl::Status status = absl::OkStatus();
   const bool key_external = key.size() > options_.inline_key_max_bytes_;
   const std::uint64_t logical_payload_bytes =
@@ -944,7 +958,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         store, db_id, key, manifest, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, false, true, true, key_external,
         logical_size, *extents, nullptr, nullptr, tx,
-        std::move(commit_retirements), trace);
+        std::move(commit_retirements), trace,
+        replica_write_root.has_value() ? &*replica_write_root : nullptr);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -953,10 +968,15 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         store, db_id, key, value, kind, value_type, expire_at_ms, digest,
         /*txid=*/0, mutation_sequence, false, true, false, key_external,
         logical_size, nullptr, nullptr, nullptr, tx,
-        std::move(commit_retirements), trace);
+        std::move(commit_retirements), trace,
+        replica_write_root.has_value() ? &*replica_write_root : nullptr);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
+  }
+  if (status.ok() && replica_mutation_sequence.has_value()) {
+    partition.mutation_sequence_ =
+        std::max(partition.mutation_sequence_, mutation_sequence);
   }
   if (status.ok() && tx != nullptr) {
     tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
@@ -966,78 +986,186 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         .exists_ = kind == RecordKind::kValue,
     });
   }
+  std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
   if (status.ok() && replication != nullptr) {
     AppendReplicationExpirationEffect(
-        &replication->args_, db_id, db_id, key,
-        kind == RecordKind::kValue,
+        &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
         kind == RecordKind::kValue ? expire_at_ms : 0);
     replication->db_id_ = db_id;
     replication->partition_id_ = partition.id_;
     replication->partition_sequence_ = mutation_sequence;
+    if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
+      fullsync_command =
+          std::make_shared<const ReplicationCommandAppend>(*replication);
+    }
     (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
-  if (status.ok() && partition.capture_deltas_) {
-    std::string replicated_value(value);
-    AppendDelta(store, partition, SnapshotRecord{
-                               .kind_ = kind == RecordKind::kValue
-                                            ? SnapshotRecord::Kind::kValue
-                                            : SnapshotRecord::Kind::kDelete,
-                               .db_id_ = db_id,
-                               .db_epoch_ = DbEpoch(db_id),
-                               .mutation_sequence_ = mutation_sequence,
-                               .expire_at_ms_ = expire_at_ms,
-                               .value_type_ = value_type,
-                               .logical_size_ = logical_size,
-                               .key_ = std::string(key),
-                               .value_ = std::move(replicated_value),
-                           });
+  if (status.ok() && capture_fullsync &&
+      (tx != nullptr || !partition.fullsync_subscribers_.empty()))
+      [[unlikely]] {
+    auto make_effect = [&] {
+      return SnapshotRecord{
+          .kind_ = kind == RecordKind::kValue ? SnapshotRecord::Kind::kValue
+                                              : SnapshotRecord::Kind::kDelete,
+          .db_id_ = db_id,
+          .db_epoch_ = DbEpoch(db_id),
+          .mutation_sequence_ = mutation_sequence,
+          .expire_at_ms_ = expire_at_ms,
+          .value_type_ = value_type,
+          .logical_size_ = logical_size,
+          .key_ = std::string(key),
+          .value_ = {},
+      };
+    };
+    if (tx != nullptr) {
+      std::vector<std::uint64_t> session_ids;
+      session_ids.reserve(partition.fullsync_subscribers_.size());
+      for (const auto& [session_id, capture] :
+           partition.fullsync_subscribers_) {
+        // Transaction events are not projected before FULLSYNC_CUT. Their
+        // participant-local after-images remain captured through the final
+        // transaction fence, including for partitions already tailing.
+        (void)capture;
+        session_ids.push_back(session_id);
+      }
+      if (!session_ids.empty()) {
+        tx->fullsync_effects_.push_back(TxShardWrites::FullSyncEffect{
+            .partition_id_ = partition.id_,
+            .record_ = make_effect(),
+            .session_ids_ = std::move(session_ids),
+        });
+      }
+    } else {
+      SnapshotRecord effect = make_effect();
+      FullSyncOnCommit(store, partition, effect, digest,
+                       std::move(fullsync_command));
+    }
   }
   co_return status;
 }
 
-void StorageEngine::Impl::AppendDelta(
+std::string StorageEngine::Impl::FullSyncOverrideKey(
+    std::uint8_t db_id, std::string_view key) {
+  std::string result;
+  result.reserve(key.size() + 1);
+  result.push_back(static_cast<char>(db_id));
+  result.append(key);
+  return result;
+}
+
+void StorageEngine::Impl::ClearFullSyncCapture(
+    WorkerStore& store, WorkerStore::FullSyncCapture& capture) {
+  (void)store;
+  capture.overrides_.clear();
+  capture.latest_by_key_.clear();
+  capture.key_phases_.Clear();
+}
+
+void StorageEngine::Impl::FullSyncOnCommit(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
-    SnapshotRecord record) {
-  constexpr std::size_t kMaxRetainedMutations = 65536;
-  constexpr std::size_t kMaxRetainedBytesPerWorker = 64U * 1024U * 1024U;
-  const std::size_t record_bytes =
-      sizeof(SnapshotRecord) + record.key_.size() + record.value_.size();
-  if (partition.delta_overflow_) return;
-  if (record_bytes > kMaxRetainedBytesPerWorker ||
-      store.replication_delta_bytes_ >
-          kMaxRetainedBytesPerWorker - record_bytes) {
-    // This compatibility queue is intentionally lossy at its hard bound. A
-    // flow observing any affected partition must restart its full sync; the
-    // primary write remains independent of replica speed.
-    for (auto& candidate : store.partitions_) {
-      if (!candidate.capture_deltas_) continue;
-      candidate.delta_floor_ = candidate.mutation_sequence_;
-      candidate.delta_bytes_ = 0;
-      candidate.deltas_.clear();
-      candidate.delta_overflow_ = true;
-    }
-    store.replication_delta_bytes_ = 0;
+    const SnapshotRecord& record, const Digest& digest,
+    std::shared_ptr<const ReplicationCommandAppend> command) {
+  for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
+    FullSyncCaptureOnCommit(store, session_id, capture, record, digest,
+                            command);
+  }
+}
+
+void StorageEngine::Impl::FullSyncCaptureOnCommit(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
+    const Digest& digest,
+    std::shared_ptr<const ReplicationCommandAppend> command) {
+  const auto db_phase = capture.db_phases_[record.db_id_];
+  if (db_phase == WorkerStore::FullSyncCapture::DbPhase::kUnstarted) {
     return;
   }
-  partition.delta_bytes_ += record_bytes;
-  store.replication_delta_bytes_ += record_bytes;
-  partition.deltas_.push_back(std::move(record));
-  if (!partition.delta_queued_) {
-    partition.delta_queued_ = true;
-    (void)replication_ready_.enqueue(partition.id_);
+  auto* phase = capture.key_phases_.Find(digest, record.key_);
+  if (command != nullptr &&
+      (db_phase == WorkerStore::FullSyncCapture::DbPhase::kTailing ||
+       phase != nullptr)) {
+    (void)TryEnqueueFullSyncCommand(store, session_id, std::move(command));
+    return;
   }
-  while (partition.deltas_.size() > kMaxRetainedMutations) {
-    partition.delta_floor_ = std::max(
-        partition.delta_floor_, partition.deltas_.front().mutation_sequence_);
-    const SnapshotRecord& removed = partition.deltas_.front();
-    const std::size_t removed_bytes =
-        sizeof(SnapshotRecord) + removed.key_.size() + removed.value_.size();
-    assert(partition.delta_bytes_ >= removed_bytes);
-    assert(store.replication_delta_bytes_ >= removed_bytes);
-    partition.delta_bytes_ -= removed_bytes;
-    store.replication_delta_bytes_ -= removed_bytes;
-    partition.deltas_.pop_front();
+  // An unseen key, or a committed transaction participant for which there is
+  // no independently replayable command, is represented by its latest
+  // after-image. A later scanner observation skips this key; an older ACK can
+  // never erase the newer sequence below.
+  if (phase != nullptr) {
+    capture.key_phases_.Erase(phase);
   }
+  const std::string key = FullSyncOverrideKey(record.db_id_, record.key_);
+  if (auto found = capture.latest_by_key_.find(key);
+      found != capture.latest_by_key_.end()) {
+    auto previous = capture.overrides_.find(found->second);
+    assert(previous != capture.overrides_.end());
+    capture.overrides_.erase(previous);
+    capture.latest_by_key_.erase(found);
+  }
+  capture.overrides_.emplace(record.mutation_sequence_, record);
+  capture.latest_by_key_.emplace(std::move(key), record.mutation_sequence_);
+}
+
+bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
+    WorkerStore& store, std::uint64_t session_id,
+    std::shared_ptr<const ReplicationCommandAppend> command) {
+  auto session = store.fullsync_sessions_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_ || command == nullptr ||
+      command->args_.empty()) {
+    return false;
+  }
+  std::size_t logical_bytes = sizeof(command->kind_) + sizeof(command->db_id_) +
+                              sizeof(command->partition_id_) +
+                              sizeof(command->partition_sequence_);
+  for (const std::string& arg : command->args_) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
+        sizeof(std::uint32_t) >
+            std::numeric_limits<std::size_t>::max() - logical_bytes -
+                arg.size()) {
+      session->second.db_epoch_invalidated_ = true;
+      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+      return false;
+    }
+    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  }
+  auto& state = session->second;
+  if (state.next_publish_id_ == 0) {
+    state.db_epoch_invalidated_ = true;
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  if (logical_bytes > std::numeric_limits<std::size_t>::max() -
+                          state.publish_queue_bytes_) {
+    state.db_epoch_invalidated_ = true;
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  const std::uint64_t id = state.next_publish_id_++;
+  state.publish_queue_bytes_ += logical_bytes;
+  state.publish_queue_.push_back(
+      WorkerStore::FullSyncSessionState::PendingCommand{
+          .id_ = id,
+          .logical_bytes_ = logical_bytes,
+          .command_ = std::move(command),
+      });
+  return true;
+}
+
+void StorageEngine::Impl::PublishCommittedFullSyncEffects(
+    TxShardWrites* shard) {
+  if (shard == nullptr) return;
+  WorkerStore& store = CurrentStore();
+  for (const TxShardWrites::FullSyncEffect& effect : shard->fullsync_effects_) {
+    auto& partition = PartitionFor(store, effect.partition_id_);
+    for (std::uint64_t session_id : effect.session_ids_) {
+      auto capture = partition.fullsync_subscribers_.find(session_id);
+      if (capture == partition.fullsync_subscribers_.end()) continue;
+      FullSyncCaptureOnCommit(store, session_id, capture->second,
+                              effect.record_, ComputeDigest(effect.record_.key_));
+    }
+  }
+  shard->fullsync_effects_.clear();
 }
 
 Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
@@ -1051,7 +1179,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     RecordLocation* written_location, const RelocationSource* relocation,
     TxShardWrites* tx,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    SetLatencyTrace* trace) {
+    SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1140,7 +1268,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   WorkerStore::PartitionStore* partition_ptr =
       kind == RecordKind::kTxCommit ? nullptr : &PartitionForKey(store, key);
   RecordIndex* index_ptr =
-      partition_ptr == nullptr ? nullptr : &partition_ptr->indexes_[db_id];
+      explicit_root != nullptr
+          ? explicit_root->index_
+          : (partition_ptr == nullptr ? nullptr
+                                      : &partition_ptr->indexes_[db_id]);
   auto allocated_lsn = AllocateLsn(store);
   if (!allocated_lsn.ok()) {
     co_return allocated_lsn.status();
@@ -1148,16 +1279,14 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   const std::uint64_t lsn = *allocated_lsn;
 
   const bool transaction_append = txid != 0;
-  const std::uint64_t tx_generation = transaction_append && tx != nullptr
-                                          ? tx->generation_
-                                          : 0;
+  const std::uint64_t tx_generation =
+      transaction_append && tx != nullptr ? tx->generation_ : 0;
   if (transaction_append && tx_generation == 0) {
     co_return absl::InvalidArgumentError(
         "transaction record has no generation lease");
   }
-  const BlockKind append_block_kind = transaction_append
-                                          ? BlockKind::kTransaction
-                                          : BlockKind::kRecords;
+  const BlockKind append_block_kind =
+      transaction_append ? BlockKind::kTransaction : BlockKind::kRecords;
   // Never keep a flat_hash_map value reference across an await that can
   // release store_state_mutex_. Another transaction may install a different
   // generation and rehash active_tx_blocks_ while block allocation is in
@@ -1191,10 +1320,30 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       std::uint16_t write_buffer_id = 0;
       std::byte* heap_buffer = nullptr;
       if (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id)) {
-        if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
-          co_await ReturnReservedBlock(*allocated);
-          co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                                 "no registered or fallback write buffers");
+        if (for_defrag || !unlock_writer_while_waiting) {
+          // Maintenance paths that deliberately keep store_state_mutex_
+          // across an atomic rewrite cannot wait for a flush that needs the
+          // same lock. Their concurrency is separately bounded.
+          if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
+            co_await ReturnReservedBlock(*allocated);
+            co_return absl::Status(absl::StatusCode::kResourceExhausted,
+                                   "no storage write buffer is available");
+          }
+        } else {
+          do {
+            store.store_state_mutex_.Unlock(*store.worker_);
+            co_await store.buffers_.WaitForWriteBuffer();
+            co_await store.store_state_mutex_.Lock();
+          } while (!store.buffers_.TryAcquireWriteBuffer(&write_buffer_id));
+
+          // Another writer may have installed this append stream while this
+          // coroutine was waiting without the store lock. It owns the stream;
+          // return both resources and let the outer loop append to it.
+          if (active_stream().has_value()) {
+            store.buffers_.ReleaseWriteBuffer(write_buffer_id);
+            co_await ReturnReservedBlock(*allocated);
+            continue;
+          }
         }
       }
       FixedBuffer staging_buffer =
@@ -1244,11 +1393,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       state.kind_ = append_block_kind;
       if (transaction_append) {
         store.tx_blocks_.insert_or_assign(
-            block_id,
-            WorkerStore::TxBlockRuntime{
-                .allocation_epoch_ = allocated->allocation_epoch_,
-                .generation_ = tx_generation,
-            });
+            block_id, WorkerStore::TxBlockRuntime{
+                          .allocation_epoch_ = allocated->allocation_epoch_,
+                          .generation_ = tx_generation,
+                      });
       }
       state.staging_slot_ = AcquireStagingSlot(store);
       StagingSlot& staging_state = store.staging_slots_[state.staging_slot_];
@@ -1290,6 +1438,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
        !relocation->Matches(previous_entry->value_))) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "relocation source changed while waiting");
+  }
+  if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
+      previous_entry != nullptr &&
+      previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
+    co_return absl::OkStatus();
   }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
@@ -1345,13 +1498,18 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
       .txid_ = txid,
       .replication_epoch_ =
-          partition_ptr == nullptr ? 1 : partition_ptr->replication_epoch_,
+          explicit_root != nullptr
+              ? explicit_root->replication_epoch_
+              : (partition_ptr == nullptr ? 1
+                                          : partition_ptr->replication_epoch_),
       // A relocation stamps the epoch its source was validated under, not a
       // fresh read: worker 0 publishes a FLUSHDB epoch concurrently, and a
       // fresh read here could adopt it mid-append — turning a record
       // recovery must drop into one it must keep.
-      .db_epoch_ =
-          relocation != nullptr ? relocation->db_epoch_ : DbEpoch(db_id),
+      .db_epoch_ = explicit_root != nullptr
+                       ? explicit_root->db_epoch_
+                       : (relocation != nullptr ? relocation->db_epoch_
+                                                : DbEpoch(db_id)),
       .mutation_sequence_ = mutation_sequence,
       .expire_at_ms_ = expire_at_ms,
       .lsn_ = lsn,
@@ -1517,18 +1675,40 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   }
   if (was_live != is_live) {
     if (is_live) {
-      ++partition_ptr->live_key_count_[db_id];
-      ++store.live_key_count_[db_id];
+      if (explicit_root != nullptr) {
+        ++*explicit_root->live_key_count_;
+        if (explicit_root->store_live_key_count_ != nullptr) {
+          ++*explicit_root->store_live_key_count_;
+        }
+      } else {
+        ++partition_ptr->live_key_count_[db_id];
+        ++store.live_key_count_[db_id];
+      }
     } else {
-      --partition_ptr->live_key_count_[db_id];
-      --store.live_key_count_[db_id];
+      if (explicit_root != nullptr) {
+        --*explicit_root->live_key_count_;
+        if (explicit_root->store_live_key_count_ != nullptr) {
+          --*explicit_root->store_live_key_count_;
+        }
+      } else {
+        --partition_ptr->live_key_count_[db_id];
+        --store.live_key_count_[db_id];
+      }
     }
   }
   if (was_expiring != is_expiring) {
     if (is_expiring) {
-      ++partition_ptr->expiring_key_count_[db_id];
+      if (explicit_root != nullptr) {
+        ++*explicit_root->expiring_key_count_;
+      } else {
+        ++partition_ptr->expiring_key_count_[db_id];
+      }
     } else {
-      --partition_ptr->expiring_key_count_[db_id];
+      if (explicit_root != nullptr) {
+        --*explicit_root->expiring_key_count_;
+      } else {
+        --partition_ptr->expiring_key_count_[db_id];
+      }
     }
   }
   state.committed_bytes_ = updated.committed_bytes_;

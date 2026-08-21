@@ -1,7 +1,7 @@
-#include "impl.h"
-
+#include <new>
 #include <optional>
 
+#include "impl.h"
 #include "keylane/replication_command.h"
 
 namespace keylane::storage {
@@ -74,15 +74,230 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
       std::max<std::size_t>(1, capacity_bytes / kStorageBlockBytes);
   log.publish_queue_.clear();
   log.publish_queue_bytes_ = 0;
-  log.reserved_memory_bytes_ = std::min(
-      log.max_blocks_ * kStorageBlockBytes,
-      options_.replication_publish_queue_bytes_);
-  log.max_publish_queue_bytes_ = log.reserved_memory_bytes_;
+  log.publisher_admitted_bytes_ = 0;
+  log.retained_lsn_by_session_.clear();
+  log.capacity_backpressured_ = false;
+  log.capacity_waits_ = 0;
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
+    std::size_t capacity_bytes) {
+  if (capacity_bytes < kStorageBlockBytes ||
+      capacity_bytes % kStorageBlockBytes != 0) {
+    co_return absl::InvalidArgumentError(
+        "replication backlog capacity must be a positive multiple of 8 MiB");
+  }
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  const std::size_t requested_blocks = capacity_bytes / kStorageBlockBytes;
+  // Cursor progress is worker-local and deliberately does not acquire the log
+  // append mutex. Apply a resize and wake a publisher before attempting any
+  // eager trimming: growth is an administrative escape hatch for an ACK-
+  // backpressured publisher, and must not queue behind that publisher's wait.
+  if (log.state_ == ReplicationLogState::kActive &&
+      !log.retained_lsn_by_session_.empty()) {
+    if (requested_blocks > log.max_blocks_) {
+      log.capacity_backpressured_ = false;
+    }
+    log.max_blocks_ = requested_blocks;
+    log.retention_advanced_.NotifyAll(*store.worker_);
+    // A shrink beneath live retained history is a target quota. Existing
+    // blocks remain until ACK progress permits complete-event reclamation.
+    co_return absl::OkStatus();
+  }
+  co_await log.mutex_.Lock();
+  UnlockGuard unlock(&log.mutex_, store.worker_);
+  if (log.state_ == ReplicationLogState::kDisabled) {
+    co_return absl::OkStatus();
+  }
+  if (log.state_ == ReplicationLogState::kInvalid) {
+    log.max_blocks_ = requested_blocks;
+    co_return absl::OkStatus();
+  }
+
+  log.max_blocks_ = requested_blocks;
+  std::optional<std::uint64_t> retained_lsn;
+  for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
+    (void)session_id;
+    retained_lsn = !retained_lsn.has_value() || lsn < *retained_lsn
+                       ? std::optional<std::uint64_t>(lsn)
+                       : retained_lsn;
+  }
+  while (log.blocks_.size() > log.max_blocks_) {
+    if (log.blocks_.empty() || !log.blocks_.front().sealed_) break;
+    if (retained_lsn.has_value() &&
+        log.blocks_.front().last_lsn_ >= *retained_lsn) {
+      // Shrinking the reconnect window must not punch a hole beneath a live
+      // ONLINE replica. Keep the excess blocks for now; subsequent appends
+      // backpressure until ACK progress makes the new quota attainable.
+      break;
+    }
+    // Never split a fragmented logical event while reducing the retained
+    // reconnect window.
+    std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
+    do {
+      evicted_through =
+          std::max(evicted_through, log.blocks_.front().last_lsn_);
+      log.blocks_.pop_front();
+    } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
+             log.blocks_.front().first_lsn_ <= evicted_through);
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::SetReplicationPublishQueueCapacity(
+    std::size_t capacity_bytes) {
+  if (capacity_bytes == 0) {
+    co_return absl::InvalidArgumentError(
+        "replication publish queue capacity must be nonzero");
+  }
+  replication_publish_queue_bytes_.store(capacity_bytes,
+                                         std::memory_order_release);
+  WorkerStore& store = CurrentStore();
+  store.replication_log_.publisher_capacity_ready_.NotifyAll(*store.worker_);
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
   co_return absl::OkStatus();
 }
 
 bool StorageEngine::Impl::ReplicationLogActive() const noexcept {
   return CurrentStore().replication_log_.state_ == ReplicationLogState::kActive;
+}
+
+Task<absl::StatusOr<ReplicationPublisherAdmission>>
+StorageEngine::Impl::AcquireReplicationPublisherAdmission(
+    std::size_t logical_bytes,
+    std::optional<ReplicationPublisherTarget> target) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (target.has_value() &&
+      (target->partition_id_ >= kLogicalStorageShards ||
+       target->db_id_ >= kLogicalDatabaseCount ||
+       target->partition_id_ % worker_count_ != store.worker_->id())) {
+    co_return absl::InvalidArgumentError(
+        "replication publisher target does not belong to this worker");
+  }
+  auto session_needs_credit = [&](std::uint64_t session_id) {
+    if (!target.has_value()) return true;
+    const auto& partition = PartitionFor(store, target->partition_id_);
+    const auto capture = partition.fullsync_subscribers_.find(session_id);
+    return capture != partition.fullsync_subscribers_.end() &&
+           capture->second.db_phases_[target->db_id_] !=
+               WorkerStore::FullSyncCapture::DbPhase::kUnstarted;
+  };
+  if (logical_bytes == 0) logical_bytes = 1;
+  if (store.replication_publisher_next_ticket_ ==
+      std::numeric_limits<std::uint64_t>::max()) {
+    co_return absl::ResourceExhaustedError(
+        "replication publisher admission ticket space exhausted");
+  }
+  const std::uint64_t ticket = store.replication_publisher_next_ticket_++;
+  for (;;) {
+    if (ticket != store.replication_publisher_serving_ticket_) {
+      co_await store.replication_publisher_admission_ready_.Wait();
+      continue;
+    }
+    const std::size_t capacity =
+        replication_publish_queue_bytes_.load(std::memory_order_acquire);
+    auto has_capacity = [logical_bytes, capacity](std::size_t queued,
+                                                  std::size_t admitted) {
+      const std::size_t occupied =
+          queued > std::numeric_limits<std::size_t>::max() - admitted
+              ? std::numeric_limits<std::size_t>::max()
+              : queued + admitted;
+      // A command larger than the configured waterline is one exclusive,
+      // heap-backed item. This keeps large values functional without letting
+      // unrelated writes accumulate behind them.
+      return logical_bytes > capacity ? occupied == 0
+                                      : occupied <= capacity - logical_bytes;
+    };
+    const bool log_available =
+        log.state_ != ReplicationLogState::kActive ||
+        has_capacity(log.publish_queue_bytes_, log.publisher_admitted_bytes_);
+    bool available = log_available;
+    if (available) {
+      for (const auto& [session_id, session] : store.fullsync_sessions_) {
+        if (session.db_epoch_invalidated_ ||
+            !session_needs_credit(session_id)) {
+          continue;
+        }
+        if (!has_capacity(session.publish_queue_bytes_,
+                          session.publisher_admitted_bytes_)) {
+          available = false;
+          break;
+        }
+      }
+    }
+    if (available) {
+      ReplicationPublisherAdmission admission;
+      if (log.state_ == ReplicationLogState::kActive) {
+        admission.log_epoch_ = log.log_epoch_;
+        log.publisher_admitted_bytes_ += logical_bytes;
+      }
+      admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
+      admission.fullsync_unstarted_guards_.reserve(
+          target.has_value() ? store.fullsync_sessions_.size() : 0);
+      for (auto& [session_id, session] : store.fullsync_sessions_) {
+        if (session.db_epoch_invalidated_) continue;
+        if (session_needs_credit(session_id)) {
+          session.publisher_admitted_bytes_ += logical_bytes;
+          admission.fullsync_session_ids_.push_back(session_id);
+        } else if (target.has_value()) {
+          const std::uint32_t target_id =
+              (static_cast<std::uint32_t>(target->partition_id_) << 8) |
+              target->db_id_;
+          ++session.unstarted_admissions_[target_id];
+          admission.fullsync_unstarted_guards_.push_back(
+              ReplicationPublisherAdmission::UnstartedGuard{
+                  .session_id_ = session_id,
+                  .partition_id_ = target->partition_id_,
+                  .db_id_ = target->db_id_,
+              });
+        }
+      }
+      ++store.replication_publisher_serving_ticket_;
+      store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
+      co_return admission;
+    }
+    // Either queue may free space. The worker-lifetime notification is also
+    // signalled when a full-sync session is cancelled, so a disconnected
+    // replica can never leave source writes asleep on destroyed state.
+    if (!log_available) {
+      co_await log.publisher_capacity_ready_.Wait();
+    } else {
+      co_await store.fullsync_publisher_capacity_ready_.Wait();
+    }
+  }
+}
+
+void StorageEngine::Impl::ReleaseReplicationPublisherAdmission(
+    const ReplicationPublisherAdmission& admission, std::size_t logical_bytes) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (logical_bytes == 0) logical_bytes = 1;
+  if (admission.log_epoch_ != 0 && log.log_epoch_ == admission.log_epoch_) {
+    log.publisher_admitted_bytes_ -=
+        std::min(log.publisher_admitted_bytes_, logical_bytes);
+    log.publisher_capacity_ready_.NotifyAll(*store.worker_);
+  }
+  for (std::uint64_t session_id : admission.fullsync_session_ids_) {
+    auto session = store.fullsync_sessions_.find(session_id);
+    if (session == store.fullsync_sessions_.end()) continue;
+    session->second.publisher_admitted_bytes_ -=
+        std::min(session->second.publisher_admitted_bytes_, logical_bytes);
+  }
+  for (const auto& guard : admission.fullsync_unstarted_guards_) {
+    auto session = store.fullsync_sessions_.find(guard.session_id_);
+    if (session == store.fullsync_sessions_.end()) continue;
+    const std::uint32_t target_id =
+        (static_cast<std::uint32_t>(guard.partition_id_) << 8) | guard.db_id_;
+    auto count = session->second.unstarted_admissions_.find(target_id);
+    if (count == session->second.unstarted_admissions_.end()) continue;
+    if (--count->second == 0) {
+      session->second.unstarted_admissions_.erase(count);
+    }
+  }
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
 }
 
 bool StorageEngine::Impl::TryEnqueueReplicationCommand(
@@ -106,14 +321,11 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
     }
     logical_bytes += sizeof(std::uint32_t) + arg.size();
   }
-  if (command.args_.empty() || logical_bytes > log.max_publish_queue_bytes_ ||
-      log.publish_queue_bytes_ > log.max_publish_queue_bytes_ - logical_bytes) {
+  if (command.args_.empty()) return false;
+  if (logical_bytes >
+      std::numeric_limits<std::size_t>::max() - log.publish_queue_bytes_) {
     log.state_ = ReplicationLogState::kInvalid;
-    log.publish_queue_.clear();
-    log.publish_queue_bytes_ = 0;
-    spdlog::warn(
-        "replication publisher cannot keep up; invalidating backlog for full "
-        "resynchronization");
+    spdlog::warn("replication publisher queue accounting overflow");
     return false;
   }
 
@@ -155,12 +367,10 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
     }
     logical_bytes += sizeof(std::uint32_t) + arg.size();
   }
-  if (logical_bytes > log.max_publish_queue_bytes_ ||
-      log.publish_queue_bytes_ > log.max_publish_queue_bytes_ - logical_bytes) {
+  if (logical_bytes >
+      std::numeric_limits<std::size_t>::max() - log.publish_queue_bytes_) {
     log.state_ = ReplicationLogState::kInvalid;
-    spdlog::warn(
-        "replication transaction publisher cannot keep up; invalidating "
-        "backlog for full resynchronization");
+    spdlog::warn("replication transaction queue accounting overflow");
     return false;
   }
 
@@ -180,15 +390,15 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
   return true;
 }
 
-Task<absl::StatusOr<std::uint64_t>>
-StorageEngine::Impl::FenceReplicationLog() {
+Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (log.state_ != ReplicationLogState::kActive) {
     co_return InvalidState("replication log is not active");
   }
 
-  auto fence = std::make_shared<WorkerStore::ReplicationLogRuntime::PublishFence>();
+  auto fence =
+      std::make_shared<WorkerStore::ReplicationLogRuntime::PublishFence>();
   log.publish_queue_.push_back(
       WorkerStore::ReplicationLogRuntime::PendingCommand{
           .log_epoch_ = log.log_epoch_,
@@ -228,9 +438,9 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       continue;
     }
     if (pending.transaction_ != nullptr) {
-      while (pending.transaction_->resolution_.load(
-                 std::memory_order_acquire) ==
-             ReplicationTransactionResolution::kPending) {
+      while (
+          pending.transaction_->resolution_.load(std::memory_order_acquire) ==
+          ReplicationTransactionResolution::kPending) {
         co_await celer::Yield(*store->worker_);
       }
       if (pending.transaction_->resolution_.load(std::memory_order_acquire) ==
@@ -238,6 +448,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
           log.publish_queue_bytes_ -= pending.logical_bytes_;
         }
+        log.publisher_capacity_ready_.NotifyAll(*store->worker_);
         continue;
       }
       const auto final_logical_bytes =
@@ -250,12 +461,11 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       if (*final_logical_bytes > pending.logical_bytes_) {
         const std::size_t growth =
             *final_logical_bytes - pending.logical_bytes_;
-        if (growth > log.max_publish_queue_bytes_ -
-                         std::min(log.publish_queue_bytes_,
-                                  log.max_publish_queue_bytes_)) {
+        if (growth > std::numeric_limits<std::size_t>::max() -
+                         log.publish_queue_bytes_) {
           log.state_ = ReplicationLogState::kInvalid;
           spdlog::warn(
-              "canonical replication transaction exceeds publisher queue");
+              "canonical replication transaction queue accounting overflow");
           break;
         }
         log.publish_queue_bytes_ += growth;
@@ -263,13 +473,13 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         log.publish_queue_bytes_ -=
             std::min(log.publish_queue_bytes_,
                      pending.logical_bytes_ - *final_logical_bytes);
+        log.publisher_capacity_ready_.NotifyAll(*store->worker_);
       }
       pending.logical_bytes_ = *final_logical_bytes;
       pending.append_ = ReplicationCommandAppend{
           .kind_ = ReplicationEventKind::kTransaction,
           .db_id_ = pending.transaction_->db_id_,
-          .partition_id_ =
-              static_cast<std::uint16_t>(celer::ThisWorker().id_),
+          .partition_id_ = static_cast<std::uint16_t>(celer::ThisWorker().id_),
           .partition_sequence_ = pending.transaction_->id_,
           .args_ = pending.transaction_->envelope_args_,
       };
@@ -279,6 +489,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
         log.publish_queue_bytes_ -= pending.logical_bytes_;
       }
+      log.publisher_capacity_ready_.NotifyAll(*store->worker_);
       continue;
     }
 
@@ -309,6 +520,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     if (log.publish_queue_bytes_ >= pending.logical_bytes_) {
       log.publish_queue_bytes_ -= pending.logical_bytes_;
     }
+    log.publisher_capacity_ready_.NotifyAll(*store->worker_);
   }
   if (log.state_ != ReplicationLogState::kActive) {
     for (auto& pending : log.publish_queue_) {
@@ -320,6 +532,7 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     }
     log.publish_queue_.clear();
     log.publish_queue_bytes_ = 0;
+    log.publisher_capacity_ready_.NotifyAll(*store->worker_);
   }
   log.publisher_running_ = false;
   co_return absl::OkStatus();
@@ -331,18 +544,28 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid FLUSHDB replication barrier");
   }
+  const std::uint64_t barrier_id =
+      next_replication_control_id_.fetch_add(1, std::memory_order_relaxed);
+  if (barrier_id == 0 ||
+      barrier_id == std::numeric_limits<std::uint64_t>::max()) {
+    next_replication_control_id_.store(
+        std::numeric_limits<std::uint64_t>::max(), std::memory_order_relaxed);
+    co_return absl::OutOfRangeError(
+        "replication control barrier identity exhausted");
+  }
   for (unsigned target = 0; target < worker_count_; ++target) {
-    auto publish = [this, db_id, db_epoch]() -> Task<absl::Status> {
+    auto publish = [this, db_id, db_epoch, barrier_id]() -> Task<absl::Status> {
       if (ReplicationLogActive()) {
         (void)TryEnqueueReplicationCommand(ReplicationCommandAppend{
             .kind_ = ReplicationEventKind::kControl,
             .db_id_ = db_id,
             // Control events do not belong to a partition. Zero is the
             // canonical transport placeholder; receivers key the barrier by
-            // (db_id, db_epoch) carried in the command payload.
+            // its explicit history-local identity carried in the payload.
             .partition_id_ = 0,
-            .partition_sequence_ = db_epoch,
-            .args_ = {"FLUSHDB", std::to_string(db_epoch)},
+            .partition_sequence_ = barrier_id,
+            .args_ = {"FLUSHDB", std::to_string(barrier_id),
+                      std::to_string(db_epoch)},
         });
       }
       co_return absl::OkStatus();
@@ -358,103 +581,175 @@ Task<absl::Status> StorageEngine::Impl::PublishFlushDbReplication(
   co_return absl::OkStatus();
 }
 
+Task<absl::Status> StorageEngine::Impl::PublishFlushAllReplication(
+    const std::array<std::uint64_t, kLogicalDatabaseCount>& db_epochs) {
+  if (std::any_of(db_epochs.begin(), db_epochs.end(),
+                  [](std::uint64_t epoch) { return epoch == 0; })) {
+    co_return absl::InvalidArgumentError(
+        "invalid FLUSHALL replication barrier");
+  }
+  const std::uint64_t barrier_id =
+      next_replication_control_id_.fetch_add(1, std::memory_order_relaxed);
+  if (barrier_id == 0 ||
+      barrier_id == std::numeric_limits<std::uint64_t>::max()) {
+    next_replication_control_id_.store(
+        std::numeric_limits<std::uint64_t>::max(), std::memory_order_relaxed);
+    co_return absl::OutOfRangeError(
+        "replication control barrier identity exhausted");
+  }
+  std::vector<std::string> args;
+  args.reserve(2 + kLogicalDatabaseCount);
+  args.emplace_back("FLUSHALL");
+  args.push_back(std::to_string(barrier_id));
+  for (const std::uint64_t epoch : db_epochs) {
+    args.push_back(std::to_string(epoch));
+  }
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto publish = [this, barrier_id, args]() mutable -> Task<absl::Status> {
+      if (ReplicationLogActive()) {
+        (void)TryEnqueueReplicationCommand(ReplicationCommandAppend{
+            .kind_ = ReplicationEventKind::kControl,
+            .db_id_ = 0,
+            .partition_id_ = 0,
+            .partition_sequence_ = barrier_id,
+            .args_ = std::move(args),
+        });
+      }
+      co_return absl::OkStatus();
+    };
+    absl::Status published;
+    if (target == celer::ThisWorker().id_) {
+      published = co_await publish();
+    } else {
+      published = co_await celer::SubmitTaskTo(target, std::move(publish));
+    }
+    if (!published.ok()) co_return published;
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::ReclaimReplicationLogPrefix(
     WorkerStore& store, std::uint64_t keep_from_lsn, bool force_all) {
   auto& log = store.replication_log_;
-  std::vector<std::uint64_t> released;
   while (!log.blocks_.empty()) {
     const auto& front = log.blocks_.front();
     if (!force_all && (!front.sealed_ || front.last_lsn_ >= keep_from_lsn)) {
       break;
     }
-    released.push_back(front.block_id_);
     log.blocks_.pop_front();
   }
-  if (released.empty()) {
-    co_return absl::OkStatus();
-  }
-  co_await store.store_state_mutex_.Lock();
-  for (const std::uint64_t block_id : released) {
-    DestroyBlockState(store, block_id);
-  }
-  store.store_state_mutex_.Unlock(*store.worker_);
-  absl::Status returned = co_await ReturnColdBlocks(std::move(released));
-  if (!returned.ok()) {
-    log.state_ = ReplicationLogState::kInvalid;
-  }
-  co_return returned;
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     WorkerStore& store, std::uint64_t protected_lsn) {
   auto& log = store.replication_log_;
-  if (log.active_buffer_ != nullptr) {
+  if (!log.blocks_.empty() && !log.blocks_.back().sealed_) {
     co_return absl::OkStatus();
   }
   if (log.max_blocks_ == 0) {
     co_return InvalidState("replication log has no capacity");
   }
 
-  while (log.blocks_.size() >= log.max_blocks_) {
-    if (log.blocks_.empty() || !log.blocks_.front().sealed_ ||
-        log.blocks_.front().last_lsn_ >= protected_lsn) {
-      co_return absl::Status(
-          absl::StatusCode::kResourceExhausted,
-          "one replication event exceeds the configured backlog capacity");
+  auto retained_lsn = [&]() -> std::optional<std::uint64_t> {
+    std::optional<std::uint64_t> retained_lsn;
+    for (const auto& [session_id, lsn] : log.retained_lsn_by_session_) {
+      (void)session_id;
+      if (!retained_lsn.has_value() || lsn < *retained_lsn) {
+        retained_lsn = lsn;
+      }
     }
+    return retained_lsn;
+  };
+  auto evict_event = [&]() {
     std::uint64_t evicted_through = log.blocks_.front().last_lsn_;
-    std::vector<std::uint64_t> released;
     do {
       evicted_through =
           std::max(evicted_through, log.blocks_.front().last_lsn_);
-      released.push_back(log.blocks_.front().block_id_);
       log.blocks_.pop_front();
     } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
              log.blocks_.front().first_lsn_ <= evicted_through);
+  };
 
-    co_await store.store_state_mutex_.Lock();
-    for (const std::uint64_t block_id : released) {
-      DestroyBlockState(store, block_id);
+  for (;;) {
+    const std::size_t low_watermark =
+        log.max_blocks_ - std::max<std::size_t>(1, log.max_blocks_ / 4);
+    const auto retained = retained_lsn();
+    const std::uint64_t keep_from = retained.has_value()
+                                        ? std::min(protected_lsn, *retained)
+                                        : protected_lsn;
+    const bool evictable = !log.blocks_.empty() &&
+                           log.blocks_.front().sealed_ &&
+                           log.blocks_.front().last_lsn_ < keep_from;
+
+    // Low-water hysteresis exists to avoid repeatedly waking foreground
+    // writers while an ACK-pinned replica is still behind. Once the final pin
+    // disappears (normally on disconnect), preserve the ordinary circular
+    // reconnect window and evict only what the next allocation needs. Eagerly
+    // draining to the low watermark here can discard a just-disconnected
+    // replica's cursor even though it still fits inside the configured quota.
+    if (log.capacity_backpressured_ && !retained.has_value()) {
+      log.capacity_backpressured_ = false;
     }
-    store.store_state_mutex_.Unlock(*store.worker_);
-    absl::Status returned = co_await ReturnColdBlocks(std::move(released));
-    if (!returned.ok()) {
-      co_return returned;
+    if (log.capacity_backpressured_) {
+      if (log.blocks_.size() <= low_watermark) {
+        log.capacity_backpressured_ = false;
+      } else if (evictable) {
+        evict_event();
+        continue;
+      } else if (retained.has_value()) {
+        // High/low hysteresis is intentional: waking for one ACK and admitting
+        // one write can leave a slower replica permanently glued to the high
+        // watermark. Drain to the low watermark before reopening writers.
+        co_await log.retention_advanced_.Wait();
+        if (log.state_ != ReplicationLogState::kActive) {
+          co_return InvalidState(
+              "replication log stopped while waiting for replica ACK");
+        }
+        continue;
+      } else {
+        log.capacity_backpressured_ = false;
+      }
     }
+
+    if (log.blocks_.size() < log.max_blocks_) break;
+    if (evictable) {
+      evict_event();
+      continue;
+    }
+    if (!log.blocks_.empty() &&
+        log.blocks_.front().last_lsn_ >= protected_lsn &&
+        (!retained.has_value() || *retained >= protected_lsn)) {
+      // One logical event may exceed the configured window. It owns an
+      // exclusive heap-backed run of chunks and temporarily exceeds the
+      // waterline; following writes remain behind it until it is reclaimable.
+      break;
+    }
+    if (retained.has_value()) {
+      log.capacity_backpressured_ = true;
+      ++log.capacity_waits_;
+      co_await log.retention_advanced_.Wait();
+      if (log.state_ != ReplicationLogState::kActive) {
+        co_return InvalidState(
+            "replication log stopped while waiting for replica ACK");
+      }
+      continue;
+    }
+    evict_event();
   }
 
-  auto reserved =
-      co_await AllocateBlock(store, AllocationPurpose::kReplication);
-  if (!reserved.ok()) {
-    co_return reserved.status();
+  if (WouldExceedMemoryLimit(kStorageBlockBytes)) {
+    co_return absl::ResourceExhaustedError(
+        "maxmemory cannot allocate an in-memory replication backlog chunk");
   }
-  auto* buffer = static_cast<std::byte*>(
-      celer::AllocateStorageBuffer(kStorageBlockBytes, kDirectIoAlignment));
-  if (buffer == nullptr) {
-    absl::Status returned = co_await ReturnReservedBlock(*reserved);
-    co_return returned.ok()
-        ? absl::Status(absl::StatusCode::kResourceExhausted,
-                       "failed to allocate replication staging block")
-        : returned;
+  std::unique_ptr<std::byte[]> bytes(new (std::nothrow)
+                                         std::byte[kStorageBlockBytes]);
+  if (bytes == nullptr) {
+    co_return absl::ResourceExhaustedError(
+        "cannot allocate an in-memory replication backlog chunk");
   }
-  std::fill_n(buffer, kStorageBlockBytes, std::byte{0});
-
-  co_await store.store_state_mutex_.Lock();
-  BlockState& state = CreateBlockState(store, reserved->block_id_);
-  state.writer_id_ = static_cast<std::uint16_t>(store.worker_->id());
-  state.layout_worker_count_ = static_cast<std::uint16_t>(worker_count_);
-  state.allocation_epoch_ = reserved->allocation_epoch_;
-  state.committed_bytes_ = kBlockHeaderBytes;
-  state.live_bytes_ = 0;
-  state.allocated_ = true;
-  state.in_memory_ = true;
-  state.kind_ = BlockKind::kReplicationLog;
-  store.store_state_mutex_.Unlock(*store.worker_);
-
-  log.active_buffer_ = buffer;
   log.blocks_.push_back(WorkerStore::ReplicationLogBlock{
-      .block_id_ = reserved->block_id_,
-      .allocation_epoch_ = reserved->allocation_epoch_,
+      .bytes_ = std::move(bytes),
       .sparse_offsets_ = {},
   });
   co_return absl::OkStatus();
@@ -463,8 +758,7 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
 Task<absl::Status> StorageEngine::Impl::SealReplicationLogActiveBlock(
     WorkerStore& store) {
   auto& log = store.replication_log_;
-  if (log.active_buffer_ == nullptr || log.blocks_.empty() ||
-      log.blocks_.back().sealed_) {
+  if (log.blocks_.empty() || log.blocks_.back().sealed_) {
     co_return InvalidState("replication log has no active block");
   }
   auto& block = log.blocks_.back();
@@ -472,57 +766,7 @@ Task<absl::Status> StorageEngine::Impl::SealReplicationLogActiveBlock(
     co_return InvalidState("cannot seal an empty replication block");
   }
 
-  BlockHeader header{
-      .block_id_ = block.block_id_,
-      .writer_id_ = static_cast<std::uint32_t>(store.worker_->id()),
-      .allocation_epoch_ = block.allocation_epoch_,
-      .committed_bytes_ = block.committed_bytes_,
-      .record_count_ = block.frame_count_,
-      .max_lsn_ = 0,
-      .layout_worker_count_ = worker_count_,
-      .kind_ = BlockKind::kReplicationLog,
-      .replication_log_epoch_ = log.log_epoch_,
-      .first_replication_lsn_ = block.first_lsn_,
-      .last_replication_lsn_ = block.last_lsn_,
-  };
-  EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                                log.active_buffer_, kBlockHeaderSlotBytes));
-  const std::size_t write_bytes = AlignDirect(block.committed_bytes_);
-  const auto [file_index, offset] = FileOffset(block.block_id_);
-  auto written = co_await WriteStorageBuffer(
-      *store.worker_, store.files_[file_index],
-      std::span<const std::byte>(log.active_buffer_, write_bytes), false, {},
-      offset);
-  if (!written.ok() || *written != write_bytes) {
-    celer::FreeStorageBuffer(log.active_buffer_, kDirectIoAlignment);
-    log.active_buffer_ = nullptr;
-    log.state_ = ReplicationLogState::kInvalid;
-    co_return written.ok()
-        ? absl::Status(absl::StatusCode::kInternal,
-                       "short replication backlog block write")
-        : written.status();
-  }
-
   block.sealed_ = true;
-  co_await store.store_state_mutex_.Lock();
-  BlockState* state = FindBlockState(store, block.block_id_);
-  if (state == nullptr || state->allocation_epoch_ != block.allocation_epoch_) {
-    store.store_state_mutex_.Unlock(*store.worker_);
-    celer::FreeStorageBuffer(log.active_buffer_, kDirectIoAlignment);
-    log.active_buffer_ = nullptr;
-    log.state_ = ReplicationLogState::kInvalid;
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "replication block lost its allocation identity");
-  }
-  state->committed_bytes_ = block.committed_bytes_;
-  state->live_bytes_ = block.committed_bytes_ - kBlockHeaderBytes;
-    // Runtime backlog persistence is intentionally write-through to the
-    // storage block but does not enter the foreground fdatasync boundary.
-    // TODO(replication): add an explicit durable-replication policy/ACK mode.
-    state->in_memory_ = false;
-  store.store_state_mutex_.Unlock(*store.worker_);
-  celer::FreeStorageBuffer(log.active_buffer_, kDirectIoAlignment);
-  log.active_buffer_ = nullptr;
   co_return absl::OkStatus();
 }
 
@@ -530,8 +774,6 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     ReplicationLogAppend event) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
-  co_await log.mutex_.Lock();
-  UnlockGuard unlock(&log.mutex_, store.worker_);
   if (log.state_ != ReplicationLogState::kActive) {
     co_return InvalidState("replication log is not active");
   }
@@ -559,26 +801,15 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
   }
 
   const std::size_t frame_payload_capacity =
-      kStorageBlockBytes - kBlockHeaderBytes - sizeof(ReplicationFrameHeader);
+      kStorageBlockBytes - sizeof(ReplicationFrameHeader);
   const std::size_t payload_size =
       static_cast<std::size_t>(logical_payload_bytes);
-  const std::size_t minimum_blocks =
-      payload_size == 0 ? 1
-                        : (payload_size + frame_payload_capacity - 1) /
-                              frame_payload_capacity;
-  if (minimum_blocks > log.max_blocks_) {
-    log.state_ = ReplicationLogState::kInvalid;
-    co_return absl::Status(
-        absl::StatusCode::kResourceExhausted,
-        "replication event is larger than the configured backlog");
-  }
-
   const std::uint64_t lsn = log.next_lsn_;
   const std::size_t single_frame_bytes =
       payload_size <= frame_payload_capacity
           ? AlignRecord(sizeof(ReplicationFrameHeader) + payload_size)
           : kStorageBlockBytes;
-  if (log.active_buffer_ != nullptr &&
+  if (!log.blocks_.empty() && !log.blocks_.back().sealed_ &&
       log.blocks_.back().committed_bytes_ + single_frame_bytes >
           kStorageBlockBytes) {
     // Never start an event in a block that cannot hold it whole. Events larger
@@ -623,7 +854,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     const bool last = payload_offset + payload_bytes == payload_size;
     const std::uint32_t frame_offset = block.committed_bytes_;
     std::span<std::byte> payload(
-        log.active_buffer_ + frame_offset + sizeof(ReplicationFrameHeader),
+        block.bytes_.get() + frame_offset + sizeof(ReplicationFrameHeader),
         payload_bytes);
     if (event.payload_source_ != nullptr) {
       absl::Status loaded =
@@ -636,9 +867,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
       std::memcpy(payload.data(), event.payload_.data() + payload_offset,
                   payload_bytes);
     }
-    std::fill(log.active_buffer_ + frame_offset +
+    std::fill(block.bytes_.get() + frame_offset +
                   sizeof(ReplicationFrameHeader) + payload_bytes,
-              log.active_buffer_ + frame_offset + frame_bytes, std::byte{0});
+              block.bytes_.get() + frame_offset + frame_bytes, std::byte{0});
     ReplicationFrameHeader header{
         .header_bytes_ = sizeof(ReplicationFrameHeader),
         .kind_ = event.kind_,
@@ -657,7 +888,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     };
     if (!EncodeReplicationFrameHeader(
             header, std::span<std::byte, sizeof(ReplicationFrameHeader)>(
-                        log.active_buffer_ + frame_offset,
+                        block.bytes_.get() + frame_offset,
                         sizeof(ReplicationFrameHeader)))) {
       log.state_ = ReplicationLogState::kInvalid;
       co_return absl::Status(absl::StatusCode::kInternal,
@@ -687,7 +918,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
     }
   } while (!emitted || payload_offset < payload_size);
 
-  if (multi_block_event && log.active_buffer_ != nullptr) {
+  if (multi_block_event && !log.blocks_.empty() &&
+      !log.blocks_.back().sealed_) {
     absl::Status sealed = co_await SealReplicationLogActiveBlock(store);
     if (!sealed.ok()) {
       co_return sealed;
@@ -738,43 +970,14 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
                           std::uint64_t lsn) { return block.last_lsn_ < lsn; });
   for (; block_it != log.blocks_.end(); ++block_it) {
     const auto& block = *block_it;
-    ReadBufferLease lease;
-    const std::byte* bytes = nullptr;
-    if (block.sealed_) {
-      const std::size_t read_bytes = AlignDirect(block.committed_bytes_);
-      auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-      if (!acquired.ok()) {
-        co_return acquired.status();
-      }
-      lease = std::move(*acquired);
-      FixedBuffer buffer = lease.io_buffer();
-      if (buffer.size_ < read_bytes) {
-        co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                               "replication read buffer is too small");
-      }
-      buffer.size_ = read_bytes;
-      const auto [file_index, offset] = FileOffset(block.block_id_);
-      auto read =
-          co_await ReadStorageBuffer(*store.worker_, store.files_[file_index],
-                                     buffer, lease.registered(), offset);
-      if (!read.ok() || *read != read_bytes) {
-        log.state_ = ReplicationLogState::kInvalid;
-        co_return read.ok()
-            ? absl::Status(absl::StatusCode::kInternal,
-                           "short replication backlog block read")
-            : read.status();
-      }
-      bytes = buffer.data_;
-    } else {
-      if (&block != &log.blocks_.back() || log.active_buffer_ == nullptr) {
-        log.state_ = ReplicationLogState::kInvalid;
-        co_return absl::Status(absl::StatusCode::kInternal,
-                               "replication active block is unavailable");
-      }
-      bytes = log.active_buffer_;
+    if (block.bytes_ == nullptr) {
+      log.state_ = ReplicationLogState::kInvalid;
+      co_return absl::InternalError(
+          "replication memory backlog block is unavailable");
     }
+    const std::byte* bytes = block.bytes_.get();
 
-    std::uint32_t offset = kBlockHeaderBytes;
+    std::uint32_t offset = 0;
     const auto sparse = std::upper_bound(
         block.sparse_offsets_.begin(), block.sparse_offsets_.end(), batch.next_,
         [](const ReplicationLogCursor& cursor,
@@ -841,6 +1044,45 @@ StorageEngine::Impl::ReadReplicationLog(ReplicationLogCursor next,
   co_return batch;
 }
 
+absl::Status StorageEngine::Impl::RetainReplicationLog(
+    std::uint64_t session_id, std::uint64_t keep_from_lsn) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (session_id == 0 || keep_from_lsn == 0) {
+    return absl::InvalidArgumentError(
+        "replication retention identity and LSN must be nonzero");
+  }
+  if (log.state_ != ReplicationLogState::kActive) {
+    return InvalidState("replication log is not active");
+  }
+  const std::uint64_t floor_lsn =
+      log.blocks_.empty() ? log.next_lsn_ : log.blocks_.front().first_lsn_;
+  if (keep_from_lsn < floor_lsn || keep_from_lsn > log.next_lsn_) {
+    return absl::OutOfRangeError(
+        "replication retention cursor is outside the backlog");
+  }
+  auto [found, inserted] =
+      log.retained_lsn_by_session_.try_emplace(session_id, keep_from_lsn);
+  if (!inserted) {
+    if (keep_from_lsn < found->second) {
+      return absl::InvalidArgumentError(
+          "replication retention cursor cannot move backwards");
+    }
+    found->second = keep_from_lsn;
+  }
+  log.retention_advanced_.NotifyAll(*store.worker_);
+  return absl::OkStatus();
+}
+
+void StorageEngine::Impl::ReleaseReplicationLogRetention(
+    std::uint64_t session_id) {
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (log.retained_lsn_by_session_.erase(session_id) != 0) {
+    log.retention_advanced_.NotifyAll(*store.worker_);
+  }
+}
+
 Task<absl::Status> StorageEngine::Impl::TrimReplicationLog(
     std::uint64_t keep_from_lsn) {
   WorkerStore& store = CurrentStore();
@@ -854,6 +1096,10 @@ Task<absl::Status> StorageEngine::Impl::TrimReplicationLog(
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid replication trim LSN");
   }
+  for (const auto& [session_id, retained_lsn] : log.retained_lsn_by_session_) {
+    (void)session_id;
+    keep_from_lsn = std::min(keep_from_lsn, retained_lsn);
+  }
   co_return co_await ReclaimReplicationLogPrefix(store, keep_from_lsn);
 }
 
@@ -865,10 +1111,6 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   if (log.state_ == ReplicationLogState::kDisabled) {
     co_return absl::OkStatus();
   }
-  if (log.active_buffer_ != nullptr) {
-    celer::FreeStorageBuffer(log.active_buffer_, kDirectIoAlignment);
-    log.active_buffer_ = nullptr;
-  }
   absl::Status reclaimed =
       co_await ReclaimReplicationLogPrefix(store, 0, /*force_all=*/true);
   if (!reclaimed.ok()) {
@@ -878,6 +1120,7 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   log.log_epoch_ = 0;
   log.next_lsn_ = 1;
   log.max_blocks_ = 0;
+  log.capacity_backpressured_ = false;
   for (auto& pending : log.publish_queue_) {
     if (pending.fence_ == nullptr) continue;
     pending.fence_->status_ =
@@ -887,8 +1130,10 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   }
   log.publish_queue_.clear();
   log.publish_queue_bytes_ = 0;
-  log.max_publish_queue_bytes_ = 0;
-  log.reserved_memory_bytes_ = 0;
+  log.publisher_admitted_bytes_ = 0;
+  log.retained_lsn_by_session_.clear();
+  log.retention_advanced_.NotifyAll(*store.worker_);
+  log.publisher_capacity_ready_.NotifyAll(*store.worker_);
   co_return absl::OkStatus();
 }
 
@@ -903,7 +1148,11 @@ ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
       .block_count_ = log.blocks_.size(),
       .capacity_bytes_ = log.max_blocks_ * kStorageBlockBytes,
       .publish_queue_bytes_ = log.publish_queue_bytes_,
-      .publish_queue_capacity_bytes_ = log.reserved_memory_bytes_,
+      .publish_queue_capacity_bytes_ =
+          replication_publish_queue_bytes_.load(std::memory_order_acquire),
+      .retained_cursor_count_ = log.retained_lsn_by_session_.size(),
+      .backpressure_waits_ = log.capacity_waits_,
+      .capacity_backpressured_ = log.capacity_backpressured_,
   };
 }
 

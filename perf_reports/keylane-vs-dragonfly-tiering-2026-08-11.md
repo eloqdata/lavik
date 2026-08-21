@@ -141,7 +141,7 @@ Keylane 三个存储后端都使用 16 workers，并保持 defrag 开启。SPDK 
 
 - Keylane 不使用 LSM-tree，没有 RocksDB compaction；本轮复测始终保持自身 defrag 开启。纯读不产生旧版本，不会主动触发 defrag；1:1 使用每设备最多 2 个活动任务、块间冷却 15 ms；纯写使用每设备最多 6 个活动任务且不设置块间冷却。两种写入负载的记录间冷却均为 0。
 - Keylane io_uring 的 raw 和 regular-file 两组使用同一个二进制和服务参数。regular files 以 O_DIRECT 打开，不依赖 Linux page cache；raw 组绕过 XFS，但仍经过 Linux block layer 和 NVMe 内核驱动。两块盘均未组成 RAID，Keylane 自己把两个路径识别为独立设备并各分配 8 个 home workers。
-- 当前代码把 `--registered-buffer-mb=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
+- 当前代码把 `--registered-buffer-mb-per-worker=256` 解释为每个 worker 256 MiB；16 workers 合计约 4 GiB，而不是全进程 256 MiB。SPDK 和 io_uring 两组使用相同设置，因此后端对比一致，但部署容量规划必须按 per-worker 语义计算。
 - 三种 Keylane 后端都在各自全量灌数后直接运行正式测试，没有预先老化数据或挑选短窗口。每种后端只灌数一次，正式顺序固定为纯读、1:1 读写混合、纯写。纯读和混合期间两块盘 I/O 量对称；raw 组绕过文件系统，file 组则保留更通用的普通 Linux 文件部署方式。
 - raw io_uring 需要独占块设备，部署和运维约束接近 SPDK；regular-file io_uring 包含 XFS 成本，但更接近普通 Linux 文件部署。两者都保留 Linux NVMe 驱动、中断和内核块层成本。
 - Dragonfly 的 `backing_file_direct=false` 使用 Linux buffered I/O。正常运行会保留 Linux page cache，因此本轮在灌数后执行 180 秒随机 GET 预热，随后依次执行纯读、1:1 和纯写；正式测试之间不清 page cache、不重启。

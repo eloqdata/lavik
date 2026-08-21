@@ -216,6 +216,50 @@ TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
   EXPECT_TRUE(map.empty());
 }
 
+TEST(ScanHashMapTest,
+     ScanDoesNotMissStableEntriesWhenMutationOccursBetweenCalls) {
+  ScanHashMap<std::uint64_t> map;
+  constexpr std::uint64_t kStable = 12000;
+  constexpr std::uint64_t kChurn = 8000;
+  for (std::uint64_t i = 0; i < kStable; ++i) {
+    const std::string key = "stable-" + std::to_string(i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+  for (std::uint64_t i = 0; i < kChurn; ++i) {
+    const std::string key = "churn-" + std::to_string(i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+
+  std::unordered_map<std::string, unsigned> seen;
+  std::uint64_t cursor = 0;
+  std::uint64_t round = 0;
+  do {
+    cursor = map.Scan(cursor, [&](const auto& entry) {
+      const std::string key(entry.key());
+      if (key.starts_with("stable-")) ++seen[key];
+    });
+
+    // Deleting and reinserting unrelated keys compacts bucket chains while
+    // the larger insert population repeatedly advances incremental rehash.
+    for (std::uint64_t i = round * 32;
+         i < std::min(kChurn, round * 32 + 32); ++i) {
+      const std::string key = "churn-" + std::to_string(i);
+      ASSERT_TRUE(map.Erase(ComputeDigest(key), key));
+    }
+    for (std::uint64_t i = 0; i < 8; ++i) {
+      const std::string key = "growth-" + std::to_string(round * 8 + i);
+      map.InsertOrAssign(ComputeDigest(key), key, i);
+    }
+    ++round;
+  } while (cursor != 0);
+
+  ASSERT_EQ(seen.size(), kStable);
+  for (std::uint64_t i = 0; i < kStable; ++i) {
+    const std::string key = "stable-" + std::to_string(i);
+    ASSERT_TRUE(seen.contains(key)) << key;
+  }
+}
+
 TEST(ScanHashMapTest, ForEachWhileStopsImmediately) {
   ScanHashMap<std::uint64_t> map;
   for (std::uint64_t i = 0; i < 100; ++i) {

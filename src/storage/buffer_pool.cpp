@@ -1,5 +1,6 @@
 #include "keylane/storage/buffer_pool.h"
 
+#include <sys/resource.h>
 #include <sys/uio.h>
 
 #include <algorithm>
@@ -175,11 +176,13 @@ absl::Status RegisteredBufferPool::Init(
         absl::StatusCode::kInvalidArgument,
         "registered buffer sizes must satisfy O_DIRECT alignment");
   }
-  if (options.write_buffer_count_ == 0) {
+  if (options.storage_write_buffer_count_ == 0) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
-                        "at least one write buffer is required");
+                        "storage write buffers are required");
   }
-  if (options.write_buffer_count_ >
+  const std::size_t configured_write_count =
+      options.storage_write_buffer_count_;
+  if (configured_write_count >
       static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max() - 1)) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "too many write buffers for fixed-buffer indices");
@@ -191,20 +194,32 @@ absl::Status RegisteredBufferPool::Init(
                         "registered buffer sizes must be positive");
   }
   if (options.write_buffer_bytes_ > 0 &&
-      (std::numeric_limits<std::size_t>::max() / options.write_buffer_count_) <
+      (std::numeric_limits<std::size_t>::max() / configured_write_count) <
           options.write_buffer_bytes_) {
     return absl::Status(absl::StatusCode::kOutOfRange,
                         "write buffer budget overflow");
   }
 
+  if (options.read_headroom_bytes_ > std::numeric_limits<std::size_t>::max() -
+                                         options.read_payload_bytes_ ||
+      options.read_headroom_bytes_ + options.read_payload_bytes_ >
+          std::numeric_limits<std::size_t>::max() -
+              options.read_tailroom_bytes_) {
+    return absl::Status(absl::StatusCode::kOutOfRange,
+                        "registered read buffer size overflow");
+  }
   const std::size_t read_slot_bytes = options.read_headroom_bytes_ +
                                       options.read_payload_bytes_ +
                                       options.read_tailroom_bytes_;
-  const std::size_t registered_write_count =
-      std::min(options.write_buffer_count_,
-               options.registered_bytes_ / options.write_buffer_bytes_);
+  const std::size_t registered_write_count = configured_write_count;
   const std::size_t registered_write_bytes =
       registered_write_count * options.write_buffer_bytes_;
+  if (registered_write_bytes > options.registered_bytes_) {
+    return absl::Status(
+        absl::StatusCode::kInvalidArgument,
+        "registered buffer budget cannot fit configured storage write "
+        "buffers");
+  }
   const std::size_t read_count =
       (options.registered_bytes_ - registered_write_bytes) / read_slot_bytes;
   const std::size_t total_count = registered_write_count + read_count;
@@ -294,10 +309,26 @@ absl::Status RegisteredBufferPool::Init(
 #else
     // The buffers themselves are fine; only the fixed-IO fast path is lost.
     // Keep the pool and submit plain (non-fixed) reads and writes instead.
-    spdlog::warn(
-        "worker {}: io_uring buffer registration failed ({}); falling back to "
-        "unregistered IO — raise RLIMIT_MEMLOCK to restore fixed-buffer IO",
-        worker.id(), status.message());
+    rlimit memlock{};
+    if (::getrlimit(RLIMIT_MEMLOCK, &memlock) == 0) {
+      spdlog::warn(
+          "worker {}: io_uring buffer registration failed ({}); requested "
+          "registered bytes={} RLIMIT_MEMLOCK soft={} hard={}; falling back "
+          "to the same reusable buffers with unregistered IO",
+          worker.id(), status.message(), options.registered_bytes_,
+          memlock.rlim_cur == RLIM_INFINITY
+              ? std::numeric_limits<std::uint64_t>::max()
+              : static_cast<std::uint64_t>(memlock.rlim_cur),
+          memlock.rlim_max == RLIM_INFINITY
+              ? std::numeric_limits<std::uint64_t>::max()
+              : static_cast<std::uint64_t>(memlock.rlim_max));
+    } else {
+      spdlog::warn(
+          "worker {}: io_uring buffer registration failed ({}); requested "
+          "registered bytes={}; falling back to the same reusable buffers "
+          "with unregistered IO",
+          worker.id(), status.message(), options.registered_bytes_);
+    }
 #endif
   }
 
@@ -312,8 +343,8 @@ absl::Status RegisteredBufferPool::Init(
   read_buffers_ = std::move(read_buffers);
   write_buffer_in_use_.assign(write_buffers_.size(), false);
   read_buffer_in_use_.assign(read_buffers_.size(), false);
-  free_write_buffers_.reserve(write_buffers_.size());
-  for (std::size_t i = write_buffers_.size(); i > 0; --i) {
+  free_write_buffers_.reserve(options_.storage_write_buffer_count_);
+  for (std::size_t i = options_.storage_write_buffer_count_; i > 0; --i) {
     free_write_buffers_.push_back(static_cast<std::uint16_t>(i));
   }
   free_read_buffers_.reserve(read_buffers_.size());
@@ -326,7 +357,8 @@ absl::Status RegisteredBufferPool::Init(
 bool RegisteredBufferPool::IsWriteBufferId(
     std::uint16_t buffer_id) const noexcept {
   return buffer_id != 0 &&
-         buffer_id <= static_cast<std::uint16_t>(write_buffers_.size());
+         buffer_id <=
+             static_cast<std::uint16_t>(options_.storage_write_buffer_count_);
 }
 
 bool RegisteredBufferPool::IsReadBufferId(
@@ -407,8 +439,7 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
   }
   if (best_free != free_overflow_read_buffers_.size()) {
     const std::size_t overflow_id = free_overflow_read_buffers_[best_free];
-    free_overflow_read_buffers_[best_free] =
-        free_overflow_read_buffers_.back();
+    free_overflow_read_buffers_[best_free] = free_overflow_read_buffers_.back();
     free_overflow_read_buffers_.pop_back();
     overflow_read_buffer_in_use_[overflow_id - 1] = true;
     return ReadBufferLease(this, owner_worker_,
@@ -498,6 +529,7 @@ void RegisteredBufferPool::ReleaseWriteBufferLocal(
   }
   write_buffer_in_use_[offset] = false;
   free_write_buffers_.push_back(buffer_id);
+  if (worker_ != nullptr) storage_write_buffer_ready_.NotifyAll(*worker_);
 }
 
 void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
@@ -518,8 +550,7 @@ void RegisteredBufferPool::Release(std::uint16_t buffer_id) noexcept {
       });
 }
 
-void RegisteredBufferPool::ReleaseOverflow(
-    std::size_t overflow_id) noexcept {
+void RegisteredBufferPool::ReleaseOverflow(std::size_t overflow_id) noexcept {
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (current.cross_core_ == cross_core_ && current.id_ == owner_worker_) {
     ReleaseOverflowLocal(overflow_id);

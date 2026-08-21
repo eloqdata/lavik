@@ -16,6 +16,7 @@ namespace {
 
 using keylane::ApplyRedisConfigDirective;
 using keylane::LoadRedisConfigFile;
+using keylane::ParseMemorySize;
 using keylane::ParseRedisConfigLine;
 using keylane::ParseReplicaOfRequest;
 using keylane::ServerOptions;
@@ -60,6 +61,15 @@ TEST(RedisConfigTest, TokenizesQuotesEscapesAndComments) {
   EXPECT_FALSE(ParseRedisConfigLine("bind \"unterminated").ok());
 }
 
+TEST(RedisConfigTest, ParsesRedisMemorySizes) {
+  ASSERT_TRUE(ParseMemorySize("64mb").ok());
+  EXPECT_EQ(*ParseMemorySize("64mb"), 64ULL * 1024 * 1024);
+  EXPECT_EQ(*ParseMemorySize("1GB"), 1024ULL * 1024 * 1024);
+  EXPECT_EQ(*ParseMemorySize("8388608"), 8ULL * 1024 * 1024);
+  EXPECT_FALSE(ParseMemorySize("1.5gb").ok());
+  EXPECT_FALSE(ParseMemorySize("8xb").ok());
+}
+
 TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ServerOptions options;
   ASSERT_TRUE(ApplyRedisConfigDirective(
@@ -73,8 +83,22 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"replica-read-only", "no"}, &options).ok());
   ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"replication-publish-queue-mb", "64"}, &options)
+                  {"replication-publish-queue-mb-per-worker", "64"}, &options)
                   .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"registered-buffer-mb-per-worker", "192"}, &options)
+                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"recv-buffers-per-worker", "2048"}, &options)
+          .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"storage-write-buffers-per-worker", "6"}, &options)
+                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"storage-read-buffer-kb", "2048"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"repl-backlog-size", "2gb"}, &options).ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -85,6 +109,12 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.replicaof_->port_, 6379);
   EXPECT_FALSE(options.replication_options_.replica_read_only_);
   EXPECT_EQ(options.replication_publish_queue_bytes_, 64ULL * 1024 * 1024);
+  EXPECT_EQ(options.registered_buffer_bytes_, 192ULL * 1024 * 1024);
+  EXPECT_EQ(options.recv_buffer_count_, 2048u);
+  EXPECT_EQ(options.storage_write_buffer_count_, 6u);
+  EXPECT_EQ(options.storage_read_buffer_bytes_, 2ULL * 1024 * 1024);
+  EXPECT_EQ(options.replication_options_.backlog_size_bytes_,
+            2ULL * 1024 * 1024 * 1024);
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
@@ -95,8 +125,21 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"replica-read-only", "maybe"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective(
-                   {"replication-publish-queue-mb", "0"}, &options)
+                   {"replication-publish-queue-mb-per-worker", "0"}, &options)
                    .ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"registered-buffer-mb-per-worker", "0"}, &options)
+                   .ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"storage-write-buffers-per-worker", "0"}, &options)
+                   .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"storage-read-buffer-kb", "0"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"repl-backlog-size", "0"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"repl-backlog-size", "large"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
 }
 
@@ -108,11 +151,9 @@ TEST(RedisConfigTest, AppliesAndValidatesTlsAndPasswordDirectives) {
       ApplyRedisConfigDirective({"tls-cert-file", "server.crt"}, &options)
           .ok());
   ASSERT_TRUE(
-      ApplyRedisConfigDirective({"tls-key-file", "server.key"}, &options)
-          .ok());
+      ApplyRedisConfigDirective({"tls-key-file", "server.key"}, &options).ok());
   ASSERT_TRUE(
-      ApplyRedisConfigDirective({"tls-ca-cert-file", "ca.crt"}, &options)
-          .ok());
+      ApplyRedisConfigDirective({"tls-ca-cert-file", "ca.crt"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"tls-auth-clients", "optional"}, &options)
           .ok());
@@ -140,13 +181,21 @@ TEST(RedisConfigTest, AppliesAndValidatesTlsAndPasswordDirectives) {
 
 TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {
   TempConfigFile valid(
-      "# keylane test\nport 6381\nio-threads 2\nreplicaof redis.local 6379\n");
+      "# keylane test\nport 6381\nio-threads 2\n"
+      "registered-buffer-mb-per-worker 128\n"
+      "storage-write-buffers-per-worker 3\n"
+      "replication-publish-queue-mb-per-worker 12\n"
+      "recv-buffers-per-worker 0\nreplicaof redis.local 6379\n");
   ServerOptions options;
   absl::Status loaded = LoadRedisConfigFile(valid.path().string(), &options);
   ASSERT_TRUE(loaded.ok()) << loaded;
   EXPECT_EQ(options.config_file_, valid.path().string());
   EXPECT_EQ(options.port_, 6381);
   EXPECT_EQ(options.thread_count_, 2u);
+  EXPECT_EQ(options.registered_buffer_bytes_, 128ULL * 1024 * 1024);
+  EXPECT_EQ(options.storage_write_buffer_count_, 3u);
+  EXPECT_EQ(options.replication_publish_queue_bytes_, 12ULL * 1024 * 1024);
+  EXPECT_EQ(options.recv_buffer_count_, 0u);
   ASSERT_TRUE(options.replicaof_.has_value());
 
   TempConfigFile invalid("port 6381\nappendonly yes\n");

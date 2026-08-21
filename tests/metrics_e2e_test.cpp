@@ -180,7 +180,7 @@ class ServerProcess {
           std::to_string(metrics_port),
           "--threads",
           "2",
-          "--recv-buffers",
+          "--recv-buffers-per-worker",
           "0",
           "--max-memory",
           "1073741824",
@@ -295,7 +295,10 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   const int fd =
       ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);
-  ASSERT_EQ(::posix_fallocate(fd, 0, 96ULL * 1024 * 1024), 0);
+  // Two workers can each hold an active block while a multi-key transaction
+  // also needs rollback/commit space. Leave that foreground budget in
+  // addition to the fixed per-device defrag reserve.
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t redis_port = FindFreePort();
@@ -351,6 +354,11 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_EQ(MetricValue(body, "keylane_blocked_clients"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_control_connections"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_flow_connections"), 0);
+  // The lazy shared backlog is enabled on the first downstream handshake.
+  EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_capacity_bytes"), 0);
+  EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_pinned_cursors"), 0);
+  EXPECT_GT(
+      MetricValue(body, "keylane_replication_publish_queue_capacity_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_memory_current_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_memory_rss_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_memory_max_bytes"), 1073741824);

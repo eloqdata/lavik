@@ -9,6 +9,7 @@
 
 #include "absl/status/statusor.h"
 #include "celer/io/storage.h"
+#include "celer/runtime/sync.h"
 
 namespace celer {
 class CrossCore;
@@ -22,7 +23,7 @@ inline constexpr std::size_t kKiB = 1024;
 
 struct RegisteredBufferPoolOptions {
   std::size_t registered_bytes_ = 64 * kMiB;
-  std::size_t write_buffer_count_ = 4;
+  std::size_t storage_write_buffer_count_ = 4;
   std::size_t write_buffer_bytes_ = 8 * kMiB;
   std::size_t read_payload_bytes_ = 1 * kMiB;
   std::size_t read_headroom_bytes_ = 4 * kKiB;
@@ -76,8 +77,7 @@ class ReadBufferLease {
                   std::size_t heap_alignment) noexcept;
   ReadBufferLease(RegisteredBufferPool* pool, unsigned owner_worker,
                   celer::FixedBuffer buffer, std::size_t headroom_bytes,
-                  std::size_t tailroom_bytes,
-                  std::size_t overflow_id) noexcept;
+                  std::size_t tailroom_bytes, std::size_t overflow_id) noexcept;
 
   RegisteredBufferPool* pool_ = nullptr;
   unsigned owner_worker_ = 0;
@@ -111,7 +111,7 @@ class RegisteredBufferPool {
     return free_read_buffers_.size();
   }
   std::size_t write_buffer_count() const noexcept {
-    return write_buffers_.size();
+    return options_.storage_write_buffer_count_;
   }
   std::size_t available_write_buffers() const noexcept {
     return free_write_buffers_.size();
@@ -126,6 +126,11 @@ class RegisteredBufferPool {
   }
 
   bool TryAcquireWriteBuffer(std::uint16_t* buffer_id) noexcept;
+  // Foreground storage writers wait only for the statically reserved storage
+  // pool. A backlog-buffer release cannot wake or satisfy this waiter.
+  celer::AsyncNotification::Awaiter WaitForWriteBuffer() noexcept {
+    return storage_write_buffer_ready_.Wait();
+  }
   void ReleaseWriteBuffer(std::uint16_t buffer_id) noexcept;
   bool TryAcquireHeapWriteBuffer(std::byte** buffer) noexcept;
   void ReleaseHeapWriteBuffer(std::byte* buffer) noexcept;
@@ -179,6 +184,7 @@ class RegisteredBufferPool {
   std::vector<celer::FixedBuffer> write_buffers_;
   std::vector<std::uint16_t> free_write_buffers_;
   std::vector<bool> write_buffer_in_use_;
+  celer::AsyncNotification storage_write_buffer_ready_;
   std::vector<std::byte*> heap_write_buffers_;
   std::vector<std::byte*> free_heap_write_buffers_;
   std::vector<celer::FixedBuffer> read_buffers_;
@@ -193,8 +199,7 @@ class RegisteredBufferPool {
 };
 
 inline bool ReadBufferLease::registered() const noexcept {
-  return buffer_.index_ != 0 && pool_ != nullptr &&
-         pool_->buffers_registered_;
+  return buffer_.index_ != 0 && pool_ != nullptr && pool_->buffers_registered_;
 }
 
 }  // namespace keylane::storage

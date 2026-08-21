@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -9,6 +10,10 @@
 #include "keylane/server.h"
 
 namespace keylane {
+
+// Parses Redis-style binary memory sizes such as "67108864", "64mb", and
+// "1gb". A suffix is optional; unsuffixed values are bytes.
+absl::StatusOr<std::size_t> ParseMemorySize(std::string_view text);
 
 // Tokenizes one Redis configuration line. Whitespace separates arguments,
 // single and double quotes preserve whitespace, and an unquoted '#' starts a

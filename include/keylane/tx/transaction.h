@@ -4,6 +4,7 @@
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -14,10 +15,9 @@
 #include "keylane/storage/format.h"
 #include "keylane/tx/fingerprint.h"
 #include "keylane/tx/tx_queue.h"
+#include "keylane/tx/tx_shard.h"
 
 namespace keylane::tx {
-
-class TxShard;
 
 // One key of a transaction: the full digest for engine access, the
 // fingerprint, database, and mode for locking, and the argument index it
@@ -49,9 +49,10 @@ using ShardEntryHook = void (*)(void* ctx, unsigned shard_id);
 // A multi-key transaction, embedded in the coordinator coroutine's frame.
 //
 // Lifecycle: Begin -> AddKey... -> Seal -> [Schedule ->] Execute(release).
-// Single-shard transactions skip Schedule entirely: Execute hops to the
-// owner and takes the fast-path key-set guard there, never touching the
-// global txid counter. Multi-shard transactions draw a txid, run a schedule
+// Single-shard transactions skip Schedule entirely: Execute hops to the owner
+// and takes a fast-path key-set guard there, never touching the global txid
+// counter. A non-releasing hop retains that guard on the owner until the final
+// releasing hop. Multi-shard transactions draw a txid, run a schedule
 // round on every shard (recording lock intents and taking a txid-ordered
 // queue position; the reorder rule may fail the round, which cancels and
 // retries with a fresh txid), then execute hops: each hop arms every shard
@@ -88,8 +89,8 @@ class Transaction {
   celer::Task<absl::Status> Schedule();
 
   // Runs `cb` on every shard's slice. `release` drops all locks and queue
-  // positions once the hop completes. Single-shard transactions currently
-  // require release == true (multi-hop lands with MULTI/EXEC).
+  // positions once the hop completes. Single-shard calls retain one owner-
+  // local no-txid guard across non-releasing hops.
   celer::Task<absl::Status> Execute(ShardCallback cb, void* ctx, bool release);
 
   // Final no-op hop that releases every shard's locks and queue position.
@@ -147,7 +148,7 @@ class Transaction {
   static void CancelInShard(ShardData* sd);
   static void ArmInShard(ShardData* sd);
   ShardSlice Slice(const ShardData& sd) const;
-  celer::Task<absl::Status> ExecuteSingleShard();
+  celer::Task<absl::Status> ExecuteSingleShard(bool release);
 
   bool releasing_ = false;
   bool scheduled_ = false;
@@ -161,6 +162,7 @@ class Transaction {
   absl::InlinedVector<KeyRef, 4> lock_refs_;
   absl::InlinedVector<ShardData, 2> shards_;
   std::uint64_t schedule_retries_ = 0;
+  std::optional<TxShard::Guard> single_shard_guard_;
 
   // The only cross-thread words on the hop path.
   std::atomic<std::uint32_t> barrier_{0};

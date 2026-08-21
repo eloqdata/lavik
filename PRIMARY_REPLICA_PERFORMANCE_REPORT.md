@@ -59,8 +59,8 @@ RX softirq 引导到 CPU 12-15。因此两台机器的标称 CPU/存储配置相
 
 ```text
 --threads=12
---replication-publish-queue-mb=64
---registered-buffer-mb=256
+--replication-publish-queue-mb-per-worker=64
+--registered-buffer-mb-per-worker=256
 --busy-poll-us=20
 --background-budget-us=10
 --background-warrant-percent=1

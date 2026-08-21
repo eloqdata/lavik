@@ -196,7 +196,7 @@ class ServerProcess {
           std::to_string(port),
           "--threads",
           "1",
-          "--recv-buffers",
+          "--recv-buffers-per-worker",
           "0",
           "--flush-max-ms",
           std::to_string(flush_max_ms),
@@ -551,14 +551,17 @@ int main(int argc, char** argv) {
             observed_full = true;
             break;
           }
-          Fail("full-device SET returned an unexpected response: " +
-               response);
+          Fail("full-device SET returned an unexpected response: " + response);
         }
         if (!observed_full) {
           Fail("expiration test device did not reach foreground exhaustion");
         }
 
-        const auto reclaim_deadline = std::chrono::steady_clock::now() + 20s;
+        // Active expiration advances through every logical (partition, DB)
+        // map at background priority. Allow more than one complete sweep so
+        // keys visited just before their TTL elapsed are revisited reliably
+        // on slower/debug test runs.
+        const auto reclaim_deadline = std::chrono::steady_clock::now() + 60s;
         bool write_recovered = false;
         while (std::chrono::steady_clock::now() < reclaim_deadline) {
           const std::string response =

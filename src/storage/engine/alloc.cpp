@@ -147,18 +147,22 @@ Task<absl::Status> StorageEngine::Impl::RefillReadyBlocksLocal(
   activated.reserve(kActivationBatchBlocks);
   std::vector<std::uint64_t> reactivated;
   reactivated.reserve(kActivationBatchBlocks);
-  while (activated.size() < kActivationBatchBlocks &&
-         allocator.next_pristine_ < device.capacity_blocks_) {
-    const std::uint32_t local =
-        static_cast<std::uint32_t>(allocator.next_pristine_++);
-    activated.push_back(MakeBlockId(device.id_, local));
-  }
+  // Reuse reclaimed blocks before touching new offsets. Besides bounding the
+  // physical footprint of sparse file-backed devices under overwrite-heavy
+  // workloads, this makes blocks released by replication backlog trimming
+  // immediately useful to both foreground writes and the next backlog batch.
   while (activated.size() < kActivationBatchBlocks &&
          !allocator.cold_free_.empty()) {
     const std::uint64_t block_id = allocator.cold_free_.back();
     allocator.cold_free_.pop_back();
     activated.push_back(block_id);
     reactivated.push_back(block_id);
+  }
+  while (activated.size() < kActivationBatchBlocks &&
+         allocator.next_pristine_ < device.capacity_blocks_) {
+    const std::uint32_t local =
+        static_cast<std::uint32_t>(allocator.next_pristine_++);
+    activated.push_back(MakeBlockId(device.id_, local));
   }
   if (activated.empty()) {
     co_return absl::OkStatus();
@@ -676,11 +680,6 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
                              "defrag reserve is exhausted");
     }
-    if (purpose == AllocationPurpose::kReplication) {
-      co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                             "replication backlog has no allocatable blocks");
-    }
-
     const std::uint64_t generation_after =
         space_reclaim_generation_.load(std::memory_order_acquire);
     if (generation_after != generation_before) {

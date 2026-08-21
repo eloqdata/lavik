@@ -16,8 +16,7 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
       // INFO request may finish and append on a worker already visited; the
       // initial nonzero sample keeps this observation conservative, and the
       // following poll will see the appended record's dirty bytes.
-      .tx_commits_pending_ =
-          active_tx_commits_.load(std::memory_order_acquire),
+      .tx_commits_pending_ = active_tx_commits_.load(std::memory_order_acquire),
   };
   for (unsigned target = 0; target < worker_count_; ++target) {
     result.dirty_staging_bytes_ +=
@@ -37,9 +36,8 @@ Task<StorageDurabilityStats> StorageEngine::Impl::DurabilityStats() const {
           return dirty;
         });
   }
-  result.flushes_pending_ =
-      std::max(result.flushes_pending_,
-               active_flushes_.load(std::memory_order_acquire));
+  result.flushes_pending_ = std::max(
+      result.flushes_pending_, active_flushes_.load(std::memory_order_acquire));
   result.tx_commits_pending_ =
       std::max(result.tx_commits_pending_,
                active_tx_commits_.load(std::memory_order_acquire));
@@ -90,6 +88,27 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
       }
     }
     result.devices_.push_back(std::move(metrics));
+  }
+  result.replication_logs_.reserve(worker_count_);
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    result.replication_logs_.push_back(
+        co_await celer::SubmitTo(target, [this, target] {
+          const ReplicationLogInfo log = LocalReplicationLogInfo();
+          return StorageReplicationLogMetrics{
+              .worker_id_ = target,
+              .floor_lsn_ = log.floor_lsn_,
+              .tail_lsn_ = log.tail_lsn_,
+              .backpressure_waits_ = log.backpressure_waits_,
+              .chunk_count_ = log.block_count_,
+              .capacity_bytes_ = log.capacity_bytes_,
+              .publish_queue_bytes_ = log.publish_queue_bytes_,
+              .publish_queue_capacity_bytes_ =
+                  log.publish_queue_capacity_bytes_,
+              .pinned_cursors_ = log.retained_cursor_count_,
+              .active_ = log.state_ == ReplicationLogState::kActive,
+              .capacity_backpressured_ = log.capacity_backpressured_,
+          };
+        }));
   }
   co_return result;
 }

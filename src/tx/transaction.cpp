@@ -247,19 +247,26 @@ Task<absl::Status> Transaction::Schedule() {
   }
 }
 
-Task<absl::Status> Transaction::ExecuteSingleShard() {
-  // The whole key set lives on one shard: hop there and take the fast-path
-  // key-set guard. No txid, no queue entry, no barrier beyond the hop.
+Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
+  // The whole key set lives on one shard. The first hop takes the fast-path
+  // key-set guard; a non-releasing hop leaves it resident on that owner for
+  // the next callback. The final hop resets it there. No txid or queue entry.
   const unsigned owner = shards_[0].shard_id_;
-  co_return co_await celer::SubmitTaskTo(owner, [this]() -> Task<absl::Status> {
-    ShardData& sd = shards_[0];
-    auto guard = co_await CurrentTxShard().AcquireKeys(sd.node_.keys_);
-    if (!sd.entry_hook_invoked_ && entry_hook_ != nullptr) {
-      sd.entry_hook_invoked_ = true;
-      entry_hook_(entry_hook_ctx_, sd.shard_id_);
-    }
-    co_return co_await cb_(cb_ctx_, Slice(sd));
-  });
+  co_return co_await celer::SubmitTaskTo(
+      owner, [this, release]() -> Task<absl::Status> {
+        ShardData& sd = shards_[0];
+        if (!single_shard_guard_.has_value()) {
+          single_shard_guard_.emplace(
+              co_await CurrentTxShard().AcquireKeys(sd.node_.keys_));
+        }
+        if (!sd.entry_hook_invoked_ && entry_hook_ != nullptr) {
+          sd.entry_hook_invoked_ = true;
+          entry_hook_(entry_hook_ctx_, sd.shard_id_);
+        }
+        absl::Status status = co_await cb_(cb_ctx_, Slice(sd));
+        if (release) single_shard_guard_.reset();
+        co_return status;
+      });
 }
 
 Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
@@ -269,8 +276,7 @@ Task<absl::Status> Transaction::Execute(ShardCallback cb, void* ctx,
   cb_ctx_ = ctx;
   releasing_ = release;
   if (single_shard()) {
-    assert(release && "single-shard multi-hop lands with MULTI/EXEC");
-    co_return co_await ExecuteSingleShard();
+    co_return co_await ExecuteSingleShard(release);
   }
   assert(scheduled_ && "Schedule before Execute");
   for (ShardData& sd : shards_) {

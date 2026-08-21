@@ -66,6 +66,48 @@ char DecodeEscape(char escaped) {
 
 }  // namespace
 
+absl::StatusOr<std::size_t> ParseMemorySize(std::string_view text) {
+  if (text.empty()) {
+    return absl::InvalidArgumentError("memory size must not be empty");
+  }
+  std::size_t digits = 0;
+  while (digits < text.size() && text[digits] >= '0' && text[digits] <= '9') {
+    ++digits;
+  }
+  if (digits == 0) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid memory size '", text, "'"));
+  }
+  std::uint64_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + digits, value);
+  if (parsed.ec != std::errc{} || parsed.ptr != text.data() + digits) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid memory size '", text, "'"));
+  }
+  std::string suffix(text.substr(digits));
+  absl::AsciiStrToLower(&suffix);
+  std::uint64_t multiplier = 1;
+  if (suffix.empty() || suffix == "b") {
+    multiplier = 1;
+  } else if (suffix == "k" || suffix == "kb") {
+    multiplier = 1024ULL;
+  } else if (suffix == "m" || suffix == "mb") {
+    multiplier = 1024ULL * 1024;
+  } else if (suffix == "g" || suffix == "gb") {
+    multiplier = 1024ULL * 1024 * 1024;
+  } else if (suffix == "t" || suffix == "tb") {
+    multiplier = 1024ULL * 1024 * 1024 * 1024;
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid memory size suffix in '", text, "'"));
+  }
+  if (value > std::numeric_limits<std::size_t>::max() / multiplier) {
+    return absl::OutOfRangeError(
+        absl::StrCat("memory size is too large: '", text, "'"));
+  }
+  return static_cast<std::size_t>(value * multiplier);
+}
+
 absl::StatusOr<std::vector<std::string>> ParseRedisConfigLine(
     std::string_view line) {
   std::vector<std::string> result;
@@ -128,8 +170,7 @@ absl::Status ApplyRedisConfigDirective(
   const std::string name = absl::AsciiStrToLower(directive.front());
   if (name == "bind") {
     if (directive.size() < 2) return WrongArgumentCount(name);
-    std::vector<std::string> addresses(directive.begin() + 1,
-                                       directive.end());
+    std::vector<std::string> addresses(directive.begin() + 1, directive.end());
     for (const std::string& address : addresses) {
       if (address.empty()) {
         return absl::InvalidArgumentError("bind address must not be empty");
@@ -152,8 +193,7 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     if (name == "tls-cert-file") options->tls_cert_file_ = directive[1];
     if (name == "tls-key-file") options->tls_key_file_ = directive[1];
-    if (name == "tls-ca-cert-file")
-      options->tls_ca_cert_file_ = directive[1];
+    if (name == "tls-ca-cert-file") options->tls_ca_cert_file_ = directive[1];
     if (name == "requirepass") options->requirepass_ = directive[1];
     if (name == "masteruser") options->masteruser_ = directive[1];
     if (name == "masterauth") options->masterauth_ = directive[1];
@@ -199,18 +239,57 @@ absl::Status ApplyRedisConfigDirective(
     options->replication_options_.replica_read_only_ = *read_only;
     return absl::OkStatus();
   }
-  if (name == "replication-publish-queue-mb") {
+  if (name == "recv-buffers-per-worker") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->recv_buffer_count_,
+                         true);
+  }
+  if (name == "registered-buffer-mb-per-worker" ||
+      name == "replication-publish-queue-mb-per-worker") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     std::size_t megabytes = 0;
-    absl::Status parsed =
-        ParseUnsigned(directive[1], name, &megabytes, false);
+    absl::Status parsed = ParseUnsigned(directive[1], name, &megabytes, false);
     if (!parsed.ok()) return parsed;
     constexpr std::size_t kMiB = 1024 * 1024;
     if (megabytes > std::numeric_limits<std::size_t>::max() / kMiB) {
       return absl::OutOfRangeError(
           "replication publish queue size is too large");
     }
-    options->replication_publish_queue_bytes_ = megabytes * kMiB;
+    if (name == "registered-buffer-mb-per-worker") {
+      options->registered_buffer_bytes_ = megabytes * kMiB;
+    } else {
+      options->replication_publish_queue_bytes_ = megabytes * kMiB;
+    }
+    return absl::OkStatus();
+  }
+  if (name == "storage-write-buffers-per-worker") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    unsigned count = 0;
+    absl::Status parsed = ParseUnsigned(directive[1], name, &count, false);
+    if (!parsed.ok()) return parsed;
+    options->storage_write_buffer_count_ = count;
+    return absl::OkStatus();
+  }
+  if (name == "storage-read-buffer-kb") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    std::size_t kilobytes = 0;
+    absl::Status parsed = ParseUnsigned(directive[1], name, &kilobytes, false);
+    if (!parsed.ok()) return parsed;
+    constexpr std::size_t kKiB = 1024;
+    if (kilobytes > std::numeric_limits<std::size_t>::max() / kKiB) {
+      return absl::OutOfRangeError("storage read buffer size is too large");
+    }
+    options->storage_read_buffer_bytes_ = kilobytes * kKiB;
+    return absl::OkStatus();
+  }
+  if (name == "repl-backlog-size") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto bytes = ParseMemorySize(directive[1]);
+    if (!bytes.ok()) return bytes.status();
+    if (*bytes == 0) {
+      return absl::InvalidArgumentError("repl-backlog-size must be nonzero");
+    }
+    options->replication_options_.backlog_size_bytes_ = *bytes;
     return absl::OkStatus();
   }
   return absl::InvalidArgumentError(
@@ -261,6 +340,18 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (options.masteruser_ != "default") {
     return absl::InvalidArgumentError(
         "only the default replication user is currently supported");
+  }
+  if (options.storage_write_buffer_count_ == 0) {
+    return absl::InvalidArgumentError(
+        "storage write buffer count must be nonzero");
+  }
+  if (options.thread_count_ > std::numeric_limits<std::size_t>::max() /
+                                  storage::kStorageBlockBytes ||
+      options.replication_options_.backlog_size_bytes_ <
+          static_cast<std::size_t>(options.thread_count_) *
+              storage::kStorageBlockBytes) {
+    return absl::InvalidArgumentError(
+        "repl-backlog-size must provide at least one 8 MiB block per worker");
   }
   return absl::OkStatus();
 }

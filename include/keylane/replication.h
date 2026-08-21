@@ -41,14 +41,20 @@ struct ReplicationOptions {
   std::shared_ptr<celer::TlsContext> tls_context_;
   std::string masteruser_ = "default";
   std::string masterauth_;
+  // Global in-memory history quota. Chunks are allocated lazily and distributed
+  // across source-worker flows without multiplying this value by worker count.
+  std::size_t backlog_size_bytes_ = 1ULL * 1024 * 1024 * 1024;
+  // Bounded source publisher staging memory on each worker. A single larger
+  // command may exceed this waterline only while it is the exclusive item.
+  std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
 };
 
-inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 16;
+inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 128;
 
 enum class ReplicationRole : std::uint8_t {
   kMaster,
   kConnecting,
-  kHandshake,
+  kSyncing,
   kOnline,
 };
 
@@ -63,12 +69,14 @@ struct DownstreamReplicaStatus {
 struct ReplicationStatus {
   ReplicationRole role_ = ReplicationRole::kMaster;
   std::optional<ReplicaOfConfig> upstream_;
-  std::uint64_t generation_ = 0;
+  std::uint64_t role_epoch_ = 0;
   std::uint64_t session_id_ = 0;
   unsigned source_worker_count_ = 0;
   unsigned connected_flows_ = 0;
   std::string local_node_id_;
+  std::string local_history_id_;
   std::optional<std::string> upstream_node_id_;
+  std::optional<std::string> upstream_history_id_;
   std::vector<DownstreamReplicaStatus> downstream_replicas_;
 };
 
@@ -97,13 +105,25 @@ class ReplicationManager {
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
   unsigned snapshot_read_concurrency() const noexcept;
 
+  // Changes the global in-memory backlog quota. Growth preserves the current
+  // history; shrinkage may advance individual flow floors at event boundaries.
+  celer::Task<absl::Status> SetBacklogSizeBytes(std::size_t bytes);
+  std::size_t backlog_size_bytes() const noexcept;
+
+  celer::Task<absl::Status> SetPublishQueueBytesPerWorker(std::size_t bytes);
+  std::size_t publish_queue_bytes_per_worker() const noexcept;
+
   // KLPSYNC and KLFLOW arrive as RESP commands on the ordinary Redis port.
   static bool IsNativeHandshake(std::span<const std::string> args) noexcept;
-  celer::Task<absl::Status> ServeNativeConnection(
-      celer::TcpStream& stream, std::vector<std::string> args);
+  celer::Task<absl::Status> ServeNativeConnection(celer::TcpStream& stream,
+                                                  std::vector<std::string> args,
+                                                  std::uint64_t client_id,
+                                                  std::string client_address,
+                                                  bool tls);
 
   ReplicationStatus status() const;
   bool is_replica() const noexcept;
+  bool is_loading() const noexcept;
   bool reject_writes() const noexcept;
   bool replica_read_only() const noexcept {
     return options_.replica_read_only_;

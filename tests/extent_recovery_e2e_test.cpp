@@ -229,7 +229,7 @@ class ServerProcess {
           std::to_string(port),
           "--threads",
           std::to_string(threads),
-          "--recv-buffers",
+          "--recv-buffers-per-worker",
           "0",
           "--data-file",
           data_path,

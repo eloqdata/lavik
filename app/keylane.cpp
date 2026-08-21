@@ -52,9 +52,12 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  unsigned registered_buffer_mb = 256;
+  unsigned registered_buffer_mb = static_cast<unsigned>(
+      options.registered_buffer_bytes_ / (1024ULL * 1024));
   unsigned replication_publish_queue_mb = static_cast<unsigned>(
       options.replication_publish_queue_bytes_ / (1024ULL * 1024));
+  unsigned storage_read_buffer_kb =
+      static_cast<unsigned>(options.storage_read_buffer_bytes_ / 1024ULL);
   unsigned flush_size_kb = 128;
   bool disable_read_crc = false;
 
@@ -103,7 +106,7 @@ int main(int argc, char** argv) {
   app.add_option("-i,--idle-timeout", options.idle_timeout_ms_,
                  "Idle timeout in ms (-1 = disabled)")
       ->capture_default_str();
-  app.add_option("--recv-buffers", options.recv_buffer_count_,
+  app.add_option("--recv-buffers-per-worker", options.recv_buffer_count_,
                  "Multishot recv buffer-ring entries per worker (0 disables)")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
@@ -136,14 +139,29 @@ int main(int argc, char** argv) {
                  "(-1 disables purging)")
       ->capture_default_str()
       ->check(CLI::Range(-1L, std::numeric_limits<long>::max()));
-  app.add_option("--registered-buffer-mb", registered_buffer_mb,
+  app.add_option("--registered-buffer-mb-per-worker", registered_buffer_mb,
                  "Registered storage buffer budget in MiB per worker")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_option("--replication-publish-queue-mb",
+  app.add_option("--storage-write-buffers-per-worker",
+                 options.storage_write_buffer_count_,
+                 "Registered storage write buffers per worker")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--storage-read-buffer-kb", storage_read_buffer_kb,
+                 "Registered storage read payload size in KiB")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--replication-publish-queue-mb-per-worker",
                  replication_publish_queue_mb,
                  "Replication publisher staging budget in MiB per worker")
       ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--repl-backlog-size",
+                 options.replication_options_.backlog_size_bytes_,
+                 "Global lazy in-memory replication backlog quota")
+      ->capture_default_str()
+      ->transform(CLI::AsSizeValue(false))
       ->check(CLI::PositiveNumber);
   app.add_option("--max-memory,--maxmemory", options.max_memory_bytes_,
                  "Maximum process memory (0 uses 80% of memory capacity)")
@@ -211,6 +229,7 @@ int main(int argc, char** argv) {
   if (registered_buffer_mb > std::numeric_limits<std::size_t>::max() / kMiB ||
       replication_publish_queue_mb >
           std::numeric_limits<std::size_t>::max() / kMiB ||
+      storage_read_buffer_kb > std::numeric_limits<std::size_t>::max() / kKiB ||
       flush_size_kb > std::numeric_limits<std::size_t>::max() / kKiB) {
     return 2;
   }
@@ -218,6 +237,8 @@ int main(int argc, char** argv) {
       static_cast<std::size_t>(registered_buffer_mb) * kMiB;
   options.replication_publish_queue_bytes_ =
       static_cast<std::size_t>(replication_publish_queue_mb) * kMiB;
+  options.storage_read_buffer_bytes_ =
+      static_cast<std::size_t>(storage_read_buffer_kb) * kKiB;
   options.flush_size_bytes_ = static_cast<std::size_t>(flush_size_kb) * kKiB;
   options.verify_read_crc_ = !disable_read_crc;
   return keylane::RunServer(std::move(options));
