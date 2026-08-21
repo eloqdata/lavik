@@ -372,13 +372,26 @@ bool RegisteredBufferPool::IsReadBufferId(
 }
 
 bool RegisteredBufferPool::AcquireReadAwaiter::await_ready() const noexcept {
-  return true;
+  if (pool_ == nullptr || !pool_->initialized()) {
+    return true;
+  }
+  // Oversized reads cannot use a fixed slot and retain the aligned overflow
+  // path. Ordinary reads wait for their worker's bounded fixed pool instead
+  // of turning a transient hand-back delay into unbounded DMA allocation.
+  return minimum_payload_bytes_ > pool_->options_.read_payload_bytes_ ||
+         !pool_->free_read_buffers_.empty();
 }
 
 bool RegisteredBufferPool::AcquireReadAwaiter::await_suspend(
     std::coroutine_handle<> awaiting) {
-  (void)awaiting;
-  return false;
+  if (pool_ == nullptr || !pool_->initialized() ||
+      minimum_payload_bytes_ > pool_->options_.read_payload_bytes_ ||
+      !pool_->free_read_buffers_.empty()) {
+    return false;
+  }
+  awaiting_ = awaiting;
+  pool_->read_waiters_.push_back(this);
+  return true;
 }
 
 absl::StatusOr<ReadBufferLease>
@@ -387,9 +400,16 @@ RegisteredBufferPool::AcquireReadAwaiter::await_resume() {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
                         "registered buffer pool is not initialized");
   }
+  if (assigned_buffer_id_ != 0) {
+    return pool_->LeaseReadBuffer(assigned_buffer_id_);
+  }
   if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes_ &&
       !pool_->free_read_buffers_.empty()) {
     return pool_->TakeReadBuffer();
+  }
+  if (minimum_payload_bytes_ <= pool_->options_.read_payload_bytes_) {
+    return absl::Status(absl::StatusCode::kInternal,
+                        "read buffer waiter resumed without a buffer");
   }
   return pool_->AllocateHeapReadBuffer(minimum_payload_bytes_);
 }
@@ -400,6 +420,12 @@ ReadBufferLease RegisteredBufferPool::TakeReadBuffer() {
   const std::size_t read_base = write_buffers_.size() + 1;
   const std::size_t offset = static_cast<std::size_t>(buffer_id - read_base);
   read_buffer_in_use_[offset] = true;
+  return LeaseReadBuffer(buffer_id);
+}
+
+ReadBufferLease RegisteredBufferPool::LeaseReadBuffer(std::uint16_t buffer_id) {
+  const std::size_t read_base = write_buffers_.size() + 1;
+  const std::size_t offset = static_cast<std::size_t>(buffer_id - read_base);
   return ReadBufferLease(this, owner_worker_, read_buffers_[offset],
                          options_.read_headroom_bytes_,
                          options_.read_tailroom_bytes_);
@@ -592,6 +618,15 @@ void RegisteredBufferPool::ReleaseLocal(std::uint16_t buffer_id) noexcept {
   const std::size_t read_base = write_buffers_.size() + 1;
   const std::size_t offset = static_cast<std::size_t>(buffer_id - read_base);
   if (!read_buffer_in_use_[offset]) {
+    return;
+  }
+  if (!read_waiters_.empty()) {
+    AcquireReadAwaiter* waiter = read_waiters_.front();
+    read_waiters_.pop_front();
+    waiter->assigned_buffer_id_ = buffer_id;
+    if (worker_ != nullptr) {
+      worker_->Enqueue(waiter->awaiting_);
+    }
     return;
   }
   read_buffer_in_use_[offset] = false;

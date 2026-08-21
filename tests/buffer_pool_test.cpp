@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "celer/net/server.h"
@@ -62,6 +63,42 @@ class BufferPoolWaitService final : public celer::Service {
     if (!storage_waiter_acquired_) {
       result_ = absl::DeadlineExceededError(
           "storage-buffer release did not wake its waiter");
+      worker.RequestStop();
+      co_return result_;
+    }
+
+    std::vector<ReadBufferLease> held_reads;
+    held_reads.reserve(pool_.read_buffer_count());
+    for (std::size_t i = 0; i < pool_.read_buffer_count(); ++i) {
+      auto acquired = co_await pool_.AcquireReadBuffer();
+      if (!acquired.ok() || acquired->buffer_id() == 0) {
+        result_ = absl::FailedPreconditionError(
+            "test could not reserve every fixed read buffer");
+        worker.RequestStop();
+        co_return result_;
+      }
+      held_reads.push_back(std::move(*acquired));
+    }
+    read_waiter_started_ = false;
+    read_waiter_acquired_ = false;
+    worker.Spawn(AcquireReadAfterRelease());
+    co_await celer::Yield(worker);
+    if (!read_waiter_started_ || read_waiter_acquired_ ||
+        pool_.overflow_read_buffer_count() != 0) {
+      result_ = absl::FailedPreconditionError(
+          "read-buffer exhaustion allocated overflow instead of waiting");
+      worker.RequestStop();
+      co_return result_;
+    }
+    held_reads.back().Reset();
+    held_reads.pop_back();
+    for (unsigned attempt = 0; attempt < 100 && !read_waiter_acquired_;
+         ++attempt) {
+      co_await celer::Yield(worker);
+    }
+    if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
+      result_ = absl::DeadlineExceededError(
+          "fixed-read-buffer release did not wake its waiter");
     }
     worker.RequestStop();
     co_return result_;
@@ -83,10 +120,25 @@ class BufferPoolWaitService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
+  celer::Task<absl::Status> AcquireReadAfterRelease() {
+    read_waiter_started_ = true;
+    auto acquired = co_await pool_.AcquireReadBuffer();
+    if (!acquired.ok() || acquired->buffer_id() == 0) {
+      result_ = absl::FailedPreconditionError(
+          "read waiter did not receive a fixed buffer");
+      co_return result_;
+    }
+    read_waiter_acquired_ = true;
+    acquired->Reset();
+    co_return absl::OkStatus();
+  }
+
   RegisteredBufferPool pool_;
   bool prepared_ = false;
   bool storage_waiter_started_ = false;
   bool storage_waiter_acquired_ = false;
+  bool read_waiter_started_ = false;
+  bool read_waiter_acquired_ = false;
   absl::Status result_ =
       absl::UnknownError("buffer-pool wait service did not run");
 };
