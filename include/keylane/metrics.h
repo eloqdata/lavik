@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -34,6 +35,11 @@ struct CommandMetricTotals {
       latency_bins_{};
 };
 
+struct StorageIoMetricTotals {
+  std::uint64_t operations_ = 0;
+  std::uint64_t bytes_ = 0;
+};
+
 struct WorkerMetricsSnapshot {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
   std::uint64_t connections_ = 0;
@@ -46,6 +52,9 @@ struct WorkerMetricsSnapshot {
   std::uint64_t defrag_failures_ = 0;
   std::uint64_t active_defrags_ = 0;
   std::uint64_t pending_defrags_ = 0;
+  StorageIoMetricTotals storage_reads_{};
+  StorageIoMetricTotals storage_writes_{};
+  StorageIoMetricTotals storage_fdatasyncs_{};
   double counter_frequency_ = 1.0;
 
   std::uint64_t TotalCalls() const noexcept;
@@ -80,7 +89,8 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
 celer::Task<absl::Status> RenderPrometheusMetrics(
-    const storage::StorageEngine& storage, std::string* output);
+    const storage::StorageEngine& storage, bool server_ready,
+    std::string* output);
 
 }  // namespace keylane
 
@@ -91,6 +101,7 @@ class Service;
 namespace keylane {
 
 std::unique_ptr<celer::Service> CreateMetricsService(
-    std::uint16_t port, const storage::StorageEngine* storage);
+    std::uint16_t port, const storage::StorageEngine* storage,
+    std::function<bool()> server_ready);
 
 }  // namespace keylane

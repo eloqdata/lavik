@@ -114,7 +114,7 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   const std::uint64_t logical_size =
       update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
   absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key,
+      store, partition, db_id, key, digest,
       update->erase_ ? std::string_view{} : encoded,
       kind, published_type, expire_at_ms, tx,
       update->erase_ ? 0 : logical_size, nullptr, nullptr, replication);

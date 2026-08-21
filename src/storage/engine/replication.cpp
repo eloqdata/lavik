@@ -82,6 +82,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
                 .expire_at_ms_ = location.expire_at_ms_,
                 .value_type_ = location.value_type_,
                 .logical_size_ = location.logical_size_,
+                .key_digest_ = digest,
                 .key_ = *key,
                 .value_ = std::string(
                     reinterpret_cast<const char*>(value.data()), value.size()),
@@ -102,9 +103,8 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
             WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight);
       }
     }
-    // A completed detached background frame may not be destroyed until the
-    // next background scheduler slice. Release the shared key hold before
-    // waking the parent so foreground writes never wait for frame cleanup.
+    // Release the shared key hold before waking the parent so foreground
+    // writes never wait for frame cleanup.
     key_lock.Reset();
   }
   join->Complete(std::move(status));
@@ -436,8 +436,6 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
       capture->second.phase_ !=
           WorkerStore::FullSyncCapture::Phase::kCapturing ||
       capture->second.db_phases_[db_id] !=
-          WorkerStore::FullSyncCapture::DbPhase::kScanning ||
-      capture->second.db_phases_[db_id] !=
           WorkerStore::FullSyncCapture::DbPhase::kScanning) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "full-sync partition capture is not active");
@@ -463,10 +461,8 @@ StorageEngine::Impl::SnapshotPartition(std::uint64_t session_id,
     SnapshotReadJoin join;
     join.pending_ = last - first;
     for (std::size_t i = first; i < last; ++i) {
-      // Full sync must make bounded progress even while the owner is saturated
-      // by foreground writes. These reads are part of an active replication
-      // session, not maintenance work: putting them on the background queue
-      // lets the configured background warrant starve the snapshot forever.
+      // Snapshot work is an online replication task, so it remains on the
+      // foreground queue. The bounded wave yields naturally between groups.
       store.worker_->Spawn(
           ReadSnapshotRecord(store, partition, index, db_id, &keys[i],
                              session_id, baseline_version, &records[i], &join));
@@ -573,8 +569,7 @@ void StorageEngine::Impl::AcknowledgePartitionSnapshotRecords(
   }
   for (const SnapshotRecord& record : records) {
     const std::string& key = record.key_;
-    const Digest digest = ComputeDigest(key);
-    auto* phase = capture->second.key_phases_.Find(digest, key);
+    auto* phase = capture->second.key_phases_.Find(record.key_digest_, key);
     if (phase == nullptr ||
         phase->value_ !=
             WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight) {
@@ -663,12 +658,32 @@ StorageEngine::Impl::PeekFullSyncPublishItems(std::uint64_t session_id,
   }
   std::vector<FullSyncPublishItem> result;
   result.reserve(std::min(max_items, session->second.publish_queue_.size()));
-  for (const auto& pending : session->second.publish_queue_) {
-    if (result.size() == max_items) break;
+  const std::size_t count =
+      std::min(max_items, session->second.publish_queue_.size());
+  for (std::size_t index = 0; index < count; ++index) {
+    const auto& pending = session->second.publish_queue_[index];
     result.push_back(
         FullSyncPublishItem{.id_ = pending.id_, .command_ = pending.command_});
   }
   return result;
+}
+
+absl::StatusOr<FullSyncPublishQueueInfo>
+StorageEngine::Impl::GetFullSyncPublishQueueInfo(
+    std::uint64_t session_id) const {
+  const WorkerStore& store = CurrentStore();
+  const auto session = store.fullsync_sessions_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_) {
+    return absl::FailedPreconditionError(
+        "full-sync publish session is not active");
+  }
+  return FullSyncPublishQueueInfo{
+      .queued_bytes_ = session->second.publish_queue_bytes_,
+      .admitted_bytes_ = session->second.publisher_admitted_bytes_,
+      .capacity_bytes_ =
+          replication_publish_queue_bytes_.load(std::memory_order_acquire),
+  };
 }
 
 void StorageEngine::Impl::AcknowledgeFullSyncPublishItem(

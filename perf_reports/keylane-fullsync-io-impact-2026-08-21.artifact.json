@@ -1,0 +1,516 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Keylane Full Sync 硬盘 I/O 增量",
+    "description": "主节点与从节点在空闲基线和 Full Sync 稳态窗口下的存储 I/O 对比。",
+    "generatedAt": "2026-08-21T13:38:14Z",
+    "cards": [],
+    "charts": [
+      {
+        "id": "fullsync_throughput",
+        "title": "Full Sync storage throughput",
+        "subtitle": "30-second rates from Aug 21, 1:30–1:38 PM UTC; Full Sync began at 1:31:43 PM.",
+        "type": "line",
+        "dataset": "throughput_timeline",
+        "sourceId": "prometheus_storage_io",
+        "valueFormat": "number",
+        "encodings": {
+          "x": {
+            "field": "timestamp",
+            "type": "temporal",
+            "label": "Time (UTC)"
+          },
+          "y": {
+            "field": "bytes_per_second",
+            "type": "quantitative",
+            "label": "Bytes/s"
+          },
+          "color": {
+            "field": "series",
+            "type": "nominal",
+            "label": "I/O path"
+          },
+          "tooltip": [
+            {
+              "field": "instance",
+              "type": "nominal",
+              "label": "Instance"
+            },
+            {
+              "field": "operation",
+              "type": "nominal",
+              "label": "Operation"
+            },
+            {
+              "field": "phase",
+              "type": "nominal",
+              "label": "Phase"
+            }
+          ]
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "fullsync_summary",
+        "title": "Full Sync I/O summary",
+        "subtitle": "Baseline is the 90 seconds before synchronization; Full Sync average is a stable five-minute window.",
+        "dataset": "fullsync_summary",
+        "sourceId": "prometheus_storage_io",
+        "defaultSort": {
+          "field": "fullsync_avg_bytes_per_second",
+          "direction": "desc"
+        },
+        "columns": [
+          {
+            "field": "node",
+            "label": "Node",
+            "type": "text"
+          },
+          {
+            "field": "operation",
+            "label": "Operation",
+            "type": "text"
+          },
+          {
+            "field": "baseline_iops",
+            "label": "Baseline IOPS",
+            "format": "number"
+          },
+          {
+            "field": "fullsync_avg_iops",
+            "label": "Full Sync avg IOPS",
+            "format": "number"
+          },
+          {
+            "field": "fullsync_peak_iops",
+            "label": "Full Sync peak IOPS",
+            "format": "number"
+          },
+          {
+            "field": "baseline_bytes_per_second",
+            "label": "Baseline B/s",
+            "format": "number"
+          },
+          {
+            "field": "fullsync_avg_bytes_per_second",
+            "label": "Full Sync avg B/s",
+            "format": "number"
+          },
+          {
+            "field": "fullsync_peak_bytes_per_second",
+            "label": "Full Sync peak B/s",
+            "format": "number"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "prometheus_storage_io",
+        "label": "Keylane Prometheus storage I/O counters",
+        "path": "Prometheus keylane job"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# Keylane Full Sync 硬盘 I/O 增量"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "prometheus_storage_io",
+        "body": "## 技术结论\n\nFull Sync 将空闲基线上的存储 I/O 从接近 0 推高到：主节点平均 **382.8K read IOPS / 1.20 GB/s**，从节点平均 **7.86K write IOPS / 1.01 GB/s**，并产生约 **266 fdatasync/s**。30 秒峰值分别达到主节点 **416.2K read IOPS / 1.31 GB/s**、从节点 **8.55K write IOPS / 1.10 GB/s** 和 **287 fdatasync/s**。因此可以明确看出 Full Sync 的增量，而且源端主要承担小粒度读取，目标端主要承担 128 KiB 左右的聚合写入与 durability barrier。"
+      },
+      {
+        "id": "finding",
+        "type": "markdown",
+        "sourceId": "prometheus_storage_io",
+        "body": "## Full Sync 几乎解释了本次全部磁盘负载\n\n同步前 90 秒，主从节点的 read、write、fdatasync 六项速率都为 0。Full Sync 启动后，源端读取和目标端写入同时阶跃上升；目标写吞吐约为源读吞吐的 84%，差异来自源端读取粒度、对齐及只发送有效记录，不应直接解释为数据丢失。下图用相同 B/s 单位对齐源读和目标写，便于观察同步流速是否稳定。"
+      },
+      {
+        "id": "chart",
+        "type": "chart",
+        "chartId": "fullsync_throughput"
+      },
+      {
+        "id": "exact_values",
+        "type": "markdown",
+        "sourceId": "prometheus_storage_io",
+        "body": "## 稳态平均值与 30 秒峰值\n\n平均值使用 Full Sync 稳定运行后的连续 5 分钟；峰值是在同一 5 分钟内对 30 秒 rate 取最大值。表中的增量等于 Full Sync 值减去空闲基线。"
+      },
+      {
+        "id": "table",
+        "type": "table",
+        "tableId": "fullsync_summary"
+      },
+      {
+        "id": "scope",
+        "type": "markdown",
+        "sourceId": "prometheus_storage_io",
+        "body": "## 测量范围与指标定义\n\n测量对象是 Keylane 完成的存储 read/write/fdatasync 操作，按节点跨 12 个 worker 汇总。IOPS 使用 `rate(keylane_storage_io_operations_total)`；吞吐使用 `rate(keylane_storage_io_bytes_total)`。`fdatasync` 字节表示成功 barrier 新覆盖的逻辑写入量，不代表 NVMe 自己上报的物理传输字节。"
+      },
+      {
+        "id": "method",
+        "type": "markdown",
+        "sourceId": "prometheus_storage_io",
+        "body": "## 对比方法\n\n基线窗口为 Aug 21, 1:30:00–1:31:30 PM UTC，Full Sync 于 1:31:43 PM 开始；稳态窗口取 Aug 21, 1:33:14–1:38:14 PM UTC。时间曲线使用 30 秒 rate 和 30 秒步长；峰值使用最近 5 分钟内的 30 秒 rate 最大值。两端运行同一 fixed-wave snapshot 版本、各 12 个 worker。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 限制与稳健性\n\n这些是应用层完成的逻辑 I/O，不等同于 Azure 宿主机或 NVMe 控制器的物理 I/O 统计；缓存、设备内部合并和虚拟化层可能改变物理请求数。当前基线没有在线业务，因此能隔离 Full Sync 自身成本，但不能直接代表“Full Sync + 业务流量”的叠加结果。若同时压测，应从同 workload、无 Full Sync 的对照窗口中扣除业务基线。"
+      },
+      {
+        "id": "next",
+        "type": "markdown",
+        "body": "## 建议的监控方式\n\n- Grafana 同时观察 `Storage IOPS` 和 `Storage Throughput`，按节点 checkbox 选择主从。\n- 将 Full Sync 开始/结束时间作为 annotation，比较相同业务 QPS 下的 I/O 增量。\n- 生产升级验收同时看 I/O、GET/SET P99/P99.9/P99.99 和同步 partition 进度，避免仅凭平均吞吐判断影响。"
+      },
+      {
+        "id": "questions",
+        "type": "markdown",
+        "body": "## 后续问题\n\n下一步最有价值的对照是固定 50K 或 100K 在线 QPS，各跑一段无 Full Sync 与 Full Sync 窗口；这样可以分离同步造成的硬盘增量和业务本身的 I/O，并量化每增加 1 GB/s snapshot 读取会带来多少长尾变化。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-21T13:38:14Z",
+    "status": "ready",
+    "datasets": {
+      "throughput_timeline": [
+        {
+          "timestamp": "2026-08-21T13:30:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:30:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:30:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:30:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:31:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:31:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:31:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:31:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 0,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Baseline"
+        },
+        {
+          "timestamp": "2026-08-21T13:32:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 498758486.521,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:32:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 464681583.444,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:32:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1305200066.56,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:32:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1097610362.88,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:33:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1301643571.2,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:33:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1094595706.88,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:33:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1304599347.2,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:33:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1095951974.4,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:34:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1302447841.28,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:34:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1096273428.48,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:34:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1303221438.285,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:34:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1095232389.12,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:35:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1306311889.289,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:35:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1098966302.72,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:35:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1304910991.36,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:35:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1095964098.56,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:36:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1160923832.32,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:36:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 965916426.24,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:36:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1109286809.6,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:36:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 931307356.16,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:37:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1161745674.24,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:37:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 946038538.24,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:37:30.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 891537018.88,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:37:30.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 751679078.4,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:38:00.000Z",
+          "series": "Primary read",
+          "bytes_per_second": 1286517534.72,
+          "instance": "10.0.0.4:9100",
+          "operation": "read",
+          "phase": "Full Sync"
+        },
+        {
+          "timestamp": "2026-08-21T13:38:00.000Z",
+          "series": "Replica write",
+          "bytes_per_second": 1090244608,
+          "instance": "10.0.0.7:9100",
+          "operation": "write",
+          "phase": "Full Sync"
+        }
+      ],
+      "fullsync_summary": [
+        {
+          "node": "Primary 10.0.0.4",
+          "operation": "read",
+          "baseline_iops": 0,
+          "fullsync_avg_iops": 382799.742,
+          "fullsync_peak_iops": 416232,
+          "baseline_bytes_per_second": 0,
+          "fullsync_avg_bytes_per_second": 1203270527.566,
+          "fullsync_peak_bytes_per_second": 1308320010.24
+        },
+        {
+          "node": "Replica 10.0.0.7",
+          "operation": "write",
+          "baseline_iops": 0,
+          "fullsync_avg_iops": 7863.614,
+          "fullsync_peak_iops": 8549.04,
+          "baseline_bytes_per_second": 0,
+          "fullsync_avg_bytes_per_second": 1011721080.624,
+          "fullsync_peak_bytes_per_second": 1100301434.88
+        },
+        {
+          "node": "Replica 10.0.0.7",
+          "operation": "fdatasync",
+          "baseline_iops": 0,
+          "fullsync_avg_iops": 265.78,
+          "fullsync_peak_iops": 287.2,
+          "baseline_bytes_per_second": 0,
+          "fullsync_avg_bytes_per_second": 1011693088.976,
+          "fullsync_peak_bytes_per_second": 1100301434.88
+        }
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {
+      "id": "prometheus_storage_io",
+      "query": {
+        "engine": "Prometheus",
+        "language": "PromQL",
+        "sql": "sum by (instance, operation) (rate(keylane_storage_io_operations_total[window])); sum by (instance, operation) (rate(keylane_storage_io_bytes_total[window]))",
+        "description": "Compares per-instance storage operation and byte rates before and during Full Sync.",
+        "executed_at": "2026-08-21T13:38:14Z",
+        "tables_used": [
+          "keylane_storage_io_operations_total",
+          "keylane_storage_io_bytes_total"
+        ],
+        "filters": [
+          "instances 10.0.0.4:9100 and 10.0.0.7:9100",
+          "baseline ending 2026-08-21T13:31:30Z",
+          "Full Sync stable five-minute window ending 2026-08-21T13:38:14Z",
+          "30-second rate for peak and timeline"
+        ]
+      }
+    }
+  ]
+}

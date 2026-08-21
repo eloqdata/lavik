@@ -32,6 +32,7 @@ struct ServerOptions {
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;
   unsigned busy_poll_us_ = 20;
+  unsigned foreground_budget_us_ = 1000;
   unsigned background_budget_us_ = 10;
   unsigned background_warrant_percent_ = 1;
   unsigned spdk_max_completions_per_poll_ = 8;
@@ -45,7 +46,6 @@ struct ServerOptions {
   std::size_t inline_key_max_bytes_ = storage::kDefaultInlineKeyBytes;
   std::uint32_t flush_max_ms_ = 1000;
   std::size_t flush_size_bytes_ = 128ULL * 1024;
-  bool verify_read_crc_ = true;
   std::vector<std::string> data_files_{"keylane.data"};
   std::uint32_t tomb_raider_interval_ms_ = 86'400'000;
   std::uint32_t tomb_raider_sleep_ms_ = 10;

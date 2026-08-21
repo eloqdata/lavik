@@ -59,7 +59,6 @@ int main(int argc, char** argv) {
   unsigned storage_read_buffer_kb =
       static_cast<unsigned>(options.storage_read_buffer_bytes_ / 1024ULL);
   unsigned flush_size_kb = 128;
-  bool disable_read_crc = false;
 
   app.add_option("config", config_file,
                  "Redis-style configuration file (must be the first argument)");
@@ -114,6 +113,10 @@ int main(int argc, char** argv) {
                  "Busy-poll CQ and cross-core mailboxes before parking")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--foreground-budget-us", options.foreground_budget_us_,
+                 "Maximum worker foreground slice in microseconds")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
   app.add_option("--background-budget-us", options.background_budget_us_,
                  "Maximum worker background slice in microseconds")
       ->capture_default_str()
@@ -123,6 +126,12 @@ int main(int argc, char** argv) {
          "Maximum rolling worker CPU share guaranteed to background tasks")
       ->capture_default_str()
       ->check(CLI::Range(1U, 100U));
+  app.add_option("--replication-snapshot-batch-size",
+                 options.replication_options_.snapshot_batch_size_,
+                 "Maximum keys processed by each full-sync scheduling round")
+      ->capture_default_str()
+      ->check(CLI::Range(std::size_t{1},
+                         keylane::kMaxReplicationSnapshotBatchSize));
   app.add_option(
          "--spdk-max-completions-per-poll",
          options.spdk_max_completions_per_poll_,
@@ -175,8 +184,6 @@ int main(int argc, char** argv) {
                  "Maximum size of each storage write submission in KiB")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
-  app.add_flag("--disable-read-crc", disable_read_crc,
-               "Skip payload CRC32C verification on GET reads");
   app.add_option("--tomb-raider-interval-ms", options.tomb_raider_interval_ms_,
                  "Interval between tombstone-reclaim disk sweeps (0 disables)")
       ->capture_default_str()
@@ -240,6 +247,5 @@ int main(int argc, char** argv) {
   options.storage_read_buffer_bytes_ =
       static_cast<std::size_t>(storage_read_buffer_kb) * kKiB;
   options.flush_size_bytes_ = static_cast<std::size_t>(flush_size_kb) * kKiB;
-  options.verify_read_crc_ = !disable_read_crc;
   return keylane::RunServer(std::move(options));
 }

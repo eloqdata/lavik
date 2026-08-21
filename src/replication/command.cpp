@@ -179,6 +179,12 @@ void AppendReplicationExpirationEffect(
     std::uint8_t effect_db_id, std::string_view key, bool exists,
     std::uint64_t expire_at_ms) {
   if (args == nullptr || args->empty() || !exists) return;
+  // SET already clears the previous TTL, while SetLocked canonicalizes a
+  // requested or retained TTL to an absolute PXAT argument before publishing
+  // the command. Wrapping it in a replicated EXEC with a second PERSIST or
+  // PEXPIREAT is redundant and makes the replica write an extra transactional
+  // record plus commit for every ordinary SET.
+  if ((*args)[0] == "SET") return;
   if ((*args)[0] == kReplicatedExecCommand) {
     if (args->size() < 2) return;
     std::uint64_t count = 0;

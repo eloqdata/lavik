@@ -283,6 +283,11 @@ StorageEngine::PeekFullSyncPublishItems(std::uint64_t session_id,
   return impl_->PeekFullSyncPublishItems(session_id, max_items);
 }
 
+absl::StatusOr<FullSyncPublishQueueInfo>
+StorageEngine::GetFullSyncPublishQueueInfo(std::uint64_t session_id) const {
+  return impl_->GetFullSyncPublishQueueInfo(session_id);
+}
+
 void StorageEngine::AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                                    std::uint64_t item_id) {
   impl_->AcknowledgeFullSyncPublishItem(session_id, item_id);

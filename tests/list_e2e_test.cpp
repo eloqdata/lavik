@@ -1618,6 +1618,35 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(source_client.Command(
                 {"CONFIG", "GET", "replication-snapshot-read-concurrency"}),
             BulkArray({"replication-snapshot-read-concurrency", "8"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "replication-snapshot-batch-size", "32"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command(
+                {"CONFIG", "GET", "replication-snapshot-batch-size"}),
+            BulkArray({"replication-snapshot-batch-size", "32"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "foreground-budget-us", "250"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command({"CONFIG", "GET", "foreground-budget-us"}),
+            BulkArray({"foreground-budget-us", "250"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "background-budget-us", "20"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command({"CONFIG", "GET", "background-budget-us"}),
+            BulkArray({"background-budget-us", "20"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "background-warrant-percent", "7"}),
+            "+OK");
+  EXPECT_EQ(
+      source_client.Command(
+          {"CONFIG", "GET", "background-warrant-percent"}),
+      BulkArray({"background-warrant-percent", "7"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "spdk-max-completions-per-poll", "4"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command(
+                {"CONFIG", "GET", "spdk-max-completions-per-poll"}),
+            BulkArray({"spdk-max-completions-per-poll", "4"}));
   EXPECT_EQ(
       source_client.Command({"CONFIG", "GET", "defrag-*"}),
       BulkArray({"defrag-paused", "no", "defrag-max-active-per-device", "8",

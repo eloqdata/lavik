@@ -251,6 +251,8 @@ if (BUILD_TESTING)
     tests/command_table_test.cpp
     tests/random_sample_test.cpp
     tests/rdb_test.cpp
+    tests/replication_command_test.cpp
+    tests/ring_buffer_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp

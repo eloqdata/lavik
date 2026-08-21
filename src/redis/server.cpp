@@ -473,6 +473,9 @@ class RedisService final : public TcpService {
   bool startup_failed() const noexcept {
     return startup_failed_.load(std::memory_order_acquire);
   }
+  bool ready() const noexcept {
+    return ready_.load(std::memory_order_acquire);
+  }
   void StopAcceptingRequests() noexcept;
   void WaitForRequestsDrained() const noexcept;
 
@@ -506,6 +509,7 @@ class RedisService final : public TcpService {
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
   std::unique_ptr<CoroutineBarrier> online_allocator_barrier_;
   std::atomic<bool> startup_failed_{false};
+  std::atomic<bool> ready_{false};
   std::atomic<std::uint64_t> request_gate_{0};
 };
 
@@ -579,6 +583,12 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   status = co_await online_allocator_barrier_->Wait(worker);
   if (!status.ok()) [[unlikely]] {
     co_return status;
+  }
+
+  if (worker.id() == 0) {
+    // Every worker has completed recovery and online allocator setup before
+    // this barrier opens. Publish readiness only after that shared boundary.
+    ready_.store(true, std::memory_order_release);
   }
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
@@ -957,7 +967,7 @@ int RunServer(ServerOptions options) {
       "keylane listening on {}:{} tls_port={} metrics_port={} threads={} "
       "pin_workers={} "
       "idle_timeout_ms={} "
-      "busy_poll_us={} background_budget_us={} "
+      "busy_poll_us={} foreground_budget_us={} background_budget_us={} "
       "background_warrant_percent={} "
       "spdk_max_completions_per_poll={} spdk_foreground_pre_poll_us={} "
       "registered_buffer_bytes={} per worker "
@@ -966,21 +976,22 @@ int RunServer(ServerOptions options) {
       "replication_publish_queue_bytes={} per worker max_memory={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
-      "inline_key_max_bytes={} verify_read_crc={} "
+      "inline_key_max_bytes={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={}",
       bind_display, options.port_, options.tls_port_, options.metrics_port_,
       options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
-      options.busy_poll_us_, options.background_budget_us_,
+      options.busy_poll_us_, options.foreground_budget_us_,
+      options.background_budget_us_,
       options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
-      options.inline_key_max_bytes_, options.verify_read_crc_,
-      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
-      options.defrag_record_sleep_us_, options.defrag_paused_);
+      options.inline_key_max_bytes_, options.defrag_max_active_per_device_,
+      options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
+      options.defrag_paused_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
@@ -1006,7 +1017,6 @@ int RunServer(ServerOptions options) {
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.replication_publish_queue_bytes_ =
       options.replication_publish_queue_bytes_;
-  storage_options.verify_read_crc_ = options.verify_read_crc_;
   storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their
@@ -1057,6 +1067,7 @@ int RunServer(ServerOptions options) {
   runtime_options.idle_timeout_ms_ = options.idle_timeout_ms_;
   runtime_options.recv_buffer_count_ = options.recv_buffer_count_;
   runtime_options.busy_poll_us_ = options.busy_poll_us_;
+  runtime_options.foreground_budget_us_ = options.foreground_budget_us_;
   runtime_options.background_budget_us_ = options.background_budget_us_;
   runtime_options.background_warrant_percent_ =
       options.background_warrant_percent_;
@@ -1074,7 +1085,8 @@ int RunServer(ServerOptions options) {
   Server server;
   server.AddService(&redis);
   if (options.metrics_port_ != 0) {
-    metrics = CreateMetricsService(options.metrics_port_, &storage);
+    metrics = CreateMetricsService(options.metrics_port_, &storage,
+                                   [&redis] { return redis.ready(); });
     server.AddService(metrics.get());
   }
   auto start_status = server.Start(runtime_options);

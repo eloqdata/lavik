@@ -1,6 +1,118 @@
 # Keylane Performance Session Handoff
 
-Updated: 2026-08-20 UTC
+Updated: 2026-08-21 UTC
+
+## 2026-08-21 two-host 1-TiB ONLINE and rolling FULLSYNC retest
+
+The complete technical report is
+[perf_reports/keylane-primary-replica-rolling-fullsync-2026-08-21.html](perf_reports/keylane-primary-replica-rolling-fullsync-2026-08-21.html),
+with its reviewed source rows in
+[perf_reports/data/keylane-primary-replica-2026-08-21.csv](perf_reports/data/keylane-primary-replica-2026-08-21.csv).
+The portable report passed artifact validation and structural verification;
+browser-level verification was unavailable because this host has no installed
+Chromium.
+
+The canonical artifact JSON and reviewed CSV were updated at 11:46 UTC with
+the snapshot-reader A/B addendum below. The generated HTML still reflects the
+earlier report revision: this host currently has no `node`, `nodejs`, or `npm`,
+so the required portable report builder cannot be rerun. Do not hand-edit the
+generated HTML; regenerate it from the artifact JSON once a Node runtime is
+available.
+
+### 2026-08-21 snapshot reader A/B addendum
+
+The proposed fixed reader pool with a continuously replenished I/O window was
+rejected after three valid 300-second A/B runs from client `10.0.0.5`. All
+runs used memtier cluster mode, 80 active connections, 100,000 QPS,
+SET:GET=1:19, 1,000-4,000 byte values, and remained in FULLSYNC for the entire
+measurement window:
+
+    Implementation                 Read concurrency  QPS        p99      p99.9    p99.99  Primary CPU  Replica CPU
+    legacy grouped barrier         16                99,996.91  2.863ms  4.511ms  5.663ms  1,096.6%     279.3%
+    sliding reader pool            16                99,959.88  3.279ms  5.023ms  6.079ms  1,101.5%     357.1%
+    sliding reader pool             8                99,997.92  2.943ms  4.671ms  5.791ms  1,093.2%     303.3%
+    grouped barrier + digest reuse 16                99,983.16  2.895ms  4.479ms  5.663ms  1,113.8%     244.7%
+
+Relative to the sliding pool at concurrency 16, the final grouped-barrier
+build improved p99, p99.9, and p99.99 by 11.7%, 10.8%, and 6.8%. It is within
+1.1%, -0.7%, and 0% of the original grouped-barrier baseline. The sliding
+pool saved per-record coroutine creation but immediately replaced every
+completed snapshot read, keeping NVMe queue depth continuously occupied and
+removing the natural foreground I/O gaps between waves. Lowering its dynamic
+concurrency to eight reduced the damage but did not beat the barrier.
+
+The apparently unused CPU is I/O wait, not a lost scheduling opportunity.
+With the client stopped and only FULLSYNC running, source worker CPUs reported
+about 25% iowait and replica worker CPUs 69-76% iowait while the replication
+link carried about 1.15 GB/s (only about 9.4% of the 100-Gb link). During the
+formal workload the source process still used 10.9-11.1 of its 12 assigned
+worker CPUs; CPUs 12-15 are intentionally reserved for IRQ work. Increasing
+snapshot in-flight I/O therefore raises foreground tail latency without
+increasing the storage completion rate.
+
+The final code keeps snapshot work on the foreground queue, restores bounded
+read waves with a completion barrier, retains dynamic
+`replication-snapshot-batch-size` and
+`replication-snapshot-read-concurrency`, and reuses the already-computed key
+digest during snapshot acknowledgement without changing the wire format. The
+deployed binary is
+`bin/keylane-perf-20260821-snapshot-barrier-final`, SHA-256
+`c93767271430c00ce625292c366fa31ade880b50fb2aba14fa381692a5ed15ac`.
+The current primary PID is 171886 and replica PID is 35937; the replica was
+cleared by zeroing only the first 8 MiB of each replica device and is currently
+continuing its fresh FULLSYNC.
+
+A subsequent valid 50,000-QPS sensitivity run used the same barrier build,
+80 connections, SET:GET=1:19, and 300-second all-FULLSYNC window. Its total
+p99/p99.9/p99.99 was 3.743/5.471/7.231 ms, worse than the matching 100,000-QPS
+run's 2.895/4.479/5.663 ms by 29.3%/22.1%/27.7%. SET tails were essentially
+unchanged at 2.591/4.127/5.343 ms; GET tails rose to
+3.791/5.503/7.263 ms. Lower foreground demand therefore does not automatically
+improve latency: snapshot work consumes the freed scheduling and I/O capacity,
+so read-tail isolation requires explicit admission or budgeting.
+
+The Release/SPDK binary was `bin/keylane-perf-20260821`, SHA-256
+`e340769db8549f5d26140ccbcff699443dd0ae30ca454d6ad318e7d4be1bd09d`.
+The primary on `10.0.0.4` and replica on `10.0.0.7` each used two NVMe devices
+and 12 workers on CPUs 0-11, with CPUs 12-15 reserved for network IRQ or
+softirq work. The dataset contained 400,000,000 keys with 1,000-4,000 byte
+values. The fill averaged 226,152.79 SET/s. All formal workload rounds used
+80 active business connections, memtier cluster mode, a 100,000 QPS target,
+and a 300-second duration.
+
+ONLINE steady-state results with the replica caught up:
+
+    Workload       QPS          p50 ms   p99 ms   p99.9 ms   p99.99 ms
+    pure read      100,000.31   0.231    0.511    0.799      1.415
+    pure write      99,999.35   0.215    0.767    1.407      1.887
+    SET:GET 1:1     99,999.58   0.231    0.679    1.191      1.567
+    SET:GET 1:19   100,000.60   0.239    0.591    0.951      1.263
+
+After clearing the first 8 MiB of both replica devices, the empty replica
+completed full sync in approximately 19 minutes 22 seconds. Three workloads
+ran entirely during FULLSYNC and all held the 100K QPS target:
+
+    Workload       QPS         p99 ms   p99.99 ms   source CPU   target CPU
+    pure write     99,980.79   2.943    5.823        1,073.2%      289.0%
+    SET:GET 1:1    99,974.31   2.799    5.567        1,077.9%      301.1%
+    SET:GET 1:19   99,996.91   2.863    5.663        1,096.6%      279.3%
+
+There was no replication backlog failure: credit waits remained zero, the
+largest full-sync queue observation was 505,293 bytes, and the largest normal
+publish queue observation was 4,742 bytes. The source and replica finished at
+400,000,000 keys, ONLINE, with lag zero. FULLSYNC nevertheless increased p99
+by 3.84-4.84x and p99.99 by 3.09-4.48x versus the matching ONLINE workloads.
+Source CPU increased by 2.29-2.39x, consuming about 10.7-11.0 of the 12 worker
+cores. Perf attributes the added work mainly to storage polling, cross-core
+drain, CRC, NVMe completions, and snapshot digest. The remaining rolling
+upgrade issue is therefore latency isolation, not sync progress or queue
+capacity.
+
+The current primary PID is 126030 and the current replica PID is 22738. Both
+are ONLINE at 400,000,000 keys and lag zero. Formal memtier logs remain on the
+client at `/tmp/keylane-{fullsync,online}-*.memtier`; local and replica CPU and
+metrics samples remain under matching `/tmp/keylane-*.pidstat` and
+`/tmp/keylane-*.metrics.csv` names.
 
 ## 2026-08-20 local 20-GB continuous-write full-sync validation
 
@@ -487,7 +599,6 @@ The current SPDK server uses:
       --threads=8 \
       --flush-max-ms=1000 \
       --flush-size-kb=128 \
-      --disable-read-crc \
       --tomb-raider-interval-ms=0 \
       --tomb-raider-sleep-ms=10 \
       --defrag-paused \
@@ -531,8 +642,7 @@ The comparable io_uring launch is:
       --data-file=/dev/nvme1n1 \
       --threads=8 \
       --flush-max-ms=1000 \
-      --flush-size-kb=128 \
-      --disable-read-crc \
+      --flush-size-kb=128
       --tomb-raider-interval-ms=0 \
       --tomb-raider-sleep-ms=10 \
       --defrag-paused \
@@ -649,7 +759,6 @@ current process and not supported by current CMake):
       --threads=8 \
       --flush-max-ms=1000 \
       --flush-size-kb=128 \
-      --disable-read-crc
 
 That command requires the historical `bld-libc` binary. It cannot be recreated
 from current main because the allocator switch was removed.

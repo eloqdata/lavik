@@ -102,7 +102,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   // its own expiration timestamp. This is the full-disk escape valve that
   // lets expiration free blocks which can then accept durable tombstones.
   absl::Status durable = co_await AppendLocked(
-      store, partition, candidate.db_id_, candidate.key_, {},
+      store, partition, candidate.db_id_, candidate.key_, candidate.digest_, {},
       RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
   if (durable.ok() ||
       durable.code() != absl::StatusCode::kResourceExhausted ||

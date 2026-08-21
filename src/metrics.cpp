@@ -166,6 +166,8 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
           return std::pair{g_worker_metrics[worker],
                            celer::ThisWorker().self_->ActiveConnectionCount()};
         });
+    const celer::Worker::StorageIoStats storage_io = co_await celer::SubmitTo(
+        worker, [] { return celer::ThisWorker().self_->storage_io_stats(); });
     result.connections_ += connections;
     result.connected_clients_ += shard.connected_clients_;
     result.blocked_clients_ += shard.blocked_clients_;
@@ -177,6 +179,12 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
     result.defrag_failures_ += shard.defrag_failures_;
     result.active_defrags_ += shard.active_defrags_;
     result.pending_defrags_ += shard.pending_defrags_;
+    result.storage_reads_.operations_ += storage_io.read_operations_;
+    result.storage_reads_.bytes_ += storage_io.read_bytes_;
+    result.storage_writes_.operations_ += storage_io.write_operations_;
+    result.storage_writes_.bytes_ += storage_io.write_bytes_;
+    result.storage_fdatasyncs_.operations_ += storage_io.fdatasync_operations_;
+    result.storage_fdatasyncs_.bytes_ += storage_io.fdatasync_bytes_;
     for (std::size_t command = 0; command < kCommandKindCount; ++command) {
       CommandMetricTotals& destination = result.commands_[command];
       const CommandMetricTotals& source = shard.commands_[command];
@@ -232,7 +240,22 @@ std::string SecondsFromMicroseconds(std::uint64_t microseconds) {
 }  // namespace
 
 celer::Task<absl::Status> RenderPrometheusMetrics(
-    const storage::StorageEngine& storage, std::string* output_ptr) {
+    const storage::StorageEngine& storage, bool server_ready,
+    std::string* output_ptr) {
+  std::string& output = *output_ptr;
+  output.clear();
+  output.reserve(server_ready ? 32 * 1024 : 256);
+  absl::StrAppend(
+      &output,
+      "# HELP keylane_server_ready Whether storage recovery is complete and "
+      "Redis requests are being accepted.\n"
+      "# TYPE keylane_server_ready gauge\n"
+      "keylane_server_ready ",
+      server_ready ? 1 : 0, "\n");
+  if (!server_ready) {
+    co_return absl::OkStatus();
+  }
+
   RefreshMemoryDiagnostics();
   const WorkerMetricsSnapshot worker_metrics = co_await CollectWorkerMetrics();
   const storage::StorageMetricsSnapshot storage_metrics =
@@ -240,10 +263,6 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
   const storage::DefragTotals defrag = storage.DefragStats();
   const MemoryStats memory_metrics = GetMemoryStats();
   const std::uint64_t current_memory = memory_metrics.used_bytes_;
-  std::string& output = *output_ptr;
-  output.clear();
-  output.reserve(32 * 1024);
-
   absl::StrAppend(&output,
                   "# HELP keylane_commands_total Completed Redis commands.\n"
                   "# TYPE keylane_commands_total counter\n"
@@ -301,6 +320,24 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
 
   absl::StrAppend(
       &output,
+      "# HELP keylane_storage_io_operations_total Completed storage I/O "
+      "operations.\n"
+      "# TYPE keylane_storage_io_operations_total counter\n"
+      "keylane_storage_io_operations_total{operation=\"read\"} ",
+      worker_metrics.storage_reads_.operations_, "\n",
+      "keylane_storage_io_operations_total{operation=\"write\"} ",
+      worker_metrics.storage_writes_.operations_, "\n",
+      "keylane_storage_io_operations_total{operation=\"fdatasync\"} ",
+      worker_metrics.storage_fdatasyncs_.operations_, "\n",
+      "# HELP keylane_storage_io_bytes_total Bytes completed by storage "
+      "reads and writes, or covered by successful fdatasync barriers.\n"
+      "# TYPE keylane_storage_io_bytes_total counter\n"
+      "keylane_storage_io_bytes_total{operation=\"read\"} ",
+      worker_metrics.storage_reads_.bytes_, "\n",
+      "keylane_storage_io_bytes_total{operation=\"write\"} ",
+      worker_metrics.storage_writes_.bytes_, "\n",
+      "keylane_storage_io_bytes_total{operation=\"fdatasync\"} ",
+      worker_metrics.storage_fdatasyncs_.bytes_, "\n",
       "# HELP keylane_connections Current TCP connections, including Redis "
       "clients, metrics scrapes, and replication.\n"
       "# TYPE keylane_connections gauge\n"
@@ -506,14 +543,17 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
 }
 
 std::unique_ptr<celer::Service> CreateMetricsService(
-    std::uint16_t port, const storage::StorageEngine* storage) {
+    std::uint16_t port, const storage::StorageEngine* storage,
+    std::function<bool()> server_ready) {
   auto service = std::make_unique<celer::HttpService>(port);
   service->RegisterGet(
       "/metrics",
-      [storage](const celer::HttpRequest&,
-                celer::HttpResponse* response) -> celer::Task<absl::Status> {
+      [storage, server_ready = std::move(server_ready)](
+          const celer::HttpRequest&,
+          celer::HttpResponse* response) -> celer::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
-        co_return co_await RenderPrometheusMetrics(*storage, &response->body_);
+        co_return co_await RenderPrometheusMetrics(
+            *storage, server_ready(), &response->body_);
       });
   return service;
 }

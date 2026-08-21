@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Keylane throughput, latency, connections, memory, defrag activity, and storage capacity.",
+  "description": "Keylane throughput, latency, storage I/O, connections, memory, defrag activity, and storage capacity.",
   "editable": false,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -41,6 +41,10 @@
                   "text": "DOWN"
                 },
                 "1": {
+                  "color": "yellow",
+                  "text": "STARTING"
+                },
+                "2": {
                   "color": "green",
                   "text": "UP"
                 }
@@ -57,8 +61,12 @@
                 "value": null
               },
               {
-                "color": "green",
+                "color": "yellow",
                 "value": 1
+              },
+              {
+                "color": "green",
+                "value": 2
               }
             ]
           }
@@ -90,7 +98,7 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "min by (instance) (up{job=\"keylane\",instance=~\"$instance\"})",
+          "expr": "min by (instance) (up{job=\"keylane\",instance=~\"$instance\"}) + min by (instance) (up{job=\"keylane\",instance=~\"$instance\"}) * (min by (instance) (keylane_server_ready{instance=~\"$instance\"}) or on (instance) (min by (instance) (up{job=\"keylane\",instance=~\"$instance\"}) * 0 + 1))",
           "instant": true,
           "legendFormat": "{{instance}}",
           "range": false,
@@ -397,7 +405,7 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
+        "w": 2,
         "x": 15,
         "y": 0
       },
@@ -457,8 +465,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 18,
+        "w": 2,
+        "x": 17,
         "y": 0
       },
       "id": 5,
@@ -526,8 +534,8 @@
       },
       "gridPos": {
         "h": 4,
-        "w": 3,
-        "x": 21,
+        "w": 2,
+        "x": 19,
         "y": 0
       },
       "id": 6,
@@ -558,6 +566,76 @@
       ],
       "title": "Minimum Writable Space",
       "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 1,
+          "mappings": [],
+          "max": 100,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 75
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 0
+      },
+      "id": 17,
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto"
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "100 * keylane_memory_current_bytes{instance=~\"$instance\"} / keylane_memory_max_bytes{instance=~\"$instance\"}",
+          "instant": true,
+          "legendFormat": "{{instance}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Memory Limit Utilization",
+      "type": "gauge"
     },
     {
       "datasource": {
@@ -774,6 +852,200 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
+      "description": "Completed storage reads, writes, and fdatasync barriers per second. Each series is aggregated across workers for the selected instance.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "IOPS",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "iops"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 18,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, operation) (rate(keylane_storage_io_operations_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{instance}} {{operation}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Storage IOPS",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Completed storage read/write bytes per second. fdatasync is the logical write volume newly covered by successful durability barriers, not a device-reported physical transfer count.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "Throughput",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 19,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "editorMode": "code",
+          "expr": "sum by (instance, operation) (rate(keylane_storage_io_bytes_total{instance=~\"$instance\"}[$__rate_interval]))",
+          "instant": false,
+          "legendFormat": "{{instance}} {{operation}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Storage Throughput",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 20
+      },
+      "id": 20,
+      "panels": [
+        {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "description": "Correlates per-instance command P99.9 latency with running, queued, paused, and configured defrag work.",
       "fieldConfig": {
         "defaults": {
@@ -916,9 +1188,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 14,
+        "w": 24,
         "x": 0,
-        "y": 12
+        "y": 21
       },
       "id": 9,
       "options": {
@@ -976,8 +1248,22 @@
       ],
       "title": "Defrag Impact on P99.9 Latency",
       "type": "timeseries"
+        }
+      ],
+      "title": "Defrag Impact on P99.9 Latency",
+      "type": "row"
     },
     {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 21
+      },
+      "id": 21,
+      "panels": [
+        {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1034,9 +1320,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 10,
-        "x": 14,
-        "y": 12
+        "w": 24,
+        "x": 0,
+        "y": 22
       },
       "id": 10,
       "options": {
@@ -1065,6 +1351,10 @@
       ],
       "title": "Defrag Outcomes",
       "type": "timeseries"
+        }
+      ],
+      "title": "Defrag Outcomes",
+      "type": "row"
     },
     {
       "datasource": {
@@ -1126,7 +1416,7 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 20
+        "y": 22
       },
       "id": 11,
       "options": {
@@ -1224,7 +1514,7 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 20
+        "y": 22
       },
       "id": 12,
       "options": {
@@ -1307,7 +1597,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 28
+        "y": 30
       },
       "id": 13,
       "options": {
@@ -1342,6 +1632,16 @@
       "type": "bargauge"
     },
     {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 36
+      },
+      "id": 22,
+      "panels": [
+        {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1398,9 +1698,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 16,
+        "w": 24,
         "x": 0,
-        "y": 34
+        "y": 37
       },
       "id": 16,
       "options": {
@@ -1451,76 +1751,10 @@
       ],
       "title": "Process Memory and Limit",
       "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "decimals": 1,
-          "mappings": [],
-          "max": 100,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 75
-              },
-              {
-                "color": "red",
-                "value": 90
-              }
-            ]
-          },
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 34
-      },
-      "id": 17,
-      "options": {
-        "minVizHeight": 75,
-        "minVizWidth": 75,
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto"
-      },
-      "targets": [
-        {
-          "editorMode": "code",
-          "expr": "100 * keylane_memory_current_bytes{instance=~\"$instance\"} / keylane_memory_max_bytes{instance=~\"$instance\"}",
-          "instant": true,
-          "legendFormat": "{{instance}}",
-          "range": false,
-          "refId": "A"
         }
       ],
-      "title": "Memory Limit Utilization",
-      "type": "gauge"
+      "title": "Memory History",
+      "type": "row"
     }
   ],
   "refresh": "10s",
@@ -1577,6 +1811,6 @@
   "timezone": "browser",
   "title": "Keylane Overview",
   "uid": "keylane-overview",
-  "version": 1,
+  "version": 6,
   "weekStart": ""
 }

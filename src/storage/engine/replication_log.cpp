@@ -528,7 +528,8 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
     log.publisher_capacity_ready_.NotifyAll(*store->worker_);
   }
   if (log.state_ != ReplicationLogState::kActive) {
-    for (auto& pending : log.publish_queue_) {
+    for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
+      auto& pending = log.publish_queue_[index];
       if (pending.fence_ == nullptr) continue;
       pending.fence_->status_ =
           InvalidState("replication publisher failed before fence");
@@ -1126,7 +1127,8 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   log.next_lsn_ = 1;
   log.max_blocks_ = 0;
   log.capacity_backpressured_ = false;
-  for (auto& pending : log.publish_queue_) {
+  for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
+    auto& pending = log.publish_queue_[index];
     if (pending.fence_ == nullptr) continue;
     pending.fence_->status_ =
         InvalidState("replication log disabled before publisher fence");

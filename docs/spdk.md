@@ -176,9 +176,8 @@ disables the pre-poll slice, respectively.
 
 The default maximum storage submission is 128 KiB. Tomb raider runs once every
 24 hours by default, so it cannot overlap a five-minute benchmark started from
-a fresh process. Defrag remains enabled with its default runtime controls. Read
-CRC verification remains enabled unless `--disable-read-crc` is explicitly
-passed.
+a fresh process. Defrag remains enabled with its default runtime controls.
+Payload CRC32C verification is mandatory on reads.
 
 `--registered-buffer-mb-per-worker` is a budget **per worker**. With 256 MiB and eight
 workers, a process can reserve roughly 2 GiB of fixed storage buffers, before

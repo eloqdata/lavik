@@ -47,9 +47,14 @@ struct ReplicationOptions {
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
+  // Number of keys one source flow admits into a snapshot scheduling round.
+  // Sampled for every round so CONFIG SET takes effect during full sync.
+  std::size_t snapshot_batch_size_ = 64;
 };
 
+inline constexpr unsigned kDefaultReplicationSnapshotReadConcurrency = 16;
 inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 128;
+inline constexpr std::size_t kMaxReplicationSnapshotBatchSize = 4096;
 
 enum class ReplicationRole : std::uint8_t {
   kMaster,
@@ -104,6 +109,8 @@ class ReplicationManager {
   // so CONFIG SET takes effect without reconnecting the replica.
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
   unsigned snapshot_read_concurrency() const noexcept;
+  absl::Status SetSnapshotBatchSize(std::size_t count) noexcept;
+  std::size_t snapshot_batch_size() const noexcept;
 
   // Changes the global in-memory backlog quota. Growth preserves the current
   // history; shrinkage may advance individual flow floors at event boundaries.

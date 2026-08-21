@@ -656,6 +656,8 @@ bool ParseUint64(std::string_view text, std::uint64_t* value) {
 
 constexpr std::string_view kSnapshotReadConcurrencyConfig =
     "replication-snapshot-read-concurrency";
+constexpr std::string_view kSnapshotBatchSizeConfig =
+    "replication-snapshot-batch-size";
 constexpr std::string_view kReplicationBacklogSizeConfig = "repl-backlog-size";
 constexpr std::string_view kReplicationPublishQueueConfig =
     "replication-publish-queue-mb-per-worker";
@@ -671,9 +673,16 @@ constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
 constexpr std::string_view kTxCleanerCooldownConfig = "tx-cleaner-cooldown-ms";
+constexpr std::string_view kForegroundBudgetConfig = "foreground-budget-us";
+constexpr std::string_view kBackgroundBudgetConfig = "background-budget-us";
+constexpr std::string_view kBackgroundWarrantConfig =
+    "background-warrant-percent";
+constexpr std::string_view kSpdkMaxCompletionsConfig =
+    "spdk-max-completions-per-poll";
 
 enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
+  kSnapshotBatchSize,
   kReplicationBacklogSize,
   kReplicationPublishQueue,
   kDefragPaused,
@@ -685,6 +694,10 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderSleep,
   kTombRaiderDailyTime,
   kTxCleanerCooldown,
+  kForegroundBudget,
+  kBackgroundBudget,
+  kBackgroundWarrant,
+  kSpdkMaxCompletions,
 };
 
 struct RuntimeConfigDescriptor {
@@ -697,6 +710,8 @@ struct RuntimeConfigDescriptor {
 constexpr std::array kRuntimeConfigs{
     RuntimeConfigDescriptor{kSnapshotReadConcurrencyConfig,
                             RuntimeConfigKey::kSnapshotReadConcurrency},
+    RuntimeConfigDescriptor{kSnapshotBatchSizeConfig,
+                            RuntimeConfigKey::kSnapshotBatchSize},
     RuntimeConfigDescriptor{kReplicationBacklogSizeConfig,
                             RuntimeConfigKey::kReplicationBacklogSize},
     RuntimeConfigDescriptor{kReplicationPublishQueueConfig,
@@ -718,6 +733,14 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderDailyTime},
     RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
                             RuntimeConfigKey::kTxCleanerCooldown},
+    RuntimeConfigDescriptor{kForegroundBudgetConfig,
+                            RuntimeConfigKey::kForegroundBudget},
+    RuntimeConfigDescriptor{kBackgroundBudgetConfig,
+                            RuntimeConfigKey::kBackgroundBudget},
+    RuntimeConfigDescriptor{kBackgroundWarrantConfig,
+                            RuntimeConfigKey::kBackgroundWarrant},
+    RuntimeConfigDescriptor{kSpdkMaxCompletionsConfig,
+                            RuntimeConfigKey::kSpdkMaxCompletions},
 };
 
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
@@ -738,6 +761,33 @@ std::string NormalizeConfigPattern(std::string_view pattern) {
   return lower;
 }
 
+Task<absl::Status> ConfigureAllWorkerSchedulers(RuntimeConfigKey key,
+                                                unsigned value) {
+  for (unsigned worker_id = 0; worker_id < g_storage->worker_count();
+       ++worker_id) {
+    absl::Status configured = co_await SubmitTaskTo(
+        worker_id, [key, value]() -> Task<absl::Status> {
+          celer::Worker* worker = celer::ThisWorker().self_;
+          switch (key) {
+            case RuntimeConfigKey::kForegroundBudget:
+              co_return worker->SetForegroundBudgetUs(value);
+            case RuntimeConfigKey::kBackgroundBudget:
+              co_return worker->SetBackgroundBudgetUs(value);
+            case RuntimeConfigKey::kBackgroundWarrant:
+              co_return worker->SetBackgroundWarrantPercent(value);
+            case RuntimeConfigKey::kSpdkMaxCompletions:
+              worker->SetSpdkMaxCompletionsPerPoll(value);
+              co_return absl::OkStatus();
+            default:
+              co_return absl::InvalidArgumentError(
+                  "CONFIG parameter is not a worker scheduler setting");
+          }
+        });
+    if (!configured.ok()) co_return configured;
+  }
+  co_return absl::OkStatus();
+}
+
 Task<CommandReply> ExecuteConfig(const CommandRequest& request,
                                  ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
@@ -747,6 +797,7 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
     matches.reserve(kRuntimeConfigs.size());
     for (const RuntimeConfigDescriptor& config : kRuntimeConfigs) {
       if ((config.key_ == RuntimeConfigKey::kSnapshotReadConcurrency ||
+           config.key_ == RuntimeConfigKey::kSnapshotBatchSize ||
            config.key_ == RuntimeConfigKey::kReplicationBacklogSize ||
            config.key_ == RuntimeConfigKey::kReplicationPublishQueue) &&
           g_replication == nullptr) {
@@ -762,6 +813,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       switch (key) {
         case RuntimeConfigKey::kSnapshotReadConcurrency:
           return std::to_string(g_replication->snapshot_read_concurrency());
+        case RuntimeConfigKey::kSnapshotBatchSize:
+          return std::to_string(g_replication->snapshot_batch_size());
         case RuntimeConfigKey::kReplicationBacklogSize:
           return std::to_string(g_replication->backlog_size_bytes());
         case RuntimeConfigKey::kReplicationPublishQueue:
@@ -795,6 +848,18 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return FormatDailySecond(tomb_raider->daily_second_);
         case RuntimeConfigKey::kTxCleanerCooldown:
           return std::to_string(g_storage->TxCleanerCooldownMs());
+        case RuntimeConfigKey::kForegroundBudget:
+          return std::to_string(
+              celer::ThisWorker().self_->foreground_budget_us());
+        case RuntimeConfigKey::kBackgroundBudget:
+          return std::to_string(
+              celer::ThisWorker().self_->background_budget_us());
+        case RuntimeConfigKey::kBackgroundWarrant:
+          return std::to_string(
+              celer::ThisWorker().self_->background_warrant_percent());
+        case RuntimeConfigKey::kSpdkMaxCompletions:
+          return std::to_string(
+              celer::ThisWorker().self_->spdk_max_completions_per_poll());
       }
       return {};
     };
@@ -830,6 +895,18 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured = g_replication->SetSnapshotReadConcurrency(
             static_cast<unsigned>(value));
+      }
+    } else if (config->key_ == RuntimeConfigKey::kSnapshotBatchSize) {
+      if (g_replication == nullptr) {
+        configured =
+            absl::FailedPreconditionError("replication backend is unavailable");
+      } else if (!ParseUint64(args[3], &value) || value == 0 ||
+                 value > kMaxReplicationSnapshotBatchSize) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = g_replication->SetSnapshotBatchSize(
+            static_cast<std::size_t>(value));
       }
     } else if (config->key_ == RuntimeConfigKey::kReplicationBacklogSize) {
       if (g_replication == nullptr) {
@@ -950,6 +1027,22 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured = g_storage->ConfigureTxCleanerCooldown(value);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kForegroundBudget ||
+               config->key_ == RuntimeConfigKey::kBackgroundBudget ||
+               config->key_ == RuntimeConfigKey::kBackgroundWarrant ||
+               config->key_ == RuntimeConfigKey::kSpdkMaxCompletions) {
+      const bool allow_zero =
+          config->key_ == RuntimeConfigKey::kSpdkMaxCompletions;
+      if (!ParseUint64(args[3], &value) || (!allow_zero && value == 0) ||
+          value > std::numeric_limits<unsigned>::max() ||
+          (config->key_ == RuntimeConfigKey::kBackgroundWarrant &&
+           value > 100)) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await ConfigureAllWorkerSchedulers(
+            config->key_, static_cast<unsigned>(value));
       }
     }
     co_return configured.ok()
