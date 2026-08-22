@@ -317,9 +317,8 @@ bool WaitForReply(RespClient& client,
   return false;
 }
 
-// Polls until the reply matches. Unlike WaitForReply this keeps going on an
-// ordinary mismatch, which is what a replica read needs: replication is
-// asynchronous, so the effect legitimately is not there yet.
+// Unlike WaitForReply, an ordinary mismatch is not a failure here but a retry:
+// a replica read legitimately disagrees until the effect arrives.
 bool WaitForEventualReply(RespClient& client,
                           const std::vector<std::string_view>& command,
                           std::string_view expected,
@@ -2760,13 +2759,10 @@ TEST(ListE2eTest, PublisherBackpressurePreservesHistoryAndReplica) {
   source.Stop();
 }
 
-// Single-key writes reach their key owner in one cross-core transfer that also
-// carries publisher admission and its release. Hop count is not observable and
-// is deliberately not asserted here; what a client can see is asserted instead:
-// the reply must not depend on whether a replica is attached, nor on which
-// worker a connection happened to be assigned, and every effect must land on
-// the replica. The source runs three workers so most connections do not own the
-// key they write, which is the case the collapse is about.
+// Hop count is not observable, so this asserts what a client can see instead:
+// a reply must not depend on whether a replica is attached, nor on which
+// worker the connection was assigned. Three source workers means most
+// connections do not own the key they write, which is the case being changed.
 TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -2795,9 +2791,9 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
   ServerProcess replica(g_keylane_binary, replica_port, replica_data,
                         replica_log, 2);
 
-  // One entry per single-key write shape, each against a fresh key so the
-  // reply is the same whichever round the battery runs in. XGROUP is here for
-  // its own sake: it is the only qualifying write whose key is not argv[1].
+  // Each entry gets a fresh key, so the reply is the same in either round.
+  // XGROUP earns its place: it is the only single-key write whose key is not
+  // argv[1], so it is the one that catches a wrong key index.
   struct SingleKeyWrite {
     std::vector<std::string> args_;
     std::string reply_;
@@ -2825,7 +2821,7 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
         {{"SETNX", key + ":nx", "v"}, ":1"},
     };
   };
-  // What the battery leaves behind, read back from whichever server is asked.
+  // What the battery leaves behind.
   const auto effects = [](const std::string& key) {
     return std::vector<SingleKeyWrite>{
         {{"GET", key + ":str"}, "$-1"},
@@ -2844,11 +2840,10 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
     return std::vector<std::string_view>(args.begin(), args.end());
   };
 
-  // Enough connections that the round-robin worker assignment covers every
-  // worker, crossed with keys pinned to every worker, so both the
-  // connection-owns-the-key case and the it-does-not case are exercised. Which
-  // connection draws which worker is not asserted -- only that all of them
-  // behave the same.
+  // Connections are assigned to workers round-robin, so enough of them crossed
+  // with keys pinned to every worker covers both the connection-owns-the-key
+  // case and the it-does-not case. Which connection draws which worker is not
+  // asserted, only that they all behave the same.
   constexpr unsigned kConnections = 6;
   const auto run_battery = [&](std::string_view round) {
     std::vector<std::string> replies;
@@ -2871,7 +2866,7 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
     return std::pair{std::move(replies), std::move(keys)};
   };
 
-  // Round one: no replica attached, so no publisher admission is taken at all.
+  // Round one: no replica attached, so no publisher admission is taken.
   auto [solo_replies, solo_keys] = run_battery("collapse-solo");
 
   RespClient replica_client(replica_port);
@@ -2892,13 +2887,12 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
             std::string::npos);
   ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
 
-  // Round two: identical writes while every one of them takes admission on its
-  // key owner. The replies must be byte-identical to round one.
+  // Round two: the same writes, now each taking admission on its key owner.
   auto [replicated_replies, replicated_keys] = run_battery("collapse-repl");
   EXPECT_EQ(replicated_replies, solo_replies);
 
-  // Every effect from both rounds must reach the replica, including the ones
-  // written before it attached (those arrive through the full-sync baseline).
+  // Round-one effects predate the replica, so they arrive through the
+  // full-sync baseline rather than the live flow.
   std::vector<std::string> all_keys = std::move(solo_keys);
   all_keys.insert(all_keys.end(),
                   std::make_move_iterator(replicated_keys.begin()),
@@ -2908,8 +2902,8 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
     for (const SingleKeyWrite& effect : effects(key)) {
       EXPECT_EQ(source_client.Command(as_views(effect.args_)), effect.reply_)
           << effect.args_[0] << " on source " << key;
-      // ASSERT, not EXPECT: if replication has stopped converging there are
-      // hundreds of these left to run and each would burn its whole timeout.
+      // ASSERT, not EXPECT: hundreds of these follow, and once replication
+      // stops converging each one burns its whole timeout.
       ASSERT_TRUE(WaitForEventualReply(replica_client, as_views(effect.args_),
                                        effect.reply_, 30s))
           << effect.args_[0] << " on replica " << key;
@@ -2920,21 +2914,15 @@ TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
   source.Stop();
 }
 
-// Publisher admission now runs on the key owner, in the same visit as the
-// write and its release. A tight per-worker waterline is what makes that
-// pairing testable: each worker pushes two MiB of writes through a one MiB
-// waterline, so an admission that is acquired and never released exhausts the
-// waterline part-way through and this test hangs instead of passing. The
-// marker write then pins ordering -- a worker publishes in the order it
-// admitted, so everything written before an already-visible marker must
-// already be readable on the replica.
+// A tight waterline is what makes acquire/release testable as a pair: an
+// admission that is acquired and never released exhausts it part-way through,
+// so a leak hangs this test rather than passing it.
 //
-// What this deliberately does not claim is that the source waited. With the
-// replica on loopback the publish queue drains faster than a client can fill
-// it, and asserting on the internal wait counters is out of scope. The
-// admission path that provably does wait -- a single value larger than the
-// whole waterline, which is admitted only against an empty queue -- is covered
-// by PublisherBackpressurePreservesHistoryAndReplica above.
+// This deliberately does not claim the source ever waited. With the replica on
+// loopback the publish queue drains faster than a client can fill it, so the
+// waiting branch is not reached at this seam either way. The path that does
+// wait -- a value larger than the whole waterline, admitted only against an
+// empty queue -- is covered by PublisherBackpressurePreservesHistoryAndReplica.
 TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -2981,9 +2969,9 @@ TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
             std::string::npos);
   ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
 
-  // Two MiB of writes per worker against a one MiB per-worker waterline. Each
-  // value goes to its own key: rewriting one growing value instead would spend
-  // the run on storage reclaim rather than on admission.
+  // Two MiB per worker against a one MiB per-worker waterline. Each value gets
+  // its own key: appending to one growing value instead would spend the run on
+  // storage reclaim rather than on admission.
   constexpr unsigned kWrites = 64;
   constexpr std::size_t kValueBytes = 32 * 1024;
   const auto value = [](unsigned index) {
@@ -3006,9 +2994,9 @@ TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
         KeyForWorker(worker_prefix + "marker", worker, kSourceThreads));
   }
 
-  // The writer threads report rather than assert: a gtest assertion here would
-  // only return from the lambda, leaving the marker unwritten and the real
-  // failure hidden behind a marker timeout further down.
+  // The writers report rather than assert: a gtest assertion only returns from
+  // the lambda, which would leave the marker unwritten and hide the real
+  // failure behind a marker timeout further down.
   std::vector<std::future<std::string>> writers;
   writers.reserve(kSourceThreads);
   for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
@@ -3035,10 +3023,9 @@ TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
   }
 
   for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
-    // A worker publishes in the order it admitted, so once the marker has
-    // arrived every value written before it must already be readable. Waiting
-    // only on the marker is what makes this an ordering assertion rather than
-    // an eventual-convergence one.
+    // A worker publishes in the order it admitted and the replica applies each
+    // flow in order, so waiting on the marker alone -- and not on the values --
+    // is what makes this an ordering assertion rather than a convergence one.
     ASSERT_TRUE(WaitForEventualReply(replica_client, {"GET", markers[worker]},
                                      Bulk("done")))
         << "replica never received the marker for worker " << worker;
