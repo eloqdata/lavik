@@ -9,8 +9,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   WorkerStore& store = CurrentStore();
   bool revalidation_failed = false;
   auto materialize = [&](WorkerStore::PartitionStore& partition,
-                         RecordIndex& index,
-                         RecordIndex::Entry* selected)
+                         RecordIndex& index, RecordIndex::Entry* selected)
       -> Task<absl::StatusOr<std::optional<std::string>>> {
     if (selected->key_complete()) {
       co_return std::optional<std::string>(std::string(selected->key()));
@@ -535,6 +534,60 @@ Task<absl::Status> StorageEngine::Impl::ReadExtentInto(
                            "extent payload checksum mismatch");
   }
   std::memcpy(destination, payload.data(), payload.size());
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::ReadExtentSlice(
+    WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
+    std::size_t source_offset, std::span<std::byte> destination) {
+  if (source_offset > ref.payload_bytes_ ||
+      destination.size() > ref.payload_bytes_ - source_offset) {
+    co_return absl::InvalidArgumentError("extent slice is out of range");
+  }
+  BlockState* state = FindBlockState(store, ref.block_id_);
+  if (state == nullptr || !state->allocated_ || state->freeing_ ||
+      state->kind_ != BlockKind::kPayloadExtent ||
+      state->allocation_epoch_ != ref.allocation_epoch_) {
+    co_return absl::AbortedError("stale or missing external extent");
+  }
+  ++state->pins_;
+  struct ExtentPin {
+    BlockState* state_;
+    ~ExtentPin() { --state_->pins_; }
+  } pin{state};
+  const std::size_t read_bytes =
+      AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
+  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+  if (!acquired.ok()) co_return acquired.status();
+  ReadBufferLease buffer = std::move(*acquired);
+  FixedBuffer io = buffer.io_buffer();
+  io.size_ = read_bytes;
+  const auto [file_id, block_offset] = FileOffset(ref.block_id_);
+  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
+                                         io, buffer.registered(), block_offset);
+  if (!read.ok()) co_return read.status();
+  if (*read != read_bytes) {
+    co_return absl::InternalError("short extent block read");
+  }
+  BlockHeader header{};
+  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                  io.data_, kBlockHeaderBytes),
+                              &header) ||
+      header.kind_ != BlockKind::kPayloadExtent ||
+      header.block_id_ != ref.block_id_ ||
+      header.allocation_epoch_ != ref.allocation_epoch_ ||
+      header.extent_index_ != extent_index ||
+      header.extent_payload_bytes_ != ref.payload_bytes_ ||
+      header.extent_payload_checksum_ != ref.payload_checksum_) {
+    co_return absl::InternalError("extent header does not match manifest");
+  }
+  const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
+                                                  ref.payload_bytes_);
+  if (options_.verify_read_crc_ && Crc32c(payload) != ref.payload_checksum_) {
+    co_return absl::InternalError("extent payload checksum mismatch");
+  }
+  std::memcpy(destination.data(), payload.data() + source_offset,
+              destination.size());
   co_return absl::OkStatus();
 }
 

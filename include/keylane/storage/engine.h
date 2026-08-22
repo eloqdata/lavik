@@ -180,6 +180,7 @@ struct ScanBatch {
   std::uint64_t cursor_ = 0;
   std::vector<std::string> keys_;
   std::vector<ValueType> value_types_;
+  std::vector<std::size_t> value_bytes_;
 };
 
 struct SnapshotRecord {
@@ -200,6 +201,10 @@ struct SnapshotRecord {
   std::uint64_t logical_size_ = 0;
   std::uint32_t chunk_index_ = 0;
   std::uint32_t chunk_count_ = 0;
+  // Source-only handle for an immutable external value pinned during full
+  // sync. It is never serialized; the sender reads it in transfer chunks.
+  std::uint64_t source_id_ = 0;
+  std::uint64_t source_value_bytes_ = 0;
   std::string key_;
   std::string value_;
 };
@@ -207,6 +212,7 @@ struct SnapshotRecord {
 // Full-sync values use the same 2 MiB transfer granularity as the ONLINE
 // backlog reader. kMaxDataFrame remains only a protocol validation ceiling.
 inline constexpr std::size_t kReplicationTransferBytes = 2ULL * 1024 * 1024;
+inline constexpr std::size_t kFullSyncReplacementMetadataBytes = 320;
 
 struct PartitionReplicationStart {
   std::uint64_t baseline_version_ = 0;
@@ -365,6 +371,7 @@ struct ReplicationCommandAppend {
 struct FullSyncPublishItem {
   std::uint64_t id_ = 0;
   std::shared_ptr<const ReplicationCommandAppend> command_;
+  std::optional<SnapshotRecord> record_;
 };
 
 struct ReplicationPublisherAdmission {
@@ -712,11 +719,21 @@ class StorageEngine {
                                std::uint16_t partition_id);
   celer::Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
-      std::uint64_t cursor, std::size_t count,
-      std::size_t read_concurrency = 1);
+      std::uint64_t cursor, std::size_t count, std::size_t read_concurrency = 1,
+      std::size_t max_bytes = kReplicationTransferBytes);
   celer::Task<absl::StatusOr<PartitionFullSyncBatch>>
-  ReadPartitionFullSyncOverrides(std::uint64_t session_id,
-                                 std::uint16_t partition_id, std::size_t count);
+  ReadPartitionFullSyncOverrides(
+      std::uint64_t session_id, std::uint16_t partition_id, std::size_t count,
+      std::size_t max_bytes = kReplicationTransferBytes);
+  celer::Task<absl::StatusOr<SnapshotRecord>> MaterializeFullSyncPublishRecord(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      const SnapshotRecord& requested);
+  celer::Task<absl::StatusOr<std::string>> ReadFullSyncValueChunk(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t source_id, std::uint64_t offset, std::size_t max_bytes);
+  void ReleaseFullSyncValue(std::uint64_t session_id,
+                            std::uint16_t partition_id,
+                            std::uint64_t source_id);
   void AcknowledgePartitionFullSyncOverrides(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::span<const SnapshotRecord> records);

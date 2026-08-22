@@ -640,8 +640,104 @@ class ReplicationLogService final : public celer::Service {
     if (!oversized_length.ok()) co_return oversized_length.status();
     Check(*oversized_length == 2048,
           "disk-backed full-sync override changed the primary value");
+    auto external =
+        co_await storage_->Set(kDb, key, std::string(10 * kMiB, 'z'), {});
+    if (!external.ok()) co_return external.status();
+    auto streamed_override = co_await storage_->ReadPartitionFullSyncOverrides(
+        kDiskBackedOverrideSession, partition_id, 16,
+        keylane::storage::kReplicationTransferBytes);
+    if (!streamed_override.ok()) co_return streamed_override.status();
+    Check(streamed_override->records_.size() == 1 &&
+              streamed_override->records_.front().value_.empty() &&
+              streamed_override->records_.front().source_id_ != 0 &&
+              streamed_override->records_.front().source_value_bytes_ ==
+                  10 * kMiB,
+          "large full-sync override was copied into the batch vector");
+    const auto& streamed_record = streamed_override->records_.front();
+    auto first_chunk = co_await storage_->ReadFullSyncValueChunk(
+        kDiskBackedOverrideSession, partition_id, streamed_record.source_id_, 0,
+        keylane::storage::kReplicationTransferBytes);
+    if (!first_chunk.ok()) co_return first_chunk.status();
+    auto last_chunk = co_await storage_->ReadFullSyncValueChunk(
+        kDiskBackedOverrideSession, partition_id, streamed_record.source_id_,
+        9 * kMiB, keylane::storage::kReplicationTransferBytes);
+    if (!last_chunk.ok()) co_return last_chunk.status();
+    Check(first_chunk->size() == 2 * kMiB && last_chunk->size() == kMiB &&
+              first_chunk->front() == 'z' && last_chunk->back() == 'z',
+          "large full-sync override did not stream bounded chunks");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kDiskBackedOverrideSession, partition_id, streamed_override->records_);
     storage_->EndPartitionReplication(kDiskBackedOverrideSession, partition_id);
     storage_->EndFullSyncSession(kDiskBackedOverrideSession);
+
+    constexpr std::uint64_t kReplacementRaceSession = 305;
+    const std::string race_first = "fullsync-race-a{materialize-race}";
+    const std::string race_second = "fullsync-race-b{materialize-race}";
+    const std::uint16_t race_partition =
+        keylane::storage::RedisSlot(race_first);
+    Check(keylane::storage::RedisSlot(race_second) == race_partition,
+          "replacement race keys do not share a partition");
+    auto race_session = storage_->BeginFullSyncSession(kReplacementRaceSession);
+    if (!race_session.ok()) co_return race_session.status();
+    auto race_start = storage_->BeginPartitionReplication(
+        kReplacementRaceSession, race_partition);
+    if (!race_start.ok()) co_return race_start.status();
+    absl::Status race_db = storage_->BeginPartitionDbReplication(
+        kReplacementRaceSession, race_partition, kDb);
+    if (!race_db.ok()) co_return race_db;
+    auto race_first_small = co_await storage_->Set(kDb, race_first, "a", {});
+    if (!race_first_small.ok()) co_return race_first_small.status();
+    auto race_second_small = co_await storage_->Set(kDb, race_second, "b", {});
+    if (!race_second_small.ok()) co_return race_second_small.status();
+
+    auto race_lock = co_await keylane::tx::CurrentTxShard().AcquireKey(
+        kDb,
+        keylane::tx::FingerprintOf(keylane::storage::ComputeDigest(race_first)),
+        keylane::tx::LockMode::kExclusive);
+    bool race_read_finished = false;
+    absl::Status race_read_status = absl::UnknownError("not started");
+    std::optional<PartitionFullSyncBatch> race_batch;
+    auto read_racing_batch = [&]() -> celer::Task<absl::Status> {
+      auto read = co_await storage_->ReadPartitionFullSyncOverrides(
+          kReplacementRaceSession, race_partition, 16,
+          keylane::storage::kReplicationTransferBytes);
+      if (read.ok()) race_batch.emplace(std::move(*read));
+      race_read_status = read.status();
+      race_read_finished = true;
+      co_return absl::OkStatus();
+    };
+    worker_->Spawn(read_racing_batch());
+    for (unsigned spin = 0; spin < 32; ++spin) {
+      co_await celer::Yield(*worker_);
+    }
+    Check(!race_read_finished,
+          "replacement race reader did not wait on the first key");
+    auto race_second_large = co_await storage_->Set(
+        kDb, race_second, std::string(10 * kMiB, 'r'), {});
+    if (!race_second_large.ok()) co_return race_second_large.status();
+    race_lock.Reset();
+    while (!race_read_finished) co_await celer::Yield(*worker_);
+    if (!race_read_status.ok()) co_return race_read_status;
+    Check(race_batch.has_value() && race_batch->records_.size() == 1 &&
+              race_batch->records_.front().key_ == race_first &&
+              race_batch->records_.front().source_id_ == 0,
+          "replacement materialization retained a raced large-value pin in a "
+          "non-exclusive batch");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, race_batch->records_);
+    auto raced_large = co_await storage_->ReadPartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, 16,
+        keylane::storage::kReplicationTransferBytes);
+    if (!raced_large.ok()) co_return raced_large.status();
+    Check(raced_large->records_.size() == 1 &&
+              raced_large->records_.front().key_ == race_second &&
+              raced_large->records_.front().source_id_ != 0 &&
+              raced_large->records_.front().source_value_bytes_ == 10 * kMiB,
+          "raced large replacement was not deferred to an exclusive batch");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kReplacementRaceSession, race_partition, raced_large->records_);
+    storage_->EndPartitionReplication(kReplacementRaceSession, race_partition);
+    storage_->EndFullSyncSession(kReplacementRaceSession);
 
     constexpr std::uint64_t kEpochSession = 304;
     auto epoch_session = storage_->BeginFullSyncSession(kEpochSession);
@@ -694,10 +790,18 @@ class ReplicationLogService final : public celer::Service {
               replacement.records_.front().mutation_sequence_ >
                   start.baseline_version_,
           "pre-handoff mutation was not captured as a replacement");
+    const std::size_t replacement_credit =
+        keylane::storage::kFullSyncReplacementMetadataBytes + key.size() * 2;
+    Check(storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ >=
+              replacement_credit,
+          "pending replacement did not retain bounded queue credit");
 
     PartitionFullSyncBatch frozen = std::move(replacement);
     storage_->AcknowledgePartitionFullSyncOverrides(kSession, partition_id,
                                                     frozen.records_);
+    Check(
+        storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ == 0,
+        "replacement ACK did not release queue credit");
 
     std::vector<std::string> after_args{"SET", key, "after-handoff"};
     written =
@@ -870,8 +974,7 @@ class ReplicationLogService final : public celer::Service {
           kDb, keylane::tx::FingerprintOf(pending_digest),
           keylane::tx::LockMode::kExclusive);
       auto staged = co_await storage_->SetLocked(
-          kDb, pending_key, pending_digest, "committed-before-marker", {},
-          &pending_tx);
+          kDb, pending_key, pending_digest, "10", {}, &pending_tx);
       if (!staged.ok()) co_return staged.status();
       key_lock.Reset();
     }
@@ -882,12 +985,30 @@ class ReplicationLogService final : public celer::Service {
     auto late_commit_result = co_await storage_->ReadPartitionFullSyncOverrides(
         kPendingTxSession, partition_id, 16);
     if (!late_commit_result.ok()) co_return late_commit_result.status();
-    PartitionFullSyncBatch late_commit = std::move(*late_commit_result);
-    Check(late_commit.records_.size() == 1 &&
-              late_commit.records_.front().key_ == pending_key,
-          "pre-marker transaction was lost when commit arrived in TAILING");
-    storage_->AcknowledgePartitionFullSyncOverrides(
-        kPendingTxSession, partition_id, late_commit.records_);
+    Check(late_commit_result->records_.empty(),
+          "TAILING transaction escaped the ordered publish FIFO");
+    std::vector<std::string> increment_args{"INCR", pending_key};
+    written = co_await ExecuteClientCommand(kDb, std::move(increment_args),
+                                            ":11\r\n");
+    if (!written.ok()) co_return written;
+    auto ordered = storage_->PeekFullSyncPublishItems(kPendingTxSession, 2);
+    if (!ordered.ok()) co_return ordered.status();
+    Check(ordered->size() == 2 && (*ordered)[0].record_.has_value() &&
+              (*ordered)[0].command_ == nullptr &&
+              (*ordered)[1].command_ != nullptr &&
+              (*ordered)[0].id_ + 1 == (*ordered)[1].id_,
+          "transaction after-image was overtaken by a later command");
+    auto after_image = co_await storage_->MaterializeFullSyncPublishRecord(
+        kPendingTxSession, partition_id, *(*ordered)[0].record_);
+    if (!after_image.ok()) co_return after_image.status();
+    Check(after_image->value_ == "11" &&
+              after_image->mutation_sequence_ ==
+                  (*ordered)[1].command_->partition_sequence_,
+          "ordered transaction after-image did not materialize latest state");
+    storage_->AcknowledgeFullSyncPublishItem(kPendingTxSession,
+                                             (*ordered)[0].id_);
+    storage_->AcknowledgeFullSyncPublishItem(kPendingTxSession,
+                                             (*ordered)[1].id_);
     storage_->EndPartitionReplication(kPendingTxSession, partition_id);
     storage_->EndFullSyncSession(kPendingTxSession);
     absl::Status pending_discarded =

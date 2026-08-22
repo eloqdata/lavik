@@ -1046,7 +1046,22 @@ class StorageEngine::Impl {
       std::uint64_t baseline_version_ = 0;
       std::map<std::uint64_t, SnapshotRecord> overrides_;
       absl::flat_hash_map<std::string, std::uint64_t> latest_by_key_;
+      std::size_t replacement_credit_bytes_ = 0;
       ScanHashMap<KeyPhase> key_phases_;
+      struct PendingSnapshotKey {
+        std::string key_;
+        ValueType value_type_ = ValueType::kNone;
+        std::size_t value_bytes_ = 0;
+      };
+      std::deque<PendingSnapshotKey> pending_snapshot_keys_;
+      std::uint64_t pending_snapshot_cursor_ = 0;
+      struct PinnedValue {
+        ExtentManifest extents_;
+        std::size_t key_bytes_ = 0;
+        std::uint64_t value_bytes_ = 0;
+      };
+      absl::flat_hash_map<std::uint64_t, PinnedValue> pinned_values_;
+      std::uint64_t next_pinned_value_id_ = 1;
       std::array<DbPhase, kLogicalDatabaseCount> db_phases_{};
       Phase phase_ = Phase::kCapturing;
     };
@@ -1056,6 +1071,7 @@ class StorageEngine::Impl {
         std::uint64_t id_ = 0;
         std::size_t logical_bytes_ = 0;
         std::shared_ptr<const ReplicationCommandAppend> command_;
+        std::optional<SnapshotRecord> record_;
       };
 
       std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
@@ -1570,10 +1586,22 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<PartitionSnapshotBatch>> SnapshotPartition(
       std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
-      std::uint64_t cursor, std::size_t count, std::size_t read_concurrency);
+      std::uint64_t cursor, std::size_t count, std::size_t read_concurrency,
+      std::size_t max_bytes);
 
   Task<absl::StatusOr<PartitionFullSyncBatch>> ReadPartitionFullSyncOverrides(
-      std::uint64_t session_id, std::uint16_t partition_id, std::size_t count);
+      std::uint64_t session_id, std::uint16_t partition_id, std::size_t count,
+      std::size_t max_bytes);
+
+  Task<absl::StatusOr<SnapshotRecord>> MaterializeFullSyncPublishRecord(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      const SnapshotRecord& requested);
+  Task<absl::StatusOr<std::string>> ReadFullSyncValueChunk(
+      std::uint64_t session_id, std::uint16_t partition_id,
+      std::uint64_t source_id, std::uint64_t offset, std::size_t max_bytes);
+  void ReleaseFullSyncValue(std::uint64_t session_id,
+                            std::uint16_t partition_id,
+                            std::uint64_t source_id);
 
   Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                           std::size_t capacity_bytes);
@@ -1667,7 +1695,7 @@ class StorageEngine::Impl {
       std::optional<SnapshotRecord>* output, SnapshotReadJoin* join);
   Task<absl::StatusOr<SnapshotRecord>> ReadFullSyncOverrideRecord(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
-      const SnapshotRecord& requested);
+      std::uint64_t session_id, const SnapshotRecord& requested);
 
   Task<absl::Status> EnsureReplicationLogActiveBlock(
       WorkerStore& store, std::uint64_t protected_lsn);
@@ -2009,6 +2037,10 @@ class StorageEngine::Impl {
   Task<absl::Status> ReadExtentInto(WorkerStore& store, ExtentRef ref,
                                     std::uint32_t extent_index,
                                     std::byte* destination);
+  Task<absl::Status> ReadExtentSlice(WorkerStore& store, ExtentRef ref,
+                                     std::uint32_t extent_index,
+                                     std::size_t source_offset,
+                                     std::span<std::byte> destination);
 
   Task<absl::StatusOr<LoadedValue>> LoadExternalValueLocal(
       WorkerStore& store, const RecordLocation& location,
@@ -2101,14 +2133,23 @@ class StorageEngine::Impl {
       WorkerStore& store, std::uint64_t session_id,
       WorkerStore::FullSyncCapture& capture, const SnapshotRecord& record,
       const Digest& digest,
-      std::shared_ptr<const ReplicationCommandAppend> command = nullptr);
+      std::shared_ptr<const ReplicationCommandAppend> command = nullptr,
+      bool transaction_effect = false);
   bool TryEnqueueFullSyncCommand(
       WorkerStore& store, std::uint64_t session_id,
       std::shared_ptr<const ReplicationCommandAppend> command);
+  bool TryEnqueueFullSyncRecord(WorkerStore& store, std::uint64_t session_id,
+                                const SnapshotRecord& record);
   static std::string FullSyncOverrideKey(std::uint8_t db_id,
                                          std::string_view key);
-  static void ClearFullSyncCapture(WorkerStore& store,
-                                   WorkerStore::FullSyncCapture& capture);
+  void ClearFullSyncCapture(WorkerStore& store,
+                            WorkerStore::FullSyncCapture& capture);
+  Task<absl::Status> PinFullSyncExtents(ExtentManifest extents);
+  Task<absl::Status> ReleaseFullSyncExtents(ExtentManifest extents);
+  Task<absl::StatusOr<std::uint64_t>> PinFullSyncValue(
+      WorkerStore& store, std::uint64_t session_id,
+      WorkerStore::PartitionStore& partition, RecordLocation location,
+      ExtentManifest extents, std::size_t key_bytes);
 
   Task<absl::StatusOr<ReservedBlock>> AcquireWriteBlock(WorkerStore& store,
                                                         bool for_defrag,

@@ -2424,7 +2424,8 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
   while (replica_port == source_port) replica_port = FindFreePort();
   ServerProcess source(
       g_keylane_binary, source_port, source_data, source_log, 2, {}, {},
-      {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "2000"}});
+      {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "2000"},
+       {"KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CUT_MS", "3000"}});
   ServerProcess replica(g_keylane_binary, replica_port, replica_data,
                         replica_log, 2);
   RespClient source_client(source_port);
@@ -2480,6 +2481,14 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
         "+OK");
   }
 
+  // The final-cut test hook sleeps after every worker stopped capture and the
+  // DB gates reopened, but before flow 0 sends its cut. Online writes must not
+  // inherit the target's cut latency.
+  std::this_thread::sleep_for(2200ms);
+  const auto cut_write_start = std::chrono::steady_clock::now();
+  ASSERT_EQ(source_client.Command({"SET", "cut-gate-probe", "open"}), "+OK");
+  EXPECT_LT(std::chrono::steady_clock::now() - cut_write_start, 500ms);
+
   const auto online_deadline = std::chrono::steady_clock::now() + 60s;
   std::string info;
   do {
@@ -2510,6 +2519,7 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
   EXPECT_EQ(replica_client.Command({"GET", tx1}),
             Bulk("right-" + std::to_string(kWrites - 1)));
   EXPECT_EQ(replica_client.Command({"GET", same_name}), Bulk("db0-after"));
+  EXPECT_EQ(replica_client.Command({"GET", "cut-gate-probe"}), Bulk("open"));
   ASSERT_EQ(replica_db1.Command({"READONLY"}), "+OK");
   EXPECT_EQ(replica_db1.Command({"GET", same_name}), Bulk("db1-after"));
   replica.Stop();

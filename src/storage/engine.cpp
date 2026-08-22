@@ -169,16 +169,40 @@ void StorageEngine::EndPartitionReplication(std::uint64_t session_id,
 
 Task<absl::StatusOr<PartitionSnapshotBatch>> StorageEngine::SnapshotPartition(
     std::uint64_t session_id, std::uint16_t partition_id, std::uint8_t db_id,
-    std::uint64_t cursor, std::size_t count, std::size_t read_concurrency) {
+    std::uint64_t cursor, std::size_t count, std::size_t read_concurrency,
+    std::size_t max_bytes) {
   return impl_->SnapshotPartition(session_id, partition_id, db_id, cursor,
-                                  count, read_concurrency);
+                                  count, read_concurrency, max_bytes);
 }
 
 Task<absl::StatusOr<PartitionFullSyncBatch>>
 StorageEngine::ReadPartitionFullSyncOverrides(std::uint64_t session_id,
                                               std::uint16_t partition_id,
-                                              std::size_t count) {
-  return impl_->ReadPartitionFullSyncOverrides(session_id, partition_id, count);
+                                              std::size_t count,
+                                              std::size_t max_bytes) {
+  return impl_->ReadPartitionFullSyncOverrides(session_id, partition_id, count,
+                                               max_bytes);
+}
+
+Task<absl::StatusOr<SnapshotRecord>>
+StorageEngine::MaterializeFullSyncPublishRecord(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    const SnapshotRecord& requested) {
+  return impl_->MaterializeFullSyncPublishRecord(session_id, partition_id,
+                                                 requested);
+}
+
+Task<absl::StatusOr<std::string>> StorageEngine::ReadFullSyncValueChunk(
+    std::uint64_t session_id, std::uint16_t partition_id,
+    std::uint64_t source_id, std::uint64_t offset, std::size_t max_bytes) {
+  return impl_->ReadFullSyncValueChunk(session_id, partition_id, source_id,
+                                       offset, max_bytes);
+}
+
+void StorageEngine::ReleaseFullSyncValue(std::uint64_t session_id,
+                                         std::uint16_t partition_id,
+                                         std::uint64_t source_id) {
+  impl_->ReleaseFullSyncValue(session_id, partition_id, source_id);
 }
 
 Task<absl::Status> StorageEngine::EnableReplicationLog(

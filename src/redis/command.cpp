@@ -1318,10 +1318,34 @@ struct ReplicationPublisherAdmission {
   std::vector<WorkerToken> worker_tokens_;
 };
 
+std::size_t FullSyncReplacementAdmissionBytes(
+    const CommandRequest& request) noexcept {
+  if (request.spec_ == nullptr) return 0;
+  const auto keys = DetermineKeys(*request.spec_, request.args_);
+  if (!keys.ok() || keys->empty()) return 0;
+  std::size_t bytes = 0;
+  for (std::uint16_t index = keys->first_; index <= keys->last_;
+       index = static_cast<std::uint16_t>(index + keys->step_)) {
+    const std::size_t key_bytes = request.args_[index].size();
+    const std::size_t identity =
+        SaturatingAdd(storage::kFullSyncReplacementMetadataBytes,
+                      key_bytes > std::numeric_limits<std::size_t>::max() / 2
+                          ? std::numeric_limits<std::size_t>::max()
+                          : key_bytes * 2);
+    bytes = SaturatingAdd(bytes, identity);
+    if (keys->last_ - index < keys->step_) break;
+  }
+  return bytes;
+}
+
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                                      const CommandRequest* request = nullptr) {
   ReplicationPublisherAdmission admission;
+  if (request != nullptr) {
+    logical_bytes = SaturatingAdd(logical_bytes,
+                                  FullSyncReplacementAdmissionBytes(*request));
+  }
   admission.logical_bytes_ = std::max<std::size_t>(logical_bytes, 1);
   struct WorkerScope {
     unsigned worker_ = 0;
@@ -6153,6 +6177,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
       source_write = true;
       logical_bytes =
           SaturatingAdd(logical_bytes, RequestArgumentBytes(command));
+      logical_bytes = SaturatingAdd(logical_bytes,
+                                    FullSyncReplacementAdmissionBytes(command));
     }
   }
   source_write =

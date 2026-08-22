@@ -1225,7 +1225,8 @@ struct MasterSession {
         flow_resume_possible_(worker_count, -1),
         snapshot_ready_(worker_count),
         snapshot_gate_closed_(worker_count),
-        snapshot_fenced_(worker_count) {}
+        snapshot_fenced_(worker_count),
+        snapshot_capture_stopped_(worker_count) {}
 
   bool SetControl(int fd) {
     std::lock_guard lock(mutex_);
@@ -1289,10 +1290,16 @@ struct MasterSession {
     co_return co_await snapshot_fenced_.Wait(*celer::ThisWorker().self_);
   }
 
+  Task<absl::Status> WaitSnapshotCaptureStopped() {
+    co_return co_await snapshot_capture_stopped_.Wait(
+        *celer::ThisWorker().self_);
+  }
+
   void AbortSnapshotCut(const absl::Status& status) {
     snapshot_ready_.Abort(status);
     snapshot_gate_closed_.Abort(status);
     snapshot_fenced_.Abort(status);
+    snapshot_capture_stopped_.Abort(status);
   }
 
   unsigned connected_flows() const {
@@ -1449,6 +1456,7 @@ struct MasterSession {
   celer::CoroutineBarrier snapshot_ready_;
   celer::CoroutineBarrier snapshot_gate_closed_;
   celer::CoroutineBarrier snapshot_fenced_;
+  celer::CoroutineBarrier snapshot_capture_stopped_;
   std::atomic<unsigned> connected_flows_{0};
   std::atomic<bool> online_{false};
   std::atomic<bool> cancelled_{false};
@@ -3838,23 +3846,29 @@ class ReplicationManager::Impl {
         co_return absl::OkStatus();
       };
 
-      std::vector<SnapshotRecord> normal;
+      std::size_t normal_start = 0;
+      std::size_t normal_count = 0;
       std::size_t normal_bytes = 2 + 4;
       auto flush_normal = [&]() -> Task<absl::Status> {
-        if (normal.empty()) co_return absl::OkStatus();
-        absl::Status sent = co_await send_batch(normal);
-        normal.clear();
+        if (normal_count == 0) co_return absl::OkStatus();
+        absl::Status sent =
+            co_await send_batch(records.subspan(normal_start, normal_count));
+        normal_count = 0;
         normal_bytes = 2 + 4;
         co_return sent;
       };
-      for (const SnapshotRecord& record : records) {
+      for (std::size_t record_index = 0; record_index < records.size();
+           ++record_index) {
+        const SnapshotRecord& record = records[record_index];
         const std::size_t encoded = EncodedRecordBytes(record);
-        if (encoded <= kBacklogBatchBytes - (2 + 4)) {
+        const bool streamed = record.source_id_ != 0;
+        if (!streamed && encoded <= kBacklogBatchBytes - (2 + 4)) {
           if (encoded > kBacklogBatchBytes - normal_bytes) {
             absl::Status sent = co_await flush_normal();
             if (!sent.ok()) co_return sent;
           }
-          normal.push_back(record);
+          if (normal_count == 0) normal_start = record_index;
+          ++normal_count;
           normal_bytes += encoded;
           continue;
         }
@@ -3862,12 +3876,16 @@ class ReplicationManager::Impl {
         if (!sent.ok()) co_return sent;
         if (record.kind_ != SnapshotRecord::Kind::kValue ||
             record.key_.size() > kBacklogBatchBytes / 2 ||
-            record.value_.empty()) {
+            (!streamed && record.value_.empty()) ||
+            (streamed &&
+             (record.source_value_bytes_ == 0 || !record.value_.empty()))) {
           co_return absl::ResourceExhaustedError(
               "replication record identity exceeds frame limit");
         }
-        const std::size_t chunks =
-            (record.value_.size() + storage::kReplicationTransferBytes - 1) /
+        const std::uint64_t value_bytes =
+            streamed ? record.source_value_bytes_ : record.value_.size();
+        const std::uint64_t chunks =
+            (value_bytes + storage::kReplicationTransferBytes - 1) /
             storage::kReplicationTransferBytes;
         if (chunks > std::numeric_limits<std::uint32_t>::max()) {
           co_return absl::ResourceExhaustedError(
@@ -3882,7 +3900,7 @@ class ReplicationManager::Impl {
             .mutation_sequence_ = record.mutation_sequence_,
             .expire_at_ms_ = record.expire_at_ms_,
             .value_type_ = record.value_type_,
-            .logical_size_ = record.value_.size(),
+            .logical_size_ = value_bytes,
             .chunk_index_ = 0,
             .chunk_count_ = static_cast<std::uint32_t>(chunks),
             .key_ = record.key_,
@@ -3893,6 +3911,18 @@ class ReplicationManager::Impl {
         for (std::size_t chunk_index = 0; chunk_index < chunks; ++chunk_index) {
           const std::size_t offset =
               chunk_index * storage::kReplicationTransferBytes;
+          std::string chunk_value;
+          if (streamed) {
+            auto read = co_await storage_->ReadFullSyncValueChunk(
+                session->id_, partition_id, record.source_id_, offset,
+                storage::kReplicationTransferBytes);
+            if (!read.ok()) co_return read.status();
+            chunk_value = std::move(*read);
+          } else {
+            chunk_value = record.value_.substr(
+                offset, std::min(storage::kReplicationTransferBytes,
+                                 record.value_.size() - offset));
+          }
           SnapshotRecord chunk{
               .kind_ = SnapshotRecord::Kind::kValueChunk,
               .db_id_ = record.db_id_,
@@ -3904,9 +3934,7 @@ class ReplicationManager::Impl {
               .chunk_index_ = static_cast<std::uint32_t>(chunk_index),
               .chunk_count_ = static_cast<std::uint32_t>(chunks),
               .key_ = record.key_,
-              .value_ = record.value_.substr(
-                  offset, std::min(storage::kReplicationTransferBytes,
-                                   record.value_.size() - offset)),
+              .value_ = std::move(chunk_value),
           };
           sent = co_await send_batch(std::span(&chunk, 1));
           if (!sent.ok()) co_return sent;
@@ -3942,13 +3970,38 @@ class ReplicationManager::Impl {
         if (!pending.ok()) co_return pending.status();
         if (pending->empty()) co_return absl::OkStatus();
 
-        struct EncodedFullSyncCommand {
+        if (pending->front().record_.has_value()) {
+          const storage::FullSyncPublishItem& item = pending->front();
+          if (item.command_ != nullptr ||
+              item.record_->mutation_sequence_ == 0) {
+            co_return absl::InvalidArgumentError(
+                "invalid record in full-sync publish queue");
+          }
+          const std::uint16_t partition_id =
+              storage::RedisSlot(item.record_->key_);
+          auto materialized =
+              co_await storage_->MaterializeFullSyncPublishRecord(
+                  session->id_, partition_id, *item.record_);
+          if (!materialized.ok()) co_return materialized.status();
+          absl::Status sent =
+              co_await send_records(partition_id, std::span(&*materialized, 1));
+          if (!sent.ok()) co_return sent;
+          storage_->ReleaseFullSyncValue(session->id_, partition_id,
+                                         materialized->source_id_);
+          storage_->AcknowledgeFullSyncPublishItem(session->id_, item.id_);
+          ++drained_items;
+          continue;
+        }
+
+        struct StreamedFullSyncCommand {
           storage::FullSyncPublishItem item_;
-          std::string payload_;
+          ReplicationCommandPayloadSource source_;
+          std::size_t payload_bytes_ = 0;
         };
-        std::vector<EncodedFullSyncCommand> commands;
+        std::vector<StreamedFullSyncCommand> commands;
         commands.reserve(pending->size());
         for (storage::FullSyncPublishItem& item : *pending) {
+          if (item.record_.has_value()) break;
           if (item.command_ == nullptr || item.command_->args_.empty() ||
               item.command_->partition_id_ >= storage::kLogicalStorageShards ||
               item.command_->partition_sequence_ == 0) {
@@ -3967,13 +4020,13 @@ class ReplicationManager::Impl {
             co_return absl::ResourceExhaustedError(
                 "full-sync command is too large for this process");
           }
-          std::string encoded(static_cast<std::size_t>(source->size()), '\0');
-          absl::Status encoded_status = co_await source->Read(
-              0, std::span(reinterpret_cast<std::byte*>(encoded.data()),
-                           encoded.size()));
-          if (!encoded_status.ok()) co_return encoded_status;
-          commands.push_back(EncodedFullSyncCommand{
-              .item_ = std::move(item), .payload_ = std::move(encoded)});
+          const std::size_t payload_bytes =
+              static_cast<std::size_t>(source->size());
+          commands.push_back(StreamedFullSyncCommand{
+              .item_ = std::move(item),
+              .source_ = std::move(*source),
+              .payload_bytes_ = payload_bytes,
+          });
         }
 
         struct PendingFullSyncAck {
@@ -4005,16 +4058,16 @@ class ReplicationManager::Impl {
 
           while (command_index < commands.size() &&
                  frame_payloads.size() < kBacklogBatchFrames) {
-            EncodedFullSyncCommand& encoded = commands[command_index];
+            StreamedFullSyncCommand& encoded = commands[command_index];
             const std::size_t count = std::min(
-                kFragmentBytes, encoded.payload_.size() - command_offset);
+                kFragmentBytes, encoded.payload_bytes_ - command_offset);
             const std::size_t wire_bytes = kWireOverhead + count;
             if (!frame_payloads.empty() &&
                 wire_bytes > kBacklogBatchBytes - batch_bytes) {
               break;
             }
             const bool first = command_offset == 0;
-            const bool last = command_offset + count == encoded.payload_.size();
+            const bool last = command_offset + count == encoded.payload_bytes_;
             std::uint8_t flags = 0;
             if (first) {
               flags |= static_cast<std::uint8_t>(
@@ -4033,7 +4086,13 @@ class ReplicationManager::Impl {
             PutU64(payload, encoded.item_.id_);
             PutU32(payload, command_fragment);
             PutU8(payload, flags);
-            payload.append(encoded.payload_.data() + command_offset, count);
+            const std::size_t payload_offset = payload.size();
+            payload.resize(payload_offset + count);
+            absl::Status read = co_await encoded.source_.Read(
+                command_offset, std::span(reinterpret_cast<std::byte*>(
+                                              payload.data() + payload_offset),
+                                          count));
+            if (!read.ok()) co_return read;
             PutU32(frame_headers,
                    static_cast<std::uint32_t>(1 + payload.size()));
             PutU8(frame_headers,
@@ -4070,13 +4129,15 @@ class ReplicationManager::Impl {
           }
           absl::Status sent = co_await stream.WriteAllV(wire_batch);
           if (!sent.ok()) co_return sent;
+          // Sending bytes is protocol progress even when the command's final
+          // fragment (and therefore its ACK) is still minutes away.
+          session->TouchProgress(flow_id);
           for (const PendingFullSyncAck& expected : pending_acks) {
             absl::Status acknowledged = co_await WaitFullSyncAck(
                 stream, expected.partition_id_, expected.sequence_);
             if (!acknowledged.ok()) co_return acknowledged;
             storage_->AcknowledgeFullSyncPublishItem(session->id_,
                                                      expected.item_id_);
-            session->TouchProgress(flow_id);
             ++drained_items;
           }
         }
@@ -4461,28 +4522,46 @@ class ReplicationManager::Impl {
       cleanup();
       co_return fenced;
     }
+    // The cursor is pinned and the full-sync prefix is finite. Stop this
+    // worker's capture before reopening source admission, then use only an
+    // owner-local barrier (no network round trip) to prove every flow has
+    // done the same. Post-reopen writes now enter the retained backlog only.
+    cleanup();
+    absl::Status capture_stopped =
+        co_await session->WaitSnapshotCaptureStopped();
+    if (!capture_stopped.ok()) {
+      co_return capture_stopped;
+    }
     if (flow_id == 0) {
       gate_reopen.Open();
       command_gate_reopen.Open();
+      if (const char* configured =
+              std::getenv("KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CUT_MS");
+          configured != nullptr) {
+        std::uint64_t pause_ms = 0;
+        const std::size_t length = std::strlen(configured);
+        const auto parsed =
+            std::from_chars(configured, configured + length, pause_ms);
+        if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+            pause_ms != 0) {
+          absl::Status paused = co_await celer::SleepFor(
+              *celer::ThisWorker().self_, std::chrono::milliseconds(pause_ms));
+          if (!paused.ok()) co_return paused;
+        }
+      }
     }
     // The fence fixed this flow's stable ONLINE cursor. Source admission is
     // already open again; a slow target can delay only this session while
     // backlog pressure accounts for post-fence writes normally.
-    if (!storage_->FullSyncSessionValid(session->id_)) {
-      cleanup();
-      co_return absl::AbortedError("full sync invalidated before final cut");
-    }
     std::string cut_body;
     PutU64(cut_body, *backlog_cursor);
     absl::Status cut_sent = co_await WriteFullSyncFrameAndWaitAck(
         stream, DataFrameKind::kFullSyncCut, cut_body, kResetBatchAckPartition,
         fullsync_sequence);
     if (!cut_sent.ok()) {
-      cleanup();
       co_return cut_sent;
     }
     ++fullsync_sequence;
-    cleanup();
     co_return co_await EnterMasterFlowBacklog(stream, session, flow_id,
                                               *backlog_cursor, 0);
   }
