@@ -23,6 +23,9 @@ struct ConnectionContext {
   // Redis Cluster replica reads are opt-in per connection. READONLY enables
   // them and READWRITE restores the default MOVED-to-primary behavior.
   bool cluster_readonly_ = false;
+  // Set by REPLCONF capa eof before this connection is handed to the
+  // diskless Redis PSYNC exporter.
+  bool redis_replica_eof_ = false;
   ReplyBuilder reply_builder_;
 
   // MULTI/EXEC queueing. `multi_db` tracks SELECTs issued while queueing so

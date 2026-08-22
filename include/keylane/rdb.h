@@ -64,6 +64,23 @@ absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
                                             std::string_view key,
                                             const storage::RawValue& value);
 
+// Stateful checksum encoder for a diskless RDB transfer. Header() must be
+// sent first, every subsequently sent fragment must be passed to Account(),
+// and Finish() returns the EOF opcode plus Redis' little-endian CRC64.
+class StreamEncoder {
+ public:
+  explicit StreamEncoder(unsigned version = kVersion);
+
+  std::string_view Header() const noexcept { return header_; }
+  void Account(std::string_view fragment) noexcept;
+  std::string Finish();
+
+ private:
+  std::string header_;
+  std::uint64_t crc_ = 0;
+  bool finished_ = false;
+};
+
 // Blocking filesystem sink used only by the backup writer thread. Open writes
 // the Redis header to a same-directory temporary file; Finish appends EOF and
 // checksum, fdatasyncs, atomically renames, and fsyncs the directory.

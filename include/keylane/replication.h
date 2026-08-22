@@ -50,6 +50,10 @@ struct ReplicationOptions {
   // Compatibility override declaring that the initial upstream speaks Redis
   // PSYNC. Ordinary replicaof performs safe protocol detection instead.
   bool redis_psync_ = false;
+  // Retain the post-cut Redis export cursor. When disabled (the default), a
+  // slow Redis replica is disconnected after it falls behind the bounded
+  // backlog instead of applying backpressure to foreground writes.
+  bool redis_export_backpressure_ = false;
   // Number of keys one source flow admits into a snapshot scheduling round.
   // Sampled for every round so CONFIG SET takes effect during full sync.
   std::size_t snapshot_batch_size_ = 64;
@@ -146,6 +150,10 @@ class ReplicationManager {
                                                   std::uint64_t client_id,
                                                   std::string client_address,
                                                   bool tls);
+  celer::Task<absl::Status> ServeRedisExportConnection(
+      celer::TcpStream& stream, std::vector<std::string> args,
+      std::uint64_t client_id, std::string client_address, bool tls,
+      bool eof_capable);
 
   ReplicationStatus status() const;
   bool is_replica() const noexcept;

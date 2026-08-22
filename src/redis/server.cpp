@@ -937,6 +937,50 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       continue;
     }
 
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "REPLCONF")) {
+      if (args.size() < 3 || (args.size() & 1U) == 0) {
+        const std::string_view encoded = ctx.reply_builder_.AppendError(
+            "ERR wrong number of arguments for 'replconf' command");
+        absl::Status written =
+            co_await stream.WriteAll(std::span<const std::byte>(
+                reinterpret_cast<const std::byte*>(encoded.data()),
+                encoded.size()));
+        if (!written.ok()) co_return written;
+        continue;
+      }
+      for (std::size_t index = 1; index + 1 < args.size(); index += 2) {
+        if (absl::EqualsIgnoreCase(args[index], "capa") &&
+            absl::EqualsIgnoreCase(args[index + 1], "eof")) {
+          ctx.redis_replica_eof_ = true;
+        }
+      }
+      const std::string_view encoded =
+          ctx.reply_builder_.AppendSimpleString("OK");
+      absl::Status written =
+          co_await stream.WriteAll(std::span<const std::byte>(
+              reinterpret_cast<const std::byte*>(encoded.data()),
+              encoded.size()));
+      if (!written.ok()) co_return written;
+      continue;
+    }
+
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
+      if (!pending.empty()) {
+        co_return absl::InvalidArgumentError(
+            "PSYNC handshake must be an isolated command");
+      }
+      ConnectionClosed();
+      ctx.counted_as_client_ = false;
+      auto peer_address = stream.PeerAddress();
+      const std::string address =
+          peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+      const bool tls = stream.IsTls();
+      UnregisterClientConnection(ctx.conn_id_);
+      co_return co_await replication_->ServeRedisExportConnection(
+          stream, std::move(command_result->args_), ctx.conn_id_, address, tls,
+          ctx.redis_replica_eof_);
+    }
+
     if (ReplicationManager::IsNativeHandshake(command_result->args_)) {
       if (!pending.empty()) {
         co_return absl::InvalidArgumentError(

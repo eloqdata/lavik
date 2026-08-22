@@ -286,6 +286,27 @@ if (BUILD_TESTING)
       set_tests_properties(keylane_redis_cluster_psync_e2e
         PROPERTIES TIMEOUT 120)
       add_test(
+        NAME keylane_redis_export_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                $<TARGET_FILE:keylane>
+                ${KEYLANE_REDIS_SERVER_EXECUTABLE}
+                ${KEYLANE_REDIS_CLI_EXECUTABLE}
+      )
+      set_tests_properties(keylane_redis_export_e2e PROPERTIES
+        TIMEOUT 120
+        RUN_SERIAL TRUE)
+      add_test(
+        NAME keylane_redis_export_backpressure_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_export_e2e.sh
+                $<TARGET_FILE:keylane>
+                ${KEYLANE_REDIS_SERVER_EXECUTABLE}
+                ${KEYLANE_REDIS_CLI_EXECUTABLE}
+                backpressure
+      )
+      set_tests_properties(keylane_redis_export_backpressure_e2e PROPERTIES
+        TIMEOUT 120
+        RUN_SERIAL TRUE)
+      add_test(
         NAME keylane_rdb_backup_e2e
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdb_backup_e2e.sh
                 $<TARGET_FILE:keylane>

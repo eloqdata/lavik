@@ -76,6 +76,14 @@ std::string RdbFile(std::string body, unsigned version) {
   return result;
 }
 
+TEST(RdbTest, StreamEncoderSupportsRedisSevenCompatibilityHeader) {
+  StreamEncoder encoder(10);
+  EXPECT_EQ(encoder.Header(), "REDIS0010");
+  std::string streamed(encoder.Header());
+  streamed += encoder.Finish();
+  EXPECT_EQ(streamed, RdbFile({}, 10));
+}
+
 class TempFile {
  public:
   explicit TempFile(std::string_view contents) {

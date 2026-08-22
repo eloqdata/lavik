@@ -1886,6 +1886,26 @@ struct FileWriter::Impl {
   bool finished_ = false;
 };
 
+StreamEncoder::StreamEncoder(unsigned version) {
+  const std::string encoded_version = std::to_string(version);
+  header_ = absl::StrCat("REDIS", std::string(4 - encoded_version.size(), '0'),
+                         encoded_version);
+  crc_ = UpdateCrc64(crc_, header_);
+}
+
+void StreamEncoder::Account(std::string_view fragment) noexcept {
+  if (!finished_) crc_ = UpdateCrc64(crc_, fragment);
+}
+
+std::string StreamEncoder::Finish() {
+  if (finished_) return {};
+  finished_ = true;
+  std::string trailer(1, static_cast<char>(kEof));
+  crc_ = UpdateCrc64(crc_, trailer);
+  PutLe64(&trailer, Reflect64(crc_));
+  return trailer;
+}
+
 FileWriter::FileWriter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 FileWriter::FileWriter(FileWriter&&) noexcept = default;
 FileWriter& FileWriter::operator=(FileWriter&&) noexcept = default;

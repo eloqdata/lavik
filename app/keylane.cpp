@@ -137,6 +137,10 @@ int main(int argc, char** argv) {
       ->capture_default_str()
       ->check(CLI::Range(std::size_t{1},
                          keylane::kMaxReplicationSnapshotBatchSize));
+  app.add_flag("--redis-export-backpressure,!--no-redis-export-backpressure",
+               options.replication_options_.redis_export_backpressure_,
+               "Backpressure writes when a Redis PSYNC export falls behind")
+      ->capture_default_str();
   app.add_option(
          "--spdk-max-completions-per-poll",
          options.spdk_max_completions_per_poll_,
