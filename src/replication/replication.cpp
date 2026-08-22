@@ -1004,6 +1004,9 @@ struct RedisExportEvent {
   ReplicatedCommand command_;
 };
 
+constexpr std::string_view kRedisExportBacklogGapMessage =
+    "Redis export cursor fell behind the online-write backlog";
+
 struct RedisExportTransaction {
   std::uint64_t id_ = 0;
   std::vector<unsigned> participants_;
@@ -1041,7 +1044,16 @@ Task<absl::StatusOr<std::optional<RedisExportEvent>>> ReadLocalRedisExportEvent(
   while (true) {
     auto batch = co_await storage->ReadReplicationLog(
         cursor, storage::kReplicationTransferBytes, 1);
-    if (!batch.ok()) co_return batch.status();
+    if (!batch.ok()) {
+      // Only an online-write backlog gap is classified as a slow Redis
+      // replica. RDB producer pressure is handled separately by suspending the
+      // snapshot scanner until the bounded MPSC queue has room.
+      if (batch.status().code() == absl::StatusCode::kOutOfRange) {
+        co_return absl::ResourceExhaustedError(
+            kRedisExportBacklogGapMessage);
+      }
+      co_return batch.status();
+    }
     if (batch->frames_.empty()) {
       if (!encoded.empty()) {
         co_return absl::InternalError(
@@ -2848,7 +2860,13 @@ class ReplicationManager::Impl {
         return true;
       });
     }
-    if (!status.ok()) {
+    if (status.code() == absl::StatusCode::kResourceExhausted &&
+        status.message() == kRedisExportBacklogGapMessage) {
+      spdlog::warn(
+          "Redis PSYNC export {} failed: Redis replica fell behind online "
+          "writes; disconnecting and requiring a new full sync",
+          session_id);
+    } else if (!status.ok()) {
       spdlog::warn("Redis PSYNC export {} ended: {}", session_id,
                    status.message());
     }

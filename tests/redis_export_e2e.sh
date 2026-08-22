@@ -122,3 +122,6 @@ done
 "${redis_cli}" -p "${redis_port}" replicaof no one >/dev/null
 "${redis_cli}" -p "${redis_port}" set detached writable >/dev/null
 [[ $("${redis_cli}" -p "${redis_port}" get detached) == writable ]]
+# Ordinary RDB streaming, online replication, ACKs, and an intentional detach
+# must never be reported as an online-write backlog overrun.
+! grep -q 'Redis replica fell behind online writes' "${case_dir}/keylane.log"
