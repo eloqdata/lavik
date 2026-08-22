@@ -3156,6 +3156,16 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(durability.tx_commits_pending_) + "\r\n";
     info += std::string("storage_durability_pending:") +
             (durability.pending() ? "1\r\n\r\n" : "0\r\n\r\n");
+#if KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT
+    std::uint64_t command_cross_core_hops = 0;
+    for (unsigned worker = 0; worker < g_server_threads; ++worker) {
+      command_cross_core_hops += co_await SubmitTo(
+          worker, [] { return celer::LocalSubmitTaskCount(); });
+    }
+    info +=
+        "command_cross_core_hops:" + std::to_string(command_cross_core_hops) +
+        "\r\n\r\n";
+#endif
   }
   if (wants("replication")) {
     const ReplicationStatus replication = g_replication != nullptr
@@ -7425,6 +7435,9 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
 #endif
 #if KEYLANE_ENABLE_SET_LATENCY_TRACE
         if (request.kind_ == CommandKind::kSet) {
+          // A source SET is already on the key owner by the time it gets
+          // here, so remote_ reads false. Read route-out as unmeasured, not
+          // as "no hop".
           SetLatencyTrace trace;
           trace.request_start_ns_ = SetTraceNowNanos();
           trace.remote_ = target != ThisWorker().id_;
@@ -7471,8 +7484,42 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
   }
 }
 
-Task<CommandReply> ExecuteCommand(const CommandRequest& request,
-                                  ReplyBuilder& reply_builder) {
+namespace {
+
+// Publisher admission reserves worker-local state on the worker that appends
+// this write to its replication log, which is the key owner -- the same worker
+// the command body dispatches to. Resolving that owner out here leaves
+// admission, body, and release on their existing "already on the target"
+// inline paths, so the write pays one cross-core round trip instead of three.
+std::optional<unsigned> SingleKeyWriteOwner(const CommandRequest& request) {
+  if (request.replication_origin_ || request.spec_ == nullptr ||
+      g_storage == nullptr) {
+    return std::nullopt;
+  }
+  if ((request.spec_->flags_ & kCmdWrite) == 0 ||
+      (request.spec_->flags_ & (kCmdGlobal | kCmdMultiShard)) != 0) {
+    return std::nullopt;
+  }
+  // A refused write is answered where it arrived. A read-only replica should
+  // not spend cross-core round trips producing READONLY errors.
+  if (g_replication != nullptr ? g_replication->reject_writes()
+                               : g_replica_read_only) {
+    return std::nullopt;
+  }
+  const absl::StatusOr<KeyIndexView> keys =
+      DetermineKeys(*request.spec_, request.args_);
+  // count() == 1 rather than !empty(): XGROUP HELP resolves to no key at all
+  // and must keep the all-worker admission fan-out.
+  if (!keys.ok() || keys->count() != 1) return std::nullopt;
+  return ShardForKey(request.args_[keys->first_]);
+}
+
+// The acquire must stay ahead of the DB gate that ExecuteCommandBody takes.
+// Admission suspends on the publish-queue capacity of the worker it runs on,
+// and holding that same worker's DB gate across the wait would stall every
+// FLUSHDB and FULLSYNC_CUT drain waiting for the gate counts to reach zero.
+Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
+                                          ReplyBuilder& reply_builder) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & kCmdWrite) != 0 && g_storage != nullptr &&
@@ -7496,6 +7543,20 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                      released.message())));
   }
   co_return reply;
+}
+
+}  // namespace
+
+Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
+  const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
+  if (owner.has_value() && *owner != ThisWorker().id_) {
+    co_return co_await SubmitTaskTo(
+        *owner, [&request, &reply_builder]() -> Task<CommandReply> {
+          co_return co_await ExecuteAdmittedCommand(request, reply_builder);
+        });
+  }
+  co_return co_await ExecuteAdmittedCommand(request, reply_builder);
 }
 
 Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {

@@ -317,6 +317,20 @@ bool WaitForReply(RespClient& client,
   return false;
 }
 
+// Unlike WaitForReply, an ordinary mismatch is not a failure here but a retry:
+// a replica read legitimately disagrees until the effect arrives.
+bool WaitForEventualReply(RespClient& client,
+                          const std::vector<std::string_view>& command,
+                          std::string_view expected,
+                          std::chrono::seconds timeout = 60s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  do {
+    if (client.Command(command) == expected) return true;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
 std::string KeyForWorker(std::string_view prefix, unsigned worker,
                          unsigned worker_count) {
   for (std::uint64_t candidate = 0;; ++candidate) {
@@ -2744,6 +2758,406 @@ TEST(ListE2eTest, PublisherBackpressurePreservesHistoryAndReplica) {
   replica.Stop();
   source.Stop();
 }
+
+// Hop count is not observable, so this asserts what a client can see instead:
+// a reply must not depend on whether a replica is attached, nor on which
+// worker the connection was assigned. Three source workers means most
+// connections do not own the key they write, which is the case being changed.
+TEST(ListE2eTest, SingleKeyWritesAreIdenticalWithAndWithoutAReplica) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-single-key-admission-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  constexpr unsigned kSourceThreads = 3;
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       kSourceThreads);
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2);
+
+  // Each entry gets a fresh key, so the reply is the same in either round.
+  // XGROUP earns its place: it is the only single-key write whose key is not
+  // argv[1], so it is the one that catches a wrong key index.
+  struct SingleKeyWrite {
+    std::vector<std::string> args_;
+    std::string reply_;
+  };
+  const auto battery = [](const std::string& key) {
+    return std::vector<SingleKeyWrite>{
+        {{"SET", key + ":str", "v0"}, "+OK"},
+        {{"APPEND", key + ":str", "x"}, ":3"},
+        {{"SETRANGE", key + ":str", "1", "Y"}, ":3"},
+        {{"GETSET", key + ":str", "z"}, Bulk("vYx")},
+        {{"GETDEL", key + ":str"}, Bulk("z")},
+        {{"INCR", key + ":ctr"}, ":1"},
+        {{"INCRBY", key + ":ctr", "41"}, ":42"},
+        {{"EXPIRE", key + ":ctr", "100"}, ":1"},
+        {{"PERSIST", key + ":ctr"}, ":1"},
+        {{"HSET", key + ":hash", "f", "1"}, ":1"},
+        {{"HINCRBY", key + ":hash", "f", "2"}, ":3"},
+        {{"LPUSH", key + ":list", "a"}, ":1"},
+        {{"RPUSH", key + ":list", "b"}, ":2"},
+        {{"SADD", key + ":set", "m"}, ":1"},
+        {{"ZADD", key + ":zset", "1", "m"}, ":1"},
+        {{"XADD", key + ":stream", "1-1", "f", "v"}, Bulk("1-1")},
+        {{"XGROUP", "CREATE", key + ":stream", "g", "0"}, "+OK"},
+        {{"SETEX", key + ":vol", "100", "v"}, "+OK"},
+        {{"SETNX", key + ":nx", "v"}, ":1"},
+    };
+  };
+  // What the battery leaves behind.
+  const auto effects = [](const std::string& key) {
+    return std::vector<SingleKeyWrite>{
+        {{"GET", key + ":str"}, "$-1"},
+        {{"GET", key + ":ctr"}, Bulk("42")},
+        {{"TTL", key + ":ctr"}, ":-1"},
+        {{"HGET", key + ":hash", "f"}, Bulk("3")},
+        {{"LRANGE", key + ":list", "0", "-1"}, BulkArray({"a", "b"})},
+        {{"SCARD", key + ":set"}, ":1"},
+        {{"ZSCORE", key + ":zset", "m"}, Bulk("1")},
+        {{"XLEN", key + ":stream"}, ":1"},
+        {{"GET", key + ":vol"}, Bulk("v")},
+        {{"GET", key + ":nx"}, Bulk("v")},
+    };
+  };
+  const auto as_views = [](const std::vector<std::string>& args) {
+    return std::vector<std::string_view>(args.begin(), args.end());
+  };
+
+  // Connections are assigned to workers round-robin, so enough of them crossed
+  // with keys pinned to every worker covers both the connection-owns-the-key
+  // case and the it-does-not case. Which connection draws which worker is not
+  // asserted, only that they all behave the same.
+  constexpr unsigned kConnections = 6;
+  const auto run_battery = [&](std::string_view round) {
+    std::vector<std::string> replies;
+    std::vector<std::string> keys;
+    for (unsigned connection = 0; connection < kConnections; ++connection) {
+      RespClient client(source_port);
+      for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+        const std::string key = KeyForWorker(std::string(round) + "-c" +
+                                                 std::to_string(connection) +
+                                                 "-w" + std::to_string(worker),
+                                             worker, kSourceThreads);
+        keys.push_back(key);
+        for (const SingleKeyWrite& write : battery(key)) {
+          const std::string reply = client.Command(as_views(write.args_));
+          EXPECT_EQ(reply, write.reply_) << write.args_[0] << " on " << key;
+          replies.push_back(reply);
+        }
+      }
+    }
+    return std::pair{std::move(replies), std::move(keys)};
+  };
+
+  // Round one: no replica attached, so no publisher admission is taken.
+  auto [solo_replies, solo_keys] = run_battery("collapse-solo");
+
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replication_info;
+  do {
+    replication_info = replica_client.Command({"INFO", "replication"});
+    if (replication_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replication_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+
+  // Round two: the same writes, now each taking admission on its key owner.
+  auto [replicated_replies, replicated_keys] = run_battery("collapse-repl");
+  EXPECT_EQ(replicated_replies, solo_replies);
+
+  // Round-one effects predate the replica, so they arrive through the
+  // full-sync baseline rather than the live flow.
+  std::vector<std::string> all_keys = std::move(solo_keys);
+  all_keys.insert(all_keys.end(),
+                  std::make_move_iterator(replicated_keys.begin()),
+                  std::make_move_iterator(replicated_keys.end()));
+  RespClient source_client(source_port);
+  for (const std::string& key : all_keys) {
+    for (const SingleKeyWrite& effect : effects(key)) {
+      EXPECT_EQ(source_client.Command(as_views(effect.args_)), effect.reply_)
+          << effect.args_[0] << " on source " << key;
+      // ASSERT, not EXPECT: hundreds of these follow, and once replication
+      // stops converging each one burns its whole timeout.
+      ASSERT_TRUE(WaitForEventualReply(replica_client, as_views(effect.args_),
+                                       effect.reply_, 30s))
+          << effect.args_[0] << " on replica " << key;
+    }
+  }
+
+  replica.Stop();
+  source.Stop();
+}
+
+// A tight waterline is what makes acquire/release testable as a pair: an
+// admission that is acquired and never released exhausts it part-way through,
+// so a leak hangs this test rather than passing it.
+//
+// This deliberately does not claim the source ever waited. With the replica on
+// loopback the publish queue drains faster than a client can fill it, so the
+// waiting branch is not reached at this seam either way. The path that does
+// wait -- a value larger than the whole waterline, admitted only against an
+// empty queue -- is covered by PublisherBackpressurePreservesHistoryAndReplica.
+TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-single-key-backpressure-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  constexpr unsigned kSourceThreads = 3;
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       kSourceThreads, {},
+                       {"--replication-publish-queue-mb-per-worker", "1"});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2);
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replication_info;
+  do {
+    replication_info = replica_client.Command({"INFO", "replication"});
+    if (replication_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replication_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+
+  // Two MiB per worker against a one MiB per-worker waterline. Each value gets
+  // its own key: appending to one growing value instead would spend the run on
+  // storage reclaim rather than on admission.
+  constexpr unsigned kWrites = 64;
+  constexpr std::size_t kValueBytes = 32 * 1024;
+  const auto value = [](unsigned index) {
+    std::string payload(kValueBytes, 'v');
+    const std::string tag = "v" + std::to_string(index) + ":";
+    payload.replace(0, tag.size(), tag);
+    return payload;
+  };
+  std::vector<std::vector<std::string>> keys(kSourceThreads);
+  std::vector<std::string> markers;
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    const std::string worker_prefix =
+        "backpressure-w" + std::to_string(worker) + "-";
+    keys[worker].reserve(kWrites);
+    for (unsigned index = 0; index < kWrites; ++index) {
+      keys[worker].push_back(KeyForWorker(worker_prefix + std::to_string(index),
+                                          worker, kSourceThreads));
+    }
+    markers.push_back(
+        KeyForWorker(worker_prefix + "marker", worker, kSourceThreads));
+  }
+
+  // The writers report rather than assert: a gtest assertion only returns from
+  // the lambda, which would leave the marker unwritten and hide the real
+  // failure behind a marker timeout further down.
+  std::vector<std::future<std::string>> writers;
+  writers.reserve(kSourceThreads);
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    writers.push_back(std::async(std::launch::async, [&, worker] {
+      RespClient client(source_port);
+      for (unsigned index = 0; index < kWrites; ++index) {
+        const std::string reply =
+            client.Command({"SET", keys[worker][index], value(index)});
+        if (reply != "+OK") {
+          return "SET " + keys[worker][index] + " replied " + reply;
+        }
+      }
+      // Written last, so it is also published last for this worker.
+      const std::string marked =
+          client.Command({"SET", markers[worker], "done"});
+      if (marked != "+OK") {
+        return "SET " + markers[worker] + " replied " + marked;
+      }
+      return std::string{};
+    }));
+  }
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    ASSERT_EQ(writers[worker].get(), "") << "writer for worker " << worker;
+  }
+
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    // A worker publishes in the order it admitted and the replica applies each
+    // flow in order, so waiting on the marker alone -- and not on the values --
+    // is what makes this an ordering assertion rather than a convergence one.
+    ASSERT_TRUE(WaitForEventualReply(replica_client, {"GET", markers[worker]},
+                                     Bulk("done")))
+        << "replica never received the marker for worker " << worker;
+    for (unsigned index = 0; index < kWrites; ++index) {
+      const std::string& key = keys[worker][index];
+      EXPECT_TRUE(replica_client.Command({"GET", key}) == Bulk(value(index)))
+          << "replica is missing or has the wrong value for " << key
+          << ", written before an already-visible marker";
+    }
+  }
+
+  replica.Stop();
+  source.Stop();
+}
+
+#if KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT
+// The rest of this file can only fence behaviour, and the collapse changes no
+// behaviour -- it removes two cross-core round trips per write, which is
+// latency, which nothing can assert. Configuring with
+// -DKEYLANE_ENABLE_CROSS_CORE_HOP_COUNT=ON counts the transfers instead, so
+// the one-hop property has a regression fence and not just a benchmark.
+//
+// The claim being fenced is the issue's headline: attaching a replica must
+// stop adding cross-core round trips to a single-key write. So the same writes
+// run twice, once with no replica and once with one, and the two hop counts
+// must match. Before the collapse the second round cost three times the first.
+TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-single-key-hops-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    // Only tiny writes; the smallest allocation the engine accepts is plenty.
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  constexpr unsigned kSourceThreads = 3;
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       kSourceThreads);
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2);
+
+  // A single writer connection sits on exactly one worker, and the keys are
+  // pinned one third to each of the three. Two thirds of the writes therefore
+  // cross a core, whichever worker the connection happened to draw. A warmup
+  // below removes one-time storage SubmitTaskTo work from the measured rounds,
+  // making the expected steady-state count exact rather than a bound.
+  constexpr unsigned kPerWorker = 30;
+  constexpr std::uint64_t kRemoteWrites = 2 * kPerWorker;
+  RespClient writer(source_port);
+  RespClient observer(source_port);
+  std::vector<std::string> keys;
+  keys.reserve(kSourceThreads * kPerWorker);
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    for (unsigned index = 0; index < kPerWorker; ++index) {
+      keys.push_back(KeyForWorker(
+          "hops-w" + std::to_string(worker) + "-" + std::to_string(index),
+          worker, kSourceThreads));
+    }
+  }
+  const auto hops = [](RespClient& client) {
+    constexpr std::string_view marker = "command_cross_core_hops:";
+    const std::string info = client.Command({"INFO", "STATS"});
+    const std::size_t begin = info.find(marker);
+    if (begin == std::string::npos) {
+      throw std::runtime_error("hop counter is missing from INFO STATS");
+    }
+    const std::size_t value_begin = begin + marker.size();
+    const std::size_t value_end = info.find("\r\n", value_begin);
+    std::uint64_t counted = 0;
+    const char* first = info.data() + value_begin;
+    const char* last = info.data() + value_end;
+    const auto [parsed, error] = std::from_chars(first, last, counted);
+    if (error != std::errc{} || parsed != last) {
+      throw std::runtime_error("malformed hop counter");
+    }
+    return counted;
+  };
+  // INFO gathers each worker's local counter with SubmitTo, so reading the
+  // SubmitTaskTo counter cannot move it.
+  // EXPECT, not ASSERT: a gtest assertion returns from the enclosing function,
+  // which here is the lambda, and the hop delta still has to be computed.
+  const auto write_all = [&](std::string_view round) -> std::uint64_t {
+    const std::uint64_t before = hops(observer);
+    for (const std::string& key : keys) {
+      EXPECT_EQ(writer.Command({"SET", key, round}), "+OK");
+    }
+    return hops(observer) - before;
+  };
+
+  (void)write_all("warmup");
+  const std::uint64_t solo_hops = write_all("solo");
+  EXPECT_EQ(solo_hops, kRemoteWrites);
+
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replication_info;
+  do {
+    replication_info = replica_client.Command({"INFO", "replication"});
+    if (replication_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replication_info.find("keylane_replication_state:online"),
+            std::string::npos);
+
+  const std::uint64_t replicated_hops = write_all("replicated");
+  EXPECT_EQ(replicated_hops, solo_hops);
+  EXPECT_EQ(replicated_hops, kRemoteWrites);
+
+  replica.Stop();
+  source.Stop();
+}
+#endif  // KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT
 
 // Covers asymmetric source/replica worker counts, dynamic replica admission,
 // a one-shot flow disconnect, backlog continuation, and FLUSHDB propagation.
