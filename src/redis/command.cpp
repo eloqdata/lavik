@@ -7425,6 +7425,10 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
 #endif
 #if KEYLANE_ENABLE_SET_LATENCY_TRACE
         if (request.kind_ == CommandKind::kSet) {
+          // A source SET arrives here already on the key owner (ExecuteCommand
+          // transfers once, above the admission wrapper), so remote_ reads
+          // false and the cross-core segment is charged to the caller rather
+          // than to this trace. Read route-out as zero, not as "no hop".
           SetLatencyTrace trace;
           trace.request_start_ns_ = SetTraceNowNanos();
           trace.remote_ = target != ThisWorker().id_;
@@ -7471,8 +7475,57 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
   }
 }
 
-Task<CommandReply> ExecuteCommand(const CommandRequest& request,
-                                  ReplyBuilder& reply_builder) {
+namespace {
+
+// The worker a single-key write must run on for its admission, its body, and
+// its admission release to share one visit, or nullopt when the command keeps
+// the general structure.
+//
+// Publisher admission reserves worker-local state -- the replication log's
+// admitted-bytes waterline, the full-sync sessions' waterlines, the worker's
+// admission ticket sequence -- on the worker that appends this write to its
+// replication log, which is the key owner. That is the same worker the command
+// body dispatches to. Resolving it once out here leaves all three of those
+// steps on their existing "already on the target" inline paths, so the write
+// pays one cross-core round trip instead of three.
+//
+// Excluded, deliberately: replication-origin replays (they never take source
+// admission), global and multi-key writes (no single owner to collapse onto),
+// and writes this server rejects outright.
+std::optional<unsigned> SingleKeyWriteOwner(const CommandRequest& request) {
+  if (request.replication_origin_ || request.spec_ == nullptr ||
+      g_storage == nullptr) {
+    return std::nullopt;
+  }
+  if ((request.spec_->flags_ & kCmdWrite) == 0 ||
+      (request.spec_->flags_ & (kCmdGlobal | kCmdMultiShard)) != 0) {
+    return std::nullopt;
+  }
+  // A write this server refuses is answered on the connection worker today.
+  // Keep it there: a read-only replica should not spend cross-core round trips
+  // producing READONLY errors for misdirected clients.
+  if (g_replication != nullptr ? g_replication->reject_writes()
+                               : g_replica_read_only) {
+    return std::nullopt;
+  }
+  const absl::StatusOr<KeyIndexView> keys =
+      DetermineKeys(*request.spec_, request.args_);
+  // count() == 1 rather than !empty(): XGROUP HELP resolves to no key at all
+  // and must keep the all-worker admission fan-out.
+  if (!keys.ok() || keys->count() != 1) return std::nullopt;
+  return ShardForKey(request.args_[keys->first_]);
+}
+
+// Publisher admission, the command, and the release, all on the worker this
+// runs on. ExecuteCommand below has already moved to the key owner when the
+// command is a single-key write, so nothing in here transfers again.
+//
+// The acquire must stay ahead of the DB gate that ExecuteCommandBody takes.
+// Admission suspends on the owner's publish-queue capacity, and holding that
+// same worker's DB gate across the wait would stall every FLUSHDB and
+// FULLSYNC_CUT drain that waits for the gate counts to reach zero.
+Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
+                                          ReplyBuilder& reply_builder) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & kCmdWrite) != 0 && g_storage != nullptr &&
@@ -7496,6 +7549,20 @@ Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                      released.message())));
   }
   co_return reply;
+}
+
+}  // namespace
+
+Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
+  const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
+  if (owner.has_value() && *owner != ThisWorker().id_) {
+    co_return co_await SubmitTaskTo(
+        *owner, [&request, &reply_builder]() -> Task<CommandReply> {
+          co_return co_await ExecuteAdmittedCommand(request, reply_builder);
+        });
+  }
+  co_return co_await ExecuteAdmittedCommand(request, reply_builder);
 }
 
 Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {
