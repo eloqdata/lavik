@@ -57,4 +57,33 @@ class FileReader {
 absl::StatusOr<std::string> EncodeDump(const storage::RawValue& value);
 absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload);
 
+// Encodes one self-contained RDB key fragment. It includes SELECTDB so
+// fragments produced concurrently by different storage workers may be
+// written in any order by the single checksum/file sink.
+absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
+                                            std::string_view key,
+                                            const storage::RawValue& value);
+
+// Blocking filesystem sink used only by the backup writer thread. Open writes
+// the Redis header to a same-directory temporary file; Finish appends EOF and
+// checksum, fdatasyncs, atomically renames, and fsyncs the directory.
+class FileWriter {
+ public:
+  static absl::StatusOr<FileWriter> Open(std::string target_path);
+
+  FileWriter(FileWriter&&) noexcept;
+  FileWriter& operator=(FileWriter&&) noexcept;
+  FileWriter(const FileWriter&) = delete;
+  FileWriter& operator=(const FileWriter&) = delete;
+  ~FileWriter();
+
+  absl::Status WriteFragment(std::string_view fragment);
+  absl::Status Finish();
+
+ private:
+  struct Impl;
+  explicit FileWriter(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+};
+
 }  // namespace keylane::rdb

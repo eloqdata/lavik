@@ -1522,6 +1522,28 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
     co_return absl::OkStatus();
   }
+  if (!for_defrag && partition_ptr != nullptr &&
+      partition_ptr->rdb_snapshot_.has_value()) [[unlikely]] {
+    // The capture stores only physical metadata and pins. It may release the
+    // store mutex while pinning a block owned by another worker, so resolve
+    // the current entry again before the ordinary overwrite bookkeeping.
+    (void)co_await CaptureRdbSnapshotBeforeWriteLocked(store, *partition_ptr,
+                                                       db_id, key, digest);
+    previous_entry =
+        index_ptr != nullptr ? index_ptr->Find(digest, key) : nullptr;
+    if (previous_entry != nullptr && !previous_entry->key_complete())
+        [[unlikely]] {
+      auto resolved =
+          co_await FindVerifiedEntry(store, *index_ptr, digest, key);
+      if (!resolved.ok()) co_return resolved.status();
+      previous_entry = *resolved;
+    }
+    if (explicit_root != nullptr && explicit_root->reject_older_sequence_ &&
+        previous_entry != nullptr &&
+        previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
+      co_return absl::OkStatus();
+    }
+  }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
           ? std::nullopt

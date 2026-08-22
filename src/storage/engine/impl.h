@@ -1090,6 +1090,29 @@ class StorageEngine::Impl {
     };
 
     struct PartitionStore {
+      struct RdbSnapshotValue {
+        enum class Phase : std::uint8_t {
+          kOldValue,
+          kAbsent,
+          kInflight,
+          kDone,
+        };
+
+        RecordLocation location_{};
+        ExtentManifest extents_;
+        Phase phase_ = Phase::kAbsent;
+        bool pins_held_ = false;
+      };
+
+      struct RdbSnapshotCapture {
+        std::uint64_t session_id_ = 0;
+        std::uint64_t cut_sequence_ = 0;
+        std::uint64_t snapshot_time_ms_ = 0;
+        ScanHashMap<RdbSnapshotValue> dirty_keys_;
+        std::uint32_t capture_admissions_ = 0;
+        bool accepting_ = true;
+      };
+
       struct ReplicaSyncState {
         std::array<std::uint64_t, kLogicalDatabaseCount> source_db_epochs_{};
         std::array<std::uint64_t, kLogicalDatabaseCount> local_db_epochs_{};
@@ -1112,6 +1135,7 @@ class StorageEngine::Impl {
       // this map through one [[unlikely]] branch and synchronously coalesce
       // the latest committed record for each (db,key).
       absl::flat_hash_map<std::uint64_t, FullSyncCapture> fullsync_subscribers_;
+      std::optional<RdbSnapshotCapture> rdb_snapshot_;
       std::optional<ReplicaValueStage> replica_value_stage_;
       // Small protocol state only. Full sync destructively rebuilds indexes_
       // in place; no second data root is retained in the first version.
@@ -1135,6 +1159,12 @@ class StorageEngine::Impl {
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
     std::vector<PartitionStore> partitions_;
+    struct RdbSnapshotSession {
+      std::uint64_t id_ = 0;
+      std::uint64_t snapshot_time_ms_ = 0;
+      bool invalidated_ = false;
+    };
+    std::optional<RdbSnapshotSession> rdb_snapshot_;
     // Serializes replica apply/reset work on this worker across sessions. A
     // disconnected session may still be suspended in storage IO; a new full
     // sync must not reset a partition until that stale apply has completed.
@@ -1568,6 +1598,13 @@ class StorageEngine::Impl {
       std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
       std::size_t count, std::uint64_t now_ms,
       std::size_t max_bytes = SIZE_MAX);
+
+  absl::Status BeginRdbSnapshot(std::uint64_t session_id,
+                                std::uint64_t snapshot_time_ms);
+  Task<absl::StatusOr<RdbSnapshotBatch>> ReadRdbSnapshotBatch(
+      std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
+      std::size_t max_bytes);
+  Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
 
   absl::StatusOr<FullSyncSessionStart> BeginFullSyncSession(
       std::uint64_t session_id);
@@ -2127,6 +2164,19 @@ class StorageEngine::Impl {
       std::uint64_t* committed_sequence = nullptr,
       ReplicationCommandAppend* replication = nullptr,
       SetLatencyTrace* trace = nullptr, bool capture_fullsync = true);
+
+  Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      std::uint8_t db_id, std::string_view key, const Digest& digest);
+  Task<absl::Status> PinRdbSnapshotValue(
+      WorkerStore::PartitionStore::RdbSnapshotValue* value);
+  Task<absl::Status> ReleaseRdbSnapshotValue(
+      WorkerStore::PartitionStore::RdbSnapshotValue* value);
+  Task<absl::StatusOr<std::optional<storage::RdbSnapshotValue>>>
+  MaterializeRdbSnapshotKey(WorkerStore& store,
+                            WorkerStore::PartitionStore& partition,
+                            std::uint64_t session_id, std::uint8_t db_id,
+                            std::string key);
 
   void FullSyncOnCommit(
       WorkerStore& store, WorkerStore::PartitionStore& partition,

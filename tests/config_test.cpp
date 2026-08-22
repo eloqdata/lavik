@@ -104,6 +104,9 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
           .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"load-rdb-replace", "yes"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"dir", "/backup"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"dbfilename", "snapshot.rdb"}, &options).ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -122,6 +125,8 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
             2ULL * 1024 * 1024 * 1024);
   EXPECT_EQ(options.load_rdb_file_, "/backup/dump.rdb");
   EXPECT_TRUE(options.load_rdb_replace_);
+  EXPECT_EQ(options.rdb_dir_, "/backup");
+  EXPECT_EQ(options.dbfilename_, "snapshot.rdb");
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
@@ -224,6 +229,17 @@ TEST(RedisConfigTest, RejectsLoadRdbReplaceWithoutSource) {
   EXPECT_FALSE(ValidateServerOptions(options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"load-rdb-replace", "maybe"}, &options).ok());
+}
+
+TEST(RedisConfigTest, RejectsInvalidRdbOutputNames) {
+  ServerOptions options;
+  options.rdb_dir_.clear();
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.rdb_dir_ = "/backup";
+  options.dbfilename_ = "nested/dump.rdb";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.dbfilename_ = "..";
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
 TEST(RedisConfigTest, LoadsFileAndReportsLineNumber) {

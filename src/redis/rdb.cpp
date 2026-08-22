@@ -86,8 +86,7 @@ std::uint64_t Reflect64(std::uint64_t value) {
   return result;
 }
 
-std::uint64_t Crc64(std::string_view input) {
-  std::uint64_t crc = 0;
+std::uint64_t UpdateCrc64(std::uint64_t crc, std::string_view input) {
   for (unsigned char byte : input) {
     for (unsigned mask = 1; mask <= 0x80; mask <<= 1) {
       bool high = (crc & (std::uint64_t{1} << 63)) != 0;
@@ -96,7 +95,11 @@ std::uint64_t Crc64(std::string_view input) {
       if (high) crc ^= kCrcPolynomial;
     }
   }
-  return Reflect64(crc);
+  return crc;
+}
+
+std::uint64_t Crc64(std::string_view input) {
+  return Reflect64(UpdateCrc64(0, input));
 }
 
 void PutLe16(std::string* out, std::uint16_t value) {
@@ -1850,10 +1853,171 @@ void FileReader::Rewind() { impl_->Rewind(); }
 
 unsigned FileReader::version() const noexcept { return impl_->version_; }
 
+struct FileWriter::Impl {
+  ~Impl() {
+    if (fd_ >= 0) ::close(fd_);
+    if (!temporary_path_.empty()) ::unlink(temporary_path_.c_str());
+  }
+
+  absl::Status Write(std::string_view bytes, bool checksum = true) {
+    while (!bytes.empty()) {
+      const ssize_t written = ::write(fd_, bytes.data(), bytes.size());
+      if (written < 0) {
+        if (errno == EINTR) continue;
+        return absl::InternalError(absl::StrCat(
+            "cannot write RDB temporary file: ", std::strerror(errno)));
+      }
+      if (written == 0) {
+        return absl::InternalError("short write to RDB temporary file");
+      }
+      const std::string_view part =
+          bytes.substr(0, static_cast<std::size_t>(written));
+      if (checksum) crc_ = UpdateCrc64(crc_, part);
+      bytes.remove_prefix(static_cast<std::size_t>(written));
+    }
+    return absl::OkStatus();
+  }
+
+  int fd_ = -1;
+  std::string target_path_;
+  std::string temporary_path_;
+  std::string directory_;
+  std::uint64_t crc_ = 0;
+  bool finished_ = false;
+};
+
+FileWriter::FileWriter(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+FileWriter::FileWriter(FileWriter&&) noexcept = default;
+FileWriter& FileWriter::operator=(FileWriter&&) noexcept = default;
+FileWriter::~FileWriter() = default;
+
+absl::StatusOr<FileWriter> FileWriter::Open(std::string target_path) {
+  if (target_path.empty()) {
+    return absl::InvalidArgumentError("RDB target path is empty");
+  }
+  const std::size_t slash = target_path.find_last_of('/');
+  const std::string directory =
+      slash == std::string::npos
+          ? "."
+          : (slash == 0 ? "/" : target_path.substr(0, slash));
+  const std::string basename =
+      slash == std::string::npos ? target_path : target_path.substr(slash + 1);
+  if (basename.empty() || basename == "." || basename == "..") {
+    return absl::InvalidArgumentError("invalid RDB target filename");
+  }
+  struct stat directory_info {};
+  if (::stat(directory.c_str(), &directory_info) != 0 ||
+      !S_ISDIR(directory_info.st_mode)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("RDB directory is not accessible: ", directory));
+  }
+
+  std::string temporary =
+      absl::StrCat(directory, "/.", basename, ".tmp.XXXXXX");
+  std::vector<char> path(temporary.begin(), temporary.end());
+  path.push_back('\0');
+  const int fd = ::mkstemp(path.data());
+  if (fd < 0) {
+    return absl::InternalError(
+        absl::StrCat("cannot create RDB temporary file in '", directory,
+                     "': ", std::strerror(errno)));
+  }
+  (void)::fcntl(fd, F_SETFD, FD_CLOEXEC);
+  auto impl = std::make_unique<Impl>();
+  impl->fd_ = fd;
+  impl->target_path_ = std::move(target_path);
+  impl->temporary_path_ = path.data();
+  impl->directory_ = directory;
+  FileWriter writer(std::move(impl));
+  const std::string version = std::to_string(kVersion);
+  const std::string header =
+      absl::StrCat("REDIS", std::string(4 - version.size(), '0'), version);
+  absl::Status written = writer.impl_->Write(header);
+  if (!written.ok()) return written;
+  return writer;
+}
+
+absl::Status FileWriter::WriteFragment(std::string_view fragment) {
+  if (impl_ == nullptr || impl_->fd_ < 0 || impl_->finished_) {
+    return absl::FailedPreconditionError("RDB writer is not open");
+  }
+  return impl_->Write(fragment);
+}
+
+absl::Status FileWriter::Finish() {
+  if (impl_ == nullptr || impl_->fd_ < 0 || impl_->finished_) {
+    return absl::FailedPreconditionError("RDB writer is not open");
+  }
+  const char eof = static_cast<char>(kEof);
+  absl::Status status = impl_->Write(std::string_view(&eof, 1));
+  if (status.ok()) {
+    std::string checksum;
+    PutLe64(&checksum, Reflect64(impl_->crc_));
+    status = impl_->Write(checksum, false);
+  }
+  if (status.ok() && ::fdatasync(impl_->fd_) != 0) {
+    status = absl::InternalError(
+        absl::StrCat("cannot sync RDB temporary file: ", std::strerror(errno)));
+  }
+  if (::close(impl_->fd_) != 0 && status.ok()) {
+    status = absl::InternalError(absl::StrCat(
+        "cannot close RDB temporary file: ", std::strerror(errno)));
+  }
+  impl_->fd_ = -1;
+  if (!status.ok()) return status;
+  if (::rename(impl_->temporary_path_.c_str(), impl_->target_path_.c_str()) !=
+      0) {
+    return absl::InternalError(
+        absl::StrCat("cannot replace RDB file: ", std::strerror(errno)));
+  }
+  impl_->temporary_path_.clear();
+  const int directory_fd =
+      ::open(impl_->directory_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory_fd < 0) {
+    return absl::InternalError(absl::StrCat(
+        "cannot open RDB directory for sync: ", std::strerror(errno)));
+  }
+  const int sync_result = ::fsync(directory_fd);
+  const int sync_error = errno;
+  ::close(directory_fd);
+  if (sync_result != 0) {
+    return absl::InternalError(
+        absl::StrCat("cannot sync RDB directory: ", std::strerror(sync_error)));
+  }
+  impl_->finished_ = true;
+  return absl::OkStatus();
+}
+
 absl::StatusOr<std::string> EncodeDump(const storage::RawValue& value) {
   auto logical = DecodeRaw(value);
   if (!logical.ok()) return logical.status();
   return EncodeRdbObject(*logical);
+}
+
+absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
+                                            std::string_view key,
+                                            const storage::RawValue& value) {
+  if (db_id >= storage::kLogicalDatabaseCount ||
+      key.size() > storage::MaxKeyBytes()) {
+    return absl::InvalidArgumentError("invalid RDB file entry");
+  }
+  auto dump = EncodeDump(value);
+  if (!dump.ok()) return dump.status();
+  if (dump->size() < 11) {
+    return absl::InternalError("encoded RDB object is truncated");
+  }
+  std::string output;
+  output.reserve(key.size() + dump->size() + 24);
+  output.push_back(static_cast<char>(kSelectDb));
+  WriteLength(&output, db_id);
+  if (value.expire_at_ms_ != 0) {
+    output.push_back(static_cast<char>(kExpireTimeMs));
+    PutLe64(&output, value.expire_at_ms_);
+  }
+  output.push_back((*dump)[0]);
+  WriteString(&output, key);
+  output.append(dump->data() + 1, dump->size() - 11);
+  return output;
 }
 
 absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload) {

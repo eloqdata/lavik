@@ -47,6 +47,10 @@ struct ServerOptions {
   std::size_t flush_size_bytes_ = 128ULL * 1024;
   bool verify_read_crc_ = true;
   std::vector<std::string> data_files_{"keylane.data"};
+  // RDB output always uses a normal filesystem directory, independently of
+  // whether data_files_ names regular files, block devices, or SPDK devices.
+  std::string rdb_dir_{"."};
+  std::string dbfilename_{"dump.rdb"};
   // One-shot logical import performed after storage recovery and before any
   // listener opens. The target Keylane dataset must be empty.
   std::string load_rdb_file_;

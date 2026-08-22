@@ -189,7 +189,8 @@ absl::Status ApplyRedisConfigDirective(
   }
   if (name == "tls-cert-file" || name == "tls-key-file" ||
       name == "tls-ca-cert-file" || name == "requirepass" ||
-      name == "masteruser" || name == "masterauth" || name == "load-rdb") {
+      name == "masteruser" || name == "masterauth" || name == "load-rdb" ||
+      name == "rdb-dir" || name == "dir" || name == "dbfilename") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     if (name == "tls-cert-file") options->tls_cert_file_ = directive[1];
     if (name == "tls-key-file") options->tls_key_file_ = directive[1];
@@ -198,6 +199,8 @@ absl::Status ApplyRedisConfigDirective(
     if (name == "masteruser") options->masteruser_ = directive[1];
     if (name == "masterauth") options->masterauth_ = directive[1];
     if (name == "load-rdb") options->load_rdb_file_ = directive[1];
+    if (name == "rdb-dir" || name == "dir") options->rdb_dir_ = directive[1];
+    if (name == "dbfilename") options->dbfilename_ = directive[1];
     return absl::OkStatus();
   }
   if (name == "tls-auth-clients") {
@@ -368,6 +371,15 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (options.load_rdb_replace_ && options.load_rdb_file_.empty()) {
     return absl::InvalidArgumentError(
         "load-rdb-replace requires load-rdb to be configured");
+  }
+  if (options.rdb_dir_.empty()) {
+    return absl::InvalidArgumentError("rdb-dir must not be empty");
+  }
+  if (options.dbfilename_.empty() || options.dbfilename_ == "." ||
+      options.dbfilename_ == ".." ||
+      options.dbfilename_.find('/') != std::string::npos) {
+    return absl::InvalidArgumentError(
+        "dbfilename must be a plain filename without '/'");
   }
   if (options.storage_write_buffer_count_ == 0) {
     return absl::InvalidArgumentError(

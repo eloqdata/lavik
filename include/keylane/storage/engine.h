@@ -557,6 +557,30 @@ struct RawValue {
   ValueType value_type_ = ValueType::kNone;
 };
 
+// One Redis-visible value materialized from an online point-in-time snapshot.
+// Batches are deliberately value-oriented so the RDB encoder can run outside
+// the storage worker and no physical block remains pinned while filesystem IO
+// is pending.
+struct RdbSnapshotValue {
+  std::uint8_t db_id_ = 0;
+  std::string key_;
+  RawValue value_;
+};
+
+struct RdbSnapshotCursor {
+  std::size_t partition_index_ = 0;
+  std::uint8_t db_id_ = 0;
+  std::uint64_t index_cursor_ = 0;
+  std::uint64_t dirty_cursor_ = 0;
+  bool finalizing_ = false;
+};
+
+struct RdbSnapshotBatch {
+  RdbSnapshotCursor cursor_;
+  std::vector<RdbSnapshotValue> values_;
+  bool done_ = false;
+};
+
 struct RestoreRawResult {
   bool busy_ = false;
   bool changed_ = false;
@@ -645,6 +669,17 @@ class StorageEngine {
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
   std::size_t LocalSize(std::uint8_t db_id) const noexcept;
+
+  // The command layer closes and drains every DB gate before invoking Begin
+  // on all workers. That short cut cannot split a transaction. Scanning then
+  // proceeds online: the first post-cut mutation of a not-yet-covered key
+  // pins its old physical record in a partition-local ScanHashMap.
+  absl::Status BeginRdbSnapshot(std::uint64_t session_id,
+                                std::uint64_t snapshot_time_ms);
+  celer::Task<absl::StatusOr<RdbSnapshotBatch>> ReadRdbSnapshotBatch(
+      std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
+      std::size_t max_bytes);
+  celer::Task<absl::Status> EndRdbSnapshot(std::uint64_t session_id);
   // Runs on one worker and returns a random live key owned by that worker.
   // Nullopt means this worker currently has no live key in the database.
   celer::Task<absl::StatusOr<std::optional<std::string>>> RandomKeyLocal(

@@ -24,6 +24,7 @@
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_cat.h"
+#include "backup.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/cycle_clock.h"
@@ -7074,6 +7075,11 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
 
     case CommandKind::kKeys:
       co_return co_await ExecuteKeys(request, reply_builder);
+
+    case CommandKind::kSave:
+    case CommandKind::kBgSave:
+    case CommandKind::kLastSave:
+      co_return co_await ExecuteRdbBackupCommand(request, reply_builder);
 
     case CommandKind::kDbSize:
       co_return co_await ExecuteDbSize(request, reply_builder);
