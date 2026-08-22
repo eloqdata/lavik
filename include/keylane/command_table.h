@@ -24,6 +24,8 @@ enum CommandFlag : std::uint32_t {
   // The handler may wait indefinitely and therefore acquires the DB gate only
   // around each concrete attempt, never around the wait itself.
   kCmdMayBlock = 1u << 7,
+  kCmdAdmin = 1u << 8,        // omitted from MONITOR output
+  kCmdSkipMonitor = 1u << 9,  // explicit MONITOR suppression
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the

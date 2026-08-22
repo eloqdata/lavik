@@ -11,6 +11,8 @@
 
 namespace keylane {
 
+class MonitorSession;
+
 // Per-connection state, owned by the connection's Serve coroutine frame.
 // Everything here must be cleaned up through the single cleanup point at the
 // end of RedisService::Serve.
@@ -50,7 +52,9 @@ struct ConnectionContext {
     bool live_ = false;
   };
   std::uint64_t conn_id_ = 0;
+  std::string peer_address_;
   std::vector<WatchedKey> watched_;
+  std::shared_ptr<MonitorSession> monitor_session_;
 
   void ResetMulti() {
     in_multi_ = false;

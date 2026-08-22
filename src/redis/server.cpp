@@ -39,6 +39,7 @@
 #include "keylane/config.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
+#include "keylane/monitor.h"
 #include "keylane/rdb.h"
 #include "keylane/replication.h"
 #include "keylane/resp.h"
@@ -498,7 +499,15 @@ class RedisService final : public TcpService {
     explicit RequestGuard(RedisService* service) : service_(service) {}
     RequestGuard(const RequestGuard&) = delete;
     RequestGuard& operator=(const RequestGuard&) = delete;
-    ~RequestGuard() { service_->EndRequest(); }
+    ~RequestGuard() {
+      if (service_ != nullptr) service_->EndRequest();
+    }
+
+    void Release() noexcept {
+      if (service_ == nullptr) return;
+      service_->EndRequest();
+      service_ = nullptr;
+    }
 
    private:
     RedisService* service_;
@@ -527,6 +536,7 @@ class RedisService final : public TcpService {
 
 void RedisService::Prepare(unsigned thread_count) {
   TcpService::Prepare(thread_count);
+  PrepareMonitor(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   recovery_collect_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   online_allocator_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -797,12 +807,14 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   auto peer_address = stream.PeerAddress();
   const std::string address =
       peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
+  ctx.peer_address_ = address;
   const bool tls = stream.IsTls();
   RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
   ConnectionOpened();
   const absl::Status status = co_await Serve(stream, ctx);
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
+  UnregisterMonitorSession(ctx.monitor_session_);
   UnregisterClientConnection(ctx.conn_id_);
   co_await ReleaseConnectionWatches(ctx);
   if (ctx.counted_as_client_) ConnectionClosed();
@@ -875,6 +887,13 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 
     const auto& args = command_result->args_;
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "AUTH")) {
+      std::shared_ptr<const std::string> monitor_message;
+      if (HasMonitorSessions()) [[unlikely]] {
+        if (args.size() == 2 || args.size() == 3) {
+          monitor_message =
+              PrepareMonitorMessage(ctx.selected_db_, ctx.peer_address_, args);
+        }
+      }
       std::string_view encoded;
       if (args.size() != 2 && args.size() != 3) {
         encoded = ctx.reply_builder_.AppendError(
@@ -895,6 +914,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
               "WRONGPASS invalid username-password pair or user is "
               "disabled.");
         }
+      }
+      if (monitor_message != nullptr) [[unlikely]] {
+        PublishMonitorMessage(std::move(monitor_message));
       }
       absl::Status written =
           co_await stream.WriteAll(std::span<const std::byte>(
@@ -944,12 +966,40 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     auto request_result =
         BuildCommandRequest(std::move(*command_result), ctx.selected_db_);
     CommandReply reply;
+    std::shared_ptr<const std::string> monitor_message;
+    bool publish_monitor_after_dispatch = false;
     if (!request_result.ok()) [[unlikely]] {
       reply.encoded_ = ctx.reply_builder_.AppendError(
           absl::StrCat("ERR ", request_result.status().message()));
     } else {
+      // Valkey emits queued MULTI children only when EXEC reaches them. The
+      // transaction implementation publishes those children after WATCH and
+      // other pre-execution checks pass.
+      if (HasMonitorSessions()) [[unlikely]] {
+        const CommandKind kind = request_result->kind_;
+        publish_monitor_after_dispatch = kind == CommandKind::kExec;
+        const bool defer_to_exec =
+            ctx.in_multi_ && kind != CommandKind::kExec &&
+            kind != CommandKind::kDiscard && kind != CommandKind::kMulti &&
+            kind != CommandKind::kWatch;
+        if (!defer_to_exec) {
+          monitor_message =
+              PrepareMonitorMessage(request_result->db_id_, ctx.peer_address_,
+                                    request_result->args_, &*request_result);
+        }
+      }
+      if (monitor_message != nullptr && !publish_monitor_after_dispatch)
+          [[unlikely]] {
+        PublishMonitorMessage(std::move(monitor_message));
+      }
       reply = co_await DispatchCommand(ctx, std::move(*request_result),
                                        ctx.reply_builder_);
+    }
+    if (monitor_message != nullptr) [[unlikely]] {
+      PublishMonitorMessage(std::move(monitor_message));
+    }
+    if (reply.start_monitoring_) [[unlikely]] {
+      ctx.monitor_session_ = RegisterMonitorSession(stream.NativeFd());
     }
     if (reply.selected_db_.has_value()) {
       ctx.selected_db_ = *reply.selected_db_;
@@ -1029,6 +1079,12 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
     if (!write_status.ok()) [[unlikely]] {
       co_return write_status;
+    }
+    if (reply.start_monitoring_) [[unlikely]] {
+      // MONITOR is no longer an in-flight request while its connection waits
+      // indefinitely for asynchronously published messages.
+      request_guard.Release();
+      co_return co_await StreamMonitorMessages(stream, ctx.monitor_session_);
     }
     if (reply.close_connection_ || ShutdownRequested()) [[unlikely]] {
       stream.Close().IgnoreError();

@@ -229,6 +229,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("CONFIG", CommandKind::kConfig);
+  CheckKind("MONITOR", CommandKind::kMonitor);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
   CheckKind("ZADD", CommandKind::kZAdd);
@@ -248,6 +249,10 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   EXPECT_CHECK(FindCommand("") == nullptr, "empty name should not resolve");
   EXPECT_CHECK(FindCommand("GETT") == nullptr,
                "prefix collision should not resolve");
+  const CommandSpec* monitor = FindCommand("MONITOR");
+  ASSERT_NE(monitor, nullptr);
+  EXPECT_NE(monitor->flags_ & keylane::kCmdAdmin, 0u);
+  EXPECT_NE(monitor->flags_ & keylane::kCmdSkipMonitor, 0u);
   for (std::size_t value = 0;
        value < static_cast<std::size_t>(CommandKind::kUnknown); ++value) {
     EXPECT_NE(CommandCanonicalName(static_cast<CommandKind>(value)), "unknown");

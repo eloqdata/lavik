@@ -52,6 +52,8 @@ class RespClient {
     return ReadReply();
   }
 
+  std::string ReadPush() { return ReadReply(); }
+
  private:
   std::string ReadReply() {
     const std::string line = ReadLine();
@@ -268,6 +270,14 @@ void Expect(std::string_view actual, std::string_view expected,
   if (actual != expected) {
     Fail(std::string(operation) + " returned '" + std::string(actual) +
          "', expected '" + std::string(expected) + "'");
+  }
+}
+
+void ExpectContains(std::string_view actual, std::string_view expected,
+                    std::string_view operation) {
+  if (actual.find(expected) == std::string_view::npos) {
+    Fail(std::string(operation) + " returned '" + std::string(actual) +
+         "', expected it to contain '" + std::string(expected) + "'");
   }
 }
 
@@ -631,6 +641,89 @@ int main(int argc, char** argv) {
     Expect(client.Command({"INFO", "server"}), "+QUEUED", "queue INFO");
     const std::string exec_info = client.Command({"EXEC"});
     contains(exec_info, "# Server", "INFO inside EXEC");
+
+    // ---- MONITOR ----
+    // Connections are assigned round-robin to four workers, so this monitor
+    // and the original client exercise cross-worker one-way delivery.
+    {
+      RespClient monitor = Connect(port);
+      Expect(monitor.Command({"MONITOR"}), "+OK", "MONITOR");
+
+      Expect(client.Command({"SET", "monitor-key", "value"}), "+OK",
+             "monitored SET");
+      const std::string initial_message = monitor.ReadPush();
+      ExpectContains(initial_message, "[0 127.0.0.1:", "MONITOR endpoint");
+      ExpectContains(initial_message, "\"SET\" \"monitor-key\" \"value\"",
+                     "MONITOR SET");
+
+      const std::string escaped = std::string("line\n\"\\") + '\x01';
+      Expect(client.Command({"ECHO", escaped}), Bulk(escaped),
+             "monitored escaped ECHO");
+      const std::string echo_message = monitor.ReadPush();
+      ExpectContains(echo_message, "\"ECHO\"", "MONITOR command name");
+      ExpectContains(echo_message, "\"line\\n\\\"\\\\\\x01\"",
+                     "MONITOR argument escaping");
+
+      // AUTH is visible like Valkey, but every credential argument is
+      // redacted before it enters the shared monitor message.
+      ExpectContains(client.Command({"AUTH", "monitor-secret"}),
+                     "AUTH called without any password", "AUTH without config");
+      const std::string auth_message = monitor.ReadPush();
+      ExpectContains(auth_message, "\"AUTH\" \"(redacted)\"",
+                     "MONITOR AUTH redaction");
+      if (auth_message.find("monitor-secret") != std::string::npos) {
+        Fail("MONITOR exposed an AUTH credential");
+      }
+
+      // ADMIN commands are omitted. The next visible message must be PING,
+      // not CONFIG.
+      (void)client.Command({"CONFIG", "GET", "maxmemory"});
+      Expect(client.Command({"PING"}), "+PONG", "monitor marker PING");
+      const std::string after_admin = monitor.ReadPush();
+      ExpectContains(after_admin, "\"PING\"", "MONITOR skips ADMIN");
+      if (after_admin.find("CONFIG") != std::string::npos) {
+        Fail("MONITOR published an ADMIN command");
+      }
+
+      Expect(client.Command({"MULTI"}), "+OK", "monitored MULTI");
+      Expect(client.Command({"SET", "monitor-tx", "1"}), "+QUEUED",
+             "monitored queued SET");
+      Expect(client.Command({"GET", "monitor-tx"}), "+QUEUED",
+             "monitored queued GET");
+      Expect(client.Command({"EXEC"}), "*2\r\n+OK\r\n" + Bulk("1"),
+             "monitored EXEC");
+      const std::string multi_message = monitor.ReadPush();
+      const std::string set_message = monitor.ReadPush();
+      const std::string get_message = monitor.ReadPush();
+      const std::string exec_message = monitor.ReadPush();
+      ExpectContains(multi_message, "\"MULTI\"", "MONITOR MULTI order");
+      ExpectContains(set_message, "\"SET\" \"monitor-tx\" \"1\"",
+                     "MONITOR SET order");
+      ExpectContains(get_message, "\"GET\" \"monitor-tx\"",
+                     "MONITOR GET order");
+      ExpectContains(exec_message, "\"EXEC\"", "MONITOR EXEC order");
+
+      // Like Valkey's DENY BLOCKING EXEC state, MONITOR cannot turn a
+      // transaction connection into a streaming connection. The ADMIN child
+      // is omitted, while MULTI and EXEC remain visible.
+      Expect(client.Command({"MULTI"}), "+OK", "MONITOR inside MULTI setup");
+      Expect(client.Command({"MONITOR"}), "+QUEUED",
+             "MONITOR queued inside MULTI");
+      Expect(client.Command({"EXEC"}),
+             "*1\r\n-ERR MONITOR isn't allowed for DENY BLOCKING client",
+             "MONITOR rejected inside EXEC");
+      ExpectContains(monitor.ReadPush(), "\"MULTI\"",
+                     "MONITOR nested MULTI visibility");
+      ExpectContains(monitor.ReadPush(), "\"EXEC\"",
+                     "MONITOR nested EXEC visibility");
+      Expect(client.Command({"PING"}), "+PONG",
+             "connection remains non-monitor after EXEC");
+      ExpectContains(monitor.ReadPush(), "\"PING\"",
+                     "MONITOR post-EXEC connection state");
+    }
+    // Let the worker-local peer watcher observe the closed monitor socket so
+    // graceful shutdown also exercises unregister cleanup.
+    std::this_thread::sleep_for(300ms);
 
     server.Stop();
   } catch (const std::exception& error) {

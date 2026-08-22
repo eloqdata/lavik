@@ -152,6 +152,7 @@ add_library(keylane_module
   src/redis/command.cpp
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
+  src/redis/monitor.cpp
   src/redis/set_command.cpp
   src/redis/sort_command.cpp
   src/redis/string_command.cpp

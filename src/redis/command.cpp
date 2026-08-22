@@ -36,6 +36,7 @@
 #include "keylane/glob.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
+#include "keylane/monitor.h"
 #include "keylane/random_sample.h"
 #include "keylane/rdb.h"
 #include "keylane/redis_parse.h"
@@ -302,6 +303,11 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
       reply.encoded_ = reply_builder.AppendSimpleString("OK");
       return reply;
 
+    case CommandKind::kMonitor:
+      reply.encoded_ = reply_builder.AppendSimpleString("OK");
+      reply.start_monitoring_ = true;
+      return reply;
+
     case CommandKind::kSelect: {
       if (args.size() != 2) {
         reply.encoded_ = reply_builder.AppendError(
@@ -526,6 +532,8 @@ void AppendCommandFlags(ReplyBuilder& reply_builder,
   count += (command.flags_ & kCmdReadOnly) != 0 ? 1 : 0;
   count += (command.flags_ & kCmdMovableKeys) != 0 ? 1 : 0;
   count += (command.flags_ & kCmdMayBlock) != 0 ? 1 : 0;
+  count += (command.flags_ & kCmdAdmin) != 0 ? 1 : 0;
+  count += (command.flags_ & kCmdSkipMonitor) != 0 ? 1 : 0;
   reply_builder.AppendArrayHeader(count);
   if ((command.flags_ & kCmdWrite) != 0) {
     reply_builder.AppendBulkString("write");
@@ -538,6 +546,12 @@ void AppendCommandFlags(ReplyBuilder& reply_builder,
   }
   if ((command.flags_ & kCmdMayBlock) != 0) {
     reply_builder.AppendBulkString("blocking");
+  }
+  if ((command.flags_ & kCmdAdmin) != 0) {
+    reply_builder.AppendBulkString("admin");
+  }
+  if ((command.flags_ & kCmdSkipMonitor) != 0) {
+    reply_builder.AppendBulkString("skip_monitor");
   }
 }
 
@@ -5928,7 +5942,14 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
     ReplyBuilder local_builder;
     CommandReply local;
-    if (cmd.kind_ == CommandKind::kInfo) {
+    if (cmd.kind_ == CommandKind::kMonitor) {
+      // Valkey refuses streaming commands while EXEC is running with its
+      // deny-blocking client state. Do not switch the connection from inside
+      // an aggregate EXEC reply.
+      local = BuiltReply(
+          local_builder.AppendError(
+              "ERR MONITOR isn't allowed for DENY BLOCKING client"));
+    } else if (cmd.kind_ == CommandKind::kInfo) {
       local = co_await ExecuteInfo(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kRandomKey) {
       local = co_await ExecuteRandomKey(cmd, local_builder);
@@ -6108,6 +6129,12 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         co_await DropWatches(ctx);
         co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
       }
+      // Publish from the connection's coordinator worker after the shard hop
+      // returns. EXEC is published from this same worker, preserving the
+      // per-connection MULTI -> children -> EXEC order in every target lane.
+      if (HasMonitorSessions()) [[unlikely]] {
+        PublishExecMonitorCommands(ctx, queued);
+      }
       if (replication != nullptr) {
         commit_replication(replication.get());
       }
@@ -6148,6 +6175,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           co_await DropWatches(ctx);
           co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
         }
+      }
+      if (HasMonitorSessions()) [[unlikely]] {
+        PublishExecMonitorCommands(ctx, queued);
       }
       // Squashed execution: each hop covers a whole run of consecutive keyed
       // commands — every shard works its keys of every command in the run in
@@ -6224,6 +6254,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     if (!ctx.watched_.empty() && !co_await CheckConnectionWatches(ctx)) {
       co_await DropWatches(ctx);
       co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
+    }
+    if (HasMonitorSessions()) [[unlikely]] {
+      PublishExecMonitorCommands(ctx, queued);
     }
     for (std::size_t i = 0; i < queued.size(); ++i) {
       if (!key_errors[i].empty()) {
@@ -6953,6 +6986,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kCommand:
         case CommandKind::kReadOnly:
         case CommandKind::kReadWrite:
+        case CommandKind::kMonitor:
           return true;
         default:
           return false;
