@@ -101,7 +101,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   }
   if (trace != nullptr) trace->append_start_ns_ = SetTraceNowNanos();
   absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key, value, RecordKind::kValue,
+      store, partition, db_id, key, digest, value, RecordKind::kValue,
       ValueType::kString, expire_at_ms, tx,
       std::numeric_limits<std::uint64_t>::max(), nullptr, nullptr, replication,
       trace);
@@ -171,7 +171,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
 
   if (expire_at_ms != 0 && expire_at_ms <= now_ms) {
     absl::Status status = co_await AppendLocked(
-        store, partition, db_id, key, {}, RecordKind::kTombstone,
+        store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
         ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
     if (!status.ok()) co_return status;
     co_return true;
@@ -187,7 +187,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   std::string_view value(reinterpret_cast<const char*>(value_bytes.data()),
                          value_bytes.size());
   absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key, value, RecordKind::kValue,
+      store, partition, db_id, key, digest, value, RecordKind::kValue,
       previous.value_type_, expire_at_ms, tx, previous.logical_size_, nullptr,
       nullptr, replication);
   if (!status.ok()) {
@@ -229,7 +229,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   }
   const bool expired = IsExpired(found->value_, UnixTimeMillis());
   absl::Status status = co_await AppendLocked(
-      store, partition, db_id, key, {}, RecordKind::kTombstone,
+      store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
       ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
   if (!status.ok()) co_return status;
   co_return !expired;
@@ -250,10 +250,10 @@ Task<absl::Status> StorageEngine::Impl::WriteRawValueLocked(
   auto& partition = PartitionForKey(store, key);
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
-  co_return co_await AppendLocked(store, partition, db_id, key, value.encoded_,
-                                  RecordKind::kValue, value.value_type_,
-                                  value.expire_at_ms_, tx, value.logical_size_,
-                                  nullptr, nullptr, replication);
+  co_return co_await AppendLocked(
+      store, partition, db_id, key, digest, value.encoded_, RecordKind::kValue,
+      value.value_type_, value.expire_at_ms_, tx, value.logical_size_, nullptr,
+      nullptr, replication);
 }
 
 Task<absl::StatusOr<RestoreRawResult>> StorageEngine::Impl::RestoreRawValue(
@@ -494,6 +494,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const std::string_view undo_key = entry.entry_->key_complete()
                                           ? entry.entry_->key()
                                           : std::string_view(loaded_key);
+    const Digest undo_digest = ComputeDigest(undo_key);
     auto& partition = PartitionForKey(store, undo_key);
     if (compensation != nullptr) {
       // Do not merely rewind the in-memory index: EXEC will later commit this
@@ -506,7 +507,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       if (entry.previous_.has_value() &&
           entry.previous_->kind_ == RecordKind::kValue) {
         auto loaded = co_await LoadValue(
-            store, partition, entry.db_id_, undo_key, ComputeDigest(undo_key),
+            store, partition, entry.db_id_, undo_key, undo_digest,
             *entry.previous_, entry.previous_extents_);
         if (!loaded.ok()) {
           store.write_failed_ = true;
@@ -531,8 +532,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
                                               : 0;
       absl::Status appended =
           co_await AppendLocked(store, partition, entry.db_id_, undo_key,
-                                restored_payload, restored_kind, restored_type,
-                                restored_expiry, compensation, restored_size);
+                                undo_digest, restored_payload, restored_kind,
+                                restored_type, restored_expiry, compensation,
+                                restored_size);
       if (!appended.ok()) {
         store.write_failed_ = true;
         co_return appended;
@@ -544,8 +546,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       // recovery state. The aborted transaction was never published to a
       // full-sync session, so this internal rollback must not publish either.
       absl::Status tombstone = co_await AppendLocked(
-          store, partition, entry.db_id_, undo_key, {}, RecordKind::kTombstone,
-          ValueType::kNone, 0,
+          store, partition, entry.db_id_, undo_key, undo_digest, {},
+          RecordKind::kTombstone, ValueType::kNone, 0,
           /*tx=*/nullptr, /*logical_size=*/0,
           /*commit_retirements=*/nullptr, /*committed_sequence=*/nullptr,
           /*replication=*/nullptr, /*trace=*/nullptr,
@@ -903,16 +905,15 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
 
 Task<absl::Status> StorageEngine::Impl::AppendLocked(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
-    std::uint8_t db_id, std::string_view key, std::string_view value,
-    RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
-    TxShardWrites* tx, std::uint64_t logical_size,
+    std::uint8_t db_id, std::string_view key, const Digest& digest,
+    std::string_view value, RecordKind kind, ValueType value_type,
+    std::uint64_t expire_at_ms, TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
     SetLatencyTrace* trace, bool capture_fullsync) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
-  const Digest digest = ComputeDigest(key);
   // Every real keyspace modification funnels through here (client writes,
   // deletes, expiration rewrites, active expiry): invalidate watchers.
   tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));

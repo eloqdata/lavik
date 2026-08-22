@@ -1693,15 +1693,11 @@ class ReplicationLogService final : public celer::Service {
       if (command_lsn == 1) {
         std::uint8_t effect_db = 0;
         const auto set_effect = ReplicatedEffectAt(*decoded, 0, &effect_db);
-        const auto ttl_effect = ReplicatedEffectAt(*decoded, 1);
         Check(fragments == 1 && decoded->db_id_ == 2 && effect_db == 2 &&
                   set_effect == std::vector<std::string>(
                                     {"SET", "replication-set", "value", "PXAT",
-                                     std::to_string(kExpireAt)}) &&
-                  ttl_effect ==
-                      std::vector<std::string>({"PEXPIREAT", "replication-set",
-                                                std::to_string(kExpireAt)}),
-              "SET was not normalized with its absolute expiry");
+                                     std::to_string(kExpireAt)}),
+              "SET did not carry its final absolute expiry directly");
       } else {
         const auto set_effect = ReplicatedEffectAt(*decoded, 0);
         Check(fragments > 1 && decoded->db_id_ == 2 && set_effect.size() == 3 &&

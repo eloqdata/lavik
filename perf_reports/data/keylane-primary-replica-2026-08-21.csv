@@ -1,0 +1,13 @@
+phase,workload,duration_s,target_qps,actual_qps,avg_ms,p50_ms,p99_ms,p999_ms,p9999_ms,set_qps,get_qps,set_avg_ms,get_avg_ms,primary_cpu_pct,replica_cpu_pct,max_fullsync_queue_bytes,max_publish_queue_bytes,credit_waits,notes
+ONLINE,pure_read,300,100000,100000.31,0.24810,0.231,0.511,0.799,1.415,0.00,100000.31,,0.24810,489.7,5.8,0,0,0,replica online and caught up
+ONLINE,pure_write,300,100000,99999.35,0.23978,0.215,0.767,1.407,1.887,99999.35,0.00,0.23978,,468.5,144.5,0,1740,0,replica online and caught up
+ONLINE,set_get_1_1,300,100000,99999.58,0.25018,0.231,0.679,1.191,1.567,49987.23,49987.08,0.21489,0.28547,469.9,75.8,0,0,0,replica online and caught up
+ONLINE,set_get_1_19,300,100000,100000.60,0.25108,0.239,0.591,0.951,1.263,4999.96,94996.96,0.19402,0.25408,457.9,16.9,0,0,0,replica online and caught up
+FULLSYNC,pure_write,300,100000,99980.79,0.37696,0.223,2.943,4.575,5.823,99980.79,0.00,0.37696,,1073.2,289.0,505293,3556,0,empty replica receiving snapshot
+FULLSYNC,set_get_1_1,300,100000,99974.31,0.37520,0.239,2.799,4.351,5.567,49987.23,49987.08,0.32337,0.42704,1077.9,301.1,366581,4742,0,empty replica receiving snapshot
+FULLSYNC,set_get_1_19,300,100000,99996.91,0.41872,0.271,2.863,4.511,5.663,4999.96,94996.96,0.29959,0.42499,1096.6,279.3,111560,0,0,empty replica receiving snapshot
+FULLSYNC_TO_ONLINE,pure_read,300,100000,99999.21,0.27408,0.239,0.903,2.671,4.127,0.00,99999.21,,0.27408,521.3,21.0,,,0,first approximately 56 seconds fullsync then approximately 244 seconds online
+FULLSYNC_SLIDING_C16,set_get_1_19,300,100000,99959.88,0.48286,,3.279,5.023,6.079,4998.12,94961.76,0.34438,0.49015,1101.46,357.11,,,0,fixed reader pool with continuously replenished snapshot IO depth; valid client run from 10.0.0.5
+FULLSYNC_SLIDING_C8,set_get_1_19,300,100000,99997.92,0.40808,,2.943,4.671,5.791,4999.95,94997.97,0.30473,0.41352,1093.21,303.27,,,0,fixed reader pool at dynamic read concurrency 8; valid client run from 10.0.0.5
+FULLSYNC_BARRIER_C16,set_get_1_19,300,100000,99983.16,0.45784,0.287,2.895,4.479,5.663,4999.28,94983.88,0.27029,0.46771,1113.80,244.66,,,0,bounded 16-read waves with barrier and digest reuse; entire run remained FULLSYNC; valid client run from 10.0.0.5
+FULLSYNC_BARRIER_C16_50K,set_get_1_19,300,50000,49919.87,0.66926,0.343,3.743,5.471,7.231,2496.10,47423.78,0.26626,0.69048,,,,,0,bounded 16-read waves with barrier and digest reuse; entire run remained FULLSYNC; valid client run from 10.0.0.5

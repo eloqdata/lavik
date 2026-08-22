@@ -218,17 +218,32 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   constexpr std::size_t kRecoveryBatchItems = 1U << 20;
   std::size_t buffered_items = 0;
 
+  // Preserve the global striped ownership of physical blocks, but visit one
+  // block from each device in turn. Scanning every device to completion in
+  // file order makes all workers saturate device 0 while every other NVMe is
+  // idle, then move to device 1 together.
+  std::vector<std::uint64_t> next_device_offsets(devices_.size());
   std::uint64_t device_linear_begin = 0;
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
-    const std::uint64_t first_device_offset =
-        (store.worker_->id() + worker_count_ -
-         device_linear_begin % worker_count_) %
-        worker_count_;
-    for (std::uint64_t device_offset = first_device_offset;
-         device_offset < device.data_block_count_;
-         device_offset += worker_count_) {
+    next_device_offsets[device_index] = (store.worker_->id() + worker_count_ -
+                                         device_linear_begin % worker_count_) %
+                                        worker_count_;
+    device_linear_begin += device.data_block_count_;
+  }
+  while (true) {
+    bool scanned_block = false;
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      std::uint64_t& next_device_offset = next_device_offsets[device_index];
+      if (next_device_offset >= device.data_block_count_) {
+        continue;
+      }
+      const std::uint64_t device_offset = next_device_offset;
+      next_device_offset += worker_count_;
+      scanned_block = true;
       const std::uint32_t local_block =
           static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);
       const std::uint64_t block_id = MakeBlockId(device.id_, local_block);
@@ -425,20 +440,19 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                                    record.key_bytes_);
           }
         }
+        const std::uint16_t partition_id = RedisSlot(key);
         if (record.digest_ != ComputeDigest(key) ||
-            StorageShardForKey(key) % block.layout_worker_count_ !=
-                block.writer_id_) {
+            partition_id % block.layout_worker_count_ != block.writer_id_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
         }
-        const std::uint16_t partition_id = RedisSlot(key);
         if (record.replication_epoch_ !=
             epoch_values_[kLogicalDatabaseCount + partition_id]) {
           record_offset += record.total_disk_bytes_;
           ++records;
           continue;
         }
-        const unsigned key_owner = OwnerForKey(key);
+        const unsigned key_owner = partition_id % worker_count_;
         batches->at(key_owner).records_.push_back(RecoveryRecord{
             .digest_ = record.digest_,
             .key_ = std::string(key),
@@ -483,7 +497,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         buffered_items = 0;
       }
     }
-    device_linear_begin += device.data_block_count_;
+    if (!scanned_block) break;
   }
   co_return absl::OkStatus();
 }

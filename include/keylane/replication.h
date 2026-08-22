@@ -50,9 +50,14 @@ struct ReplicationOptions {
   // Compatibility override declaring that the initial upstream speaks Redis
   // PSYNC. Ordinary replicaof performs safe protocol detection instead.
   bool redis_psync_ = false;
+  // Number of keys one source flow admits into a snapshot scheduling round.
+  // Sampled for every round so CONFIG SET takes effect during full sync.
+  std::size_t snapshot_batch_size_ = 64;
 };
 
+inline constexpr unsigned kDefaultReplicationSnapshotReadConcurrency = 16;
 inline constexpr unsigned kMaxReplicationSnapshotReadConcurrency = 128;
+inline constexpr std::size_t kMaxReplicationSnapshotBatchSize = 4096;
 
 enum class ReplicationRole : std::uint8_t {
   kMaster,
@@ -123,6 +128,8 @@ class ReplicationManager {
   // so CONFIG SET takes effect without reconnecting the replica.
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
   unsigned snapshot_read_concurrency() const noexcept;
+  absl::Status SetSnapshotBatchSize(std::size_t count) noexcept;
+  std::size_t snapshot_batch_size() const noexcept;
 
   // Changes the global in-memory backlog quota. Growth preserves the current
   // history; shrinkage may advance individual flow floors at event boundaries.

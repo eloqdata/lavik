@@ -9,6 +9,15 @@
 
 #include "keylane/storage/format.h"
 
+TEST(StorageFormatTest, ComputesRedisClusterSlots) {
+  using keylane::storage::RedisSlot;
+
+  EXPECT_EQ(RedisSlot("123456789"), 12'739);
+  EXPECT_EQ(RedisSlot("foo"), 12'182);
+  EXPECT_EQ(RedisSlot("{user1000}.following"), 3'443);
+  EXPECT_EQ(RedisSlot("{user1000}.followers"), 3'443);
+}
+
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace keylane::storage;
   static_assert(kStorageFormatVersion == 1);

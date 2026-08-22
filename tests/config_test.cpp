@@ -107,6 +107,21 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ASSERT_TRUE(ApplyRedisConfigDirective({"dir", "/backup"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"dbfilename", "snapshot.rdb"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"foreground-budget-us", "250"},
+                                        &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"background-budget-us", "20"},
+                                        &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"background-warrant-percent", "7"}, &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"spdk-max-completions-per-poll", "4"}, &options)
+                  .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"replication-snapshot-batch-size", "32"}, &options)
+                  .ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -127,6 +142,11 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_TRUE(options.load_rdb_replace_);
   EXPECT_EQ(options.rdb_dir_, "/backup");
   EXPECT_EQ(options.dbfilename_, "snapshot.rdb");
+  EXPECT_EQ(options.foreground_budget_us_, 250u);
+  EXPECT_EQ(options.background_budget_us_, 20u);
+  EXPECT_EQ(options.background_warrant_percent_, 7u);
+  EXPECT_EQ(options.spdk_max_completions_per_poll_, 4u);
+  EXPECT_EQ(options.replication_options_.snapshot_batch_size_, 32u);
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
@@ -152,6 +172,16 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
       ApplyRedisConfigDirective({"repl-backlog-size", "0"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"repl-backlog-size", "large"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"foreground-budget-us", "0"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"background-budget-us", "0"}, &options).ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"background-warrant-percent", "101"}, &options)
+                   .ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"replication-snapshot-batch-size", "0"}, &options)
+                   .ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
 }
 

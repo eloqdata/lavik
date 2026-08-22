@@ -72,14 +72,26 @@ void Sha1Compress(const std::uint8_t* block,
   (*state)[4] += e;
 }
 
-std::uint16_t RedisCrc16(std::string_view key) noexcept {
-  std::uint16_t crc = 0;
-  for (unsigned char byte : key) {
-    crc ^= static_cast<std::uint16_t>(byte) << 8;
+constexpr std::array<std::uint16_t, 256> MakeRedisCrc16Table() noexcept {
+  std::array<std::uint16_t, 256> table{};
+  for (std::size_t byte = 0; byte < table.size(); ++byte) {
+    std::uint16_t crc = static_cast<std::uint16_t>(byte << 8);
     for (unsigned bit = 0; bit < 8; ++bit) {
       crc = static_cast<std::uint16_t>(
           (crc & 0x8000U) != 0 ? (crc << 1) ^ 0x1021U : crc << 1);
     }
+    table[byte] = crc;
+  }
+  return table;
+}
+
+constexpr auto kRedisCrc16Table = MakeRedisCrc16Table();
+
+std::uint16_t RedisCrc16(std::string_view key) noexcept {
+  std::uint16_t crc = 0;
+  for (unsigned char byte : key) {
+    const auto index = static_cast<std::uint8_t>((crc >> 8) ^ byte);
+    crc = static_cast<std::uint16_t>((crc << 8) ^ kRedisCrc16Table[index]);
   }
   return crc;
 }

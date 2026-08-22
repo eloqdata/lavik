@@ -65,18 +65,18 @@ constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
 constexpr auto kFullSyncStallTimeout = std::chrono::minutes(10);
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
 constexpr auto kRedisTopologyPollInterval = std::chrono::seconds(2);
-// A typical disk-backed partition contains hundreds of records. Materialize
-// enough keys to approach the ONLINE replication transfer size so full sync
-// does not pay one ACK round-trip per tiny 16-record group; send_records still
-// splits this batch at the exact byte limit and chunks oversized values.
-constexpr std::size_t kSnapshotKeysPerBatch = 1024;
+// Keep snapshot reads and captured writes on a small, symmetric scheduling
+// quantum. Snapshot records are accumulated separately into transfer-sized
+// frames, so this does not turn the wire protocol into 64-record packets.
+constexpr std::size_t kFullSyncSchedulingItems = 64;
+constexpr std::size_t kSnapshotKeysPerBatch = kFullSyncSchedulingItems;
 constexpr std::size_t kOverrideRecordsPerBatch = 256;
 // A continuously written tailing partition can keep the session FIFO
 // permanently nonempty.  Snapshot scanning therefore consumes only a bounded
 // number of commands at each interleave point.  Queue admission supplies
 // backpressure when the target cannot keep up; the final cut closes admission
 // and drains the remaining finite prefix completely.
-constexpr std::size_t kFullSyncInterleaveCommands = 64;
+constexpr std::size_t kFullSyncInterleaveCommands = kFullSyncSchedulingItems;
 // Candidate epochs are independent of the source-side scan fence. Persist a
 // group in one target fdatasync, then install/scan/handoff one source
 // partition at a time. This keeps the one-partition memory bound without
@@ -85,6 +85,10 @@ constexpr std::size_t kFullSyncResetBatch = 64;
 constexpr std::size_t kMaxDataFrame = 12U * 1024U * 1024U;
 constexpr std::size_t kBacklogBatchBytes = storage::kReplicationTransferBytes;
 constexpr std::size_t kBacklogBatchFrames = 128;
+// A flow that finishes its partitions before its peers must keep publishing
+// captured writes.  Use a small quantum there so all flows notice the final
+// scanner promptly and reach the cut barrier with little queued work.
+constexpr std::size_t kFullSyncReadyWaitCommands = kBacklogBatchFrames;
 constexpr std::uint16_t kResetBatchAckPartition =
     std::numeric_limits<std::uint16_t>::max();
 constexpr std::string_view kReplicationTransactionEnvelope = "__KEYLANE_TX_V1";
@@ -1282,6 +1286,15 @@ struct MasterSession {
     co_return co_await snapshot_ready_.Wait(*celer::ThisWorker().self_);
   }
 
+  void MarkSnapshotScanComplete() {
+    snapshot_scans_complete_.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  bool AllSnapshotScansComplete() const {
+    return snapshot_scans_complete_.load(std::memory_order_acquire) ==
+           flows_.size();
+  }
+
   Task<absl::Status> WaitSnapshotGateClosed() {
     co_return co_await snapshot_gate_closed_.Wait(*celer::ThisWorker().self_);
   }
@@ -1457,6 +1470,7 @@ struct MasterSession {
   celer::CoroutineBarrier snapshot_gate_closed_;
   celer::CoroutineBarrier snapshot_fenced_;
   celer::CoroutineBarrier snapshot_capture_stopped_;
+  std::atomic<unsigned> snapshot_scans_complete_{0};
   std::atomic<unsigned> connected_flows_{0};
   std::atomic<bool> online_{false};
   std::atomic<bool> cancelled_{false};
@@ -1511,6 +1525,8 @@ class ReplicationManager::Impl {
                               std::memory_order_relaxed);
     publish_queue_bytes_per_worker_.store(
         options.publish_queue_bytes_per_worker_, std::memory_order_relaxed);
+    snapshot_batch_size_.store(options.snapshot_batch_size_,
+                               std::memory_order_relaxed);
     if (upstream_.has_value()) {
       role_.store(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
@@ -1820,6 +1836,20 @@ class ReplicationManager::Impl {
 
   unsigned snapshot_read_concurrency() const noexcept {
     return snapshot_read_concurrency_.load(std::memory_order_acquire);
+  }
+
+  absl::Status SetSnapshotBatchSize(std::size_t count) noexcept {
+    if (count == 0 || count > kMaxReplicationSnapshotBatchSize) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "replication snapshot batch size must be between 1 and ",
+          kMaxReplicationSnapshotBatchSize));
+    }
+    snapshot_batch_size_.store(count, std::memory_order_release);
+    return absl::OkStatus();
+  }
+
+  std::size_t snapshot_batch_size() const noexcept {
+    return snapshot_batch_size_.load(std::memory_order_acquire);
   }
 
   std::size_t BacklogCapacityForFlow(unsigned flow_id,
@@ -4145,6 +4175,39 @@ class ReplicationManager::Impl {
       co_return absl::OkStatus();
     };
 
+    // A fixed command ratio cannot keep the publisher stable: the number and
+    // byte size of writes arriving during one snapshot slice vary with load,
+    // partition coverage, and storage latency. Normally yield back to the
+    // snapshot after one small quantum. Once this flow's own queue crosses the
+    // high watermark, prioritize live commands until it reaches the low
+    // watermark. This changes publisher duty cycle before capacity admission
+    // has to stop foreground writes; it does not weaken the capacity limit.
+    auto drain_interleaved_publish_queue = [&]() -> Task<absl::Status> {
+      absl::Status drained =
+          co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands);
+      if (!drained.ok()) co_return drained;
+
+      auto info = storage_->GetFullSyncPublishQueueInfo(session->id_);
+      if (!info.ok()) co_return info.status();
+      const std::size_t high_watermark =
+          std::max<std::size_t>(1, info->capacity_bytes_ / 8);
+      if (info->queued_bytes_ + info->admitted_bytes_ <= high_watermark) {
+        co_return absl::OkStatus();
+      }
+      const std::size_t low_watermark =
+          std::max<std::size_t>(1, high_watermark / 2);
+      do {
+        drained = co_await drain_fullsync_publish_queue(kBacklogBatchFrames);
+        if (!drained.ok()) co_return drained;
+        info = storage_->GetFullSyncPublishQueueInfo(session->id_);
+        if (!info.ok()) co_return info.status();
+        // Admitted bytes have reserved capacity but are not dequeueable until
+        // their writes commit. Do not spin this worker waiting for those
+        // writes.
+      } while (info->queued_bytes_ > low_watermark);
+      co_return absl::OkStatus();
+    };
+
     auto drain_partition_overrides =
         [&](std::uint16_t partition_id) -> Task<absl::Status> {
       while (true) {
@@ -4297,6 +4360,26 @@ class ReplicationManager::Impl {
                              fullsync_backlog_cursor.lsn_,
                              fullsync_backlog_cursor.fragment_index_,
                              partition_id, start->baseline_version_);
+        // Snapshot reads use a small scheduling quantum so captured writes get
+        // a chance to run frequently. Keep the records across those reads and
+        // flush only transfer-sized frames (or at a DB boundary) so fairness
+        // does not cost a network ACK for every 64 records.
+        constexpr std::size_t kRecordsFrameHeaderBytes = 2 + 4;
+        std::vector<SnapshotRecord> pending_snapshot_records;
+        std::size_t pending_snapshot_bytes = kRecordsFrameHeaderBytes;
+        auto flush_snapshot_records = [&]() -> Task<absl::Status> {
+          if (pending_snapshot_records.empty()) {
+            co_return absl::OkStatus();
+          }
+          absl::Status flushed =
+              co_await send_records(partition_id, pending_snapshot_records);
+          if (!flushed.ok()) co_return flushed;
+          storage_->AcknowledgePartitionSnapshotRecords(
+              session->id_, partition_id, pending_snapshot_records);
+          pending_snapshot_records.clear();
+          pending_snapshot_bytes = kRecordsFrameHeaderBytes;
+          co_return absl::OkStatus();
+        };
         for (std::uint8_t db_id = 0; db_id < storage::kLogicalDatabaseCount;
              ++db_id) {
           for (;;) {
@@ -4314,34 +4397,63 @@ class ReplicationManager::Impl {
             do {
               auto batch = co_await storage_->SnapshotPartition(
                   session->id_, partition_id, db_id, cursor,
-                  kSnapshotKeysPerBatch, snapshot_read_concurrency());
+                  snapshot_batch_size(), snapshot_read_concurrency());
               if (!batch.ok()) {
                 cleanup();
                 co_return batch.status();
               }
               if (!batch->records_.empty()) {
-                sent = co_await send_records(partition_id, batch->records_);
-                if (!sent.ok()) {
-                  cleanup();
-                  co_return sent;
+                for (SnapshotRecord& record : batch->records_) {
+                  const std::size_t encoded = EncodedRecordBytes(record);
+                  if (encoded > kBacklogBatchBytes - kRecordsFrameHeaderBytes) {
+                    sent = co_await flush_snapshot_records();
+                    if (!sent.ok()) {
+                      cleanup();
+                      co_return sent;
+                    }
+                    sent = co_await send_records(
+                        partition_id,
+                        std::span<const SnapshotRecord>(&record, 1));
+                    if (!sent.ok()) {
+                      cleanup();
+                      co_return sent;
+                    }
+                    storage_->AcknowledgePartitionSnapshotRecords(
+                        session->id_, partition_id,
+                        std::span<const SnapshotRecord>(&record, 1));
+                    continue;
+                  }
+                  if (!pending_snapshot_records.empty() &&
+                      encoded > kBacklogBatchBytes - pending_snapshot_bytes) {
+                    sent = co_await flush_snapshot_records();
+                    if (!sent.ok()) {
+                      cleanup();
+                      co_return sent;
+                    }
+                  }
+                  pending_snapshot_bytes += encoded;
+                  pending_snapshot_records.push_back(std::move(record));
                 }
-                storage_->AcknowledgePartitionSnapshotRecords(
-                    session->id_, partition_id, batch->records_);
-                absl::Status published = co_await drain_fullsync_publish_queue(
-                    kFullSyncInterleaveCommands);
-                if (!published.ok()) {
-                  cleanup();
-                  co_return published;
-                }
-                absl::Status replacements =
-                    co_await drain_partition_overrides(partition_id);
-                if (!replacements.ok()) {
-                  cleanup();
-                  co_return replacements;
-                }
+              }
+              absl::Status published =
+                  co_await drain_interleaved_publish_queue();
+              if (!published.ok()) {
+                cleanup();
+                co_return published;
+              }
+              absl::Status replacements =
+                  co_await drain_partition_overrides(partition_id);
+              if (!replacements.ok()) {
+                cleanup();
+                co_return replacements;
               }
               cursor = batch->cursor_;
             } while (cursor != 0);
+          }
+          sent = co_await flush_snapshot_records();
+          if (!sent.ok()) {
+            cleanup();
+            co_return sent;
           }
           for (;;) {
             absl::Status replacements =
@@ -4392,8 +4504,7 @@ class ReplicationManager::Impl {
             co_return completed;
           }
         }
-        absl::Status published =
-            co_await drain_fullsync_publish_queue(kFullSyncInterleaveCommands);
+        absl::Status published = co_await drain_interleaved_publish_queue();
         if (!published.ok()) {
           cleanup();
           co_return published;
@@ -4434,6 +4545,35 @@ class ReplicationManager::Impl {
         }
       }
     }
+
+    // Flows do not finish scanning at exactly the same time.  Waiting on the
+    // cut barrier immediately would stop an early flow's publisher while
+    // writes to its already-tailing partitions continue to enqueue.  Keep
+    // that FIFO moving until the last flow has finished its scan, then do one
+    // final bounded pass so the gate-closed cut has only a small race tail to
+    // drain.
+    session->MarkSnapshotScanComplete();
+    do {
+      absl::Status published = co_await drain_fullsync_publish_queue(
+          session->AllSnapshotScansComplete() ? kFullSyncInterleaveCommands
+                                              : kFullSyncReadyWaitCommands);
+      if (!published.ok()) {
+        cleanup();
+        co_return published;
+      }
+      if (session->cancelled()) {
+        cleanup();
+        co_return absl::CancelledError(
+            "replication session ended while waiting for snapshot scans");
+      }
+      if (session->AllSnapshotScansComplete()) break;
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) {
+        cleanup();
+        co_return waited;
+      }
+    } while (true);
 
     absl::Status cut_ready = co_await session->WaitSnapshotReady();
     if (!cut_ready.ok()) {
@@ -5076,7 +5216,9 @@ class ReplicationManager::Impl {
   std::atomic<bool> replication_command_apply_fault_drop_used_{false};
   std::atomic<bool> replication_fullsync_pause_used_{false};
   std::atomic<bool> replication_fullsync_handoff_pause_used_{false};
-  std::atomic<unsigned> snapshot_read_concurrency_{16};
+  std::atomic<unsigned> snapshot_read_concurrency_{
+      kDefaultReplicationSnapshotReadConcurrency};
+  std::atomic<std::size_t> snapshot_batch_size_{kSnapshotKeysPerBatch};
   std::atomic<std::size_t> backlog_size_bytes_{0};
   std::atomic<std::size_t> publish_queue_bytes_per_worker_{0};
   bool history_reset_running_ = false;  // worker 0 only
@@ -5132,6 +5274,15 @@ absl::Status ReplicationManager::SetSnapshotReadConcurrency(
 
 unsigned ReplicationManager::snapshot_read_concurrency() const noexcept {
   return impl_->snapshot_read_concurrency();
+}
+
+absl::Status ReplicationManager::SetSnapshotBatchSize(
+    std::size_t count) noexcept {
+  return impl_->SetSnapshotBatchSize(count);
+}
+
+std::size_t ReplicationManager::snapshot_batch_size() const noexcept {
+  return impl_->snapshot_batch_size();
 }
 
 Task<absl::Status> ReplicationManager::SetBacklogSizeBytes(std::size_t bytes) {

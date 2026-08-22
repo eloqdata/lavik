@@ -338,13 +338,18 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_NE(memory_info.find("maxmemory_policy:noeviction\r\n"),
             std::string::npos);
 
+  // Let the periodic flusher turn the small active block into completed
+  // writes and fdatasync barriers before sampling cumulative I/O counters.
+  std::this_thread::sleep_for(100ms);
+
   const std::string response = HttpGet(metrics_port, "/metrics");
-  ASSERT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n"));
+  ASSERT_TRUE(response.starts_with("HTTP/1.1 200 OK\r\n")) << response;
   const std::size_t body_offset = response.find("\r\n\r\n");
   ASSERT_NE(body_offset, std::string::npos);
   const std::string_view body(response.data() + body_offset + 4,
                               response.size() - body_offset - 4);
   EXPECT_GE(MetricValue(body, "keylane_commands_total"), 3);
+  EXPECT_EQ(MetricValue(body, "keylane_server_ready"), 1);
   const std::uint64_t connections = MetricValue(body, "keylane_connections");
   const std::uint64_t connected_clients =
       MetricValue(body, "keylane_connected_clients");
@@ -373,6 +378,26 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_GT(MetricValue(body, "keylane_memory_rss_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_memory_max_bytes"), 1073741824);
   EXPECT_EQ(MetricValue(body, "keylane_memory_rejected_commands_total"), 0);
+  EXPECT_GT(
+      MetricValue(body,
+                  "keylane_storage_io_operations_total{operation=\"write\"}"),
+      0);
+  EXPECT_GT(
+      MetricValue(
+          body, "keylane_storage_io_operations_total{operation=\"fdatasync\"}"),
+      0);
+  EXPECT_GT(
+      MetricValue(body, "keylane_storage_io_bytes_total{operation=\"write\"}"),
+      0);
+  EXPECT_GT(
+      MetricValue(body,
+                  "keylane_storage_io_bytes_total{operation=\"fdatasync\"}"),
+      0);
+  EXPECT_NE(
+      body.find("keylane_storage_io_operations_total{operation=\"read\"} "),
+      std::string_view::npos);
+  EXPECT_NE(body.find("keylane_storage_io_bytes_total{operation=\"read\"} "),
+            std::string_view::npos);
   EXPECT_GT(MetricValue(body, "keylane_storage_capacity_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_storage_available_bytes"), 0);
   EXPECT_GT(MetricValue(body, "keylane_filesystem_available_bytes"), 0);

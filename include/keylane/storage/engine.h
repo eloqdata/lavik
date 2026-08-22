@@ -39,7 +39,6 @@ struct StorageEngineOptions {
   // Bounded, per-worker staging memory for commands waiting to enter the
   // shared in-memory replication backlog.
   std::size_t replication_publish_queue_bytes_ = 16ULL * 1024 * 1024;
-  bool verify_read_crc_ = true;
   bool expiration_authority_ = true;
   // Keys at or below this size stay complete in the in-memory index. Larger
   // keys are stored in disk extents and verified on demand.
@@ -205,6 +204,10 @@ struct SnapshotRecord {
   // sync. It is never serialized; the sender reads it in transfer chunks.
   std::uint64_t source_id_ = 0;
   std::uint64_t source_value_bytes_ = 0;
+  // Source-local snapshot metadata. This is deliberately not encoded on the
+  // replication wire; carrying it through the send ACK avoids hashing every
+  // baseline key a second time when coverage advances to TAILING.
+  Digest key_digest_{};
   std::string key_;
   std::string value_;
 };
@@ -372,6 +375,12 @@ struct FullSyncPublishItem {
   std::uint64_t id_ = 0;
   std::shared_ptr<const ReplicationCommandAppend> command_;
   std::optional<SnapshotRecord> record_;
+};
+
+struct FullSyncPublishQueueInfo {
+  std::size_t queued_bytes_ = 0;
+  std::size_t admitted_bytes_ = 0;
+  std::size_t capacity_bytes_ = 0;
 };
 
 struct ReplicationPublisherAdmission {
@@ -782,6 +791,8 @@ class StorageEngine {
                                               std::uint8_t db_id);
   absl::StatusOr<std::vector<FullSyncPublishItem>> PeekFullSyncPublishItems(
       std::uint64_t session_id, std::size_t max_items);
+  absl::StatusOr<FullSyncPublishQueueInfo> GetFullSyncPublishQueueInfo(
+      std::uint64_t session_id) const;
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);
   // Runtime-only source replication backlog for the current storage worker.

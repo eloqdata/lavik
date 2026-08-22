@@ -461,7 +461,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             : result.scalar_};
   }
   absl::Status written = co_await AppendLocked(
-      store, partition, db_id, key, payload, kind, published_type,
+      store, partition, db_id, key, digest, payload, kind, published_type,
       kind == RecordKind::kValue ? expire_at_ms : 0, tx,
       kind == RecordKind::kValue ? compact.entries_.size() : 0, nullptr,
       nullptr, replication);

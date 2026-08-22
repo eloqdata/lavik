@@ -44,6 +44,7 @@
 #include "keylane/storage/format.h"
 #include "keylane/storage/scan_hash_map.h"
 #include "keylane/storage/tx_cleaner.h"
+#include "../ring_buffer.h"
 #include "keylane/tx/tx_shard.h"
 #include "spdlog/spdlog.h"
 
@@ -1013,7 +1014,7 @@ class StorageEngine::Impl {
       std::deque<ReplicationLogBlock> blocks_;
       bool capacity_backpressured_ = false;
       std::uint64_t capacity_waits_ = 0;
-      std::deque<PendingCommand> publish_queue_;
+      RingBuffer<PendingCommand> publish_queue_;
       std::size_t publish_queue_bytes_ = 0;
       std::size_t publisher_admitted_bytes_ = 0;
       bool publisher_running_ = false;
@@ -1076,7 +1077,7 @@ class StorageEngine::Impl {
 
       std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
       std::size_t reserved_memory_bytes_ = 0;
-      std::deque<PendingCommand> publish_queue_;
+      RingBuffer<PendingCommand> publish_queue_;
       std::size_t publish_queue_bytes_ = 0;
       std::size_t publisher_admitted_bytes_ = 0;
       std::uint64_t next_publish_id_ = 1;
@@ -1689,6 +1690,9 @@ class StorageEngine::Impl {
   absl::StatusOr<std::vector<FullSyncPublishItem>> PeekFullSyncPublishItems(
       std::uint64_t session_id, std::size_t max_items);
 
+  absl::StatusOr<FullSyncPublishQueueInfo> GetFullSyncPublishQueueInfo(
+      std::uint64_t session_id) const;
+
   void AcknowledgeFullSyncPublishItem(std::uint64_t session_id,
                                       std::uint64_t item_id);
 
@@ -2156,9 +2160,9 @@ class StorageEngine::Impl {
 
   Task<absl::Status> AppendLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
-      std::uint8_t db_id, std::string_view key, std::string_view value,
-      RecordKind kind, ValueType value_type, std::uint64_t expire_at_ms,
-      TxShardWrites* tx = nullptr,
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      std::string_view value, RecordKind kind, ValueType value_type,
+      std::uint64_t expire_at_ms, TxShardWrites* tx = nullptr,
       std::uint64_t logical_size = std::numeric_limits<std::uint64_t>::max(),
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr,

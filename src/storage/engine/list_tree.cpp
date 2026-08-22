@@ -427,10 +427,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     payload = std::move(*encoded);
   }
   absl::Status written =
-      co_await AppendLocked(store, partition, db_id, key, payload, kind, type,
-                            kind == RecordKind::kValue ? expire_at_ms : 0, tx,
-                            kind == RecordKind::kValue ? elements.size() : 0,
-                            nullptr, nullptr, replication);
+      co_await AppendLocked(
+          store, partition, db_id, key, digest, payload, kind, type,
+          kind == RecordKind::kValue ? expire_at_ms : 0, tx,
+          kind == RecordKind::kValue ? elements.size() : 0, nullptr, nullptr,
+          replication);
   if (!written.ok()) co_return written;
   co_return result;
 }

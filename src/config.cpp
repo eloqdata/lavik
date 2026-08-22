@@ -259,6 +259,42 @@ absl::Status ApplyRedisConfigDirective(
     return ParseUnsigned(directive[1], name, &options->recv_buffer_count_,
                          true);
   }
+  if (name == "foreground-budget-us" || name == "background-budget-us" ||
+      name == "background-warrant-percent" ||
+      name == "spdk-max-completions-per-poll") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    unsigned value = 0;
+    const bool allow_zero = name == "spdk-max-completions-per-poll";
+    absl::Status parsed =
+        ParseUnsigned(directive[1], name, &value, allow_zero);
+    if (!parsed.ok()) return parsed;
+    if (name == "background-warrant-percent" && value > 100) {
+      return absl::InvalidArgumentError(
+          "background-warrant-percent must be between 1 and 100");
+    }
+    if (name == "foreground-budget-us") {
+      options->foreground_budget_us_ = value;
+    } else if (name == "background-budget-us") {
+      options->background_budget_us_ = value;
+    } else if (name == "background-warrant-percent") {
+      options->background_warrant_percent_ = value;
+    } else {
+      options->spdk_max_completions_per_poll_ = value;
+    }
+    return absl::OkStatus();
+  }
+  if (name == "replication-snapshot-batch-size") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    std::size_t count = 0;
+    absl::Status parsed = ParseUnsigned(directive[1], name, &count, false);
+    if (!parsed.ok()) return parsed;
+    if (count > kMaxReplicationSnapshotBatchSize) {
+      return absl::InvalidArgumentError(
+          "replication-snapshot-batch-size is out of range");
+    }
+    options->replication_options_.snapshot_batch_size_ = count;
+    return absl::OkStatus();
+  }
   if (name == "registered-buffer-mb-per-worker" ||
       name == "replication-publish-queue-mb-per-worker") {
     if (directive.size() != 2) return WrongArgumentCount(name);
