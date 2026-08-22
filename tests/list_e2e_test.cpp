@@ -3041,6 +3041,121 @@ TEST(ListE2eTest, SingleKeyWritesKeepAdmissionAndOrderUnderATightWaterline) {
   source.Stop();
 }
 
+#if KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT
+// The rest of this file can only fence behaviour, and the collapse changes no
+// behaviour -- it removes two cross-core round trips per write, which is
+// latency, which nothing can assert. Configuring with
+// -DKEYLANE_ENABLE_CROSS_CORE_HOP_COUNT=ON counts the transfers instead, so
+// the one-hop property has a regression fence and not just a benchmark.
+//
+// The claim being fenced is the issue's headline: attaching a replica must
+// stop adding cross-core round trips to a single-key write. So the same writes
+// run twice, once with no replica and once with one, and the two hop counts
+// must match. Before the collapse the second round cost three times the first.
+TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-single-key-hops-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    // 180 tiny writes; the smallest allocation the engine accepts is plenty.
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  constexpr unsigned kSourceThreads = 3;
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       kSourceThreads);
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2);
+
+  // A single writer connection sits on exactly one worker, and the keys are
+  // pinned one third to each of the three. Two thirds of the writes therefore
+  // cross a core, whichever worker the connection happened to draw, so the
+  // expected count is exact rather than a bound.
+  constexpr unsigned kPerWorker = 30;
+  constexpr std::uint64_t kRemoteWrites = 2 * kPerWorker;
+  RespClient writer(source_port);
+  RespClient observer(source_port);
+  std::vector<std::string> keys;
+  keys.reserve(kSourceThreads * kPerWorker);
+  for (unsigned worker = 0; worker < kSourceThreads; ++worker) {
+    for (unsigned index = 0; index < kPerWorker; ++index) {
+      keys.push_back(KeyForWorker(
+          "hops-w" + std::to_string(worker) + "-" + std::to_string(index),
+          worker, kSourceThreads));
+    }
+  }
+  const auto hops = [](RespClient& client) {
+    constexpr std::string_view marker = "command_cross_core_hops:";
+    const std::string info = client.Command({"INFO", "STATS"});
+    const std::size_t begin = info.find(marker);
+    if (begin == std::string::npos) {
+      throw std::runtime_error("hop counter is missing from INFO STATS");
+    }
+    const std::size_t value_begin = begin + marker.size();
+    const std::size_t value_end = info.find("\r\n", value_begin);
+    std::uint64_t counted = 0;
+    const char* first = info.data() + value_begin;
+    const char* last = info.data() + value_end;
+    const auto [parsed, error] = std::from_chars(first, last, counted);
+    if (error != std::errc{} || parsed != last) {
+      throw std::runtime_error("malformed hop counter");
+    }
+    return counted;
+  };
+  // INFO is neither keyed nor a write, so reading the counter cannot move it.
+  // EXPECT, not ASSERT: a gtest assertion returns from the enclosing function,
+  // which here is the lambda, and the hop delta still has to be computed.
+  const auto write_all = [&](std::string_view round) -> std::uint64_t {
+    const std::uint64_t before = hops(observer);
+    for (const std::string& key : keys) {
+      EXPECT_EQ(writer.Command({"SET", key, round}), "+OK");
+    }
+    return hops(observer) - before;
+  };
+
+  const std::uint64_t solo_hops = write_all("solo");
+  EXPECT_EQ(solo_hops, kRemoteWrites);
+
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replication_info;
+  do {
+    replication_info = replica_client.Command({"INFO", "replication"});
+    if (replication_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replication_info.find("keylane_replication_state:online"),
+            std::string::npos);
+
+  const std::uint64_t replicated_hops = write_all("replicated");
+  EXPECT_EQ(replicated_hops, solo_hops);
+  EXPECT_EQ(replicated_hops, kRemoteWrites);
+
+  replica.Stop();
+  source.Stop();
+}
+#endif  // KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT
+
 // Covers asymmetric source/replica worker counts, dynamic replica admission,
 // a one-shot flow disconnect, backlog continuation, and FLUSHDB propagation.
 TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
