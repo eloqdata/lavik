@@ -225,6 +225,52 @@ TEST(RdbTest, ReadsFileMetadataDatabasesAndExpirations) {
   EXPECT_TRUE(rewound->has_value());
 }
 
+TEST(RdbTest, WritesAtomicRedisCompatibleFileFromIndependentFragments) {
+  TempFile target("");
+  ASSERT_EQ(::unlink(target.path().c_str()), 0);
+  auto writer = FileWriter::Open(target.path());
+  ASSERT_TRUE(writer.ok()) << writer.status();
+
+  storage::RawValue first{
+      .encoded_ = "first-value",
+      .logical_size_ = 11,
+      .expire_at_ms_ = 4'102'444'800'123ULL,
+      .value_type_ = storage::ValueType::kString,
+  };
+  storage::RawValue second{
+      .encoded_ = "second-value",
+      .logical_size_ = 12,
+      .value_type_ = storage::ValueType::kString,
+  };
+  auto first_fragment = EncodeFileEntry(2, "first", first);
+  auto second_fragment = EncodeFileEntry(0, "second", second);
+  ASSERT_TRUE(first_fragment.ok()) << first_fragment.status();
+  ASSERT_TRUE(second_fragment.ok()) << second_fragment.status();
+  ASSERT_TRUE(writer->WriteFragment(*first_fragment).ok());
+  ASSERT_TRUE(writer->WriteFragment(*second_fragment).ok());
+  ASSERT_TRUE(writer->Finish().ok());
+
+  auto reader = FileReader::Open(target.path());
+  ASSERT_TRUE(reader.ok()) << reader.status();
+  EXPECT_EQ(reader->version(), 11u);
+  auto first_entry = reader->Next();
+  ASSERT_TRUE(first_entry.ok()) << first_entry.status();
+  ASSERT_TRUE(first_entry->has_value());
+  EXPECT_EQ((**first_entry).db_id_, 2);
+  EXPECT_EQ((**first_entry).key_, "first");
+  EXPECT_EQ((**first_entry).value_.encoded_, "first-value");
+  EXPECT_EQ((**first_entry).value_.expire_at_ms_, 4'102'444'800'123ULL);
+  auto second_entry = reader->Next();
+  ASSERT_TRUE(second_entry.ok()) << second_entry.status();
+  ASSERT_TRUE(second_entry->has_value());
+  EXPECT_EQ((**second_entry).db_id_, 0);
+  EXPECT_EQ((**second_entry).key_, "second");
+  EXPECT_EQ((**second_entry).value_.encoded_, "second-value");
+  auto eof = reader->Next();
+  ASSERT_TRUE(eof.ok()) << eof.status();
+  EXPECT_FALSE(eof->has_value());
+}
+
 TEST(RdbTest, ReadsHistoricalSecondExpirationWithoutChecksum) {
   std::string body;
   body.push_back(static_cast<char>(0xfd));

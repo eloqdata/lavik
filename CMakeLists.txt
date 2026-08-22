@@ -116,6 +116,7 @@ add_library(keylane_module
   src/storage/buffer_pool.cpp
   src/storage/engine.cpp
   src/storage/engine/alloc.cpp
+  src/storage/engine/backup.cpp
   src/storage/engine/compact_api.cpp
   src/storage/engine/defrag.cpp
   src/storage/engine/expire.cpp
@@ -142,6 +143,7 @@ add_library(keylane_module
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/rdb.cpp
+  src/redis/backup.cpp
   src/redis/blocking_wait.cpp
   src/redis/command.cpp
   src/redis/hash_command.cpp
@@ -275,6 +277,15 @@ if (BUILD_TESTING)
       )
       set_tests_properties(keylane_redis_cluster_psync_e2e
         PROPERTIES TIMEOUT 120)
+      add_test(
+        NAME keylane_rdb_backup_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rdb_backup_e2e.sh
+                $<TARGET_FILE:keylane>
+                ${KEYLANE_REDIS_CLI_EXECUTABLE}
+      )
+      set_tests_properties(keylane_rdb_backup_e2e PROPERTIES
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
     endif()
 
     add_executable(keylane_replication_log_e2e_test

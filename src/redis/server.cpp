@@ -29,6 +29,7 @@
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "backup.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
@@ -1259,6 +1260,10 @@ int RunServer(ServerOptions options) {
                                  std::move(options.replication_options_),
                                  std::move(replication_upstream));
   InitStorage(&storage, &replication);
+  InitRdbBackup(
+      &storage,
+      absl::StrCat(options.rdb_dir_, options.rdb_dir_.ends_with('/') ? "" : "/",
+                   options.dbfilename_));
   InitWorkerMetrics(options.thread_count_);
   SetServerInfo(std::move(advertised_bind), advertised_port,
                 options.thread_count_);
@@ -1309,6 +1314,7 @@ int RunServer(ServerOptions options) {
     redis.StopAcceptingRequests();
     server.StopAccepting();
     redis.WaitForRequestsDrained();
+    WaitForRdbBackupDrained();
     spdlog::info("all active requests drained; flushing storage buffers");
     absl::Status flush_status = storage.FlushForShutdown();
     if (!flush_status.ok()) {

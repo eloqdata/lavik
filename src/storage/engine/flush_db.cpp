@@ -258,15 +258,26 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   // The first full-sync implementation treats a DB epoch change as a session
   // boundary. A partially built root may already contain keys from this DB,
   // including partitions whose capture has not started, so a per-partition
-  // replacement cannot make the in-place rebuild correct. Invalidate every local
-  // session synchronously with detach; its next snapshot/override/DB handoff
-  // operation aborts the whole full sync.
+  // replacement cannot make the in-place rebuild correct. Invalidate every
+  // local session synchronously with detach; its next snapshot/override/DB
+  // handoff operation aborts the whole full sync.
   for (auto& [session_id, session] : store.fullsync_sessions_) {
     (void)session_id;
     session.db_epoch_invalidated_ = true;
     session.publish_queue_.clear();
     session.publish_queue_bytes_ = 0;
     session.publisher_admitted_bytes_ = 0;
+  }
+  // A DB epoch is part of every physical record validation. Keep FLUSHDB
+  // online and bounded by invalidating an active RDB job; its coordinator
+  // removes the temporary file and releases all snapshot pins.
+  if (store.rdb_snapshot_.has_value()) [[unlikely]] {
+    store.rdb_snapshot_->invalidated_ = true;
+    for (auto& partition : store.partitions_) {
+      if (partition.rdb_snapshot_.has_value()) {
+        partition.rdb_snapshot_->accepting_ = false;
+      }
+    }
   }
   store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
   ++store.index_generations_[db_id];

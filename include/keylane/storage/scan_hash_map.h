@@ -92,9 +92,11 @@ class ScanHashMap {
         throw;
       }
       if (key_complete && !key.empty()) {
-        std::memcpy(entry + 1, key.data(), key.size());
+        std::memcpy(static_cast<void*>(reinterpret_cast<std::byte*>(entry + 1)),
+                    key.data(), key.size());
       } else if (!key_complete) {
-        std::memcpy(entry + 1, digest.bytes_.data(), digest.bytes_.size());
+        std::memcpy(static_cast<void*>(reinterpret_cast<std::byte*>(entry + 1)),
+                    digest.bytes_.data(), digest.bytes_.size());
       }
       return entry;
     }

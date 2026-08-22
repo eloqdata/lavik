@@ -33,6 +33,21 @@ std::size_t StorageEngine::LocalSize(std::uint8_t db_id) const noexcept {
   return impl_->LocalSize(db_id);
 }
 
+absl::Status StorageEngine::BeginRdbSnapshot(std::uint64_t session_id,
+                                             std::uint64_t snapshot_time_ms) {
+  return impl_->BeginRdbSnapshot(session_id, snapshot_time_ms);
+}
+
+Task<absl::StatusOr<RdbSnapshotBatch>> StorageEngine::ReadRdbSnapshotBatch(
+    std::uint64_t session_id, RdbSnapshotCursor cursor, std::size_t count,
+    std::size_t max_bytes) {
+  return impl_->ReadRdbSnapshotBatch(session_id, cursor, count, max_bytes);
+}
+
+Task<absl::Status> StorageEngine::EndRdbSnapshot(std::uint64_t session_id) {
+  return impl_->EndRdbSnapshot(session_id);
+}
+
 Task<absl::StatusOr<std::optional<std::string>>> StorageEngine::RandomKeyLocal(
     std::uint8_t db_id) {
   return impl_->RandomKeyLocal(db_id);

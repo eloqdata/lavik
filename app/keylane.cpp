@@ -209,6 +209,12 @@ int main(int argc, char** argv) {
          "--data-file", options.data_files_,
          "Existing data file or block device; repeat for multiple paths")
       ->capture_default_str();
+  app.add_option("--rdb-dir", options.rdb_dir_,
+                 "Filesystem directory for Redis-compatible RDB backups")
+      ->capture_default_str();
+  app.add_option("--dbfilename", options.dbfilename_,
+                 "Filename written by SAVE/BGSAVE inside --rdb-dir")
+      ->capture_default_str();
   app.add_option("--load-rdb", options.load_rdb_file_,
                  "Import a complete Redis RDB into an empty dataset before "
                  "opening listeners");
