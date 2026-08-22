@@ -19,7 +19,7 @@ set(KEYLANE_MARCH "native" CACHE STRING
   "Value passed to -march for optimized local builds (empty disables it)")
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
 option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
-option(KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT "Count command dispatch cross-core transfers (test builds only)" OFF)
+option(KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfers (test builds only)" OFF)
 option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
 
 set(KEYLANE_ASAN_BUILD OFF)
@@ -76,6 +76,9 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
 else()
   message(FATAL_ERROR "celer submodule not found; run git submodule update --init --recursive")
 endif()
+target_compile_definitions(celer PUBLIC
+  CELER_ENABLE_SUBMIT_TASK_COUNT=$<BOOL:${KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT}>
+)
 
 if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/mimalloc/CMakeLists.txt)
   message(FATAL_ERROR

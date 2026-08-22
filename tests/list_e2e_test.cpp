@@ -3068,7 +3068,7 @@ TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
     const int fd =
         ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     ASSERT_GE(fd, 0);
-    // 180 tiny writes; the smallest allocation the engine accepts is plenty.
+    // Only tiny writes; the smallest allocation the engine accepts is plenty.
     ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
     ASSERT_EQ(::close(fd), 0);
   }
@@ -3083,8 +3083,9 @@ TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
 
   // A single writer connection sits on exactly one worker, and the keys are
   // pinned one third to each of the three. Two thirds of the writes therefore
-  // cross a core, whichever worker the connection happened to draw, so the
-  // expected count is exact rather than a bound.
+  // cross a core, whichever worker the connection happened to draw. A warmup
+  // below removes one-time storage SubmitTaskTo work from the measured rounds,
+  // making the expected steady-state count exact rather than a bound.
   constexpr unsigned kPerWorker = 30;
   constexpr std::uint64_t kRemoteWrites = 2 * kPerWorker;
   RespClient writer(source_port);
@@ -3116,7 +3117,8 @@ TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
     }
     return counted;
   };
-  // INFO is neither keyed nor a write, so reading the counter cannot move it.
+  // INFO gathers each worker's local counter with SubmitTo, so reading the
+  // SubmitTaskTo counter cannot move it.
   // EXPECT, not ASSERT: a gtest assertion returns from the enclosing function,
   // which here is the lambda, and the hop delta still has to be computed.
   const auto write_all = [&](std::string_view round) -> std::uint64_t {
@@ -3127,6 +3129,7 @@ TEST(ListE2eTest, AttachingAReplicaAddsNoCrossCoreHopsToSingleKeyWrites) {
     return hops(observer) - before;
   };
 
+  (void)write_all("warmup");
   const std::uint64_t solo_hops = write_all("solo");
   EXPECT_EQ(solo_hops, kRemoteWrites);
 
