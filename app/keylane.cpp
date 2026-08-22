@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
   app.add_option("--masterauth", options.masterauth_,
                  "Password used to authenticate to the replication source");
   app.add_option("--redis-replicaof", redis_replicaof_cli,
-                 "Permanently follow a standalone Redis server: HOST PORT")
+                 "Initially follow a standalone Redis server: HOST PORT")
       ->expected(2);
   app.add_option("--metrics-port", options.metrics_port_,
                  "Prometheus HTTP listen port (0 disables)")

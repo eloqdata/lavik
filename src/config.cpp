@@ -365,11 +365,6 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     return absl::InvalidArgumentError(
         "replicaof and redis-replicaof cannot be configured together");
   }
-  if (options.redis_replicaof_.has_value() &&
-      !options.replication_options_.replica_read_only_) {
-    return absl::InvalidArgumentError(
-        "redis-replicaof is permanently read-only");
-  }
   if (options.load_rdb_replace_ && options.load_rdb_file_.empty()) {
     return absl::InvalidArgumentError(
         "load-rdb-replace requires load-rdb to be configured");

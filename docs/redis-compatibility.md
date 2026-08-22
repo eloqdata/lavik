@@ -75,7 +75,7 @@ validated but not inserted.
 ## Standalone Redis PSYNC follower
 
 `--redis-replicaof <host> <port>` (or `redis-replicaof <host> <port>` in the
-configuration file) makes Keylane a permanent read-only follower of one
+configuration file) starts Keylane as a read-only follower of one
 standalone Redis server. This mode is separate from Keylane's native
 `replicaof` protocol. It performs the Redis `PSYNC` handshake, imports a
 length-delimited FULLRESYNC RDB, and then applies the single RESP replication
@@ -90,11 +90,22 @@ The node continues serving its last complete dataset read-only while retrying
 a transient connection. If Redis requires another FULLRESYNC, reads return
 `LOADING` while the replacement RDB is validated and imported.
 
-This mode cannot be promoted with `REPLICAOF NO ONE`, cannot change upstream at
-runtime, and does not accept downstream Keylane replication sessions. RDB
-Module and Function records have the same skip-and-warn behavior as startup
-import. Incremental commands that Keylane cannot replay stop the session and
-force a retry instead of silently diverging.
+While attached to Redis, the node does not accept downstream Keylane
+replication sessions. `REPLICAOF NO ONE` disconnects Redis and retains the last
+complete dataset, enables expiration authority and local writes, and makes the
+node an independent Keylane source. If the command races an incomplete initial
+FULLRESYNC, the partial dataset is discarded. A later ordinary `REPLICAOF
+<host> <port>` explicitly selects Keylane's native `KLPSYNC` protocol and may
+follow another Keylane node.
+
+`REPLICAOF` is only a local role-control command; it is not sent to the remote
+server. `redis-replicaof` chooses the Redis `PSYNC` handshake, while ordinary
+`replicaof`/`REPLICAOF` chooses `KLPSYNC/KLFLOW`. Keylane deliberately does not
+guess the peer type, because an authentication or version failure must not be
+misclassified as another protocol. RDB Module and Function records have the
+same skip-and-warn behavior as startup import. Incremental commands that
+Keylane cannot replay stop the session and force a retry instead of silently
+diverging.
 
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
 scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s

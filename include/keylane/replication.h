@@ -47,8 +47,8 @@ struct ReplicationOptions {
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
-  // The configured upstream speaks Redis PSYNC rather than Keylane's native
-  // multi-flow protocol. This is a permanent, read-only follower mode.
+  // The initial upstream speaks Redis PSYNC rather than Keylane's native
+  // multi-flow protocol. REPLICAOF NO ONE may later detach it.
   bool redis_psync_ = false;
 };
 
@@ -130,9 +130,7 @@ class ReplicationManager {
   bool reject_writes() const noexcept;
   // Native Keylane replicas participate in cluster-style redirection. A
   // standalone Redis PSYNC follower instead serves its local read-only copy.
-  bool redirects_clients_to_upstream() const noexcept {
-    return !options_.redis_psync_;
-  }
+  bool redirects_clients_to_upstream() const noexcept;
   bool replica_read_only() const noexcept {
     return options_.replica_read_only_;
   }

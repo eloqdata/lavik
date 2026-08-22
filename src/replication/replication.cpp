@@ -1286,10 +1286,6 @@ class ReplicationManager::Impl {
             return SetUpstream(std::move(upstream));
           });
     }
-    if (redis_psync_) {
-      co_return absl::FailedPreconditionError(
-          "redis-replicaof is permanent and cannot be changed at runtime");
-    }
     if (upstream.has_value() &&
         (upstream->host_.empty() || upstream->port_ == 0)) {
       co_return absl::InvalidArgumentError("invalid replication upstream");
@@ -1317,7 +1313,14 @@ class ReplicationManager::Impl {
 
     {
       std::lock_guard lock(state_mutex_);
-      if (upstream_ == upstream) co_return absl::OkStatus();
+      // A non-null SetUpstream request always selects Keylane's native
+      // protocol. The same endpoint is therefore still a topology change when
+      // the current session was started with redis-replicaof.
+      if (upstream_ == upstream &&
+          (!upstream.has_value() ||
+           !redis_psync_.load(std::memory_order_relaxed))) {
+        co_return absl::OkStatus();
+      }
     }
     if (upstream.has_value()) {
       absl::Status quiesced = co_await storage_->QuiesceExpiration();
@@ -1345,6 +1348,13 @@ class ReplicationManager::Impl {
       // writes may have occurred while promoted or while following another
       // source, so none of the old per-flow cursors are safe for CONTINUE.
       cursor_state_.reset();
+      // REPLICAOF host port selects native Keylane replication; NO ONE exits
+      // either protocol. Redis PSYNC can be selected again on a later restart
+      // with redis-replicaof.
+      redis_psync_.store(false, std::memory_order_release);
+      redis_dataset_valid_ = false;
+      redis_replid_.reset();
+      redis_offset_ = 0;
       role_epoch_.fetch_add(1, std::memory_order_acq_rel);
       role_.store(upstream_.has_value() ? ReplicationRole::kConnecting
                                         : ReplicationRole::kMaster,
@@ -1424,6 +1434,10 @@ class ReplicationManager::Impl {
 
   bool is_replica() const noexcept {
     return role_.load(std::memory_order_acquire) != ReplicationRole::kMaster;
+  }
+
+  bool is_redis_follower() const noexcept {
+    return redis_psync_.load(std::memory_order_acquire);
   }
 
   bool is_loading() const noexcept {
@@ -1530,7 +1544,7 @@ class ReplicationManager::Impl {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls) {
-    if (redis_psync_) {
+    if (redis_psync_.load(std::memory_order_acquire)) {
       co_return absl::FailedPreconditionError(
           "a redis-replicaof follower cannot serve downstream replicas");
     }
@@ -1642,25 +1656,27 @@ class ReplicationManager::Impl {
     while (true) {
       ReplicaOfConfig upstream;
       std::uint64_t role_epoch = 0;
+      bool redis_psync = false;
       std::shared_ptr<ReplicaSession> session;
       {
         std::lock_guard lock(state_mutex_);
         if (!upstream_.has_value()) break;
         upstream = *upstream_;
         role_epoch = role_epoch_.load(std::memory_order_relaxed);
+        redis_psync = redis_psync_.load(std::memory_order_relaxed);
         session = std::make_shared<ReplicaSession>();
         active_replica_session_ = session;
       }
-      role_.store(redis_psync_ && redis_dataset_valid_
+      role_.store(redis_psync && redis_dataset_valid_
                       ? ReplicationRole::kOnline
                       : ReplicationRole::kConnecting,
                   std::memory_order_release);
       absl::Status connected =
-          redis_psync_
+          redis_psync
               ? co_await RunRedisReplicaSession(upstream, role_epoch, session)
               : co_await RunReplicaSession(upstream, role_epoch, session);
       session->Cancel();
-      if (!redis_psync_ && session->session_id_ != 0) {
+      if (!redis_psync && session->session_id_ != 0) {
         absl::Status discarded =
             co_await storage_->AbortReplicaRoot(session->session_id_);
         if (!discarded.ok()) {
@@ -1681,7 +1697,8 @@ class ReplicationManager::Impl {
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch;
       }
       if (!retry) continue;
-      role_.store(redis_psync_ && redis_dataset_valid_
+      const bool retrying_redis = redis_psync_.load(std::memory_order_acquire);
+      role_.store(retrying_redis && redis_dataset_valid_
                       ? ReplicationRole::kOnline
                       : ReplicationRole::kConnecting,
                   std::memory_order_release);
@@ -1698,7 +1715,8 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
-  Task<absl::Status> ImportRedisRdb(const std::string& path) {
+  Task<absl::Status> ImportRedisRdb(const std::string& path,
+                                    std::uint64_t role_epoch) {
     auto reader = rdb::FileReader::Open(path);
     if (!reader.ok()) co_return reader.status();
 
@@ -1728,6 +1746,11 @@ class ReplicationManager::Impl {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
+    }
+    if (role_epoch_.load(std::memory_order_acquire) != role_epoch ||
+        !redis_psync_.load(std::memory_order_acquire)) {
+      co_return absl::CancelledError(
+          "Redis full sync was cancelled by a role change");
     }
 
     absl::Status cleared = co_await storage_->FlushAllDetach();
@@ -1971,7 +1994,7 @@ class ReplicationManager::Impl {
     redis_dataset_valid_ = false;
     auto rdb_path = co_await ReceiveRedisRdb(stream);
     if (!rdb_path.ok()) co_return rdb_path.status();
-    absl::Status status = co_await ImportRedisRdb(*rdb_path);
+    absl::Status status = co_await ImportRedisRdb(*rdb_path, role_epoch);
     (void)::unlink(rdb_path->c_str());
     if (!status.ok()) co_return status;
     redis_replid_ = std::move(replid);
@@ -4106,7 +4129,7 @@ class ReplicationManager::Impl {
   const std::shared_ptr<celer::TlsContext> tls_context_;
   const std::string masteruser_;
   const std::string masterauth_;
-  const bool redis_psync_;
+  std::atomic<bool> redis_psync_{false};
   // Redis's offset is retained across transient reconnects, enabling PSYNC
   // partial resynchronization. It is intentionally not persisted yet: after a
   // process restart we request a fresh RDB because storage and cursor updates
@@ -4193,7 +4216,12 @@ bool ReplicationManager::is_loading() const noexcept {
 }
 
 bool ReplicationManager::reject_writes() const noexcept {
-  return options_.redis_psync_ || (options_.replica_read_only_ && is_replica());
+  return impl_->is_redis_follower() ||
+         (options_.replica_read_only_ && is_replica());
+}
+
+bool ReplicationManager::redirects_clients_to_upstream() const noexcept {
+  return !impl_->is_redis_follower();
 }
 
 std::string_view ReplicationRoleName(ReplicationRole role) noexcept {
