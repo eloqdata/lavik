@@ -72,40 +72,63 @@ formats, databases above 15, malformed records, and unknown object types whose
 boundaries cannot be determined safely are rejected. Expired keys are
 validated but not inserted.
 
-## Standalone Redis PSYNC follower
+## Redis PSYNC follower
 
 `--redis-replicaof <host> <port>` (or `redis-replicaof <host> <port>` in the
-configuration file) starts Keylane as a read-only follower of one
-standalone Redis server. This mode is separate from Keylane's native
-`replicaof` protocol. It performs the Redis `PSYNC` handshake, imports a
-length-delimited FULLRESYNC RDB, and then applies the single RESP replication
-stream directly to storage. `SELECT`, keepalive `PING`, `REPLCONF GETACK`, and
-`MULTI`/`EXEC` streams are handled explicitly.
+configuration file) explicitly starts Keylane as a read-only Redis follower.
+Runtime `REPLICAOF <host> <port>` and the ordinary `replicaof` configuration
+directive automatically distinguish Keylane from Redis: Keylane first attempts
+`KLPSYNC`, and falls back to Redis only when the peer explicitly returns an
+unknown-command error for `KLPSYNC`. Authentication, network, and other
+protocol errors are never treated as protocol detection failures.
 
-Transient reconnects retain the Redis replication id and applied byte offset
-in memory and request partial resynchronization. The cursor is deliberately
-not recovered after a Keylane process restart, because it is not yet committed
-atomically with storage writes; a restart therefore requests a new FULLRESYNC.
-The node continues serving its last complete dataset read-only while retrying
-a transient connection. If Redis requires another FULLRESYNC, reads return
-`LOADING` while the replacement RDB is validated and imported.
+Redis mode imports a length-delimited FULLRESYNC RDB and then applies the RESP
+replication stream directly to storage. `SELECT`, keepalive `PING`, `REPLCONF
+GETACK`, and `MULTI`/`EXEC` streams are handled explicitly. Transient reconnects
+retain the Redis replication id and byte offset in memory and request partial
+resynchronization. These cursors are not recovered after a Keylane process
+restart because storage writes and offsets do not yet share a crash-atomic
+commit record; restart therefore requests a new FULLRESYNC.
 
-While attached to Redis, the node does not accept downstream Keylane
-replication sessions. `REPLICAOF NO ONE` disconnects Redis and retains the last
+When the endpoint is a slot-owning Redis Cluster master, Keylane reads
+`CLUSTER NODES` and freezes the complete 0-16383 slot layout.
+`ADDREPLICAOF <host> <port>` registers each remaining master. Every addition
+must report the same layout and a slot set disjoint from all registered
+sources; overlap is rejected before starting a session or mutating storage.
+Keylane remains `LOADING` until every advertised slot-owning master is
+registered and synchronized. Each master sees the same Keylane listening port
+as a downstream replica because every PSYNC connection sends `REPLCONF
+listening-port`.
+
+Each source has an independent replication id, offset, ACK stream, and
+reconnect loop. Cluster FULLRESYNC advances durable replication epochs and
+detaches indexes only for that source's slots. RDB keys outside those slots
+stop the session as a topology error. Stale physical records are reclaimed by
+normal detached-index and defragmentation work; the record format and other
+masters' slots do not change. Incremental commands are checked through the
+command table so all keys belong to the source. Cluster `FLUSHDB`/`FLUSHALL`
+becomes a reset of that source's slots, never a global flush.
+
+The last complete dataset remains readable during an ordinary disconnected
+partial-resync retry. A required FULLRESYNC makes the node `LOADING` while that
+source's slots are rebuilt. A background topology check accepts failover when
+a new master owns exactly the same slot set, switches the endpoint, and tries
+PSYNC. Two consecutive observations of migrating/importing, overlapping,
+incomplete, or changed slot ownership stop all Redis sources and leave Keylane
+in `LOADING`; re-run `REPLICAOF` and the required `ADDREPLICAOF` commands after
+the cluster reaches a new stable layout. Online resharding is intentionally not
+merged.
+
+While attached to Redis, Keylane does not accept downstream Keylane
+replication sessions. `REPLICAOF NO ONE` disconnects all sources, retains a
 complete dataset, enables expiration authority and local writes, and makes the
-node an independent Keylane source. If the command races an incomplete initial
-FULLRESYNC, the partial dataset is discarded. A later ordinary `REPLICAOF
-<host> <port>` explicitly selects Keylane's native `KLPSYNC` protocol and may
-follow another Keylane node.
-
-`REPLICAOF` is only a local role-control command; it is not sent to the remote
-server. `redis-replicaof` chooses the Redis `PSYNC` handshake, while ordinary
-`replicaof`/`REPLICAOF` chooses `KLPSYNC/KLFLOW`. Keylane deliberately does not
-guess the peer type, because an authentication or version failure must not be
-misclassified as another protocol. RDB Module and Function records have the
-same skip-and-warn behavior as startup import. Incremental commands that
-Keylane cannot replay stop the session and force a retry instead of silently
-diverging.
+node an independent Keylane source. A later `REPLICAOF <host> <port>` may
+follow either Keylane or Redis through the same safe detection. The command is
+local role control and is never sent to the remote server. Runtime additions
+and Redis cursors are not persisted, so orchestration must replay additions
+after restart. RDB Module and Function records are skipped with a warning;
+incremental commands Keylane cannot replay stop the session instead of
+silently diverging.
 
 Redis 7.2's wire formatting is part of the compatibility target. Sorted Set
 scores use the shortest round-trip digits with Redis 7.2 `fpconv_dtoa`'s

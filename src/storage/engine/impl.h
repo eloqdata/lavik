@@ -1632,6 +1632,10 @@ class StorageEngine::Impl {
   Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);
+  Task<absl::Status> ResetPartitionsDetach(
+      std::span<const std::uint16_t> partition_ids);
+  Task<absl::Status> ResetPartitionsDetachLocal(
+      std::span<const std::uint16_t> partition_ids);
   Task<absl::Status> HandoffReplicaPartition(std::uint64_t session_id,
                                              std::uint16_t partition_id,
                                              std::uint64_t replication_epoch);

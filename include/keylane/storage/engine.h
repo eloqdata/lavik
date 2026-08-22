@@ -793,6 +793,12 @@ class StorageEngine {
   celer::Task<absl::StatusOr<std::vector<ReplicaPartitionEpoch>>>
   ResetReplicaPartitions(std::uint64_t session_id,
                          std::span<const ReplicaPartitionReset> resets);
+  // Logically empties only the selected Redis hash slots. Each partition gets
+  // a new durable replication epoch and its indexes are detached in O(slots)
+  // time; records sharing physical blocks with other slots remain untouched.
+  // The caller must exclude command execution while this runs.
+  celer::Task<absl::Status> ResetPartitionsDetach(
+      std::span<const std::uint16_t> partition_ids);
   celer::Task<absl::Status> HandoffReplicaPartition(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch);

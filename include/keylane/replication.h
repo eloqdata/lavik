@@ -47,8 +47,8 @@ struct ReplicationOptions {
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
-  // The initial upstream speaks Redis PSYNC rather than Keylane's native
-  // multi-flow protocol. REPLICAOF NO ONE may later detach it.
+  // Compatibility override declaring that the initial upstream speaks Redis
+  // PSYNC. Ordinary replicaof performs safe protocol detection instead.
   bool redis_psync_ = false;
 };
 
@@ -69,6 +69,16 @@ struct DownstreamReplicaStatus {
   std::uint64_t min_lsn_ = 0;
 };
 
+struct RedisSourceStatus {
+  ReplicaOfConfig upstream_;
+  std::string node_id_;
+  std::string slots_;
+  std::optional<std::string> replid_;
+  std::uint64_t offset_ = 0;
+  bool link_up_ = false;
+  bool dataset_valid_ = false;
+};
+
 struct ReplicationStatus {
   ReplicationRole role_ = ReplicationRole::kMaster;
   std::optional<ReplicaOfConfig> upstream_;
@@ -81,6 +91,9 @@ struct ReplicationStatus {
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
   std::vector<DownstreamReplicaStatus> downstream_replicas_;
+  std::vector<RedisSourceStatus> redis_sources_;
+  bool redis_cluster_ = false;
+  bool redis_topology_fault_ = false;
 };
 
 // Owns replication role and connection lifetime. Replica connections are
@@ -101,6 +114,9 @@ class ReplicationManager {
   // REPLICAOF NO ONE. Connection establishment continues asynchronously.
   celer::Task<absl::Status> SetUpstream(
       std::optional<ReplicaOfConfig> upstream);
+  // Adds one more master from the same Redis Cluster. The source's advertised
+  // slots must be disjoint from every already registered source.
+  celer::Task<absl::Status> AddUpstream(ReplicaOfConfig upstream);
 
   // Controls the number of snapshot value reads each source flow may keep in
   // flight during a full sync. The value is sampled for every snapshot batch,

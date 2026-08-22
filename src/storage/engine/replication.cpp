@@ -906,6 +906,105 @@ StorageEngine::Impl::ResetReplicaPartitions(
   co_return result;
 }
 
+Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetach(
+    std::span<const std::uint16_t> partition_ids) {
+  if (partition_ids.empty()) co_return absl::OkStatus();
+  if (celer::ThisWorker().id_ != 0) {
+    std::vector<std::uint16_t> copied(partition_ids.begin(),
+                                      partition_ids.end());
+    co_return co_await celer::SubmitTaskTo(
+        0, [this, copied = std::move(copied)]() {
+          return ResetPartitionsDetach(copied);
+        });
+  }
+
+  std::array<bool, kLogicalStorageShards> seen{};
+  std::vector<std::vector<std::uint16_t>> by_worker(worker_count_);
+  for (const std::uint16_t partition_id : partition_ids) {
+    if (partition_id >= kLogicalStorageShards || seen[partition_id]) {
+      co_return absl::InvalidArgumentError(
+          "invalid or duplicate partition in targeted reset");
+    }
+    seen[partition_id] = true;
+    by_worker[partition_id % worker_count_].push_back(partition_id);
+  }
+  for (unsigned worker = 0; worker < worker_count_; ++worker) {
+    if (by_worker[worker].empty()) continue;
+    absl::Status reset;
+    if (worker == 0) {
+      reset = co_await ResetPartitionsDetachLocal(by_worker[worker]);
+    } else {
+      reset = co_await celer::SubmitTaskTo(
+          worker, [this, ids = std::move(by_worker[worker])]() {
+            return ResetPartitionsDetachLocal(ids);
+          });
+    }
+    if (!reset.ok()) co_return reset;
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
+    std::span<const std::uint16_t> partition_ids) {
+  if (partition_ids.empty()) co_return absl::OkStatus();
+  WorkerStore& store = CurrentStore();
+  co_await store.replica_apply_mutex_.Lock();
+  UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
+
+  std::vector<std::pair<std::size_t, std::uint64_t>> epoch_updates;
+  epoch_updates.reserve(partition_ids.size());
+  for (const std::uint16_t partition_id : partition_ids) {
+    if (partition_id >= kLogicalStorageShards ||
+        partition_id % worker_count_ != celer::ThisWorker().id_) {
+      co_return absl::InvalidArgumentError(
+          "targeted reset partition belongs to another worker");
+    }
+    const auto& partition = PartitionFor(store, partition_id);
+    if (partition.replica_sync_ != nullptr) {
+      co_return absl::FailedPreconditionError(
+          "targeted reset conflicts with native replica synchronization");
+    }
+    if (partition.replica_candidate_epoch_ ==
+        std::numeric_limits<std::uint64_t>::max()) {
+      co_return absl::OutOfRangeError("partition replication epoch exhausted");
+    }
+    epoch_updates.emplace_back(kLogicalDatabaseCount + partition_id,
+                               partition.replica_candidate_epoch_ + 1);
+  }
+  // Durably fence old records before making the detached indexes invisible.
+  absl::Status persisted = co_await PersistEpochValues(epoch_updates);
+  if (!persisted.ok()) co_return persisted;
+
+  co_await store.store_state_mutex_.Lock();
+  UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
+  for (std::size_t i = 0; i < partition_ids.size(); ++i) {
+    auto& partition = PartitionFor(store, partition_ids[i]);
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      if (partition.indexes_[db_id].has_allocated_storage()) {
+        store.detached_indexes_.push_back(DetachedIndex{
+            .index_ = partition.indexes_[db_id].Detach(), .db_id_ = db_id});
+      }
+      if (store.live_key_count_[db_id] < partition.live_key_count_[db_id]) {
+        co_return absl::InternalError(
+            "targeted reset found inconsistent live-key accounting");
+      }
+      store.live_key_count_[db_id] -= partition.live_key_count_[db_id];
+      partition.live_key_count_[db_id] = 0;
+      partition.expiring_key_count_[db_id] = 0;
+    }
+    partition.replica_candidate_epoch_ = epoch_updates[i].second;
+    partition.replication_epoch_ = epoch_updates[i].second;
+    partition.mutation_sequence_ = 0;
+    partition.replica_value_stage_.reset();
+  }
+  for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+    ++store.index_generations_[db_id];
+    tx::CurrentTxShard().MarkAllWatched(db_id);
+  }
+  EnsureDetachedReclaim(store);
+  co_return absl::OkStatus();
+}
+
 // TODO(replication): ResetReplicaPartition above holds store_state_mutex across
 // its whole tombstone loop (unlock_writer_while_waiting=false), so on a full
 // device its inline block allocation waits for reclaim progress while the

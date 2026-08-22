@@ -263,6 +263,20 @@ if (BUILD_TESTING)
   gtest_discover_tests(keylane_unit_tests)
 
   if (UNIX)
+    find_program(KEYLANE_REDIS_SERVER_EXECUTABLE redis-server)
+    find_program(KEYLANE_REDIS_CLI_EXECUTABLE redis-cli)
+    if (KEYLANE_REDIS_SERVER_EXECUTABLE AND KEYLANE_REDIS_CLI_EXECUTABLE)
+      add_test(
+        NAME keylane_redis_cluster_psync_e2e
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/redis_cluster_psync_e2e.sh
+                $<TARGET_FILE:keylane>
+                ${KEYLANE_REDIS_SERVER_EXECUTABLE}
+                ${KEYLANE_REDIS_CLI_EXECUTABLE}
+      )
+      set_tests_properties(keylane_redis_cluster_psync_e2e
+        PROPERTIES TIMEOUT 120)
+    endif()
+
     add_executable(keylane_replication_log_e2e_test
       tests/replication_log_e2e_test.cpp
     )

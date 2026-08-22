@@ -353,6 +353,29 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
   co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
 }
 
+Task<CommandReply> ExecuteAddReplicaOf(const CommandRequest& request,
+                                       ReplyBuilder& reply_builder) {
+  auto parsed = ParseReplicaOfRequest(request.args_);
+  if (!parsed.ok() || !parsed->host_.has_value()) {
+    const std::string message = parsed.ok()
+                                    ? "ADDREPLICAOF does not accept NO ONE"
+                                    : std::string(parsed.status().message());
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", message)));
+  }
+  if (g_replication == nullptr) {
+    co_return BuiltReply(
+        reply_builder.AppendError("ERR replication backend is unavailable"));
+  }
+  absl::Status configured = co_await g_replication->AddUpstream(
+      ReplicaOfConfig{*parsed->host_, parsed->port_});
+  if (!configured.ok()) {
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", configured.message())));
+  }
+  co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+}
+
 std::string ClusterNodeAddress(std::string_view host, std::uint16_t port) {
   if (host.find(':') != std::string_view::npos &&
       !(host.starts_with('[') && host.ends_with(']'))) {
@@ -3052,14 +3075,40 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       info += "master_host:" + replication.upstream_->host_ + "\r\n";
       info += "master_port:" + std::to_string(replication.upstream_->port_) +
               "\r\n";
+      const bool redis_links_up =
+          replication.redis_sources_.empty() ||
+          std::all_of(
+              replication.redis_sources_.begin(),
+              replication.redis_sources_.end(),
+              [](const RedisSourceStatus& source) { return source.link_up_; });
       info += "master_link_status:" +
-              std::string(replication.role_ == ReplicationRole::kOnline
+              std::string(replication.role_ == ReplicationRole::kOnline &&
+                                  redis_links_up
                               ? "up\r\n"
                               : "down\r\n");
       info += "keylane_source_workers:" +
               std::to_string(replication.source_worker_count_) + "\r\n";
       info += "keylane_connected_flows:" +
               std::to_string(replication.connected_flows_) + "\r\n";
+      if (!replication.redis_sources_.empty()) {
+        info += std::string("keylane_redis_cluster:") +
+                (replication.redis_cluster_ ? "1\r\n" : "0\r\n");
+        info += std::string("keylane_redis_topology_fault:") +
+                (replication.redis_topology_fault_ ? "1\r\n" : "0\r\n");
+        info += "keylane_redis_sources:" +
+                std::to_string(replication.redis_sources_.size()) + "\r\n";
+        for (std::size_t index = 0; index < replication.redis_sources_.size();
+             ++index) {
+          const RedisSourceStatus& source = replication.redis_sources_[index];
+          info += "keylane_redis_source" + std::to_string(index) +
+                  ":node=" + source.node_id_ +
+                  ",host=" + source.upstream_.host_ +
+                  ",port=" + std::to_string(source.upstream_.port_) +
+                  ",link=" + (source.link_up_ ? "up" : "down") +
+                  ",offset=" + std::to_string(source.offset_) +
+                  ",slots=" + source.slots_ + "\r\n";
+        }
+      }
       info += std::string("slave_read_only:") +
               (g_replication != nullptr && g_replication->replica_read_only()
                    ? "1\r\n"
@@ -6767,6 +6816,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kSelect:
         case CommandKind::kClient:
         case CommandKind::kReplicaOf:
+        case CommandKind::kAddReplicaOf:
         case CommandKind::kConfig:
         case CommandKind::kInfo:
         case CommandKind::kCluster:
@@ -6980,6 +7030,9 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
   switch (request.kind_) {
     case CommandKind::kReplicaOf:
       co_return co_await ExecuteReplicaOf(request, reply_builder);
+
+    case CommandKind::kAddReplicaOf:
+      co_return co_await ExecuteAddReplicaOf(request, reply_builder);
 
     case CommandKind::kConfig:
       co_return co_await ExecuteConfig(request, reply_builder);

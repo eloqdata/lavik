@@ -60,8 +60,8 @@ struct ServerOptions {
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
   std::optional<ReplicaOfConfig> replicaof_;
-  // Initially follows a standalone Redis server using PSYNC. REPLICAOF NO ONE
-  // detaches it while retaining a completed imported dataset.
+  // Explicit Redis PSYNC compatibility alias. It may name a standalone Redis
+  // server or the first master of a Redis Cluster.
   std::optional<ReplicaOfConfig> redis_replicaof_;
   ReplicationOptions replication_options_;
 };

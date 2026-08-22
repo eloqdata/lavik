@@ -300,6 +300,11 @@ StorageEngine::ResetReplicaPartitions(
   return impl_->ResetReplicaPartitions(session_id, resets);
 }
 
+Task<absl::Status> StorageEngine::ResetPartitionsDetach(
+    std::span<const std::uint16_t> partition_ids) {
+  return impl_->ResetPartitionsDetach(partition_ids);
+}
+
 Task<absl::Status> StorageEngine::HandoffReplicaPartition(
     std::uint64_t session_id, std::uint16_t partition_id,
     std::uint64_t replication_epoch) {

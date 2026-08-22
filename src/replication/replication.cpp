@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -36,6 +37,7 @@
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
 #include "keylane/command.h"
+#include "keylane/command_table.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/rdb.h"
@@ -62,6 +64,7 @@ constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
 // there is deliberately no wall-clock limit on the whole synchronization.
 constexpr auto kFullSyncStallTimeout = std::chrono::minutes(10);
 constexpr auto kReconnectDelay = std::chrono::seconds(1);
+constexpr auto kRedisTopologyPollInterval = std::chrono::seconds(2);
 // A typical disk-backed partition contains hundreds of records. Materialize
 // enough keys to approach the ONLINE replication transfer size so full sync
 // does not pay one ACK round-trip per tiny 16-record group; send_records still
@@ -85,6 +88,7 @@ constexpr std::size_t kBacklogBatchFrames = 128;
 constexpr std::uint16_t kResetBatchAckPartition =
     std::numeric_limits<std::uint16_t>::max();
 constexpr std::string_view kReplicationTransactionEnvelope = "__KEYLANE_TX_V1";
+using RedisSlotSet = std::bitset<storage::kLogicalStorageShards>;
 
 enum class DataFrameKind : std::uint8_t {
   kReset = 1,
@@ -423,6 +427,217 @@ Task<absl::StatusOr<std::string>> ReadLine(TcpStream& stream) {
   }
   co_return absl::ResourceExhaustedError(
       "replication handshake line exceeds 64 KiB");
+}
+
+Task<absl::StatusOr<std::string>> ReadRedisBulkReply(TcpStream& stream) {
+  auto header = co_await ReadLine(stream);
+  if (!header.ok()) co_return header.status();
+  if (header->empty()) {
+    co_return absl::InvalidArgumentError("empty Redis reply");
+  }
+  if (header->front() == '-') {
+    co_return absl::FailedPreconditionError(*header);
+  }
+  if (header->front() != '$') {
+    co_return absl::InvalidArgumentError(
+        absl::StrCat("Redis bulk reply expected: ", *header));
+  }
+  std::uint64_t length = 0;
+  if (!ParseUnsigned(std::string_view(*header).substr(1), &length) ||
+      length > 16ULL * 1024 * 1024) {
+    co_return absl::InvalidArgumentError("invalid Redis bulk reply length");
+  }
+  auto body = co_await ReadExact(stream, static_cast<std::size_t>(length) + 2);
+  if (!body.ok()) co_return body.status();
+  if (!body->ends_with("\r\n")) {
+    co_return absl::InvalidArgumentError("Redis bulk reply is not terminated");
+  }
+  body->resize(static_cast<std::size_t>(length));
+  co_return std::move(*body);
+}
+
+struct RedisClusterMaster {
+  std::string node_id_;
+  ReplicaOfConfig endpoint_;
+  RedisSlotSet slots_;
+  bool myself_ = false;
+};
+
+struct RedisClusterTopology {
+  std::vector<RedisClusterMaster> masters_;
+  std::string self_id_;
+};
+
+bool HasCommaFlag(std::string_view flags, std::string_view wanted) {
+  while (!flags.empty()) {
+    const std::size_t comma = flags.find(',');
+    if (flags.substr(0, comma) == wanted) return true;
+    if (comma == std::string_view::npos) break;
+    flags.remove_prefix(comma + 1);
+  }
+  return false;
+}
+
+absl::StatusOr<ReplicaOfConfig> ParseRedisClusterAddress(
+    std::string_view address) {
+  if (const std::size_t comma = address.find(',');
+      comma != std::string_view::npos) {
+    address = address.substr(0, comma);
+  }
+  if (const std::size_t bus = address.find('@');
+      bus != std::string_view::npos) {
+    address = address.substr(0, bus);
+  }
+  std::string_view host;
+  std::string_view port_text;
+  if (address.starts_with('[')) {
+    const std::size_t close = address.find(']');
+    if (close == std::string_view::npos || close + 1 >= address.size() ||
+        address[close + 1] != ':') {
+      return absl::InvalidArgumentError("invalid Redis Cluster IPv6 address");
+    }
+    host = address.substr(1, close - 1);
+    port_text = address.substr(close + 2);
+  } else {
+    const std::size_t colon = address.rfind(':');
+    if (colon == std::string_view::npos) {
+      return absl::InvalidArgumentError("invalid Redis Cluster node address");
+    }
+    host = address.substr(0, colon);
+    port_text = address.substr(colon + 1);
+  }
+  std::uint16_t port = 0;
+  if (host.empty() || !ParseUnsigned(port_text, &port) || port == 0) {
+    return absl::InvalidArgumentError("invalid Redis Cluster node endpoint");
+  }
+  return ReplicaOfConfig{std::string(host), port};
+}
+
+absl::StatusOr<RedisClusterTopology> ParseRedisClusterNodes(
+    std::string_view body) {
+  RedisClusterTopology topology;
+  RedisSlotSet assigned;
+  while (!body.empty()) {
+    const std::size_t newline = body.find('\n');
+    std::string_view line = body.substr(0, newline);
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    if (newline == std::string_view::npos) {
+      body = {};
+    } else {
+      body.remove_prefix(newline + 1);
+    }
+    if (line.empty()) continue;
+    const std::vector<std::string_view> fields = SplitWords(line);
+    if (fields.size() < 8) {
+      return absl::InvalidArgumentError("malformed CLUSTER NODES line");
+    }
+    const bool myself = HasCommaFlag(fields[2], "myself");
+    const bool master = HasCommaFlag(fields[2], "master");
+    if (myself) topology.self_id_ = std::string(fields[0]);
+    if (!master || HasCommaFlag(fields[2], "fail") ||
+        HasCommaFlag(fields[2], "fail?") ||
+        HasCommaFlag(fields[2], "handshake") ||
+        HasCommaFlag(fields[2], "noaddr")) {
+      continue;
+    }
+    RedisClusterMaster entry;
+    entry.node_id_ = std::string(fields[0]);
+    entry.myself_ = myself;
+    auto endpoint = ParseRedisClusterAddress(fields[1]);
+    if (!endpoint.ok()) return endpoint.status();
+    entry.endpoint_ = std::move(*endpoint);
+    for (std::size_t i = 8; i < fields.size(); ++i) {
+      const std::string_view token = fields[i];
+      if (token.starts_with('[')) {
+        return absl::FailedPreconditionError(
+            "Redis Cluster is migrating or importing slots");
+      }
+      std::uint16_t first = 0;
+      std::uint16_t last = 0;
+      const std::size_t dash = token.find('-');
+      if (dash == std::string_view::npos) {
+        if (!ParseUnsigned(token, &first)) {
+          return absl::InvalidArgumentError("invalid Redis Cluster slot");
+        }
+        last = first;
+      } else if (!ParseUnsigned(token.substr(0, dash), &first) ||
+                 !ParseUnsigned(token.substr(dash + 1), &last) ||
+                 first > last) {
+        return absl::InvalidArgumentError("invalid Redis Cluster slot range");
+      }
+      if (last >= storage::kLogicalStorageShards) {
+        return absl::InvalidArgumentError("Redis Cluster slot is out of range");
+      }
+      for (std::uint32_t slot = first; slot <= last; ++slot) {
+        if (assigned.test(slot)) {
+          return absl::FailedPreconditionError(
+              absl::StrCat("Redis Cluster masters overlap at slot ", slot));
+        }
+        assigned.set(slot);
+        entry.slots_.set(slot);
+      }
+    }
+    // Redis permits an empty master during scale-out. It is not a replication
+    // source until it owns at least one slot.
+    if (entry.slots_.any()) topology.masters_.push_back(std::move(entry));
+  }
+  if (topology.self_id_.empty()) {
+    return absl::FailedPreconditionError(
+        "CLUSTER NODES did not identify the connected node");
+  }
+  if (assigned.count() != storage::kLogicalStorageShards) {
+    return absl::FailedPreconditionError(absl::StrCat(
+        "Redis Cluster has incomplete slot coverage: ", assigned.count(), "/",
+        storage::kLogicalStorageShards));
+  }
+  if (std::none_of(topology.masters_.begin(), topology.masters_.end(),
+                   [&](const RedisClusterMaster& node) {
+                     return node.node_id_ == topology.self_id_;
+                   })) {
+    return absl::FailedPreconditionError(
+        "the connected Redis Cluster node is not a slot-owning master");
+  }
+  return topology;
+}
+
+std::string FormatRedisSlots(const RedisSlotSet& slots) {
+  std::string result;
+  for (std::size_t first = 0; first < slots.size();) {
+    if (!slots.test(first)) {
+      ++first;
+      continue;
+    }
+    std::size_t last = first;
+    while (last + 1 < slots.size() && slots.test(last + 1)) ++last;
+    if (!result.empty()) result.push_back(',');
+    absl::StrAppend(&result, first);
+    if (last != first) absl::StrAppend(&result, "-", last);
+    first = last + 1;
+  }
+  return result;
+}
+
+std::vector<std::uint16_t> RedisSlotsVector(const RedisSlotSet& slots) {
+  std::vector<std::uint16_t> result;
+  result.reserve(slots.count());
+  for (std::size_t slot = 0; slot < slots.size(); ++slot) {
+    if (slots.test(slot)) result.push_back(static_cast<std::uint16_t>(slot));
+  }
+  return result;
+}
+
+bool SameRedisSlotLayout(const RedisClusterTopology& left,
+                         const RedisClusterTopology& right) {
+  if (left.masters_.size() != right.masters_.size()) return false;
+  for (const RedisClusterMaster& expected : left.masters_) {
+    if (std::none_of(right.masters_.begin(), right.masters_.end(),
+                     [&](const RedisClusterMaster& current) {
+                       return current.slots_ == expected.slots_;
+                     })) {
+      return false;
+    }
+  }
+  return true;
 }
 
 class TemporaryRedisRdb {
@@ -1239,6 +1454,29 @@ struct MasterSession {
   std::atomic<bool> cancelled_{false};
 };
 
+struct RedisSource {
+  ReplicaOfConfig upstream_;
+  std::string node_id_;
+  RedisSlotSet slots_;
+  std::shared_ptr<ReplicaSession> session_;
+  std::optional<std::string> replid_;
+  std::atomic<std::uint64_t> offset_{0};
+  std::uint64_t role_epoch_ = 0;
+  std::atomic<bool> dataset_valid_{false};
+  std::atomic<bool> link_up_{false};
+  std::atomic<bool> syncing_{false};
+  bool coordinator_started_ = false;
+};
+
+enum class UpstreamProtocol : std::uint8_t { kNative, kRedis };
+
+struct UpstreamDiscovery {
+  UpstreamProtocol protocol_ = UpstreamProtocol::kNative;
+  bool redis_cluster_ = false;
+  std::optional<RedisClusterTopology> topology_;
+  std::optional<RedisClusterMaster> self_;
+};
+
 }  // namespace
 
 class ReplicationManager::Impl {
@@ -1268,6 +1506,14 @@ class ReplicationManager::Impl {
     if (upstream_.has_value()) {
       role_.store(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
+      if (options.redis_psync_) {
+        auto source = std::make_shared<RedisSource>();
+        source->upstream_ = *upstream_;
+        source->role_epoch_ = 1;
+        redis_sources_.push_back(std::move(source));
+      } else {
+        initial_protocol_probe_pending_ = true;
+      }
     }
   }
 
@@ -1297,6 +1543,16 @@ class ReplicationManager::Impl {
           "replication upstream resolves to this server");
     }
 
+    std::optional<UpstreamDiscovery> discovery;
+    if (upstream.has_value()) {
+      auto probed = co_await ProbeUpstream(*upstream);
+      if (probed.ok()) {
+        discovery = std::move(*probed);
+      } else if (probed.status().code() != absl::StatusCode::kUnavailable) {
+        co_return probed.status();
+      }
+    }
+
     while (!CloseAllCommandDbGates()) {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -1311,17 +1567,6 @@ class ReplicationManager::Impl {
       if (!waited.ok()) co_return waited;
     }
 
-    {
-      std::lock_guard lock(state_mutex_);
-      // A non-null SetUpstream request always selects Keylane's native
-      // protocol. The same endpoint is therefore still a topology change when
-      // the current session was started with redis-replicaof.
-      if (upstream_ == upstream &&
-          (!upstream.has_value() ||
-           !redis_psync_.load(std::memory_order_relaxed))) {
-        co_return absl::OkStatus();
-      }
-    }
     if (upstream.has_value()) {
       absl::Status quiesced = co_await storage_->QuiesceExpiration();
       if (!quiesced.ok()) co_return quiesced;
@@ -1329,7 +1574,7 @@ class ReplicationManager::Impl {
       storage_->ResumeExpiration();
     }
 
-    std::shared_ptr<ReplicaSession> cancelled;
+    std::vector<std::shared_ptr<ReplicaSession>> cancelled;
     bool start_upstream = false;
     bool discard_incomplete_root = false;
     {
@@ -1338,8 +1583,20 @@ class ReplicationManager::Impl {
       discard_incomplete_root =
           !upstream.has_value() && (old_role == ReplicationRole::kConnecting ||
                                     old_role == ReplicationRole::kSyncing);
-      upstream_ = std::move(upstream);
-      cancelled = std::move(active_replica_session_);
+      upstream_ = upstream;
+      if (active_replica_session_ != nullptr) {
+        cancelled.push_back(std::move(active_replica_session_));
+      }
+      for (const auto& source : redis_sources_) {
+        if (source->session_ != nullptr) cancelled.push_back(source->session_);
+      }
+      redis_sources_.clear();
+      expected_redis_topology_.reset();
+      redis_cluster_ = false;
+      redis_topology_fault_ = false;
+      redis_topology_monitor_started_ = false;
+      initial_protocol_probe_pending_ =
+          upstream.has_value() && !discovery.has_value();
       replica_session_id_ = 0;
       source_worker_count_ = 0;
       upstream_node_id_.reset();
@@ -1348,26 +1605,38 @@ class ReplicationManager::Impl {
       // writes may have occurred while promoted or while following another
       // source, so none of the old per-flow cursors are safe for CONTINUE.
       cursor_state_.reset();
-      // REPLICAOF host port selects native Keylane replication; NO ONE exits
-      // either protocol. Redis PSYNC can be selected again on a later restart
-      // with redis-replicaof.
-      redis_psync_.store(false, std::memory_order_release);
-      redis_dataset_valid_ = false;
-      redis_replid_.reset();
-      redis_offset_ = 0;
-      role_epoch_.fetch_add(1, std::memory_order_acq_rel);
+      const std::uint64_t next_epoch =
+          role_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      const bool redis = discovery.has_value() &&
+                         discovery->protocol_ == UpstreamProtocol::kRedis;
+      redis_psync_.store(redis, std::memory_order_release);
+      if (redis) {
+        auto source = std::make_shared<RedisSource>();
+        source->upstream_ = *upstream;
+        source->role_epoch_ = next_epoch;
+        redis_cluster_ = discovery->redis_cluster_;
+        if (redis_cluster_) {
+          expected_redis_topology_ = std::move(discovery->topology_);
+          source->node_id_ = discovery->self_->node_id_;
+          source->slots_ = discovery->self_->slots_;
+        } else {
+          source->node_id_ = "standalone";
+          source->slots_.set();
+        }
+        redis_sources_.push_back(std::move(source));
+      }
       role_.store(upstream_.has_value() ? ReplicationRole::kConnecting
                                         : ReplicationRole::kMaster,
                   std::memory_order_release);
       start_upstream = upstream_.has_value();
     }
-    if (cancelled != nullptr) cancelled->Cancel();
-    if (cancelled != nullptr) {
-      absl::Status stopped = co_await CancelAndWaitForReplicaFlows(cancelled);
+    for (const auto& session : cancelled) session->Cancel();
+    for (const auto& session : cancelled) {
+      absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
       if (!stopped.ok()) co_return stopped;
-      if (cancelled->session_id_ != 0) {
+      if (session->session_id_ != 0) {
         absl::Status discarded =
-            co_await storage_->AbortReplicaRoot(cancelled->session_id_);
+            co_await storage_->AbortReplicaRoot(session->session_id_);
         if (!discarded.ok()) co_return discarded;
       }
     }
@@ -1387,6 +1656,64 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
+  Task<absl::Status> AddUpstream(ReplicaOfConfig upstream) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, upstream = std::move(upstream)]() mutable {
+            return AddUpstream(std::move(upstream));
+          });
+    }
+    if (!redis_psync_.load(std::memory_order_acquire) || !redis_cluster_ ||
+        !expected_redis_topology_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "ADDREPLICAOF requires an active Redis Cluster upstream");
+    }
+    if (redis_topology_fault_) {
+      co_return absl::FailedPreconditionError(
+          "Redis Cluster topology is faulted; use REPLICAOF to rebuild it");
+    }
+    auto discovery = co_await DiscoverRedis(upstream);
+    if (!discovery.ok()) co_return discovery.status();
+    if (!discovery->redis_cluster_ || !discovery->topology_.has_value() ||
+        !discovery->self_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "ADDREPLICAOF source is not a Redis Cluster master");
+    }
+    std::shared_ptr<RedisSource> source;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (!redis_psync_.load(std::memory_order_relaxed) || !redis_cluster_ ||
+          !expected_redis_topology_.has_value() || redis_topology_fault_) {
+        co_return absl::FailedPreconditionError(
+            "Redis Cluster replication changed while adding the source");
+      }
+      if (!SameRedisSlotLayout(*expected_redis_topology_,
+                               *discovery->topology_)) {
+        co_return absl::FailedPreconditionError(
+            "Redis Cluster slot topology changed; reconfigure with "
+            "REPLICAOF");
+      }
+      for (const auto& current : redis_sources_) {
+        const RedisSlotSet overlap = current->slots_ & discovery->self_->slots_;
+        if (overlap.any()) {
+          std::size_t slot = 0;
+          while (!overlap.test(slot)) ++slot;
+          co_return absl::AlreadyExistsError(
+              absl::StrCat("Redis replication slot overlap at slot ", slot));
+        }
+      }
+      source = std::make_shared<RedisSource>();
+      source->upstream_ = std::move(upstream);
+      source->node_id_ = discovery->self_->node_id_;
+      source->slots_ = discovery->self_->slots_;
+      source->role_epoch_ = role_epoch_.load(std::memory_order_relaxed);
+      redis_sources_.push_back(source);
+    }
+    if (StorageIsReady()) StartRedisCoordinator(source);
+    RefreshRedisRole();
+    co_return absl::OkStatus();
+  }
+
   ReplicationStatus status() const {
     ReplicationStatus result;
     result.role_ = role_.load(std::memory_order_acquire);
@@ -1403,6 +1730,32 @@ class ReplicationManager::Impl {
         result.connected_flows_ =
             active_replica_session_->connected_flows_.load(
                 std::memory_order_acquire);
+      }
+      if (redis_psync_.load(std::memory_order_relaxed)) {
+        result.source_worker_count_ =
+            static_cast<unsigned>(redis_sources_.size());
+        result.connected_flows_ = 0;
+        for (const auto& source : redis_sources_) {
+          if (source->session_ != nullptr) {
+            result.connected_flows_ += source->session_->connected_flows_.load(
+                std::memory_order_acquire);
+          }
+        }
+      }
+      result.redis_cluster_ = redis_cluster_;
+      result.redis_topology_fault_ = redis_topology_fault_;
+      result.redis_sources_.reserve(redis_sources_.size());
+      for (const auto& source : redis_sources_) {
+        result.redis_sources_.push_back(RedisSourceStatus{
+            .upstream_ = source->upstream_,
+            .node_id_ = source->node_id_,
+            .slots_ = FormatRedisSlots(source->slots_),
+            .replid_ = source->replid_,
+            .offset_ = source->offset_.load(std::memory_order_acquire),
+            .link_up_ = source->link_up_.load(std::memory_order_acquire),
+            .dataset_valid_ =
+                source->dataset_valid_.load(std::memory_order_acquire),
+        });
       }
     }
     {
@@ -1629,6 +1982,98 @@ class ReplicationManager::Impl {
            storage_->worker_count();
   }
 
+  Task<absl::StatusOr<std::optional<RedisClusterTopology>>>
+  QueryRedisClusterTopology(const ReplicaOfConfig& upstream) {
+    auto connected =
+        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    if (!connected.ok()) co_return connected.status();
+    TcpStream stream = std::move(*connected);
+    absl::Status status =
+        co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+    if (!status.ok()) {
+      stream.Close().IgnoreError();
+      co_return status;
+    }
+    const std::vector<std::string> command{"CLUSTER", "NODES"};
+    status = co_await WriteText(stream, EncodeRespCommand(command));
+    if (!status.ok()) {
+      stream.Close().IgnoreError();
+      co_return status;
+    }
+    auto body = co_await ReadRedisBulkReply(stream);
+    stream.Close().IgnoreError();
+    if (!body.ok()) {
+      const std::string message(body.status().message());
+      if (body.status().code() == absl::StatusCode::kFailedPrecondition &&
+          message.find("cluster support disabled") != std::string::npos) {
+        co_return std::optional<RedisClusterTopology>{};
+      }
+      co_return body.status();
+    }
+    auto topology = ParseRedisClusterNodes(*body);
+    if (!topology.ok()) co_return topology.status();
+    co_return std::optional<RedisClusterTopology>(std::move(*topology));
+  }
+
+  Task<absl::StatusOr<UpstreamDiscovery>> DiscoverRedis(
+      const ReplicaOfConfig& upstream) {
+    auto topology = co_await QueryRedisClusterTopology(upstream);
+    if (!topology.ok()) co_return topology.status();
+    UpstreamDiscovery result;
+    result.protocol_ = UpstreamProtocol::kRedis;
+    if (!topology->has_value()) co_return result;
+    result.redis_cluster_ = true;
+    result.topology_ = std::move(**topology);
+    for (const RedisClusterMaster& master : result.topology_->masters_) {
+      if (master.node_id_ == result.topology_->self_id_) {
+        result.self_ = master;
+        break;
+      }
+    }
+    if (!result.self_.has_value()) {
+      co_return absl::FailedPreconditionError(
+          "connected Redis node is not a slot-owning cluster master");
+    }
+    co_return result;
+  }
+
+  Task<absl::StatusOr<UpstreamDiscovery>> ProbeUpstream(
+      const ReplicaOfConfig& upstream) {
+    auto connected =
+        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    if (!connected.ok()) co_return connected.status();
+    TcpStream stream = std::move(*connected);
+    absl::Status status =
+        co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
+    if (!status.ok()) {
+      stream.Close().IgnoreError();
+      co_return status;
+    }
+    const std::vector<std::string> sync_args{
+        "KLPSYNC", std::string(kProtocolVersion), "?", "?"};
+    status = co_await WriteText(stream, EncodeRespCommand(sync_args));
+    if (!status.ok()) {
+      stream.Close().IgnoreError();
+      co_return status;
+    }
+    auto response = co_await ReadLine(stream);
+    stream.Close().IgnoreError();
+    if (!response.ok()) co_return response.status();
+    if (response->starts_with("+KLFULLRESYNC ")) {
+      UpstreamDiscovery result;
+      result.protocol_ = UpstreamProtocol::kNative;
+      co_return result;
+    }
+    if (response->starts_with('-') &&
+        response->find("unknown command") != std::string::npos &&
+        (response->find("KLPSYNC") != std::string::npos ||
+         response->find("klpsync") != std::string::npos)) {
+      co_return co_await DiscoverRedis(upstream);
+    }
+    co_return absl::FailedPreconditionError(
+        absl::StrCat("upstream rejected Keylane protocol probe: ", *response));
+  }
+
   Task<absl::Status> WaitUntilStorageReady() {
     while (!StorageIsReady()) {
       absl::Status slept = co_await celer::SleepFor(
@@ -1640,10 +2085,26 @@ class ReplicationManager::Impl {
   }
 
   void StartCoordinator() {
-    if (celer::ThisWorker().id_ != 0 || coordinator_started_ ||
-        !StorageIsReady()) {
+    if (celer::ThisWorker().id_ != 0 || !StorageIsReady()) return;
+    if (initial_protocol_probe_pending_) {
+      if (coordinator_started_) return;
+      coordinator_started_ = true;
+      celer::ThisWorker().self_->SpawnRoot(ProbeInitialUpstream());
       return;
     }
+    if (redis_psync_.load(std::memory_order_acquire)) {
+      std::vector<std::shared_ptr<RedisSource>> sources;
+      {
+        std::lock_guard lock(state_mutex_);
+        sources = redis_sources_;
+      }
+      spdlog::info("starting {} Redis replication coordinator(s)",
+                   sources.size());
+      for (const auto& source : sources) StartRedisCoordinator(source);
+      if (redis_cluster_) StartRedisTopologyMonitor();
+      return;
+    }
+    if (coordinator_started_) return;
     {
       std::lock_guard lock(state_mutex_);
       if (!upstream_.has_value()) return;
@@ -1652,31 +2113,326 @@ class ReplicationManager::Impl {
     celer::ThisWorker().self_->Spawn(Coordinator());
   }
 
+  Task<absl::Status> ProbeInitialUpstream() {
+    while (true) {
+      ReplicaOfConfig upstream;
+      std::uint64_t role_epoch = 0;
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!upstream_.has_value() || !initial_protocol_probe_pending_) {
+          coordinator_started_ = false;
+          co_return absl::OkStatus();
+        }
+        upstream = *upstream_;
+        role_epoch = role_epoch_.load(std::memory_order_relaxed);
+      }
+      auto discovery = co_await ProbeUpstream(upstream);
+      if (!discovery.ok()) {
+        spdlog::warn("replication protocol probe for {}:{} failed: {}",
+                     upstream.host_, upstream.port_,
+                     discovery.status().message());
+        absl::Status slept = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, kReconnectDelay);
+        if (!slept.ok()) {
+          coordinator_started_ = false;
+          co_return slept;
+        }
+        continue;
+      }
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!upstream_.has_value() || *upstream_ != upstream ||
+            role_epoch_.load(std::memory_order_relaxed) != role_epoch ||
+            !initial_protocol_probe_pending_) {
+          coordinator_started_ = false;
+          co_return absl::CancelledError("initial upstream was replaced");
+        }
+        initial_protocol_probe_pending_ = false;
+        if (discovery->protocol_ == UpstreamProtocol::kRedis) {
+          redis_psync_.store(true, std::memory_order_release);
+          redis_cluster_ = discovery->redis_cluster_;
+          auto source = std::make_shared<RedisSource>();
+          source->upstream_ = upstream;
+          source->role_epoch_ = role_epoch;
+          if (redis_cluster_) {
+            expected_redis_topology_ = std::move(discovery->topology_);
+            source->node_id_ = discovery->self_->node_id_;
+            source->slots_ = discovery->self_->slots_;
+          } else {
+            source->node_id_ = "standalone";
+            source->slots_.set();
+          }
+          redis_sources_.push_back(std::move(source));
+        }
+      }
+      coordinator_started_ = false;
+      StartCoordinator();
+      co_return absl::OkStatus();
+    }
+  }
+
+  bool RedisSourceRegistered(const std::shared_ptr<RedisSource>& source) const {
+    return std::find(redis_sources_.begin(), redis_sources_.end(), source) !=
+           redis_sources_.end();
+  }
+
+  void RefreshRedisRole() {
+    bool ready = false;
+    bool syncing = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (!redis_psync_.load(std::memory_order_relaxed)) return;
+      RedisSlotSet registered;
+      bool valid = !redis_sources_.empty() && !redis_topology_fault_;
+      for (const auto& source : redis_sources_) {
+        registered |= source->slots_;
+        valid = valid && source->dataset_valid_.load(std::memory_order_acquire);
+        syncing = syncing || source->syncing_.load(std::memory_order_acquire);
+      }
+      const bool complete =
+          !redis_cluster_ ||
+          (expected_redis_topology_.has_value() &&
+           registered.count() == storage::kLogicalStorageShards &&
+           redis_sources_.size() == expected_redis_topology_->masters_.size());
+      ready = valid && complete;
+    }
+    role_.store(ready ? ReplicationRole::kOnline
+                      : (syncing ? ReplicationRole::kSyncing
+                                 : ReplicationRole::kConnecting),
+                std::memory_order_release);
+  }
+
+  void StartRedisTopologyMonitor() {
+    if (redis_topology_monitor_started_ || !redis_cluster_) return;
+    redis_topology_monitor_started_ = true;
+    const std::uint64_t epoch = role_epoch_.load(std::memory_order_acquire);
+    celer::ThisWorker().self_->SpawnRoot(RedisTopologyMonitor(epoch));
+  }
+
+  void FaultRedisTopology(std::string_view reason) {
+    std::vector<std::shared_ptr<ReplicaSession>> sessions;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (redis_topology_fault_) return;
+      redis_topology_fault_ = true;
+      for (const auto& source : redis_sources_) {
+        source->link_up_ = false;
+        source->syncing_ = false;
+        if (source->session_ != nullptr) sessions.push_back(source->session_);
+      }
+    }
+    for (const auto& session : sessions) session->Cancel();
+    spdlog::error(
+        "Redis Cluster topology changed; replication stopped and Keylane "
+        "entered LOADING: {}",
+        reason);
+    RefreshRedisRole();
+  }
+
+  void ApplyStableRedisTopology(RedisClusterTopology topology) {
+    std::vector<std::shared_ptr<ReplicaSession>> replaced;
+    {
+      std::lock_guard lock(state_mutex_);
+      for (const auto& source : redis_sources_) {
+        auto current =
+            std::find_if(topology.masters_.begin(), topology.masters_.end(),
+                         [&](const RedisClusterMaster& master) {
+                           return master.slots_ == source->slots_;
+                         });
+        if (current == topology.masters_.end()) continue;
+        if (source->node_id_ == current->node_id_ &&
+            source->upstream_ == current->endpoint_) {
+          continue;
+        }
+        spdlog::warn(
+            "Redis Cluster master for slots {} changed from {} {}:{} to {} "
+            "{}:{}",
+            FormatRedisSlots(source->slots_), source->node_id_,
+            source->upstream_.host_, source->upstream_.port_, current->node_id_,
+            current->endpoint_.host_, current->endpoint_.port_);
+        source->node_id_ = current->node_id_;
+        source->upstream_ = current->endpoint_;
+        source->link_up_ = false;
+        if (source->session_ != nullptr) replaced.push_back(source->session_);
+      }
+      expected_redis_topology_ = std::move(topology);
+      if (!redis_sources_.empty())
+        upstream_ = redis_sources_.front()->upstream_;
+    }
+    for (const auto& session : replaced) session->Cancel();
+  }
+
+  Task<absl::Status> RedisTopologyMonitor(std::uint64_t role_epoch) {
+    unsigned incompatible_observations = 0;
+    while (true) {
+      absl::Status slept = co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                                    kRedisTopologyPollInterval);
+      if (!slept.ok()) co_return slept;
+      std::vector<ReplicaOfConfig> endpoints;
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!redis_psync_.load(std::memory_order_relaxed) || !redis_cluster_ ||
+            redis_topology_fault_ ||
+            role_epoch_.load(std::memory_order_relaxed) != role_epoch) {
+          if (role_epoch_.load(std::memory_order_relaxed) == role_epoch) {
+            redis_topology_monitor_started_ = false;
+          }
+          co_return absl::OkStatus();
+        }
+        endpoints.reserve(redis_sources_.size());
+        for (const auto& source : redis_sources_) {
+          endpoints.push_back(source->upstream_);
+        }
+      }
+
+      absl::StatusOr<std::optional<RedisClusterTopology>> observed =
+          absl::UnavailableError("no Redis Cluster source was reachable");
+      for (const ReplicaOfConfig& endpoint : endpoints) {
+        observed = co_await QueryRedisClusterTopology(endpoint);
+        if (observed.ok() ||
+            observed.status().code() != absl::StatusCode::kUnavailable) {
+          break;
+        }
+      }
+      if (!observed.ok() &&
+          observed.status().code() == absl::StatusCode::kUnavailable) {
+        spdlog::warn("Redis Cluster topology check unavailable: {}",
+                     observed.status().message());
+        continue;
+      }
+
+      bool compatible = false;
+      if (observed.ok() && observed->has_value()) {
+        std::lock_guard lock(state_mutex_);
+        compatible = expected_redis_topology_.has_value() &&
+                     SameRedisSlotLayout(*expected_redis_topology_, **observed);
+      }
+      if (compatible) {
+        incompatible_observations = 0;
+        ApplyStableRedisTopology(std::move(**observed));
+        continue;
+      }
+
+      ++incompatible_observations;
+      const std::string reason =
+          observed.ok()
+              ? "source no longer reports a complete Redis Cluster topology"
+              : std::string(observed.status().message());
+      if (incompatible_observations < 2) {
+        spdlog::warn("Redis Cluster topology change awaiting confirmation: {}",
+                     reason);
+        continue;
+      }
+      FaultRedisTopology(reason);
+      redis_topology_monitor_started_ = false;
+      co_return absl::FailedPreconditionError(reason);
+    }
+  }
+
+  void StartRedisCoordinator(const std::shared_ptr<RedisSource>& source) {
+    if (source->coordinator_started_) return;
+    source->coordinator_started_ = true;
+    spdlog::info("starting Redis replication coordinator for {}:{}",
+                 source->upstream_.host_, source->upstream_.port_);
+    celer::ThisWorker().self_->SpawnRoot(RedisCoordinator(source));
+  }
+
+  Task<absl::Status> RedisCoordinator(std::shared_ptr<RedisSource> source) {
+    if (source->node_id_.empty()) {
+      auto discovery = co_await DiscoverRedis(source->upstream_);
+      if (!discovery.ok()) {
+        spdlog::warn("failed to discover Redis source {}:{}: {}",
+                     source->upstream_.host_, source->upstream_.port_,
+                     discovery.status().message());
+        source->coordinator_started_ = false;
+        RefreshRedisRole();
+        co_return discovery.status();
+      }
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!RedisSourceRegistered(source) ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
+          source->coordinator_started_ = false;
+          co_return absl::CancelledError("Redis source was replaced");
+        }
+        redis_cluster_ = discovery->redis_cluster_;
+        if (redis_cluster_) {
+          expected_redis_topology_ = std::move(discovery->topology_);
+          source->node_id_ = discovery->self_->node_id_;
+          source->slots_ = discovery->self_->slots_;
+        } else {
+          source->node_id_ = "standalone";
+          source->slots_.set();
+        }
+      }
+      RefreshRedisRole();
+      if (redis_cluster_) StartRedisTopologyMonitor();
+    }
+
+    while (true) {
+      auto session = std::make_shared<ReplicaSession>();
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!redis_psync_.load(std::memory_order_relaxed) ||
+            !RedisSourceRegistered(source) || redis_topology_fault_ ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
+          break;
+        }
+        source->session_ = session;
+      }
+      absl::Status connected = co_await RunRedisReplicaSession(source, session);
+      session->Cancel();
+      {
+        std::lock_guard lock(state_mutex_);
+        source->link_up_ = false;
+        source->syncing_ = false;
+        if (source->session_ == session) source->session_.reset();
+      }
+      RefreshRedisRole();
+
+      bool retry = false;
+      {
+        std::lock_guard lock(state_mutex_);
+        retry =
+            redis_psync_.load(std::memory_order_relaxed) &&
+            RedisSourceRegistered(source) && !redis_topology_fault_ &&
+            source->role_epoch_ == role_epoch_.load(std::memory_order_relaxed);
+      }
+      if (!retry) break;
+      spdlog::warn("Redis replication connection to {}:{} ended: {}",
+                   source->upstream_.host_, source->upstream_.port_,
+                   connected.message());
+      absl::Status slept =
+          co_await celer::SleepFor(*celer::ThisWorker().self_, kReconnectDelay);
+      if (!slept.ok()) {
+        source->coordinator_started_ = false;
+        co_return slept;
+      }
+    }
+    source->coordinator_started_ = false;
+    co_return absl::OkStatus();
+  }
+
   Task<absl::Status> Coordinator() {
     while (true) {
       ReplicaOfConfig upstream;
       std::uint64_t role_epoch = 0;
-      bool redis_psync = false;
       std::shared_ptr<ReplicaSession> session;
       {
         std::lock_guard lock(state_mutex_);
         if (!upstream_.has_value()) break;
         upstream = *upstream_;
         role_epoch = role_epoch_.load(std::memory_order_relaxed);
-        redis_psync = redis_psync_.load(std::memory_order_relaxed);
         session = std::make_shared<ReplicaSession>();
         active_replica_session_ = session;
       }
-      role_.store(redis_psync && redis_dataset_valid_
-                      ? ReplicationRole::kOnline
-                      : ReplicationRole::kConnecting,
-                  std::memory_order_release);
+      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
       absl::Status connected =
-          redis_psync
-              ? co_await RunRedisReplicaSession(upstream, role_epoch, session)
-              : co_await RunReplicaSession(upstream, role_epoch, session);
+          co_await RunReplicaSession(upstream, role_epoch, session);
       session->Cancel();
-      if (!redis_psync && session->session_id_ != 0) {
+      if (session->session_id_ != 0) {
         absl::Status discarded =
             co_await storage_->AbortReplicaRoot(session->session_id_);
         if (!discarded.ok()) {
@@ -1697,11 +2453,7 @@ class ReplicationManager::Impl {
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch;
       }
       if (!retry) continue;
-      const bool retrying_redis = redis_psync_.load(std::memory_order_acquire);
-      role_.store(retrying_redis && redis_dataset_valid_
-                      ? ReplicationRole::kOnline
-                      : ReplicationRole::kConnecting,
-                  std::memory_order_release);
+      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
       spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
                    upstream.port_, connected.message());
       absl::Status slept =
@@ -1715,8 +2467,8 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
-  Task<absl::Status> ImportRedisRdb(const std::string& path,
-                                    std::uint64_t role_epoch) {
+  Task<absl::Status> ImportRedisRdb(
+      const std::string& path, const std::shared_ptr<RedisSource>& source) {
     auto reader = rdb::FileReader::Open(path);
     if (!reader.ok()) co_return reader.status();
 
@@ -1734,6 +2486,10 @@ class ReplicationManager::Impl {
     }
     reader->Rewind();
 
+    co_await redis_fullsync_mutex_.Lock();
+    celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                       celer::ThisWorker().self_);
+
     while (!CloseAllCommandDbGates()) {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -1747,13 +2503,18 @@ class ReplicationManager::Impl {
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!waited.ok()) co_return waited;
     }
-    if (role_epoch_.load(std::memory_order_acquire) != role_epoch ||
-        !redis_psync_.load(std::memory_order_acquire)) {
-      co_return absl::CancelledError(
-          "Redis full sync was cancelled by a role change");
+    {
+      std::lock_guard lock(state_mutex_);
+      if (!redis_psync_.load(std::memory_order_relaxed) ||
+          source->role_epoch_ != role_epoch_.load(std::memory_order_relaxed) ||
+          !RedisSourceRegistered(source) || redis_topology_fault_) {
+        co_return absl::CancelledError(
+            "Redis full sync was cancelled by a role or topology change");
+      }
     }
 
-    absl::Status cleared = co_await storage_->FlushAllDetach();
+    const std::vector<std::uint16_t> slots = RedisSlotsVector(source->slots_);
+    absl::Status cleared = co_await storage_->ResetPartitionsDetach(slots);
     if (!cleared.ok()) co_return cleared;
 
     std::uint64_t imported = 0;
@@ -1761,7 +2522,7 @@ class ReplicationManager::Impl {
     while (true) {
       auto next = reader->Next();
       if (!next.ok()) {
-        (void)co_await storage_->FlushAllDetach();
+        (void)co_await storage_->ResetPartitionsDetach(slots);
         co_return next.status();
       }
       if (!next->has_value()) break;
@@ -1779,6 +2540,13 @@ class ReplicationManager::Impl {
         }
         continue;
       }
+      const std::uint16_t slot = storage::RedisSlot(entry.key_);
+      if (!source->slots_.test(slot)) {
+        (void)co_await storage_->ResetPartitionsDetach(slots);
+        co_return absl::FailedPreconditionError(
+            absl::StrCat("Redis RDB key belongs to slot ", slot,
+                         " outside source ownership"));
+      }
       const unsigned owner = storage_->OwnerForKey(entry.key_);
       auto apply = [this, entry = std::move(entry)]() mutable
           -> Task<absl::StatusOr<storage::RestoreRawResult>> {
@@ -1795,7 +2563,8 @@ class ReplicationManager::Impl {
         const absl::Status failure =
             result.ok() ? absl::AlreadyExistsError("duplicate key in Redis RDB")
                         : result.status();
-        absl::Status discarded = co_await storage_->FlushAllDetach();
+        absl::Status discarded =
+            co_await storage_->ResetPartitionsDetach(slots);
         if (!discarded.ok()) {
           co_return absl::InternalError(absl::StrCat(
               "Redis RDB import failed: ", failure.message(),
@@ -1811,8 +2580,9 @@ class ReplicationManager::Impl {
     }
     spdlog::info(
         "Redis PSYNC loaded RDB version={} entries={} imported={} expired={} "
-        "unsupported-skipped={}",
-        reader->version(), entries, imported, expired, skipped);
+        "unsupported-skipped={} slots={}",
+        reader->version(), entries, imported, expired, skipped,
+        FormatRedisSlots(source->slots_));
     co_return absl::OkStatus();
   }
 
@@ -1831,14 +2601,76 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
-  Task<absl::Status> SendRedisAck(TcpStream& stream) {
-    const std::vector<std::string> command{"REPLCONF", "ACK",
-                                           absl::StrCat(redis_offset_)};
+  Task<absl::Status> SendRedisAck(TcpStream& stream,
+                                  const std::shared_ptr<RedisSource>& source) {
+    const std::vector<std::string> command{
+        "REPLCONF", "ACK",
+        absl::StrCat(source->offset_.load(std::memory_order_acquire))};
     const std::string encoded = EncodeRespCommand(command);
     co_return co_await WriteText(stream, encoded);
   }
 
-  Task<absl::Status> ConsumeRedisCommandStream(TcpStream& stream) {
+  absl::Status ValidateRedisSourceCommand(
+      const ReplicatedCommand& command,
+      const std::shared_ptr<RedisSource>& source) {
+    if (!redis_cluster_) return absl::OkStatus();
+    RespCommand wire{.args_ = command.args_};
+    auto request = BuildCommandRequest(std::move(wire), command.db_id_);
+    if (!request.ok()) return request.status();
+    if (request->kind_ == CommandKind::kFlushDb ||
+        request->kind_ == CommandKind::kFlushAll) {
+      return absl::OkStatus();
+    }
+    if (request->spec_ == nullptr) {
+      return absl::InvalidArgumentError("unknown Redis replication command");
+    }
+    auto keys = DetermineKeys(*request->spec_, request->args_);
+    if (!keys.ok() || keys->count() == 0) {
+      return absl::InvalidArgumentError(
+          "Redis replication command has no routable key");
+    }
+    for (std::uint16_t index = keys->first_; index <= keys->last_;
+         index = static_cast<std::uint16_t>(index + keys->step_)) {
+      const std::uint16_t slot = storage::RedisSlot(request->args_[index]);
+      if (!source->slots_.test(slot)) {
+        return absl::FailedPreconditionError(
+            absl::StrCat("Redis command key belongs to slot ", slot,
+                         " outside source ownership"));
+      }
+    }
+    return absl::OkStatus();
+  }
+
+  Task<absl::Status> ResetRedisSourceSlots(
+      const std::shared_ptr<RedisSource>& source) {
+    co_await redis_fullsync_mutex_.Lock();
+    celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                       celer::ThisWorker().self_);
+    while (!CloseAllCommandDbGates()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    struct CommandGateGuard {
+      ~CommandGateGuard() { OpenAllCommandDbGates(); }
+    } reopen;
+    while (CommandDbOperationsActive()) {
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    {
+      std::lock_guard lock(state_mutex_);
+      if (!RedisSourceRegistered(source) || redis_topology_fault_) {
+        co_return absl::CancelledError("Redis source was replaced");
+      }
+    }
+    const std::vector<std::uint16_t> slots = RedisSlotsVector(source->slots_);
+    co_return co_await storage_->ResetPartitionsDetach(slots);
+  }
+
+  Task<absl::Status> ConsumeRedisCommandStream(
+      TcpStream& stream, const std::shared_ptr<RedisSource>& source) {
     RedisCommandStream commands(&stream);
     std::uint8_t db_id = 0;
     bool in_multi = false;
@@ -1861,7 +2693,7 @@ class ReplicationManager::Impl {
               "invalid SELECT in Redis replication stream");
         }
         db_id = static_cast<std::uint8_t>(selected);
-        redis_offset_ += wire->bytes_;
+        source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
         continue;
       }
       if (EqualCaseInsensitive(name, "PING")) {
@@ -1869,8 +2701,8 @@ class ReplicationManager::Impl {
           co_return absl::InvalidArgumentError(
               "PING inside Redis replicated transaction");
         }
-        redis_offset_ += wire->bytes_;
-        absl::Status acked = co_await SendRedisAck(stream);
+        source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
+        absl::Status acked = co_await SendRedisAck(stream, source);
         if (!acked.ok()) co_return acked;
         continue;
       }
@@ -1880,8 +2712,8 @@ class ReplicationManager::Impl {
           co_return absl::InvalidArgumentError(
               "unsupported REPLCONF in Redis replication stream");
         }
-        redis_offset_ += wire->bytes_;
-        absl::Status acked = co_await SendRedisAck(stream);
+        source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
+        absl::Status acked = co_await SendRedisAck(stream, source);
         if (!acked.ok()) co_return acked;
         continue;
       }
@@ -1901,10 +2733,14 @@ class ReplicationManager::Impl {
               "EXEC without MULTI in Redis replication stream");
         }
         transaction_bytes += wire->bytes_;
+        for (const ReplicatedCommand& command : transaction) {
+          absl::Status valid = ValidateRedisSourceCommand(command, source);
+          if (!valid.ok()) co_return valid;
+        }
         absl::Status applied =
             co_await ApplyRedisReplicatedTransaction(transaction);
         if (!applied.ok()) co_return applied;
-        redis_offset_ += transaction_bytes;
+        source->offset_.fetch_add(transaction_bytes, std::memory_order_acq_rel);
         transaction.clear();
         transaction_bytes = 0;
         in_multi = false;
@@ -1917,17 +2753,34 @@ class ReplicationManager::Impl {
         transaction.push_back(std::move(command));
         continue;
       }
+      absl::Status valid = ValidateRedisSourceCommand(command, source);
+      if (!valid.ok()) co_return valid;
+      if (redis_cluster_ && (EqualCaseInsensitive(name, "FLUSHDB") ||
+                             EqualCaseInsensitive(name, "FLUSHALL"))) {
+        if (command.args_.size() > 2 ||
+            (command.args_.size() == 2 &&
+             !EqualCaseInsensitive(command.args_[1], "ASYNC") &&
+             !EqualCaseInsensitive(command.args_[1], "SYNC"))) {
+          co_return absl::InvalidArgumentError(
+              "invalid Redis replicated flush command");
+        }
+        absl::Status reset = co_await ResetRedisSourceSlots(source);
+        if (!reset.ok()) co_return reset;
+        source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
+        continue;
+      }
       absl::Status applied = co_await ApplyRedisReplicatedCommand(command);
       if (!applied.ok()) {
         co_return absl::Status(applied.code(),
                                absl::StrCat("failed to apply Redis command '",
                                             name, "': ", applied.message()));
       }
-      redis_offset_ += wire->bytes_;
+      source->offset_.fetch_add(wire->bytes_, std::memory_order_acq_rel);
     }
   }
 
-  Task<absl::StatusOr<RedisPsyncReply>> StartRedisPsync(TcpStream& stream) {
+  Task<absl::StatusOr<RedisPsyncReply>> StartRedisPsync(
+      TcpStream& stream, const std::shared_ptr<RedisSource>& source) {
     absl::Status status =
         co_await AuthenticateUpstream(stream, masteruser_, masterauth_);
     if (!status.ok()) co_return status;
@@ -1950,13 +2803,21 @@ class ReplicationManager::Impl {
       if (!status.ok()) co_return status;
     }
 
-    const bool can_continue = redis_dataset_valid_ && redis_replid_.has_value();
+    std::optional<std::string> replid;
+    {
+      std::lock_guard lock(state_mutex_);
+      if (source->dataset_valid_.load(std::memory_order_acquire)) {
+        replid = source->replid_;
+      }
+    }
+    const bool can_continue = replid.has_value();
     std::vector<std::string> command;
     command.reserve(3);
     command.emplace_back("PSYNC");
     if (can_continue) {
-      command.push_back(*redis_replid_);
-      command.push_back(absl::StrCat(redis_offset_));
+      command.push_back(*replid);
+      command.push_back(
+          absl::StrCat(source->offset_.load(std::memory_order_acquire)));
     } else {
       command.emplace_back("?");
       command.emplace_back("-1");
@@ -1971,51 +2832,55 @@ class ReplicationManager::Impl {
     co_return std::move(*parsed);
   }
 
-  Task<absl::Status> RedisFollowerOnline(const ReplicaOfConfig& upstream,
-                                         std::uint64_t role_epoch,
-                                         TcpStream& stream) {
-    if (role_epoch_.load(std::memory_order_acquire) != role_epoch) {
+  Task<absl::Status> RedisFollowerOnline(
+      TcpStream& stream, const std::shared_ptr<RedisSource>& source) {
+    if (role_epoch_.load(std::memory_order_acquire) != source->role_epoch_) {
       co_return absl::CancelledError("replication role epoch was replaced");
     }
-    role_.store(ReplicationRole::kOnline, std::memory_order_release);
-    absl::Status status = co_await SendRedisAck(stream);
+    source->link_up_ = true;
+    source->syncing_ = false;
+    RefreshRedisRole();
+    absl::Status status = co_await SendRedisAck(stream, source);
     if (!status.ok()) co_return status;
-    spdlog::info("Redis PSYNC follower online with {}:{}", upstream.host_,
-                 upstream.port_);
-    co_return co_await ConsumeRedisCommandStream(stream);
+    spdlog::info("Redis PSYNC follower online with {}:{} slots={}",
+                 source->upstream_.host_, source->upstream_.port_,
+                 FormatRedisSlots(source->slots_));
+    co_return co_await ConsumeRedisCommandStream(stream, source);
   }
 
-  Task<absl::Status> CompleteRedisFullSync(const ReplicaOfConfig& upstream,
-                                           std::uint64_t role_epoch,
-                                           TcpStream& stream,
-                                           std::string replid,
-                                           std::uint64_t offset) {
-    role_.store(ReplicationRole::kSyncing, std::memory_order_release);
-    redis_dataset_valid_ = false;
+  Task<absl::Status> CompleteRedisFullSync(
+      TcpStream& stream, const std::shared_ptr<RedisSource>& source,
+      std::string replid, std::uint64_t offset) {
+    source->syncing_ = true;
+    source->dataset_valid_ = false;
+    RefreshRedisRole();
     auto rdb_path = co_await ReceiveRedisRdb(stream);
     if (!rdb_path.ok()) co_return rdb_path.status();
-    absl::Status status = co_await ImportRedisRdb(*rdb_path, role_epoch);
+    absl::Status status = co_await ImportRedisRdb(*rdb_path, source);
     (void)::unlink(rdb_path->c_str());
     if (!status.ok()) co_return status;
-    redis_replid_ = std::move(replid);
-    redis_offset_ = offset;
-    redis_dataset_valid_ = true;
+    source->offset_.store(offset, std::memory_order_release);
+    source->dataset_valid_ = true;
     {
       std::lock_guard lock(state_mutex_);
-      upstream_node_id_ = redis_replid_;
-      upstream_history_id_ = redis_replid_;
-      source_worker_count_ = 1;
+      source->replid_ = std::move(replid);
+      if (redis_sources_.front() == source) {
+        upstream_node_id_ = source->replid_;
+        upstream_history_id_ = source->replid_;
+      }
+      source_worker_count_ = static_cast<unsigned>(redis_sources_.size());
     }
     spdlog::info("Redis FULLRESYNC completed from {}:{} at offset {}",
-                 upstream.host_, upstream.port_, redis_offset_);
-    co_return co_await RedisFollowerOnline(upstream, role_epoch, stream);
+                 source->upstream_.host_, source->upstream_.port_,
+                 source->offset_.load(std::memory_order_acquire));
+    co_return co_await RedisFollowerOnline(stream, source);
   }
 
   Task<absl::Status> RunRedisReplicaSession(
-      const ReplicaOfConfig& upstream, std::uint64_t role_epoch,
+      const std::shared_ptr<RedisSource>& source,
       const std::shared_ptr<ReplicaSession>& session) {
-    auto connected =
-        co_await ConnectTcp(upstream.host_, upstream.port_, tls_context_);
+    auto connected = co_await ConnectTcp(source->upstream_.host_,
+                                         source->upstream_.port_, tls_context_);
     if (!connected.ok()) co_return connected.status();
     TcpStream stream = std::move(*connected);
     const int fd = stream.NativeFd();
@@ -2026,35 +2891,39 @@ class ReplicationManager::Impl {
     session->connected_flows_.store(1, std::memory_order_release);
     ReplicationConnectionMetricGuard connection_metric(
         ReplicationConnectionKind::kControl);
-    absl::Status result =
-        co_await RunRedisConnectedSession(upstream, role_epoch, stream);
+    absl::Status result = co_await RunRedisConnectedSession(source, stream);
     session->connected_flows_.store(0, std::memory_order_release);
     session->sockets_.Remove(fd);
     stream.Close().IgnoreError();
     co_return result;
   }
 
-  Task<absl::Status> RunRedisConnectedSession(const ReplicaOfConfig& upstream,
-                                              std::uint64_t role_epoch,
-                                              TcpStream& stream) {
-    auto reply = co_await StartRedisPsync(stream);
+  Task<absl::Status> RunRedisConnectedSession(
+      const std::shared_ptr<RedisSource>& source, TcpStream& stream) {
+    auto reply = co_await StartRedisPsync(stream, source);
     if (!reply.ok()) co_return reply.status();
 
     if (reply->full_) {
-      co_return co_await CompleteRedisFullSync(upstream, role_epoch, stream,
-                                               std::move(*reply->replid_),
-                                               reply->offset_);
+      co_return co_await CompleteRedisFullSync(
+          stream, source, std::move(*reply->replid_), reply->offset_);
     }
-    if (!redis_dataset_valid_ || !redis_replid_.has_value()) {
+    bool valid_cursor = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      valid_cursor = source->dataset_valid_.load(std::memory_order_acquire) &&
+                     source->replid_.has_value();
+    }
+    if (!valid_cursor) {
       co_return absl::FailedPreconditionError(
           "Redis accepted partial sync without a valid local dataset");
     }
     if (reply->replid_.has_value()) {
-      redis_replid_ = std::move(reply->replid_);
+      std::lock_guard lock(state_mutex_);
+      source->replid_ = std::move(reply->replid_);
     }
     spdlog::info("Redis partial resynchronization continued from offset {}",
-                 redis_offset_);
-    co_return co_await RedisFollowerOnline(upstream, role_epoch, stream);
+                 source->offset_.load(std::memory_order_acquire));
+    co_return co_await RedisFollowerOnline(stream, source);
   }
 
   Task<absl::Status> RunReplicaSession(
@@ -3807,6 +4676,7 @@ class ReplicationManager::Impl {
         (args[3] != "?" && !IsReplicationId(args[3]))) {
       co_return absl::InvalidArgumentError("invalid KLPSYNC handshake");
     }
+    const bool protocol_probe = args[2] == "?";
     absl::Status history_ready = co_await EnsureReplicationHistoryReady();
     if (!history_ready.ok()) co_return history_ready;
     std::string replica_node_id;
@@ -3868,6 +4738,14 @@ class ReplicationManager::Impl {
     if (!sent.ok()) {
       RemoveMasterSession(session);
       co_return sent;
+    }
+    // Anonymous KLPSYNC is reserved for protocol detection. It deliberately
+    // avoids leaving a ten-minute flow-stall session or appearing in INFO as
+    // a downstream replica. Real protocol-v1 replicas always advertise their
+    // node id and listening port.
+    if (protocol_probe) {
+      RemoveMasterSession(session);
+      co_return absl::OkStatus();
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -4108,8 +4986,9 @@ class ReplicationManager::Impl {
   std::atomic<unsigned> ready_workers_{0};
   std::uint64_t replica_session_id_ = 0;
   unsigned source_worker_count_ = 0;
-  bool ready_waiter_started_ = false;  // worker 0 only
-  bool coordinator_started_ = false;   // worker 0 only
+  bool ready_waiter_started_ = false;            // worker 0 only
+  bool coordinator_started_ = false;             // worker 0 only
+  bool initial_protocol_probe_pending_ = false;  // worker 0 only
   std::shared_ptr<ReplicaCursorState> cursor_state_;
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
@@ -4130,13 +5009,15 @@ class ReplicationManager::Impl {
   const std::string masteruser_;
   const std::string masterauth_;
   std::atomic<bool> redis_psync_{false};
-  // Redis's offset is retained across transient reconnects, enabling PSYNC
-  // partial resynchronization. It is intentionally not persisted yet: after a
-  // process restart we request a fresh RDB because storage and cursor updates
-  // do not share one crash-atomic commit record.
-  bool redis_dataset_valid_ = false;         // worker 0 only
-  std::optional<std::string> redis_replid_;  // worker 0 only
-  std::uint64_t redis_offset_ = 0;           // worker 0 only
+  // Each Redis source owns an independent PSYNC cursor. Cursors intentionally
+  // remain process-local until storage and offsets can share a crash-atomic
+  // commit record; process restart therefore requests a fresh RDB per source.
+  std::vector<std::shared_ptr<RedisSource>> redis_sources_;
+  std::optional<RedisClusterTopology> expected_redis_topology_;
+  bool redis_cluster_ = false;
+  bool redis_topology_fault_ = false;
+  bool redis_topology_monitor_started_ = false;  // worker 0 only
+  celer::AsyncMutex redis_fullsync_mutex_;       // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   mutable std::mutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
@@ -4159,6 +5040,10 @@ void ReplicationManager::StorageReady(celer::Worker& worker) {
 Task<absl::Status> ReplicationManager::SetUpstream(
     std::optional<ReplicaOfConfig> upstream) {
   co_return co_await impl_->SetUpstream(std::move(upstream));
+}
+
+Task<absl::Status> ReplicationManager::AddUpstream(ReplicaOfConfig upstream) {
+  co_return co_await impl_->AddUpstream(std::move(upstream));
 }
 
 absl::Status ReplicationManager::SetSnapshotReadConcurrency(
