@@ -263,6 +263,8 @@ credit。单个大于 queue limit 的 command 可以独占一个 heap staging it
 首次出现的 pending replacement 也持有 `(metadata + 两份 key identity)` 的 queue credit；同 key
 覆盖复用这份 credit，replacement ACK、partition 结束或 session 取消时释放。因此持续创建并删除
 不同 key 会触发与 command FIFO 相同的反压，不能靠稳定的 live-key 数绕过容量上限。
+主动过期在删除前只做非阻塞的 full-sync credit 预留：空间不足或已有前台 admission 排队时，保留
+过期候选并结束本轮，稍后重试。它不会持有 key/store lock 等待慢 replica，也不能绕过 queue 上限。
 
 单 key 命令只向实际 owner worker 申请 credit，并把 `(partition,DB)` 传给 admission：尚未为该
 session 启动的 partition/DB 不预留 full-sync queue 空间，也不会被另一个正在扫描或已经 tailing

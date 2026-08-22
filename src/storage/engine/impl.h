@@ -1624,6 +1624,9 @@ class StorageEngine::Impl {
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,
       std::optional<ReplicationPublisherTarget> target);
+  std::optional<ReplicationPublisherAdmission>
+  TryAcquireFullSyncReplacementAdmission(std::size_t logical_bytes,
+                                         ReplicationPublisherTarget target);
   void ReleaseReplicationPublisherAdmission(
       const ReplicationPublisherAdmission& admission,
       std::size_t logical_bytes);

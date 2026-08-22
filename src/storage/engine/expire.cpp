@@ -104,8 +104,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   absl::Status durable = co_await AppendLocked(
       store, partition, candidate.db_id_, candidate.key_, {},
       RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
-  if (durable.ok() ||
-      durable.code() != absl::StatusCode::kResourceExhausted ||
+  if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted ||
       current->value_.shielding_) {
     co_return durable;
   }
@@ -241,11 +240,31 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
     std::size_t deleted = 0;
     bool warned_failure = false;
     while (deleted < kDeletesPerCycle && !store->expired_candidates_.empty()) {
+      const WorkerStore::ExpireCandidate& front =
+          store->expired_candidates_.front();
+      std::size_t replacement_bytes = kFullSyncReplacementMetadataBytes;
+      if (front.key_.size() >
+          (std::numeric_limits<std::size_t>::max() - replacement_bytes) / 2) {
+        co_return absl::ResourceExhaustedError(
+            "active-expiration replacement identity is too large");
+      }
+      replacement_bytes += front.key_.size() * 2;
+      auto admission = TryAcquireFullSyncReplacementAdmission(
+          replacement_bytes,
+          ReplicationPublisherTarget{.partition_id_ = front.partition_id_,
+                                     .db_id_ = front.db_id_});
+      if (!admission.has_value()) {
+        // Expiration is maintenance and expired records are already logically
+        // invisible. Leave the candidate queued and retry next cycle rather
+        // than waiting behind a slow full-sync replica or foreground writer.
+        break;
+      }
       WorkerStore::ExpireCandidate candidate =
           std::move(store->expired_candidates_.front());
       store->expired_candidates_.pop_front();
       absl::Status expired =
           co_await ExpireCandidate(*store, std::move(candidate));
+      ReleaseReplicationPublisherAdmission(*admission, replacement_bytes);
       if (!expired.ok()) {
         // Do not terminate this worker's lifetime expiration coroutine. The
         // key remains indexed as expired and a later map pass will enqueue it

@@ -48,6 +48,18 @@ std::optional<std::size_t> TransactionLogicalBytes(
   return logical_bytes;
 }
 
+bool PublisherHasCapacity(std::size_t logical_bytes, std::size_t capacity,
+                          std::size_t queued, std::size_t admitted) noexcept {
+  const std::size_t occupied =
+      queued > std::numeric_limits<std::size_t>::max() - admitted
+          ? std::numeric_limits<std::size_t>::max()
+          : queued + admitted;
+  // An item larger than the configured waterline may proceed only while it is
+  // the exclusive heap-backed item.
+  return logical_bytes > capacity ? occupied == 0
+                                  : occupied <= capacity - logical_bytes;
+}
+
 }  // namespace
 
 Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
@@ -200,21 +212,10 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
     }
     const std::size_t capacity =
         replication_publish_queue_bytes_.load(std::memory_order_acquire);
-    auto has_capacity = [logical_bytes, capacity](std::size_t queued,
-                                                  std::size_t admitted) {
-      const std::size_t occupied =
-          queued > std::numeric_limits<std::size_t>::max() - admitted
-              ? std::numeric_limits<std::size_t>::max()
-              : queued + admitted;
-      // A command larger than the configured waterline is one exclusive,
-      // heap-backed item. This keeps large values functional without letting
-      // unrelated writes accumulate behind them.
-      return logical_bytes > capacity ? occupied == 0
-                                      : occupied <= capacity - logical_bytes;
-    };
     const bool log_available =
         log.state_ != ReplicationLogState::kActive ||
-        has_capacity(log.publish_queue_bytes_, log.publisher_admitted_bytes_);
+        PublisherHasCapacity(logical_bytes, capacity, log.publish_queue_bytes_,
+                             log.publisher_admitted_bytes_);
     bool available = log_available;
     if (available) {
       for (const auto& [session_id, session] : store.fullsync_sessions_) {
@@ -222,8 +223,9 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
             !session_needs_credit(session_id)) {
           continue;
         }
-        if (!has_capacity(session.publish_queue_bytes_,
-                          session.publisher_admitted_bytes_)) {
+        if (!PublisherHasCapacity(logical_bytes, capacity,
+                                  session.publish_queue_bytes_,
+                                  session.publisher_admitted_bytes_)) {
           available = false;
           break;
         }
@@ -273,6 +275,66 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
       co_await store.fullsync_publisher_capacity_ready_.Wait();
     }
   }
+}
+
+std::optional<ReplicationPublisherAdmission>
+StorageEngine::Impl::TryAcquireFullSyncReplacementAdmission(
+    std::size_t logical_bytes, ReplicationPublisherTarget target) {
+  WorkerStore& store = CurrentStore();
+  assert(target.partition_id_ < kLogicalStorageShards);
+  assert(target.db_id_ < kLogicalDatabaseCount);
+  assert(target.partition_id_ % worker_count_ == store.worker_->id());
+  if (logical_bytes == 0) logical_bytes = 1;
+
+  ReplicationPublisherAdmission admission;
+  if (store.fullsync_sessions_.empty()) return admission;
+  // Active expiration is background maintenance. Never bypass a foreground
+  // publisher that already owns or is waiting for the admission ticket.
+  if (store.replication_publisher_next_ticket_ !=
+      store.replication_publisher_serving_ticket_) {
+    return std::nullopt;
+  }
+
+  const auto& partition = PartitionFor(store, target.partition_id_);
+  auto session_needs_credit = [&](std::uint64_t session_id) {
+    const auto capture = partition.fullsync_subscribers_.find(session_id);
+    return capture != partition.fullsync_subscribers_.end() &&
+           capture->second.db_phases_[target.db_id_] !=
+               WorkerStore::FullSyncCapture::DbPhase::kUnstarted;
+  };
+  const std::size_t capacity =
+      replication_publish_queue_bytes_.load(std::memory_order_acquire);
+  for (const auto& [session_id, session] : store.fullsync_sessions_) {
+    if (session.db_epoch_invalidated_ || !session_needs_credit(session_id)) {
+      continue;
+    }
+    if (!PublisherHasCapacity(logical_bytes, capacity,
+                              session.publish_queue_bytes_,
+                              session.publisher_admitted_bytes_)) {
+      return std::nullopt;
+    }
+  }
+
+  admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
+  admission.fullsync_unstarted_guards_.reserve(store.fullsync_sessions_.size());
+  for (auto& [session_id, session] : store.fullsync_sessions_) {
+    if (session.db_epoch_invalidated_) continue;
+    if (session_needs_credit(session_id)) {
+      session.publisher_admitted_bytes_ += logical_bytes;
+      admission.fullsync_session_ids_.push_back(session_id);
+      continue;
+    }
+    const std::uint32_t target_id =
+        (static_cast<std::uint32_t>(target.partition_id_) << 8) | target.db_id_;
+    ++session.unstarted_admissions_[target_id];
+    admission.fullsync_unstarted_guards_.push_back(
+        ReplicationPublisherAdmission::UnstartedGuard{
+            .session_id_ = session_id,
+            .partition_id_ = target.partition_id_,
+            .db_id_ = target.db_id_,
+        });
+  }
+  return admission;
 }
 
 void StorageEngine::Impl::ReleaseReplicationPublisherAdmission(

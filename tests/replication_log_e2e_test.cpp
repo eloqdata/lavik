@@ -951,6 +951,86 @@ class ReplicationLogService final : public celer::Service {
     absl::Status completed_db =
         storage_->CompletePartitionDbReplication(kSession, partition_id, kDb);
     if (!completed_db.ok()) co_return completed_db;
+
+    // Active expiration has no client command admission. Fill the full-sync
+    // queue after installing an expiring TAILING key: expiration must leave
+    // its candidate pending instead of creating an uncredited replacement.
+    const std::string expiring_key = "fullsync-expire{ordered}";
+    std::vector<std::string> expiring_args{"SET", expiring_key, "alive", "PX",
+                                           "100"};
+    written =
+        co_await ExecuteClientCommand(kDb, std::move(expiring_args), "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto expiring_command = storage_->PeekFullSyncPublishItems(kSession, 1);
+    if (!expiring_command.ok()) co_return expiring_command.status();
+    Check(expiring_command->size() == 1 &&
+              expiring_command->front().command_ != nullptr,
+          "expiring TAILING key did not enter the command FIFO");
+    storage_->AcknowledgeFullSyncPublishItem(kSession,
+                                             expiring_command->front().id_);
+
+    std::vector<std::string> expiry_filler_args{"SET", key,
+                                                std::string(700 * 1024, 'e')};
+    written = co_await ExecuteClientCommand(kDb, std::move(expiry_filler_args),
+                                            "+OK\r\n");
+    if (!written.ok()) co_return written;
+    auto expiry_filler = storage_->PeekFullSyncPublishItems(kSession, 1);
+    if (!expiry_filler.ok()) co_return expiry_filler.status();
+    Check(expiry_filler->size() == 1,
+          "failed to fill the full-sync queue for active expiration");
+    const std::size_t full_queue_bytes =
+        storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_;
+    Check(full_queue_bytes != 0,
+          "active-expiration test did not occupy full-sync queue credit");
+    queue_capacity =
+        co_await storage_->SetReplicationPublishQueueCapacity(full_queue_bytes);
+    if (!queue_capacity.ok()) co_return queue_capacity;
+
+    absl::Status slept =
+        co_await celer::SleepFor(*worker_, std::chrono::milliseconds(150));
+    if (!slept.ok()) co_return slept;
+    Check(!co_await storage_->Exists(kDb, expiring_key),
+          "active-expiration test key did not become logically expired");
+    slept = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(50));
+    if (!slept.ok()) co_return slept;
+    absl::Status quiesced = co_await storage_->QuiesceExpiration();
+    if (!quiesced.ok()) co_return quiesced;
+    auto blocked_expiration = co_await storage_->ReadPartitionFullSyncOverrides(
+        kSession, partition_id, 16);
+    if (!blocked_expiration.ok()) co_return blocked_expiration.status();
+    Check(
+        blocked_expiration->records_.empty() &&
+            storage_->LocalReplicationLogInfo().fullsync_publish_queue_bytes_ ==
+                full_queue_bytes,
+        "active expiration bypassed full-sync replacement admission");
+
+    storage_->AcknowledgeFullSyncPublishItem(kSession,
+                                             expiry_filler->front().id_);
+    storage_->ResumeExpiration();
+    std::optional<PartitionFullSyncBatch> expired_replacement;
+    for (unsigned attempt = 0; attempt < 200; ++attempt) {
+      auto batch = co_await storage_->ReadPartitionFullSyncOverrides(
+          kSession, partition_id, 16);
+      if (!batch.ok()) co_return batch.status();
+      if (!batch->records_.empty()) {
+        expired_replacement.emplace(std::move(*batch));
+        break;
+      }
+      slept = co_await celer::SleepFor(*worker_, std::chrono::milliseconds(10));
+      if (!slept.ok()) co_return slept;
+    }
+    Check(expired_replacement.has_value() &&
+              expired_replacement->records_.size() == 1 &&
+              expired_replacement->records_.front().key_ == expiring_key &&
+              expired_replacement->records_.front().kind_ ==
+                  keylane::storage::SnapshotRecord::Kind::kDelete,
+          "active expiration did not resume after full-sync credit was freed");
+    storage_->AcknowledgePartitionFullSyncOverrides(
+        kSession, partition_id, expired_replacement->records_);
+    queue_capacity =
+        co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+    if (!queue_capacity.ok()) co_return queue_capacity;
+
     storage_->EndPartitionReplication(kSession, partition_id);
     storage_->EndFullSyncSession(kSession);
 
