@@ -61,7 +61,7 @@ source_port=16479
 import_port=16480
 truncate -s 1G "${case_dir}/source.data"
 KEYLANE_RDB_CAPTURE_PAUSE_MS=500 \
-"${keylane_bin}" --port "${source_port}" --threads 4 --no-pin-workers \
+"${keylane_bin}" --logtostderr --port "${source_port}" --threads 4 --no-pin-workers \
   --recv-buffers-per-worker 0 --data-file "${case_dir}/source.data" \
   --rdb-dir "${case_dir}" --dbfilename dump.rdb \
   >"${case_dir}/source.log" 2>&1 &
@@ -114,7 +114,7 @@ stop_server "${source_pid}"
 source_pid=
 
 truncate -s 1G "${case_dir}/import.data"
-"${keylane_bin}" --port "${import_port}" --threads 4 --no-pin-workers \
+"${keylane_bin}" --logtostderr --port "${import_port}" --threads 4 --no-pin-workers \
   --recv-buffers-per-worker 0 --data-file "${case_dir}/import.data" \
   --load-rdb "${case_dir}/dump.rdb" --rdb-dir "${case_dir}" \
   --dbfilename imported.rdb >"${case_dir}/import.log" 2>&1 &

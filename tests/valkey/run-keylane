@@ -37,6 +37,7 @@ fi
 
 truncate -s "${KEYLANE_TEST_DATA_SIZE:-8G}" "$DATA_FILE"
 "$KEYLANE_BIN" \
+    --logtostderr \
     --bind "$KEYLANE_HOST" \
     --port "$KEYLANE_PORT" \
     --threads "${KEYLANE_TEST_THREADS:-2}" \

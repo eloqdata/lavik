@@ -94,7 +94,7 @@ done
 "$redis_cli" -c -p "${master_ports[0]}" set '{c}baseline' three >/dev/null
 
 fallocate -l 128M "$case_dir/keylane.data"
-"$keylane_bin" --port "$keylane_port" --threads 3 \
+"$keylane_bin" --logtostderr --port "$keylane_port" --threads 3 \
   --recv-buffers-per-worker 0 --max-memory 8589934592 --flush-max-ms 20 \
   --data-file "$case_dir/keylane.data" >"$case_dir/keylane.log" 2>&1 &
 keylane_pid=$!

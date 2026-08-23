@@ -45,7 +45,7 @@ keylane_port=${ports[0]}
 redis_port=${ports[1]}
 
 fallocate -l 256M "${case_dir}/keylane.data"
-"${keylane_bin}" --port "${keylane_port}" --threads 4 --no-pin-workers \
+"${keylane_bin}" --logtostderr --port "${keylane_port}" --threads 4 --no-pin-workers \
   --recv-buffers-per-worker 0 --max-memory 4294967296 \
   --data-file "${case_dir}/keylane.data" \
   "${extra_args[@]}" \

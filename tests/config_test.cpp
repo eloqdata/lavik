@@ -5,6 +5,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -151,6 +152,58 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.background_warrant_percent_, 7u);
   EXPECT_EQ(options.spdk_max_completions_per_poll_, 4u);
   EXPECT_EQ(options.replication_options_.snapshot_batch_size_, 32u);
+}
+
+TEST(RedisConfigTest, AppliesLoggingDirectivesAndAliases) {
+  ServerOptions options;
+  ASSERT_TRUE(ApplyRedisConfigDirective({"logtostderr", "yes"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"alsologtostderr", "yes"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"log_dir", "/var/log/keylane"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"max_log_size_mb", "256"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"max-log-files", "12"}, &options).ok());
+
+  EXPECT_TRUE(options.logging_.log_to_stderr_);
+  EXPECT_TRUE(options.logging_.also_log_to_stderr_);
+  EXPECT_EQ(options.logging_.log_dir_, "/var/log/keylane");
+  EXPECT_EQ(options.logging_.max_log_size_mb_, 256u);
+  EXPECT_EQ(options.logging_.max_log_files_, 12u);
+
+  ASSERT_TRUE(ApplyRedisConfigDirective({"logtostderr", "no"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"log-dir", "./logs"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"max-log-size-mb", "100"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"max_log_files", "10"}, &options).ok());
+  EXPECT_FALSE(options.logging_.log_to_stderr_);
+  EXPECT_EQ(options.logging_.log_dir_, "./logs");
+  EXPECT_EQ(options.logging_.max_log_size_mb_, 100u);
+  EXPECT_EQ(options.logging_.max_log_files_, 10u);
+}
+
+TEST(RedisConfigTest, RejectsInvalidLoggingConfiguration) {
+  ServerOptions options;
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"logtostderr", "maybe"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"alsologtostderr", "1"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"max-log-size-mb", "0"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"max-log-files", "0"}, &options).ok());
+
+  options.logging_.log_dir_.clear();
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.logging_.log_dir_ = "./logs";
+  options.logging_.max_log_size_mb_ = std::numeric_limits<std::size_t>::max();
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.logging_.max_log_size_mb_ = 100;
+  options.logging_.max_log_files_ = 200'002;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
 }
 
 TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {

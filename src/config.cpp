@@ -187,6 +187,32 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->tls_port_, true);
   }
+  if (name == "logtostderr" || name == "alsologtostderr") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    if (name == "logtostderr") {
+      options->logging_.log_to_stderr_ = *enabled;
+    } else {
+      options->logging_.also_log_to_stderr_ = *enabled;
+    }
+    return absl::OkStatus();
+  }
+  if (name == "log-dir" || name == "log_dir") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    options->logging_.log_dir_ = directive[1];
+    return absl::OkStatus();
+  }
+  if (name == "max-log-size-mb" || name == "max_log_size_mb") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name,
+                         &options->logging_.max_log_size_mb_, false);
+  }
+  if (name == "max-log-files" || name == "max_log_files") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->logging_.max_log_files_,
+                         false);
+  }
   if (name == "tls-cert-file" || name == "tls-key-file" ||
       name == "tls-ca-cert-file" || name == "requirepass" ||
       name == "masteruser" || name == "masterauth" || name == "load-rdb" ||
@@ -355,6 +381,8 @@ absl::Status ApplyRedisConfigDirective(
 }
 
 absl::Status ValidateServerOptions(const ServerOptions& options) {
+  const absl::Status logging = ValidateLoggingOptions(options.logging_);
+  if (!logging.ok()) return logging;
   if (options.bind_addresses_.empty()) {
     return absl::InvalidArgumentError("at least one bind address is required");
   }

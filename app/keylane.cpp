@@ -12,6 +12,7 @@
 
 #include "keylane/CLI11.hpp"
 #include "keylane/config.h"
+#include "keylane/logging.h"
 #include "keylane/server.h"
 
 namespace {
@@ -101,6 +102,27 @@ int main(int argc, char** argv) {
                  "Prometheus HTTP listen port (0 disables)")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_flag("--logtostderr,!--nologtostderr",
+               options.logging_.log_to_stderr_,
+               "Write logs only to stderr instead of log files")
+      ->capture_default_str();
+  app.add_flag("--alsologtostderr,!--noalsologtostderr",
+               options.logging_.also_log_to_stderr_,
+               "Write logs to stderr in addition to log files")
+      ->capture_default_str();
+  app.add_option("--log-dir,--log_dir", options.logging_.log_dir_,
+                 "Directory containing keylane.log")
+      ->capture_default_str();
+  app.add_option("--max-log-size-mb,--max_log_size_mb",
+                 options.logging_.max_log_size_mb_,
+                 "Maximum size of each log file in MiB")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
+  app.add_option("--max-log-files,--max_log_files",
+                 options.logging_.max_log_files_,
+                 "Maximum log files retained, including the active file")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
   app.add_option("-t,--threads", options.thread_count_, "Worker thread count")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
@@ -276,5 +298,13 @@ int main(int argc, char** argv) {
   options.storage_read_buffer_bytes_ =
       static_cast<std::size_t>(storage_read_buffer_kb) * kKiB;
   options.flush_size_bytes_ = static_cast<std::size_t>(flush_size_kb) * kKiB;
-  return keylane::RunServer(std::move(options));
+  const absl::Status logging_status =
+      keylane::InitializeLogging(options.logging_);
+  if (!logging_status.ok()) {
+    std::cerr << "Logging error: " << logging_status.message() << '\n';
+    return 1;
+  }
+  const int exit_code = keylane::RunServer(std::move(options));
+  keylane::ShutdownLogging();
+  return exit_code;
 }
