@@ -26,6 +26,7 @@
 #include <string_view>
 #include <utility>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -481,9 +482,7 @@ class RedisService final : public TcpService {
   bool startup_failed() const noexcept {
     return startup_failed_.load(std::memory_order_acquire);
   }
-  bool ready() const noexcept {
-    return ready_.load(std::memory_order_acquire);
-  }
+  bool ready() const noexcept { return ready_.load(std::memory_order_acquire); }
   void StopAcceptingRequests() noexcept;
   void WaitForRequestsDrained() const noexcept;
 
@@ -740,47 +739,216 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   co_return co_await TcpService::Run(worker, ctx);
 }
 
-Task<absl::StatusOr<RespCommand>> ReadNextCommand(TcpStream& stream,
-                                                  std::string* pending) {
-  // Hard ceiling on one connection's accumulated request bytes. The per-frame
-  // limits (INT_MAX args of up to 512 MiB each) still admit a claimed frame far
-  // larger than RAM, and the buffer grows until the frame completes — without
-  // a cap, one client streaming an oversized frame runs the process out of
-  // memory. 1 GiB matches Redis's query buffer limit and comfortably fits
-  // any legitimate command.
-  constexpr std::size_t kMaxPendingBytes = 1ULL * 1024 * 1024 * 1024;
-  std::array<std::byte, 4096> buffer{};
-  while (true) {
-    RespParseResult parsed = ParseRespCommand(*pending);
-    if (parsed.state_ == RespParseState::kOk) {
-      RespCommand command = std::move(parsed.command_);
-      pending->erase(0, parsed.consumed_);
-      co_return command;
-    }
-    if (parsed.state_ == RespParseState::kError) {
-      co_return parsed.status_;
-    }
-    // Drop skipped filler (blank lines, empty multibulks) even while the
-    // next real command is still incomplete: retaining it would grow the
-    // buffer without bound and re-scan it from the start on every refill.
-    if (parsed.consumed_ != 0) {
-      pending->erase(0, parsed.consumed_);
-    }
-    if (pending->size() >= kMaxPendingBytes) {
-      co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                             "client request exceeds the query buffer limit");
-    }
+class RequestInputBuffer {
+ public:
+  std::string_view View() const noexcept {
+    if (begin_ == end_) return {};
+    return std::string_view(
+        reinterpret_cast<const char*>(storage_.get() + begin_), end_ - begin_);
+  }
 
+  std::span<std::byte> AppendBuffer() {
+    constexpr std::size_t kReadBytes = 4096;
+    if (capacity_ - end_ < kReadBytes && begin_ != 0) Compact();
+    if (capacity_ - end_ < kReadBytes) {
+      const std::size_t wanted = end_ + kReadBytes;
+      std::size_t capacity = capacity_ == 0 ? kReadBytes : capacity_;
+      while (capacity < wanted) capacity *= 2;
+      auto storage = std::make_unique_for_overwrite<std::byte[]>(capacity);
+      if (end_ != begin_) {
+        std::memcpy(storage.get(), storage_.get() + begin_, end_ - begin_);
+      }
+      end_ -= begin_;
+      begin_ = 0;
+      storage_ = std::move(storage);
+      capacity_ = capacity;
+    }
+    return std::span<std::byte>(storage_.get() + end_, capacity_ - end_);
+  }
+
+  void Commit(std::size_t bytes) noexcept {
+    assert(bytes <= capacity_ - end_);
+    end_ += bytes;
+  }
+
+  void Consume(std::size_t bytes) noexcept {
+    assert(bytes <= end_ - begin_);
+    begin_ += bytes;
+    if (begin_ == end_) begin_ = end_ = 0;
+  }
+
+ private:
+  void Compact() noexcept {
+    if (begin_ == 0) return;
+    if (begin_ != end_) {
+      std::memmove(storage_.get(), storage_.get() + begin_, end_ - begin_);
+    }
+    end_ -= begin_;
+    begin_ = 0;
+  }
+
+  std::unique_ptr<std::byte[]> storage_;
+  std::size_t capacity_ = 0;
+  std::size_t begin_ = 0;
+  std::size_t end_ = 0;
+};
+
+class CommandBatch {
+ public:
+  static constexpr std::size_t kMaxCommands = 128;
+
+  bool empty() const noexcept { return next_ == commands_.size(); }
+  std::size_t size() const noexcept { return commands_.size() - next_; }
+
+  void Push(RespCommand command) {
+    assert(commands_.size() < kMaxCommands);
+    commands_.push_back(std::move(command));
+  }
+
+  RespCommand PopFront() {
+    assert(!empty());
+    RespCommand command = std::move(commands_[next_++]);
+    if (next_ == commands_.size()) {
+      commands_.clear();
+      next_ = 0;
+    }
+    return command;
+  }
+
+ private:
+  // Most clients send one command at a time. Keep short pipelines allocation
+  // free while retaining contiguous storage for larger batches.
+  absl::InlinedVector<RespCommand, 4> commands_;
+  std::size_t next_ = 0;
+};
+
+Task<absl::Status> ReadCommandBatch(
+    TcpStream& stream, RequestInputBuffer* input, RespCommandParser* parser,
+    CommandBatch* ready, std::optional<absl::Status>* deferred_error) {
+  while (ready->empty()) {
+    while (!input->View().empty() &&
+           ready->size() < CommandBatch::kMaxCommands) {
+      RespParseResult parsed = parser->Parse(input->View());
+      input->Consume(parsed.consumed_);
+      if (parsed.state_ == RespParseState::kError) {
+        if (!ready->empty()) {
+          deferred_error->emplace(std::move(parsed.status_));
+          co_return absl::OkStatus();
+        }
+        co_return parsed.status_;
+      }
+      if (parsed.state_ == RespParseState::kOk) {
+        ready->Push(std::move(parsed.command_));
+        continue;
+      }
+      // A trailing CR is deliberately left unread until its LF arrives.
+      // Everything before it is now parser-owned and already consumed.
+      break;
+    }
+    if (!ready->empty()) co_return absl::OkStatus();
+
+    std::span<std::byte> buffer = input->AppendBuffer();
     auto read_result = co_await stream.ReadSome(buffer);
     if (!read_result.ok()) [[unlikely]] {
       co_return read_result.status();
     }
     if (*read_result == 0) [[unlikely]] {
-      co_return absl::Status(absl::StatusCode::kUnavailable,
-                             "peer closed connection");
+      co_return absl::UnavailableError("peer closed connection");
     }
-    pending->append(reinterpret_cast<const char*>(buffer.data()), *read_result);
+    input->Commit(*read_result);
   }
+  co_return absl::OkStatus();
+}
+
+constexpr std::size_t kMaximumBatchedReplyBytes = 64 * 1024;
+
+struct PendingReplyBatch {
+  std::string bytes_;
+  std::vector<ReadLatencyTrace> read_traces_;
+  std::vector<SetLatencyTrace> set_traces_;
+
+  bool empty() const noexcept { return bytes_.empty(); }
+
+  void Append(std::string_view bytes, ReadLatencyTrace read_trace = {},
+              SetLatencyTrace set_trace = {}) {
+    bytes_.append(bytes);
+    if (read_trace.request_start_ns_ != 0) {
+      read_traces_.push_back(std::move(read_trace));
+    }
+    if (set_trace.request_start_ns_ != 0) {
+      set_traces_.push_back(std::move(set_trace));
+    }
+  }
+};
+
+Task<absl::Status> FlushReplyBatch(TcpStream& stream,
+                                   PendingReplyBatch* batch) {
+  if (batch->empty()) co_return absl::OkStatus();
+
+  for (ReadLatencyTrace& trace : batch->read_traces_) {
+    trace.send_start_ns_ = ReadTraceNowNanos();
+  }
+  for (SetLatencyTrace& trace : batch->set_traces_) {
+    trace.send_start_ns_ = SetTraceNowNanos();
+  }
+  absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(batch->bytes_.data()),
+      batch->bytes_.size()));
+  for (ReadLatencyTrace& trace : batch->read_traces_) {
+    trace.send_complete_ns_ = ReadTraceNowNanos();
+    RecordReadLatency(trace);
+  }
+  for (SetLatencyTrace& trace : batch->set_traces_) {
+    trace.send_complete_ns_ = SetTraceNowNanos();
+    RecordSetLatency(trace);
+  }
+  batch->bytes_.clear();
+  batch->read_traces_.clear();
+  batch->set_traces_.clear();
+  co_return status;
+}
+
+Task<absl::Status> WriteOrBatchReply(TcpStream& stream,
+                                     std::string_view encoded,
+                                     bool more_commands,
+                                     PendingReplyBatch* batch,
+                                     ReadLatencyTrace read_trace = {},
+                                     SetLatencyTrace set_trace = {}) {
+  if (encoded.size() > kMaximumBatchedReplyBytes) {
+    absl::Status flushed = co_await FlushReplyBatch(stream, batch);
+    if (!flushed.ok()) co_return flushed;
+  } else {
+    if (!batch->empty() &&
+        encoded.size() > kMaximumBatchedReplyBytes - batch->bytes_.size()) {
+      absl::Status flushed = co_await FlushReplyBatch(stream, batch);
+      if (!flushed.ok()) co_return flushed;
+    }
+    if (more_commands || !batch->empty()) {
+      batch->Append(encoded, std::move(read_trace), std::move(set_trace));
+      if (!more_commands || batch->bytes_.size() >= kMaximumBatchedReplyBytes) {
+        co_return co_await FlushReplyBatch(stream, batch);
+      }
+      co_return absl::OkStatus();
+    }
+  }
+
+  if (read_trace.request_start_ns_ != 0) {
+    read_trace.send_start_ns_ = ReadTraceNowNanos();
+  }
+  if (set_trace.request_start_ns_ != 0) {
+    set_trace.send_start_ns_ = SetTraceNowNanos();
+  }
+  absl::Status status = co_await stream.WriteAll(std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
+  if (read_trace.request_start_ns_ != 0) {
+    read_trace.send_complete_ns_ = ReadTraceNowNanos();
+    RecordReadLatency(read_trace);
+  }
+  if (set_trace.request_start_ns_ != 0) {
+    set_trace.send_complete_ns_ = SetTraceNowNanos();
+    RecordSetLatency(set_trace);
+  }
+  co_return status;
 }
 
 bool ShutdownRequested() {
@@ -860,32 +1028,46 @@ Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
-  std::string pending;
+  RequestInputBuffer input;
+  RespCommandParser parser;
+  CommandBatch ready;
+  std::optional<absl::Status> deferred_read_error;
+  PendingReplyBatch pending_replies;
 
   while (stream.IsOpen()) {
     ctx.reply_builder_.Reset();
     if (ShutdownRequested()) [[unlikely]] {
-      co_return absl::OkStatus();
+      co_return co_await FlushReplyBatch(stream, &pending_replies);
     }
 
-    auto command_result = co_await ReadNextCommand(stream, &pending);
-    if (!command_result.ok()) [[unlikely]] {
-      if (command_result.status().code() == absl::StatusCode::kUnavailable)
-          [[unlikely]] {
-        co_return absl::OkStatus();
+    if (ready.empty()) {
+      absl::Status read_status;
+      if (deferred_read_error.has_value()) {
+        read_status = std::move(*deferred_read_error);
+        deferred_read_error.reset();
+      } else {
+        read_status = co_await ReadCommandBatch(stream, &input, &parser, &ready,
+                                                &deferred_read_error);
       }
+      if (!read_status.ok()) [[unlikely]] {
+        if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {
+          co_return absl::OkStatus();
+        }
 
-      const std::string_view encoded = ctx.reply_builder_.AppendError(
-          absl::StrCat("ERR ", command_result.status().message()));
-      auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
-      if (!write_status.ok()) [[unlikely]] {
-        co_return write_status;
+        const std::string_view encoded = ctx.reply_builder_.AppendError(
+            absl::StrCat("ERR ", read_status.message()));
+        auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(encoded.data()),
+            encoded.size()));
+        if (!write_status.ok()) [[unlikely]] {
+          co_return write_status;
+        }
+        co_return read_status;
       }
-      co_return command_result.status();
     }
+    RespCommand command = ready.PopFront();
 
-    const auto& args = command_result->args_;
+    const auto& args = command.args_;
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "AUTH")) {
       std::shared_ptr<const std::string> monitor_message;
       if (HasMonitorSessions()) [[unlikely]] {
@@ -918,10 +1100,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (monitor_message != nullptr) [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
-      absl::Status written =
-          co_await stream.WriteAll(std::span<const std::byte>(
-              reinterpret_cast<const std::byte*>(encoded.data()),
-              encoded.size()));
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
       continue;
     }
@@ -929,10 +1109,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (!ctx.authenticated_) {
       const std::string_view encoded =
           ctx.reply_builder_.AppendError("NOAUTH Authentication required.");
-      absl::Status written =
-          co_await stream.WriteAll(std::span<const std::byte>(
-              reinterpret_cast<const std::byte*>(encoded.data()),
-              encoded.size()));
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
       continue;
     }
@@ -941,10 +1119,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (args.size() < 3 || (args.size() & 1U) == 0) {
         const std::string_view encoded = ctx.reply_builder_.AppendError(
             "ERR wrong number of arguments for 'replconf' command");
-        absl::Status written =
-            co_await stream.WriteAll(std::span<const std::byte>(
-                reinterpret_cast<const std::byte*>(encoded.data()),
-                encoded.size()));
+        absl::Status written = co_await WriteOrBatchReply(
+            stream, encoded, !ready.empty(), &pending_replies);
         if (!written.ok()) co_return written;
         continue;
       }
@@ -956,19 +1132,19 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       }
       const std::string_view encoded =
           ctx.reply_builder_.AppendSimpleString("OK");
-      absl::Status written =
-          co_await stream.WriteAll(std::span<const std::byte>(
-              reinterpret_cast<const std::byte*>(encoded.data()),
-              encoded.size()));
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
       continue;
     }
 
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "PSYNC")) {
-      if (!pending.empty()) {
+      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
         co_return absl::InvalidArgumentError(
             "PSYNC handshake must be an isolated command");
       }
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
       ConnectionClosed();
       ctx.counted_as_client_ = false;
       auto peer_address = stream.PeerAddress();
@@ -977,15 +1153,17 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       const bool tls = stream.IsTls();
       UnregisterClientConnection(ctx.conn_id_);
       co_return co_await replication_->ServeRedisExportConnection(
-          stream, std::move(command_result->args_), ctx.conn_id_, address, tls,
+          stream, std::move(command.args_), ctx.conn_id_, address, tls,
           ctx.redis_replica_eof_);
     }
 
-    if (ReplicationManager::IsNativeHandshake(command_result->args_)) {
-      if (!pending.empty()) {
+    if (ReplicationManager::IsNativeHandshake(command.args_)) {
+      if (!ready.empty() || !input.View().empty() || !parser.idle()) {
         co_return absl::InvalidArgumentError(
             "replication handshake must be the first isolated command");
       }
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
       ConnectionClosed();
       ctx.counted_as_client_ = false;
       auto peer_address = stream.PeerAddress();
@@ -994,21 +1172,25 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       const bool tls = stream.IsTls();
       UnregisterClientConnection(ctx.conn_id_);
       co_return co_await replication_->ServeNativeConnection(
-          stream, std::move(command_result->args_), ctx.conn_id_, address, tls);
+          stream, std::move(command.args_), ctx.conn_id_, address, tls);
     }
 
     if (!TryBeginRequest()) [[unlikely]] {
       const std::string_view encoded =
           ctx.reply_builder_.AppendError("ERR server is shutting down");
-      auto write_status = co_await stream.WriteAll(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(encoded.data()), encoded.size()));
+      absl::Status write_status =
+          co_await FlushReplyBatch(stream, &pending_replies);
+      if (write_status.ok()) {
+        write_status = co_await WriteOrBatchReply(stream, encoded, false,
+                                                  &pending_replies);
+      }
       stream.Close().IgnoreError();
       co_return write_status;
     }
     RequestGuard request_guard(this);
 
     auto request_result =
-        BuildCommandRequest(std::move(*command_result), ctx.selected_db_);
+        BuildCommandRequest(std::move(command), ctx.selected_db_);
     CommandReply reply;
     std::shared_ptr<const std::string> monitor_message;
     bool publish_monitor_after_dispatch = false;
@@ -1069,19 +1251,36 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     absl::Status write_status;
-    if (reply.read_trace_.request_start_ns_ != 0) {
-      reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
-    }
-    if (reply.set_trace_.request_start_ns_ != 0) {
-      reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
-    }
     if (reply.disk_value_.has_value()) {
-      write_status =
-          co_await stream.WriteAll(reply.disk_value_->network_bytes());
+      write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      if (write_status.ok()) {
+        if (reply.read_trace_.request_start_ns_ != 0) {
+          reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
+        }
+        if (reply.set_trace_.request_start_ns_ != 0) {
+          reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
+        }
+        write_status =
+            co_await stream.WriteAll(reply.disk_value_->network_bytes());
+      }
+    } else if (reply.chunks_) {
+      write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      if (write_status.ok()) {
+        if (reply.read_trace_.request_start_ns_ != 0) {
+          reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
+        }
+        if (reply.set_trace_.request_start_ns_ != 0) {
+          reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
+        }
+        write_status = co_await stream.WriteAll(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(reply.encoded_.data()),
+            reply.encoded_.size()));
+      }
     } else {
-      write_status = co_await stream.WriteAll(std::span<const std::byte>(
-          reinterpret_cast<const std::byte*>(reply.encoded_.data()),
-          reply.encoded_.size()));
+      write_status = co_await WriteOrBatchReply(
+          stream, reply.encoded_, !ready.empty(), &pending_replies,
+          std::exchange(reply.read_trace_, {}),
+          std::exchange(reply.set_trace_, {}));
     }
     // Streamed continuation (KEYS): drain bounded chunks onto the socket.
     // The reply header already committed the element count, so a chunk
@@ -1127,10 +1326,14 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     if (reply.start_monitoring_) [[unlikely]] {
       // MONITOR is no longer an in-flight request while its connection waits
       // indefinitely for asynchronously published messages.
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
       request_guard.Release();
       co_return co_await StreamMonitorMessages(stream, ctx.monitor_session_);
     }
     if (reply.close_connection_ || ShutdownRequested()) [[unlikely]] {
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
       stream.Close().IgnoreError();
       co_return absl::OkStatus();
     }
@@ -1291,8 +1494,7 @@ int RunServer(ServerOptions options) {
       bind_display, options.port_, options.tls_port_, options.metrics_port_,
       options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
       options.busy_poll_us_, options.foreground_budget_us_,
-      options.background_budget_us_,
-      options.background_warrant_percent_,
+      options.background_budget_us_, options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,

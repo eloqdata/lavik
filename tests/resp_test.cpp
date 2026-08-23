@@ -5,6 +5,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace keylane {
 namespace {
@@ -45,6 +46,76 @@ TEST(RespParserTest, DoesNotEagerlyAllocateDeclaredArrayLength) {
 
   EXPECT_EQ(result.state_, RespParseState::kNeedMoreData);
   EXPECT_TRUE(result.command_.args_.empty());
+}
+
+TEST(RespParserTest, IncrementallyParsesEveryByteExactlyOnce) {
+  const std::string request =
+      "*4\r\n$3\r\nSET\r\n$3\r\nkey\r\n$11\r\nhello world\r\n$2\r\nNX\r\n";
+  RespCommandParser parser;
+  std::string pending;
+  RespParseResult completed;
+  std::size_t largest_pending = 0;
+
+  for (char byte : request) {
+    pending.push_back(byte);
+    while (!pending.empty()) {
+      RespParseResult parsed = parser.Parse(pending);
+      ASSERT_NE(parsed.state_, RespParseState::kError)
+          << parsed.status_.message();
+      pending.erase(0, parsed.consumed_);
+      largest_pending = std::max(largest_pending, pending.size());
+      if (parsed.state_ == RespParseState::kOk) {
+        completed = std::move(parsed);
+        break;
+      }
+      if (parsed.consumed_ == 0) break;
+    }
+  }
+
+  EXPECT_TRUE(pending.empty());
+  EXPECT_TRUE(parser.idle());
+  EXPECT_LE(largest_pending, 1);
+  EXPECT_EQ(completed.state_, RespParseState::kOk);
+  EXPECT_EQ(completed.command_.args_,
+            (std::vector<std::string>{"SET", "key", "hello world", "NX"}));
+}
+
+TEST(RespParserTest, ReturnsPipelinedCommandsInWireOrder) {
+  const std::string first = "*1\r\n$4\r\nPING\r\n";
+  const std::string second = "*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+  RespCommandParser parser;
+
+  RespParseResult one = parser.Parse(first + second);
+  ASSERT_EQ(one.state_, RespParseState::kOk);
+  EXPECT_EQ(one.command_.args_, (std::vector<std::string>{"PING"}));
+
+  RespParseResult two =
+      parser.Parse(std::string_view(first + second).substr(one.consumed_));
+  ASSERT_EQ(two.state_, RespParseState::kOk);
+  EXPECT_EQ(two.command_.args_, (std::vector<std::string>{"GET", "key"}));
+  EXPECT_TRUE(parser.idle());
+}
+
+TEST(RespParserTest, ConsumesFillerAndEmptyArraysAcrossFragments) {
+  RespCommandParser parser;
+  RespParseResult skipped = parser.Parse("\r\n*0\r");
+  EXPECT_EQ(skipped.state_, RespParseState::kNeedMoreData);
+  EXPECT_EQ(skipped.consumed_, 4);
+
+  RespParseResult parsed = parser.Parse("\r\n*1\r\n$4\r\nPING\r\n");
+  ASSERT_EQ(parsed.state_, RespParseState::kOk);
+  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+}
+
+TEST(RespParserTest, RejectsSplitMalformedBulkTerminator) {
+  RespCommandParser parser;
+  RespParseResult partial = parser.Parse("*1\r\n$3\r\nGET\r");
+  EXPECT_EQ(partial.state_, RespParseState::kNeedMoreData);
+
+  RespParseResult malformed = parser.Parse("x");
+  EXPECT_EQ(malformed.state_, RespParseState::kError);
+  EXPECT_EQ(malformed.status_.message(),
+            "malformed RESP bulk string terminator");
 }
 
 TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {

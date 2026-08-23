@@ -28,6 +28,44 @@ struct RespParseResult {
   RespCommand command_;
 };
 
+// Incremental RESP command parser. Bytes reported in consumed_ are retained in
+// parser-owned state when a command is incomplete and may be discarded by the
+// caller. One parser belongs to one connection.
+class RespCommandParser {
+ public:
+  RespParseResult Parse(std::string_view input);
+
+  void Reset();
+  [[nodiscard]] bool idle() const noexcept {
+    return state_ == State::kArrayStart;
+  }
+
+ private:
+  enum class State : std::uint8_t {
+    kArrayStart,
+    kArrayLength,
+    kBulkStart,
+    kBulkLength,
+    kBulkData,
+    kBulkTerminator,
+  };
+
+  RespParseResult Error(absl::Status status, std::size_t consumed);
+  bool Account(std::size_t bytes);
+  void ResetCommand();
+
+  State state_ = State::kArrayStart;
+  std::string length_text_;
+  RespCommand command_;
+  std::string current_argument_;
+  std::size_t arguments_remaining_ = 0;
+  std::size_t bulk_remaining_ = 0;
+  std::size_t terminator_bytes_ = 0;
+  std::size_t command_bytes_ = 0;
+};
+
+// Convenience wrapper for callers that already hold one complete contiguous
+// request. Incremental network paths should retain a RespCommandParser.
 RespParseResult ParseRespCommand(std::string_view input);
 
 // Reuses one contiguous response buffer for the lifetime of a connection.

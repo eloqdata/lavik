@@ -766,7 +766,7 @@ class RedisCommandStream {
     std::uint64_t prefix_bytes = 0;
     std::array<std::byte, 64 * 1024> input{};
     while (true) {
-      RespParseResult parsed = ParseRespCommand(pending_);
+      RespParseResult parsed = parser_.Parse(pending_);
       if (parsed.state_ == RespParseState::kOk) {
         RedisWireCommand result{.command_ = std::move(parsed.command_),
                                 .bytes_ = prefix_bytes + parsed.consumed_};
@@ -798,6 +798,7 @@ class RedisCommandStream {
 
  private:
   TcpStream* stream_;
+  RespCommandParser parser_;
   std::string pending_;
 };
 
@@ -1049,8 +1050,7 @@ Task<absl::StatusOr<std::optional<RedisExportEvent>>> ReadLocalRedisExportEvent(
       // replica. RDB producer pressure is handled separately by suspending the
       // snapshot scanner until the bounded MPSC queue has room.
       if (batch.status().code() == absl::StatusCode::kOutOfRange) {
-        co_return absl::ResourceExhaustedError(
-            kRedisExportBacklogGapMessage);
+        co_return absl::ResourceExhaustedError(kRedisExportBacklogGapMessage);
       }
       co_return batch.status();
     }
@@ -2478,9 +2478,9 @@ class ReplicationManager::Impl {
 
   absl::Status SetSnapshotBatchSize(std::size_t count) noexcept {
     if (count == 0 || count > kMaxReplicationSnapshotBatchSize) {
-      return absl::InvalidArgumentError(absl::StrCat(
-          "replication snapshot batch size must be between 1 and ",
-          kMaxReplicationSnapshotBatchSize));
+      return absl::InvalidArgumentError(
+          absl::StrCat("replication snapshot batch size must be between 1 and ",
+                       kMaxReplicationSnapshotBatchSize));
     }
     snapshot_batch_size_.store(count, std::memory_order_release);
     return absl::OkStatus();
