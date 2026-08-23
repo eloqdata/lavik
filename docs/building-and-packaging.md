@@ -17,6 +17,19 @@ and `libcrypto.a`).
 For a different local CPU target, configure CMake directly with
 `-DKEYLANE_MARCH=<target>`. An empty value disables the explicit `-march` flag.
 
+AddressSanitizer builds use Clang so coroutine symmetric transfers remain tail
+calls under sanitizer instrumentation:
+
+```bash
+./scripts/build_asan.sh
+ctest --test-dir build_asan --output-on-failure
+```
+
+The script defaults to `clang-18` and `clang++-18`. Override them with
+`KEYLANE_ASAN_CC`, `KEYLANE_ASAN_CXX`, and use `KEYLANE_ASAN_BUILD_DIR` to select
+a different build directory. It intentionally keeps `NDEBUG` disabled because
+the crash-safety fault-injection tests compile their crash points out otherwise.
+
 ## Downloadable release package
 
 ```bash

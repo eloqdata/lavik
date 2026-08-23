@@ -41,10 +41,6 @@ constexpr auto kPeerCheckInterval = std::chrono::milliseconds(250);
 
 struct WorkerMonitorRegistry;
 
-std::unique_ptr<WorkerMonitorRegistry[]> g_registries;
-unsigned g_worker_count = 0;
-std::atomic<unsigned> g_monitor_count{0};
-
 }  // namespace
 
 class MonitorSession {
@@ -90,6 +86,10 @@ struct WorkerMonitorRegistry {
   std::vector<std::shared_ptr<MonitorSession>> sessions_;
   std::size_t pending_bytes_ = 0;
 };
+
+std::unique_ptr<WorkerMonitorRegistry[]> g_registries;
+unsigned g_worker_count = 0;
+std::atomic<unsigned> g_monitor_count{0};
 
 WorkerMonitorRegistry& LocalRegistry() {
   assert(g_registries != nullptr);

@@ -34,9 +34,6 @@ constexpr std::size_t kPubSubQueueLimit = 10'000;
 
 struct WorkerPubSubRegistry;
 
-std::unique_ptr<WorkerPubSubRegistry[]> g_registries;
-unsigned g_worker_count = 0;
-
 struct QueuedFrame {
   std::shared_ptr<const std::string> encoded_;
   bool exit_ = false;
@@ -130,6 +127,9 @@ struct WorkerPubSubRegistry {
       patterns_;
   std::size_t pending_bytes_ = 0;
 };
+
+std::unique_ptr<WorkerPubSubRegistry[]> g_registries;
+unsigned g_worker_count = 0;
 
 WorkerPubSubRegistry& LocalRegistry() {
   assert(g_registries != nullptr);

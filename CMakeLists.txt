@@ -32,6 +32,11 @@ string(CONCAT KEYLANE_COMPILER_AND_LINKER_FLAGS
 if (KEYLANE_COMPILER_AND_LINKER_FLAGS MATCHES "-fsanitize=[^ ]*address")
   set(KEYLANE_ASAN_BUILD ON)
 endif()
+if (KEYLANE_ASAN_BUILD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(FATAL_ERROR
+    "AddressSanitizer builds require Clang. GCC does not preserve coroutine "
+    "symmetric transfers under ASan and can overflow the native stack.")
+endif()
 find_program(KEYLANE_CLANG_FORMAT NAMES clang-format-18 clang-format)
 file(GLOB_RECURSE KEYLANE_FORMAT_FILES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp
