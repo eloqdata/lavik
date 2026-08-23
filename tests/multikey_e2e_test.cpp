@@ -202,7 +202,7 @@ class ServerProcess {
                 const std::string& data_path, const std::string& log_path,
                 std::string_view fail_tx_write = {},
                 std::string_view tx_active_pause_ms = {},
-                bool fail_tx_cleaner_once = false) {
+                bool fail_tx_cleaner_once = false, unsigned threads = 4) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -230,7 +230,7 @@ class ServerProcess {
           "--port",
           std::to_string(port),
           "--threads",
-          "4",
+          std::to_string(threads),
           "--recv-buffers-per-worker",
           "0",
           "--flush-max-ms",
@@ -346,8 +346,14 @@ int main(int argc, char** argv) {
   const std::string suffix = std::to_string(::getpid());
   const std::string data_path = "/tmp/keylane-multikey-" + suffix + ".data";
   const std::string log_path = "/tmp/keylane-multikey-" + suffix + ".log";
+  const std::string source_data =
+      "/tmp/keylane-multikey-repl-source-" + suffix + ".data";
+  const std::string replica_data =
+      "/tmp/keylane-multikey-repl-replica-" + suffix + ".data";
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
+  (void)::unlink(source_data.c_str());
+  (void)::unlink(replica_data.c_str());
 
   int exit_code = 0;
   try {
@@ -847,6 +853,106 @@ int main(int argc, char** argv) {
            "cleaner retry value after graceful shutdown");
     retry_recovered_server.Stop();
 #endif
+
+    // A reservation that is never given back stands against its worker's
+    // publish-queue waterline for the life of the process, so a long run of
+    // wide writes against a deliberately small waterline wedges if any
+    // participant is ever missed. The replica must also converge on exactly
+    // the effects the source applied, in the order it applied them.
+    {
+      // The dataset here is a few megabytes; size the pair for that rather
+      // than for the whole-suite fixture above.
+      CreateDataFile(source_data, 256ULL * 1024 * 1024);
+      CreateDataFile(replica_data, 256ULL * 1024 * 1024);
+      const std::uint16_t source_port = FindFreePort();
+      std::uint16_t replica_port = FindFreePort();
+      while (replica_port == source_port) replica_port = FindFreePort();
+      // Both log to log_path: the likeliest failures here are replica-side,
+      // and that is the log the failure handler prints.
+      ServerProcess replication_source(argv[1], source_port, source_data,
+                                       log_path);
+      ServerProcess replication_replica(argv[1], replica_port, replica_data,
+                                        log_path, {}, {}, false, 2);
+      RespClient source_client = Connect(source_port);
+      RespClient replica_client = Connect(replica_port);
+      Expect(source_client.Command({"CONFIG", "SET",
+                                    "replication-publish-queue-mb-per-worker",
+                                    "1"}),
+             "+OK", "shrink the publisher waterline");
+      Expect(replica_client.Command(
+                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+             "+OK", "attach replica for wide multi-key writes");
+      const auto online_deadline = std::chrono::steady_clock::now() + 120s;
+      bool online = false;
+      while (!online && std::chrono::steady_clock::now() < online_deadline) {
+        online =
+            replica_client.Command({"INFO", "replication"})
+                .find("keylane_replication_state:online") != std::string::npos;
+        if (!online) std::this_thread::sleep_for(20ms);
+      }
+      if (!online) Fail("replica did not come online for wide writes");
+      // A replica redirects keyed reads to its upstream unless the connection
+      // opts into serving them locally.
+      Expect(replica_client.Command({"READONLY"}), "+OK",
+             "serve reads from the replica");
+
+      constexpr int kWideKeys = 24;
+      constexpr int kWideRounds = 120;
+      std::vector<std::string> wide_keys;
+      wide_keys.reserve(kWideKeys);
+      for (int key = 0; key < kWideKeys; ++key) {
+        wide_keys.push_back("wide-multikey:" + std::to_string(key));
+      }
+      const std::string payload(1024, 'w');
+      std::vector<std::string> values(kWideKeys);
+      for (int round = 0; round < kWideRounds; ++round) {
+        std::vector<std::string_view> command{"MSET"};
+        command.reserve(1 + 2 * kWideKeys);
+        for (int key = 0; key < kWideKeys; ++key) {
+          values[key] =
+              std::to_string(round) + ":" + std::to_string(key) + ":" + payload;
+          command.push_back(wide_keys[key]);
+          command.push_back(values[key]);
+        }
+        Expect(source_client.Command(command), "+OK",
+               "wide MSET round " + std::to_string(round));
+      }
+      // A multi-key DEL settles the same per-worker journals. Deleting only
+      // half the keys makes the replica's final state prove ordering: had the
+      // DEL been applied before the last MSET round, those keys would still
+      // hold values.
+      std::vector<std::string_view> wide_delete{"DEL"};
+      for (int key = 0; key < kWideKeys; key += 2) {
+        wide_delete.push_back(wide_keys[key]);
+      }
+      Expect(source_client.Command(wide_delete),
+             ":" + std::to_string(kWideKeys / 2), "wide multi-key DEL");
+
+      std::vector<std::string_view> wide_read{"MGET"};
+      std::string expected = "*" + std::to_string(kWideKeys) + "\r\n";
+      for (int key = 0; key < kWideKeys; ++key) {
+        wide_read.push_back(wide_keys[key]);
+        if (key != 0) expected += "\r\n";
+        expected += key % 2 == 0 ? std::string("$-1") : Bulk(values[key]);
+      }
+      Expect(source_client.Command(wide_read), expected,
+             "source state after wide multi-key writes");
+      const auto converge_deadline = std::chrono::steady_clock::now() + 120s;
+      std::string replicated;
+      while (std::chrono::steady_clock::now() < converge_deadline) {
+        replicated = replica_client.Command(wide_read);
+        if (replicated == expected) break;
+        std::this_thread::sleep_for(20ms);
+      }
+      Expect(replicated, expected, "replicated wide multi-key effects");
+      // Whatever the run reserved has to have been given back: the source
+      // must still admit a further write rather than sit permanently wedged
+      // against its own waterline. A wedge surfaces as the client's socket
+      // read timing out, not as an error reply, since a write that cannot be
+      // admitted simply never answers.
+      Expect(source_client.Command({"SET", "wide-multikey:after", "ok"}), "+OK",
+             "source write after the wide multi-key burst");
+    }
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
               << ReadFile(log_path) << std::flush;
@@ -855,6 +961,8 @@ int main(int argc, char** argv) {
 
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
+  (void)::unlink(source_data.c_str());
+  (void)::unlink(replica_data.c_str());
   std::cout << (exit_code == 0 ? "multikey e2e passed\n" : "") << std::flush;
   return exit_code;
 }

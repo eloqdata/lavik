@@ -20,6 +20,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
@@ -1416,6 +1417,81 @@ class ReplicationTransactionOrderGuard {
   bool active_ = false;
 };
 
+// Joins coroutines spawned on this worker. They all complete back on that
+// same thread, so the counter needs no atomics.
+struct WorkerJoin {
+  std::size_t pending_ = 0;
+  std::coroutine_handle<> waiter_;
+  absl::Status error_;
+
+  void Complete(absl::Status status) {
+    if (!status.ok() && error_.ok()) {
+      error_ = std::move(status);
+    }
+    if (--pending_ == 0 && waiter_) {
+      auto handle = waiter_;
+      waiter_ = {};
+      ThisWorker().self_->Enqueue(handle);
+    }
+  }
+
+  auto Join() {
+    struct Awaiter {
+      WorkerJoin* join_;
+      bool await_ready() const { return join_->pending_ == 0; }
+      void await_suspend(std::coroutine_handle<> handle) {
+        join_->waiter_ = handle;
+      }
+      void await_resume() const {}
+    };
+    return Awaiter{this};
+  }
+};
+
+// The participant that is this worker runs inline: dispatching to the thread
+// we are already on would only buy a coroutine frame and a trip through that
+// worker's own reply lane.
+template <typename Step>
+Task<absl::Status> RunJoinedStep(unsigned worker, Step step, WorkerJoin* join) {
+  absl::Status status = worker == ThisWorker().id_
+                            ? co_await step()
+                            : co_await SubmitTaskTo(worker, std::move(step));
+  join->Complete(std::move(status));
+  co_return absl::OkStatus();
+}
+
+// Precondition on `step_at`: a step touches only its own worker's state, so
+// none waits on another and none depends on the order the others run in. That
+// is what makes one round legal in place of `count` sequential round trips.
+//
+// Errors aggregate rather than short-circuit, because a step that never runs
+// leaves its worker's state stranded — a held admission reservation, an
+// un-erased undo journal — with no later chance to settle it.
+//
+// Settlement only. A loop that can block on another participant (publisher
+// admission acquisition) must stay sequential and ordered; see there.
+template <typename StepAt>
+Task<absl::Status> ForEachParticipantParallel(std::size_t count,
+                                              StepAt step_at) {
+  if (count == 0) co_return absl::OkStatus();
+  if (count == 1) {
+    // A spawn and a join to make one call is a net loss, and single-key
+    // writes reach these loops with exactly one participant.
+    auto [worker, step] = step_at(std::size_t{0});
+    co_return worker == ThisWorker().id_
+        ? co_await step()
+        : co_await SubmitTaskTo(worker, std::move(step));
+  }
+  WorkerJoin join;
+  join.pending_ = count;
+  for (std::size_t index = 0; index < count; ++index) {
+    auto [worker, step] = step_at(index);
+    SpawnOnCurrentWorker(RunJoinedStep(worker, std::move(step), &join));
+  }
+  co_await join.Join();
+  co_return std::move(join.error_);
+}
+
 struct ReplicationPublisherAdmission {
   struct WorkerToken {
     unsigned worker_ = 0;
@@ -1444,6 +1520,29 @@ std::size_t FullSyncReplacementAdmissionBytes(
     if (keys->last_ - index < keys->step_) break;
   }
   return bytes;
+}
+
+// Discharges the fan-out precondition: a release only decrements its own
+// worker's admitted-bytes waterline and full-sync session credit. Releasing
+// every participant even when one fails is the point — an early return used to
+// leave the rest reserved for the life of the process.
+//
+// Not a coroutine on purpose: forwarding the task costs one frame where
+// `co_return co_await` costs two, and a single-key write reaches this on the
+// collapsed write hop. Callers must keep `admission` alive across the await.
+Task<absl::Status> ReleaseReplicationPublisherAdmission(
+    const ReplicationPublisherAdmission& admission) {
+  return ForEachParticipantParallel(
+      admission.worker_tokens_.size(), [&admission](std::size_t index) {
+        const auto& worker_token = admission.worker_tokens_[index];
+        return std::pair{
+            worker_token.worker_,
+            [token = worker_token.token_,
+             bytes = admission.logical_bytes_]() -> Task<absl::Status> {
+              g_storage->ReleaseReplicationPublisherAdmission(token, bytes);
+              co_return absl::OkStatus();
+            }};
+      });
 }
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
@@ -1498,6 +1597,13 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
       scopes.push_back(WorkerScope{.worker_ = worker, .target_ = std::nullopt});
     }
   }
+  // Sequential and ordered by worker id, deliberately. Acquiring can block — a
+  // FIFO ticket, then a wait on that worker's publish-queue capacity — and the
+  // command holds every reservation it already took while it waits. One global
+  // order is what stops two concurrent multi-key writes from each holding a
+  // reservation the other waits on. Fanning this out would drop that order and
+  // reintroduce the cycle; the release and undo loops around it are parallel
+  // only because nothing in them can block on another participant.
   std::sort(scopes.begin(), scopes.end(),
             [](const WorkerScope& left, const WorkerScope& right) {
               return left.worker_ < right.worker_;
@@ -1515,19 +1621,9 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
             ? co_await acquire()
             : co_await SubmitTaskTo(target_worker, acquire);
     if (!token.ok()) {
-      for (const auto& acquired : admission.worker_tokens_) {
-        const auto acquired_token = acquired.token_;
-        auto release = [acquired_token,
-                        bytes =
-                            admission.logical_bytes_]() -> Task<absl::Status> {
-          g_storage->ReleaseReplicationPublisherAdmission(acquired_token,
-                                                          bytes);
-          co_return absl::OkStatus();
-        };
-        (void)(acquired.worker_ == ThisWorker().id_
-                   ? co_await release()
-                   : co_await SubmitTaskTo(acquired.worker_, release));
-      }
+      // worker_tokens_ holds exactly what was taken, so releasing the whole
+      // admission gives back precisely those reservations.
+      (void)co_await ReleaseReplicationPublisherAdmission(admission);
       co_return token.status();
     }
     admission.worker_tokens_.push_back(
@@ -1537,24 +1633,6 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
         });
   }
   co_return admission;
-}
-
-Task<absl::Status> ReleaseReplicationPublisherAdmission(
-    const ReplicationPublisherAdmission& admission) {
-  for (const auto& worker_token : admission.worker_tokens_) {
-    const auto token = worker_token.token_;
-    auto release = [token,
-                    bytes = admission.logical_bytes_]() -> Task<absl::Status> {
-      g_storage->ReleaseReplicationPublisherAdmission(token, bytes);
-      co_return absl::OkStatus();
-    };
-    absl::Status status =
-        worker_token.worker_ == ThisWorker().id_
-            ? co_await release()
-            : co_await SubmitTaskTo(worker_token.worker_, release);
-    if (!status.ok()) co_return status;
-  }
-  co_return absl::OkStatus();
 }
 
 Task<absl::Status> BeginReplicationTransactionOrder(
@@ -3660,45 +3738,13 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
   }
 }
 
-// Joins per-key reader coroutines spawned on one shard. Everything runs on
-// the owning worker thread, so plain counters suffice; the waiter resumes
-// via its own worker's ready queue once the last read lands.
-struct ShardReadJoin {
-  std::size_t pending_ = 0;
-  std::coroutine_handle<> waiter_;
-  absl::Status error_;
-
-  void Complete(absl::Status status) {
-    if (!status.ok() && error_.ok()) {
-      error_ = std::move(status);
-    }
-    if (--pending_ == 0 && waiter_) {
-      auto handle = waiter_;
-      waiter_ = {};
-      ThisWorker().self_->Enqueue(handle);
-    }
-  }
-
-  auto Join() {
-    struct Awaiter {
-      ShardReadJoin* join_;
-      bool await_ready() const { return join_->pending_ == 0; }
-      void await_suspend(std::coroutine_handle<> handle) {
-        join_->waiter_ = handle;
-      }
-      void await_resume() const {}
-    };
-    return Awaiter{this};
-  }
-};
-
 // One concurrent MGET read: locks are already held for the whole hop, and
 // distinct keys live in distinct blocks, so per-key disk reads overlap
 // instead of accumulating latency serially.
 Task<absl::Status> ReadFrameIntoSlot(std::uint8_t db, const std::string* key,
                                      storage::Digest digest,
                                      std::optional<std::string>* slot,
-                                     ShardReadJoin* join) {
+                                     WorkerJoin* join) {
   auto value = co_await g_storage->GetLocked(db, *key, digest);
   absl::Status status = absl::OkStatus();
   if (value.ok()) {
@@ -4278,7 +4324,7 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
   const auto& args = ctx->request_->args_;
   if (ctx->request_->kind_ == CommandKind::kMGet && slice.keys_.size() > 1) {
     // Overlap this shard's disk reads instead of awaiting them one by one.
-    ShardReadJoin join;
+    WorkerJoin join;
     join.pending_ = slice.keys_.size();
     for (const tx::TxKey& key : slice.keys_) {
       SpawnOnCurrentWorker(ReadFrameIntoSlot(
@@ -4441,20 +4487,25 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
   if (write_txid != 0) {
     // The two-hop path already discarded these journals in its finish hop;
     // the single-shard path has no finish hop. Settle both uniformly before
-    // handing the receipts to the detached commit chain.
+    // handing the receipts to the detached commit chain. Each shard erases
+    // only its own journal.
+    std::vector<unsigned> undo_owners;
     for (unsigned owner = 0; owner < ctx.tx_writes_.size(); ++owner) {
       storage::TxShardWrites& shard = ctx.tx_writes_[owner];
       if (!shard.collect_undo_) continue;
-      if (!shard.fences_.empty() || !shard.retirements_.empty()) {
-        absl::Status discarded =
-            co_await SubmitTaskTo(owner, [txid = write_txid] {
-              return g_storage->DiscardTxUndoLocal(txid);
-            });
-        if (!discarded.ok()) {
-          co_return BuiltReply(AppendStorageError(reply_builder, discarded));
-        }
-      }
       shard.collect_undo_ = false;
+      if (!shard.fences_.empty() || !shard.retirements_.empty()) {
+        undo_owners.push_back(owner);
+      }
+    }
+    absl::Status discarded = co_await ForEachParticipantParallel(
+        undo_owners.size(), [&undo_owners, write_txid](std::size_t index) {
+          return std::pair{undo_owners[index], [txid = write_txid] {
+                             return g_storage->DiscardTxUndoLocal(txid);
+                           }};
+        });
+    if (!discarded.ok()) {
+      co_return BuiltReply(AppendStorageError(reply_builder, discarded));
     }
     if (replication != nullptr) {
       replication->SetFinalExpirations(ctx.tx_writes_);
@@ -4648,47 +4699,53 @@ std::vector<unsigned> UniqueOwners(std::initializer_list<unsigned> owners) {
   return unique;
 }
 
+// `owners` is deduplicated by every caller, so no two steps land on one
+// worker's journal. Arming happens only after every clear has succeeded, which
+// is why a failure needs no unwinding.
 Task<absl::Status> BeginExecCommandUndo(
     const std::vector<unsigned>& owners,
     std::vector<storage::TxShardWrites>& writes,
     std::vector<ExecWriteCheckpoint>* checkpoints) {
   checkpoints->clear();
+  absl::Status discarded = co_await ForEachParticipantParallel(
+      owners.size(), [&owners, &writes](std::size_t index) {
+        const unsigned owner = owners[index];
+        return std::pair{owner, [txid = writes[owner].txid_] {
+                           return g_storage->DiscardTxUndoLocal(txid);
+                         }};
+      });
+  if (!discarded.ok()) co_return discarded;
   checkpoints->reserve(owners.size());
   for (unsigned owner : owners) {
-    storage::TxShardWrites& shard = writes[owner];
     checkpoints->push_back(ExecWriteCheckpoint{
         .owner_ = owner,
     });
-    absl::Status discarded = co_await SubmitTaskTo(owner, [txid = shard.txid_] {
-      return g_storage->DiscardTxUndoLocal(txid);
-    });
-    if (!discarded.ok()) {
-      for (const ExecWriteCheckpoint& checkpoint : *checkpoints)
-        writes[checkpoint.owner_].collect_undo_ = false;
-      checkpoints->clear();
-      co_return discarded;
-    }
-    shard.collect_undo_ = true;
+    writes[owner].collect_undo_ = true;
   }
   co_return absl::OkStatus();
 }
 
+// The order sensitivity here is *within* a shard — reverse application order —
+// and it lives inside RollbackTxLocal, so settling shards concurrently is
+// safe: each unwinds only its own journal, into its own receipt slot.
 Task<absl::Status> FinishExecCommandUndo(
     const std::vector<ExecWriteCheckpoint>& checkpoints,
     std::vector<storage::TxShardWrites>& writes, bool rollback) {
-  absl::Status first_error = absl::OkStatus();
+  // Compensation appends must not recursively enter the undo journal, and the
+  // shards now run concurrently, so disarm all of them before any starts.
   for (const ExecWriteCheckpoint& checkpoint : checkpoints) {
-    storage::TxShardWrites& shard = writes[checkpoint.owner_];
-    // Compensation appends must not recursively enter the undo journal.
-    shard.collect_undo_ = false;
-    absl::Status finished = co_await SubmitTaskTo(
-        checkpoint.owner_, [txid = shard.txid_, rollback, shard = &shard] {
-          return rollback ? g_storage->RollbackTxLocal(txid, shard)
-                          : g_storage->DiscardTxUndoLocal(txid);
-        });
-    if (!finished.ok() && first_error.ok()) first_error = finished;
+    writes[checkpoint.owner_].collect_undo_ = false;
   }
-  co_return first_error;
+  co_return co_await ForEachParticipantParallel(
+      checkpoints.size(), [&checkpoints, &writes, rollback](std::size_t index) {
+        storage::TxShardWrites& shard = writes[checkpoints[index].owner_];
+        return std::pair{checkpoints[index].owner_,
+                         [txid = shard.txid_, rollback, shard = &shard] {
+                           return rollback
+                                      ? g_storage->RollbackTxLocal(txid, shard)
+                                      : g_storage->DiscardTxUndoLocal(txid);
+                         }};
+      });
 }
 
 Task<std::string> ExecuteExecSequentialRename(
@@ -5538,7 +5595,7 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
         mine += key.owner_ == self ? 1 : 0;
       }
       if (mine > 1) {
-        ShardReadJoin join;
+        WorkerJoin join;
         join.pending_ = mine;
         for (const ExecKey& key : keys) {
           if (key.owner_ == self) {
