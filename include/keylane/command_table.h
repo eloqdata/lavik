@@ -26,6 +26,10 @@ enum CommandFlag : std::uint32_t {
   kCmdMayBlock = 1u << 7,
   kCmdAdmin = 1u << 8,        // omitted from MONITOR output
   kCmdSkipMonitor = 1u << 9,  // explicit MONITOR suppression
+  // May enter the runtime replication stream without mutating the keyspace.
+  // PUBLISH uses this so replicas remain writable for local delivery while a
+  // primary can still forward the event downstream.
+  kCmdMayReplicate = 1u << 10,
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the

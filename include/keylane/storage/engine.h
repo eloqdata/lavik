@@ -842,6 +842,11 @@ class StorageEngine {
       const ReplicationPublisherAdmission& admission,
       std::size_t logical_bytes);
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
+  // Publishes one runtime-only command on the worker owning partition_id. It
+  // is appended to that source flow's online backlog and every active
+  // full-sync FIFO, but never becomes persistent keyspace state.
+  celer::Task<absl::Status> PublishEphemeralReplicationCommand(
+      std::uint16_t partition_id, std::vector<std::string> args);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 

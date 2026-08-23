@@ -154,6 +154,7 @@ add_library(keylane_module
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
   src/redis/monitor.cpp
+  src/redis/pubsub.cpp
   src/redis/set_command.cpp
   src/redis/sort_command.cpp
   src/redis/string_command.cpp
@@ -330,6 +331,17 @@ if (BUILD_TESTING)
       COMMAND keylane_replication_log_e2e_test
     )
     set_tests_properties(keylane_replication_log_e2e PROPERTIES TIMEOUT 120)
+
+    add_executable(keylane_pubsub_e2e_test
+      tests/pubsub_e2e_test.cpp
+    )
+    add_test(
+      NAME keylane_pubsub_e2e
+      COMMAND keylane_pubsub_e2e_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(keylane_pubsub_e2e PROPERTIES
+      TIMEOUT 120
+      RUN_SERIAL TRUE)
 
     add_executable(keylane_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp

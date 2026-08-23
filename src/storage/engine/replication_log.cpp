@@ -412,6 +412,64 @@ bool StorageEngine::Impl::TryEnqueueReplicationCommand(
   return true;
 }
 
+Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
+    std::uint16_t partition_id, std::vector<std::string> args) {
+  if (partition_id >= kLogicalStorageShards ||
+      partition_id % worker_count_ != celer::ThisWorker().id_) {
+    co_return absl::FailedPreconditionError(
+        "ephemeral replication partition does not belong to this worker");
+  }
+  if (args.empty()) {
+    co_return absl::InvalidArgumentError(
+        "ephemeral replication command is empty");
+  }
+
+  std::size_t logical_bytes = sizeof(ReplicationEventKind) +
+                              sizeof(std::uint8_t) + sizeof(std::uint16_t) +
+                              sizeof(std::uint64_t);
+  for (const std::string& arg : args) {
+    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
+        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
+                                    logical_bytes - arg.size()) {
+      co_return absl::ResourceExhaustedError(
+          "ephemeral replication command size overflow");
+    }
+    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  }
+
+  auto admission = co_await AcquireReplicationPublisherAdmission(logical_bytes,
+                                                                 std::nullopt);
+  if (!admission.ok()) co_return admission.status();
+
+  const std::uint64_t sequence =
+      next_replication_ephemeral_id_.fetch_add(1, std::memory_order_relaxed);
+  if (sequence == 0 || sequence == std::numeric_limits<std::uint64_t>::max()) {
+    next_replication_ephemeral_id_.store(
+        std::numeric_limits<std::uint64_t>::max(), std::memory_order_relaxed);
+    ReleaseReplicationPublisherAdmission(*admission, logical_bytes);
+    co_return absl::ResourceExhaustedError(
+        "ephemeral replication sequence space exhausted");
+  }
+
+  auto command =
+      std::make_shared<const ReplicationCommandAppend>(ReplicationCommandAppend{
+          .kind_ = ReplicationEventKind::kEphemeral,
+          .db_id_ = 0,
+          .partition_id_ = partition_id,
+          .partition_sequence_ = sequence,
+          .args_ = std::move(args),
+      });
+  WorkerStore& store = CurrentStore();
+  for (std::uint64_t session_id : admission->fullsync_session_ids_) {
+    (void)TryEnqueueFullSyncCommand(store, session_id, command);
+  }
+  if (admission->log_epoch_ != 0) {
+    (void)TryEnqueueReplicationCommand(*command);
+  }
+  ReleaseReplicationPublisherAdmission(*admission, logical_bytes);
+  co_return absl::OkStatus();
+}
+
 bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
     std::shared_ptr<ReplicationTransaction> transaction) {
   WorkerStore& store = CurrentStore();
@@ -850,7 +908,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
       (event.payload_source_ != nullptr && !event.payload_.empty()) ||
       (event.kind_ != ReplicationEventKind::kMutation &&
        event.kind_ != ReplicationEventKind::kTransaction &&
-       event.kind_ != ReplicationEventKind::kControl)) {
+       event.kind_ != ReplicationEventKind::kControl &&
+       event.kind_ != ReplicationEventKind::kEphemeral)) {
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid replication event metadata");
   }

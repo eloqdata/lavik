@@ -38,6 +38,7 @@
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/monitor.h"
+#include "keylane/pubsub.h"
 #include "keylane/random_sample.h"
 #include "keylane/rdb.h"
 #include "keylane/redis_parse.h"
@@ -335,6 +336,123 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
                                                  args.front() + "'");
       return reply;
   }
+}
+
+Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
+                                        const CommandRequest& request,
+                                        ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  if (request.kind_ == CommandKind::kPubSub) {
+    if (CmpCaseInsensitive(args[1], "channels")) {
+      if (args.size() > 3) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR Unknown subcommand or wrong number of arguments for "
+            "'channels'. Try PUBSUB HELP."));
+      }
+      std::optional<std::string> pattern;
+      if (args.size() == 3) pattern = args[2];
+      std::vector<std::string> channels =
+          co_await PubSubChannels(std::move(pattern));
+      reply_builder.AppendArrayHeader(channels.size());
+      for (const std::string& channel : channels) {
+        reply_builder.AppendBulkString(channel);
+      }
+      co_return BuiltReply(reply_builder.View());
+    }
+    if (CmpCaseInsensitive(args[1], "numsub")) {
+      const std::span<const std::string> channels(args.data() + 2,
+                                                   args.size() - 2);
+      std::vector<std::uint64_t> counts = co_await PubSubNumSub(channels);
+      reply_builder.AppendArrayHeader(channels.size() * 2);
+      for (std::size_t index = 0; index < channels.size(); ++index) {
+        reply_builder.AppendBulkString(channels[index]);
+        reply_builder.AppendInteger(static_cast<long long>(std::min<
+            std::uint64_t>(counts[index],
+                           std::numeric_limits<long long>::max())));
+      }
+      co_return BuiltReply(reply_builder.View());
+    }
+    if (CmpCaseInsensitive(args[1], "numpat") && args.size() == 2) {
+      const std::uint64_t count = co_await PubSubNumPat();
+      co_return BuiltReply(reply_builder.AppendInteger(static_cast<long long>(
+          std::min<std::uint64_t>(count,
+                                  std::numeric_limits<long long>::max()))));
+    }
+    if (CmpCaseInsensitive(args[1], "help") && args.size() == 2) {
+      constexpr std::array<std::string_view, 10> help = {
+          "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+          "CHANNELS [<pattern>]",
+          "    Return the currently active channels matching a <pattern> "
+          "(default: '*').",
+          "NUMPAT",
+          "    Return the number of unique pattern subscriptions.",
+          "NUMSUB [<channel> ...]",
+          "    Return the number of subscribers for the specified channels, "
+          "excluding",
+          "    pattern subscriptions (default: no channels).",
+          "HELP",
+          "    Prints this help."};
+      reply_builder.AppendArrayHeader(help.size());
+      for (std::string_view line : help) reply_builder.AppendBulkString(line);
+      co_return BuiltReply(reply_builder.View());
+    }
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR Unknown subcommand or wrong number of arguments for '" +
+        args[1] + "'. Try PUBSUB HELP."));
+  }
+
+  if (request.kind_ == CommandKind::kPublish) {
+    if (request.replication_capture_ != nullptr) {
+      CaptureReplicationCommand(request, request.args_);
+    } else if (!request.replication_origin_ && g_storage != nullptr &&
+               (g_replication == nullptr || !g_replication->is_replica())) {
+      const std::uint16_t partition_id = storage::RedisSlot(args[1]);
+      const unsigned source_worker = partition_id % g_storage->worker_count();
+      std::vector<std::string> replication_args = request.args_;
+      // Native full-sync identifies runtime-only commands before dispatching
+      // them. Keep the replicated command name canonical even when the client
+      // used mixed or lower case.
+      replication_args[0] = "PUBLISH";
+      absl::Status published = co_await celer::SubmitTaskTo(
+          source_worker,
+          [partition_id, args = std::move(replication_args)]() mutable {
+            return g_storage->PublishEphemeralReplicationCommand(
+                partition_id, std::move(args));
+          });
+      if (!published.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ephemeral replication publish failed: ",
+                         published.message())));
+      }
+    }
+    const std::uint64_t receivers = co_await PublishChannel(args[1], args[2]);
+    co_return BuiltReply(reply_builder.AppendInteger(
+        static_cast<long long>(std::min<std::uint64_t>(
+            receivers, std::numeric_limits<long long>::max()))));
+  }
+
+  if (context.pubsub_session_ == nullptr) {
+    context.pubsub_session_ = RegisterPubSubSession(context.socket_fd_);
+  }
+  const std::span<const std::string> channels(args.data() + 1, args.size() - 1);
+  std::string encoded;
+  switch (request.kind_) {
+    case CommandKind::kSubscribe:
+      encoded = SubscribeChannels(context.pubsub_session_, channels);
+      break;
+    case CommandKind::kUnsubscribe:
+      encoded = UnsubscribeChannels(context.pubsub_session_, channels);
+      break;
+    case CommandKind::kPSubscribe:
+      encoded = PSubscribePatterns(context.pubsub_session_, channels);
+      break;
+    case CommandKind::kPUnsubscribe:
+      encoded = PUnsubscribePatterns(context.pubsub_session_, channels);
+      break;
+    default:
+      break;
+  }
+  co_return BuiltReply(reply_builder.AppendRaw(encoded));
 }
 
 Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
@@ -5845,6 +5963,11 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         return command.spec_ != nullptr &&
                (command.spec_->flags_ & kCmdWrite) != 0;
       });
+  const bool has_replicable = std::any_of(
+      queued.begin(), queued.end(), [](const CommandRequest& command) {
+        return command.spec_ != nullptr &&
+               (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0;
+      });
   auto blocking_notifications =
       std::make_shared<BlockingNotificationCapture>(g_storage->worker_count());
   for (CommandRequest& command : queued) {
@@ -5857,8 +5980,17 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
             return !command.replication_origin_ && command.spec_ != nullptr &&
                    (command.spec_->flags_ & kCmdWrite) != 0;
           });
+  const bool source_replicable =
+      has_replicable &&
+      (g_replication == nullptr || !g_replication->is_replica()) &&
+      std::any_of(
+          queued.begin(), queued.end(), [](const CommandRequest& command) {
+            return !command.replication_origin_ && command.spec_ != nullptr &&
+                   (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) !=
+                       0;
+          });
   ReplicationTransactionOrderGuard replication_order_guard;
-  if (source_write && g_storage != nullptr &&
+  if (source_replicable && g_storage != nullptr &&
       g_storage->ReplicationLogActive()) {
     absl::Status entered =
         co_await BeginReplicationTransactionOrder(&replication_order_guard);
@@ -5868,11 +6000,11 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           reply_builder.AppendError(absl::StrCat("ERR ", entered.message())));
     }
   }
-  if (source_write && g_storage != nullptr &&
+  if (source_replicable && g_storage != nullptr &&
       g_storage->ReplicationLogActive()) {
     for (CommandRequest& command : queued) {
       if (command.spec_ != nullptr &&
-          (command.spec_->flags_ & kCmdWrite) != 0) {
+          (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0) {
         command.replication_capture_ =
             std::make_shared<ReplicationCommandCapture>();
       }
@@ -6013,6 +6145,13 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     } else if (cmd.kind_ == CommandKind::kXGroup ||
                cmd.kind_ == CommandKind::kXInfo) {
       local = co_await ExecuteStreamCommand(cmd, local_builder);
+    } else if (cmd.kind_ == CommandKind::kPublish ||
+               cmd.kind_ == CommandKind::kPubSub ||
+               cmd.kind_ == CommandKind::kPSubscribe ||
+               cmd.kind_ == CommandKind::kPUnsubscribe ||
+               cmd.kind_ == CommandKind::kSubscribe ||
+               cmd.kind_ == CommandKind::kUnsubscribe) {
+      local = co_await ExecutePubSubCommand(ctx, cmd, local_builder);
     } else {
       local = ExecuteSimpleLocalCommand(cmd, local_builder);
     }
@@ -6066,14 +6205,15 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       const std::size_t write_count = std::count_if(
           queued.begin(), queued.end(), [](const CommandRequest& command) {
             return command.spec_ != nullptr &&
-                   (command.spec_->flags_ & kCmdWrite) != 0;
+                   (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) !=
+                       0;
           });
       replication_args.reserve(2 + queued.size() * 3);
       replication_args.emplace_back(kReplicatedExecCommand);
       replication_args.push_back(std::to_string(write_count));
       for (const CommandRequest& command : queued) {
         if (command.spec_ == nullptr ||
-            (command.spec_->flags_ & kCmdWrite) == 0) {
+            (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0) {
           continue;
         }
         replication_args.push_back(std::to_string(command.db_id_));
@@ -6095,7 +6235,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         }
         if (!captured.handled_) {
           if (command.spec_ != nullptr &&
-              (command.spec_->flags_ & kCmdWrite) != 0) {
+              (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0) {
             commands.push_back(
                 CapturedReplicationCommand{command.db_id_, command.args_});
           }
@@ -6324,6 +6464,49 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     }
   }
 
+  // A transaction with PUBLISH but no durable write has no storage shard on
+  // which to place the ordinary transaction envelope. Publish its captured
+  // effects once through the first channel's source flow instead. Read-only
+  // children and SUBSCRIBE/UNSUBSCRIBE remain local connection state.
+  if (source_replicable && !has_write && g_storage != nullptr) {
+    std::vector<CapturedReplicationCommand> commands;
+    for (std::size_t index = 0; index < queued.size(); ++index) {
+      const CommandRequest& command = queued[index];
+      if (!replies[index].empty() && replies[index].front() == '-') continue;
+      CapturedReplicationEffects captured;
+      if (command.replication_capture_ != nullptr) {
+        captured = command.replication_capture_->Take();
+      }
+      if (captured.handled_) {
+        commands.insert(commands.end(),
+                        std::make_move_iterator(captured.commands_.begin()),
+                        std::make_move_iterator(captured.commands_.end()));
+      } else if (command.spec_ != nullptr &&
+                 (command.spec_->flags_ & kCmdMayReplicate) != 0) {
+        commands.push_back(
+            CapturedReplicationCommand{command.db_id_, command.args_});
+      }
+    }
+    if (!commands.empty()) {
+      const std::uint16_t partition_id =
+          storage::RedisSlot(commands.front().args_[1]);
+      const unsigned source_worker = partition_id % g_storage->worker_count();
+      std::vector<std::string> effects =
+          EncodeReplicationCommandEffects(std::move(commands));
+      absl::Status published = co_await celer::SubmitTaskTo(
+          source_worker,
+          [partition_id, effects = std::move(effects)]() mutable {
+            return g_storage->PublishEphemeralReplicationCommand(
+                partition_id, std::move(effects));
+          });
+      if (!published.ok()) {
+        co_await DropWatches(ctx);
+        co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+            "ERR ephemeral EXEC replication failed: ", published.message())));
+      }
+    }
+  }
+
   absl::Status notified =
       co_await FlushBlockingNotifications(*blocking_notifications);
   if (!notified.ok()) {
@@ -6367,7 +6550,8 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
   bool source_write = false;
   for (const CommandRequest& command : ctx.queued_) {
     if (!command.replication_origin_ && command.spec_ != nullptr &&
-        (command.spec_->flags_ & kCmdWrite) != 0) {
+        (command.spec_->flags_ & kCmdWrite) != 0 &&
+        (g_replication == nullptr || !g_replication->is_replica())) {
       source_write = true;
       logical_bytes =
           SaturatingAdd(logical_bytes, RequestArgumentBytes(command));
@@ -7044,6 +7228,14 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kReadOnly:
         case CommandKind::kReadWrite:
         case CommandKind::kMonitor:
+        case CommandKind::kPublish:
+        case CommandKind::kPubSub:
+        case CommandKind::kPSubscribe:
+        case CommandKind::kPUnsubscribe:
+        case CommandKind::kSubscribe:
+        case CommandKind::kUnsubscribe:
+        case CommandKind::kQuit:
+        case CommandKind::kReset:
           return true;
         default:
           return false;
@@ -7071,6 +7263,19 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         ctx.ResetMulti();
         co_await DropWatches(ctx);
         co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+      case CommandKind::kQuit: {
+        CommandReply reply =
+            BuiltReply(reply_builder.AppendSimpleString("OK"));
+        reply.close_connection_ = true;
+        co_return reply;
+      }
+      case CommandKind::kReset:
+        ctx.ResetMulti();
+        co_await DropWatches(ctx);
+        ctx.selected_db_ = 0;
+        ctx.authenticated_ = !ctx.authentication_required_;
+        ctx.cluster_readonly_ = false;
+        co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
       case CommandKind::kExec:
         co_return co_await ExecuteExec(ctx, reply_builder);
       default:
@@ -7145,6 +7350,18 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     case CommandKind::kUnwatch:
       co_await DropWatches(ctx);
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+    case CommandKind::kQuit: {
+      CommandReply reply = BuiltReply(reply_builder.AppendSimpleString("OK"));
+      reply.close_connection_ = true;
+      co_return reply;
+    }
+    case CommandKind::kReset:
+      ctx.ResetMulti();
+      co_await DropWatches(ctx);
+      ctx.selected_db_ = 0;
+      ctx.authenticated_ = !ctx.authentication_required_;
+      ctx.cluster_readonly_ = false;
+      co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
     case CommandKind::kReadOnly:
       ctx.cluster_readonly_ = true;
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
@@ -7153,6 +7370,13 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kClient:
       co_return co_await ExecuteClient(ctx, request, reply_builder);
+    case CommandKind::kPublish:
+    case CommandKind::kPubSub:
+    case CommandKind::kPSubscribe:
+    case CommandKind::kPUnsubscribe:
+    case CommandKind::kSubscribe:
+    case CommandKind::kUnsubscribe:
+      co_return co_await ExecutePubSubCommand(ctx, request, reply_builder);
     default:
       break;
   }
@@ -7780,6 +8004,10 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
   if (!request.ok()) co_return request.status();
   request->replication_origin_ = true;
+  if (request->kind_ == CommandKind::kPublish) {
+    (void)co_await PublishChannel(request->args_[1], request->args_[2]);
+    co_return absl::OkStatus();
+  }
   bool replayable_write = false;
   if (request->spec_ != nullptr && (request->spec_->flags_ & kCmdWrite) != 0 &&
       (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) == 0) {
@@ -7814,6 +8042,13 @@ Task<absl::Status> ApplyRedisReplicatedCommand(
   auto request = BuildCommandRequest(std::move(wire), command.db_id_);
   if (!request.ok()) co_return request.status();
   request->replication_origin_ = true;
+
+  // Redis includes PUBLISH in its replication stream even though it does not
+  // mutate the keyspace. Deliver it locally without forwarding it again.
+  if (request->kind_ == CommandKind::kPublish) {
+    (void)co_await PublishChannel(request->args_[1], request->args_[2]);
+    co_return absl::OkStatus();
+  }
 
   bool replayable = false;
   if (request->spec_ != nullptr && (request->spec_->flags_ & kCmdWrite) != 0 &&
@@ -7860,7 +8095,7 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
     if (!request.ok()) co_return request.status();
     if (request->spec_ == nullptr ||
         (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) != 0 ||
-        (request->spec_->flags_ & kCmdWrite) == 0 ||
+        (request->spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0 ||
         request->kind_ == CommandKind::kMulti ||
         request->kind_ == CommandKind::kExec ||
         request->kind_ == CommandKind::kDiscard ||
@@ -7870,10 +8105,12 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
       co_return absl::InvalidArgumentError(
           "unsupported command in Redis replicated transaction");
     }
-    auto keys = DetermineKeys(*request->spec_, request->args_);
-    if (!keys.ok() || keys->count() == 0) {
-      co_return absl::InvalidArgumentError(
-          "Redis transaction command has no replayable key");
+    if ((request->spec_->flags_ & kCmdWrite) != 0) {
+      auto keys = DetermineKeys(*request->spec_, request->args_);
+      if (!keys.ok() || keys->count() == 0) {
+        co_return absl::InvalidArgumentError(
+            "Redis transaction command has no replayable key");
+      }
     }
     request->replication_origin_ = true;
     context.queued_.push_back(std::move(*request));

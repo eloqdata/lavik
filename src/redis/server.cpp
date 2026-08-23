@@ -37,10 +37,12 @@
 #include "celer/net/tls.h"
 #include "celer/runtime/sync.h"
 #include "keylane/command.h"
+#include "keylane/command_table.h"
 #include "keylane/config.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/monitor.h"
+#include "keylane/pubsub.h"
 #include "keylane/rdb.h"
 #include "keylane/replication.h"
 #include "keylane/resp.h"
@@ -464,6 +466,9 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
   }
 }
 
+class RequestInputBuffer;
+class CommandBatch;
+
 class RedisService final : public TcpService {
  public:
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
@@ -491,6 +496,15 @@ class RedisService final : public TcpService {
 
  private:
   Task<absl::Status> Serve(TcpStream& stream, ConnectionContext& ctx);
+  Task<absl::Status> ReadSubscribedCommands(
+      TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
+      RespCommandParser* parser, CommandBatch* ready,
+      std::optional<absl::Status>* deferred_read_error,
+      std::shared_ptr<PubSubSession> session);
+  Task<absl::Status> ServeSubscribed(
+      TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
+      RespCommandParser* parser, CommandBatch* ready,
+      std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
 
   class RequestGuard {
@@ -536,6 +550,7 @@ class RedisService final : public TcpService {
 void RedisService::Prepare(unsigned thread_count) {
   TcpService::Prepare(thread_count);
   PrepareMonitor(thread_count);
+  PreparePubSub(thread_count);
   recovery_ready_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   recovery_collect_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
   online_allocator_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
@@ -971,7 +986,9 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
   ctx.authenticated_ = !authenticator_.required();
+  ctx.authentication_required_ = authenticator_.required();
   ctx.conn_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed);
+  ctx.socket_fd_ = stream.NativeFd();
   auto peer_address = stream.PeerAddress();
   const std::string address =
       peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
@@ -983,6 +1000,7 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
   UnregisterMonitorSession(ctx.monitor_session_);
+  UnregisterPubSubSession(ctx.pubsub_session_);
   UnregisterClientConnection(ctx.conn_id_);
   co_await ReleaseConnectionWatches(ctx);
   if (ctx.counted_as_client_) ConnectionClosed();
@@ -1024,6 +1042,156 @@ Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
     }
   }
   co_return absl::OkStatus();
+}
+
+Task<absl::Status> RedisService::ReadSubscribedCommands(
+    TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
+    RespCommandParser* parser, CommandBatch* ready,
+    std::optional<absl::Status>* deferred_read_error,
+    std::shared_ptr<PubSubSession> session) {
+  struct ReaderDone {
+    std::shared_ptr<PubSubSession> session_;
+    ~ReaderDone() { MarkPubSubReaderDone(session_); }
+  } reader_done{session};
+
+  ReplyBuilder builder;
+  while (stream.IsOpen() && PubSubSubscriptionCount(session) != 0) {
+    if (ShutdownRequested()) {
+      ClosePubSubSession(session);
+      co_return absl::OkStatus();
+    }
+    absl::Status read_status = absl::OkStatus();
+    if (ready->empty()) {
+      if (deferred_read_error->has_value()) {
+        read_status = std::move(**deferred_read_error);
+        deferred_read_error->reset();
+      } else {
+        read_status = co_await ReadCommandBatch(
+            stream, input, parser, ready, deferred_read_error);
+      }
+    }
+    if (!read_status.ok()) {
+      if (read_status.code() != absl::StatusCode::kUnavailable) {
+        builder.Reset();
+        EnqueuePubSubReply(
+            session, std::string(builder.AppendError(
+                         absl::StrCat("ERR ", read_status.message()))));
+        ExitPubSubMode(session);
+        co_return read_status;
+      }
+      ClosePubSubSession(session);
+      co_return absl::OkStatus();
+    }
+    RespCommand command = ready->PopFront();
+
+    if (!TryBeginRequest()) [[unlikely]] {
+      builder.Reset();
+      EnqueuePubSubReply(
+          session,
+          std::string(builder.AppendError("ERR server is shutting down")));
+      ExitPubSubMode(session);
+      co_return absl::OkStatus();
+    }
+    RequestGuard request_guard(this);
+    auto request = BuildCommandRequest(std::move(command), ctx.selected_db_);
+    builder.Reset();
+    if (!request.ok()) {
+      EnqueuePubSubReply(session, std::string(builder.AppendError(absl::StrCat(
+                                      "ERR ", request.status().message()))));
+      continue;
+    }
+
+    const CommandKind kind = request->kind_;
+    if (HasMonitorSessions()) [[unlikely]] {
+      PublishMonitorMessage(PrepareMonitorMessage(
+          request->db_id_, ctx.peer_address_, request->args_, &*request));
+    }
+    if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
+      CommandReply reply =
+          co_await DispatchCommand(ctx, std::move(*request), builder);
+      const bool succeeded =
+          reply.encoded_.empty() || reply.encoded_.front() != '-';
+      EnqueuePubSubReply(session, std::string(reply.encoded_));
+      if (!succeeded) continue;
+      ResetPubSubSubscriptions(session);
+      ctx.close_after_pubsub_ = kind == CommandKind::kQuit;
+      ExitPubSubMode(session);
+      co_return absl::OkStatus();
+    }
+    if (kind == CommandKind::kPing) {
+      if (request->args_.size() > 2) {
+        EnqueuePubSubReply(
+            session, std::string(builder.AppendError(
+                         "ERR wrong number of arguments for 'ping' command")));
+      } else {
+        builder.AppendArrayHeader(2);
+        builder.AppendBulkString("pong");
+        builder.AppendBulkString(request->args_.size() == 2
+                                     ? std::string_view(request->args_[1])
+                                     : std::string_view{});
+        EnqueuePubSubReply(session, std::string(builder.View()));
+      }
+      continue;
+    }
+
+    if (kind != CommandKind::kSubscribe && kind != CommandKind::kUnsubscribe &&
+        kind != CommandKind::kPSubscribe &&
+        kind != CommandKind::kPUnsubscribe) {
+      if (kind == CommandKind::kUnknown) {
+        EnqueuePubSubReply(
+            session,
+            std::string(builder.AppendError("ERR unknown command '" +
+                                            request->args_.front() + "'")));
+      } else {
+        std::string name(CommandCanonicalName(kind));
+        EnqueuePubSubReply(
+            session,
+            std::string(builder.AppendError(
+                "ERR Can't execute '" + name +
+                "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / "
+                "RESET are allowed in this context")));
+      }
+      continue;
+    }
+
+    CommandReply reply =
+        co_await DispatchCommand(ctx, std::move(*request), builder);
+    EnqueuePubSubReply(session, std::string(reply.encoded_));
+    if (PubSubSubscriptionCount(session) == 0) {
+      ExitPubSubMode(session);
+      co_return absl::OkStatus();
+    }
+  }
+  ExitPubSubMode(session);
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> RedisService::ServeSubscribed(TcpStream& stream,
+                                                 ConnectionContext& ctx,
+                                                 RequestInputBuffer* input,
+                                                 RespCommandParser* parser,
+                                                 CommandBatch* ready,
+                                                 std::optional<absl::Status>*
+                                                     deferred_read_error) {
+  std::shared_ptr<PubSubSession> session = ctx.pubsub_session_;
+  MarkPubSubReaderStarted(session);
+  ThisWorker().self_->Spawn(ReadSubscribedCommands(
+      stream, ctx, input, parser, ready, deferred_read_error, session));
+
+  absl::Status streamed = co_await StreamPubSubMessages(stream, session);
+  const bool normal_exit = PubSubSubscriptionCount(session) == 0;
+  ClosePubSubSession(session);
+  if (!streamed.ok() || !normal_exit) {
+    (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+  }
+  absl::Status joined = co_await WaitPubSubReaderDone(session);
+  UnregisterPubSubSession(session);
+  ctx.pubsub_session_.reset();
+  if (!streamed.ok()) co_return streamed;
+  if (ctx.close_after_pubsub_) {
+    stream.Close().IgnoreError();
+  }
+  co_return joined;
 }
 
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
@@ -1330,6 +1498,18 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (!flushed.ok()) co_return flushed;
       request_guard.Release();
       co_return co_await StreamMonitorMessages(stream, ctx.monitor_session_);
+    }
+    if (PubSubSubscriptionCount(ctx.pubsub_session_) != 0) [[unlikely]] {
+      // The first SUBSCRIBE/EXEC response is already on the wire. Messages
+      // published during that write have only been queued, so the dedicated
+      // single writer preserves confirmation-before-message ordering.
+      absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!flushed.ok()) co_return flushed;
+      request_guard.Release();
+      absl::Status subscribed = co_await ServeSubscribed(
+          stream, ctx, &input, &parser, &ready, &deferred_read_error);
+      if (!subscribed.ok()) co_return subscribed;
+      continue;
     }
     if (reply.close_connection_ || ShutdownRequested()) [[unlikely]] {
       absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);

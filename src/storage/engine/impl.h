@@ -1669,6 +1669,8 @@ class StorageEngine::Impl {
       const ReplicationPublisherAdmission& admission,
       std::size_t logical_bytes);
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
+  Task<absl::Status> PublishEphemeralReplicationCommand(
+      std::uint16_t partition_id, std::vector<std::string> args);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 
@@ -2488,6 +2490,7 @@ class StorageEngine::Impl {
   // scoped to the in-memory replication history; a restart changes history
   // id, so it does not need persistence.
   std::atomic<std::uint64_t> next_replication_control_id_{1};
+  std::atomic<std::uint64_t> next_replication_ephemeral_id_{1};
   // Replica control rendezvous collapses all source-flow copies before
   // entering storage. Per-DB async gates serialize the resulting epoch
   // installation against another control apply; they are cold-path and not a

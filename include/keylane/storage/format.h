@@ -175,6 +175,10 @@ enum class ReplicationEventKind : std::uint8_t {
   kMutation = 1,
   kTransaction = 2,
   kControl = 3,
+  // Runtime-only commands that have no durable keyspace after-image, such as
+  // PUBLISH. They live in online/full-sync memory streams and vanish at
+  // restart with the replication history.
+  kEphemeral = 4,
 };
 
 enum class ReplicationFrameFlag : std::uint8_t {

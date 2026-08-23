@@ -519,7 +519,8 @@ bool EncodeReplicationFrameHeader(
   }
   if (header.kind_ != ReplicationEventKind::kMutation &&
       header.kind_ != ReplicationEventKind::kTransaction &&
-      header.kind_ != ReplicationEventKind::kControl) {
+      header.kind_ != ReplicationEventKind::kControl &&
+      header.kind_ != ReplicationEventKind::kEphemeral) {
     return false;
   }
   ReplicationFrameHeader encoded = header;

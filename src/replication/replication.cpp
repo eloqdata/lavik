@@ -1234,8 +1234,10 @@ Task<absl::Status> SendRedisExportMutation(TcpStream& stream,
   for (unsigned offset = 0; offset < workers; ++offset) {
     const unsigned worker = (state->next_worker_ + offset) % workers;
     if (!state->heads_[worker].has_value() ||
-        state->heads_[worker]->kind_ !=
-            storage::ReplicationEventKind::kMutation) {
+        (state->heads_[worker]->kind_ !=
+             storage::ReplicationEventKind::kMutation &&
+         state->heads_[worker]->kind_ !=
+             storage::ReplicationEventKind::kEphemeral)) {
       continue;
     }
     if (!state->heads_[worker]->command_.args_.empty() &&
@@ -4402,12 +4404,6 @@ class ReplicationManager::Impl {
             co_return absl::InvalidArgumentError(
                 "full-sync command fragments overlap");
           }
-          absl::Status begun = co_await celer::SubmitTaskTo(
-              owner, [this, session, partition_id, partition_sequence]() {
-                return storage_->BeginReplicaTailCommand(
-                    session->session_id_, partition_id, partition_sequence);
-              });
-          if (!begun.ok()) co_return begun;
           staged_command_lsn = source_lsn;
           next_command_fragment = 0;
           staged_command.clear();
@@ -4421,6 +4417,18 @@ class ReplicationManager::Impl {
         ++next_command_fragment;
         if (last) {
           auto command = DecodeReplicationCommand(staged_command);
+          const bool ephemeral =
+              command.ok() && !command->args_.empty() &&
+              (command->args_[0] == "PUBLISH" ||
+               command->args_[0] == kReplicatedExecCommand);
+          if (!ephemeral) {
+            absl::Status begun = co_await celer::SubmitTaskTo(
+                owner, [this, session, partition_id, partition_sequence]() {
+                  return storage_->BeginReplicaTailCommand(
+                      session->session_id_, partition_id, partition_sequence);
+                });
+            if (!begun.ok()) co_return begun;
+          }
           absl::Status applied;
           if (!command.ok()) {
             applied = command.status();
@@ -4433,11 +4441,14 @@ class ReplicationManager::Impl {
           } else {
             applied = co_await ApplyReplicatedCommand(*command);
           }
-          absl::Status ended = co_await celer::SubmitTaskTo(
-              owner, [this, session, partition_id, partition_sequence]() {
-                return storage_->EndReplicaTailCommand(
-                    session->session_id_, partition_id, partition_sequence);
-              });
+          absl::Status ended = absl::OkStatus();
+          if (!ephemeral) {
+            ended = co_await celer::SubmitTaskTo(
+                owner, [this, session, partition_id, partition_sequence]() {
+                  return storage_->EndReplicaTailCommand(
+                      session->session_id_, partition_id, partition_sequence);
+                });
+          }
           if (!applied.ok()) co_return applied;
           if (!ended.ok()) co_return ended;
           staged_command_lsn = 0;

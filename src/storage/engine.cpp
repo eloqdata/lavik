@@ -288,6 +288,12 @@ bool StorageEngine::TryEnqueueReplicationCommand(
   return impl_->TryEnqueueReplicationCommand(std::move(command));
 }
 
+Task<absl::Status> StorageEngine::PublishEphemeralReplicationCommand(
+    std::uint16_t partition_id, std::vector<std::string> args) {
+  return impl_->PublishEphemeralReplicationCommand(partition_id,
+                                                   std::move(args));
+}
+
 bool StorageEngine::TryEnqueueReplicationTransaction(
     std::shared_ptr<ReplicationTransaction> transaction) {
   return impl_->TryEnqueueReplicationTransaction(std::move(transaction));

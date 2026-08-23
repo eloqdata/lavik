@@ -330,7 +330,13 @@ TEST(StorageFormatTest, EncodesMemoryReplicationFrames) {
   EXPECT_EQ(decoded_frame.partition_id_, frame.partition_id_);
   EXPECT_EQ(decoded_frame.payload_checksum_, frame.payload_checksum_);
 
+  frame.kind_ = ReplicationEventKind::kEphemeral;
+  ASSERT_TRUE(EncodeReplicationFrameHeader(frame, frame_bytes));
+  ASSERT_TRUE(DecodeReplicationFrameHeader(frame_bytes, &decoded_frame));
+  EXPECT_EQ(decoded_frame.kind_, ReplicationEventKind::kEphemeral);
+
   // Middle fragments deliberately carry neither boundary flag.
+  frame.kind_ = ReplicationEventKind::kMutation;
   frame.flags_ = 0;
   frame.fragment_index_ = 1;
   ASSERT_TRUE(EncodeReplicationFrameHeader(frame, frame_bytes));

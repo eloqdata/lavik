@@ -12,6 +12,7 @@
 namespace keylane {
 
 class MonitorSession;
+class PubSubSession;
 
 // Per-connection state, owned by the connection's Serve coroutine frame.
 // Everything here must be cleaned up through the single cleanup point at the
@@ -19,6 +20,7 @@ class MonitorSession;
 struct ConnectionContext {
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
+  bool authentication_required_ = false;
   bool counted_as_client_ = true;
   // Redis Cluster replica reads are opt-in per connection. READONLY enables
   // them and READWRITE restores the default MOVED-to-primary behavior.
@@ -55,9 +57,12 @@ struct ConnectionContext {
     bool live_ = false;
   };
   std::uint64_t conn_id_ = 0;
+  int socket_fd_ = -1;
   std::string peer_address_;
   std::vector<WatchedKey> watched_;
   std::shared_ptr<MonitorSession> monitor_session_;
+  std::shared_ptr<PubSubSession> pubsub_session_;
+  bool close_after_pubsub_ = false;
 
   void ResetMulti() {
     in_multi_ = false;
