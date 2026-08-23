@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -30,6 +31,13 @@ absl::Status ApplyRedisConfigDirective(
 // number so startup failures can be fixed directly.
 absl::Status LoadRedisConfigFile(const std::string& path,
                                  ServerOptions* options);
+
+// Replaces the failover-managed directives in an existing configuration file
+// and durably installs the result with a same-directory atomic rename. Other
+// directives and comments are preserved verbatim.
+absl::Status RewriteRedisConfigFile(
+    const std::string& path, std::optional<ReplicaOfConfig> upstream,
+    bool redis_upstream, unsigned replica_priority);
 
 // Validates cross-field startup constraints after config-file and CLI values
 // have both been applied.

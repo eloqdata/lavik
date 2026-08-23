@@ -59,6 +59,7 @@ struct ConnectionContext {
   std::uint64_t conn_id_ = 0;
   int socket_fd_ = -1;
   std::string peer_address_;
+  std::string client_name_;
   std::vector<WatchedKey> watched_;
   std::shared_ptr<MonitorSession> monitor_session_;
   std::shared_ptr<PubSubSession> pubsub_session_;

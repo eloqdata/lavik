@@ -14,6 +14,7 @@
 #include "keylane/config.h"
 #include "keylane/logging.h"
 #include "keylane/server.h"
+#include "keylane/version.h"
 
 namespace {
 
@@ -41,6 +42,8 @@ int main(int argc, char** argv) {
   mi_option_set(mi_option_allow_thp, 0);
 
   CLI::App app{"keylane — high-performance Redis-compatible storage"};
+  app.set_version_flag("--version",
+                       "keylane " + std::string(keylane::kVersion));
 
   keylane::ServerOptions options;
   options.thread_count_ = DefaultWorkerThreadCount();
@@ -163,6 +166,11 @@ int main(int argc, char** argv) {
                options.replication_options_.redis_export_backpressure_,
                "Backpressure writes when a Redis PSYNC export falls behind")
       ->capture_default_str();
+  app.add_option("--replica-priority",
+                 options.replication_options_.replica_priority_,
+                 "Redis Sentinel replica promotion priority (0 disables)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option(
          "--spdk-max-completions-per-poll",
          options.spdk_max_completions_per_poll_,

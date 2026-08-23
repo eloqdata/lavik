@@ -237,6 +237,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("FLUSHDB", CommandKind::kFlushDb);
   CheckKind("FLUSHALL", CommandKind::kFlushAll);
   CheckKind("CONFIG", CommandKind::kConfig);
+  CheckKind("REPLICAOF", CommandKind::kReplicaOf);
+  CheckKind("SLAVEOF", CommandKind::kReplicaOf);
+  CheckKind("ROLE", CommandKind::kRole);
   CheckKind("MONITOR", CommandKind::kMonitor);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
@@ -282,12 +285,16 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("quit", 1, true);
   CheckArity("quit", 2, false);
   CheckArity("reset", 1, true);
+  CheckArity("slaveof", 2, false);
+  CheckArity("slaveof", 3, true);
+  CheckArity("slaveof", 4, false);
+  EXPECT_EQ(CommandCanonicalName(CommandKind::kReplicaOf), "replicaof");
   for (std::size_t value = 0;
        value < static_cast<std::size_t>(CommandKind::kUnknown); ++value) {
     EXPECT_NE(CommandCanonicalName(static_cast<CommandKind>(value)), "unknown");
   }
   EXPECT_EQ(CommandCanonicalName(CommandKind::kUnknown), "unknown");
-  CheckArity("config", 2, false);
+  CheckArity("config", 2, true);
   CheckArity("config", 3, true);
   CheckArity("config", 4, true);
   CheckArity("config", 5, false);

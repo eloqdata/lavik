@@ -431,6 +431,11 @@ std::size_t PubSubSubscriptionCount(
   return session == nullptr ? 0 : session->subscription_count();
 }
 
+std::size_t PubSubPatternSubscriptionCount(
+    const std::shared_ptr<PubSubSession>& session) noexcept {
+  return session == nullptr ? 0 : session->pattern_order().size();
+}
+
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
                               std::span<const std::string> channels) {
   ReplyBuilder builder;

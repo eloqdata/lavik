@@ -50,6 +50,7 @@
 #include "keylane/storage/format.h"
 #include "keylane/tx/transaction.h"
 #include "keylane/tx/tx_shard.h"
+#include "keylane/version.h"
 #include "list_command.h"
 #include "set_command.h"
 #include "sort_command.h"
@@ -68,16 +69,22 @@ bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
 std::string g_server_bind_ip = "127.0.0.1";
+std::string g_server_config_file;
 std::chrono::steady_clock::time_point g_server_start;
 
 struct ClientConnectionRecord {
+  enum class Type { kNormal, kReplica, kPubSub };
+
   std::uint64_t id_ = 0;
   int fd_ = -1;
   std::string address_;
   std::chrono::steady_clock::time_point connected_at_;
   std::uint64_t replication_session_id_ = 0;
   bool tls_ = false;
-  bool replica_ = false;
+  Type type_ = Type::kNormal;
+  std::string name_;
+  std::size_t subscriptions_ = 0;
+  std::size_t pattern_subscriptions_ = 0;
   bool closing_ = false;
 };
 
@@ -97,6 +104,9 @@ void NotifyRenamedValue(const CommandRequest& request, std::uint8_t db_id,
                         std::string_view key, storage::ValueType type);
 void NotifyRenamedValue(const CommandRequest& request, std::string_view key,
                         storage::ValueType type);
+Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
+                                 const CommandRequest& request,
+                                 ReplyBuilder& reply_builder);
 
 std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
   return right > std::numeric_limits<std::size_t>::max() - left
@@ -452,6 +462,9 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
     default:
       break;
   }
+  SetClientPubSubCounts(
+      context.conn_id_, PubSubSubscriptionCount(context.pubsub_session_),
+      PubSubPatternSubscriptionCount(context.pubsub_session_));
   co_return BuiltReply(reply_builder.AppendRaw(encoded));
 }
 
@@ -819,6 +832,7 @@ constexpr std::string_view kSnapshotBatchSizeConfig =
 constexpr std::string_view kReplicationBacklogSizeConfig = "repl-backlog-size";
 constexpr std::string_view kReplicationPublishQueueConfig =
     "replication-publish-queue-mb-per-worker";
+constexpr std::string_view kReplicaPriorityConfig = "replica-priority";
 constexpr std::string_view kDefragPausedConfig = "defrag-paused";
 constexpr std::string_view kDefragMaxActiveConfig =
     "defrag-max-active-per-device";
@@ -843,6 +857,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotBatchSize,
   kReplicationBacklogSize,
   kReplicationPublishQueue,
+  kReplicaPriority,
   kDefragPaused,
   kDefragMaxActive,
   kDefragSleep,
@@ -874,6 +889,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kReplicationBacklogSize},
     RuntimeConfigDescriptor{kReplicationPublishQueueConfig,
                             RuntimeConfigKey::kReplicationPublishQueue},
+    RuntimeConfigDescriptor{kReplicaPriorityConfig,
+                            RuntimeConfigKey::kReplicaPriority},
     RuntimeConfigDescriptor{kDefragPausedConfig,
                             RuntimeConfigKey::kDefragPaused},
     RuntimeConfigDescriptor{kDefragMaxActiveConfig,
@@ -949,6 +966,26 @@ Task<absl::Status> ConfigureAllWorkerSchedulers(RuntimeConfigKey key,
 Task<CommandReply> ExecuteConfig(const CommandRequest& request,
                                  ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
+  if (CmpCaseInsensitive(args[1], "REWRITE") && args.size() == 2) {
+    if (g_replication == nullptr) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR replication backend is unavailable"));
+    }
+    const ReplicationStatus replication = g_replication->status();
+    if (replication.redis_sources_.size() > 1) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR CONFIG REWRITE cannot persist multiple Redis Cluster "
+          "upstreams"));
+    }
+    const bool redis_upstream = !replication.redis_sources_.empty();
+    const absl::Status rewritten = RewriteRedisConfigFile(
+        g_server_config_file, replication.upstream_, redis_upstream,
+        g_replication->replica_priority());
+    co_return rewritten.ok()
+        ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+        : BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR ", rewritten.message())));
+  }
   if (CmpCaseInsensitive(args[1], "GET") && args.size() == 3) {
     const std::string pattern = NormalizeConfigPattern(args[2]);
     std::vector<const RuntimeConfigDescriptor*> matches;
@@ -957,7 +994,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       if ((config.key_ == RuntimeConfigKey::kSnapshotReadConcurrency ||
            config.key_ == RuntimeConfigKey::kSnapshotBatchSize ||
            config.key_ == RuntimeConfigKey::kReplicationBacklogSize ||
-           config.key_ == RuntimeConfigKey::kReplicationPublishQueue) &&
+           config.key_ == RuntimeConfigKey::kReplicationPublishQueue ||
+           config.key_ == RuntimeConfigKey::kReplicaPriority) &&
           g_replication == nullptr) {
         continue;
       }
@@ -979,6 +1017,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return std::to_string(
               g_replication->publish_queue_bytes_per_worker() /
               (1024ULL * 1024));
+        case RuntimeConfigKey::kReplicaPriority:
+          return std::to_string(g_replication->replica_priority());
         case RuntimeConfigKey::kDefragPaused:
         case RuntimeConfigKey::kDefragMaxActive:
         case RuntimeConfigKey::kDefragSleep:
@@ -1090,6 +1130,18 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured = co_await g_replication->SetPublishQueueBytesPerWorker(
             static_cast<std::size_t>(value * kMiB));
+      }
+    } else if (config->key_ == RuntimeConfigKey::kReplicaPriority) {
+      if (g_replication == nullptr) {
+        configured =
+            absl::FailedPreconditionError("replication backend is unavailable");
+      } else if (!ParseUint64(args[3], &value) ||
+                 value > std::numeric_limits<unsigned>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = g_replication->SetReplicaPriority(
+            static_cast<unsigned>(value));
       }
     } else if (config->key_ == RuntimeConfigKey::kDefragPaused) {
       const std::optional<bool> paused = ParseConfigYesNo(args[3]);
@@ -3229,6 +3281,48 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
   }
 }
 
+Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
+  const ReplicationStatus replication =
+      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
+  if (replication.role_ == ReplicationRole::kMaster) {
+    reply_builder.AppendArrayHeader(3);
+    reply_builder.AppendBulkString("master");
+    reply_builder.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
+        replication.master_repl_offset_,
+        std::numeric_limits<long long>::max())));
+    reply_builder.AppendArrayHeader(replication.downstream_replicas_.size());
+    for (const DownstreamReplicaStatus& replica :
+         replication.downstream_replicas_) {
+      reply_builder.AppendArrayHeader(3);
+      reply_builder.AppendBulkString(replica.host_);
+      reply_builder.AppendInteger(replica.port_);
+      reply_builder.AppendInteger(static_cast<long long>(
+          std::min<std::uint64_t>(replica.min_lsn_,
+                                  std::numeric_limits<long long>::max())));
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+
+  reply_builder.AppendArrayHeader(5);
+  reply_builder.AppendBulkString("slave");
+  reply_builder.AppendBulkString(replication.upstream_.has_value()
+                                     ? replication.upstream_->host_
+                                     : "");
+  reply_builder.AppendInteger(replication.upstream_.has_value()
+                                  ? replication.upstream_->port_
+                                  : 0);
+  const std::string_view state =
+      replication.role_ == ReplicationRole::kOnline
+          ? "connected"
+          : replication.role_ == ReplicationRole::kSyncing ? "sync"
+                                                            : "connecting";
+  reply_builder.AppendBulkString(state);
+  reply_builder.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
+      replication.replica_repl_offset_,
+      std::numeric_limits<long long>::max())));
+  co_return BuiltReply(reply_builder.View());
+}
+
 // INFO: Redis-shaped sections built from what keylane actually tracks. The
 // Transactions section surfaces the VLL scheduler counters.
 Task<CommandReply> ExecuteInfo(const CommandRequest& request,
@@ -3243,6 +3337,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   const bool all =
       section == "default" || section == "all" || section == "everything";
   auto wants = [&](std::string_view name) { return all || section == name; };
+  const ReplicationStatus replication =
+      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats")) {
@@ -3255,8 +3351,9 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                             std::chrono::steady_clock::now() - g_server_start)
                             .count();
     info += "# Server\r\n";
-    info += "keylane_version:0.1.0\r\n";
+    info += "keylane_version:" + std::string(kVersion) + "\r\n";
     info += "process_id:" + std::to_string(::getpid()) + "\r\n";
+    info += "run_id:" + replication.local_node_id_ + "\r\n";
     info += "tcp_port:" + std::to_string(g_server_port) + "\r\n";
     info += "worker_threads:" + std::to_string(g_server_threads) + "\r\n";
     info += "uptime_in_seconds:" + std::to_string(uptime) + "\r\n\r\n";
@@ -3378,9 +3475,6 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
 #endif
   }
   if (wants("replication")) {
-    const ReplicationStatus replication = g_replication != nullptr
-                                              ? g_replication->status()
-                                              : ReplicationStatus{};
     info += "# Replication\r\n";
     info +=
         "role:" +
@@ -3396,6 +3490,13 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                  ? *replication.upstream_history_id_
                  : replication.local_history_id_) +
             "\r\n";
+    info += "master_replid2:0000000000000000000000000000000000000000\r\n";
+    info += "master_repl_offset:" +
+            std::to_string(replication.role_ == ReplicationRole::kMaster
+                               ? replication.master_repl_offset_
+                               : replication.replica_repl_offset_) +
+            "\r\n";
+    info += "second_repl_offset:-1\r\n";
     if (replication.role_ == ReplicationRole::kMaster) {
       info += "connected_slaves:" +
               std::to_string(replication.downstream_replicas_.size()) + "\r\n";
@@ -3424,6 +3525,17 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                                   redis_links_up
                               ? "up\r\n"
                               : "down\r\n");
+      info += "master_last_io_seconds_ago:" +
+              std::to_string(replication.master_last_io_seconds_ago_) +
+              "\r\n";
+      info += "master_link_down_since_seconds:" +
+              std::to_string(replication.master_link_down_since_seconds_) +
+              "\r\n";
+      info += "slave_repl_offset:" +
+              std::to_string(replication.replica_repl_offset_) + "\r\n";
+      info += "slave_priority:" +
+              std::to_string(replication.replica_priority_) + "\r\n";
+      info += "replica_announced:1\r\n";
       info += "keylane_source_workers:" +
               std::to_string(replication.source_worker_count_) + "\r\n";
       info += "keylane_connected_flows:" +
@@ -5931,6 +6043,60 @@ Task<absl::StatusOr<std::string>> NextExecReplyChunk(
   co_return std::string();
 }
 
+bool IsSentinelManagementCommand(const CommandRequest& command) {
+  const auto& args = command.args_;
+  if (command.kind_ == CommandKind::kReplicaOf) {
+    return args.size() == 3;
+  }
+  if (command.kind_ == CommandKind::kConfig) {
+    return args.size() == 2 && CmpCaseInsensitive(args[1], "REWRITE");
+  }
+  return command.kind_ == CommandKind::kClient && args.size() == 4 &&
+         CmpCaseInsensitive(args[1], "KILL") &&
+         CmpCaseInsensitive(args[2], "TYPE") &&
+         (CmpCaseInsensitive(args[3], "NORMAL") ||
+          CmpCaseInsensitive(args[3], "PUBSUB"));
+}
+
+// Redis Sentinel sends role change, config persistence, and client eviction as
+// one MULTI/EXEC. Keylane preserves their order and per-command replies, but
+// deliberately does not stop ordinary work on other workers between them; the
+// role transition itself supplies the storage admission boundary.
+Task<CommandReply> ExecuteSentinelManagementExec(
+    ConnectionContext& ctx, std::vector<CommandRequest> queued,
+    ReplyBuilder& reply_builder) {
+  const bool clean =
+      ctx.watched_.empty() || co_await CheckConnectionWatches(ctx);
+  co_await DropWatches(ctx);
+  if (!clean) {
+    co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
+  }
+
+  std::vector<std::string> replies;
+  replies.reserve(queued.size());
+  for (const CommandRequest& command : queued) {
+    ReplyBuilder local_builder;
+    CommandReply local;
+    if (command.kind_ == CommandKind::kReplicaOf) {
+      local = co_await ExecuteReplicaOf(command, local_builder);
+    } else if (command.kind_ == CommandKind::kConfig) {
+      local = co_await ExecuteConfig(command, local_builder);
+    } else {
+      local = co_await ExecuteClient(ctx, command, local_builder);
+    }
+    if (local.disk_value_.has_value() || local.chunks_) {
+      replies.push_back(
+          EncodeError("ERR management command produced a streamed reply"));
+    } else {
+      replies.emplace_back(local.encoded_);
+    }
+  }
+
+  reply_builder.AppendArrayHeader(replies.size());
+  for (const std::string& reply : replies) reply_builder.AppendRaw(reply);
+  co_return BuiltReply(reply_builder.View());
+}
+
 Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
                                    ReplyBuilder& reply_builder) {
   std::vector<CommandRequest> queued = std::move(ctx.queued_);
@@ -5946,6 +6112,10 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         ctx.watched_.empty() || co_await CheckConnectionWatches(ctx);
     co_await DropWatches(ctx);
     co_return BuiltReply(reply_builder.AppendRaw(clean ? "*0\r\n" : "*-1\r\n"));
+  }
+  if (IsSentinelManagementCommand(queued.front())) {
+    co_return co_await ExecuteSentinelManagementExec(
+        ctx, std::move(queued), reply_builder);
   }
 
   std::size_t exec_memory_growth = 0;
@@ -6140,6 +6310,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
               "ERR MONITOR isn't allowed for DENY BLOCKING client"));
     } else if (cmd.kind_ == CommandKind::kInfo) {
       local = co_await ExecuteInfo(cmd, local_builder);
+    } else if (cmd.kind_ == CommandKind::kRole) {
+      local = co_await ExecuteRole(local_builder);
     } else if (cmd.kind_ == CommandKind::kRandomKey) {
       local = co_await ExecuteRandomKey(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kXGroup ||
@@ -6926,10 +7098,11 @@ void ReplicationTransactionGuard::EnterShardHook(void* context,
 }
 
 void SetServerInfo(std::string bind_ip, std::uint16_t port,
-                   unsigned thread_count) {
+                   unsigned thread_count, std::string config_file) {
   g_server_bind_ip = std::move(bind_ip);
   g_server_port = port;
   g_server_threads = thread_count;
+  g_server_config_file = std::move(config_file);
   g_server_start = std::chrono::steady_clock::now();
   for (auto& clients : g_worker_clients) clients.clear();
 }
@@ -6956,7 +7129,12 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
       .connected_at_ = std::chrono::steady_clock::now(),
       .replication_session_id_ = replication_session_id,
       .tls_ = tls,
-      .replica_ = replica,
+      .type_ = replica ? ClientConnectionRecord::Type::kReplica
+                       : ClientConnectionRecord::Type::kNormal,
+      .name_ = {},
+      .subscriptions_ = 0,
+      .pattern_subscriptions_ = 0,
+      .closing_ = false,
   });
 }
 
@@ -6972,6 +7150,32 @@ void SetClientReplicationSession(
   }
 }
 
+void SetClientName(std::uint64_t id, std::string name) noexcept {
+  const unsigned worker = celer::ThisWorker().id_;
+  assert(worker < g_worker_clients.size());
+  const auto found = std::find_if(
+      g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
+      [id](const auto& client) { return client.id_ == id; });
+  if (found != g_worker_clients[worker].end()) found->name_ = std::move(name);
+}
+
+void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
+                           std::size_t pattern_subscriptions) noexcept {
+  const unsigned worker = celer::ThisWorker().id_;
+  assert(worker < g_worker_clients.size());
+  const auto found = std::find_if(
+      g_worker_clients[worker].begin(), g_worker_clients[worker].end(),
+      [id](const auto& client) { return client.id_ == id; });
+  if (found == g_worker_clients[worker].end() ||
+      found->type_ == ClientConnectionRecord::Type::kReplica) {
+    return;
+  }
+  found->subscriptions_ = subscriptions;
+  found->pattern_subscriptions_ = pattern_subscriptions;
+  found->type_ = subscriptions == 0 ? ClientConnectionRecord::Type::kNormal
+                                    : ClientConnectionRecord::Type::kPubSub;
+}
+
 void UnregisterClientConnection(std::uint64_t id) noexcept {
   const unsigned worker = celer::ThisWorker().id_;
   assert(worker < g_worker_clients.size());
@@ -6984,7 +7188,7 @@ namespace {
 struct ClientFilter {
   std::optional<std::uint64_t> id_;
   std::optional<std::string> address_;
-  std::optional<bool> replica_;
+  std::optional<ClientConnectionRecord::Type> type_;
   bool skip_self_ = true;
 };
 
@@ -6996,16 +7200,23 @@ bool ClientMatches(const ClientConnectionRecord& client,
          (!filter.id_.has_value() || client.id_ == *filter.id_) &&
          (!filter.address_.has_value() ||
           client.address_ == *filter.address_) &&
-         (!filter.replica_.has_value() || client.replica_ == *filter.replica_);
+         (!filter.type_.has_value() || client.type_ == *filter.type_);
 }
 
-absl::StatusOr<bool> ParseClientType(std::string_view value) {
-  if (CmpCaseInsensitive(value, "normal")) return false;
+absl::StatusOr<ClientConnectionRecord::Type> ParseClientType(
+    std::string_view value) {
+  if (CmpCaseInsensitive(value, "normal")) {
+    return ClientConnectionRecord::Type::kNormal;
+  }
   if (CmpCaseInsensitive(value, "replica") ||
       CmpCaseInsensitive(value, "slave")) {
-    return true;
+    return ClientConnectionRecord::Type::kReplica;
   }
-  return absl::InvalidArgumentError("CLIENT type must be NORMAL or REPLICA");
+  if (CmpCaseInsensitive(value, "pubsub")) {
+    return ClientConnectionRecord::Type::kPubSub;
+  }
+  return absl::InvalidArgumentError(
+      "CLIENT type must be NORMAL, REPLICA or PUBSUB");
 }
 
 Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
@@ -7020,6 +7231,28 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
         static_cast<long long>(std::min<std::uint64_t>(
             ctx.conn_id_, std::numeric_limits<long long>::max()))));
   }
+  if (CmpCaseInsensitive(args[1], "setname")) {
+    if (args.size() != 3) {
+      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+    }
+    if (std::any_of(args[2].begin(), args[2].end(), [](unsigned char c) {
+          return c == 0 || std::isspace(c);
+        })) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR Client names cannot contain spaces, newlines or special characters."));
+    }
+    ctx.client_name_ = args[2];
+    SetClientName(ctx.conn_id_, ctx.client_name_);
+    co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+  }
+  if (CmpCaseInsensitive(args[1], "getname")) {
+    if (args.size() != 2) {
+      co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
+    }
+    co_return BuiltReply(ctx.client_name_.empty()
+                             ? reply_builder.AppendNullBulkString()
+                             : reply_builder.AppendBulkString(ctx.client_name_));
+  }
   if (CmpCaseInsensitive(args[1], "list")) {
     ClientFilter filter;
     filter.skip_self_ = false;
@@ -7032,7 +7265,7 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
         co_return BuiltReply(reply_builder.AppendError(
             absl::StrCat("ERR ", type.status().message())));
       }
-      filter.replica_ = *type;
+      filter.type_ = *type;
     }
 
     std::vector<ClientConnectionRecord> clients;
@@ -7059,10 +7292,17 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
       const auto age = std::chrono::duration_cast<std::chrono::seconds>(
                            now - client.connected_at_)
                            .count();
+      const char* flags =
+          client.type_ == ClientConnectionRecord::Type::kReplica
+              ? "S"
+              : client.type_ == ClientConnectionRecord::Type::kPubSub ? "P"
+                                                                        : "N";
       absl::StrAppend(&listing, "id=", client.id_, " addr=", client.address_,
-                      " fd=", client.fd_, " name= age=", age,
-                      " idle=0 flags=", client.replica_ ? "S" : "N",
-                      " db=0 sub=0 psub=0 ssub=0 multi=-1 qbuf=0 ",
+                      " fd=", client.fd_, " name=", client.name_, " age=", age,
+                      " idle=0 flags=", flags,
+                      " db=0 sub=", client.subscriptions_ - client.pattern_subscriptions_,
+                      " psub=", client.pattern_subscriptions_,
+                      " ssub=0 multi=-1 qbuf=0 ",
                       "qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 ",
                       "obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=client ",
                       "user=default redir=-1 resp=2",
@@ -7100,7 +7340,7 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
           co_return BuiltReply(reply_builder.AppendError(
               absl::StrCat("ERR ", type.status().message())));
         }
-        filter.replica_ = *type;
+        filter.type_ = *type;
       } else if (CmpCaseInsensitive(args[i], "skipme")) {
         if (CmpCaseInsensitive(args[i + 1], "yes")) {
           filter.skip_self_ = true;
@@ -7223,6 +7463,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kAddReplicaOf:
         case CommandKind::kConfig:
         case CommandKind::kInfo:
+        case CommandKind::kRole:
         case CommandKind::kCluster:
         case CommandKind::kCommand:
         case CommandKind::kReadOnly:
@@ -7305,6 +7546,19 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
     }
+    const bool sentinel_management = IsSentinelManagementCommand(request);
+    const bool sentinel_batch = !ctx.queued_.empty() &&
+                                IsSentinelManagementCommand(ctx.queued_.front());
+    if (sentinel_management || sentinel_batch) {
+      if (!sentinel_management || (!ctx.queued_.empty() && !sentinel_batch)) {
+        ctx.multi_dirty_ = true;
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR Sentinel management commands must be queued alone"));
+      }
+      request.db_id_ = ctx.multi_db_;
+      ctx.queued_.push_back(std::move(request));
+      co_return BuiltReply(reply_builder.AppendSimpleString("QUEUED"));
+    }
     if ((spec.flags_ & kCmdGlobal) != 0) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(
@@ -7361,6 +7615,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       ctx.selected_db_ = 0;
       ctx.authenticated_ = !ctx.authentication_required_;
       ctx.cluster_readonly_ = false;
+      ctx.client_name_.clear();
+      SetClientName(ctx.conn_id_, {});
       co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
     case CommandKind::kReadOnly:
       ctx.cluster_readonly_ = true;
@@ -7484,6 +7740,9 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
 
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request, reply_builder);
+
+    case CommandKind::kRole:
+      co_return co_await ExecuteRole(reply_builder);
 
     case CommandKind::kCluster:
       co_return co_await ExecuteCluster(request, reply_builder);

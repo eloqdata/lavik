@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.20)
 
 project(keylane VERSION 0.1.0 LANGUAGES CXX)
 
+set(KEYLANE_VERSION_SUFFIX "-dev" CACHE STRING
+    "Keylane prerelease suffix, such as -dev or -beta.1 (empty for a release)")
+set(KEYLANE_VERSION "${PROJECT_VERSION}${KEYLANE_VERSION_SUFFIX}")
+set(KEYLANE_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${KEYLANE_GENERATED_INCLUDE_DIR}/keylane")
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.h.in"
+  "${KEYLANE_GENERATED_INCLUDE_DIR}/keylane/version.h"
+  @ONLY
+)
+
 option(BUILD_TESTING "Build keylane tests" OFF)
 include(CTest)
 
@@ -175,6 +187,7 @@ add_library(keylane::module ALIAS keylane_module)
 
 target_include_directories(keylane_module
   PUBLIC
+    ${KEYLANE_GENERATED_INCLUDE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
@@ -248,6 +261,10 @@ endif()
 
 if (BUILD_TESTING)
   include(FetchContent)
+
+  add_test(NAME keylane_version COMMAND keylane --version)
+  set_tests_properties(keylane_version PROPERTIES
+    PASS_REGULAR_EXPRESSION "keylane ${KEYLANE_VERSION}")
   FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git
@@ -348,6 +365,21 @@ if (BUILD_TESTING)
     set_tests_properties(keylane_pubsub_e2e PROPERTIES
       TIMEOUT 120
       RUN_SERIAL TRUE)
+
+    find_program(KEYLANE_REDIS_SERVER_EXECUTABLE redis-server)
+    if (KEYLANE_REDIS_SERVER_EXECUTABLE)
+      add_executable(keylane_sentinel_e2e_test
+        tests/sentinel_e2e_test.cpp
+      )
+      add_test(
+        NAME keylane_sentinel_e2e
+        COMMAND keylane_sentinel_e2e_test $<TARGET_FILE:keylane>
+                ${KEYLANE_REDIS_SERVER_EXECUTABLE}
+      )
+      set_tests_properties(keylane_sentinel_e2e PROPERTIES
+        TIMEOUT 180
+        RUN_SERIAL TRUE)
+    endif()
 
     add_executable(keylane_flushdb_reclaim_e2e_test
       tests/flushdb_reclaim_e2e_test.cpp

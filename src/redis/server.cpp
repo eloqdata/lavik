@@ -49,6 +49,7 @@
 #include "keylane/session.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
+#include "keylane/version.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -1114,6 +1115,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       EnqueuePubSubReply(session, std::string(reply.encoded_));
       if (!succeeded) continue;
       ResetPubSubSubscriptions(session);
+      SetClientPubSubCounts(ctx.conn_id_, 0, 0);
       ctx.close_after_pubsub_ = kind == CommandKind::kQuit;
       ExitPubSubMode(session);
       co_return absl::OkStatus();
@@ -1656,7 +1658,7 @@ int RunServer(ServerOptions options) {
       mi_option_get(mi_option_arena_eager_commit),
       mi_option_get(mi_option_allow_thp));
   spdlog::info(
-      "keylane listening on {}:{} tls_port={} metrics_port={} threads={} "
+      "keylane version={} listening on {}:{} tls_port={} metrics_port={} threads={} "
       "pin_workers={} "
       "idle_timeout_ms={} "
       "busy_poll_us={} foreground_budget_us={} background_budget_us={} "
@@ -1671,7 +1673,8 @@ int RunServer(ServerOptions options) {
       "inline_key_max_bytes={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={}",
-      bind_display, options.port_, options.tls_port_, options.metrics_port_,
+      kVersion, bind_display, options.port_, options.tls_port_,
+      options.metrics_port_,
       options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
       options.busy_poll_us_, options.foreground_budget_us_,
       options.background_budget_us_, options.background_warrant_percent_,
@@ -1759,7 +1762,7 @@ int RunServer(ServerOptions options) {
                    options.dbfilename_));
   InitWorkerMetrics(options.thread_count_);
   SetServerInfo(std::move(advertised_bind), advertised_port,
-                options.thread_count_);
+                options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);
 
   celer::ServerOptions runtime_options;

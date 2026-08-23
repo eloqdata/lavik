@@ -1626,6 +1626,11 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   RespClient source_client(source_port);
   RespClient replica_client(replica_port);
 
+  EXPECT_EQ(source_client.Command({"CONFIG", "REWRITE"}),
+            "-ERR The server is running without a config file");
+  EXPECT_EQ(source_client.Command({"CONFIG", "GET", "replica-priority"}),
+            BulkArray({"replica-priority", "100"}));
+
   ASSERT_EQ(
       source_client.Command(
           {"CONFIG", "SET", "replication-snapshot-read-concurrency", "8"}),
@@ -1978,7 +1983,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(replica_client.Command({"SET", "blocked", "value"}),
             Moved("blocked", source_port));
 
-  ASSERT_EQ(replica_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+  ASSERT_EQ(replica_client.Command({"SLAVEOF", "NO", "ONE"}), "+OK");
   replication_info = replica_client.Command({"INFO", "replication"});
   EXPECT_NE(replication_info.find("role:master"), std::string::npos);
   EXPECT_NE(replication_info.find("keylane_replication_state:master"),
@@ -2021,7 +2026,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   ASSERT_GE(config_fd, 0);
   const std::string config = "replicaof 127.0.0.1 " +
                              std::to_string(source_port) +
-                             "\nreplica-read-only yes\n";
+                             "\nreplica-read-only yes\nreplica-priority 90\n";
   ASSERT_EQ(::write(config_fd, config.data(), config.size()),
             static_cast<ssize_t>(config.size()));
   ASSERT_EQ(::close(config_fd), 0);
@@ -2041,7 +2046,34 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
               std::string::npos);
     EXPECT_NE(replication_info.find("keylane_connected_flows:3"),
               std::string::npos);
+    EXPECT_EQ(startup_client.Command({"CONFIG", "GET", "replica-priority"}),
+              BulkArray({"replica-priority", "90"}));
+    EXPECT_EQ(startup_client.Command(
+                  {"CONFIG", "SET", "replica-priority", "25"}),
+              "+OK");
+    EXPECT_EQ(startup_client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(startup_client.Command({"SLAVEOF", "NO", "ONE"}), "+QUEUED");
+    EXPECT_EQ(startup_client.Command({"CONFIG", "REWRITE"}), "+QUEUED");
+    EXPECT_EQ(startup_client.Command({"CLIENT", "KILL", "TYPE", "normal"}),
+              "+QUEUED");
+    EXPECT_EQ(startup_client.Command({"CLIENT", "KILL", "TYPE", "pubsub"}),
+              "+QUEUED");
+    EXPECT_EQ(startup_client.Command({"EXEC"}),
+              "*4\r\n+OK\r\n+OK\r\n:0\r\n:0");
     startup_replica.Stop();
+  }
+  {
+    ServerProcess rewritten_master(g_keylane_binary, replica_port, replica_data,
+                                   replica_log, 2, {}, {}, {}, config_path);
+    RespClient rewritten_client(replica_port);
+    replication_info = rewritten_client.Command({"INFO", "replication"});
+    EXPECT_NE(replication_info.find("role:master"), std::string::npos);
+    EXPECT_EQ(
+        rewritten_client.Command({"CONFIG", "GET", "replica-priority"}),
+        BulkArray({"replica-priority", "25"}));
+    EXPECT_EQ(rewritten_client.Command({"SET", "rewritten-master", "yes"}),
+              "+OK");
+    rewritten_master.Stop();
   }
   source.Stop();
 }

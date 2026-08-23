@@ -60,6 +60,18 @@ using storage::SnapshotRecord;
 
 constexpr std::string_view kProtocolVersion = "1";
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
+
+std::uint64_t SteadyNanos() noexcept {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
+std::uint64_t SecondsSince(std::uint64_t started_nanos) noexcept {
+  const std::uint64_t now = SteadyNanos();
+  return now > started_nanos ? (now - started_nanos) / 1'000'000'000 : 0;
+}
 // A disk-backed full sync of a multi-terabyte dataset can legitimately run
 // for hours. Only a flow that stops making protocol progress is timed out;
 // there is deliberately no wall-clock limit on the whole synchronization.
@@ -1664,6 +1676,7 @@ struct ReplicaCursorState {
     for (auto& cursor : cursors_) {
       cursor = {.lsn_ = 1, .fragment_index_ = 0};
     }
+    total_lsn_.store(count, std::memory_order_relaxed);
   }
 
   storage::ReplicationLogCursor Load(unsigned flow_id) const noexcept {
@@ -1674,12 +1687,22 @@ struct ReplicaCursorState {
   void Store(unsigned flow_id, std::uint64_t lsn,
              std::uint32_t fragment) noexcept {
     if (flow_id >= cursors_.size()) return;
+    const std::uint64_t previous = cursors_[flow_id].lsn_;
     cursors_[flow_id] = {.lsn_ = lsn, .fragment_index_ = fragment};
+    if (lsn >= previous) {
+      total_lsn_.fetch_add(lsn - previous, std::memory_order_relaxed);
+    } else {
+      total_lsn_.fetch_sub(previous - lsn, std::memory_order_relaxed);
+    }
   }
 
   std::size_t size() const noexcept { return cursors_.size(); }
+  std::uint64_t total_lsn() const noexcept {
+    return total_lsn_.load(std::memory_order_relaxed);
+  }
 
   std::vector<storage::ReplicationLogCursor> cursors_;
+  std::atomic<std::uint64_t> total_lsn_{0};
 };
 
 struct ReplicaTransactionArrival {
@@ -2125,6 +2148,7 @@ struct RedisSource {
   std::uint64_t role_epoch_ = 0;
   std::atomic<bool> dataset_valid_{false};
   std::atomic<bool> link_up_{false};
+  std::atomic<std::uint64_t> link_state_changed_nanos_{SteadyNanos()};
   std::atomic<bool> syncing_{false};
   bool coordinator_started_ = false;
 };
@@ -2149,6 +2173,7 @@ class ReplicationManager::Impl {
         upstream_(std::move(initial_upstream)),
         cursor_state_(
             std::make_shared<ReplicaCursorState>(storage->worker_count())),
+        replica_priority_(options.replica_priority_),
         node_id_(NewReplicationId()),
         history_id_(NewReplicationId()),
         listen_port_(options.listen_port_),
@@ -2168,7 +2193,7 @@ class ReplicationManager::Impl {
     snapshot_batch_size_.store(options.snapshot_batch_size_,
                                std::memory_order_relaxed);
     if (upstream_.has_value()) {
-      role_.store(ReplicationRole::kConnecting, std::memory_order_relaxed);
+      StoreRole(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
       if (options.redis_psync_) {
         auto source = std::make_shared<RedisSource>();
@@ -2243,11 +2268,24 @@ class ReplicationManager::Impl {
     bool discard_incomplete_root = false;
     {
       std::lock_guard lock(state_mutex_);
-      const ReplicationRole old_role = role_.load(std::memory_order_relaxed);
+      const bool had_upstream = upstream_.has_value();
+      bool dataset_valid =
+          native_dataset_valid_.load(std::memory_order_acquire);
+      for (const auto& source : redis_sources_) {
+        dataset_valid =
+            dataset_valid ||
+            source->dataset_valid_.load(std::memory_order_acquire);
+      }
+      // A lost transport changes ONLINE to CONNECTING, but the last committed
+      // replica root remains a valid promotion candidate. Only an explicit
+      // source switch whose replacement full sync has not reached its cut
+      // publishes an empty dataset on REPLICAOF NO ONE.
       discard_incomplete_root =
-          !upstream.has_value() && (old_role == ReplicationRole::kConnecting ||
-                                    old_role == ReplicationRole::kSyncing);
+          !upstream.has_value() && had_upstream && !dataset_valid;
       upstream_ = upstream;
+      if (upstream.has_value()) {
+        native_dataset_valid_.store(false, std::memory_order_release);
+      }
       if (active_replica_session_ != nullptr) {
         cancelled.push_back(std::move(active_replica_session_));
       }
@@ -2289,9 +2327,9 @@ class ReplicationManager::Impl {
         }
         redis_sources_.push_back(std::move(source));
       }
-      role_.store(upstream_.has_value() ? ReplicationRole::kConnecting
-                                        : ReplicationRole::kMaster,
-                  std::memory_order_release);
+      StoreRole(upstream_.has_value() ? ReplicationRole::kConnecting
+                                      : ReplicationRole::kMaster,
+                std::memory_order_release);
       start_upstream = upstream_.has_value();
     }
     for (const auto& session : cancelled) session->Cancel();
@@ -2420,6 +2458,31 @@ class ReplicationManager::Impl {
             .dataset_valid_ =
                 source->dataset_valid_.load(std::memory_order_acquire),
         });
+        result.replica_repl_offset_ +=
+            source->offset_.load(std::memory_order_acquire);
+      }
+      if (result.redis_sources_.empty() && cursor_state_ != nullptr) {
+        result.replica_repl_offset_ = cursor_state_->total_lsn();
+      }
+      result.replica_priority_ =
+          replica_priority_.load(std::memory_order_acquire);
+      if (result.upstream_.has_value()) {
+        std::uint64_t down_seconds = 0;
+        if (!redis_sources_.empty()) {
+          for (const auto& source : redis_sources_) {
+            if (!source->link_up_.load(std::memory_order_acquire)) {
+              down_seconds = std::max(
+                  down_seconds,
+                  SecondsSince(source->link_state_changed_nanos_.load(
+                      std::memory_order_acquire)));
+            }
+          }
+        } else if (result.role_ != ReplicationRole::kOnline) {
+          down_seconds = SecondsSince(
+              link_state_changed_nanos_.load(std::memory_order_acquire));
+        }
+        result.master_link_down_since_seconds_ = down_seconds;
+        result.master_last_io_seconds_ago_ = down_seconds;
       }
     }
     {
@@ -2439,6 +2502,8 @@ class ReplicationManager::Impl {
             .online_ = session->online(),
             .min_lsn_ = session->min_lsn(),
         });
+        result.master_repl_offset_ =
+            std::max(result.master_repl_offset_, session->min_lsn());
       }
     }
     std::sort(result.downstream_replicas_.begin(),
@@ -2447,6 +2512,24 @@ class ReplicationManager::Impl {
                 return left.node_id_ < right.node_id_;
               });
     return result;
+  }
+
+  void StoreRole(ReplicationRole next, std::memory_order order) noexcept {
+    const ReplicationRole previous = role_.exchange(next, order);
+    if (next == ReplicationRole::kOnline ||
+        previous == ReplicationRole::kOnline ||
+        previous == ReplicationRole::kMaster) {
+      link_state_changed_nanos_.store(SteadyNanos(),
+                                      std::memory_order_release);
+    }
+  }
+
+  void StoreRedisLink(const std::shared_ptr<RedisSource>& source,
+                      bool up) noexcept {
+    if (source->link_up_.exchange(up, std::memory_order_acq_rel) != up) {
+      source->link_state_changed_nanos_.store(SteadyNanos(),
+                                              std::memory_order_release);
+    }
   }
 
   bool is_replica() const noexcept {
@@ -2490,6 +2573,15 @@ class ReplicationManager::Impl {
 
   std::size_t snapshot_batch_size() const noexcept {
     return snapshot_batch_size_.load(std::memory_order_acquire);
+  }
+
+  absl::Status SetReplicaPriority(unsigned priority) noexcept {
+    replica_priority_.store(priority, std::memory_order_release);
+    return absl::OkStatus();
+  }
+
+  unsigned replica_priority() const noexcept {
+    return replica_priority_.load(std::memory_order_acquire);
   }
 
   std::size_t BacklogCapacityForFlow(unsigned flow_id,
@@ -3104,10 +3196,10 @@ class ReplicationManager::Impl {
            redis_sources_.size() == expected_redis_topology_->masters_.size());
       ready = valid && complete;
     }
-    role_.store(ready ? ReplicationRole::kOnline
-                      : (syncing ? ReplicationRole::kSyncing
-                                 : ReplicationRole::kConnecting),
-                std::memory_order_release);
+    StoreRole(ready ? ReplicationRole::kOnline
+                    : (syncing ? ReplicationRole::kSyncing
+                               : ReplicationRole::kConnecting),
+              std::memory_order_release);
   }
 
   void StartRedisTopologyMonitor() {
@@ -3124,7 +3216,7 @@ class ReplicationManager::Impl {
       if (redis_topology_fault_) return;
       redis_topology_fault_ = true;
       for (const auto& source : redis_sources_) {
-        source->link_up_ = false;
+        StoreRedisLink(source, false);
         source->syncing_ = false;
         if (source->session_ != nullptr) sessions.push_back(source->session_);
       }
@@ -3160,7 +3252,7 @@ class ReplicationManager::Impl {
             current->endpoint_.host_, current->endpoint_.port_);
         source->node_id_ = current->node_id_;
         source->upstream_ = current->endpoint_;
-        source->link_up_ = false;
+        StoreRedisLink(source, false);
         if (source->session_ != nullptr) replaced.push_back(source->session_);
       }
       expected_redis_topology_ = std::move(topology);
@@ -3294,7 +3386,7 @@ class ReplicationManager::Impl {
       session->Cancel();
       {
         std::lock_guard lock(state_mutex_);
-        source->link_up_ = false;
+        StoreRedisLink(source, false);
         source->syncing_ = false;
         if (source->session_ == session) source->session_.reset();
       }
@@ -3336,7 +3428,7 @@ class ReplicationManager::Impl {
         session = std::make_shared<ReplicaSession>();
         active_replica_session_ = session;
       }
-      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
+      StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
       absl::Status connected =
           co_await RunReplicaSession(upstream, role_epoch, session);
       session->Cancel();
@@ -3361,7 +3453,7 @@ class ReplicationManager::Impl {
                 role_epoch_.load(std::memory_order_relaxed) == role_epoch;
       }
       if (!retry) continue;
-      role_.store(ReplicationRole::kConnecting, std::memory_order_release);
+      StoreRole(ReplicationRole::kConnecting, std::memory_order_release);
       spdlog::warn("replication connection to {}:{} ended: {}", upstream.host_,
                    upstream.port_, connected.message());
       absl::Status slept =
@@ -3745,7 +3837,7 @@ class ReplicationManager::Impl {
     if (role_epoch_.load(std::memory_order_acquire) != source->role_epoch_) {
       co_return absl::CancelledError("replication role epoch was replaced");
     }
-    source->link_up_ = true;
+    StoreRedisLink(source, true);
     source->syncing_ = false;
     RefreshRedisRole();
     absl::Status status = co_await SendRedisAck(stream, source);
@@ -3857,7 +3949,7 @@ class ReplicationManager::Impl {
       co_return authenticated;
     }
 
-    role_.store(ReplicationRole::kSyncing, std::memory_order_release);
+    StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
     // Native protocol version 1 carries the replica node identity separately
     // from the history id it wants to continue.
     const std::vector<std::string> sync_args{
@@ -3957,7 +4049,7 @@ class ReplicationManager::Impl {
       absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
       co_return stopped.ok() ? failed : stopped;
     }
-    role_.store(ReplicationRole::kOnline, std::memory_order_release);
+    StoreRole(ReplicationRole::kOnline, std::memory_order_release);
     spdlog::info(
         "replication session {} online with {}:{} using 1+{} connections",
         session_id, upstream.host_, upstream.port_, source_workers);
@@ -4502,6 +4594,7 @@ class ReplicationManager::Impl {
             session->root_swap_complete_->Abort(promoted);
             co_return promoted;
           }
+          native_dataset_valid_.store(true, std::memory_order_release);
         }
         absl::Status swapped = co_await session->root_swap_complete_->Wait(
             *celer::ThisWorker().self_);
@@ -6080,7 +6173,9 @@ class ReplicationManager::Impl {
   std::optional<ReplicaOfConfig> upstream_;
   std::shared_ptr<ReplicaSession> active_replica_session_;
   std::atomic<ReplicationRole> role_{ReplicationRole::kMaster};
+  std::atomic<std::uint64_t> link_state_changed_nanos_{SteadyNanos()};
   std::atomic<std::uint64_t> role_epoch_{0};
+  std::atomic<bool> native_dataset_valid_{false};
   std::atomic<unsigned> ready_workers_{0};
   std::uint64_t replica_session_id_ = 0;
   unsigned source_worker_count_ = 0;
@@ -6100,6 +6195,7 @@ class ReplicationManager::Impl {
   std::atomic<std::size_t> snapshot_batch_size_{kSnapshotKeysPerBatch};
   std::atomic<std::size_t> backlog_size_bytes_{0};
   std::atomic<std::size_t> publish_queue_bytes_per_worker_{0};
+  std::atomic<unsigned> replica_priority_{100};
   bool history_reset_running_ = false;  // worker 0 only
 
   const std::string node_id_;
@@ -6182,6 +6278,14 @@ Task<absl::Status> ReplicationManager::SetPublishQueueBytesPerWorker(
 std::size_t ReplicationManager::publish_queue_bytes_per_worker()
     const noexcept {
   return impl_->publish_queue_bytes_per_worker();
+}
+
+absl::Status ReplicationManager::SetReplicaPriority(unsigned priority) noexcept {
+  return impl_->SetReplicaPriority(priority);
+}
+
+unsigned ReplicationManager::replica_priority() const noexcept {
+  return impl_->replica_priority();
 }
 
 bool ReplicationManager::IsNativeHandshake(

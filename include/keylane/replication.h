@@ -34,6 +34,9 @@ struct ReplicationOptions {
   // Consulted only while this node has an upstream. REPLICAOF NO ONE makes
   // the node writable immediately.
   bool replica_read_only_ = true;
+  // Redis Sentinel promotes only replicas with a nonzero priority and prefers
+  // lower values. This is runtime mutable through CONFIG SET.
+  unsigned replica_priority_ = 100;
   // Advertised to the source during the version-1 control handshake so INFO
   // and CLUSTER NODES can identify the replica's Redis endpoint.
   std::uint16_t listen_port_ = 6379;
@@ -101,6 +104,11 @@ struct ReplicationStatus {
   std::optional<std::string> upstream_history_id_;
   std::vector<DownstreamReplicaStatus> downstream_replicas_;
   std::vector<RedisSourceStatus> redis_sources_;
+  std::uint64_t replica_repl_offset_ = 0;
+  std::uint64_t master_repl_offset_ = 0;
+  std::uint64_t master_link_down_since_seconds_ = 0;
+  std::uint64_t master_last_io_seconds_ago_ = 0;
+  unsigned replica_priority_ = 100;
   bool redis_cluster_ = false;
   bool redis_topology_fault_ = false;
 };
@@ -142,6 +150,9 @@ class ReplicationManager {
 
   celer::Task<absl::Status> SetPublishQueueBytesPerWorker(std::size_t bytes);
   std::size_t publish_queue_bytes_per_worker() const noexcept;
+
+  absl::Status SetReplicaPriority(unsigned priority) noexcept;
+  unsigned replica_priority() const noexcept;
 
   // KLPSYNC and KLFLOW arrive as RESP commands on the ordinary Redis port.
   static bool IsNativeHandshake(std::span<const std::string> args) noexcept;

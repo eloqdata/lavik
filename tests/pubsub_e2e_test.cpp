@@ -180,6 +180,7 @@ class Server {
                                   "--threads",
                                   "2",
                                   "--no-pin-workers",
+                                  "--logtostderr",
                                   "--recv-buffers-per-worker",
                                   "0",
                                   "--data-file",
@@ -207,6 +208,14 @@ void Expect(std::string_view actual, std::string_view expected,
   if (actual != expected) {
     Fail(std::string(label) + ": expected [" + std::string(expected) +
          "] got [" + std::string(actual) + "]");
+  }
+}
+
+void ExpectContains(std::string_view actual, std::string_view expected,
+                    std::string_view label) {
+  if (actual.find(expected) == std::string_view::npos) {
+    Fail(std::string(label) + ": expected to find [" + std::string(expected) +
+         "] in [" + std::string(actual) + "]");
   }
 }
 
@@ -267,6 +276,14 @@ int main(int argc, char** argv) {
 
     RespClient source_client = Connect(source_port);
     RespClient replica_client = Connect(replica_port);
+    Expect(source_client.Command({"CLIENT", "GETNAME"}), "$-1",
+           "initial client name");
+    Expect(source_client.Command({"CLIENT", "SETNAME", "sentinel-probe"}),
+           "+OK", "set client name");
+    Expect(source_client.Command({"CLIENT", "GETNAME"}),
+           "$14\r\nsentinel-probe", "get client name");
+    ExpectContains(source_client.Command({"CLIENT", "LIST"}),
+                   "name=sentinel-probe", "client list name");
 
     RespClient local_subscriber = Connect(source_port);
     Expect(local_subscriber.Command({"SUBSCRIBE", "alpha"}),
@@ -292,6 +309,10 @@ int main(int argc, char** argv) {
     Expect(pattern_subscriber.Command({"SUBSCRIBE", "news.one"}),
            Subscription("subscribe", "news.one", 2),
            "combined exact subscribe");
+    const std::string pubsub_clients =
+        source_client.Command({"CLIENT", "LIST", "TYPE", "pubsub"});
+    ExpectContains(pubsub_clients, "flags=P", "pubsub client flag");
+    ExpectContains(pubsub_clients, "sub=1 psub=1", "pubsub client counts");
     Expect(source_client.Command({"PUBLISH", "news.one", "overlap"}), ":2",
            "exact and pattern publish count");
     Expect(pattern_subscriber.ReadPush(), Message("news.one", "overlap"),
@@ -370,6 +391,22 @@ int main(int argc, char** argv) {
     Expect(quit_subscriber.Command({"QUIT"}), "+OK", "quit subscribed client");
     Expect(source_client.Command({"PUBSUB", "NUMSUB", "quit"}),
            "*2\r\n$4\r\nquit\r\n:0", "quit removes subscription");
+
+    RespClient killed_subscriber = Connect(source_port);
+    Expect(killed_subscriber.Command({"CLIENT", "SETNAME", "kill-pubsub"}),
+           "+OK", "name client before pubsub kill");
+    Expect(killed_subscriber.Command({"SUBSCRIBE", "kill-me"}),
+           Subscription("subscribe", "kill-me", 1), "subscribe before kill");
+    Expect(source_client.Command({"CLIENT", "KILL", "TYPE", "pubsub"}), ":1",
+           "kill pubsub clients");
+    const auto kill_deadline = std::chrono::steady_clock::now() + 5s;
+    while (source_client.Command({"PUBSUB", "NUMSUB", "kill-me"}) !=
+           "*2\r\n$7\r\nkill-me\r\n:0") {
+      if (std::chrono::steady_clock::now() >= kill_deadline) {
+        Fail("CLIENT KILL TYPE pubsub did not remove subscription");
+      }
+      std::this_thread::sleep_for(10ms);
+    }
 
     Expect(replica_client.Command(
                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),

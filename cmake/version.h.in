@@ -1,0 +1,12 @@
+#pragma once
+
+#include <string_view>
+
+namespace keylane {
+
+inline constexpr std::string_view kVersion = "@KEYLANE_VERSION@";
+inline constexpr unsigned kVersionMajor = @PROJECT_VERSION_MAJOR@;
+inline constexpr unsigned kVersionMinor = @PROJECT_VERSION_MINOR@;
+inline constexpr unsigned kVersionPatch = @PROJECT_VERSION_PATCH@;
+
+}  // namespace keylane

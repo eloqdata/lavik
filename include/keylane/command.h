@@ -271,6 +271,7 @@ enum class CommandKind {
   kAddReplicaOf,
   kConfig,
   kInfo,
+  kRole,
   kCluster,
   kCommand,
   kReadOnly,
@@ -406,7 +407,7 @@ class ReplicationTransactionGuard {
 
 // Static facts INFO reports. Call once before the server starts.
 void SetServerInfo(std::string bind_ip, std::uint16_t port,
-                   unsigned thread_count);
+                   unsigned thread_count, std::string config_file);
 
 // Connection accounting for INFO's Clients section.
 void ConnectionOpened() noexcept;
@@ -419,6 +420,9 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
                               std::uint64_t replication_session_id = 0);
 void SetClientReplicationSession(std::uint64_t id,
                                  std::uint64_t replication_session_id) noexcept;
+void SetClientName(std::uint64_t id, std::string name) noexcept;
+void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
+                           std::size_t pattern_subscriptions) noexcept;
 void UnregisterClientConnection(std::uint64_t id) noexcept;
 
 // Commands marked kCmdMayBlock hold the database gate only while performing

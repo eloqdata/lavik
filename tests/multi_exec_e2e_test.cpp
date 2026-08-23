@@ -434,6 +434,16 @@ int main(int argc, char** argv) {
            "-EXECABORT Transaction discarded because of previous errors.",
            "EXECABORT flushall");
 
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI Sentinel isolation");
+    Expect(client.Command({"CONFIG", "REWRITE"}), "+QUEUED",
+           "queue Sentinel CONFIG REWRITE");
+    Expect(client.Command({"PING"}),
+           "-ERR Sentinel management commands must be queued alone",
+           "reject ordinary command after Sentinel command");
+    Expect(client.Command({"EXEC"}),
+           "-EXECABORT Transaction discarded because of previous errors.",
+           "EXECABORT mixed Sentinel transaction");
+
     // DISCARD clears everything.
     Expect(client.Command({"MULTI"}), "+OK", "MULTI discard");
     Expect(client.Command({"SET", "d", "1"}), "+QUEUED", "queue discard SET");

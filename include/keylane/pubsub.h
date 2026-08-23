@@ -29,6 +29,8 @@ void UnregisterPubSubSession(const std::shared_ptr<PubSubSession>& session);
 
 std::size_t PubSubSubscriptionCount(
     const std::shared_ptr<PubSubSession>& session) noexcept;
+std::size_t PubSubPatternSubscriptionCount(
+    const std::shared_ptr<PubSubSession>& session) noexcept;
 
 // These return one or more complete RESP2 push-style frames.
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
