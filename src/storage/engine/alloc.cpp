@@ -615,7 +615,6 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
 
 Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     WorkerStore& store, AllocationPurpose purpose) {
-  const std::size_t device_count = devices_.size();
   std::vector<std::size_t> home_order(store.home_devices_.size());
   for (std::size_t i = 0; i < home_order.size(); ++i) {
     home_order[i] = i;
@@ -635,19 +634,28 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
         return left_score < right_score;
       });
   std::vector<std::size_t> attempt_order;
+#ifdef CELER_WITH_SPDK_STORAGE
+  attempt_order.reserve(home_order.size());
+#else
+  const std::size_t device_count = devices_.size();
   attempt_order.reserve(device_count);
   std::vector<bool> included(device_count, false);
+#endif
   for (const std::size_t home_index : home_order) {
     const std::size_t device_index = store.home_devices_[home_index];
     attempt_order.push_back(device_index);
+#ifndef CELER_WITH_SPDK_STORAGE
     included[device_index] = true;
+#endif
   }
+#ifndef CELER_WITH_SPDK_STORAGE
   for (std::size_t device_index = 0; device_index < device_count;
        ++device_index) {
     if (!included[device_index]) {
       attempt_order.push_back(device_index);
     }
   }
+#endif
   while (true) {
     if (store.write_failed_ ||
         epoch_metadata_failed_.load(std::memory_order_acquire)) {

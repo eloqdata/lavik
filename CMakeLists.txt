@@ -261,6 +261,7 @@ if (BUILD_TESTING)
     tests/buffer_pool_test.cpp
     tests/config_test.cpp
     tests/cross_core_active_sender_test.cpp
+    tests/device_affinity_test.cpp
     tests/logging_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp

@@ -1,6 +1,7 @@
 #include <thread>
 
 #include "absl/strings/str_cat.h"
+#include "device_affinity.h"
 #include "impl.h"
 
 namespace keylane::storage {
@@ -375,8 +376,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     capacity_by_path[i] = capacity_blocks;
     devices_.push_back(StorageDevice{
         .path_ = options_.data_files_[i],
+        .controller_id_ = probed.controller_id_,
         .id_ = device_id,
         .capacity_blocks_ = capacity_blocks,
+        .io_queue_count_ = probed.io_queue_count_,
         .data_block_begin_ = data_block_begin,
         .data_block_count_ = capacity_blocks - data_block_begin,
         .file_index_ = static_cast<std::uint32_t>(i),
@@ -682,7 +685,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
           store.partitions_.back().replication_epoch_;
     }
   }
-  ConfigureWorkerDeviceAffinity();
+  absl::Status affinity = ConfigureWorkerDeviceAffinity();
+  if (!affinity.ok()) {
+    return affinity;
+  }
+  // Metadata probing is complete. Return its temporary controller qpairs so
+  // a controller advertising exactly worker_count queues can still start.
+  celer::ReleaseSpdkStorageMetadataQpairs();
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
     db_epochs_[db_id].store(epoch_values_[db_id], std::memory_order_relaxed);
   }
@@ -706,6 +715,28 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         static_cast<unsigned>(options_.data_files_.size()));
   }
   if (status.ok()) {
+#ifdef CELER_WITH_SPDK_STORAGE
+    store.files_.resize(options_.data_files_.size());
+    for (std::size_t i = 0; i < store.files_.size(); ++i) {
+      store.files_[i] = FixedFile{.index_ = static_cast<std::uint32_t>(i)};
+    }
+    for (std::size_t device_index = 0; device_index < devices_.size();
+         ++device_index) {
+      const StorageDevice& device = devices_[device_index];
+      if (!std::binary_search(device_owners_[device_index].begin(),
+                              device_owners_[device_index].end(),
+                              static_cast<std::uint16_t>(worker.id()))) {
+        continue;
+      }
+      FixedFile file{.index_ = device.file_index_};
+      status = co_await celer::OpenFixedFile(worker, device.path_,
+                                             O_RDWR | O_DIRECT, 0, file);
+      if (!status.ok()) {
+        break;
+      }
+      store.files_[device.file_index_] = file;
+    }
+#else
     store.files_.reserve(options_.data_files_.size());
     for (std::size_t i = 0; i < options_.data_files_.size(); ++i) {
       FixedFile file{.index_ = static_cast<std::uint32_t>(i)};
@@ -716,6 +747,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       }
       store.files_.push_back(file);
     }
+#endif
   }
   if (!status.ok()) {
     Fail(status);
@@ -1156,7 +1188,107 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   orphan_extent_barrier_->Abort(status);
 }
 
-void StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
+absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
+#ifdef CELER_WITH_SPDK_STORAGE
+  struct ControllerPlan {
+    std::string id_;
+    unsigned io_queue_count_ = 0;
+    std::uint64_t weight_ = 0;
+    std::vector<std::size_t> devices_;
+    std::vector<std::uint16_t> workers_;
+  };
+
+  std::map<std::string, ControllerPlan> grouped;
+  for (std::size_t device_index = 0; device_index < devices_.size();
+       ++device_index) {
+    const StorageDevice& device = devices_[device_index];
+    if (device.controller_id_.empty() || device.io_queue_count_ == 0) {
+      return absl::FailedPreconditionError(
+          "SPDK controller did not report an available I/O qpair: " +
+          device.path_);
+    }
+    auto [entry, inserted] = grouped.try_emplace(
+        device.controller_id_,
+        ControllerPlan{.id_ = device.controller_id_,
+                       .io_queue_count_ = device.io_queue_count_,
+                       .weight_ = 0,
+                       .devices_ = {},
+                       .workers_ = {}});
+    ControllerPlan& controller = entry->second;
+    if (!inserted && controller.io_queue_count_ != device.io_queue_count_) {
+      return absl::FailedPreconditionError(
+          "SPDK namespaces on one controller reported inconsistent qpair "
+          "counts: " +
+          device.controller_id_);
+    }
+    controller.devices_.push_back(device_index);
+    controller.weight_ += ForegroundBlocksForDevice(device_index);
+  }
+  if (grouped.empty()) {
+    return absl::FailedPreconditionError("SPDK storage has no controllers");
+  }
+
+  std::vector<ControllerPlan*> controllers;
+  controllers.reserve(grouped.size());
+  for (auto& [_, controller] : grouped) {
+    controllers.push_back(&controller);
+  }
+  std::vector<ControllerAffinityInput> inputs;
+  inputs.reserve(controllers.size());
+  for (const ControllerPlan* controller : controllers) {
+    inputs.push_back(ControllerAffinityInput{
+        .id_ = controller->id_,
+        .foreground_weight_ = controller->weight_,
+        .io_qpair_count_ = controller->io_queue_count_,
+    });
+  }
+  auto planned = PlanControllerAffinity(inputs, worker_count_);
+  if (!planned.ok()) return planned.status();
+
+  device_owners_.assign(devices_.size(), {});
+  auto assign_controller = [this](ControllerPlan& controller, unsigned worker) {
+    controller.workers_.push_back(static_cast<std::uint16_t>(worker));
+    for (const std::size_t device_index : controller.devices_) {
+      stores_[worker]->home_devices_.push_back(device_index);
+      device_owners_[device_index].push_back(
+          static_cast<std::uint16_t>(worker));
+    }
+  };
+
+  for (unsigned worker = 0; worker < worker_count_; ++worker) {
+    for (const std::size_t controller : planned->worker_controllers_[worker]) {
+      assign_controller(*controllers[controller], worker);
+    }
+  }
+
+  for (std::size_t device_index = 0; device_index < devices_.size();
+       ++device_index) {
+    auto& owners = device_owners_[device_index];
+    std::sort(owners.begin(), owners.end());
+    assert(!owners.empty());
+    device_allocators_[device_index]->owner_ =
+        owners[devices_[device_index].id_ % owners.size()];
+  }
+  for (auto& store : stores_) {
+    if (store->home_devices_.empty()) {
+      return absl::InternalError(
+          "SPDK controller assignment left a worker without a qpair");
+    }
+    store->home_device_allocations_.assign(store->home_devices_.size(), 0);
+  }
+  for (const ControllerPlan* controller : controllers) {
+    std::string workers;
+    for (const std::uint16_t worker : controller->workers_) {
+      if (!workers.empty()) workers += ',';
+      workers += std::to_string(worker);
+    }
+    spdlog::info(
+        "SPDK controller={} io-qpairs={} foreground-weight={} owners=[{}]",
+        controller->id_, controller->io_queue_count_, controller->weight_,
+        workers);
+  }
+  return absl::OkStatus();
+#else
   std::vector<std::size_t> usable_devices;
   std::uint64_t total_weight = 0;
   for (std::size_t device_index = 0; device_index < devices_.size();
@@ -1248,6 +1380,8 @@ void StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {
                  ForegroundBlocksForDevice(device_index),
                  home_workers[device_index]);
   }
+  return absl::OkStatus();
+#endif
 }
 
 Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(

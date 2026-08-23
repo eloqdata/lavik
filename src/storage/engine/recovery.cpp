@@ -14,50 +14,31 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
   std::size_t offset = 0;
   for (std::size_t index = 0; index < extents->size() && offset < key.size();
        ++index) {
-    const ExtentRef& ref = extents->at(index);
-    const std::size_t read_bytes =
-        AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
-    auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
-    if (!acquired.ok()) {
-      co_return acquired.status();
+    const ExtentRef ref = extents->at(index);
+    auto destination = std::span<std::byte>(
+        reinterpret_cast<std::byte*>(key.data() + offset), key.size() - offset);
+    absl::Status read;
+#ifdef CELER_WITH_SPDK_STORAGE
+    const auto& owners = device_owners_[DeviceIndexForBlock(ref.block_id_)];
+    const unsigned owner = owners[ref.block_id_ % owners.size()];
+    if (owner == store.worker_->id()) {
+      read = co_await ReadRecoveryExtentInto(
+          store, ref, static_cast<std::uint32_t>(index), destination);
+    } else {
+      read = co_await celer::SubmitTaskTo(
+          owner,
+          [this, owner, ref, index, destination]() -> Task<absl::Status> {
+            co_return co_await ReadRecoveryExtentInto(
+                *stores_[owner], ref, static_cast<std::uint32_t>(index),
+                destination);
+          });
     }
-    ReadBufferLease lease = std::move(*acquired);
-    FixedBuffer io = lease.io_buffer();
-    io.size_ = read_bytes;
-    const auto [file_id, block_offset] = FileOffset(ref.block_id_);
-    auto read =
-        co_await ReadStorageBuffer(*store.worker_, store.files_[file_id], io,
-                                   lease.registered(), block_offset);
-    if (!read.ok()) {
-      co_return read.status();
-    }
-    if (*read != read_bytes) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "short recovered key extent read");
-    }
-    BlockHeader header{};
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                    io.data_, kBlockHeaderBytes),
-                                &header) ||
-        header.kind_ != BlockKind::kPayloadExtent ||
-        header.block_id_ != ref.block_id_ ||
-        header.allocation_epoch_ != ref.allocation_epoch_ ||
-        header.extent_index_ != index ||
-        header.extent_payload_bytes_ != ref.payload_bytes_ ||
-        header.extent_payload_checksum_ != ref.payload_checksum_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "recovered key extent does not match manifest");
-    }
-    const auto payload = std::span<const std::byte>(
-        io.data_ + kBlockHeaderBytes, ref.payload_bytes_);
-    if (Crc32c(payload) != ref.payload_checksum_) {
-      co_return absl::Status(absl::StatusCode::kInternal,
-                             "recovered key extent checksum mismatch");
-    }
-    const std::size_t copy_bytes =
-        std::min(payload.size(), key.size() - offset);
-    std::memcpy(key.data() + offset, payload.data(), copy_bytes);
-    offset += copy_bytes;
+#else
+    read = co_await ReadRecoveryExtentInto(
+        store, ref, static_cast<std::uint32_t>(index), destination);
+#endif
+    if (!read.ok()) co_return read;
+    offset += std::min<std::size_t>(ref.payload_bytes_, destination.size());
   }
   if (offset != key.size()) {
     co_return absl::Status(absl::StatusCode::kInternal,
@@ -66,20 +47,72 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
   co_return key;
 }
 
+Task<absl::Status> StorageEngine::Impl::ReadRecoveryExtentInto(
+    WorkerStore& store, ExtentRef ref, std::uint32_t extent_index,
+    std::span<std::byte> destination) {
+  const std::size_t read_bytes =
+      AlignDirect(kBlockHeaderBytes + ref.payload_bytes_);
+  auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+  if (!acquired.ok()) co_return acquired.status();
+  ReadBufferLease lease = std::move(*acquired);
+  FixedBuffer io = lease.io_buffer();
+  io.size_ = read_bytes;
+  const auto [file_id, block_offset] = FileOffset(ref.block_id_);
+  auto read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id],
+                                         io, lease.registered(), block_offset);
+  if (!read.ok()) co_return read.status();
+  if (*read != read_bytes) {
+    co_return absl::InternalError("short recovered key extent read");
+  }
+  BlockHeader header{};
+  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                  io.data_, kBlockHeaderBytes),
+                              &header) ||
+      header.kind_ != BlockKind::kPayloadExtent ||
+      header.block_id_ != ref.block_id_ ||
+      header.allocation_epoch_ != ref.allocation_epoch_ ||
+      header.extent_index_ != extent_index ||
+      header.extent_payload_bytes_ != ref.payload_bytes_ ||
+      header.extent_payload_checksum_ != ref.payload_checksum_) {
+    co_return absl::InternalError(
+        "recovered key extent does not match manifest");
+  }
+  const auto payload = std::span<const std::byte>(io.data_ + kBlockHeaderBytes,
+                                                  ref.payload_bytes_);
+  if (Crc32c(payload) != ref.payload_checksum_) {
+    co_return absl::InternalError("recovered key extent checksum mismatch");
+  }
+  std::memcpy(destination.data(), payload.data(),
+              std::min(payload.size(), destination.size()));
+  co_return absl::OkStatus();
+}
+
 std::uint16_t StorageEngine::Impl::RecoveredBlockOwner(
     const BlockHeader& block, std::uint64_t block_id) const noexcept {
+#ifdef CELER_WITH_SPDK_STORAGE
+  const auto& owners = device_owners_[DeviceIndexForBlock(block_id)];
+  if (block.layout_worker_count_ == worker_count_ &&
+      std::binary_search(owners.begin(), owners.end(), block.writer_id_)) {
+    return static_cast<std::uint16_t>(block.writer_id_);
+  }
+#else
   // writer_id belongs to the topology that wrote the block and may be
   // greater than the current worker count after a scale-down.
   if (block.layout_worker_count_ == worker_count_ &&
       block.writer_id_ < worker_count_) {
     return static_cast<std::uint16_t>(block.writer_id_);
   }
+#endif
   std::uint64_t mixed =
       block_id ^ (block.allocation_epoch_ + 0x9e3779b97f4a7c15ULL);
   mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
   mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
   mixed ^= mixed >> 31;
+#ifdef CELER_WITH_SPDK_STORAGE
+  return owners[mixed % owners.size()];
+#else
   return static_cast<std::uint16_t>(mixed % worker_count_);
+#endif
 }
 
 void StorageEngine::Impl::ReportRecoveryProgress(std::uint64_t records,
@@ -227,9 +260,19 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
+#ifdef CELER_WITH_SPDK_STORAGE
+    const auto& owners = device_owners_[device_index];
+    const auto owner =
+        std::lower_bound(owners.begin(), owners.end(), store.worker_->id());
+    next_device_offsets[device_index] =
+        owner == owners.end() || *owner != store.worker_->id()
+            ? device.data_block_count_
+            : static_cast<std::uint64_t>(owner - owners.begin());
+#else
     next_device_offsets[device_index] = (store.worker_->id() + worker_count_ -
                                          device_linear_begin % worker_count_) %
                                         worker_count_;
+#endif
     device_linear_begin += device.data_block_count_;
   }
   while (true) {
@@ -242,7 +285,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         continue;
       }
       const std::uint64_t device_offset = next_device_offset;
+#ifdef CELER_WITH_SPDK_STORAGE
+      next_device_offset += device_owners_[device_index].size();
+#else
       next_device_offset += worker_count_;
+#endif
       scanned_block = true;
       const std::uint32_t local_block =
           static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);

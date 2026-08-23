@@ -756,8 +756,10 @@ inline absl::StatusOr<std::uint64_t> RandomStorageSetId() {
 
 struct StorageDevice {
   std::string path_;
+  std::string controller_id_;
   std::uint64_t id_ = 0;
   std::uint64_t capacity_blocks_ = 0;
+  unsigned io_queue_count_ = 0;
   std::uint32_t data_block_begin_ = 1;
   std::uint64_t data_block_count_ = 0;
   std::uint32_t file_index_ = 0;
@@ -809,6 +811,8 @@ struct StoragePathInfo {
   bool is_block_device_ = false;
   std::size_t io_alignment_ = kDirectIoAlignment;
   std::uint64_t size_bytes_ = 0;
+  std::string controller_id_;
+  unsigned io_queue_count_ = 0;
 };
 
 inline absl::StatusOr<BlockDeviceInfo> ProbeBlockDevice(
@@ -861,7 +865,9 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
     }
     return StoragePathInfo{.is_block_device_ = true,
                            .io_alignment_ = device->io_alignment_,
-                           .size_bytes_ = device->size_bytes_};
+                           .size_bytes_ = device->size_bytes_,
+                           .controller_id_ = device->controller_id_,
+                           .io_queue_count_ = device->io_queue_count_};
   }
   struct stat file_info {};
   if (::stat(path.c_str(), &file_info) != 0) {
@@ -878,6 +884,8 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
         .is_block_device_ = true,
         .io_alignment_ = device->io_alignment_,
         .size_bytes_ = device->size_bytes_,
+        .controller_id_ = {},
+        .io_queue_count_ = 0,
     };
   }
   if (!S_ISREG(file_info.st_mode)) {
@@ -893,6 +901,8 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
       .is_block_device_ = false,
       .io_alignment_ = kDirectIoAlignment,
       .size_bytes_ = static_cast<std::uint64_t>(file_info.st_size),
+      .controller_id_ = {},
+      .io_queue_count_ = 0,
   };
 }
 
@@ -2055,6 +2065,9 @@ class StorageEngine::Impl {
       std::size_t key_bytes);
   Task<absl::StatusOr<std::string>> LoadExternalKeyForRecovery(
       WorkerStore& store, ExtentManifest extents, std::size_t key_bytes);
+  Task<absl::Status> ReadRecoveryExtentInto(WorkerStore& store, ExtentRef ref,
+                                            std::uint32_t extent_index,
+                                            std::span<std::byte> destination);
 
   Task<absl::StatusOr<bool>> VerifyExternalKey(WorkerStore& store,
                                                const RecordIndex::Entry& entry,
@@ -2109,7 +2122,7 @@ class StorageEngine::Impl {
                                   kDefragReserveBlocksPerDevice);
   }
 
-  void ConfigureWorkerDeviceAffinity();
+  absl::Status ConfigureWorkerDeviceAffinity();
 
   Task<absl::StatusOr<ReservedBlock>> AllocateBlock(WorkerStore& store,
                                                     AllocationPurpose purpose);
@@ -2399,6 +2412,10 @@ class StorageEngine::Impl {
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;
+#ifdef CELER_WITH_SPDK_STORAGE
+  // Workers that own a qpair for each device's physical controller.
+  std::vector<std::vector<std::uint16_t>> device_owners_;
+#endif
   // Which worker owns each block, by device and local block id. A record
   // carries its block's owner in its index entry, but an extent reference has
   // no such field, so this is how a worker holding a manifest finds the worker

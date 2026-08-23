@@ -168,7 +168,7 @@ See [Network IRQ Affinity Tuning for Tail Latency](irq-affinity-tuning.md).
 
 `--spdk-max-completions-per-poll=8` bounds one event-loop poll's completion
 work, preventing a completion burst from monopolizing a worker. The budget is
-shared fairly across all open SPDK namespaces on that worker.
+shared fairly across all controller qpairs owned by that worker.
 `--spdk-foreground-pre-poll-us=5` lets newly arrived network and cross-worker
 foreground work run for a small bounded slice before the storage completion
 poll. Both values are tunable; `0` restores unbounded completion draining or
@@ -242,6 +242,23 @@ sudo env \
 Namespaces on one controller share that controller's hardware resources and
 failure domain; namespaces on distinct controllers have separate PCI paths.
 Keylane treats each namespace URI as one storage device in either case.
+
+At startup Keylane reads the negotiated I/O queue count from every physical
+controller, then assigns controller qpairs to workers deterministically. One
+worker uses one qpair for all configured namespaces on the same controller;
+that qpair is submitted and polled only by that worker. Controller owner counts
+are weighted by usable namespace capacity and capped by the controller's
+reported qpair count. Startup fails before recovery when the available qpairs
+cannot cover every worker (and every configured controller).
+
+The SPDK backend intentionally has stronger storage affinity than the io_uring
+backend. A worker opens and allocates only from namespaces whose controller it
+owns. If all of those namespaces are full, the allocation reports `FULL`; it
+does not fall back to a controller for which the worker has no qpair. Existing
+blocks recovered after a worker-topology change remain owned by a worker with a
+qpair for their source controller. Normal overwrite and defrag paths relocate
+live data onto the current key owner's local controller over time. The
+io_uring build retains its all-device allocation fallback.
 
 All paths in one process must include the complete persisted Keylane storage
 set. To add fresh namespaces, stop Keylane and restart it with every existing
