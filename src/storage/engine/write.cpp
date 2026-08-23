@@ -1374,6 +1374,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     return transaction_append ? store.active_tx_blocks_[tx_generation]
                               : store.active_block_;
   };
+acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
          active_stream()->committed_bytes_ + total_disk_bytes >
@@ -1544,6 +1545,15 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
         previous_entry->value_.mutation_sequence_ >= mutation_sequence) {
       co_return absl::OkStatus();
     }
+  }
+  // FindVerifiedEntry and the RDB old-value capture may release the store
+  // mutex. Another writer can fill and seal this worker's append stream while
+  // this coroutine is suspended. Re-enter allocation before dereferencing the
+  // optional or appending to a replacement block that no longer has room.
+  if (!active_stream().has_value() ||
+      active_stream()->committed_bytes_ + total_disk_bytes >
+          kStorageBlockBytes) {
+    goto acquire_active_stream;
   }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr

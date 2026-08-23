@@ -74,6 +74,7 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
       UnlockGuard unlock(&block_store.store_state_mutex_, block_store.worker_);
       BlockState* state = FindBlockState(block_store, pin.block_id_);
       if (state == nullptr || !state->allocated_ || state->freeing_ ||
+          state->defragging_ ||
           state->allocation_epoch_ != pin.allocation_epoch_ ||
           (pin.extent_ && state->kind_ != BlockKind::kPayloadExtent) ||
           (!pin.extent_ && state->kind_ == BlockKind::kPayloadExtent) ||
@@ -218,6 +219,22 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
         .phase_ = Phase::kOldValue,
     };
     store.store_state_mutex_.Unlock(*store.worker_);
+#ifndef NDEBUG
+    // Deterministic regression hook for an append-stream rollover while this
+    // writer has released the store lock to pin the pre-cut value.
+    static std::atomic<bool> pause_claimed = false;
+    const char* pause_text = std::getenv("KEYLANE_RDB_CAPTURE_PAUSE_MS");
+    bool expected_pause = false;
+    if (pause_text != nullptr &&
+        pause_claimed.compare_exchange_strong(expected_pause, true)) {
+      char* end = nullptr;
+      const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
+      if (end != pause_text && *end == '\0' && pause_ms != 0) {
+        (void)co_await celer::SleepFor(
+            *store.worker_, std::chrono::milliseconds(pause_ms));
+      }
+    }
+#endif
     absl::Status pinned = co_await PinRdbSnapshotValue(&old);
     co_await store.store_state_mutex_.Lock();
 
@@ -228,6 +245,13 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     assert(admitted_capture->session_id_ == session_id);
     capture = admitted_capture;
     if (!pinned.ok()) {
+      if (absl::IsAborted(pinned)) {
+        // Defrag may have claimed or relocated the physical record while the
+        // store mutex was released for cross-worker pinning. The key lock
+        // still protects the logical value, so resolve its new location and
+        // retry instead of invalidating the whole snapshot.
+        continue;
+      }
       if (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id) {
         store.rdb_snapshot_->invalidated_ = true;
       }
