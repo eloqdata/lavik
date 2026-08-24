@@ -904,6 +904,55 @@ int main(int argc, char** argv) {
         wide_keys.push_back("wide-multikey:" + std::to_string(key));
       }
       const std::string payload(1024, 'w');
+
+      // Concurrent wide transactions used to spend their entire storage
+      // lifetime behind the source-wide replication order slot. Releasing the
+      // slot after every participant marker is queued must preserve a common
+      // flow order while allowing the storage callbacks to overlap. Hammer the
+      // same participant set so any early release before the final marker can
+      // still produce the classic cross-flow arrival/ACK cycle.
+      constexpr int kConcurrentWriters = 4;
+      constexpr int kConcurrentRounds = 32;
+      std::vector<std::future<void>> writers;
+      writers.reserve(kConcurrentWriters);
+      for (int writer = 0; writer < kConcurrentWriters; ++writer) {
+        writers.push_back(std::async(std::launch::async, [source_port, writer,
+                                                          &wide_keys]() {
+          RespClient client = Connect(source_port);
+          for (int round = 0; round < kConcurrentRounds; ++round) {
+            const std::string value = "concurrent:" + std::to_string(writer) +
+                                      ":" + std::to_string(round);
+            std::vector<std::string_view> command{"MSET"};
+            command.reserve(1 + 2 * wide_keys.size());
+            for (const std::string& key : wide_keys) {
+              command.push_back(key);
+              command.push_back(value);
+            }
+            Expect(client.Command(command), "+OK",
+                   "concurrent replicated MSET");
+          }
+        }));
+      }
+      for (auto& writer : writers) writer.get();
+
+      const std::string concurrent_final =
+          source_client.Command({"GET", wide_keys.front()});
+      for (const std::string& key : wide_keys) {
+        Expect(source_client.Command({"GET", key}), concurrent_final,
+               "atomic source state after concurrent MSET");
+      }
+      const auto concurrent_deadline = std::chrono::steady_clock::now() + 30s;
+      for (const std::string& key : wide_keys) {
+        std::string replicated;
+        do {
+          replicated = replica_client.Command({"GET", key});
+          if (replicated == concurrent_final) break;
+          std::this_thread::sleep_for(10ms);
+        } while (std::chrono::steady_clock::now() < concurrent_deadline);
+        Expect(replicated, concurrent_final,
+               "replica state after concurrent MSET");
+      }
+
       std::vector<std::string> values(kWideKeys);
       for (int round = 0; round < kWideRounds; ++round) {
         std::vector<std::string_view> command{"MSET"};

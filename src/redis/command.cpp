@@ -1589,19 +1589,19 @@ class ReplicationTransactionOrderGuard {
       delete;
   ReplicationTransactionOrderGuard& operator=(
       const ReplicationTransactionOrderGuard&) = delete;
-  ~ReplicationTransactionOrderGuard() {
-    if (active_) EndReplicationTransactionOrder();
-  }
+  ~ReplicationTransactionOrderGuard() { Release(); }
 
-  void Activate() noexcept { active_ = true; }
+  void Activate() noexcept { active_.store(true, std::memory_order_release); }
+  bool active() const noexcept {
+    return active_.load(std::memory_order_acquire);
+  }
   void Release() noexcept {
-    if (!active_) return;
+    if (!active_.exchange(false, std::memory_order_acq_rel)) return;
     EndReplicationTransactionOrder();
-    active_ = false;
   }
 
  private:
-  bool active_ = false;
+  std::atomic<bool> active_{false};
 };
 
 // Joins coroutines spawned on this worker. They all complete back on that
@@ -1734,7 +1734,8 @@ Task<absl::Status> ReleaseReplicationPublisherAdmission(
 
 Task<absl::StatusOr<ReplicationPublisherAdmission>>
 AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
-                                     const CommandRequest* request = nullptr) {
+                                     const CommandRequest* request = nullptr,
+                                     bool parallel_fanout = false) {
   ReplicationPublisherAdmission admission;
   if (request != nullptr) {
     logical_bytes = SaturatingAdd(logical_bytes,
@@ -1796,6 +1797,48 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
               return left.worker_ < right.worker_;
             });
 
+  if (parallel_fanout && scopes.size() > 1) {
+    // The caller owns the cross-flow transaction-order slot, so no second
+    // multi-worker acquisition can hold a conflicting subset while this
+    // round is suspended. Single-worker writers cannot form a reservation
+    // cycle. Run the independent owner-local waits concurrently and join once.
+    admission.worker_tokens_.resize(scopes.size());
+    absl::Status acquired = co_await ForEachParticipantParallel(
+        scopes.size(), [&scopes, &admission](std::size_t index) {
+          const WorkerScope& scope = scopes[index];
+          return std::pair{
+              scope.worker_,
+              [scope, index, &admission]() -> Task<absl::Status> {
+                auto token =
+                    co_await g_storage->AcquireReplicationPublisherAdmission(
+                        admission.logical_bytes_, scope.target_);
+                if (!token.ok()) co_return token.status();
+                admission.worker_tokens_[index] =
+                    ReplicationPublisherAdmission::WorkerToken{
+                        .worker_ = scope.worker_,
+                        .token_ = std::move(*token),
+                    };
+                co_return absl::OkStatus();
+              }};
+        });
+    if (!acquired.ok()) {
+      ReplicationPublisherAdmission partial;
+      partial.logical_bytes_ = admission.logical_bytes_;
+      for (auto& token : admission.worker_tokens_) {
+        // log_epoch_ and both vectors are empty only for an unfilled slot.
+        if (token.token_.log_epoch_ == 0 &&
+            token.token_.fullsync_session_ids_.empty() &&
+            token.token_.fullsync_unstarted_guards_.empty()) {
+          continue;
+        }
+        partial.worker_tokens_.push_back(std::move(token));
+      }
+      (void)co_await ReleaseReplicationPublisherAdmission(partial);
+      co_return acquired;
+    }
+    co_return admission;
+  }
+
   admission.worker_tokens_.reserve(scopes.size());
   for (const WorkerScope& scope : scopes) {
     const unsigned target_worker = scope.worker_;
@@ -1825,9 +1868,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
 Task<absl::Status> BeginReplicationTransactionOrder(
     ReplicationTransactionOrderGuard* guard) {
   while (!TryBeginReplicationTransactionOrder()) {
-    absl::Status waited = co_await celer::SleepFor(
-        *ThisWorker().self_, std::chrono::milliseconds(1));
-    if (!waited.ok()) co_return waited;
+    co_await celer::Yield(*ThisWorker().self_);
   }
   guard->Activate();
   co_return absl::OkStatus();
@@ -4712,8 +4753,13 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
 // DEL / EXISTS / MSET / MGET run as one transaction: every key locked up
 // front (across all owning shards), one hop where each shard works its
 // slice, locks released when the hop completes.
-Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
-                                   ReplyBuilder& reply_builder) {
+void ReleaseReplicationOrderAfterMarkers(void* context) noexcept {
+  static_cast<ReplicationTransactionOrderGuard*>(context)->Release();
+}
+
+Task<CommandReply> ExecuteMultiKey(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    ReplicationTransactionOrderGuard* replication_order = nullptr) {
   const auto& args = request.args_;
   auto keys = DetermineKeys(*request.spec_, args);
   if (!keys.ok()) {
@@ -4736,6 +4782,19 @@ Task<CommandReply> ExecuteMultiKey(const CommandRequest& request,
   std::unique_ptr<ReplicationTransactionGuard> replication;
   if (keys->count() > 1) {
     replication = std::make_unique<ReplicationTransactionGuard>(request, &txn);
+  }
+  if (replication_order != nullptr) {
+    if (replication != nullptr && replication->active()) {
+      // Entry hooks run after the transaction owns its shard locks and before
+      // the storage callbacks. Once every marker is queued, later transactions
+      // cannot overtake this one on an overlapping flow, so storage IO no
+      // longer needs to hold the global publication-order slot.
+      replication->SetParticipantsEnteredHook(
+          &ReleaseReplicationOrderAfterMarkers, replication_order);
+    } else {
+      // A one-key MSET has no cross-flow rendezvous to order.
+      replication_order->Release();
+    }
   }
 
   MultiKeyContext ctx;
@@ -7202,6 +7261,13 @@ void ReplicationTransactionGuard::SetFinalExpirations(
   SetCommandArgs(std::move(command_args));
 }
 
+void ReplicationTransactionGuard::SetParticipantsEnteredHook(
+    ParticipantsEnteredHook hook, void* context) noexcept {
+  assert(entered_participants_.load(std::memory_order_relaxed) == 0);
+  participants_entered_hook_ = hook;
+  participants_entered_context_ = context;
+}
+
 void ReplicationTransactionGuard::EnterCurrentShard() noexcept {
   EnterShard(celer::ThisWorker().id_);
 }
@@ -7222,6 +7288,12 @@ void ReplicationTransactionGuard::EnterShard(unsigned shard_id) noexcept {
     transaction_->resolution_.compare_exchange_strong(
         expected, storage::ReplicationTransactionResolution::kDiscard,
         std::memory_order_release, std::memory_order_relaxed);
+  }
+  const unsigned entered =
+      entered_participants_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  assert(entered <= participants.size());
+  if (entered == participants.size() && participants_entered_hook_ != nullptr) {
+    participants_entered_hook_(participants_entered_context_);
   }
 }
 
@@ -8051,7 +8123,9 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
 
 Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
                                       ReplyBuilder& reply_builder,
-                                      std::uint64_t client_id) {
+                                      std::uint64_t client_id,
+                                      ReplicationTransactionOrderGuard*
+                                          preacquired_order = nullptr) {
   const bool replication_origin = request.replication_origin_;
   const auto& args = request.args_;
   const std::uint32_t cmd_flags =
@@ -8100,13 +8174,18 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
       (cmd_flags & (kCmdWrite | kCmdMultiShard)) ==
           (kCmdWrite | kCmdMultiShard) &&
       (cmd_flags & kCmdMayBlock) == 0;
-  ReplicationTransactionOrderGuard replication_order_guard;
+  ReplicationTransactionOrderGuard local_replication_order;
+  ReplicationTransactionOrderGuard* replication_order =
+      preacquired_order != nullptr ? preacquired_order
+                                   : &local_replication_order;
   if (snapshot_transaction) {
-    absl::Status entered =
-        co_await BeginReplicationTransactionOrder(&replication_order_guard);
-    if (!entered.ok()) {
-      co_return BuiltReply(
-          reply_builder.AppendError(absl::StrCat("ERR ", entered.message())));
+    if (!replication_order->active()) {
+      absl::Status entered =
+          co_await BeginReplicationTransactionOrder(replication_order);
+      if (!entered.ok()) {
+        co_return BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", entered.message())));
+      }
     }
   }
   SnapshotTransactionOperationGuard snapshot_transaction_guard;
@@ -8193,9 +8272,12 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
     case CommandKind::kUnlink:
     case CommandKind::kExists:
     case CommandKind::kTouch:
-    case CommandKind::kMSet:
     case CommandKind::kMGet:
       co_return co_await ExecuteMultiKey(request, reply_builder);
+
+    case CommandKind::kMSet:
+      co_return co_await ExecuteMultiKey(request, reply_builder,
+                                         replication_order);
 
     case CommandKind::kSDiff:
     case CommandKind::kSDiffStore:
@@ -8501,15 +8583,27 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
   if (!source_write) [[likely]] {
     co_return co_await ExecuteCommandBody(request, reply_builder, client_id);
   }
+  const bool ordered_mset =
+      request.kind_ == CommandKind::kMSet && g_replication != nullptr;
+  ReplicationTransactionOrderGuard replication_order;
+  if (ordered_mset) {
+    absl::Status entered =
+        co_await BeginReplicationTransactionOrder(&replication_order);
+    if (!entered.ok()) {
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", entered.message())));
+    }
+  }
   auto admission = co_await AcquireReplicationPublisherAdmission(
-      RequestArgumentBytes(request), &request);
+      RequestArgumentBytes(request), &request, ordered_mset);
   if (!admission.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
-  CommandReply reply =
-      co_await ExecuteCommandBody(request, reply_builder, client_id);
+  CommandReply reply = co_await ExecuteCommandBody(
+      request, reply_builder, client_id,
+      ordered_mset ? &replication_order : nullptr);
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
   if (!released.ok()) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -388,6 +389,8 @@ std::vector<std::string> EncodeReplicationCommandEffects(
 // standalone cross-key command. Destruction aborts an unresolved marker.
 class ReplicationTransactionGuard {
  public:
+  using ParticipantsEnteredHook = void (*)(void*) noexcept;
+
   ReplicationTransactionGuard(const CommandRequest& request,
                               tx::Transaction* transaction,
                               std::vector<std::string> canonical_args = {});
@@ -403,6 +406,11 @@ class ReplicationTransactionGuard {
   void SetCommandArgs(std::vector<std::string> canonical_args);
   void SetFinalExpirations(
       std::span<const storage::TxShardWrites> shard_writes);
+  // Runs exactly once, on the worker that enqueues the final participant
+  // marker. The hook must be nonblocking and remain alive until the first
+  // transaction hop completes.
+  void SetParticipantsEnteredHook(ParticipantsEnteredHook hook,
+                                  void* context) noexcept;
   void EnterCurrentShard() noexcept;
   bool active() const noexcept { return transaction_ != nullptr; }
 
@@ -414,6 +422,9 @@ class ReplicationTransactionGuard {
   static void EnterShardHook(void* context, unsigned shard_id);
 
   std::shared_ptr<storage::ReplicationTransaction> transaction_;
+  std::atomic<unsigned> entered_participants_{0};
+  ParticipantsEnteredHook participants_entered_hook_ = nullptr;
+  void* participants_entered_context_ = nullptr;
 };
 
 // Static facts INFO reports. Call once before the server starts.
