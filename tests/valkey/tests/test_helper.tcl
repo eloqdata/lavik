@@ -155,13 +155,15 @@ proc r {args} {
     if {$::external && [string equal -nocase [lindex $args 0] config]} {
         set operation [string tolower [lindex $args 1]]
         set parameter [string tolower [lindex $args 2]]
-        if {$operation eq "get"} {
+        # Stream trimming semantics depend on this value, so exercise
+        # Keylane's runtime setting instead of merely emulating it here.
+        if {$operation eq "get" && $parameter ne "stream-node-max-entries"} {
             if {![dict exists $::external_config $parameter]} {
                 dict set ::external_config $parameter 0
             }
             return [list $parameter [dict get $::external_config $parameter]]
         }
-        if {$operation eq "set"} {
+        if {$operation eq "set" && $parameter ne "stream-node-max-entries"} {
             dict set ::external_config $parameter [lindex $args 3]
             return OK
         }

@@ -861,6 +861,8 @@ constexpr std::string_view kBackgroundWarrantConfig =
     "background-warrant-percent";
 constexpr std::string_view kSpdkMaxCompletionsConfig =
     "spdk-max-completions-per-poll";
+constexpr std::string_view kStreamNodeMaxEntriesConfig =
+    "stream-node-max-entries";
 
 enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
@@ -881,6 +883,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kBackgroundBudget,
   kBackgroundWarrant,
   kSpdkMaxCompletions,
+  kStreamNodeMaxEntries,
 };
 
 struct RuntimeConfigDescriptor {
@@ -926,6 +929,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kBackgroundWarrant},
     RuntimeConfigDescriptor{kSpdkMaxCompletionsConfig,
                             RuntimeConfigKey::kSpdkMaxCompletions},
+    RuntimeConfigDescriptor{kStreamNodeMaxEntriesConfig,
+                            RuntimeConfigKey::kStreamNodeMaxEntries},
 };
 
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
@@ -1075,6 +1080,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         case RuntimeConfigKey::kSpdkMaxCompletions:
           return std::to_string(
               celer::ThisWorker().self_->spdk_max_completions_per_poll());
+        case RuntimeConfigKey::kStreamNodeMaxEntries:
+          return std::to_string(StreamNodeMaxEntries());
       }
       return {};
     };
@@ -1270,6 +1277,13 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured = co_await ConfigureAllWorkerSchedulers(
             config->key_, static_cast<unsigned>(value));
+      }
+    } else if (config->key_ == RuntimeConfigKey::kStreamNodeMaxEntries) {
+      if (!ParseUint64(args[3], &value)) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = SetStreamNodeMaxEntries(value);
       }
     }
     co_return configured.ok()

@@ -621,6 +621,55 @@ std::string BulkArray(const std::vector<std::string_view>& values) {
   return reply;
 }
 
+TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-stream-trim-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command(
+                  {"CONFIG", "SET", "stream-node-max-entries", "10"}),
+              "+OK");
+    for (unsigned index = 1; index <= 100; ++index) {
+      const std::string id = std::to_string(index) + "-0";
+      EXPECT_EQ(client.Command({"XADD", "trim-stream", id, "f", "v"}),
+                Bulk(id));
+    }
+    EXPECT_EQ(client.Command({"XADD", "trim-stream", "MAXLEN", "~", "55",
+                              "LIMIT", "30", "101-0", "f", "v"}),
+              Bulk("101-0"));
+    EXPECT_EQ(client.Command({"XLEN", "trim-stream"}), ":71");
+    server.Stop();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"XLEN", "trim-stream"}), ":71");
+    EXPECT_EQ(client.Command({"XADD", "trim-stream", "MAXLEN", "~", "55",
+                              "LIMIT", "30", "102-0", "f", "v"}),
+              Bulk("102-0"));
+    EXPECT_EQ(client.Command({"XLEN", "trim-stream"}), ":62");
+    EXPECT_EQ(client.Command({"XTRIM", "trim-stream", "MAXLEN", "=", "55"}),
+              ":7");
+    EXPECT_EQ(client.Command({"XTRIM", "trim-stream", "MAXLEN", "~", "44"}),
+              ":3");
+    EXPECT_EQ(client.Command({"XLEN", "trim-stream"}), ":52");
+    server.Stop();
+  }
+}
+
 TEST(ListE2eTest, PersistsLogicalLengthSeparatelyFromSerializedBytes) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =

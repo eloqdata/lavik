@@ -1,12 +1,16 @@
 #pragma once
 
+#include <cstdint>
 #include <span>
 
+#include "absl/status/status.h"
 #include "keylane/command.h"
 
 namespace keylane {
 
 void InitStreamCommandStorage(storage::StorageEngine* engine);
+std::uint32_t StreamNodeMaxEntries() noexcept;
+absl::Status SetStreamNodeMaxEntries(std::uint64_t value);
 
 struct StreamExecKey {
   storage::Digest digest_;

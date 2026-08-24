@@ -84,6 +84,35 @@ TEST(RdbTest, StreamEncoderSupportsRedisSevenCompatibilityHeader) {
   EXPECT_EQ(streamed, RdbFile({}, 10));
 }
 
+TEST(RdbTest, UpgradesLegacyKeylaneStreamEncoding) {
+  std::string encoded = "KXS1";
+  PutLe64(&encoded, 1);  // last ID milliseconds
+  PutLe64(&encoded, 0);  // last ID sequence
+  PutLe64(&encoded, 0);  // max-deleted ID milliseconds
+  PutLe64(&encoded, 0);  // max-deleted ID sequence
+  PutLe64(&encoded, 1);  // entries added
+  PutLe32(&encoded, 1);  // live entries
+  PutLe64(&encoded, 1);
+  PutLe64(&encoded, 0);
+  PutLe32(&encoded, 2);  // field and value
+  PutLe32(&encoded, 1);
+  encoded += "f";
+  PutLe32(&encoded, 1);
+  encoded += "v";
+  PutLe32(&encoded, 0);  // consumer groups
+
+  storage::RawValue legacy{.encoded_ = std::move(encoded),
+                           .logical_size_ = 1,
+                           .value_type_ = storage::ValueType::kStream};
+  auto dump = EncodeDump(legacy);
+  ASSERT_TRUE(dump.ok()) << dump.status();
+  auto restored = DecodeDump(*dump);
+  ASSERT_TRUE(restored.ok()) << restored.status();
+  EXPECT_EQ(restored->value_type_, storage::ValueType::kStream);
+  EXPECT_EQ(restored->logical_size_, 1);
+  EXPECT_TRUE(restored->encoded_.starts_with("KXS2"));
+}
+
 class TempFile {
  public:
   explicit TempFile(std::string_view contents) {

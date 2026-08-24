@@ -69,7 +69,9 @@ constexpr std::uint8_t kEof = 255;
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
 constexpr std::string_view kListMagic = "KLL1";
 constexpr std::string_view kZSetMagic = "KZS1";
-constexpr std::string_view kStreamMagic = "KXS1";
+constexpr std::string_view kStreamMagicV1 = "KXS1";
+constexpr std::string_view kStreamMagicV2 = "KXS2";
+constexpr std::uint32_t kDefaultStreamNodeMaxEntries = 100;
 
 absl::Status Bad(std::string_view detail = {}) {
   return absl::InvalidArgumentError(
@@ -753,8 +755,31 @@ struct Stream {
   Id last, max_deleted;
   std::uint64_t entries_added = 0;
   std::vector<Entry> entries;
+  std::vector<std::uint32_t> node_entries;
   std::vector<Group> groups;
 };
+
+void SynthesizeStreamNodes(Stream* stream) {
+  stream->node_entries.clear();
+  std::size_t remaining = stream->entries.size();
+  while (remaining != 0) {
+    const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(
+        remaining, kDefaultStreamNodeMaxEntries));
+    stream->node_entries.push_back(count);
+    remaining -= count;
+  }
+}
+
+bool ValidStreamNodes(const Stream& stream) {
+  std::size_t total = 0;
+  for (const std::uint32_t count : stream.node_entries) {
+    if (count == 0 || total > stream.entries.size() ||
+        count > stream.entries.size() - total)
+      return false;
+    total += count;
+  }
+  return total == stream.entries.size();
+}
 struct ZElement {
   std::string member;
   double score = 0;
@@ -1236,7 +1261,9 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     return LogicalValue{raw.value_type_, std::move(values)};
   }
   if (raw.value_type_ == storage::ValueType::kStream) {
-    if (!input.starts_with(kStreamMagic) || input.size() < 48)
+    const bool version_two = input.starts_with(kStreamMagicV2);
+    if ((!version_two && !input.starts_with(kStreamMagicV1)) ||
+        input.size() < 48)
       return Bad("invalid Keylane Stream");
     Reader reader(input.substr(4));
     Stream stream;
@@ -1266,6 +1293,22 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
         entry.fields.push_back(std::move(text));
       }
       stream.entries.push_back(std::move(entry));
+    }
+    if (version_two) {
+      std::uint32_t nodes = 0;
+      if (!reader.Le32(&nodes) || nodes > stream.entries.size())
+        return Bad("invalid Keylane Stream nodes");
+      stream.node_entries.reserve(nodes);
+      for (std::uint32_t i = 0; i < nodes; ++i) {
+        std::uint32_t count = 0;
+        if (!reader.Le32(&count))
+          return Bad("truncated Keylane Stream nodes");
+        stream.node_entries.push_back(count);
+      }
+      if (!ValidStreamNodes(stream))
+        return Bad("invalid Keylane Stream node counts");
+    } else {
+      SynthesizeStreamNodes(&stream);
     }
     if (!reader.Le32(&groups)) return Bad("truncated Keylane Stream groups");
     for (std::uint32_t i = 0; i < groups; ++i) {
@@ -1403,6 +1446,9 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
     }
   } else if (logical.type == storage::ValueType::kStream) {
     auto stream = std::move(std::get<Stream>(logical.value));
+    if (stream.node_entries.empty() && !stream.entries.empty())
+      SynthesizeStreamNodes(&stream);
+    if (!ValidStreamNodes(stream)) return Bad("invalid Keylane Stream nodes");
     std::uint64_t bytes = 48;
     for (const auto& entry : stream.entries) {
       if (!add_size(&bytes, 20) || entry.fields.size() > UINT32_MAX)
@@ -1412,6 +1458,8 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
           return Bad("value exceeds Keylane limits");
       }
     }
+    if (!add_size(&bytes, 4 + 4 * stream.node_entries.size()))
+      return Bad("value exceeds Keylane limits");
     if (!add_size(&bytes, 4)) return Bad("value exceeds Keylane limits");
     for (const auto& group : stream.groups) {
       if (!text_size(&bytes, group.name) || !add_size(&bytes, 28) ||
@@ -1430,7 +1478,7 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       }
     }
     raw.logical_size_ = stream.entries.size();
-    raw.encoded_ = std::string(kStreamMagic);
+    raw.encoded_ = std::string(kStreamMagicV2);
     raw.encoded_.reserve(bytes);
     PutLe64(&raw.encoded_, stream.last.ms);
     PutLe64(&raw.encoded_, stream.last.seq);
@@ -1448,6 +1496,9 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       PutLe32(&raw.encoded_, entry.fields.size());
       for (const auto& field : entry.fields) put_text(field);
     }
+    PutLe32(&raw.encoded_, stream.node_entries.size());
+    for (const std::uint32_t count : stream.node_entries)
+      PutLe32(&raw.encoded_, count);
     PutLe32(&raw.encoded_, stream.groups.size());
     for (const auto& group : stream.groups) {
       put_text(group.name);

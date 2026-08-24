@@ -1,6 +1,7 @@
 #include "stream_command.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -18,11 +19,13 @@
 namespace keylane {
 namespace {
 
-constexpr std::string_view kMagic = "KXS1";
+constexpr std::string_view kMagicV1 = "KXS1";
+constexpr std::string_view kMagicV2 = "KXS2";
 constexpr std::string_view kGroupStateMagic = "KXG1";
 constexpr std::string_view kRestoreGroupSubcommand =
     "__keylane_restore_group_v1";
 storage::StorageEngine* g_storage = nullptr;
+std::atomic<std::uint32_t> g_stream_node_max_entries{100};
 
 struct Id {
   std::uint64_t ms_ = 0;
@@ -61,8 +64,125 @@ struct Stream {
   Id max_deleted_id_;
   std::uint64_t entries_added_ = 0;
   std::vector<Entry> entries_;
+  // Counts of live entries in logical Redis stream macro nodes. The sum is
+  // entries_.size(); exact trims may leave a partial first node, while
+  // approximate trims remove only complete nodes.
+  std::vector<std::uint32_t> node_entries_;
   std::vector<Group> groups_;
 };
+
+void SynthesizeStreamNodes(Stream* stream) {
+  stream->node_entries_.clear();
+  const std::uint32_t maximum =
+      g_stream_node_max_entries.load(std::memory_order_relaxed);
+  std::size_t remaining = stream->entries_.size();
+  while (remaining != 0) {
+    const auto count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(remaining, maximum));
+    stream->node_entries_.push_back(count);
+    remaining -= count;
+  }
+}
+
+bool ValidStreamNodes(const Stream& stream) {
+  std::size_t total = 0;
+  for (const std::uint32_t count : stream.node_entries_) {
+    if (count == 0 || total > stream.entries_.size() ||
+        count > stream.entries_.size() - total)
+      return false;
+    total += count;
+  }
+  return total == stream.entries_.size();
+}
+
+void AppendStreamEntry(Stream* stream, Entry entry) {
+  const std::uint32_t maximum =
+      g_stream_node_max_entries.load(std::memory_order_relaxed);
+  if (stream->node_entries_.empty() ||
+      stream->node_entries_.back() >= maximum) {
+    stream->node_entries_.push_back(1);
+  } else {
+    ++stream->node_entries_.back();
+  }
+  stream->entries_.push_back(std::move(entry));
+}
+
+void EraseStreamFront(Stream* stream, std::size_t count) {
+  stream->entries_.erase(stream->entries_.begin(),
+                         stream->entries_.begin() + count);
+  while (count != 0) {
+    if (count >= stream->node_entries_.front()) {
+      count -= stream->node_entries_.front();
+      stream->node_entries_.erase(stream->node_entries_.begin());
+    } else {
+      stream->node_entries_.front() -= count;
+      count = 0;
+    }
+  }
+}
+
+void EraseStreamEntry(Stream* stream, std::size_t index) {
+  std::size_t node_begin = 0;
+  for (auto node = stream->node_entries_.begin();
+       node != stream->node_entries_.end(); ++node) {
+    if (index < node_begin + *node) {
+      if (--*node == 0) stream->node_entries_.erase(node);
+      break;
+    }
+    node_begin += *node;
+  }
+  stream->entries_.erase(stream->entries_.begin() + index);
+}
+
+std::uint64_t DefaultApproximateTrimLimit() {
+  const std::uint64_t maximum =
+      g_stream_node_max_entries.load(std::memory_order_relaxed);
+  return std::clamp<std::uint64_t>(maximum * 100, 1, 1'000'000);
+}
+
+std::size_t TrimStreamMaxLen(Stream* stream, std::uint64_t maxlen,
+                             bool approximate, std::uint64_t limit) {
+  if (!approximate) {
+    const std::size_t remove =
+        stream->entries_.size() > maxlen
+            ? stream->entries_.size() - static_cast<std::size_t>(maxlen)
+            : 0;
+    if (remove != 0) EraseStreamFront(stream, remove);
+    return remove;
+  }
+
+  std::size_t remove = 0;
+  std::size_t remaining = stream->entries_.size();
+  for (const std::uint32_t node_entries : stream->node_entries_) {
+    if (remaining <= maxlen || remaining - node_entries < maxlen) break;
+    if (limit != 0 && remove + node_entries > limit) break;
+    remove += node_entries;
+    remaining -= node_entries;
+  }
+  if (remove != 0) EraseStreamFront(stream, remove);
+  return remove;
+}
+
+std::size_t TrimStreamMinId(Stream* stream, Id minid, bool approximate,
+                            std::uint64_t limit) {
+  if (!approximate) {
+    const auto end = std::lower_bound(
+        stream->entries_.begin(), stream->entries_.end(), minid,
+        [](const Entry& entry, Id wanted) { return entry.id_ < wanted; });
+    const std::size_t remove = end - stream->entries_.begin();
+    if (remove != 0) EraseStreamFront(stream, remove);
+    return remove;
+  }
+
+  std::size_t remove = 0;
+  for (const std::uint32_t node_entries : stream->node_entries_) {
+    if (!(stream->entries_[remove + node_entries - 1].id_ < minid)) break;
+    if (limit != 0 && remove + node_entries > limit) break;
+    remove += node_entries;
+  }
+  if (remove != 0) EraseStreamFront(stream, remove);
+  return remove;
+}
 
 std::size_t XInfoLimitedCount(std::size_t available, std::uint64_t requested) {
   return requested == 0 ? available
@@ -211,9 +331,10 @@ absl::StatusOr<Stream> Decode(
     const std::optional<storage::CompactValueView>& value) {
   if (!value) return Stream{};
   const std::string_view in = value->encoded_;
-  if (!in.starts_with(kMagic))
+  const bool version_two = in.starts_with(kMagicV2);
+  if (!version_two && !in.starts_with(kMagicV1))
     return absl::InternalError("invalid persisted Stream");
-  std::size_t at = kMagic.size();
+  std::size_t at = kMagicV1.size();
   Stream stream;
   std::uint32_t entry_count = 0, group_count = 0;
   if (!GetId(in, &at, &stream.last_id_) ||
@@ -239,6 +360,24 @@ absl::StatusOr<Stream> Decode(
       entry.fields_.push_back(std::move(item));
     }
     stream.entries_.push_back(std::move(entry));
+  }
+  if (version_two) {
+    std::uint32_t node_count = 0;
+    if (!Get32(in, &at, &node_count) ||
+        node_count > stream.entries_.size()) {
+      return absl::InternalError("invalid persisted Stream nodes");
+    }
+    stream.node_entries_.reserve(node_count);
+    for (std::uint32_t i = 0; i < node_count; ++i) {
+      std::uint32_t count = 0;
+      if (!Get32(in, &at, &count))
+        return absl::InternalError("truncated persisted Stream nodes");
+      stream.node_entries_.push_back(count);
+    }
+    if (!ValidStreamNodes(stream))
+      return absl::InternalError("invalid persisted Stream node counts");
+  } else {
+    SynthesizeStreamNodes(&stream);
   }
   if (!Get32(in, &at, &group_count))
     return absl::InternalError("truncated persisted Stream groups");
@@ -292,9 +431,11 @@ absl::StatusOr<Stream> Decode(
 
 absl::StatusOr<std::string> Encode(const Stream& stream) {
   auto fits32 = [](std::size_t size) { return size <= UINT32_MAX; };
-  if (!fits32(stream.entries_.size()) || !fits32(stream.groups_.size()))
+  if (!fits32(stream.entries_.size()) ||
+      !fits32(stream.node_entries_.size()) ||
+      !fits32(stream.groups_.size()) || !ValidStreamNodes(stream))
     return absl::OutOfRangeError("Stream exceeds storage limits");
-  std::uint64_t encoded_bytes = kMagic.size() + 2 * 16 + 8 + 4;
+  std::uint64_t encoded_bytes = kMagicV2.size() + 2 * 16 + 8 + 4;
   auto add_bytes = [&](std::uint64_t bytes) {
     if (bytes > storage::kMaxStringBytes - encoded_bytes) return false;
     encoded_bytes += bytes;
@@ -307,8 +448,10 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
       if (!fits32(field.size()) ||
           !add_bytes(4 + static_cast<std::uint64_t>(field.size())))
         return absl::OutOfRangeError("Stream field is too large");
-    }
+      }
   }
+  if (!add_bytes(4 + 4 * stream.node_entries_.size()))
+    return absl::OutOfRangeError("Stream exceeds storage limits");
   if (!add_bytes(4))
     return absl::OutOfRangeError("Stream exceeds storage limits");
   for (const Group& group : stream.groups_) {
@@ -335,7 +478,7 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
   }
   std::string out;
   out.reserve(static_cast<std::size_t>(encoded_bytes));
-  out.append(kMagic);
+  out.append(kMagicV2);
   PutId(&out, stream.last_id_);
   PutId(&out, stream.max_deleted_id_);
   Put64(&out, stream.entries_added_);
@@ -351,6 +494,8 @@ absl::StatusOr<std::string> Encode(const Stream& stream) {
       PutString(&out, field);
     }
   }
+  Put32(&out, stream.node_entries_.size());
+  for (const std::uint32_t count : stream.node_entries_) Put32(&out, count);
   Put32(&out, stream.groups_.size());
   for (const Group& group : stream.groups_) {
     PutString(&out, group.name_);
@@ -1131,6 +1276,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   bool xinfo_full = false;
   std::uint64_t xinfo_count = 10;
   std::vector<std::string> captured_xadd;
+  std::vector<std::string> captured_xtrim;
   std::vector<std::string> captured_group_args;
   const bool group_state_write =
       request.kind_ == CommandKind::kXGroup ||
@@ -1186,7 +1332,10 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         bool nomkstream = false;
         enum class Trim { kNone, kMaxLen, kMinId } trim = Trim::kNone;
         std::uint64_t maxlen = 0;
-        std::uint64_t trim_limit = 0;
+        bool trim_approximate = false;
+        std::optional<std::uint64_t> trim_limit;
+        std::optional<std::size_t> trim_specifier_arg;
+        std::optional<std::size_t> trim_threshold_arg;
         Id minid{};
         std::size_t i = 2;
         while (i < a.size()) {
@@ -1202,10 +1351,14 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             }
             trim = EqualCi(a[i], "maxlen") ? Trim::kMaxLen : Trim::kMinId;
             ++i;
-            const bool approximate = i < a.size() && a[i] == "~";
-            if (i < a.size() && (approximate || a[i] == "=")) ++i;
+            trim_approximate = i < a.size() && a[i] == "~";
+            if (i < a.size() && (trim_approximate || a[i] == "=")) {
+              trim_specifier_arg = i;
+              ++i;
+            }
             if (i >= a.size())
               return absl::InvalidArgumentError("syntax error");
+            trim_threshold_arg = i;
             if (trim == Trim::kMaxLen) {
               if (!ParseInt(a[i], &maxlen))
                 return absl::InvalidArgumentError(
@@ -1217,9 +1370,11 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             }
             ++i;
             if (i < a.size() && EqualCi(a[i], "limit")) {
-              if (!approximate || i + 1 >= a.size() ||
-                  !ParseInt(a[i + 1], &trim_limit))
+              std::uint64_t parsed_limit = 0;
+              if (!trim_approximate || i + 1 >= a.size() ||
+                  !ParseInt(a[i + 1], &parsed_limit))
                 return absl::InvalidArgumentError("syntax error");
+              trim_limit = parsed_limit;
               i += 2;
             }
           } else
@@ -1297,32 +1452,37 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         }
         Entry entry{.id_ = id, .fields_ = {}};
         for (; i < a.size(); ++i) entry.fields_.push_back(a[i]);
-        stream.entries_.push_back(std::move(entry));
+        AppendStreamEntry(&stream, std::move(entry));
         stream.last_id_ = id;
         ++stream.entries_added_;
         simple = FormatId(id);
         appended_id = id;
-        if (replication.has_value()) {
-          replication->args_[id_arg] = FormatId(id);
-        }
         captured_xadd = request.args_;
         captured_xadd[id_arg] = FormatId(id);
-        if (trim == Trim::kMaxLen && stream.entries_.size() > maxlen) {
-          std::size_t remove = stream.entries_.size() - maxlen;
-          if (trim_limit != 0)
-            remove = std::min<std::uint64_t>(remove, trim_limit);
-          stream.entries_.erase(stream.entries_.begin(),
-                                stream.entries_.begin() + remove);
+        const std::uint64_t effective_limit =
+            trim_approximate
+                ? trim_limit.value_or(DefaultApproximateTrimLimit())
+                : 0;
+        if (trim == Trim::kMaxLen) {
+          (void)TrimStreamMaxLen(&stream, maxlen, trim_approximate,
+                                 effective_limit);
         } else if (trim == Trim::kMinId) {
-          auto end = std::lower_bound(
-              stream.entries_.begin(), stream.entries_.end(), minid,
-              [](const Entry& entry, Id wanted) { return entry.id_ < wanted; });
-          if (trim_limit != 0 &&
-              static_cast<std::uint64_t>(end - stream.entries_.begin()) >
-                  trim_limit)
-            end = stream.entries_.begin() + trim_limit;
-          stream.entries_.erase(stream.entries_.begin(), end);
+          (void)TrimStreamMinId(&stream, minid, trim_approximate,
+                                effective_limit);
         }
+        // Approximate trimming depends on the local macro-node boundaries.
+        // Propagate the exact resulting boundary so replicas and AOF replay do
+        // not depend on their stream-node-max-entries setting.
+        if (trim_approximate) {
+          captured_xadd[*trim_specifier_arg] = "=";
+          captured_xadd[*trim_threshold_arg] =
+              trim == Trim::kMaxLen
+                  ? std::to_string(stream.entries_.size())
+                  : FormatId(stream.entries_.empty()
+                                 ? Id{.ms_ = UINT64_MAX, .seq_ = UINT64_MAX}
+                                 : stream.entries_.front().id_);
+        }
+        if (replication.has_value()) replication->args_ = captured_xadd;
         return Changed(std::move(stream));
       }
       case CommandKind::kXDel: {
@@ -1336,7 +1496,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           auto it = std::find_if(stream.entries_.begin(), stream.entries_.end(),
                                  [&](const Entry& e) { return e.id_ == id; });
           if (it != stream.entries_.end()) {
-            stream.entries_.erase(it);
+            EraseStreamEntry(&stream, it - stream.entries_.begin());
             ++integer;
             stream.max_deleted_id_ = std::max(stream.max_deleted_id_, id);
           }
@@ -1357,10 +1517,21 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         bool end_exclusive = end_text.starts_with('(');
         if (start_exclusive) start_text.remove_prefix(1);
         if (end_exclusive) end_text.remove_prefix(1);
+        if ((start_exclusive && (start_text == "-" || start_text == "+")) ||
+            (end_exclusive && (end_text == "-" || end_text == "+"))) {
+          return absl::InvalidArgumentError(
+              "Invalid stream ID specified as stream command argument");
+        }
         auto start = ParseId(start_text, false, true);
         auto end = ParseId(end_text, true, true);
         if (!start.ok()) return start.status();
         if (!end.ok()) return end.status();
+        if ((start_exclusive &&
+             *start == Id{.ms_ = UINT64_MAX, .seq_ = UINT64_MAX}) ||
+            (end_exclusive && *end == Id{})) {
+          return absl::InvalidArgumentError(
+              "Invalid stream ID specified as stream command argument");
+        }
         std::uint64_t count = UINT64_MAX;
         if (a.size() > 4) {
           std::int64_t parsed_count = 0;
@@ -1390,8 +1561,13 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           return absl::InvalidArgumentError("syntax error");
         ++i;
         const bool approximate = i < a.size() && a[i] == "~";
-        if (i < a.size() && (approximate || a[i] == "=")) ++i;
+        std::optional<std::size_t> trim_specifier_arg;
+        if (i < a.size() && (approximate || a[i] == "=")) {
+          trim_specifier_arg = i;
+          ++i;
+        }
         if (i >= a.size()) return absl::InvalidArgumentError("syntax error");
+        const std::size_t trim_threshold_arg = i;
         std::uint64_t maxlen = 0;
         Id minid{};
         if (maxlen_mode) {
@@ -1404,38 +1580,44 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           minid = *parsed;
         }
         ++i;
-        std::uint64_t limit = 0;
+        std::optional<std::uint64_t> requested_limit;
         if (i < a.size()) {
+          std::uint64_t parsed_limit = 0;
           if (!approximate || i + 2 != a.size() || !EqualCi(a[i], "limit") ||
-              !ParseInt(a[i + 1], &limit))
+              !ParseInt(a[i + 1], &parsed_limit))
             return absl::InvalidArgumentError("syntax error");
+          requested_limit = parsed_limit;
           i += 2;
         }
         if (i != a.size()) return absl::InvalidArgumentError("syntax error");
-        const std::size_t old = stream.entries_.size();
+        const std::uint64_t limit =
+            approximate
+                ? requested_limit.value_or(DefaultApproximateTrimLimit())
+                : 0;
+        std::size_t removed = 0;
         if (maxlen_mode) {
-          if (stream.entries_.size() > maxlen) {
-            std::size_t remove = stream.entries_.size() - maxlen;
-            if (limit != 0) remove = std::min<std::uint64_t>(remove, limit);
-            stream.entries_.erase(stream.entries_.begin(),
-                                  stream.entries_.begin() + remove);
-          }
+          removed = TrimStreamMaxLen(&stream, maxlen, approximate, limit);
         } else {
-          auto end = std::lower_bound(
-              stream.entries_.begin(), stream.entries_.end(), minid,
-              [](const Entry& entry, Id wanted) { return entry.id_ < wanted; });
-          if (limit != 0 &&
-              static_cast<std::uint64_t>(end - stream.entries_.begin()) > limit)
-            end = stream.entries_.begin() + limit;
-          stream.entries_.erase(stream.entries_.begin(), end);
+          removed = TrimStreamMinId(&stream, minid, approximate, limit);
         }
-        integer = old - stream.entries_.size();
+        integer = removed;
+        if (approximate && removed != 0) {
+          captured_xtrim = request.args_;
+          captured_xtrim[*trim_specifier_arg] = "=";
+          captured_xtrim[trim_threshold_arg] =
+              maxlen_mode
+                  ? std::to_string(stream.entries_.size())
+                  : FormatId(stream.entries_.empty()
+                                 ? Id{.ms_ = UINT64_MAX, .seq_ = UINT64_MAX}
+                                 : stream.entries_.front().id_);
+          if (replication.has_value()) replication->args_ = captured_xtrim;
+          MarkReplicationCommandHandled(request);
+        }
         return integer
                    ? Changed(std::move(stream))
                    : absl::StatusOr<storage::CompactValueUpdate>(NoChange());
       }
       case CommandKind::kXSetId: {
-        if (!value) return absl::InvalidArgumentError("no such key");
         auto id = ParseId(a[2]);
         if (!id.ok()) return id.status();
         std::optional<std::uint64_t> entries_added;
@@ -1463,6 +1645,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           } else
             return absl::InvalidArgumentError("syntax error");
         }
+        if (!value) return absl::InvalidArgumentError("no such key");
         if (*id < stream.max_deleted_id_)
           return absl::InvalidArgumentError(
               "The ID specified in XSETID is smaller than current "
@@ -1899,6 +2082,9 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   if (!captured_xadd.empty()) {
     CaptureReplicationCommand(request, std::move(captured_xadd));
   }
+  if (!captured_xtrim.empty()) {
+    CaptureReplicationCommand(request, std::move(captured_xtrim));
+  }
   if (request.kind_ == CommandKind::kXAdd && !nil && appended_id.has_value()) {
     NotifyStreamBlockingKey(request, a[1], appended_id->ms_,
                             appended_id->seq_);
@@ -1997,7 +2183,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           builder.AppendBulkString("length");
           builder.AppendInteger(info_stream.entries_.size());
           builder.AppendBulkString("radix-tree-keys");
-          builder.AppendInteger(info_stream.entries_.empty() ? 0 : 1);
+          builder.AppendInteger(info_stream.node_entries_.size());
           builder.AppendBulkString("radix-tree-nodes");
           builder.AppendInteger(info_stream.entries_.empty() ? 1 : 2);
           builder.AppendBulkString("last-generated-id");
@@ -2087,7 +2273,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         builder.AppendBulkString("length");
         builder.AppendInteger(info_stream.entries_.size());
         builder.AppendBulkString("radix-tree-keys");
-        builder.AppendInteger(info_stream.entries_.empty() ? 0 : 1);
+        builder.AppendInteger(info_stream.node_entries_.size());
         builder.AppendBulkString("radix-tree-nodes");
         builder.AppendInteger(info_stream.entries_.empty() ? 1 : 2);
         builder.AppendBulkString("last-generated-id");
@@ -2165,6 +2351,20 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
 }
 
 }  // namespace
+
+std::uint32_t StreamNodeMaxEntries() noexcept {
+  return g_stream_node_max_entries.load(std::memory_order_relaxed);
+}
+
+absl::Status SetStreamNodeMaxEntries(std::uint64_t value) {
+  if (value == 0 || value > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::InvalidArgumentError(
+        "stream-node-max-entries must be between 1 and 4294967295");
+  }
+  g_stream_node_max_entries.store(static_cast<std::uint32_t>(value),
+                                  std::memory_order_relaxed);
+  return absl::OkStatus();
+}
 
 void InitStreamCommandStorage(storage::StorageEngine* engine) {
   g_storage = engine;
