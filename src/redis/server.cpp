@@ -590,6 +590,9 @@ class RedisService final : public TcpService {
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
+  void FinalizeWorker(Worker& worker) noexcept override {
+    storage_->FinalizeWorker(worker);
+  }
   bool startup_failed() const noexcept {
     return startup_failed_.load(std::memory_order_acquire);
   }

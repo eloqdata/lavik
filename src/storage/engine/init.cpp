@@ -1153,6 +1153,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   co_return absl::OkStatus();
 }
 
+void StorageEngine::Impl::FinalizeWorker(unsigned worker_id) noexcept {
+  assert(worker_id < stores_.size());
+  stores_[worker_id].reset();
+}
+
 absl::Status StorageEngine::Impl::FlushForShutdown() {
   // Give in-flight commit chains a chance to append their commit records
   // before the flush order freezes the append streams: an acknowledged

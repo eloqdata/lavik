@@ -17,6 +17,10 @@ Task<absl::Status> StorageEngine::InitializeWorker(Worker& worker) {
   return impl_->InitializeWorker(worker);
 }
 
+void StorageEngine::FinalizeWorker(Worker& worker) noexcept {
+  impl_->FinalizeWorker(worker.id());
+}
+
 absl::Status StorageEngine::FlushForShutdown() {
   return impl_->FlushForShutdown();
 }

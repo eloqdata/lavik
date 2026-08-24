@@ -677,6 +677,10 @@ class StorageEngine {
   // complete fixed-file table, opens every file with O_DIRECT into its fixed
   // slot, and performs parallel recovery.
   celer::Task<absl::Status> InitializeWorker(celer::Worker& worker);
+  // Runs on the worker's native thread after its IO and coroutine frames have
+  // been torn down. Releases all state owned by that worker, including every
+  // worker-local ScanHashMap.
+  void FinalizeWorker(celer::Worker& worker) noexcept;
   absl::Status FlushForShutdown();
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
