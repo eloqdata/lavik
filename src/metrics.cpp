@@ -220,6 +220,16 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
   co_return result;
 }
 
+celer::Task<absl::Status> ResetCommandMetrics() {
+  for (unsigned worker = 0; worker < g_worker_metrics_count; ++worker) {
+    co_await celer::SubmitTo(worker, [worker] {
+      g_worker_metrics[worker].commands_ = {};
+      return true;
+    });
+  }
+  co_return absl::OkStatus();
+}
+
 std::string_view CommandMetricName(CommandKind kind) noexcept {
   return CommandCanonicalName(kind);
 }

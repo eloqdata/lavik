@@ -976,6 +976,13 @@ Task<absl::Status> ConfigureAllWorkerSchedulers(RuntimeConfigKey key,
 Task<CommandReply> ExecuteConfig(const CommandRequest& request,
                                  ReplyBuilder& reply_builder) {
   const auto& args = request.args_;
+  if (CmpCaseInsensitive(args[1], "RESETSTAT") && args.size() == 2) {
+    const absl::Status reset = co_await ResetCommandMetrics();
+    co_return reset.ok()
+        ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+        : BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR ", reset.message())));
+  }
   if (CmpCaseInsensitive(args[1], "REWRITE") && args.size() == 2) {
     if (g_replication == nullptr) {
       co_return BuiltReply(reply_builder.AppendError(
@@ -3333,6 +3340,31 @@ Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
   co_return BuiltReply(reply_builder.View());
 }
 
+std::uint64_t CommandLatencyMicros(const CommandMetricTotals& command,
+                                   double counter_frequency) {
+  const long double micros =
+      static_cast<long double>(command.latency_ticks_) * 1'000'000.0L /
+      std::max(1.0, counter_frequency);
+  if (micros >=
+      static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  return static_cast<std::uint64_t>(micros);
+}
+
+std::string CommandUsecPerCall(const CommandMetricTotals& command,
+                               double counter_frequency) {
+  const long double hundredths =
+      static_cast<long double>(command.latency_ticks_) * 100'000'000.0L /
+      (std::max(1.0, counter_frequency) * command.calls_);
+  const auto rounded = static_cast<std::uint64_t>(std::min<long double>(
+      hundredths + 0.5L,
+      static_cast<long double>(std::numeric_limits<std::uint64_t>::max())));
+  const std::uint64_t fraction = rounded % 100;
+  return absl::StrCat(rounded / 100, ".", fraction < 10 ? "0" : "",
+                      fraction);
+}
+
 // INFO: Redis-shaped sections built from what keylane actually tracks. The
 // Transactions section surfaces the VLL scheduler counters.
 Task<CommandReply> ExecuteInfo(const CommandRequest& request,
@@ -3351,7 +3383,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
-  if (wants("clients") || wants("stats") || wants("persistence")) {
+  if (wants("clients") || wants("stats") || wants("persistence") ||
+      wants("commandstats")) {
     runtime_metrics = co_await CollectWorkerMetrics();
   }
 
@@ -3489,6 +3522,25 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "command_cross_core_hops:" + std::to_string(command_cross_core_hops) +
         "\r\n\r\n";
 #endif
+  }
+  if (wants("commandstats")) {
+    info += "# Commandstats\r\n";
+    for (std::size_t index = 0; index < runtime_metrics->commands_.size();
+         ++index) {
+      const CommandMetricTotals& command = runtime_metrics->commands_[index];
+      if (command.calls_ == 0) continue;
+      info += "cmdstat_" +
+              std::string(CommandMetricName(static_cast<CommandKind>(index))) +
+              ":calls=" + std::to_string(command.calls_) +
+              ",usec=" +
+              std::to_string(CommandLatencyMicros(
+                  command, runtime_metrics->counter_frequency_)) +
+              ",usec_per_call=" +
+              CommandUsecPerCall(command,
+                                 runtime_metrics->counter_frequency_) +
+              ",rejected_calls=0,failed_calls=0\r\n";
+    }
+    info += "\r\n";
   }
   if (wants("replication")) {
     info += "# Replication\r\n";

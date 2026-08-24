@@ -285,6 +285,55 @@ std::uint64_t MetricValue(std::string_view body, std::string_view name) {
       std::string(body.substr(value_begin + 1, end - value_begin - 1)));
 }
 
+TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-resetstat-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t redis_port = FindFreePort();
+  std::uint16_t metrics_port = FindFreePort();
+  while (metrics_port == redis_port) metrics_port = FindFreePort();
+  ServerProcess server(g_keylane_binary, redis_port, metrics_port, data_path,
+                       log_path);
+  RespClient first(redis_port);
+  RespClient second(redis_port);
+
+  EXPECT_EQ(first.Command({"PING"}), "+PONG");
+  EXPECT_EQ(second.Command({"ECHO", "before-reset"}),
+            "$12\r\nbefore-reset");
+  EXPECT_EQ(first.Command({"SET", "resetstat-key", "value"}), "+OK");
+  const std::string before = second.Command({"INFO", "commandstats"});
+  EXPECT_NE(before.find("cmdstat_ping:calls=1,"), std::string::npos);
+  EXPECT_NE(before.find("cmdstat_echo:calls=1,"), std::string::npos);
+  EXPECT_NE(before.find("cmdstat_set:calls=1,"), std::string::npos);
+
+  EXPECT_EQ(first.Command({"CONFIG", "RESETSTAT"}), "+OK");
+  const std::string reset = second.Command({"INFO", "commandstats"});
+  EXPECT_EQ(reset.find("cmdstat_ping:"), std::string::npos);
+  EXPECT_EQ(reset.find("cmdstat_echo:"), std::string::npos);
+  EXPECT_EQ(reset.find("cmdstat_set:"), std::string::npos);
+  EXPECT_NE(reset.find("cmdstat_config:calls=1,"), std::string::npos);
+
+  // RESETSTAT resets counters, not the dataset or persistence dirty state.
+  EXPECT_EQ(first.Command({"GET", "resetstat-key"}), "$5\r\nvalue");
+  const std::string persistence = first.Command({"INFO", "persistence"});
+  EXPECT_NE(persistence.find("rdb_changes_since_last_save:1\r\n"),
+            std::string::npos);
+  EXPECT_EQ(first.Command({"CONFIG", "RESETSTAT"}), "+OK");
+  const std::string stats = first.Command({"INFO", "stats"});
+  EXPECT_NE(stats.find("total_commands_processed:1\r\n"), std::string::npos);
+  server.Stop();
+}
+
 TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =

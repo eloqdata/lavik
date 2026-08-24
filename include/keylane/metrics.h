@@ -94,6 +94,9 @@ void RecordDefragMetric(DefragMetricResult result) noexcept;
 void SetDefragActive(bool active) noexcept;
 void SetDefragPending(bool pending) noexcept;
 celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics();
+// Clears Redis command counters on their owning workers. Live gauges and
+// dataset persistence accounting are deliberately preserved.
+celer::Task<absl::Status> ResetCommandMetrics();
 std::string_view CommandMetricName(CommandKind kind) noexcept;
 
 celer::Task<absl::Status> RenderPrometheusMetrics(
