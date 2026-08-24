@@ -29,6 +29,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"quit", CommandKind::kQuit, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"reset", CommandKind::kReset, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"auth", CommandKind::kAuth, 2, 3, 0, 0, 1, kCmdNoKeys},
+    {"hello", CommandKind::kHello, 1, 7, 0, 0, 1, kCmdNoKeys},
     {"select", CommandKind::kSelect, 2, 2, 0, 0, 1, kCmdNoKeys},
     {"dbsize", CommandKind::kDbSize, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},

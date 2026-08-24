@@ -132,16 +132,6 @@ proc ::redis::__dispatch__raw__ {id method argv} {
         set fd $::redis::fd($id)
     }
 
-    # Keylane currently speaks RESP2 but does not implement HELLO. When RESP3
-    # tests are disabled, use PING as a no-op round trip for upstream's
-    # explicit "HELLO 2" resets. This also preserves deferred-client reads.
-    if {$::external && [lsearch $::denytags "resp3"] >= 0 &&
-        [string equal -nocase $method "HELLO"] &&
-        [lindex $argv 0] == 2} {
-        set method PING
-        set argv {}
-    }
-
     # Transform HELLO 2 to HELLO 3 if force_resp3
     # All set the connection var testing_resp3 in case of HELLO 3
     if {[llength $argv] > 0 && [string compare -nocase $method "HELLO"] == 0} {

@@ -34,7 +34,8 @@ Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
 Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                                        ReplyBuilder& reply_builder);
 Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
-                                              ReplyBuilder& reply_builder);
+                                              ReplyBuilder& reply_builder,
+                                              std::uint64_t client_id = 0);
 Task<std::string> ExecuteZSetMultiKeyLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes);

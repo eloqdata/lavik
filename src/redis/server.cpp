@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -19,8 +20,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -31,6 +34,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "backup.h"
+#include "blocking_wait.h"
 #include "celer/net/server.h"
 #include "celer/net/tcp_service.h"
 #include "celer/net/tcp_stream.h"
@@ -417,18 +421,119 @@ class PasswordAuthenticator {
 
   bool Authenticate(std::string_view username,
                     std::string_view password) const noexcept {
+    if (!required_) return username == "default";
     std::array<unsigned char, SHA256_DIGEST_LENGTH> candidate{};
     SHA256(reinterpret_cast<const unsigned char*>(password.data()),
            password.size(), candidate.data());
     const bool password_matches =
         CRYPTO_memcmp(candidate.data(), digest_.data(), digest_.size()) == 0;
-    return required_ && username == "default" && password_matches;
+    return username == "default" && password_matches;
   }
 
  private:
   bool required_ = false;
   std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_{};
 };
+
+bool ValidClientName(std::string_view name) {
+  return std::none_of(name.begin(), name.end(), [](unsigned char c) {
+    return c == 0 || std::isspace(c);
+  });
+}
+
+std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
+                              ReplicationManager* replication,
+                              ConnectionContext& ctx,
+                              std::span<const std::string> args,
+                              ReplyBuilder& reply) {
+  RespVersion requested = ctx.resp_version();
+  std::optional<std::pair<std::string_view, std::string_view>> credentials;
+  std::optional<std::string_view> client_name;
+
+  if (args.size() > 1) {
+    if (args[1] == "2") {
+      requested = RespVersion::k2;
+    } else if (args[1] == "3") {
+      requested = RespVersion::k3;
+    } else {
+      return reply.AppendError("NOPROTO unsupported protocol version");
+    }
+    for (std::size_t i = 2; i < args.size();) {
+      if (absl::EqualsIgnoreCase(args[i], "AUTH")) {
+        if (credentials.has_value() || i + 2 >= args.size()) {
+          return reply.AppendError("ERR syntax error");
+        }
+        credentials.emplace(args[i + 1], args[i + 2]);
+        i += 3;
+      } else if (absl::EqualsIgnoreCase(args[i], "SETNAME")) {
+        if (client_name.has_value() || i + 1 >= args.size()) {
+          return reply.AppendError("ERR syntax error");
+        }
+        client_name = args[i + 1];
+        i += 2;
+      } else {
+        return reply.AppendError("ERR syntax error");
+      }
+    }
+  }
+
+  if (client_name.has_value() && !ValidClientName(*client_name)) {
+    return reply.AppendError(
+        "ERR Client names cannot contain spaces, newlines or special "
+        "characters.");
+  }
+  if (credentials.has_value() &&
+      !authenticator.Authenticate(credentials->first, credentials->second)) {
+    return reply.AppendError(
+        "WRONGPASS invalid username-password pair or user is disabled.");
+  }
+  if (!ctx.authenticated_ && !credentials.has_value()) {
+    return reply.AppendError(
+        "NOAUTH HELLO must be called with the client already authenticated, "
+        "otherwise the HELLO AUTH <user> <pass> option can be used to "
+        "authenticate the client and select the RESP protocol version at the "
+        "same time");
+  }
+
+  // Nothing above this point mutates connection state. A failed HELLO leaves
+  // authentication, name and protocol exactly as they were.
+  if (credentials.has_value()) ctx.authenticated_ = true;
+  if (client_name.has_value()) {
+    ctx.client_name_ = *client_name;
+    SetClientName(ctx.conn_id_, ctx.client_name_);
+  }
+  ctx.SetRespVersion(requested);
+  SetClientRespVersion(ctx.conn_id_, requested);
+
+  reply.SetVersion(requested);
+  reply.AppendMapHeader(7);
+  reply.AppendBulkString("server");
+  reply.AppendBulkString("keylane");
+  reply.AppendBulkString("version");
+  reply.AppendBulkString(kVersion);
+  reply.AppendBulkString("proto");
+  reply.AppendInteger(static_cast<unsigned>(requested));
+  reply.AppendBulkString("id");
+  reply.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
+      ctx.conn_id_, std::numeric_limits<long long>::max())));
+  reply.AppendBulkString("mode");
+  reply.AppendBulkString("standalone");
+  reply.AppendBulkString("role");
+  reply.AppendBulkString(replication != nullptr && replication->is_replica()
+                             ? "slave"
+                             : "master");
+  reply.AppendBulkString("modules");
+  reply.AppendArrayHeader(0);
+  return reply.View();
+}
+
+std::string_view ExecuteHelloFromContext(
+    const void* authenticator, void* replication, ConnectionContext& ctx,
+    std::span<const std::string> args, ReplyBuilder& reply) {
+  return ExecuteHello(*static_cast<const PasswordAuthenticator*>(authenticator),
+                      static_cast<ReplicationManager*>(replication), ctx, args,
+                      reply);
+}
 
 template <typename Server>
 WaitResult WaitForSignalOrServerStop(const Server& server) {
@@ -680,6 +785,14 @@ Task<absl::Status> RedisService::ImportRdb() {
       "unsupported-skipped={}",
       load_rdb_file_, reader->version(), entry_count, imported, expired,
       skipped_count);
+  // Startup import establishes the persisted baseline; loading the snapshot
+  // itself must not make INFO report unsaved changes.
+  for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+    co_await SubmitTo(worker, [] {
+      MarkLocalDatasetChangesSaved(LocalDatasetChangesTotal());
+      return true;
+    });
+  }
   co_return absl::OkStatus();
 }
 
@@ -986,6 +1099,9 @@ Task<absl::Status> SampleMemory(Worker& worker) {
 Task<absl::Status> RedisService::Serve(TcpStream stream) {
   static std::atomic<std::uint64_t> next_connection_id{1};
   ConnectionContext ctx;
+  ctx.hello_authenticator_ = &authenticator_;
+  ctx.hello_replication_ = replication_;
+  ctx.hello_handler_ = &ExecuteHelloFromContext;
   ctx.authenticated_ = !authenticator_.required();
   ctx.authentication_required_ = authenticator_.required();
   ctx.conn_id_ = next_connection_id.fetch_add(1, std::memory_order_relaxed);
@@ -997,7 +1113,19 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
   const bool tls = stream.IsTls();
   RegisterClientConnection(ctx.conn_id_, stream.NativeFd(), address, tls);
   ConnectionOpened();
+  absl::Status observed = stream.SetPeerDisconnectCallback(
+      [](void* context) noexcept {
+        const auto* connection = static_cast<const ConnectionContext*>(context);
+        (void)CancelBlockedClientOnCurrentWorker(connection->conn_id_);
+      },
+      &ctx);
+  if (!observed.ok()) {
+    UnregisterClientConnection(ctx.conn_id_);
+    ConnectionClosed();
+    co_return observed;
+  }
   const absl::Status status = co_await Serve(stream, ctx);
+  stream.ClearPeerDisconnectCallback();
   // Single connection-scoped cleanup point: every disconnect path funnels
   // through this co_return.
   UnregisterMonitorSession(ctx.monitor_session_);
@@ -1055,7 +1183,28 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     ~ReaderDone() { MarkPubSubReaderDone(session_); }
   } reader_done{session};
 
-  ReplyBuilder builder;
+  ReplyBuilder builder(ctx.resp_version());
+  auto enqueue_command_reply =
+      [&](CommandReply reply) -> Task<absl::Status> {
+    if (reply.disk_value_.has_value()) {
+      const auto bytes = reply.disk_value_->network_bytes();
+      EnqueuePubSubReply(
+          session,
+          std::string(reinterpret_cast<const char*>(bytes.data()),
+                      bytes.size()));
+      co_return absl::OkStatus();
+    }
+    if (!reply.encoded_.empty()) {
+      EnqueuePubSubReply(session, std::string(reply.encoded_));
+    }
+    while (reply.chunks_) {
+      auto chunk = co_await reply.chunks_();
+      if (!chunk.ok()) co_return chunk.status();
+      if (chunk->empty()) break;
+      EnqueuePubSubReply(session, std::move(*chunk));
+    }
+    co_return absl::OkStatus();
+  };
   while (stream.IsOpen() && PubSubSubscriptionCount(session) != 0) {
     if (ShutdownRequested()) {
       ClosePubSubSession(session);
@@ -1095,6 +1244,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     RequestGuard request_guard(this);
     auto request = BuildCommandRequest(std::move(command), ctx.selected_db_);
+    builder.SetVersion(ctx.resp_version());
     builder.Reset();
     if (!request.ok()) {
       EnqueuePubSubReply(session, std::string(builder.AppendError(absl::StrCat(
@@ -1112,7 +1262,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
           co_await DispatchCommand(ctx, std::move(*request), builder);
       const bool succeeded =
           reply.encoded_.empty() || reply.encoded_.front() != '-';
-      EnqueuePubSubReply(session, std::string(reply.encoded_));
+      (void)co_await enqueue_command_reply(std::move(reply));
       if (!succeeded) continue;
       ResetPubSubSubscriptions(session);
       SetClientPubSubCounts(ctx.conn_id_, 0, 0);
@@ -1120,13 +1270,13 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ExitPubSubMode(session);
       co_return absl::OkStatus();
     }
-    if (kind == CommandKind::kPing) {
+    if (kind == CommandKind::kPing && ctx.resp_version() == RespVersion::k2) {
       if (request->args_.size() > 2) {
         EnqueuePubSubReply(
             session, std::string(builder.AppendError(
                          "ERR wrong number of arguments for 'ping' command")));
       } else {
-        builder.AppendArrayHeader(2);
+        builder.AppendPushHeader(2);
         builder.AppendBulkString("pong");
         builder.AppendBulkString(request->args_.size() == 2
                                      ? std::string_view(request->args_[1])
@@ -1136,7 +1286,8 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       continue;
     }
 
-    if (kind != CommandKind::kSubscribe && kind != CommandKind::kUnsubscribe &&
+    if (ctx.resp_version() == RespVersion::k2 &&
+        kind != CommandKind::kSubscribe && kind != CommandKind::kUnsubscribe &&
         kind != CommandKind::kPSubscribe &&
         kind != CommandKind::kPUnsubscribe) {
       if (kind == CommandKind::kUnknown) {
@@ -1158,7 +1309,19 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
     CommandReply reply =
         co_await DispatchCommand(ctx, std::move(*request), builder);
-    EnqueuePubSubReply(session, std::string(reply.encoded_));
+    const bool succeeded =
+        reply.encoded_.empty() || reply.encoded_.front() != '-';
+    if (reply.selected_db_.has_value()) ctx.selected_db_ = *reply.selected_db_;
+    absl::Status enqueued =
+        co_await enqueue_command_reply(std::move(reply));
+    if (!enqueued.ok()) {
+      ClosePubSubSession(session);
+      co_return enqueued;
+    }
+    if (succeeded) {
+      SetPubSubRespVersion(session, ctx.resp_version());
+      builder.SetVersion(ctx.resp_version());
+    }
     if (PubSubSubscriptionCount(session) == 0) {
       ExitPubSubMode(session);
       co_return absl::OkStatus();
@@ -1238,6 +1401,16 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     RespCommand command = ready.PopFront();
 
     const auto& args = command.args_;
+    if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "HELLO") &&
+        !ctx.in_multi_) {
+      const std::string_view encoded =
+          ExecuteHello(authenticator_, replication_, ctx, args,
+                       ctx.reply_builder_);
+      absl::Status written = co_await WriteOrBatchReply(
+          stream, encoded, !ready.empty(), &pending_replies);
+      if (!written.ok()) co_return written;
+      continue;
+    }
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "AUTH")) {
       std::shared_ptr<const std::string> monitor_message;
       if (HasMonitorSessions()) [[unlikely]] {
@@ -1368,6 +1541,21 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       reply.encoded_ = ctx.reply_builder_.AppendError(
           absl::StrCat("ERR ", request_result.status().message()));
     } else {
+      // A reply batch must never cross an unbounded command boundary. A
+      // pipelined blocking command can park this connection before the loop
+      // reaches its ordinary write path, otherwise replies for commands that
+      // already completed remain invisible to the client indefinitely.
+      // Blocking commands queued by MULTI execute non-blocking at EXEC time,
+      // so preserve batching while they are only being queued.
+      const bool may_block =
+          !ctx.in_multi_ && request_result->spec_ != nullptr &&
+          (request_result->spec_->flags_ & kCmdMayBlock) != 0;
+      if (may_block && !pending_replies.empty()) {
+        absl::Status flushed =
+            co_await FlushReplyBatch(stream, &pending_replies);
+        if (!flushed.ok()) co_return flushed;
+      }
+
       // Valkey emits queued MULTI children only when EXEC reaches them. The
       // transaction implementation publishes those children after WATCH and
       // other pre-execution checks pass.

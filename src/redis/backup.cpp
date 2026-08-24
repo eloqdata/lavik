@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -19,6 +20,7 @@
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
 #include "keylane/rdb.h"
+#include "keylane/metrics.h"
 #include "keylane/resp.h"
 #include "spdlog/spdlog.h"
 
@@ -194,19 +196,24 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
                          .count();
     const std::uint64_t snapshot_time_ms =
         now > 0 ? static_cast<std::uint64_t>(now) : 1;
+    saved_change_cuts_.clear();
+    saved_change_cuts_.reserve(storage_->worker_count());
     unsigned begun = 0;
     for (; begun < storage_->worker_count(); ++begun) {
-      absl::Status status =
-          co_await celer::SubmitTo(begun, [this, snapshot_time_ms] {
-            return storage_->BeginRdbSnapshot(session_id_, snapshot_time_ms);
+      auto cut = co_await celer::SubmitTo(
+          begun, [this, snapshot_time_ms] {
+            absl::Status status =
+                storage_->BeginRdbSnapshot(session_id_, snapshot_time_ms);
+            return std::pair{std::move(status), LocalDatasetChangesTotal()};
           });
-      if (!status.ok()) {
+      if (!cut.first.ok()) {
         for (unsigned worker = 0; worker < begun; ++worker) {
           (void)co_await celer::SubmitTaskTo(
               worker, [this] { return storage_->EndRdbSnapshot(session_id_); });
         }
-        co_return status;
+        co_return cut.first;
       }
+      saved_change_cuts_.push_back(cut.second);
     }
     OpenAllCommandDbGates();
     gates.open_ = true;
@@ -257,6 +264,9 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   }
   bool cut_failed() const noexcept {
     return cut_failed_.load(std::memory_order_acquire);
+  }
+  const std::vector<std::uint64_t>& saved_change_cuts() const noexcept {
+    return saved_change_cuts_;
   }
 
  private:
@@ -343,6 +353,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   std::atomic<unsigned> remaining_{0};
   std::atomic<bool> cut_ready_{false};
   std::atomic<bool> cut_failed_{false};
+  std::vector<std::uint64_t> saved_change_cuts_;
   mutable std::mutex status_mutex_;
   absl::Status status_;
 };
@@ -356,6 +367,13 @@ std::atomic<std::uint64_t> g_last_save_seconds{0};
 Task<absl::Status> FinishBackup(std::shared_ptr<BackupJob> job) {
   absl::Status status = co_await job->Run();
   if (status.ok()) {
+    const auto& cuts = job->saved_change_cuts();
+    for (unsigned worker = 0; worker < cuts.size(); ++worker) {
+      co_await celer::SubmitTo(worker, [saved = cuts[worker]] {
+        MarkLocalDatasetChangesSaved(saved);
+        return true;
+      });
+    }
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();

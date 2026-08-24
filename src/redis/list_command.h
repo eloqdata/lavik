@@ -22,6 +22,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                                        bool* unavailable = nullptr);
 
 Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
-                                              ReplyBuilder& reply_builder);
+                                              ReplyBuilder& reply_builder,
+                                              std::uint64_t client_id = 0);
 
 }  // namespace keylane

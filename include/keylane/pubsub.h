@@ -12,6 +12,7 @@
 
 #include "absl/status/status.h"
 #include "celer/runtime/task.h"
+#include "keylane/resp.h"
 
 namespace celer {
 class TcpStream;
@@ -24,15 +25,19 @@ class PubSubSession;
 // Initializes one worker-local subscription registry per runtime worker.
 void PreparePubSub(unsigned worker_count);
 
-std::shared_ptr<PubSubSession> RegisterPubSubSession(int fd);
+std::shared_ptr<PubSubSession> RegisterPubSubSession(int fd,
+                                                     RespVersion version);
 void UnregisterPubSubSession(const std::shared_ptr<PubSubSession>& session);
+void SetPubSubRespVersion(const std::shared_ptr<PubSubSession>& session,
+                          RespVersion version);
 
 std::size_t PubSubSubscriptionCount(
     const std::shared_ptr<PubSubSession>& session) noexcept;
 std::size_t PubSubPatternSubscriptionCount(
     const std::shared_ptr<PubSubSession>& session) noexcept;
 
-// These return one or more complete RESP2 push-style frames.
+// These return one or more complete push-style frames in the session's
+// negotiated RESP version.
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
                               std::span<const std::string> channels);
 std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,

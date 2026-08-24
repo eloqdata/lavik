@@ -727,7 +727,8 @@ Task<absl::StatusOr<ReadOneResult>> ReadOneLocal(
 Task<CommandReply> ExecuteRead(
     const CommandRequest& request, ReplyBuilder& builder,
     std::span<const StreamExecKey> locked_keys = {},
-    std::vector<storage::TxShardWrites>* tx_writes = nullptr) {
+    std::vector<storage::TxShardWrites>* tx_writes = nullptr,
+    std::uint64_t client_id = 0) {
   const auto& a = request.args_;
   const bool group_read = request.kind_ == CommandKind::kXReadGroup;
   if (group_read) MarkReplicationCommandHandled(request);
@@ -812,6 +813,7 @@ Task<CommandReply> ExecuteRead(
           ? std::optional(started + std::chrono::milliseconds(block_ms))
           : std::nullopt;
   std::unique_ptr<BlockingWaitHandle> wait_handle;
+  CommandRequest attempt_request = request;
   bool initialized_dollars = false;
   struct AttemptDbGuard {
     explicit AttemptDbGuard(std::uint8_t db, bool active)
@@ -826,25 +828,40 @@ Task<CommandReply> ExecuteRead(
     bool active_;
   };
   while (true) {
+    BlockingWakeCascade* attempt_cascade = nullptr;
     if (wait_handle) {
       const BlockingWakeReason state = BlockingWaitState(*wait_handle);
       if (state == BlockingWakeReason::kTimeout) {
-        co_return Built(builder.AppendRaw("*-1\r\n"));
+        co_return Built(builder.AppendNullArray());
+      }
+      if (state == BlockingWakeReason::kUnblockedError) {
+        co_return Built(builder.AppendError(
+            "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
       }
       if (state == BlockingWakeReason::kCancelled) {
         co_return Built(
             builder.AppendError("ERR blocking Stream wait cancelled"));
       }
       if (state == BlockingWakeReason::kReady) {
-        (void)ResetBlockingReady(*wait_handle);
+        attempt_cascade = ResetBlockingReady(*wait_handle);
       }
     }
+    struct CascadeCompletion {
+      BlockingWakeCascade* cascade_ = nullptr;
+      ~CascadeCompletion() { Finish(); }
+      void Finish() noexcept {
+        if (cascade_ == nullptr) return;
+        cascade_->Done();
+        cascade_ = nullptr;
+      }
+    } cascade_completion{attempt_cascade};
+    attempt_request.blocking_wake_cascade_ = attempt_cascade;
     const bool owns_attempt_gate = locked_keys.empty();
     while (owns_attempt_gate && !TryBeginCommandDbOperation(request.db_id_)) {
       if (block && block_ms != 0 &&
           std::chrono::steady_clock::now() - started >=
               std::chrono::milliseconds(block_ms)) {
-        co_return Built(builder.AppendRaw("*-1\r\n"));
+        co_return Built(builder.AppendNullArray());
       }
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -881,14 +898,15 @@ Task<CommandReply> ExecuteRead(
         one = co_await ReadOneLocal(
             request.db_id_, key, cursors[k], initialize, group_read, group_name,
             consumer_name, new_messages[k], noack, count,
-            locked_digest ? &*locked_digest : nullptr, local_tx, &request);
+            locked_digest ? &*locked_digest : nullptr, local_tx,
+            &attempt_request);
       } else {
         one = co_await celer::SubmitTaskTo(
             owner,
             [db = request.db_id_, key = std::move(key), cursor = cursors[k],
              initialize, group_read, group_name, consumer_name,
              is_new = new_messages[k], noack, count, locked_digest,
-             local_tx, request_ptr = &request]() mutable
+             local_tx, request_ptr = &attempt_request]() mutable
             -> Task<absl::StatusOr<ReadOneResult>> {
               co_return co_await ReadOneLocal(
                   db, std::move(key), cursor, initialize, group_read,
@@ -905,9 +923,12 @@ Task<CommandReply> ExecuteRead(
     }
     initialized_dollars = true;
     if (!found.empty()) {
-      builder.AppendArrayHeader(found.size());
+      if (builder.version() == RespVersion::k3)
+        builder.AppendMapHeader(found.size());
+      else
+        builder.AppendArrayHeader(found.size());
       for (const auto& [key, entries] : found) {
-        builder.AppendArrayHeader(2);
+        if (builder.version() == RespVersion::k2) builder.AppendArrayHeader(2);
         builder.AppendBulkString(key);
         builder.AppendArrayHeader(entries.size());
         for (const ReadOneResult::Item& item : entries) {
@@ -916,18 +937,19 @@ Task<CommandReply> ExecuteRead(
           } else {
             builder.AppendArrayHeader(2);
             builder.AppendBulkString(FormatId(item.id_));
-            builder.AppendRaw("*-1\r\n");
+            builder.AppendNullArray();
           }
         }
       }
       co_return Built(builder.View());
     }
-    if (has_history) co_return Built(builder.AppendRaw("*-1\r\n"));
-    if (!block) co_return Built(builder.AppendRaw("*-1\r\n"));
+    if (has_history) co_return Built(builder.AppendNullArray());
+    if (!block) co_return Built(builder.AppendNullArray());
     if (block_ms != 0 && std::chrono::steady_clock::now() - started >=
                              std::chrono::milliseconds(block_ms))
-      co_return Built(builder.AppendRaw("*-1\r\n"));
+      co_return Built(builder.AppendNullArray());
     db_guard.Release();
+    cascade_completion.Finish();
     if (!wait_handle) {
       const std::string lane =
           group_read
@@ -952,7 +974,7 @@ Task<CommandReply> ExecuteRead(
         specs.push_back(std::move(spec));
       }
       auto registered = co_await RegisterBlockingWait(
-          request.db_id_, std::move(specs), deadline);
+          request.db_id_, std::move(specs), client_id, deadline);
       if (!registered.ok()) {
         co_return Built(StorageError(builder, registered.status()));
       }
@@ -962,7 +984,11 @@ Task<CommandReply> ExecuteRead(
     }
     const BlockingWakeReason woke = co_await WaitForBlockingReady(*wait_handle);
     if (woke == BlockingWakeReason::kTimeout) {
-      co_return Built(builder.AppendRaw("*-1\r\n"));
+      co_return Built(builder.AppendNullArray());
+    }
+    if (woke == BlockingWakeReason::kUnblockedError) {
+      co_return Built(builder.AppendError(
+          "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
     }
     if (woke == BlockingWakeReason::kCancelled) {
       co_return Built(
@@ -974,7 +1000,8 @@ Task<CommandReply> ExecuteRead(
 Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                                const storage::Digest* digest,
                                storage::TxShardWrites* tx,
-                               ReplyBuilder& builder) {
+                               ReplyBuilder& builder,
+                               std::uint64_t client_id = 0) {
   const auto& a = request.args_;
   if (request.kind_ == CommandKind::kXGroup && a.size() >= 2 &&
       EqualCi(a[1], kRestoreGroupSubcommand)) {
@@ -1080,7 +1107,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   }
   if (request.kind_ == CommandKind::kXRead ||
       request.kind_ == CommandKind::kXReadGroup) {
-    co_return co_await ExecuteRead(request, builder);
+    co_return co_await ExecuteRead(request, builder, {}, nullptr, client_id);
   }
   bool read_only = request.kind_ == CommandKind::kXLen ||
                    request.kind_ == CommandKind::kXRange ||
@@ -1884,7 +1911,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   }
   switch (request.kind_) {
     case CommandKind::kXAdd:
-      co_return Built(nil ? builder.AppendNullBulkString()
+      co_return Built(nil ? builder.AppendNull()
                           : builder.AppendBulkString(simple));
     case CommandKind::kXSetId:
       co_return Built(builder.AppendSimpleString(simple));
@@ -1899,7 +1926,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     case CommandKind::kXRange:
     case CommandKind::kXRevRange:
     case CommandKind::kXClaim:
-      if (null_range) co_return Built(builder.AppendRaw("*-1\r\n"));
+      if (null_range) co_return Built(builder.AppendNullArray());
       builder.AppendArrayHeader(entries.size());
       for (const Entry& entry : entries) {
         if (claim_justid)
@@ -1926,8 +1953,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         builder.AppendArrayHeader(4);
         builder.AppendInteger(info_group.pending_.size());
         if (info_group.pending_.empty()) {
-          builder.AppendNullBulkString();
-          builder.AppendNullBulkString();
+          builder.AppendNull();
+          builder.AppendNull();
         } else {
           builder.AppendBulkString(FormatId(info_group.pending_.front().id_));
           builder.AppendBulkString(FormatId(info_group.pending_.back().id_));
@@ -1943,7 +1970,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             ++it->second;
         }
         if (counts.empty()) {
-          builder.AppendRaw("*-1\r\n");
+          builder.AppendNullArray();
         } else {
           builder.AppendArrayHeader(counts.size());
           for (const auto& [name, count] : counts) {
@@ -1966,7 +1993,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     case CommandKind::kXInfo:
       if (EqualCi(a[1], "stream")) {
         if (xinfo_full) {
-          builder.AppendArrayHeader(18);
+          builder.AppendMapHeader(9);
           builder.AppendBulkString("length");
           builder.AppendInteger(info_stream.entries_.size());
           builder.AppendBulkString("radix-tree-keys");
@@ -1993,21 +2020,21 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           builder.AppendBulkString("groups");
           builder.AppendArrayHeader(info_stream.groups_.size());
           for (const Group& group : info_stream.groups_) {
-            builder.AppendArrayHeader(14);
+            builder.AppendMapHeader(7);
             builder.AppendBulkString("name");
             builder.AppendBulkString(group.name_);
             builder.AppendBulkString("last-delivered-id");
             builder.AppendBulkString(FormatId(group.last_id_));
             builder.AppendBulkString("entries-read");
             if (group.entries_read_ < 0)
-              builder.AppendNullBulkString();
+              builder.AppendNull();
             else
               builder.AppendInteger(group.entries_read_);
             builder.AppendBulkString("lag");
             const std::optional<std::uint64_t> lag =
                 GroupLag(info_stream, group);
             if (!lag.has_value())
-              builder.AppendNullBulkString();
+              builder.AppendNull();
             else
               builder.AppendInteger(*lag);
             builder.AppendBulkString("pel-count");
@@ -2027,7 +2054,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
             builder.AppendBulkString("consumers");
             builder.AppendArrayHeader(group.consumers_.size());
             for (const Consumer& consumer : group.consumers_) {
-              builder.AppendArrayHeader(10);
+              builder.AppendMapHeader(5);
               builder.AppendBulkString("name");
               builder.AppendBulkString(consumer.name_);
               builder.AppendBulkString("seen-time");
@@ -2056,7 +2083,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           }
           co_return Built(builder.View());
         }
-        builder.AppendArrayHeader(20);
+        builder.AppendMapHeader(10);
         builder.AppendBulkString("length");
         builder.AppendInteger(info_stream.entries_.size());
         builder.AppendBulkString("radix-tree-keys");
@@ -2078,18 +2105,18 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         builder.AppendInteger(info_stream.groups_.size());
         builder.AppendBulkString("first-entry");
         if (info_stream.entries_.empty())
-          builder.AppendNullBulkString();
+          builder.AppendNull();
         else
           AppendEntry(builder, info_stream.entries_.front());
         builder.AppendBulkString("last-entry");
         if (info_stream.entries_.empty())
-          builder.AppendNullBulkString();
+          builder.AppendNull();
         else
           AppendEntry(builder, info_stream.entries_.back());
       } else if (EqualCi(a[1], "groups")) {
         builder.AppendArrayHeader(info_groups.size());
         for (const Group& group : info_groups) {
-          builder.AppendArrayHeader(12);
+          builder.AppendMapHeader(6);
           builder.AppendBulkString("name");
           builder.AppendBulkString(group.name_);
           builder.AppendBulkString("consumers");
@@ -2100,13 +2127,13 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           builder.AppendBulkString(FormatId(group.last_id_));
           builder.AppendBulkString("entries-read");
           if (group.entries_read_ < 0)
-            builder.AppendNullBulkString();
+            builder.AppendNull();
           else
             builder.AppendInteger(group.entries_read_);
           builder.AppendBulkString("lag");
           const std::optional<std::uint64_t> lag = GroupLag(info_stream, group);
           if (!lag.has_value())
-            builder.AppendNullBulkString();
+            builder.AppendNull();
           else
             builder.AppendInteger(*lag);
         }
@@ -2116,7 +2143,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           const auto pending = std::count_if(
               info_group.pending_.begin(), info_group.pending_.end(),
               [&](const Pending& p) { return p.consumer_ == consumer.name_; });
-          builder.AppendArrayHeader(8);
+          builder.AppendMapHeader(4);
           builder.AppendBulkString("name");
           builder.AppendBulkString(consumer.name_);
           builder.AppendBulkString("pending");
@@ -2144,8 +2171,10 @@ void InitStreamCommandStorage(storage::StorageEngine* engine) {
 }
 
 Task<CommandReply> ExecuteStreamCommand(const CommandRequest& request,
-                                        ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteImpl(request, nullptr, nullptr, reply_builder);
+                                        ReplyBuilder& reply_builder,
+                                        std::uint64_t client_id) {
+  co_return co_await ExecuteImpl(request, nullptr, nullptr, reply_builder,
+                                 client_id);
 }
 Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,
@@ -2157,7 +2186,7 @@ Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
 Task<std::string> ExecuteStreamReadLocked(
     const CommandRequest& request, std::span<const StreamExecKey> keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(request.resp_version_);
   CommandReply reply = co_await ExecuteRead(request, builder, keys, &tx_writes);
   co_return std::string(reply.encoded_);
 }

@@ -1,5 +1,6 @@
 #include "absl/strings/str_cat.h"
 #include "impl.h"
+#include "keylane/metrics.h"
 #include "keylane/replication_command.h"
 
 namespace keylane::storage {
@@ -456,6 +457,11 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   if (!written.ok()) {
     co_return written;
   }
+  std::uint64_t dataset_changes = 0;
+  for (const TxShardWrites* shard : shards) {
+    if (shard != nullptr) dataset_changes += shard->dataset_changes_;
+  }
+  RecordDatasetChanges(dataset_changes);
   // Nudge the commit's own block so the decision becomes durable promptly
   // instead of waiting out the periodic flush: until it lands, a crash
   // drops the whole (acknowledged but never durability-promised)
@@ -979,12 +985,16 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         std::max(partition.mutation_sequence_, mutation_sequence);
   }
   if (status.ok() && tx != nullptr) {
+    ++tx->dataset_changes_;
     tx->expiration_effects_.push_back(TxShardWrites::ExpirationEffect{
         .key_ = std::string(key),
         .expire_at_ms_ = kind == RecordKind::kValue ? expire_at_ms : 0,
         .db_id_ = db_id,
         .exists_ = kind == RecordKind::kValue,
     });
+  }
+  if (status.ok() && tx == nullptr) {
+    RecordDatasetChanges();
   }
   std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
   if (status.ok() && replication != nullptr) {

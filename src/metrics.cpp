@@ -39,6 +39,8 @@ struct alignas(64) WorkerMetricsShard {
   std::uint64_t defrag_failures_ = 0;
   std::uint64_t active_defrags_ = 0;
   std::uint64_t pending_defrags_ = 0;
+  std::uint64_t dataset_changes_total_ = 0;
+  std::uint64_t dataset_changes_saved_ = 0;
 };
 
 static_assert(alignof(WorkerMetricsShard) == 64);
@@ -90,6 +92,23 @@ void RecordClientUnblocked() noexcept {
   WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
   assert(shard.blocked_clients_ != 0);
   --shard.blocked_clients_;
+}
+
+void RecordDatasetChanges(std::uint64_t count) noexcept {
+  g_worker_metrics[celer::ThisWorker().id_].dataset_changes_total_ += count;
+}
+
+std::uint64_t LocalDatasetChangesTotal() noexcept {
+  return g_worker_metrics[celer::ThisWorker().id_].dataset_changes_total_;
+}
+
+void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept {
+  WorkerMetricsShard& shard = g_worker_metrics[celer::ThisWorker().id_];
+  // Only one RDB job is active today, but max keeps this correct if completed
+  // jobs are ever allowed to retire out of order.
+  shard.dataset_changes_saved_ =
+      std::max(shard.dataset_changes_saved_,
+               std::min(total, shard.dataset_changes_total_));
 }
 
 void RecordReplicationConnectionOpened(
@@ -179,6 +198,8 @@ celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {
     result.defrag_failures_ += shard.defrag_failures_;
     result.active_defrags_ += shard.active_defrags_;
     result.pending_defrags_ += shard.pending_defrags_;
+    result.rdb_changes_since_last_save_ +=
+        shard.dataset_changes_total_ - shard.dataset_changes_saved_;
     result.storage_reads_.operations_ += storage_io.read_operations_;
     result.storage_reads_.bytes_ += storage_io.read_bytes_;
     result.storage_writes_.operations_ += storage_io.write_operations_;

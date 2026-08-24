@@ -118,6 +118,27 @@ TEST(RespParserTest, RejectsSplitMalformedBulkTerminator) {
             "malformed RESP bulk string terminator");
 }
 
+TEST(RespParserTest, AcceptsInlineCommandsQuotesAndEscapesIncrementally) {
+  RespCommandParser parser;
+  RespParseResult first = parser.Parse("SET inline \"hello\\x20");
+  ASSERT_EQ(first.state_, RespParseState::kNeedMoreData);
+  RespParseResult second = parser.Parse("world\" NX\r\n");
+  ASSERT_EQ(second.state_, RespParseState::kOk) << second.status_.message();
+  EXPECT_EQ(second.command_.args_,
+            (std::vector<std::string>{"SET", "inline", "hello world", "NX"}));
+}
+
+TEST(RespParserTest, AcceptsResp3ScalarAndVerbatimArguments) {
+  const std::string request =
+      "*6\r\n+SET\r\n$3\r\nkey\r\n=9\r\ntxt:value\r\n:42\r\n"
+      ",1.5\r\n#t\r\n";
+  RespParseResult parsed = ParseRespCommand(request);
+  ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_.message();
+  EXPECT_EQ(parsed.command_.args_,
+            (std::vector<std::string>{"SET", "key", "value", "42", "1.5",
+                                      "1"}));
+}
+
 TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {
   ReplyBuilder builder;
 
@@ -153,6 +174,39 @@ TEST(ReplyBuilderTest, ReusesBoundedCapacityAndReleasesOversizedBuffer) {
   ASSERT_GT(builder.Capacity(), 64 * 1024);
   builder.Reset();
   EXPECT_LE(builder.Capacity(), 64 * 1024);
+}
+
+TEST(ReplyBuilderTest, EncodesProtocolSpecificResp3Types) {
+  ReplyBuilder builder(RespVersion::k3);
+  builder.AppendNull();
+  builder.AppendMapHeader(1);
+  builder.AppendBulkString("key");
+  builder.AppendBulkString("value");
+  builder.AppendSetHeader(1);
+  builder.AppendBulkString("member");
+  builder.AppendPushHeader(2);
+  builder.AppendBulkString("message");
+  builder.AppendBulkString("payload");
+  builder.AppendBoolean(true);
+  builder.AppendDouble(1.5);
+  builder.AppendDoubleText("2.50");
+  EXPECT_EQ(builder.View(),
+            "_\r\n%1\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
+            "~1\r\n$6\r\nmember\r\n"
+            ">2\r\n$7\r\nmessage\r\n$7\r\npayload\r\n"
+            "#t\r\n,1.5\r\n,2.50\r\n");
+}
+
+TEST(ReplyBuilderTest, DegradesSemanticTypesToResp2) {
+  ReplyBuilder builder;
+  builder.AppendNull();
+  builder.AppendMapHeader(1);
+  builder.AppendSetHeader(2);
+  builder.AppendPushHeader(3);
+  builder.AppendBoolean(false);
+  builder.AppendDouble(1.5);
+  EXPECT_EQ(builder.View(),
+            "$-1\r\n*2\r\n*2\r\n*3\r\n:0\r\n$3\r\n1.5\r\n");
 }
 
 }  // namespace

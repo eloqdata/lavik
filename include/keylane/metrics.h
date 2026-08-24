@@ -52,6 +52,7 @@ struct WorkerMetricsSnapshot {
   std::uint64_t defrag_failures_ = 0;
   std::uint64_t active_defrags_ = 0;
   std::uint64_t pending_defrags_ = 0;
+  std::uint64_t rdb_changes_since_last_save_ = 0;
   StorageIoMetricTotals storage_reads_{};
   StorageIoMetricTotals storage_writes_{};
   StorageIoMetricTotals storage_fdatasyncs_{};
@@ -67,6 +68,13 @@ void RecordConnectionOpened() noexcept;
 void RecordConnectionClosed() noexcept;
 void RecordClientBlocked() noexcept;
 void RecordClientUnblocked() noexcept;
+
+// Dataset change accounting is worker-local on the write path. INFO sums the
+// shards, avoiding a contended global counter. RDB backup captures and later
+// installs one saved baseline per worker so writes after the cut remain dirty.
+void RecordDatasetChanges(std::uint64_t count = 1) noexcept;
+[[nodiscard]] std::uint64_t LocalDatasetChangesTotal() noexcept;
+void MarkLocalDatasetChangesSaved(std::uint64_t total) noexcept;
 
 enum class ReplicationConnectionKind : std::uint8_t {
   kControl,

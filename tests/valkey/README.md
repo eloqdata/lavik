@@ -10,11 +10,10 @@ The test cases are copied unchanged. The harness has two Keylane-specific
 changes: it limits the default suite list to the vendored data-structure files,
 external-server cleanup tolerates the unsupported `FUNCTION FLUSH` command,
 Valkey-only object-encoding configuration is emulated inside the harness, and
-`HELLO 2` resets become no-op round trips. Valkey's internal `MEMORY USAGE`
-coverage probe also returns a nonzero placeholder. The runner uses one database,
-ignores server-internal object encoding, and skips slow, replication,
-debug-only, RESP3-only, and large-memory cases. All data structure command
-semantics are still checked by the original assertions.
+Valkey's internal `MEMORY USAGE` coverage probe returns a nonzero placeholder.
+The runner uses one database, ignores server-internal object encoding, and
+skips slow, replication, debug-only, RESP3-only, and large-memory cases. All
+data structure command semantics are still checked by the original assertions.
 
 Build Keylane, then run all currently vendored suites:
 

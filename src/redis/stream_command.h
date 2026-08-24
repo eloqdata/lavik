@@ -15,7 +15,8 @@ struct StreamExecKey {
 };
 
 Task<CommandReply> ExecuteStreamCommand(const CommandRequest& request,
-                                        ReplyBuilder& reply_builder);
+                                        ReplyBuilder& reply_builder,
+                                        std::uint64_t client_id = 0);
 Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,
                                               storage::TxShardWrites* tx,

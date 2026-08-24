@@ -910,6 +910,265 @@ TEST(ListE2eTest, StreamBlockingRegistryBroadcastsAndKeepsGroupFifo) {
   server.Stop();
 }
 
+TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-client-unblock-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient client(port);
+  auto wait_until_blocked = [&](std::string_view id) {
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      const std::string listing =
+          client.Command({"CLIENT", "LIST", "ID", id});
+      if (listing.find("id=" + std::string(id) + " ") !=
+              std::string::npos &&
+          listing.find(" flags=b ") != std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  };
+  auto client_id = [](std::string encoded) {
+    if (!encoded.starts_with(':')) {
+      throw std::runtime_error("CLIENT ID did not return an integer");
+    }
+    return encoded.substr(1);
+  };
+
+  const std::string help = client.Command({"CLIENT", "HELP"});
+  EXPECT_NE(help.find(
+                "+CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+            std::string::npos);
+  EXPECT_NE(help.find("+SETINFO <option> <value>"), std::string::npos);
+  EXPECT_NE(help.find("+    Print this help."), std::string::npos);
+  EXPECT_EQ(client.Command({"CLIENT", "HELP", "extra"}),
+            "-ERR wrong number of arguments for 'client|help' command");
+
+  std::string info = client.Command({"CLIENT", "INFO"});
+  EXPECT_NE(info.find(" cmd=client|info "), std::string::npos);
+  EXPECT_NE(info.find(" lib-name= lib-ver="), std::string::npos);
+  EXPECT_EQ(client.Command({"CLIENT", "INFO", "extra"}),
+            "-ERR wrong number of arguments for 'client|info' command");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", "redis.py"}),
+            "+OK");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "LIB-VER", "1.2.3"}),
+            "+OK");
+  info = client.Command({"CLIENT", "INFO"});
+  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"),
+            std::string::npos);
+  const std::string metadata_id = client_id(client.Command({"CLIENT", "ID"}));
+  const std::string metadata_listing =
+      client.Command({"CLIENT", "LIST", "ID", metadata_id});
+  EXPECT_NE(metadata_listing.find(" lib-name=redis.py lib-ver=1.2.3"),
+            std::string::npos);
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", "redis py"}),
+            "-ERR lib-name cannot contain spaces, newlines or special characters.");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-ver", "1.2\n3"}),
+            "-ERR lib-ver cannot contain spaces, newlines or special characters.");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "badger", "hamster"}),
+            "-ERR Unrecognized option 'badger'");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name"}),
+            "-ERR wrong number of arguments for 'client|setinfo' command");
+  EXPECT_EQ(client.Command({"RESET"}), "+RESET");
+  info = client.Command({"CLIENT", "INFO"});
+  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"),
+            std::string::npos);
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", ""}), "+OK");
+  info = client.Command({"CLIENT", "INFO"});
+  EXPECT_NE(info.find(" lib-name= lib-ver=1.2.3"), std::string::npos);
+
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", "not-an-id"}),
+            "-ERR value is not an integer or out of range");
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", "1", "invalid"}),
+            "-ERR CLIENT UNBLOCK reason should be TIMEOUT or ERROR");
+  const std::string active_id = client_id(client.Command({"CLIENT", "ID"}));
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", active_id}), ":0");
+
+  std::promise<std::string> timeout_id_promise;
+  std::future<std::string> timeout_id = timeout_id_promise.get_future();
+  auto timeout_waiter = std::async(
+      std::launch::async, [port, &timeout_id_promise, &client_id] {
+        RespClient waiting(port);
+        timeout_id_promise.set_value(
+            client_id(waiting.Command({"CLIENT", "ID"})));
+        return waiting.Command({"BLPOP", "client-unblock-timeout", "5"});
+      });
+  const std::string timeout_client_id = timeout_id.get();
+  ASSERT_TRUE(wait_until_blocked(timeout_client_id));
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", timeout_client_id}), ":1");
+  ASSERT_EQ(timeout_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(timeout_waiter.get(), "*-1");
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", timeout_client_id}), ":0");
+
+  std::promise<std::string> error_id_promise;
+  std::future<std::string> error_id = error_id_promise.get_future();
+  auto error_waiter = std::async(std::launch::async,
+                                 [port, &error_id_promise, &client_id] {
+                                   RespClient waiting(port);
+                                   error_id_promise.set_value(
+                                       client_id(waiting.Command(
+                                           {"CLIENT", "ID"})));
+                                   return waiting.Command(
+                                       {"BLPOP", "client-unblock-error", "5"});
+                                 });
+  const std::string error_client_id = error_id.get();
+  ASSERT_TRUE(wait_until_blocked(error_client_id));
+  EXPECT_EQ(
+      client.Command({"CLIENT", "UNBLOCK", error_client_id, "ERROR"}),
+      ":1");
+  ASSERT_EQ(error_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(error_waiter.get(),
+            "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
+
+  std::promise<std::string> stream_id_promise;
+  std::future<std::string> stream_id = stream_id_promise.get_future();
+  auto stream_waiter = std::async(std::launch::async,
+                                  [port, &stream_id_promise, &client_id] {
+                                    RespClient waiting(port);
+                                    stream_id_promise.set_value(
+                                        client_id(waiting.Command(
+                                            {"CLIENT", "ID"})));
+                                    return waiting.Command(
+                                        {"XREAD", "BLOCK", "5000", "STREAMS",
+                                         "client-unblock-stream", "0-0"});
+                                  });
+  const std::string stream_client_id = stream_id.get();
+  ASSERT_TRUE(wait_until_blocked(stream_client_id));
+  EXPECT_EQ(
+      client.Command({"CLIENT", "UNBLOCK", stream_client_id, "ERROR"}),
+      ":1");
+  ASSERT_EQ(stream_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(stream_waiter.get(),
+            "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
+
+  server.Stop();
+}
+
+TEST(ListE2eTest, DisconnectCancelsActiveBlockingWait) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-blocking-disconnect-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient control(port);
+  auto wait_for_blocked_clients = [&](std::uint64_t expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (control.Command({"INFO", "CLIENTS"}).find(field) !=
+          std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  };
+
+  const int blocked = ConnectSocket(port);
+  ASSERT_GE(blocked, 0);
+  SendAll(blocked,
+          EncodeCommand({"BLPOP", "disconnect-blocked-client", "0"}));
+  ASSERT_TRUE(wait_for_blocked_clients(1));
+  ASSERT_EQ(::close(blocked), 0);
+  EXPECT_TRUE(wait_for_blocked_clients(0));
+
+  // The dead waiter's key registration must be gone as well as its metric.
+  EXPECT_EQ(control.Command({"LPUSH", "disconnect-blocked-client", "value"}),
+            ":1");
+  EXPECT_EQ(control.Command({"LPOP", "disconnect-blocked-client"}),
+            "$5\r\nvalue");
+  server.Stop();
+}
+
+TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-blocking-pipeline-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient control(port);
+  auto wait_for_blocked_clients = [&](std::uint64_t expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (control.Command({"INFO", "CLIENTS"}).find(field) !=
+          std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  };
+
+  constexpr std::string_view key = "pipeline-blocking-fairness";
+  auto first_waiter = std::async(std::launch::async, [port, key] {
+    RespClient waiting(port);
+    return waiting.Command({"BLPOP", key, "2"});
+  });
+  ASSERT_TRUE(wait_for_blocked_clients(1));
+
+  const int pipelined = ConnectSocket(port);
+  ASSERT_GE(pipelined, 0);
+  timeval short_timeout{.tv_sec = 2, .tv_usec = 0};
+  ASSERT_EQ(::setsockopt(pipelined, SOL_SOCKET, SO_RCVTIMEO, &short_timeout,
+                        sizeof(short_timeout)),
+            0);
+  std::string commands = EncodeCommand({"LPUSH", key, "first"});
+  commands += EncodeCommand({"BLPOP", key, "2"});
+  SendAll(pipelined, commands);
+
+  ASSERT_EQ(first_waiter.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(first_waiter.get(), "*2\r\n$26\r\npipeline-blocking-fairness\r\n"
+                                "$5\r\nfirst");
+  // This reply must be on the wire even though the next pipelined command is
+  // now blocked on the same connection.
+  EXPECT_EQ(ReadRespLine(pipelined), ":1");
+  ASSERT_TRUE(wait_for_blocked_clients(1));
+
+  EXPECT_EQ(control.Command({"LPUSH", key, "second"}), ":1");
+  ASSERT_TRUE(wait_for_blocked_clients(0));
+  EXPECT_EQ(ReadRespLine(pipelined), "*2");
+  EXPECT_EQ(ReadRespBulk(pipelined), key);
+  EXPECT_EQ(ReadRespBulk(pipelined), "second");
+  ASSERT_EQ(::close(pipelined), 0);
+  server.Stop();
+}
+
 TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -1004,6 +1263,184 @@ TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
                                      "\r\n*2\r\n" + Bulk("field") + "\r\n" +
                                      Bulk("ready"));
   EXPECT_TRUE(wait_for_blocked_clients(0));
+
+  server.Stop();
+}
+
+TEST(ListE2eTest, CircularBlockingMovesDrainBeforeTriggerReply) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-circular-blocking-move-e2e-" +
+      std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient client(port);
+  const std::string first = "circular-first{nested}";
+  const std::string second = "circular-second{nested}";
+  auto wait_for_blocked_clients = [&](std::uint64_t expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (client.Command({"INFO", "CLIENTS"}).find(field) !=
+          std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  };
+
+  auto run_cycle = [&](bool transaction) {
+    const std::string deleted = client.Command({"DEL", first, second});
+    EXPECT_TRUE(deleted == ":0" || deleted == ":1");
+    auto forward = std::async(std::launch::async, [port, first, second] {
+      RespClient waiting(port);
+      return waiting.Command({"BRPOPLPUSH", first, second, "2"});
+    });
+    ASSERT_TRUE(wait_for_blocked_clients(1));
+    auto backward = std::async(std::launch::async, [port, first, second] {
+      RespClient waiting(port);
+      return waiting.Command({"BRPOPLPUSH", second, first, "2"});
+    });
+    ASSERT_TRUE(wait_for_blocked_clients(2));
+
+    if (transaction) {
+      EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+      EXPECT_EQ(client.Command({"RPUSH", first, "foo"}), "+QUEUED");
+      EXPECT_EQ(client.Command({"EXEC"}), "*1\r\n:1");
+    } else {
+      EXPECT_EQ(client.Command({"RPUSH", first, "foo"}), ":1");
+    }
+
+    // Redis drains ready keys, including nested wakes, before accepting the
+    // next command. The value must already have completed both moves here.
+    EXPECT_EQ(client.Command({"LRANGE", first, "0", "-1"}),
+              BulkArray({"foo"}));
+    EXPECT_EQ(client.Command({"LRANGE", second, "0", "-1"}), "*0");
+    ASSERT_EQ(forward.wait_for(1s), std::future_status::ready);
+    ASSERT_EQ(backward.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(forward.get(), Bulk("foo"));
+    EXPECT_EQ(backward.get(), Bulk("foo"));
+    EXPECT_TRUE(wait_for_blocked_clients(0));
+  };
+
+  run_cycle(false);
+  run_cycle(true);
+  server.Stop();
+}
+
+TEST(ListE2eTest, BlockingMovesDoNotDirtyWatchBeforeWakeAndCountChanges) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-blocking-watch-dirty-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  ServerProcess server(g_keylane_binary, port, data_path, log_path, 3);
+  RespClient trigger(port);
+  auto blocked_clients = [&](std::uint64_t expected) {
+    const std::string field =
+        "blocked_clients:" + std::to_string(expected) + "\r\n";
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (trigger.Command({"INFO", "CLIENTS"}).find(field) !=
+          std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(1ms);
+    }
+    return false;
+  };
+  auto dirty = [&] {
+    constexpr std::string_view marker = "rdb_changes_since_last_save:";
+    const std::string info = trigger.Command({"INFO", "PERSISTENCE"});
+    const std::size_t begin = info.find(marker);
+    if (begin == std::string::npos) {
+      throw std::runtime_error("RDB dirty counter is missing");
+    }
+    const std::size_t value_begin = begin + marker.size();
+    const std::size_t value_end = info.find("\r\n", value_begin);
+    std::uint64_t value = 0;
+    const auto [parsed, error] =
+        std::from_chars(info.data() + value_begin, info.data() + value_end,
+                        value);
+    if (error != std::errc{} || parsed != info.data() + value_end) {
+      throw std::runtime_error("RDB dirty counter is malformed");
+    }
+    return value;
+  };
+
+  const std::string source = "watch-source{blocking-watch}";
+  const std::string destination = "watch-destination{blocking-watch}";
+  const std::string value_key = "watch-value{blocking-watch}";
+  for (unsigned iteration = 0; iteration < 32; ++iteration) {
+    const std::string deleted =
+        trigger.Command({"DEL", source, destination, value_key});
+    ASSERT_TRUE(deleted == ":0" || deleted == ":1" || deleted == ":2" ||
+                deleted == ":3");
+    ASSERT_EQ(trigger.Command({"SET", value_key, "somevalue"}), "+OK");
+    auto blocked = std::async(std::launch::async, [port, source, destination] {
+      RespClient client(port);
+      return client.Command({"BRPOPLPUSH", source, destination, "2"});
+    });
+    ASSERT_TRUE(blocked_clients(1));
+
+    RespClient watcher(port);
+    ASSERT_EQ(watcher.Command({"WATCH", destination}), "+OK");
+    ASSERT_EQ(watcher.Command({"MULTI"}), "+OK");
+    ASSERT_EQ(watcher.Command({"GET", value_key}), "+QUEUED");
+    // Complete EXEC while BRPOPLPUSH is still blocked. Ordering two
+    // independent TCP streams by client-side send time is not a server-side
+    // synchronization primitive; reading the reply makes the intended
+    // pre-wake ordering explicit.
+    EXPECT_EQ(watcher.Command({"EXEC"}), "*1\r\n" + Bulk("somevalue"));
+    ASSERT_EQ(trigger.Command({"LPUSH", source, "element"}), ":1");
+    ASSERT_EQ(blocked.wait_for(1s), std::future_status::ready);
+    EXPECT_EQ(blocked.get(), Bulk("element"));
+  }
+
+  const std::string pop_key = "dirty-pop{blocking-dirty}";
+  auto pop = std::async(std::launch::async, [port, pop_key] {
+    RespClient client(port);
+    return client.Command({"BLPOP", pop_key, "2"});
+  });
+  ASSERT_TRUE(blocked_clients(1));
+  const std::uint64_t before_pop = dirty();
+  ASSERT_EQ(trigger.Command({"LPUSH", pop_key, "a"}), ":1");
+  ASSERT_EQ(pop.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(pop.get(), "*2\r\n" + Bulk(pop_key) + "\r\n" + Bulk("a"));
+  EXPECT_EQ(dirty(), before_pop + 2);
+
+  auto move = std::async(std::launch::async, [port, source, destination] {
+    RespClient client(port);
+    return client.Command(
+        {"BLMOVE", source, destination, "LEFT", "LEFT", "2"});
+  });
+  ASSERT_TRUE(blocked_clients(1));
+  const std::uint64_t before_move = dirty();
+  ASSERT_EQ(trigger.Command({"LPUSH", source, "a"}), ":1");
+  ASSERT_EQ(move.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(move.get(), Bulk("a"));
+  EXPECT_EQ(dirty(), before_move + 2);
 
   server.Stop();
 }

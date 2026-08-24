@@ -461,7 +461,7 @@ void AppendSortArray(ReplyBuilder& builder,
     if (value.has_value())
       builder.AppendBulkString(*value);
     else
-      builder.AppendNullBulkString();
+      builder.AppendNull();
   }
 }
 
@@ -636,7 +636,7 @@ Task<std::string> ExecuteSortCommandLocked(
                                             std::move(*source), keys);
   if (!product.ok()) co_return EncodeSortError(product.status());
   if (!options->store_arg_.has_value()) {
-    ReplyBuilder builder;
+    ReplyBuilder builder(request.resp_version_);
     AppendSortArray(builder, product->reply_values_);
     co_return std::string(builder.View());
   }

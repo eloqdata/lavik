@@ -109,6 +109,10 @@ for _ in $(seq 1 3000); do
 done
 [[ ${current} != "${previous}" ]]
 [[ -s "${case_dir}/dump.rdb" ]]
+dirty_after_save=$("${redis_cli}" -p "${source_port}" info persistence |
+  awk -F: '/^rdb_changes_since_last_save:/ {gsub("\r", "", $2); print $2}')
+[[ ${dirty_after_save} =~ ^[0-9]+$ ]]
+((dirty_after_save > 0))
 
 stop_server "${source_pid}"
 source_pid=
@@ -120,6 +124,9 @@ truncate -s 1G "${case_dir}/import.data"
   --dbfilename imported.rdb >"${case_dir}/import.log" 2>&1 &
 import_pid=$!
 wait_ready "${import_port}"
+import_dirty=$("${redis_cli}" -p "${import_port}" info persistence |
+  awk -F: '/^rdb_changes_since_last_save:/ {gsub("\r", "", $2); print $2}')
+[[ ${import_dirty} == 0 ]]
 
 [[ $("${redis_cli}" -p "${import_port}" dbsize) == 5016 ]]
 [[ $("${redis_cli}" -p "${import_port}" --scan --pattern 'after:*' | wc -l) == 0 ]]

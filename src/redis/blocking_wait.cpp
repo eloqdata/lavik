@@ -29,6 +29,19 @@
 namespace keylane {
 using namespace celer;
 
+void BlockingWakeCascade::Done() noexcept {
+  const std::uint64_t previous =
+      pending_.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous != 0);
+}
+
+Task<absl::Status> DrainBlockingWakeCascade(BlockingWakeCascade& cascade) {
+  while (!cascade.empty()) {
+    co_await celer::Yield(*celer::ThisWorker().self_);
+  }
+  co_return absl::OkStatus();
+}
+
 BlockingNotificationCapture::BlockingNotificationCapture(
     unsigned worker_count)
     : per_worker_(worker_count) {}
@@ -152,7 +165,9 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
     Awaiter(const Awaiter&) = delete;
     Awaiter& operator=(const Awaiter&) = delete;
     ~Awaiter() {
-      if (handle_ && !resumed_) waiter_->Cancel();
+      if (handle_ && !resumed_) {
+        if (BlockingWakeCascade* cascade = waiter_->Cancel()) cascade->Done();
+      }
     }
 
     bool await_ready() const noexcept {
@@ -182,14 +197,30 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
 
   WakeReason reason() const noexcept { return reason_; }
 
-  bool ResetReady() noexcept {
-    if (reason_ != WakeReason::kReady) return false;
+  BlockingWakeCascade* ResetReady() noexcept {
+    if (reason_ != WakeReason::kReady) return nullptr;
     reason_ = WakeReason::kWaiting;
+    return std::exchange(cascade_, nullptr);
+  }
+
+  bool Signal(WakeReason reason,
+              BlockingWakeCascade* cascade = nullptr) noexcept {
+    if (reason_ != WakeReason::kWaiting) return false;
+    reason_ = reason;
+    cascade_ = cascade;
+    std::coroutine_handle<> handle = std::exchange(handle_, {});
+    if (handle) worker_->Enqueue(handle);
     return true;
   }
 
-  bool Signal(WakeReason reason) noexcept {
-    if (reason_ != WakeReason::kWaiting) return false;
+  bool SignalTerminal(WakeReason reason) noexcept {
+    if (reason_ != WakeReason::kWaiting && reason_ != WakeReason::kReady) {
+      return false;
+    }
+    if (cascade_ != nullptr) {
+      cascade_->Done();
+      cascade_ = nullptr;
+    }
     reason_ = reason;
     std::coroutine_handle<> handle = std::exchange(handle_, {});
     if (handle) worker_->Enqueue(handle);
@@ -197,22 +228,21 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
   }
 
   void SignalTimeout() noexcept {
-    if (reason_ != WakeReason::kWaiting && reason_ != WakeReason::kReady) {
-      return;
-    }
     // Deadline is terminal even if readiness was already latched. If the
     // woken attempt loses the element to an earlier waiter, it must observe
     // the expired deadline instead of sleeping after its timer has exited.
-    reason_ = WakeReason::kTimeout;
-    std::coroutine_handle<> handle = std::exchange(handle_, {});
-    if (handle) worker_->Enqueue(handle);
+    (void)SignalTerminal(WakeReason::kTimeout);
   }
 
-  void Cancel() noexcept {
-    if (reason_ == WakeReason::kWaiting || reason_ == WakeReason::kReady) {
-      reason_ = WakeReason::kCancelled;
-    }
+  BlockingWakeCascade* Cancel() noexcept {
+    // Cancellation is the final lifecycle state, including after a terminal
+    // timeout or CLIENT UNBLOCK wake. This also lets the detached deadline
+    // task retire instead of sleeping until its original (possibly distant)
+    // deadline after the command has already replied.
+    BlockingWakeCascade* cascade = std::exchange(cascade_, nullptr);
+    reason_ = WakeReason::kCancelled;
     handle_ = {};
+    return cascade;
   }
 
  private:
@@ -225,22 +255,37 @@ class BlockingWaiter : public std::enable_shared_from_this<BlockingWaiter> {
   celer::Worker* worker_ = nullptr;
   std::uint64_t ticket_ = 0;
   WakeReason reason_ = WakeReason::kWaiting;
+  BlockingWakeCascade* cascade_ = nullptr;
   std::coroutine_handle<> handle_{};
 };
 
+struct BlockingReadyNotification {
+  std::shared_ptr<BlockingWaiter> waiter_;
+  BlockingWakeCascade* cascade_ = nullptr;
+};
+
 void RunBlockingReadyNotification(void* context, std::uint64_t) noexcept {
-  std::unique_ptr<std::shared_ptr<BlockingWaiter>> waiter(
-      static_cast<std::shared_ptr<BlockingWaiter>*>(context));
-  (void)(*waiter)->Signal(WakeReason::kReady);
+  std::unique_ptr<BlockingReadyNotification> notification(
+      static_cast<BlockingReadyNotification*>(context));
+  if (!notification->waiter_->Signal(WakeReason::kReady,
+                                     notification->cascade_) &&
+      notification->cascade_ != nullptr) {
+    notification->cascade_->Done();
+  }
 }
 
-void SignalBlockingReady(const std::shared_ptr<BlockingWaiter>& waiter) {
+void SignalBlockingReady(const std::shared_ptr<BlockingWaiter>& waiter,
+                         BlockingWakeCascade* cascade) {
+  if (cascade != nullptr) cascade->Add();
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (waiter->worker_id() == current.id_) {
-    (void)waiter->Signal(WakeReason::kReady);
+    if (!waiter->Signal(WakeReason::kReady, cascade) && cascade != nullptr) {
+      cascade->Done();
+    }
     return;
   }
-  auto context = std::make_unique<std::shared_ptr<BlockingWaiter>>(waiter);
+  auto context = std::make_unique<BlockingReadyNotification>(
+      BlockingReadyNotification{waiter, cascade});
   celer::PostNotification(
       current.cross_core_, waiter->worker_id(),
       celer::RemoteNotification{.context_ = context.release(),
@@ -272,7 +317,8 @@ class BlockingWaitRegistry {
   // Pass FIFO ownership only within the lane whose active waiter completed.
   // A physical-key notification here would spuriously wake every private
   // XREAD broadcast lane whenever an unrelated waiter timed out.
-  void NotifyLane(const BlockingKey& key) {
+  void NotifyLane(const BlockingKey& key,
+                  BlockingWakeCascade* cascade = nullptr) {
     auto found = queues_.find(key);
     if (found == queues_.end()) return;
     auto& queue = found->second.entries_;
@@ -285,20 +331,21 @@ class BlockingWaitRegistry {
     if (queue.front().policy_ == BlockingQueuePolicy::kBroadcast) {
       for (const Entry& entry : queue) {
         if (const auto waiter = entry.waiter_.lock()) {
-          SignalBlockingReady(waiter);
+          SignalBlockingReady(waiter, cascade);
         }
       }
       return;
     }
     if (const auto waiter = queue.front().waiter_.lock()) {
-      SignalBlockingReady(waiter);
+      SignalBlockingReady(waiter, cascade);
     }
   }
 
   void Notify(std::uint8_t db_id, std::string_view key,
               BlockingValueType value_type,
               std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id =
-                  std::nullopt) {
+                  std::nullopt,
+              BlockingWakeCascade* cascade = nullptr) {
     for (auto found = queues_.begin(); found != queues_.end();) {
       if (found->first.db_id_ != db_id || found->first.key_ != key) {
         ++found;
@@ -325,13 +372,13 @@ class BlockingWaitRegistry {
         for (const Entry& entry : queue) {
           if (!matches(entry)) continue;
           if (const auto waiter = entry.waiter_.lock())
-            SignalBlockingReady(waiter);
+            SignalBlockingReady(waiter, cascade);
         }
       } else {
         for (const Entry& entry : queue) {
           if (!matches(entry)) continue;
           if (const auto waiter = entry.waiter_.lock()) {
-            SignalBlockingReady(waiter);
+            SignalBlockingReady(waiter, cascade);
             break;
           }
         }
@@ -357,7 +404,7 @@ class BlockingWaitRegistry {
       if (key.db_id_ != db_id) continue;
       for (const Entry& entry : state.entries_) {
         if (const auto waiter = entry.waiter_.lock()) {
-          SignalBlockingReady(waiter);
+          SignalBlockingReady(waiter, nullptr);
           if (entry.policy_ == BlockingQueuePolicy::kFifo) break;
         }
       }
@@ -391,6 +438,39 @@ BlockingWaitRegistry& LocalBlockingWaiters() {
   return registry;
 }
 
+absl::flat_hash_map<std::uint64_t, std::weak_ptr<BlockingWaiter>>&
+LocalBlockedClients() {
+  static thread_local absl::flat_hash_map<
+      std::uint64_t, std::weak_ptr<BlockingWaiter>>
+      clients;
+  return clients;
+}
+
+void RegisterBlockedClient(
+    std::uint64_t client_id,
+    const std::shared_ptr<BlockingWaiter>& waiter) {
+  if (client_id == 0) return;
+  LocalBlockedClients()[client_id] = waiter;
+  SetClientBlocked(client_id, true);
+}
+
+void UnregisterBlockedClient(
+    std::uint64_t client_id,
+    const std::shared_ptr<BlockingWaiter>& waiter) noexcept {
+  if (client_id == 0) return;
+  auto& clients = LocalBlockedClients();
+  const auto found = clients.find(client_id);
+  bool cleared = false;
+  if (found != clients.end()) {
+    const std::shared_ptr<BlockingWaiter> current = found->second.lock();
+    if (current == nullptr || current == waiter) {
+      clients.erase(found);
+      cleared = true;
+    }
+  }
+  if (cleared) SetClientBlocked(client_id, false);
+}
+
 Task<absl::Status> TimeoutBlockingWaiter(
     std::shared_ptr<BlockingWaiter> waiter,
     std::chrono::steady_clock::time_point deadline) {
@@ -420,18 +500,22 @@ unsigned ShardForKey(std::string_view key) {
 struct WaiterCleanup {
   BlockingKey key_;
   std::uint64_t ticket_ = 0;
+  BlockingWakeCascade* cascade_ = nullptr;
 };
 
 void RunWaiterCleanup(void* context, std::uint64_t) noexcept {
   std::unique_ptr<WaiterCleanup> cleanup(static_cast<WaiterCleanup*>(context));
   LocalBlockingWaiters().Unregister(cleanup->key_, cleanup->ticket_);
-  LocalBlockingWaiters().NotifyLane(cleanup->key_);
+  LocalBlockingWaiters().NotifyLane(cleanup->key_, cleanup->cascade_);
+  if (cleanup->cascade_ != nullptr) cleanup->cascade_->Done();
 }
 
 void PostWaiterCleanup(const WaitRegistration& registration,
-                       std::uint64_t ticket) noexcept {
-  auto cleanup =
-      std::make_unique<WaiterCleanup>(WaiterCleanup{registration.key_, ticket});
+                       std::uint64_t ticket,
+                       BlockingWakeCascade* cascade) noexcept {
+  if (cascade != nullptr) cascade->Add();
+  auto cleanup = std::make_unique<WaiterCleanup>(
+      WaiterCleanup{registration.key_, ticket, cascade});
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (registration.owner_ == current.id_) {
     RunWaiterCleanup(cleanup.release(), 0);
@@ -460,15 +544,17 @@ Task<absl::Status> RegisterBlockingWaiter(
 void UnregisterBlockingWaiter(
     const std::shared_ptr<BlockingWaiter>& waiter,
     const std::vector<WaitRegistration>& registrations) {
-  waiter->Cancel();
+  BlockingWakeCascade* cascade = waiter->Cancel();
   for (const WaitRegistration& registration : registrations) {
-    PostWaiterCleanup(registration, waiter->ticket());
+    PostWaiterCleanup(registration, waiter->ticket(), cascade);
   }
+  if (cascade != nullptr) cascade->Done();
 }
 
 struct BlockingKeyNotification {
   BlockingKey key_;
   std::optional<std::pair<std::uint64_t, std::uint64_t>> stream_id_;
+  BlockingWakeCascade* cascade_ = nullptr;
 };
 
 void RunBlockingKeyNotification(void* context, std::uint64_t) noexcept {
@@ -476,22 +562,27 @@ void RunBlockingKeyNotification(void* context, std::uint64_t) noexcept {
       static_cast<BlockingKeyNotification*>(context));
   LocalBlockingWaiters().Notify(
       notification->key_.db_id_, notification->key_.key_,
-      notification->key_.value_type_, notification->stream_id_);
+      notification->key_.value_type_, notification->stream_id_,
+      notification->cascade_);
+  if (notification->cascade_ != nullptr) notification->cascade_->Done();
 }
 
 void NotifyBlockingKey(std::uint8_t db_id, std::string_view key,
                        BlockingValueType value_type,
                        std::optional<std::pair<std::uint64_t, std::uint64_t>>
-                           stream_id = std::nullopt) {
+                           stream_id = std::nullopt,
+                       BlockingWakeCascade* cascade = nullptr) {
   const unsigned owner = ShardForKey(key);
   const celer::CurrentWorker& current = celer::ThisWorker();
   if (owner == current.id_) {
-    LocalBlockingWaiters().Notify(db_id, key, value_type, stream_id);
+    LocalBlockingWaiters().Notify(db_id, key, value_type, stream_id, cascade);
     return;
   }
+  if (cascade != nullptr) cascade->Add();
   auto notification =
       std::make_unique<BlockingKeyNotification>(BlockingKeyNotification{
-          BlockingKey{db_id, std::string(key), {}, value_type}, stream_id});
+          BlockingKey{db_id, std::string(key), {}, value_type}, stream_id,
+          cascade});
   celer::PostNotification(current.cross_core_, owner,
                           celer::RemoteNotification{
                               .context_ = notification.release(),
@@ -500,12 +591,42 @@ void NotifyBlockingKey(std::uint8_t db_id, std::string_view key,
                           });
 }
 
-
 }  // namespace
+
+bool UnblockClientOnCurrentWorker(std::uint64_t client_id,
+                                  ClientUnblockMode mode) noexcept {
+  auto& clients = LocalBlockedClients();
+  const auto found = clients.find(client_id);
+  if (found == clients.end()) return false;
+  const std::shared_ptr<BlockingWaiter> waiter = found->second.lock();
+  if (waiter == nullptr) {
+    clients.erase(found);
+    SetClientBlocked(client_id, false);
+    return false;
+  }
+  const WakeReason reason = mode == ClientUnblockMode::kTimeout
+                                ? WakeReason::kTimeout
+                                : WakeReason::kUnblockedError;
+  return waiter->SignalTerminal(reason);
+}
+
+bool CancelBlockedClientOnCurrentWorker(std::uint64_t client_id) noexcept {
+  auto& clients = LocalBlockedClients();
+  const auto found = clients.find(client_id);
+  if (found == clients.end()) return false;
+  const std::shared_ptr<BlockingWaiter> waiter = found->second.lock();
+  if (waiter == nullptr) {
+    clients.erase(found);
+    SetClientBlocked(client_id, false);
+    return false;
+  }
+  return waiter->SignalTerminal(WakeReason::kCancelled);
+}
 
 struct BlockingWaitHandle::Impl {
   std::shared_ptr<BlockingWaiter> waiter_;
   std::vector<WaitRegistration> registrations_;
+  std::uint64_t client_id_ = 0;
   bool active_ = true;
 };
 
@@ -526,8 +647,10 @@ BlockingWaitHandle::~BlockingWaitHandle() { FinishBlockingWait(*this); }
 
 Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
     std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+    std::uint64_t client_id,
     std::optional<std::chrono::steady_clock::time_point> deadline) {
   auto impl = std::make_unique<BlockingWaitHandle::Impl>();
+  impl->client_id_ = client_id;
   impl->waiter_ = std::make_shared<BlockingWaiter>(
       celer::ThisWorker().self_, storage::StorageEngine::AllocateWriteTxid());
   impl->registrations_.reserve(specs.size());
@@ -550,6 +673,7 @@ Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
   absl::Status registered =
       co_await RegisterBlockingWaiter(impl->waiter_, impl->registrations_);
   if (!registered.ok()) co_return registered;
+  RegisterBlockedClient(impl->client_id_, impl->waiter_);
   RecordClientBlocked();
   if (deadline.has_value()) {
     celer::SpawnOnCurrentWorker(
@@ -573,24 +697,28 @@ BlockingWakeReason BlockingWaitState(const BlockingWaitHandle& handle) {
   return handle.impl_->waiter_->reason();
 }
 
-bool ResetBlockingReady(BlockingWaitHandle& handle) {
-  return handle.impl_ && handle.impl_->active_ &&
-         handle.impl_->waiter_->ResetReady();
+BlockingWakeCascade* ResetBlockingReady(BlockingWaitHandle& handle) {
+  return handle.impl_ && handle.impl_->active_
+             ? handle.impl_->waiter_->ResetReady()
+             : nullptr;
 }
 
 void FinishBlockingWait(BlockingWaitHandle& handle) {
   if (!handle.impl_ || !handle.impl_->active_) return;
   handle.impl_->active_ = false;
   RecordClientUnblocked();
+  UnregisterBlockedClient(handle.impl_->client_id_, handle.impl_->waiter_);
   UnregisterBlockingWaiter(handle.impl_->waiter_, handle.impl_->registrations_);
 }
 
 Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+    std::uint64_t client_id, std::uint8_t db_id,
+    std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,
     BlockingReplyFactory timeout_reply,
-    BlockingStatusReplyFactory status_reply) {
+    BlockingReplyFactory unblock_error_reply,
+    BlockingStatusReplyFactory status_reply, bool yield_before_retry) {
   class AttemptDbGuard {
    public:
     explicit AttemptDbGuard(std::uint8_t db_id) : db_id_(db_id) {}
@@ -609,16 +737,30 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
 
   std::unique_ptr<BlockingWaitHandle> waiter;
   for (;;) {
+    BlockingWakeCascade* attempt_cascade = nullptr;
     if (waiter) {
       const BlockingWakeReason state = BlockingWaitState(*waiter);
       if (state == BlockingWakeReason::kTimeout) co_return timeout_reply();
+      if (state == BlockingWakeReason::kUnblockedError) {
+        co_return unblock_error_reply();
+      }
       if (state == BlockingWakeReason::kCancelled) {
         co_return status_reply(absl::CancelledError(cancellation_message));
       }
       if (state == BlockingWakeReason::kReady) {
-        (void)ResetBlockingReady(*waiter);
+        attempt_cascade = ResetBlockingReady(*waiter);
       }
     }
+
+    struct CascadeCompletion {
+      BlockingWakeCascade* cascade_ = nullptr;
+      ~CascadeCompletion() { Finish(); }
+      void Finish() noexcept {
+        if (cascade_ == nullptr) return;
+        cascade_->Done();
+        cascade_ = nullptr;
+      }
+    } cascade_completion{attempt_cascade};
 
     while (!TryBeginCommandDbOperation(db_id)) {
       if (deadline && std::chrono::steady_clock::now() >= *deadline) {
@@ -630,7 +772,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     }
     AttemptDbGuard gate(db_id);
 
-    BlockingAttemptResult result = co_await attempt();
+    BlockingAttemptResult result = co_await attempt(attempt_cascade);
+    cascade_completion.Finish();
     if (result.state_ == BlockingAttemptState::kComplete) {
       co_return std::move(result.reply_);
     }
@@ -641,7 +784,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     if (!waiter) {
       gate.Release();
       auto registered =
-          co_await RegisterBlockingWait(db_id, std::move(specs), deadline);
+          co_await RegisterBlockingWait(db_id, std::move(specs), client_id,
+                                        deadline);
       if (!registered.ok()) co_return status_reply(registered.status());
       waiter = std::move(*registered);
       continue;  // closes the unavailable-check/register race
@@ -650,8 +794,19 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     gate.Release();
     const BlockingWakeReason woke = co_await WaitForBlockingReady(*waiter);
     if (woke == BlockingWakeReason::kTimeout) co_return timeout_reply();
+    if (woke == BlockingWakeReason::kUnblockedError) {
+      co_return unblock_error_reply();
+    }
     if (woke == BlockingWakeReason::kCancelled) {
       co_return status_reply(absl::CancelledError(cancellation_message));
+    }
+    // Readiness is not an ownership handoff. A blocking move may write a
+    // destination unrelated to the key that woke it. Let requests already
+    // admitted on other connections establish their destination lock queue
+    // positions before the move retries. This is deliberately restricted to
+    // moves and costs no timer sleep or ordinary-command latency.
+    if (yield_before_retry) {
+      co_await celer::Yield(*celer::ThisWorker().self_);
     }
   }
 }
@@ -678,8 +833,10 @@ void InitBlockingWaitStorage(storage::StorageEngine* engine) {
   g_storage = engine;
 }
 
-void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key) {
-  NotifyBlockingKey(db_id, key, BlockingValueType::kList);
+void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key,
+                           BlockingWakeCascade* cascade) {
+  NotifyBlockingKey(db_id, key, BlockingValueType::kList, std::nullopt,
+                    cascade);
 }
 
 void NotifyListBlockingKey(const CommandRequest& request,
@@ -689,11 +846,14 @@ void NotifyListBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kList);
     return;
   }
-  NotifyListBlockingKey(request.db_id_, key);
+  NotifyListBlockingKey(request.db_id_, key,
+                        request.blocking_wake_cascade_);
 }
 
-void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key) {
-  NotifyBlockingKey(db_id, key, BlockingValueType::kSortedSet);
+void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key,
+                           BlockingWakeCascade* cascade) {
+  NotifyBlockingKey(db_id, key, BlockingValueType::kSortedSet, std::nullopt,
+                    cascade);
 }
 
 void NotifyZSetBlockingKey(const CommandRequest& request,
@@ -703,13 +863,15 @@ void NotifyZSetBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kSortedSet);
     return;
   }
-  NotifyZSetBlockingKey(request.db_id_, key);
+  NotifyZSetBlockingKey(request.db_id_, key,
+                        request.blocking_wake_cascade_);
 }
 
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
-                             std::uint64_t id_ms, std::uint64_t id_seq) {
+                             std::uint64_t id_ms, std::uint64_t id_seq,
+                             BlockingWakeCascade* cascade) {
   NotifyBlockingKey(db_id, key, BlockingValueType::kStream,
-                    std::pair{id_ms, id_seq});
+                    std::pair{id_ms, id_seq}, cascade);
 }
 
 void NotifyStreamBlockingKey(const CommandRequest& request,
@@ -720,11 +882,14 @@ void NotifyStreamBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kStream);
     return;
   }
-  NotifyStreamBlockingKey(request.db_id_, key, id_ms, id_seq);
+  NotifyStreamBlockingKey(request.db_id_, key, id_ms, id_seq,
+                          request.blocking_wake_cascade_);
 }
 
-void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key) {
-  NotifyBlockingKey(db_id, key, BlockingValueType::kStream);
+void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
+                             BlockingWakeCascade* cascade) {
+  NotifyBlockingKey(db_id, key, BlockingValueType::kStream, std::nullopt,
+                    cascade);
 }
 
 void NotifyStreamBlockingKey(const CommandRequest& request,
@@ -734,11 +899,12 @@ void NotifyStreamBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kStream);
     return;
   }
-  NotifyStreamBlockingKey(request.db_id_, key);
+  NotifyStreamBlockingKey(request.db_id_, key,
+                          request.blocking_wake_cascade_);
 }
 
 Task<absl::Status> FlushBlockingNotifications(
-    BlockingNotificationCapture& capture) {
+    BlockingNotificationCapture& capture, BlockingWakeCascade* cascade) {
   std::vector<CapturedBlockingNotification> notifications = capture.Take();
   std::sort(notifications.begin(), notifications.end(),
             [](const CapturedBlockingNotification& left,
@@ -779,11 +945,11 @@ Task<absl::Status> FlushBlockingNotifications(
       if (matching !=
           notifications.begin() + static_cast<std::ptrdiff_t>(end)) {
         if (info.value_type_ == storage::ValueType::kList) {
-          NotifyListBlockingKey(db_id, key);
+          NotifyListBlockingKey(db_id, key, cascade);
         } else if (info.value_type_ == storage::ValueType::kSortedSet) {
-          NotifyZSetBlockingKey(db_id, key);
+          NotifyZSetBlockingKey(db_id, key, cascade);
         } else if (info.value_type_ == storage::ValueType::kStream) {
-          NotifyStreamBlockingKey(db_id, key);
+          NotifyStreamBlockingKey(db_id, key, cascade);
         }
       }
     }

@@ -264,6 +264,8 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     (void)co_await g_storage->RollbackTxLocal(txid);
     co_return SingleShardListOutcome(pushed.status());
   }
+  // The source and destination records form one logical Redis move.
+  writes.dataset_changes_ = 1;
   std::vector<storage::TxShardWrites*> write_refs{&writes};
   absl::Status committed =
       co_await g_storage->CommitTxWrites(txid, std::move(write_refs));
@@ -465,19 +467,19 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
     case CommandKind::kRPop:
       if (op.count_provided_) {
         if (!result->key_exists_) {
-          co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
+          co_return BuiltReply(reply_builder.AppendNullArray());
         }
         AppendBulkArray(reply_builder, result->values_);
         co_return BuiltReply(reply_builder.View());
       }
       co_return BuiltReply(
           result->values_.empty()
-              ? reply_builder.AppendNullBulkString()
+              ? reply_builder.AppendNull()
               : reply_builder.AppendBulkString(result->values_.front()));
     case CommandKind::kLIndex:
       co_return BuiltReply(
           result->values_.empty()
-              ? reply_builder.AppendNullBulkString()
+              ? reply_builder.AppendNull()
               : reply_builder.AppendBulkString(result->values_.front()));
     case CommandKind::kLRange:
       AppendBulkArray(reply_builder, result->values_);
@@ -501,7 +503,7 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
       }
       co_return BuiltReply(
           result->positions_.empty()
-              ? reply_builder.AppendNullBulkString()
+              ? reply_builder.AppendNull()
               : reply_builder.AppendInteger(result->positions_.front()));
     default:
       break;
@@ -632,8 +634,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     if (outcome.values_.empty()) {
       if (unavailable != nullptr) *unavailable = true;
-      co_return BuiltReply(move ? reply_builder.AppendNullBulkString()
-                                : reply_builder.AppendRaw("*-1\r\n"));
+      co_return BuiltReply(move ? reply_builder.AppendNull()
+                                : reply_builder.AppendNullArray());
     }
     if (!move) {
       replication.SetCommandArgs(EncodeListPopEffect(
@@ -713,7 +715,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     }
     (void)co_await release();
     if (unavailable != nullptr) *unavailable = true;
-    co_return BuiltReply(reply_builder.AppendRaw("*-1\r\n"));
+    co_return BuiltReply(reply_builder.AppendNullArray());
   }
 
   const std::string_view source_key = args[1];
@@ -737,7 +739,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
     if (!moved->values_.empty()) replication.Commit();
     co_return BuiltReply(
         moved->values_.empty()
-            ? reply_builder.AppendNullBulkString()
+            ? reply_builder.AppendNull()
             : reply_builder.AppendBulkString(moved->values_.front()));
   }
 
@@ -764,7 +766,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       co_return BuiltReply(AppendStorageError(reply_builder, popped.status()));
     }
     if (unavailable != nullptr) *unavailable = true;
-    co_return BuiltReply(reply_builder.AppendNullBulkString());
+    co_return BuiltReply(reply_builder.AppendNull());
   }
 
   storage::ListOperation push;
@@ -791,6 +793,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   }
 
   std::vector<storage::TxShardWrites*> write_ptrs;
+  // One LMOVE/RPOPLPUSH is one logical dataset change even though its atomic
+  // storage transaction writes both the source and destination records.
+  for (auto& write : writes) write.dataset_changes_ = 0;
+  writes[source_owner].dataset_changes_ = 1;
   for (auto& write : writes) write_ptrs.push_back(&write);
   status = co_await g_storage->CommitTxWrites(txid, std::move(write_ptrs));
   if (!status.ok()) {
@@ -822,7 +828,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
 }
 
 Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
-                                              ReplyBuilder& reply_builder) {
+                                              ReplyBuilder& reply_builder,
+                                              std::uint64_t client_id) {
   const auto& args = request.args_;
   const std::size_t timeout_arg = request.kind_ == CommandKind::kBLMPop   ? 1
                                   : request.kind_ == CommandKind::kBLMove ? 5
@@ -910,8 +917,8 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   auto timeout_reply = [&] {
     return BuiltReply((request.kind_ == CommandKind::kBLMove ||
                        request.kind_ == CommandKind::kBRPopLPush)
-                          ? reply_builder.AppendNullBulkString()
-                          : reply_builder.AppendRaw("*-1\r\n"));
+                          ? reply_builder.AppendNull()
+                          : reply_builder.AppendNullArray());
   };
 
   std::vector<BlockingWaitSpec> specs;
@@ -951,8 +958,10 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     register_key(nonblocking.args_[1]);
   }
 
-  auto attempt = [&]() -> Task<BlockingAttemptResult> {
-    ReplyBuilder attempt_builder;
+  auto attempt = [&](BlockingWakeCascade* cascade)
+      -> Task<BlockingAttemptResult> {
+    nonblocking.blocking_wake_cascade_ = cascade;
+    ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool unavailable = false;
     CommandReply result = co_await ExecuteListMultiKey(
         nonblocking, attempt_builder, &unavailable);
@@ -963,10 +972,16 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
   auto status_reply = [&](const absl::Status& status) {
     return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
   };
+  auto unblock_error_reply = [&] {
+    return BuiltReply(reply_builder.AppendError(
+        "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
+  };
   co_return co_await ExecuteBlockingWaitLoop(
-      request.db_id_, std::move(specs), *wait_deadline,
+      client_id, request.db_id_, std::move(specs), *wait_deadline,
       "blocking List wait cancelled", std::move(attempt), timeout_reply,
-      status_reply);
+      unblock_error_reply, status_reply,
+      request.kind_ == CommandKind::kBLMove ||
+          request.kind_ == CommandKind::kBRPopLPush);
 }
 
 }  // namespace keylane

@@ -212,14 +212,14 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
       co_return BuiltReply(
           reply_builder.AppendInteger(result->signed_integer_));
     case CommandKind::kHIncrByFloat:
-      co_return BuiltReply(reply_builder.AppendBulkString(result->scalar_));
+      // RESP3 has a native double; RESP2 keeps Redis' bulk-string shape.
+      co_return BuiltReply(reply_builder.AppendDoubleText(result->scalar_));
     case CommandKind::kHGet:
       co_return BuiltReply(
           result->values_.empty() || !result->values_.front().has_value()
-              ? reply_builder.AppendNullBulkString()
+              ? reply_builder.AppendNull()
               : reply_builder.AppendBulkString(*result->values_.front()));
     case CommandKind::kHMGet:
-    case CommandKind::kHGetAll:
     case CommandKind::kHKeys:
     case CommandKind::kHVals:
       reply_builder.AppendArrayHeader(result->values_.size());
@@ -227,7 +227,17 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
         if (value.has_value()) {
           reply_builder.AppendBulkString(*value);
         } else {
-          reply_builder.AppendNullBulkString();
+          reply_builder.AppendNull();
+        }
+      }
+      co_return BuiltReply(reply_builder.View());
+    case CommandKind::kHGetAll:
+      reply_builder.AppendMapHeader(result->values_.size() / 2);
+      for (const auto& value : result->values_) {
+        if (value.has_value()) {
+          reply_builder.AppendBulkString(*value);
+        } else {
+          reply_builder.AppendNull();
         }
       }
       co_return BuiltReply(reply_builder.View());
@@ -235,12 +245,22 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
       if (!operation.count_provided_) {
         co_return BuiltReply(
             result->values_.empty() || !result->values_.front().has_value()
-                ? reply_builder.AppendNullBulkString()
+                ? reply_builder.AppendNull()
                 : reply_builder.AppendBulkString(*result->values_.front()));
       }
-      reply_builder.AppendArrayHeader(result->values_.size());
-      for (const auto& value : result->values_) {
-        reply_builder.AppendBulkString(*value);
+      if (operation.with_values_ &&
+          reply_builder.version() == RespVersion::k3) {
+        reply_builder.AppendArrayHeader(result->values_.size() / 2);
+        for (std::size_t i = 0; i < result->values_.size(); i += 2) {
+          reply_builder.AppendArrayHeader(2);
+          reply_builder.AppendBulkString(*result->values_[i]);
+          reply_builder.AppendBulkString(*result->values_[i + 1]);
+        }
+      } else {
+        reply_builder.AppendArrayHeader(result->values_.size());
+        for (const auto& value : result->values_) {
+          reply_builder.AppendBulkString(*value);
+        }
       }
       co_return BuiltReply(reply_builder.View());
     case CommandKind::kHScan:

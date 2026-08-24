@@ -98,18 +98,25 @@ class RespClient {
   std::string ReadReply() {
     const std::string line = ReadLine();
     if (line.empty()) Fail("empty RESP reply");
-    if (line[0] == '+' || line[0] == '-' || line[0] == ':') return line;
-    if (line[0] == '$') {
+    if (line[0] == '+' || line[0] == '-' || line[0] == ':' ||
+        line[0] == ',' || line[0] == '#') {
+      return line;
+    }
+    if (line == "_") return line;
+    if (line[0] == '$' || line[0] == '=') {
       if (line == "$-1") return line;
       std::string body(Length(line) + 2, '\0');
       ReadExact(body.data(), body.size());
       body.resize(body.size() - 2);
       return line + "\r\n" + body;
     }
-    if (line[0] == '*') {
+    if (line[0] == '*' || line[0] == '~' || line[0] == '>' ||
+        line[0] == '%') {
       if (line == "*-1") return line;
       std::string result = line;
-      for (std::size_t i = 0; i < Length(line); ++i) {
+      const std::size_t elements =
+          Length(line) * (line[0] == '%' ? 2 : 1);
+      for (std::size_t i = 0; i < elements; ++i) {
         result += "\r\n" + ReadReply();
       }
       return result;
@@ -164,7 +171,7 @@ void CreateDataFile(const std::string& path) {
 class Server {
  public:
   Server(const std::string& binary, std::uint16_t port, const std::string& data,
-         const std::string& log) {
+         const std::string& log, std::string requirepass = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ != 0) return;
@@ -185,6 +192,10 @@ class Server {
                                   "0",
                                   "--data-file",
                                   data};
+    if (!requirepass.empty()) {
+      args.push_back("--requirepass");
+      args.push_back(std::move(requirepass));
+    }
     std::vector<char*> argv;
     for (std::string& arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);
@@ -232,6 +243,19 @@ std::string Message(std::string_view channel, std::string_view payload) {
          "\r\n" + std::string(payload);
 }
 
+std::string Resp3Subscription(std::string_view kind,
+                              std::string_view channel, unsigned count) {
+  return ">3\r\n$" + std::to_string(kind.size()) + "\r\n" +
+         std::string(kind) + "\r\n$" + std::to_string(channel.size()) +
+         "\r\n" + std::string(channel) + "\r\n:" + std::to_string(count);
+}
+
+std::string Resp3Message(std::string_view channel, std::string_view payload) {
+  return ">3\r\n$7\r\nmessage\r\n$" + std::to_string(channel.size()) +
+         "\r\n" + std::string(channel) + "\r\n$" +
+         std::to_string(payload.size()) + "\r\n" + std::string(payload);
+}
+
 std::string PatternMessage(std::string_view pattern, std::string_view channel,
                            std::string_view payload) {
   return "*4\r\n$8\r\npmessage\r\n$" + std::to_string(pattern.size()) + "\r\n" +
@@ -267,8 +291,10 @@ int main(int argc, char** argv) {
     const std::string root(directory);
     const std::string source_data = root + "/source.data";
     const std::string replica_data = root + "/replica.data";
+    const std::string auth_data = root + "/auth.data";
     CreateDataFile(source_data);
     CreateDataFile(replica_data);
+    CreateDataFile(auth_data);
     const std::uint16_t source_port = FreePort();
     const std::uint16_t replica_port = FreePort();
     Server source(argv[1], source_port, source_data, root + "/source.log");
@@ -284,6 +310,134 @@ int main(int argc, char** argv) {
            "$14\r\nsentinel-probe", "get client name");
     ExpectContains(source_client.Command({"CLIENT", "LIST"}),
                    "name=sentinel-probe", "client list name");
+
+    RespClient resp3_client = Connect(source_port);
+    const std::string hello3 =
+        resp3_client.Command({"HELLO", "3", "SETNAME", "resp3-client"});
+    ExpectContains(hello3, "%7\r\n$6\r\nserver\r\n$7\r\nkeylane",
+                   "HELLO 3 map");
+    ExpectContains(hello3, "$5\r\nproto\r\n:3", "HELLO 3 protocol");
+    ExpectContains(resp3_client.Command({"CLIENT", "LIST"}),
+                   "name=resp3-client", "RESP3 client name");
+    ExpectContains(resp3_client.Command({"CLIENT", "LIST"}), "resp=3",
+                   "RESP3 client metadata");
+    Expect(resp3_client.Command(
+               {"CLIENT", "SETINFO", "lib-name", "keylane-test"}),
+           "+OK", "RESP3 CLIENT SETINFO");
+    const std::string resp3_client_info =
+        resp3_client.Command({"CLIENT", "INFO"});
+    ExpectContains(resp3_client_info, "=", "RESP3 CLIENT INFO verbatim");
+    ExpectContains(resp3_client_info, "txt:id=", "RESP3 CLIENT INFO format");
+    ExpectContains(resp3_client_info, "lib-name=keylane-test",
+                   "RESP3 CLIENT INFO metadata");
+    Expect(resp3_client.Command({"GET", "resp3-missing"}), "_",
+           "RESP3 null");
+    Expect(resp3_client.Command({"HSET", "resp3-hash", "field", "value"}),
+           ":1", "RESP3 HSET");
+    Expect(resp3_client.Command({"HGETALL", "resp3-hash"}),
+           "%1\r\n$5\r\nfield\r\n$5\r\nvalue", "RESP3 HGETALL map");
+    Expect(resp3_client.Command({"SADD", "resp3-set", "member"}), ":1",
+           "RESP3 SADD");
+    Expect(resp3_client.Command({"SMEMBERS", "resp3-set"}),
+           "~1\r\n$6\r\nmember", "RESP3 SMEMBERS set");
+    Expect(resp3_client.Command({"SDIFF", "resp3-set", "missing-set"}),
+           "~1\r\n$6\r\nmember", "RESP3 SDIFF set");
+    Expect(resp3_client.Command({"MGET", "resp3-missing"}), "*1\r\n_",
+           "RESP3 MGET null");
+    Expect(resp3_client.Command({"HINCRBYFLOAT", "resp3-hash", "number",
+                                 "1.5"}),
+           ",1.5", "RESP3 hash double");
+    Expect(resp3_client.Command({"HSET", "resp3-random-hash", "field",
+                                 "value"}),
+           ":1", "seed RESP3 random hash");
+    Expect(resp3_client.Command({"HRANDFIELD", "resp3-random-hash", "1",
+                                 "WITHVALUES"}),
+           "*1\r\n*2\r\n$5\r\nfield\r\n$5\r\nvalue",
+           "RESP3 random hash pairs");
+    Expect(resp3_client.Command({"ZADD", "resp3-zset", "INCR", "1.5", "m"}),
+           ",1.5", "RESP3 ZADD INCR double");
+    Expect(resp3_client.Command({"ZSCORE", "resp3-zset", "m"}), ",1.5",
+           "RESP3 ZSCORE double");
+    Expect(resp3_client.Command({"ZMSCORE", "resp3-zset", "m", "missing"}),
+           "*2\r\n,1.5\r\n_", "RESP3 ZMSCORE values");
+    Expect(resp3_client.Command(
+               {"ZRANGE", "resp3-zset", "0", "-1", "WITHSCORES"}),
+           "*1\r\n*2\r\n$1\r\nm\r\n,1.5",
+           "RESP3 sorted-set scored pairs");
+    ExpectContains(
+        resp3_client.Command({"CONFIG", "GET", "repl-backlog-size"}),
+        "%1\r\n$17\r\nrepl-backlog-size", "RESP3 CONFIG map");
+    Expect(resp3_client.Command({"SET", "lcs-a", "abc"}), "+OK",
+           "seed LCS a");
+    Expect(resp3_client.Command({"SET", "lcs-b", "abc"}), "+OK",
+           "seed LCS b");
+    ExpectContains(resp3_client.Command({"LCS", "lcs-a", "lcs-b", "IDX"}),
+                   "%2\r\n$7\r\nmatches", "RESP3 LCS map");
+    ExpectContains(resp3_client.Command({"XADD", "resp3-stream", "*", "f",
+                                         "v"}),
+                   "-", "RESP3 XADD id");
+    ExpectContains(resp3_client.Command({"XINFO", "STREAM", "resp3-stream"}),
+                   "%10\r\n$6\r\nlength", "RESP3 XINFO map");
+    ExpectContains(resp3_client.Command({"XREAD", "STREAMS", "resp3-stream",
+                                         "0-0"}),
+                   "%1\r\n$12\r\nresp3-stream", "RESP3 XREAD map");
+
+    RespClient resp3_subscriber = Connect(source_port);
+    ExpectContains(resp3_subscriber.Command({"HELLO", "3"}),
+                   "$5\r\nproto\r\n:3", "subscriber HELLO 3");
+    Expect(resp3_subscriber.Command({"SUBSCRIBE", "mixed"}),
+           Resp3Subscription("subscribe", "mixed", 1),
+           "RESP3 subscribe push");
+    RespClient resp2_subscriber = Connect(source_port);
+    Expect(resp2_subscriber.Command({"SUBSCRIBE", "mixed"}),
+           Subscription("subscribe", "mixed", 1), "RESP2 mixed subscribe");
+    Expect(source_client.Command({"PUBLISH", "mixed", "payload"}), ":2",
+           "mixed protocol publish count");
+    Expect(resp3_subscriber.ReadPush(), Resp3Message("mixed", "payload"),
+           "RESP3 message push");
+    Expect(resp2_subscriber.ReadPush(), Message("mixed", "payload"),
+           "RESP2 mixed message");
+    Expect(source_client.Command({"SET", "subscribed-read", "visible"}),
+           "+OK", "seed subscribed RESP3 read");
+    Expect(resp3_subscriber.Command({"GET", "subscribed-read"}),
+           "$7\r\nvisible", "RESP3 subscribed client ordinary command");
+    Expect(resp3_subscriber.Command({"PING", "token"}), "$5\r\ntoken",
+           "RESP3 subscribed ping is an ordinary reply");
+    Expect(resp3_subscriber.Command({"UNSUBSCRIBE", "mixed"}),
+           Resp3Subscription("unsubscribe", "mixed", 0),
+           "RESP3 unsubscribe push");
+    Expect(resp2_subscriber.Command({"UNSUBSCRIBE", "mixed"}),
+           Subscription("unsubscribe", "mixed", 0),
+           "RESP2 mixed unsubscribe");
+    Expect(resp3_client.Command({"MULTI"}), "+OK", "RESP3 MULTI");
+    Expect(resp3_client.Command({"HELLO", "2"}), "+QUEUED",
+           "HELLO queued in MULTI");
+    ExpectContains(resp3_client.Command({"EXEC"}),
+                   "*1\r\n*14\r\n$6\r\nserver",
+                   "EXEC keeps its starting protocol and HELLO switches");
+    Expect(resp3_client.Command({"GET", "resp3-missing"}), "$-1",
+           "RESP2 null after HELLO 2");
+    Expect(resp3_client.Command({"MULTI"}), "+OK", "RESP2 MULTI");
+    Expect(resp3_client.Command({"HELLO", "3"}), "+QUEUED",
+           "HELLO 3 queued in RESP2 MULTI");
+    ExpectContains(resp3_client.Command({"EXEC"}),
+                   "*1\r\n%7\r\n$6\r\nserver",
+                   "queued HELLO emits RESP3 map");
+    Expect(resp3_client.Command({"GET", "resp3-missing"}), "_",
+           "queued HELLO preserves new protocol");
+    Expect(resp3_client.Command({"MULTI"}), "+OK", "mixed protocol MULTI");
+    Expect(resp3_client.Command({"HELLO", "2"}), "+QUEUED",
+           "queue protocol downgrade");
+    Expect(resp3_client.Command({"HGETALL", "resp3-hash"}), "+QUEUED",
+           "queue keyed command after HELLO");
+    ExpectContains(resp3_client.Command({"EXEC"}),
+                   "*2\r\n*14\r\n$6\r\nserver",
+                   "mixed EXEC keeps original outer protocol");
+    Expect(resp3_client.Command({"HGETALL", "resp3-random-hash"}),
+           "*2\r\n$5\r\nfield\r\n$5\r\nvalue",
+           "keyed command follows transaction protocol switch");
+    ExpectContains(resp3_client.Command({"HELLO", "3"}),
+                   "%7\r\n$6\r\nserver", "restore RESP3 after mixed EXEC");
 
     RespClient local_subscriber = Connect(source_port);
     Expect(local_subscriber.Command({"SUBSCRIBE", "alpha"}),
@@ -465,6 +619,30 @@ int main(int argc, char** argv) {
 
     replica.Stop();
     source.Stop();
+
+    const std::uint16_t auth_port = FreePort();
+    Server auth_server(argv[1], auth_port, auth_data, root + "/auth.log",
+                       "secret");
+    RespClient auth_client = Connect(auth_port);
+    ExpectContains(auth_client.Command({"HELLO", "3"}), "-NOAUTH ",
+                   "HELLO without authentication");
+    ExpectContains(auth_client.Command(
+                       {"HELLO", "3", "AUTH", "default", "secret",
+                        "SETNAME", "authenticated-resp3"}),
+                   "$5\r\nproto\r\n:3", "HELLO AUTH and SETNAME");
+    Expect(auth_client.Command({"GET", "missing"}), "_",
+           "authenticated RESP3 null");
+    ExpectContains(auth_client.Command(
+                       {"HELLO", "2", "AUTH", "default", "wrong"}),
+                   "-WRONGPASS ", "failed HELLO AUTH");
+    Expect(auth_client.Command({"GET", "missing"}), "_",
+           "failed HELLO preserves protocol");
+    ExpectContains(auth_client.Command(
+                       {"HELLO", "2", "AUTH", "default", "secret"}),
+                   "*14\r\n$6\r\nserver", "authenticated HELLO 2");
+    Expect(auth_client.Command({"GET", "missing"}), "$-1",
+           "authenticated RESP2 null");
+    auth_server.Stop();
     std::cout << "pubsub e2e passed\n";
     return 0;
   } catch (const std::exception& error) {

@@ -226,6 +226,8 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("UNSUBSCRIBE", CommandKind::kUnsubscribe);
   CheckKind("QUIT", CommandKind::kQuit);
   CheckKind("RESET", CommandKind::kReset);
+  CheckKind("AUTH", CommandKind::kAuth);
+  CheckKind("HELLO", CommandKind::kHello);
   CheckKind("SELECT", CommandKind::kSelect);
   CheckKind("DBSIZE", CommandKind::kDbSize);
   CheckKind("SCAN", CommandKind::kScan);

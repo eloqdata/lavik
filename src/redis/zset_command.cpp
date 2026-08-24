@@ -168,6 +168,22 @@ std::string FormatDouble(double value) {
   return output;
 }
 
+void AppendScore(ReplyBuilder& builder, double score) {
+  builder.AppendDoubleText(FormatDouble(score));
+}
+
+void AppendScore(ReplyBuilder& builder, std::string_view score) {
+  builder.AppendDoubleText(score);
+}
+
+void AppendMemberScore(ReplyBuilder& builder, std::string_view member,
+                       double score, bool nested_in_resp3 = true) {
+  if (nested_in_resp3 && builder.version() == RespVersion::k3)
+    builder.AppendArrayHeader(2);
+  builder.AppendBulkString(member);
+  AppendScore(builder, score);
+}
+
 std::string FormatGeoCoordinate(double value) {
   char buffer[128];
   const int formatted = std::snprintf(buffer, sizeof(buffer), "%.17Lf",
@@ -587,7 +603,7 @@ void AppendMultiPopReply(ReplyBuilder& builder, std::string_view key,
     builder.AppendArrayHeader(3);
     builder.AppendBulkString(key);
     builder.AppendBulkString(popped.front().member_);
-    builder.AppendBulkString(FormatDouble(popped.front().score_));
+    AppendScore(builder, popped.front().score_);
     return;
   }
   builder.AppendArrayHeader(2);
@@ -596,7 +612,7 @@ void AppendMultiPopReply(ReplyBuilder& builder, std::string_view key,
   for (const Element& element : popped) {
     builder.AppendArrayHeader(2);
     builder.AppendBulkString(element.member_);
-    builder.AppendBulkString(FormatDouble(element.score_));
+    AppendScore(builder, element.score_);
   }
 }
 
@@ -657,7 +673,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     if (!status.ok()) co_return Built(StorageError(builder, status));
     if (context.popped_.empty()) {
       if (empty != nullptr) *empty = true;
-      co_return Built(builder.AppendRaw("*-1\r\n"));
+      co_return Built(builder.AppendNullArray());
     }
     replication.SetCommandArgs(CanonicalSelectedZSetPop(
         request.args_[context.selected_arg_], shape.maximum_,
@@ -697,7 +713,7 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
   }
   (void)co_await transaction.Execute(&ZSetHoldCallback, nullptr, true);
   if (empty != nullptr) *empty = true;
-  co_return Built(builder.AppendRaw("*-1\r\n"));
+  co_return Built(builder.AppendNullArray());
 }
 
 std::uint64_t Interleave26(std::uint32_t lon, std::uint32_t lat) {
@@ -1127,8 +1143,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     if (changed != 0) NotifyZSetBlockingKey(request, a[1]);
     if (incr) {
       co_return Built(incremented.has_value()
-                          ? builder.AppendBulkString(FormatDouble(*incremented))
-                          : builder.AppendNullBulkString());
+                          ? builder.AppendDoubleText(FormatDouble(*incremented))
+                          : builder.AppendNull());
     }
     co_return Built(builder.AppendInteger(ch ? changed : added));
   }
@@ -1377,7 +1393,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         unit_meters = *unit;
       }
       co_return Built(results.empty()
-                          ? builder.AppendNullBulkString()
+                          ? builder.AppendNull()
                           : builder.AppendBulkString(FormatGeoDistance(
                                 results[0]->distance_m_ / unit_meters)));
     }
@@ -1385,17 +1401,17 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     for (const auto& result : results) {
       if (!result) {
         if (request.kind_ == CommandKind::kGeoPos)
-          builder.AppendRaw("*-1\r\n");
+          builder.AppendNullArray();
         else
-          builder.AppendNullBulkString();
+          builder.AppendNull();
         continue;
       }
       if (request.kind_ == CommandKind::kGeoHash) {
         builder.AppendBulkString(GeoHashString(result->lon_, result->lat_));
       } else if (request.kind_ == CommandKind::kGeoPos) {
         builder.AppendArrayHeader(2);
-        builder.AppendBulkString(FormatGeoCoordinate(result->lon_));
-        builder.AppendBulkString(FormatGeoCoordinate(result->lat_));
+        builder.AppendDoubleText(FormatGeoCoordinate(result->lon_));
+        builder.AppendDoubleText(FormatGeoCoordinate(result->lat_));
       } else if (!with_coord && !with_dist && !with_hash) {
         builder.AppendBulkString(result->member_);
       } else {
@@ -1407,8 +1423,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
         if (with_hash) builder.AppendInteger(result->hash_);
         if (with_coord) {
           builder.AppendArrayHeader(2);
-          builder.AppendBulkString(FormatGeoCoordinate(result->lon_));
-          builder.AppendBulkString(FormatGeoCoordinate(result->lat_));
+          builder.AppendDoubleText(FormatGeoCoordinate(result->lon_));
+          builder.AppendDoubleText(FormatGeoCoordinate(result->lat_));
         }
       }
     }
@@ -1433,6 +1449,11 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   std::optional<std::string> scalar;
   std::vector<std::optional<std::string>> output;
   std::uint64_t next_cursor = 0;
+  const bool reply_with_scores =
+      std::any_of(a.begin() + std::min<std::size_t>(2, a.size()), a.end(),
+                  [](std::string_view arg) {
+                    return EqualCi(arg, "withscores");
+                  });
   if ((request.kind_ == CommandKind::kZRank ||
        request.kind_ == CommandKind::kZRevRank) &&
       a.size() == 4 && !EqualCi(a[3], "withscore")) {
@@ -1796,41 +1817,89 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       co_return Built(builder.AppendInteger(integer));
     case CommandKind::kZScore:
       co_return Built(output.empty() || !output[0].has_value()
-                          ? builder.AppendNullBulkString()
-                          : builder.AppendBulkString(*output[0]));
+                          ? builder.AppendNull()
+                          : builder.AppendDoubleText(*output[0]));
+    case CommandKind::kZMScore:
+      builder.AppendArrayHeader(output.size());
+      for (const auto& item : output) {
+        if (item)
+          AppendScore(builder, *item);
+        else
+          builder.AppendNull();
+      }
+      co_return Built(builder.View());
     case CommandKind::kZRank:
     case CommandKind::kZRevRank:
       if (integer < 0) {
-        co_return Built(a.size() == 4 ? builder.AppendRaw("*-1\r\n")
-                                      : builder.AppendNullBulkString());
+        co_return Built(a.size() == 4 ? builder.AppendNullArray()
+                                      : builder.AppendNull());
       }
       if (a.size() == 4 && EqualCi(a[3], "withscore")) {
         builder.AppendArrayHeader(2);
         builder.AppendInteger(integer);
-        builder.AppendBulkString(*scalar);
+        AppendScore(builder, *scalar);
         co_return Built(builder.View());
       }
       co_return Built(builder.AppendInteger(integer));
     case CommandKind::kZRandMember:
       if (a.size() == 2)
-        co_return Built(output.empty() ? builder.AppendNullBulkString()
+        co_return Built(output.empty() ? builder.AppendNull()
                                        : builder.AppendBulkString(*output[0]));
+      if (reply_with_scores) {
+        const std::size_t pairs = output.size() / 2;
+        builder.AppendArrayHeader(builder.version() == RespVersion::k3
+                                      ? pairs
+                                      : output.size());
+        for (std::size_t i = 0; i < pairs; ++i) {
+          if (builder.version() == RespVersion::k3)
+            builder.AppendArrayHeader(2);
+          builder.AppendBulkString(*output[i * 2]);
+          AppendScore(builder, *output[i * 2 + 1]);
+        }
+        co_return Built(builder.View());
+      }
       break;
     case CommandKind::kZScan:
       builder.AppendArrayHeader(2);
       builder.AppendBulkString(std::to_string(next_cursor));
       builder.AppendArrayHeader(output.size());
-      for (auto& item : output) builder.AppendBulkString(*item);
+      for (const auto& item : output) builder.AppendBulkString(*item);
       co_return Built(builder.View());
+    case CommandKind::kZPopMin:
+    case CommandKind::kZPopMax: {
+      const std::size_t pairs = output.size() / 2;
+      const bool nested = builder.version() == RespVersion::k3 && a.size() == 3;
+      builder.AppendArrayHeader(nested
+                                    ? pairs
+                                    : output.size());
+      for (std::size_t i = 0; i < pairs; ++i) {
+        if (nested) builder.AppendArrayHeader(2);
+        builder.AppendBulkString(*output[i * 2]);
+        AppendScore(builder, *output[i * 2 + 1]);
+      }
+      co_return Built(builder.View());
+    }
     default:
       break;
+  }
+  if (reply_with_scores) {
+    const std::size_t pairs = output.size() / 2;
+    builder.AppendArrayHeader(builder.version() == RespVersion::k3
+                                  ? pairs
+                                  : output.size());
+    for (std::size_t i = 0; i < pairs; ++i) {
+      if (builder.version() == RespVersion::k3) builder.AppendArrayHeader(2);
+      builder.AppendBulkString(*output[i * 2]);
+      AppendScore(builder, *output[i * 2 + 1]);
+    }
+    co_return Built(builder.View());
   }
   builder.AppendArrayHeader(output.size());
   for (auto& item : output) {
     if (item)
       builder.AppendBulkString(*item);
     else
-      builder.AppendNullBulkString();
+      builder.AppendNull();
   }
   co_return Built(builder.View());
 }
@@ -2652,10 +2721,15 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(
         builder.AppendInteger(limit == 0 ? size : std::min(size, limit)));
   }
-  builder.AppendArrayHeader(context.output_.size() * (with_scores ? 2 : 1));
+  builder.AppendArrayHeader(
+      with_scores && builder.version() == RespVersion::k3
+          ? context.output_.size()
+          : context.output_.size() * (with_scores ? 2 : 1));
   for (const Element& element : context.output_) {
-    builder.AppendBulkString(element.member_);
-    if (with_scores) builder.AppendBulkString(FormatDouble(element.score_));
+    if (with_scores)
+      AppendMemberScore(builder, element.member_, element.score_);
+    else
+      builder.AppendBulkString(element.member_);
   }
   co_return Built(builder.View());
 }
@@ -2663,7 +2737,7 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
 Task<std::string> ExecuteZSetMultiKeyLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(request.resp_version_);
   const auto& args = request.args_;
   auto parsed_store = ParseStoreShape(request);
   if (!parsed_store.ok()) {
@@ -2894,10 +2968,15 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     co_return EncodeInteger(
         static_cast<long long>(limit == 0 ? size : std::min(size, limit)));
   }
-  builder.AppendArrayHeader(context.output_.size() * (with_scores ? 2 : 1));
+  builder.AppendArrayHeader(
+      with_scores && builder.version() == RespVersion::k3
+          ? context.output_.size()
+          : context.output_.size() * (with_scores ? 2 : 1));
   for (const Element& element : context.output_) {
-    builder.AppendBulkString(element.member_);
-    if (with_scores) builder.AppendBulkString(FormatDouble(element.score_));
+    if (with_scores)
+      AppendMemberScore(builder, element.member_, element.score_);
+    else
+      builder.AppendBulkString(element.member_);
   }
   co_return std::string(builder.View());
 }
@@ -2906,7 +2985,7 @@ Task<std::string> ExecuteZSetMultiPopLocked(
     const CommandRequest& request, std::span<const ZSetExecKey> locked_keys,
     std::vector<storage::TxShardWrites>& tx_writes) {
   MarkReplicationCommandHandled(request);
-  ReplyBuilder builder;
+  ReplyBuilder builder(request.resp_version_);
   if (request.kind_ != CommandKind::kZMPop) {
     auto timeout = ParseBlockingZSetDeadline(request);
     if (!timeout.ok()) {
@@ -2952,11 +3031,12 @@ Task<std::string> ExecuteZSetMultiPopLocked(
       co_return std::string(builder.View());
     }
   }
-  co_return "*-1\r\n";
+  co_return std::string(builder.AppendNullArray());
 }
 
 Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
-                                              ReplyBuilder& builder) {
+                                              ReplyBuilder& builder,
+                                              std::uint64_t client_id) {
   const auto& args = request.args_;
   auto deadline = ParseBlockingZSetDeadline(request);
   if (!deadline.ok()) {
@@ -2980,26 +3060,33 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
         .stream_after_ = std::nullopt,
     });
   }
-  auto attempt = [&]() -> Task<BlockingAttemptResult> {
-    ReplyBuilder attempt_builder;
+  CommandRequest nonblocking = request;
+  auto attempt = [&](BlockingWakeCascade* cascade)
+      -> Task<BlockingAttemptResult> {
+    nonblocking.blocking_wake_cascade_ = cascade;
+    ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool empty = false;
     CommandReply result = co_await ExecuteZSetMultiPopAttempt(
-        request, attempt_builder, &empty);
+        nonblocking, attempt_builder, &empty);
     if (empty) co_return BlockingAttemptResult{};
     co_return BlockingAttemptResult{
         BlockingAttemptState::kComplete,
         Built(builder.AppendRaw(result.encoded_))};
   };
   auto timeout_reply = [&] {
-    return Built(builder.AppendRaw("*-1\r\n"));
+    return Built(builder.AppendNullArray());
   };
   auto status_reply = [&](const absl::Status& status) {
     return Built(StorageError(builder, status));
   };
+  auto unblock_error_reply = [&] {
+    return Built(builder.AppendError(
+        "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
+  };
   co_return co_await ExecuteBlockingWaitLoop(
-      request.db_id_, std::move(specs), *deadline,
+      client_id, request.db_id_, std::move(specs), *deadline,
       "blocking Sorted Set wait cancelled", std::move(attempt), timeout_reply,
-      status_reply);
+      unblock_error_reply, status_reply);
 }
 
 }  // namespace keylane

@@ -650,6 +650,10 @@ struct TxShardWrites {
   // Collected under participant key locks, but invisible to full-sync
   // sessions until the coordinator has made the global commit decision.
   std::vector<FullSyncEffect> fullsync_effects_;
+  // Successful staged logical mutations. The owner writes this local receipt;
+  // CommitTxWrites publishes the sum to its coordinator worker only after the
+  // transaction commit record succeeds.
+  std::uint64_t dataset_changes_ = 0;
   // Journal undo state for runtime rollback (standalone MSET / multi-key
   // DEL). EXEC leaves this off: its commands report errors individually and
   // never roll back (Redis semantics), while recovery still treats the

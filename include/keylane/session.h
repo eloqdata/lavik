@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,9 @@ class PubSubSession;
 // Everything here must be cleaned up through the single cleanup point at the
 // end of RedisService::Serve.
 struct ConnectionContext {
+  using HelloHandler = std::string_view (*)(
+      const void*, void*, ConnectionContext&, std::span<const std::string>,
+      ReplyBuilder&);
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
   bool authentication_required_ = false;
@@ -29,6 +33,19 @@ struct ConnectionContext {
   // diskless Redis PSYNC exporter.
   bool redis_replica_eof_ = false;
   ReplyBuilder reply_builder_;
+  const void* hello_authenticator_ = nullptr;
+  void* hello_replication_ = nullptr;
+  HelloHandler hello_handler_ = nullptr;
+  // Set only while DispatchCommand is active. EXEC uses it when flushing the
+  // readiness notifications captured from its queued child commands.
+  BlockingWakeCascade* blocking_wake_cascade_ = nullptr;
+
+  [[nodiscard]] RespVersion resp_version() const noexcept {
+    return reply_builder_.version();
+  }
+  void SetRespVersion(RespVersion version) noexcept {
+    reply_builder_.SetVersion(version);
+  }
 
   // MULTI/EXEC queueing. `multi_db` tracks SELECTs issued while queueing so
   // every queued command records the database it will execute against;

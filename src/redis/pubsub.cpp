@@ -31,6 +31,13 @@ namespace {
 
 constexpr std::size_t kWorkerPubSubBufferLimit = 128ULL * 1024 * 1024;
 constexpr std::size_t kPubSubQueueLimit = 10'000;
+std::atomic<std::uint64_t> g_resp2_subscribers{0};
+std::atomic<std::uint64_t> g_resp3_subscribers{0};
+
+std::atomic<std::uint64_t>& SubscriberCount(RespVersion version) {
+  return version == RespVersion::k3 ? g_resp3_subscribers
+                                    : g_resp2_subscribers;
+}
 
 struct WorkerPubSubRegistry;
 
@@ -39,12 +46,18 @@ struct QueuedFrame {
   bool exit_ = false;
 };
 
+struct EncodedFrames {
+  std::shared_ptr<const std::string> resp2_;
+  std::shared_ptr<const std::string> resp3_;
+};
+
 }  // namespace
 
 class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
  public:
-  PubSubSession(WorkerPubSubRegistry* registry, Worker* worker, int fd)
-      : registry_(registry), worker_(worker), fd_(fd) {}
+  PubSubSession(WorkerPubSubRegistry* registry, Worker* worker, int fd,
+                RespVersion version)
+      : registry_(registry), worker_(worker), fd_(fd), version_(version) {}
 
   bool Subscribe(std::string_view channel);
   bool Unsubscribe(std::string_view channel);
@@ -60,6 +73,15 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
   }
   std::size_t subscription_count() const noexcept {
     return channels_.size() + patterns_.size();
+  }
+  RespVersion version() const noexcept { return version_; }
+  void SetVersion(RespVersion version) noexcept {
+    if (version == version_) return;
+    if (subscription_count() != 0) {
+      SubscriberCount(version_).fetch_sub(1, std::memory_order_relaxed);
+      SubscriberCount(version).fetch_add(1, std::memory_order_relaxed);
+    }
+    version_ = version;
   }
   const std::vector<std::string>& channel_order() const noexcept {
     return channel_order_;
@@ -103,6 +125,7 @@ class PubSubSession : public std::enable_shared_from_this<PubSubSession> {
   WorkerPubSubRegistry* registry_ = nullptr;
   Worker* worker_ = nullptr;
   int fd_ = -1;
+  RespVersion version_ = RespVersion::k2;
   absl::flat_hash_set<std::string> channels_;
   std::vector<std::string> channel_order_;
   absl::flat_hash_set<std::string> patterns_;
@@ -140,21 +163,22 @@ WorkerPubSubRegistry& LocalRegistry() {
 void AppendSubscriptionFrame(ReplyBuilder* builder, std::string_view kind,
                              const std::string* channel,
                              std::size_t subscription_count) {
-  builder->AppendArrayHeader(3);
+  builder->AppendPushHeader(3);
   builder->AppendBulkString(kind);
   if (channel == nullptr) {
-    builder->AppendNullBulkString();
+    builder->AppendNull();
   } else {
     builder->AppendBulkString(*channel);
   }
   builder->AppendInteger(static_cast<long long>(subscription_count));
 }
 
-std::shared_ptr<const std::string> EncodeMessage(std::string_view channel,
+std::shared_ptr<const std::string> EncodeMessage(RespVersion version,
+                                                 std::string_view channel,
                                                  std::string_view payload) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(version);
   builder.Reserve(channel.size() + payload.size() + 48);
-  builder.AppendArrayHeader(3);
+  builder.AppendPushHeader(3);
   builder.AppendBulkString("message");
   builder.AppendBulkString(channel);
   builder.AppendBulkString(payload);
@@ -162,11 +186,11 @@ std::shared_ptr<const std::string> EncodeMessage(std::string_view channel,
 }
 
 std::shared_ptr<const std::string> EncodePatternMessage(
-    std::string_view pattern, std::string_view channel,
+    RespVersion version, std::string_view pattern, std::string_view channel,
     std::string_view payload) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(version);
   builder.Reserve(pattern.size() + channel.size() + payload.size() + 64);
-  builder.AppendArrayHeader(4);
+  builder.AppendPushHeader(4);
   builder.AppendBulkString("pmessage");
   builder.AppendBulkString(pattern);
   builder.AppendBulkString(channel);
@@ -174,8 +198,28 @@ std::shared_ptr<const std::string> EncodePatternMessage(
   return std::make_shared<const std::string>(std::move(builder).Release());
 }
 
-std::uint64_t DeliverLocal(std::string_view channel, std::string_view payload,
-                           const std::shared_ptr<const std::string>& encoded) {
+std::shared_ptr<const EncodedFrames> EncodeMessages(std::string_view channel,
+                                                    std::string_view payload) {
+  const bool need_resp2 =
+      g_resp2_subscribers.load(std::memory_order_relaxed) != 0;
+  const bool need_resp3 =
+      g_resp3_subscribers.load(std::memory_order_relaxed) != 0;
+  return std::make_shared<const EncodedFrames>(EncodedFrames{
+      .resp2_ = need_resp2 ? EncodeMessage(RespVersion::k2, channel, payload)
+                           : nullptr,
+      .resp3_ = need_resp3 ? EncodeMessage(RespVersion::k3, channel, payload)
+                           : nullptr,
+  });
+}
+
+const std::shared_ptr<const std::string>& SelectFrame(
+    const EncodedFrames& frames, RespVersion version) {
+  return version == RespVersion::k3 ? frames.resp3_ : frames.resp2_;
+}
+
+std::uint64_t DeliverLocal(
+    std::string_view channel, std::string_view payload,
+    const std::shared_ptr<const EncodedFrames>& encoded) {
   WorkerPubSubRegistry& registry = LocalRegistry();
   std::uint64_t receivers = 0;
   if (auto found = registry.channels_.find(channel);
@@ -183,17 +227,29 @@ std::uint64_t DeliverLocal(std::string_view channel, std::string_view payload,
     for (const auto& session : found->second) {
       // A notification posted before UNSUBSCRIBE may run afterward.
       // Membership is checked at the final worker-local enqueue point.
-      if (session->subscribed_to(channel) && session->Enqueue(encoded)) {
+      const auto& frame = SelectFrame(*encoded, session->version());
+      if (frame != nullptr && session->subscribed_to(channel) &&
+          session->Enqueue(frame)) {
         ++receivers;
       }
     }
   }
   for (const auto& [pattern, sessions] : registry.patterns_) {
     if (!RedisGlobMatch(pattern, channel)) continue;
-    auto pattern_message = EncodePatternMessage(pattern, channel, payload);
+    const EncodedFrames pattern_message{
+        .resp2_ = encoded->resp2_ == nullptr
+                      ? nullptr
+                      : EncodePatternMessage(RespVersion::k2, pattern, channel,
+                                             payload),
+        .resp3_ = encoded->resp3_ == nullptr
+                      ? nullptr
+                      : EncodePatternMessage(RespVersion::k3, pattern, channel,
+                                             payload),
+    };
     for (const auto& session : sessions) {
-      if (session->subscribed_to_pattern(pattern) &&
-          session->Enqueue(pattern_message)) {
+      const auto& frame = SelectFrame(pattern_message, session->version());
+      if (frame != nullptr && session->subscribed_to_pattern(pattern) &&
+          session->Enqueue(frame)) {
         ++receivers;
       }
     }
@@ -206,7 +262,7 @@ class PublishOperation : public std::enable_shared_from_this<PublishOperation> {
   PublishOperation(Worker* origin, unsigned participants,
                    std::shared_ptr<const std::string> channel,
                    std::shared_ptr<const std::string> payload,
-                   std::shared_ptr<const std::string> encoded)
+                   std::shared_ptr<const EncodedFrames> encoded)
       : origin_(origin),
         remaining_(participants),
         channel_(std::move(channel)),
@@ -294,16 +350,19 @@ class PublishOperation : public std::enable_shared_from_this<PublishOperation> {
   std::coroutine_handle<> handle_{};
   std::shared_ptr<const std::string> channel_;
   std::shared_ptr<const std::string> payload_;
-  std::shared_ptr<const std::string> encoded_;
+  std::shared_ptr<const EncodedFrames> encoded_;
 };
 
 }  // namespace
 
 bool PubSubSession::Subscribe(std::string_view channel) {
+  const bool was_empty = subscription_count() == 0;
   auto [found, inserted] = channels_.insert(std::string(channel));
   if (!inserted) return false;
   channel_order_.push_back(*found);
   registry_->channels_[*found].push_back(shared_from_this());
+  if (was_empty)
+    SubscriberCount(version_).fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -321,6 +380,8 @@ bool PubSubSession::Unsubscribe(std::string_view channel) {
   RemoveFromChannel(owned);
   channels_.erase(found);
   std::erase(channel_order_, owned);
+  if (subscription_count() == 0)
+    SubscriberCount(version_).fetch_sub(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -332,10 +393,13 @@ void PubSubSession::UnsubscribeAll() {
 }
 
 bool PubSubSession::PSubscribe(std::string_view pattern) {
+  const bool was_empty = subscription_count() == 0;
   auto [found, inserted] = patterns_.insert(std::string(pattern));
   if (!inserted) return false;
   pattern_order_.push_back(*found);
   registry_->patterns_[*found].push_back(shared_from_this());
+  if (was_empty)
+    SubscriberCount(version_).fetch_add(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -353,6 +417,8 @@ bool PubSubSession::PUnsubscribe(std::string_view pattern) {
   RemoveFromPattern(owned);
   patterns_.erase(found);
   std::erase(pattern_order_, owned);
+  if (subscription_count() == 0)
+    SubscriberCount(version_).fetch_sub(1, std::memory_order_relaxed);
   return true;
 }
 
@@ -405,13 +471,21 @@ Task<QueuedFrame> PubSubSession::Next() {
 }
 
 void PreparePubSub(unsigned worker_count) {
+  g_resp2_subscribers.store(0, std::memory_order_relaxed);
+  g_resp3_subscribers.store(0, std::memory_order_relaxed);
   g_worker_count = worker_count;
   g_registries = std::make_unique<WorkerPubSubRegistry[]>(worker_count);
 }
 
-std::shared_ptr<PubSubSession> RegisterPubSubSession(int fd) {
+void SetPubSubRespVersion(const std::shared_ptr<PubSubSession>& session,
+                          RespVersion version) {
+  if (session != nullptr) session->SetVersion(version);
+}
+
+std::shared_ptr<PubSubSession> RegisterPubSubSession(int fd,
+                                                     RespVersion version) {
   return std::make_shared<PubSubSession>(&LocalRegistry(), ThisWorker().self_,
-                                         fd);
+                                         fd, version);
 }
 
 void UnregisterPubSubSession(const std::shared_ptr<PubSubSession>& session) {
@@ -438,7 +512,7 @@ std::size_t PubSubPatternSubscriptionCount(
 
 std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
                               std::span<const std::string> channels) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(session->version());
   for (const std::string& channel : channels) {
     (void)session->Subscribe(channel);
     AppendSubscriptionFrame(&builder, "subscribe", &channel,
@@ -449,7 +523,7 @@ std::string SubscribeChannels(const std::shared_ptr<PubSubSession>& session,
 
 std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
                                 std::span<const std::string> channels) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(session->version());
   if (channels.empty()) {
     const std::vector<std::string> current = session->channel_order();
     if (current.empty()) {
@@ -474,7 +548,7 @@ std::string UnsubscribeChannels(const std::shared_ptr<PubSubSession>& session,
 
 std::string PSubscribePatterns(const std::shared_ptr<PubSubSession>& session,
                                std::span<const std::string> patterns) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(session->version());
   for (const std::string& pattern : patterns) {
     (void)session->PSubscribe(pattern);
     AppendSubscriptionFrame(&builder, "psubscribe", &pattern,
@@ -485,7 +559,7 @@ std::string PSubscribePatterns(const std::shared_ptr<PubSubSession>& session,
 
 std::string PUnsubscribePatterns(const std::shared_ptr<PubSubSession>& session,
                                  std::span<const std::string> patterns) {
-  ReplyBuilder builder;
+  ReplyBuilder builder(session->version());
   if (patterns.empty()) {
     const std::vector<std::string> current = session->pattern_order();
     if (current.empty()) {
@@ -599,7 +673,7 @@ Task<std::uint64_t> PublishChannel(std::string_view channel,
   auto owned_payload = std::make_shared<const std::string>(payload);
   auto operation = std::make_shared<PublishOperation>(
       ThisWorker().self_, g_worker_count, owned_channel, owned_payload,
-      EncodeMessage(channel, payload));
+      EncodeMessages(channel, payload));
   co_return co_await operation->Wait();
 }
 

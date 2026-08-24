@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -17,12 +18,33 @@
 
 namespace keylane {
 
+// One client command owns a cascade. Every asynchronous readiness hop holds
+// one pending unit, so the command can yield until nested blocking operations
+// have reached a stable state without synchronously resuming coroutines.
+class BlockingWakeCascade {
+ public:
+  void Add() noexcept { pending_.fetch_add(1, std::memory_order_relaxed); }
+  void Done() noexcept;
+  [[nodiscard]] bool empty() const noexcept {
+    return pending_.load(std::memory_order_acquire) == 0;
+  }
+
+ private:
+  std::atomic<std::uint64_t> pending_{0};
+};
+
+celer::Task<absl::Status> DrainBlockingWakeCascade(
+    BlockingWakeCascade& cascade);
+
 enum class BlockingWakeReason : std::uint8_t {
   kWaiting,
   kReady,
   kTimeout,
+  kUnblockedError,
   kCancelled,
 };
+
+enum class ClientUnblockMode : std::uint8_t { kTimeout, kError };
 
 enum class BlockingQueuePolicy : std::uint8_t { kFifo, kBroadcast };
 
@@ -33,8 +55,8 @@ struct BlockingAttemptResult {
   CommandReply reply_;
 };
 
-using BlockingAttempt =
-    std::function<celer::Task<BlockingAttemptResult>()>;
+using BlockingAttempt = std::function<celer::Task<BlockingAttemptResult>(
+    BlockingWakeCascade*)>;
 using BlockingReplyFactory = std::function<CommandReply()>;
 using BlockingStatusReplyFactory =
     std::function<CommandReply(const absl::Status&)>;
@@ -75,23 +97,24 @@ class BlockingWaitHandle {
 
   friend celer::Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
       RegisterBlockingWait(
-          std::uint8_t, std::vector<BlockingWaitSpec>,
+          std::uint8_t, std::vector<BlockingWaitSpec>, std::uint64_t,
           std::optional<std::chrono::steady_clock::time_point>);
   friend celer::Task<BlockingWakeReason> WaitForBlockingReady(
       BlockingWaitHandle&);
   friend BlockingWakeReason BlockingWaitState(const BlockingWaitHandle&);
-  friend bool ResetBlockingReady(BlockingWaitHandle&);
+  friend BlockingWakeCascade* ResetBlockingReady(BlockingWaitHandle&);
   friend void FinishBlockingWait(BlockingWaitHandle&);
 };
 
 celer::Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
 RegisterBlockingWait(std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+                     std::uint64_t client_id,
                      std::optional<std::chrono::steady_clock::time_point>
                          deadline = std::nullopt);
 celer::Task<BlockingWakeReason> WaitForBlockingReady(
     BlockingWaitHandle& handle);
 BlockingWakeReason BlockingWaitState(const BlockingWaitHandle& handle);
-bool ResetBlockingReady(BlockingWaitHandle& handle);
+BlockingWakeCascade* ResetBlockingReady(BlockingWaitHandle& handle);
 void FinishBlockingWait(BlockingWaitHandle& handle);
 
 // Runs the common check/register/recheck/wait state machine used by blocking
@@ -99,27 +122,43 @@ void FinishBlockingWait(BlockingWaitHandle& handle);
 // unavailable value from a completed command, so reply encodings never become
 // control-flow signals.
 celer::Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
+    std::uint64_t client_id, std::uint8_t db_id,
+    std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,
     BlockingReplyFactory timeout_reply,
-    BlockingStatusReplyFactory status_reply);
+    BlockingReplyFactory unblock_error_reply,
+    BlockingStatusReplyFactory status_reply, bool yield_before_retry = false);
+
+// Called on the worker owning the blocked command coroutine. CLIENT UNBLOCK
+// fans out to these worker-local indexes without introducing a shared mutex.
+bool UnblockClientOnCurrentWorker(std::uint64_t client_id,
+                                  ClientUnblockMode mode) noexcept;
+bool CancelBlockedClientOnCurrentWorker(std::uint64_t client_id) noexcept;
 
 void InitBlockingWaitStorage(storage::StorageEngine* engine);
-void NotifyListBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyListBlockingKey(
+    std::uint8_t db_id, std::string_view key,
+    BlockingWakeCascade* cascade = nullptr);
 void NotifyListBlockingKey(const CommandRequest& request, std::string_view key);
-void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyZSetBlockingKey(
+    std::uint8_t db_id, std::string_view key,
+    BlockingWakeCascade* cascade = nullptr);
 void NotifyZSetBlockingKey(const CommandRequest& request, std::string_view key);
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
-                             std::uint64_t id_ms, std::uint64_t id_seq);
+                             std::uint64_t id_ms, std::uint64_t id_seq,
+                             BlockingWakeCascade* cascade = nullptr);
 void NotifyStreamBlockingKey(const CommandRequest& request,
                              std::string_view key, std::uint64_t id_ms,
                              std::uint64_t id_seq);
-void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key);
+void NotifyStreamBlockingKey(
+    std::uint8_t db_id, std::string_view key,
+    BlockingWakeCascade* cascade = nullptr);
 void NotifyStreamBlockingKey(const CommandRequest& request,
                              std::string_view key);
 celer::Task<absl::Status> FlushBlockingNotifications(
-    BlockingNotificationCapture& capture);
+    BlockingNotificationCapture& capture,
+    BlockingWakeCascade* cascade = nullptr);
 celer::Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id);
 
 }  // namespace keylane

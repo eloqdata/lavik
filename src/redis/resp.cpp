@@ -20,6 +20,61 @@ constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 constexpr std::size_t kMaxCommandBytes = 1ULL * 1024 * 1024 * 1024;
 constexpr std::size_t kMaxLengthTextBytes = 32;
 
+absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
+    std::string_view line) {
+  std::vector<std::string> args;
+  std::size_t pos = 0;
+  while (pos < line.size()) {
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+    if (pos == line.size()) break;
+    std::string argument;
+    char quote = 0;
+    if (line[pos] == '\'' || line[pos] == '"') quote = line[pos++];
+    bool closed = quote == 0;
+    while (pos < line.size()) {
+      char value = line[pos++];
+      if (quote != 0 && value == quote) {
+        closed = true;
+        break;
+      }
+      if (quote == 0 && (value == ' ' || value == '\t')) break;
+      if (value != '\\') {
+        argument.push_back(value);
+        continue;
+      }
+      if (pos == line.size())
+        return absl::InvalidArgumentError("unterminated inline escape");
+      const char escaped = line[pos++];
+      switch (escaped) {
+        case 'n': argument.push_back('\n'); break;
+        case 'r': argument.push_back('\r'); break;
+        case 't': argument.push_back('\t'); break;
+        case 'b': argument.push_back('\b'); break;
+        case 'a': argument.push_back('\a'); break;
+        case 'x': {
+          if (pos + 2 > line.size())
+            return absl::InvalidArgumentError("invalid inline hex escape");
+          unsigned byte = 0;
+          const auto parsed = std::from_chars(line.data() + pos,
+                                              line.data() + pos + 2, byte, 16);
+          if (parsed.ec != std::errc{} || parsed.ptr != line.data() + pos + 2)
+            return absl::InvalidArgumentError("invalid inline hex escape");
+          argument.push_back(static_cast<char>(byte));
+          pos += 2;
+          break;
+        }
+        default: argument.push_back(escaped); break;
+      }
+    }
+    if (!closed)
+      return absl::InvalidArgumentError("unterminated inline quote");
+    if (quote != 0 && pos < line.size() && line[pos] != ' ' && line[pos] != '\t')
+      return absl::InvalidArgumentError("characters after inline quote");
+    args.push_back(std::move(argument));
+  }
+  return args;
+}
+
 }  // namespace
 
 void RespCommandParser::ResetCommand() {
@@ -68,12 +123,43 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         }
         if (pos == input.size()) break;
         if (input[pos] != '*') {
-          return Error(absl::InvalidArgumentError("expected RESP array"), pos);
+          command_bytes_ = 0;
+          current_argument_.clear();
+          state_ = State::kInline;
+          break;
         }
         command_bytes_ = 1;
         ++pos;
         state_ = State::kArrayLength;
         break;
+      }
+
+      case State::kInline: {
+        const std::size_t newline = input.find('\n', pos);
+        const std::size_t end = newline == std::string_view::npos
+                                    ? input.size()
+                                    : newline + 1;
+        current_argument_.append(input.substr(pos, end - pos));
+        if (!consume(end - pos)) {
+          return Error(absl::ResourceExhaustedError(
+                           "client request exceeds the query buffer limit"),
+                       pos);
+        }
+        if (newline == std::string_view::npos) break;
+        current_argument_.pop_back();
+        if (!current_argument_.empty() && current_argument_.back() == '\r')
+          current_argument_.pop_back();
+        auto parsed = ParseInlineArguments(current_argument_);
+        if (!parsed.ok()) return Error(parsed.status(), pos);
+        if (parsed->empty()) {
+          ResetCommand();
+          break;
+        }
+        result.state_ = RespParseState::kOk;
+        result.consumed_ = pos;
+        result.command_.args_ = std::move(*parsed);
+        ResetCommand();
+        return result;
       }
 
       case State::kArrayLength:
@@ -127,7 +213,7 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
               arguments_remaining_ = static_cast<std::size_t>(parsed);
               command_.args_.reserve(
                   std::min(arguments_remaining_, kInitialArgCapacity));
-              state_ = State::kBulkStart;
+              state_ = State::kArgumentStart;
             } else {
               if (parsed > static_cast<long long>(kMaxBulkLen)) {
                 return Error(
@@ -155,9 +241,14 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         break;
       }
 
-      case State::kBulkStart:
-        if (input[pos] != '$') {
-          return Error(absl::InvalidArgumentError("expected RESP bulk string"),
+      case State::kArgumentStart:
+        argument_type_ = input[pos];
+        if (argument_type_ != '$' && argument_type_ != '=' &&
+            argument_type_ != '+' && argument_type_ != ':' &&
+            argument_type_ != ',' && argument_type_ != '(' &&
+            argument_type_ != '#') {
+          return Error(absl::InvalidArgumentError(
+                           "expected RESP string or scalar argument"),
                        pos);
         }
         if (!consume(1)) {
@@ -165,8 +256,53 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                            "client request exceeds the query buffer limit"),
                        pos);
         }
-        state_ = State::kBulkLength;
+        current_argument_.clear();
+        state_ = argument_type_ == '$' || argument_type_ == '='
+                     ? State::kBulkLength
+                     : State::kLineArgument;
         break;
+
+      case State::kLineArgument: {
+        const std::size_t newline = input.find('\n', pos);
+        const std::size_t end = newline == std::string_view::npos
+                                    ? input.size()
+                                    : newline + 1;
+        current_argument_.append(input.substr(pos, end - pos));
+        if (!consume(end - pos)) {
+          return Error(absl::ResourceExhaustedError(
+                           "client request exceeds the query buffer limit"),
+                       pos);
+        }
+        if (newline == std::string_view::npos) break;
+        if (current_argument_.size() < 2 ||
+            current_argument_[current_argument_.size() - 2] != '\r') {
+          return Error(absl::InvalidArgumentError(
+                           "malformed RESP scalar terminator"),
+                       pos);
+        }
+        current_argument_.resize(current_argument_.size() - 2);
+        if (argument_type_ == '#') {
+          if (current_argument_ == "t")
+            current_argument_ = "1";
+          else if (current_argument_ == "f")
+            current_argument_ = "0";
+          else
+            return Error(absl::InvalidArgumentError("invalid RESP boolean"),
+                         pos);
+        }
+        command_.args_.push_back(std::move(current_argument_));
+        current_argument_.clear();
+        --arguments_remaining_;
+        if (arguments_remaining_ != 0) {
+          state_ = State::kArgumentStart;
+          break;
+        }
+        result.state_ = RespParseState::kOk;
+        result.consumed_ = pos;
+        result.command_ = std::move(command_);
+        ResetCommand();
+        return result;
+      }
 
       case State::kBulkData: {
         const std::size_t available = input.size() - pos;
@@ -204,11 +340,20 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         }
         if (terminator_bytes_ != 2) break;
 
+        if (argument_type_ == '=') {
+          if (current_argument_.size() < 4 || current_argument_[3] != ':') {
+            return Error(
+                absl::InvalidArgumentError("invalid RESP verbatim string"),
+                pos);
+          }
+          current_argument_.erase(0, 4);
+        }
+
         command_.args_.push_back(std::move(current_argument_));
         current_argument_.clear();
         --arguments_remaining_;
         if (arguments_remaining_ != 0) {
-          state_ = State::kBulkStart;
+          state_ = State::kArgumentStart;
           break;
         }
 
@@ -273,6 +418,23 @@ std::string_view ReplyBuilder::AppendNullBulkString() {
   return buffer_;
 }
 
+std::string_view ReplyBuilder::AppendNullArray() {
+  if (version_ == RespVersion::k3) {
+    buffer_.append("_\r\n");
+  } else {
+    buffer_.append("*-1\r\n");
+  }
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendNull() {
+  if (version_ == RespVersion::k3) {
+    buffer_.append("_\r\n");
+    return buffer_;
+  }
+  return AppendNullBulkString();
+}
+
 std::string_view ReplyBuilder::AppendInteger(long long value) {
   char digits[std::numeric_limits<long long>::digits10 + 3];
   const auto [end, error] =
@@ -280,6 +442,39 @@ std::string_view ReplyBuilder::AppendInteger(long long value) {
   assert(error == std::errc{});
   buffer_.push_back(':');
   buffer_.append(digits, end);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendBoolean(bool value) {
+  if (version_ == RespVersion::k3) {
+    buffer_.append(value ? "#t\r\n" : "#f\r\n");
+    return buffer_;
+  }
+  return AppendInteger(value ? 1 : 0);
+}
+
+std::string_view ReplyBuilder::AppendDouble(double value) {
+  char digits[64];
+  const auto [end, error] =
+      std::to_chars(digits, digits + sizeof(digits), value);
+  assert(error == std::errc{});
+  if (version_ == RespVersion::k3) {
+    buffer_.push_back(',');
+  } else {
+    buffer_.push_back('$');
+    AppendUnsigned(buffer_, static_cast<std::uint64_t>(end - digits));
+    buffer_.append("\r\n");
+  }
+  buffer_.append(digits, end);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendDoubleText(std::string_view value) {
+  if (version_ == RespVersion::k2) return AppendBulkString(value);
+  buffer_.push_back(',');
+  buffer_.append(value);
   buffer_.append("\r\n");
   return buffer_;
 }
@@ -299,6 +494,32 @@ std::string_view ReplyBuilder::AppendError(std::string_view prefix,
 
 std::string_view ReplyBuilder::AppendArrayHeader(std::uint64_t count) {
   buffer_.push_back('*');
+  AppendUnsigned(buffer_, count);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendMapHeader(std::uint64_t count) {
+  if (version_ == RespVersion::k2) {
+    return AppendArrayHeader(count * 2);
+  }
+  buffer_.push_back('%');
+  AppendUnsigned(buffer_, count);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendSetHeader(std::uint64_t count) {
+  if (version_ == RespVersion::k2) return AppendArrayHeader(count);
+  buffer_.push_back('~');
+  AppendUnsigned(buffer_, count);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendPushHeader(std::uint64_t count) {
+  if (version_ == RespVersion::k2) return AppendArrayHeader(count);
+  buffer_.push_back('>');
   AppendUnsigned(buffer_, count);
   buffer_.append("\r\n");
   return buffer_;

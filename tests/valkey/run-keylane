@@ -42,8 +42,9 @@ truncate -s "${KEYLANE_TEST_DATA_SIZE:-8G}" "$DATA_FILE"
     --port "$KEYLANE_PORT" \
     --threads "${KEYLANE_TEST_THREADS:-2}" \
     --no-pin-workers \
-    --registered-buffer-mb "${KEYLANE_TEST_BUFFER_MB:-32}" \
-    --replication-publish-queue-mb "${KEYLANE_TEST_REPLICATION_QUEUE_MB:-8}" \
+    --recv-buffers-per-worker "${KEYLANE_TEST_RECV_BUFFERS:-0}" \
+    --registered-buffer-mb-per-worker "${KEYLANE_TEST_BUFFER_MB:-256}" \
+    --replication-publish-queue-mb-per-worker "${KEYLANE_TEST_REPLICATION_QUEUE_MB:-8}" \
     --max-memory "${KEYLANE_TEST_MAX_MEMORY:-2147483648}" \
     --data-file "$DATA_FILE" >"$LOG_FILE" 2>&1 &
 SERVER_PID=$!

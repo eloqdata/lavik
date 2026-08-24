@@ -13,10 +13,13 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/read_trace.h"
+#include "keylane/resp_version.h"
 #include "keylane/set_trace.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
+
+class BlockingWakeCascade;
 
 namespace tx {
 class Transaction;
@@ -90,6 +93,7 @@ enum class CommandKind {
   kQuit,
   kReset,
   kAuth,
+  kHello,
   kDbSize,
   kDel,
   kUnlink,
@@ -292,6 +296,10 @@ struct CommandSpec;
 struct CommandRequest {
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
+  // Reply protocol for every nested/cross-core execution path. Replication
+  // and internal callers naturally default to RESP2 because their replies are
+  // discarded; client dispatch overwrites this from the connection.
+  RespVersion resp_version_ = RespVersion::k2;
   // Set only for commands applied from the replication stream. Such commands
   // bypass replica read-only checks and must not be published again.
   bool replication_origin_ = false;
@@ -299,6 +307,9 @@ struct CommandRequest {
   std::vector<std::string> args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
   std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;
+  // Non-owning: the dispatch coroutine keeps the cascade alive until every
+  // waiter transitively woken by this command has finished its ready attempt.
+  BlockingWakeCascade* blocking_wake_cascade_ = nullptr;
 };
 
 struct ReplicaOfRequest {
@@ -421,8 +432,10 @@ void RegisterClientConnection(std::uint64_t id, int fd, std::string address,
 void SetClientReplicationSession(std::uint64_t id,
                                  std::uint64_t replication_session_id) noexcept;
 void SetClientName(std::uint64_t id, std::string name) noexcept;
+void SetClientRespVersion(std::uint64_t id, RespVersion version) noexcept;
 void SetClientPubSubCounts(std::uint64_t id, std::size_t subscriptions,
                            std::size_t pattern_subscriptions) noexcept;
+void SetClientBlocked(std::uint64_t id, bool blocked) noexcept;
 void UnregisterClientConnection(std::uint64_t id) noexcept;
 
 // Commands marked kCmdMayBlock hold the database gate only while performing
@@ -454,7 +467,8 @@ void EndReplicationTransactionOrder() noexcept;
 // disk operations use SubmitTaskTo and return on the connection's original
 // worker.
 Task<CommandReply> ExecuteCommand(const CommandRequest& request,
-                                  ReplyBuilder& reply_builder);
+                                  ReplyBuilder& reply_builder,
+                                  std::uint64_t client_id = 0);
 
 // Replays one trusted canonical command from the native replication stream.
 // Transaction envelopes rendezvous on every source flow before this primitive
