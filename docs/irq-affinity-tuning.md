@@ -12,6 +12,83 @@ it improved average GET latency by 8.3% and p99.9 by 4.9%, while p99.99 remained
 within normal run-to-run variation. Always validate the percentiles required by
 the deployment.
 
+## Reserve a scheduler housekeeping CPU
+
+Before attempting strict IRQ isolation, leave one logical CPU outside the
+Keylane worker affinity set. The spare CPU gives Linux a low-load destination
+for movable system work such as SSH sessions, monitoring agents, command-line
+tools, and unbound kernel workqueues. This is scheduler headroom, not explicit
+migration: it is not necessary to find and pin every system process for this
+first experiment.
+
+On the 16-vCPU Azure reference VM, the tested configuration used 15 workers on
+CPUs 0-14 and left CPU15 out of Keylane's allowed CPU set:
+
+```sh
+taskset -c 0-14 ./bld-spdk/keylane --threads=15 OTHER_OPTIONS
+```
+
+Both parts are required. `taskset` prevents the process from running on CPU15,
+and `--threads=15` prevents Keylane from creating a sixteenth worker. Keylane
+then pins worker `i` to allowed CPU `i`. Linux CFS load balancing naturally
+prefers the otherwise idle CPU15 for movable housekeeping tasks.
+
+Verify the process and worker placement after startup:
+
+```sh
+keylane_pid=$(pgrep -xo keylane)
+taskset -pc "$keylane_pid"
+ps -T -p "$keylane_pid" -o pid,tid,psr,stat,comm
+```
+
+This does **not** strictly isolate CPUs 0-14. Per-CPU kernel threads can still
+run there, and a NIC IRQ mapped to a worker CPU can still interrupt its worker.
+Strict isolation requires a separate cpuset/cgroup or boot-time CPU-isolation
+configuration in addition to deliberate IRQ, RPS, XPS, and workqueue placement.
+Use the one-spare-CPU setup first because it is reversible and showed a large
+tail-latency benefit without changing global kernel policy.
+
+On 2026-08-24, with `htop` stopped, the same binary and 400M-key SPDK dataset,
+the original per-queue mlx5 IRQ distribution, and a remote memtier client fixed
+at 400k GET/s, the 60-second A/B was:
+
+| Server placement | GET/s | Average | p99 | p99.9 | p99.99 | runnable off-CPU >=2 ms | >=4 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 workers, CPUs 0-15 | 399,339 | 0.323 ms | 0.647 ms | 3.167 ms | 4.447 ms | 540 | 10 |
+| 15 workers, CPUs 0-14 | 399,359 | 0.335 ms | 0.583 ms | 0.791 ms | 1.639 ms | 5 | 1 |
+
+Leaving CPU15 available reduced p99.99 by 63.1% and runnable worker off-CPU
+events of at least 2 ms by 99.1%, while throughput was unchanged. Average
+latency increased 3.6% because each remaining worker handled more traffic. The
+only >=4 ms runnable interruption in the 15-worker run was a 6.35 ms
+`ksoftirqd/12` interval, illustrating that this setup is not strict isolation.
+
+Do not concentrate every NIC completion IRQ onto the single spare CPU without
+first validating packet capacity. On this VM, moving all 16 mlx5 completion
+IRQs to CPU15 limited the same test to about 216k GET/s. Restoring the original
+one-queue-per-CPU IRQ mapping recovered 400k GET/s while retaining the benefit
+of scheduler headroom on CPU15.
+
+A 300-second, fixed-100k GET/s follow-up compared scheduler headroom with
+strict worker/IRQ separation. The 12-worker configuration ran Keylane on CPUs
+0-11 and distributed the 16 mlx5 completion IRQs round-robin over CPUs 12-15.
+The 15-worker configuration ran Keylane on CPUs 0-14 and retained the original
+one-queue-per-CPU IRQ mapping. All other server and client settings were the
+same:
+
+| Placement at 100k GET/s | GET/s | Average | p99 | p99.9 | p99.99 | runnable off-CPU >=1 ms | >=2 ms | >=4 ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 15 workers, IRQs distributed on CPUs 0-15 | 99,843 | 0.326 ms | 0.655 ms | 1.215 ms | 1.807 ms | 20 | 6 | 0 |
+| 12 workers, IRQs isolated on CPUs 12-15 | 99,845 | 0.334 ms | 0.735 ms | 1.263 ms | 1.943 ms | 3 | 2 | 1 |
+
+Strict IRQ separation reduced runnable scheduling interruptions, proving that
+the placement worked, but p99.99 regressed 7.5% and average latency regressed
+2.6%. At this load, the benefit from eliminating IRQ interference did not
+offset the cost of reducing worker parallelism and changing the SPDK qpair
+owner layout. Prefer 15 workers with the original distributed IRQ mapping on
+this 16-vCPU VM unless a different workload demonstrates a repeatable benefit
+from strict IRQ isolation.
+
 ## 1. Inspect physical CPU topology
 
 Logical CPU numbers do not necessarily identify separate physical cores. Find
