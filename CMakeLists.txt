@@ -29,7 +29,7 @@ option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
 option(KEYLANE_ENABLE_OPT "Enable aggressive optimization" ON)
 option(KEYLANE_STATIC_OPENSSL "Link OpenSSL statically" ON)
 option(KEYLANE_STATIC_CXX_RUNTIME
-  "Link the GNU C++ and compiler runtimes statically" OFF)
+  "Link the GNU C++ and compiler runtimes statically" ON)
 set(KEYLANE_MARCH "native" CACHE STRING
   "Value passed to -march for optimized local builds (empty disables it)")
 option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" OFF)
