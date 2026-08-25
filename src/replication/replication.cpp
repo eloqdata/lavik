@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -4115,6 +4116,12 @@ class ReplicationManager::Impl {
       co_return connected.status();
     }
     TcpStream stream = std::move(*connected);
+    absl::Status bounded_recv = stream.SetReadAhead(false);
+    if (!bounded_recv.ok()) {
+      stream.Close().IgnoreError();
+      session->Cancel();
+      co_return bounded_recv;
+    }
     const int fd = stream.NativeFd();
     if (!session->sockets_.Add(fd)) {
       stream.Close().IgnoreError();
@@ -4391,6 +4398,237 @@ class ReplicationManager::Impl {
     co_return result;
   }
 
+  struct ReplicaOnlineCommand {
+    std::uint64_t lsn_ = 0;
+    ReplicatedCommand command_;
+  };
+
+  struct ReplicaOnlineApplyState {
+    std::deque<ReplicaOnlineCommand> commands_;
+    celer::AsyncNotification command_ready_;
+    celer::AsyncNotification capacity_ready_;
+    celer::AsyncNotification apply_done_ready_;
+    absl::Status receiver_status_ =
+        absl::UnknownError("replication flow receiver is running");
+    absl::Status apply_status_ =
+        absl::UnknownError("replication flow apply queue is running");
+    bool receiver_done_ = false;
+    bool apply_done_ = false;
+  };
+
+  Task<absl::Status> ApplyReplicaOnlineCommands(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id,
+      const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    auto send_ack = [&stream](std::uint64_t lsn) -> Task<absl::Status> {
+      std::string payload;
+      payload.reserve(10);
+      PutU16(payload, 0);
+      PutU64(payload, lsn);
+      co_return co_await WriteDataFrame(stream, DataFrameKind::kAck, payload);
+    };
+
+    for (;;) {
+      while (state->commands_.empty() && !state->receiver_done_) {
+        co_await state->command_ready_.Wait();
+      }
+      if (session->cancelled()) {
+        co_return absl::CancelledError(
+            "replication session ended while applying commands");
+      }
+      if (state->receiver_done_ && !state->receiver_status_.ok()) {
+        co_return state->receiver_status_;
+      }
+      if (state->commands_.empty()) {
+        co_return absl::UnavailableError("replication flow closed");
+      }
+
+      ReplicaOnlineCommand pending = std::move(state->commands_.front());
+      state->commands_.pop_front();
+      state->capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+      const bool transaction =
+          !pending.command_.args_.empty() &&
+          pending.command_.args_[0] == kReplicationTransactionEnvelope;
+      const bool control =
+          !pending.command_.args_.empty() &&
+          (pending.command_.args_[0] == "FLUSHDB" ||
+           pending.command_.args_[0] == "FLUSHALL");
+      absl::Status applied;
+      if (transaction) {
+        applied = co_await ApplyReplicaTransaction(
+            session, flow_id, pending.lsn_, std::move(pending.command_));
+      } else if (control) {
+        applied = co_await ApplyReplicaControl(
+            session, flow_id, pending.lsn_, std::move(pending.command_));
+      } else {
+        applied = co_await ApplyReplicatedCommand(pending.command_);
+      }
+      if (!applied.ok()) {
+        InvalidateReplicaContinuation(session);
+        co_return applied;
+      }
+
+      // Preserve the old durability contract: receipt alone never advances a
+      // cursor. The per-flow apply queue is strictly FIFO, and progress becomes
+      // resumable only after the command (or every transaction participant)
+      // has completed.
+      session->cursors_->Store(flow_id, pending.lsn_ + 1, 0);
+      if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
+        co_return absl::UnavailableError(
+            "injected replication flow disconnect after transaction");
+      }
+      if (!transaction && ShouldInjectFlowDropAfterCommandApply(flow_id)) {
+        co_return absl::UnavailableError(
+            "injected replication flow disconnect after command apply");
+      }
+      absl::Status acknowledged = co_await send_ack(pending.lsn_);
+      if (!acknowledged.ok()) co_return acknowledged;
+    }
+  }
+
+  Task<absl::Status> TrackReplicaOnlineApply(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id,
+      const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    state->apply_status_ =
+        co_await ApplyReplicaOnlineCommands(stream, session, flow_id, state);
+    state->apply_done_ = true;
+    state->apply_done_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!state->apply_status_.ok()) {
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+    }
+    co_return state->apply_status_;
+  }
+
+  Task<absl::Status> RunReplicaOnlineFlowData(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id,
+      std::pair<DataFrameKind, std::string> first_frame) {
+    auto state = std::make_shared<ReplicaOnlineApplyState>();
+    celer::ThisWorker().self_->Spawn(
+        TrackReplicaOnlineApply(stream, session, flow_id, state));
+
+    std::uint64_t staged_command_lsn = 0;
+    std::uint32_t next_command_fragment = 0;
+    std::string staged_command;
+    std::size_t received_commands = 0;
+    std::optional<std::pair<DataFrameKind, std::string>> pending_frame(
+        std::move(first_frame));
+    absl::Status receiver_status = absl::OkStatus();
+    constexpr std::size_t kOnlineQueueCommands = 256;
+    while (stream.IsOpen()) {
+      if (state->apply_done_) {
+        receiver_status = state->apply_status_;
+        break;
+      }
+      absl::StatusOr<std::pair<DataFrameKind, std::string>> frame =
+          pending_frame.has_value()
+              ? absl::StatusOr<std::pair<DataFrameKind, std::string>>(
+                    std::move(*pending_frame))
+              : co_await ReadDataFrame(stream);
+      pending_frame.reset();
+      if (!frame.ok()) {
+        receiver_status = frame.status();
+        break;
+      }
+      if (frame->first != DataFrameKind::kCommand) {
+        receiver_status = absl::InvalidArgumentError(
+            "replication command frame expected after ONLINE handoff");
+        break;
+      }
+      if (ShouldInjectFlowDrop(flow_id)) {
+        receiver_status =
+            absl::UnavailableError("injected replication flow disconnect");
+        break;
+      }
+
+      DataReader reader(frame->second);
+      std::uint64_t lsn = 0;
+      std::uint32_t fragment = 0;
+      std::uint8_t flags = 0;
+      if (!reader.U64(&lsn) || !reader.U32(&fragment) ||
+          !reader.U8(&flags) || reader.remaining() == 0) {
+        receiver_status = absl::InvalidArgumentError(
+            "malformed replication command frame");
+        break;
+      }
+      const auto first_flag =
+          static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kFirst);
+      const auto last_flag =
+          static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast);
+      if ((flags & ~(first_flag | last_flag)) != 0) {
+        receiver_status =
+            absl::InvalidArgumentError("invalid replication command flags");
+        break;
+      }
+      const bool first = (flags & first_flag) != 0;
+      const bool last = (flags & last_flag) != 0;
+      if (first) {
+        if (fragment != 0 || staged_command_lsn != 0) {
+          receiver_status = absl::InvalidArgumentError(
+              "replication command fragments overlap");
+          break;
+        }
+        staged_command_lsn = lsn;
+        next_command_fragment = 0;
+        staged_command.clear();
+      }
+      if (staged_command_lsn != lsn || fragment != next_command_fragment) {
+        receiver_status = absl::InvalidArgumentError(
+            "replication command fragment is out of order");
+        break;
+      }
+      staged_command.append(frame->second.data() + 13, reader.remaining());
+      ++next_command_fragment;
+      if (!last) continue;
+      auto command = DecodeReplicationCommand(staged_command);
+      if (!command.ok()) {
+        receiver_status = command.status();
+        break;
+      }
+      while (state->commands_.size() >= kOnlineQueueCommands &&
+             !state->apply_done_) {
+        co_await state->capacity_ready_.Wait();
+      }
+      if (state->apply_done_) {
+        receiver_status = state->apply_status_;
+        break;
+      }
+      state->commands_.push_back(ReplicaOnlineCommand{
+          .lsn_ = lsn,
+          .command_ = std::move(*command),
+      });
+      state->command_ready_.NotifyAll(*celer::ThisWorker().self_);
+      staged_command_lsn = 0;
+      next_command_fragment = 0;
+      staged_command.clear();
+      // Loopback and fast LAN reads can remain immediately-ready for hundreds
+      // of megabytes. Give the owner-local FIFO consumer a bounded scheduling
+      // opportunity even when ingress never naturally suspends.
+      if ((++received_commands % kFullSyncSchedulingItems) == 0) {
+        co_await celer::Yield(*celer::ThisWorker().self_);
+      }
+    }
+
+    if (receiver_status.ok()) {
+      receiver_status = absl::UnavailableError("replication flow closed");
+    }
+    state->receiver_status_ = receiver_status;
+    state->receiver_done_ = true;
+    state->command_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!state->apply_done_) {
+      // A broken ingress flow can strand another flow at a transaction
+      // barrier. Cancel the whole session before joining so every waiter is
+      // released and no detached apply coroutine can retain `stream`.
+      session->Cancel();
+      while (!state->apply_done_) {
+        co_await state->apply_done_ready_.Wait();
+      }
+    }
+    if (!state->apply_status_.ok()) co_return state->apply_status_;
+    co_return receiver_status;
+  }
+
   Task<absl::Status> RunReplicaFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
       unsigned flow_id) {
@@ -4630,84 +4868,8 @@ class ReplicationManager::Impl {
         if (!acknowledged.ok()) co_return acknowledged;
         ++expected_fullsync_sequence;
       } else if (frame->first == DataFrameKind::kCommand) {
-        if (ShouldInjectFlowDrop(flow_id)) {
-          co_return absl::UnavailableError(
-              "injected replication flow disconnect");
-        }
-        DataReader reader(frame->second);
-        std::uint64_t lsn = 0;
-        std::uint32_t fragment = 0;
-        std::uint8_t flags = 0;
-        if (!reader.U64(&lsn) || !reader.U32(&fragment) || !reader.U8(&flags) ||
-            reader.remaining() == 0) {
-          co_return absl::InvalidArgumentError(
-              "malformed replication command frame");
-        }
-        const auto first_flag =
-            static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kFirst);
-        const auto last_flag =
-            static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast);
-        if ((flags & ~(first_flag | last_flag)) != 0) {
-          co_return absl::InvalidArgumentError(
-              "invalid replication command flags");
-        }
-        const bool first = (flags & first_flag) != 0;
-        const bool last = (flags & last_flag) != 0;
-        if (first) {
-          if (fragment != 0 || staged_command_lsn != 0) {
-            co_return absl::InvalidArgumentError(
-                "replication command fragments overlap");
-          }
-          staged_command_lsn = lsn;
-          next_command_fragment = 0;
-          staged_command.clear();
-        }
-        if (staged_command_lsn != lsn || fragment != next_command_fragment) {
-          co_return absl::InvalidArgumentError(
-              "replication command fragment is out of order");
-        }
-        staged_command.append(frame->second.data() + 13, reader.remaining());
-        ++next_command_fragment;
-        if (!last) continue;
-        auto command = DecodeReplicationCommand(staged_command);
-        if (!command.ok()) co_return command.status();
-        absl::Status applied;
-        const bool transaction =
-            !command->args_.empty() &&
-            command->args_[0] == kReplicationTransactionEnvelope;
-        const bool control =
-            !command->args_.empty() &&
-            (command->args_[0] == "FLUSHDB" || command->args_[0] == "FLUSHALL");
-        if (transaction) {
-          applied = co_await ApplyReplicaTransaction(session, flow_id, lsn,
-                                                     std::move(*command));
-        } else if (control) {
-          applied = co_await ApplyReplicaControl(session, flow_id, lsn,
-                                                 std::move(*command));
-        } else {
-          applied = co_await ApplyReplicatedCommand(*command);
-        }
-        if (!applied.ok()) {
-          InvalidateReplicaContinuation(session);
-          co_return applied;
-        }
-        // Publish progress before the ACK write. A peer disconnect is only
-        // observed by that write; retaining the old cursor until afterwards
-        // would replay non-idempotent commands such as APPEND on reconnect.
-        session->cursors_->Store(flow_id, lsn + 1, 0);
-        if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
-          co_return absl::UnavailableError(
-              "injected replication flow disconnect after transaction");
-        }
-        if (!transaction && ShouldInjectFlowDropAfterCommandApply(flow_id)) {
-          co_return absl::UnavailableError(
-              "injected replication flow disconnect after command apply");
-        }
-        absl::Status acknowledged = co_await send_ack(0, lsn);
-        if (!acknowledged.ok()) co_return acknowledged;
-        staged_command_lsn = 0;
-        next_command_fragment = 0;
-        staged_command.clear();
+        co_return co_await RunReplicaOnlineFlowData(
+            stream, session, flow_id, std::move(*frame));
       } else if (frame->first == DataFrameKind::kCursor) {
         DataReader reader(frame->second);
         std::uint64_t lsn = 0;
@@ -5815,6 +5977,73 @@ class ReplicationManager::Impl {
     co_return co_await RunMasterFlowBacklog(stream, session, flow_id, cursor);
   }
 
+  struct MasterBacklogDuplexState {
+    std::deque<std::uint64_t> expected_acks_;
+    celer::AsyncNotification expected_ack_ready_;
+    celer::AsyncNotification receiver_done_ready_;
+    absl::Status receiver_status_ =
+        absl::UnknownError("replication backlog ACK receiver is running");
+    bool sender_done_ = false;
+    bool receiver_done_ = false;
+  };
+
+  Task<absl::Status> ReceiveMasterFlowBacklogAcks(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id,
+      const std::shared_ptr<MasterBacklogDuplexState>& duplex) {
+    while (stream.IsOpen()) {
+      while (duplex->expected_acks_.empty() && !duplex->sender_done_) {
+        co_await duplex->expected_ack_ready_.Wait();
+      }
+      if (duplex->expected_acks_.empty()) {
+        co_return duplex->sender_done_
+                      ? absl::OkStatus()
+                      : absl::UnavailableError(
+                            "replication backlog flow closed");
+      }
+
+      const std::uint64_t expected_lsn = duplex->expected_acks_.front();
+      auto ack = co_await ReadDataFrame(stream);
+      if (!ack.ok()) co_return ack.status();
+      if (ack->first != DataFrameKind::kAck) {
+        co_return absl::InvalidArgumentError(
+            "replication command ACK expected");
+      }
+      DataReader ack_reader(ack->second);
+      std::uint16_t ignored_partition = 0;
+      std::uint64_t acknowledged_lsn = 0;
+      if (!ack_reader.U16(&ignored_partition) ||
+          !ack_reader.U64(&acknowledged_lsn) ||
+          acknowledged_lsn != expected_lsn) {
+        co_return absl::InvalidArgumentError(
+            "malformed replication command ACK");
+      }
+      const storage::ReplicationLogCursor acknowledged{
+          .lsn_ = expected_lsn + 1, .fragment_index_ = 0};
+      absl::Status retained =
+          storage_->RetainReplicationLog(session->id_, acknowledged.lsn_);
+      if (!retained.ok()) co_return retained;
+      session->SetBacklogCursor(flow_id, ReplicationPhase::kReady,
+                                acknowledged);
+      duplex->expected_acks_.pop_front();
+    }
+    co_return absl::UnavailableError("replication backlog flow closed");
+  }
+
+  Task<absl::Status> TrackMasterFlowBacklogAcks(
+      TcpStream& stream, const std::shared_ptr<MasterSession>& session,
+      unsigned flow_id,
+      const std::shared_ptr<MasterBacklogDuplexState>& duplex) {
+    duplex->receiver_status_ =
+        co_await ReceiveMasterFlowBacklogAcks(stream, session, flow_id, duplex);
+    duplex->receiver_done_ = true;
+    duplex->receiver_done_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!duplex->receiver_status_.ok()) {
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+    }
+    co_return duplex->receiver_status_;
+  }
+
   Task<absl::Status> MonitorBacklogStall(std::shared_ptr<MasterSession> session,
                                          unsigned flow_id, int fd,
                                          std::uint64_t observed_generation) {
@@ -5847,10 +6076,26 @@ class ReplicationManager::Impl {
   Task<absl::Status> RunMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
       unsigned flow_id, storage::ReplicationLogCursor cursor) {
+    auto duplex = std::make_shared<MasterBacklogDuplexState>();
+    celer::ThisWorker().self_->Spawn(
+        TrackMasterFlowBacklogAcks(stream, session, flow_id, duplex));
+    absl::Status sender_status = absl::OkStatus();
     while (stream.IsOpen()) {
+      if (duplex->receiver_done_) {
+        sender_status = duplex->receiver_status_;
+        break;
+      }
+      if (session->cancelled()) {
+        sender_status = absl::CancelledError(
+            "replication session ended while sending backlog");
+        break;
+      }
       auto batch = co_await storage_->ReadReplicationLog(
           cursor, kBacklogBatchBytes, kBacklogBatchFrames);
-      if (!batch.ok()) co_return batch.status();
+      if (!batch.ok()) {
+        sender_status = batch.status();
+        break;
+      }
       std::string frame_headers;
       frame_headers.reserve(batch->frames_.size() * 18);
       std::vector<iovec> wire_batch;
@@ -5884,46 +6129,52 @@ class ReplicationManager::Impl {
         if (last) pending_acks.push_back(frame.header_.lsn_);
       }
       if (!wire_batch.empty()) {
+        // Publish the expected ACK order before the write can yield. The
+        // receiver runs concurrently on this worker and may observe an ACK as
+        // soon as the first complete frame reaches the peer.
+        duplex->expected_acks_.insert(duplex->expected_acks_.end(),
+                                      pending_acks.begin(),
+                                      pending_acks.end());
+        duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
         absl::Status sent = co_await stream.WriteAllV(wire_batch);
-        if (!sent.ok()) co_return sent;
+        if (!sent.ok()) {
+          sender_status = sent;
+          break;
+        }
       }
-      // Keep the storage reader moving independently from the durable cursor.
-      // A batch may end in the middle of a fragmented command, so its next
-      // cursor can be ahead of the last command the replica has acknowledged.
+      // Keep sending independently from the durable cursor. In particular,
+      // never stop a source flow at an arbitrary batch boundary waiting for a
+      // cross-worker transaction ACK: another participant's envelope may be
+      // in that flow's next batch. The concurrent receiver advances retained
+      // history as ACKs arrive while socket backpressure bounds wire output.
       cursor = batch->next_;
-      for (const std::uint64_t expected_lsn : pending_acks) {
-        auto ack = co_await ReadDataFrame(stream);
-        if (!ack.ok()) co_return ack.status();
-        if (ack->first != DataFrameKind::kAck) {
-          co_return absl::InvalidArgumentError(
-              "replication command ACK expected");
-        }
-        DataReader ack_reader(ack->second);
-        std::uint16_t ignored_partition = 0;
-        std::uint64_t acknowledged_lsn = 0;
-        if (!ack_reader.U16(&ignored_partition) ||
-            !ack_reader.U64(&acknowledged_lsn) ||
-            acknowledged_lsn != expected_lsn) {
-          co_return absl::InvalidArgumentError(
-              "malformed replication command ACK");
-        }
-        const storage::ReplicationLogCursor acknowledged{
-            .lsn_ = expected_lsn + 1, .fragment_index_ = 0};
-        absl::Status retained =
-            storage_->RetainReplicationLog(session->id_, acknowledged.lsn_);
-        if (!retained.ok()) co_return retained;
-        session->SetBacklogCursor(flow_id, ReplicationPhase::kReady,
-                                  acknowledged);
-      }
       if (batch->at_tail_) {
         absl::Status slept = co_await celer::SleepFor(
             *celer::ThisWorker().self_, std::chrono::milliseconds(1));
-        if (!slept.ok()) co_return slept;
+        if (!slept.ok()) {
+          sender_status = slept;
+          break;
+        }
         continue;
       }
       cursor = batch->next_;
     }
-    co_return absl::UnavailableError("replication backlog flow closed");
+    if (sender_status.ok()) {
+      sender_status = absl::UnavailableError(
+          "replication backlog flow closed");
+    }
+    duplex->sender_done_ = true;
+    duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!duplex->receiver_done_) {
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+      while (!duplex->receiver_done_) {
+        co_await duplex->receiver_done_ready_.Wait();
+      }
+    }
+    if (!duplex->receiver_status_.ok()) {
+      co_return duplex->receiver_status_;
+    }
+    co_return sender_status;
   }
 
   Task<absl::Status> RunAdoptedConnection(

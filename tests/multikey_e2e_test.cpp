@@ -1051,6 +1051,54 @@ int main(int argc, char** argv) {
                "replica state after concurrent MSET");
       }
 
+      // Exercise changing participant sets across enough concurrent
+      // transactions to cross several per-flow wire-batch boundaries. A
+      // stop-and-wait sender can form an arrival/ACK cycle here: one flow
+      // waits for a transaction whose missing participant is just beyond a
+      // different flow's arbitrary batch boundary. ONLINE replication must
+      // keep sending while its independent ACK receiver advances retention.
+      constexpr int kVariedWriters = 12;
+      constexpr int kVariedRounds = 192;
+      const std::string varied_payload(256, 'd');
+      writers.clear();
+      writers.reserve(kVariedWriters);
+      for (int writer = 0; writer < kVariedWriters; ++writer) {
+        writers.push_back(std::async(
+            std::launch::async,
+            [source_port, writer, &varied_payload]() {
+              RespClient client = Connect(source_port);
+              for (int round = 0; round < kVariedRounds; ++round) {
+                const int key_count = 2 + (writer * 5 + round * 3) % 7;
+                std::vector<std::string> keys;
+                keys.reserve(key_count);
+                std::vector<std::string_view> command{"MSET"};
+                command.reserve(1 + 2 * key_count);
+                for (int key = 0; key < key_count; ++key) {
+                  keys.push_back("duplex-multikey:" +
+                                 std::to_string(writer) + ":" +
+                                 std::to_string(round) + ":" +
+                                 std::to_string(key));
+                  command.push_back(keys.back());
+                  command.push_back(varied_payload);
+                }
+                Expect(client.Command(command), "+OK",
+                       "varied-participant replicated MSET");
+              }
+            }));
+      }
+      for (auto& writer : writers) writer.get();
+      const std::string varied_source_size =
+          source_client.Command({"DBSIZE"});
+      const auto varied_deadline = std::chrono::steady_clock::now() + 30s;
+      std::string varied_replica_size;
+      do {
+        varied_replica_size = replica_client.Command({"DBSIZE"});
+        if (varied_replica_size == varied_source_size) break;
+        std::this_thread::sleep_for(10ms);
+      } while (std::chrono::steady_clock::now() < varied_deadline);
+      Expect(varied_replica_size, varied_source_size,
+             "replica convergence after varied-participant MSET");
+
       std::vector<std::string> values(kWideKeys);
       for (int round = 0; round < kWideRounds; ++round) {
         std::vector<std::string_view> command{"MSET"};

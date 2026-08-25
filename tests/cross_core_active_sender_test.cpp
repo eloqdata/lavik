@@ -129,7 +129,9 @@ TEST(CrossCoreActiveSenderTest, ConcurrentDrainReactivatesNonemptyLanes) {
         }
         consumed += count;
 
-        lane.active_.store(false, std::memory_order_release);
+        // Match Worker::DrainCrossCore: acquire a producer that coalesced its
+        // post while the lane was still active before checking for leftovers.
+        (void)lane.active_.exchange(false, std::memory_order_acq_rel);
         if (!lane.empty() &&
             !lane.active_.exchange(true, std::memory_order_acq_rel)) {
           cross_core.ActivateSender(kReceiver, sender);
