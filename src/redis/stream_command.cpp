@@ -2373,14 +2373,13 @@ void InitStreamCommandStorage(storage::StorageEngine* engine) {
 Task<CommandReply> ExecuteStreamCommand(const CommandRequest& request,
                                         ReplyBuilder& reply_builder,
                                         std::uint64_t client_id) {
-  co_return co_await ExecuteImpl(request, nullptr, nullptr, reply_builder,
-                                 client_id);
+  return ExecuteImpl(request, nullptr, nullptr, reply_builder, client_id);
 }
 Task<CommandReply> ExecuteStreamCommandLocked(const CommandRequest& request,
                                               const storage::Digest& digest,
                                               storage::TxShardWrites* tx,
                                               ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteImpl(request, &digest, tx, reply_builder);
+  return ExecuteImpl(request, &digest, tx, reply_builder);
 }
 
 Task<std::string> ExecuteStreamReadLocked(

@@ -513,16 +513,14 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
 
 Task<CommandReply> ExecuteSingleListCommand(const CommandRequest& request,
                                             ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteSingleListCommandImpl(request, nullptr, nullptr,
-                                                  reply_builder);
+  return ExecuteSingleListCommandImpl(request, nullptr, nullptr, reply_builder);
 }
 
 Task<CommandReply> ExecuteSingleListCommandLocked(const CommandRequest& request,
                                                   const storage::Digest& digest,
                                                   storage::TxShardWrites* tx,
                                                   ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteSingleListCommandImpl(request, &digest, tx,
-                                                  reply_builder);
+  return ExecuteSingleListCommandImpl(request, &digest, tx, reply_builder);
 }
 Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                                        ReplyBuilder& reply_builder,

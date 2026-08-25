@@ -906,14 +906,15 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
   };
 }
 
-inline Task<absl::StatusOr<std::size_t>> ReadStorageBuffer(
-    Worker& worker, FixedFile file, FixedBuffer buffer, bool registered,
-    std::uint64_t offset) {
+inline celer::SizeIoAwaitable ReadStorageBuffer(Worker& worker, FixedFile file,
+                                                FixedBuffer buffer,
+                                                bool registered,
+                                                std::uint64_t offset) {
   if (registered) {
-    co_return co_await celer::ReadFixed(worker, file, buffer, offset);
+    return celer::ReadFixed(worker, file, buffer, offset);
   }
-  co_return co_await celer::Read(
-      worker, file, std::span<std::byte>(buffer.data_, buffer.size_), offset);
+  return celer::Read(worker, file,
+                     std::span<std::byte>(buffer.data_, buffer.size_), offset);
 }
 
 inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
@@ -1614,7 +1615,7 @@ class StorageEngine::Impl {
   Task<absl::Status> FlushAllDetach();
 
   Task<absl::Status> FlushDbReclaim(bool wait) {
-    co_return co_await ReclaimDetachedAllWorkers(wait);
+    return ReclaimDetachedAllWorkers(wait);
   }
 
   Task<absl::Status> PublishFlushDbReplication(std::uint8_t db_id,

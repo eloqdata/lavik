@@ -319,7 +319,7 @@ std::string EncodeRespCommand(std::span<const std::string> args) {
 }
 
 Task<absl::Status> WriteText(TcpStream& stream, std::string_view text) {
-  co_return co_await stream.WriteAll(std::span<const std::byte>(
+  return stream.WriteAll(std::span<const std::byte>(
       reinterpret_cast<const std::byte*>(text.data()), text.size()));
 }
 
@@ -902,6 +902,7 @@ class RedisRdbStreamQueue
  private:
   static Task<absl::Status> RunOwned(std::shared_ptr<RedisRdbStreamQueue> queue,
                                      unsigned worker_id) {
+    // Keep this coroutine frame: it owns queue until ScanWorker completes.
     co_return co_await queue->ScanWorker(worker_id);
   }
 
@@ -1945,8 +1946,8 @@ struct MasterSession {
     return all_flows_resume_possible_;
   }
 
-  Task<absl::Status> WaitSnapshotReady() {
-    co_return co_await snapshot_ready_.Wait(*celer::ThisWorker().self_);
+  celer::CoroutineBarrier::Awaiter WaitSnapshotReady() {
+    return snapshot_ready_.Wait(*celer::ThisWorker().self_);
   }
 
   void MarkSnapshotScanComplete() {
@@ -1958,17 +1959,16 @@ struct MasterSession {
            flows_.size();
   }
 
-  Task<absl::Status> WaitSnapshotGateClosed() {
-    co_return co_await snapshot_gate_closed_.Wait(*celer::ThisWorker().self_);
+  celer::CoroutineBarrier::Awaiter WaitSnapshotGateClosed() {
+    return snapshot_gate_closed_.Wait(*celer::ThisWorker().self_);
   }
 
-  Task<absl::Status> WaitSnapshotFenced() {
-    co_return co_await snapshot_fenced_.Wait(*celer::ThisWorker().self_);
+  celer::CoroutineBarrier::Awaiter WaitSnapshotFenced() {
+    return snapshot_fenced_.Wait(*celer::ThisWorker().self_);
   }
 
-  Task<absl::Status> WaitSnapshotCaptureStopped() {
-    co_return co_await snapshot_capture_stopped_.Wait(
-        *celer::ThisWorker().self_);
+  celer::CoroutineBarrier::Awaiter WaitSnapshotCaptureStopped() {
+    return snapshot_capture_stopped_.Wait(*celer::ThisWorker().self_);
   }
 
   void AbortSnapshotCut(const absl::Status& status) {
@@ -6340,11 +6340,11 @@ void ReplicationManager::StorageReady(celer::Worker& worker) {
 
 Task<absl::Status> ReplicationManager::SetUpstream(
     std::optional<ReplicaOfConfig> upstream) {
-  co_return co_await impl_->SetUpstream(std::move(upstream));
+  return impl_->SetUpstream(std::move(upstream));
 }
 
 Task<absl::Status> ReplicationManager::AddUpstream(ReplicaOfConfig upstream) {
-  co_return co_await impl_->AddUpstream(std::move(upstream));
+  return impl_->AddUpstream(std::move(upstream));
 }
 
 absl::Status ReplicationManager::SetSnapshotReadConcurrency(
@@ -6366,7 +6366,7 @@ std::size_t ReplicationManager::snapshot_batch_size() const noexcept {
 }
 
 Task<absl::Status> ReplicationManager::SetBacklogSizeBytes(std::size_t bytes) {
-  co_return co_await impl_->SetBacklogSizeBytes(bytes);
+  return impl_->SetBacklogSizeBytes(bytes);
 }
 
 std::size_t ReplicationManager::backlog_size_bytes() const noexcept {
@@ -6375,7 +6375,7 @@ std::size_t ReplicationManager::backlog_size_bytes() const noexcept {
 
 Task<absl::Status> ReplicationManager::SetPublishQueueBytesPerWorker(
     std::size_t bytes) {
-  co_return co_await impl_->SetPublishQueueBytesPerWorker(bytes);
+  return impl_->SetPublishQueueBytesPerWorker(bytes);
 }
 
 std::size_t ReplicationManager::publish_queue_bytes_per_worker()
@@ -6411,9 +6411,9 @@ Task<absl::Status> ReplicationManager::ServeNativeConnection(
 Task<absl::Status> ReplicationManager::ServeRedisExportConnection(
     TcpStream& stream, std::vector<std::string> args, std::uint64_t client_id,
     std::string client_address, bool tls, bool eof_capable) {
-  co_return co_await impl_->ServeRedisExportConnection(
-      stream, std::move(args), client_id, std::move(client_address), tls,
-      eof_capable);
+  return impl_->ServeRedisExportConnection(stream, std::move(args), client_id,
+                                           std::move(client_address), tls,
+                                           eof_capable);
 }
 
 ReplicationStatus ReplicationManager::status() const { return impl_->status(); }

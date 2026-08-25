@@ -488,15 +488,14 @@ void InitSetCommandStorage(storage::StorageEngine* engine) {
 
 Task<CommandReply> ExecuteSetCommand(const CommandRequest& request,
                                      ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteSetCommandImpl(request, nullptr, nullptr,
-                                           reply_builder);
+  return ExecuteSetCommandImpl(request, nullptr, nullptr, reply_builder);
 }
 
 Task<CommandReply> ExecuteSetCommandLocked(const CommandRequest& request,
                                            const storage::Digest& digest,
                                            storage::TxShardWrites* tx,
                                            ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteSetCommandImpl(request, &digest, tx, reply_builder);
+  return ExecuteSetCommandImpl(request, &digest, tx, reply_builder);
 }
 
 Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,

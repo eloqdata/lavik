@@ -302,7 +302,7 @@ Task<absl::Status> NoopShardCallback(void*, const ShardSlice&) {
 }  // namespace
 
 Task<absl::Status> Transaction::Release() {
-  co_return co_await Execute(&NoopShardCallback, nullptr, true);
+  return Execute(&NoopShardCallback, nullptr, true);
 }
 
 namespace {

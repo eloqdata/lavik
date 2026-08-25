@@ -38,8 +38,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     const HashOperation& operation, TxShardWrites* tx,
     ReplicationCommandAppend* replication) {
-  co_return co_await ExecuteHashLikeLocked(db_id, key, digest, operation,
-                                           ValueType::kHash, tx, replication);
+  return ExecuteHashLikeLocked(db_id, key, digest, operation, ValueType::kHash,
+                               tx, replication);
 }
 
 Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(

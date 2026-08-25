@@ -701,7 +701,7 @@ void MarkPubSubReaderDone(const std::shared_ptr<PubSubSession>& session) {
 
 Task<absl::Status> WaitPubSubReaderDone(
     const std::shared_ptr<PubSubSession>& session) {
-  co_return co_await session->WaitReaderDone();
+  return session->WaitReaderDone();
 }
 
 Task<absl::Status> StreamPubSubMessages(

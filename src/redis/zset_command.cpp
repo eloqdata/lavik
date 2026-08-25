@@ -2507,7 +2507,7 @@ Task<absl::StatusOr<storage::HashResult>> ZSetRandomSnapshotLocked(
 
 Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
                                       ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteImpl(request, nullptr, nullptr, reply_builder);
+  return ExecuteImpl(request, nullptr, nullptr, reply_builder);
 }
 
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
@@ -2528,7 +2528,7 @@ Task<CommandReply> ExecuteZSetCommandLocked(const CommandRequest& request,
                                             const storage::Digest& digest,
                                             storage::TxShardWrites* tx,
                                             ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteImpl(request, &digest, tx, reply_builder);
+  return ExecuteImpl(request, &digest, tx, reply_builder);
 }
 
 Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,

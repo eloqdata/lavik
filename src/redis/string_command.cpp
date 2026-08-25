@@ -1270,8 +1270,7 @@ celer::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
 
 celer::Task<absl::Status> BitOpReadCallback(void* opaque,
                                             const tx::ShardSlice& slice) {
-  co_return co_await ReadBitOpSources(static_cast<BitOpContext*>(opaque),
-                                      slice);
+  return ReadBitOpSources(static_cast<BitOpContext*>(opaque), slice);
 }
 
 celer::Task<absl::Status> WriteBitOpDestination(BitOpContext* context,

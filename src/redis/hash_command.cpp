@@ -285,16 +285,14 @@ void InitHashCommandStorage(storage::StorageEngine* engine) {
 
 Task<CommandReply> ExecuteHashCommand(const CommandRequest& request,
                                       ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteHashCommandImpl(request, nullptr, nullptr,
-                                            reply_builder);
+  return ExecuteHashCommandImpl(request, nullptr, nullptr, reply_builder);
 }
 
 Task<CommandReply> ExecuteHashCommandLocked(const CommandRequest& request,
                                             const storage::Digest& digest,
                                             storage::TxShardWrites* tx,
                                             ReplyBuilder& reply_builder) {
-  co_return co_await ExecuteHashCommandImpl(request, &digest, tx,
-                                            reply_builder);
+  return ExecuteHashCommandImpl(request, &digest, tx, reply_builder);
 }
 
 }  // namespace keylane

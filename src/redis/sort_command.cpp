@@ -466,7 +466,7 @@ void AppendSortArray(ReplyBuilder& builder,
 }
 
 Task<absl::Status> ReleaseSortTransaction(tx::Transaction* transaction) {
-  co_return co_await transaction->Execute(&HoldSortLocks, nullptr, true);
+  return transaction->Execute(&HoldSortLocks, nullptr, true);
 }
 
 }  // namespace

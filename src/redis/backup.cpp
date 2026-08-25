@@ -297,6 +297,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
  private:
   static Task<absl::Status> RunOwnedWorker(std::shared_ptr<BackupJob> job,
                                            unsigned worker_id) {
+    // Keep this coroutine frame: it owns job until ScanWorker completes.
     co_return co_await job->ScanWorker(worker_id);
   }
 
