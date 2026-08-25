@@ -47,8 +47,11 @@ class BatchReadAwaiter {
         --remaining_;
       }
     }
-    // Storage backends never complete inline from SubmitRead: completions are
-    // drained by the worker loop after this coroutine has suspended.
+    // A full io_uring SQ may submit and reap earlier operations while this
+    // loop is still preparing the batch. Unvisited operations are already in
+    // remaining_, so those completions cannot resume us early. The operation
+    // passed to each SubmitRead is itself guaranteed to complete
+    // asynchronously.
     return remaining_ != 0;
   }
 
