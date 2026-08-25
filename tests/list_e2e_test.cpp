@@ -5745,6 +5745,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     } while (scan_cursor != "0");
     EXPECT_TRUE(saw_empty_key);
 
+    EXPECT_EQ(
+        client.Command({"CONFIG", "SET", "stream-node-max-entries", "1"}),
+        "+OK");
     EXPECT_EQ(client.Command({"XADD", "bare-ms", "1", "f", "v"}), Bulk("1-0"));
     EXPECT_TRUE(client.Command({"XADD", "bare-ms", "1", "f", "v2"})
                     .starts_with("-ERR The ID specified in XADD"));
@@ -5780,6 +5783,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
                       "6-0", "f", "6"})
             .starts_with("-ERR syntax error, MAXLEN and MINID options at the "
                          "same time are not compatible"));
+    EXPECT_EQ(client.Command(
+                  {"CONFIG", "SET", "stream-node-max-entries", "100"}),
+              "+OK");
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "xgroup-options", "g", "0",
                               "MKSTREAM", "ENTRIESREAD", "0"}),
               "+OK");
