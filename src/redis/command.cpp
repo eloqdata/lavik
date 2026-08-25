@@ -2880,11 +2880,6 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
              : reply_builder.AppendError("ERR ", status.message());
 }
 
-bool IsMissingStringValue(const absl::Status& status) {
-  return status.code() == absl::StatusCode::kNotFound ||
-         status.message().starts_with("WRONGTYPE ");
-}
-
 absl::StatusOr<storage::SetOptions> ParseSetOptions(
     const std::vector<std::string>& args) {
   storage::SetOptions options;
@@ -4230,25 +4225,6 @@ Task<std::string> RunSingleKeyLocked(std::uint8_t db_id,
   }
 }
 
-// One concurrent MGET read: locks are already held for the whole hop, and
-// distinct keys live in distinct blocks, so per-key disk reads overlap
-// instead of accumulating latency serially.
-Task<absl::Status> ReadFrameIntoSlot(std::uint8_t db, const std::string* key,
-                                     storage::Digest digest,
-                                     std::optional<std::string>* slot,
-                                     WorkerJoin* join) {
-  auto value = co_await g_storage->GetLocked(db, *key, digest);
-  absl::Status status = absl::OkStatus();
-  if (value.ok()) {
-    const auto bytes = value->network_bytes();
-    slot->emplace(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-  } else if (!IsMissingStringValue(value.status())) {
-    status = value.status();
-  }
-  join->Complete(std::move(status));
-  co_return absl::OkStatus();
-}
-
 // Shared context of one multi-key command's transaction. Shard callbacks
 // write disjoint reply slots (MGET) or bump the shared counter (DEL/EXISTS)
 // before the hop barrier; the coordinator assembles the reply afterwards.
@@ -4785,17 +4761,25 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
                                          const tx::ShardSlice& slice) {
   auto* ctx = static_cast<MultiKeyContext*>(context);
   const auto& args = ctx->request_->args_;
-  if (ctx->request_->kind_ == CommandKind::kMGet && slice.keys_.size() > 1) {
-    // Overlap this shard's disk reads instead of awaiting them one by one.
-    WorkerJoin join;
-    join.pending_ = slice.keys_.size();
+  if (ctx->request_->kind_ == CommandKind::kMGet) {
+    std::vector<storage::BatchGetRequest> reads;
+    reads.reserve(slice.keys_.size());
     for (const tx::TxKey& key : slice.keys_) {
-      SpawnOnCurrentWorker(ReadFrameIntoSlot(
-          ctx->request_->db_id_, &args[key.arg_index_], key.digest_,
-          &ctx->frames_[key.arg_index_ - 1], &join));
+      reads.push_back(storage::BatchGetRequest{
+          .key_ = args[key.arg_index_],
+          .digest_ = key.digest_,
+      });
     }
-    co_await join.Join();
-    co_return join.error_;
+    auto values =
+        co_await g_storage->BatchGetLocked(ctx->request_->db_id_, reads);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+      if (!values[i].ok()) co_return values[i].status();
+      if (values[i]->has_value()) {
+        const std::size_t slot = slice.keys_[i].arg_index_ - 1;
+        ctx->frames_[slot] = EncodeBulkString(**values[i]);
+      }
+    }
+    co_return absl::OkStatus();
   }
   for (const tx::TxKey& key : slice.keys_) {
     const std::string& name = args[key.arg_index_];
@@ -4816,18 +4800,6 @@ Task<absl::Status> MultiKeyShardCallback(void* context,
                 ctx->tx_writes_.front().txid_);
           }
           co_return result.status();
-        }
-        break;
-      }
-      case CommandKind::kMGet: {
-        auto value = co_await g_storage->GetLocked(ctx->request_->db_id_, name,
-                                                   key.digest_);
-        if (value.ok()) {
-          const auto bytes = value->network_bytes();
-          ctx->frames_[key.arg_index_ - 1].emplace(
-              reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        } else if (!IsMissingStringValue(value.status())) {
-          co_return value.status();
         }
         break;
       }
@@ -6677,26 +6649,30 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
     };
 
     if (cmd.kind_ == CommandKind::kMGet) {
-      std::size_t mine = 0;
+      std::vector<storage::BatchGetRequest> reads;
+      std::vector<std::size_t> slots;
+      reads.reserve(keys.size());
+      slots.reserve(keys.size());
       for (const ExecKey& key : keys) {
-        mine += key.owner_ == self ? 1 : 0;
+        if (key.owner_ == self) {
+          reads.push_back(storage::BatchGetRequest{
+              .key_ = args[key.arg_],
+              .digest_ = key.digest_,
+          });
+          slots.push_back(key.slot_);
+        }
       }
-      if (mine > 1) {
-        WorkerJoin join;
-        join.pending_ = mine;
-        for (const ExecKey& key : keys) {
-          if (key.owner_ == self) {
-            SpawnOnCurrentWorker(
-                ReadFrameIntoSlot(cmd.db_id_, &args[key.arg_], key.digest_,
-                                  &ctx->mget_[local][key.slot_], &join));
+      if (!reads.empty()) {
+        auto values = co_await g_storage->BatchGetLocked(cmd.db_id_, reads);
+        for (std::size_t read = 0; read < values.size(); ++read) {
+          if (!values[read].ok()) {
+            record_error(values[read].status());
+          } else if (values[read]->has_value()) {
+            ctx->mget_[local][slots[read]] = EncodeBulkString(**values[read]);
           }
         }
-        co_await join.Join();
-        if (!join.error_.ok()) {
-          record_error(std::move(join.error_));
-        }
-        continue;
       }
+      continue;
     }
 
     for (const ExecKey& key : keys) {
@@ -6713,19 +6689,6 @@ Task<absl::Status> ExecRunShardCallback(void* context, const tx::ShardSlice&) {
               tx);
           if (!result.ok()) {
             record_error(result.status());
-            command_failed = true;
-          }
-          break;
-        }
-        case CommandKind::kMGet: {
-          auto value = co_await g_storage->GetLocked(cmd.db_id_, args[key.arg_],
-                                                     key.digest_);
-          if (value.ok()) {
-            const auto bytes = value->network_bytes();
-            ctx->mget_[local][key.slot_].emplace(
-                reinterpret_cast<const char*>(bytes.data()), bytes.size());
-          } else if (!IsMissingStringValue(value.status())) {
-            record_error(value.status());
             command_failed = true;
           }
           break;

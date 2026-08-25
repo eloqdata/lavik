@@ -478,6 +478,11 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::GetLocked(
   return impl_->GetLocked(db_id, key, digest, trace);
 }
 
+Task<std::vector<BatchGetValue>> StorageEngine::BatchGetLocked(
+    std::uint8_t db_id, std::span<const BatchGetRequest> requests) {
+  return impl_->BatchGetLocked(db_id, requests);
+}
+
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLengthLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest) {
   return impl_->StringLengthLocked(db_id, key, digest);

@@ -1150,16 +1150,68 @@ Task<absl::Status> RedisService::Serve(TcpStream stream) {
 constexpr auto kStreamStallLimit = std::chrono::seconds(30);
 
 struct StreamStallState {
+  // Both holders run on the connection's worker. The count protects lifetime
+  // across the detached watchdog without paying std::shared_ptr's atomic RMWs.
+  std::size_t references_ = 1;
   std::chrono::steady_clock::time_point last_progress_;
   bool done_ = false;  // same-worker access only
+};
+
+class StreamStallRef {
+ public:
+  StreamStallRef() = default;
+
+  static StreamStallRef Make() { return StreamStallRef(new StreamStallState); }
+
+  StreamStallRef(const StreamStallRef& other) noexcept : state_(other.state_) {
+    Retain();
+  }
+
+  StreamStallRef& operator=(const StreamStallRef& other) noexcept {
+    if (this != &other) {
+      Release();
+      state_ = other.state_;
+      Retain();
+    }
+    return *this;
+  }
+
+  StreamStallRef(StreamStallRef&& other) noexcept
+      : state_(std::exchange(other.state_, nullptr)) {}
+
+  StreamStallRef& operator=(StreamStallRef&& other) noexcept {
+    if (this != &other) {
+      Release();
+      state_ = std::exchange(other.state_, nullptr);
+    }
+    return *this;
+  }
+
+  ~StreamStallRef() { Release(); }
+
+  explicit operator bool() const noexcept { return state_ != nullptr; }
+  StreamStallState* operator->() const noexcept { return state_; }
+
+ private:
+  explicit StreamStallRef(StreamStallState* state) noexcept : state_(state) {}
+
+  void Retain() noexcept {
+    if (state_ != nullptr) ++state_->references_;
+  }
+
+  void Release() noexcept {
+    StreamStallState* state = std::exchange(state_, nullptr);
+    if (state != nullptr && --state->references_ == 0) delete state;
+  }
+
+  StreamStallState* state_ = nullptr;
 };
 
 // Watchdog for one streamed reply. shutdown() rather than close: it fails
 // the parked write immediately without releasing the descriptor out from
 // under the pending io_uring operation, and the serve loop's normal
 // teardown then reopens the gate and closes the socket.
-Task<absl::Status> BreakStalledStream(std::shared_ptr<StreamStallState> state,
-                                      int fd) {
+Task<absl::Status> BreakStalledStream(StreamStallRef state, int fd) {
   while (!state->done_) {
     const auto deadline = state->last_progress_ + kStreamStallLimit;
     const auto now = std::chrono::steady_clock::now();
@@ -1597,17 +1649,17 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     // Streamed replies hold the database gate at the peer's pace; arm the
     // stall watchdog for the whole stream, header included. The scope guard
     // retires it on every exit path, including error co_returns.
-    std::shared_ptr<StreamStallState> stall;
+    StreamStallRef stall;
     struct RetireStall {
-      std::shared_ptr<StreamStallState> state_;
+      StreamStallRef state_;
       ~RetireStall() {
-        if (state_ != nullptr) {
+        if (state_) {
           state_->done_ = true;
         }
       }
     } retire_stall;
     if (reply.chunks_) {
-      stall = std::make_shared<StreamStallState>();
+      stall = StreamStallRef::Make();
       stall->last_progress_ = std::chrono::steady_clock::now();
       retire_stall.state_ = stall;
       ThisWorker().self_->Spawn(BreakStalledStream(stall, stream.NativeFd()));
@@ -1649,7 +1701,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     // The reply header already committed the element count, so a chunk
     // failure can only end the connection.
     while (write_status.ok() && reply.chunks_) {
-      if (stall != nullptr) {
+      if (stall) {
         stall->last_progress_ = std::chrono::steady_clock::now();
       }
       auto chunk = co_await reply.chunks_();
@@ -1670,7 +1722,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             std::min(kWriteSegmentBytes, remaining.size());
         write_status = co_await stream.WriteAll(remaining.first(segment));
         remaining = remaining.subspan(segment);
-        if (stall != nullptr) {
+        if (stall) {
           stall->last_progress_ = std::chrono::steady_clock::now();
         }
       }

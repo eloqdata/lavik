@@ -2,6 +2,101 @@
 #include "keylane/random_sample.h"
 
 namespace keylane::storage {
+namespace {
+
+class BatchReadAwaiter;
+
+// One address-stable io_uring/SPDK tag. A whole MGET shard owns a vector of
+// these ordinary objects and has only one awaiting coroutine.
+struct BatchReadOperation final : celer::IoCompletion {
+  void Complete(Worker& worker, int result, unsigned flags) override;
+
+  BatchReadAwaiter* batch_ = nullptr;
+  Worker* worker_ = nullptr;
+  FixedFile file_{};
+  FixedBuffer buffer_{};
+  std::uint64_t offset_ = 0;
+  bool registered_ = false;
+  absl::Status submit_status_ = absl::OkStatus();
+  int result_ = 0;
+};
+
+class BatchReadAwaiter {
+ public:
+  explicit BatchReadAwaiter(std::span<BatchReadOperation*> operations)
+      : operations_(operations) {}
+
+  bool await_ready() const noexcept { return operations_.empty(); }
+
+  bool await_suspend(std::coroutine_handle<> awaiting) {
+    awaiting_ = awaiting;
+    remaining_ = operations_.size();
+    for (BatchReadOperation* operation : operations_) {
+      operation->batch_ = this;
+      operation->submit_status_ =
+          operation->registered_
+              ? operation->worker_->SubmitReadFixed(
+                    operation->file_, operation->buffer_, operation->offset_,
+                    operation)
+              : operation->worker_->SubmitRead(
+                    operation->file_,
+                    std::span<std::byte>(operation->buffer_.data_,
+                                         operation->buffer_.size_),
+                    operation->offset_, operation);
+      if (!operation->submit_status_.ok()) {
+        --remaining_;
+      }
+    }
+    // Storage backends never complete inline from SubmitRead: completions are
+    // drained by the worker loop after this coroutine has suspended.
+    return remaining_ != 0;
+  }
+
+  void await_resume() const noexcept {}
+
+  void Complete(Worker& worker) noexcept {
+    assert(remaining_ != 0);
+    if (--remaining_ == 0) worker.Enqueue(awaiting_);
+  }
+
+ private:
+  std::span<BatchReadOperation*> operations_;
+  std::coroutine_handle<> awaiting_{};
+  std::size_t remaining_ = 0;
+};
+
+void BatchReadOperation::Complete(Worker& worker, int result, unsigned flags) {
+  (void)flags;
+  result_ = result;
+  batch_->Complete(worker);
+}
+
+absl::Status BatchReadError(int error) {
+  std::string message = "read failed: " + std::string(std::strerror(error)) +
+                        " (errno=" + std::to_string(error) + ")";
+  switch (error) {
+    case EAGAIN:
+    case EBUSY:
+      return absl::UnavailableError(std::move(message));
+    case ECANCELED:
+      return absl::CancelledError(std::move(message));
+    case EINVAL:
+      return absl::InvalidArgumentError(std::move(message));
+    case EBADF:
+      return absl::FailedPreconditionError(std::move(message));
+    case ENOSPC:
+    case EMFILE:
+    case ENFILE:
+    case ENOMEM:
+      return absl::ResourceExhaustedError(std::move(message));
+    case ENOENT:
+      return absl::NotFoundError(std::move(message));
+    default:
+      return absl::UnknownError(std::move(message));
+  }
+}
+
+}  // namespace
 
 Task<absl::StatusOr<std::optional<std::string>>>
 StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
@@ -168,6 +263,273 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
   }
 
   co_return EncodeDiskValue(std::move(*loaded));
+}
+
+Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
+    std::uint8_t db_id, std::span<const BatchGetRequest> requests) {
+  assert(db_id < kLogicalDatabaseCount);
+  WorkerStore& store = CurrentStore();
+
+  std::vector<BatchGetValue> results;
+  results.reserve(requests.size());
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    results.emplace_back(std::optional<std::string>{});
+  }
+
+  struct Candidate {
+    std::size_t result_index_ = 0;
+    WorkerStore::PartitionStore* partition_ = nullptr;
+    RecordLocation location_{};
+    std::uint64_t replication_epoch_ = 0;
+  };
+  std::vector<Candidate> candidates;
+  std::vector<std::size_t> fallbacks;
+  candidates.reserve(requests.size());
+  fallbacks.reserve(requests.size());
+
+  const std::uint64_t now_ms = UnixTimeMillis();
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const BatchGetRequest& request = requests[i];
+    auto& partition = PartitionForKey(store, request.key_);
+    auto& index = partition.indexes_[db_id];
+    auto* found = index.Find(request.digest_, request.key_);
+    if (found != nullptr && !found->key_complete()) [[unlikely]] {
+      // Key verification can itself require multiple extents or a remote block
+      // owner. Keep it on the complete existing state machine rather than
+      // duplicating that cold path in the flat batch reader.
+      fallbacks.push_back(i);
+      continue;
+    }
+    if (found == nullptr || found->value_.kind_ == RecordKind::kTombstone) {
+      continue;
+    }
+    if (IsExpired(found->value_, now_ms)) {
+      QueueExpiredCandidate(store, partition.id_, db_id, *found, request.key_);
+      continue;
+    }
+    // Redis MGET returns nil for a non-string key rather than failing the whole
+    // command.
+    if (found->value_.value_type_ != ValueType::kString) {
+      continue;
+    }
+
+    const RecordLocation location = found->value_;
+    if (location.external_ || location.block_owner_ != store.worker_->id() ||
+        location.in_memory_) {
+      fallbacks.push_back(i);
+      continue;
+    }
+    candidates.push_back(Candidate{
+        .result_index_ = i,
+        .partition_ = &partition,
+        .location_ = location,
+        .replication_epoch_ = partition.replication_epoch_,
+    });
+  }
+
+  struct PendingRead {
+    PendingRead(WorkerStore* store, BlockState* state, Candidate candidate,
+                ReadBufferLease lease, std::size_t record_headroom,
+                std::size_t read_bytes)
+        : store_(store),
+          state_(state),
+          candidate_(candidate),
+          lease_(std::move(lease)),
+          record_headroom_(record_headroom),
+          read_bytes_(read_bytes) {
+      ++state_->pins_;
+    }
+
+    PendingRead(const PendingRead&) = delete;
+    PendingRead& operator=(const PendingRead&) = delete;
+
+    ~PendingRead() {
+      --state_->pins_;
+      if (state_->pins_ == 0 && state_->release_pending_) {
+        StorageEngine::Impl::ReleaseStagingBuffer(*store_, *state_);
+      }
+    }
+
+    WorkerStore* store_ = nullptr;
+    BlockState* state_ = nullptr;
+    Candidate candidate_{};
+    ReadBufferLease lease_;
+    std::size_t record_headroom_ = 0;
+    std::size_t read_bytes_ = 0;
+    BatchReadOperation operation_;
+  };
+
+  std::size_t next = 0;
+  while (next < candidates.size()) {
+    std::vector<std::unique_ptr<PendingRead>> wave;
+    std::vector<BatchReadOperation*> operations;
+    wave.reserve(
+        std::min(candidates.size() - next, store.buffers_.read_buffer_count()));
+
+    while (next < candidates.size()) {
+      const Candidate candidate = candidates[next];
+      const RecordLocation& location = candidate.location_;
+      const std::uint64_t absolute_offset =
+          FileOffset(location.block_id_).second + location.record_offset_;
+      const std::uint64_t direct_io_mask =
+          static_cast<std::uint64_t>(direct_io_alignment_ - 1);
+      const std::uint64_t aligned_offset = absolute_offset & ~direct_io_mask;
+      const std::size_t record_headroom =
+          static_cast<std::size_t>(absolute_offset - aligned_offset);
+      const std::size_t record_span =
+          record_headroom + location.total_disk_bytes_;
+      const std::size_t read_bytes =
+          (record_span + direct_io_alignment_ - 1) & ~direct_io_mask;
+      const bool ordinary_buffer =
+          read_bytes <= options_.buffers_.read_payload_bytes_;
+      if (!wave.empty() && ordinary_buffer &&
+          store.buffers_.available_read_buffers() == 0) {
+        break;
+      }
+
+      auto acquired = co_await store.buffers_.AcquireReadBuffer(read_bytes);
+      if (!acquired.ok()) {
+        results[candidate.result_index_] = acquired.status();
+        ++next;
+        continue;
+      }
+      ReadBufferLease lease = std::move(*acquired);
+      BlockState* state = FindBlockState(store, location.block_id_);
+      if (state == nullptr || !state->allocated_ || state->freeing_ ||
+          state->allocation_epoch_ != location.allocation_epoch_ ||
+          (location.in_memory_ && state->in_memory_)) {
+        fallbacks.push_back(candidate.result_index_);
+        ++next;
+        continue;
+      }
+
+      auto pending = std::make_unique<PendingRead>(&store, state, candidate,
+                                                   std::move(lease),
+                                                   record_headroom, read_bytes);
+      FixedBuffer io = pending->lease_.io_buffer();
+      if (read_bytes > io.size_) {
+        results[candidate.result_index_] = absl::OutOfRangeError(
+            "record exceeds registered read buffer capacity");
+        ++next;
+        continue;
+      }
+      const auto [file_id, unused_block_offset] =
+          FileOffset(location.block_id_);
+      (void)unused_block_offset;
+      pending->operation_.worker_ = store.worker_;
+      pending->operation_.file_ = store.files_[file_id];
+      pending->operation_.buffer_ = io;
+      pending->operation_.buffer_.size_ = read_bytes;
+      pending->operation_.offset_ = aligned_offset;
+      pending->operation_.registered_ = pending->lease_.registered();
+      operations.push_back(&pending->operation_);
+      wave.push_back(std::move(pending));
+      ++next;
+    }
+
+    if (wave.empty()) continue;
+    co_await BatchReadAwaiter(operations);
+
+    std::vector<std::size_t> retry;
+    for (const std::unique_ptr<PendingRead>& pending : wave) {
+      const std::size_t index = pending->candidate_.result_index_;
+      const BatchGetRequest& request = requests[index];
+      BatchReadOperation& operation = pending->operation_;
+      if (!operation.submit_status_.ok()) {
+        results[index] = operation.submit_status_;
+        continue;
+      }
+      if (operation.result_ < 0) {
+        results[index] = BatchReadError(-operation.result_);
+        continue;
+      }
+      if (static_cast<std::size_t>(operation.result_) != pending->read_bytes_) {
+        results[index] = absl::InternalError("short compact record read");
+        continue;
+      }
+
+      if (pending->candidate_.partition_->replication_epoch_ !=
+          pending->candidate_.replication_epoch_) [[unlikely]] {
+        results[index] = std::optional<std::string>{};
+        continue;
+      }
+
+      const RecordLocation& location = pending->candidate_.location_;
+      const FixedBuffer io = pending->lease_.io_buffer();
+      const std::byte* record_data = io.data_ + pending->record_headroom_;
+      const std::span<const std::byte> record_bytes(record_data,
+                                                    location.total_disk_bytes_);
+      RecordHeader record{};
+      std::string_view disk_key;
+      if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
+          record.db_id_ != db_id || record.digest_ != request.digest_ ||
+          (!record.key_external_ && disk_key != request.key_) ||
+          record.kind_ != RecordKind::kValue ||
+          record.db_epoch_ != DbEpoch(db_id) ||
+          record.mutation_sequence_ != location.mutation_sequence_ ||
+          record.replication_epoch_ != pending->candidate_.replication_epoch_ ||
+          record.allocation_epoch_ != location.allocation_epoch_ ||
+          record.expire_at_ms_ != location.expire_at_ms_ ||
+          record.value_type_ != location.value_type_ ||
+          record.external_ != location.external_ ||
+          record.key_external_ != location.key_external_ ||
+          record.logical_size_ != location.logical_size_ ||
+          record.total_disk_bytes_ != location.total_disk_bytes_) {
+        retry.push_back(index);
+        continue;
+      }
+      const std::byte* payload_data = record_data + record.header_bytes_;
+      const std::size_t key_prefix =
+          record.key_external_ ? record.key_bytes_ : 0;
+      if (record.payload_bytes_ < key_prefix ||
+          (record.key_external_ &&
+           (record.key_bytes_ != request.key_.size() ||
+            std::memcmp(payload_data, request.key_.data(),
+                        request.key_.size()) != 0))) {
+        retry.push_back(index);
+        continue;
+      }
+      const std::size_t value_bytes = record.payload_bytes_ - key_prefix;
+      if (value_bytes != record.logical_size_) {
+        results[index] =
+            absl::InternalError("inline string length does not match metadata");
+        continue;
+      }
+      if (Crc32c(std::span<const std::byte>(payload_data,
+                                            record.payload_bytes_)) !=
+          record.payload_checksum_) {
+        results[index] = absl::InternalError("record value checksum mismatch");
+        continue;
+      }
+      const char* value =
+          reinterpret_cast<const char*>(payload_data + key_prefix);
+      results[index] = std::optional<std::string>(
+          std::in_place, value, static_cast<std::size_t>(value_bytes));
+    }
+    // Releasing the wave returns all fixed buffers before any relocation retry
+    // can suspend and lets the next wave use the bounded pool.
+    wave.clear();
+    fallbacks.insert(fallbacks.end(), retry.begin(), retry.end());
+  }
+
+  for (const std::size_t index : fallbacks) {
+    const BatchGetRequest& request = requests[index];
+    auto value =
+        co_await GetLocked(db_id, request.key_, request.digest_, nullptr);
+    if (value.ok()) {
+      const std::span<const std::byte> bytes = value->value_bytes();
+      results[index] = std::optional<std::string>(
+          std::in_place, reinterpret_cast<const char*>(bytes.data()),
+          bytes.size());
+    } else if (value.status().code() == absl::StatusCode::kNotFound ||
+               value.status().message().starts_with("WRONGTYPE ")) {
+      results[index] = std::optional<std::string>{};
+    } else {
+      results[index] = value.status();
+    }
+  }
+
+  co_return results;
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLength(
@@ -397,7 +759,7 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
   buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
   const std::size_t network_offset = value_offset - prefix_bytes;
   return DiskValue(std::move(lease), network_offset,
-                   prefix_bytes + value_bytes + 2);
+                   prefix_bytes + value_bytes + 2, value_offset, value_bytes);
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>

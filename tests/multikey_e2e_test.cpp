@@ -753,6 +753,10 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("after-d") + "\r\n" + Bulk("after-a") +
                "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-b"),
            "values after tx cleaner retirement");
+    Expect(client.Command({"MSET", "{disk-batch}a", "batch-a", "{disk-batch}b",
+                           "batch-b", "{disk-batch}c", "batch-c",
+                           "{disk-batch}d", "batch-d"}),
+           "+OK", "same-shard disk batch seed");
 
     server.Stop();
     ServerProcess recovered_server(argv[1], port, data_path, log_path);
@@ -762,6 +766,11 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("after-a") + "\r\n" + Bulk("after-b") +
                "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-d"),
            "promoted values after restart");
+    Expect(recovered.Command({"MGET", "{disk-batch}d", "{disk-batch}b",
+                              "{disk-batch}a", "{disk-batch}c"}),
+           "*4\r\n" + Bulk("batch-d") + "\r\n" + Bulk("batch-b") + "\r\n" +
+               Bulk("batch-a") + "\r\n" + Bulk("batch-c"),
+           "same-shard batched disk MGET after restart");
     Expect(recovered.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "disable tx cleaner before recovery fixture");

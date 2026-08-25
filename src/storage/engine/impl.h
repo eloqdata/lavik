@@ -1328,6 +1328,9 @@ class StorageEngine::Impl {
                                             const Digest& digest,
                                             ReadLatencyTrace* trace);
 
+  Task<std::vector<BatchGetValue>> BatchGetLocked(
+      std::uint8_t db_id, std::span<const BatchGetRequest> requests);
+
   Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
                                                    std::string_view key);
 

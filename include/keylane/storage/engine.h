@@ -330,10 +330,13 @@ class DiskValue {
  public:
   DiskValue() = default;
   DiskValue(ReadBufferLease lease, std::size_t network_offset,
-            std::size_t network_size) noexcept
+            std::size_t network_size, std::size_t value_offset,
+            std::size_t value_size) noexcept
       : lease_(std::move(lease)),
         network_offset_(network_offset),
-        network_size_(network_size) {}
+        network_size_(network_size),
+        value_offset_(value_offset),
+        value_size_(value_size) {}
 
   DiskValue(const DiskValue&) = delete;
   DiskValue& operator=(const DiskValue&) = delete;
@@ -345,11 +348,28 @@ class DiskValue {
     return {bytes.data() + network_offset_, network_size_};
   }
 
+  std::span<const std::byte> value_bytes() const noexcept {
+    auto bytes = lease_.bytes();
+    return {bytes.data() + value_offset_, value_size_};
+  }
+
  private:
   ReadBufferLease lease_;
   std::size_t network_offset_ = 0;
   std::size_t network_size_ = 0;
+  std::size_t value_offset_ = 0;
+  std::size_t value_size_ = 0;
 };
+
+// One string lookup in a pre-locked, worker-local batch. BatchGetLocked keeps
+// the storage pipeline inside one coroutine and fans ordinary disk reads into
+// one completion barrier instead of spawning one coroutine per key.
+struct BatchGetRequest {
+  std::string_view key_;
+  Digest digest_{};
+};
+
+using BatchGetValue = absl::StatusOr<std::optional<std::string>>;
 
 enum class SetCondition : std::uint8_t {
   kNone,
@@ -961,6 +981,8 @@ class StorageEngine {
   celer::Task<absl::StatusOr<DiskValue>> GetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       ReadLatencyTrace* trace = nullptr);
+  celer::Task<std::vector<BatchGetValue>> BatchGetLocked(
+      std::uint8_t db_id, std::span<const BatchGetRequest> requests);
   celer::Task<absl::StatusOr<std::uint64_t>> StringLengthLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest);
   celer::Task<absl::StatusOr<SetResult>> SetLocked(
