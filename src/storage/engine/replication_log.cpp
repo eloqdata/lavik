@@ -806,12 +806,11 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
                            log.blocks_.front().sealed_ &&
                            log.blocks_.front().last_lsn_ < keep_from;
 
-    // Low-water hysteresis exists to avoid repeatedly waking foreground
-    // writers while an ACK-pinned replica is still behind. Once the final pin
-    // disappears (normally on disconnect), preserve the ordinary circular
-    // reconnect window and evict only what the next allocation needs. Eagerly
-    // draining to the low watermark here can discard a just-disconnected
-    // replica's cursor even though it still fits inside the configured quota.
+    // Once the final pin disappears (normally on disconnect), preserve the
+    // ordinary circular reconnect window and evict only what the next
+    // allocation needs. Eagerly draining the window here can discard a
+    // just-disconnected replica's cursor even though it still fits inside the
+    // configured quota.
     if (log.capacity_backpressured_ && !retained.has_value()) {
       log.capacity_backpressured_ = false;
     }

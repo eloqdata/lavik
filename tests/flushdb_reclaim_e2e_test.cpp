@@ -462,9 +462,11 @@ std::uint64_t CopyCommittedHeaderToUnusedAllocatedBlock(
 int main(int argc, char** argv) {
   const bool stale_header_only =
       argc == 3 && std::string_view(argv[2]) == "--stale-header-only";
-  if (argc != 2 && !stale_header_only) {
+  const bool paused_defrag_only =
+      argc == 3 && std::string_view(argv[2]) == "--paused-defrag-only";
+  if (argc != 2 && !stale_header_only && !paused_defrag_only) {
     std::cerr << "usage: flushdb_reclaim_e2e_test /path/to/keylane "
-                 "[--stale-header-only]\n";
+                 "[--stale-header-only|--paused-defrag-only]\n";
     return 2;
   }
 
@@ -515,15 +517,33 @@ int main(int argc, char** argv) {
         Fail("test device did not reach foreground block exhaustion");
       }
 
+      // A paused defrag queue cannot make allocation progress. Treating its
+      // pending entries as reclaim work makes a full-device SET wait forever
+      // for work that is explicitly disabled instead of reporting FULL.
+      Expect(client.Command({"DEFRAG", "PAUSE"}), "+OK", "DEFRAG PAUSE");
       Expect(client.Command({"FLUSHDB"}), "+OK", "FLUSHDB");
-      // The active block has become entirely dead. This write must wait while
-      // FLUSHDB seals and flushes it and defrag returns it to the ready pool.
+      const std::string paused_response =
+          client.Command({"SET", "paused-fresh", value});
+      if (!paused_response.starts_with("-ERR ") ||
+          paused_response.find("out of disk space") == std::string::npos) {
+        Fail("paused defrag did not report stable device exhaustion: " +
+             paused_response);
+      }
+      Expect(client.Command({"DEFRAG", "RESUME"}), "+OK", "DEFRAG RESUME");
+      // The active block has become entirely dead. Once resumed, this write
+      // waits while defrag returns it to the ready pool.
       Expect(client.Command({"SET", "fresh", value}), "+OK",
              "post-FLUSHDB SET");
       Expect(client.Command({"DBSIZE"}), ":1", "DBSIZE");
       Expect(client.Command({"EXISTS", "old-0", "fresh"}), ":1",
              "EXISTS before restart");
       server.Stop();
+    }
+
+    if (paused_defrag_only) {
+      (void)::unlink(data_path.c_str());
+      (void)::unlink(log_path.c_str());
+      return 0;
     }
 
     // Fill a device after placing several unshielded, short-lived records in

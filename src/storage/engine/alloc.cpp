@@ -693,8 +693,11 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     if (generation_after != generation_before) {
       continue;
     }
-    if (active_defrags_.load(std::memory_order_acquire) != 0 ||
-        pending_defrags_.load(std::memory_order_acquire) != 0 ||
+    const bool defrag_can_reclaim =
+        active_defrags_.load(std::memory_order_acquire) != 0 ||
+        (pending_defrags_.load(std::memory_order_acquire) != 0 &&
+         !defrag_config_.paused_.load(std::memory_order_acquire));
+    if (defrag_can_reclaim ||
         active_flushes_.load(std::memory_order_acquire) != 0 ||
         active_extent_reclaims_.load(std::memory_order_acquire) != 0) {
       absl::Status waited = co_await celer::SleepFor(

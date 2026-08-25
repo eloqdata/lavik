@@ -438,6 +438,12 @@ if (BUILD_TESTING)
     )
     set_tests_properties(keylane_flushdb_reclaim_e2e PROPERTIES TIMEOUT 600)
     add_test(
+      NAME keylane_paused_defrag_full_e2e
+      COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
+              --paused-defrag-only
+    )
+    set_tests_properties(keylane_paused_defrag_full_e2e PROPERTIES TIMEOUT 120)
+    add_test(
       NAME keylane_stale_block_recovery_e2e
       COMMAND keylane_flushdb_reclaim_e2e_test $<TARGET_FILE:keylane>
               --stale-header-only
