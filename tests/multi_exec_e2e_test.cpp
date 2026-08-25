@@ -686,6 +686,16 @@ int main(int argc, char** argv) {
            "*2\r\n:1\r\n:0", "SCRIPT EXISTS");
     Expect(client.Command({"EVALSHA", loaded_sha, "0"}), Bulk("loaded"),
            "EVALSHA after SCRIPT LOAD");
+    constexpr std::string_view uppercase_loaded_sha =
+        "B534286061D4B9E4026607613B95C06C06015AE8";
+    Expect(client.Command({"EVALSHA", uppercase_loaded_sha, "0"}),
+           Bulk("loaded"), "EVALSHA accepts uppercase SHA");
+    Expect(client.Command(
+               {"EVALSHA_RO", "b534286061D4B9E4026607613b95C06C06015aE8",
+                "0"}),
+           Bulk("loaded"), "EVALSHA_RO accepts mixed-case SHA");
+    Expect(client.Command({"SCRIPT", "EXISTS", uppercase_loaded_sha}),
+           "*1\r\n:0", "SCRIPT EXISTS preserves exact SHA matching");
     for (unsigned i = 0; i < 16; ++i) {
       RespClient cache_client = Connect(port);
       Expect(cache_client.Command({"EVALSHA", loaded_sha, "0"}), Bulk("loaded"),
