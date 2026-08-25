@@ -6089,7 +6089,8 @@ Task<std::string> ExecuteLuaRedisCall(
     std::span<const std::string> declared_keys, tx::Transaction* transaction,
     std::vector<storage::TxShardWrites>* tx_writes,
     const std::shared_ptr<BlockingNotificationCapture>& notifications,
-    std::vector<CapturedReplicationCommand>* effects) {
+    std::vector<CapturedReplicationCommand>* effects,
+    LuaExecution* lua_execution) {
   RespCommand wire{.args_ = std::move(call.args_)};
   auto built = BuildCommandRequest(std::move(wire), eval_request.db_id_);
   if (!built.ok() || built->spec_ == nullptr) {
@@ -6191,6 +6192,9 @@ Task<std::string> ExecuteLuaRedisCall(
       (transaction == nullptr || unsafe_special_case ||
        (sequential == ExecSequentialFamily::kNone && !batch_supported))) {
     co_return EncodeError("ERR command is not supported from script");
+  }
+  if (write && !lua_execution->MarkWriteCommand()) {
+    co_return EncodeError("ERR Script killed by user with SCRIPT KILL...");
   }
 
   std::string reply;
@@ -6405,11 +6409,17 @@ Task<std::string> ExecuteEvalWithTransaction(
     }
   }
 
-  LuaExecutionStep step = (*execution)->Start();
-  while (step.call_.has_value()) {
+  LuaExecutionStep step = (*execution)->Start(request.replication_origin_);
+  for (;;) {
+    if (step.scheduler_yield_) {
+      co_await Yield(*ThisWorker().self_);
+      step = (*execution)->ResumeAfterSchedulerYield();
+      continue;
+    }
+    if (!step.call_.has_value()) break;
     std::string command_reply = co_await ExecuteLuaRedisCall(
         request, std::move(*step.call_), declared_keys, transaction, tx_writes,
-        notifications, effects);
+        notifications, effects, execution->get());
     step = (*execution)->Resume(command_reply);
   }
   co_return std::move(step.reply_);
@@ -6523,6 +6533,52 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
 Task<CommandReply> ExecuteScript(const CommandRequest& request,
                                  ReplyBuilder& reply_builder) {
   const std::string_view subcommand = request.args_[1];
+  if (CmpCaseInsensitive(subcommand, "help") && request.args_.size() == 2) {
+    constexpr std::array<std::string_view, 17> help = {
+        "SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "DEBUG (YES|SYNC|NO)",
+        "    Set the debug mode for subsequent scripts executed.",
+        "EXISTS <sha1> [<sha1> ...]",
+        "    Return information about the existence of the scripts in the "
+        "script cache.",
+        "FLUSH [ASYNC|SYNC]",
+        "    Flush the Lua scripts cache. Very dangerous on replicas.",
+        "    When called without the optional mode argument, the behavior is "
+        "determined by the",
+        "    lazyfree-lazy-user-flush configuration directive. Valid modes "
+        "are:",
+        "    * ASYNC: Asynchronously flush the scripts cache.",
+        "    * SYNC: Synchronously flush the scripts cache.",
+        "KILL",
+        "    Kill the currently executing Lua script.",
+        "LOAD <script>",
+        "    Load a script into the scripts cache without executing it.",
+        "HELP",
+        "    Print this help.",
+    };
+    reply_builder.AppendArrayHeader(help.size());
+    for (std::string_view line : help) reply_builder.AppendSimpleString(line);
+    co_return BuiltReply(reply_builder.View());
+  }
+  if (CmpCaseInsensitive(subcommand, "kill") && request.args_.size() == 2) {
+    switch (RequestLuaScriptKill()) {
+      case LuaScriptKillResult::kKilled:
+        co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+      case LuaScriptKillResult::kNotBusy:
+        co_return BuiltReply(reply_builder.AppendError(
+            "NOTBUSY No scripts in execution right now."));
+      case LuaScriptKillResult::kUnkillableWrite:
+        co_return BuiltReply(reply_builder.AppendError(
+            "UNKILLABLE Sorry the script already executed write commands "
+            "against the dataset. You can either wait the script termination "
+            "or kill the server in a hard way using the SHUTDOWN NOSAVE "
+            "command."));
+      case LuaScriptKillResult::kUnkillableReplication:
+        co_return BuiltReply(reply_builder.AppendError(
+            "UNKILLABLE The busy script was sent by a master instance in the "
+            "context of replication and cannot be killed."));
+    }
+  }
   if (CmpCaseInsensitive(subcommand, "load")) {
     if (request.args_.size() != 3) {
       co_return BuiltReply(reply_builder.AppendError(

@@ -2,7 +2,9 @@
 
 #include <openssl/evp.h>
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -36,7 +38,7 @@ namespace keylane {
 namespace {
 
 constexpr int kMaxReplyDepth = 128;
-constexpr std::chrono::seconds kScriptTimeLimit{5};
+constexpr std::chrono::seconds kScriptBusyThreshold{5};
 
 struct ScriptKey : std::array<char, 40> {
   ScriptKey() = default;
@@ -53,21 +55,51 @@ std::mutex g_script_bodies_mutex;
 absl::flat_hash_map<ScriptKey, std::unique_ptr<const std::string>>
     g_script_bodies;
 
-struct LuaRunLimit {
-  std::chrono::steady_clock::time_point deadline_;
+enum class LuaRunState : std::uint8_t {
+  kClean,
+  kDirty,
+  kKillRequested,
 };
 
-char g_run_limit_registry_key;
+struct LuaRunControl {
+  std::chrono::steady_clock::time_point deadline_;
+  std::atomic<LuaRunState> state_{LuaRunState::kClean};
+  bool replication_origin_ = false;
+  bool scheduler_yield_pending_ = false;
+};
+
+char g_run_control_registry_key;
+std::mutex g_active_scripts_mutex;
+std::vector<LuaRunControl*> g_active_scripts;
+
+void RegisterActiveScript(LuaRunControl* run) {
+  std::lock_guard lock(g_active_scripts_mutex);
+  g_active_scripts.push_back(run);
+}
+
+void UnregisterActiveScript(LuaRunControl* run) {
+  std::lock_guard lock(g_active_scripts_mutex);
+  const auto found = std::find(g_active_scripts.begin(), g_active_scripts.end(),
+                               run);
+  if (found != g_active_scripts.end()) g_active_scripts.erase(found);
+}
 
 void ScriptInstructionHook(lua_State* state, lua_Debug*) {
-  lua_pushlightuserdata(state, &g_run_limit_registry_key);
+  lua_pushlightuserdata(state, &g_run_control_registry_key);
   lua_rawget(state, LUA_REGISTRYINDEX);
-  auto* limit = static_cast<LuaRunLimit*>(lua_touserdata(state, -1));
+  auto* control = static_cast<LuaRunControl*>(lua_touserdata(state, -1));
   lua_pop(state, 1);
-  if (limit != nullptr &&
-      std::chrono::steady_clock::now() >= limit->deadline_) {
-    luaL_error(state, "Script timed out");
+  if (control == nullptr) return;
+  if (control->state_.load(std::memory_order_acquire) ==
+      LuaRunState::kKillRequested) {
+    (void)luaL_error(state, "Script killed by user with SCRIPT KILL...");
+    return;
   }
+  if (std::chrono::steady_clock::now() < control->deadline_) return;
+  // After the busy threshold, yield the coroutine so this worker can process
+  // pending requests including SCRIPT KILL without aborting the script.
+  control->scheduler_yield_pending_ = true;
+  (void)lua_yield(state, 0);
 }
 
 std::string LuaError(lua_State* state) {
@@ -132,6 +164,8 @@ function redis.status_reply(message)
 end
 
 redis.sha1hex = __keylane_sha1hex
+redis.REDIS_VERSION = "7.2.4"
+redis.REDIS_VERSION_NUM = 0x00070204
 redis.LOG_DEBUG = 0
 redis.LOG_VERBOSE = 1
 redis.LOG_NOTICE = 2
@@ -487,21 +521,29 @@ LuaExecutionStep RuntimeErrorStep(lua_State* state) {
   };
 }
 
+LuaExecutionStep KilledStep() {
+  return LuaExecutionStep{
+      .call_ = std::nullopt,
+      .reply_ = EncodeError("ERR Script killed by user with SCRIPT KILL..."),
+  };
+}
+
 }  // namespace
 
 struct LuaExecution::Impl {
   LuaWorkerRuntime* runtime_ = nullptr;
   lua_State* state_ = nullptr;
   int thread_ref_ = LUA_NOREF;
-  LuaRunLimit run_limit_;
+  LuaRunControl run_control_;
   std::string bytecode_;
-  bool run_limit_registered_ = false;
+  bool active_registered_ = false;
 
   ~Impl() {
     if (state_ == nullptr) return;
     lua_sethook(state_, nullptr, 0, 0);
-    if (run_limit_registered_) {
-      lua_pushlightuserdata(state_, &g_run_limit_registry_key);
+    if (active_registered_) {
+      UnregisterActiveScript(&run_control_);
+      lua_pushlightuserdata(state_, &g_run_control_registry_key);
       lua_pushnil(state_);
       lua_rawset(state_, LUA_REGISTRYINDEX);
     }
@@ -513,6 +555,10 @@ struct LuaExecution::Impl {
       const int status = lua_resume(state_, resume_args);
       resume_args = 0;
       if (status == 0) {
+        if (run_control_.state_.load(std::memory_order_acquire) ==
+            LuaRunState::kKillRequested) {
+          return KilledStep();
+        }
         ReplyBuilder builder;
         if (lua_gettop(state_) == 0)
           builder.AppendNullBulkString();
@@ -522,6 +568,12 @@ struct LuaExecution::Impl {
                                 .reply_ = std::move(builder).Release()};
       }
       if (status != LUA_YIELD) return RuntimeErrorStep(state_);
+
+      if (run_control_.scheduler_yield_pending_) {
+        run_control_.scheduler_yield_pending_ = false;
+        return LuaExecutionStep{
+            .call_ = std::nullopt, .reply_ = {}, .scheduler_yield_ = true};
+      }
 
       const int count = lua_gettop(state_);
       bool valid = count >= 2 && lua_isboolean(state_, 1);
@@ -600,13 +652,17 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
 
 std::string_view LuaExecution::bytecode() const { return impl_->bytecode_; }
 
-LuaExecutionStep LuaExecution::Start() {
-  impl_->run_limit_.deadline_ =
-      std::chrono::steady_clock::now() + kScriptTimeLimit;
-  lua_pushlightuserdata(impl_->state_, &g_run_limit_registry_key);
-  lua_pushlightuserdata(impl_->state_, &impl_->run_limit_);
+LuaExecutionStep LuaExecution::Start(bool replication_origin) {
+  impl_->run_control_.deadline_ =
+      std::chrono::steady_clock::now() + kScriptBusyThreshold;
+  impl_->run_control_.replication_origin_ = replication_origin;
+  impl_->run_control_.state_.store(LuaRunState::kClean,
+                                   std::memory_order_release);
+  lua_pushlightuserdata(impl_->state_, &g_run_control_registry_key);
+  lua_pushlightuserdata(impl_->state_, &impl_->run_control_);
   lua_rawset(impl_->state_, LUA_REGISTRYINDEX);
-  impl_->run_limit_registered_ = true;
+  impl_->active_registered_ = true;
+  RegisterActiveScript(&impl_->run_control_);
   return impl_->Run(0);
 }
 
@@ -630,6 +686,20 @@ LuaExecutionStep LuaExecution::Resume(std::string_view command_reply) {
     lua_pushlstring(impl_->state_, error.data(), error.size());
   }
   return impl_->Run(2);
+}
+
+LuaExecutionStep LuaExecution::ResumeAfterSchedulerYield() {
+  return impl_->Run(0);
+}
+
+bool LuaExecution::MarkWriteCommand() {
+  LuaRunState expected = LuaRunState::kClean;
+  if (impl_->run_control_.state_.compare_exchange_strong(
+          expected, LuaRunState::kDirty, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    return true;
+  }
+  return expected == LuaRunState::kDirty;
 }
 
 std::string LuaScriptSha1(std::string_view script) {
@@ -680,6 +750,34 @@ void ClearLocalLuaScriptCache() {
 void ClearStoredLuaScripts() {
   std::lock_guard<std::mutex> lock(g_script_bodies_mutex);
   g_script_bodies.clear();
+}
+
+LuaScriptKillResult RequestLuaScriptKill() {
+  std::lock_guard lock(g_active_scripts_mutex);
+  if (g_active_scripts.empty()) return LuaScriptKillResult::kNotBusy;
+
+  bool killed = false;
+  bool dirty = false;
+  bool replication = false;
+  for (LuaRunControl* run : g_active_scripts) {
+    if (run->replication_origin_) {
+      replication = true;
+      continue;
+    }
+    LuaRunState expected = LuaRunState::kClean;
+    if (run->state_.compare_exchange_strong(
+            expected, LuaRunState::kKillRequested, std::memory_order_acq_rel,
+            std::memory_order_acquire) ||
+        expected == LuaRunState::kKillRequested) {
+      killed = true;
+    } else if (expected == LuaRunState::kDirty) {
+      dirty = true;
+    }
+  }
+  if (killed) return LuaScriptKillResult::kKilled;
+  if (replication) return LuaScriptKillResult::kUnkillableReplication;
+  if (dirty) return LuaScriptKillResult::kUnkillableWrite;
+  return LuaScriptKillResult::kNotBusy;
 }
 
 }  // namespace keylane

@@ -46,7 +46,7 @@ class RespClient {
     if (fd_ >= 0) ::close(fd_);
   }
 
-  std::string Command(const std::vector<std::string_view>& args) {
+  void SendCommand(const std::vector<std::string_view>& args) {
     last_command_ = std::to_string(++command_index_);
     for (std::string_view arg : args) {
       last_command_.push_back(' ');
@@ -59,6 +59,10 @@ class RespClient {
       request += "\r\n";
     }
     SendAll(request);
+  }
+
+  std::string Command(const std::vector<std::string_view>& args) {
+    SendCommand(args);
     return ReadReply();
   }
 
@@ -327,6 +331,45 @@ int main(int argc, char** argv) {
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
 
+    const std::string script_help = client.Command({"SCRIPT", "HELP"});
+    ExpectContains(script_help, "*17\r\n+SCRIPT <subcommand>", "SCRIPT HELP");
+    ExpectContains(script_help, "+LOAD <script>", "SCRIPT HELP LOAD");
+    Expect(client.Command({"SCRIPT", "KILL"}),
+           "-NOTBUSY No scripts in execution right now.",
+           "SCRIPT KILL without active script");
+
+    // redis.call yields to the worker scheduler, allowing another connection
+    // to request termination. The instruction hook then stops the script.
+    RespClient looping_script = Connect(port);
+    looping_script.SendCommand(
+        {"EVAL",
+         "while true do redis.call('GET',KEYS[1]) end",
+         "1", "lua:kill-loop"});
+    std::this_thread::sleep_for(50ms);
+    RespClient script_killer = Connect(port);
+    Expect(script_killer.Command({"SCRIPT", "KILL"}), "+OK", "SCRIPT KILL");
+    ExpectContains(looping_script.ReadPush(),
+                   "Script killed by user with SCRIPT KILL",
+                   "killed script reply");
+    Expect(script_killer.Command({"SCRIPT", "KILL"}),
+           "-NOTBUSY No scripts in execution right now.",
+           "SCRIPT KILL after termination");
+
+    RespClient dirty_script = Connect(port);
+    dirty_script.SendCommand(
+        {"EVAL",
+         "redis.call('SET',KEYS[1],'written'); "
+         "for i=1,20000 do redis.call('GET',KEYS[1]) end; return 'done'",
+         "1", "lua:unkillable"});
+    std::this_thread::sleep_for(50ms);
+    ExpectContains(script_killer.Command({"SCRIPT", "KILL"}),
+                   "-UNKILLABLE Sorry the script already executed write "
+                   "commands against the dataset.",
+                   "SCRIPT KILL refuses dirty script");
+    Expect(dirty_script.ReadPush(), Bulk("done"), "dirty script completion");
+    Expect(client.Command({"GET", "lua:unkillable"}), Bulk("written"),
+           "SCRIPT KILL preserves dirty script write");
+
     // Lua scripts use a node-local SHA cache and execute their declared key
     // set under one transaction. EVALSHA reuses the cache populated by EVAL.
     constexpr std::string_view argv_script = "return ARGV[1]";
@@ -334,6 +377,10 @@ int main(int argc, char** argv) {
            "EVAL ARGV");
     Expect(client.Command({"EVAL", argv_script, "0", "eval-cache"}),
            Bulk("eval-cache"), "EVAL reuses worker registry closure");
+    Expect(client.Command({"EVAL", "return redis.REDIS_VERSION", "0"}),
+           Bulk("7.2.4"), "Lua Redis compatibility version");
+    Expect(client.Command({"EVAL", "return redis.REDIS_VERSION_NUM", "0"}),
+           ":459268", "Lua numeric Redis compatibility version");
     Expect(
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
                         "0", "cached"}),

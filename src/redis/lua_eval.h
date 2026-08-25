@@ -19,6 +19,14 @@ struct LuaRedisCall {
 struct LuaExecutionStep {
   std::optional<LuaRedisCall> call_;
   std::string reply_;
+  bool scheduler_yield_ = false;
+};
+
+enum class LuaScriptKillResult {
+  kKilled,
+  kNotBusy,
+  kUnkillableWrite,
+  kUnkillableReplication,
 };
 
 class LuaExecution {
@@ -37,8 +45,11 @@ class LuaExecution {
   // lua_dump output for the user chunk. It can be loaded into another
   // lua_State created by this binary without parsing the source again.
   std::string_view bytecode() const;
-  LuaExecutionStep Start();
+  LuaExecutionStep Start(bool replication_origin);
   LuaExecutionStep Resume(std::string_view command_reply);
+  LuaExecutionStep ResumeAfterSchedulerYield();
+  // Returns false if SCRIPT KILL won the race before this write started.
+  bool MarkWriteCommand();
 
  private:
   struct Impl;
@@ -58,5 +69,6 @@ bool CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode);
 std::optional<std::string_view> FindCachedLuaScript(std::string_view sha);
 void ClearLocalLuaScriptCache();
 void ClearStoredLuaScripts();
+LuaScriptKillResult RequestLuaScriptKill();
 
 }  // namespace keylane
