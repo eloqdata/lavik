@@ -334,15 +334,11 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   co_return result;
 }
 
-Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
+ScanPartitionAwaitable StorageEngine::Impl::ScanPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) {
   assert(db_id < kLogicalDatabaseCount);
   assert(count > 0);
-  const auto& index =
-      PartitionFor(CurrentStore(), partition_id).indexes_[db_id];
-  ScanBatch result;
-  result.cursor_ = cursor;
   if (now_ms == 0) {
     now_ms = UnixTimeMillis();
   }
@@ -350,30 +346,40 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
       count > std::numeric_limits<std::size_t>::max() / 10
           ? std::numeric_limits<std::size_t>::max()
           : count * 10;
-  std::size_t iterations = 0;
-  std::size_t bytes = 0;
-  auto add_bytes = [&bytes](std::size_t value) {
-    bytes = value > std::numeric_limits<std::size_t>::max() - bytes
-                ? std::numeric_limits<std::size_t>::max()
-                : bytes + value;
+  ScanPartitionState state;
+  state.index_ = &PartitionFor(CurrentStore(), partition_id).indexes_[db_id];
+  state.now_ms_ = now_ms;
+  state.count_ = count;
+  state.max_bytes_ = max_bytes;
+  state.max_iterations_ = max_iterations;
+  state.result_.cursor_ = cursor;
+
+  if (ScanPartitionInline(&state)) {
+    return ScanPartitionAwaitable(std::move(state.result_));
+  }
+  return ScanPartitionAwaitable(ResumeScanPartition(std::move(state)));
+}
+
+bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
+  assert(state != nullptr);
+  assert(state->index_ != nullptr);
+  assert(state->external_.empty());
+  auto add_bytes = [state](std::size_t value) {
+    state->bytes_ =
+        value > std::numeric_limits<std::size_t>::max() - state->bytes_
+            ? std::numeric_limits<std::size_t>::max()
+            : state->bytes_ + value;
   };
+
   do {
-    struct ExternalCandidate {
-      const RecordIndex::Entry* entry_ = nullptr;
-      ExtentManifest extents_;
-      RecordLocation location_{};
-      std::uint64_t hash_ = 0;
-      std::uint32_t key_bytes_ = 0;
-    };
-    std::vector<ExternalCandidate> external;
-    result.cursor_ =
-        index.Scan(result.cursor_, [&](const RecordIndex::Entry& entry) {
+    state->result_.cursor_ = state->index_->Scan(
+        state->result_.cursor_, [&](const RecordIndex::Entry& entry) {
           if (entry.value_.kind_ == RecordKind::kValue &&
-              !IsExpired(entry.value_, now_ms)) {
+              !IsExpired(entry.value_, state->now_ms_)) {
             if (entry.key_complete()) [[likely]] {
               add_bytes(entry.key().size());
-              result.keys_.emplace_back(entry.key());
-              result.value_types_.push_back(entry.value_.value_type_);
+              state->result_.keys_.emplace_back(entry.key());
+              state->result_.value_types_.push_back(entry.value_.value_type_);
               std::size_t value_bytes = entry.value_.logical_size_;
               if (entry.value_.value_type_ != ValueType::kString) {
                 value_bytes = entry.value_.total_disk_bytes_;
@@ -390,51 +396,83 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ScanPartition(
                                               ? entry.logical_key_size()
                                               : std::size_t{0});
               }
-              result.value_bytes_.push_back(value_bytes);
+              state->result_.value_bytes_.push_back(value_bytes);
               add_bytes(value_bytes);
             } else [[unlikely]] {
-              external.push_back(ExternalCandidate{
+              ExtentManifest extents = ExtentsFor(CurrentStore(), &entry);
+              std::size_t value_bytes = 0;
+              if (extents != nullptr) {
+                for (const ExtentRef& ref : *extents) {
+                  value_bytes += ref.payload_bytes_;
+                }
+              }
+              value_bytes -= std::min<std::size_t>(
+                  value_bytes,
+                  entry.value_.key_external_ ? entry.logical_key_size() : 0);
+              state->external_.push_back(ScanPartitionState::ExternalCandidate{
                   .entry_ = &entry,
-                  .extents_ = ExtentsFor(CurrentStore(), &entry),
+                  .extents_ = std::move(extents),
                   .location_ = entry.value_,
                   .hash_ = entry.hash_,
                   .key_bytes_ = entry.logical_key_size(),
+                  .value_bytes_ = value_bytes,
               });
             }
           }
         });
-    for (const ExternalCandidate& candidate : external) {
-      auto key =
-          co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
-                                     candidate.extents_, candidate.key_bytes_);
+    ++state->iterations_;
+    if (!state->external_.empty()) return false;
+  } while (state->result_.cursor_ != 0 &&
+           state->result_.keys_.size() < state->count_ &&
+           state->bytes_ < state->max_bytes_ &&
+           state->iterations_ < state->max_iterations_);
+  return true;
+}
+
+Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
+    ScanPartitionState state) {
+  auto add_bytes = [&state](std::size_t value) {
+    state.bytes_ =
+        value > std::numeric_limits<std::size_t>::max() - state.bytes_
+            ? std::numeric_limits<std::size_t>::max()
+            : state.bytes_ + value;
+  };
+
+  while (true) {
+    for (std::size_t index = 0; index < state.external_.size(); ++index) {
+      // Keep the metadata needed after the read in the coroutine frame, while
+      // transferring the manifest to the child that materializes the key.
+      ScanPartitionState::ExternalCandidate candidate =
+          std::move(state.external_[index]);
+      auto key = co_await LoadOutOfIndexKey(CurrentStore(), candidate.location_,
+                                            std::move(candidate.extents_),
+                                            candidate.key_bytes_);
       if (!key.ok()) {
         co_return key.status();
       }
-      if (!index.Contains(candidate.entry_, candidate.hash_)) {
+      if (!state.index_->Contains(candidate.entry_, candidate.hash_)) {
         continue;
       }
       const RecordIndex::Entry* current = candidate.entry_;
       if (current->value_.SamePhysicalRecord(candidate.location_) &&
           current->value_.kind_ == RecordKind::kValue &&
-          !IsExpired(current->value_, now_ms)) {
+          !IsExpired(current->value_, state.now_ms_)) {
         add_bytes(key->size());
-        result.keys_.push_back(std::move(*key));
-        result.value_types_.push_back(current->value_.value_type_);
-        std::size_t value_bytes = 0;
-        for (const ExtentRef& ref : *candidate.extents_) {
-          value_bytes += ref.payload_bytes_;
-        }
-        value_bytes -= std::min<std::size_t>(
-            value_bytes,
-            current->value_.key_external_ ? candidate.key_bytes_ : 0);
-        result.value_bytes_.push_back(value_bytes);
-        add_bytes(value_bytes);
+        state.result_.keys_.push_back(std::move(*key));
+        state.result_.value_types_.push_back(current->value_.value_type_);
+        state.result_.value_bytes_.push_back(candidate.value_bytes_);
+        add_bytes(candidate.value_bytes_);
       }
     }
-    ++iterations;
-  } while (result.cursor_ != 0 && result.keys_.size() < count &&
-           bytes < max_bytes && iterations < max_iterations);
-  co_return result;
+    state.external_.clear();
+    if (state.result_.cursor_ == 0 ||
+        state.result_.keys_.size() >= state.count_ ||
+        state.bytes_ >= state.max_bytes_ ||
+        state.iterations_ >= state.max_iterations_ ||
+        ScanPartitionInline(&state)) {
+      co_return std::move(state.result_);
+    }
+  }
 }
 
 absl::StatusOr<FullSyncSessionStart> StorageEngine::Impl::BeginFullSyncSession(

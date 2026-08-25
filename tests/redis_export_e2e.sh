@@ -69,6 +69,9 @@ done
 "${redis_cli}" -p "${keylane_port}" sadd set x y >/dev/null
 "${redis_cli}" -p "${keylane_port}" zadd zset 1 one 2 two >/dev/null
 "${redis_cli}" -p "${keylane_port}" -n 1 set db-one before >/dev/null
+# Force the snapshot scan through its asynchronous out-of-index-key path.
+external_key=$(printf '%05000d' 0)
+"${redis_cli}" -p "${keylane_port}" set "${external_key}" external >/dev/null
 fullsync_function=$'#!lua name=redis_export_fullsync\nredis.register_function{function_name="redis_export_fullsync_value", callback=function(keys, args) return args[1] end, flags={"no-writes"}}'
 [[ $("${redis_cli}" -p "${keylane_port}" function load "${fullsync_function}") == redis_export_fullsync ]]
 "${redis_cli}" -p "${redis_port}" replicaof 127.0.0.1 \
@@ -87,6 +90,7 @@ done
 [[ $("${redis_cli}" -p "${redis_port}" scard set) == 2 ]]
 [[ $("${redis_cli}" -p "${redis_port}" zcard zset) == 2 ]]
 [[ $("${redis_cli}" -p "${redis_port}" -n 1 get db-one) == before ]]
+[[ $("${redis_cli}" -p "${redis_port}" get "${external_key}") == external ]]
 [[ $("${redis_cli}" -p "${redis_port}" fcall_ro redis_export_fullsync_value 0 baseline) == baseline ]]
 
 "${redis_cli}" -p "${keylane_port}" set online two >/dev/null

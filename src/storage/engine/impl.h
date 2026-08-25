@@ -1647,10 +1647,34 @@ class StorageEngine::Impl {
 
   Task<absl::Status> AdvanceDbEpoch(std::uint8_t db_id, std::uint64_t next);
 
-  Task<absl::StatusOr<ScanBatch>> ScanPartition(
-      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count, std::uint64_t now_ms,
-      std::size_t max_bytes = SIZE_MAX);
+  struct ScanPartitionState {
+    struct ExternalCandidate {
+      const RecordIndex::Entry* entry_ = nullptr;
+      ExtentManifest extents_;
+      RecordLocation location_{};
+      std::uint64_t hash_ = 0;
+      std::uint32_t key_bytes_ = 0;
+      std::size_t value_bytes_ = 0;
+    };
+
+    const RecordIndex* index_ = nullptr;
+    std::uint64_t now_ms_ = 0;
+    std::size_t count_ = 0;
+    std::size_t max_bytes_ = 0;
+    std::size_t max_iterations_ = 0;
+    std::size_t iterations_ = 0;
+    std::size_t bytes_ = 0;
+    ScanBatch result_;
+    std::vector<ExternalCandidate> external_;
+  };
+
+  ScanPartitionAwaitable ScanPartition(std::uint16_t partition_id,
+                                       std::uint8_t db_id, std::uint64_t cursor,
+                                       std::size_t count, std::uint64_t now_ms,
+                                       std::size_t max_bytes = SIZE_MAX);
+
+  bool ScanPartitionInline(ScanPartitionState* state);
+  Task<absl::StatusOr<ScanBatch>> ResumeScanPartition(ScanPartitionState state);
 
   absl::Status BeginRdbSnapshot(std::uint64_t session_id,
                                 std::uint64_t snapshot_time_ms);

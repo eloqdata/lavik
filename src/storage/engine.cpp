@@ -57,7 +57,7 @@ Task<absl::StatusOr<std::optional<std::string>>> StorageEngine::RandomKeyLocal(
   return impl_->RandomKeyLocal(db_id);
 }
 
-Task<absl::StatusOr<ScanBatch>> StorageEngine::ScanPartition(
+ScanPartitionAwaitable StorageEngine::ScanPartition(
     std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
     std::size_t count, std::uint64_t now_ms, std::size_t max_bytes) {
   return impl_->ScanPartition(partition_id, db_id, cursor, count, now_ms,

@@ -2,6 +2,8 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -191,6 +193,45 @@ struct ScanBatch {
   std::vector<std::string> keys_;
   std::vector<ValueType> value_types_;
   std::vector<std::size_t> value_bytes_;
+};
+
+// Completes inline when a partition scan only touches the in-memory index.
+// A nested Task is created only for the uncommon path that must materialize
+// an out-of-index key from storage.
+class ScanPartitionAwaitable {
+ public:
+  using Result = absl::StatusOr<ScanBatch>;
+  using PendingTask = celer::Task<Result>;
+
+  explicit ScanPartitionAwaitable(Result ready) : ready_(std::move(ready)) {}
+  explicit ScanPartitionAwaitable(PendingTask pending)
+      : pending_(std::move(pending)) {}
+
+  ScanPartitionAwaitable(ScanPartitionAwaitable&&) noexcept = default;
+  ScanPartitionAwaitable& operator=(ScanPartitionAwaitable&&) noexcept =
+      default;
+  ScanPartitionAwaitable(const ScanPartitionAwaitable&) = delete;
+  ScanPartitionAwaitable& operator=(const ScanPartitionAwaitable&) = delete;
+
+  bool await_ready() const noexcept { return ready_.has_value(); }
+
+  std::coroutine_handle<> await_suspend(
+      std::coroutine_handle<> awaiting) noexcept {
+    assert(pending_.has_value());
+    pending_awaiter_.emplace(std::move(*pending_).operator co_await());
+    return pending_awaiter_->await_suspend(awaiting);
+  }
+
+  Result await_resume() {
+    if (ready_.has_value()) return std::move(*ready_);
+    assert(pending_awaiter_.has_value());
+    return pending_awaiter_->await_resume();
+  }
+
+ private:
+  std::optional<Result> ready_;
+  std::optional<PendingTask> pending_;
+  std::optional<typename PendingTask::Awaiter> pending_awaiter_;
 };
 
 struct SnapshotRecord {
@@ -740,10 +781,11 @@ class StorageEngine {
   // at most one bucket chain, since the scan emits whole chains), so a
   // caller assembling bounded chunks stays bounded even with huge key
   // names.
-  celer::Task<absl::StatusOr<ScanBatch>> ScanPartition(
-      std::uint16_t partition_id, std::uint8_t db_id, std::uint64_t cursor,
-      std::size_t count, std::uint64_t now_ms = 0,
-      std::size_t max_bytes = SIZE_MAX);
+  ScanPartitionAwaitable ScanPartition(std::uint16_t partition_id,
+                                       std::uint8_t db_id, std::uint64_t cursor,
+                                       std::size_t count,
+                                       std::uint64_t now_ms = 0,
+                                       std::size_t max_bytes = SIZE_MAX);
 
   // Atomically invalidates one logical DB by advancing its durable epoch and
   // taking its indexes out of service. The command layer must prevent
