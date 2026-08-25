@@ -318,6 +318,8 @@ int main(int argc, char** argv) {
     constexpr std::string_view argv_script = "return ARGV[1]";
     Expect(client.Command({"EVAL", argv_script, "0", "hello"}), Bulk("hello"),
            "EVAL ARGV");
+    Expect(client.Command({"EVAL", argv_script, "0", "eval-cache"}),
+           Bulk("eval-cache"), "EVAL reuses worker registry closure");
     Expect(
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
                         "0", "cached"}),
@@ -343,6 +345,8 @@ int main(int argc, char** argv) {
         "b534286061d4b9e4026607613b95c06c06015ae8";
     Expect(client.Command({"SCRIPT", "LOAD", loaded_script}), Bulk(loaded_sha),
            "SCRIPT LOAD");
+    Expect(client.Command({"SCRIPT", "LOAD", loaded_script}), Bulk(loaded_sha),
+           "SCRIPT LOAD reuses worker registry closure");
     Expect(client.Command({"SCRIPT", "EXISTS", loaded_sha,
                            "0000000000000000000000000000000000000000"}),
            "*2\r\n:1\r\n:0", "SCRIPT EXISTS");
@@ -376,6 +380,28 @@ int main(int argc, char** argv) {
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
                         "0", "compiled-cache"}),
         Bulk("compiled-cache"), "EVALSHA loads compiled chunk");
+
+    // The connection remains on one worker: repeated EVALSHA calls exercise
+    // the same registry closure while each coroutine receives fresh ARGV.
+    for (unsigned i = 0; i < 128; ++i) {
+      const std::string value = "registry-call-" + std::to_string(i);
+      Expect(
+          client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
+                          "0", value}),
+          Bulk(value), "EVALSHA reuses worker registry closure");
+    }
+
+    // Persistent workers must not let one invocation alter shared libraries
+    // or globals for later scripts.
+    ExpectContains(
+        client.Command(
+            {"EVAL", "math.abs=function() return 9 end; return 1", "0"}),
+        "Attempt to modify a readonly table", "Lua shared library is readonly");
+    Expect(client.Command({"EVAL", "return math.abs(-3)", "0"}), ":3",
+           "Lua shared library remains intact");
+    ExpectContains(
+        client.Command({"EVAL", "keylane_persistent_global=1; return 1", "0"}),
+        "Attempt to modify a readonly table", "Lua global table is readonly");
 
     Expect(client.Command({"SET", "lua:ro", "seed"}), "+OK", "EVAL_RO seed");
     Expect(client.Command(

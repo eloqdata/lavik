@@ -47,15 +47,11 @@ struct ScriptKey : std::array<char, 40> {
 
 // Like Dragonfly's ScriptMgr, the flat table stores a separately allocated
 // immutable body. Rehashing the table therefore cannot invalidate views held
-// by worker-local indexes. A future SCRIPT FLUSH must clear every local index
-// before releasing these bodies.
+// by worker-local indexes. SCRIPT FLUSH clears every local index before
+// releasing these bodies.
 std::mutex g_script_bodies_mutex;
 absl::flat_hash_map<ScriptKey, std::unique_ptr<const std::string>>
     g_script_bodies;
-
-// EVAL broadcasts a successfully compiled script to every worker before
-// replying, so EVALSHA's normal path needs no lock or cross-core hop.
-thread_local absl::flat_hash_map<ScriptKey, std::string_view> g_script_cache;
 
 struct LuaRunLimit {
   std::chrono::steady_clock::time_point deadline_;
@@ -150,7 +146,156 @@ void SetStringArray(lua_State* state, const char* name,
     lua_pushlstring(state, values[i].data(), values[i].size());
     lua_rawseti(state, -2, static_cast<int>(i + 1));
   }
+  lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 0);
   lua_setglobal(state, name);
+  lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 1);
+}
+
+int AbsoluteStackIndex(lua_State* state, int index) {
+  return index < 0 ? lua_gettop(state) + index + 1 : index;
+}
+
+void ProtectTableRecursively(lua_State* state, int index) {
+  index = AbsoluteStackIndex(state, index);
+  if (!lua_istable(state, index) || lua_isreadonlytable(state, index)) return;
+  // Mark before descending so cycles such as _G._G terminate immediately.
+  lua_enablereadonlytable(state, index, 1);
+  lua_pushnil(state);
+  while (lua_next(state, index) != 0) {
+    if (lua_istable(state, -1)) ProtectTableRecursively(state, -1);
+    lua_pop(state, 1);
+  }
+  if (lua_getmetatable(state, index) != 0) {
+    ProtectTableRecursively(state, -1);
+    lua_pop(state, 1);
+  }
+}
+
+struct CachedLuaFunction {
+  std::string_view bytecode_;
+  int registry_ref_ = LUA_NOREF;
+};
+
+class LuaWorkerRuntime {
+ public:
+  static absl::StatusOr<std::unique_ptr<LuaWorkerRuntime>> Create() {
+    auto runtime = std::unique_ptr<LuaWorkerRuntime>(new LuaWorkerRuntime());
+    runtime->root_ = luaL_newstate();
+    if (runtime->root_ == nullptr) {
+      return absl::ResourceExhaustedError("unable to create Lua interpreter");
+    }
+    lua_State* state = runtime->root_;
+    OpenLibrary(state, "", luaopen_base);
+    OpenLibrary(state, LUA_TABLIBNAME, luaopen_table);
+    OpenLibrary(state, LUA_STRLIBNAME, luaopen_string);
+    OpenLibrary(state, LUA_MATHLIBNAME, luaopen_math);
+    OpenLibrary(state, "cjson", luaopen_cjson);
+    OpenLibrary(state, "struct", luaopen_struct);
+    OpenLibrary(state, "cmsgpack", luaopen_cmsgpack);
+    OpenLibrary(state, "bit", luaopen_bit);
+    for (const char* unsafe : {"dofile", "loadfile", "print"}) {
+      lua_pushnil(state);
+      lua_setglobal(state, unsafe);
+    }
+    lua_pushcfunction(state, YieldRedisCall);
+    lua_setglobal(state, "__keylane_call");
+    lua_pushcfunction(state, Sha1Hex);
+    lua_setglobal(state, "__keylane_sha1hex");
+    if (luaL_loadbuffer(state, kRedisLibrary.data(), kRedisLibrary.size(),
+                        "@keylane_redis") != 0 ||
+        lua_pcall(state, 0, 0, 0) != 0) {
+      return absl::InternalError(LuaError(state));
+    }
+
+    // Valkey protects its persistent global environment recursively. KEYS and
+    // ARGV are replaced by the host between serialized executions by briefly
+    // opening only the global table itself.
+    lua_pushvalue(state, LUA_GLOBALSINDEX);
+    ProtectTableRecursively(state, -1);
+    lua_pop(state, 1);
+    return runtime;
+  }
+
+  LuaWorkerRuntime(const LuaWorkerRuntime&) = delete;
+  LuaWorkerRuntime& operator=(const LuaWorkerRuntime&) = delete;
+
+  ~LuaWorkerRuntime() {
+    if (root_ != nullptr) lua_close(root_);
+  }
+
+  lua_State* NewThread(int* registry_ref) {
+    lua_State* thread = lua_newthread(root_);
+    *registry_ref = luaL_ref(root_, LUA_REGISTRYINDEX);
+    return thread;
+  }
+
+  void ReleaseThread(int registry_ref) {
+    luaL_unref(root_, LUA_REGISTRYINDEX, registry_ref);
+    if (++completed_executions_ % 50 == 0) {
+      (void)lua_gc(root_, LUA_GCSTEP, 50);
+    }
+  }
+
+  bool Cache(std::string_view sha, std::string_view bytecode) {
+    if (sha.size() != ScriptKey{}.size()) return false;
+    const ScriptKey key(sha);
+    if (scripts_.contains(key)) return true;
+    if (luaL_loadbytecode(root_, bytecode.data(), bytecode.size(),
+                          "@cached_script") != 0) {
+      lua_pop(root_, 1);
+      return false;
+    }
+    const int function_ref = luaL_ref(root_, LUA_REGISTRYINDEX);
+    scripts_.emplace(key, CachedLuaFunction{bytecode, function_ref});
+    return true;
+  }
+
+  bool PushCached(lua_State* thread, std::string_view sha) {
+    if (sha.size() != ScriptKey{}.size()) return false;
+    const auto found = scripts_.find(ScriptKey(sha));
+    if (found == scripts_.end()) return false;
+    lua_rawgeti(root_, LUA_REGISTRYINDEX, found->second.registry_ref_);
+    lua_xmove(root_, thread, 1);
+    // A script may call setfenv on itself. Restore the protected worker-global
+    // environment before every invocation of the cached closure.
+    lua_pushvalue(thread, LUA_GLOBALSINDEX);
+    (void)lua_setfenv(thread, -2);
+    return true;
+  }
+
+  std::optional<std::string_view> Find(std::string_view sha) const {
+    if (sha.size() != ScriptKey{}.size()) return std::nullopt;
+    const auto found = scripts_.find(ScriptKey(sha));
+    if (found == scripts_.end()) return std::nullopt;
+    return found->second.bytecode_;
+  }
+
+  void ClearScripts() {
+    for (const auto& [key, script] : scripts_) {
+      (void)key;
+      luaL_unref(root_, LUA_REGISTRYINDEX, script.registry_ref_);
+    }
+    scripts_.clear();
+    (void)lua_gc(root_, LUA_GCCOLLECT, 0);
+  }
+
+ private:
+  LuaWorkerRuntime() = default;
+
+  lua_State* root_ = nullptr;
+  absl::flat_hash_map<ScriptKey, CachedLuaFunction> scripts_;
+  std::uint64_t completed_executions_ = 0;
+};
+
+thread_local std::unique_ptr<LuaWorkerRuntime> g_lua_runtime;
+
+absl::StatusOr<LuaWorkerRuntime*> WorkerLuaRuntime() {
+  if (g_lua_runtime == nullptr) {
+    auto runtime = LuaWorkerRuntime::Create();
+    if (!runtime.ok()) return runtime.status();
+    g_lua_runtime = std::move(*runtime);
+  }
+  return g_lua_runtime.get();
 }
 
 absl::Status ReadLine(std::string_view encoded, std::size_t* position,
@@ -345,12 +490,22 @@ LuaExecutionStep RuntimeErrorStep(lua_State* state) {
 }  // namespace
 
 struct LuaExecution::Impl {
+  LuaWorkerRuntime* runtime_ = nullptr;
   lua_State* state_ = nullptr;
+  int thread_ref_ = LUA_NOREF;
   LuaRunLimit run_limit_;
   std::string bytecode_;
+  bool run_limit_registered_ = false;
 
   ~Impl() {
-    if (state_ != nullptr) lua_close(state_);
+    if (state_ == nullptr) return;
+    lua_sethook(state_, nullptr, 0, 0);
+    if (run_limit_registered_) {
+      lua_pushlightuserdata(state_, &g_run_limit_registry_key);
+      lua_pushnil(state_);
+      lua_rawset(state_, LUA_REGISTRYINDEX);
+    }
+    runtime_->ReleaseThread(thread_ref_);
   }
 
   LuaExecutionStep Run(int resume_args) {
@@ -406,60 +561,39 @@ LuaExecution::~LuaExecution() = default;
 absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::Create(
     std::string_view script, std::span<const std::string> keys,
     std::span<const std::string> argv) {
-  auto execution = CreateFromBytecode({}, keys, argv);
-  if (!execution.ok()) return execution.status();
-  lua_State* state = (*execution)->impl_->state_;
+  auto runtime = WorkerLuaRuntime();
+  if (!runtime.ok()) return runtime.status();
+  auto impl = std::make_unique<Impl>();
+  impl->runtime_ = *runtime;
+  impl->state_ = (*runtime)->NewThread(&impl->thread_ref_);
+  lua_State* state = impl->state_;
+  lua_sethook(state, ScriptInstructionHook, LUA_MASKCOUNT, 100000);
+  SetStringArray(state, "KEYS", keys);
+  SetStringArray(state, "ARGV", argv);
   if (luaL_loadbuffer(state, script.data(), script.size(), "@user_script") !=
       0) {
     return absl::InvalidArgumentError(LuaError(state));
   }
-  if (lua_dump(state, AppendBytecode, &(*execution)->impl_->bytecode_) != 0) {
+  if (lua_dump(state, AppendBytecode, &impl->bytecode_) != 0) {
     return absl::InternalError("unable to serialize compiled Lua script");
   }
-  return execution;
+  return std::unique_ptr<LuaExecution>(new LuaExecution(std::move(impl)));
 }
 
-absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFromBytecode(
-    std::string_view bytecode, std::span<const std::string> keys,
+absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
+    std::string_view sha, std::span<const std::string> keys,
     std::span<const std::string> argv) {
+  auto runtime = WorkerLuaRuntime();
+  if (!runtime.ok()) return runtime.status();
   auto impl = std::make_unique<Impl>();
-  impl->state_ = luaL_newstate();
-  if (impl->state_ == nullptr) {
-    return absl::ResourceExhaustedError("unable to create Lua interpreter");
-  }
+  impl->runtime_ = *runtime;
+  impl->state_ = (*runtime)->NewThread(&impl->thread_ref_);
   lua_State* state = impl->state_;
-  lua_pushlightuserdata(state, &g_run_limit_registry_key);
-  lua_pushlightuserdata(state, &impl->run_limit_);
-  lua_rawset(state, LUA_REGISTRYINDEX);
   lua_sethook(state, ScriptInstructionHook, LUA_MASKCOUNT, 100000);
-  OpenLibrary(state, "", luaopen_base);
-  OpenLibrary(state, LUA_TABLIBNAME, luaopen_table);
-  OpenLibrary(state, LUA_STRLIBNAME, luaopen_string);
-  OpenLibrary(state, LUA_MATHLIBNAME, luaopen_math);
-  OpenLibrary(state, "cjson", luaopen_cjson);
-  OpenLibrary(state, "struct", luaopen_struct);
-  OpenLibrary(state, "cmsgpack", luaopen_cmsgpack);
-  OpenLibrary(state, "bit", luaopen_bit);
-  for (const char* unsafe : {"dofile", "loadfile", "print"}) {
-    lua_pushnil(state);
-    lua_setglobal(state, unsafe);
-  }
-
-  lua_pushcfunction(state, YieldRedisCall);
-  lua_setglobal(state, "__keylane_call");
-  lua_pushcfunction(state, Sha1Hex);
-  lua_setglobal(state, "__keylane_sha1hex");
-  if (luaL_loadbuffer(state, kRedisLibrary.data(), kRedisLibrary.size(),
-                      "@keylane_redis") != 0 ||
-      lua_pcall(state, 0, 0, 0) != 0) {
-    return absl::InternalError(LuaError(state));
-  }
   SetStringArray(state, "KEYS", keys);
   SetStringArray(state, "ARGV", argv);
-  if (!bytecode.empty() &&
-      luaL_loadbytecode(state, bytecode.data(), bytecode.size(),
-                        "@cached_script") != 0) {
-    return absl::InvalidArgumentError(LuaError(state));
+  if (!(*runtime)->PushCached(state, sha)) {
+    return absl::NotFoundError("script is not present in the worker cache");
   }
   return std::unique_ptr<LuaExecution>(new LuaExecution(std::move(impl)));
 }
@@ -469,6 +603,10 @@ std::string_view LuaExecution::bytecode() const { return impl_->bytecode_; }
 LuaExecutionStep LuaExecution::Start() {
   impl_->run_limit_.deadline_ =
       std::chrono::steady_clock::now() + kScriptTimeLimit;
+  lua_pushlightuserdata(impl_->state_, &g_run_limit_registry_key);
+  lua_pushlightuserdata(impl_->state_, &impl_->run_limit_);
+  lua_rawset(impl_->state_, LUA_REGISTRYINDEX);
+  impl_->run_limit_registered_ = true;
   return impl_->Run(0);
 }
 
@@ -525,19 +663,19 @@ std::string_view StoreLuaScript(std::string_view sha,
   return *found->second;
 }
 
-void CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode) {
-  if (sha.size() != ScriptKey{}.size()) return;
-  g_script_cache.insert_or_assign(ScriptKey(sha), bytecode);
+bool CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode) {
+  auto runtime = WorkerLuaRuntime();
+  return runtime.ok() && (*runtime)->Cache(sha, bytecode);
 }
 
 std::optional<std::string_view> FindCachedLuaScript(std::string_view sha) {
-  if (sha.size() != ScriptKey{}.size()) return std::nullopt;
-  const auto found = g_script_cache.find(ScriptKey(sha));
-  if (found == g_script_cache.end()) return std::nullopt;
-  return found->second;
+  if (g_lua_runtime == nullptr) return std::nullopt;
+  return g_lua_runtime->Find(sha);
 }
 
-void ClearLocalLuaScriptCache() { g_script_cache.clear(); }
+void ClearLocalLuaScriptCache() {
+  if (g_lua_runtime != nullptr) g_lua_runtime->ClearScripts();
+}
 
 void ClearStoredLuaScripts() {
   std::lock_guard<std::mutex> lock(g_script_bodies_mutex);

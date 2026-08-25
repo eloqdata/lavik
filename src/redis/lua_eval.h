@@ -26,8 +26,8 @@ class LuaExecution {
   static absl::StatusOr<std::unique_ptr<LuaExecution>> Create(
       std::string_view script, std::span<const std::string> keys,
       std::span<const std::string> argv);
-  static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateFromBytecode(
-      std::string_view bytecode, std::span<const std::string> keys,
+  static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateCached(
+      std::string_view sha, std::span<const std::string> keys,
       std::span<const std::string> argv);
 
   LuaExecution(const LuaExecution&) = delete;
@@ -52,9 +52,9 @@ std::string LuaScriptSha1(std::string_view script);
 std::string_view StoreLuaScript(std::string_view sha,
                                 std::string_view bytecode);
 
-// The index is worker-local. Its string_view refers to StoreLuaScript-owned
-// immutable storage, so EVALSHA reads need neither a lock nor a source copy.
-void CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode);
+// Each worker keeps a persistent Lua VM and one registry function per SHA.
+// The bytecode view refers to StoreLuaScript-owned immutable storage.
+bool CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode);
 std::optional<std::string_view> FindCachedLuaScript(std::string_view sha);
 void ClearLocalLuaScriptCache();
 void ClearStoredLuaScripts();

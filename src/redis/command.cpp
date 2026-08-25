@@ -74,6 +74,10 @@ std::string g_server_bind_ip = "127.0.0.1";
 std::string g_server_config_file;
 std::chrono::steady_clock::time_point g_server_start;
 std::atomic_flag g_lua_script_cache_operation = ATOMIC_FLAG_INIT;
+// Cached closures share the worker VM's KEYS/ARGV globals. Keep Lua scripts
+// serialized across redis.call() yields on a worker; ordinary commands are
+// not subject to this gate.
+thread_local bool g_lua_execution_active = false;
 
 struct ClientConnectionRecord {
   enum class Type { kNormal, kReplica, kPubSub };
@@ -6176,21 +6180,39 @@ class LuaScriptCacheOperationGuard {
   }
 };
 
+Task<bool> BeginLuaExecution() {
+  while (g_lua_execution_active) {
+    co_await Yield(*ThisWorker().self_);
+  }
+  g_lua_execution_active = true;
+  co_return true;
+}
+
+class LuaExecutionGuard {
+ public:
+  LuaExecutionGuard() = default;
+  LuaExecutionGuard(const LuaExecutionGuard&) = delete;
+  LuaExecutionGuard& operator=(const LuaExecutionGuard&) = delete;
+  ~LuaExecutionGuard() { g_lua_execution_active = false; }
+};
+
 Task<bool> CacheLuaScriptOnAllWorkers(const std::string& sha,
                                       std::string_view bytecode) {
   (void)co_await BeginLuaScriptCacheOperation();
   LuaScriptCacheOperationGuard operation;
   bytecode = StoreLuaScript(sha, bytecode);
+  if (bytecode.empty()) co_return false;
   for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
     auto cache = [sha, bytecode] {
-      CacheLuaScriptLocally(sha, bytecode);
-      return true;
+      return CacheLuaScriptLocally(sha, bytecode);
     };
+    bool cached = false;
     if (worker == ThisWorker().id_) {
-      cache();
+      cached = cache();
     } else {
-      (void)co_await SubmitTo(worker, std::move(cache));
+      cached = co_await SubmitTo(worker, std::move(cache));
     }
+    if (!cached) co_return false;
   }
   co_return true;
 }
@@ -6243,15 +6265,12 @@ Task<std::string> ExecuteEvalWithTransaction(
     co_return EncodeError(absl::StrCat("ERR ", key_view.status().message()));
   }
 
+  const bool source_kind = IsEvalSourceKind(request.kind_);
   std::string_view script;
-  std::optional<std::string_view> bytecode;
-  if (IsEvalSourceKind(request.kind_)) {
+  std::string sha;
+  if (source_kind) {
     script = request.args_[1];
-  } else {
-    bytecode = FindCachedLuaScript(request.args_[1]);
-    if (!bytecode.has_value()) {
-      co_return EncodeError("NOSCRIPT No matching script. Please use EVAL.");
-    }
+    sha = LuaScriptSha1(script);
   }
 
   const std::size_t key_count = key_view->count();
@@ -6261,19 +6280,28 @@ Task<std::string> ExecuteEvalWithTransaction(
   const std::size_t argv_begin = 3 + key_count;
   const std::span<const std::string> script_argv(
       request.args_.data() + argv_begin, request.args_.size() - argv_begin);
-  auto execution =
-      IsEvalSourceKind(request.kind_)
-          ? LuaExecution::Create(script, declared_keys, script_argv)
-          : LuaExecution::CreateFromBytecode(*bytecode, declared_keys,
-                                             script_argv);
+  (void)co_await BeginLuaExecution();
+  LuaExecutionGuard lua_execution;
+  const bool source_cached =
+      source_kind && !sha.empty() && FindCachedLuaScript(sha).has_value();
+  auto execution = source_kind && !source_cached
+                       ? LuaExecution::Create(script, declared_keys, script_argv)
+                       : LuaExecution::CreateCached(
+                             source_kind ? std::string_view(sha)
+                                         : std::string_view(request.args_[1]),
+                             declared_keys, script_argv);
   if (!execution.ok()) {
+    if (absl::IsNotFound(execution.status())) {
+      co_return EncodeError("NOSCRIPT No matching script. Please use EVAL.");
+    }
     co_return EncodeError(absl::StrCat("ERR Error compiling script: ",
                                        execution.status().message()));
   }
-  if (IsEvalSourceKind(request.kind_)) {
-    const std::string sha = LuaScriptSha1(script);
-    if (!sha.empty()) {
-      (void)co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode());
+  if (source_kind && !source_cached && !sha.empty()) {
+    const bool cached =
+        co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode());
+    if (!cached) {
+      co_return EncodeError("ERR unable to cache compiled Lua script");
     }
   }
 
@@ -6400,17 +6428,25 @@ Task<CommandReply> ExecuteScript(const CommandRequest& request,
           "ERR wrong number of arguments for 'script|load' command"));
     }
     constexpr std::span<const std::string> empty;
-    auto execution = LuaExecution::Create(request.args_[2], empty, empty);
-    if (!execution.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR Error compiling script: ", execution.status().message())));
-    }
     const std::string sha = LuaScriptSha1(request.args_[2]);
     if (sha.empty()) {
       co_return BuiltReply(
           reply_builder.AppendError("ERR unable to compute script SHA1"));
     }
-    (void)co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode());
+    (void)co_await BeginLuaExecution();
+    LuaExecutionGuard lua_execution;
+    if (FindCachedLuaScript(sha).has_value()) {
+      co_return BuiltReply(reply_builder.AppendBulkString(sha));
+    }
+    auto execution = LuaExecution::Create(request.args_[2], empty, empty);
+    if (!execution.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR Error compiling script: ", execution.status().message())));
+    }
+    if (!(co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode()))) {
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR unable to cache compiled Lua script"));
+    }
     co_return BuiltReply(reply_builder.AppendBulkString(sha));
   }
 
