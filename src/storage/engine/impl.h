@@ -983,6 +983,11 @@ class StorageEngine::Impl {
   };
 
   struct WorkerStore {
+    struct PendingTxCommit {
+      std::uint64_t txid_ = 0;
+      std::vector<TxShardWrites> writes_;
+    };
+
     struct ReplicationSparseOffset {
       std::uint64_t lsn_ = 0;
       std::uint32_t fragment_index_ = 0;
@@ -1216,6 +1221,12 @@ class StorageEngine::Impl {
     // finish after rotation, so append streams are keyed by generation.
     absl::flat_hash_map<std::uint64_t, std::optional<ActiveBlock>>
         active_tx_blocks_;
+    // Owner-local MPSC is unnecessary: commands and the drain coroutine both
+    // run on this worker. Keeping receipts here replaces one detached
+    // coroutine frame per transaction with one bounded-size batch runner.
+    std::deque<PendingTxCommit> tx_commit_queue_;
+    bool tx_commit_runner_ = false;
+    AsyncNotification tx_commit_capacity_;
     // Recovery only. A recovered extent block's identity has to be checked
     // against the manifests that reference it, and the two arrive in separate
     // passes, so they meet here instead of in every BlockState. Cleared once
@@ -1541,6 +1552,13 @@ class StorageEngine::Impl {
   Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                     std::vector<TxShardWrites*> shards);
 
+  static constexpr std::size_t kTxCommitQueueHighWatermark = 4096;
+
+  [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
+                                     std::vector<TxShardWrites> writes);
+  Task<absl::Status> WaitForTxCommitCapacity();
+  Task<absl::Status> DrainTxCommitQueue(WorkerStore* store);
+
   void PublishCommittedFullSyncEffects(TxShardWrites* shard);
 
   void NoteTxCommitStarted() noexcept {
@@ -1548,6 +1566,25 @@ class StorageEngine::Impl {
   }
   void NoteTxCommitFinished() noexcept {
     active_tx_commits_.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  TxCommitBatchTotals TxCommitBatchStats() const noexcept {
+    return TxCommitBatchTotals{
+        .batches_ = tx_commit_batches_.load(std::memory_order_acquire),
+        .transactions_ =
+            tx_commit_batch_transactions_.load(std::memory_order_acquire),
+        .input_fences_ =
+            tx_commit_input_fences_.load(std::memory_order_acquire),
+        .merged_fences_ =
+            tx_commit_merged_fences_.load(std::memory_order_acquire),
+        .queue_depth_ =
+            tx_commit_queue_depth_.load(std::memory_order_acquire),
+        .queue_peak_ =
+            tx_commit_queue_peak_.load(std::memory_order_acquire),
+        .backpressure_waits_ =
+            tx_commit_backpressure_waits_.load(std::memory_order_acquire),
+        .queue_high_watermark_ = kTxCommitQueueHighWatermark,
+    };
   }
 
   Task<absl::Status> RollbackTxLocal(std::uint64_t txid,
@@ -2487,6 +2524,13 @@ class StorageEngine::Impl {
   // them before the final flush so acknowledged multi-key writes do not
   // lose their commit records to the shutdown ordering.
   std::atomic<std::uint64_t> active_tx_commits_{0};
+  std::atomic<std::uint64_t> tx_commit_batches_{0};
+  std::atomic<std::uint64_t> tx_commit_batch_transactions_{0};
+  std::atomic<std::uint64_t> tx_commit_input_fences_{0};
+  std::atomic<std::uint64_t> tx_commit_merged_fences_{0};
+  std::atomic<std::uint64_t> tx_commit_queue_depth_{0};
+  std::atomic<std::uint64_t> tx_commit_queue_peak_{0};
+  std::atomic<std::uint64_t> tx_commit_backpressure_waits_{0};
   // Committed transactions seen during the block scans; merged by each
   // worker before the recovery barrier, read only after it.
   std::mutex recovery_committed_mutex_;

@@ -35,13 +35,23 @@ class RespClient {
   explicit RespClient(int fd) : fd_(fd) {}
   RespClient(const RespClient&) = delete;
   RespClient& operator=(const RespClient&) = delete;
-  RespClient(RespClient&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+  RespClient(RespClient&& other) noexcept
+      : fd_(other.fd_),
+        command_index_(other.command_index_),
+        last_command_(std::move(other.last_command_)) {
+    other.fd_ = -1;
+  }
   RespClient& operator=(RespClient&&) = delete;
   ~RespClient() {
     if (fd_ >= 0) ::close(fd_);
   }
 
   std::string Command(const std::vector<std::string_view>& args) {
+    last_command_ = std::to_string(++command_index_);
+    for (std::string_view arg : args) {
+      last_command_.push_back(' ');
+      last_command_.append(arg.substr(0, 80));
+    }
     std::string request = "*" + std::to_string(args.size()) + "\r\n";
     for (std::string_view arg : args) {
       request += "$" + std::to_string(arg.size()) + "\r\n";
@@ -122,7 +132,9 @@ class RespClient {
         if (errno == EINTR) continue;
         Fail("recv failed: " + std::string(std::strerror(errno)));
       }
-      if (received == 0) Fail("server closed the connection");
+      if (received == 0) {
+        Fail("server closed the connection while reading " + last_command_);
+      }
       output += received;
       size -= static_cast<std::size_t>(received);
     }
@@ -141,6 +153,8 @@ class RespClient {
   }
 
   int fd_ = -1;
+  std::uint64_t command_index_ = 0;
+  std::string last_command_;
 };
 
 std::uint16_t FindFreePort() {

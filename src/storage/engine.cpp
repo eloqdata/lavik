@@ -592,6 +592,15 @@ Task<absl::Status> StorageEngine::CommitTxWrites(
   return impl_->CommitTxWrites(txid, std::move(shards));
 }
 
+bool StorageEngine::EnqueueTxCommit(std::uint64_t txid,
+                                    std::vector<TxShardWrites> writes) {
+  return impl_->EnqueueTxCommit(txid, std::move(writes));
+}
+
+Task<absl::Status> StorageEngine::WaitForTxCommitCapacity() {
+  return impl_->WaitForTxCommitCapacity();
+}
+
 void StorageEngine::PublishCommittedFullSyncEffects(TxShardWrites* shard) {
   impl_->PublishCommittedFullSyncEffects(shard);
 }
@@ -612,6 +621,10 @@ void StorageEngine::NoteTxCommitStarted() noexcept {
 
 void StorageEngine::NoteTxCommitFinished() noexcept {
   impl_->NoteTxCommitFinished();
+}
+
+TxCommitBatchTotals StorageEngine::TxCommitBatchStats() const noexcept {
+  return impl_->TxCommitBatchStats();
 }
 
 Task<absl::Status> StorageEngine::RollbackTxLocal(std::uint64_t txid,

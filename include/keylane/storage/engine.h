@@ -142,6 +142,17 @@ struct TxCleanerTotals {
   bool running_ = false;
 };
 
+struct TxCommitBatchTotals {
+  std::uint64_t batches_ = 0;
+  std::uint64_t transactions_ = 0;
+  std::uint64_t input_fences_ = 0;
+  std::uint64_t merged_fences_ = 0;
+  std::uint64_t queue_depth_ = 0;
+  std::uint64_t queue_peak_ = 0;
+  std::uint64_t backpressure_waits_ = 0;
+  std::uint64_t queue_high_watermark_ = 0;
+};
+
 struct StorageDeviceMetrics {
   std::string path_;
   std::uint64_t device_id_ = 0;
@@ -1016,6 +1027,16 @@ class StorageEngine {
   // reply never waits for durability.
   celer::Task<absl::Status> CommitTxWrites(std::uint64_t txid,
                                            std::vector<TxShardWrites*> shards);
+  // Transfers one successful transaction's receipts to the current worker's
+  // commit coordinator. At most one coordinator coroutine runs per worker;
+  // it merges durability fences and appends commit decisions in batches.
+  // Returns true when the caller may reply immediately. A false result means
+  // the worker-local queue crossed its high watermark; the command should
+  // await WaitForTxCommitCapacity() before replying. The idle fast path does
+  // not create or await another coroutine.
+  [[nodiscard]] bool EnqueueTxCommit(std::uint64_t txid,
+                                     std::vector<TxShardWrites> writes);
+  celer::Task<absl::Status> WaitForTxCommitCapacity();
   // Must run on the owning worker before participant locks are released.
   void PublishCommittedFullSyncEffects(TxShardWrites* shard);
 
@@ -1026,11 +1047,12 @@ class StorageEngine {
   // transaction generation and holds one shared generation lease.
   void InitializeTxWrites(std::uint64_t txid, std::span<TxShardWrites> writes);
 
-  // Bracket a detached commit chain: Started before spawning it (so a
-  // graceful shutdown that already drained client requests still waits for
-  // it), Finished when the chain ends whatever its outcome.
+  // Bracket a queued commit: graceful shutdown waits for every accepted
+  // transaction to leave the worker-local coordinator.
   void NoteTxCommitStarted() noexcept;
   void NoteTxCommitFinished() noexcept;
+
+  TxCommitBatchTotals TxCommitBatchStats() const noexcept;
 
   // Undo every journaled write of the transaction on the calling shard:
   // overwritten keys get their previous location back (and their partitions

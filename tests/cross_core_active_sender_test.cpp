@@ -11,6 +11,30 @@
 namespace celer {
 namespace {
 
+TEST(SpscRingTest, RefreshesCachedHeadAfterConsumerProgress) {
+  SpscRing<int, 4> ring;
+
+  EXPECT_TRUE(ring.try_enqueue(1));
+  EXPECT_TRUE(ring.try_enqueue(2));
+  EXPECT_TRUE(ring.try_enqueue(3));
+  EXPECT_FALSE(ring.try_enqueue(4));
+
+  int drained[3]{};
+  EXPECT_EQ(ring.try_dequeue_bulk(drained, 2), 2U);
+  EXPECT_EQ(drained[0], 1);
+  EXPECT_EQ(drained[1], 2);
+
+  EXPECT_TRUE(ring.try_enqueue(4));
+  EXPECT_TRUE(ring.try_enqueue(5));
+  EXPECT_FALSE(ring.try_enqueue(6));
+
+  EXPECT_EQ(ring.try_dequeue_bulk(drained, 3), 3U);
+  EXPECT_EQ(drained[0], 3);
+  EXPECT_EQ(drained[1], 4);
+  EXPECT_EQ(drained[2], 5);
+  EXPECT_TRUE(ring.empty());
+}
+
 TEST(CrossCoreActiveSenderTest, BitmapAddressesAndClearsSenderGroups) {
   CrossCore cross_core(130);
 

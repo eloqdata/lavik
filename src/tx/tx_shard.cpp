@@ -13,11 +13,68 @@ TxRuntime* g_runtime = nullptr;
 
 }  // namespace
 
+void TxShard::EnqueueBypassReady(TxWaiter* waiter) {
+  assert(waiter != nullptr && waiter->tx_ != nullptr);
+  assert(waiter->armed_ && !waiter->running_);
+  bypass_ready_.push_back(waiter);
+}
+
+TxWaiter* TxShard::PopBypassReady() noexcept {
+  if (bypass_ready_.empty()) return nullptr;
+  TxWaiter* waiter = bypass_ready_.front();
+  bypass_ready_.pop_front();
+  return waiter;
+}
+
+void TxShard::ArmTransaction(TxWaiter* waiter, bool bypass_ordered_queue) {
+  assert(waiter != nullptr && waiter->tx_ != nullptr);
+  assert(!waiter->armed_ && !waiter->running_);
+  waiter->armed_ = true;
+  if (bypass_ordered_queue) EnqueueBypassReady(waiter);
+  Poll();
+}
+
 void TxShard::Poll() {
   if (polling_) {
     return;
   }
   polling_ = true;
+
+  // Every bypass-ready entry also retains its ordered queue position. Keep
+  // the uncontended plain/single-shard path identical to the old scheduler:
+  // one empty ordered-queue check, then return without touching the
+  // multi-shard-only ready queue.
+  if (queue_.Front() == nullptr) {
+    polling_ = false;
+    return;
+  }
+
+  // A granted multi-shard entry is independent of everything that was
+  // registered before it on this shard. Dispatch all such armed hops first.
+  // Their intents prevent later conflicting entries from taking this path,
+  // and CanHoldAll protects against a callback that is still suspended with
+  // an actual hold.
+  while (TxWaiter* ready = PopBypassReady()) {
+    assert(ready->tx_ != nullptr);
+    if (!ready->armed_ || ready->running_) continue;
+    if (!ready->holds_acquired_ && !CanHoldAll(ready->keys_)) {
+      // This should only be transient (for example a callback already
+      // executing when the intent was recorded). Leave it armed; the holder's
+      // release will poll again.
+      EnqueueBypassReady(ready);
+      break;
+    }
+    committed_txid_ = std::max(committed_txid_, ready->txid_);
+    if (!ready->holds_acquired_) {
+      AcquireHolds(ready->keys_);
+      ready->holds_acquired_ = true;
+    }
+    ready->armed_ = false;
+    ready->running_ = true;
+    ++queued_runs_;
+    StartTransactionHop(*this, ready);
+  }
+
   while (true) {
     TxWaiter* head = queue_.Front();
     if (head == nullptr) {

@@ -470,6 +470,180 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   co_return absl::OkStatus();
 }
 
+namespace {
+
+constexpr std::size_t kTxCommitBatchSize = 256;
+
+void MergeTxCommitFence(
+    std::vector<RelocationDurabilityFence>* merged,
+    const TxShardWrites::Fence& fence) {
+  for (RelocationDurabilityFence& existing : *merged) {
+    if (existing.block_id_ == fence.block_id_ &&
+        existing.allocation_epoch_ == fence.allocation_epoch_ &&
+        existing.block_owner_ == fence.block_owner_) {
+      existing.committed_bytes_ =
+          std::max(existing.committed_bytes_, fence.committed_bytes_);
+      return;
+    }
+  }
+  merged->push_back(RelocationDurabilityFence{
+      .block_id_ = fence.block_id_,
+      .allocation_epoch_ = fence.allocation_epoch_,
+      .block_owner_ = fence.block_owner_,
+      .committed_bytes_ = fence.committed_bytes_,
+  });
+}
+
+}  // namespace
+
+bool StorageEngine::Impl::EnqueueTxCommit(
+    std::uint64_t txid, std::vector<TxShardWrites> writes) {
+  assert(txid != 0);
+#ifndef NDEBUG
+  for (const TxShardWrites& shard : writes) {
+    // Command-local undo must be settled before ownership transfers to the
+    // background coordinator. Otherwise an append could race rollback.
+    assert(!shard.collect_undo_);
+  }
+#endif
+  WorkerStore& store = CurrentStore();
+  NoteTxCommitStarted();
+  store.tx_commit_queue_.push_back(WorkerStore::PendingTxCommit{
+      .txid_ = txid,
+      .writes_ = std::move(writes),
+  });
+  const std::uint64_t depth =
+      tx_commit_queue_depth_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  std::uint64_t peak = tx_commit_queue_peak_.load(std::memory_order_relaxed);
+  while (depth > peak &&
+         !tx_commit_queue_peak_.compare_exchange_weak(
+             peak, depth, std::memory_order_release,
+             std::memory_order_relaxed)) {
+  }
+  if (!store.tx_commit_runner_) {
+    store.tx_commit_runner_ = true;
+    store.worker_->Spawn(DrainTxCommitQueue(&store));
+  }
+  if (store.tx_commit_queue_.size() < kTxCommitQueueHighWatermark) {
+    return true;
+  }
+  tx_commit_backpressure_waits_.fetch_add(1, std::memory_order_relaxed);
+  return false;
+}
+
+Task<absl::Status> StorageEngine::Impl::WaitForTxCommitCapacity() {
+  WorkerStore& store = CurrentStore();
+  while (store.tx_commit_queue_.size() >= kTxCommitQueueHighWatermark) {
+    co_await store.tx_commit_capacity_.Wait();
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(
+    WorkerStore* store) {
+  while (!store->tx_commit_queue_.empty()) {
+    std::vector<WorkerStore::PendingTxCommit> batch;
+    const std::size_t count =
+        std::min(kTxCommitBatchSize, store->tx_commit_queue_.size());
+    batch.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+      batch.push_back(std::move(store->tx_commit_queue_.front()));
+      store->tx_commit_queue_.pop_front();
+    }
+    tx_commit_queue_depth_.fetch_sub(count, std::memory_order_acq_rel);
+    if (store->tx_commit_queue_.size() < kTxCommitQueueHighWatermark) {
+      store->tx_commit_capacity_.NotifyAll(*store->worker_);
+    }
+    tx_commit_batches_.fetch_add(1, std::memory_order_relaxed);
+    tx_commit_batch_transactions_.fetch_add(count,
+                                            std::memory_order_relaxed);
+
+    // Transactions sharing a participant's active transaction block also
+    // share a durability frontier. Trigger every unique frontier before
+    // awaiting any one of them, so all owner flushes make progress in
+    // parallel without one detached waiter coroutine per transaction.
+    std::vector<RelocationDurabilityFence> fences;
+    std::uint64_t input_fences = 0;
+    for (const WorkerStore::PendingTxCommit& pending : batch) {
+      for (const TxShardWrites& shard : pending.writes_) {
+        input_fences += shard.fences_.size();
+        for (const TxShardWrites::Fence& fence : shard.fences_) {
+          MergeTxCommitFence(&fences, fence);
+        }
+      }
+    }
+    tx_commit_input_fences_.fetch_add(input_fences,
+                                      std::memory_order_relaxed);
+    tx_commit_merged_fences_.fetch_add(fences.size(),
+                                       std::memory_order_relaxed);
+
+    absl::Status batch_status = absl::OkStatus();
+    // Preserve the original one-transaction path exactly: opportunistic
+    // batching must not add a dispatch round trip to an idle connection's
+    // durability latency. With backlog, pre-arm every unique block so their
+    // flushes overlap; each transaction below still awaits only its own
+    // fences, never the slowest unrelated fence in the batch.
+    if (batch.size() > 1) {
+      for (const RelocationDurabilityFence& fence : fences) {
+        if (fence.block_owner_ >= worker_count_) {
+          batch_status = absl::InternalError(
+              "transaction durability fence has an invalid block owner");
+          break;
+        }
+        auto request = [this, fence]() -> Task<absl::Status> {
+          WorkerStore& owner = *stores_[fence.block_owner_];
+          co_await owner.store_state_mutex_.Lock();
+          UnlockGuard unlock(&owner.store_state_mutex_, owner.worker_);
+          BlockState* state = FindBlockState(owner, fence.block_id_);
+          if (state != nullptr && state->allocated_ &&
+              state->allocation_epoch_ == fence.allocation_epoch_) {
+            RequestFlush(owner, fence.block_id_);
+          }
+          co_return owner.write_failed_
+                        ? absl::InternalError(
+                              "storage write failed while starting "
+                              "transaction batch flush")
+                        : absl::OkStatus();
+        };
+        absl::Status requested =
+            fence.block_owner_ == celer::ThisWorker().id_
+                ? co_await request()
+                : co_await celer::SubmitTaskTo(fence.block_owner_,
+                                               std::move(request));
+        if (!requested.ok()) {
+          batch_status = std::move(requested);
+          break;
+        }
+      }
+    }
+
+    for (WorkerStore::PendingTxCommit& pending : batch) {
+      if (batch_status.ok()) {
+        std::vector<TxShardWrites*> shards;
+        for (TxShardWrites& shard : pending.writes_) {
+          if (!shard.fences_.empty() || !shard.retirements_.empty()) {
+            shards.push_back(&shard);
+          }
+        }
+        if (!shards.empty()) {
+          absl::Status committed =
+              co_await CommitTxWrites(pending.txid_, std::move(shards));
+          if (!committed.ok()) {
+            spdlog::warn("transaction {} commit append failed: {}",
+                         pending.txid_, committed.message());
+          }
+        }
+      } else {
+        spdlog::warn("transaction {} batch durability failed: {}",
+                     pending.txid_, batch_status.message());
+      }
+      NoteTxCommitFinished();
+    }
+  }
+  store->tx_commit_runner_ = false;
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     std::uint64_t txid, TxShardWrites* compensation) {
   WorkerStore& store = CurrentStore();

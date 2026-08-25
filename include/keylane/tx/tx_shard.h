@@ -5,6 +5,7 @@
 #include <cassert>
 #include <coroutine>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <span>
 #include <utility>
@@ -129,8 +130,14 @@ class TxShard {
     return Awaiter(this, KeyRef{fp, mode, db_id});
   }
 
-  // Starts the queue head while it is hold-compatible. Called after every
-  // release and by the queue machinery; safe to call at any time.
+  // Arms one hop of a scheduled multi-shard transaction and drives it. An
+  // entry whose intents were granted at schedule time can bypass unrelated
+  // ordered queue entries; contended entries still wait at the queue head.
+  void ArmTransaction(TxWaiter* waiter, bool bypass_ordered_queue);
+
+  // Starts ready conflict-free transaction hops, then the ordered queue head
+  // while it is hold-compatible. Called after every release and by the queue
+  // machinery; safe to call at any time.
   void Poll();
 
   // Shard-local WATCH registrations (push model): every real keyspace
@@ -274,6 +281,9 @@ class TxShard {
 
   void Enqueue(TxWaiter* waiter) { queue_.Insert(waiter); }
 
+  void EnqueueBypassReady(TxWaiter* waiter);
+  TxWaiter* PopBypassReady() noexcept;
+
   void Release(std::span<const KeyRef> keys) {
     ReleaseHolds(keys);
     ReleaseIntents(keys);
@@ -297,6 +307,9 @@ class TxShard {
   std::atomic<std::uint64_t>* next_txid_ = nullptr;
   std::uint64_t fastpath_runs_ = 0;
   std::uint64_t queued_runs_ = 0;
+  // Only conflict-free multi-shard hops enter this owner-local ready queue.
+  // Plain and single-shard acquisition never touches it.
+  std::deque<TxWaiter*> bypass_ready_;
 };
 
 // Process-wide transaction runtime: one TxShard per worker plus the global

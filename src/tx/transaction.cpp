@@ -156,6 +156,9 @@ void Transaction::ScheduleInShard(ShardData* sd) {
   }
   sd->node_.txid_ = tx->txid_;
   sd->granted_ = shard.AcquireIntents(sd->node_.keys_);
+  // A fully granted intent set has no conflict with any transaction already
+  // registered on this shard. Preserve that fact for every hop: future
+  // conflicting schedulers see these intents and cannot take the bypass.
   const std::uint64_t tail = shard.queue().TailTxid();
   // Reorder rule: inserting before the tail while conflicting is unsound —
   // a later transaction may already have run out of order assuming nothing
@@ -178,8 +181,7 @@ void Transaction::CancelInShard(ShardData* sd) {
 }
 
 void Transaction::ArmInShard(ShardData* sd) {
-  sd->node_.armed_ = true;
-  CurrentTxShard().Poll();
+  CurrentTxShard().ArmTransaction(&sd->node_, sd->granted_);
 }
 
 Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {

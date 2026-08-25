@@ -3617,6 +3617,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     const storage::TombRaiderTotals raider = g_storage->TombRaiderStats();
     const storage::DefragTotals defrag = g_storage->DefragStats();
     const storage::TxCleanerTotals tx_cleaner = g_storage->TxCleanerStats();
+    const storage::TxCommitBatchTotals tx_commit_batches =
+        g_storage->TxCommitBatchStats();
     const storage::StorageDurabilityStats durability =
         co_await g_storage->DurabilityStats();
     info += "# Stats\r\n";
@@ -3663,6 +3665,23 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "\r\n";
     info += std::string("tx_cleaner_running:") +
             (tx_cleaner.running_ ? "1\r\n\r\n" : "0\r\n\r\n");
+    info += "tx_commit_batches:" +
+            std::to_string(tx_commit_batches.batches_) + "\r\n";
+    info += "tx_commit_batch_transactions:" +
+            std::to_string(tx_commit_batches.transactions_) + "\r\n";
+    info += "tx_commit_input_fences:" +
+            std::to_string(tx_commit_batches.input_fences_) + "\r\n";
+    info += "tx_commit_merged_fences:" +
+            std::to_string(tx_commit_batches.merged_fences_) + "\r\n";
+    info += "tx_commit_queue_depth:" +
+            std::to_string(tx_commit_batches.queue_depth_) + "\r\n";
+    info += "tx_commit_queue_peak:" +
+            std::to_string(tx_commit_batches.queue_peak_) + "\r\n";
+    info += "tx_commit_backpressure_waits:" +
+            std::to_string(tx_commit_batches.backpressure_waits_) + "\r\n";
+    info += "tx_commit_queue_high_watermark:" +
+            std::to_string(tx_commit_batches.queue_high_watermark_) +
+            "\r\n\r\n";
     info += "storage_dirty_staging_bytes:" +
             std::to_string(durability.dirty_staging_bytes_) + "\r\n";
     info += "storage_expiration_pause_count:" +
@@ -4247,38 +4266,6 @@ Task<absl::Status> MultiKeyFinishCallback(void* context,
   co_return co_await g_storage->DiscardTxUndoLocal(txid);
 }
 
-// Detached commit chain for one multi-key write: waits for every shard's
-// tagged data to be durable, then appends the kTxCommit record. The client
-// reply never waits for this — losing the commit before it lands drops the
-// whole transaction at recovery, which relaxed durability already allows;
-// what it can never do is keep half of it.
-Task<absl::Status> RunTxCommit(std::uint64_t txid,
-                               std::vector<storage::TxShardWrites> writes) {
-  struct CommitDone {
-    ~CommitDone() { g_storage->NoteTxCommitFinished(); }
-  } commit_done;
-  std::vector<storage::TxShardWrites*> shards;
-  for (auto& shard : writes) {
-    // Command-local undo must always be settled before the EXEC-wide commit
-    // chain is detached. Committing while this flag is armed means a failure
-    // path forgot to restore its receipt checkpoint.
-    assert(!shard.collect_undo_);
-    if (!shard.fences_.empty() || !shard.retirements_.empty()) {
-      shards.push_back(&shard);
-    }
-  }
-  if (shards.empty()) {
-    co_return absl::OkStatus();
-  }
-  absl::Status committed =
-      co_await g_storage->CommitTxWrites(txid, std::move(shards));
-  if (!committed.ok()) {
-    spdlog::warn("transaction {} commit append failed: {}", txid,
-                 committed.message());
-  }
-  co_return absl::OkStatus();
-}
-
 using TwoPhaseCallback = Task<absl::Status> (*)(void*, const tx::ShardSlice&);
 
 Task<absl::Status> ReleaseHeldKeys(void*, const tx::ShardSlice&);
@@ -4518,9 +4505,10 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
 
   replication.SetFinalExpirations(context.writes_);
   replication.Commit();
-  g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(
-      RunTxCommit(execution.txid_, std::move(context.writes_)));
+  if (!g_storage->EnqueueTxCommit(execution.txid_,
+                                  std::move(context.writes_))) {
+    co_await g_storage->WaitForTxCommitCapacity();
+  }
   NotifyRenamedValue(request, args[2], context.source_.value_type_);
   co_return BuiltReply(nx ? reply_builder.AppendInteger(1)
                           : reply_builder.AppendSimpleString("OK"));
@@ -4672,9 +4660,10 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
 
   replication.SetFinalExpirations(context.writes_);
   replication.Commit();
-  g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(
-      RunTxCommit(execution.txid_, std::move(context.writes_)));
+  if (!g_storage->EnqueueTxCommit(execution.txid_,
+                                  std::move(context.writes_))) {
+    co_await g_storage->WaitForTxCommitCapacity();
+  }
   NotifyRenamedValue(request, options->destination_db_, args[2],
                      context.source_->value_type_);
   co_return BuiltReply(reply_builder.AppendInteger(1));
@@ -4769,9 +4758,10 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
   }
   replication.SetFinalExpirations(context.writes_);
   replication.Commit();
-  g_storage->NoteTxCommitStarted();
-  SpawnOnCurrentWorker(
-      RunTxCommit(execution.txid_, std::move(context.writes_)));
+  if (!g_storage->EnqueueTxCommit(execution.txid_,
+                                  std::move(context.writes_))) {
+    co_await g_storage->WaitForTxCommitCapacity();
+  }
   co_return BuiltReply(reply_builder.AppendInteger(1));
 }
 
@@ -4959,6 +4949,7 @@ Task<CommandReply> ExecuteMultiKey(
     // of the command.
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
+  bool tx_commit_has_capacity = true;
   if (write_txid != 0) {
     // The two-hop path already discarded these journals in its finish hop;
     // the single-shard path has no finish hop. Settle both uniformly before
@@ -4985,11 +4976,14 @@ Task<CommandReply> ExecuteMultiKey(
     if (replication != nullptr) {
       replication->SetFinalExpirations(ctx.tx_writes_);
     }
-    g_storage->NoteTxCommitStarted();
-    SpawnOnCurrentWorker(RunTxCommit(write_txid, std::move(ctx.tx_writes_)));
+    tx_commit_has_capacity =
+        g_storage->EnqueueTxCommit(write_txid, std::move(ctx.tx_writes_));
   }
 
   if (write && replication != nullptr) replication->Commit();
+  if (!tx_commit_has_capacity) {
+    co_await g_storage->WaitForTxCommitCapacity();
+  }
 
   switch (request.kind_) {
     case CommandKind::kMSet:
@@ -6510,9 +6504,10 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
       replication->Commit();
     }
     if (!read_only) {
-      g_storage->NoteTxCommitStarted();
-      SpawnOnCurrentWorker(
-          RunTxCommit(tx_writes.front().txid_, std::move(tx_writes)));
+      const std::uint64_t txid = tx_writes.front().txid_;
+      if (!g_storage->EnqueueTxCommit(txid, std::move(tx_writes))) {
+        co_await g_storage->WaitForTxCommitCapacity();
+      }
     }
   }
 
@@ -7321,8 +7316,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       if (replication != nullptr) {
         commit_replication(replication.get());
       }
-      g_storage->NoteTxCommitStarted();
-      SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
+      if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
+        co_await g_storage->WaitForTxCommitCapacity();
+      }
     } else {
       tx::Transaction txn;
       for (const auto& keys : cmd_keys) {
@@ -7454,8 +7450,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       if (replication != nullptr) {
         commit_replication(replication.get());
       }
-      g_storage->NoteTxCommitStarted();
-      SpawnOnCurrentWorker(RunTxCommit(exec_txid, std::move(tx_writes)));
+      if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
+        co_await g_storage->WaitForTxCommitCapacity();
+      }
     }
   } else {
     // Keyless-only transaction.

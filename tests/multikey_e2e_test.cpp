@@ -299,25 +299,25 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-std::uint64_t TxCleanerStat(RespClient& client, std::string_view marker) {
+std::uint64_t InfoStat(RespClient& client, std::string_view marker) {
   const std::string info = client.Command({"INFO", "STATS"});
   const std::size_t begin = info.find(marker);
-  if (begin == std::string::npos) Fail("tx cleaner INFO field is missing");
+  if (begin == std::string::npos) Fail("INFO field is missing");
   const std::size_t value_begin = begin + marker.size();
   const std::size_t value_end = info.find("\r\n", value_begin);
-  if (value_end == std::string::npos) Fail("malformed tx cleaner INFO field");
+  if (value_end == std::string::npos) Fail("malformed INFO field");
   std::uint64_t retired = 0;
   const char* first = info.data() + value_begin;
   const char* last = info.data() + value_end;
   const auto [parsed, error] = std::from_chars(first, last, retired);
   if (error != std::errc{} || parsed != last) {
-    Fail("invalid tx cleaner INFO counter");
+    Fail("invalid INFO counter");
   }
   return retired;
 }
 
 std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
-  return TxCleanerStat(client, "tx_cleaner_retired_generations:");
+  return InfoStat(client, "tx_cleaner_retired_generations:");
 }
 
 bool WaitForCleanerStat(RespClient& client, std::string_view marker,
@@ -325,7 +325,18 @@ bool WaitForCleanerStat(RespClient& client, std::string_view marker,
                         std::chrono::seconds timeout = 30s) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   while (std::chrono::steady_clock::now() < deadline) {
-    if (TxCleanerStat(client, marker) > baseline) return true;
+    if (InfoStat(client, marker) > baseline) return true;
+    std::this_thread::sleep_for(20ms);
+  }
+  return false;
+}
+
+bool WaitForInfoStat(RespClient& client, std::string_view marker,
+                     std::uint64_t expected,
+                     std::chrono::seconds timeout = 30s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (InfoStat(client, marker) == expected) return true;
     std::this_thread::sleep_for(20ms);
   }
   return false;
@@ -444,6 +455,84 @@ int main(int argc, char** argv) {
                Bulk("v7") + "\r\n" + Bulk("v2"),
            "shuffled MGET");
     Expect(client.Command({"GET", "mk3"}), Bulk("v3"), "single GET after MSET");
+
+    // Progress regression for the multi-shard scheduler. These writers use
+    // disjoint key sets, so their granted intents are conflict-free even when
+    // lower-txid transactions are still waiting on unrelated shards. A
+    // head-only queue can form a cross-shard wait cycle here and stop all
+    // clients; every command must instead finish within one shared deadline.
+    {
+      constexpr int kWriters = 48;
+      constexpr int kRounds = 64;
+      constexpr int kKeysPerCommand = 8;
+      if (!WaitForInfoStat(client, "storage_tx_commits_pending:", 0)) {
+        Fail("initial MSET commit did not drain");
+      }
+      const std::uint64_t batches_before =
+          InfoStat(client, "tx_commit_batches:");
+      const std::uint64_t transactions_before =
+          InfoStat(client, "tx_commit_batch_transactions:");
+      const std::uint64_t input_fences_before =
+          InfoStat(client, "tx_commit_input_fences:");
+      const std::uint64_t merged_fences_before =
+          InfoStat(client, "tx_commit_merged_fences:");
+      std::vector<std::future<void>> writers;
+      writers.reserve(kWriters);
+      for (int writer = 0; writer < kWriters; ++writer) {
+        writers.push_back(std::async(std::launch::async, [port, writer] {
+          RespClient stress = Connect(port);
+          std::vector<std::string> keys;
+          keys.reserve(kKeysPerCommand);
+          for (int key = 0; key < kKeysPerCommand; ++key) {
+            keys.push_back("tx-progress:" + std::to_string(writer) + ":" +
+                           std::to_string(key));
+          }
+          for (int round = 0; round < kRounds; ++round) {
+            std::string value = "writer:" + std::to_string(writer) +
+                                ":round:" + std::to_string(round);
+            value.resize(256, static_cast<char>('a' + writer % 26));
+            std::vector<std::string_view> command{"MSET"};
+            command.reserve(1 + 2 * kKeysPerCommand);
+            for (const std::string& key : keys) {
+              command.push_back(key);
+              command.push_back(value);
+            }
+            Expect(stress.Command(command), "+OK",
+                   "conflict-free concurrent MSET");
+          }
+        }));
+      }
+      const auto progress_deadline = std::chrono::steady_clock::now() + 45s;
+      for (auto& writer : writers) {
+        if (writer.wait_until(progress_deadline) != std::future_status::ready) {
+          Fail("conflict-free concurrent MSET made no progress");
+        }
+      }
+      for (auto& writer : writers) writer.get();
+      if (!WaitForInfoStat(client, "storage_tx_commits_pending:", 0)) {
+        Fail("batched MSET commits did not drain");
+      }
+      const std::uint64_t batches =
+          InfoStat(client, "tx_commit_batches:") - batches_before;
+      const std::uint64_t transactions =
+          InfoStat(client, "tx_commit_batch_transactions:") -
+          transactions_before;
+      const std::uint64_t input_fences =
+          InfoStat(client, "tx_commit_input_fences:") -
+          input_fences_before;
+      const std::uint64_t merged_fences =
+          InfoStat(client, "tx_commit_merged_fences:") -
+          merged_fences_before;
+      if (transactions != kWriters * kRounds) {
+        Fail("commit coordinator lost a concurrent MSET receipt");
+      }
+      if (batches >= transactions) {
+        Fail("commit coordinator did not batch concurrent MSET receipts");
+      }
+      if (merged_fences >= input_fences) {
+        Fail("commit coordinator did not merge shared durability fences");
+      }
+    }
 
     // Arity and pairing errors.
     Expect(client.Command({"MSET", "solo"}),
@@ -782,7 +871,7 @@ int main(int argc, char** argv) {
            "+OK", "enable cleaner for active transaction map rehash");
     std::this_thread::sleep_for(100ms);
     const std::uint64_t rehash_round_baseline =
-        TxCleanerStat(rehash_control, "tx_cleaner_rounds:");
+        InfoStat(rehash_control, "tx_cleaner_rounds:");
     auto paused_write = std::async(std::launch::async, [port] {
       RespClient client = Connect(port);
       return client.Command({"MSET", "rehash-paused-a{tx-map}", "paused-a",
@@ -823,7 +912,7 @@ int main(int argc, char** argv) {
                                true);
     RespClient retry = Connect(port);
     const std::uint64_t failure_baseline =
-        TxCleanerStat(retry, "tx_cleaner_failures:");
+        InfoStat(retry, "tx_cleaner_failures:");
     const std::uint64_t retry_retired_baseline =
         TxCleanerRetiredGenerations(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
