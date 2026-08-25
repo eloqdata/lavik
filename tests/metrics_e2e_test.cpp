@@ -114,13 +114,7 @@ class RespClient {
   }
 
   std::string Command(const std::vector<std::string_view>& args) {
-    std::string request = "*" + std::to_string(args.size()) + "\r\n";
-    for (const std::string_view arg : args) {
-      request += "$" + std::to_string(arg.size()) + "\r\n";
-      request.append(arg);
-      request.append("\r\n");
-    }
-    SendAll(fd_, request);
+    SendCommand(args);
     std::string reply;
     while (!reply.ends_with("\r\n")) {
       char byte = 0;
@@ -150,7 +144,74 @@ class RespClient {
     return reply + "\r\n" + payload;
   }
 
+  std::string RawCommand(const std::vector<std::string_view>& args) {
+    SendCommand(args);
+    return ReadRawReply();
+  }
+
  private:
+  void SendCommand(const std::vector<std::string_view>& args) {
+    std::string request = "*" + std::to_string(args.size()) + "\r\n";
+    for (const std::string_view arg : args) {
+      request += "$" + std::to_string(arg.size()) + "\r\n";
+      request.append(arg);
+      request.append("\r\n");
+    }
+    SendAll(fd_, request);
+  }
+
+  std::string ReadLine() {
+    std::string line;
+    for (;;) {
+      char byte = 0;
+      if (::recv(fd_, &byte, 1, 0) != 1) {
+        throw std::runtime_error("failed to read RESP line");
+      }
+      if (byte == '\r') {
+        if (::recv(fd_, &byte, 1, 0) != 1 || byte != '\n') {
+          throw std::runtime_error("malformed RESP line terminator");
+        }
+        return line;
+      }
+      line.push_back(byte);
+    }
+  }
+
+  std::string ReadRawReply() {
+    char prefix = 0;
+    if (::recv(fd_, &prefix, 1, 0) != 1) {
+      throw std::runtime_error("failed to read RESP type");
+    }
+    const std::string line = ReadLine();
+    std::string result(1, prefix);
+    result.append(line);
+    result.append("\r\n");
+    if (prefix == '*') {
+      const long long count = std::stoll(line);
+      for (long long index = 0; index < count; ++index) {
+        result.append(ReadRawReply());
+      }
+      return result;
+    }
+    if (prefix != '$' || line == "-1") return result;
+    const std::size_t length = static_cast<std::size_t>(std::stoull(line));
+    std::string payload(length + 2, '\0');
+    std::size_t received = 0;
+    while (received < payload.size()) {
+      const ssize_t bytes =
+          ::recv(fd_, payload.data() + received, payload.size() - received, 0);
+      if (bytes <= 0) {
+        throw std::runtime_error("failed to read RESP bulk payload");
+      }
+      received += static_cast<std::size_t>(bytes);
+    }
+    if (!payload.ends_with("\r\n")) {
+      throw std::runtime_error("malformed RESP bulk terminator");
+    }
+    result.append(payload);
+    return result;
+  }
+
   int fd_ = -1;
 };
 
@@ -308,8 +369,7 @@ TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {
   RespClient second(redis_port);
 
   EXPECT_EQ(first.Command({"PING"}), "+PONG");
-  EXPECT_EQ(second.Command({"ECHO", "before-reset"}),
-            "$12\r\nbefore-reset");
+  EXPECT_EQ(second.Command({"ECHO", "before-reset"}), "$12\r\nbefore-reset");
   EXPECT_EQ(first.Command({"SET", "resetstat-key", "value"}), "+OK");
   const std::string before = second.Command({"INFO", "commandstats"});
   EXPECT_NE(before.find("cmdstat_ping:calls=1,"), std::string::npos);
@@ -331,6 +391,57 @@ TEST(MetricsE2eTest, ConfigResetstatClearsCommandCountersOnly) {
   EXPECT_EQ(first.Command({"CONFIG", "RESETSTAT"}), "+OK");
   const std::string stats = first.Command({"INFO", "stats"});
   EXPECT_NE(stats.find("total_commands_processed:1\r\n"), std::string::npos);
+  server.Stop();
+}
+
+TEST(MetricsE2eTest, SlowLogRecordsBoundsQueriesAndDisables) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-slowlog-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t redis_port = FindFreePort();
+  std::uint16_t metrics_port = FindFreePort();
+  while (metrics_port == redis_port) metrics_port = FindFreePort();
+  ServerProcess server(g_keylane_binary, redis_port, metrics_port, data_path,
+                       log_path);
+  RespClient client(redis_port);
+
+  EXPECT_EQ(client.Command({"CONFIG", "SET", "slowlog-log-slower-than", "0"}),
+            "+OK");
+  EXPECT_EQ(client.Command({"CONFIG", "SET", "slowlog-max-len", "3"}), "+OK");
+  const std::string configuration =
+      client.RawCommand({"CONFIG", "GET", "slowlog-*"});
+  EXPECT_NE(configuration.find("slowlog-log-slower-than"), std::string::npos);
+  EXPECT_NE(configuration.find("slowlog-max-len"), std::string::npos);
+  EXPECT_EQ(client.Command({"CLIENT", "SETNAME", "slowlog-e2e"}), "+OK");
+  EXPECT_EQ(client.Command({"SLOWLOG", "RESET"}), "+OK");
+  EXPECT_EQ(client.Command({"PING"}), "+PONG");
+  const std::string large_argument(200, 'x');
+  EXPECT_EQ(client.Command({"ECHO", large_argument}),
+            "$200\r\n" + large_argument);
+
+  const std::string entries = client.RawCommand({"SLOWLOG", "GET", "-1"});
+  EXPECT_TRUE(entries.starts_with("*3\r\n")) << entries;
+  EXPECT_NE(entries.find("$4\r\nECHO\r\n"), std::string::npos) << entries;
+  EXPECT_NE(entries.find("... (72 more bytes)"), std::string::npos) << entries;
+  EXPECT_NE(entries.find("$11\r\nslowlog-e2e\r\n"), std::string::npos)
+      << entries;
+  EXPECT_EQ(client.Command({"SLOWLOG", "LEN"}), ":3");
+
+  EXPECT_EQ(client.Command({"CONFIG", "SET", "slowlog-log-slower-than", "-1"}),
+            "+OK");
+  EXPECT_EQ(client.Command({"SLOWLOG", "RESET"}), "+OK");
+  EXPECT_EQ(client.Command({"PING"}), "+PONG");
+  EXPECT_EQ(client.Command({"SLOWLOG", "LEN"}), ":0");
   server.Stop();
 }
 

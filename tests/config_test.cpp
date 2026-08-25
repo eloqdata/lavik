@@ -129,6 +129,11 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ASSERT_TRUE(ApplyRedisConfigDirective(
                   {"replication-snapshot-batch-size", "32"}, &options)
                   .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"slowlog-log-slower-than", "2500"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"slowlog-max-len", "64"}, &options).ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -156,6 +161,8 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.background_warrant_percent_, 7u);
   EXPECT_EQ(options.spdk_max_completions_per_poll_, 4u);
   EXPECT_EQ(options.replication_options_.snapshot_batch_size_, 32u);
+  EXPECT_EQ(options.slowlog_log_slower_than_us_, 2500);
+  EXPECT_EQ(options.slowlog_max_len_, 64u);
 }
 
 TEST(RedisConfigTest, AppliesLoggingDirectivesAndAliases) {
@@ -248,6 +255,14 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   EXPECT_FALSE(ApplyRedisConfigDirective(
                    {"replication-snapshot-batch-size", "0"}, &options)
                    .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"slowlog-log-slower-than", "-2"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"slowlog-log-slower-than", "fast"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"slowlog-max-len", "-1"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());
 }
 

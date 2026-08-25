@@ -51,6 +51,7 @@
 #include "keylane/replication.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
+#include "keylane/slowlog.h"
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
 #include "keylane/version.h"
@@ -1952,6 +1953,8 @@ int RunServer(ServerOptions options) {
       absl::StrCat(options.rdb_dir_, options.rdb_dir_.ends_with('/') ? "" : "/",
                    options.dbfilename_));
   InitWorkerMetrics(options.thread_count_);
+  InitSlowLog(options.thread_count_, options.slowlog_log_slower_than_us_,
+              options.slowlog_max_len_);
   SetServerInfo(std::move(advertised_bind), advertised_port,
                 options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);

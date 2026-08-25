@@ -143,6 +143,16 @@ int main(int argc, char** argv) {
                  "Busy-poll CQ and cross-core mailboxes before parking")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_option(
+         "--slowlog-log-slower-than", options.slowlog_log_slower_than_us_,
+         "Log commands slower than this many microseconds (-1 disables)")
+      ->capture_default_str()
+      ->check(CLI::Range(std::int64_t{-1},
+                         std::numeric_limits<std::int64_t>::max()));
+  app.add_option("--slowlog-max-len", options.slowlog_max_len_,
+                 "Maximum number of slow commands retained")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--foreground-budget-us", options.foreground_budget_us_,
                  "Maximum worker foreground slice in microseconds")
       ->capture_default_str()

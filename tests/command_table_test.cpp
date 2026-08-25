@@ -246,6 +246,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("SLAVEOF", CommandKind::kReplicaOf);
   CheckKind("ROLE", CommandKind::kRole);
   CheckKind("MONITOR", CommandKind::kMonitor);
+  CheckKind("SLOWLOG", CommandKind::kSlowLog);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
   CheckKind("DEFRAG", CommandKind::kDefrag);
   CheckKind("ZADD", CommandKind::kZAdd);
@@ -306,6 +307,10 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("config", 3, true);
   CheckArity("config", 4, true);
   CheckArity("config", 5, false);
+  CheckArity("slowlog", 1, false);
+  CheckArity("slowlog", 2, true);
+  CheckArity("slowlog", 3, true);
+  CheckArity("slowlog", 4, false);
   CheckArity("dump", 1, false);
   CheckArity("dump", 2, true);
   CheckArity("dump", 3, false);

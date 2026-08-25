@@ -47,6 +47,7 @@
 #include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/session.h"
+#include "keylane/slowlog.h"
 #include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/transaction.h"
@@ -841,6 +842,82 @@ bool ParseUint64(std::string_view text, std::uint64_t* value) {
   return error == std::errc{} && parsed_end == end;
 }
 
+bool ParseSlowLogCount(std::string_view text, std::int64_t* value) {
+  if (text.empty()) return false;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [parsed_end, error] = std::from_chars(begin, end, *value);
+  return error == std::errc{} && parsed_end == end;
+}
+
+Task<CommandReply> ExecuteSlowLog(const CommandRequest& request,
+                                  ReplyBuilder& reply_builder) {
+  const auto& args = request.args_;
+  const std::string_view subcommand = args[1];
+  if (CmpCaseInsensitive(subcommand, "HELP") && args.size() == 2) {
+    constexpr std::array<std::string_view, 12> help{
+        "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "GET [<count>]",
+        "    Return the newest <count> entries (default: 10, -1 means all).",
+        "    Entries are made of:",
+        "    id, timestamp, time in microseconds, arguments array, client IP "
+        "and port,",
+        "    client name",
+        "LEN",
+        "    Return the length of the slow log.",
+        "RESET",
+        "    Reset the slow log.",
+        "HELP",
+        "    Print this help.",
+    };
+    reply_builder.AppendArrayHeader(help.size());
+    for (std::string_view line : help) reply_builder.AppendBulkString(line);
+    co_return BuiltReply(reply_builder.View());
+  }
+  if (CmpCaseInsensitive(subcommand, "LEN") && args.size() == 2) {
+    const std::size_t length = co_await SlowLogLength();
+    co_return BuiltReply(reply_builder.AppendInteger(static_cast<long long>(
+        std::min<std::size_t>(length, std::numeric_limits<long long>::max()))));
+  }
+  if (CmpCaseInsensitive(subcommand, "RESET") && args.size() == 2) {
+    const absl::Status reset = co_await ResetSlowLog();
+    co_return reset.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+        : BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR ", reset.message())));
+  }
+  if (CmpCaseInsensitive(subcommand, "GET") && args.size() <= 3) {
+    std::size_t count = 10;
+    if (args.size() == 3) {
+      std::int64_t parsed = 0;
+      if (!ParseSlowLogCount(args[2], &parsed) || parsed < -1) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR count should be greater than or equal to -1"));
+      }
+      count = parsed == -1 ? std::numeric_limits<std::size_t>::max()
+                           : static_cast<std::size_t>(parsed);
+    }
+    std::vector<SlowLogEntry> entries = co_await CollectSlowLog(count);
+    reply_builder.AppendArrayHeader(entries.size());
+    for (const SlowLogEntry& entry : entries) {
+      reply_builder.AppendArrayHeader(6);
+      reply_builder.AppendInteger(static_cast<long long>(entry.id_));
+      reply_builder.AppendInteger(entry.unix_time_seconds_);
+      reply_builder.AppendInteger(
+          static_cast<long long>(std::min<std::uint64_t>(
+              entry.duration_micros_, std::numeric_limits<long long>::max())));
+      reply_builder.AppendArrayHeader(entry.args_.size());
+      for (const std::string& argument : entry.args_) {
+        reply_builder.AppendBulkString(argument);
+      }
+      reply_builder.AppendBulkString(entry.client_address_);
+      reply_builder.AppendBulkString(entry.client_name_);
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+  co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+      "ERR unknown subcommand '", subcommand, "'. Try SLOWLOG HELP.")));
+}
+
 constexpr std::string_view kSnapshotReadConcurrencyConfig =
     "replication-snapshot-read-concurrency";
 constexpr std::string_view kSnapshotBatchSizeConfig =
@@ -869,6 +946,8 @@ constexpr std::string_view kSpdkMaxCompletionsConfig =
     "spdk-max-completions-per-poll";
 constexpr std::string_view kStreamNodeMaxEntriesConfig =
     "stream-node-max-entries";
+constexpr std::string_view kSlowLogThresholdConfig = "slowlog-log-slower-than";
+constexpr std::string_view kSlowLogMaxLenConfig = "slowlog-max-len";
 
 enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
@@ -890,6 +969,8 @@ enum class RuntimeConfigKey : std::uint8_t {
   kBackgroundWarrant,
   kSpdkMaxCompletions,
   kStreamNodeMaxEntries,
+  kSlowLogThreshold,
+  kSlowLogMaxLen,
 };
 
 struct RuntimeConfigDescriptor {
@@ -937,6 +1018,10 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kSpdkMaxCompletions},
     RuntimeConfigDescriptor{kStreamNodeMaxEntriesConfig,
                             RuntimeConfigKey::kStreamNodeMaxEntries},
+    RuntimeConfigDescriptor{kSlowLogThresholdConfig,
+                            RuntimeConfigKey::kSlowLogThreshold},
+    RuntimeConfigDescriptor{kSlowLogMaxLenConfig,
+                            RuntimeConfigKey::kSlowLogMaxLen},
 };
 
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
@@ -1087,6 +1172,10 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
               celer::ThisWorker().self_->spdk_max_completions_per_poll());
         case RuntimeConfigKey::kStreamNodeMaxEntries:
           return std::to_string(StreamNodeMaxEntries());
+        case RuntimeConfigKey::kSlowLogThreshold:
+          return std::to_string(SlowLogThresholdMicros());
+        case RuntimeConfigKey::kSlowLogMaxLen:
+          return std::to_string(SlowLogMaxLen());
       }
       return {};
     };
@@ -1289,6 +1378,23 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured = SetStreamNodeMaxEntries(value);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kSlowLogThreshold) {
+      std::int64_t threshold = 0;
+      if (!ParseSlowLogCount(args[3], &threshold) || threshold < -1) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured = co_await ConfigureSlowLogThreshold(threshold);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kSlowLogMaxLen) {
+      if (!ParseUint64(args[3], &value) ||
+          value > std::numeric_limits<std::size_t>::max()) {
+        configured = absl::InvalidArgumentError(
+            "value is not an integer or out of range");
+      } else {
+        configured =
+            co_await ConfigureSlowLogMaxLen(static_cast<std::size_t>(value));
       }
     }
     co_return configured.ok()
@@ -8428,7 +8534,7 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
 }  // namespace
 
 Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
-                                       CommandRequest request,
+                                       CommandRequest& request,
                                        ReplyBuilder& reply_builder) {
   const CommandKind kind = request.kind_;
   if (request.spec_ != nullptr) {
@@ -8460,6 +8566,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kReadOnly:
         case CommandKind::kReadWrite:
         case CommandKind::kMonitor:
+        case CommandKind::kSlowLog:
         case CommandKind::kPublish:
         case CommandKind::kPubSub:
         case CommandKind::kPSubscribe:
@@ -8661,13 +8768,18 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
   } restore{ctx, previous_cascade};
   request.resp_version_ = ctx.resp_version();
   const CommandKind kind = request.kind_;
+  const bool may_block =
+      request.spec_ != nullptr && (request.spec_->flags_ & kCmdMayBlock) != 0;
   const std::uint64_t started = celer::ReadCycleCounter();
   CommandReply reply =
-      co_await DispatchCommandImpl(ctx, std::move(request), reply_builder);
+      co_await DispatchCommandImpl(ctx, request, reply_builder);
   if (!cascade.empty()) {
     (void)co_await DrainBlockingWakeCascade(cascade);
   }
-  RecordCommandMetric(kind, celer::ReadCycleCounter() - started);
+  const std::uint64_t elapsed_ticks = celer::ReadCycleCounter() - started;
+  RecordCommandMetric(kind, elapsed_ticks);
+  MaybeRecordSlowCommand(request.args_, ctx.peer_address_, ctx.client_name_,
+                         elapsed_ticks, may_block);
   co_return reply;
 }
 
@@ -8773,6 +8885,9 @@ Task<CommandReply> ExecuteCommandBody(
 
     case CommandKind::kConfig:
       co_return co_await ExecuteConfig(request, reply_builder);
+
+    case CommandKind::kSlowLog:
+      co_return co_await ExecuteSlowLog(request, reply_builder);
 
     case CommandKind::kInfo:
       co_return co_await ExecuteInfo(request, reply_builder);

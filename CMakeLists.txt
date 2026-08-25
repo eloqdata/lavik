@@ -215,6 +215,7 @@ add_library(keylane_module
   src/redis/monitor.cpp
   src/redis/pubsub.cpp
   src/redis/set_command.cpp
+  src/redis/slowlog.cpp
   src/redis/sort_command.cpp
   src/redis/string_command.cpp
   src/redis/stream_command.cpp

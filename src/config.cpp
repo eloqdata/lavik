@@ -41,6 +41,22 @@ absl::Status ParseUnsigned(std::string_view text, std::string_view name,
   return absl::OkStatus();
 }
 
+template <typename T>
+absl::Status ParseSigned(std::string_view text, std::string_view name,
+                         T* value) {
+  static_assert(std::is_signed_v<T>);
+  T parsed = 0;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto [parsed_end, error] = std::from_chars(begin, end, parsed);
+  if (text.empty() || error != std::errc{} || parsed_end != end) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("invalid ", name, " '", text, "'"));
+  }
+  *value = parsed;
+  return absl::OkStatus();
+}
+
 absl::StatusOr<bool> ParseYesNo(std::string_view text, std::string_view name) {
   if (absl::EqualsIgnoreCase(text, "yes")) return true;
   if (absl::EqualsIgnoreCase(text, "no")) return false;
@@ -361,6 +377,21 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->recv_buffer_count_,
                          true);
+  }
+  if (name == "slowlog-log-slower-than") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    absl::Status parsed =
+        ParseSigned(directive[1], name, &options->slowlog_log_slower_than_us_);
+    if (!parsed.ok()) return parsed;
+    if (options->slowlog_log_slower_than_us_ < -1) {
+      return absl::InvalidArgumentError(
+          "slowlog-log-slower-than must be greater than or equal to -1");
+    }
+    return absl::OkStatus();
+  }
+  if (name == "slowlog-max-len") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->slowlog_max_len_, true);
   }
   if (name == "foreground-budget-us" || name == "background-budget-us" ||
       name == "background-warrant-percent" ||
