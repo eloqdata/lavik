@@ -798,8 +798,6 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
   };
 
   for (;;) {
-    const std::size_t low_watermark =
-        log.max_blocks_ - std::max<std::size_t>(1, log.max_blocks_ / 4);
     const auto retained = retained_lsn();
     const std::uint64_t keep_from = retained.has_value()
                                         ? std::min(protected_lsn, *retained)
@@ -818,15 +816,19 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
       log.capacity_backpressured_ = false;
     }
     if (log.capacity_backpressured_) {
-      if (log.blocks_.size() <= low_watermark) {
-        log.capacity_backpressured_ = false;
-      } else if (evictable) {
+      if (evictable) {
         evict_event();
-        continue;
+        // One block is the allocation quantum. Once an ACK makes a complete
+        // event reclaimable, hand that space directly to the waiting
+        // publisher instead of requiring the replica to drain a quarter of
+        // the entire backlog first. A multi-gigabyte reconnect window can
+        // otherwise turn ordinary replica lag into minutes of zero foreground
+        // throughput even though ACKs are advancing continuously.
+        log.capacity_backpressured_ = false;
       } else if (retained.has_value()) {
-        // High/low hysteresis is intentional: waking for one ACK and admitting
-        // one write can leave a slower replica permanently glued to the high
-        // watermark. Drain to the low watermark before reopening writers.
+        // Keep the publisher asleep until the oldest complete event is ACKed.
+        // Admission remains block-granular, so a slower replica cannot cause
+        // one wakeup per command while the backlog stays at capacity.
         co_await log.retention_advanced_.Wait();
         if (log.state_ != ReplicationLogState::kActive) {
           co_return InvalidState(

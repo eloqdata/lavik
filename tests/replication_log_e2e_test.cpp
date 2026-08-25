@@ -1479,10 +1479,10 @@ class ReplicationLogService final : public celer::Service {
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
-    // Releasing the final disconnected-replica pin must leave a full circular
-    // reconnect window. The connected-consumer low-water hysteresis would
-    // otherwise discard a second block even though only one block of space is
-    // needed by the waiting append.
+    // Advancing a connected replica by one complete block must hand that space
+    // directly to the waiting publisher. Waiting for a percentage-based low
+    // watermark makes a large reconnect window produce arbitrarily long
+    // zero-throughput stalls even while replica ACKs keep advancing.
     status = co_await storage_->EnableReplicationLog(20, 8 * 8 * kMiB);
     if (!status.ok()) co_return status;
     status = storage_->RetainReplicationLog(79, 1);
@@ -1520,14 +1520,10 @@ class ReplicationLogService final : public celer::Service {
           "full backlog did not wait for its retained cursor");
     status = storage_->RetainReplicationLog(79, 2);
     if (!status.ok()) co_return status;
-    for (unsigned spin = 0; spin < 32; ++spin) {
-      co_await celer::Yield(*worker_);
-    }
-    Check(!reconnect_append_finished,
-          "connected pin ignored low-water backpressure hysteresis");
-    storage_->ReleaseReplicationLogRetention(79);
     while (!reconnect_append_finished) co_await celer::Yield(*worker_);
-    if (!reconnect_append_status.ok()) co_return reconnect_append_status;
+    Check(reconnect_append_status.ok(),
+          "ACKed backlog block did not release the waiting publisher");
+    storage_->ReleaseReplicationLogRetention(79);
     const auto reconnect_info = storage_->LocalReplicationLogInfo();
     Check(reconnect_info.floor_lsn_ == 2,
           "disconnect eagerly discarded part of the reconnect window");
