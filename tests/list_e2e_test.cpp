@@ -639,8 +639,8 @@ TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
   {
     ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
     RespClient client(port);
-    EXPECT_EQ(client.Command(
-                  {"CONFIG", "SET", "stream-node-max-entries", "10"}),
+    EXPECT_EQ(
+        client.Command({"CONFIG", "SET", "stream-node-max-entries", "10"}),
               "+OK");
     for (unsigned index = 1; index <= 100; ++index) {
       const std::string id = std::to_string(index) + "-0";
@@ -979,10 +979,8 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   auto wait_until_blocked = [&](std::string_view id) {
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (std::chrono::steady_clock::now() < deadline) {
-      const std::string listing =
-          client.Command({"CLIENT", "LIST", "ID", id});
-      if (listing.find("id=" + std::string(id) + " ") !=
-              std::string::npos &&
+      const std::string listing = client.Command({"CLIENT", "LIST", "ID", id});
+      if (listing.find("id=" + std::string(id) + " ") != std::string::npos &&
           listing.find(" flags=b ") != std::string::npos) {
         return true;
       }
@@ -998,7 +996,8 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   };
 
   const std::string help = client.Command({"CLIENT", "HELP"});
-  EXPECT_NE(help.find(
+  EXPECT_NE(
+      help.find(
                 "+CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
             std::string::npos);
   EXPECT_NE(help.find("+SETINFO <option> <value>"), std::string::npos);
@@ -1013,19 +1012,19 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
             "-ERR wrong number of arguments for 'client|info' command");
   EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", "redis.py"}),
             "+OK");
-  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "LIB-VER", "1.2.3"}),
-            "+OK");
+  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "LIB-VER", "1.2.3"}), "+OK");
   info = client.Command({"CLIENT", "INFO"});
-  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"),
-            std::string::npos);
+  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"), std::string::npos);
   const std::string metadata_id = client_id(client.Command({"CLIENT", "ID"}));
   const std::string metadata_listing =
       client.Command({"CLIENT", "LIST", "ID", metadata_id});
   EXPECT_NE(metadata_listing.find(" lib-name=redis.py lib-ver=1.2.3"),
             std::string::npos);
-  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", "redis py"}),
+  EXPECT_EQ(
+      client.Command({"CLIENT", "SETINFO", "lib-name", "redis py"}),
             "-ERR lib-name cannot contain spaces, newlines or special characters.");
-  EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-ver", "1.2\n3"}),
+  EXPECT_EQ(
+      client.Command({"CLIENT", "SETINFO", "lib-ver", "1.2\n3"}),
             "-ERR lib-ver cannot contain spaces, newlines or special characters.");
   EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "badger", "hamster"}),
             "-ERR Unrecognized option 'badger'");
@@ -1033,8 +1032,7 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
             "-ERR wrong number of arguments for 'client|setinfo' command");
   EXPECT_EQ(client.Command({"RESET"}), "+RESET");
   info = client.Command({"CLIENT", "INFO"});
-  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"),
-            std::string::npos);
+  EXPECT_NE(info.find(" lib-name=redis.py lib-ver=1.2.3"), std::string::npos);
   EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name", ""}), "+OK");
   info = client.Command({"CLIENT", "INFO"});
   EXPECT_NE(info.find(" lib-name= lib-ver=1.2.3"), std::string::npos);
@@ -1048,8 +1046,8 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
 
   std::promise<std::string> timeout_id_promise;
   std::future<std::string> timeout_id = timeout_id_promise.get_future();
-  auto timeout_waiter = std::async(
-      std::launch::async, [port, &timeout_id_promise, &client_id] {
+  auto timeout_waiter =
+      std::async(std::launch::async, [port, &timeout_id_promise, &client_id] {
         RespClient waiting(port);
         timeout_id_promise.set_value(
             client_id(waiting.Command({"CLIENT", "ID"})));
@@ -1064,19 +1062,15 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
 
   std::promise<std::string> error_id_promise;
   std::future<std::string> error_id = error_id_promise.get_future();
-  auto error_waiter = std::async(std::launch::async,
-                                 [port, &error_id_promise, &client_id] {
+  auto error_waiter = std::async(std::launch::async, [port, &error_id_promise,
+                                                      &client_id] {
                                    RespClient waiting(port);
-                                   error_id_promise.set_value(
-                                       client_id(waiting.Command(
-                                           {"CLIENT", "ID"})));
-                                   return waiting.Command(
-                                       {"BLPOP", "client-unblock-error", "5"});
+    error_id_promise.set_value(client_id(waiting.Command({"CLIENT", "ID"})));
+    return waiting.Command({"BLPOP", "client-unblock-error", "5"});
                                  });
   const std::string error_client_id = error_id.get();
   ASSERT_TRUE(wait_until_blocked(error_client_id));
-  EXPECT_EQ(
-      client.Command({"CLIENT", "UNBLOCK", error_client_id, "ERROR"}),
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", error_client_id, "ERROR"}),
       ":1");
   ASSERT_EQ(error_waiter.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(error_waiter.get(),
@@ -1084,20 +1078,16 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
 
   std::promise<std::string> stream_id_promise;
   std::future<std::string> stream_id = stream_id_promise.get_future();
-  auto stream_waiter = std::async(std::launch::async,
-                                  [port, &stream_id_promise, &client_id] {
+  auto stream_waiter = std::async(std::launch::async, [port, &stream_id_promise,
+                                                       &client_id] {
                                     RespClient waiting(port);
-                                    stream_id_promise.set_value(
-                                        client_id(waiting.Command(
-                                            {"CLIENT", "ID"})));
+    stream_id_promise.set_value(client_id(waiting.Command({"CLIENT", "ID"})));
                                     return waiting.Command(
-                                        {"XREAD", "BLOCK", "5000", "STREAMS",
-                                         "client-unblock-stream", "0-0"});
+        {"XREAD", "BLOCK", "5000", "STREAMS", "client-unblock-stream", "0-0"});
                                   });
   const std::string stream_client_id = stream_id.get();
   ASSERT_TRUE(wait_until_blocked(stream_client_id));
-  EXPECT_EQ(
-      client.Command({"CLIENT", "UNBLOCK", stream_client_id, "ERROR"}),
+  EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", stream_client_id, "ERROR"}),
       ":1");
   ASSERT_EQ(stream_waiter.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(stream_waiter.get(),
@@ -1139,8 +1129,7 @@ TEST(ListE2eTest, DisconnectCancelsActiveBlockingWait) {
 
   const int blocked = ConnectSocket(port);
   ASSERT_GE(blocked, 0);
-  SendAll(blocked,
-          EncodeCommand({"BLPOP", "disconnect-blocked-client", "0"}));
+  SendAll(blocked, EncodeCommand({"BLPOP", "disconnect-blocked-client", "0"}));
   ASSERT_TRUE(wait_for_blocked_clients(1));
   ASSERT_EQ(::close(blocked), 0);
   EXPECT_TRUE(wait_for_blocked_clients(0));
@@ -1202,7 +1191,8 @@ TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
   SendAll(pipelined, commands);
 
   ASSERT_EQ(first_waiter.wait_for(1s), std::future_status::ready);
-  EXPECT_EQ(first_waiter.get(), "*2\r\n$26\r\npipeline-blocking-fairness\r\n"
+  EXPECT_EQ(first_waiter.get(),
+            "*2\r\n$26\r\npipeline-blocking-fairness\r\n"
                                 "$5\r\nfirst");
   // This reply must be on the wire even though the next pipelined command is
   // now blocked on the same connection.
@@ -1319,8 +1309,7 @@ TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
 TEST(ListE2eTest, CircularBlockingMovesDrainBeforeTriggerReply) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
-      "/tmp/keylane-circular-blocking-move-e2e-" +
-      std::to_string(::getpid());
+      "/tmp/keylane-circular-blocking-move-e2e-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
   const std::string log_path = prefix + ".log";
   FileCleanup data_cleanup(data_path);
@@ -1374,8 +1363,7 @@ TEST(ListE2eTest, CircularBlockingMovesDrainBeforeTriggerReply) {
 
     // Redis drains ready keys, including nested wakes, before accepting the
     // next command. The value must already have completed both moves here.
-    EXPECT_EQ(client.Command({"LRANGE", first, "0", "-1"}),
-              BulkArray({"foo"}));
+    EXPECT_EQ(client.Command({"LRANGE", first, "0", "-1"}), BulkArray({"foo"}));
     EXPECT_EQ(client.Command({"LRANGE", second, "0", "-1"}), "*0");
     ASSERT_EQ(forward.wait_for(1s), std::future_status::ready);
     ASSERT_EQ(backward.wait_for(1s), std::future_status::ready);
@@ -1429,9 +1417,8 @@ TEST(ListE2eTest, BlockingMovesDoNotDirtyWatchBeforeWakeAndCountChanges) {
     const std::size_t value_begin = begin + marker.size();
     const std::size_t value_end = info.find("\r\n", value_begin);
     std::uint64_t value = 0;
-    const auto [parsed, error] =
-        std::from_chars(info.data() + value_begin, info.data() + value_end,
-                        value);
+    const auto [parsed, error] = std::from_chars(
+        info.data() + value_begin, info.data() + value_end, value);
     if (error != std::errc{} || parsed != info.data() + value_end) {
       throw std::runtime_error("RDB dirty counter is malformed");
     }
@@ -1481,8 +1468,7 @@ TEST(ListE2eTest, BlockingMovesDoNotDirtyWatchBeforeWakeAndCountChanges) {
 
   auto move = std::async(std::launch::async, [port, source, destination] {
     RespClient client(port);
-    return client.Command(
-        {"BLMOVE", source, destination, "LEFT", "LEFT", "2"});
+    return client.Command({"BLMOVE", source, destination, "LEFT", "LEFT", "2"});
   });
   ASSERT_TRUE(blocked_clients(1));
   const std::uint64_t before_move = dirty();
@@ -1509,6 +1495,8 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();
+  const std::string lua_recovery_a = KeyForWorker("lua-exec-recovery-a", 0, 3);
+  const std::string lua_recovery_b = KeyForWorker("lua-exec-recovery-b", 1, 3);
   std::vector<std::string> large_values;
   large_values.reserve(1200);
   for (int i = 0; i < 1200; ++i) {
@@ -1932,6 +1920,16 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
     EXPECT_EQ(client.Command({"LREM", "large-list", "1", large_values[10]}),
               ":1");
     EXPECT_EQ(client.Command({"LLEN", "large-list"}), ":1199");
+    EXPECT_EQ(client.Command({"MULTI"}), "+OK");
+    EXPECT_EQ(client.Command({"EVAL",
+                              "redis.call('SET',KEYS[1],ARGV[1]); "
+                              "redis.call('SET',KEYS[2],ARGV[2]); return 'OK'",
+                              "2", lua_recovery_a, lua_recovery_b,
+                              "recovered-a", "recovered-b"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"SET", "lua-exec-recovery-tail", "tail"}),
+              "+QUEUED");
+    EXPECT_EQ(client.Command({"EXEC"}), "*2\r\n" + Bulk("OK") + "\r\n+OK");
     ASSERT_TRUE(WaitForDurability(client));
     server.Kill();
   }
@@ -1943,6 +1941,10 @@ TEST(ListE2eTest, CommandsLargeKeyTransactionsAndCrashRecovery) {
     EXPECT_EQ(client.Command({"LINDEX", "large-list", "79"}),
               Bulk("recovered"));
     EXPECT_EQ(client.Command({"LPOS", "large-list", large_values[10]}), "$-1");
+    EXPECT_EQ(client.Command({"MGET", lua_recovery_a, lua_recovery_b,
+                              "lua-exec-recovery-tail"}),
+              "*3\r\n" + Bulk("recovered-a") + "\r\n" + Bulk("recovered-b") +
+                  "\r\n" + Bulk("tail"));
     server.Stop();
   }
 
@@ -2130,13 +2132,13 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(source_client.Command(
                 {"CONFIG", "GET", "replication-snapshot-batch-size"}),
             BulkArray({"replication-snapshot-batch-size", "32"}));
-  ASSERT_EQ(source_client.Command(
-                {"CONFIG", "SET", "foreground-budget-us", "250"}),
+  ASSERT_EQ(
+      source_client.Command({"CONFIG", "SET", "foreground-budget-us", "250"}),
             "+OK");
   EXPECT_EQ(source_client.Command({"CONFIG", "GET", "foreground-budget-us"}),
             BulkArray({"foreground-budget-us", "250"}));
-  ASSERT_EQ(source_client.Command(
-                {"CONFIG", "SET", "background-budget-us", "20"}),
+  ASSERT_EQ(
+      source_client.Command({"CONFIG", "SET", "background-budget-us", "20"}),
             "+OK");
   EXPECT_EQ(source_client.Command({"CONFIG", "GET", "background-budget-us"}),
             BulkArray({"background-budget-us", "20"}));
@@ -2144,14 +2146,13 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
                 {"CONFIG", "SET", "background-warrant-percent", "7"}),
             "+OK");
   EXPECT_EQ(
-      source_client.Command(
-          {"CONFIG", "GET", "background-warrant-percent"}),
+      source_client.Command({"CONFIG", "GET", "background-warrant-percent"}),
       BulkArray({"background-warrant-percent", "7"}));
   ASSERT_EQ(source_client.Command(
                 {"CONFIG", "SET", "spdk-max-completions-per-poll", "4"}),
             "+OK");
-  EXPECT_EQ(source_client.Command(
-                {"CONFIG", "GET", "spdk-max-completions-per-poll"}),
+  EXPECT_EQ(
+      source_client.Command({"CONFIG", "GET", "spdk-max-completions-per-poll"}),
             BulkArray({"spdk-max-completions-per-poll", "4"}));
   EXPECT_EQ(
       source_client.Command({"CONFIG", "GET", "defrag-*"}),
@@ -2351,6 +2352,156 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   } while (std::chrono::steady_clock::now() < delta_deadline);
   EXPECT_EQ(delta_value, Bulk("delta"));
 
+  // Script caches are node-local: running EVAL on the primary must not make
+  // the script available through EVALSHA on a replica.
+  ASSERT_EQ(source_client.Command({"EVAL", "return 'primary-only-cache'", "0"}),
+            Bulk("primary-only-cache"));
+  EXPECT_EQ(replica_client.Command(
+                {"EVALSHA", "9745810589cb3cddf789007adccdb056ceba66bb", "0"}),
+            "-NOSCRIPT No matching script. Please use EVAL.");
+
+  // A READONLY replica may execute and cache a read-only script locally.
+  const std::string readonly_script = "return redis.call('GET',KEYS[1])";
+  EXPECT_EQ(replica_client.Command(
+                {"EVAL", readonly_script, "1", "replicated-after{mvp}"}),
+            Bulk("delta"));
+  EXPECT_EQ(replica_client.Command({"EVALSHA",
+                                    "620cd258c2c9c88c9d10db67812ccf663d96bdc6",
+                                    "1", "replicated-after{mvp}"}),
+            Bulk("delta"));
+  EXPECT_EQ(replica_client.Command(
+                {"EVAL_RO", readonly_script, "1", "replicated-after{mvp}"}),
+            Bulk("delta"));
+  EXPECT_EQ(replica_client.Command({"EVALSHA_RO",
+                                    "620cd258c2c9c88c9d10db67812ccf663d96bdc6",
+                                    "1", "replicated-after{mvp}"}),
+            Bulk("delta"));
+
+  const std::string explicit_readonly_error = replica_client.Command(
+      {"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])", "1",
+       "replicated-after{mvp}", "forbidden"});
+  EXPECT_NE(explicit_readonly_error.find(
+                "Write commands are not allowed from read-only scripts."),
+            std::string::npos);
+
+  const std::string readonly_error = replica_client.Command(
+      {"EVAL", "return redis.call('SET',KEYS[1],ARGV[1])", "1",
+       "replicated-after{mvp}", "forbidden"});
+  EXPECT_NE(readonly_error.find(
+                "READONLY You can't write against a read only replica."),
+            std::string::npos);
+  EXPECT_EQ(replica_client.Command({"GET", "replicated-after{mvp}"}),
+            Bulk("delta"));
+
+  ASSERT_EQ(replica_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(replica_client.Command(
+                {"EVAL", readonly_script, "1", "replicated-after{mvp}"}),
+            "+QUEUED");
+  ASSERT_EQ(replica_client.Command({"PING"}), "+QUEUED");
+  EXPECT_EQ(replica_client.Command({"EXEC"}),
+            "*2\r\n" + Bulk("delta") + "\r\n+PONG");
+
+  ASSERT_EQ(replica_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(replica_client.Command(
+                {"EVAL", "return redis.call('SET',KEYS[1],ARGV[1])", "1",
+                 "replicated-after{mvp}", "still-forbidden"}),
+            "+QUEUED");
+  ASSERT_EQ(replica_client.Command({"GET", "replicated-after{mvp}"}),
+            "+QUEUED");
+  const std::string readonly_exec_error = replica_client.Command({"EXEC"});
+  EXPECT_NE(readonly_exec_error.find(
+                "READONLY You can't write against a read only replica."),
+            std::string::npos);
+  EXPECT_NE(readonly_exec_error.find(Bulk("delta")), std::string::npos);
+
+  // The primary publishes deterministic effects, not EVAL/EVALSHA. One
+  // committed script transaction therefore arrives atomically on the replica
+  // even when its keys live on different shards.
+  const std::string effects_script =
+      "redis.call('SET',KEYS[1],ARGV[1]); "
+      "redis.call('SET',KEYS[2],ARGV[2]); return 'OK'";
+  ASSERT_EQ(
+      source_client.Command({"EVAL", effects_script, "2", "{lua:a}:effects",
+                             "{lua:b}:effects", "left", "right"}),
+      Bulk("OK"));
+  const std::string expected_effects =
+      "*2\r\n" + Bulk("left") + "\r\n" + Bulk("right");
+  std::string replicated_effects;
+  const auto effects_deadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    replicated_effects =
+        replica_client.Command({"MGET", "{lua:a}:effects", "{lua:b}:effects"});
+    if (replicated_effects == expected_effects) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < effects_deadline);
+  EXPECT_EQ(replicated_effects, expected_effects);
+
+  // Like Valkey, a script runtime error does not roll back writes that already
+  // completed. Those successful effects must still reach the replica.
+  const std::string script_error = source_client.Command(
+      {"EVAL", "redis.call('SET',KEYS[1],ARGV[1]); return redis.call('NOPE')",
+       "1", "lua:error{effects}", "retained"});
+  EXPECT_NE(script_error.find("Unknown Redis command called from script: NOPE"),
+            std::string::npos);
+  std::string retained_value;
+  const auto retained_deadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    retained_value = replica_client.Command({"GET", "lua:error{effects}"});
+    if (retained_value == Bulk("retained")) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < retained_deadline);
+  EXPECT_EQ(retained_value, Bulk("retained"));
+
+  // MULTI wraps the Lua effects and ordinary queued writes in one replication
+  // transaction. The replica still never needs the script body or SHA.
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(
+      source_client.Command({"SET", "lua:exec-ordinary{effects}", "ordinary"}),
+      "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"EVAL", effects_script, "2", "{lua:exec-a}:effects",
+                 "{lua:exec-b}:effects", "exec-left", "exec-right"}),
+            "+QUEUED");
+  EXPECT_EQ(source_client.Command({"EXEC"}), "*2\r\n+OK\r\n" + Bulk("OK"));
+  const std::string expected_exec_effects = "*3\r\n" + Bulk("ordinary") +
+                                            "\r\n" + Bulk("exec-left") +
+                                            "\r\n" + Bulk("exec-right");
+  std::string replicated_exec_effects;
+  const auto exec_effects_deadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    replicated_exec_effects = replica_client.Command(
+        {"MGET", "lua:exec-ordinary{effects}", "{lua:exec-a}:effects",
+         "{lua:exec-b}:effects"});
+    if (replicated_exec_effects == expected_exec_effects) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < exec_effects_deadline);
+  EXPECT_EQ(replicated_exec_effects, expected_exec_effects);
+
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(
+      source_client.Command({"EVAL",
+                             "redis.call('SET',KEYS[1],ARGV[1]); return "
+                             "redis.call('NOPE')",
+                             "1", "lua:exec-error{effects}", "exec-retained"}),
+      "+QUEUED");
+  ASSERT_EQ(source_client.Command(
+                {"SET", "lua:exec-after-error{effects}", "continued"}),
+            "+QUEUED");
+  const std::string exec_error = source_client.Command({"EXEC"});
+  EXPECT_NE(exec_error.find("Unknown Redis command called from script: NOPE"),
+            std::string::npos);
+  const std::string expected_exec_error_effects =
+      "*2\r\n" + Bulk("exec-retained") + "\r\n" + Bulk("continued");
+  std::string replicated_exec_error_effects;
+  const auto exec_error_deadline = std::chrono::steady_clock::now() + 10s;
+  do {
+    replicated_exec_error_effects = replica_client.Command(
+        {"MGET", "lua:exec-error{effects}", "lua:exec-after-error{effects}"});
+    if (replicated_exec_error_effects == expected_exec_error_effects) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < exec_error_deadline);
+  EXPECT_EQ(replicated_exec_error_effects, expected_exec_error_effects);
+
   // A single mutation larger than the per-worker publisher high-water mark
   // uses exclusive heap staging, is fragmented in the memory backlog, and is
   // reconstructed as one command by the replica.
@@ -2534,8 +2685,8 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
               std::string::npos);
     EXPECT_EQ(startup_client.Command({"CONFIG", "GET", "replica-priority"}),
               BulkArray({"replica-priority", "90"}));
-    EXPECT_EQ(startup_client.Command(
-                  {"CONFIG", "SET", "replica-priority", "25"}),
+    EXPECT_EQ(
+        startup_client.Command({"CONFIG", "SET", "replica-priority", "25"}),
               "+OK");
     EXPECT_EQ(startup_client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(startup_client.Command({"SLAVEOF", "NO", "ONE"}), "+QUEUED");
@@ -2544,8 +2695,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
               "+QUEUED");
     EXPECT_EQ(startup_client.Command({"CLIENT", "KILL", "TYPE", "pubsub"}),
               "+QUEUED");
-    EXPECT_EQ(startup_client.Command({"EXEC"}),
-              "*4\r\n+OK\r\n+OK\r\n:0\r\n:0");
+    EXPECT_EQ(startup_client.Command({"EXEC"}), "*4\r\n+OK\r\n+OK\r\n:0\r\n:0");
     startup_replica.Stop();
   }
   {
@@ -2554,8 +2704,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
     RespClient rewritten_client(replica_port);
     replication_info = rewritten_client.Command({"INFO", "replication"});
     EXPECT_NE(replication_info.find("role:master"), std::string::npos);
-    EXPECT_EQ(
-        rewritten_client.Command({"CONFIG", "GET", "replica-priority"}),
+    EXPECT_EQ(rewritten_client.Command({"CONFIG", "GET", "replica-priority"}),
         BulkArray({"replica-priority", "25"}));
     EXPECT_EQ(rewritten_client.Command({"SET", "rewritten-master", "yes"}),
               "+OK");

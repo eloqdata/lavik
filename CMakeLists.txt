@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(keylane VERSION 0.1.0 LANGUAGES CXX)
+project(keylane VERSION 0.1.0 LANGUAGES C CXX)
 
 set(KEYLANE_VERSION_SUFFIX "-dev" CACHE STRING
     "Keylane prerelease suffix, such as -dev or -beta.1 (empty for a release)")
@@ -20,6 +20,9 @@ include(CTest)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(KEYLANE_ENABLE_WERROR "Treat warnings as errors" OFF)
@@ -87,6 +90,7 @@ foreach(open_ssl_cache_var IN ITEMS OPENSSL_SSL_LIBRARY OPENSSL_CRYPTO_LIBRARY)
     unset(${open_ssl_cache_var} CACHE)
   endif()
 endforeach()
+find_package(OpenSSL REQUIRED)
 
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/celer/CMakeLists.txt")
   add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/celer" "${CMAKE_CURRENT_BINARY_DIR}/celer")
@@ -114,6 +118,43 @@ set(MI_NO_OPT_ARCH ON CACHE BOOL "" FORCE)
 set(MI_TRACK_ASAN ${KEYLANE_ASAN_BUILD} CACHE BOOL "" FORCE)
 set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
+
+set(KEYLANE_LUA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/src")
+add_library(keylane_lua STATIC
+  ${KEYLANE_LUA_SOURCE_DIR}/lapi.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lauxlib.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lbaselib.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lcode.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ldebug.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ldo.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ldump.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lfunc.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lgc.c
+  ${KEYLANE_LUA_SOURCE_DIR}/llex.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lmathlib.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lmem.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lobject.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lopcodes.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lparser.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lstate.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lstring.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lstrlib.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ltable.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ltablib.c
+  ${KEYLANE_LUA_SOURCE_DIR}/ltm.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lundump.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lvm.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lzio.c
+  ${KEYLANE_LUA_SOURCE_DIR}/strbuf.c
+  ${KEYLANE_LUA_SOURCE_DIR}/fpconv.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lua_cjson.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lua_struct.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lua_cmsgpack.c
+  ${KEYLANE_LUA_SOURCE_DIR}/lua_bit.c
+)
+target_include_directories(keylane_lua PUBLIC ${KEYLANE_LUA_SOURCE_DIR})
+target_compile_definitions(keylane_lua PRIVATE LUA_USE_POSIX)
+target_link_libraries(keylane_lua PUBLIC m)
 
 if (TARGET format AND TARGET celer-format)
   add_dependencies(format celer-format)
@@ -170,6 +211,7 @@ add_library(keylane_module
   src/redis/command.cpp
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
+  src/redis/lua_eval.cpp
   src/redis/monitor.cpp
   src/redis/pubsub.cpp
   src/redis/set_command.cpp
@@ -211,6 +253,8 @@ target_link_libraries(keylane_module PUBLIC
   absl::statusor
   absl::strings
   mimalloc-static
+  keylane_lua
+  OpenSSL::Crypto
 )
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")

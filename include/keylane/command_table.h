@@ -30,6 +30,10 @@ enum CommandFlag : std::uint32_t {
   // PUBLISH uses this so replicas remain writable for local delivery while a
   // primary can still forward the event downstream.
   kCmdMayReplicate = 1u << 10,
+  // The command may write depending on runtime behavior. EVAL/EVALSHA use
+  // this so read-only scripts can run on replicas while redis.call() rejects
+  // the first attempted write.
+  kCmdDynamicWrite = 1u << 11,
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the

@@ -53,6 +53,7 @@
 #include "keylane/tx/tx_shard.h"
 #include "keylane/version.h"
 #include "list_command.h"
+#include "lua_eval.h"
 #include "set_command.h"
 #include "sort_command.h"
 #include "stream_command.h"
@@ -72,6 +73,7 @@ unsigned g_server_threads = 0;
 std::string g_server_bind_ip = "127.0.0.1";
 std::string g_server_config_file;
 std::chrono::steady_clock::time_point g_server_start;
+std::atomic_flag g_lua_script_cache_operation = ATOMIC_FLAG_INIT;
 
 struct ClientConnectionRecord {
   enum class Type { kNormal, kReplica, kPubSub };
@@ -385,17 +387,17 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
       reply_builder.AppendArrayHeader(channels.size() * 2);
       for (std::size_t index = 0; index < channels.size(); ++index) {
         reply_builder.AppendBulkString(channels[index]);
-        reply_builder.AppendInteger(static_cast<long long>(std::min<
-            std::uint64_t>(counts[index],
-                           std::numeric_limits<long long>::max())));
+        reply_builder.AppendInteger(
+            static_cast<long long>(std::min<std::uint64_t>(
+                counts[index], std::numeric_limits<long long>::max())));
       }
       co_return BuiltReply(reply_builder.View());
     }
     if (CmpCaseInsensitive(args[1], "numpat") && args.size() == 2) {
       const std::uint64_t count = co_await PubSubNumPat();
-      co_return BuiltReply(reply_builder.AppendInteger(static_cast<long long>(
-          std::min<std::uint64_t>(count,
-                                  std::numeric_limits<long long>::max()))));
+      co_return BuiltReply(reply_builder.AppendInteger(
+          static_cast<long long>(std::min<std::uint64_t>(
+              count, std::numeric_limits<long long>::max()))));
     }
     if (CmpCaseInsensitive(args[1], "help") && args.size() == 2) {
       constexpr std::array<std::string_view, 10> help = {
@@ -416,8 +418,8 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
       co_return BuiltReply(reply_builder.View());
     }
     co_return BuiltReply(reply_builder.AppendError(
-        "ERR Unknown subcommand or wrong number of arguments for '" +
-        args[1] + "'. Try PUBSUB HELP."));
+        "ERR Unknown subcommand or wrong number of arguments for '" + args[1] +
+        "'. Try PUBSUB HELP."));
   }
 
   if (request.kind_ == CommandKind::kPublish) {
@@ -955,8 +957,8 @@ Task<absl::Status> ConfigureAllWorkerSchedulers(RuntimeConfigKey key,
                                                 unsigned value) {
   for (unsigned worker_id = 0; worker_id < g_storage->worker_count();
        ++worker_id) {
-    absl::Status configured = co_await SubmitTaskTo(
-        worker_id, [key, value]() -> Task<absl::Status> {
+    absl::Status configured =
+        co_await SubmitTaskTo(worker_id, [key, value]() -> Task<absl::Status> {
           celer::Worker* worker = celer::ThisWorker().self_;
           switch (key) {
             case RuntimeConfigKey::kForegroundBudget:
@@ -983,15 +985,14 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
   const auto& args = request.args_;
   if (CmpCaseInsensitive(args[1], "RESETSTAT") && args.size() == 2) {
     const absl::Status reset = co_await ResetCommandMetrics();
-    co_return reset.ok()
-        ? BuiltReply(reply_builder.AppendSimpleString("OK"))
+    co_return reset.ok() ? BuiltReply(reply_builder.AppendSimpleString("OK"))
         : BuiltReply(reply_builder.AppendError(
               absl::StrCat("ERR ", reset.message())));
   }
   if (CmpCaseInsensitive(args[1], "REWRITE") && args.size() == 2) {
     if (g_replication == nullptr) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "ERR replication backend is unavailable"));
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR replication backend is unavailable"));
     }
     const ReplicationStatus replication = g_replication->status();
     if (replication.redis_sources_.size() > 1) {
@@ -1164,8 +1165,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         configured = absl::InvalidArgumentError(
             "value is not an integer or out of range");
       } else {
-        configured = g_replication->SetReplicaPriority(
-            static_cast<unsigned>(value));
+        configured =
+            g_replication->SetReplicaPriority(static_cast<unsigned>(value));
       }
     } else if (config->key_ == RuntimeConfigKey::kDefragPaused) {
       const std::optional<bool> paused = ParseConfigYesNo(args[3]);
@@ -3359,8 +3360,8 @@ Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
   if (replication.role_ == ReplicationRole::kMaster) {
     reply_builder.AppendArrayHeader(3);
     reply_builder.AppendBulkString("master");
-    reply_builder.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
-        replication.master_repl_offset_,
+    reply_builder.AppendInteger(static_cast<long long>(
+        std::min<std::uint64_t>(replication.master_repl_offset_,
         std::numeric_limits<long long>::max())));
     reply_builder.AppendArrayHeader(replication.downstream_replicas_.size());
     for (const DownstreamReplicaStatus& replica :
@@ -3368,38 +3369,34 @@ Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
       reply_builder.AppendArrayHeader(3);
       reply_builder.AppendBulkString(replica.host_);
       reply_builder.AppendInteger(replica.port_);
-      reply_builder.AppendInteger(static_cast<long long>(
-          std::min<std::uint64_t>(replica.min_lsn_,
-                                  std::numeric_limits<long long>::max())));
+      reply_builder.AppendInteger(
+          static_cast<long long>(std::min<std::uint64_t>(
+              replica.min_lsn_, std::numeric_limits<long long>::max())));
     }
     co_return BuiltReply(reply_builder.View());
   }
 
   reply_builder.AppendArrayHeader(5);
   reply_builder.AppendBulkString("slave");
-  reply_builder.AppendBulkString(replication.upstream_.has_value()
-                                     ? replication.upstream_->host_
-                                     : "");
-  reply_builder.AppendInteger(replication.upstream_.has_value()
-                                  ? replication.upstream_->port_
-                                  : 0);
+  reply_builder.AppendBulkString(
+      replication.upstream_.has_value() ? replication.upstream_->host_ : "");
+  reply_builder.AppendInteger(
+      replication.upstream_.has_value() ? replication.upstream_->port_ : 0);
   const std::string_view state =
-      replication.role_ == ReplicationRole::kOnline
-          ? "connected"
+      replication.role_ == ReplicationRole::kOnline    ? "connected"
           : replication.role_ == ReplicationRole::kSyncing ? "sync"
                                                             : "connecting";
   reply_builder.AppendBulkString(state);
-  reply_builder.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
-      replication.replica_repl_offset_,
+  reply_builder.AppendInteger(static_cast<long long>(
+      std::min<std::uint64_t>(replication.replica_repl_offset_,
       std::numeric_limits<long long>::max())));
   co_return BuiltReply(reply_builder.View());
 }
 
 std::uint64_t CommandLatencyMicros(const CommandMetricTotals& command,
                                    double counter_frequency) {
-  const long double micros =
-      static_cast<long double>(command.latency_ticks_) * 1'000'000.0L /
-      std::max(1.0, counter_frequency);
+  const long double micros = static_cast<long double>(command.latency_ticks_) *
+                             1'000'000.0L / std::max(1.0, counter_frequency);
   if (micros >=
       static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
     return std::numeric_limits<std::uint64_t>::max();
@@ -3416,8 +3413,7 @@ std::string CommandUsecPerCall(const CommandMetricTotals& command,
       hundredths + 0.5L,
       static_cast<long double>(std::numeric_limits<std::uint64_t>::max())));
   const std::uint64_t fraction = rounded % 100;
-  return absl::StrCat(rounded / 100, ".", fraction < 10 ? "0" : "",
-                      fraction);
+  return absl::StrCat(rounded / 100, ".", fraction < 10 ? "0" : "", fraction);
 }
 
 // INFO: Redis-shaped sections built from what keylane actually tracks. The
@@ -3586,13 +3582,11 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       if (command.calls_ == 0) continue;
       info += "cmdstat_" +
               std::string(CommandMetricName(static_cast<CommandKind>(index))) +
-              ":calls=" + std::to_string(command.calls_) +
-              ",usec=" +
+              ":calls=" + std::to_string(command.calls_) + ",usec=" +
               std::to_string(CommandLatencyMicros(
                   command, runtime_metrics->counter_frequency_)) +
               ",usec_per_call=" +
-              CommandUsecPerCall(command,
-                                 runtime_metrics->counter_frequency_) +
+              CommandUsecPerCall(command, runtime_metrics->counter_frequency_) +
               ",rejected_calls=0,failed_calls=0\r\n";
     }
     info += "\r\n";
@@ -3649,15 +3643,15 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                               ? "up\r\n"
                               : "down\r\n");
       info += "master_last_io_seconds_ago:" +
-              std::to_string(replication.master_last_io_seconds_ago_) +
-              "\r\n";
+              std::to_string(replication.master_last_io_seconds_ago_) + "\r\n";
       info += "master_link_down_since_seconds:" +
               std::to_string(replication.master_link_down_since_seconds_) +
               "\r\n";
       info += "slave_repl_offset:" +
               std::to_string(replication.replica_repl_offset_) + "\r\n";
-      info += "slave_priority:" +
-              std::to_string(replication.replica_priority_) + "\r\n";
+      info +=
+          "slave_priority:" + std::to_string(replication.replica_priority_) +
+          "\r\n";
       info += "replica_announced:1\r\n";
       info += "keylane_source_workers:" +
               std::to_string(replication.source_worker_count_) + "\r\n";
@@ -5948,6 +5942,508 @@ Task<absl::Status> ArmOnlyShardCallback(void*, const tx::ShardSlice&) {
   co_return absl::OkStatus();
 }
 
+Task<absl::Status> ExecRunShardCallback(void* context,
+                                        const tx::ShardSlice& slice);
+
+bool IsDeclaredLuaKey(std::span<const std::string> keys,
+                      std::string_view candidate) {
+  return std::any_of(keys.begin(), keys.end(),
+                     [&](const std::string& key) { return key == candidate; });
+}
+
+bool IsEvalReadOnlyKind(CommandKind kind) {
+  return kind == CommandKind::kEvalRo || kind == CommandKind::kEvalShaRo;
+}
+
+bool IsEvalSourceKind(CommandKind kind) {
+  return kind == CommandKind::kEval || kind == CommandKind::kEvalRo;
+}
+
+void CollectLuaReplicationEffects(
+    const CommandRequest& command, std::string_view reply,
+    std::vector<CapturedReplicationCommand>* effects) {
+  if (command.spec_ == nullptr || reply.empty() || reply.front() == '-' ||
+      (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0) {
+    return;
+  }
+  CapturedReplicationEffects captured;
+  if (command.replication_capture_ != nullptr) {
+    captured = command.replication_capture_->Take();
+  }
+  if (!captured.handled_) {
+    effects->push_back(
+        CapturedReplicationCommand{command.db_id_, command.args_});
+    return;
+  }
+  effects->insert(effects->end(),
+                  std::make_move_iterator(captured.commands_.begin()),
+                  std::make_move_iterator(captured.commands_.end()));
+}
+
+Task<std::string> ExecuteLuaRedisCall(
+    const CommandRequest& eval_request, LuaRedisCall call,
+    std::span<const std::string> declared_keys, tx::Transaction* transaction,
+    std::vector<storage::TxShardWrites>* tx_writes,
+    const std::shared_ptr<BlockingNotificationCapture>& notifications,
+    std::vector<CapturedReplicationCommand>* effects) {
+  RespCommand wire{.args_ = std::move(call.args_)};
+  auto built = BuildCommandRequest(std::move(wire), eval_request.db_id_);
+  if (!built.ok() || built->spec_ == nullptr) {
+    const std::string name =
+        built.ok() && !built->args_.empty() ? built->args_.front() : "";
+    co_return EncodeError(
+        absl::StrCat("ERR Unknown Redis command called from "
+                     "script: ",
+                     name));
+  }
+  CommandRequest command = std::move(*built);
+  command.resp_version_ = RespVersion::k2;
+  command.replication_origin_ = eval_request.replication_origin_;
+  command.blocking_notification_capture_ = notifications;
+  command.blocking_wake_cascade_ = eval_request.blocking_wake_cascade_;
+  command.replication_capture_ = std::make_shared<ReplicationCommandCapture>();
+
+  auto keys = DetermineKeys(*command.spec_, command.args_);
+  if (!keys.ok()) {
+    co_return EncodeError(absl::StrCat("ERR ", keys.status().message()));
+  }
+  const std::uint32_t flags = command.spec_->flags_;
+  if ((flags & (kCmdGlobal | kCmdMayBlock | kCmdAdmin | kCmdDynamicWrite)) !=
+          0 ||
+      command.kind_ == CommandKind::kEval ||
+      command.kind_ == CommandKind::kEvalSha ||
+      command.kind_ == CommandKind::kEvalRo ||
+      command.kind_ == CommandKind::kEvalShaRo ||
+      command.kind_ == CommandKind::kScript) {
+    co_return EncodeError("ERR command is not allowed from script");
+  }
+  if ((command.kind_ == CommandKind::kMSet ||
+       command.kind_ == CommandKind::kMSetNx) &&
+      command.args_.size() % 2 != 1) {
+    co_return EncodeError(absl::StrCat("ERR wrong number of arguments for '",
+                                       command.spec_->name_, "' command"));
+  }
+  const bool write = (flags & kCmdWrite) != 0;
+  if (IsEvalReadOnlyKind(eval_request.kind_) &&
+      (flags & (kCmdWrite | kCmdMayReplicate)) != 0) {
+    co_return EncodeError(
+        "ERR Write commands are not allowed from read-only scripts.");
+  }
+  const bool reject_writes = g_replication != nullptr
+                                 ? g_replication->reject_writes()
+                                 : g_replica_read_only;
+  if (!command.replication_origin_ && write && reject_writes) {
+    co_return EncodeError(
+        "READONLY You can't write against a read only replica.");
+  }
+  if (write && RejectForMemory(EstimatedMemoryGrowth(command))) {
+    co_return EncodeError(
+        "OOM command not allowed when used memory > 'maxmemory'.");
+  }
+
+  if (keys->empty()) {
+    if (command.kind_ != CommandKind::kPing &&
+        command.kind_ != CommandKind::kEcho) {
+      co_return EncodeError("ERR command is not allowed from script");
+    }
+    ReplyBuilder local_builder(RespVersion::k2);
+    CommandReply local = ExecuteSimpleLocalCommand(command, local_builder);
+    co_return std::string(local.encoded_);
+  }
+
+  std::vector<ExecKey> command_keys;
+  command_keys.reserve(keys->count());
+  std::uint16_t slot = 0;
+  for (std::size_t index = keys->first_; index <= keys->last_;
+       index += keys->step_) {
+    if (!IsDeclaredLuaKey(declared_keys, command.args_[index])) {
+      co_return EncodeError("ERR Script attempted to access an undeclared key");
+    }
+    command_keys.push_back(ExecKey{
+        .digest_ = storage::ComputeDigest(command.args_[index]),
+        .owner_ = static_cast<std::uint16_t>(ShardForKey(command.args_[index])),
+        .arg_ = static_cast<std::uint16_t>(index),
+        .slot_ = slot++,
+        .mode_ = tx::LockMode::kExclusive,
+        .db_ = command.db_id_,
+    });
+  }
+
+  const bool routed_multi = (flags & (kCmdMultiShard | kCmdMovableKeys)) != 0 ||
+                            command_keys.size() != 1;
+  const ExecSequentialFamily sequential = ClassifyExecSequential(command.kind_);
+  const bool batch_supported = command.kind_ == CommandKind::kMSet ||
+                               command.kind_ == CommandKind::kMGet ||
+                               command.kind_ == CommandKind::kDel ||
+                               command.kind_ == CommandKind::kUnlink ||
+                               command.kind_ == CommandKind::kExists ||
+                               command.kind_ == CommandKind::kTouch;
+  const bool unsafe_special_case =
+      command.kind_ == CommandKind::kCopy ||
+      command.kind_ == CommandKind::kGeoRadius ||
+      command.kind_ == CommandKind::kGeoRadiusByMember ||
+      command.kind_ == CommandKind::kGeoSearchStore;
+  if (routed_multi &&
+      (transaction == nullptr || unsafe_special_case ||
+       (sequential == ExecSequentialFamily::kNone && !batch_supported))) {
+    co_return EncodeError("ERR command is not supported from script");
+  }
+
+  std::string reply;
+  if (routed_multi && sequential != ExecSequentialFamily::kNone) {
+    reply = co_await ExecuteExecSequentialCommand(sequential, command,
+                                                  command_keys, *tx_writes);
+    CollectLuaReplicationEffects(command, reply, effects);
+    co_return reply;
+  }
+  if (routed_multi) {
+    std::vector<CommandRequest> queued{command};
+    std::vector<std::vector<ExecKey>> all_keys{std::move(command_keys)};
+    std::vector<std::string> replies(1);
+    std::vector<ReplyChunkSource> reply_chunks(1);
+    ExecRunContext run;
+    InitExecRun(run, queued, all_keys, replies, reply_chunks, 0, 1);
+    run.tx_writes_ = tx_writes->data();
+    absl::Status dispatched = co_await transaction->Execute(
+        &ExecRunShardCallback, &run, /*release=*/false);
+    if (!dispatched.ok()) co_return EncodeStorageError(dispatched);
+    AssembleRunReplies(run);
+    if (reply_chunks.front()) {
+      co_return EncodeError(
+          "ERR streamed command replies are not allowed from script");
+    }
+    reply = std::move(replies.front());
+    CollectLuaReplicationEffects(command, reply, effects);
+    co_return reply;
+  }
+
+  const std::size_t key_index = command_keys.front().arg_;
+  const storage::Digest digest = command_keys.front().digest_;
+  const unsigned owner = command_keys.front().owner_;
+  ReplyChunkSource chunks;
+  absl::Status dispatched =
+      co_await SubmitTaskTo(owner, [&]() -> Task<absl::Status> {
+        storage::TxShardWrites* writes =
+            tx_writes == nullptr ? nullptr : &(*tx_writes)[owner];
+        if (command.kind_ == CommandKind::kDel ||
+            command.kind_ == CommandKind::kUnlink) {
+          auto deleted = co_await g_storage->DeleteLocked(
+              command.db_id_, command.args_[key_index], digest, writes);
+          if (!deleted.ok()) {
+            reply = EncodeStorageError(deleted.status());
+          } else {
+            reply = EncodeInteger(*deleted ? 1 : 0);
+          }
+          co_return absl::OkStatus();
+        }
+        if (command.kind_ == CommandKind::kExists ||
+            command.kind_ == CommandKind::kTouch) {
+          const bool exists = co_await g_storage->ExistsLocked(
+              command.db_id_, command.args_[key_index], digest);
+          reply = EncodeInteger(exists ? 1 : 0);
+          co_return absl::OkStatus();
+        }
+        reply = co_await RunSingleKeyLocked(command.db_id_, command, digest,
+                                            writes, &chunks);
+        co_return absl::OkStatus();
+      });
+  if (!dispatched.ok()) {
+    co_return EncodeStorageError(dispatched);
+  }
+  if (chunks) {
+    co_return EncodeError(
+        "ERR streamed command replies are not allowed from script");
+  }
+  CollectLuaReplicationEffects(command, reply, effects);
+  co_return reply;
+}
+
+Task<bool> BeginLuaScriptCacheOperation() {
+  while (g_lua_script_cache_operation.test_and_set(std::memory_order_acquire)) {
+    co_await Yield(*ThisWorker().self_);
+  }
+  co_return true;
+}
+
+class LuaScriptCacheOperationGuard {
+ public:
+  LuaScriptCacheOperationGuard() = default;
+  LuaScriptCacheOperationGuard(const LuaScriptCacheOperationGuard&) = delete;
+  LuaScriptCacheOperationGuard& operator=(const LuaScriptCacheOperationGuard&) =
+      delete;
+  ~LuaScriptCacheOperationGuard() {
+    g_lua_script_cache_operation.clear(std::memory_order_release);
+  }
+};
+
+Task<bool> CacheLuaScriptOnAllWorkers(const std::string& sha,
+                                      std::string_view bytecode) {
+  (void)co_await BeginLuaScriptCacheOperation();
+  LuaScriptCacheOperationGuard operation;
+  bytecode = StoreLuaScript(sha, bytecode);
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    auto cache = [sha, bytecode] {
+      CacheLuaScriptLocally(sha, bytecode);
+      return true;
+    };
+    if (worker == ThisWorker().id_) {
+      cache();
+    } else {
+      (void)co_await SubmitTo(worker, std::move(cache));
+    }
+  }
+  co_return true;
+}
+
+Task<bool> FlushLuaScriptCacheOnAllWorkers() {
+  (void)co_await BeginLuaScriptCacheOperation();
+  LuaScriptCacheOperationGuard operation;
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    auto clear = [] {
+      ClearLocalLuaScriptCache();
+      return true;
+    };
+    if (worker == ThisWorker().id_) {
+      clear();
+    } else {
+      (void)co_await SubmitTo(worker, std::move(clear));
+    }
+  }
+  // Worker indexes hold string_views into the process-wide bodies. Release
+  // the bodies only after every worker has crossed the clear barrier.
+  ClearStoredLuaScripts();
+  co_return true;
+}
+
+bool IsEvalCommand(const CommandRequest& request) {
+  return request.kind_ == CommandKind::kEval ||
+         request.kind_ == CommandKind::kEvalSha ||
+         request.kind_ == CommandKind::kEvalRo ||
+         request.kind_ == CommandKind::kEvalShaRo;
+}
+
+bool ExecCommandMayWrite(const CommandRequest& request) {
+  return request.spec_ != nullptr &&
+         (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0;
+}
+
+bool ExecCommandMayReplicate(const CommandRequest& request) {
+  return request.spec_ != nullptr &&
+         (request.spec_->flags_ &
+          (kCmdWrite | kCmdMayReplicate | kCmdDynamicWrite)) != 0;
+}
+
+Task<std::string> ExecuteEvalWithTransaction(
+    const CommandRequest& request, tx::Transaction* transaction,
+    std::vector<storage::TxShardWrites>* tx_writes,
+    const std::shared_ptr<BlockingNotificationCapture>& notifications,
+    std::vector<CapturedReplicationCommand>* effects) {
+  auto key_view = DetermineKeys(*request.spec_, request.args_);
+  if (!key_view.ok()) {
+    co_return EncodeError(absl::StrCat("ERR ", key_view.status().message()));
+  }
+
+  std::string_view script;
+  std::optional<std::string_view> bytecode;
+  if (IsEvalSourceKind(request.kind_)) {
+    script = request.args_[1];
+  } else {
+    bytecode = FindCachedLuaScript(request.args_[1]);
+    if (!bytecode.has_value()) {
+      co_return EncodeError("NOSCRIPT No matching script. Please use EVAL.");
+    }
+  }
+
+  const std::size_t key_count = key_view->count();
+  const std::size_t key_begin = key_count == 0 ? 3 : key_view->first_;
+  const std::span<const std::string> declared_keys(
+      request.args_.data() + key_begin, key_count);
+  const std::size_t argv_begin = 3 + key_count;
+  const std::span<const std::string> script_argv(
+      request.args_.data() + argv_begin, request.args_.size() - argv_begin);
+  auto execution =
+      IsEvalSourceKind(request.kind_)
+          ? LuaExecution::Create(script, declared_keys, script_argv)
+          : LuaExecution::CreateFromBytecode(*bytecode, declared_keys,
+                                             script_argv);
+  if (!execution.ok()) {
+    co_return EncodeError(absl::StrCat("ERR Error compiling script: ",
+                                       execution.status().message()));
+  }
+  if (IsEvalSourceKind(request.kind_)) {
+    const std::string sha = LuaScriptSha1(script);
+    if (!sha.empty()) {
+      (void)co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode());
+    }
+  }
+
+  LuaExecutionStep step = (*execution)->Start();
+  while (step.call_.has_value()) {
+    std::string command_reply = co_await ExecuteLuaRedisCall(
+        request, std::move(*step.call_), declared_keys, transaction, tx_writes,
+        notifications, effects);
+    step = (*execution)->Resume(command_reply);
+  }
+  co_return std::move(step.reply_);
+}
+
+void StoreEvalReplicationEffects(
+    const CommandRequest& request,
+    std::vector<CapturedReplicationCommand> effects) {
+  if (request.replication_capture_ == nullptr) return;
+  MarkReplicationCommandHandled(request);
+  for (CapturedReplicationCommand& effect : effects) {
+    CaptureReplicationCommand(request, effect.db_id_, std::move(effect.args_));
+  }
+}
+
+Task<CommandReply> ExecuteEval(const CommandRequest& request,
+                               ReplyBuilder& reply_builder) {
+  auto key_view = DetermineKeys(*request.spec_, request.args_);
+  if (!key_view.ok()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR ", key_view.status().message())));
+  }
+
+  const std::size_t key_count = key_view->count();
+  const bool read_only = IsEvalReadOnlyKind(request.kind_);
+  const std::size_t key_begin = key_count == 0 ? 3 : key_view->first_;
+  const std::span<const std::string> declared_keys(
+      request.args_.data() + key_begin, key_count);
+  auto notifications =
+      std::make_shared<BlockingNotificationCapture>(g_storage->worker_count());
+  std::vector<CapturedReplicationCommand> effects;
+  std::vector<storage::TxShardWrites> tx_writes;
+  std::optional<tx::Transaction> transaction;
+  std::unique_ptr<ReplicationTransactionGuard> replication;
+
+  if (key_count != 0) {
+    transaction.emplace();
+    for (std::size_t i = 0; i < key_count; ++i) {
+      const std::string& key = declared_keys[i];
+      transaction->AddKey(
+          ShardForKey(key), request.db_id_, storage::ComputeDigest(key),
+          static_cast<std::uint32_t>(i),
+          read_only ? tx::LockMode::kShared : tx::LockMode::kExclusive);
+    }
+    transaction->Seal();
+    if (!read_only) {
+      replication =
+          std::make_unique<ReplicationTransactionGuard>(request, &*transaction);
+    }
+    absl::Status scheduled = co_await transaction->Schedule();
+    if (!scheduled.ok()) {
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", scheduled.message())));
+    }
+    absl::Status armed = co_await transaction->Execute(
+        &ArmOnlyShardCallback, nullptr, /*release=*/false);
+    if (!armed.ok()) {
+      (void)co_await transaction->Release();
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
+    }
+    if (!read_only) {
+      const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
+      tx_writes.resize(g_storage->worker_count());
+      g_storage->InitializeTxWrites(txid, tx_writes);
+    }
+  }
+
+  std::string eval_reply = co_await ExecuteEvalWithTransaction(
+      request, transaction.has_value() ? &*transaction : nullptr,
+      tx_writes.empty() ? nullptr : &tx_writes, notifications, &effects);
+
+  if (transaction.has_value()) {
+    if (!read_only) {
+      absl::Status published = co_await transaction->Execute(
+          &PublishFullSyncEffectsCallback, &tx_writes, /*release=*/false);
+      if (!published.ok()) {
+        (void)co_await transaction->Release();
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", published.message())));
+      }
+    }
+    absl::Status released = co_await transaction->Release();
+    if (!released.ok()) {
+      co_return BuiltReply(
+          reply_builder.AppendError(absl::StrCat("ERR ", released.message())));
+    }
+    if (!read_only && !effects.empty() && replication != nullptr) {
+      replication->SetCommandArgs(
+          EncodeReplicationCommandEffects(std::move(effects)));
+      replication->SetFinalExpirations(tx_writes);
+      replication->Commit();
+    }
+    if (!read_only) {
+      g_storage->NoteTxCommitStarted();
+      SpawnOnCurrentWorker(
+          RunTxCommit(tx_writes.front().txid_, std::move(tx_writes)));
+    }
+  }
+
+  absl::Status notified = co_await FlushBlockingNotifications(
+      *notifications, request.blocking_wake_cascade_);
+  if (!notified.ok()) {
+    co_return BuiltReply(
+        reply_builder.AppendError(absl::StrCat("ERR ", notified.message())));
+  }
+  co_return BuiltReply(reply_builder.AppendRaw(eval_reply));
+}
+
+Task<CommandReply> ExecuteScript(const CommandRequest& request,
+                                 ReplyBuilder& reply_builder) {
+  const std::string_view subcommand = request.args_[1];
+  if (CmpCaseInsensitive(subcommand, "load")) {
+    if (request.args_.size() != 3) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'script|load' command"));
+    }
+    constexpr std::span<const std::string> empty;
+    auto execution = LuaExecution::Create(request.args_[2], empty, empty);
+    if (!execution.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR Error compiling script: ", execution.status().message())));
+    }
+    const std::string sha = LuaScriptSha1(request.args_[2]);
+    if (sha.empty()) {
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR unable to compute script SHA1"));
+    }
+    (void)co_await CacheLuaScriptOnAllWorkers(sha, (*execution)->bytecode());
+    co_return BuiltReply(reply_builder.AppendBulkString(sha));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "exists")) {
+    if (request.args_.size() < 3) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'script|exists' command"));
+    }
+    reply_builder.AppendArrayHeader(request.args_.size() - 2);
+    for (std::size_t i = 2; i < request.args_.size(); ++i) {
+      reply_builder.AppendInteger(FindCachedLuaScript(request.args_[i]) ? 1
+                                                                        : 0);
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+
+  if (CmpCaseInsensitive(subcommand, "flush")) {
+    if (request.args_.size() > 3 ||
+        (request.args_.size() == 3 &&
+         !CmpCaseInsensitive(request.args_[2], "sync") &&
+         !CmpCaseInsensitive(request.args_[2], "async"))) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR SCRIPT FLUSH only support SYNC|ASYNC option"));
+    }
+    (void)co_await FlushLuaScriptCacheOnAllWorkers();
+    co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+  }
+
+  co_return BuiltReply(reply_builder.AppendError(
+      absl::StrCat("ERR Unknown subcommand or wrong number of arguments for '",
+                   subcommand, "'. Try SCRIPT HELP.")));
+}
+
 // One EXEC hop = one squashed run: every shard executes its keys of each
 // command in [begin, end) in queue order (same-key commands share an owner,
 // so their relative order is preserved). A command's failure is recorded and
@@ -6274,8 +6770,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     co_return BuiltReply(reply_builder.AppendArrayHeader(0));
   }
   if (IsSentinelManagementCommand(queued.front())) {
-    co_return co_await ExecuteSentinelManagementExec(
-        ctx, std::move(queued), reply_builder);
+    co_return co_await ExecuteSentinelManagementExec(ctx, std::move(queued),
+                                                     reply_builder);
   }
 
   std::size_t exec_memory_growth = 0;
@@ -6288,36 +6784,28 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     co_return BuiltReply(AppendOomError(reply_builder));
   }
 
-  const bool has_write = std::any_of(
-      queued.begin(), queued.end(), [](const CommandRequest& command) {
-        return command.spec_ != nullptr &&
-               (command.spec_->flags_ & kCmdWrite) != 0;
-      });
-  const bool has_replicable = std::any_of(
-      queued.begin(), queued.end(), [](const CommandRequest& command) {
-        return command.spec_ != nullptr &&
-               (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0;
-      });
+  const bool has_write =
+      std::any_of(queued.begin(), queued.end(), ExecCommandMayWrite);
+  const bool has_replicable =
+      std::any_of(queued.begin(), queued.end(), ExecCommandMayReplicate);
   auto blocking_notifications =
       std::make_shared<BlockingNotificationCapture>(g_storage->worker_count());
   for (CommandRequest& command : queued) {
     command.blocking_notification_capture_ = blocking_notifications;
   }
   const bool source_write =
-      has_write &&
-      std::any_of(
-          queued.begin(), queued.end(), [](const CommandRequest& command) {
-            return !command.replication_origin_ && command.spec_ != nullptr &&
-                   (command.spec_->flags_ & kCmdWrite) != 0;
+      has_write && std::any_of(queued.begin(), queued.end(),
+                               [](const CommandRequest& command) {
+                                 return !command.replication_origin_ &&
+                                        ExecCommandMayWrite(command);
           });
   const bool source_replicable =
       has_replicable &&
       (g_replication == nullptr || !g_replication->is_replica()) &&
-      std::any_of(
-          queued.begin(), queued.end(), [](const CommandRequest& command) {
-            return !command.replication_origin_ && command.spec_ != nullptr &&
-                   (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) !=
-                       0;
+      std::any_of(queued.begin(), queued.end(),
+                  [](const CommandRequest& command) {
+                    return !command.replication_origin_ &&
+                           ExecCommandMayReplicate(command);
           });
   ReplicationTransactionOrderGuard replication_order_guard;
   if (source_replicable && g_storage != nullptr &&
@@ -6333,8 +6821,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   if (source_replicable && g_storage != nullptr &&
       g_storage->ReplicationLogActive()) {
     for (CommandRequest& command : queued) {
-      if (command.spec_ != nullptr &&
-          (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0) {
+      if (ExecCommandMayReplicate(command)) {
         command.replication_capture_ =
             std::make_shared<ReplicationCommandCapture>();
       }
@@ -6374,7 +6861,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           EncodeError(absl::StrCat("ERR ", keys.status().message()));
       continue;
     }
-    const bool write = (cmd.spec_->flags_ & kCmdWrite) != 0;
+    const bool write = ExecCommandMayWrite(cmd);
     std::uint16_t slot = 0;
     if (cmd.kind_ == CommandKind::kCopy) {
       auto options = ParseCopyOptions(cmd);
@@ -6464,6 +6951,18 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
+    if (IsEvalCommand(cmd)) {
+      std::vector<CapturedReplicationCommand> effects;
+      std::string reply = co_await ExecuteEvalWithTransaction(
+          cmd, nullptr, nullptr, blocking_notifications, &effects);
+      StoreEvalReplicationEffects(cmd, std::move(effects));
+      co_return reply;
+    }
+    if (cmd.kind_ == CommandKind::kScript) {
+      ReplyBuilder local_builder(ctx.resp_version());
+      CommandReply local = co_await ExecuteScript(cmd, local_builder);
+      co_return std::string(local.encoded_);
+    }
     ReplyBuilder local_builder(ctx.resp_version());
     CommandReply local;
     if (cmd.kind_ == CommandKind::kHello) {
@@ -6471,15 +6970,14 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         co_return std::string(
             local_builder.AppendError("ERR HELLO is unavailable"));
       }
-      co_return std::string(ctx.hello_handler_(
-          ctx.hello_authenticator_, ctx.hello_replication_, ctx, cmd.args_,
-          local_builder));
+      co_return std::string(ctx.hello_handler_(ctx.hello_authenticator_,
+                                               ctx.hello_replication_, ctx,
+                                               cmd.args_, local_builder));
     } else if (cmd.kind_ == CommandKind::kMonitor) {
       // Valkey refuses streaming commands while EXEC is running with its
       // deny-blocking client state. Do not switch the connection from inside
       // an aggregate EXEC reply.
-      local = BuiltReply(
-          local_builder.AppendError(
+      local = BuiltReply(local_builder.AppendError(
               "ERR MONITOR isn't allowed for DENY BLOCKING client"));
     } else if (cmd.kind_ == CommandKind::kInfo) {
       local = co_await ExecuteInfo(cmd, local_builder);
@@ -6545,26 +7043,20 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
 
     const CommandRequest* replication_request = nullptr;
     for (const CommandRequest& command : queued) {
-      if (command.spec_ != nullptr &&
-          (command.spec_->flags_ & kCmdWrite) != 0) {
+      if (ExecCommandMayWrite(command)) {
         replication_request = &command;
         break;
       }
     }
     std::vector<std::string> replication_args;
     if (replication_request != nullptr && !owners.empty()) {
-      const std::size_t write_count = std::count_if(
-          queued.begin(), queued.end(), [](const CommandRequest& command) {
-            return command.spec_ != nullptr &&
-                   (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) !=
-                       0;
-          });
+      const std::size_t write_count =
+          std::count_if(queued.begin(), queued.end(), ExecCommandMayReplicate);
       replication_args.reserve(2 + queued.size() * 3);
       replication_args.emplace_back(kReplicatedExecCommand);
       replication_args.push_back(std::to_string(write_count));
       for (const CommandRequest& command : queued) {
-        if (command.spec_ == nullptr ||
-            (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0) {
+        if (!ExecCommandMayReplicate(command)) {
           continue;
         }
         replication_args.push_back(std::to_string(command.db_id_));
@@ -6577,23 +7069,20 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       std::vector<CapturedReplicationCommand> commands;
       for (std::size_t index = 0; index < queued.size(); ++index) {
         const CommandRequest& command = queued[index];
-        if (!replies[index].empty() && replies[index].front() == '-') {
-          continue;
-        }
         CapturedReplicationEffects captured;
         if (command.replication_capture_ != nullptr) {
           captured = command.replication_capture_->Take();
         }
-        if (!captured.handled_) {
+        if (captured.handled_) {
+          commands.insert(commands.end(),
+                          std::make_move_iterator(captured.commands_.begin()),
+                          std::make_move_iterator(captured.commands_.end()));
+        } else if (replies[index].empty() || replies[index].front() != '-') {
           if (command.spec_ != nullptr &&
               (command.spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) != 0) {
             commands.push_back(
                 CapturedReplicationCommand{command.db_id_, command.args_});
           }
-        } else {
-          commands.insert(commands.end(),
-                          std::make_move_iterator(captured.commands_.begin()),
-                          std::make_move_iterator(captured.commands_.end()));
         }
       }
       return EncodeReplicationCommandEffects(std::move(commands));
@@ -6607,7 +7096,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       replication->Commit();
     };
 
-    if (owners.size() == 1) {
+    const bool contains_eval =
+        std::any_of(queued.begin(), queued.end(), IsEvalCommand);
+    if (owners.size() == 1 && !contains_eval) {
       std::unique_ptr<ReplicationTransactionGuard> replication;
       if (replication_request != nullptr) {
         replication = std::make_unique<ReplicationTransactionGuard>(
@@ -6700,8 +7191,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       for (const auto& watched : ctx.watched_) {
         bool covered = false;
         for (const auto& keys : cmd_keys) {
-          covered = std::any_of(
-              keys.begin(), keys.end(), [&](const ExecKey& key) {
+          covered =
+              std::any_of(keys.begin(), keys.end(), [&](const ExecKey& key) {
                 return key.db_ == watched.db_ &&
                        tx::FingerprintOf(key.digest_) == watched.fp_;
               });
@@ -6762,6 +7253,14 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           ++i;
           continue;
         }
+        if (IsEvalCommand(cmd)) {
+          std::vector<CapturedReplicationCommand> effects;
+          replies[i] = co_await ExecuteEvalWithTransaction(
+              cmd, &txn, &tx_writes, blocking_notifications, &effects);
+          StoreEvalReplicationEffects(cmd, std::move(effects));
+          ++i;
+          continue;
+        }
         const ExecSequentialFamily sequential =
             ClassifyExecSequential(cmd.kind_);
         if (sequential != ExecSequentialFamily::kNone) {
@@ -6772,6 +7271,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         }
         std::size_t end = i + 1;
         while (end < queued.size() && !cmd_keys[end].empty() &&
+               !IsEvalCommand(queued[end]) &&
                ClassifyExecSequential(queued[end].kind_) ==
                    ExecSequentialFamily::kNone) {
           ++end;
@@ -7176,7 +7676,8 @@ void ReplicationTransactionGuard::Initialize(
     std::vector<std::string> canonical_args) {
   if (request.replication_origin_ || g_storage == nullptr ||
       !g_storage->ReplicationLogActive() || request.spec_ == nullptr ||
-      (request.spec_->flags_ & kCmdWrite) == 0 || participants.empty()) {
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) == 0 ||
+      participants.empty()) {
     return;
   }
   const std::uint64_t id =
@@ -7469,10 +7970,9 @@ const char* ClientFlags(const ClientConnectionRecord& client) noexcept {
   return "N";
 }
 
-std::string FormatClientInfo(
-    const ClientConnectionRecord& client,
-    std::chrono::steady_clock::time_point now, std::uint8_t db_id,
-    std::string_view command) {
+std::string FormatClientInfo(const ClientConnectionRecord& client,
+                             std::chrono::steady_clock::time_point now,
+                             std::uint8_t db_id, std::string_view command) {
   const auto age = std::chrono::duration_cast<std::chrono::seconds>(
                        now - client.connected_at_)
                        .count();
@@ -7480,16 +7980,15 @@ std::string FormatClientInfo(
   absl::StrAppend(
       &listing, "id=", client.id_, " addr=", client.address_,
       " fd=", client.fd_, " name=", client.name_, " age=", age,
-      " idle=0 flags=", ClientFlags(client), " db=",
-      static_cast<unsigned>(db_id),
+      " idle=0 flags=", ClientFlags(client),
+      " db=", static_cast<unsigned>(db_id),
       " sub=", client.subscriptions_ - client.pattern_subscriptions_,
-      " psub=", client.pattern_subscriptions_,
-      " ssub=0 multi=-1 qbuf=0 ",
+      " psub=", client.pattern_subscriptions_, " ssub=0 multi=-1 qbuf=0 ",
       "qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 ",
       "obl=0 oll=0 omem=0 tot-mem=0 events=r cmd=", command,
       " user=default redir=-1 resp=",
-      static_cast<unsigned>(client.resp_version_), " lib-name=",
-      client.library_name_, " lib-ver=", client.library_version_,
+      static_cast<unsigned>(client.resp_version_),
+      " lib-name=", client.library_name_, " lib-ver=", client.library_version_,
       client.tls_ ? " tls=1" : "");
   return listing;
 }
@@ -7508,9 +8007,11 @@ std::string_view AppendClientInfoReply(ReplyBuilder& reply_builder,
 std::string_view AppendClientHelp(ReplyBuilder& reply_builder) {
   static constexpr std::string_view kHelp[] = {
       "CACHING (YES|NO)",
-      "    Enable/disable tracking of the keys for next command in OPTIN/OPTOUT modes.",
+      "    Enable/disable tracking of the keys for next command in "
+      "OPTIN/OPTOUT modes.",
       "GETREDIR",
-      "    Return the client ID we are redirecting to when tracking is enabled.",
+      "    Return the client ID we are redirecting to when tracking is "
+      "enabled.",
       "GETNAME",
       "    Return the name of the current connection.",
       "ID",
@@ -7628,8 +8129,8 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
       co_return BuiltReply(
           reply_builder.AppendError("ERR current client is not registered"));
     }
-    std::string& record_value = library_name ? found->library_name_
-                                             : found->library_version_;
+    std::string& record_value =
+        library_name ? found->library_name_ : found->library_version_;
     record_value = args[3];
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
@@ -7648,8 +8149,9 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
     if (std::any_of(args[2].begin(), args[2].end(), [](unsigned char c) {
           return c == 0 || std::isspace(c);
         })) {
-      co_return BuiltReply(reply_builder.AppendError(
-          "ERR Client names cannot contain spaces, newlines or special characters."));
+      co_return BuiltReply(
+          reply_builder.AppendError("ERR Client names cannot contain spaces, "
+                                    "newlines or special characters."));
     }
     ctx.client_name_ = args[2];
     SetClientName(ctx.conn_id_, ctx.client_name_);
@@ -7659,7 +8161,8 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
     if (args.size() != 2) {
       co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
     }
-    co_return BuiltReply(ctx.client_name_.empty()
+    co_return BuiltReply(
+        ctx.client_name_.empty()
                              ? reply_builder.AppendNull()
                              : reply_builder.AppendBulkString(ctx.client_name_));
   }
@@ -7724,8 +8227,8 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
     std::string listing;
     const auto now = std::chrono::steady_clock::now();
     for (const auto& client : clients) {
-      absl::StrAppend(&listing,
-                      FormatClientInfo(client, now, 0, "client"), "\n");
+      absl::StrAppend(&listing, FormatClientInfo(client, now, 0, "client"),
+                      "\n");
     }
     co_return BuiltReply(AppendClientInfoReply(reply_builder, listing));
   }
@@ -7929,6 +8432,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kUnsubscribe:
         case CommandKind::kQuit:
         case CommandKind::kReset:
+        case CommandKind::kScript:
           return true;
         default:
           return false;
@@ -7957,8 +8461,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         co_await DropWatches(ctx);
         co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
       case CommandKind::kQuit: {
-        CommandReply reply =
-            BuiltReply(reply_builder.AppendSimpleString("OK"));
+        CommandReply reply = BuiltReply(reply_builder.AppendSimpleString("OK"));
         reply.close_connection_ = true;
         co_return reply;
       }
@@ -8003,7 +8506,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           "READONLY You can't write against a read only replica."));
     }
     const bool sentinel_management = IsSentinelManagementCommand(request);
-    const bool sentinel_batch = !ctx.queued_.empty() &&
+    const bool sentinel_batch =
+        !ctx.queued_.empty() &&
                                 IsSentinelManagementCommand(ctx.queued_.front());
     if (sentinel_management || sentinel_batch) {
       if (!sentinel_management || (!ctx.queued_.empty() && !sentinel_batch)) {
@@ -8046,11 +8550,11 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
   switch (kind) {
     case CommandKind::kHello:
       if (ctx.hello_handler_ == nullptr) {
-        co_return BuiltReply(reply_builder.AppendError(
-            "ERR HELLO is unavailable"));
+        co_return BuiltReply(
+            reply_builder.AppendError("ERR HELLO is unavailable"));
       }
-      co_return BuiltReply(ctx.hello_handler_(
-          ctx.hello_authenticator_, ctx.hello_replication_, ctx,
+      co_return BuiltReply(ctx.hello_handler_(ctx.hello_authenticator_,
+                                              ctx.hello_replication_, ctx,
           request.args_, reply_builder));
     case CommandKind::kMulti:
       ctx.in_multi_ = true;
@@ -8135,11 +8639,10 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
   co_return co_await DropWatches(ctx);
 }
 
-Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
-                                      ReplyBuilder& reply_builder,
+Task<CommandReply> ExecuteCommandBody(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
                                       std::uint64_t client_id,
-                                      ReplicationTransactionOrderGuard*
-                                          preacquired_order = nullptr) {
+    ReplicationTransactionOrderGuard* preacquired_order = nullptr) {
   const bool replication_origin = request.replication_origin_;
   const auto& args = request.args_;
   const std::uint32_t cmd_flags =
@@ -8184,9 +8687,8 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
   // trying to drain. This is backpressure, not a transient client error.
   const bool snapshot_transaction =
       !replication_origin && g_replication != nullptr && g_storage != nullptr &&
-      g_storage->ReplicationLogActive() &&
-      (cmd_flags & (kCmdWrite | kCmdMultiShard)) ==
-          (kCmdWrite | kCmdMultiShard) &&
+      g_storage->ReplicationLogActive() && (cmd_flags & kCmdMultiShard) != 0 &&
+      (cmd_flags & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       (cmd_flags & kCmdMayBlock) == 0;
   ReplicationTransactionOrderGuard local_replication_order;
   ReplicationTransactionOrderGuard* replication_order =
@@ -8218,6 +8720,15 @@ Task<CommandReply> ExecuteCommandBody(const CommandRequest& request,
   }
 
   switch (request.kind_) {
+    case CommandKind::kEval:
+    case CommandKind::kEvalSha:
+    case CommandKind::kEvalRo:
+    case CommandKind::kEvalShaRo:
+      co_return co_await ExecuteEval(request, reply_builder);
+
+    case CommandKind::kScript:
+      co_return co_await ExecuteScript(request, reply_builder);
+
     case CommandKind::kReplicaOf:
       co_return co_await ExecuteReplicaOf(request, reply_builder);
 
@@ -8592,8 +9103,8 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
                                           std::uint64_t client_id) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
-      (request.spec_->flags_ & kCmdWrite) != 0 && g_storage != nullptr &&
-      g_storage->ReplicationLogActive();
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
+      g_storage != nullptr && g_storage->ReplicationLogActive();
   if (!source_write) [[likely]] {
     co_return co_await ExecuteCommandBody(request, reply_builder, client_id);
   }
@@ -8615,8 +9126,8 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
-  CommandReply reply = co_await ExecuteCommandBody(
-      request, reply_builder, client_id,
+  CommandReply reply =
+      co_await ExecuteCommandBody(request, reply_builder, client_id,
       ordered_mset ? &replication_order : nullptr);
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);

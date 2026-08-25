@@ -313,6 +313,226 @@ int main(int argc, char** argv) {
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
 
+    // Lua scripts use a node-local SHA cache and execute their declared key
+    // set under one transaction. EVALSHA reuses the cache populated by EVAL.
+    constexpr std::string_view argv_script = "return ARGV[1]";
+    Expect(client.Command({"EVAL", argv_script, "0", "hello"}), Bulk("hello"),
+           "EVAL ARGV");
+    Expect(
+        client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
+                        "0", "cached"}),
+        Bulk("cached"), "EVALSHA cached");
+    // EVAL populates every worker-local cache before replying. New connections
+    // may be accepted by any worker and must all observe the same node cache.
+    for (unsigned i = 0; i < 16; ++i) {
+      RespClient cache_client = Connect(port);
+      Expect(cache_client.Command({"EVALSHA",
+                                   "098e0f0d1448c0a81dafe820f66d460eb09263da",
+                                   "0", "worker-cache"}),
+             Bulk("worker-cache"), "EVALSHA worker-local cache");
+    }
+    Expect(client.Command(
+               {"EVALSHA", "0000000000000000000000000000000000000000", "0"}),
+           "-NOSCRIPT No matching script. Please use EVAL.", "EVALSHA missing");
+
+    // SCRIPT LOAD shares EVAL's compiler/cache path but does not execute the
+    // chunk. EXISTS preserves argument order, and FLUSH clears every worker's
+    // local compiled-chunk index before releasing the backing storage.
+    constexpr std::string_view loaded_script = "return 'loaded'";
+    constexpr std::string_view loaded_sha =
+        "b534286061d4b9e4026607613b95c06c06015ae8";
+    Expect(client.Command({"SCRIPT", "LOAD", loaded_script}), Bulk(loaded_sha),
+           "SCRIPT LOAD");
+    Expect(client.Command({"SCRIPT", "EXISTS", loaded_sha,
+                           "0000000000000000000000000000000000000000"}),
+           "*2\r\n:1\r\n:0", "SCRIPT EXISTS");
+    Expect(client.Command({"EVALSHA", loaded_sha, "0"}), Bulk("loaded"),
+           "EVALSHA after SCRIPT LOAD");
+    for (unsigned i = 0; i < 16; ++i) {
+      RespClient cache_client = Connect(port);
+      Expect(cache_client.Command({"EVALSHA", loaded_sha, "0"}), Bulk("loaded"),
+             "SCRIPT LOAD worker-local compiled cache");
+    }
+    Expect(client.Command({"SCRIPT", "FLUSH", "ASYNC"}), "+OK",
+           "SCRIPT FLUSH ASYNC");
+    Expect(client.Command({"SCRIPT", "EXISTS", loaded_sha}), "*1\r\n:0",
+           "SCRIPT EXISTS after FLUSH");
+    for (unsigned i = 0; i < 16; ++i) {
+      RespClient cache_client = Connect(port);
+      Expect(cache_client.Command({"EVALSHA", loaded_sha, "0"}),
+             "-NOSCRIPT No matching script. Please use EVAL.",
+             "SCRIPT FLUSH worker barrier");
+    }
+    ExpectContains(client.Command({"SCRIPT", "LOAD", "return +"}),
+                   "Error compiling script", "SCRIPT LOAD compile error");
+    ExpectContains(client.Command({"SCRIPT", "FLUSH", "INVALID"}),
+                   "SCRIPT FLUSH only support SYNC|ASYNC option",
+                   "SCRIPT FLUSH option validation");
+
+    // EVAL also stores the compiled chunk after FLUSH.
+    Expect(client.Command({"EVAL", argv_script, "0", "recompiled"}),
+           Bulk("recompiled"), "EVAL compiled cache after FLUSH");
+    Expect(
+        client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
+                        "0", "compiled-cache"}),
+        Bulk("compiled-cache"), "EVALSHA loads compiled chunk");
+
+    Expect(client.Command({"SET", "lua:ro", "seed"}), "+OK", "EVAL_RO seed");
+    Expect(client.Command(
+               {"EVAL_RO", "return redis.call('GET',KEYS[1])", "1", "lua:ro"}),
+           Bulk("seed"), "EVAL_RO read");
+    Expect(client.Command({"EVALSHA_RO",
+                           "098e0f0d1448c0a81dafe820f66d460eb09263da", "0",
+                           "readonly-cache"}),
+           Bulk("readonly-cache"), "EVALSHA_RO shared compiled cache");
+    ExpectContains(
+        client.Command({"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])",
+                        "1", "lua:ro", "changed"}),
+        "Write commands are not allowed from read-only scripts",
+        "EVAL_RO rejects write");
+    Expect(client.Command({"GET", "lua:ro"}), Bulk("seed"),
+           "EVAL_RO write made no change");
+    Expect(client.Command(
+               {"EVAL_RO",
+                "if false then redis.call('SET',KEYS[1],'changed') end; "
+                "return redis.call('GET',KEYS[1])",
+                "1", "lua:ro"}),
+           Bulk("seed"), "EVAL_RO checks executed commands, not source text");
+    Expect(client.Command(
+               {"EVALSHA_RO", "0000000000000000000000000000000000000000", "0"}),
+           "-NOSCRIPT No matching script. Please use EVAL.",
+           "EVALSHA_RO missing");
+
+    constexpr std::string_view cross_script =
+        "redis.call('MSET',KEYS[1],ARGV[1],KEYS[2],ARGV[2]); "
+        "return redis.call('MGET',KEYS[1],KEYS[2])";
+    Expect(client.Command({"EVAL", cross_script, "2", "{lua:a}:cross",
+                           "{lua:b}:cross", "left", "right"}),
+           "*2\r\n" + Bulk("left") + "\r\n" + Bulk("right"),
+           "cross-shard EVAL");
+
+    // Like Valkey and MULTI/EXEC, a later runtime error does not roll back
+    // commands that the script already completed.
+    constexpr std::string_view error_script =
+        "redis.call('SET',KEYS[1],ARGV[1]); "
+        "return redis.call('NOPE',KEYS[1])";
+    ExpectContains(
+        client.Command({"EVAL", error_script, "1", "lua:error", "retained"}),
+        "Unknown Redis command called from script: NOPE", "EVAL runtime error");
+    Expect(client.Command({"GET", "lua:error"}), Bulk("retained"),
+           "EVAL keeps writes before runtime error");
+    Expect(client.Command({"EVAL",
+                           "local e=redis.pcall('NOPE',KEYS[1]); return e.err",
+                           "1", "lua:error"}),
+           Bulk("ERR Unknown Redis command called from script: NOPE"),
+           "redis.pcall");
+    ExpectContains(client.Command({"EVAL", "return redis.call('GET',ARGV[1])",
+                                   "0", "lua:error"}),
+                   "Script attempted to access an undeclared key",
+                   "EVAL undeclared key");
+
+    // Lua is an ordering barrier inside EXEC and borrows the outer
+    // transaction's locks, write receipts, txid, and commit record.
+    constexpr std::string_view exec_order_script =
+        "local v=redis.call('GET',KEYS[1]); "
+        "redis.call('SET',KEYS[2],v..ARGV[1]); return v";
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI Lua ordering");
+    Expect(client.Command({"SET", "{exec-lua:a}:source", "before"}), "+QUEUED",
+           "queue before Lua");
+    Expect(
+        client.Command({"EVAL", exec_order_script, "2", "{exec-lua:a}:source",
+                        "{exec-lua:b}:destination", "-lua"}),
+        "+QUEUED", "queue Lua ordering barrier");
+    Expect(client.Command({"GET", "{exec-lua:b}:destination"}), "+QUEUED",
+           "queue after Lua");
+    Expect(client.Command({"EXEC"}),
+           "*3\r\n+OK\r\n" + Bulk("before") + "\r\n" + Bulk("before-lua"),
+           "EXEC Lua ordering");
+    Expect(client.Command(
+               {"EVALSHA", "66e95443c434dfcc86d257faaa686b00a87a4afd", "2",
+                "{exec-lua:a}:source", "{exec-lua:b}:destination", "-cached"}),
+           Bulk("before"), "successful EXEC EVAL populated cache");
+    Expect(client.Command({"GET", "{exec-lua:b}:destination"}),
+           Bulk("before-cached"), "cached EXEC script ran");
+
+    // A keyless EVALSHA is still executed at its exact queue position.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI EVALSHA");
+    Expect(
+        client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
+                        "0", "inside-exec"}),
+        "+QUEUED", "queue EVALSHA");
+    Expect(client.Command({"PING"}), "+QUEUED", "queue after EVALSHA");
+    Expect(client.Command({"EXEC"}),
+           "*2\r\n" + Bulk("inside-exec") + "\r\n+PONG", "EXEC EVALSHA");
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI SCRIPT LOAD");
+    Expect(client.Command({"SCRIPT", "LOAD", loaded_script}), "+QUEUED",
+           "queue SCRIPT LOAD");
+    Expect(client.Command({"EVALSHA", loaded_sha, "0"}), "+QUEUED",
+           "queue EVALSHA after SCRIPT LOAD");
+    Expect(client.Command({"EXEC"}),
+           "*2\r\n" + Bulk(loaded_sha) + "\r\n" + Bulk("loaded"),
+           "EXEC SCRIPT LOAD before EVALSHA");
+
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI EVAL_RO write guard");
+    Expect(
+        client.Command({"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])",
+                        "1", "lua:ro", "changed-in-exec"}),
+        "+QUEUED", "queue EVAL_RO write");
+    Expect(client.Command({"SET", "lua:after-ro-error", "continued"}),
+           "+QUEUED", "queue after EVAL_RO write");
+    const std::string exec_ro_error = client.Command({"EXEC"});
+    ExpectContains(exec_ro_error,
+                   "Write commands are not allowed from read-only scripts",
+                   "EXEC EVAL_RO rejects write");
+    ExpectContains(exec_ro_error, "+OK", "EXEC continues after EVAL_RO error");
+    Expect(client.Command({"GET", "lua:ro"}), Bulk("seed"),
+           "EXEC EVAL_RO write made no change");
+    Expect(client.Command({"GET", "lua:after-ro-error"}), Bulk("continued"),
+           "EXEC continued after EVAL_RO error");
+
+    // Runtime errors retain earlier script effects and do not prevent later
+    // queued commands from running.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI Lua runtime error");
+    Expect(client.Command({"EVAL", error_script, "1", "lua:exec-error",
+                           "retained-in-exec"}),
+           "+QUEUED", "queue failing Lua");
+    Expect(client.Command({"SET", "lua:after-error", "continued"}), "+QUEUED",
+           "queue after failing Lua");
+    const std::string exec_lua_error = client.Command({"EXEC"});
+    ExpectContains(exec_lua_error,
+                   "Unknown Redis command called from script: NOPE",
+                   "EXEC Lua runtime error");
+    ExpectContains(exec_lua_error, "+OK", "EXEC continues after Lua error");
+    Expect(client.Command({"GET", "lua:exec-error"}), Bulk("retained-in-exec"),
+           "EXEC retains Lua write before error");
+    Expect(client.Command({"GET", "lua:after-error"}), Bulk("continued"),
+           "EXEC runs command after Lua error");
+
+    // NOSCRIPT and movable-key argument errors are runtime errors in the EXEC
+    // array, not queue-time errors that doom the transaction.
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI Lua runtime validation");
+    Expect(client.Command(
+               {"EVALSHA", "0000000000000000000000000000000000000000", "0"}),
+           "+QUEUED", "queue missing EVALSHA");
+    Expect(client.Command({"EVAL", "return 1", "not-a-number"}), "+QUEUED",
+           "queue invalid EVAL numkeys");
+    Expect(client.Command({"EVAL", "return +", "0"}), "+QUEUED",
+           "queue Lua compile error");
+    Expect(client.Command({"SET", "lua:after-validation", "ran"}), "+QUEUED",
+           "queue after invalid Lua commands");
+    const std::string exec_lua_validation = client.Command({"EXEC"});
+    ExpectContains(exec_lua_validation,
+                   "NOSCRIPT No matching script. Please use EVAL.",
+                   "EXEC EVALSHA NOSCRIPT");
+    ExpectContains(exec_lua_validation,
+                   "value is not an integer or out of range",
+                   "EXEC EVAL numkeys error");
+    ExpectContains(exec_lua_validation, "Error compiling script",
+                   "EXEC EVAL compile error");
+    Expect(client.Command({"GET", "lua:after-validation"}), Bulk("ran"),
+           "EXEC continues after Lua validation errors");
+
     // Basic transaction: replies in queue order, later commands see earlier
     // effects.
     Expect(client.Command({"MULTI"}), "+OK", "MULTI");
@@ -535,6 +755,40 @@ int main(int argc, char** argv) {
 
     // ---- WATCH / UNWATCH ----
     RespClient other = Connect(port);
+
+    // WATCH aborts before the Lua body starts. In particular, an aborted EVAL
+    // must not populate the node-local script cache.
+    constexpr std::string_view watched_script =
+        "return 'watch-should-not-cache'";
+    Expect(client.Command({"SET", "watch-lua", "base"}), "+OK",
+           "WATCH Lua seed");
+    Expect(client.Command({"WATCH", "watch-lua"}), "+OK", "WATCH Lua");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI watched Lua");
+    Expect(client.Command({"EVAL", watched_script, "0"}), "+QUEUED",
+           "queue watched Lua");
+    Expect(other.Command({"SET", "watch-lua", "changed"}), "+OK",
+           "invalidate watched Lua");
+    Expect(client.Command({"EXEC"}), "*-1", "WATCH aborts Lua EXEC");
+    Expect(client.Command(
+               {"EVALSHA", "30f2362e36ab75397d4f6d756a73a1254c57464a", "0"}),
+           "-NOSCRIPT No matching script. Please use EVAL.",
+           "aborted EVAL did not cache script");
+
+    // A watched key may also be one of the Lua KEYS. The EXEC exclusive hold
+    // covers the watch fence and the script writes it only after validation.
+    Expect(client.Command({"SET", "watch-lua-key", "base"}), "+OK",
+           "WATCH declared Lua key seed");
+    Expect(client.Command({"WATCH", "watch-lua-key"}), "+OK",
+           "WATCH declared Lua key");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI declared watched Lua key");
+    Expect(client.Command({"EVAL",
+                           "redis.call('SET',KEYS[1],ARGV[1]); return ARGV[1]",
+                           "1", "watch-lua-key", "updated"}),
+           "+QUEUED", "queue declared watched Lua key");
+    Expect(client.Command({"EXEC"}), "*1\r\n" + Bulk("updated"),
+           "EXEC declared watched Lua key");
+    Expect(client.Command({"GET", "watch-lua-key"}), Bulk("updated"),
+           "declared watched Lua key updated");
 
     // Unmodified watch: EXEC proceeds.
     Expect(client.Command({"SET", "w1", "base"}), "+OK", "watch seed");

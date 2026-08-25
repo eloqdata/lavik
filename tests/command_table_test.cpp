@@ -173,6 +173,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("get", CommandKind::kGet);
   CheckKind("GeT", CommandKind::kGet);
   CheckKind("SET", CommandKind::kSet);
+  CheckKind("SCRIPT", CommandKind::kScript);
+  CheckKind("EVAL_RO", CommandKind::kEvalRo);
+  CheckKind("EVALSHA_RO", CommandKind::kEvalShaRo);
   CheckKind("APPEND", CommandKind::kAppend);
   CheckKind("GETBIT", CommandKind::kGetBit);
   CheckKind("SETBIT", CommandKind::kSetBit);
@@ -287,6 +290,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckArity("quit", 1, true);
   CheckArity("quit", 2, false);
   CheckArity("reset", 1, true);
+  CheckArity("script", 1, false);
+  CheckArity("script", 2, true);
+  CheckArity("script", 8, true);
   CheckArity("slaveof", 2, false);
   CheckArity("slaveof", 3, true);
   CheckArity("slaveof", 4, false);
@@ -551,6 +557,51 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   }
 }
 
+TEST(CommandTableTest, ResolvesEvalKeys) {
+  const CommandSpec* eval = FindCommand("EVAL");
+  const CommandSpec* evalsha = FindCommand("evalsha");
+  const CommandSpec* eval_ro = FindCommand("eval_ro");
+  const CommandSpec* evalsha_ro = FindCommand("EVALSHA_RO");
+  ASSERT_NE(eval, nullptr);
+  ASSERT_NE(evalsha, nullptr);
+  ASSERT_NE(eval_ro, nullptr);
+  ASSERT_NE(evalsha_ro, nullptr);
+  EXPECT_NE(eval_ro->flags_ & keylane::kCmdReadOnly, 0u);
+  EXPECT_EQ(eval_ro->flags_ & keylane::kCmdDynamicWrite, 0u);
+  EXPECT_NE(evalsha_ro->flags_ & keylane::kCmdReadOnly, 0u);
+
+  std::vector<std::string> args = {"EVAL",  "return ARGV[1]", "2",
+                                   "first", "second",         "argument"};
+  auto keys = DetermineKeys(*eval, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 3);
+  EXPECT_EQ(keys->last_, 4);
+  EXPECT_EQ(keys->count(), 2);
+
+  args = {"EVALSHA", "digest", "0", "argument"};
+  keys = DetermineKeys(*evalsha, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_TRUE(keys->empty());
+
+  args = {"EVAL_RO", "return redis.call('GET',KEYS[1])", "1", "first"};
+  keys = DetermineKeys(*eval_ro, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_EQ(keys->first_, 3);
+  EXPECT_EQ(keys->last_, 3);
+
+  args = {"EVALSHA_RO", "digest", "0"};
+  keys = DetermineKeys(*evalsha_ro, args);
+  ASSERT_TRUE(keys.ok()) << keys.status();
+  EXPECT_TRUE(keys->empty());
+
+  args = {"EVAL", "return 1", "-1"};
+  EXPECT_EQ(DetermineKeys(*eval, args).status().message(),
+            "Number of keys can't be negative");
+  args = {"EVAL", "return 1", "2", "only-one"};
+  EXPECT_EQ(DetermineKeys(*eval, args).status().message(),
+            "Number of keys can't be greater than number of args");
+}
+
 TEST(CommandTableTest, ResolvesStreamReadMovableKeys) {
   const CommandSpec* read = FindCommand("xread");
   ASSERT_NE(read, nullptr);
@@ -594,8 +645,7 @@ TEST(CommandTableTest, ResolvesSortStoreDestination) {
   const CommandSpec* sort = FindCommand("sort");
   ASSERT_NE(sort, nullptr);
   const std::vector<std::string> args = {
-      "SORT", "abc", "STORE", "invalid", "STORE", "stillbad",
-      "STORE", "def"};
+      "SORT", "abc", "STORE", "invalid", "STORE", "stillbad", "STORE", "def"};
   auto keys = DetermineKeys(*sort, args);
   ASSERT_TRUE(keys.ok()) << keys.status();
   EXPECT_EQ(keys->first_, 1);

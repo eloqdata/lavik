@@ -20,8 +20,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"echo", CommandKind::kEcho, 2, 2, 0, 0, 1, kCmdNoKeys},
     {"publish", CommandKind::kPublish, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdMayReplicate},
-    {"pubsub", CommandKind::kPubSub, 2, 0, 0, 0, 1,
-     kCmdReadOnly | kCmdNoKeys},
+    {"pubsub", CommandKind::kPubSub, 2, 0, 0, 0, 1, kCmdReadOnly | kCmdNoKeys},
     {"psubscribe", CommandKind::kPSubscribe, 2, 0, 0, 0, 1, kCmdNoKeys},
     {"punsubscribe", CommandKind::kPUnsubscribe, 1, 0, 0, 0, 1, kCmdNoKeys},
     {"subscribe", CommandKind::kSubscribe, 2, 0, 0, 0, 1, kCmdNoKeys},
@@ -31,6 +30,15 @@ constexpr CommandSpec kCommandTable[] = {
     {"auth", CommandKind::kAuth, 2, 3, 0, 0, 1, kCmdNoKeys},
     {"hello", CommandKind::kHello, 1, 7, 0, 0, 1, kCmdNoKeys},
     {"select", CommandKind::kSelect, 2, 2, 0, 0, 1, kCmdNoKeys},
+    {"eval", CommandKind::kEval, 3, 0, 0, 0, 1,
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"evalsha", CommandKind::kEvalSha, 3, 0, 0, 0, 1,
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"eval_ro", CommandKind::kEvalRo, 3, 0, 0, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"evalsha_ro", CommandKind::kEvalShaRo, 3, 0, 0, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"script", CommandKind::kScript, 2, 0, 0, 0, 1, kCmdNoKeys},
     {"dbsize", CommandKind::kDbSize, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"scan", CommandKind::kScan, 2, 0, 0, 0, 1,
@@ -272,8 +280,7 @@ constexpr CommandSpec kCommandTable[] = {
     {"config", CommandKind::kConfig, 2, 4, 0, 0, 1,
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
-    {"role", CommandKind::kRole, 1, 1, 0, 0, 1,
-     kCmdNoKeys | kCmdReadOnly},
+    {"role", CommandKind::kRole, 1, 1, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"cluster", CommandKind::kCluster, 2, 2, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"command", CommandKind::kCommand, 1, 0, 0, 0, 1,
@@ -391,6 +398,31 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
       return KeyIndexView{};
     }
     return DetermineKeys(spec, args.size());
+  }
+  if (spec.kind_ == CommandKind::kEval || spec.kind_ == CommandKind::kEvalSha ||
+      spec.kind_ == CommandKind::kEvalRo ||
+      spec.kind_ == CommandKind::kEvalShaRo) {
+    std::int64_t key_count = 0;
+    if (!ParseRedisInt64(args[2], &key_count)) {
+      return absl::InvalidArgumentError(
+          "value is not an integer or out of range");
+    }
+    if (key_count < 0) {
+      return absl::InvalidArgumentError("Number of keys can't be negative");
+    }
+    if (static_cast<std::uint64_t>(key_count) > args.size() - 3) {
+      return absl::InvalidArgumentError(
+          "Number of keys can't be greater than number of args");
+    }
+    if (key_count == 0) return KeyIndexView{};
+    if (key_count > std::numeric_limits<std::uint16_t>::max()) {
+      return absl::InvalidArgumentError("too many script keys");
+    }
+    return KeyIndexView{
+        .first_ = 3,
+        .last_ = static_cast<std::uint16_t>(2 + key_count),
+        .step_ = 1,
+    };
   }
   if (spec.kind_ == CommandKind::kSort) {
     std::optional<std::size_t> destination;
