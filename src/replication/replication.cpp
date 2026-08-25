@@ -45,6 +45,7 @@
 #include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
+#include "../redis/lua_eval.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -2880,6 +2881,8 @@ class ReplicationManager::Impl {
       }
       co_return status;
     }
+    const std::vector<LuaFunctionLibrary> function_libraries =
+        SnapshotLuaFunctionLibraries();
     OpenAllCommandDbGates();
     gates_open = true;
 
@@ -2897,6 +2900,15 @@ class ReplicationManager::Impl {
       // do not require the v11 metadata additions used by backup files.
       rdb::StreamEncoder encoder(10);
       status = co_await WriteText(stream, encoder.Header());
+      if (status.ok()) {
+        for (const LuaFunctionLibrary& library : function_libraries) {
+          const std::string fragment =
+              rdb::EncodeFunctionLibraryEntry(library.code_);
+          status = co_await WriteText(stream, fragment);
+          if (!status.ok()) break;
+          encoder.Account(fragment);
+        }
+      }
       if (status.ok()) {
         while (status.ok()) {
           std::string fragment;
@@ -3474,16 +3486,22 @@ class ReplicationManager::Impl {
 
     std::uint64_t entries = 0;
     std::uint64_t skipped = 0;
+    std::vector<std::string> function_libraries;
     while (true) {
       auto next = reader->Next();
       if (!next.ok()) co_return next.status();
       if (!next->has_value()) break;
       if ((**next).kind_ == rdb::FileEntryKind::kValue) {
         ++entries;
+      } else if ((**next).kind_ == rdb::FileEntryKind::kFunctionLibrary) {
+        function_libraries.push_back((**next).function_code_);
       } else {
         ++skipped;
       }
     }
+    absl::Status functions_validated =
+        co_await ValidateLuaFunctionCatalog(function_libraries);
+    if (!functions_validated.ok()) co_return functions_validated;
     reader->Rewind();
 
     co_await redis_fullsync_mutex_.Lock();
@@ -3528,15 +3546,15 @@ class ReplicationManager::Impl {
       if (!next->has_value()) break;
       rdb::FileEntry entry = std::move(**next);
       if (entry.kind_ != rdb::FileEntryKind::kValue) {
-        if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
+        if (entry.kind_ == rdb::FileEntryKind::kFunctionLibrary) {
+          continue;
+        } else if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
           spdlog::warn(
               "Redis PSYNC skipped unsupported Module value db={} "
               "key-bytes={}",
               entry.db_id_, entry.key_.size());
         } else if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleAux) {
           spdlog::warn("Redis PSYNC skipped unsupported Module auxiliary data");
-        } else {
-          spdlog::warn("Redis PSYNC skipped unsupported Function library data");
         }
         continue;
       }
@@ -3578,6 +3596,12 @@ class ReplicationManager::Impl {
         ++expired;
       }
     }
+    absl::Status functions_installed =
+        co_await ReplaceLuaFunctionCatalog(function_libraries);
+    if (!functions_installed.ok()) {
+      (void)co_await storage_->ResetPartitionsDetach(slots);
+      co_return functions_installed;
+    }
     spdlog::info(
         "Redis PSYNC loaded RDB version={} entries={} imported={} expired={} "
         "unsupported-skipped={} slots={}",
@@ -3618,7 +3642,8 @@ class ReplicationManager::Impl {
     auto request = BuildCommandRequest(std::move(wire), command.db_id_);
     if (!request.ok()) return request.status();
     if (request->kind_ == CommandKind::kFlushDb ||
-        request->kind_ == CommandKind::kFlushAll) {
+        request->kind_ == CommandKind::kFlushAll ||
+        request->kind_ == CommandKind::kFunction) {
       return absl::OkStatus();
     }
     if (request->spec_ == nullptr) {
@@ -4511,8 +4536,9 @@ class ReplicationManager::Impl {
           auto command = DecodeReplicationCommand(staged_command);
           const bool ephemeral =
               command.ok() && !command->args_.empty() &&
-              (command->args_[0] == "PUBLISH" ||
-               command->args_[0] == kReplicatedExecCommand);
+              (EqualCaseInsensitive(command->args_[0], "PUBLISH") ||
+               command->args_[0] == kReplicatedExecCommand ||
+               EqualCaseInsensitive(command->args_[0], "FUNCTION"));
           if (!ephemeral) {
             absl::Status begun = co_await celer::SubmitTaskTo(
                 owner, [this, session, partition_id, partition_sequence]() {
@@ -5147,6 +5173,76 @@ class ReplicationManager::Impl {
       co_return absl::OkStatus();
     };
 
+    // Function libraries live outside the storage snapshot. Send one
+    // synthesized, fragmented mutation on flow zero after command admission
+    // is closed. RESTORE FLUSH makes the catalog at the native full-sync cut
+    // exact even when earlier FUNCTION mutations were also captured while the
+    // key snapshot was being scanned.
+    auto send_function_catalog = [&]() -> Task<absl::Status> {
+      std::vector<std::string> codes;
+      for (const LuaFunctionLibrary& library :
+           SnapshotLuaFunctionLibraries()) {
+        codes.push_back(library.code_);
+      }
+      std::vector<std::string> args{
+          "FUNCTION", "RESTORE", rdb::EncodeFunctionDump(codes), "FLUSH"};
+      std::vector<std::string_view> views;
+      views.reserve(args.size());
+      for (const std::string& arg : args) views.push_back(arg);
+      auto source = ReplicationCommandPayloadSource::Create(0, views);
+      if (!source.ok()) co_return source.status();
+      if (source->size() > std::numeric_limits<std::size_t>::max()) {
+        co_return absl::ResourceExhaustedError(
+            "function catalog is too large for this process");
+      }
+
+      constexpr std::size_t kCommandHeaderBytes = 2 + 8 + 8 + 4 + 1;
+      constexpr std::size_t kFragmentBytes =
+          kBacklogBatchBytes - 5 - 8 - kCommandHeaderBytes;
+      const std::size_t total = static_cast<std::size_t>(source->size());
+      std::size_t offset = 0;
+      std::uint32_t fragment = 0;
+      do {
+        const std::size_t count = std::min(kFragmentBytes, total - offset);
+        const bool first = offset == 0;
+        const bool last = offset + count == total;
+        std::uint8_t flags = 0;
+        if (first) {
+          flags |= static_cast<std::uint8_t>(
+              storage::ReplicationFrameFlag::kFirst);
+        }
+        if (last) {
+          flags |= static_cast<std::uint8_t>(
+              storage::ReplicationFrameFlag::kLast);
+        }
+        const std::uint64_t sequence = fullsync_sequence++;
+        std::string payload;
+        payload.reserve(8 + kCommandHeaderBytes + count);
+        PutU64(payload, sequence);
+        PutU16(payload, 0);
+        PutU64(payload, 1);
+        PutU64(payload, 1);
+        PutU32(payload, fragment++);
+        PutU8(payload, flags);
+        const std::size_t payload_offset = payload.size();
+        payload.resize(payload_offset + count);
+        absl::Status read = co_await source->Read(
+            offset, std::span(reinterpret_cast<std::byte*>(
+                                  payload.data() + payload_offset),
+                              count));
+        if (!read.ok()) co_return read;
+        absl::Status sent = co_await WriteDataFrame(
+            stream, DataFrameKind::kFullSyncCommand, payload);
+        if (!sent.ok()) co_return sent;
+        session->TouchProgress(flow_id);
+        if (last) {
+          co_return co_await WaitFullSyncAck(stream, 0, sequence);
+        }
+        offset += count;
+      } while (offset < total);
+      co_return absl::InternalError("empty function catalog command");
+    };
+
     // A fixed command ratio cannot keep the publisher stable: the number and
     // byte size of writes arriving during one snapshot slice vary with load,
     // partition coverage, and storage latency. Normally yield back to the
@@ -5612,6 +5708,13 @@ class ReplicationManager::Impl {
     if (!queue_drained.ok()) {
       cleanup();
       co_return queue_drained;
+    }
+    if (flow_id == 0) {
+      absl::Status functions_sent = co_await send_function_catalog();
+      if (!functions_sent.ok()) {
+        cleanup();
+        co_return functions_sent;
+      }
     }
 
     auto backlog_cursor = co_await storage_->FenceReplicationLog();

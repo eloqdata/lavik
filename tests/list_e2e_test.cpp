@@ -2193,6 +2193,13 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   ASSERT_EQ(source_client.Command(
                 {"SET", "fullsync-large{baseline}", fullsync_large_value}),
             "+OK");
+  constexpr std::string_view fullsync_function =
+      "#!lua name=native_fullsync\n"
+      "redis.register_function{function_name='native_fullsync_value', "
+      "callback=function(keys, args) return args[1] end, "
+      "flags={'no-writes'}}";
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", fullsync_function}),
+            Bulk("native_fullsync"));
 
   EXPECT_EQ(replica_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(replica_port)}),
@@ -2229,6 +2236,27 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_NE(source_replication.find("port=" + std::to_string(replica_port)),
             std::string::npos);
   EXPECT_NE(source_replication.find("state=online"), std::string::npos);
+  EXPECT_EQ(replica_client.Command(
+                {"FCALL_RO", "native_fullsync_value", "0", "baseline"}),
+            Bulk("baseline"));
+
+  constexpr std::string_view incremental_function =
+      "#!lua name=native_incremental\n"
+      "redis.register_function{function_name='native_incremental_value', "
+      "callback=function(keys, args) return args[1] end, "
+      "flags={'no-writes'}}";
+  ASSERT_EQ(
+      source_client.Command({"FUNCTION", "LOAD", incremental_function}),
+      Bulk("native_incremental"));
+  const auto function_deadline = std::chrono::steady_clock::now() + 10s;
+  std::string replicated_function;
+  do {
+    replicated_function = replica_client.Command(
+        {"FCALL_RO", "native_incremental_value", "0", "incremental"});
+    if (replicated_function == Bulk("incremental")) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < function_deadline);
+  EXPECT_EQ(replicated_function, Bulk("incremental"));
   ASSERT_EQ(
       source_client.Command({"CONFIG", "SET", "repl-backlog-size", "192mb"}),
       "+OK");

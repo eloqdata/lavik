@@ -152,6 +152,9 @@ enum class CommandKind {
   kEvalRo,
   kEvalShaRo,
   kScript,
+  kFCall,
+  kFCallRo,
+  kFunction,
   kSet,
   kLPush,
   kLPushX,
@@ -486,6 +489,13 @@ void EndReplicationTransactionOrder() noexcept;
 Task<CommandReply> ExecuteCommand(const CommandRequest& request,
                                   ReplyBuilder& reply_builder,
                                   std::uint64_t client_id = 0);
+
+// RDB loaders validate complete FUNCTION2 catalogs before applying keys, then
+// install the same source set at the dataset cut.
+Task<absl::Status> ValidateLuaFunctionCatalog(
+    const std::vector<std::string>& library_codes);
+Task<absl::Status> ReplaceLuaFunctionCatalog(
+    const std::vector<std::string>& library_codes);
 
 // Replays one trusted canonical command from the native replication stream.
 // Transaction envelopes rendezvous on every source flow before this primitive

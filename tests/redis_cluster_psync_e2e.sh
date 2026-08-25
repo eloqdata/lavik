@@ -92,6 +92,10 @@ done
 "$redis_cli" -c -p "${master_ports[0]}" set '{a}baseline' one >/dev/null
 "$redis_cli" -c -p "${master_ports[0]}" set '{b}baseline' two >/dev/null
 "$redis_cli" -c -p "${master_ports[0]}" set '{c}baseline' three >/dev/null
+fullsync_function=$'#!lua name=redis_import_fullsync\nredis.register_function{function_name="redis_import_fullsync_value", callback=function(keys, args) return args[1] end, flags={"no-writes"}}'
+for port in "${master_ports[@]}"; do
+  [[ $("$redis_cli" -p "$port" function load replace "$fullsync_function") == redis_import_fullsync ]]
+done
 
 fallocate -l 128M "$case_dir/keylane.data"
 "$keylane_bin" --logtostderr --port "$keylane_port" --threads 3 \
@@ -132,6 +136,7 @@ grep -q '^master_link_status:up$' <<<"$info"
 [[ $("$redis_cli" -p "$keylane_port" get '{a}baseline') == one ]]
 [[ $("$redis_cli" -p "$keylane_port" get '{b}baseline') == two ]]
 [[ $("$redis_cli" -p "$keylane_port" get '{c}baseline') == three ]]
+[[ $("$redis_cli" -p "$keylane_port" fcall_ro redis_import_fullsync_value 0 baseline) == baseline ]]
 
 for port in "${master_ports[@]}"; do
   master_info=$("$redis_cli" -p "$port" info replication | tr -d '\r')
@@ -142,6 +147,10 @@ done
 "$redis_cli" -c -p "${master_ports[0]}" set '{a}online' A >/dev/null
 "$redis_cli" -c -p "${master_ports[0]}" set '{b}online' B >/dev/null
 "$redis_cli" -c -p "${master_ports[0]}" set '{c}online' C >/dev/null
+incremental_function=$'#!lua name=redis_import_incremental\nredis.register_function{function_name="redis_import_incremental_value", callback=function(keys, args) return args[1] end, flags={"no-writes"}}'
+for port in "${master_ports[@]}"; do
+  [[ $("$redis_cli" -p "$port" function load replace "$incremental_function") == redis_import_incremental ]]
+done
 for pair in '{a}online A' '{b}online B' '{c}online C'; do
   read -r key value <<<"$pair"
   for _ in {1..200}; do
@@ -151,6 +160,11 @@ for pair in '{a}online A' '{b}online B' '{c}online C'; do
   done
   [[ $("$redis_cli" -p "$keylane_port" get "$key") == "$value" ]]
 done
+for _ in {1..200}; do
+  [[ $("$redis_cli" -p "$keylane_port" fcall_ro redis_import_incremental_value 0 incremental 2>/dev/null || true) == incremental ]] && break
+  sleep 0.05
+done
+[[ $("$redis_cli" -p "$keylane_port" fcall_ro redis_import_incremental_value 0 incremental) == incremental ]]
 
 for port in "${master_ports[@]}"; do
   "$redis_cli" -p "$port" client kill type slave >/dev/null

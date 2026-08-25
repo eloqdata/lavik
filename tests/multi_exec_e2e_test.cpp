@@ -336,6 +336,15 @@ std::string Bulk(std::string_view value) {
   return "$" + std::to_string(value.size()) + "\r\n" + std::string(value);
 }
 
+std::string BulkPayload(std::string_view reply) {
+  const std::size_t separator = reply.find("\r\n");
+  if (reply.empty() || reply.front() != '$' ||
+      separator == std::string_view::npos) {
+    Fail("expected bulk reply");
+  }
+  return std::string(reply.substr(separator + 2));
+}
+
 std::string ReadFile(const std::string& path) {
   std::ifstream input(path);
   return std::string(std::istreambuf_iterator<char>(input),
@@ -362,6 +371,121 @@ int main(int argc, char** argv) {
     ServerProcess server(argv[1], port, data_path, log_path);
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
+
+    constexpr std::string_view invalid_function_library =
+        "#!lua name=invalid_named_arg\n"
+        "redis.register_function{function_name='invalid_named_arg', "
+        "callback=function(keys, args) return 1 end, surprise=true}";
+    ExpectContains(
+        client.Command({"FUNCTION", "LOAD", invalid_function_library}),
+        "unknown argument given to redis.register_function",
+        "FUNCTION LOAD rejects unknown named argument");
+    constexpr std::string_view case_insensitive_function_library =
+        "#!lua name=named_arg_case\n"
+        "redis.register_function{FUNCTION_NAME='named_arg_case', "
+        "CALLBACK=function(keys, args) return args[1] end, "
+        "FLAGS={'NO-WRITES'}}";
+    Expect(client.Command(
+               {"FUNCTION", "LOAD", case_insensitive_function_library}),
+           Bulk("named_arg_case"), "FUNCTION LOAD named argument case");
+    Expect(client.Command({"FCALL_RO", "named_arg_case", "0", "works"}),
+           Bulk("works"), "FCALL case-insensitive named arguments");
+    Expect(client.Command({"FUNCTION", "DELETE", "named_arg_case"}), "+OK",
+           "FUNCTION DELETE named argument fixture");
+
+    constexpr std::string_view function_library =
+        "#!lua name=keylane_test\n"
+        "local prefix = 'fn:'\n"
+        "redis.register_function('keylane_set', function(keys, args) "
+        "return redis.call('SET', keys[1], prefix .. args[1]) end)\n"
+        "redis.register_function{function_name='keylane_get', "
+        "callback=function(keys, args) return redis.call('GET', keys[1]) "
+        "end, description='read a value', flags={'no-writes'}}\n"
+        "redis.register_function{function_name='keylane_loop', "
+        "callback=function(keys, args) while true do "
+        "redis.call('GET', keys[1]) end end, flags={'no-writes'}}\n"
+        "redis.register_function{function_name='keylane_globals', "
+        "callback=function(keys, args) return type(KEYS)..':'..type(ARGV) "
+        "end, flags={'no-writes'}}";
+    Expect(client.Command({"FUNCTION", "LOAD", function_library}),
+           Bulk("keylane_test"), "FUNCTION LOAD");
+    Expect(client.Command({"FCALL", "keylane_set", "1", "function:key",
+                           "value"}),
+           "+OK", "FCALL write function");
+    Expect(client.Command({"FCALL", "keylane_get", "1", "function:key"}),
+           Bulk("fn:value"), "FCALL read function");
+    Expect(client.Command(
+               {"FCALL_RO", "keylane_get", "1", "function:key"}),
+           Bulk("fn:value"), "FCALL_RO no-writes function");
+    Expect(client.Command({"FCALL_RO", "keylane_globals", "0"}),
+           Bulk("nil:nil"), "FCALL does not inherit EVAL globals");
+    ExpectContains(
+        client.Command({"FCALL_RO", "keylane_set", "1", "function:key",
+                        "blocked"}),
+        "Can not execute a script with write flag using *_ro command",
+        "FCALL_RO rejects write function");
+    const std::string function_list =
+        client.Command({"FUNCTION", "LIST", "WITHCODE"});
+    ExpectContains(function_list, "keylane_test", "FUNCTION LIST library");
+    ExpectContains(function_list, "keylane_get", "FUNCTION LIST function");
+    ExpectContains(function_list, "read a value", "FUNCTION LIST description");
+    ExpectContains(function_list, "no-writes", "FUNCTION LIST flags");
+    ExpectContains(function_list, "#!lua name=keylane_test",
+                   "FUNCTION LIST WITHCODE");
+    const std::string function_dump =
+        BulkPayload(client.Command({"FUNCTION", "DUMP"}));
+    Expect(client.Command({"FUNCTION", "DELETE", "keylane_test"}), "+OK",
+           "FUNCTION DELETE");
+    ExpectContains(
+        client.Command({"FCALL", "keylane_get", "1", "function:key"}),
+        "Function not found", "FCALL after FUNCTION DELETE");
+    Expect(client.Command({"FUNCTION", "RESTORE", function_dump}), "+OK",
+           "FUNCTION RESTORE");
+    Expect(client.Command({"FCALL", "keylane_get", "1", "function:key"}),
+           Bulk("fn:value"), "FCALL after FUNCTION RESTORE");
+    Expect(client.Command({"FUNCTION", "FLUSH", "ASYNC"}), "+OK",
+           "FUNCTION FLUSH ASYNC");
+    ExpectContains(
+        client.Command({"FCALL", "keylane_get", "1", "function:key"}),
+        "Function not found", "FCALL after FUNCTION FLUSH");
+    Expect(client.Command(
+               {"FUNCTION", "RESTORE", function_dump, "FLUSH"}),
+           "+OK", "FUNCTION RESTORE FLUSH");
+    ExpectContains(client.Command({"FUNCTION", "RESTORE", "broken"}),
+                   "DUMP payload version or checksum are wrong",
+                   "FUNCTION RESTORE invalid payload");
+
+    constexpr std::string_view transaction_library =
+        "#!lua name=transaction_library\n"
+        "redis.register_function('transaction_set', function(keys, args) "
+        "return redis.call('SET', keys[1], args[1]) end)";
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI FUNCTION LOAD");
+    Expect(client.Command({"FUNCTION", "LOAD", transaction_library}),
+           "+QUEUED", "queue FUNCTION LOAD");
+    Expect(client.Command(
+               {"FCALL", "transaction_set", "1", "function:transaction",
+                "loaded-in-exec"}),
+           "+QUEUED", "queue FCALL after FUNCTION LOAD");
+    Expect(client.Command({"EXEC"}),
+           "*2\r\n" + Bulk("transaction_library") + "\r\n+OK",
+           "FUNCTION LOAD then FCALL inside EXEC");
+    Expect(client.Command({"GET", "function:transaction"}),
+           Bulk("loaded-in-exec"), "FCALL effect inside EXEC");
+
+    Expect(client.Command({"WATCH", "function:watched"}), "+OK",
+           "WATCH before FCALL");
+    RespClient function_writer = Connect(port);
+    Expect(function_writer.Command({"SET", "function:watched", "changed"}),
+           "+OK",
+           "invalidate FCALL watch");
+    Expect(client.Command({"MULTI"}), "+OK", "MULTI watched FCALL");
+    Expect(client.Command(
+               {"FCALL", "transaction_set", "1", "function:watched",
+                "must-not-run"}),
+           "+QUEUED", "queue watched FCALL");
+    Expect(client.Command({"EXEC"}), "*-1", "WATCH aborts FCALL");
+    Expect(client.Command({"GET", "function:watched"}), Bulk("changed"),
+           "aborted FCALL made no write");
 
     const std::string script_help = client.Command({"SCRIPT", "HELP"});
     ExpectContains(script_help, "*17\r\n+SCRIPT <subcommand>", "SCRIPT HELP");
@@ -397,6 +521,23 @@ int main(int argc, char** argv) {
            "+OK", "CONFIG SET lua-time-limit");
     ExpectContains(ReadFile(log_path), "Slow script detected",
                    "busy script warning log");
+
+    RespClient looping_function = Connect(port);
+    looping_function.SendCommand(
+        {"FCALL", "keylane_loop", "1", "lua:function-kill-loop"});
+    std::this_thread::sleep_for(100ms);
+    const std::string function_stats =
+        script_killer.Command({"FUNCTION", "STATS"});
+    ExpectContains(function_stats, "keylane_loop", "FUNCTION STATS name");
+    ExpectContains(function_stats, "duration_ms", "FUNCTION STATS duration");
+    ExpectContains(script_killer.Command({"SCRIPT", "KILL"}),
+                   "You can only call FUNCTION KILL",
+                   "SCRIPT KILL cannot kill function");
+    Expect(script_killer.Command({"FUNCTION", "KILL"}), "+OK",
+           "FUNCTION KILL");
+    ExpectContains(looping_function.ReadPush(),
+                   "Script killed by user with FUNCTION KILL",
+                   "killed function reply");
 
     RespClient dirty_script = Connect(port);
     dirty_script.SendCommand(

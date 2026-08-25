@@ -1843,10 +1843,11 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
       auto code = ReadString(&impl_->reader_);
       if (!code.ok()) return code.status();
       return std::optional<FileEntry>(FileEntry{
-          .kind_ = FileEntryKind::kSkippedFunction,
+          .kind_ = FileEntryKind::kFunctionLibrary,
           .db_id_ = impl_->db_id_,
           .key_ = {},
           .value_ = {},
+          .function_code_ = std::move(*code),
       });
     }
     if (type == kFunctionPreGa) {
@@ -1860,6 +1861,7 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
           .db_id_ = impl_->db_id_,
           .key_ = {},
           .value_ = {},
+          .function_code_ = {},
       });
     }
 
@@ -1872,7 +1874,8 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
       FileEntry entry{.kind_ = FileEntryKind::kSkippedModuleValue,
                       .db_id_ = impl_->db_id_,
                       .key_ = std::move(*key),
-                      .value_ = {}};
+                      .value_ = {},
+                      .function_code_ = {}};
       impl_->expire_at_ms_.reset();
       impl_->entry_metadata_ = false;
       return std::optional<FileEntry>(std::move(entry));
@@ -1893,7 +1896,8 @@ absl::StatusOr<std::optional<FileEntry>> FileReader::Next() {
     FileEntry entry{.kind_ = FileEntryKind::kValue,
                     .db_id_ = impl_->db_id_,
                     .key_ = std::move(*key),
-                    .value_ = std::move(*value)};
+                    .value_ = std::move(*value),
+                    .function_code_ = {}};
     impl_->expire_at_ms_.reset();
     impl_->entry_metadata_ = false;
     return std::optional<FileEntry>(std::move(entry));
@@ -2089,6 +2093,53 @@ absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
   WriteString(&output, key);
   output.append(dump->data() + 1, dump->size() - 11);
   return output;
+}
+
+std::string EncodeFunctionLibraryEntry(std::string_view code) {
+  std::string out(1, static_cast<char>(kFunction2));
+  WriteString(&out, code);
+  return out;
+}
+
+std::string EncodeFunctionDump(std::span<const std::string> libraries) {
+  std::string payload;
+  for (const std::string& code : libraries) {
+    payload += EncodeFunctionLibraryEntry(code);
+  }
+  PutLe16(&payload, kVersion);
+  PutLe64(&payload, Crc64(payload));
+  return payload;
+}
+
+absl::StatusOr<std::vector<std::string>> DecodeFunctionDump(
+    std::string_view payload) {
+  if (payload.size() < 10) return Bad("truncated FUNCTION DUMP payload");
+  Reader footer(payload.substr(payload.size() - 10));
+  std::uint16_t version = 0;
+  std::uint64_t checksum = 0;
+  if (!footer.Le16(&version) || !footer.Le64(&checksum) || version == 0 ||
+      version > kVersion ||
+      Crc64(payload.substr(0, payload.size() - 8)) != checksum) {
+    return Bad("FUNCTION DUMP payload version or checksum is invalid");
+  }
+
+  Reader reader(payload.substr(0, payload.size() - 10));
+  std::vector<std::string> libraries;
+  while (!reader.done()) {
+    std::uint8_t type = 0;
+    if (!reader.Byte(&type)) return Bad("truncated FUNCTION DUMP payload");
+    if (type == kFunctionPreGa) {
+      return Bad("pre-release Redis Function format is not supported");
+    }
+    if (type != kFunction2) {
+      return Bad("FUNCTION DUMP payload contains a non-function entry");
+    }
+    reader.ResetExpandedAccounting();
+    auto code = ReadString(&reader);
+    if (!code.ok()) return code.status();
+    libraries.push_back(std::move(*code));
+  }
+  return libraries;
 }
 
 absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload) {

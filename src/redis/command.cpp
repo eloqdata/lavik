@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -6043,8 +6044,9 @@ bool IsDeclaredLuaKey(std::span<const std::string> keys,
                      [&](const std::string& key) { return key == candidate; });
 }
 
-bool IsEvalReadOnlyKind(CommandKind kind) {
-  return kind == CommandKind::kEvalRo || kind == CommandKind::kEvalShaRo;
+bool IsLuaReadOnlyKind(CommandKind kind) {
+  return kind == CommandKind::kEvalRo || kind == CommandKind::kEvalShaRo ||
+         kind == CommandKind::kFCallRo;
 }
 
 bool IsEvalSourceKind(CommandKind kind) {
@@ -6107,7 +6109,10 @@ Task<std::string> ExecuteLuaRedisCall(
       command.kind_ == CommandKind::kEvalSha ||
       command.kind_ == CommandKind::kEvalRo ||
       command.kind_ == CommandKind::kEvalShaRo ||
-      command.kind_ == CommandKind::kScript) {
+      command.kind_ == CommandKind::kFCall ||
+      command.kind_ == CommandKind::kFCallRo ||
+      command.kind_ == CommandKind::kScript ||
+      command.kind_ == CommandKind::kFunction) {
     co_return EncodeError("ERR command is not allowed from script");
   }
   if ((command.kind_ == CommandKind::kMSet ||
@@ -6117,7 +6122,8 @@ Task<std::string> ExecuteLuaRedisCall(
                                        command.spec_->name_, "' command"));
   }
   const bool write = (flags & kCmdWrite) != 0;
-  if (IsEvalReadOnlyKind(eval_request.kind_) &&
+  if ((IsLuaReadOnlyKind(eval_request.kind_) ||
+       (lua_execution->function_flags() & kLuaFunctionNoWrites) != 0) &&
       (flags & (kCmdWrite | kCmdMayReplicate)) != 0) {
     co_return EncodeError(
         "ERR Write commands are not allowed from read-only scripts.");
@@ -6129,7 +6135,11 @@ Task<std::string> ExecuteLuaRedisCall(
     co_return EncodeError(
         "READONLY You can't write against a read only replica.");
   }
-  if (write && RejectForMemory(EstimatedMemoryGrowth(command))) {
+  const bool function_allows_oom =
+      (lua_execution->function_flags() &
+       (kLuaFunctionAllowOom | kLuaFunctionNoWrites)) != 0;
+  if (write && !function_allows_oom &&
+      RejectForMemory(EstimatedMemoryGrowth(command))) {
     co_return EncodeError(
         "OOM command not allowed when used memory > 'maxmemory'.");
   }
@@ -6329,11 +6339,171 @@ Task<bool> FlushLuaScriptCacheOnAllWorkers() {
   co_return true;
 }
 
+bool SameFunctionLibrary(const LuaFunctionLibrary& left,
+                         const LuaFunctionLibrary& right) {
+  if (left.name_ != right.name_ || left.engine_ != right.engine_ ||
+      left.code_ != right.code_ ||
+      left.functions_.size() != right.functions_.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < left.functions_.size(); ++index) {
+    const LuaFunctionInfo& a = left.functions_[index];
+    const LuaFunctionInfo& b = right.functions_[index];
+    if (a.name_ != b.name_ || a.description_ != b.description_ ||
+        a.flags_ != b.flags_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Task<absl::StatusOr<LuaFunctionLibrary>> StageFunctionLibraryOnAllWorkers(
+    std::string code, bool replace) {
+  std::optional<LuaFunctionLibrary> library;
+  unsigned staged = 0;
+  for (; staged < g_storage->worker_count(); ++staged) {
+    auto stage = [code, replace]() -> Task<absl::StatusOr<LuaFunctionLibrary>> {
+      (void)co_await BeginLuaExecution();
+      LuaExecutionGuard execution;
+      co_return StageLuaFunctionLibraryLocally(code, replace);
+    };
+    absl::StatusOr<LuaFunctionLibrary> result =
+        staged == ThisWorker().id_
+            ? co_await stage()
+            : co_await SubmitTaskTo(staged, std::move(stage));
+    if (!result.ok() ||
+        (library.has_value() && !SameFunctionLibrary(*library, *result))) {
+      const absl::Status failure =
+          result.ok()
+              ? absl::InternalError(
+                    "workers registered different function metadata")
+              : result.status();
+      const unsigned staged_count = result.ok() ? staged + 1 : staged;
+      for (unsigned worker = 0; worker < staged_count; ++worker) {
+        auto abort = [] {
+          AbortStagedLuaFunctionLibraryLocally();
+          return true;
+        };
+        if (worker == ThisWorker().id_) {
+          abort();
+        } else {
+          (void)co_await SubmitTo(worker, std::move(abort));
+        }
+      }
+      co_return failure;
+    }
+    if (!library.has_value()) library = std::move(*result);
+  }
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    auto commit = [] {
+      CommitStagedLuaFunctionLibraryLocally();
+      return true;
+    };
+    if (worker == ThisWorker().id_) {
+      commit();
+    } else {
+      (void)co_await SubmitTo(worker, std::move(commit));
+    }
+  }
+  if (!library.has_value()) {
+    co_return absl::FailedPreconditionError("Lua runtime has no workers");
+  }
+  StoreLuaFunctionLibrary(*library);
+  co_return std::move(*library);
+}
+
+Task<bool> DeleteFunctionLibraryOnAllWorkers(std::string name) {
+  bool exists = false;
+  for (const LuaFunctionLibrary& library : SnapshotLuaFunctionLibraries()) {
+    if (library.name_ == name) {
+      exists = true;
+      break;
+    }
+  }
+  if (!exists) co_return false;
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    auto erase = [name] { return DeleteLuaFunctionLibraryLocally(name); };
+    if (worker == ThisWorker().id_) {
+      (void)erase();
+    } else {
+      (void)co_await SubmitTo(worker, std::move(erase));
+    }
+  }
+  (void)DeleteStoredLuaFunctionLibrary(name);
+  co_return true;
+}
+
+Task<bool> FlushFunctionLibrariesOnAllWorkers() {
+  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
+    auto clear = [] {
+      ClearLuaFunctionLibrariesLocally();
+      return true;
+    };
+    if (worker == ThisWorker().id_) {
+      clear();
+    } else {
+      (void)co_await SubmitTo(worker, std::move(clear));
+    }
+  }
+  ClearStoredLuaFunctionLibraries();
+  co_return true;
+}
+
+Task<absl::Status> RebuildFunctionCatalog(
+    const std::vector<LuaFunctionLibrary>& target,
+    const std::vector<LuaFunctionLibrary>& rollback) {
+  (void)co_await FlushFunctionLibrariesOnAllWorkers();
+  for (const LuaFunctionLibrary& library : target) {
+    auto loaded =
+        co_await StageFunctionLibraryOnAllWorkers(library.code_, false);
+    if (loaded.ok()) continue;
+    const absl::Status failure = loaded.status();
+    (void)co_await FlushFunctionLibrariesOnAllWorkers();
+    for (const LuaFunctionLibrary& prior : rollback) {
+      auto restored =
+          co_await StageFunctionLibraryOnAllWorkers(prior.code_, false);
+      if (!restored.ok()) {
+        co_return absl::InternalError(absl::StrCat(
+            "FUNCTION RESTORE failed: ", failure.message(),
+            "; rollback failed: ", restored.status().message()));
+      }
+    }
+    co_return failure;
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> PublishFunctionMutation(const CommandRequest& request) {
+  if (request.replication_capture_ != nullptr) {
+    CaptureReplicationCommand(request, request.args_);
+    co_return absl::OkStatus();
+  }
+  if (request.replication_origin_ || g_storage == nullptr ||
+      !g_storage->ReplicationLogActive() ||
+      (g_replication != nullptr && g_replication->is_replica())) {
+    co_return absl::OkStatus();
+  }
+  auto publish = [args = request.args_]() mutable {
+    return g_storage->PublishEphemeralReplicationCommand(0, std::move(args));
+  };
+  if (ThisWorker().id_ == 0) co_return co_await publish();
+  co_return co_await SubmitTaskTo(0, std::move(publish));
+}
+
 bool IsEvalCommand(const CommandRequest& request) {
   return request.kind_ == CommandKind::kEval ||
          request.kind_ == CommandKind::kEvalSha ||
          request.kind_ == CommandKind::kEvalRo ||
          request.kind_ == CommandKind::kEvalShaRo;
+}
+
+bool IsFCallCommand(const CommandRequest& request) {
+  return request.kind_ == CommandKind::kFCall ||
+         request.kind_ == CommandKind::kFCallRo;
+}
+
+bool IsLuaInvocationCommand(const CommandRequest& request) {
+  return IsEvalCommand(request) || IsFCallCommand(request);
 }
 
 bool ExecCommandMayWrite(const CommandRequest& request) {
@@ -6358,6 +6528,13 @@ Task<std::string> ExecuteEvalWithTransaction(
   }
 
   const bool source_kind = IsEvalSourceKind(request.kind_);
+  const bool function_kind = IsFCallCommand(request);
+  std::unique_ptr<LuaScriptCacheOperationGuard> function_catalog_guard;
+  if (function_kind) {
+    (void)co_await BeginLuaScriptCacheOperation();
+    function_catalog_guard =
+        std::make_unique<LuaScriptCacheOperationGuard>();
+  }
   std::string_view script;
   std::string sha;
   if (source_kind) {
@@ -6374,21 +6551,53 @@ Task<std::string> ExecuteEvalWithTransaction(
       request.args_.data() + argv_begin, request.args_.size() - argv_begin);
   (void)co_await BeginLuaExecution();
   LuaExecutionGuard lua_execution;
-  const bool source_cached =
-      source_kind && !sha.empty() && FindCachedLuaScript(sha).has_value();
-  auto execution = source_kind && !source_cached
-                       ? LuaExecution::Create(script, declared_keys, script_argv,
-                                              request.resp_version_)
-                       : LuaExecution::CreateCached(
-                             source_kind ? std::string_view(sha)
-                                         : std::string_view(request.args_[1]),
-                             declared_keys, script_argv, request.resp_version_);
+  const bool source_cached = source_kind && !sha.empty() &&
+                             FindCachedLuaScript(sha).has_value();
+  absl::StatusOr<std::unique_ptr<LuaExecution>> execution =
+      function_kind
+          ? LuaExecution::CreateFunction(request.args_[1], declared_keys,
+                                         script_argv, request.resp_version_)
+      : source_kind && !source_cached
+          ? LuaExecution::Create(script, declared_keys, script_argv,
+                                 request.resp_version_)
+          : LuaExecution::CreateCached(
+                source_kind ? std::string_view(sha)
+                            : std::string_view(request.args_[1]),
+                declared_keys, script_argv, request.resp_version_);
   if (!execution.ok()) {
     if (absl::IsNotFound(execution.status())) {
+      if (function_kind) co_return EncodeError("ERR Function not found");
       co_return EncodeError("NOSCRIPT No matching script. Please use EVAL.");
     }
     co_return EncodeError(absl::StrCat("ERR Error compiling script: ",
                                        execution.status().message()));
+  }
+  if (request.kind_ == CommandKind::kFCallRo &&
+      (((*execution)->function_flags() & kLuaFunctionNoWrites) == 0)) {
+    co_return EncodeError(
+        "ERR Can not execute a script with write flag using *_ro command.");
+  }
+  if (function_kind) {
+    const std::uint64_t flags = (*execution)->function_flags();
+    const bool reject_writes = g_replication != nullptr
+                                   ? g_replication->reject_writes()
+                                   : g_replica_read_only;
+    if (!request.replication_origin_ && reject_writes &&
+        (flags & kLuaFunctionNoWrites) == 0) {
+      co_return EncodeError(
+          "READONLY Can not run script with write flag on readonly replica");
+    }
+    if ((flags & (kLuaFunctionAllowOom | kLuaFunctionNoWrites)) == 0 &&
+        RejectForMemory(RequestArgumentBytes(request))) {
+      co_return EncodeError(
+          "OOM allow-oom flag is not set on the script, can not run it when "
+          "used memory > 'maxmemory'");
+    }
+    // The callback is now rooted on this Lua coroutine's stack, so deleting
+    // or replacing its registry entry cannot invalidate the in-flight call.
+    // Keep the catalog barrier only around lookup instead of serializing all
+    // FCALL execution process-wide.
+    function_catalog_guard.reset();
   }
   if (source_kind && !source_cached && !sha.empty()) {
     const bool cached =
@@ -6400,7 +6609,8 @@ Task<std::string> ExecuteEvalWithTransaction(
 
   LuaExecutionStep step = (*execution)->Start(
       request.replication_origin_,
-      source_kind ? std::string_view(sha) : std::string_view(request.args_[1]));
+      source_kind ? std::string_view(sha) : std::string_view(request.args_[1]),
+      request.args_);
   for (;;) {
     if (step.scheduler_yield_) {
       co_await Yield(*ThisWorker().self_);
@@ -6435,7 +6645,7 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
   }
 
   const std::size_t key_count = key_view->count();
-  const bool read_only = IsEvalReadOnlyKind(request.kind_);
+  const bool read_only = IsLuaReadOnlyKind(request.kind_);
   const std::size_t key_begin = key_count == 0 ? 3 : key_view->first_;
   const std::span<const std::string> declared_keys(
       request.args_.data() + key_begin, key_count);
@@ -6552,7 +6762,7 @@ Task<CommandReply> ExecuteScript(const CommandRequest& request,
     co_return BuiltReply(reply_builder.View());
   }
   if (CmpCaseInsensitive(subcommand, "kill") && request.args_.size() == 2) {
-    switch (RequestLuaScriptKill()) {
+    switch (RequestLuaScriptKill(false)) {
       case LuaScriptKillResult::kKilled:
         co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
       case LuaScriptKillResult::kNotBusy:
@@ -6568,6 +6778,10 @@ Task<CommandReply> ExecuteScript(const CommandRequest& request,
         co_return BuiltReply(reply_builder.AppendError(
             "UNKILLABLE The busy script was sent by a master instance in the "
             "context of replication and cannot be killed."));
+      case LuaScriptKillResult::kWrongInvocationKind:
+        co_return BuiltReply(reply_builder.AppendError(
+            "BUSY Redis is busy running a script. You can only call FUNCTION "
+            "KILL or SHUTDOWN NOSAVE."));
     }
   }
   if (CmpCaseInsensitive(subcommand, "load")) {
@@ -6626,6 +6840,407 @@ Task<CommandReply> ExecuteScript(const CommandRequest& request,
   co_return BuiltReply(reply_builder.AppendError(
       absl::StrCat("ERR Unknown subcommand or wrong number of arguments for '",
                    subcommand, "'. Try SCRIPT HELP.")));
+}
+
+std::vector<std::string_view> LuaFunctionFlagNames(std::uint64_t flags) {
+  std::vector<std::string_view> names;
+  if ((flags & kLuaFunctionNoWrites) != 0) names.push_back("no-writes");
+  if ((flags & kLuaFunctionAllowOom) != 0) names.push_back("allow-oom");
+  if ((flags & kLuaFunctionAllowStale) != 0) names.push_back("allow-stale");
+  if ((flags & kLuaFunctionNoCluster) != 0) names.push_back("no-cluster");
+  if ((flags & kLuaFunctionAllowCrossSlotKeys) != 0) {
+    names.push_back("allow-cross-slot-keys");
+  }
+  return names;
+}
+
+void AppendLuaFunctionFlags(ReplyBuilder& reply_builder,
+                            std::uint64_t flags) {
+  const std::vector<std::string_view> names = LuaFunctionFlagNames(flags);
+  reply_builder.AppendSetHeader(names.size());
+  for (std::string_view name : names) reply_builder.AppendSimpleString(name);
+}
+
+bool FunctionMutationRejected(const CommandRequest& request) {
+  if (request.replication_origin_) return false;
+  return g_replication != nullptr ? g_replication->reject_writes()
+                                  : g_replica_read_only;
+}
+
+std::optional<std::string> FunctionLibraryNameFromCode(std::string_view code) {
+  const std::size_t newline = code.find('\n');
+  if (!code.starts_with("#!") || newline == std::string_view::npos) {
+    return std::nullopt;
+  }
+  std::string_view header = code.substr(2, newline - 2);
+  while (!header.empty()) {
+    while (!header.empty() &&
+           std::isspace(static_cast<unsigned char>(header.front())) != 0) {
+      header.remove_prefix(1);
+    }
+    if (header.empty()) break;
+    const std::size_t end = header.find_first_of(" \t\r");
+    const std::string_view token = header.substr(0, end);
+    if (token.starts_with("name=") && token.size() > 5) {
+      return std::string(token.substr(5));
+    }
+    header = end == std::string_view::npos ? std::string_view{}
+                                           : header.substr(end);
+  }
+  return std::nullopt;
+}
+
+Task<CommandReply> ExecuteFunction(const CommandRequest& request,
+                                   ReplyBuilder& reply_builder) {
+  const std::string_view subcommand = request.args_[1];
+  if (CmpCaseInsensitive(subcommand, "help") && request.args_.size() == 2) {
+    constexpr std::string_view help[] = {
+        "FUNCTION <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        "LOAD [REPLACE] <FUNCTION CODE>",
+        "    Create a new library with the given library name and code.",
+        "DELETE <LIBRARY NAME>",
+        "    Delete the given library.",
+        "LIST [LIBRARYNAME PATTERN] [WITHCODE]",
+        "    Return general information on all the libraries:",
+        "    * Library name",
+        "    * The engine used to run the Library",
+        "    * Library description",
+        "    * Functions list",
+        "    * Library code (if WITHCODE is given)",
+        "    It also possible to get only function that matches a pattern "
+        "using LIBRARYNAME argument.",
+        "STATS",
+        "    Return information about the current function running:",
+        "    * Function name",
+        "    * Command used to run the function",
+        "    * Duration in MS that the function is running",
+        "    If no function is running, return nil",
+        "    In addition, returns a list of available engines.",
+        "KILL",
+        "    Kill the current running function.",
+        "FLUSH [ASYNC|SYNC]",
+        "    Delete all the libraries.",
+        "    When called without the optional mode argument, the behavior is "
+        "determined by the",
+        "    lazyfree-lazy-user-flush configuration directive. Valid modes "
+        "are:",
+        "    * ASYNC: Asynchronously flush the libraries.",
+        "    * SYNC: Synchronously flush the libraries.",
+        "DUMP",
+        "    Return a serialized payload representing the current libraries, "
+        "can be restored using FUNCTION RESTORE command",
+        "RESTORE <PAYLOAD> [FLUSH|APPEND|REPLACE]",
+        "    Restore the libraries represented by the given payload, it is "
+        "possible to give a restore policy to",
+        "    control how to handle existing libraries (default APPEND):",
+        "    * FLUSH: delete all existing libraries.",
+        "    * APPEND: appends the restored libraries to the existing "
+        "libraries. On collision, abort.",
+        "    * REPLACE: appends the restored libraries to the existing "
+        "libraries, On collision, replace the old",
+        "      libraries with the new libraries (notice that even on this "
+        "option there is a chance of failure",
+        "      in case of functions name collision with another library).",
+        "HELP",
+        "    Prints this help."};
+    reply_builder.AppendArrayHeader(std::size(help));
+    for (std::string_view line : help) reply_builder.AppendSimpleString(line);
+    co_return BuiltReply(reply_builder.View());
+  }
+
+  if (CmpCaseInsensitive(subcommand, "load")) {
+    bool replace = false;
+    std::string_view code;
+    if (request.args_.size() == 3) {
+      code = request.args_[2];
+    } else if (request.args_.size() == 4 &&
+               CmpCaseInsensitive(request.args_[2], "replace")) {
+      replace = true;
+      code = request.args_[3];
+    } else {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'function|load' command"));
+    }
+    if (FunctionMutationRejected(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
+    }
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    auto library =
+        co_await StageFunctionLibraryOnAllWorkers(std::string(code), replace);
+    if (!library.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR Error registering functions: ",
+                       library.status().message())));
+    }
+    absl::Status published = co_await PublishFunctionMutation(request);
+    if (!published.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR function replication publish failed: ", published.message())));
+    }
+    co_return BuiltReply(reply_builder.AppendBulkString(library->name_));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "delete")) {
+    if (request.args_.size() != 3) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'function|delete' command"));
+    }
+    if (FunctionMutationRejected(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
+    }
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    if (!(co_await DeleteFunctionLibraryOnAllWorkers(request.args_[2]))) {
+      co_return BuiltReply(reply_builder.AppendError("ERR Library not found"));
+    }
+    absl::Status published = co_await PublishFunctionMutation(request);
+    if (!published.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR function replication publish failed: ", published.message())));
+    }
+    co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "flush")) {
+    if (request.args_.size() > 3 ||
+        (request.args_.size() == 3 &&
+         !CmpCaseInsensitive(request.args_[2], "sync") &&
+         !CmpCaseInsensitive(request.args_[2], "async"))) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR FUNCTION FLUSH only supports SYNC|ASYNC option"));
+    }
+    if (FunctionMutationRejected(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
+    }
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    (void)co_await FlushFunctionLibrariesOnAllWorkers();
+    absl::Status published = co_await PublishFunctionMutation(request);
+    if (!published.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR function replication publish failed: ", published.message())));
+    }
+    co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "dump") && request.args_.size() == 2) {
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    const std::vector<LuaFunctionLibrary> libraries =
+        SnapshotLuaFunctionLibraries();
+    std::vector<std::string> codes;
+    codes.reserve(libraries.size());
+    for (const LuaFunctionLibrary& library : libraries) {
+      codes.push_back(library.code_);
+    }
+    co_return BuiltReply(
+        reply_builder.AppendBulkString(rdb::EncodeFunctionDump(codes)));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "restore")) {
+    if (request.args_.size() < 3 || request.args_.size() > 4) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'function|restore' command"));
+    }
+    enum class RestorePolicy { kAppend, kReplace, kFlush };
+    RestorePolicy policy = RestorePolicy::kAppend;
+    if (request.args_.size() == 4) {
+      if (CmpCaseInsensitive(request.args_[3], "append")) {
+        policy = RestorePolicy::kAppend;
+      } else if (CmpCaseInsensitive(request.args_[3], "replace")) {
+        policy = RestorePolicy::kReplace;
+      } else if (CmpCaseInsensitive(request.args_[3], "flush")) {
+        policy = RestorePolicy::kFlush;
+      } else {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR Wrong restore policy given, value should be either FLUSH, "
+            "APPEND or REPLACE."));
+      }
+    }
+    auto decoded = rdb::DecodeFunctionDump(request.args_[2]);
+    if (!decoded.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR DUMP payload version or checksum are wrong"));
+    }
+    if (FunctionMutationRejected(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "READONLY You can't write against a read only replica."));
+    }
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    const std::vector<LuaFunctionLibrary> previous =
+        SnapshotLuaFunctionLibraries();
+    std::vector<LuaFunctionLibrary> target =
+        policy == RestorePolicy::kFlush
+            ? std::vector<LuaFunctionLibrary>{}
+            : previous;
+    for (const std::string& code : *decoded) {
+      const std::optional<std::string> name =
+          FunctionLibraryNameFromCode(code);
+      if (!name.has_value()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR Error registering functions: Missing library metadata"));
+      }
+      const auto existing =
+          std::find_if(target.begin(), target.end(), [&](const auto& library) {
+            return library.name_ == *name;
+          });
+      if (existing != target.end()) {
+        if (policy != RestorePolicy::kReplace) {
+          co_return BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR Library ", *name, " already exists")));
+        }
+        target.erase(existing);
+      }
+      target.push_back(LuaFunctionLibrary{.name_ = *name,
+                                          .engine_ = "LUA",
+                                          .code_ = code,
+                                          .functions_ = {}});
+    }
+    absl::Status rebuilt = co_await RebuildFunctionCatalog(target, previous);
+    if (!rebuilt.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR Error registering functions: ", rebuilt.message())));
+    }
+    absl::Status published = co_await PublishFunctionMutation(request);
+    if (!published.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR function replication publish failed: ", published.message())));
+    }
+    co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+  }
+
+  if (CmpCaseInsensitive(subcommand, "list")) {
+    (void)co_await BeginLuaScriptCacheOperation();
+    LuaScriptCacheOperationGuard operation;
+    std::optional<std::string_view> pattern;
+    bool with_code = false;
+    for (std::size_t index = 2; index < request.args_.size(); ++index) {
+      if (!with_code && CmpCaseInsensitive(request.args_[index], "withcode")) {
+        with_code = true;
+      } else if (!pattern.has_value() &&
+                 CmpCaseInsensitive(request.args_[index], "libraryname") &&
+                 index + 1 < request.args_.size()) {
+        pattern = request.args_[++index];
+      } else {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR Unknown argument ", request.args_[index])));
+      }
+    }
+    std::vector<LuaFunctionLibrary> libraries =
+        SnapshotLuaFunctionLibraries();
+    const std::size_t count = static_cast<std::size_t>(std::count_if(
+        libraries.begin(), libraries.end(), [&](const auto& library) {
+          return !pattern.has_value() ||
+                 RedisGlobMatch(*pattern, library.name_);
+        }));
+    reply_builder.AppendArrayHeader(count);
+    for (const LuaFunctionLibrary& library : libraries) {
+      if (pattern.has_value() &&
+          !RedisGlobMatch(*pattern, library.name_)) {
+        continue;
+      }
+      reply_builder.AppendMapHeader(with_code ? 4 : 3);
+      reply_builder.AppendBulkString("library_name");
+      reply_builder.AppendBulkString(library.name_);
+      reply_builder.AppendBulkString("engine");
+      reply_builder.AppendBulkString(library.engine_);
+      reply_builder.AppendBulkString("functions");
+      reply_builder.AppendArrayHeader(library.functions_.size());
+      for (const LuaFunctionInfo& function : library.functions_) {
+        reply_builder.AppendMapHeader(3);
+        reply_builder.AppendBulkString("name");
+        reply_builder.AppendBulkString(function.name_);
+        reply_builder.AppendBulkString("description");
+        if (function.description_.has_value()) {
+          reply_builder.AppendBulkString(*function.description_);
+        } else {
+          reply_builder.AppendNull();
+        }
+        reply_builder.AppendBulkString("flags");
+        AppendLuaFunctionFlags(reply_builder, function.flags_);
+      }
+      if (with_code) {
+        reply_builder.AppendBulkString("library_code");
+        reply_builder.AppendBulkString(library.code_);
+      }
+    }
+    co_return BuiltReply(reply_builder.View());
+  }
+
+  if (CmpCaseInsensitive(subcommand, "stats") && request.args_.size() == 2) {
+    const std::optional<LuaRunningInvocation> running =
+        SnapshotLuaRunningInvocation();
+    if (running.has_value() && !running->is_function_) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "BUSY Redis is busy running a script. You can only call SCRIPT KILL "
+          "or SHUTDOWN NOSAVE."));
+    }
+    const std::vector<LuaFunctionLibrary> libraries =
+        SnapshotLuaFunctionLibraries();
+    std::size_t function_count = 0;
+    for (const auto& library : libraries) {
+      function_count += library.functions_.size();
+    }
+    reply_builder.AppendMapHeader(2);
+    reply_builder.AppendBulkString("running_script");
+    if (!running.has_value()) {
+      reply_builder.AppendNull();
+    } else {
+      reply_builder.AppendMapHeader(3);
+      reply_builder.AppendBulkString("name");
+      reply_builder.AppendBulkString(running->name_);
+      reply_builder.AppendBulkString("command");
+      reply_builder.AppendArrayHeader(running->command_.size());
+      for (const std::string& arg : running->command_) {
+        reply_builder.AppendBulkString(arg);
+      }
+      reply_builder.AppendBulkString("duration_ms");
+      reply_builder.AppendInteger(
+          static_cast<long long>(running->duration_ms_));
+    }
+    reply_builder.AppendBulkString("engines");
+    reply_builder.AppendMapHeader(1);
+    reply_builder.AppendBulkString("LUA");
+    reply_builder.AppendMapHeader(2);
+    reply_builder.AppendBulkString("libraries_count");
+    reply_builder.AppendInteger(static_cast<long long>(libraries.size()));
+    reply_builder.AppendBulkString("functions_count");
+    reply_builder.AppendInteger(static_cast<long long>(function_count));
+    co_return BuiltReply(reply_builder.View());
+  }
+
+  if (CmpCaseInsensitive(subcommand, "kill") && request.args_.size() == 2) {
+    switch (RequestLuaScriptKill(true)) {
+      case LuaScriptKillResult::kKilled:
+        co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
+      case LuaScriptKillResult::kNotBusy:
+        co_return BuiltReply(reply_builder.AppendError(
+            "NOTBUSY No scripts in execution right now."));
+      case LuaScriptKillResult::kUnkillableWrite:
+        co_return BuiltReply(reply_builder.AppendError(
+            "UNKILLABLE Sorry the script already executed write commands "
+            "against the dataset. You can either wait the script termination "
+            "or kill the server in a hard way using the SHUTDOWN NOSAVE "
+            "command."));
+      case LuaScriptKillResult::kUnkillableReplication:
+        co_return BuiltReply(reply_builder.AppendError(
+            "UNKILLABLE The busy script was sent by a master instance in the "
+            "context of replication and cannot be killed."));
+      case LuaScriptKillResult::kWrongInvocationKind:
+        co_return BuiltReply(reply_builder.AppendError(
+            "BUSY Redis is busy running a script. You can only call SCRIPT KILL "
+            "or SHUTDOWN NOSAVE."));
+    }
+  }
+
+  co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+      "ERR Unknown subcommand or wrong number of arguments for '", subcommand,
+      "'. Try FUNCTION HELP.")));
 }
 
 // One EXEC hop = one squashed run: every shard executes its keys of each
@@ -7126,7 +7741,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
-    if (IsEvalCommand(cmd)) {
+    if (IsLuaInvocationCommand(cmd)) {
       std::vector<CapturedReplicationCommand> effects;
       std::string reply = co_await ExecuteEvalWithTransaction(
           cmd, nullptr, nullptr, blocking_notifications, &effects);
@@ -7136,6 +7751,11 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     if (cmd.kind_ == CommandKind::kScript) {
       ReplyBuilder local_builder(ctx.resp_version());
       CommandReply local = co_await ExecuteScript(cmd, local_builder);
+      co_return std::string(local.encoded_);
+    }
+    if (cmd.kind_ == CommandKind::kFunction) {
+      ReplyBuilder local_builder(ctx.resp_version());
+      CommandReply local = co_await ExecuteFunction(cmd, local_builder);
       co_return std::string(local.encoded_);
     }
     ReplyBuilder local_builder(ctx.resp_version());
@@ -7272,7 +7892,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     };
 
     const bool contains_eval =
-        std::any_of(queued.begin(), queued.end(), IsEvalCommand);
+        std::any_of(queued.begin(), queued.end(), IsLuaInvocationCommand);
     if (owners.size() == 1 && !contains_eval) {
       std::unique_ptr<ReplicationTransactionGuard> replication;
       if (replication_request != nullptr) {
@@ -7429,7 +8049,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           ++i;
           continue;
         }
-        if (IsEvalCommand(cmd)) {
+        if (IsLuaInvocationCommand(cmd)) {
           std::vector<CapturedReplicationCommand> effects;
           replies[i] = co_await ExecuteEvalWithTransaction(
               cmd, &txn, &tx_writes, blocking_notifications, &effects);
@@ -7447,7 +8067,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         }
         std::size_t end = i + 1;
         while (end < queued.size() && !cmd_keys[end].empty() &&
-               !IsEvalCommand(queued[end]) &&
+               !IsLuaInvocationCommand(queued[end]) &&
                ClassifyExecSequential(queued[end].kind_) ==
                    ExecSequentialFamily::kNone) {
           ++end;
@@ -7515,7 +8135,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   // which to place the ordinary transaction envelope. Publish its captured
   // effects once through the first channel's source flow instead. Read-only
   // children and SUBSCRIBE/UNSUBSCRIBE remain local connection state.
-  if (source_replicable && !has_write && g_storage != nullptr) {
+  if (source_replicable && (!has_write || dbs.empty()) &&
+      g_storage != nullptr) {
     std::vector<CapturedReplicationCommand> commands;
     for (std::size_t index = 0; index < queued.size(); ++index) {
       const CommandRequest& command = queued[index];
@@ -7536,7 +8157,10 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     }
     if (!commands.empty()) {
       const std::uint16_t partition_id =
-          storage::RedisSlot(commands.front().args_[1]);
+          !commands.front().args_.empty() &&
+                  CmpCaseInsensitive(commands.front().args_.front(), "function")
+              ? 0
+              : storage::RedisSlot(commands.front().args_[1]);
       const unsigned source_worker = partition_id % g_storage->worker_count();
       std::vector<std::string> effects =
           EncodeReplicationCommandEffects(std::move(commands));
@@ -7637,6 +8261,56 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
 }
 
 }  // namespace
+
+Task<absl::Status> ReplaceLuaFunctionCatalog(
+    const std::vector<std::string>& library_codes) {
+  (void)co_await BeginLuaScriptCacheOperation();
+  LuaScriptCacheOperationGuard operation;
+  const std::vector<LuaFunctionLibrary> previous =
+      SnapshotLuaFunctionLibraries();
+  std::vector<LuaFunctionLibrary> target;
+  target.reserve(library_codes.size());
+  for (const std::string& code : library_codes) {
+    const std::optional<std::string> name = FunctionLibraryNameFromCode(code);
+    if (!name.has_value()) {
+      co_return absl::InvalidArgumentError("Missing library metadata");
+    }
+    target.push_back(LuaFunctionLibrary{.name_ = *name,
+                                        .engine_ = "LUA",
+                                        .code_ = code,
+                                        .functions_ = {}});
+  }
+  co_return co_await RebuildFunctionCatalog(target, previous);
+}
+
+Task<absl::Status> ValidateLuaFunctionCatalog(
+    const std::vector<std::string>& library_codes) {
+  (void)co_await BeginLuaScriptCacheOperation();
+  LuaScriptCacheOperationGuard operation;
+  const std::vector<LuaFunctionLibrary> previous =
+      SnapshotLuaFunctionLibraries();
+  std::vector<LuaFunctionLibrary> target;
+  target.reserve(library_codes.size());
+  for (const std::string& code : library_codes) {
+    const std::optional<std::string> name = FunctionLibraryNameFromCode(code);
+    if (!name.has_value()) {
+      co_return absl::InvalidArgumentError("Missing library metadata");
+    }
+    target.push_back(LuaFunctionLibrary{.name_ = *name,
+                                        .engine_ = "LUA",
+                                        .code_ = code,
+                                        .functions_ = {}});
+  }
+  absl::Status validated = co_await RebuildFunctionCatalog(target, previous);
+  if (!validated.ok()) co_return validated;
+  absl::Status restored = co_await RebuildFunctionCatalog(previous, target);
+  if (!restored.ok()) {
+    co_return absl::InternalError(absl::StrCat(
+        "validated FUNCTION catalog but failed to restore current catalog: ",
+        restored.message()));
+  }
+  co_return absl::OkStatus();
+}
 
 bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept {
   return TryBeginDbOperation(db_id);
@@ -8586,10 +9260,22 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
   const bool script_kill =
       kind == CommandKind::kScript && request.args_.size() == 2 &&
       CmpCaseInsensitive(request.args_[1], "kill");
-  if (!request.replication_origin_ && LuaScriptsBusy() && !script_kill) {
+  const bool function_kill =
+      kind == CommandKind::kFunction && request.args_.size() == 2 &&
+      CmpCaseInsensitive(request.args_[1], "kill");
+  const bool function_stats =
+      kind == CommandKind::kFunction && request.args_.size() == 2 &&
+      CmpCaseInsensitive(request.args_[1], "stats");
+  if (!request.replication_origin_ && LuaScriptsBusy() && !script_kill &&
+      !function_kill && !function_stats) {
+    const std::optional<LuaRunningInvocation> running =
+        SnapshotLuaRunningInvocation();
     co_return BuiltReply(reply_builder.AppendError(
-        "BUSY Redis is busy running a script. You can only call SCRIPT KILL "
-        "or SHUTDOWN NOSAVE."));
+        running.has_value() && running->is_function_
+            ? "BUSY Redis is busy running a script. You can only call FUNCTION "
+              "KILL or SHUTDOWN NOSAVE."
+            : "BUSY Redis is busy running a script. You can only call SCRIPT "
+              "KILL or SHUTDOWN NOSAVE."));
   }
   if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
     const bool allowed_while_loading = [&] {
@@ -8915,10 +9601,15 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kEvalSha:
     case CommandKind::kEvalRo:
     case CommandKind::kEvalShaRo:
+    case CommandKind::kFCall:
+    case CommandKind::kFCallRo:
       co_return co_await ExecuteEval(request, reply_builder);
 
     case CommandKind::kScript:
       co_return co_await ExecuteScript(request, reply_builder);
+
+    case CommandKind::kFunction:
+      co_return co_await ExecuteFunction(request, reply_builder);
 
     case CommandKind::kReplicaOf:
       co_return co_await ExecuteReplicaOf(request, reply_builder);
@@ -9266,10 +9957,14 @@ namespace {
 // admission, body, and release on their existing "already on the target"
 // inline paths, so the write pays one cross-core round trip instead of three.
 std::optional<unsigned> SingleKeyWriteOwner(const CommandRequest& request) {
-  if (request.replication_origin_ || request.spec_ == nullptr ||
-      g_storage == nullptr) {
+  if (request.spec_ == nullptr || g_storage == nullptr) {
     return std::nullopt;
   }
+  // Function-library mutations are process-global. Route every standalone
+  // FUNCTION command through worker zero so mutation and replication order
+  // are identical even when clients are accepted by different workers.
+  if (request.kind_ == CommandKind::kFunction) return 0;
+  if (request.replication_origin_) return std::nullopt;
   if ((request.spec_->flags_ & kCmdWrite) == 0 ||
       (request.spec_->flags_ & (kCmdGlobal | kCmdMultiShard)) != 0) {
     return std::nullopt;
@@ -9483,7 +10178,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
     (void)co_await PublishChannel(request->args_[1], request->args_[2]);
     co_return absl::OkStatus();
   }
-  bool replayable_write = false;
+  bool replayable_write = request->kind_ == CommandKind::kFunction;
   if (request->spec_ != nullptr && (request->spec_->flags_ & kCmdWrite) != 0 &&
       (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) == 0) {
     auto keys = DetermineKeys(*request->spec_, request->args_);
@@ -9525,7 +10220,7 @@ Task<absl::Status> ApplyRedisReplicatedCommand(
     co_return absl::OkStatus();
   }
 
-  bool replayable = false;
+  bool replayable = request->kind_ == CommandKind::kFunction;
   if (request->spec_ != nullptr && (request->spec_->flags_ & kCmdWrite) != 0 &&
       (request->spec_->flags_ & kCmdMayBlock) == 0) {
     if (request->kind_ == CommandKind::kFlushDb ||

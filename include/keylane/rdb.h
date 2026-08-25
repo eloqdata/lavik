@@ -3,8 +3,10 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "absl/status/statusor.h"
 #include "keylane/storage/engine.h"
@@ -17,7 +19,7 @@ enum class FileEntryKind : std::uint8_t {
   kValue,
   kSkippedModuleValue,
   kSkippedModuleAux,
-  kSkippedFunction,
+  kFunctionLibrary,
 };
 
 struct FileEntry {
@@ -25,6 +27,7 @@ struct FileEntry {
   std::uint8_t db_id_ = 0;
   std::string key_;
   storage::RawValue value_;
+  std::string function_code_;
 };
 
 // Memory-maps and validates one complete Redis RDB file. Files produced by
@@ -63,6 +66,14 @@ absl::StatusOr<storage::RawValue> DecodeDump(std::string_view payload);
 absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
                                             std::string_view key,
                                             const storage::RawValue& value);
+
+// Redis 7 FUNCTION2 stores one complete library source as an RDB string.
+// FUNCTION DUMP concatenates these entries and appends the RDB version and
+// CRC64 footer used by RESTORE payloads.
+std::string EncodeFunctionLibraryEntry(std::string_view code);
+std::string EncodeFunctionDump(std::span<const std::string> libraries);
+absl::StatusOr<std::vector<std::string>> DecodeFunctionDump(
+    std::string_view payload);
 
 // Stateful checksum encoder for a diskless RDB transfer. Header() must be
 // sent first, every subsequently sent fragment must be passed to Account(),

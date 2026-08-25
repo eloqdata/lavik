@@ -176,6 +176,9 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("SCRIPT", CommandKind::kScript);
   CheckKind("EVAL_RO", CommandKind::kEvalRo);
   CheckKind("EVALSHA_RO", CommandKind::kEvalShaRo);
+  CheckKind("FCALL", CommandKind::kFCall);
+  CheckKind("FCALL_RO", CommandKind::kFCallRo);
+  CheckKind("FUNCTION", CommandKind::kFunction);
   CheckKind("APPEND", CommandKind::kAppend);
   CheckKind("GETBIT", CommandKind::kGetBit);
   CheckKind("SETBIT", CommandKind::kSetBit);

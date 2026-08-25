@@ -364,7 +364,8 @@ TEST(RdbTest, SkipsSelfDescribingUnsupportedRedisData) {
   auto function = reader->Next();
   ASSERT_TRUE(function.ok()) << function.status();
   ASSERT_TRUE(function->has_value());
-  EXPECT_EQ((**function).kind_, FileEntryKind::kSkippedFunction);
+  EXPECT_EQ((**function).kind_, FileEntryKind::kFunctionLibrary);
+  EXPECT_EQ((**function).function_code_, "#!lua name=library");
 
   auto module_aux = reader->Next();
   ASSERT_TRUE(module_aux.ok()) << module_aux.status();
@@ -383,6 +384,21 @@ TEST(RdbTest, SkipsSelfDescribingUnsupportedRedisData) {
   EXPECT_EQ((**kept).kind_, FileEntryKind::kValue);
   EXPECT_EQ((**kept).key_, "kept");
   EXPECT_EQ((**kept).value_.encoded_, "value");
+}
+
+TEST(RdbTest, EncodesAndDecodesRedisFunctionDump) {
+  const std::vector<std::string> libraries = {
+      "#!lua name=one\nredis.register_function('one', function() return 1 end)",
+      "#!lua name=two\nredis.register_function('two', function() return 2 end)",
+  };
+  const std::string payload = EncodeFunctionDump(libraries);
+  auto decoded = DecodeFunctionDump(payload);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(*decoded, libraries);
+
+  std::string corrupt = payload;
+  corrupt[1] ^= 1;
+  EXPECT_FALSE(DecodeFunctionDump(corrupt).ok());
 }
 
 TEST(RdbTest, RejectsCorruptAndUnsupportedCompleteFiles) {

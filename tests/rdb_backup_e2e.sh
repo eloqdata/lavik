@@ -68,6 +68,9 @@ KEYLANE_RDB_CAPTURE_PAUSE_MS=500 \
 source_pid=$!
 wait_ready "${source_port}"
 
+function_code=$'#!lua name=rdb_library\nredis.register_function{function_name="rdb_get", callback=function(keys, args) return redis.call("GET", keys[1]) end, flags={"no-writes"}}'
+[[ $("${redis_cli}" -p "${source_port}" function load "${function_code}") == rdb_library ]]
+
 emit_sets key: 1 5000 OLD | "${redis_cli}" -p "${source_port}" --pipe >/dev/null
 head -c 10485760 /dev/zero | tr '\0' A |
   "${redis_cli}" -p "${source_port}" -x set external-big >/dev/null
@@ -141,6 +144,9 @@ values=$("${redis_cli}" -p "${import_port}" --scan --pattern 'key:*' |
 [[ $("${redis_cli}" -p "${import_port}" get race-trigger) == OLD ]]
 [[ $("${redis_cli}" -p "${import_port}" --scan --pattern 'race-fill:*' |
   wc -l) == 12 ]]
+[[ $("${redis_cli}" -p "${import_port}" fcall_ro rdb_get 1 race-trigger) == OLD ]]
+[[ $("${redis_cli}" -p "${import_port}" function list libraryname rdb_library |
+  grep -c rdb_get) -ge 1 ]]
 
 stop_server "${import_pid}"
 import_pid=

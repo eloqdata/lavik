@@ -7,6 +7,7 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +57,9 @@ std::mutex g_script_bodies_mutex;
 absl::flat_hash_map<ScriptKey, std::unique_ptr<const std::string>>
     g_script_bodies;
 
+std::mutex g_function_catalog_mutex;
+absl::flat_hash_map<std::string, LuaFunctionLibrary> g_function_libraries;
+
 enum class LuaRunState : std::uint8_t {
   kClean,
   kDirty,
@@ -63,16 +67,20 @@ enum class LuaRunState : std::uint8_t {
 };
 
 struct LuaRunControl {
+  std::chrono::steady_clock::time_point started_at_;
   std::chrono::steady_clock::time_point deadline_;
   std::atomic<LuaRunState> state_{LuaRunState::kClean};
   std::atomic<bool> busy_{false};
   bool replication_origin_ = false;
+  bool is_function_ = false;
   bool scheduler_yield_pending_ = false;
   std::string script_name_;
+  std::vector<std::string> invocation_command_;
   RespVersion resp_version_ = RespVersion::k2;
 };
 
 char g_run_control_registry_key;
+char g_function_load_registry_key;
 std::mutex g_active_scripts_mutex;
 std::vector<LuaRunControl*> g_active_scripts;
 std::atomic<std::uint32_t> g_busy_script_count{0};
@@ -82,6 +90,203 @@ std::atomic<std::uint32_t> g_busy_script_count{0};
 // Lua runtime; math.randomseed() makes a particular invocation reproducible
 // regardless of the host libc or architecture.
 thread_local std::uint64_t g_lua_random_state = 0x1234abcd330eULL;
+
+std::string FoldFunctionName(std::string_view name) {
+  std::string folded(name);
+  for (char& byte : folded) {
+    byte = static_cast<char>(
+        std::tolower(static_cast<unsigned char>(byte)));
+  }
+  return folded;
+}
+
+bool ValidFunctionName(std::string_view name) {
+  if (name.empty()) return false;
+  return std::all_of(name.begin(), name.end(), [](unsigned char byte) {
+    return std::isalnum(byte) != 0 || byte == '_';
+  });
+}
+
+struct StagedLuaFunction {
+  LuaFunctionInfo info_;
+  int registry_ref_ = LUA_NOREF;
+};
+
+struct StagedLuaLibrary {
+  LuaFunctionLibrary info_;
+  std::vector<StagedLuaFunction> functions_;
+};
+
+struct FunctionLoadContext {
+  StagedLuaLibrary* library_ = nullptr;
+  std::chrono::steady_clock::time_point deadline_;
+};
+
+void RawGetField(lua_State* state, int table, const char* field);
+
+std::optional<std::uint64_t> ParseFunctionFlag(std::string_view flag) {
+  const std::string folded = FoldFunctionName(flag);
+  flag = folded;
+  if (flag == "no-writes") return kLuaFunctionNoWrites;
+  if (flag == "allow-oom") return kLuaFunctionAllowOom;
+  if (flag == "allow-stale") return kLuaFunctionAllowStale;
+  if (flag == "no-cluster") return kLuaFunctionNoCluster;
+  if (flag == "allow-cross-slot-keys") {
+    return kLuaFunctionAllowCrossSlotKeys;
+  }
+  return std::nullopt;
+}
+
+void RawGetFieldCaseInsensitive(lua_State* state, int table,
+                                std::string_view field) {
+  table = table < 0 ? lua_gettop(state) + table + 1 : table;
+  lua_pushnil(state);
+  while (lua_next(state, table) != 0) {
+    if (lua_type(state, -2) == LUA_TSTRING) {
+      std::size_t size = 0;
+      const char* key = lua_tolstring(state, -2, &size);
+      if (FoldFunctionName(std::string_view(key, size)) == field) {
+        lua_remove(state, -2);
+        return;
+      }
+    }
+    lua_pop(state, 1);
+  }
+  lua_pushnil(state);
+}
+
+int RedisRegisterFunction(lua_State* state) {
+  lua_pushlightuserdata(state, &g_function_load_registry_key);
+  lua_rawget(state, LUA_REGISTRYINDEX);
+  auto* context =
+      static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
+  lua_pop(state, 1);
+  if (context == nullptr || context->library_ == nullptr) {
+    return luaL_error(
+        state, "redis.register_function can only be called on FUNCTION LOAD");
+  }
+
+  int callback_index = 0;
+  LuaFunctionInfo info;
+  const int argc = lua_gettop(state);
+  if (argc == 2) {
+    if (lua_type(state, 1) != LUA_TSTRING ||
+        lua_type(state, 2) != LUA_TFUNCTION) {
+      return luaL_error(state,
+                        "redis.register_function requires a name and callback");
+    }
+    std::size_t size = 0;
+    const char* name = lua_tolstring(state, 1, &size);
+    info.name_.assign(name, size);
+    callback_index = 2;
+  } else if (argc == 1 && lua_istable(state, 1)) {
+    lua_pushnil(state);
+    while (lua_next(state, 1) != 0) {
+      if (lua_type(state, -2) != LUA_TSTRING) {
+        lua_pop(state, 2);
+        return luaL_error(
+            state,
+            "named argument key given to redis.register_function is not a "
+            "string");
+      }
+      std::size_t key_size = 0;
+      const char* key = lua_tolstring(state, -2, &key_size);
+      const std::string folded =
+          FoldFunctionName(std::string_view(key, key_size));
+      if (folded != "function_name" && folded != "description" &&
+          folded != "flags" && folded != "callback") {
+        lua_pop(state, 2);
+        return luaL_error(
+            state, "unknown argument given to redis.register_function");
+      }
+      lua_pop(state, 1);
+    }
+
+    RawGetFieldCaseInsensitive(state, 1, "function_name");
+    if (lua_type(state, -1) != LUA_TSTRING) {
+      lua_pop(state, 1);
+      return luaL_error(state, "function_name must be a string");
+    }
+    std::size_t size = 0;
+    const char* name = lua_tolstring(state, -1, &size);
+    info.name_.assign(name, size);
+    lua_pop(state, 1);
+
+    RawGetFieldCaseInsensitive(state, 1, "description");
+    if (!lua_isnil(state, -1)) {
+      if (lua_type(state, -1) != LUA_TSTRING) {
+        lua_pop(state, 1);
+        return luaL_error(state, "description must be a string");
+      }
+      const char* description = lua_tolstring(state, -1, &size);
+      info.description_.emplace(description, size);
+    }
+    lua_pop(state, 1);
+
+    RawGetFieldCaseInsensitive(state, 1, "flags");
+    if (!lua_isnil(state, -1)) {
+      if (!lua_istable(state, -1)) {
+        lua_pop(state, 1);
+        return luaL_error(state, "flags must be a table");
+      }
+      for (int index = 1;; ++index) {
+        lua_rawgeti(state, -1, index);
+        if (lua_isnil(state, -1)) {
+          lua_pop(state, 1);
+          break;
+        }
+        if (lua_type(state, -1) != LUA_TSTRING) {
+          lua_pop(state, 2);
+          return luaL_error(state, "function flags must be strings");
+        }
+        const char* flag = lua_tolstring(state, -1, &size);
+        auto parsed = ParseFunctionFlag(std::string_view(flag, size));
+        if (!parsed.has_value()) {
+          std::string invalid(flag, size);
+          lua_pop(state, 2);
+          return luaL_error(state, "unknown flag given: %s", invalid.c_str());
+        }
+        info.flags_ |= *parsed;
+        lua_pop(state, 1);
+      }
+    }
+    lua_pop(state, 1);
+
+    RawGetFieldCaseInsensitive(state, 1, "callback");
+    if (lua_type(state, -1) != LUA_TFUNCTION) {
+      lua_pop(state, 1);
+      return luaL_error(state, "callback must be a function");
+    }
+    callback_index = lua_gettop(state);
+  } else {
+    return luaL_error(state, "wrong number of arguments to redis.register_function");
+  }
+
+  if (!ValidFunctionName(info.name_)) {
+    if (callback_index > argc) lua_pop(state, 1);
+    return luaL_error(
+        state,
+        "Function names can only contain letters, numbers, or underscores");
+  }
+  const std::string folded = FoldFunctionName(info.name_);
+  const auto duplicate = std::find_if(
+      context->library_->functions_.begin(),
+      context->library_->functions_.end(), [&](const StagedLuaFunction& fn) {
+        return FoldFunctionName(fn.info_.name_) == folded;
+      });
+  if (duplicate != context->library_->functions_.end()) {
+    if (callback_index > argc) lua_pop(state, 1);
+    return luaL_error(state, "Function already exists in the library");
+  }
+
+  lua_pushvalue(state, callback_index);
+  const int registry_ref = luaL_ref(state, LUA_REGISTRYINDEX);
+  context->library_->info_.functions_.push_back(info);
+  context->library_->functions_.push_back(
+      StagedLuaFunction{std::move(info), registry_ref});
+  if (callback_index > argc) lua_pop(state, 1);
+  return 0;
+}
 
 std::int32_t NextLuaRandom() {
   constexpr std::uint64_t kMask = (1ULL << 48) - 1;
@@ -209,7 +414,10 @@ void ScriptInstructionHook(lua_State* state, lua_Debug*) {
   if (control == nullptr) return;
   if (control->state_.load(std::memory_order_acquire) ==
       LuaRunState::kKillRequested) {
-    (void)luaL_error(state, "Script killed by user with SCRIPT KILL...");
+    (void)luaL_error(
+        state, control->is_function_
+                   ? "Script killed by user with FUNCTION KILL..."
+                   : "Script killed by user with SCRIPT KILL...");
     return;
   }
   if (std::chrono::steady_clock::now() < control->deadline_) return;
@@ -217,9 +425,10 @@ void ScriptInstructionHook(lua_State* state, lua_Debug*) {
     g_busy_script_count.fetch_add(1, std::memory_order_acq_rel);
     spdlog::warn(
         "Slow script detected: still in execution after {} milliseconds. "
-        "You can try killing the script using the SCRIPT KILL command. "
+        "You can try killing the script using the {} KILL command. "
         "Script name is: {}.",
         g_script_busy_threshold_ms.load(std::memory_order_acquire),
+        control->is_function_ ? "FUNCTION" : "SCRIPT",
         control->script_name_);
   }
   // After the busy threshold, yield the coroutine so this worker can process
@@ -317,6 +526,22 @@ void SetStringArray(lua_State* state, const char* name,
   lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 1);
 }
 
+void SetGlobalNil(lua_State* state, const char* name) {
+  lua_pushnil(state);
+  lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 0);
+  lua_setglobal(state, name);
+  lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 1);
+}
+
+void PushStringArray(lua_State* state,
+                     std::span<const std::string> values) {
+  lua_createtable(state, static_cast<int>(values.size()), 0);
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    lua_pushlstring(state, values[i].data(), values[i].size());
+    lua_rawseti(state, -2, static_cast<int>(i + 1));
+  }
+}
+
 int AbsoluteStackIndex(lua_State* state, int index) {
   return index < 0 ? lua_gettop(state) + index + 1 : index;
 }
@@ -341,6 +566,84 @@ struct CachedLuaFunction {
   std::string_view bytecode_;
   int registry_ref_ = LUA_NOREF;
 };
+
+struct LocalLuaFunction {
+  LuaFunctionInfo info_;
+  int registry_ref_ = LUA_NOREF;
+};
+
+struct LocalLuaLibrary {
+  std::string name_;
+  std::string code_;
+  absl::flat_hash_map<std::string, LocalLuaFunction> functions_;
+};
+
+struct LocalLuaFunctionLookup {
+  LocalLuaLibrary* library_ = nullptr;
+  LocalLuaFunction* function_ = nullptr;
+};
+
+absl::StatusOr<std::pair<std::string, std::string>> ParseLibraryMetadata(
+    std::string_view code) {
+  if (!code.starts_with("#!")) {
+    return absl::InvalidArgumentError("Missing library metadata");
+  }
+  const std::size_t newline = code.find('\n');
+  if (newline == std::string_view::npos) {
+    return absl::InvalidArgumentError("Invalid library metadata");
+  }
+  std::string_view header = code.substr(2, newline - 2);
+  while (!header.empty() &&
+         std::isspace(static_cast<unsigned char>(header.front())) != 0) {
+    header.remove_prefix(1);
+  }
+  const std::size_t engine_end = header.find_first_of(" \t\r");
+  const std::string_view engine = header.substr(0, engine_end);
+  if (FoldFunctionName(engine) != "lua") {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Engine '", engine, "' not found"));
+  }
+  header = engine_end == std::string_view::npos
+               ? std::string_view{}
+               : header.substr(engine_end);
+  std::optional<std::string> name;
+  while (!header.empty()) {
+    while (!header.empty() &&
+           std::isspace(static_cast<unsigned char>(header.front())) != 0) {
+      header.remove_prefix(1);
+    }
+    if (header.empty()) break;
+    const std::size_t end = header.find_first_of(" \t\r");
+    const std::string_view token = header.substr(0, end);
+    if (!token.starts_with("name=") || name.has_value()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("Invalid metadata value given: ", token));
+    }
+    name.emplace(token.substr(5));
+    header = end == std::string_view::npos ? std::string_view{}
+                                           : header.substr(end);
+  }
+  if (!name.has_value()) {
+    return absl::InvalidArgumentError("Library name was not given");
+  }
+  if (!ValidFunctionName(*name)) {
+    return absl::InvalidArgumentError(
+        "Library names can only contain letters, numbers, or underscores");
+  }
+  return std::pair{std::move(*name), std::string("LUA")};
+}
+
+void FunctionLoadInstructionHook(lua_State* state, lua_Debug*) {
+  lua_pushlightuserdata(state, &g_function_load_registry_key);
+  lua_rawget(state, LUA_REGISTRYINDEX);
+  auto* context =
+      static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
+  lua_pop(state, 1);
+  if (context != nullptr && context->library_ != nullptr &&
+      std::chrono::steady_clock::now() >= context->deadline_) {
+    (void)luaL_error(state, "FUNCTION LOAD exceeded the maximum execution time");
+  }
+}
 
 class LuaWorkerRuntime {
  public:
@@ -378,6 +681,7 @@ class LuaWorkerRuntime {
     SetTableFunction(state, -1, "replicate_commands",
                      RedisReplicateCommands);
     SetTableFunction(state, -1, "setresp", RedisSetResp);
+    SetTableFunction(state, -1, "register_function", RedisRegisterFunction);
     lua_pop(state, 1);
     lua_getglobal(state, "math");
     SetTableFunction(state, -1, "random", RedisMathRandom);
@@ -456,11 +760,168 @@ class LuaWorkerRuntime {
     (void)lua_gc(root_, LUA_GCCOLLECT, 0);
   }
 
+  absl::StatusOr<LuaFunctionLibrary> StageFunctionLibrary(
+      std::string_view code, bool replace) {
+    if (staged_library_ != nullptr) {
+      return absl::FailedPreconditionError(
+          "another function library is already staged");
+    }
+    auto metadata = ParseLibraryMetadata(code);
+    if (!metadata.ok()) return metadata.status();
+    const std::string& library_name = metadata->first;
+    const auto existing_library = libraries_.find(library_name);
+    if (existing_library != libraries_.end() && !replace) {
+      return absl::AlreadyExistsError(
+          absl::StrCat("Library '", library_name, "' already exists"));
+    }
+
+    auto staged = std::make_unique<StagedLuaLibrary>();
+    staged->info_.name_ = library_name;
+    staged->info_.engine_ = metadata->second;
+    staged->info_.code_.assign(code);
+
+    // Functions receive keys and arguments only through their two callback
+    // parameters. Do not leak globals left by an earlier EVAL invocation into
+    // library initialization or callback closures.
+    SetGlobalNil(root_, "KEYS");
+    SetGlobalNil(root_, "ARGV");
+
+    const int base = lua_gettop(root_);
+    FunctionLoadContext context{
+        .library_ = staged.get(),
+        .deadline_ = std::chrono::steady_clock::now() +
+                     std::chrono::milliseconds(500),
+    };
+    lua_pushlightuserdata(root_, &g_function_load_registry_key);
+    lua_pushlightuserdata(root_, &context);
+    lua_rawset(root_, LUA_REGISTRYINDEX);
+    lua_sethook(root_, FunctionLoadInstructionHook, LUA_MASKCOUNT, 100000);
+    const std::string chunk_name = absl::StrCat("@", library_name);
+    const std::size_t body_offset = code.find('\n');
+    const std::string_view body = code.substr(body_offset);
+    const int loaded = luaL_loadbuffer(root_, body.data(), body.size(),
+                                       chunk_name.c_str());
+    const int executed = loaded == 0 ? lua_pcall(root_, 0, 0, 0) : loaded;
+    lua_sethook(root_, nullptr, 0, 0);
+    lua_pushlightuserdata(root_, &g_function_load_registry_key);
+    lua_pushnil(root_);
+    lua_rawset(root_, LUA_REGISTRYINDEX);
+    if (executed != 0) {
+      const std::string error = LuaError(root_);
+      lua_settop(root_, base);
+      ReleaseStaged(staged.get());
+      return absl::InvalidArgumentError(error);
+    }
+    lua_settop(root_, base);
+
+    LocalLuaLibrary* replaced =
+        existing_library == libraries_.end() ? nullptr
+                                              : existing_library->second.get();
+    for (const StagedLuaFunction& function : staged->functions_) {
+      const auto collision = functions_.find(FoldFunctionName(function.info_.name_));
+      if (collision != functions_.end() &&
+          (!replace || collision->second.library_ != replaced)) {
+        const std::string name = function.info_.name_;
+        ReleaseStaged(staged.get());
+        return absl::AlreadyExistsError(
+            absl::StrCat("Function ", name, " already exists"));
+      }
+    }
+    staged_replace_ = replace;
+    LuaFunctionLibrary info = staged->info_;
+    staged_library_ = std::move(staged);
+    return info;
+  }
+
+  void CommitStagedFunctionLibrary() {
+    if (staged_library_ == nullptr) return;
+    const std::string name = staged_library_->info_.name_;
+    if (staged_replace_) DeleteFunctionLibrary(name);
+
+    auto library = std::make_unique<LocalLuaLibrary>();
+    library->name_ = name;
+    library->code_ = staged_library_->info_.code_;
+    for (StagedLuaFunction& staged : staged_library_->functions_) {
+      const std::string folded = FoldFunctionName(staged.info_.name_);
+      library->functions_.emplace(
+          folded, LocalLuaFunction{std::move(staged.info_),
+                                   std::exchange(staged.registry_ref_,
+                                                 LUA_NOREF)});
+    }
+    LocalLuaLibrary* library_ptr = library.get();
+    auto [entry, inserted] = libraries_.emplace(name, std::move(library));
+    if (!inserted) return;
+    for (auto& [folded, function] : entry->second->functions_) {
+      functions_.emplace(
+          folded, LocalLuaFunctionLookup{library_ptr, &function});
+    }
+    staged_library_.reset();
+    staged_replace_ = false;
+  }
+
+  void AbortStagedFunctionLibrary() {
+    if (staged_library_ == nullptr) return;
+    ReleaseStaged(staged_library_.get());
+    staged_library_.reset();
+    staged_replace_ = false;
+  }
+
+  bool DeleteFunctionLibrary(std::string_view name) {
+    auto found = libraries_.find(std::string(name));
+    if (found == libraries_.end()) return false;
+    for (auto& [folded, function] : found->second->functions_) {
+      functions_.erase(folded);
+      luaL_unref(root_, LUA_REGISTRYINDEX, function.registry_ref_);
+      function.registry_ref_ = LUA_NOREF;
+    }
+    libraries_.erase(found);
+    (void)lua_gc(root_, LUA_GCSTEP, 50);
+    return true;
+  }
+
+  void ClearFunctionLibraries() {
+    for (auto& [name, library] : libraries_) {
+      (void)name;
+      for (auto& [folded, function] : library->functions_) {
+        (void)folded;
+        luaL_unref(root_, LUA_REGISTRYINDEX, function.registry_ref_);
+      }
+    }
+    functions_.clear();
+    libraries_.clear();
+    AbortStagedFunctionLibrary();
+    (void)lua_gc(root_, LUA_GCCOLLECT, 0);
+  }
+
+  bool PushFunction(lua_State* thread, std::string_view name,
+                    std::uint64_t* flags) {
+    const auto found = functions_.find(FoldFunctionName(name));
+    if (found == functions_.end()) return false;
+    if (flags != nullptr) *flags = found->second.function_->info_.flags_;
+    lua_rawgeti(root_, LUA_REGISTRYINDEX,
+                found->second.function_->registry_ref_);
+    lua_xmove(root_, thread, 1);
+    return true;
+  }
+
  private:
   LuaWorkerRuntime() = default;
 
+  void ReleaseStaged(StagedLuaLibrary* staged) {
+    for (StagedLuaFunction& function : staged->functions_) {
+      if (function.registry_ref_ != LUA_NOREF) {
+        luaL_unref(root_, LUA_REGISTRYINDEX, function.registry_ref_);
+        function.registry_ref_ = LUA_NOREF;
+      }
+    }
+  }
+
   lua_State* root_ = nullptr;
   absl::flat_hash_map<ScriptKey, CachedLuaFunction> scripts_;
+  absl::flat_hash_map<std::string, std::unique_ptr<LocalLuaLibrary>> libraries_;
+  absl::flat_hash_map<std::string, LocalLuaFunctionLookup> functions_;
+  std::unique_ptr<StagedLuaLibrary> staged_library_;
+  bool staged_replace_ = false;
   std::uint64_t completed_executions_ = 0;
 };
 
@@ -920,10 +1381,12 @@ LuaExecutionStep RuntimeErrorStep(lua_State* state) {
   };
 }
 
-LuaExecutionStep KilledStep() {
+LuaExecutionStep KilledStep(bool function) {
   return LuaExecutionStep{
       .call_ = std::nullopt,
-      .reply_ = EncodeError("ERR Script killed by user with SCRIPT KILL..."),
+      .reply_ = EncodeError(
+          function ? "ERR Script killed by user with FUNCTION KILL..."
+                   : "ERR Script killed by user with SCRIPT KILL..."),
   };
 }
 
@@ -937,6 +1400,9 @@ struct LuaExecution::Impl {
   std::string bytecode_;
   bool active_registered_ = false;
   RespVersion client_resp_version_ = RespVersion::k2;
+  int initial_args_ = 0;
+  std::uint64_t function_flags_ = 0;
+  bool is_function_ = false;
 
   ~Impl() {
     if (state_ == nullptr) return;
@@ -960,7 +1426,7 @@ struct LuaExecution::Impl {
       if (status == 0) {
         if (run_control_.state_.load(std::memory_order_acquire) ==
             LuaRunState::kKillRequested) {
-          return KilledStep();
+          return KilledStep(run_control_.is_function_);
         }
         ReplyBuilder builder(client_resp_version_);
         if (lua_gettop(state_) == 0)
@@ -1055,23 +1521,52 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateCached(
   return std::unique_ptr<LuaExecution>(new LuaExecution(std::move(impl)));
 }
 
+absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
+    std::string_view name, std::span<const std::string> keys,
+    std::span<const std::string> argv, RespVersion client_resp_version) {
+  auto runtime = WorkerLuaRuntime();
+  if (!runtime.ok()) return runtime.status();
+  auto impl = std::make_unique<Impl>();
+  impl->client_resp_version_ = client_resp_version;
+  impl->runtime_ = *runtime;
+  impl->state_ = (*runtime)->NewThread(&impl->thread_ref_);
+  lua_State* state = impl->state_;
+  lua_sethook(state, ScriptInstructionHook, LUA_MASKCOUNT, 100000);
+  SetGlobalNil(state, "KEYS");
+  SetGlobalNil(state, "ARGV");
+  if (!(*runtime)->PushFunction(state, name, &impl->function_flags_)) {
+    return absl::NotFoundError("function is not present in the worker catalog");
+  }
+  impl->is_function_ = true;
+  PushStringArray(state, keys);
+  PushStringArray(state, argv);
+  impl->initial_args_ = 2;
+  return std::unique_ptr<LuaExecution>(new LuaExecution(std::move(impl)));
+}
+
 std::string_view LuaExecution::bytecode() const { return impl_->bytecode_; }
 
 LuaExecutionStep LuaExecution::Start(bool replication_origin,
-                                     std::string_view script_name) {
+                                     std::string_view script_name,
+                                     std::span<const std::string>
+                                         invocation_command) {
   const auto now = std::chrono::steady_clock::now();
   const std::uint64_t threshold =
       g_script_busy_threshold_ms.load(std::memory_order_acquire);
   const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::time_point::max() - now)
                              .count();
+  impl_->run_control_.started_at_ = now;
   impl_->run_control_.deadline_ =
       threshold > static_cast<std::uint64_t>(remaining)
           ? std::chrono::steady_clock::time_point::max()
           : now + std::chrono::milliseconds(threshold);
   impl_->run_control_.replication_origin_ = replication_origin;
+  impl_->run_control_.is_function_ = impl_->is_function_;
   impl_->run_control_.busy_.store(false, std::memory_order_release);
   impl_->run_control_.script_name_.assign(script_name);
+  impl_->run_control_.invocation_command_.assign(invocation_command.begin(),
+                                                 invocation_command.end());
   impl_->run_control_.resp_version_ = RespVersion::k2;
   impl_->run_control_.state_.store(LuaRunState::kClean,
                                    std::memory_order_release);
@@ -1080,7 +1575,7 @@ LuaExecutionStep LuaExecution::Start(bool replication_origin,
   lua_rawset(impl_->state_, LUA_REGISTRYINDEX);
   impl_->active_registered_ = true;
   RegisterActiveScript(&impl_->run_control_);
-  return impl_->Run(0);
+  return impl_->Run(impl_->initial_args_);
 }
 
 LuaExecutionStep LuaExecution::Resume(std::string_view command_reply) {
@@ -1121,6 +1616,10 @@ bool LuaExecution::MarkWriteCommand() {
 
 RespVersion LuaExecution::resp_version() const {
   return impl_->run_control_.resp_version_;
+}
+
+std::uint64_t LuaExecution::function_flags() const {
+  return impl_->function_flags_;
 }
 
 std::string LuaScriptSha1(std::string_view script) {
@@ -1173,14 +1672,77 @@ void ClearStoredLuaScripts() {
   g_script_bodies.clear();
 }
 
-LuaScriptKillResult RequestLuaScriptKill() {
+absl::StatusOr<LuaFunctionLibrary> StageLuaFunctionLibraryLocally(
+    std::string_view code, bool replace) {
+  auto runtime = WorkerLuaRuntime();
+  if (!runtime.ok()) return runtime.status();
+  return (*runtime)->StageFunctionLibrary(code, replace);
+}
+
+void CommitStagedLuaFunctionLibraryLocally() {
+  if (g_lua_runtime != nullptr) {
+    g_lua_runtime->CommitStagedFunctionLibrary();
+  }
+}
+
+void AbortStagedLuaFunctionLibraryLocally() {
+  if (g_lua_runtime != nullptr) {
+    g_lua_runtime->AbortStagedFunctionLibrary();
+  }
+}
+
+bool DeleteLuaFunctionLibraryLocally(std::string_view name) {
+  return g_lua_runtime != nullptr &&
+         g_lua_runtime->DeleteFunctionLibrary(name);
+}
+
+void ClearLuaFunctionLibrariesLocally() {
+  if (g_lua_runtime != nullptr) g_lua_runtime->ClearFunctionLibraries();
+}
+
+void StoreLuaFunctionLibrary(LuaFunctionLibrary library) {
+  std::lock_guard lock(g_function_catalog_mutex);
+  const std::string name = library.name_;
+  g_function_libraries.insert_or_assign(name, std::move(library));
+}
+
+bool DeleteStoredLuaFunctionLibrary(std::string_view name) {
+  std::lock_guard lock(g_function_catalog_mutex);
+  return g_function_libraries.erase(std::string(name)) != 0;
+}
+
+void ClearStoredLuaFunctionLibraries() {
+  std::lock_guard lock(g_function_catalog_mutex);
+  g_function_libraries.clear();
+}
+
+std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries() {
+  std::lock_guard lock(g_function_catalog_mutex);
+  std::vector<LuaFunctionLibrary> libraries;
+  libraries.reserve(g_function_libraries.size());
+  for (const auto& [name, library] : g_function_libraries) {
+    (void)name;
+    libraries.push_back(library);
+  }
+  std::sort(libraries.begin(), libraries.end(),
+            [](const LuaFunctionLibrary& left,
+               const LuaFunctionLibrary& right) {
+              return left.name_ < right.name_;
+            });
+  return libraries;
+}
+
+LuaScriptKillResult RequestLuaScriptKill(bool function) {
   std::lock_guard lock(g_active_scripts_mutex);
   if (g_active_scripts.empty()) return LuaScriptKillResult::kNotBusy;
 
   bool killed = false;
   bool dirty = false;
   bool replication = false;
+  bool matching = false;
   for (LuaRunControl* run : g_active_scripts) {
+    if (run->is_function_ != function) continue;
+    matching = true;
     if (run->replication_origin_) {
       replication = true;
       continue;
@@ -1198,7 +1760,22 @@ LuaScriptKillResult RequestLuaScriptKill() {
   if (killed) return LuaScriptKillResult::kKilled;
   if (replication) return LuaScriptKillResult::kUnkillableReplication;
   if (dirty) return LuaScriptKillResult::kUnkillableWrite;
-  return LuaScriptKillResult::kNotBusy;
+  return matching ? LuaScriptKillResult::kNotBusy
+                  : LuaScriptKillResult::kWrongInvocationKind;
+}
+
+std::optional<LuaRunningInvocation> SnapshotLuaRunningInvocation() {
+  std::lock_guard lock(g_active_scripts_mutex);
+  if (g_active_scripts.empty()) return std::nullopt;
+  const LuaRunControl& run = *g_active_scripts.front();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - run.started_at_);
+  return LuaRunningInvocation{
+      .is_function_ = run.is_function_,
+      .name_ = run.script_name_,
+      .command_ = run.invocation_command_,
+      .duration_ms_ = static_cast<std::uint64_t>(elapsed.count()),
+  };
 }
 
 bool LuaScriptsBusy() {

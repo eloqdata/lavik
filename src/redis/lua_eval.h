@@ -13,6 +13,27 @@
 
 namespace keylane {
 
+enum LuaFunctionFlag : std::uint64_t {
+  kLuaFunctionNoWrites = 1ULL << 0,
+  kLuaFunctionAllowOom = 1ULL << 1,
+  kLuaFunctionAllowStale = 1ULL << 2,
+  kLuaFunctionNoCluster = 1ULL << 3,
+  kLuaFunctionAllowCrossSlotKeys = 1ULL << 4,
+};
+
+struct LuaFunctionInfo {
+  std::string name_;
+  std::optional<std::string> description_;
+  std::uint64_t flags_ = 0;
+};
+
+struct LuaFunctionLibrary {
+  std::string name_;
+  std::string engine_ = "LUA";
+  std::string code_;
+  std::vector<LuaFunctionInfo> functions_;
+};
+
 struct LuaRedisCall {
   bool protected_call_ = false;
   std::vector<std::string> args_;
@@ -29,6 +50,14 @@ enum class LuaScriptKillResult {
   kNotBusy,
   kUnkillableWrite,
   kUnkillableReplication,
+  kWrongInvocationKind,
+};
+
+struct LuaRunningInvocation {
+  bool is_function_ = false;
+  std::string name_;
+  std::vector<std::string> command_;
+  std::uint64_t duration_ms_ = 0;
 };
 
 class LuaExecution {
@@ -41,6 +70,10 @@ class LuaExecution {
       std::string_view sha, std::span<const std::string> keys,
       std::span<const std::string> argv,
       RespVersion client_resp_version = RespVersion::k2);
+  static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateFunction(
+      std::string_view name, std::span<const std::string> keys,
+      std::span<const std::string> argv,
+      RespVersion client_resp_version = RespVersion::k2);
 
   LuaExecution(const LuaExecution&) = delete;
   LuaExecution& operator=(const LuaExecution&) = delete;
@@ -50,12 +83,14 @@ class LuaExecution {
   // lua_State created by this binary without parsing the source again.
   std::string_view bytecode() const;
   LuaExecutionStep Start(bool replication_origin,
-                         std::string_view script_name = "user_script");
+                         std::string_view script_name = "user_script",
+                         std::span<const std::string> invocation_command = {});
   LuaExecutionStep Resume(std::string_view command_reply);
   LuaExecutionStep ResumeAfterSchedulerYield();
   // Returns false if SCRIPT KILL won the race before this write started.
   bool MarkWriteCommand();
   RespVersion resp_version() const;
+  std::uint64_t function_flags() const;
 
  private:
   struct Impl;
@@ -75,7 +110,24 @@ bool CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode);
 std::optional<std::string_view> FindCachedLuaScript(std::string_view sha);
 void ClearLocalLuaScriptCache();
 void ClearStoredLuaScripts();
-LuaScriptKillResult RequestLuaScriptKill();
+
+// FUNCTION LOAD is staged independently on every worker. Callers commit only
+// after every worker compiled the source and registered an identical function
+// set; abort discards the unpublished registry references.
+absl::StatusOr<LuaFunctionLibrary> StageLuaFunctionLibraryLocally(
+    std::string_view code, bool replace);
+void CommitStagedLuaFunctionLibraryLocally();
+void AbortStagedLuaFunctionLibraryLocally();
+bool DeleteLuaFunctionLibraryLocally(std::string_view name);
+void ClearLuaFunctionLibrariesLocally();
+
+void StoreLuaFunctionLibrary(LuaFunctionLibrary library);
+bool DeleteStoredLuaFunctionLibrary(std::string_view name);
+void ClearStoredLuaFunctionLibraries();
+std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries();
+
+LuaScriptKillResult RequestLuaScriptKill(bool function);
+std::optional<LuaRunningInvocation> SnapshotLuaRunningInvocation();
 bool LuaScriptsBusy();
 void SetLuaScriptBusyThresholdMs(std::uint64_t milliseconds);
 std::uint64_t LuaScriptBusyThresholdMs();

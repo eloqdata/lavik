@@ -39,6 +39,12 @@ constexpr CommandSpec kCommandTable[] = {
     {"evalsha_ro", CommandKind::kEvalShaRo, 3, 0, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"script", CommandKind::kScript, 2, 0, 0, 0, 1, kCmdNoKeys},
+    {"fcall", CommandKind::kFCall, 3, 0, 0, 0, 1,
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"fcall_ro", CommandKind::kFCallRo, 3, 0, 0, 0, 1,
+     kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    {"function", CommandKind::kFunction, 2, 0, 0, 0, 1,
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdNoKeys},
     {"dbsize", CommandKind::kDbSize, 1, 1, 0, 0, 1,
      kCmdReadOnly | kCmdGlobal | kCmdUsesDbGate | kCmdNoKeys},
     {"scan", CommandKind::kScan, 2, 0, 0, 0, 1,
@@ -403,7 +409,9 @@ absl::StatusOr<KeyIndexView> DetermineKeys(const CommandSpec& spec,
   }
   if (spec.kind_ == CommandKind::kEval || spec.kind_ == CommandKind::kEvalSha ||
       spec.kind_ == CommandKind::kEvalRo ||
-      spec.kind_ == CommandKind::kEvalShaRo) {
+      spec.kind_ == CommandKind::kEvalShaRo ||
+      spec.kind_ == CommandKind::kFCall ||
+      spec.kind_ == CommandKind::kFCallRo) {
     std::int64_t key_count = 0;
     if (!ParseRedisInt64(args[2], &key_count)) {
       return absl::InvalidArgumentError(

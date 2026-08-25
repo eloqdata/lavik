@@ -718,16 +718,22 @@ Task<absl::Status> RedisService::ImportRdb() {
   // rewound and decoded a second time one entry at a time during application.
   std::uint64_t entry_count = 0;
   std::uint64_t skipped_count = 0;
+  std::vector<std::string> function_libraries;
   while (true) {
     auto entry = reader->Next();
     if (!entry.ok()) co_return entry.status();
     if (!entry->has_value()) break;
     if ((**entry).kind_ == rdb::FileEntryKind::kValue) {
       ++entry_count;
+    } else if ((**entry).kind_ == rdb::FileEntryKind::kFunctionLibrary) {
+      function_libraries.push_back((**entry).function_code_);
     } else {
       ++skipped_count;
     }
   }
+  absl::Status functions_validated =
+      co_await ValidateLuaFunctionCatalog(function_libraries);
+  if (!functions_validated.ok()) co_return functions_validated;
   reader->Rewind();
 
   std::uint64_t imported = 0;
@@ -738,7 +744,9 @@ Task<absl::Status> RedisService::ImportRdb() {
     if (!next->has_value()) break;
     rdb::FileEntry entry = std::move(**next);
     if (entry.kind_ != rdb::FileEntryKind::kValue) {
-      if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
+      if (entry.kind_ == rdb::FileEntryKind::kFunctionLibrary) {
+        continue;
+      } else if (entry.kind_ == rdb::FileEntryKind::kSkippedModuleValue) {
         spdlog::warn(
             "skipping unsupported Redis Module value from RDB db={} "
             "key-bytes={}",
@@ -747,8 +755,6 @@ Task<absl::Status> RedisService::ImportRdb() {
         spdlog::warn(
             "skipping unsupported Redis Module auxiliary data from "
             "RDB");
-      } else {
-        spdlog::warn("skipping unsupported Redis Function library from RDB");
       }
       continue;
     }
@@ -783,6 +789,18 @@ Task<absl::Status> RedisService::ImportRdb() {
     } else {
       ++expired;
     }
+  }
+
+  absl::Status functions_installed =
+      co_await ReplaceLuaFunctionCatalog(function_libraries);
+  if (!functions_installed.ok()) {
+    absl::Status discarded = co_await storage_->FlushAllDetach();
+    if (!discarded.ok()) {
+      co_return absl::InternalError(absl::StrCat(
+          "RDB Function import failed: ", functions_installed.message(),
+          "; failed to discard imported keys: ", discarded.message()));
+    }
+    co_return functions_installed;
   }
 
   spdlog::info(

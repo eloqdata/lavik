@@ -22,6 +22,7 @@
 #include "keylane/rdb.h"
 #include "keylane/metrics.h"
 #include "keylane/resp.h"
+#include "lua_eval.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -214,6 +215,30 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
         co_return cut.first;
       }
       saved_change_cuts_.push_back(cut.second);
+    }
+    for (const LuaFunctionLibrary& library :
+         SnapshotLuaFunctionLibraries()) {
+      std::string fragment = rdb::EncodeFunctionLibraryEntry(library.code_);
+      while (!output_.TryPush(&fragment)) {
+        if (output_.failed()) {
+          for (unsigned worker = 0; worker < begun; ++worker) {
+            (void)co_await celer::SubmitTaskTo(worker, [this] {
+              return storage_->EndRdbSnapshot(session_id_);
+            });
+          }
+          co_return absl::InternalError("RDB output writer failed");
+        }
+        absl::Status yielded = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!yielded.ok()) {
+          for (unsigned worker = 0; worker < begun; ++worker) {
+            (void)co_await celer::SubmitTaskTo(worker, [this] {
+              return storage_->EndRdbSnapshot(session_id_);
+            });
+          }
+          co_return yielded;
+        }
+      }
     }
     OpenAllCommandDbGates();
     gates.open_ = true;
