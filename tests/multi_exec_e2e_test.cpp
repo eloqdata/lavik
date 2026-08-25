@@ -75,6 +75,10 @@ class RespClient {
       case '+':
       case '-':
       case ':':
+      case ',':
+      case '(':
+      case '#':
+      case '_':
         return line;
       case '$': {
         if (line == "$-1") {
@@ -89,10 +93,38 @@ class RespClient {
         payload.resize(size);
         return line + "\r\n" + payload;
       }
+      case '=':
+      case '!': {
+        const std::size_t size = ParseLength(line);
+        std::string payload(size + 2, '\0');
+        ReadExact(payload.data(), payload.size());
+        if (!payload.ends_with("\r\n")) {
+          Fail("malformed RESP3 bulk terminator");
+        }
+        payload.resize(size);
+        return line + "\r\n" + payload;
+      }
       case '*': {
         if (line == "*-1") {
           return line;
         }
+        const std::size_t count = ParseLength(line);
+        std::string reply = line;
+        for (std::size_t i = 0; i < count; ++i) {
+          reply += "\r\n" + ReadReply();
+        }
+        return reply;
+      }
+      case '%': {
+        const std::size_t count = ParseLength(line);
+        std::string reply = line;
+        for (std::size_t i = 0; i < count * 2; ++i) {
+          reply += "\r\n" + ReadReply();
+        }
+        return reply;
+      }
+      case '~':
+      case '>': {
         const std::size_t count = ParseLength(line);
         std::string reply = line;
         for (std::size_t i = 0; i < count; ++i) {
@@ -337,6 +369,10 @@ int main(int argc, char** argv) {
     Expect(client.Command({"SCRIPT", "KILL"}),
            "-NOTBUSY No scripts in execution right now.",
            "SCRIPT KILL without active script");
+    ExpectContains(client.Command({"CONFIG", "GET", "lua-time-limit"}),
+                   "lua-time-limit", "CONFIG GET lua-time-limit");
+    Expect(client.Command({"CONFIG", "SET", "busy-reply-threshold", "10"}),
+           "+OK", "CONFIG SET busy-reply-threshold alias");
 
     // redis.call yields to the worker scheduler, allowing another connection
     // to request termination. The instruction hook then stops the script.
@@ -345,8 +381,11 @@ int main(int argc, char** argv) {
         {"EVAL",
          "while true do redis.call('GET',KEYS[1]) end",
          "1", "lua:kill-loop"});
-    std::this_thread::sleep_for(50ms);
+    std::this_thread::sleep_for(100ms);
     RespClient script_killer = Connect(port);
+    ExpectContains(client.Command({"PING"}),
+                   "-BUSY Redis is busy running a script",
+                   "busy script command gate");
     Expect(script_killer.Command({"SCRIPT", "KILL"}), "+OK", "SCRIPT KILL");
     ExpectContains(looping_script.ReadPush(),
                    "Script killed by user with SCRIPT KILL",
@@ -354,6 +393,10 @@ int main(int argc, char** argv) {
     Expect(script_killer.Command({"SCRIPT", "KILL"}),
            "-NOTBUSY No scripts in execution right now.",
            "SCRIPT KILL after termination");
+    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}),
+           "+OK", "CONFIG SET lua-time-limit");
+    ExpectContains(ReadFile(log_path), "Slow script detected",
+                   "busy script warning log");
 
     RespClient dirty_script = Connect(port);
     dirty_script.SendCommand(
@@ -381,6 +424,95 @@ int main(int argc, char** argv) {
            Bulk("7.2.4"), "Lua Redis compatibility version");
     Expect(client.Command({"EVAL", "return redis.REDIS_VERSION_NUM", "0"}),
            ":459268", "Lua numeric Redis compatibility version");
+    Expect(client.Command({"EVAL", "return redis.replicate_commands()", "0"}),
+           ":1", "redis.replicate_commands compatibility no-op");
+    constexpr std::string_view seeded_random_script =
+        "math.randomseed(ARGV[1]); return "
+        "tostring(math.random())..':'..math.random(100)..':'..math.random(-5,5)";
+    const std::string seeded_random =
+        client.Command({"EVAL", seeded_random_script, "0", "10"});
+    Expect(client.Command({"EVAL", seeded_random_script, "0", "10"}),
+           seeded_random, "deterministic math.random seed");
+    if (client.Command({"EVAL", seeded_random_script, "0", "20"}) ==
+        seeded_random) {
+      Fail("different math.random seeds returned the same sequence");
+    }
+    constexpr std::string_view lua_log_marker =
+        "keylane-lua-log-e2e-marker";
+    Expect(client.Command(
+               {"EVAL",
+                "redis.log(redis.LOG_WARNING,ARGV[1],42); return true", "0",
+                lua_log_marker}),
+           ":1", "redis.log warning");
+    ExpectContains(ReadFile(log_path),
+                   std::string(lua_log_marker) + " 42", "redis.log output");
+    ExpectContains(client.Command({"EVAL", "redis.log(4,'bad')", "0"}),
+                   "Invalid debug level", "redis.log level validation");
+    ExpectContains(client.Command({"EVAL", "redis.log(redis.LOG_NOTICE)", "0"}),
+                   "requires two arguments or more",
+                   "redis.log arity validation");
+    ExpectContains(client.Command({"EVAL", "redis.setresp(4)", "0"}),
+                   "RESP version must be 2 or 3", "redis.setresp validation");
+    Expect(client.Command({"HSET", "lua:resp3:hash", "field", "value"}),
+           ":1", "RESP3 Lua hash seed");
+    Expect(client.Command(
+               {"EVAL",
+                "redis.setresp(3); return "
+                "redis.call('HGETALL',KEYS[1]).map.field",
+                "1", "lua:resp3:hash"}),
+           Bulk("value"), "RESP3 map to Lua");
+    Expect(client.Command({"SADD", "lua:resp3:set", "member"}), ":1",
+           "RESP3 Lua set seed");
+    Expect(client.Command(
+               {"EVAL",
+                "redis.setresp(3); return "
+                "redis.call('SMEMBERS',KEYS[1]).set.member",
+                "1", "lua:resp3:set"}),
+           ":1", "RESP3 set to Lua");
+    Expect(client.Command({"ZADD", "lua:resp3:zset", "1.5", "member"}),
+           ":1", "RESP3 Lua double seed");
+    Expect(client.Command(
+               {"EVAL",
+                "redis.setresp(3); return "
+                "redis.call('ZSCORE',KEYS[1],'member').double ~= nil",
+                "1", "lua:resp3:zset"}),
+           ":1", "RESP3 double to Lua");
+    Expect(client.Command(
+               {"EVAL",
+                "redis.setresp(3); return redis.call('GET',KEYS[1]) == nil",
+                "1", "lua:resp3:missing"}),
+           ":1", "RESP3 null to Lua");
+    Expect(client.Command(
+               {"EVAL", "return redis.call('GET',KEYS[1]) == false", "1",
+                "lua:resp2:missing"}),
+           ":1", "RESP2 null remains false in Lua");
+
+    RespClient resp3_client = Connect(port);
+    ExpectContains(resp3_client.Command({"HELLO", "3"}), "%",
+                   "HELLO RESP3");
+    Expect(resp3_client.Command({"EVAL", "return true", "0"}), ":1",
+           "RESP2 script boolean to RESP3 client");
+    Expect(resp3_client.Command(
+               {"EVAL", "redis.setresp(3); return true", "0"}),
+           "#t", "RESP3 script boolean");
+    Expect(resp3_client.Command({"EVAL", "return false", "0"}), "_",
+           "RESP2 script false to RESP3 null");
+    Expect(resp3_client.Command(
+               {"EVAL", "return {map={one='two'}}", "0"}),
+           "%1\r\n" + Bulk("one") + "\r\n" + Bulk("two"),
+           "Lua map to RESP3");
+    Expect(resp3_client.Command(
+               {"EVAL", "return {set={one=true}}", "0"}),
+           "~1\r\n" + Bulk("one"), "Lua set to RESP3");
+    Expect(resp3_client.Command({"EVAL", "return {double=1.5}", "0"}),
+           ",1.5", "Lua double to RESP3");
+    Expect(resp3_client.Command(
+               {"EVAL", "return {big_number='12345678901234567890'}", "0"}),
+           "(12345678901234567890", "Lua big number to RESP3");
+    Expect(resp3_client.Command(
+               {"EVAL",
+                "return {verbatim_string={format='txt',string='hey'}}", "0"}),
+           "=7\r\ntxt:hey", "Lua verbatim string to RESP3");
     Expect(
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
                         "0", "cached"}),

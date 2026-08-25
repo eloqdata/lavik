@@ -190,11 +190,14 @@ TEST(ReplyBuilderTest, EncodesProtocolSpecificResp3Types) {
   builder.AppendBoolean(true);
   builder.AppendDouble(1.5);
   builder.AppendDoubleText("2.50");
+  builder.AppendBigNumber("12345678901234567890");
+  builder.AppendVerbatimString("txt", "hello");
   EXPECT_EQ(builder.View(),
             "_\r\n%1\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"
             "~1\r\n$6\r\nmember\r\n"
             ">2\r\n$7\r\nmessage\r\n$7\r\npayload\r\n"
-            "#t\r\n,1.5\r\n,2.50\r\n");
+            "#t\r\n,1.5\r\n,2.50\r\n"
+            "(12345678901234567890\r\n=9\r\ntxt:hello\r\n");
 }
 
 TEST(ReplyBuilderTest, DegradesSemanticTypesToResp2) {
@@ -205,8 +208,11 @@ TEST(ReplyBuilderTest, DegradesSemanticTypesToResp2) {
   builder.AppendPushHeader(3);
   builder.AppendBoolean(false);
   builder.AppendDouble(1.5);
+  builder.AppendBigNumber("12345678901234567890");
+  builder.AppendVerbatimString("txt", "hello");
   EXPECT_EQ(builder.View(),
-            "$-1\r\n*2\r\n*2\r\n*3\r\n:0\r\n$3\r\n1.5\r\n");
+            "$-1\r\n*2\r\n*2\r\n*3\r\n:0\r\n$3\r\n1.5\r\n"
+            "$20\r\n12345678901234567890\r\n$5\r\nhello\r\n");
 }
 
 }  // namespace

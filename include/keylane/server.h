@@ -43,6 +43,7 @@ struct ServerOptions {
   long mimalloc_purge_delay_ms_ = kDefaultMimallocPurgeDelayMs;
   std::int64_t slowlog_log_slower_than_us_ = kDefaultSlowLogThresholdMicros;
   std::size_t slowlog_max_len_ = kDefaultSlowLogMaxLen;
+  std::uint64_t lua_time_limit_ms_ = 5000;
   std::size_t registered_buffer_bytes_ = 256ULL * 1024 * 1024;
   unsigned storage_write_buffer_count_ = 4;
   std::size_t storage_read_buffer_bytes_ = 1ULL * 1024 * 1024;

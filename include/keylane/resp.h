@@ -97,6 +97,9 @@ class ReplyBuilder {
   // Emits an already formatted finite/inf/nan Redis double without parsing it
   // again. RESP2 represents the same semantic value as a bulk string.
   std::string_view AppendDoubleText(std::string_view value);
+  std::string_view AppendBigNumber(std::string_view value);
+  std::string_view AppendVerbatimString(std::string_view format,
+                                        std::string_view value);
   std::string_view AppendError(std::string_view message);
   std::string_view AppendError(std::string_view prefix,
                                std::string_view message);

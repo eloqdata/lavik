@@ -479,6 +479,28 @@ std::string_view ReplyBuilder::AppendDoubleText(std::string_view value) {
   return buffer_;
 }
 
+std::string_view ReplyBuilder::AppendBigNumber(std::string_view value) {
+  if (version_ == RespVersion::k2) return AppendBulkString(value);
+  buffer_.push_back('(');
+  buffer_.append(value);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
+std::string_view ReplyBuilder::AppendVerbatimString(std::string_view format,
+                                                    std::string_view value) {
+  if (version_ == RespVersion::k2) return AppendBulkString(value);
+  if (format.size() != 3) format = "txt";
+  buffer_.push_back('=');
+  AppendUnsigned(buffer_, value.size() + 4);
+  buffer_.append("\r\n");
+  buffer_.append(format.substr(0, 3));
+  buffer_.push_back(':');
+  buffer_.append(value);
+  buffer_.append("\r\n");
+  return buffer_;
+}
+
 std::string_view ReplyBuilder::AppendError(std::string_view message) {
   return AppendError({}, message);
 }

@@ -477,6 +477,10 @@ absl::Status ApplyRedisConfigDirective(
     options->replication_options_.backlog_size_bytes_ = *bytes;
     return absl::OkStatus();
   }
+  if (name == "lua-time-limit" || name == "busy-reply-threshold") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->lua_time_limit_ms_, true);
+  }
   return absl::InvalidArgumentError(
       absl::StrCat("unsupported configuration directive '", name, "'"));
 }

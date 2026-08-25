@@ -55,6 +55,7 @@
 #include "keylane/storage/engine.h"
 #include "keylane/tx/tx_shard.h"
 #include "keylane/version.h"
+#include "lua_eval.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -1955,6 +1956,7 @@ int RunServer(ServerOptions options) {
   InitWorkerMetrics(options.thread_count_);
   InitSlowLog(options.thread_count_, options.slowlog_log_slower_than_us_,
               options.slowlog_max_len_);
+  SetLuaScriptBusyThresholdMs(options.lua_time_limit_ms_);
   SetServerInfo(std::move(advertised_bind), advertised_port,
                 options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);

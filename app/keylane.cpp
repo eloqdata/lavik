@@ -153,6 +153,11 @@ int main(int argc, char** argv) {
                  "Maximum number of slow commands retained")
       ->capture_default_str()
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--lua-time-limit,--busy-reply-threshold",
+                 options.lua_time_limit_ms_,
+                 "Milliseconds before a Lua script enters BUSY mode")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--foreground-budget-us", options.foreground_budget_us_,
                  "Maximum worker foreground slice in microseconds")
       ->capture_default_str()

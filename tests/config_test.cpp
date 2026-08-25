@@ -134,6 +134,8 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
           .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"slowlog-max-len", "64"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"lua-time-limit", "1234"}, &options).ok());
 
   EXPECT_EQ(options.bind_addresses_,
             (std::vector<std::string>{"0.0.0.0", "::1", "redis.internal"}));
@@ -163,6 +165,7 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.replication_options_.snapshot_batch_size_, 32u);
   EXPECT_EQ(options.slowlog_log_slower_than_us_, 2500);
   EXPECT_EQ(options.slowlog_max_len_, 64u);
+  EXPECT_EQ(options.lua_time_limit_ms_, 1234u);
 }
 
 TEST(RedisConfigTest, AppliesLoggingDirectivesAndAliases) {

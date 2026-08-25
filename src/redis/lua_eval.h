@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <span>
@@ -8,6 +9,7 @@
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "keylane/resp_version.h"
 
 namespace keylane {
 
@@ -33,10 +35,12 @@ class LuaExecution {
  public:
   static absl::StatusOr<std::unique_ptr<LuaExecution>> Create(
       std::string_view script, std::span<const std::string> keys,
-      std::span<const std::string> argv);
+      std::span<const std::string> argv,
+      RespVersion client_resp_version = RespVersion::k2);
   static absl::StatusOr<std::unique_ptr<LuaExecution>> CreateCached(
       std::string_view sha, std::span<const std::string> keys,
-      std::span<const std::string> argv);
+      std::span<const std::string> argv,
+      RespVersion client_resp_version = RespVersion::k2);
 
   LuaExecution(const LuaExecution&) = delete;
   LuaExecution& operator=(const LuaExecution&) = delete;
@@ -45,11 +49,13 @@ class LuaExecution {
   // lua_dump output for the user chunk. It can be loaded into another
   // lua_State created by this binary without parsing the source again.
   std::string_view bytecode() const;
-  LuaExecutionStep Start(bool replication_origin);
+  LuaExecutionStep Start(bool replication_origin,
+                         std::string_view script_name = "user_script");
   LuaExecutionStep Resume(std::string_view command_reply);
   LuaExecutionStep ResumeAfterSchedulerYield();
   // Returns false if SCRIPT KILL won the race before this write started.
   bool MarkWriteCommand();
+  RespVersion resp_version() const;
 
  private:
   struct Impl;
@@ -70,5 +76,8 @@ std::optional<std::string_view> FindCachedLuaScript(std::string_view sha);
 void ClearLocalLuaScriptCache();
 void ClearStoredLuaScripts();
 LuaScriptKillResult RequestLuaScriptKill();
+bool LuaScriptsBusy();
+void SetLuaScriptBusyThresholdMs(std::uint64_t milliseconds);
+std::uint64_t LuaScriptBusyThresholdMs();
 
 }  // namespace keylane
