@@ -9576,8 +9576,9 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
 
 Task<CommandReply> ExecuteCommandBody(
     const CommandRequest& request, ReplyBuilder& reply_builder,
-                                      std::uint64_t client_id,
-    ReplicationTransactionOrderGuard* preacquired_order = nullptr) {
+    std::uint64_t client_id,
+    ReplicationTransactionOrderGuard* preacquired_order = nullptr,
+    std::optional<bool> precomputed_spans_multiple_shards = std::nullopt) {
   const bool replication_origin = request.replication_origin_;
   const auto& args = request.args_;
   const std::uint32_t cmd_flags =
@@ -9642,7 +9643,16 @@ Task<CommandReply> ExecuteCommandBody(
   ReplicationTransactionOrderGuard* replication_order =
       preacquired_order != nullptr ? preacquired_order
                                    : &local_replication_order;
-  if (snapshot_transaction && RequestSpansMultipleShards(request)) {
+  // MSET must decide whether to preacquire the order gate before publisher
+  // admission. Reuse that decision here instead of parsing and hashing its
+  // complete key view a second time. Other command paths still decide lazily,
+  // and the snapshot_transaction short circuit keeps standalone writes free
+  // of this admission work.
+  const bool spans_multiple_shards =
+      snapshot_transaction && (precomputed_spans_multiple_shards.has_value()
+                                   ? *precomputed_spans_multiple_shards
+                                   : RequestSpansMultipleShards(request));
+  if (spans_multiple_shards) {
     if (!replication_order->active()) {
       absl::Status entered =
           co_await BeginReplicationTransactionOrder(replication_order);
@@ -10072,9 +10082,11 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
   // admission cannot invert the order of two wide MSETs. Single-shard MSETs
   // skip the gate for the same reason ExecuteCommandBody skips it: one
   // participant flow cannot join a cross-flow rendezvous cycle.
-  const bool ordered_mset = request.kind_ == CommandKind::kMSet &&
-                            g_replication != nullptr &&
-                            RequestSpansMultipleShards(request);
+  std::optional<bool> mset_spans_multiple_shards;
+  if (request.kind_ == CommandKind::kMSet && g_replication != nullptr) {
+    mset_spans_multiple_shards = RequestSpansMultipleShards(request);
+  }
+  const bool ordered_mset = mset_spans_multiple_shards.value_or(false);
   ReplicationTransactionOrderGuard replication_order;
   if (ordered_mset) {
     absl::Status entered =
@@ -10091,9 +10103,9 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
-  CommandReply reply =
-      co_await ExecuteCommandBody(request, reply_builder, client_id,
-      ordered_mset ? &replication_order : nullptr);
+  CommandReply reply = co_await ExecuteCommandBody(
+      request, reply_builder, client_id,
+      ordered_mset ? &replication_order : nullptr, mset_spans_multiple_shards);
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
   if (!released.ok()) {
