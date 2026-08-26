@@ -15,6 +15,7 @@
 
 #include "celer/net/server.h"
 #include "keylane/command.h"
+#include "keylane/command_table.h"
 #include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication_command.h"
@@ -1132,6 +1133,39 @@ class ReplicationLogService final : public celer::Service {
     Check(keylane::TryBeginReplicationTransactionOrder(),
           "replication transaction order did not reopen");
     keylane::EndReplicationTransactionOrder();
+
+    // Dynamic gate admission: with one worker every key view resolves to a
+    // single shard, so flagged kinds skip the gate while unknown, malformed,
+    // and view-incomplete kinds stay conservative. Multi-shard outcomes are
+    // covered by CommandTableTest.RequestSpansMultipleShardsDecision and the
+    // multikey e2e gate regression.
+    auto admission_request = [](std::vector<std::string> args) {
+      keylane::CommandRequest built;
+      built.spec_ = keylane::FindCommand(args.front());
+      built.kind_ = built.spec_ != nullptr ? built.spec_->kind_
+                                           : keylane::CommandKind::kUnknown;
+      built.args_ = std::move(args);
+      return built;
+    };
+    Check(keylane::RequestSpansMultipleShards(admission_request({"nope"})),
+          "unknown command skipped the replication order gate");
+    Check(keylane::RequestSpansMultipleShards(admission_request({"del"})),
+          "malformed DEL skipped the replication order gate");
+    Check(keylane::RequestSpansMultipleShards(
+              admission_request({"sort", "a", "store", "b"})),
+          "SORT STORE skipped the replication order gate");
+    Check(keylane::RequestSpansMultipleShards(
+              admission_request({"zunionstore", "out", "2", "a", "b"})),
+          "ZUNIONSTORE skipped the replication order gate");
+    Check(keylane::RequestSpansMultipleShards(
+              admission_request({"function", "flush"})),
+          "FUNCTION skipped the replication order gate");
+    Check(!keylane::RequestSpansMultipleShards(
+              admission_request({"del", "a", "b"})),
+          "single-shard DEL still took the replication order gate");
+    Check(!keylane::RequestSpansMultipleShards(
+              admission_request({"mset", "a", "1", "b", "2"})),
+          "single-shard MSET still took the replication order gate");
 
     status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
     if (!status.ok()) co_return status;

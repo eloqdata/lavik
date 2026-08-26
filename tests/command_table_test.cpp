@@ -1,11 +1,14 @@
 #include "keylane/command_table.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +16,7 @@
 
 #include "keylane/command.h"
 #include "keylane/glob.h"
+#include "keylane/storage/engine.h"
 
 namespace {
 
@@ -895,4 +899,182 @@ TEST(CommandTableTest, ResolvesSInterCardKeysAndRedis72Errors) {
   const std::vector<std::string> repeated{"SINTERCARD", "1",     "set", "LIMIT",
                                           "1",          "LIMIT", "2"};
   EXPECT_TRUE(DetermineKeys(*spec, repeated).ok());
+}
+
+TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
+  // Every gate-eligible kind (kCmdMultiShard && (kCmdWrite|kCmdDynamicWrite)
+  // && !kCmdMayBlock) must either carry kCmdKeyViewComplete -- granted only
+  // after auditing that DetermineKeys covers exactly the command's
+  // transaction participants -- or appear in this explicit list of kinds
+  // whose key view is known to be incomplete. A newly eligible kind that
+  // nobody classified fails here, which forces the audit instead of silently
+  // keeping (safe) or accidentally skipping (unsafe) the replication
+  // transaction order gate.
+  const std::set<std::string_view> known_incomplete = {
+      "sort",        // BY/GET patterns expand participants from row data
+      "georadius",   // STORE/STOREDIST destination is outside the view
+      "georadiusbymember",  // same STORE/STOREDIST shape as georadius
+      "zdiffstore",  // destination arg1 is outside the source-only view
+      "zinterstore",        // same aggregate-store shape as zdiffstore
+      "zunionstore",        // same aggregate-store shape as zdiffstore
+      "function",    // kCmdNoKeys: library mutations are process-global
+  };
+  std::size_t eligible_count = 0;
+  for (const CommandSpec& spec : keylane::CommandSpecs()) {
+    const bool eligible =
+        (spec.flags_ & keylane::kCmdMultiShard) != 0 &&
+        (spec.flags_ & (keylane::kCmdWrite | keylane::kCmdDynamicWrite)) != 0 &&
+        (spec.flags_ & keylane::kCmdMayBlock) == 0;
+    if (!eligible) {
+      EXPECT_EQ(spec.flags_ & keylane::kCmdKeyViewComplete, 0u)
+          << spec.name_ << " carries kCmdKeyViewComplete without being "
+             "gate-eligible; the flag is meaningless there";
+      continue;
+    }
+    ++eligible_count;
+    const bool flagged = (spec.flags_ & keylane::kCmdKeyViewComplete) != 0;
+    if (known_incomplete.contains(spec.name_)) {
+      EXPECT_FALSE(flagged) << spec.name_
+                            << " is known to have an incomplete key view and "
+                               "must not carry kCmdKeyViewComplete";
+    } else {
+      EXPECT_TRUE(flagged)
+          << spec.name_ << " is gate-eligible but neither carries "
+             "kCmdKeyViewComplete nor is classified as key-view-incomplete; "
+             "audit its execution path and classify it";
+    }
+  }
+  EXPECT_EQ(eligible_count, 28u)
+      << "the gate-eligible kind set changed; re-run the audit and update "
+         "this test";
+  // Every stale entry in the incomplete list hides a kind that no longer
+  // needs it; keep the list exact.
+  for (std::string_view name : known_incomplete) {
+    const CommandSpec* spec = FindCommand(name);
+    ASSERT_NE(spec, nullptr) << name;
+    EXPECT_NE(spec->flags_ & keylane::kCmdMultiShard, 0u) << name;
+    EXPECT_NE(
+        spec->flags_ & (keylane::kCmdWrite | keylane::kCmdDynamicWrite), 0u)
+        << name << " is no longer gate-eligible; drop its list entry";
+    EXPECT_EQ(spec->flags_ & keylane::kCmdMayBlock, 0u) << name;
+  }
+}
+
+// Direct assertions on RequestSpansMultipleShards, the dynamic admission test
+// for the replication transaction order gate. Needs a real storage engine so
+// OwnerForKey can spread keys over several shards.
+TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
+  const std::string path =
+      "/tmp/keylane-command-table-" + std::to_string(::getpid()) + ".data";
+  const int fd =
+      ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 80 * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+  struct Cleanup {
+    std::string path_;
+    ~Cleanup() { (void)::unlink(path_.c_str()); }
+  } cleanup{path};
+
+  keylane::storage::StorageEngineOptions options;
+  options.data_files_ = {path};
+  keylane::storage::StorageEngine engine(std::move(options));
+  ASSERT_TRUE(engine.Prepare(4).ok());
+  keylane::InitStorage(&engine, nullptr);
+  struct ResetStorage {
+    ~ResetStorage() { keylane::InitStorage(nullptr, nullptr); }
+  } reset_storage;
+
+  // Same hashtag => same Redis slot => same shard, guaranteed by
+  // construction. Cross-shard keys are probed against the live engine so the
+  // test does not depend on a particular hash outcome.
+  const std::string same_a = "{kgate}a";
+  const std::string same_b = "{kgate}b";
+  const std::string same_c = "{kgate}c";
+  ASSERT_EQ(engine.OwnerForKey(same_a), engine.OwnerForKey(same_b));
+  std::string cross;
+  for (unsigned probe = 0; probe < 256; ++probe) {
+    std::string candidate = "kgate-probe-" + std::to_string(probe);
+    if (engine.OwnerForKey(candidate) != engine.OwnerForKey(same_a)) {
+      cross = std::move(candidate);
+      break;
+    }
+  }
+  ASSERT_FALSE(cross.empty()) << "no cross-shard probe key found";
+
+  auto request = [](std::vector<std::string> args) {
+    keylane::CommandRequest built;
+    built.spec_ = FindCommand(args.front());
+    built.kind_ =
+        built.spec_ != nullptr ? built.spec_->kind_ : CommandKind::kUnknown;
+    built.args_ = std::move(args);
+    return built;
+  };
+  auto spans = [&request](std::vector<std::string> args) {
+    return keylane::RequestSpansMultipleShards(request(std::move(args)));
+  };
+
+  // Conservative fallbacks: unknown command, arity failure, and any kind
+  // without kCmdKeyViewComplete keep taking the gate even when every visible
+  // key sits on one shard.
+  EXPECT_TRUE(spans({"nope", same_a}));
+  EXPECT_TRUE(spans({"del"}));
+  EXPECT_TRUE(spans({"exists", same_a, same_b}));  // multi-shard but unflagged
+  // FUNCTION has no key view at all and always keeps the gate.
+  EXPECT_TRUE(spans({"function", "flush"}));
+  // Sorts with STORE stay gated: BY/GET patterns can add participants.
+  EXPECT_TRUE(spans({"sort", same_a, "STORE", same_b}));
+  // GEO STORE destinations live outside the key view.
+  EXPECT_TRUE(
+      spans({"georadius", same_a, "0", "0", "1", "km", "STORE", same_b}));
+  // Aggregate stores keep the gate even when source and destination share a
+  // shard, and also when the view's sources sit on a different shard than the
+  // out-of-view destination.
+  EXPECT_TRUE(spans({"zunionstore", same_c, "2", same_a, same_b}));
+  EXPECT_TRUE(spans({"zunionstore", cross, "2", same_a, same_b}));
+  EXPECT_TRUE(spans({"zinterstore", cross, "2", same_a, same_b}));
+  EXPECT_TRUE(spans({"zdiffstore", same_c, "2", same_a, same_b}));
+  // A zero-key script has an empty view and stays conservative.
+  EXPECT_TRUE(spans({"eval", "return 1", "0"}));
+
+  // Flagged kinds skip the gate only when the concrete view is single-shard.
+  EXPECT_FALSE(spans({"del", same_a}));
+  EXPECT_FALSE(spans({"del", same_a, same_b}));
+  EXPECT_TRUE(spans({"del", same_a, cross}));
+  EXPECT_FALSE(spans({"unlink", same_a, same_b}));
+  EXPECT_TRUE(spans({"unlink", same_a, cross}));
+  EXPECT_FALSE(spans({"mset", same_a, "1", same_b, "2"}));
+  EXPECT_TRUE(spans({"mset", same_a, "1", cross, "2"}));
+  EXPECT_FALSE(spans({"msetnx", same_a, "1"}));
+  EXPECT_TRUE(spans({"msetnx", same_a, "1", cross, "2"}));
+  EXPECT_FALSE(spans({"rename", same_a, same_b}));
+  EXPECT_TRUE(spans({"rename", same_a, cross}));
+  EXPECT_FALSE(spans({"renamenx", same_a, same_b}));
+  EXPECT_TRUE(spans({"renamenx", same_a, cross}));
+  EXPECT_FALSE(spans({"copy", same_a, same_b}));
+  EXPECT_FALSE(spans({"copy", same_a, same_b, "DB", "2"}));
+  EXPECT_TRUE(spans({"copy", same_a, cross}));
+  EXPECT_FALSE(spans({"bitop", "OR", same_c, same_a, same_b}));
+  EXPECT_TRUE(spans({"bitop", "OR", cross, same_a, same_b}));
+  EXPECT_FALSE(spans({"sdiffstore", same_c, same_a, same_b}));
+  EXPECT_FALSE(spans({"sinterstore", same_c, same_a, same_b}));
+  EXPECT_FALSE(spans({"sunionstore", same_c, same_a, same_b}));
+  EXPECT_FALSE(spans({"smove", same_a, same_b, "m"}));
+  EXPECT_FALSE(spans({"lmove", same_a, same_b, "LEFT", "RIGHT"}));
+  EXPECT_FALSE(spans({"rpoplpush", same_a, same_b}));
+  EXPECT_FALSE(spans({"lmpop", "2", same_a, same_b, "LEFT"}));
+  EXPECT_TRUE(spans({"lmpop", "2", same_a, cross, "LEFT"}));
+  EXPECT_FALSE(spans({"zmpop", "2", same_a, same_b, "MIN"}));
+  EXPECT_TRUE(spans({"zmpop", "2", same_a, cross, "MIN"}));
+  EXPECT_FALSE(spans({"zrangestore", same_b, same_a, "0", "-1"}));
+  EXPECT_FALSE(spans({"geosearchstore", same_b, same_a, "FROMLONLAT", "0", "0",
+                      "BYRADIUS", "1", "km"}));
+  // Scripts are confined to their declared keys, so their participant set is
+  // exactly the view.
+  EXPECT_FALSE(spans({"eval", "return redis.call('set', KEYS[1], '1')", "2",
+                      same_a, same_b}));
+  EXPECT_TRUE(spans({"eval", "return redis.call('set', KEYS[1], '1')", "2",
+                     same_a, cross}));
+  EXPECT_FALSE(spans({"fcall", "fn", "2", same_a, same_b}));
+  EXPECT_TRUE(spans({"fcall", "fn", "2", same_a, cross}));
 }
