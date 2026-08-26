@@ -21,10 +21,10 @@ struct ReplicatedCommand {
   std::vector<std::string> args_;
 };
 
-// Streams one encoded command into the disk-backed replication log without
-// flattening large arguments into another contiguous allocation. Replication
-// log frames may split this byte stream, but the receiver still observes one
-// logical command and one LSN.
+// Streams one encoded command into the runtime-only in-memory replication log
+// without flattening large arguments into another contiguous allocation.
+// Replication log frames may split this byte stream, but the receiver still
+// observes one logical command and one LSN.
 class ReplicationCommandPayloadSource final
     : public storage::ReplicationLogPayloadSource {
  public:

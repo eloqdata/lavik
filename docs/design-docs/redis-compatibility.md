@@ -161,7 +161,8 @@ Other Redis `CLIENT` subcommands and client types are not yet exposed.
 List, Hash, Set, Sorted Set, geospatial index, and Stream values are stored as
 single atomic records. A command decodes, modifies, and rewrites one complete
 key while holding its intent lock. Large-key splitting is not currently
-implemented; `large-key-design.md` records constraints for a future redesign.
+implemented; [large-key redesign constraints](large-key-design.md)
+record requirements for a future implementation.
 
 The implemented Sorted Set surface is `ZADD`, `ZCARD`, `ZCOUNT`, `ZINCRBY`,
 `ZLEXCOUNT`, `ZMPOP`, `ZMSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZRANDMEMBER`,

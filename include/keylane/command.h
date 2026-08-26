@@ -329,7 +329,7 @@ struct ReplicaOfRequest {
 };
 
 // Parses REPLICAOF <host> <port> and REPLICAOF NO ONE without changing role.
-// The replication backend will consume this request in a later change.
+// Command dispatch passes the validated request to ReplicationManager.
 absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
     std::span<const std::string> args);
 
@@ -477,9 +477,9 @@ bool CloseSnapshotTransactionGate() noexcept;
 void OpenSnapshotTransactionGate() noexcept;
 bool SnapshotTransactionsActive() noexcept;
 
-// Replication flows wait for an ACK before sending their next command. Keep
-// cross-flow transactions in one global source order so overlapping flow
-// subsets cannot form an arrival/ACK cycle on the replica.
+// Replication flows send bounded batches, then wait for complete-event ACKs
+// before advancing. Keep cross-flow transactions in one global source order
+// so overlapping flow subsets cannot form an arrival/ACK cycle on the replica.
 bool TryBeginReplicationTransactionOrder() noexcept;
 void EndReplicationTransactionOrder() noexcept;
 

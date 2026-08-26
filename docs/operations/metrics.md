@@ -12,7 +12,7 @@ and uses the Prometheus text exposition format.
 
 A ready-to-run Prometheus and Grafana deployment, including a provisioned
 dashboard and multi-node discovery, is available in
-[`deploy/monitoring`](../deploy/monitoring/README.md).
+[`deploy/monitoring`](../../deploy/monitoring/README.md).
 
 ## Memory limit
 

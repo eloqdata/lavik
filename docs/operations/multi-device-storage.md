@@ -51,9 +51,11 @@ keylane \
 ```
 
 For a raw block device, first verify the exact device and that it is neither
-mounted nor in use. A device that has never held Keylane data already has a
-zero label. To intentionally reuse a former Keylane member as a new device,
-clear only its 4 KiB label page while Keylane is stopped:
+mounted nor in use. Prefer a genuinely empty or fully sanitized device. A
+device that has never held Keylane data already has a zero label. Clearing only
+the 4 KiB label of a former Keylane member makes it eligible as a new member,
+but does not provide secure erasure or a crash-safe stale-media sanitization
+guarantee:
 
 ```sh
 lsblk -o NAME,PATH,SIZE,MODEL,SERIAL,MOUNTPOINTS /dev/nvme1n1
@@ -68,8 +70,10 @@ keylane \
 
 The label reset is destructive to the selected new member's old Keylane
 storage set. It must never target an existing member being preserved. Keylane
-rewrites the new path's complete fixed metadata prefix before publishing its
-new identity, so stale data beyond the label cannot reappear.
+rewrites the new path's fixed metadata prefix, but it does not securely erase
+the data region or prove every crash window between block activation and first
+flush. Use fully sanitized media when stale-data isolation is required, and
+retain the original data set or backup until expansion succeeds.
 
 Expansion preserves old device IDs and assigns new IDs after them. Command-line
 order is irrelevant, foreign initialized devices are rejected, and an empty
@@ -101,7 +105,7 @@ IDs are preserved; new device IDs are appended independently of argument order.
 The label is followed by capacity-derived fixed A/B metadata pages for database
 epochs, partition epochs, and the recovery scan bitmap. Data begins at the next
 8 MiB boundary; it is not hard-coded to local block one. See
-[Recovery Metadata Layout](recovery-metadata-design.md).
+[Recovery Metadata Layout](../design-docs/recovery-metadata-design.md).
 
 ## Per-device allocator ownership
 
@@ -118,8 +122,10 @@ page update through a cross-worker task; there is no shared MPMC free queue,
 bitmap CAS, global metadata-page owner, or special worker-zero writer.
 
 Fresh block IDs are activated in batches of 256. The owner makes their bitmap
-bits durable before adding them to its ready pool. Defrag returns a durably
-zeroed block to the same owner and keeps its bit set for cheap warm reuse.
+bits durable before adding them to its ready pool. Reclaimed blocks follow a
+cold-reuse lifecycle: clear and persist the allocation bit before adding the
+ID to `cold_free`; before reuse, zero and synchronize the stale 8 KiB header,
+then set and persist the allocation bit before publishing the ID as ready.
 
 ## Worker write affinity
 

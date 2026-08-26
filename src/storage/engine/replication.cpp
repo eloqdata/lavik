@@ -1500,11 +1500,12 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
 // (db_epoch, replication_epoch, index_generation) afterwards, the same
 // expected-version handoff defrag relocation uses.
 //
-// TODO(replication): this path applies records without invoking source-side
-// full-sync subscribers, so a node that is both a replica and a source
-// (A -> B -> C) silently forwards nothing after the snapshot baseline.
-// Until cascading is designed, the option parser should reject running with
-// --replication-port and --replicate-to at the same time.
+// TODO(replication): native cascading is unsupported. This path applies
+// records without invoking source-side full-sync subscribers, so a node that
+// follows one Keylane source while accepting another Keylane replica
+// (A -> B -> C) can stop forwarding after the snapshot baseline. Reject
+// downstream native sessions while following an upstream until cascading has
+// an explicit publication design.
 //
 // TODO(replication): this path also bypasses the command layer's database
 // gates (file-static in command.cpp), which KEYS and FLUSHDB close to get an

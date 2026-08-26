@@ -121,7 +121,7 @@ ShardView exposes the shard's slice as **original argument indices**. MSET: each
 
 ### Replication and FLUSHDB (decisions for this milestone)
 - Replication: this milestone's per-key-delta design has been superseded by
-  `docs/replication-design.md`. Transactions publish only after commit. During
+  `docs/design-docs/replication-design.md`. Transactions publish only after commit. During
   hidden full sync their participant after-images may apply independently, but
   `FULLSYNC_CUT` cannot split a transaction; ONLINE uses one transaction
   envelope and advances all participant cursors atomically. The replica

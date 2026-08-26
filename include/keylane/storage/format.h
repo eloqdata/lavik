@@ -191,9 +191,8 @@ constexpr std::uint8_t operator|(ReplicationFrameFlag left,
   return static_cast<std::uint8_t>(left) | static_cast<std::uint8_t>(right);
 }
 
-// Stable on-disk Redis value type identifiers. Only strings are implemented
-// today; reserving the remaining top-level types keeps expiration and recovery
-// metadata generic as their command implementations are added.
+// Stable on-disk Redis value type identifiers shared by write, recovery, and
+// expiration paths. Keep the numeric assignments stable across releases.
 enum class ValueType : std::uint8_t {
   kNone = 0,
   kString = 1,

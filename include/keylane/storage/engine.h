@@ -740,9 +740,10 @@ class StorageEngine {
   StorageEngine& operator=(const StorageEngine&) = delete;
   ~StorageEngine();
 
-  // Runs on the main thread before Server::Start. Creates/preallocates every
-  // configured file and sizes per-worker metadata, but does not perform data
-  // IO.
+  // Runs on the main thread before Server::Start. Probes the existing storage
+  // paths, validates or initializes their fixed metadata, and sizes
+  // per-worker state. It does not create, extend, truncate, or preallocate a
+  // configured file; the parallel data-block scan begins in InitializeWorker.
   absl::Status Prepare(unsigned worker_count);
 
   // Runs once on each worker before its listener is opened. Registers the
