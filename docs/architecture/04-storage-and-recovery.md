@@ -32,11 +32,16 @@ Storage separates three ownership domains:
   snapshot state.
 - A physical block has one current runtime owner. When the worker topology
   matches the topology recorded in its header, recovery retains the original
-  writer. Otherwise recovery hashes the block ID and allocation epoch across
-  the current workers.
-- Each device has one allocator owner, `device_index % worker_count`, which
-  serializes that device's ready and cold-free pools, scan bitmap, fixed
-  metadata page generations, epoch mirrors, and allocation-epoch counter.
+  writer if that worker can access the device. Otherwise recovery hashes the
+  block ID and allocation epoch across the eligible workers. All workers are
+  eligible on io_uring; SPDK eligibility is restricted to workers holding a
+  qpair for the block's physical controller.
+- Each device has one allocator owner, which serializes that device's ready and
+  cold-free pools, scan bitmap, fixed metadata page generations, epoch mirrors,
+  and allocation-epoch counter. io_uring initially assigns this role as
+  `device_index % worker_count`. SPDK selects it from the controller's qpair
+  owners, so metadata and allocation I/O never route to a worker that cannot
+  open the namespace.
 
 Every worker has an ordinary append stream and may have one append stream for
 each live transaction generation. Physical streams are per worker, not per
@@ -55,12 +60,13 @@ participates in that same arbitration boundary.
 
 Active storage paths are existing regular files, Linux raw block devices, or
 Celer SPDK storage paths. `Prepare` probes and validates them; it does not
-create, extend, truncate, or preallocate a missing regular file. Worker startup
-opens the complete configured path table for direct I/O. On the POSIX io_uring
-path, registered buffers are used when registration succeeds and the same
-aligned memory with plain asynchronous I/O is the fallback. SPDK paths use
-Celer's SPDK storage abstraction and fail initialization when their required
-DMA buffer registration fails.
+create, extend, truncate, or preallocate a missing regular file. On the POSIX
+io_uring backend, every worker opens the complete configured path table for
+direct I/O; registered buffers are used when registration succeeds and the
+same aligned memory with plain asynchronous I/O is the fallback. On SPDK, a
+worker opens only namespaces whose physical controller assigned it a qpair.
+SPDK also requires DMA buffer registration and fails initialization when that
+registration or controller-qpair coverage is insufficient.
 
 Every device has a persistent identity and a capacity-derived metadata prefix:
 
@@ -146,20 +152,26 @@ page on every device. Epochs only increase, so the runtime vector is the
 component-wise maximum of all device copies; a later mirrored update also
 repairs stale fields on a lagging member.
 
-### Per-worker initialization
+### Per-worker initialization and teardown
 
 `InitializeWorker` creates the worker's aligned buffer pool, registers the
-fixed-file table, and opens every path with direct I/O. Worker barriers then
-coordinate one parallel recovery rather than independent worker-local boots.
-Request readiness follows successful completion of the complete recovery and
-allocator-cleanup sequence; the exact moment a listening socket exists is not
-the readiness boundary.
+fixed-file table, and opens the paths accessible on that backend. Before worker
+startup, io_uring assigns weighted home devices for foreground allocation.
+SPDK groups namespaces by physical controller, weights controllers by usable
+foreground blocks, and distributes available controller qpairs across workers;
+startup fails unless every controller and every worker can be covered. Worker
+barriers then coordinate one parallel recovery rather than independent
+worker-local boots. Request readiness follows successful completion of the
+complete recovery and allocator-cleanup sequence; the exact moment a listening
+socket exists is not the readiness boundary.
 
 Recovery proceeds as follows:
 
-1. Workers divide physical scan work across the configured devices. A clear
-   allocation bit is authoritative and skips block I/O. A set bit leads to a
-   header read.
+1. Workers divide physical scan work across the configured devices. io_uring
+   stripes every device across all workers. SPDK scans each namespace only on
+   that controller's qpair owners and strides the namespace across those
+   owners. A clear allocation bit is authoritative and skips block I/O. A set
+   bit leads to a header read.
 2. An all-zero or wholly invalid header on an allocated block is a permitted
    activation false positive and becomes reusable. A valid header whose
    embedded block ID does not match its physical location is stale media and
@@ -192,6 +204,11 @@ Changing the worker count does not rewrite data during startup. Old physical
 blocks may temporarily be remote from their keys; foreground replacement and
 background defrag gradually move live records to current key owners.
 
+After the runtime has torn down a worker's I/O and coroutine frames, the server
+calls `StorageEngine::FinalizeWorker` on that worker's native thread. It
+destroys the complete `WorkerStore`, including worker-affine `ScanHashMap`
+state, before engine-wide storage objects are released.
+
 ## Runtime read, write, and flush flows
 
 ### Append and index publication
@@ -218,12 +235,20 @@ Multi-key durable writes use transaction-generation blocks. Each participant's
 tagged records become durable first. `CommitTxWrites` waits for all participant
 durability fences, then appends a keyless `kTxCommit` and requests its flush.
 Recovery keeps tagged records only when that decision exists. Superseded
-versions remain charged until the commit record itself is durable. The client
-path chooses whether to await this chain: SORT STORE and list-move operations
-wait through tagged-record fences and commit-record append, while generic
-multi-key and EXEC paths can detach completion. Even an awaited
-`CommitTxWrites` only requests the commit-record flush; it is not a synchronous
-crash-durability fence.
+versions remain charged until the commit record itself is durable.
+
+Successful common multi-key, keyed write-capable Lua, and EXEC paths hand their
+receipts to a worker-local commit coordinator instead of spawning one coroutine
+per transaction. One runner per worker drains at most 256 receipts at a time.
+With a backlog it merges fences for the same block incarnation up to the
+greatest required committed boundary and requests those unique frontiers in
+parallel; each transaction still awaits only its own fences before appending
+its own commit decision. A singleton batch retains the direct path. The queue
+high watermark is 4096 receipts: crossing it makes the command wait for queue
+capacity before replying, but not for commit durability. Direct callers such
+as SORT STORE and list-move operations still wait through tagged-record fences
+and commit-record append. Even an awaited `CommitTxWrites` only requests the
+commit-record flush; it is not a synchronous crash-durability fence.
 
 ### Reads and pins
 
@@ -232,6 +257,15 @@ entry. Tombstones and expired values are invisible; an expired observation can
 enqueue a bounded active-expiration candidate. A staged location is copied or
 framed from its write buffer. A disk location is read on its physical block
 owner into an aligned lease.
+
+Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
+locks. It classifies index entries in one coroutine and issues ordinary-size
+local inline records in waves paced by the fixed read-buffer pool; oversized
+records use aligned overflow leases. One completion barrier covers every I/O in
+a wave, and all leases are returned before relocation retries or the next wave
+can suspend. Staged, remote, external, external-key, and stale-validation cases
+fall back to the complete `GetLocked` state machine, preserving the ordinary
+identity and relocation checks without one coroutine per key.
 
 Before returning disk bytes, storage validates block and record allocation
 epochs, record identity, database and replication epochs, mutation sequence,
@@ -272,11 +306,11 @@ child-before-root ordering.
 An ordinary successful command is therefore not necessarily crash-durable at
 reply time. `StorageDurabilityStats` reports dirty staging bytes, pending
 flushes, and pending transaction decisions for operators and tests that need a
-durability fence. Graceful shutdown gives detached transaction commit chains a
-bounded opportunity to append their decisions, seals every active stream, and
-drains flushes, extent reclaims, and retirement accounting. An I/O failure
-fail-stops further writes and retains staging buffers so already staged reads
-do not follow recycled memory.
+durability fence. Graceful shutdown gives accepted queued and explicitly
+background transaction commits up to five seconds to append their decisions,
+then seals every active stream and drains flushes, extent reclaims, and
+retirement accounting. An I/O failure fail-stops further writes and retains
+staging buffers so already staged reads do not follow recycled memory.
 
 ## Allocation and maintenance lifecycles
 
@@ -284,9 +318,16 @@ do not follow recycled memory.
 
 The persistent allocation bitmap is the recovery authority, not merely an
 allocation hint. Device allocators activate ready IDs in batches and preserve
-eight allocatable blocks per device for defrag. Foreground allocation may wait
-while flush or reclamation can still return space; it reports exhaustion only
-after a stable observation with no progress in flight.
+eight allocatable blocks per device for defrag. Each worker first balances
+foreground allocations across its weighted home devices. io_uring can then
+fall back to every other configured device; SPDK cannot leave the namespaces of
+controllers for which that worker owns qpairs. Foreground allocation may wait
+while an active flush, extent reclaim, or runnable defrag can still return
+space; it reports exhaustion only after a stable observation with no progress
+in flight. A queued defrag while defrag is paused is deliberately not counted
+as runnable progress, so a full-device write reports exhaustion instead of
+waiting forever. Resuming defrag allows later allocation to wait for and use
+the reclaimed block.
 
 Current reclaimed-block lifecycle is:
 
@@ -394,12 +435,14 @@ active transaction leases, live tagged bytes, or dependency pins.
 
 The engine exposes durability status, per-device capacity and available block
 metrics, filesystem free space for regular-file devices, and Defrag, Tomb
-Raider, and transaction-cleaner totals. Prometheus also aggregates Celer's
-completed storage read, write, and `fdatasync` counters and publishes server
-readiness; recovery reports periodic progress in the log. Runtime configuration
-can pause or pace defrag and select Tomb Raider off, interval, or daily
-scheduling. Engine snapshots are collected on the worker or allocator that
-owns the underlying mutable state.
+Raider, transaction-cleaner, and transaction-commit coordinator totals. INFO
+STATS reports commit batch and transaction counts, input and merged fences,
+queue depth and peak, backpressure waits, and the 4096-receipt watermark.
+Prometheus also aggregates Celer's completed storage read, write, and
+`fdatasync` counters and publishes server readiness; recovery reports periodic
+progress in the log. Runtime configuration can pause or pace defrag and select
+Tomb Raider off, interval, or daily scheduling. Engine snapshots are collected
+on the worker or allocator that owns the underlying mutable state.
 
 Current test evidence includes:
 
@@ -408,13 +451,14 @@ Current test evidence includes:
 | `tests/storage_format_test.cpp` | Label, metadata, block, record, extent, and transaction encoding; CRC rejection; A/B winner and torn-slot fallback |
 | `tests/storage_capacity_test.cpp` | Existing-file requirement, alignment and minimum capacity, persisted capacity, expansion membership, foreign-device rejection, and explicit reset |
 | `tests/extent_recovery_e2e_test.cpp` | External keys and values, manifest/extent recovery, reclamation, and repeated worker-count changes |
-| `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
+| `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
 | `tests/ttl_e2e_test.cpp` | TTL mutation, disk-resident rewrite, expired/live restart behavior, and extent-backed values |
 | `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling plus retain/reap behavior for buried persistent or expired values |
-| `tests/multikey_e2e_test.cpp`, `tests/tx_cleaner_test.cpp` | Transaction-generation rotation, recovery, FLUSHDB invalidation, rollback, retry, and exact retirement readiness |
+| `tests/multikey_e2e_test.cpp`, `tests/tx_cleaner_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-generation rotation, recovery, FLUSHDB invalidation, rollback, retry, and exact retirement readiness |
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Shielded expired-winner behavior under an injected recovery clock rollback |
 | `tests/buffer_pool_test.cpp` | Reuse of a waiting storage write-buffer acquisition |
+| `tests/device_affinity_test.cpp` | SPDK controller quota and qpair-owner planning across balanced, weighted, and controller-heavy layouts |
 
 ## Known gaps and documentation limits
 
@@ -452,10 +496,9 @@ Current test evidence includes:
 - [Tomb Raider scheduling](../operations/tomb-raider.md)
 - [Running with SPDK](../design-docs/spdk.md)
 
-The topical storage documents retain detailed rationale and operational
-examples, but some also contain historical allocator language. This focused
-architecture document and current source code are authoritative when those
-descriptions disagree.
+The linked design documents are historical references, while the operations
+documents are procedural guidance. This focused architecture document and
+current source code are authoritative for present storage behavior.
 
 ## Source map
 
@@ -465,11 +508,11 @@ descriptions disagree.
 | Worker, partition, block, staging, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h`, `include/keylane/storage/scan_hash_map.h` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/keylane/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
-| Storage-path probing, device-set validation and expansion, metadata load, worker initialization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/impl.h` |
+| Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
-| Append streams, extent construction, index publication, replacement accounting, transaction fences, commit decisions, caller wait policy, and rollback | `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
-| Staged and disk reads, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
+| Append streams, extent construction, index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
+| Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |
 | Lazy and active expiration, authority and quiescence, durable tombstones, and the full-device escape valve | `src/storage/engine/expire.cpp` |

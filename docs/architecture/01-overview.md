@@ -2,9 +2,10 @@
 
 ## System context
 
-Keylane is a Linux C++23 server that accepts Redis/Valkey-compatible RESP2
-traffic and persists the resulting logical data to local files, block devices,
-or SPDK NVMe namespaces. The process uses the Celer submodule for its
+Keylane is a Linux C++23 server that accepts Redis/Valkey-compatible commands.
+Connections start with RESP2 reply semantics and can negotiate RESP2 or RESP3
+with `HELLO`. Keylane persists the resulting logical data to local files, block
+devices, or SPDK NVMe namespaces. The process uses the Celer submodule for its
 thread-per-worker coroutine runtime, TCP/TLS transport, cross-core messaging,
 HTTP service, and storage I/O backends.
 
@@ -14,17 +15,19 @@ coordination, and storage are composed in `RunServer`; Celer owns the worker and
 socket lifecycle underneath those Keylane modules.
 
 ```text
-Redis/Valkey clients and replicas
+Redis/Valkey clients, Sentinels, and replicas
                 |
         Celer TCP/TLS services
                 |
-     RESP session and command layer
-                |
-     transaction coordination -------- replication manager
-                |                              |
-          storage engine <------------- replication log/replay
-                |
-       file, block-device, or SPDK I/O
+    RESP2/RESP3 session and command layer
+          /                         \
+ command handlers and Lua       worker-local Pub/Sub
+          |                       registries/fan-out
+ transaction coordination -------- replication manager
+          |                              |
+    storage engine <------------- replication log/replay
+          |
+ file, block-device, or SPDK I/O
 
 Prometheus scrapes a separate Celer HTTP service backed by worker/storage
 snapshots.
@@ -36,11 +39,11 @@ snapshots.
 |---|---|---|
 | Process shell | Parse configuration, initialize logging and memory limits, compose modules, start services, and coordinate graceful shutdown | `app/keylane.cpp`, `keylane::RunServer` |
 | Celer runtime | Own worker threads, coroutines, cross-core submissions, TCP/TLS sessions, HTTP serving, and I/O backends | `celer::Server`, `celer::TcpService`, `celer::Worker`, `celer::SubmitTaskTo` |
-| Request and Redis serving | Parse RESP, retain connection state, classify and dispatch commands, and encode or stream replies | `RedisService`, `DispatchCommand`, `ExecuteCommand` |
+| Request and Redis serving | Parse commands, negotiate RESP reply semantics, retain connection state, run Lua and Pub/Sub, classify and dispatch commands, and encode or stream replies | `RedisService`, `DispatchCommand`, `ExecuteCommand` |
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
-| Replication | Manage node role and sessions, publish native logs, run full/partial synchronization, interoperate with Redis PSYNC, and apply trusted replay | `ReplicationManager` |
-| Observability and limits | Maintain worker-local command/connection metrics, expose Prometheus snapshots, account process memory, and enforce admission estimates | `RenderPrometheusMetrics`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
+| Replication | Manage node role and sessions, publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
+| Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account process memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
 
@@ -57,8 +60,11 @@ snapshots.
 4. Worker 0 performs an optional validated RDB import before the readiness flag
    is published. Replication is notified only after worker storage is ready.
 5. On a shutdown signal, new requests and accepts are closed, active requests
-   and RDB backup work drain, storage is durably flushed, and then Celer workers
-   are stopped and joined.
+   and RDB backup work drain, and storage is durably flushed. Celer then stops
+   each worker; after that worker's I/O and coroutine frames are gone but before
+   its native thread exits and is joined, `RedisService::FinalizeWorker` calls
+   `StorageEngine::FinalizeWorker` to release worker-owned indexes and storage
+   state.
 
 ## Primary flows
 
@@ -66,12 +72,30 @@ snapshots.
 
 `RedisService` incrementally parses a connection's byte stream, creates a
 `CommandRequest` from static command metadata, and dispatches it with the
-connection's explicit logical database. Dispatch handles connection-scoped
-state such as authentication, `SELECT`, `MULTI`/`EXEC`, `WATCH`, and replica
-read routing. Keyed work runs on the owning worker, using transaction
-coordination when the command spans keys or requires ordered multi-hop work.
-The result is encoded into a reusable reply buffer, sent directly from a
-storage read lease, or emitted as bounded streamed chunks.
+connection's explicit logical database and negotiated reply version. Dispatch
+handles connection-scoped state such as authentication, `HELLO`, `SELECT`,
+`MULTI`/`EXEC`, `WATCH`, Pub/Sub subscriptions, and replica read routing. Keyed
+work runs on the owning worker, using transaction coordination when the command
+spans keys or requires ordered multi-hop work. MGET holds one shared-lock
+transactional view while each participant batches ordinary-size disk reads in
+waves paced by its fixed read-buffer pool and uses aligned overflow leases for
+oversized reads. The result is encoded into a reusable reply buffer, sent
+directly from a storage read lease, or emitted as bounded streamed chunks.
+
+Lua `EVAL`/`EVALSHA` and stored `FCALL` invocations run in a persistent
+worker-local VM. Their declared keys establish the transaction boundary;
+`redis.call` re-enters restricted command execution inside those retained
+holds, and successful write effects are committed and replicated with the
+outer invocation. Script-cache mutations fan out to every worker before the
+mutation command returns, while Function invocations and catalog operations
+share a catalog barrier that hides staged Function updates.
+
+Pub/Sub keeps subscription registries on each connection's worker. A subscribed
+connection uses separate reader and writer coroutines joined at exit: commands
+and publications enqueue negotiated RESP2 arrays or RESP3 push frames, while a
+single writer drains the socket. Per-session frame limits and a worker-wide
+pending-byte limit close a slow subscriber instead of permitting unbounded
+output growth.
 
 ### Durable write and publication
 
@@ -100,9 +124,20 @@ state explicitly.
 - The command table is the shared classification source for arity, key
   positions, write/read behavior, global fan-out, database gates, and blocking
   behavior.
+- Reply encoding follows the connection's current `RespVersion`. An `EXEC`
+  freezes its outer aggregate encoding at entry, while a queued `HELLO` can
+  change later child replies and the post-`EXEC` connection version. `HELLO`
+  validates authentication and client-name options before changing connection
+  state, and Pub/Sub changes its frame encoding with the session.
 - Conflicting key access uses the transaction module. Storage background work
   participates in the same arbitration boundary rather than maintaining an
   independent client lock system.
+- Lua calls cannot escape their declared-key transaction or recursively enter
+  administrative, blocking, global, or scripting commands. Worker-local Lua
+  executions are serialized because cached closures share VM globals. Ordinary
+  commands do not take that worker-local execution gate, but once an invocation
+  exceeds `lua-time-limit`, a process-wide busy flag rejects ordinary client
+  commands until it finishes or an eligible kill succeeds.
 - A node configured as a replica does not create authoritative local expiry
   mutations, and replayed commands do not republish themselves.
 - Readiness follows recovery and optional import; shutdown drains admitted
@@ -119,7 +154,8 @@ state explicitly.
 | Celer | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
 | mimalloc | Pinned allocator submodule plus Keylane new/delete accounting hooks |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
-| Redis/Valkey clients | RESP2 command and reply compatibility at the listener |
+| Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
+| Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |
 | Keylane or Redis upstreams/downstreams | Native replication, Redis PSYNC following, and Redis-compatible export |
 | Local storage | Existing files, raw block devices, or `spdk://` namespaces supplied through repeated `--data-file` options |
 | RDB files | Startup import and Redis-compatible `SAVE`/`BGSAVE` output through filesystem paths |
@@ -137,10 +173,12 @@ those deployment boundaries remain unknown here.
 | CLI/config parsing and top-level process entry | `app/keylane.cpp`, `include/keylane/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
 | Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |
-| Request/session/command flow | `include/keylane/resp.h`, `include/keylane/session.h`, `include/keylane/command.h`, `src/redis/` |
+| Request/session/command flow and negotiated RESP semantics | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `src/redis/server.cpp`, `src/redis/resp.cpp` |
+| Lua scripts, Functions, and their transaction boundary | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |
+| Pub/Sub sessions, worker-local registries, fan-out, and bounded output | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | Transaction boundary | `include/keylane/tx/`, `src/tx/` |
 | Storage boundary and focused lifecycle units | `include/keylane/storage/engine.h`, `include/keylane/storage/format.h`, `src/storage/engine/`, `src/storage/format.cpp` |
-| Replication manager, protocol, and log boundary | `include/keylane/replication.h`, `include/keylane/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp` |
-| Memory accounting and Prometheus service | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp` |
+| Replication manager, protocol, Sentinel-visible role state, and log boundary | `include/keylane/replication.h`, `include/keylane/replication_command.h`, `src/replication/`, `src/storage/engine/replication_log.cpp`, `tests/sentinel_e2e_test.cpp` |
+| Memory accounting, slow log, command statistics, and Prometheus service | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `include/keylane/slowlog.h`, `src/redis/slowlog.cpp` |
 | Build, release, and package commands | `scripts/build_debug.sh`, `scripts/build_release.sh`, `scripts/package_release.sh`, `docs/operations/building-and-packaging.md` |
 | Keylane process deployment unit or orchestration manifest | Unknown; `deploy/` contains the monitoring stack, not the Keylane process definition |
