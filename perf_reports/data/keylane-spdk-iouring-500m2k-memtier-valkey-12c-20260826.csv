@@ -1,0 +1,12 @@
+backend,client,workload,duration_s,key_count,value_bytes,connections,threads,pipeline,qps,set_qps,get_qps,get_miss_qps,avg_ms,p50_ms,p95_ms,p99_ms,p999_lower_ms,p999_upper_ms,p9999_lower_ms,p9999_upper_ms,p99999_lower_ms,p99999_upper_ms,max_ms,primary_result,notes
+SPDK,memtier,read,300,500000000,2048,80,8,1,322639.86,0,322639.86,0,0.24764,0.247,0.375,0.447,0.543,0.543,1.039,1.039,1.727,1.727,,true,GET hit rate 100 percent
+SPDK,memtier,rw50,300,500000000,2048,80,8,1,370683.28,185341.70,185341.58,0,0.21551,0.207,0.359,0.551,1.351,1.351,1.639,1.639,4.959,4.959,,true,Independent random SET and GET keys
+SPDK,memtier,write,300,500000000,2048,80,8,1,419672.66,419672.66,0,0,0.19029,0.167,0.311,0.871,1.407,1.407,2.127,2.127,10.367,10.367,,true,Online defrag enabled
+SPDK,Valkey,read,300,500000000,2048,80,8,1,322096.47,0,322096.47,0,0.230,0.223,0.351,0.423,0.479,0.511,0.591,0.623,0.703,1.271,7.263,true,Valkey HDR bounds reported as open-lower closed-upper intervals
+SPDK,Valkey,write,300,500000000,2048,80,8,1,434038.25,434038.25,0,0,0.163,0.143,0.279,0.839,1.367,1.479,1.879,2.423,6.503,7.599,12.511,true,Online defrag enabled; Valkey HDR interval bounds
+io_uring,memtier,read,300,500000000,2048,80,8,1,305282.28,0,305282.28,0,0.26173,0.255,0.383,0.455,0.559,0.559,1.079,1.079,1.703,1.703,,true,GET hit rate 100 percent
+io_uring,memtier,rw50,300,500000000,2048,80,8,1,347351.57,173675.85,173675.72,0,0.22998,0.215,0.391,0.679,1.543,1.543,2.255,2.255,5.919,5.919,,true,Independent random SET and GET keys
+io_uring,memtier,write,300,500000000,2048,80,8,1,421737.32,421737.32,0,0,0.18940,0.159,0.311,0.903,1.495,1.495,2.623,2.623,13.439,13.439,,true,Online defrag enabled
+io_uring,Valkey,read,300,500000000,2048,80,8,1,297588.91,0,297588.91,0,0.251,0.247,0.375,0.439,0.503,0.527,0.607,0.639,0.727,3.055,7.423,true,Stable rerun; Valkey HDR interval bounds
+io_uring,Valkey,write,300,500000000,2048,80,8,1,434877.59,434877.59,0,0,0.163,0.135,0.279,0.847,1.367,1.479,1.951,3.175,8.983,10.367,40.607,true,Online defrag enabled; Valkey HDR interval bounds
+io_uring,Valkey,read,300,500000000,2048,80,8,1,290002.56,0,290002.56,0,0.258,0.247,0.383,0.471,1.383,1.783,2.535,2.735,3.127,3.367,206.463,false,Anomalous first run with a 5.4 second throughput collapse at seconds 277-282

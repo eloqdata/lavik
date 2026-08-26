@@ -13,7 +13,9 @@ On this 16-logical-CPU, eight-physical-core host, the validated layout is:
 | io_uring raw-block NVMe managed IRQs | one queue per logical CPU, 0-15; not manually movable |
 | tmux, Codex, benchmark SSH launcher and other user housekeeping | 12-15 |
 
-With the SPDK backend, this layout sustained 316,412 QPS at pipeline one. At 100K QPS, a five-minute Release run measured p99.9 `0.375-0.399 ms` and p99.99 `0.455-0.479 ms`.
+With the SPDK backend, this layout sustained 316,412 QPS at pipeline one in the original fixed-size validation. At 100K QPS, a five-minute Release run measured p99.9 `0.375-0.399 ms` and p99.99 `0.455-0.479 ms`.
+
+The later 500-million-key, fixed-2-KiB matrix retained the same runtime layout. SPDK sustained 322,639.86 memtier GET/s versus raw io_uring at 305,282.28 GET/s; with Valkey the corresponding results were 322,096.47 and 297,588.91 GET/s. The full result is in [the 500M x 2 KiB backend report](keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md).
 
 BPF tracing showed why the user-process affinity matters: before isolation, tmux/Codex accounted for 93 of 95 worker wake-to-run delays above 100 us. After isolation, all 12 workers' request/reply queue p99.99 values fell to at most 30 us.
 
@@ -82,8 +84,8 @@ sudo systemd-run \
     --threads=12 --pin-workers \
     --busy-poll-us=20 --foreground-budget-us=1000 \
     --spdk-max-completions-per-poll=8 \
-    --data-file=spdk://fe8d:00:00.0/1 \
-    --data-file=spdk://9913:00:00.0/1 \
+    --data-file=spdk://BDF0/1 \
+    --data-file=spdk://BDF1/1 \
     --logtostderr
 ```
 
@@ -153,6 +155,31 @@ Compare `/proc/interrupts` snapshots before and after load. Both accepted backen
 - SPDK `spdk-max-completions-per-poll=8`
 - trace disabled for formal latency tests
 
+Both formal build caches must report all three trace options as `OFF`:
+
+```bash
+rg 'CELER_ENABLE_CROSS_CORE_LATENCY_TRACE:|KEYLANE_ENABLE_(READ|SET)_LATENCY_TRACE:' \
+  BUILD_DIR/CMakeCache.txt
+```
+
+The trace strings can still exist in the binary because the disabled functions are compiled as immediate returns. Validate the CMake options and absence of diagnostic journal lines; do not use `strings` as the pass/fail check.
+
+Keep defrag enabled and tune only its runtime concurrency to the workload:
+
+```bash
+# Random 1:1: protect foreground tail latency.
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG MAX-ACTIVE 2
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG BLOCK-SLEEP 15
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG RECORD-SLEEP 0
+
+# Pure write: let reclamation keep up with overwrite traffic.
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG MAX-ACTIVE 6
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG BLOCK-SLEEP 0
+redis-cli -h 10.0.0.4 -p 6379 DEFRAG RECORD-SLEEP 0
+```
+
+Pure read can retain the startup values `8/0/0` because it does not create retired records. Always record `DEFRAG STATUS` before and after a formal window; do not pause defrag to make write latency look better.
+
 Fixed `busy-poll-us=100`, SPDK completion batch 32, foreground budget 100, and moving Keylane support threads to IRQ CPUs did not improve the controlled tests and are not part of this recipe.
 
 Detailed evidence and raw-run paths are in [the p99.99 diagnosis](keylane-valkey-100k-p9999-profile-2026-08-26.md).
@@ -162,3 +189,5 @@ Detailed evidence and raw-run paths are in [the p99.99 diagnosis](keylane-valkey
 With the layout above, io_uring raw block sustained 296,266.47 QPS for five minutes at pipeline one. It measured p99.9 `0.511-0.535 ms` and p99.99 `0.615-0.647 ms`. SPDK under the same user-visible CPU layout sustained 316,412.41 QPS with p99.99 `0.599-0.631 ms`; raw block was 6.37% slower in throughput.
 
 Raw evidence is under `perf_runs/valkey-keylane-iouring-raw-unlimited-12c-irq4-5min-20260826/`.
+
+In the later fixed-2-KiB, 500-million-key matrix, SPDK led raw io_uring by 5.69% for memtier read, 6.72% for memtier random 1:1, and 8.24% for Valkey read. Pure-write throughput was effectively tied: raw was 0.49% higher with memtier and 0.19% higher with Valkey. This newer matrix also captured zero mlx5 IRQ increments on CPUs 0-11 and retained the kernel-managed NVMe IRQ cost in the raw result.

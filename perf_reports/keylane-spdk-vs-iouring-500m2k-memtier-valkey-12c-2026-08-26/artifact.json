@@ -1,0 +1,297 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Keylane SPDK vs raw io_uring: 500M keys, fixed 2 KiB, 12 workers",
+    "description": "Five-minute unlimited-load comparison using memtier and Valkey clients.",
+    "generatedAt": "2026-08-26T11:52:27Z",
+    "sources": [
+      {
+        "id": "results_csv",
+        "label": "Reviewed benchmark results CSV",
+        "path": "perf_reports/data/keylane-spdk-iouring-500m2k-memtier-valkey-12c-20260826.csv",
+        "query": {
+          "description": "Parsed final summaries and exact HDR rank bounds from the accepted 300-second client logs.",
+          "language": "csv",
+          "executed_at": "2026-08-26T11:52:27Z",
+          "filters": [
+            "500,000,000 existing keys",
+            "2048-byte values",
+            "80 connections and 8 client threads",
+            "pipeline one",
+            "unlimited closed-loop load",
+            "300-second measured window",
+            "primary_result=true except the separately retained anomalous raw Valkey read"
+          ],
+          "metric_definitions": [
+            "QPS is completed Redis commands per second; memtier 1:1 totals include both SET and GET commands.",
+            "Valkey p99.9, p99.99 and p99.999 values are represented by the upper end of the exact open-lower, closed-upper HDR rank interval.",
+            "memtier percentile values are the point estimates printed by memtier_benchmark."
+          ],
+          "tables_used": [
+            "perf_reports/data/keylane-spdk-iouring-500m2k-memtier-valkey-12c-20260826.csv"
+          ]
+        }
+      },
+      {
+        "id": "technical_report",
+        "label": "Technical methodology and evidence report",
+        "path": "perf_reports/keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md",
+        "query": {
+          "description": "Technical narrative, workload commands, affinity settings, validation checks, caveats, and raw-evidence locations.",
+          "language": "markdown",
+          "executed_at": "2026-08-26T11:52:27Z",
+          "tables_used": [
+            "perf_reports/keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md"
+          ]
+        }
+      }
+    ],
+    "cards": [
+      {
+        "id": "card_memtier_read",
+        "description": "SPDK throughput advantage over raw io_uring for memtier random GET.",
+        "dataset": "headline",
+        "sourceId": "results_csv",
+        "metrics": [
+          {"label": "SPDK read advantage", "field": "memtier_read_advantage", "format": "percent"}
+        ]
+      },
+      {
+        "id": "card_memtier_mix",
+        "description": "SPDK throughput advantage over raw io_uring for memtier random 1:1.",
+        "dataset": "headline",
+        "sourceId": "results_csv",
+        "metrics": [
+          {"label": "SPDK 1:1 advantage", "field": "memtier_mix_advantage", "format": "percent"}
+        ]
+      },
+      {
+        "id": "card_write_gap",
+        "description": "raw io_uring throughput advantage over SPDK for memtier pure write.",
+        "dataset": "headline",
+        "sourceId": "results_csv",
+        "metrics": [
+          {"label": "raw write advantage", "field": "memtier_write_raw_advantage", "format": "percent"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "chart_memtier_qps",
+        "title": "memtier throughput by backend and workload",
+        "subtitle": "Completed Redis commands/s; 500M keys, fixed 2 KiB, 80 connections, pipeline one, 300 seconds.",
+        "type": "bar",
+        "dataset": "memtier_results",
+        "sourceId": "results_csv",
+        "encodings": {
+          "x": {"field": "workload", "type": "nominal", "label": "Workload"},
+          "y": {"field": "qps", "type": "quantitative", "label": "Commands/s", "format": "compact"},
+          "color": {"field": "backend", "type": "nominal", "label": "Backend"},
+          "tooltip": [
+            {"field": "backend", "type": "text", "label": "Backend"},
+            {"field": "workload", "type": "text", "label": "Workload"},
+            {"field": "qps", "type": "quantitative", "label": "Commands/s", "format": "number"},
+            {"field": "p9999_ms", "type": "quantitative", "label": "p99.99 ms", "format": "number"}
+          ]
+        },
+        "layout": "full"
+      },
+      {
+        "id": "chart_valkey_qps",
+        "title": "Valkey throughput by backend and workload",
+        "subtitle": "Completed Redis commands/s; Valkey 1:1 excluded because its multi-command P1 path did not scale.",
+        "type": "bar",
+        "dataset": "valkey_results",
+        "sourceId": "results_csv",
+        "encodings": {
+          "x": {"field": "workload", "type": "nominal", "label": "Workload"},
+          "y": {"field": "qps", "type": "quantitative", "label": "Commands/s", "format": "compact"},
+          "color": {"field": "backend", "type": "nominal", "label": "Backend"},
+          "tooltip": [
+            {"field": "backend", "type": "text", "label": "Backend"},
+            {"field": "workload", "type": "text", "label": "Workload"},
+            {"field": "qps", "type": "quantitative", "label": "Commands/s", "format": "number"},
+            {"field": "p9999_upper_ms", "type": "quantitative", "label": "p99.99 upper ms", "format": "number"}
+          ]
+        },
+        "layout": "full"
+      },
+      {
+        "id": "chart_read_tail",
+        "title": "Read p99.99 latency by client and backend",
+        "subtitle": "Milliseconds; Valkey bars use the conservative upper end of the exact HDR rank interval.",
+        "type": "bar",
+        "dataset": "read_tail",
+        "sourceId": "results_csv",
+        "encodings": {
+          "x": {"field": "backend", "type": "nominal", "label": "Backend"},
+          "y": {"field": "p9999_ms", "type": "quantitative", "label": "p99.99 latency", "unit": "ms", "format": "number"},
+          "color": {"field": "client", "type": "nominal", "label": "Client"},
+          "tooltip": [
+            {"field": "backend", "type": "text", "label": "Backend"},
+            {"field": "client", "type": "text", "label": "Client"},
+            {"field": "qps", "type": "quantitative", "label": "Commands/s", "format": "number"},
+            {"field": "p9999_ms", "type": "quantitative", "label": "p99.99 ms", "format": "number"}
+          ]
+        },
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "table_results",
+        "title": "Accepted five-minute results",
+        "subtitle": "Valkey tail columns use conservative HDR upper bounds; QPS is individual Redis commands/s.",
+        "dataset": "primary_results",
+        "sourceId": "results_csv",
+        "defaultSort": {"field": "qps", "direction": "desc"},
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          {"field": "backend", "label": "Backend", "type": "text"},
+          {"field": "client", "label": "Client", "type": "text"},
+          {"field": "workload", "label": "Workload", "type": "text"},
+          {"field": "qps", "label": "QPS", "format": "number"},
+          {"field": "avg_ms", "label": "Avg ms", "format": "number"},
+          {"field": "p99_ms", "label": "p99 ms", "format": "number"},
+          {"field": "p999_ms", "label": "p99.9 ms", "format": "number"},
+          {"field": "p9999_ms", "label": "p99.99 ms", "format": "number"},
+          {"field": "p99999_ms", "label": "p99.999 ms", "format": "number"}
+        ]
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# Keylane SPDK vs raw io_uring: 500M keys, fixed 2 KiB, 12 workers"
+      },
+      {
+        "id": "summary",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "results_csv",
+        "body": "## Technical summary\n\nSPDK leads random-read and 1:1 throughput, while pure-write throughput is effectively tied. With nearly identical SPDK read throughput, memtier reports a materially higher p99.99 than Valkey, identifying a client-side deep-tail contribution. All accepted runs retained 500M keys with zero misses or memory rejections."
+      },
+      {
+        "id": "headline_metrics",
+        "type": "metric-strip",
+        "layout": "full",
+        "cardIds": ["card_memtier_read", "card_memtier_mix", "card_write_gap"]
+      },
+      {"id": "memtier_heading", "type": "markdown", "layout": "full", "body": "## memtier backend comparison"},
+      {"id": "memtier_chart", "type": "chart", "layout": "full", "chartId": "chart_memtier_qps"},
+      {"id": "valkey_heading", "type": "markdown", "layout": "full", "body": "## Valkey backend comparison"},
+      {"id": "valkey_chart", "type": "chart", "layout": "full", "chartId": "chart_valkey_qps"},
+      {
+        "id": "client_finding",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "results_csv",
+        "body": "## Client-side read tail\n\nOn SPDK, memtier and Valkey differ by only 0.17% in read throughput, but memtier p99.99 is at least 66.8% above Valkey's conservative upper bound. On raw io_uring the corresponding gap is at least 68.9%."
+      },
+      {"id": "tail_chart", "type": "chart", "layout": "full", "chartId": "chart_read_tail"},
+      {"id": "results_heading", "type": "markdown", "layout": "full", "body": "## Exact accepted results"},
+      {"id": "results_table", "type": "table", "layout": "full", "tableId": "table_results"},
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "technical_report",
+        "body": "## Methodology\n\nKeylane used 12 pinned workers on CPUs 0-11; local user processes and mlx5 IRQs used CPUs 12-15. Both clients used 80 connections, eight threads, pipeline one, unlimited load, and 300-second windows. Defrag remained enabled: read 8/0/0, random 1:1 2/15ms/0, and write 6/0/0. Each client used a separately rebuilt native-key-format dataset because memtier emits unpadded numeric keys while Valkey emits 12-digit zero-padded random placeholders."
+      },
+      {
+        "id": "anomaly",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "technical_report",
+        "body": "## raw Valkey read anomaly\n\nThe first raw Valkey read contained a 5.4-second throughput collapse at seconds 277-282 and is excluded from the headline table. An immediate 300-second rerun was stable. The original evidence is retained, and no Keylane, kernel, or NVMe SMART error accompanied the event."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "technical_report",
+        "body": "## Limitations\n\nThis is a single-host point comparison rather than repeated independent trials. Client-native key formats differ by a few bytes. memtier write followed its mixed workload, while Valkey write followed only read, so cross-client write differences also include different prior aging. raw NVMe managed IRQs remain on worker CPUs and are intentionally part of the io_uring result."
+      },
+      {
+        "id": "recommendations",
+        "type": "markdown",
+        "layout": "full",
+        "sourceId": "technical_report",
+        "body": "## Recommended next steps\n\n1. Prefer SPDK when random-read or mixed throughput is the priority.\n2. Prefer raw io_uring when simpler Linux operation outweighs a 5.7-8.2% read penalty; pure-write throughput is tied.\n3. Use Valkey for deep-tail read characterization and memtier for workload-mix generation.\n4. If the raw read disturbance recurs, capture block issue/completion, io_uring completion, per-worker queue delay, and IRQ timing together."
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-26T11:52:27Z",
+    "status": "ready",
+    "datasets": {
+      "headline": [
+        {"memtier_read_advantage": 0.0569, "memtier_mix_advantage": 0.0672, "memtier_write_raw_advantage": 0.0049}
+      ],
+      "memtier_results": [
+        {"backend": "SPDK", "workload": "Read", "qps": 322639.86, "p9999_ms": 1.039},
+        {"backend": "raw io_uring", "workload": "Read", "qps": 305282.28, "p9999_ms": 1.079},
+        {"backend": "SPDK", "workload": "Random 1:1", "qps": 370683.28, "p9999_ms": 1.639},
+        {"backend": "raw io_uring", "workload": "Random 1:1", "qps": 347351.57, "p9999_ms": 2.255},
+        {"backend": "SPDK", "workload": "Write", "qps": 419672.66, "p9999_ms": 2.127},
+        {"backend": "raw io_uring", "workload": "Write", "qps": 421737.32, "p9999_ms": 2.623}
+      ],
+      "valkey_results": [
+        {"backend": "SPDK", "workload": "Read", "qps": 322096.47, "p9999_upper_ms": 0.623},
+        {"backend": "raw io_uring", "workload": "Read", "qps": 297588.91, "p9999_upper_ms": 0.639},
+        {"backend": "SPDK", "workload": "Write", "qps": 434038.25, "p9999_upper_ms": 2.423},
+        {"backend": "raw io_uring", "workload": "Write", "qps": 434877.59, "p9999_upper_ms": 3.175}
+      ],
+      "read_tail": [
+        {"backend": "SPDK", "client": "memtier", "qps": 322639.86, "p9999_ms": 1.039},
+        {"backend": "SPDK", "client": "Valkey", "qps": 322096.47, "p9999_ms": 0.623},
+        {"backend": "raw io_uring", "client": "memtier", "qps": 305282.28, "p9999_ms": 1.079},
+        {"backend": "raw io_uring", "client": "Valkey", "qps": 297588.91, "p9999_ms": 0.639}
+      ],
+      "primary_results": [
+        {"backend": "SPDK", "client": "memtier", "workload": "Read", "qps": 322639.86, "avg_ms": 0.24764, "p99_ms": 0.447, "p999_ms": 0.543, "p9999_ms": 1.039, "p99999_ms": 1.727},
+        {"backend": "SPDK", "client": "memtier", "workload": "Random 1:1", "qps": 370683.28, "avg_ms": 0.21551, "p99_ms": 0.551, "p999_ms": 1.351, "p9999_ms": 1.639, "p99999_ms": 4.959},
+        {"backend": "SPDK", "client": "memtier", "workload": "Write", "qps": 419672.66, "avg_ms": 0.19029, "p99_ms": 0.871, "p999_ms": 1.407, "p9999_ms": 2.127, "p99999_ms": 10.367},
+        {"backend": "SPDK", "client": "Valkey", "workload": "Read", "qps": 322096.47, "avg_ms": 0.230, "p99_ms": 0.423, "p999_ms": 0.511, "p9999_ms": 0.623, "p99999_ms": 1.271},
+        {"backend": "SPDK", "client": "Valkey", "workload": "Write", "qps": 434038.25, "avg_ms": 0.163, "p99_ms": 0.839, "p999_ms": 1.479, "p9999_ms": 2.423, "p99999_ms": 7.599},
+        {"backend": "raw io_uring", "client": "memtier", "workload": "Read", "qps": 305282.28, "avg_ms": 0.26173, "p99_ms": 0.455, "p999_ms": 0.559, "p9999_ms": 1.079, "p99999_ms": 1.703},
+        {"backend": "raw io_uring", "client": "memtier", "workload": "Random 1:1", "qps": 347351.57, "avg_ms": 0.22998, "p99_ms": 0.679, "p999_ms": 1.543, "p9999_ms": 2.255, "p99999_ms": 5.919},
+        {"backend": "raw io_uring", "client": "memtier", "workload": "Write", "qps": 421737.32, "avg_ms": 0.18940, "p99_ms": 0.903, "p999_ms": 1.495, "p9999_ms": 2.623, "p99999_ms": 13.439},
+        {"backend": "raw io_uring", "client": "Valkey", "workload": "Read", "qps": 297588.91, "avg_ms": 0.251, "p99_ms": 0.439, "p999_ms": 0.527, "p9999_ms": 0.639, "p99999_ms": 3.055},
+        {"backend": "raw io_uring", "client": "Valkey", "workload": "Write", "qps": 434877.59, "avg_ms": 0.163, "p99_ms": 0.847, "p999_ms": 1.479, "p9999_ms": 3.175, "p99999_ms": 10.367}
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "results_csv",
+      "label": "Reviewed benchmark results CSV",
+      "path": "perf_reports/data/keylane-spdk-iouring-500m2k-memtier-valkey-12c-20260826.csv",
+      "query": {
+        "description": "Parsed final summaries and exact HDR rank bounds from the accepted 300-second client logs.",
+        "language": "csv",
+        "executed_at": "2026-08-26T11:52:27Z",
+        "filters": ["500M keys", "2048-byte values", "pipeline one", "unlimited load", "300 seconds"],
+        "metric_definitions": ["QPS is completed individual Redis commands per second."],
+        "tables_used": ["perf_reports/data/keylane-spdk-iouring-500m2k-memtier-valkey-12c-20260826.csv"]
+      }
+    },
+    {
+      "id": "technical_report",
+      "label": "Technical methodology and evidence report",
+      "path": "perf_reports/keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md",
+      "query": {
+        "description": "Technical narrative, workload commands, validation checks, caveats, and raw-evidence locations.",
+        "language": "markdown",
+        "executed_at": "2026-08-26T11:52:27Z",
+        "tables_used": ["perf_reports/keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md"]
+      }
+    }
+  ]
+}
