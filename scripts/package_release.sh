@@ -61,7 +61,7 @@ install -m 0755 "$BINARY" "$STAGE_DIR/keylane"
 if command -v strip >/dev/null 2>&1; then
   strip --strip-unneeded "$STAGE_DIR/keylane"
 fi
-install -m 0644 "$REPO_ROOT/docs/tls-and-auth.md" \
+install -m 0644 "$REPO_ROOT/docs/design-docs/tls-and-auth.md" \
   "$STAGE_DIR/tls-and-auth.md"
 OPENSSL_LICENSE=${KEYLANE_OPENSSL_LICENSE:-/usr/share/common-licenses/Apache-2.0}
 if [[ ! -f "$OPENSSL_LICENSE" ]]; then

@@ -1,11 +1,16 @@
 # Celer Redis Overview
 
+> Historical integration note: this file records Keylane's initial Celer
+> milestone and is not the current architecture authority. Start with
+> [`docs/README.md`](docs/README.md) and the
+> [architecture index](docs/architecture/README.md) for the implemented system.
+
 ## Goal
 
 `keylane` is a Redis/Valkey-protocol server built on top of the `celer` core runtime.
 
 Supported commands follow the Redis 7.2 semantic baseline documented in
-[`docs/redis-compatibility.md`](docs/redis-compatibility.md).
+[`docs/design-docs/redis-compatibility.md`](docs/design-docs/redis-compatibility.md).
 
 This repository should own:
 

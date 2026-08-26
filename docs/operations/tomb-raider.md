@@ -19,3 +19,12 @@ timezone, and whether a round is running.
 Runtime changes are not persisted across restarts. Startup uses
 `--tomb-raider-interval-ms` and `--tomb-raider-sleep-ms`; an interval of zero
 starts in off mode.
+
+## Replication role changes
+
+The cleanup loop is launched only when the node has expiration authority at
+startup. Once launched, it does not recheck that authority after a runtime
+`REPLICAOF` role change, so scheduled rounds can continue after the node becomes
+a replica. To stop future cleanup before changing role, issue `TOMBRAIDER OFF`
+and account for any round already in progress completing. This setting is not
+persisted across restart.

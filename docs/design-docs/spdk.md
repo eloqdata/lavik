@@ -3,7 +3,7 @@
 Keylane can access one or more local NVMe namespaces directly through SPDK.
 Networking remains on celer/io_uring; only the storage backend changes. This
 guide is hardware-independent; benchmark-host details belong in
-[`PERF_SESSION_HANDOFF.md`](../PERF_SESSION_HANDOFF.md).
+[`PERF_SESSION_HANDOFF.md`](../../PERF_SESSION_HANDOFF.md).
 
 Binding an NVMe controller to a userspace driver removes every namespace on
 that controller from the kernel. Use a dedicated data controller, never an OS
@@ -164,7 +164,7 @@ I/O is outstanding.
 
 For latency-sensitive deployments, also reserve physical cores for the network
 device's completion IRQs and keep them disjoint from the Keylane worker set.
-See [Network IRQ Affinity Tuning for Tail Latency](irq-affinity-tuning.md).
+See [Network IRQ Affinity Tuning for Tail Latency](../operations/irq-affinity-tuning.md).
 
 `--spdk-max-completions-per-poll=8` bounds one event-loop poll's completion
 work, preventing a completion burst from monopolizing a worker. The budget is
@@ -337,4 +337,4 @@ driver and the expected model/serial numbers returned. Re-discover device names
 rather than assuming the previous `/dev/nvmeXnY` numbering.
 
 For storage-set layout and recovery rules, see
-[Multi-Device Storage](multi-device-storage.md).
+[Multi-Device Storage](../operations/multi-device-storage.md).
