@@ -336,6 +336,7 @@ if (BUILD_TESTING)
     tests/storage_format_test.cpp
     tests/storage_capacity_test.cpp
     tests/tx_cleaner_test.cpp
+    tests/tcp_nodelay_accept_test.cpp
   )
   target_link_libraries(keylane_unit_tests
     PRIVATE keylane::module GTest::gtest_main
