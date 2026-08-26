@@ -188,9 +188,14 @@ Recovery proceeds as follows:
    physical relocation copies of one logical version, so the higher physical
    LSN wins. Recovery also rebuilds whether the winner shields an older,
    potentially live value.
-6. A second cross-worker pass charges every winning root and referenced extent
-   exactly once to its physical block owner and verifies each live manifest
-   against the recovered extent headers.
+6. A second cross-worker pass walks each in-memory winner index once and
+   charges every winning root and referenced extent exactly once to its
+   physical block owner. A resumable stable cursor pauses at a bounded
+   reference target, applies the per-owner batches, and then continues at the
+   next entry; it neither rescans storage nor restarts an index scan. One
+   external value's manifest remains an indivisible unit. The owner also
+   verifies every live manifest against the recovered extent headers before
+   the batch is released.
 7. Recovery reconstructs ready and cold-free allocator state, reclaims orphan
    extents before it needs new space, and handles expired winners. Expired
    versions participate in winner selection first, then normally receive a

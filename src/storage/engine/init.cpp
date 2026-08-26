@@ -705,6 +705,68 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   return absl::OkStatus();
 }
 
+Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
+    WorkerStore& store,
+    std::vector<std::vector<RecoveryLiveReference>>* batches) {
+  for (unsigned owner = 0; owner < worker_count_; ++owner) {
+    std::vector<RecoveryLiveReference>& pending = batches->at(owner);
+    if (pending.empty()) {
+      continue;
+    }
+    std::vector<RecoveryLiveReference> references;
+    std::swap(references, pending);
+    auto apply_live = [this, owner,
+                       references = std::move(references)]() mutable {
+      WorkerStore& owner_store = *stores_[owner];
+      for (const RecoveryLiveReference& reference : references) {
+        BlockState* state = FindBlockState(owner_store, reference.block_id_);
+        if (state == nullptr || !state->allocated_ ||
+            state->allocation_epoch_ != reference.allocation_epoch_) {
+          return absl::Status(absl::StatusCode::kInternal,
+                              "recovery live reference has no owning block");
+        }
+        if (reference.extent_) {
+          const auto found =
+              owner_store.recovered_extents_.find(reference.block_id_);
+          if (state->kind_ != BlockKind::kPayloadExtent ||
+              state->committed_bytes_ != kBlockHeaderBytes + reference.bytes_ ||
+              found == owner_store.recovered_extents_.end() ||
+              found->second.extent_index_ != reference.extent_index_ ||
+              found->second.payload_checksum_ !=
+                  reference.extent_payload_checksum_) {
+            return absl::Status(absl::StatusCode::kInternal,
+                                "live extent header does not match manifest");
+          }
+        }
+        state->live_bytes_ += reference.bytes_;
+        if (reference.txid_ != 0) {
+          const auto tx_block =
+              owner_store.tx_blocks_.find(reference.block_id_);
+          if (tx_block != owner_store.tx_blocks_.end()) {
+            NoteTxRecordLocal(owner_store, reference.block_id_,
+                              reference.allocation_epoch_,
+                              tx_block->second.generation_, reference.txid_,
+                              reference.bytes_, false);
+          }
+        }
+      }
+      return absl::OkStatus();
+    };
+    // if/else, not ?:, to keep the co_await out of a conditional expression
+    // (GCC coroutine frame-slot aliasing).
+    absl::Status applied = absl::OkStatus();
+    if (owner == store.worker_->id()) {
+      applied = apply_live();
+    } else {
+      applied = co_await celer::SubmitTo(owner, std::move(apply_live));
+    }
+    if (!applied.ok()) {
+      co_return applied;
+    }
+  }
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   WorkerStore& store = *stores_[worker.id()];
   store.worker_ = &worker;
@@ -895,96 +957,83 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         std::memory_order_relaxed);
   }
 
+  // The winner index is already entirely resident at this point. Walk it once
+  // with an exact resumable cursor, but send physical accounting to block
+  // owners in bounded batches instead of retaining one reference per live key
+  // until the whole pass completes. A single external value's manifest stays
+  // indivisible, so it may take a batch just over the target.
+  constexpr std::size_t kRecoveryAccountingBatchReferences = 1U << 20;
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
+  std::size_t buffered_references = 0;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
-        const RecordLocation& location = entry.value_;
-        assert(location.block_owner() < worker_count_);
-        live_by_owner[location.block_owner()].push_back(RecoveryLiveReference{
-            .block_id_ = location.block_id(),
-            .allocation_epoch_ = location.allocation_epoch(),
-            .txid_ = store.recovery_txids_.contains(&entry)
-                         ? store.recovery_txids_.at(&entry)
-                         : 0,
-            .bytes_ = location.total_disk_bytes(),
-        });
-        const ExtentManifest extents = ExtentsFor(store, &entry);
-        if (!location.external() || extents == nullptr) return;
-        for (std::size_t extent_index = 0; extent_index < extents->size();
-             ++extent_index) {
-          const ExtentRef& extent = extents->at(extent_index);
-          const std::uint16_t extent_owner = BlockOwner(extent.block_id_);
-          if (extent_owner >= worker_count_) {
-            Fail(
-                absl::InternalError("manifest references an unscanned extent"));
-            return;
-          }
-          live_by_owner[extent_owner].push_back(RecoveryLiveReference{
-              .block_id_ = extent.block_id_,
-              .allocation_epoch_ = extent.allocation_epoch_,
-              .bytes_ = extent.payload_bytes_,
-              .extent_ = true,
-              .extent_index_ = static_cast<std::uint32_t>(extent_index),
-              .extent_payload_checksum_ = extent.payload_checksum_,
-          });
+      auto& index = partition.indexes_[db_id];
+      RecordIndex::StableScanCursor cursor;
+      bool exhausted = false;
+      while (!exhausted) {
+        exhausted = index.ScanStableWhile(
+            &cursor, [&](const RecordIndex::Entry& entry) {
+              const RecordLocation& location = entry.value_;
+              if (location.block_owner() >= worker_count_) {
+                status = absl::InternalError(
+                    "recovery live root has no scanned block owner");
+                return false;
+              }
+              live_by_owner[location.block_owner()].push_back(
+                  RecoveryLiveReference{
+                      .block_id_ = location.block_id(),
+                      .allocation_epoch_ = location.allocation_epoch(),
+                      .txid_ = store.recovery_txids_.contains(&entry)
+                                   ? store.recovery_txids_.at(&entry)
+                                   : 0,
+                      .bytes_ = location.total_disk_bytes(),
+                  });
+              ++buffered_references;
+              const ExtentManifest extents = ExtentsFor(store, &entry);
+              if (location.external() && extents != nullptr) {
+                for (std::size_t extent_index = 0;
+                     extent_index < extents->size(); ++extent_index) {
+                  const ExtentRef& extent = extents->at(extent_index);
+                  const std::uint16_t extent_owner =
+                      BlockOwner(extent.block_id_);
+                  if (extent_owner >= worker_count_) {
+                    status = absl::InternalError(
+                        "manifest references an unscanned extent");
+                    return false;
+                  }
+                  live_by_owner[extent_owner].push_back(RecoveryLiveReference{
+                      .block_id_ = extent.block_id_,
+                      .allocation_epoch_ = extent.allocation_epoch_,
+                      .bytes_ = extent.payload_bytes_,
+                      .extent_ = true,
+                      .extent_index_ = static_cast<std::uint32_t>(extent_index),
+                      .extent_payload_checksum_ = extent.payload_checksum_,
+                  });
+                  ++buffered_references;
+                }
+              }
+              return buffered_references < kRecoveryAccountingBatchReferences;
+            });
+        if (!status.ok()) {
+          Fail(status);
+          co_return status;
         }
-      });
-    }
-  }
-  for (unsigned owner = 0; owner < worker_count_; ++owner) {
-    if (live_by_owner[owner].empty()) {
-      continue;
-    }
-    auto apply_live = [this, owner,
-                       references = std::move(live_by_owner[owner])]() mutable {
-      WorkerStore& owner_store = *stores_[owner];
-      for (const RecoveryLiveReference& reference : references) {
-        BlockState* state = FindBlockState(owner_store, reference.block_id_);
-        if (state == nullptr || !state->allocated_ ||
-            state->allocation_epoch_ != reference.allocation_epoch_) {
-          return absl::Status(absl::StatusCode::kInternal,
-                              "recovery live reference has no owning block");
-        }
-        if (reference.extent_) {
-          const auto found =
-              owner_store.recovered_extents_.find(reference.block_id_);
-          if (state->kind_ != BlockKind::kPayloadExtent ||
-              state->committed_bytes_ != kBlockHeaderBytes + reference.bytes_ ||
-              found == owner_store.recovered_extents_.end() ||
-              found->second.extent_index_ != reference.extent_index_ ||
-              found->second.payload_checksum_ !=
-                  reference.extent_payload_checksum_) {
-            return absl::Status(absl::StatusCode::kInternal,
-                                "live extent header does not match manifest");
+        if (buffered_references >= kRecoveryAccountingBatchReferences) {
+          status =
+              co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+          if (!status.ok()) {
+            Fail(status);
+            co_return status;
           }
-        }
-        state->live_bytes_ += reference.bytes_;
-        if (reference.txid_ != 0) {
-          const auto tx_block =
-              owner_store.tx_blocks_.find(reference.block_id_);
-          if (tx_block != owner_store.tx_blocks_.end()) {
-            NoteTxRecordLocal(owner_store, reference.block_id_,
-                              reference.allocation_epoch_,
-                              tx_block->second.generation_, reference.txid_,
-                              reference.bytes_, false);
-          }
+          buffered_references = 0;
         }
       }
-      return absl::OkStatus();
-    };
-    // if/else, not ?:, to keep the co_await out of a conditional
-    // expression (GCC coroutine frame-slot aliasing).
-    absl::Status applied = absl::OkStatus();
-    if (owner == worker.id()) {
-      applied = apply_live();
-    } else {
-      applied = co_await celer::SubmitTo(owner, std::move(apply_live));
     }
-    if (!applied.ok()) {
-      Fail(applied);
-      co_return applied;
-    }
+  }
+  status = co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+  if (!status.ok()) {
+    Fail(status);
+    co_return status;
   }
 
   status = co_await recovery_accounting_barrier_->Wait(worker);

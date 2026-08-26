@@ -309,6 +309,46 @@ TEST(ScanHashMapTest, ForEachWhileStopsImmediately) {
   EXPECT_EQ(visited, map.size());
 }
 
+TEST(ScanHashMapTest, StableScanResumesWithoutRepeatingEntries) {
+  ScanHashMap<std::uint64_t> map;
+  constexpr std::uint64_t kEntries = 4096;
+  for (std::uint64_t i = 0; i < kEntries; ++i) {
+    const std::string key = "stable-batch-" + std::to_string(i);
+    // InsertNew intentionally leaves an incremental expansion in progress,
+    // exercising traversal across both stable tables and long bucket chains.
+    map.InsertNew(ComputeDigest(key), key, i);
+  }
+
+  ScanHashMap<std::uint64_t>::StableScanCursor cursor;
+  std::unordered_map<std::string, unsigned> seen;
+  bool exhausted = false;
+  std::size_t batches = 0;
+  while (!exhausted) {
+    std::size_t batch_entries = 0;
+    exhausted = map.ScanStableWhile(&cursor, [&](const auto& entry) {
+      ++seen[std::string(entry.key())];
+      ++batch_entries;
+      return batch_entries < 17;
+    });
+    EXPECT_LE(batch_entries, 17u);
+    ++batches;
+  }
+
+  EXPECT_TRUE(cursor.finished());
+  EXPECT_GT(batches, 1u);
+  ASSERT_EQ(seen.size(), map.size());
+  for (const auto& [key, count] : seen) {
+    (void)key;
+    EXPECT_EQ(count, 1u);
+  }
+
+  ScanHashMap<std::uint64_t> empty;
+  ScanHashMap<std::uint64_t>::StableScanCursor empty_cursor;
+  EXPECT_TRUE(
+      empty.ScanStableWhile(&empty_cursor, [](const auto&) { return false; }));
+  EXPECT_TRUE(empty_cursor.finished());
+}
+
 TEST(ScanHashMapTest, FairRandomEntrySamplesExistingEntries) {
   ScanHashMap<std::uint64_t> map;
   EXPECT_EQ(map.FairRandomEntry(1), nullptr);

@@ -129,6 +129,23 @@ class ScanHashMap {
     bool inserted_ = false;
   };
 
+  // Resumable traversal for callers that can keep the map stable between
+  // batches. Unlike Scan's stateless cursor, this cursor remembers an exact
+  // entry position, so pausing never repeats a bucket chain. A cursor belongs
+  // to one map and becomes invalid after any insertion, erase, or rehash.
+  class StableScanCursor {
+   public:
+    bool finished() const noexcept { return table_ == 2; }
+
+   private:
+    friend class ScanHashMap;
+
+    std::uint8_t table_ = 0;
+    std::size_t bucket_ = 0;
+    std::size_t chain_ = 0;
+    std::size_t slot_ = 0;
+  };
+
   ScanHashMap() = default;
   ScanHashMap(const ScanHashMap&) = delete;
   ScanHashMap& operator=(const ScanHashMap&) = delete;
@@ -322,6 +339,50 @@ class ScanHashMap {
   bool ForEachWhile(Fn&& fn) {
     return ForEachTableWhile(tables_[0], fn) &&
            ForEachTableWhile(tables_[1], fn);
+  }
+
+  // Visits a stable map from cursor's exact position. Returning false from
+  // the callback pauses after the current entry; a later call with the same
+  // cursor resumes at the following entry. Returns true only after both
+  // tables are exhausted. Mutation between calls is unsupported because it
+  // can move entries between tables or compact a bucket chain.
+  template <typename Fn>
+  bool ScanStableWhile(StableScanCursor* cursor, Fn&& fn) const {
+    assert(cursor != nullptr);
+    while (cursor->table_ < 2) {
+      const Table& table = tables_[cursor->table_];
+      const std::size_t bucket_count = BucketCount(table);
+      if (cursor->bucket_ >= bucket_count) {
+        ++cursor->table_;
+        cursor->bucket_ = 0;
+        cursor->chain_ = 0;
+        cursor->slot_ = 0;
+        continue;
+      }
+
+      const Bucket* bucket = &table.buckets_[cursor->bucket_];
+      for (std::size_t chain = 0; chain < cursor->chain_; ++chain) {
+        assert(Chained(*bucket));
+        bucket = Child(bucket);
+      }
+      const std::size_t slots =
+          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+      while (cursor->slot_ < slots) {
+        const std::size_t slot = cursor->slot_++;
+        if (Occupied(*bucket, slot) && !fn(*bucket->entries_[slot])) {
+          return false;
+        }
+      }
+
+      cursor->slot_ = 0;
+      if (Chained(*bucket)) {
+        ++cursor->chain_;
+      } else {
+        ++cursor->bucket_;
+        cursor->chain_ = 0;
+      }
+    }
+    return true;
   }
 
   // Samples a short range of buckets and chooses uniformly from the sampled
