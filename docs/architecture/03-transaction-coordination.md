@@ -35,8 +35,10 @@ The caller-facing interfaces are:
 - `ShardCallback`, which receives the current owner's `ShardSlice` and may
   suspend on storage I/O while locks remain held.
 - `SetShardEntryHook`, which runs a non-suspending hook once on each participant
-  before its first callback. The command layer uses this to enter replication
-  transaction ordering.
+  before its first callback. The command layer uses it to enqueue that shard's
+  replication transaction marker before storage I/O; a guard-level hook can
+  release an already-acquired publication-order slot after the final
+  participant marker enters.
 - `Watch`, `WatchClean`, `Unwatch`, `MarkWatched`, and `MarkAllWatched`, which
   maintain owner-local optimistic WATCH marks.
 
@@ -94,22 +96,65 @@ of its keys share one worker.
    successful participants, releases their intents, removes their nodes, and
    repolls. The coordinator then retries with a fresh id. The current retry loop
    is unbounded and counted, with no explicit backoff.
-4. `Execute` clears participant statuses and arms every transaction node.
-   `TxShard::Poll` examines only the live queue head. It stops if that entry is
-   unarmed, already running, or still conflicts with a held predecessor.
-   Otherwise it publishes the head's id to the committed watermark, acquires
-   holds once, and spawns the shard callback.
-5. Every participant records its callback status and decrements the transaction
+4. `Execute` clears participant statuses and arms every transaction node. A
+   participant whose complete intent set was granted during scheduling enters
+   the owner-local `bypass_ready_` queue while retaining its txid-ordered queue
+   position. Such a participant is conflict-free with every earlier registered
+   operation on that shard; its intents also prevent a later conflicting
+   transaction from making the same claim. `TxShard::Poll` therefore dispatches
+   armed bypass entries before examining the ordered queue head, subject to a
+   final hold-compatibility check. This avoids cross-shard wait cycles in which
+   several otherwise independent transactions are each hidden behind a lower
+   txid waiting on another shard.
+5. Plain waiters and transaction participants whose intents were not fully
+   granted still run through the ordered queue head. Polling stops if that head
+   is unarmed, already running, or conflicts with a suspended holder. Otherwise
+   it publishes the entry's id to the committed watermark, acquires holds once,
+   and starts the waiter or shard callback. A bypassed transaction keeps its
+   ordered position and retained intents and holds under the same rules as any
+   other persistent transaction entry.
+6. Every participant records its callback status and decrements the transaction
    barrier. The last participant schedules the coordinator coroutine on its
    original worker. The coordinator observes all statuses only after this
    barrier completes.
-6. A non-releasing hop leaves holds, intents, and queue positions in place. A
+7. A non-releasing hop leaves holds, intents, and queue positions in place. A
    releasing hop drops holds and intents, removes each node, and repolls its
    shard. `Release` is a no-op callback executed as such a final releasing hop.
 
 The coordinator awaits every round it starts. A participant's barrier
 decrement is its final access to the frame-embedded transaction, which prevents
 the coordinator frame from disappearing while a shard callback is suspended.
+
+## Durable commit handoff
+
+Transaction scheduling ends when the command has completed its logical hops
+and released its locks; crash-atomic storage completion has a separate
+worker-local coordinator. Successful common multi-key, keyed write-capable Lua,
+and EXEC paths settle their undo state, then transfer their `TxShardWrites`
+receipts to the current worker's commit queue. At most one drain coroutine runs
+per worker, replacing a detached coroutine per accepted transaction.
+
+The drain coroutine removes at most 256 receipts per batch. When it finds a
+backlog, it merges durability fences that name the same block owner, block ID,
+and allocation epoch, retaining the largest required committed boundary. It
+requests all unique flush frontiers before awaiting them so different storage
+owners can progress in parallel. Each transaction still waits only for its own
+tagged-record fences before appending its own `kTxCommit` decision; one receipt
+on an otherwise idle queue stays on the direct low-latency path.
+
+The queue high watermark is 4096 receipts per worker. Enqueueing always
+transfers an accepted receipt, but returns a backpressure indication at or above
+that depth; the command waits until the owner-local queue falls below the
+watermark before replying. This bounds reply-side backlog without turning a
+successful reply into a synchronous durability promise. INFO STATS exposes
+batch and transaction counts, input and merged fence counts, current and peak
+queue depth, backpressure waits, and the configured watermark.
+
+Accepted queued and explicitly background commit paths increment a shared
+pending count. Graceful shutdown gives that count up to five seconds to drain
+before freezing append streams and starting the final storage flush. After the
+deadline, shutdown proceeds without waiting further; recovery drops all tagged
+records atomically whenever their durable commit decision is absent.
 
 ## WATCH integration
 
@@ -138,9 +183,13 @@ passive expiration or creation of the other key.
 - Lock, queue, and WATCH mutations run on the owning worker. Cross-worker work
   moves through Celer requests and notifications, and the coordinator resumes
   on its origin worker.
-- `TxShard::Poll` starts only the queue head. A suspended conflicting holder can
-  delay it; unrelated owner-local acquisitions may still take the fast path
-  when their intents are compatible.
+- Queued plain acquisitions and conflicting transaction participants start
+  only from the ordered queue head. An uncontended plain acquisition instead
+  completes through `TryFastPath` without entering the queue. A fully granted
+  multi-shard participant may run from `bypass_ready_` while retaining its
+  ordered position; its recorded intents prove compatibility with predecessors
+  and prevent a later conflicting bypass. A suspended incompatible holder can
+  still delay either queued path.
 - Shard callback failures do not short-circuit an active round. All participants
   reach the barrier, after which `Execute` returns the first non-OK status in
   participant order.
@@ -161,18 +210,21 @@ passive expiration or creation of the other key.
 `tests/tx_lock_test.cpp` directly covers intent/hold compatibility, queue
 ordering and tombstones, the no-id fast path, anti-barging, a conflicting
 waiter behind suspended I/O, and progress on an unrelated key. The multi-key
-and MULTI/EXEC end-to-end tests cover cross-shard and cross-database behavior,
-duplicate keys, single-shard hashtag commands, WATCH invalidation, runtime
-rollback, and recovery. The atomicity stress test overlaps writers with MGET
-and EXEC readers to detect torn snapshots.
+end-to-end test drives many conflict-free cross-shard MSET writers under one
+deadline to catch head-only scheduler cycles, and verifies that commit receipts
+are neither lost nor all drained as singleton batches and that shared fences
+are merged. The multi-key and MULTI/EXEC tests also cover cross-shard and
+cross-database behavior, duplicate keys, single-shard hashtag commands, WATCH
+invalidation, runtime rollback, and recovery. The atomicity stress test
+overlaps writers with MGET and EXEC readers to detect torn snapshots.
 
 There is no focused deterministic unit test for a multi-shard schedule
-cancellation/retry, one-shot shard entry hooks, deliberate fingerprint
-collisions, or a retained single-shard guard across several hops. Those paths
-are implementation-backed and receive indirect end-to-end coverage, but the
-specific edge behavior is not isolated by the current test suite. The scheduler
-also defines no retry limit, fairness deadline, or timeout for a slow held
-predecessor.
+cancellation/retry, the conflict-free bypass queue, one-shot shard entry hooks,
+deliberate fingerprint collisions, or a retained single-shard guard across
+several hops. Those paths are implementation-backed and receive indirect
+end-to-end coverage, but the specific edge behavior is not isolated by the
+current test suite. The scheduler also defines no retry limit, fairness
+deadline, or timeout for a slow held predecessor.
 
 ## Source map
 
@@ -181,12 +233,12 @@ predecessor.
 | Lock modes, fingerprint identity, key references, and collision boundary | `include/keylane/tx/fingerprint.h`, `include/keylane/tx/transaction.h` |
 | Intent/hold compatibility and the hold-subset-of-intent invariant | `include/keylane/tx/intent_lock.h` |
 | Waiter flavors, txid ordering, removal, and tombstones | `include/keylane/tx/tx_queue.h` |
-| Shard-local acquisition, polling state, WATCH tables, runtime, and metrics | `include/keylane/tx/tx_shard.h`, `src/tx/tx_shard.cpp` |
+| Shard-local acquisition, ordered and bypass-ready polling, WATCH tables, runtime, and metrics | `include/keylane/tx/tx_shard.h`, `src/tx/tx_shard.cpp` |
 | Key grouping, schedule/cancel/arm phases, callbacks, barriers, and release | `include/keylane/tx/transaction.h`, `src/tx/transaction.cpp` |
 | Runtime creation, worker binding, and recovery seeding | `src/redis/server.cpp`, `src/storage/engine/init.cpp` |
 | Command construction, multi-hop use, WATCH checks, replication entry hook, and INFO fields | `include/keylane/command.h`, `include/keylane/session.h`, `src/redis/command.cpp`, `src/redis/string_command.cpp`, `src/redis/set_command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp`, `src/redis/zset_command.cpp` |
 | Owner routing and the pre-locked storage contract | `include/keylane/storage/engine.h`, `src/storage/engine/impl.h` |
 | Ordinary and background storage participation in transaction locks | `src/storage/engine/read.cpp`, `src/storage/engine/write.cpp`, `src/storage/engine/expire.cpp`, `src/storage/engine/backup.cpp`, `src/storage/engine/replication.cpp`, `src/storage/engine/tomb_raider.cpp` |
 | Mutation and database-wide WATCH marking | `src/storage/engine/write.cpp`, `src/storage/engine/expire.cpp`, `src/storage/engine/flush_db.cpp`, `src/storage/engine/replication.cpp` |
-| Durable write ids, undo/commit boundary, and storage-owned crash atomicity | `include/keylane/storage/engine.h`, `src/storage/engine.cpp`, `src/redis/command.cpp`, `src/storage/engine/recovery.cpp`, `src/storage/engine/tx_cleaner.cpp` |
+| Durable write ids, undo/commit boundary, worker-local commit batching and backpressure, and storage-owned crash atomicity | `include/keylane/storage/engine.h`, `src/storage/engine.cpp`, `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/storage/engine/recovery.cpp`, `src/storage/engine/tx_cleaner.cpp` |
 | Direct lock tests and end-to-end transaction coverage | `tests/tx_lock_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp` |

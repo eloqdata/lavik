@@ -2,12 +2,13 @@
 
 ## Responsibility and boundary
 
-This subsystem owns the Redis-facing connection lifecycle: incremental RESP2
-parsing, per-connection state, authentication and replication handoff,
-command classification, admission and dispatch, Redis command handlers, and
-reply encoding or streaming. Celer owns sockets and worker scheduling below the
-boundary. Transaction coordination, durable records, and replication sessions
-remain separate modules reached through explicit interfaces.
+This subsystem owns the Redis-facing connection lifecycle: incremental command
+parsing, connection-level RESP2/RESP3 reply negotiation, per-connection state,
+authentication and replication handoff, command classification, admission and
+dispatch, Lua and Pub/Sub execution, Redis command handlers, and reply encoding
+or streaming. Celer owns sockets and worker scheduling below the boundary.
+Transaction coordination, durable records, and replication sessions remain
+separate modules reached through explicit interfaces.
 
 The implementation is split across shared protocol/session interfaces and
 focused command families under `src/redis/`. `src/redis/command.cpp` is the
@@ -18,10 +19,26 @@ storage calls, role control, and trusted replay.
 
 `RedisService` is a Celer `TcpService`. Each accepted connection gets one
 `ConnectionContext` in its serving coroutine. That context retains the selected
-logical database, authentication and cluster-read state, reusable reply buffer,
-`MULTI` queue, WATCH registrations, client identity, and MONITOR subscription.
-All disconnect paths return through one cleanup point which unregisters client
-metadata, monitor state, and WATCH registrations.
+logical database, authentication and cluster-read state, negotiated
+`RespVersion` in its reusable reply builder, `MULTI` queue, WATCH registrations,
+socket and peer identity, client name, MONITOR subscription, and optional
+`PubSubSession`. A worker-local client record separately tracks data exposed by
+`CLIENT`, including RESP version, client library name/version, subscription
+counts, blocking state, and replication-session identity. All disconnect paths
+return through one cleanup point which unregisters client, monitor, Pub/Sub, and
+WATCH state.
+
+Connections start in RESP2. `HELLO 2` or `HELLO 3` can combine protocol
+selection with `AUTH` and `SETNAME`; validation finishes before authentication,
+name, or reply-version state is changed. The selected version follows every
+subsequent `CommandRequest` and `ReplyBuilder`. RESP3 handlers can therefore
+emit native nulls, booleans, doubles, maps, sets, and push frames, while the same
+logical replies retain their RESP2-compatible encodings on RESP2 connections.
+An `EXEC` retains its entry version for the outer aggregate header; a queued
+`HELLO` changes later child replies and the connection version that remains
+after `EXEC`.
+`RESET` returns the connection to RESP2 and clears its selected database,
+authentication, cluster-read, transaction, WATCH, and name state.
 
 The service recognizes authentication and replication handshakes before
 ordinary dispatch. An isolated Redis `PSYNC` connection is transferred to the
@@ -37,7 +54,8 @@ used by graceful shutdown.
    command table and copies the connection's current database ID into the
    request.
 3. `DispatchCommand` handles connection-level transaction and client state,
-   then records command metrics around the dispatch result.
+   attaches the connection's reply version, then records command metrics and
+   eligible slow-log entries around the dispatch result.
 4. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
    capacity for source writes before database/key work. Eligible single-key
    writes are moved directly to their owner so admission and mutation share the
@@ -64,6 +82,16 @@ Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.
 
+MGET acquires all requested keys in one shared-lock transaction and preserves
+their argument positions in the assembled reply. Each participating shard
+passes its local keys to `StorageEngine::BatchGetLocked`. Ordinary-size compact
+on-disk values are submitted together in waves paced by that worker's available
+fixed read buffers; oversized reads use aligned overflow leases. One awaiter
+resumes only after every submitted read in the wave completes. The wave
+releases all leases before relocation retries or the next wave, while external,
+in-memory, remote-owner, or stale-location cases use the complete single-key
+fallback path.
+
 Blocking List, Sorted Set, and Stream commands release database admission while
 waiting and reacquire it for each concrete attempt. Their waiter registry and
 readiness events are implemented in the Redis subsystem, while storage remains
@@ -88,6 +116,84 @@ the source of truth checked after wakeup.
   use a chunk source. A 30-second no-progress watchdog closes a connection that
   stalls while a streamed reply holds a database gate.
 
+## Lua scripts and Functions
+
+Each Celer worker lazily owns one persistent `LuaWorkerRuntime`. It retains the
+Lua VM, compiled script closures, and locally installed Function libraries;
+source bodies and the canonical Function catalog have process-wide ownership.
+`SCRIPT LOAD`/`FLUSH` update every worker's script index. Function loads and
+restores stage and validate the same library on every worker before committing
+the process-wide catalog; delete and flush operations likewise visit every
+worker before releasing canonical catalog ownership. Script-cache mutations are
+serialized with each other and finish their worker fan-out before replying, but
+concurrent `SCRIPT EXISTS` or `EVALSHA` lookups do not join that mutation guard
+and can temporarily observe the per-worker transition. Function invocations,
+catalog reads, and catalog mutations do share the guard, so staged Function
+updates are not externally visible.
+
+`EVAL`, `EVALSHA`, their `_RO` variants, `FCALL`, and `FCALL_RO` derive their
+key set from `numkeys`. The command layer acquires those declared keys through
+one transaction before starting Lua. The `_RO` command variants use shared
+holds; ordinary `EVAL`, `EVALSHA`, and `FCALL` use exclusive holds regardless
+of the Function's runtime flags. Calls made through `redis.call` or
+`redis.pcall` re-enter command metadata and keyed execution inside those
+retained holds. Undeclared keys and global, blocking, administrative, nested
+scripting, or otherwise unsafe commands are rejected. Write effects, blocking
+notifications, durable transaction receipts, and replication effects remain
+attached to the outer invocation rather than becoming independent commands.
+
+Cached closures share VM globals, so Lua invocations are serialized per worker
+even when a script yields to execute a command on another owner. Ordinary
+commands do not take this worker-local Lua gate. Once an invocation exceeds
+`lua-time-limit`, however, a process-wide busy flag makes ordinary non-replay
+commands return `BUSY`; the matching `SCRIPT KILL` or `FUNCTION KILL` and
+`FUNCTION STATS` remain available. An invocation that has written or came from
+replication cannot be killed in a way that would expose partial effects.
+
+## Pub/Sub mode
+
+Channel and pattern indexes are worker-local. `PUBLISH` fans out to every
+worker registry and counts live matching subscriptions after membership is
+rechecked on the destination worker. Encoded RESP2 and RESP3 message bodies are
+shared between recipients where possible; each session receives frames in its
+negotiated version.
+
+After the first subscription, the connection enters a two-coroutine serving
+mode. A dedicated reader continues parsing allowed commands and enqueues their
+replies, while the original serving coroutine is the only socket writer and
+drains both command replies and published messages. On exit or failure the
+writer closes the session and joins the reader before connection cleanup.
+RESP2 subscribed clients are restricted to subscription management, `PING`,
+`QUIT`, and `RESET`; RESP3 subscribed clients can continue issuing ordinary
+commands while push messages are interleaved by the single writer.
+
+Output is bounded rather than silently dropped: a session queue holds at most
+10,000 data frames, and all sessions on one worker share a 128 MiB pending-byte
+budget. Exceeding either limit closes the slow subscriber and shuts down its
+socket, preventing Pub/Sub delivery from consuming unbounded worker memory.
+
+## Administrative compatibility and observability
+
+SLOWLOG uses one bounded, single-owner ring per worker. Command completion
+records eligible non-blocking commands after dispatch, redacts credentials,
+and bounds copied arguments; `SLOWLOG GET` merges worker snapshots by a global
+entry ID. Its threshold and capacity are runtime-configurable. `CONFIG
+RESETSTAT` visits every worker and clears command counters only; it does not
+alter data or persistence dirty state. The successful `CONFIG` command is
+recorded after the reset traversal returns, but the traversal does not globally
+quiesce requests, so concurrent commands can also contribute post-reset
+samples.
+
+Redis Sentinel observes compatible `ROLE`, `INFO replication`, `CLIENT`, and
+Pub/Sub behavior. It can drive role changes and persistence through
+`REPLICAOF`, `CONFIG REWRITE`, and client eviction. Sentinel sends those
+management commands together in `MULTI`/`EXEC`; Keylane accepts a dedicated
+management-only batch, preserves its command order and individual replies, and
+uses the role transition rather than a process-wide transaction to provide the
+storage admission boundary. Runtime `replica-priority` controls promotion
+eligibility and preference, while `CONFIG REWRITE` persists the current
+single-upstream role configuration.
+
 ## Failure and backpressure behavior
 
 Parse errors are returned to the connection and end that malformed session.
@@ -100,14 +206,20 @@ Replication publisher admission occurs before database gates and key locks so
 a slow replica cannot suspend a write while holding state required by
 `FLUSHDB` or a full-sync cut. Memory-growing commands use the sampled memory
 guard before execution. Graceful shutdown closes admission, drains active
-requests, and only then asks storage for its final durable flush.
+requests, and only then asks storage for its final durable flush. After Celer
+has torn down a worker's I/O and coroutine frames, its native-thread service
+finalizer releases that worker's remaining `StorageEngine` state; worker-owned
+indexes are never destroyed from the shutdown thread.
 
 ## Verification
 
-Parser and reply encoding are unit-tested independently. The command-table
-tests cover kind lookup, flags, arity, and movable key extraction. E2E binaries
-exercise multi-key atomicity, `MULTI`/`EXEC`/WATCH, TTL, collections, metrics,
-RDB import/export/backup, replication logs, and Redis PSYNC behavior through the
+Parser and version-aware reply encoding are unit-tested independently. The
+command-table tests cover kind lookup, flags, arity, and movable key extraction.
+E2E binaries exercise HELLO/RESP3 and Pub/Sub through the Pub/Sub suite, Lua
+through the transaction suite, bounded batched MGET through the multi-key
+suite, SLOWLOG and `RESETSTAT` through the metrics suite, Sentinel failover,
+multi-key atomicity, `MULTI`/`EXEC`/WATCH, TTL, collections, RDB
+import/export/backup, replication logs, and Redis PSYNC behavior through the
 real server executable.
 
 ## Source map
@@ -115,12 +227,15 @@ real server executable.
 | Claim | Repository source |
 |---|---|
 | Celer service integration, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `src/redis/server.cpp` |
-| Per-connection database, authentication, MULTI, WATCH, and monitor state | `include/keylane/session.h` |
-| Incremental RESP parser and reusable reply builder | `include/keylane/resp.h`, `src/redis/resp.cpp` |
+| Per-connection database, authentication, reply version, MULTI, WATCH, monitor, Pub/Sub, and client identity state | `include/keylane/session.h`, `include/keylane/resp_version.h` |
+| Incremental RESP parser and version-aware reusable reply builder | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/keylane/command.h` |
 | Static command classification and key extraction | `include/keylane/command_table.h`, `src/redis/command_table.cpp` |
 | Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |
 | Blocking waiter ownership and wakeups | `src/redis/blocking_wait.h`, `src/redis/blocking_wait.cpp` |
+| Worker-local Lua VM, script cache, Function catalog, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |
+| Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
+| SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/keylane/slowlog.h`, `src/redis/slowlog.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
-| Parser, metadata, configuration, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/list_e2e_test.cpp` |
+| Parser, metadata, configuration, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/list_e2e_test.cpp` |
