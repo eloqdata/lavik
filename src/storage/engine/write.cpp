@@ -802,8 +802,22 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
     std::atomic<std::uint32_t>* active_;
     ~SettlementGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
   } settlement{&active_settlements_};
+  // Keep one settlement coroutine per flush, not one child coroutine per
+  // retired record. Local records settle synchronously after the flush lock
+  // has been released; the exceptional remote records use SubmitTo directly
+  // and retain their original order.
   for (const RetiredRecord& record : records) {
-    absl::Status dead = co_await MarkRecordDead(record);
+    assert(record.block_owner_ < worker_count_);
+    const unsigned owner = record.block_owner_;
+    absl::Status dead;
+    if (owner == celer::ThisWorker().id_) {
+      dead = MarkRecordDeadLocal(owner, record);
+    } else {
+      dead = co_await celer::SubmitTo(
+          owner, [this, owner, record] {
+            return MarkRecordDeadLocal(owner, record);
+          });
+    }
     if (!dead.ok()) {
       // The inline path fails the client write on an accounting error; here
       // there is no client left to tell, so fail-stop the writer the same way

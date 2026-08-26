@@ -63,6 +63,12 @@ using namespace celer;
 
 namespace {
 
+#if CELER_ENABLE_CROSS_CORE_LATENCY_TRACE
+constexpr std::uint64_t kReadLatencyReportIntervalNs = 45'000'000'000ULL;
+#else
+constexpr std::uint64_t kReadLatencyReportIntervalNs = 10'000'000'000ULL;
+#endif
+
 constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
     1,    2,    3,    4,    5,    8,     10,    15,   20,  30,
     40,   50,   75,   100,  150,  200,   300,   500,  750, 1000,
@@ -158,7 +164,8 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
     // bursts from every worker otherwise become an artificial tail-latency
     // event in the trace build itself.
     stats.next_report_ns_ =
-        now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
+        now + kReadLatencyReportIntervalNs +
+        100'000'000ULL * ThisWorker().id_;
     return;
   }
   if (now < stats.next_report_ns_) {
@@ -244,9 +251,28 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p9999(stats.total_), p9999(stats.io_), p9999(stats.route_out_),
       p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
       p9999(stats.route_back_), p9999(stats.send_));
+#if CELER_ENABLE_CROSS_CORE_LATENCY_TRACE
+  const auto cross_core_stats =
+      ThisWorker().self_->TakeCrossCoreLatencyStats();
+  const auto log_cross_core = [&](std::string_view name,
+                                  const Worker::LatencySampleStats& value) {
+    spdlog::info(
+        "cross-core-latency worker={} kind={} n={} avg-us={:.2f} "
+        "p99.9-us<={} p99.99-us<={} max-us={:.2f}",
+        ThisWorker().id_, name, value.count_, value.AverageUs(),
+        value.PercentileUpperUs(0.999), value.PercentileUpperUs(0.9999),
+        static_cast<double>(value.max_ns_) / 1000.0);
+  };
+  log_cross_core("wake-batch", cross_core_stats.wake_batch_wait_);
+  log_cross_core("parked-wake-batch",
+                 cross_core_stats.parked_wake_batch_wait_);
+  log_cross_core("request-queue", cross_core_stats.request_queue_);
+  log_cross_core("reply-queue", cross_core_stats.reply_queue_);
+#endif
   stats = ReadLatencyStats{};
   stats.next_report_ns_ =
-      now + 10'000'000'000ULL + 100'000'000ULL * ThisWorker().id_;
+      now + kReadLatencyReportIntervalNs +
+      100'000'000ULL * ThisWorker().id_;
 }
 
 struct SetLatencyStats {
