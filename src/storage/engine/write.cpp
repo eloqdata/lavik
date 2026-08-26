@@ -854,6 +854,13 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     char* end = nullptr;
     const unsigned long pause_ms = std::strtoul(tx_active_pause_text, &end, 10);
     if (end != tx_active_pause_text && *end == '\0' && pause_ms != 0) {
+      // Test-only observability: e2e fixtures poll the server log for this
+      // marker to confirm the pause is actually in effect instead of guessing
+      // with sleeps.
+      spdlog::warn(
+          "KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS pausing foreground allocation "
+          "for {} ms",
+          pause_ms);
       absl::Status paused = co_await celer::SleepFor(
           *store.worker_, std::chrono::milliseconds(pause_ms));
       if (!paused.ok()) {

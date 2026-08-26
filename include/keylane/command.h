@@ -479,9 +479,19 @@ bool SnapshotTransactionsActive() noexcept;
 
 // Replication flows send bounded batches, then wait for complete-event ACKs
 // before advancing. Keep cross-flow transactions in one global source order
-// so overlapping flow subsets cannot form an arrival/ACK cycle on the replica.
+// so overlapping flow subsets cannot form an arrival/ACK cycle on the
+// replica. Requests that are proven to touch at most one shard skip this gate
+// (see RequestSpansMultipleShards): a single-flow marker never joins a
+// cross-flow rendezvous cycle.
 bool TryBeginReplicationTransactionOrder() noexcept;
 void EndReplicationTransactionOrder() noexcept;
+
+// Conservative admission test for the transaction order gate above: returns
+// true (keep taking the gate) unless the command kind carries
+// kCmdKeyViewComplete AND every key in this request's DetermineKeys view maps
+// to one shard. Unknown commands, unproven key views, arity failures, and
+// empty views all answer true; the gate fails safe, never unsafe.
+bool RequestSpansMultipleShards(const CommandRequest& request);
 
 // Route `request` to the worker owning its Redis hash-slot partition. Async
 // disk operations use SubmitTaskTo and return on the connection's original

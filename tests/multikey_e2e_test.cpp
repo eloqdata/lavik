@@ -202,7 +202,8 @@ class ServerProcess {
                 const std::string& data_path, const std::string& log_path,
                 std::string_view fail_tx_write = {},
                 std::string_view tx_active_pause_ms = {},
-                bool fail_tx_cleaner_once = false, unsigned threads = 4) {
+                bool fail_tx_cleaner_once = false, unsigned threads = 4,
+                std::string_view order_hold_ms = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -220,6 +221,10 @@ class ServerProcess {
       if (!tx_active_pause_ms.empty()) {
         (void)::setenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS",
                        std::string(tx_active_pause_ms).c_str(), 1);
+      }
+      if (!order_hold_ms.empty()) {
+        (void)::setenv("KEYLANE_REPLICATION_ORDER_HOLD_MS",
+                       std::string(order_hold_ms).c_str(), 1);
       }
       if (fail_tx_cleaner_once) {
         (void)::setenv("KEYLANE_FAIL_TX_CLEANER_ONCE", "1", 1);
@@ -361,10 +366,19 @@ int main(int argc, char** argv) {
       "/tmp/keylane-multikey-repl-source-" + suffix + ".data";
   const std::string replica_data =
       "/tmp/keylane-multikey-repl-replica-" + suffix + ".data";
+  const std::string gate_source_data =
+      "/tmp/keylane-multikey-gate-source-" + suffix + ".data";
+  const std::string gate_replica_data =
+      "/tmp/keylane-multikey-gate-replica-" + suffix + ".data";
+  const std::string gate_log_path =
+      "/tmp/keylane-multikey-gate-" + suffix + ".log";
   (void)::unlink(data_path.c_str());
   (void)::unlink(log_path.c_str());
   (void)::unlink(source_data.c_str());
   (void)::unlink(replica_data.c_str());
+  (void)::unlink(gate_source_data.c_str());
+  (void)::unlink(gate_replica_data.c_str());
+  (void)::unlink(gate_log_path.c_str());
 
   int exit_code = 0;
   try {
@@ -1148,9 +1162,117 @@ int main(int argc, char** argv) {
       Expect(source_client.Command({"SET", "wide-multikey:after", "ok"}), "+OK",
              "source write after the wide multi-key burst");
     }
+
+#ifndef NDEBUG
+    // Replication transaction order gate admission regression: with an ONLINE
+    // replica, a cross-shard MSET acquires the global order gate while the
+    // test-only KEYLANE_REPLICATION_ORDER_HOLD_MS hook holds it for 10 s. A
+    // same-shard hashtag MSET (proven single-participant via
+    // kCmdKeyViewComplete) must skip the gate and finish well inside that
+    // window; a second cross-shard MSET must keep waiting on the gate and
+    // complete only after the hold ends.
+    {
+      CreateDataFile(gate_source_data, 256ULL * 1024 * 1024);
+      CreateDataFile(gate_replica_data, 256ULL * 1024 * 1024);
+      const std::uint16_t gate_source_port = FindFreePort();
+      std::uint16_t gate_replica_port = FindFreePort();
+      while (gate_replica_port == gate_source_port)
+        gate_replica_port = FindFreePort();
+      ServerProcess gate_source(argv[1], gate_source_port, gate_source_data,
+                                gate_log_path, {}, {}, false, 4, "10000");
+      ServerProcess gate_replica(argv[1], gate_replica_port, gate_replica_data,
+                                 gate_log_path, {}, {}, false, 2);
+      RespClient gate_source_client = Connect(gate_source_port);
+      RespClient gate_replica_client = Connect(gate_replica_port);
+      Expect(gate_replica_client.Command(
+                 {"REPLICAOF", "127.0.0.1", std::to_string(gate_source_port)}),
+             "+OK", "attach replica for order-gate regression");
+      const auto gate_online_deadline =
+          std::chrono::steady_clock::now() + 120s;
+      bool gate_online = false;
+      while (!gate_online &&
+             std::chrono::steady_clock::now() < gate_online_deadline) {
+        gate_online =
+            gate_replica_client.Command({"INFO", "replication"})
+                .find("keylane_replication_state:online") != std::string::npos;
+        if (!gate_online) std::this_thread::sleep_for(20ms);
+      }
+      if (!gate_online) Fail("replica did not come online for the gate test");
+      Expect(gate_replica_client.Command({"READONLY"}), "+OK",
+             "serve gate-test reads from the replica");
+
+      // The 10 s hold is claimed once per process by the first order-gate
+      // acquisition; this MSET is the first client write on the source.
+      // "order-a"/"order-b" hash to different shards with four workers, so
+      // this request must take the global order gate.
+      auto paused_cross = std::async(std::launch::async, [gate_source_port] {
+        RespClient client = Connect(gate_source_port);
+        return client.Command(
+            {"MSET", "order-a", "paused-1", "order-b", "paused-2"});
+      });
+      // Do not guess with sleeps: the gate hold is in effect once the hook
+      // logs its marker.
+      const auto marker_deadline = std::chrono::steady_clock::now() + 30s;
+      bool marker_seen = false;
+      while (!marker_seen &&
+             std::chrono::steady_clock::now() < marker_deadline) {
+        marker_seen =
+            ReadFile(gate_log_path)
+                .find("KEYLANE_REPLICATION_ORDER_HOLD_MS holding") !=
+            std::string::npos;
+        if (!marker_seen) std::this_thread::sleep_for(20ms);
+      }
+      if (!marker_seen) Fail("order-gate hold did not engage for the MSET");
+
+      // Hashtag keys share one slot: this MSET is proven single-shard by
+      // kCmdKeyViewComplete and must skip the held global gate.
+      auto same_shard = std::async(std::launch::async, [gate_source_port] {
+        RespClient client = Connect(gate_source_port);
+        return client.Command({"MSET", "{og}a", "fast-1", "{og}b", "fast-2"});
+      });
+      if (same_shard.wait_for(5s) != std::future_status::ready) {
+        Fail("same-shard MSET blocked behind the replication order gate");
+      }
+      Expect(same_shard.get(), "+OK", "same-shard MSET during held gate");
+
+      // A second cross-shard MSET still serializes on the gate: it must be
+      // incomplete at the 5 s checkpoint and finish once the 10 s hold (and
+      // with it the first MSET's gate acquisition) ends.
+      auto blocked_cross = std::async(std::launch::async, [gate_source_port] {
+        RespClient client = Connect(gate_source_port);
+        return client.Command(
+            {"MSET", "order-c", "late-1", "order-d", "late-2"});
+      });
+      if (blocked_cross.wait_for(5s) == std::future_status::ready) {
+        Fail("cross-shard MSET completed while the order gate was held");
+      }
+      Expect(paused_cross.get(), "+OK", "held cross-shard MSET resumed");
+      if (blocked_cross.wait_for(20s) != std::future_status::ready) {
+        Fail("cross-shard MSET did not complete after the gate released");
+      }
+      Expect(blocked_cross.get(), "+OK", "queued cross-shard MSET");
+
+      const std::string gate_expected =
+          "*6\r\n" + Bulk("paused-1") + "\r\n" + Bulk("paused-2") + "\r\n" +
+          Bulk("fast-1") + "\r\n" + Bulk("fast-2") + "\r\n" +
+          Bulk("late-1") + "\r\n" + Bulk("late-2");
+      const auto gate_converge_deadline =
+          std::chrono::steady_clock::now() + 60s;
+      std::string gate_replicated;
+      while (std::chrono::steady_clock::now() < gate_converge_deadline) {
+        gate_replicated = gate_replica_client.Command(
+            {"MGET", "order-a", "order-b", "{og}a", "{og}b", "order-c",
+             "order-d"});
+        if (gate_replicated == gate_expected) break;
+        std::this_thread::sleep_for(20ms);
+      }
+      Expect(gate_replicated, gate_expected, "replicated gate-test effects");
+    }
+#endif
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
-              << ReadFile(log_path) << std::flush;
+              << ReadFile(log_path) << "\n--- gate-test log ---\n"
+              << ReadFile(gate_log_path) << std::flush;
     exit_code = 1;
   }
 
@@ -1158,6 +1280,9 @@ int main(int argc, char** argv) {
   (void)::unlink(log_path.c_str());
   (void)::unlink(source_data.c_str());
   (void)::unlink(replica_data.c_str());
+  (void)::unlink(gate_source_data.c_str());
+  (void)::unlink(gate_replica_data.c_str());
+  (void)::unlink(gate_log_path.c_str());
   std::cout << (exit_code == 0 ? "multikey e2e passed\n" : "") << std::flush;
   return exit_code;
 }

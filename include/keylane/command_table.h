@@ -34,6 +34,13 @@ enum CommandFlag : std::uint32_t {
   // this so read-only scripts can run on replicas while redis.call() rejects
   // the first attempted write.
   kCmdDynamicWrite = 1u << 11,
+  // DetermineKeys(spec, args) returns a key view that covers exactly the keys
+  // this command can turn into transaction participants / replication envelope
+  // flows. Only commands carrying this flag may skip the replication
+  // transaction order gate when their concrete key view lands on a single
+  // shard. Internal admission metadata: it must never surface as a
+  // Redis-visible COMMAND flag.
+  kCmdKeyViewComplete = 1u << 12,
 };
 
 // Key positions follow the Redis key-spec convention: `first_key` is the

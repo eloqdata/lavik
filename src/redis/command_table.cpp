@@ -15,6 +15,13 @@ namespace {
 constexpr std::uint32_t kKeyedRead = kCmdReadOnly | kCmdUsesDbGate;
 constexpr std::uint32_t kKeyedWrite = kCmdWrite | kCmdUsesDbGate;
 
+// kCmdKeyViewComplete audit legend: the flag is granted only where the
+// command's transaction participants / replication envelope flows are exactly
+// the shards of the keys returned by DetermineKeys(spec, args). Every
+// kCmdMultiShard && (kCmdWrite|kCmdDynamicWrite) && !kCmdMayBlock entry below
+// carries a "key view complete:" / "key view INCOMPLETE:" note with the
+// evidence; the classification is enforced by
+// CommandTableTest.ReplicationGateCandidatesAreClassified.
 constexpr CommandSpec kCommandTable[] = {
     {"ping", CommandKind::kPing, 1, 2, 0, 0, 1, kCmdNoKeys},
     {"echo", CommandKind::kEcho, 2, 2, 0, 0, 1, kCmdNoKeys},
@@ -30,19 +37,30 @@ constexpr CommandSpec kCommandTable[] = {
     {"auth", CommandKind::kAuth, 2, 3, 0, 0, 1, kCmdNoKeys},
     {"hello", CommandKind::kHello, 1, 7, 0, 0, 1, kCmdNoKeys},
     {"select", CommandKind::kSelect, 2, 2, 0, 0, 1, kCmdNoKeys},
+    // key view complete: ExecuteEval transacts on exactly the declared keys,
+    // and script-issued commands are hard-confined to that declared set
+    // ("Script attempted to access an undeclared key" in command.cpp), so the
+    // envelope's participants are always the view's shards.
     {"eval", CommandKind::kEval, 3, 0, 0, 0, 1,
-     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdKeyViewComplete},
     {"evalsha", CommandKind::kEvalSha, 3, 0, 0, 0, 1,
-     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdKeyViewComplete},
     {"eval_ro", CommandKind::kEvalRo, 3, 0, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"evalsha_ro", CommandKind::kEvalShaRo, 3, 0, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"script", CommandKind::kScript, 2, 0, 0, 0, 1, kCmdNoKeys},
+    // key view complete: FCALL runs the same confined script machinery as
+    // eval; declared keys are exactly the participant set.
     {"fcall", CommandKind::kFCall, 3, 0, 0, 0, 1,
-     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+     kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdKeyViewComplete},
     {"fcall_ro", CommandKind::kFCallRo, 3, 0, 0, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    // key view INCOMPLETE: kCmdNoKeys, so no key view exists to narrow on;
+    // library mutations (FUNCTION FLUSH/RESTORE) are process-global.
     {"function", CommandKind::kFunction, 2, 0, 0, 0, 1,
      kCmdDynamicWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdNoKeys},
     {"dbsize", CommandKind::kDbSize, 1, 1, 0, 0, 1,
@@ -52,6 +70,8 @@ constexpr CommandSpec kCommandTable[] = {
     {"type", CommandKind::kType, 2, 2, 1, 1, 1, kKeyedRead},
     {"dump", CommandKind::kDump, 2, 2, 1, 1, 1, kKeyedRead},
     {"restore", CommandKind::kRestore, 4, 0, 1, 1, 1, kKeyedWrite},
+    // key view INCOMPLETE: BY/GET patterns expand the lock set from the
+    // source's data at execution time (sort_command.cpp CollectPatternKeys).
     {"sort", CommandKind::kSort, 2, 0, 1, 1, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"sort_ro", CommandKind::kSortRo, 2, 0, 1, 1, 1, kKeyedRead},
@@ -73,8 +93,10 @@ constexpr CommandSpec kCommandTable[] = {
     {"bitpos", CommandKind::kBitPos, 3, 0, 1, 1, 1, kKeyedRead},
     {"bitfield", CommandKind::kBitField, 2, 0, 1, 1, 1, kKeyedWrite},
     {"bitfield_ro", CommandKind::kBitFieldRo, 2, 0, 1, 1, 1, kKeyedRead},
+    // key view complete: ExecuteBitOpCommand adds exactly args[2..] (dest +
+    // sources) to the transaction.
     {"bitop", CommandKind::kBitOp, 4, 0, 2, -1, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdKeyViewComplete},
     {"set", CommandKind::kSet, 3, 0, 1, 1, 1, kKeyedWrite},
     {"setex", CommandKind::kSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
     {"psetex", CommandKind::kPSetEx, 4, 4, 1, 1, 1, kKeyedWrite},
@@ -96,13 +118,18 @@ constexpr CommandSpec kCommandTable[] = {
     {"lrem", CommandKind::kLRem, 4, 4, 1, 1, 1, kKeyedWrite},
     {"ltrim", CommandKind::kLTrim, 4, 4, 1, 1, 1, kKeyedWrite},
     {"lpos", CommandKind::kLPos, 3, 0, 1, 1, 1, kKeyedRead},
-    {"lmove", CommandKind::kLMove, 5, 5, 1, 2, 1, kKeyedWrite | kCmdMultiShard},
+    // key view complete: ExecuteListMultiKey transacts on key_args {1,2}.
+    {"lmove", CommandKind::kLMove, 5, 5, 1, 2, 1,
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"rpoplpush", CommandKind::kRPopLPush, 3, 3, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     // LMPOP/BLMPOP have argument-dependent key ranges. Their handlers build
     // the concrete transaction key set after parsing numkeys.
+    // key view complete: ExecuteListMultiKey key_args = {2..2+numkeys-1},
+    // exactly the movable view below (LMPop is the non-blocking variant).
     {"lmpop", CommandKind::kLMPop, 4, 0, 2, 0, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdKeyViewComplete},
     {"blpop", CommandKind::kBLPop, 3, 0, 1, -2, 1,
      kKeyedWrite | kCmdMultiShard | kCmdMayBlock},
     {"brpop", CommandKind::kBRPop, 3, 0, 1, -2, 1,
@@ -133,26 +160,33 @@ constexpr CommandSpec kCommandTable[] = {
     {"sadd", CommandKind::kSAdd, 3, 0, 1, 1, 1, kKeyedWrite},
     {"scard", CommandKind::kSCard, 2, 2, 1, 1, 1, kKeyedRead},
     {"sdiff", CommandKind::kSDiff, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
+    // key view complete: ExecuteSetMultiKey adds exactly the view keys
+    // (destination arg1 + sources); writes land only on the destination.
     {"sdiffstore", CommandKind::kSDiffStore, 3, 0, 1, -1, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"sinter", CommandKind::kSInter, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
     {"sintercard", CommandKind::kSInterCard, 3, 0, 2, 0, 1,
      kKeyedRead | kCmdMultiShard | kCmdMovableKeys},
+    // key view complete: same ExecuteSetMultiKey argument as sdiffstore.
     {"sinterstore", CommandKind::kSInterStore, 3, 0, 1, -1, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"sismember", CommandKind::kSIsMember, 3, 3, 1, 1, 1, kKeyedRead},
     {"smembers", CommandKind::kSMembers, 2, 2, 1, 1, 1, kKeyedRead},
     {"smismember", CommandKind::kSMIsMember, 3, 0, 1, 1, 1, kKeyedRead},
-    {"smove", CommandKind::kSMove, 4, 4, 1, 2, 1, kKeyedWrite | kCmdMultiShard},
+    // key view complete: ExecuteSetMultiKey transacts on view keys {1,2} and
+    // writes only those two.
+    {"smove", CommandKind::kSMove, 4, 4, 1, 2, 1,
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"spop", CommandKind::kSPop, 2, 3, 1, 1, 1, kKeyedWrite},
     {"srandmember", CommandKind::kSRandMember, 2, 3, 1, 1, 1, kKeyedRead},
     {"srem", CommandKind::kSRem, 3, 0, 1, 1, 1, kKeyedWrite},
     {"sscan", CommandKind::kSScan, 3, 0, 1, 1, 1, kKeyedRead},
     {"sunion", CommandKind::kSUnion, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
+    // key view complete: same ExecuteSetMultiKey argument as sdiffstore.
     {"sunionstore", CommandKind::kSUnionStore, 3, 0, 1, -1, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"bzmpop", CommandKind::kBZMPop, 5, 0, 3, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
          kCmdMayBlock},
@@ -165,15 +199,20 @@ constexpr CommandSpec kCommandTable[] = {
     {"zcount", CommandKind::kZCount, 4, 4, 1, 1, 1, kKeyedRead},
     {"zincrby", CommandKind::kZIncrBy, 4, 4, 1, 1, 1, kKeyedWrite},
     {"zlexcount", CommandKind::kZLexCount, 4, 4, 1, 1, 1, kKeyedRead},
+    // key view complete: ExecuteZSetMultiPopAttempt transacts on
+    // ParseMultiPopShape key_args = {2..2+numkeys-1}, exactly the movable view.
     {"zmpop", CommandKind::kZMPop, 4, 0, 2, 0, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys |
+         kCmdKeyViewComplete},
     {"zmscore", CommandKind::kZMScore, 3, 0, 1, 1, 1, kKeyedRead},
     {"zpopmax", CommandKind::kZPopMax, 2, 3, 1, 1, 1, kKeyedWrite},
     {"zpopmin", CommandKind::kZPopMin, 2, 3, 1, 1, 1, kKeyedWrite},
     {"zrandmember", CommandKind::kZRandMember, 2, 4, 1, 1, 1, kKeyedRead},
     {"zrange", CommandKind::kZRange, 4, 0, 1, 1, 1, kKeyedRead},
+    // key view complete: ExecuteZSetMultiKey transacts on destination arg1
+    // plus source arg2; both sit inside the static {1,2} view.
     {"zrangestore", CommandKind::kZRangeStore, 5, 0, 1, 2, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdKeyViewComplete},
     {"zrangebylex", CommandKind::kZRangeByLex, 4, 0, 1, 1, 1, kKeyedRead},
     {"zrangebyscore", CommandKind::kZRangeByScore, 4, 0, 1, 1, 1, kKeyedRead},
     {"zrank", CommandKind::kZRank, 3, 0, 1, 1, 1, kKeyedRead},
@@ -193,32 +232,44 @@ constexpr CommandSpec kCommandTable[] = {
     {"zscore", CommandKind::kZScore, 3, 3, 1, 1, 1, kKeyedRead},
     {"zdiff", CommandKind::kZDiff, 3, 0, 2, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    // key view INCOMPLETE: the view below covers only the source keys; the
+    // destination arg1 joins the transaction separately (ExecuteZSetMultiKey).
     {"zdiffstore", CommandKind::kZDiffStore, 4, 0, 3, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"zinter", CommandKind::kZInter, 3, 0, 2, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"zintercard", CommandKind::kZInterCard, 3, 0, 2, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    // key view INCOMPLETE: same shape as zdiffstore (destination arg1 outside
+    // the source-only view).
     {"zinterstore", CommandKind::kZInterStore, 4, 0, 3, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"zunion", CommandKind::kZUnion, 3, 0, 2, 0, 1,
      kCmdReadOnly | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
+    // key view INCOMPLETE: same shape as zdiffstore (destination arg1 outside
+    // the source-only view).
     {"zunionstore", CommandKind::kZUnionStore, 4, 0, 3, 0, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"geoadd", CommandKind::kGeoAdd, 5, 0, 1, 1, 1, kKeyedWrite},
     {"geodist", CommandKind::kGeoDist, 4, 5, 1, 1, 1, kKeyedRead},
     {"geohash", CommandKind::kGeoHash, 2, 0, 1, 1, 1, kKeyedRead},
     {"geopos", CommandKind::kGeoPos, 2, 0, 1, 1, 1, kKeyedRead},
+    // key view INCOMPLETE: the optional STORE/STOREDIST destination is parsed
+    // by the GEO handler and joins the transaction from outside the view,
+    // which names only the mandatory source (see DetermineKeys below).
     {"georadius", CommandKind::kGeoRadius, 6, 0, 1, 1, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"georadius_ro", CommandKind::kGeoRadiusRo, 6, 0, 1, 1, 1, kKeyedRead},
+    // key view INCOMPLETE: same STORE/STOREDIST shape as georadius.
     {"georadiusbymember", CommandKind::kGeoRadiusByMember, 5, 0, 1, 1, 1,
      kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdMovableKeys},
     {"georadiusbymember_ro", CommandKind::kGeoRadiusByMemberRo, 5, 0, 1, 1, 1,
      kKeyedRead},
     {"geosearch", CommandKind::kGeoSearch, 7, 0, 1, 1, 1, kKeyedRead},
+    // key view complete: ExecuteZSetMultiKey transacts on destination arg1
+    // plus source arg2; both sit inside the static {1,2} view.
     {"geosearchstore", CommandKind::kGeoSearchStore, 8, 0, 1, 2, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdKeyViewComplete},
     {"xadd", CommandKind::kXAdd, 5, 0, 1, 1, 1, kKeyedWrite},
     {"xdel", CommandKind::kXDel, 3, 0, 1, 1, 1, kKeyedWrite},
     {"xlen", CommandKind::kXLen, 2, 2, 1, 1, 1, kKeyedRead},
@@ -254,21 +305,31 @@ constexpr CommandSpec kCommandTable[] = {
     {"pttl", CommandKind::kPttl, 2, 2, 1, 1, 1, kKeyedRead},
     {"expiretime", CommandKind::kExpireTime, 2, 2, 1, 1, 1, kKeyedRead},
     {"pexpiretime", CommandKind::kPExpireTime, 2, 2, 1, 1, 1, kKeyedRead},
-    {"del", CommandKind::kDel, 2, 0, 1, -1, 1, kKeyedWrite | kCmdMultiShard},
+    // key view complete: ExecuteMultiKey adds exactly the view keys.
+    {"del", CommandKind::kDel, 2, 0, 1, -1, 1,
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"unlink", CommandKind::kUnlink, 2, 0, 1, -1, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
+    // key view complete: ExecuteRename adds exactly args[1] and args[2]; the
+    // same-key shortcut touches one shard by construction.
     {"rename", CommandKind::kRename, 3, 3, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"renamenx", CommandKind::kRenameNx, 3, 3, 1, 2, 1,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
+    // key view complete: ExecuteCopy adds exactly args[1] and args[2]; the DB
+    // option changes the destination database, never the shard set.
     {"copy", CommandKind::kCopy, 3, 0, 1, 2, 1,
-     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard},
+     kCmdWrite | kCmdUsesDbGate | kCmdMultiShard | kCmdKeyViewComplete},
     {"exists", CommandKind::kExists, 2, 0, 1, -1, 1,
      kKeyedRead | kCmdMultiShard},
     {"touch", CommandKind::kTouch, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
-    {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2, kKeyedWrite | kCmdMultiShard},
+    // key view complete: ExecuteMultiKey adds exactly the view keys.
+    {"mset", CommandKind::kMSet, 3, 0, 1, -1, 2,
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
+    // key view complete: ExecuteMSetNx adds exactly the odd key arguments,
+    // which is what first=1, last=-1, step=2 resolves to.
     {"msetnx", CommandKind::kMSetNx, 3, 0, 1, -1, 2,
-     kKeyedWrite | kCmdMultiShard},
+     kKeyedWrite | kCmdMultiShard | kCmdKeyViewComplete},
     {"mget", CommandKind::kMGet, 2, 0, 1, -1, 1, kKeyedRead | kCmdMultiShard},
     {"multi", CommandKind::kMulti, 1, 1, 0, 0, 1, kCmdNoKeys},
     {"exec", CommandKind::kExec, 1, 1, 0, 0, 1, kCmdNoKeys},

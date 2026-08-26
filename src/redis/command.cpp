@@ -58,6 +58,7 @@
 #include "lua_eval.h"
 #include "set_command.h"
 #include "sort_command.h"
+#include "spdlog/spdlog.h"
 #include "stream_command.h"
 #include "string_command.h"
 #include "zset_command.h"
@@ -2013,6 +2014,34 @@ Task<absl::Status> BeginReplicationTransactionOrder(
     co_await celer::Yield(*ThisWorker().self_);
   }
   guard->Activate();
+#ifndef NDEBUG
+  // Test-only hold for the order-gate e2e: once per process, keep the freshly
+  // acquired gate for the configured span and log a marker the fixture polls,
+  // so the test observes gate admission behaviour instead of guessing with
+  // sleeps. The gate's real hold window (until participant markers are
+  // queued) is otherwise too short to observe deterministically.
+  static std::atomic<bool> order_hold_claimed = false;
+  const char* order_hold_text = std::getenv("KEYLANE_REPLICATION_ORDER_HOLD_MS");
+  bool expected_order_hold = false;
+  if (order_hold_text != nullptr &&
+      order_hold_claimed.compare_exchange_strong(
+          expected_order_hold, true, std::memory_order_acq_rel)) {
+    char* end = nullptr;
+    const unsigned long hold_ms = std::strtoul(order_hold_text, &end, 10);
+    if (end != order_hold_text && *end == '\0' && hold_ms != 0) {
+      spdlog::warn(
+          "KEYLANE_REPLICATION_ORDER_HOLD_MS holding the replication order "
+          "gate for {} ms",
+          hold_ms);
+      absl::Status held = co_await celer::SleepFor(
+          *ThisWorker().self_, std::chrono::milliseconds(hold_ms));
+      if (!held.ok()) {
+        guard->Release();
+        co_return held;
+      }
+    }
+  }
+#endif
   co_return absl::OkStatus();
 }
 
@@ -8425,6 +8454,25 @@ void EndReplicationTransactionOrder() noexcept {
   g_replication_transaction_order.store(false, std::memory_order_release);
 }
 
+bool RequestSpansMultipleShards(const CommandRequest& request) {
+  if (request.spec_ == nullptr || g_storage == nullptr) return true;
+  // Kinds without a proven-complete key view keep taking the gate; their
+  // DetermineKeys view may miss participants (e.g. SORT BY/GET patterns,
+  // GEORADIUS STORE destinations, ZUNIONSTORE's destination arg).
+  if ((request.spec_->flags_ & kCmdKeyViewComplete) == 0) return true;
+  const absl::StatusOr<KeyIndexView> keys =
+      DetermineKeys(*request.spec_, request.args_);
+  // Arity/syntax failures and keyless views keep today's behaviour: the
+  // handler reports the error later, and admission stays conservative.
+  if (!keys.ok() || keys->count() == 0) return true;
+  const unsigned first = ShardForKey(request.args_[keys->first_]);
+  for (std::size_t i = keys->first_ + keys->step_; i <= keys->last_;
+       i += keys->step_) {
+    if (ShardForKey(request.args_[i]) != first) return true;
+  }
+  return false;
+}
+
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication) {
   g_storage = engine;
@@ -9577,11 +9625,24 @@ Task<CommandReply> ExecuteCommandBody(
       g_storage->ReplicationLogActive() && (cmd_flags & kCmdMultiShard) != 0 &&
       (cmd_flags & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       (cmd_flags & kCmdMayBlock) == 0;
+  // The global order gate keeps cross-flow transactions in one source order
+  // so overlapping flow subsets cannot rendezvous into an arrival/ACK cycle
+  // on the replica; it only needs to cover the window until every
+  // participant marker is queued (ExecuteMultiKey releases it from the
+  // participants-entered hook). A request whose participants all land on one
+  // shard publishes at most a single-flow envelope, and a single-flow marker
+  // never joins a cross-flow rendezvous cycle, so it may skip the gate --
+  // the same argument the one-key MSET fast path below already relies on.
+  // FLUSH still holds the gate and publishes an all-flow control barrier; a
+  // skipped single-shard write waits on no other flow, so it cannot form a
+  // wait cycle with that barrier. The snapshot gate below is intentionally
+  // unchanged: FULLSYNC_CUT close/drain semantics are the snapshot gate's
+  // job, not this gate's.
   ReplicationTransactionOrderGuard local_replication_order;
   ReplicationTransactionOrderGuard* replication_order =
       preacquired_order != nullptr ? preacquired_order
                                    : &local_replication_order;
-  if (snapshot_transaction) {
+  if (snapshot_transaction && RequestSpansMultipleShards(request)) {
     if (!replication_order->active()) {
       absl::Status entered =
           co_await BeginReplicationTransactionOrder(replication_order);
@@ -10007,8 +10068,13 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
   if (!source_write) [[likely]] {
     co_return co_await ExecuteCommandBody(request, reply_builder, client_id);
   }
-  const bool ordered_mset =
-      request.kind_ == CommandKind::kMSet && g_replication != nullptr;
+  // Preacquire the order gate across publisher admission so a suspending
+  // admission cannot invert the order of two wide MSETs. Single-shard MSETs
+  // skip the gate for the same reason ExecuteCommandBody skips it: one
+  // participant flow cannot join a cross-flow rendezvous cycle.
+  const bool ordered_mset = request.kind_ == CommandKind::kMSet &&
+                            g_replication != nullptr &&
+                            RequestSpansMultipleShards(request);
   ReplicationTransactionOrderGuard replication_order;
   if (ordered_mset) {
     absl::Status entered =

@@ -237,15 +237,28 @@ fragment reassembly, and KRC1 decode failures instead cancel the session
 without explicitly invalidating the prior continuation state.
 
 Source-side cross-flow transaction and control publication uses one
-process-global ordering slot. A replicated standalone `MSET` acquires it before
-publisher admission or database gating, admits its participant workers in
-parallel, and releases it as soon as every participant marker is queued rather
-than holding it across storage I/O. `EXEC` and database-control publication use
-the same slot for their ordering boundary; `FLUSH` acquires it before closing
-database gates, and full-sync cut closes and drains the snapshot-transaction
-gate before database gates. The shared command-layer helper cooperatively
-yields while the slot is held, but blocking List and Sorted Set attempt paths
-still retry the same acquisition after 1 ms sleeps.
+process-global ordering slot. Unless its concrete key set lands on a single
+shard (see the dynamic admission below), a replicated standalone `MSET`
+acquires it before publisher admission or database gating, admits its
+participant workers in parallel, and releases it as soon as every participant
+marker is queued rather than holding it across storage I/O. `EXEC` and
+database-control publication use the same slot for their ordering boundary;
+`FLUSH` acquires it before closing database gates, and full-sync cut closes
+and drains the snapshot-transaction gate before database gates. The shared
+command-layer helper cooperatively yields while the slot is held, but blocking
+List and Sorted Set attempt paths still retry the same acquisition after
+1 ms sleeps.
+
+Admission onto the slot is dynamic rather than static-flag based. A request
+whose command kind carries `kCmdKeyViewComplete` and whose concrete
+`DetermineKeys` view maps to a single shard skips the slot entirely: a
+single-flow envelope cannot join a cross-flow rendezvous cycle, so ordering it
+against other flows buys nothing. Gate-eligible writes whose execution-time
+participant sets can exceed their key view keep serializing on it, including
+`SORT` with BY/GET patterns, `GEORADIUS` with STORE/STOREDIST, and the
+aggregate sorted-set STORE variants; command kinds without the proven-complete
+flag fail conservative and always serialize. `EXEC` keeps the slot regardless
+of how many shards its queued writes touch.
 
 The MSET pre-acquisition fixes only that command's order-slot/DB inversion. Its
 body still acquires database admission before snapshot-transaction admission,
