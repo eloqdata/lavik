@@ -63,12 +63,12 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   }
   const std::uint64_t now_ms = UnixTimeMillis();
   const bool exists = found != nullptr &&
-                      found->value_.kind_ == RecordKind::kValue &&
+                      found->value_.kind() == RecordKind::kValue &&
                       !IsExpired(found->value_, now_ms);
   if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
   SetResult result;
   if (options.return_old_value_ && exists) {
-    if (found->value_.value_type_ != ValueType::kString) {
+    if (found->value_.value_type() != ValueType::kString) {
       co_return absl::Status(
           absl::StatusCode::kInvalidArgument,
           "WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -144,7 +144,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     found = *resolved;
   }
   const std::uint64_t now_ms = UnixTimeMillis();
-  if (found == nullptr || found->value_.kind_ != RecordKind::kValue ||
+  if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
       IsExpired(found->value_, now_ms)) {
     co_return false;
   }
@@ -189,7 +189,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
                          value_bytes.size());
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, value, RecordKind::kValue,
-      previous.value_type_, expire_at_ms, tx, previous.logical_size_, nullptr,
+      previous.value_type(), expire_at_ms, tx, previous.logical_size_, nullptr,
       nullptr, replication);
   if (!status.ok()) {
     co_return status;
@@ -225,7 +225,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
     }
     found = *resolved;
   }
-  if (found == nullptr || found->value_.kind_ == RecordKind::kTombstone) {
+  if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
     co_return false;
   }
   const bool expired = IsExpired(found->value_, UnixTimeMillis());
@@ -466,7 +466,7 @@ Task<absl::Status> StorageEngine::Impl::CommitTxWrites(
   // instead of waiting out the periodic flush: until it lands, a crash
   // drops the whole (acknowledged but never durability-promised)
   // transaction.
-  RequestFlush(store, commit_location.block_id_);
+  RequestFlush(store, commit_location.block_id());
   co_return absl::OkStatus();
 }
 
@@ -474,9 +474,8 @@ namespace {
 
 constexpr std::size_t kTxCommitBatchSize = 256;
 
-void MergeTxCommitFence(
-    std::vector<RelocationDurabilityFence>* merged,
-    const TxShardWrites::Fence& fence) {
+void MergeTxCommitFence(std::vector<RelocationDurabilityFence>* merged,
+                        const TxShardWrites::Fence& fence) {
   for (RelocationDurabilityFence& existing : *merged) {
     if (existing.block_id_ == fence.block_id_ &&
         existing.allocation_epoch_ == fence.allocation_epoch_ &&
@@ -496,8 +495,8 @@ void MergeTxCommitFence(
 
 }  // namespace
 
-bool StorageEngine::Impl::EnqueueTxCommit(
-    std::uint64_t txid, std::vector<TxShardWrites> writes) {
+bool StorageEngine::Impl::EnqueueTxCommit(std::uint64_t txid,
+                                          std::vector<TxShardWrites> writes) {
   assert(txid != 0);
 #ifndef NDEBUG
   for (const TxShardWrites& shard : writes) {
@@ -515,10 +514,9 @@ bool StorageEngine::Impl::EnqueueTxCommit(
   const std::uint64_t depth =
       tx_commit_queue_depth_.fetch_add(1, std::memory_order_acq_rel) + 1;
   std::uint64_t peak = tx_commit_queue_peak_.load(std::memory_order_relaxed);
-  while (depth > peak &&
-         !tx_commit_queue_peak_.compare_exchange_weak(
-             peak, depth, std::memory_order_release,
-             std::memory_order_relaxed)) {
+  while (depth > peak && !tx_commit_queue_peak_.compare_exchange_weak(
+                             peak, depth, std::memory_order_release,
+                             std::memory_order_relaxed)) {
   }
   if (!store.tx_commit_runner_) {
     store.tx_commit_runner_ = true;
@@ -539,8 +537,7 @@ Task<absl::Status> StorageEngine::Impl::WaitForTxCommitCapacity() {
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(
-    WorkerStore* store) {
+Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(WorkerStore* store) {
   while (!store->tx_commit_queue_.empty()) {
     std::vector<WorkerStore::PendingTxCommit> batch;
     const std::size_t count =
@@ -555,8 +552,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(
       store->tx_commit_capacity_.NotifyAll(*store->worker_);
     }
     tx_commit_batches_.fetch_add(1, std::memory_order_relaxed);
-    tx_commit_batch_transactions_.fetch_add(count,
-                                            std::memory_order_relaxed);
+    tx_commit_batch_transactions_.fetch_add(count, std::memory_order_relaxed);
 
     // Transactions sharing a participant's active transaction block also
     // share a durability frontier. Trigger every unique frontier before
@@ -572,8 +568,7 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(
         }
       }
     }
-    tx_commit_input_fences_.fetch_add(input_fences,
-                                      std::memory_order_relaxed);
+    tx_commit_input_fences_.fetch_add(input_fences, std::memory_order_relaxed);
     tx_commit_merged_fences_.fetch_add(fences.size(),
                                        std::memory_order_relaxed);
 
@@ -600,10 +595,10 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCommitQueue(
             RequestFlush(owner, fence.block_id_);
           }
           co_return owner.write_failed_
-                        ? absl::InternalError(
-                              "storage write failed while starting "
-                              "transaction batch flush")
-                        : absl::OkStatus();
+              ? absl::InternalError(
+                    "storage write failed while starting "
+                    "transaction batch flush")
+              : absl::OkStatus();
         };
         absl::Status requested =
             fence.block_owner_ == celer::ThisWorker().id_
@@ -685,7 +680,7 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       std::string_view restored_payload;
       std::optional<LoadedValue> restored;
       if (entry.previous_.has_value() &&
-          entry.previous_->kind_ == RecordKind::kValue) {
+          entry.previous_->kind() == RecordKind::kValue) {
         auto loaded = co_await LoadValue(
             store, partition, entry.db_id_, undo_key, undo_digest,
             *entry.previous_, entry.previous_extents_);
@@ -699,10 +694,10 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
             reinterpret_cast<const char*>(bytes.data()), bytes.size());
       }
       const RecordKind restored_kind = entry.previous_.has_value()
-                                           ? entry.previous_->kind_
+                                           ? entry.previous_->kind()
                                            : RecordKind::kTombstone;
       const ValueType restored_type = restored_kind == RecordKind::kValue
-                                          ? entry.previous_->value_type_
+                                          ? entry.previous_->value_type()
                                           : ValueType::kNone;
       const std::uint64_t restored_expiry = restored_kind == RecordKind::kValue
                                                 ? entry.previous_->expire_at_ms_
@@ -710,11 +705,10 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       const std::uint64_t restored_size = restored_kind == RecordKind::kValue
                                               ? entry.previous_->logical_size_
                                               : 0;
-      absl::Status appended =
-          co_await AppendLocked(store, partition, entry.db_id_, undo_key,
-                                undo_digest, restored_payload, restored_kind,
-                                restored_type, restored_expiry, compensation,
-                                restored_size);
+      absl::Status appended = co_await AppendLocked(
+          store, partition, entry.db_id_, undo_key, undo_digest,
+          restored_payload, restored_kind, restored_type, restored_expiry,
+          compensation, restored_size);
       if (!appended.ok()) {
         store.write_failed_ = true;
         co_return appended;
@@ -742,8 +736,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
     const ExtentManifest applied_extents = ExtentsFor(store, entry.entry_);
     const ExtentManifest applied_dependent_extents =
         DependentExtentsFor(store, entry.entry_);
-    const bool applied_live = applied.kind_ == RecordKind::kValue;
-    const bool restored_live = entry.previous_->kind_ == RecordKind::kValue;
+    const bool applied_live = applied.kind() == RecordKind::kValue;
+    const bool restored_live = entry.previous_->kind() == RecordKind::kValue;
     if (applied_live != restored_live) {
       if (restored_live) {
         ++partition.live_key_count_[entry.db_id_];
@@ -764,13 +758,13 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       }
     }
     entry.entry_->value_ = *entry.previous_;
-    if (entry.previous_->external_) {
+    if (entry.previous_->external()) {
       store.external_manifests_.insert_or_assign(entry.entry_,
                                                  entry.previous_extents_);
     } else {
       store.external_manifests_.erase(entry.entry_);
     }
-    if (applied.external_ && !applied.key_external_ &&
+    if (applied.external() && !applied.key_external() &&
         applied_extents != nullptr) {
       SpawnExtentReclaim(store, ExtentsNotReferencedBy(
                                     applied_extents, entry.previous_extents_));
@@ -782,8 +776,8 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       store.write_failed_ = true;
       co_return dead;
     }
-    UnpinTxDependencyLocal(store, entry.previous_->block_id_,
-                           entry.previous_->allocation_epoch_);
+    UnpinTxDependencyLocal(store, entry.previous_->block_id(),
+                           entry.previous_->allocation_epoch());
   }
   co_return absl::OkStatus();
 }
@@ -813,10 +807,9 @@ Task<absl::Status> StorageEngine::Impl::MarkRetiredRecordsDead(
     if (owner == celer::ThisWorker().id_) {
       dead = MarkRecordDeadLocal(owner, record);
     } else {
-      dead = co_await celer::SubmitTo(
-          owner, [this, owner, record] {
-            return MarkRecordDeadLocal(owner, record);
-          });
+      dead = co_await celer::SubmitTo(owner, [this, owner, record] {
+        return MarkRecordDeadLocal(owner, record);
+      });
     }
     if (!dead.ok()) {
       // The inline path fails the client write on an accounting error; here
@@ -1862,18 +1855,9 @@ acquire_active_stream:
     active_stream() = updated;
   }
 
-  const RecordLocation location{
-      .block_id_ = updated.block_id_,
-      .mutation_sequence_ = mutation_sequence,
-      .allocation_epoch_ = updated.allocation_epoch_,
-      .expire_at_ms_ = expire_at_ms,
-      .logical_size_ = static_cast<std::uint32_t>(logical_size),
-      .record_offset_ = record_offset,
-      .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
-      .block_owner_ = writer_id,
-      .in_memory_ = true,
-      .external_ = external,
-      .key_external_ = key_external,
+  const RecordLocation location(
+      updated.block_id_, mutation_sequence, updated.allocation_epoch_,
+      expire_at_ms, static_cast<std::uint32_t>(logical_size),
       // A relocation rewrites the same logical version, so it carries the
       // bit unchanged. A real overwrite shields what its predecessor was
       // shielding, plus the buried value itself — but only if that value
@@ -1882,25 +1866,31 @@ acquire_active_stream:
       // its timestamp whenever this entry may be dropped. Records with no
       // deadline of their own (tombstones, TTL-less values) must judge
       // against now instead, since their successors' deadlines are unknown.
-      .shielding_ = previous.has_value() &&
-                    (relocation != nullptr
-                         ? previous->shielding_
-                         : (previous->shielding_ ||
-                            (previous->kind_ == RecordKind::kValue &&
-                             (previous->expire_at_ms_ == 0 ||
-                              previous->expire_at_ms_ >
-                                  std::max(expire_at_ms, UnixTimeMillis()))))),
-      .tx_tagged_ = txid != 0 && kind != RecordKind::kTxCommit,
-      .kind_ = kind,
-      .value_type_ = value_type,
-  };
+      RecordLocation::PackedMetadata::Encode(
+          record_offset, static_cast<std::uint32_t>(total_disk_bytes),
+          writer_id, true, external, key_external,
+          previous.has_value() &&
+              (relocation != nullptr
+                   ? previous->shielding()
+                   : (previous->shielding() ||
+                      (previous->kind() == RecordKind::kValue &&
+                       (previous->expire_at_ms_ == 0 ||
+                        previous->expire_at_ms_ >
+                            std::max(expire_at_ms, UnixTimeMillis()))))),
+          false, txid != 0 && kind != RecordKind::kTxCommit,
+          // Commit records never enter the key index. Their temporary
+          // RecordLocation is used only to request the destination block's
+          // flush, so encode the packed, index-only type state as its empty
+          // default rather than spending one of the five reserve bits.
+          kind == RecordKind::kTxCommit ? RecordKind::kValue : kind,
+          value_type));
   if (transaction_append) {
     NoteTxRecordLocal(store, updated.block_id_, updated.allocation_epoch_,
-                      tx_generation, txid, location.total_disk_bytes_,
+                      tx_generation, txid, location.total_disk_bytes(),
                       kind == RecordKind::kTxCommit);
   }
   const bool was_live =
-      previous.has_value() && previous->kind_ == RecordKind::kValue;
+      previous.has_value() && previous->kind() == RecordKind::kValue;
   const bool is_live = kind == RecordKind::kValue;
   const bool was_expiring = was_live && previous->expire_at_ms_ != 0;
   const bool is_expiring = is_live && expire_at_ms != 0;
@@ -1928,8 +1918,8 @@ acquire_active_stream:
       .entry_ = inserted_entry,
       .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
                                   !route_to_commit && previous.has_value() &&
-                                  previous->external_ &&
-                                  !previous->key_external_
+                                  previous->external() &&
+                                  !previous->key_external()
                               ? retired_value_extents
                               : nullptr,
       .retired_record_ = (!for_defrag || defer_defrag_retirement) &&
@@ -1955,17 +1945,17 @@ acquire_active_stream:
     // must still find the old copy — so its retirement travels with the
     // transaction instead of this record's flush.
     tx->retirements_.push_back(TxShardWrites::Retired{
-        .block_id_ = previous->block_id_,
-        .allocation_epoch_ = previous->allocation_epoch_,
-        .total_disk_bytes_ = previous->total_disk_bytes_,
-        .block_owner_ = previous->block_owner_,
-        .record_offset_ = previous->record_offset_,
-        .tx_tagged_ = previous->tx_tagged_,
+        .block_id_ = previous->block_id(),
+        .allocation_epoch_ = previous->allocation_epoch(),
+        .total_disk_bytes_ = previous->total_disk_bytes(),
+        .block_owner_ = previous->block_owner(),
+        .record_offset_ = previous->record_offset(),
+        .tx_tagged_ = previous->tx_tagged(),
         .dependency_pinned_ = dependency_pinned,
         .dependent_extents_ =
-            previous->key_external_ ? previous_dependent_extents : nullptr,
+            previous->key_external() ? previous_dependent_extents : nullptr,
         .immediate_extents_ =
-            previous->key_external_ ? nullptr : retired_value_extents,
+            previous->key_external() ? nullptr : retired_value_extents,
     });
   }
   if (tx != nullptr) {
@@ -2032,7 +2022,7 @@ acquire_active_stream:
   staging_state->committed_bytes_ = updated.committed_bytes_;
   staging_state->record_count_ = updated.record_count_;
   staging_state->max_lsn_ = updated.max_lsn_;
-  state.live_bytes_ += location.total_disk_bytes_;
+  state.live_bytes_ += location.total_disk_bytes();
   state.flush_queued_ = updated.committed_bytes_ == kStorageBlockBytes;
   // A superseded record stays in its block's live_bytes until this record's
   // flush completes (the RecordIdentity above carries it there): the old copy
@@ -2049,7 +2039,7 @@ acquire_active_stream:
       co_return dead;
     }
   }
-  if (!for_defrag && previous.has_value() && previous->external_) {
+  if (!for_defrag && previous.has_value() && previous->external()) {
     RequestFlush(store, updated.block_id_);
     if (active_stream().has_value() &&
         active_stream()->block_id_ == updated.block_id_) {

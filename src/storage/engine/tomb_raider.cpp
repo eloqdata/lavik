@@ -308,10 +308,10 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
           co_return absl::OkStatus();  // forfeit the round
         }
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
-          if (entry.value_.kind_ == RecordKind::kTombstone ||
-              (entry.value_.kind_ == RecordKind::kValue &&
-               entry.value_.shielding_)) {
-            entry.value_.unclaimed_ = true;
+          if (entry.value_.kind() == RecordKind::kTombstone ||
+              (entry.value_.kind() == RecordKind::kValue &&
+               entry.value_.shielding())) {
+            entry.value_.set_unclaimed(true);
           }
         });
         if (++steps % 256 == 0) {
@@ -335,9 +335,9 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
         co_return resolved.status();
       }
       auto* entry = *resolved;
-      if (entry != nullptr && entry->value_.unclaimed_ &&
+      if (entry != nullptr && entry->value_.unclaimed() &&
           claim.mutation_sequence_ < entry->value_.mutation_sequence_) {
-        entry->value_.unclaimed_ = false;
+        entry->value_.set_unclaimed(false);
       }
     }
     if (++handled % 256 == 0) {
@@ -596,19 +596,19 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       std::uint64_t cursor = 0;
       do {
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
-          if (!entry.value_.unclaimed_) {
+          if (!entry.value_.unclaimed()) {
             return;
           }
-          if (entry.value_.kind_ == RecordKind::kValue) {
+          if (entry.value_.kind() == RecordKind::kValue) {
             // The sweep found nothing this value was shielding: the sticky
             // bit outlived whatever it once protected. Its next expiry can
             // take the in-memory path.
-            entry.value_.unclaimed_ = false;
-            if (entry.value_.shielding_) {
-              entry.value_.shielding_ = false;
+            entry.value_.set_unclaimed(false);
+            if (entry.value_.shielding()) {
+              entry.value_.set_shielding(false);
               ++refreshed;
             }
-          } else if (entry.value_.kind_ == RecordKind::kTombstone) {
+          } else if (entry.value_.kind() == RecordKind::kTombstone) {
             tombs.push_back(Candidate{
                 .digest_ = entry.key_complete() ? ComputeDigest(entry.key())
                                                 : entry.external_key_digest(),
@@ -654,8 +654,8 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       co_return resolved.status();
     }
     auto* entry = *resolved;
-    if (entry == nullptr || entry->value_.kind_ != RecordKind::kTombstone ||
-        !entry->value_.unclaimed_) {
+    if (entry == nullptr || entry->value_.kind() != RecordKind::kTombstone ||
+        !entry->value_.unclaimed()) {
       continue;  // rewritten or claimed since collection
     }
     const RecordLocation dropped = entry->value_;

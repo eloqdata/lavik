@@ -8,6 +8,10 @@
 
 namespace keylane {
 
+// Worker IDs occupy ten bits in storage's runtime record-location index. Keep
+// memory admission and that representation on the same process-wide limit.
+inline constexpr unsigned kMaxMemoryWorkers = 1024;
+
 struct MemoryStats {
   std::uint64_t used_bytes_ = 0;
   std::uint64_t rss_bytes_ = 0;

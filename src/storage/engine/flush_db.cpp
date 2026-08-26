@@ -329,16 +329,16 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
     detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
       BlockDelta& delta = dead_by_block[std::pair(
-          entry.value_.block_id_, entry.value_.allocation_epoch_)];
-      delta.block_owner_ = entry.value_.block_owner_;
-      delta.bytes_ += entry.value_.total_disk_bytes_;
-      if (entry.value_.tx_tagged_) {
-        delta.tagged_bytes_ += entry.value_.total_disk_bytes_;
+          entry.value_.block_id(), entry.value_.allocation_epoch())];
+      delta.block_owner_ = entry.value_.block_owner();
+      delta.bytes_ += entry.value_.total_disk_bytes();
+      if (entry.value_.tx_tagged()) {
+        delta.tagged_bytes_ += entry.value_.total_disk_bytes();
       }
-      if (entry.value_.external_) {
+      if (entry.value_.external()) {
         auto manifest = store.external_manifests_.find(&entry);
         if (manifest != store.external_manifests_.end()) {
-          if (entry.value_.key_external_) [[unlikely]] {
+          if (entry.value_.key_external()) [[unlikely]] {
             delta.dependent_extents_.push_back(std::move(manifest->second));
           } else {
             dead_extents.push_back(std::move(manifest->second));

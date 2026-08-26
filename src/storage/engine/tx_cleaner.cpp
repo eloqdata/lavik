@@ -15,8 +15,8 @@ std::int64_t MonotonicMillis() noexcept {
 
 }  // namespace
 
-void StorageEngine::Impl::InitializeTxWrites(
-    std::uint64_t txid, std::span<TxShardWrites> writes) {
+void StorageEngine::Impl::InitializeTxWrites(std::uint64_t txid,
+                                             std::span<TxShardWrites> writes) {
   if (writes.empty()) return;
 
   const std::uint64_t generation =
@@ -26,11 +26,11 @@ void StorageEngine::Impl::InitializeTxWrites(
   if (slot == nullptr) slot = std::make_shared<TxGenerationRuntime>();
   const std::shared_ptr<TxGenerationRuntime> state = slot;
 
-  auto lease = std::shared_ptr<void>(
-      new std::uint8_t{0}, [this, state](void* token) {
+  auto lease =
+      std::shared_ptr<void>(new std::uint8_t{0}, [this, state](void* token) {
         delete static_cast<std::uint8_t*>(token);
-        const std::uint64_t previous = state->active_transactions_.fetch_sub(
-            1, std::memory_order_acq_rel);
+        const std::uint64_t previous =
+            state->active_transactions_.fetch_sub(1, std::memory_order_acq_rel);
         assert(previous != 0);
         tx_cleaner_dirty_.store(true, std::memory_order_release);
       });
@@ -57,10 +57,12 @@ void StorageEngine::Impl::RegisterRecoveredTxGeneration(
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
-void StorageEngine::Impl::NoteTxRecordLocal(
-    WorkerStore& store, std::uint64_t block_id,
-    std::uint64_t allocation_epoch, std::uint64_t generation,
-    std::uint64_t txid, std::uint32_t bytes, bool commit) {
+void StorageEngine::Impl::NoteTxRecordLocal(WorkerStore& store,
+                                            std::uint64_t block_id,
+                                            std::uint64_t allocation_epoch,
+                                            std::uint64_t generation,
+                                            std::uint64_t txid,
+                                            std::uint32_t bytes, bool commit) {
   assert(generation != 0 && txid != 0 && bytes != 0);
   WorkerStore::TxBlockRuntime& block = store.tx_blocks_[block_id];
   if (block.allocation_epoch_ != allocation_epoch ||
@@ -82,9 +84,10 @@ void StorageEngine::Impl::NoteTxRecordLocal(
   tx_cleaner_dirty_.store(true, std::memory_order_release);
 }
 
-void StorageEngine::Impl::DropTaggedRecordLocal(
-    WorkerStore& store, std::uint64_t block_id,
-    std::uint64_t allocation_epoch, std::uint32_t bytes) noexcept {
+void StorageEngine::Impl::DropTaggedRecordLocal(WorkerStore& store,
+                                                std::uint64_t block_id,
+                                                std::uint64_t allocation_epoch,
+                                                std::uint32_t bytes) noexcept {
   const auto found = store.tx_blocks_.find(block_id);
   if (found == store.tx_blocks_.end() ||
       found->second.allocation_epoch_ != allocation_epoch) {
@@ -97,9 +100,9 @@ void StorageEngine::Impl::DropTaggedRecordLocal(
 
 bool StorageEngine::Impl::PinTxDependencyLocal(
     WorkerStore& store, const RecordLocation& location) noexcept {
-  const auto found = store.tx_blocks_.find(location.block_id_);
+  const auto found = store.tx_blocks_.find(location.block_id());
   if (found == store.tx_blocks_.end() ||
-      found->second.allocation_epoch_ != location.allocation_epoch_) {
+      found->second.allocation_epoch_ != location.allocation_epoch()) {
     return false;
   }
   ++found->second.dependency_pins_;
@@ -143,9 +146,9 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner() {
     co_return absl::OkStatus();
   }
   bool expected = false;
-  if (!tx_cleaner_running_.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel,
-          std::memory_order_acquire)) {
+  if (!tx_cleaner_running_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
     co_return absl::OkStatus();
   }
   struct RunningGuard {
@@ -154,8 +157,8 @@ Task<absl::Status> StorageEngine::Impl::MaybeRunTxCleaner() {
   } guard{&tx_cleaner_running_};
 
   tx_cleaner_dirty_.store(false, std::memory_order_release);
-  tx_cleaner_next_run_ms_.store(
-      now + static_cast<std::int64_t>(cooldown), std::memory_order_release);
+  tx_cleaner_next_run_ms_.store(now + static_cast<std::int64_t>(cooldown),
+                                std::memory_order_release);
   tx_cleaner_rounds_.fetch_add(1, std::memory_order_relaxed);
   absl::Status status = absl::OkStatus();
 #ifndef NDEBUG
@@ -214,18 +217,17 @@ StorageEngine::Impl::InspectTxGenerationLocal(WorkerStore& store,
     result.active_transactions_ =
         runtime->second->active_transactions_.load(std::memory_order_acquire);
     result.committed_txids_.assign(runtime->second->committed_txids_.begin(),
-                                  runtime->second->committed_txids_.end());
+                                   runtime->second->committed_txids_.end());
   }
   for (const auto& [block_id, tx_block] : store.tx_blocks_) {
     if (tx_block.generation_ != generation) continue;
     const BlockState* state = FindBlockState(store, block_id);
-    const bool durable = state != nullptr && state->allocated_ &&
-                         state->allocation_epoch_ ==
-                             tx_block.allocation_epoch_ &&
-                         state->kind_ == BlockKind::kTransaction &&
-                         !IsActiveBlock(store, block_id) &&
-                         !state->in_memory_ && !state->flush_queued_ &&
-                         !state->flush_in_progress_ && !state->freeing_;
+    const bool durable =
+        state != nullptr && state->allocated_ &&
+        state->allocation_epoch_ == tx_block.allocation_epoch_ &&
+        state->kind_ == BlockKind::kTransaction &&
+        !IsActiveBlock(store, block_id) && !state->in_memory_ &&
+        !state->flush_queued_ && !state->flush_in_progress_ && !state->freeing_;
     result.sealed_and_durable_ &= durable;
     result.live_tagged_bytes_ += tx_block.live_tagged_bytes_;
     result.dependency_pins_ += tx_block.dependency_pins_;
@@ -239,9 +241,8 @@ StorageEngine::Impl::InspectTxGenerationLocal(WorkerStore& store,
   co_return result;
 }
 
-Task<std::vector<std::uint64_t>>
-StorageEngine::Impl::ListTxGenerationsLocal(WorkerStore& store,
-                                            std::uint64_t closed_before) {
+Task<std::vector<std::uint64_t>> StorageEngine::Impl::ListTxGenerationsLocal(
+    WorkerStore& store, std::uint64_t closed_before) {
   co_await store.store_state_mutex_.Lock();
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   std::vector<std::uint64_t> generations;
@@ -258,7 +259,7 @@ Task<bool> StorageEngine::Impl::TxGenerationHasRecordsLocal(
   UnlockGuard unlock(&store.store_state_mutex_, store.worker_);
   const auto runtime = store.tx_generations_.find(generation);
   co_return runtime != store.tx_generations_.end() &&
-            runtime->second->has_records_;
+      runtime->second->has_records_;
 }
 
 Task<absl::Status> StorageEngine::Impl::ForgetTxGenerationLocal(
@@ -339,13 +340,13 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
     for (const auto& [block_id, tx_block] : store.tx_blocks_) {
       if (tx_block.generation_ != generation) continue;
       const BlockState* state = FindBlockState(store, block_id);
-      if (state == nullptr || state->allocation_epoch_ !=
-                                  tx_block.allocation_epoch_ ||
+      if (state == nullptr ||
+          state->allocation_epoch_ != tx_block.allocation_epoch_ ||
           state->kind_ != BlockKind::kTransaction || state->in_memory_ ||
           state->flush_queued_ || state->flush_in_progress_ ||
           state->defragging_ || state->freeing_ || state->pins_ != 0 ||
-          tx_block.live_tagged_bytes_ != 0 ||
-          tx_block.dependency_pins_ != 0 || IsActiveBlock(store, block_id)) {
+          tx_block.live_tagged_bytes_ != 0 || tx_block.dependency_pins_ != 0 ||
+          IsActiveBlock(store, block_id)) {
         co_return absl::FailedPreconditionError(
             "transaction generation changed before retirement");
       }
@@ -381,11 +382,11 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     bool local_has_records = false;
     if (owner == coordinator) {
-      local_has_records = co_await TxGenerationHasRecordsLocal(
-          *stores_[owner], current);
+      local_has_records =
+          co_await TxGenerationHasRecordsLocal(*stores_[owner], current);
     } else {
-      local_has_records = co_await celer::SubmitTaskTo(
-          owner, [this, owner, current]() {
+      local_has_records =
+          co_await celer::SubmitTaskTo(owner, [this, owner, current]() {
             return TxGenerationHasRecordsLocal(*stores_[owner], current);
           });
     }
@@ -415,8 +416,8 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
     if (owner == coordinator) {
       local = co_await ListTxGenerationsLocal(*stores_[owner], closed_before);
     } else {
-      local = co_await celer::SubmitTaskTo(
-          owner, [this, owner, closed_before]() {
+      local =
+          co_await celer::SubmitTaskTo(owner, [this, owner, closed_before]() {
             return ListTxGenerationsLocal(*stores_[owner], closed_before);
           });
     }
@@ -427,8 +428,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
                     generations.end());
 
   for (std::uint64_t generation : generations) {
-    auto committed =
-        std::make_shared<absl::flat_hash_set<std::uint64_t>>();
+    auto committed = std::make_shared<absl::flat_hash_set<std::uint64_t>>();
     std::uint64_t active_transactions = 0;
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       absl::StatusOr<TxGenerationLocalState> local;
@@ -436,11 +436,10 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
         local = co_await InspectTxGenerationLocal(*stores_[owner], generation,
                                                   false);
       } else {
-        local = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation]() {
-              return InspectTxGenerationLocal(*stores_[owner], generation,
-                                               false);
-            });
+        local = co_await celer::SubmitTaskTo(owner, [this, owner,
+                                                     generation]() {
+          return InspectTxGenerationLocal(*stores_[owner], generation, false);
+        });
       }
       if (!local.ok()) co_return local.status();
       active_transactions += local->active_transactions_;
@@ -461,11 +460,10 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
         local = co_await InspectTxGenerationLocal(*stores_[owner], generation,
                                                   true);
       } else {
-        local = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation]() {
-              return InspectTxGenerationLocal(*stores_[owner], generation,
-                                               true);
-            });
+        local = co_await celer::SubmitTaskTo(owner, [this, owner,
+                                                     generation]() {
+          return InspectTxGenerationLocal(*stores_[owner], generation, true);
+        });
       }
       if (!local.ok()) co_return local.status();
       readiness.active_transactions_ += local->active_transactions_;
@@ -475,14 +473,14 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
       committed->insert(local->committed_txids_.begin(),
                         local->committed_txids_.end());
     }
-    if (readiness.active_transactions_ != 0 ||
-        !readiness.sealed_and_durable_) {
+    if (readiness.active_transactions_ != 0 || !readiness.sealed_and_durable_) {
       tx_cleaner_dirty_.store(true, std::memory_order_release);
       continue;
     }
 
-    auto frozen_committed = std::shared_ptr<
-        const absl::flat_hash_set<std::uint64_t>>(std::move(committed));
+    auto frozen_committed =
+        std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>(
+            std::move(committed));
     for (unsigned owner = 0; owner < worker_count_; ++owner) {
       absl::Status promoted;
       if (owner == coordinator) {
@@ -492,7 +490,7 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
         promoted = co_await celer::SubmitTaskTo(
             owner, [this, owner, generation, frozen_committed]() {
               return PromoteTxGenerationLocal(*stores_[owner], generation,
-                                               frozen_committed);
+                                              frozen_committed);
             });
       }
       if (!promoted.ok()) co_return promoted;
@@ -508,11 +506,10 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
         local = co_await InspectTxGenerationLocal(*stores_[owner], generation,
                                                   false);
       } else {
-        local = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation]() {
-              return InspectTxGenerationLocal(*stores_[owner], generation,
-                                               false);
-            });
+        local = co_await celer::SubmitTaskTo(owner, [this, owner,
+                                                     generation]() {
+          return InspectTxGenerationLocal(*stores_[owner], generation, false);
+        });
       }
       if (!local.ok()) co_return local.status();
       readiness.active_transactions_ += local->active_transactions_;
@@ -530,8 +527,8 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
       if (owner == coordinator) {
         retired = co_await RetireTxGenerationLocal(*stores_[owner], generation);
       } else {
-        retired = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation]() {
+        retired =
+            co_await celer::SubmitTaskTo(owner, [this, owner, generation]() {
               return RetireTxGenerationLocal(*stores_[owner], generation);
             });
       }
@@ -543,15 +540,14 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
         forgotten =
             co_await ForgetTxGenerationLocal(*stores_[owner], generation);
       } else {
-        forgotten = co_await celer::SubmitTaskTo(
-            owner, [this, owner, generation]() {
+        forgotten =
+            co_await celer::SubmitTaskTo(owner, [this, owner, generation]() {
               return ForgetTxGenerationLocal(*stores_[owner], generation);
             });
       }
       if (!forgotten.ok()) co_return forgotten;
     }
-    tx_cleaner_retired_generations_.fetch_add(1,
-                                              std::memory_order_relaxed);
+    tx_cleaner_retired_generations_.fetch_add(1, std::memory_order_relaxed);
   }
   co_return absl::OkStatus();
 }

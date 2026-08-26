@@ -96,54 +96,267 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& bucket);
 
 struct RecordLocation {
-  std::uint64_t block_id_ = 0;
+  // Runtime block identities need only the 27-bit local block id plus the
+  // 16-bit configured device id. Pairing those 43 bits with a 53-bit
+  // allocation epoch removes four bytes without weakening any practical
+  // reuse horizon: at 8 MiB per allocation, the epoch spans 64 ZiB per
+  // device. The durable format retains both original 64-bit fields.
+  static constexpr unsigned kBlockIdBits = kLocalBlockIdBits + 16;
+  static constexpr unsigned kAllocationEpochBits = 53;
+  static constexpr unsigned kAllocationEpochLowBits = 64 - kBlockIdBits;
+  static constexpr std::uint64_t kBlockIdMask =
+      (std::uint64_t{1} << kBlockIdBits) - 1;
+  static constexpr std::uint64_t kAllocationEpochMask =
+      (std::uint64_t{1} << kAllocationEpochBits) - 1;
+
+  static_assert(kBlockIdBits == 43);
+  static_assert(kAllocationEpochLowBits == 21);
+  static_assert(kAllocationEpochBits - kAllocationEpochLowBits == 32);
+
+  // Offsets and record lengths are always 8-byte aligned inside an 8 MiB
+  // block, so storing their alignment units preserves their complete range in
+  // 20 bits each. The owner is process-local and InitMemoryLimit caps a
+  // process at 1024 workers. Keep this as an explicitly masked runtime word,
+  // rather than C++ bit-fields, so layout and overflow behavior are auditable.
+  // Five high bits remain reserved for future hot-path state; uncommon state
+  // should use a sparse side table instead of widening every key.
+  class PackedMetadata {
+   public:
+    static constexpr unsigned kOffsetBits = 20;
+    static constexpr unsigned kLengthBits = 20;
+    static constexpr unsigned kOwnerBits = 10;
+    static constexpr unsigned kStateBits = 9;
+    static constexpr unsigned kReservedBits = 5;
+
+    static constexpr unsigned kLengthShift = kOffsetBits;
+    static constexpr unsigned kOwnerShift = kLengthShift + kLengthBits;
+    static constexpr unsigned kInMemoryShift = kOwnerShift + kOwnerBits;
+    static constexpr unsigned kExternalShift = kInMemoryShift + 1;
+    static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
+    static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
+    static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
+    static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
+    static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
+
+    static constexpr std::uint64_t kOffsetMask =
+        (std::uint64_t{1} << kOffsetBits) - 1;
+    static constexpr std::uint64_t kLengthMask =
+        (std::uint64_t{1} << kLengthBits) - 1;
+    static constexpr std::uint64_t kOwnerMask =
+        (std::uint64_t{1} << kOwnerBits) - 1;
+    static constexpr std::uint64_t kTypeCodeMask = 0x7;
+    static constexpr std::uint8_t kTombstoneTypeCode = 0x7;
+
+    static_assert(kStorageBlockBytes / kRecordAlignment - 1 <= kOffsetMask);
+    static_assert((kStorageBlockBytes - kBlockHeaderBytes) / kRecordAlignment <=
+                  kLengthMask);
+    static_assert(kMaxMemoryWorkers <= (std::uint64_t{1} << kOwnerBits));
+
+    static PackedMetadata Encode(std::uint32_t record_offset,
+                                 std::uint32_t total_disk_bytes,
+                                 std::uint16_t block_owner, bool in_memory,
+                                 bool external, bool key_external,
+                                 bool shielding, bool unclaimed, bool tx_tagged,
+                                 RecordKind kind,
+                                 ValueType value_type) noexcept {
+      assert(record_offset % kRecordAlignment == 0);
+      assert(total_disk_bytes % kRecordAlignment == 0);
+      assert((record_offset / kRecordAlignment) <= kOffsetMask);
+      assert((total_disk_bytes / kRecordAlignment) <= kLengthMask);
+      assert(block_owner < kMaxMemoryWorkers);
+      assert(kind == RecordKind::kValue || kind == RecordKind::kTombstone);
+      assert(kind != RecordKind::kValue ||
+             static_cast<std::uint8_t>(value_type) < kTombstoneTypeCode);
+      assert(kind != RecordKind::kTombstone || value_type == ValueType::kNone);
+
+      const std::uint8_t type_code =
+          kind == RecordKind::kTombstone
+              ? kTombstoneTypeCode
+              : static_cast<std::uint8_t>(value_type);
+      std::uint64_t bits =
+          static_cast<std::uint64_t>(record_offset / kRecordAlignment) |
+          (static_cast<std::uint64_t>(total_disk_bytes / kRecordAlignment)
+           << kLengthShift) |
+          (static_cast<std::uint64_t>(block_owner) << kOwnerShift) |
+          (static_cast<std::uint64_t>(type_code) << kTypeCodeShift);
+      SetBit(&bits, kInMemoryShift, in_memory);
+      SetBit(&bits, kExternalShift, external);
+      SetBit(&bits, kKeyExternalShift, key_external);
+      SetBit(&bits, kShieldingShift, shielding);
+      SetBit(&bits, kUnclaimedShift, unclaimed);
+      SetBit(&bits, kTxTaggedShift, tx_tagged);
+      return PackedMetadata(bits);
+    }
+
+    std::uint32_t record_offset() const noexcept {
+      return static_cast<std::uint32_t>(bits_ & kOffsetMask) * kRecordAlignment;
+    }
+    std::uint32_t total_disk_bytes() const noexcept {
+      return static_cast<std::uint32_t>((bits_ >> kLengthShift) & kLengthMask) *
+             kRecordAlignment;
+    }
+    std::uint16_t block_owner() const noexcept {
+      return static_cast<std::uint16_t>((bits_ >> kOwnerShift) & kOwnerMask);
+    }
+    bool in_memory() const noexcept { return Bit(kInMemoryShift); }
+    bool external() const noexcept { return Bit(kExternalShift); }
+    bool key_external() const noexcept { return Bit(kKeyExternalShift); }
+    bool shielding() const noexcept { return Bit(kShieldingShift); }
+    bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
+    bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
+    RecordKind kind() const noexcept {
+      return type_code() == kTombstoneTypeCode ? RecordKind::kTombstone
+                                               : RecordKind::kValue;
+    }
+    ValueType value_type() const noexcept {
+      return type_code() == kTombstoneTypeCode
+                 ? ValueType::kNone
+                 : static_cast<ValueType>(type_code());
+    }
+
+    void set_in_memory(bool value) noexcept {
+      SetBit(&bits_, kInMemoryShift, value);
+    }
+    void set_shielding(bool value) noexcept {
+      SetBit(&bits_, kShieldingShift, value);
+    }
+    void set_unclaimed(bool value) noexcept {
+      SetBit(&bits_, kUnclaimedShift, value);
+    }
+    void set_tx_tagged(bool value) noexcept {
+      SetBit(&bits_, kTxTaggedShift, value);
+    }
+
+   private:
+    explicit constexpr PackedMetadata(std::uint64_t bits) noexcept
+        : bits_(bits) {}
+
+    static void SetBit(std::uint64_t* bits, unsigned shift,
+                       bool value) noexcept {
+      const std::uint64_t mask = std::uint64_t{1} << shift;
+      *bits = value ? (*bits | mask) : (*bits & ~mask);
+    }
+    bool Bit(unsigned shift) const noexcept {
+      return (bits_ & (std::uint64_t{1} << shift)) != 0;
+    }
+    std::uint8_t type_code() const noexcept {
+      return static_cast<std::uint8_t>((bits_ >> kTypeCodeShift) &
+                                       kTypeCodeMask);
+    }
+
+    std::uint64_t bits_ = 0;
+  };
+
+  static_assert(PackedMetadata::kOffsetBits + PackedMetadata::kLengthBits +
+                    PackedMetadata::kOwnerBits + PackedMetadata::kStateBits +
+                    PackedMetadata::kReservedBits ==
+                64);
+
+  RecordLocation() noexcept = default;
+
+  RecordLocation(std::uint64_t block_id, std::uint64_t mutation_sequence,
+                 std::uint64_t allocation_epoch, std::uint64_t expire_at_ms,
+                 std::uint32_t logical_size, PackedMetadata metadata) noexcept
+      : mutation_sequence_(mutation_sequence),
+        expire_at_ms_(expire_at_ms),
+        block_and_epoch_low_(
+            EncodeBlockAndEpochLow(block_id, allocation_epoch)),
+        allocation_epoch_high_(EncodeAllocationEpochHigh(allocation_epoch)),
+        logical_size_(logical_size),
+        metadata_(metadata) {
+    assert(CanEncodeBlockIdentity(block_id, allocation_epoch));
+  }
+
+  static constexpr bool CanEncodeBlockIdentity(
+      std::uint64_t block_id, std::uint64_t allocation_epoch) noexcept {
+    return block_id <= kBlockIdMask && allocation_epoch <= kAllocationEpochMask;
+  }
+
   std::uint64_t mutation_sequence_ = 0;
-  std::uint64_t allocation_epoch_ = 0;
   std::uint64_t expire_at_ms_ = 0;
+  // Low word: block id in bits [0, 42], low allocation-epoch bits in
+  // [43, 63]. The remaining 32 epoch bits sit beside logical_size_, filling
+  // what would otherwise be alignment padding before metadata_.
+  std::uint64_t block_and_epoch_low_ = 0;
+  std::uint32_t allocation_epoch_high_ = 0;
   // Exact Redis-visible bytes/cardinality.
   std::uint32_t logical_size_ = 0;
-  std::uint32_t record_offset_ = 0;
-  std::uint32_t total_disk_bytes_ = 0;
-  // Owner in the current process topology. Unlike the persisted writer_id,
-  // this must always be in [0, worker_count).
-  std::uint16_t block_owner_ = 0;
-  // Packed flags: one byte for all six.
-  bool in_memory_ : 1 = false;
-  bool external_ : 1 = false;
-  bool key_external_ : 1 = false;
+  PackedMetadata metadata_ =
+      PackedMetadata::Encode(0, 0, 0, false, false, false, false, false, false,
+                             RecordKind::kValue, ValueType::kNone);
+
+  std::uint64_t block_id() const noexcept {
+    return block_and_epoch_low_ & kBlockIdMask;
+  }
+  std::uint64_t allocation_epoch() const noexcept {
+    return (block_and_epoch_low_ >> kBlockIdBits) |
+           (static_cast<std::uint64_t>(allocation_epoch_high_)
+            << kAllocationEpochLowBits);
+  }
+
+  std::uint32_t record_offset() const noexcept {
+    return metadata_.record_offset();
+  }
+  std::uint32_t total_disk_bytes() const noexcept {
+    return metadata_.total_disk_bytes();
+  }
+  std::uint16_t block_owner() const noexcept { return metadata_.block_owner(); }
+  bool in_memory() const noexcept { return metadata_.in_memory(); }
+  bool external() const noexcept { return metadata_.external(); }
+  bool key_external() const noexcept { return metadata_.key_external(); }
   // True while an older, still-unexpired value of this key may survive on
   // disk. Erasing this entry then would un-suppress that copy: recovery
   // picks the newest surviving record, so the key would resurrect with the
   // stale value. Propagates through every overwrite — tombstones included,
   // since a superseded tombstone leaves the disk like any dead record — and
   // is rebuilt exactly during recovery, which sees every surviving record.
-  bool shielding_ : 1 = false;
+  bool shielding() const noexcept { return metadata_.shielding(); }
   // Tomb-raider round state: set on candidates (tombstones, shielded values)
   // when a round begins, cleared when the sweep finds an older on-disk
   // record the entry still suppresses. Whatever survives the sweep
   // unclaimed proved nothing on disk needs it. False outside rounds, and
   // any overwrite resets it, exempting concurrently-touched keys.
-  bool unclaimed_ : 1 = false;
+  bool unclaimed() const noexcept { return metadata_.unclaimed(); }
   // The on-disk record carries a nonzero transaction id. Retirement uses the
   // bit to remove its bytes from transaction-generation accounting; the
-  // 48-byte index entry deliberately does not retain the full txid.
-  bool tx_tagged_ : 1 = false;
-  RecordKind kind_ : 3 = RecordKind::kValue;
-  ValueType value_type_ : 3 = ValueType::kNone;
+  // 40-byte index location deliberately does not retain the full txid.
+  bool tx_tagged() const noexcept { return metadata_.tx_tagged(); }
+  RecordKind kind() const noexcept { return metadata_.kind(); }
+  ValueType value_type() const noexcept { return metadata_.value_type(); }
+
+  void set_in_memory(bool value) noexcept { metadata_.set_in_memory(value); }
+  void set_shielding(bool value) noexcept { metadata_.set_shielding(value); }
+  void set_unclaimed(bool value) noexcept { metadata_.set_unclaimed(value); }
+  void set_tx_tagged(bool value) noexcept { metadata_.set_tx_tagged(value); }
 
   bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
-    return block_id_ == other.block_id_ &&
-           record_offset_ == other.record_offset_ &&
-           allocation_epoch_ == other.allocation_epoch_;
+    return block_id() == other.block_id() &&
+           record_offset() == other.record_offset() &&
+           allocation_epoch() == other.allocation_epoch();
+  }
+
+ private:
+  static constexpr std::uint64_t EncodeBlockAndEpochLow(
+      std::uint64_t block_id, std::uint64_t allocation_epoch) noexcept {
+    return (block_id & kBlockIdMask) |
+           ((allocation_epoch &
+             ((std::uint64_t{1} << kAllocationEpochLowBits) - 1))
+            << kBlockIdBits);
+  }
+
+  static constexpr std::uint32_t EncodeAllocationEpochHigh(
+      std::uint64_t allocation_epoch) noexcept {
+    return static_cast<std::uint32_t>(allocation_epoch >>
+                                      kAllocationEpochLowBits);
   }
 };
 
 using RecordIndex = ScanHashMap<RecordLocation>;
 
 static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
-static_assert(sizeof(RecordLocation) == 48);
+static_assert(sizeof(RecordLocation) == 40);
 static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 64);
+static_assert(sizeof(RecordIndex::Entry) == 48);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -204,7 +417,7 @@ inline std::uint64_t UnixTimeMillis() noexcept {
 
 inline bool IsExpired(const RecordLocation& location,
                       std::uint64_t now_ms) noexcept {
-  return location.kind_ == RecordKind::kValue && location.expire_at_ms_ != 0 &&
+  return location.kind() == RecordKind::kValue && location.expire_at_ms_ != 0 &&
          location.expire_at_ms_ <= now_ms;
 }
 
@@ -473,9 +686,9 @@ struct RelocationSource {
   std::uint32_t record_offset_ = 0;
 
   bool Matches(const RecordLocation& location) const noexcept {
-    return location.block_id_ == block_id_ &&
-           location.allocation_epoch_ == allocation_epoch_ &&
-           location.record_offset_ == record_offset_;
+    return location.block_id() == block_id_ &&
+           location.allocation_epoch() == allocation_epoch_ &&
+           location.record_offset() == record_offset_;
   }
 };
 
@@ -2103,7 +2316,7 @@ class StorageEngine::Impl {
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {
-    if (entry == nullptr || !entry->value_.external_) {
+    if (entry == nullptr || !entry->value_.external()) {
       return {};
     }
     const auto found = store.external_manifests_.find(entry);
@@ -2113,11 +2326,11 @@ class StorageEngine::Impl {
 
   static ExtentManifest DependentExtentsFor(const WorkerStore& store,
                                             const RecordIndex::Entry* entry) {
-    if (entry == nullptr || !entry->value_.key_external_) [[likely]] {
+    if (entry == nullptr || !entry->value_.key_external()) [[likely]] {
       return {};
     }
-    return entry->value_.external_ ? ExtentsFor(store, entry)
-                                   : ExtentManifest{};
+    return entry->value_.external() ? ExtentsFor(store, entry)
+                                    : ExtentManifest{};
   }
 
   Task<absl::StatusOr<std::string>> LoadExternalKey(WorkerStore& store,
@@ -2208,12 +2421,12 @@ class StorageEngine::Impl {
   static RetiredRecord RetiredRecordOf(const RecordLocation& location,
                                        ExtentManifest dependent_extents = {}) {
     return RetiredRecord{
-        .block_id_ = location.block_id_,
-        .allocation_epoch_ = location.allocation_epoch_,
-        .total_disk_bytes_ = location.total_disk_bytes_,
-        .block_owner_ = location.block_owner_,
-        .record_offset_ = location.record_offset_,
-        .tx_tagged_ = location.tx_tagged_,
+        .block_id_ = location.block_id(),
+        .allocation_epoch_ = location.allocation_epoch(),
+        .total_disk_bytes_ = location.total_disk_bytes(),
+        .block_owner_ = location.block_owner(),
+        .record_offset_ = location.record_offset(),
+        .tx_tagged_ = location.tx_tagged(),
         .dependency_pinned_ = false,
         .dependent_extents_ = std::move(dependent_extents),
         .immediate_extents_ = nullptr,

@@ -38,8 +38,6 @@ struct alignas(64) AllocationShard {
   std::atomic<std::int64_t> bytes_{0};
 };
 
-constexpr unsigned kMaxMemoryWorkers = 1024;
-
 static_assert(sizeof(MemoryGaugeCache) == 64);
 static_assert(sizeof(MemoryCounterCache) == 64);
 static_assert(sizeof(AllocationShard) == 64);

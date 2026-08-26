@@ -393,9 +393,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
       .db_epoch_ = record.db_epoch_,
       .replication_epoch_ = partition.replication_epoch_,
       .index_generation_ = key_store.index_generations_[record.db_id_],
-      .block_id_ = source_location.block_id_,
-      .allocation_epoch_ = source_location.allocation_epoch_,
-      .record_offset_ = source_location.record_offset_,
+      .block_id_ = source_location.block_id(),
+      .allocation_epoch_ = source_location.allocation_epoch(),
+      .record_offset_ = source_location.record_offset(),
   };
   RecordLocation relocated;
   absl::Status written = co_await WriteRecordLocked(
@@ -414,11 +414,11 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
     co_return written;
   }
   co_return std::optional<RelocationDurabilityFence>(RelocationDurabilityFence{
-      .block_id_ = relocated.block_id_,
-      .allocation_epoch_ = relocated.allocation_epoch_,
-      .block_owner_ = relocated.block_owner_,
+      .block_id_ = relocated.block_id(),
+      .allocation_epoch_ = relocated.allocation_epoch(),
+      .block_owner_ = relocated.block_owner(),
       .committed_bytes_ = static_cast<std::uint32_t>(
-          relocated.record_offset_ + relocated.total_disk_bytes_),
+          relocated.record_offset() + relocated.total_disk_bytes()),
   });
 }
 
@@ -578,8 +578,7 @@ Task<absl::Status> StorageEngine::Impl::CleanBlockLocked(
 Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
     WorkerStore& store, std::uint64_t block_id, BlockState& source,
     std::uint32_t source_file_id, std::uint64_t source_block_offset,
-    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>>
-        committed_txids) {
+    std::shared_ptr<const absl::flat_hash_set<std::uint64_t>> committed_txids) {
   struct DefragBuffer {
     RegisteredBufferPool* pool_ = nullptr;
     std::uint16_t buffer_id_ = 0;
@@ -697,6 +696,18 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       co_return absl::Status(absl::StatusCode::kInternal,
                              "payload checksum mismatch during defrag");
     }
+    if (record.kind_ == RecordKind::kTxCommit) {
+      if (committed_txids == nullptr) {
+        source.defragging_ = false;
+        co_return absl::InternalError(
+            "ordinary records block contains a TxCommit");
+      }
+      // Commit decisions are not key-index locations, so they have no packed
+      // runtime type state to construct. Keep them in place until every
+      // tagged winner in the generation has a durable untagged copy.
+      record_offset += record.total_disk_bytes_;
+      continue;
+    }
     std::string loaded_key;
     if (record.key_external_) [[unlikely]] {
       if (record.external_) {
@@ -729,22 +740,14 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       }
     }
 
-    RecordLocation source_location{
-        .block_id_ = block_id,
-        .mutation_sequence_ = record.mutation_sequence_,
-        .allocation_epoch_ = record.allocation_epoch_,
-        .expire_at_ms_ = record.expire_at_ms_,
-        .logical_size_ = static_cast<std::uint32_t>(record.logical_size_),
-        .record_offset_ = record_offset,
-        .total_disk_bytes_ = record.total_disk_bytes_,
-        .block_owner_ = store.worker_->id(),
-        .external_ = record.external_,
-        .key_external_ = record.key_external_,
-        .tx_tagged_ =
+    RecordLocation source_location(
+        block_id, record.mutation_sequence_, record.allocation_epoch_,
+        record.expire_at_ms_, static_cast<std::uint32_t>(record.logical_size_),
+        RecordLocation::PackedMetadata::Encode(
+            record_offset, record.total_disk_bytes_, store.worker_->id(), false,
+            record.external_, record.key_external_, false, false,
             record.txid_ != 0 && record.kind_ != RecordKind::kTxCommit,
-        .kind_ = record.kind_,
-        .value_type_ = record.value_type_,
-    };
+            record.kind_, record.value_type_));
     if (record.external_) {
       const std::uint64_t extent_bytes =
           record.logical_size_ + (record.key_external_ ? record.key_bytes_ : 0);
@@ -758,18 +761,6 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
       }
     }
 
-    if (record.kind_ == RecordKind::kTxCommit) {
-      if (committed_txids == nullptr) {
-        source.defragging_ = false;
-        co_return absl::InternalError(
-            "ordinary records block contains a TxCommit");
-      }
-      // Keep decision records in place until every tagged winner in the
-      // generation has a durable untagged copy. Whole-generation retirement
-      // then removes the decisions and sources together.
-      record_offset += record.total_disk_bytes_;
-      continue;
-    }
     if (committed_txids != nullptr &&
         !committed_txids->contains(record.txid_)) {
       // No durable decision: never turn this record into an unconditional

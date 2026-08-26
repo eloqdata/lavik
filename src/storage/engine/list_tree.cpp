@@ -194,10 +194,10 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     found = *resolved;
   }
   const bool stored_value =
-      found != nullptr && found->value_.kind_ == RecordKind::kValue;
+      found != nullptr && found->value_.kind() == RecordKind::kValue;
   const bool exists =
       stored_value && !IsExpired(found->value_, UnixTimeMillis());
-  if (exists && found->value_.value_type_ != ValueType::kList) {
+  if (exists && found->value_.value_type() != ValueType::kList) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
@@ -205,8 +205,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   const std::uint64_t observed_index_generation =
       store.index_generations_[db_id];
   const std::uint64_t observed_db_epoch = DbEpoch(db_id);
-  const std::uint64_t observed_replication_epoch =
-      partition.replication_epoch_;
+  const std::uint64_t observed_replication_epoch = partition.replication_epoch_;
   auto read_epoch_changed = [&]() {
     return read_only &&
            (store.index_generations_[db_id] != observed_index_generation ||
@@ -426,12 +425,11 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
     if (!encoded.ok()) co_return encoded.status();
     payload = std::move(*encoded);
   }
-  absl::Status written =
-      co_await AppendLocked(
-          store, partition, db_id, key, digest, payload, kind, type,
-          kind == RecordKind::kValue ? expire_at_ms : 0, tx,
-          kind == RecordKind::kValue ? elements.size() : 0, nullptr, nullptr,
-          replication);
+  absl::Status written = co_await AppendLocked(
+      store, partition, db_id, key, digest, payload, kind, type,
+      kind == RecordKind::kValue ? expire_at_ms : 0, tx,
+      kind == RecordKind::kValue ? elements.size() : 0, nullptr, nullptr,
+      replication);
   if (!written.ok()) co_return written;
   co_return result;
 }

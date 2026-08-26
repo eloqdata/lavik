@@ -341,6 +341,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         ReportRecoveryProgress(0, /*allocated=*/true);
         continue;
       }
+      if (!RecordLocation::CanEncodeBlockIdentity(block_id,
+                                                  block.allocation_epoch_)) {
+        co_return absl::Status(
+            absl::StatusCode::kOutOfRange,
+            "durable block identity exceeds the runtime index range");
+      }
       AtomicMax(&recovery_device_cursors_[device_index].next_local_,
                 static_cast<std::uint64_t>(local_block) + 1);
       AtomicMax(&recovery_device_cursors_[device_index].next_allocation_epoch_,
@@ -507,22 +513,14 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             .txid_ = record.txid_,
             .lsn_ = record.lsn_,
             .replication_epoch_ = record.replication_epoch_,
-            .location_ =
-                RecordLocation{
-                    .block_id_ = block_id,
-                    .mutation_sequence_ = record.mutation_sequence_,
-                    .allocation_epoch_ = record.allocation_epoch_,
-                    .expire_at_ms_ = record.expire_at_ms_,
-                    .logical_size_ =
-                        static_cast<std::uint32_t>(record.logical_size_),
-                    .record_offset_ = record_offset,
-                    .total_disk_bytes_ = record.total_disk_bytes_,
-                    .block_owner_ = block_owner,
-                    .external_ = record.external_,
-                    .key_external_ = record.key_external_,
-                    .kind_ = record.kind_,
-                    .value_type_ = record.value_type_,
-                },
+            .location_ = RecordLocation(
+                block_id, record.mutation_sequence_, record.allocation_epoch_,
+                record.expire_at_ms_,
+                static_cast<std::uint32_t>(record.logical_size_),
+                RecordLocation::PackedMetadata::Encode(
+                    record_offset, record.total_disk_bytes_, block_owner, false,
+                    record.external_, record.key_external_, false, false,
+                    record.txid_ != 0, record.kind_, record.value_type_)),
             .extents_ = extents,
         });
         ++buffered_items;
@@ -652,29 +650,29 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                                   recovered.lsn_ > current_lsn);
     if (candidate_newer) {
       const bool was_live =
-          found != nullptr && found->value_.kind_ == RecordKind::kValue;
-      const bool is_live = recovered.location_.kind_ == RecordKind::kValue;
+          found != nullptr && found->value_.kind() == RecordKind::kValue;
+      const bool is_live = recovered.location_.kind() == RecordKind::kValue;
       const bool was_expiring = was_live && found->value_.expire_at_ms_ != 0;
       const bool is_expiring =
           is_live && recovered.location_.expire_at_ms_ != 0;
       RecordLocation winner = recovered.location_;
       if (found != nullptr) {
-        winner.shielding_ = found->value_.shielding_ ||
-                            (found->value_.kind_ == RecordKind::kValue &&
-                             found->value_.mutation_sequence_ <
-                                 recovered.location_.mutation_sequence_ &&
-                             (found->value_.expire_at_ms_ == 0 ||
-                              found->value_.expire_at_ms_ >
-                                  std::max(recovered.location_.expire_at_ms_,
-                                           UnixTimeMillis())));
+        winner.set_shielding(found->value_.shielding() ||
+                             (found->value_.kind() == RecordKind::kValue &&
+                              found->value_.mutation_sequence_ <
+                                  recovered.location_.mutation_sequence_ &&
+                              (found->value_.expire_at_ms_ == 0 ||
+                               found->value_.expire_at_ms_ >
+                                   std::max(recovered.location_.expire_at_ms_,
+                                            UnixTimeMillis()))));
       }
-      winner.tx_tagged_ = recovered.txid_ != 0;
+      winner.set_tx_tagged(recovered.txid_ != 0);
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
         winner_entry->value_ = winner;
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
-                                       winner, !winner.key_external_);
+                                       winner, !winner.key_external());
       }
       store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
       if (recovered.txid_ != 0) {
@@ -682,13 +680,13 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       } else {
         store.recovery_txids_.erase(winner_entry);
       }
-      if (winner.external_) {
+      if (winner.external()) {
         store.external_manifests_.insert_or_assign(winner_entry,
                                                    recovered.extents_);
       } else {
         store.external_manifests_.erase(winner_entry);
       }
-      if (winner.key_external_) [[unlikely]] {
+      if (winner.key_external()) [[unlikely]] {
         store.recovery_external_keys_.insert_or_assign(winner_entry,
                                                        recovered.key_);
       } else {
@@ -710,13 +708,13 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
           --partition.expiring_key_count_[recovered.db_id_];
         }
       }
-    } else if (recovered.location_.kind_ == RecordKind::kValue &&
+    } else if (recovered.location_.kind() == RecordKind::kValue &&
                recovered.location_.mutation_sequence_ <
                    found->value_.mutation_sequence_ &&
                (recovered.location_.expire_at_ms_ == 0 ||
                 recovered.location_.expire_at_ms_ >
                     std::max(found->value_.expire_at_ms_, UnixTimeMillis()))) {
-      found->value_.shielding_ = true;
+      found->value_.set_shielding(true);
     }
   }
 }

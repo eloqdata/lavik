@@ -38,7 +38,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
   if (!expiration_authority_.load(std::memory_order_acquire) ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
-      entry.value_.kind_ != RecordKind::kValue ||
+      entry.value_.kind() != RecordKind::kValue ||
       entry.value_.expire_at_ms_ == 0) {
     return;
   }
@@ -89,7 +89,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
     co_return resolved.status();
   }
   auto* current = *resolved;
-  if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
+  if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
       current->value_.mutation_sequence_ != candidate.mutation_sequence_ ||
       current->value_.expire_at_ms_ != candidate.expire_at_ms_ ||
       !IsExpired(current->value_, UnixTimeMillis())) {
@@ -105,7 +105,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
       store, partition, candidate.db_id_, candidate.key_, candidate.digest_, {},
       RecordKind::kTombstone, ValueType::kNone, 0, nullptr, 0);
   if (durable.ok() || durable.code() != absl::StatusCode::kResourceExhausted ||
-      current->value_.shielding_) {
+      current->value_.shielding()) {
     co_return durable;
   }
 
@@ -140,7 +140,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   --partition.expiring_key_count_[candidate.db_id_];
   store.external_manifests_.erase(current);
   partition.indexes_[candidate.db_id_].Erase(current);
-  if (dropped.external_ && !dropped.key_external_) {
+  if (dropped.external() && !dropped.key_external()) {
     SpawnExtentReclaim(store, dropped_extents);
   }
   absl::Status dead = co_await MarkRecordDead(

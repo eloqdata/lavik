@@ -55,8 +55,8 @@ Task<absl::Status> StorageEngine::Impl::PinRdbSnapshotValue(
   std::vector<BlockPin> blocks;
   blocks.reserve(1 +
                  (value->extents_ == nullptr ? 0 : value->extents_->size()));
-  blocks.push_back(BlockPin{value->location_.block_id_,
-                            value->location_.allocation_epoch_, false});
+  blocks.push_back(BlockPin{value->location_.block_id(),
+                            value->location_.allocation_epoch(), false});
   if (value->extents_ != nullptr) {
     for (const ExtentRef& ref : *value->extents_) {
       blocks.push_back(BlockPin{ref.block_id_, ref.allocation_epoch_, true});
@@ -136,8 +136,8 @@ Task<absl::Status> StorageEngine::Impl::ReleaseRdbSnapshotValue(
   std::vector<BlockPin> blocks;
   blocks.reserve(1 +
                  (value->extents_ == nullptr ? 0 : value->extents_->size()));
-  blocks.push_back(
-      BlockPin{value->location_.block_id_, value->location_.allocation_epoch_});
+  blocks.push_back(BlockPin{value->location_.block_id(),
+                            value->location_.allocation_epoch()});
   if (value->extents_ != nullptr) {
     for (const ExtentRef& ref : *value->extents_) {
       blocks.push_back(BlockPin{ref.block_id_, ref.allocation_epoch_});
@@ -200,7 +200,7 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
       co_return absl::OkStatus();
     }
     RecordIndex::Entry* current = *resolved;
-    if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
+    if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
         current->value_.mutation_sequence_ > capture->cut_sequence_ ||
         IsExpired(current->value_, capture->snapshot_time_ms_)) {
       capture->dirty_keys_.InsertNew(map_digest, map_key,
@@ -230,8 +230,8 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
       char* end = nullptr;
       const unsigned long pause_ms = std::strtoul(pause_text, &end, 10);
       if (end != pause_text && *end == '\0' && pause_ms != 0) {
-        (void)co_await celer::SleepFor(
-            *store.worker_, std::chrono::milliseconds(pause_ms));
+        (void)co_await celer::SleepFor(*store.worker_,
+                                       std::chrono::milliseconds(pause_ms));
       }
     }
 #endif
@@ -335,7 +335,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
         co_return resolved.status();
       }
       RecordIndex::Entry* current = *resolved;
-      if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
+      if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
           IsExpired(current->value_, capture->snapshot_time_ms_)) {
         capture->dirty_keys_.InsertNew(map_digest, map_key,
                                        SavedValue{
@@ -396,7 +396,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
                               bytes.size()),
       .logical_size_ = physical.location_.logical_size_,
       .expire_at_ms_ = physical.location_.expire_at_ms_,
-      .value_type_ = physical.location_.value_type_,
+      .value_type_ = physical.location_.value_type(),
   };
   absl::Status released = co_await ReleaseRdbSnapshotValue(&saved->value_);
   if (!released.ok()) {

@@ -226,6 +226,12 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
     co_return absl::Status(absl::StatusCode::kResourceExhausted,
                            "device has no allocatable blocks");
   }
+  if (allocator.next_allocation_epoch_ > RecordLocation::kAllocationEpochMask) {
+    // The durable epoch remains 64-bit, but publishing a block that the
+    // runtime index cannot identify exactly would make reuse checks unsafe.
+    co_return absl::Status(absl::StatusCode::kResourceExhausted,
+                           "device allocation epoch exhausted");
+  }
   const std::uint64_t block_id = allocator.ready_blocks_.back();
   allocator.ready_blocks_.pop_back();
   MaybeRefillDeviceInBackground(device_index, allocator);
@@ -495,8 +501,7 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
   for (std::size_t page_index = 0; page_index < dirty_pages.size();
        ++page_index) {
     if (!dirty_pages[page_index]) continue;
-    const std::size_t page_byte_offset =
-        page_index * kMetadataPagePayloadBytes;
+    const std::size_t page_byte_offset = page_index * kMetadataPagePayloadBytes;
     const std::size_t payload_bytes = std::min(
         kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
     const MetadataPageState current = allocator.epoch_pages_[page_index];
@@ -539,12 +544,10 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValuesOnDeviceLocal(
        ++page_index) {
     if (!dirty_pages[page_index]) continue;
     allocator.epoch_pages_[page_index] = next_states[page_index];
-    const std::size_t page_byte_offset =
-        page_index * kMetadataPagePayloadBytes;
+    const std::size_t page_byte_offset = page_index * kMetadataPagePayloadBytes;
     const std::size_t payload_bytes = std::min(
         kMetadataPagePayloadBytes, kEpochMetadataBytes - page_byte_offset);
-    const std::size_t first_value =
-        page_byte_offset / sizeof(std::uint64_t);
+    const std::size_t first_value = page_byte_offset / sizeof(std::uint64_t);
     const std::size_t value_count = payload_bytes / sizeof(std::uint64_t);
     for (std::size_t i = 0; i < value_count; ++i) {
       allocator.durable_epoch_values_[first_value + i] =
@@ -602,10 +605,10 @@ Task<absl::Status> StorageEngine::Impl::PersistEpochValues(
                                                                 values.end());
       persisted = co_await celer::SubmitTaskTo(
           owner,
-          [this, device_index, copied = std::move(copied)]()
-              -> Task<absl::Status> {
+          [this, device_index,
+           copied = std::move(copied)]() -> Task<absl::Status> {
             co_return co_await PersistEpochValuesOnDeviceLocal(device_index,
-                                                                copied);
+                                                               copied);
           });
     }
     if (!persisted.ok()) co_return persisted;

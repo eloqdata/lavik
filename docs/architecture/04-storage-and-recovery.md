@@ -220,6 +220,18 @@ block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
 
+The runtime index keeps its fixed entry header at 48 bytes. Its 40-byte
+`RecordLocation` combines the configured 43-bit block-ID range with a 53-bit
+allocation epoch, and packs aligned record offset, aligned length, current
+worker owner, type, and hot state into one 64-bit word with five reserve bits.
+These are runtime representations only: block and record headers retain their
+full durable fields. `ScanHashMap` caches the low 32 hash bits used for bucket
+addressing while each bucket slot carries its independent 8-bit lookup tag.
+Incremental rehash preserves that tag with the entry pointer. A table that has
+already reached `2^32` direct buckets stops expanding and accepts further
+entries through its existing bucket chains, so the address-width limit changes
+load factor and lookup cost rather than correctness or capacity.
+
 Extent construction is synchronous with the foreground write. Each extent's
 payload and unused header slot are written and synchronized before its header
 commit slot is written and synchronized. Only after all children are durable

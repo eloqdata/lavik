@@ -261,7 +261,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       auto written = co_await WriteStorageBuffer(
           *store->worker_, store->files_[file_id],
           std::span<const std::byte>(staging.data_ + write_offset, chunk_bytes),
-          pending->write_buffer_id_ != 0 && store->buffers_.buffers_registered(),
+          pending->write_buffer_id_ != 0 &&
+              store->buffers_.buffers_registered(),
           staging, block_offset + write_offset);
       if (!written.ok() || *written != chunk_bytes) {
         co_await store->store_state_mutex_.Lock();
@@ -314,10 +315,9 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
         staging, slot_offset);
     if (!header_written.ok() || *header_written != kBlockHeaderSlotBytes) {
       absl::Status header_status =
-          header_written.ok()
-              ? absl::Status(absl::StatusCode::kInternal,
-                             "short block header write")
-              : header_written.status();
+          header_written.ok() ? absl::Status(absl::StatusCode::kInternal,
+                                             "short block header write")
+                              : header_written.status();
       co_return co_await fail_flush(std::move(header_status));
     }
     synced = co_await celer::Fdatasync(*store->worker_, store->files_[file_id]);
@@ -391,11 +391,11 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // send readers to disk pages that are still zero. Offsets within one
       // allocation only grow, so the boundary check identifies stale
       // versions exactly.
-      if (current.block_id_ == pending->block_id_ &&
-          current.allocation_epoch_ == pending->allocation_epoch_ &&
-          current.record_offset_ + current.total_disk_bytes_ <=
+      if (current.block_id() == pending->block_id_ &&
+          current.allocation_epoch() == pending->allocation_epoch_ &&
+          current.record_offset() + current.total_disk_bytes() <=
               pending->committed_bytes_) {
-        current.in_memory_ = false;
+        current.set_in_memory(false);
       }
     }
 

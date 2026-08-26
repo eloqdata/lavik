@@ -99,7 +99,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     WorkerStore& store, std::uint64_t session_id,
     WorkerStore::PartitionStore& partition, RecordLocation location,
     ExtentManifest extents, std::size_t key_bytes) {
-  if (!location.external_ || extents == nullptr) {
+  if (!location.external() || extents == nullptr) {
     co_return absl::InvalidArgumentError(
         "only external full-sync values can be pinned");
   }
@@ -110,7 +110,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
     }
     extent_bytes += ref.payload_bytes_;
   }
-  const std::size_t key_prefix = location.key_external_ ? key_bytes : 0;
+  const std::size_t key_prefix = location.key_external() ? key_bytes : 0;
   if (extent_bytes < key_prefix) {
     co_return absl::InternalError("full-sync extent manifest is truncated");
   }
@@ -162,23 +162,23 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
       status = resolved.status();
     } else {
       auto* current = *resolved;
-      if (current != nullptr && current->value_.kind_ == RecordKind::kValue) {
+      if (current != nullptr && current->value_.kind() == RecordKind::kValue) {
         const RecordLocation location = current->value_;
         if (IsExpired(location, UnixTimeMillis())) {
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else {
           const ExtentManifest extents = ExtentsFor(store, current);
           std::uint64_t value_bytes = location.logical_size_;
-          if (location.external_) {
+          if (location.external()) {
             value_bytes = 0;
             for (const ExtentRef& ref : *extents) {
               value_bytes += ref.payload_bytes_;
             }
-            if (location.key_external_) {
+            if (location.key_external()) {
               value_bytes -= std::min<std::uint64_t>(value_bytes, key->size());
             }
           }
-          if (location.external_ && value_bytes > kReplicationTransferBytes) {
+          if (location.external() && value_bytes > kReplicationTransferBytes) {
             auto source_id = co_await PinFullSyncValue(
                 store, session_id, partition, location, extents, key->size());
             if (!source_id.ok()) {
@@ -190,7 +190,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
                   .db_epoch_ = DbEpoch(db_id),
                   .mutation_sequence_ = baseline_version,
                   .expire_at_ms_ = location.expire_at_ms_,
-                  .value_type_ = location.value_type_,
+                  .value_type_ = location.value_type(),
                   .logical_size_ = location.logical_size_,
                   .source_id_ = *source_id,
                   .source_value_bytes_ = value_bytes,
@@ -214,7 +214,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
                   .db_epoch_ = DbEpoch(db_id),
                   .mutation_sequence_ = baseline_version,
                   .expire_at_ms_ = location.expire_at_ms_,
-                  .value_type_ = location.value_type_,
+                  .value_type_ = location.value_type(),
                   .logical_size_ = location.logical_size_,
                   .key_digest_ = digest,
                   .key_ = *key,
@@ -265,7 +265,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   if (!resolved.ok()) co_return resolved.status();
 
   const RecordIndex::Entry* current = *resolved;
-  if (current == nullptr || current->value_.kind_ != RecordKind::kValue ||
+  if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
       IsExpired(current->value_, UnixTimeMillis())) {
     const std::uint64_t sequence =
         current == nullptr ? requested.mutation_sequence_
@@ -285,15 +285,15 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
   const RecordLocation location = current->value_;
   const ExtentManifest extents = ExtentsFor(store, current);
   std::uint64_t value_bytes = location.logical_size_;
-  if (location.external_) {
+  if (location.external()) {
     value_bytes = 0;
     for (const ExtentRef& ref : *extents) value_bytes += ref.payload_bytes_;
-    if (location.key_external_) {
+    if (location.key_external()) {
       value_bytes -=
           std::min<std::uint64_t>(value_bytes, requested.key_.size());
     }
   }
-  if (location.external_ && value_bytes > kReplicationTransferBytes) {
+  if (location.external() && value_bytes > kReplicationTransferBytes) {
     auto source_id = co_await PinFullSyncValue(
         store, session_id, partition, location, extents, requested.key_.size());
     if (!source_id.ok()) co_return source_id.status();
@@ -305,7 +305,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
         .mutation_sequence_ =
             std::max(requested.mutation_sequence_, location.mutation_sequence_),
         .expire_at_ms_ = location.expire_at_ms_,
-        .value_type_ = location.value_type_,
+        .value_type_ = location.value_type(),
         .logical_size_ = location.logical_size_,
         .source_id_ = *source_id,
         .source_value_bytes_ = value_bytes,
@@ -324,7 +324,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
       .mutation_sequence_ =
           std::max(requested.mutation_sequence_, location.mutation_sequence_),
       .expire_at_ms_ = location.expire_at_ms_,
-      .value_type_ = location.value_type_,
+      .value_type_ = location.value_type(),
       .logical_size_ = location.logical_size_,
       .key_ = requested.key_,
       .value_ = std::string(reinterpret_cast<const char*>(value.data()),
@@ -374,17 +374,17 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
   do {
     state->result_.cursor_ = state->index_->Scan(
         state->result_.cursor_, [&](const RecordIndex::Entry& entry) {
-          if (entry.value_.kind_ == RecordKind::kValue &&
+          if (entry.value_.kind() == RecordKind::kValue &&
               !IsExpired(entry.value_, state->now_ms_)) {
             if (entry.key_complete()) [[likely]] {
               add_bytes(entry.key().size());
               state->result_.keys_.emplace_back(entry.key());
-              state->result_.value_types_.push_back(entry.value_.value_type_);
+              state->result_.value_types_.push_back(entry.value_.value_type());
               std::size_t value_bytes = entry.value_.logical_size_;
-              if (entry.value_.value_type_ != ValueType::kString) {
-                value_bytes = entry.value_.total_disk_bytes_;
+              if (entry.value_.value_type() != ValueType::kString) {
+                value_bytes = entry.value_.total_disk_bytes();
               }
-              if (entry.value_.external_) {
+              if (entry.value_.external()) {
                 value_bytes = 0;
                 const ExtentManifest extents =
                     ExtentsFor(CurrentStore(), &entry);
@@ -392,7 +392,7 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                   value_bytes += ref.payload_bytes_;
                 }
                 value_bytes -=
-                    std::min(value_bytes, entry.value_.key_external_
+                    std::min(value_bytes, entry.value_.key_external()
                                               ? entry.logical_key_size()
                                               : std::size_t{0});
               }
@@ -408,7 +408,7 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
               }
               value_bytes -= std::min<std::size_t>(
                   value_bytes,
-                  entry.value_.key_external_ ? entry.logical_key_size() : 0);
+                  entry.value_.key_external() ? entry.logical_key_size() : 0);
               state->external_.push_back(ScanPartitionState::ExternalCandidate{
                   .entry_ = &entry,
                   .extents_ = std::move(extents),
@@ -455,11 +455,11 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
       }
       const RecordIndex::Entry* current = candidate.entry_;
       if (current->value_.SamePhysicalRecord(candidate.location_) &&
-          current->value_.kind_ == RecordKind::kValue &&
+          current->value_.kind() == RecordKind::kValue &&
           !IsExpired(current->value_, state.now_ms_)) {
         add_bytes(key->size());
         state.result_.keys_.push_back(std::move(*key));
-        state.result_.value_types_.push_back(current->value_.value_type_);
+        state.result_.value_types_.push_back(current->value_.value_type());
         state.result_.value_bytes_.push_back(candidate.value_bytes_);
         add_bytes(candidate.value_bytes_);
       }

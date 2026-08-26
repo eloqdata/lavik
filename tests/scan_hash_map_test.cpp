@@ -216,6 +216,33 @@ TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
   EXPECT_TRUE(map.empty());
 }
 
+TEST(ScanHashMapTest, SaturatedAddressSpaceUsesBucketChains) {
+  // A two-bit test table reaches the same state as production at 2^32
+  // buckets, without requiring an enormous allocation.
+  ScanHashMap<std::uint64_t, 2> map;
+  constexpr std::uint64_t kEntries = 256;
+  for (std::uint64_t i = 0; i < kEntries; ++i) {
+    const std::string key = "saturated-" + std::to_string(i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
+  }
+
+  EXPECT_EQ(map.allocated_bucket_count(), 4);
+  EXPECT_EQ(map.size(), kEntries);
+  for (std::uint64_t i = 0; i < kEntries; ++i) {
+    const std::string key = "saturated-" + std::to_string(i);
+    auto* found = map.Find(ComputeDigest(key), key);
+    ASSERT_NE(found, nullptr);
+    EXPECT_EQ(found->value_, i);
+  }
+
+  for (std::uint64_t i = 0; i < kEntries; i += 2) {
+    const std::string key = "saturated-" + std::to_string(i);
+    EXPECT_TRUE(map.Erase(ComputeDigest(key), key));
+  }
+  EXPECT_EQ(map.allocated_bucket_count(), 4);
+  EXPECT_EQ(map.size(), kEntries / 2);
+}
+
 TEST(ScanHashMapTest,
      ScanDoesNotMissStableEntriesWhenMutationOccursBetweenCalls) {
   ScanHashMap<std::uint64_t> map;
@@ -241,8 +268,8 @@ TEST(ScanHashMapTest,
 
     // Deleting and reinserting unrelated keys compacts bucket chains while
     // the larger insert population repeatedly advances incremental rehash.
-    for (std::uint64_t i = round * 32;
-         i < std::min(kChurn, round * 32 + 32); ++i) {
+    for (std::uint64_t i = round * 32; i < std::min(kChurn, round * 32 + 32);
+         ++i) {
       const std::string key = "churn-" + std::to_string(i);
       ASSERT_TRUE(map.Erase(ComputeDigest(key), key));
     }

@@ -4,8 +4,8 @@ namespace keylane::storage {
 
 Task<absl::Status> StorageEngine::Impl::ExecuteCompact(
     std::uint8_t db_id, std::string_view key, ValueType value_type,
-    bool read_only, const CompactValueCallback& callback,
-    std::uint64_t now_ms, ReplicationCommandAppend* replication) {
+    bool read_only, const CompactValueCallback& callback, std::uint64_t now_ms,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
@@ -41,10 +41,10 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
   }
 
   const bool stored_value =
-      found != nullptr && found->value_.kind_ == RecordKind::kValue;
+      found != nullptr && found->value_.kind() == RecordKind::kValue;
   if (now_ms == 0) now_ms = UnixTimeMillis();
   const bool exists = stored_value && !IsExpired(found->value_, now_ms);
-  if (exists && found->value_.value_type_ != value_type) {
+  if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
@@ -109,15 +109,16 @@ Task<absl::Status> StorageEngine::Impl::ExecuteCompactLocked(
       update->erase_
           ? 0
           : update->expire_at_ms_.value_or(exists ? location.expire_at_ms_ : 0);
-  const std::string_view encoded =
-      update->reuse_encoded_ ? view->encoded_ : std::string_view(update->encoded_);
+  const std::string_view encoded = update->reuse_encoded_
+                                       ? view->encoded_
+                                       : std::string_view(update->encoded_);
   const std::uint64_t logical_size =
       update->reuse_encoded_ ? location.logical_size_ : update->logical_size_;
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest,
-      update->erase_ ? std::string_view{} : encoded,
-      kind, published_type, expire_at_ms, tx,
-      update->erase_ ? 0 : logical_size, nullptr, nullptr, replication);
+      update->erase_ ? std::string_view{} : encoded, kind, published_type,
+      expire_at_ms, tx, update->erase_ ? 0 : logical_size, nullptr, nullptr,
+      replication);
   co_return status;
 }
 

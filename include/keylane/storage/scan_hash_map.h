@@ -35,15 +35,25 @@
 
 namespace keylane::storage {
 
-template <typename Value>
+// Cached hashes retain the 32 address bits needed by the largest direct bucket
+// table. MaxBucketExponent is configurable so tests can exercise saturation
+// without allocating 2^32 buckets; production uses the full uint32_t range.
+template <typename Value, unsigned MaxBucketExponent =
+                              std::numeric_limits<std::uint32_t>::digits>
 class ScanHashMap {
  public:
+  static_assert(MaxBucketExponent <=
+                std::numeric_limits<std::uint32_t>::digits);
+  static_assert(MaxBucketExponent < std::numeric_limits<std::size_t>::digits);
+
   struct Entry {
     static constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
 
-    std::uint64_t hash_ = 0;
-    Value value_{};
+    // The bucket already owns an independent 8-bit tag. Entries retain only
+    // the low hash bits needed to find and redistribute their bucket.
+    std::uint32_t hash_ = 0;
     std::uint32_t key_size_ = 0;
+    Value value_{};
 
     bool key_complete() const noexcept {
       return (key_size_ & kExternalKeyMask) == 0;
@@ -83,7 +93,7 @@ class ScanHashMap {
       void* storage = ::operator new(sizeof(Entry) + tail_bytes);
       Entry* entry = nullptr;
       try {
-        entry = new (storage) Entry(Hash(digest),
+        entry = new (storage) Entry(static_cast<std::uint32_t>(Hash(digest)),
                                     static_cast<std::uint32_t>(key.size()) |
                                         (key_complete ? 0 : kExternalKeyMask),
                                     value);
@@ -110,8 +120,8 @@ class ScanHashMap {
     }
 
    private:
-    Entry(std::uint64_t hash, std::uint32_t key_size, const Value& value)
-        : hash_(hash), value_(value), key_size_(key_size) {}
+    Entry(std::uint32_t hash, std::uint32_t key_size, const Value& value)
+        : hash_(hash), key_size_(key_size), value_(value) {}
   };
 
   struct InsertResult {
@@ -143,6 +153,12 @@ class ScanHashMap {
 
   bool has_allocated_storage() const noexcept {
     return tables_[0].buckets_ != nullptr || tables_[1].buckets_ != nullptr;
+  }
+
+  // Includes both tables during incremental expansion. Primarily useful for
+  // capacity diagnostics and saturation tests.
+  std::size_t allocated_bucket_count() const noexcept {
+    return BucketCount(tables_[0]) + BucketCount(tables_[1]);
   }
 
   Entry* Find(const Digest& digest, std::string_view key) {
@@ -203,7 +219,8 @@ class ScanHashMap {
     std::unique_ptr<Entry, void (*)(Entry*)> entry(
         Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
     Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw,
+               HashTag(Hash(digest)));
     entry.release();
     return {raw, true};
   }
@@ -215,7 +232,8 @@ class ScanHashMap {
     std::unique_ptr<Entry, void (*)(Entry*)> entry(
         Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
     Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw);
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw,
+               HashTag(Hash(digest)));
     entry.release();
     return raw;
   }
@@ -265,7 +283,7 @@ class ScanHashMap {
       return false;
     }
     RehashStep();
-    const std::uint64_t hash = entry->hash_;
+    const std::uint32_t hash = entry->hash_;
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
@@ -517,7 +535,13 @@ class ScanHashMap {
     if (tables_[0].used_ + 1 <= buckets * kTargetEntriesPerBucket) {
       return;
     }
-    assert(tables_[0].exponent_ < 63);
+    // Once every cached address bit is in use, retaining the current direct
+    // table is safer than overflowing the entry hash. AddToTable continues to
+    // accept entries through bucket chains, so saturation is a performance
+    // boundary rather than a capacity or correctness failure.
+    if (tables_[0].exponent_ >= MaxBucketExponent) {
+      return;
+    }
     tables_[1].exponent_ = tables_[0].exponent_ + 1;
     tables_[1].buckets_ =
         std::make_unique<Bucket[]>(std::size_t{1} << tables_[1].exponent_);
@@ -606,9 +630,8 @@ class ScanHashMap {
     return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
   }
 
-  static void AddToTable(Table& table, Entry* entry) {
-    const std::uint64_t hash = entry->hash_;
-    const std::uint8_t tag = HashTag(hash);
+  static void AddToTable(Table& table, Entry* entry, std::uint8_t tag) {
+    const std::uint32_t hash = entry->hash_;
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     while (true) {
       const std::size_t slots =
@@ -683,7 +706,9 @@ class ScanHashMap {
       const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot)) {
-          AddToTable(*target, bucket->entries_[slot]);
+          // The tag contains hash bits that are intentionally absent from the
+          // compact entry. Carry it with the pointer across every rehash.
+          AddToTable(*target, bucket->entries_[slot], bucket->hashes_[slot]);
           ClearOccupied(bucket, slot);
         }
       }

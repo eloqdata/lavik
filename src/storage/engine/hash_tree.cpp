@@ -66,11 +66,11 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
     found = *resolved;
   }
   const bool stored_value =
-      found != nullptr && found->value_.kind_ == RecordKind::kValue;
+      found != nullptr && found->value_.kind() == RecordKind::kValue;
   const std::uint64_t now_ms =
       operation.now_ms_ == 0 ? UnixTimeMillis() : operation.now_ms_;
   const bool exists = stored_value && !IsExpired(found->value_, now_ms);
-  if (exists && found->value_.value_type_ != value_type) {
+  if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
@@ -78,8 +78,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
   const std::uint64_t observed_index_generation =
       store.index_generations_[db_id];
   const std::uint64_t observed_db_epoch = DbEpoch(db_id);
-  const std::uint64_t observed_replication_epoch =
-      partition.replication_epoch_;
+  const std::uint64_t observed_replication_epoch = partition.replication_epoch_;
   auto read_epoch_changed = [&]() {
     return read_only &&
            (store.index_generations_[db_id] != observed_index_generation ||
@@ -87,8 +86,8 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             partition.replication_epoch_ != observed_replication_epoch);
   };
   const RecordLocation location = exists ? found->value_ : RecordLocation{};
-  const ExtentManifest extents = exists ? ExtentsFor(store, found)
-                                         : ExtentManifest{};
+  const ExtentManifest extents =
+      exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;
 
   HashResult result;
@@ -393,9 +392,9 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
         co_return result;
       }
       const std::size_t begin = begin_it - compact.entries_.begin();
-      const std::size_t examined = static_cast<std::size_t>(
-          std::min<std::uint64_t>(operation.scan_count_,
-                                  compact.entries_.size() - begin));
+      const std::size_t examined =
+          static_cast<std::size_t>(std::min<std::uint64_t>(
+              operation.scan_count_, compact.entries_.size() - begin));
       std::size_t end = begin + examined;
       while (end < compact.entries_.size() &&
              ScanCursorPrefix(compact.entries_[end].digest_) ==
