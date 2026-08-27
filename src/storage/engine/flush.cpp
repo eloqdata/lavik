@@ -358,7 +358,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
                                identity.tx_retirements_->begin(),
                                identity.tx_retirements_->end());
       }
-      if (identity.entry_ == nullptr) {
+      if (identity.entry_address_ == 0) {
         continue;
       }
       // FLUSHDB detached the population this entry belongs to. The entry is
@@ -368,21 +368,19 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
           store->index_generations_[identity.db_id_]) {
         continue;
       }
-      // Memory-only expiration freed the entry while its record was still
-      // staged; the retirements above still settled, only the marking is
-      // moot.
-      if (identity.entry_ == nullptr) {
+      // A TTL transition can replace and free the concrete Entry while this
+      // physical record is staged. FindAddress compares integer addresses
+      // with bucket slots; only a still-live member may be inspected below.
+      // Address reuse is harmless because the physical boundary check then
+      // applies to the replacement entry's own location.
+      RecordIndex& index = PartitionFor(*store, identity.partition_id_)
+                               .indexes_[identity.db_id_];
+      RecordIndex::Entry* current_entry =
+          index.FindAddress(identity.entry_address_, identity.entry_hash_);
+      if (current_entry == nullptr) {
         continue;
       }
-      RecordLocation& current = identity.entry_->value_;
-      // The entry may no longer hold the version this identity was staged
-      // for. Matching on block and epoch alone was enough when a block
-      // flushed once: an overwrite necessarily landed in a different block.
-      // With block reuse an overwrite racing this flush lands in the same
-      // block above the snapshot boundary, and marking it flushed would
-      // send readers to disk pages that are still zero. Offsets within one
-      // allocation only grow, so the boundary check identifies stale
-      // versions exactly.
+      RecordLocationCore& current = current_entry->value_;
       // The entry may no longer hold the version this identity was staged
       // for. Matching on block and epoch alone was enough when a block
       // flushed once: an overwrite necessarily landed in a different block.

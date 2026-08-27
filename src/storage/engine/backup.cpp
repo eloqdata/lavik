@@ -202,7 +202,7 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     RecordIndex::Entry* current = *resolved;
     if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
         current->value_.mutation_sequence_ > capture->cut_sequence_ ||
-        IsExpired(current->value_, capture->snapshot_time_ms_)) {
+        IsExpired(*current, capture->snapshot_time_ms_)) {
       capture->dirty_keys_.InsertNew(map_digest, map_key,
                                      SnapshotValue{
                                          .location_ = {},
@@ -214,7 +214,7 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     }
 
     SnapshotValue old{
-        .location_ = current->value_,
+        .location_ = current->value(),
         .extents_ = ExtentsFor(store, current),
         .phase_ = Phase::kOldValue,
     };
@@ -336,7 +336,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
       }
       RecordIndex::Entry* current = *resolved;
       if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
-          IsExpired(current->value_, capture->snapshot_time_ms_)) {
+          IsExpired(*current, capture->snapshot_time_ms_)) {
         capture->dirty_keys_.InsertNew(map_digest, map_key,
                                        SavedValue{
                                            .location_ = {},
@@ -351,7 +351,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
             "post-cut RDB key has no ABSENT/old-value capture");
       }
       SavedValue candidate{
-          .location_ = current->value_,
+          .location_ = current->value(),
           .extents_ = ExtentsFor(store, current),
           .phase_ = Phase::kInflight,
       };

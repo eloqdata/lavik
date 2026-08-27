@@ -35,16 +35,43 @@
 
 namespace keylane::storage {
 
+// The default policy stores every value directly in Entry. Specialized maps
+// may split a value into a common hot-path prefix and an optional derived
+// payload while retaining the same hash-table implementation.
+template <typename Value>
+struct ScanHashMapInlineEntryPolicy {
+  using StoredValue = Value;
+  struct Extra {};
+
+  static constexpr bool HasExtraValue(const Value&) noexcept { return false; }
+  static constexpr bool HasExtraStored(const StoredValue&) noexcept {
+    return false;
+  }
+  static StoredValue Store(const Value& value) { return value; }
+  static Extra StoreExtra(const Value&) noexcept { return {}; }
+  static Value Load(const StoredValue& value, const Extra*) { return value; }
+  static void Assign(StoredValue* stored, Extra*, const Value& value) {
+    *stored = value;
+  }
+};
+
 // Cached hashes retain the 32 address bits needed by the largest direct bucket
 // table. MaxBucketExponent is configurable so tests can exercise saturation
 // without allocating 2^32 buckets; production uses the full uint32_t range.
-template <typename Value, unsigned MaxBucketExponent =
-                              std::numeric_limits<std::uint32_t>::digits>
+template <typename Value,
+          unsigned MaxBucketExponent =
+              std::numeric_limits<std::uint32_t>::digits,
+          typename EntryPolicy = ScanHashMapInlineEntryPolicy<Value>>
 class ScanHashMap {
  public:
   static_assert(MaxBucketExponent <=
                 std::numeric_limits<std::uint32_t>::digits);
   static_assert(MaxBucketExponent < std::numeric_limits<std::size_t>::digits);
+
+  using StoredValue = typename EntryPolicy::StoredValue;
+  using EntryExtra = typename EntryPolicy::Extra;
+
+  struct ExtendedEntry;
 
   struct Entry {
     static constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
@@ -53,7 +80,29 @@ class ScanHashMap {
     // the low hash bits needed to find and redistribute their bucket.
     std::uint32_t hash_ = 0;
     std::uint32_t key_size_ = 0;
-    Value value_{};
+    StoredValue value_{};
+
+    bool has_extra() const noexcept {
+      return EntryPolicy::HasExtraStored(value_);
+    }
+
+    EntryExtra* optional_extra() noexcept {
+      return has_extra() ? extra() : nullptr;
+    }
+    const EntryExtra* optional_extra() const noexcept {
+      return has_extra() ? extra() : nullptr;
+    }
+
+    Value value() const { return EntryPolicy::Load(value_, optional_extra()); }
+
+    bool can_assign(const Value& value) const noexcept {
+      return has_extra() == EntryPolicy::HasExtraValue(value);
+    }
+
+    void assign(const Value& value) {
+      assert(can_assign(value));
+      EntryPolicy::Assign(&value_, optional_extra(), value);
+    }
 
     bool key_complete() const noexcept {
       return (key_size_ & kExternalKeyMask) == 0;
@@ -65,7 +114,7 @@ class ScanHashMap {
 
     std::string_view key() const noexcept {
       return key_complete()
-                 ? std::string_view(reinterpret_cast<const char*>(this + 1),
+                 ? std::string_view(reinterpret_cast<const char*>(tail()),
                                     logical_key_size())
                  : std::string_view{};
     }
@@ -73,55 +122,38 @@ class ScanHashMap {
     Digest external_key_digest() const noexcept {
       Digest digest;
       if (!key_complete()) {
-        std::memcpy(digest.bytes_.data(), this + 1, digest.bytes_.size());
+        std::memcpy(digest.bytes_.data(), tail(), digest.bytes_.size());
       }
       return digest;
     }
 
     static Entry* Create(const Digest& digest, std::string_view key,
-                         const Value& value, bool key_complete = true) {
-      if (key.size() >= kExternalKeyMask) {
-        throw std::bad_alloc();
-      }
-      const std::size_t tail_bytes =
-          key_complete ? key.size() : digest.bytes_.size();
-      if (tail_bytes >
-          std::numeric_limits<std::size_t>::max() - sizeof(Entry)) {
-        throw std::bad_alloc();
-      }
-      static_assert(alignof(Entry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
-      void* storage = ::operator new(sizeof(Entry) + tail_bytes);
-      Entry* entry = nullptr;
-      try {
-        entry = new (storage) Entry(static_cast<std::uint32_t>(Hash(digest)),
-                                    static_cast<std::uint32_t>(key.size()) |
-                                        (key_complete ? 0 : kExternalKeyMask),
-                                    value);
-      } catch (...) {
-        ::operator delete(storage);
-        throw;
-      }
-      if (key_complete && !key.empty()) {
-        std::memcpy(static_cast<void*>(reinterpret_cast<std::byte*>(entry + 1)),
-                    key.data(), key.size());
-      } else if (!key_complete) {
-        std::memcpy(static_cast<void*>(reinterpret_cast<std::byte*>(entry + 1)),
-                    digest.bytes_.data(), digest.bytes_.size());
-      }
-      return entry;
-    }
+                         const Value& value, bool key_complete = true);
+    static Entry* CreateReplacement(const Entry& source, const Value& value);
 
-    static void Destroy(Entry* entry) noexcept {
-      if (entry == nullptr) {
-        return;
-      }
-      entry->~Entry();
-      ::operator delete(entry);
-    }
+    static void Destroy(Entry* entry) noexcept;
 
    private:
-    Entry(std::uint32_t hash, std::uint32_t key_size, const Value& value)
+    friend struct ExtendedEntry;
+
+    Entry(std::uint32_t hash, std::uint32_t key_size, const StoredValue& value)
         : hash_(hash), key_size_(key_size), value_(value) {}
+
+    EntryExtra* extra() noexcept;
+    const EntryExtra* extra() const noexcept;
+    std::byte* tail() noexcept;
+    const std::byte* tail() const noexcept;
+  };
+
+  struct ExtendedEntry final : Entry {
+    EntryExtra extra_{};
+
+   private:
+    friend struct Entry;
+
+    ExtendedEntry(std::uint32_t hash, std::uint32_t key_size,
+                  const StoredValue& value, const EntryExtra& extra)
+        : Entry(hash, key_size, value), extra_(extra) {}
   };
 
   struct InsertResult {
@@ -200,8 +232,23 @@ class ScanHashMap {
   }
 
   bool Contains(const Entry* entry, std::uint64_t hash) const noexcept {
-    if (entry == nullptr) {
-      return false;
+    return FindAddress(reinterpret_cast<std::uintptr_t>(entry), hash) !=
+           nullptr;
+  }
+
+  Entry* FindAddress(std::uintptr_t address, std::uint64_t hash) noexcept {
+    return const_cast<Entry*>(std::as_const(*this).FindAddress(address, hash));
+  }
+
+  // Resolves an address cached by an asynchronous owner without interpreting
+  // it as an Entry first. The object may have been erased while that owner was
+  // suspended; comparing integer addresses with live bucket slots makes the
+  // membership check safe before any object lifetime is assumed. Callers must
+  // use the returned live pointer rather than reconstructing one from address.
+  const Entry* FindAddress(std::uintptr_t address,
+                           std::uint64_t hash) const noexcept {
+    if (address == 0) {
+      return nullptr;
     }
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
@@ -214,20 +261,67 @@ class ScanHashMap {
         const std::size_t slots =
             Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
         for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) && bucket->entries_[slot] == entry) {
-            return true;
+          if (Occupied(*bucket, slot) &&
+              reinterpret_cast<std::uintptr_t>(bucket->entries_[slot]) ==
+                  address) {
+            return bucket->entries_[slot];
           }
         }
         bucket = Chained(*bucket) ? Child(bucket) : nullptr;
       }
     }
-    return false;
+    return nullptr;
+  }
+
+  // Updates an entry without changing its address when the policy-selected
+  // concrete type stays the same. If the representation changes, swaps a new
+  // object into the existing bucket slot and returns the detached old object
+  // through `replaced`. Before destroying it, the caller must migrate caches
+  // that assume a live object; asynchronous address-only caches can instead
+  // use FindAddress to validate membership before dereferencing.
+  Entry* ReplaceValue(Entry* existing, const Value& value, Entry** replaced) {
+    assert(existing != nullptr);
+    assert(replaced != nullptr);
+    *replaced = nullptr;
+    if (existing->can_assign(value)) {
+      existing->assign(value);
+      return existing;
+    }
+
+    std::unique_ptr<Entry, void (*)(Entry*)> replacement(
+        Entry::CreateReplacement(*existing, value), &Entry::Destroy);
+    const std::uint32_t hash = existing->hash_;
+    const int tables = Rehashing() ? 2 : 1;
+    for (int t = 0; t < tables; ++t) {
+      Table& table = tables_[t];
+      if (table.buckets_ == nullptr) {
+        continue;
+      }
+      Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+      while (bucket != nullptr) {
+        const std::size_t slots =
+            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+          if (Occupied(*bucket, slot) && bucket->entries_[slot] == existing) {
+            bucket->entries_[slot] = replacement.get();
+            *replaced = existing;
+            return replacement.release();
+          }
+        }
+        bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      }
+    }
+    assert(false && "replacement target must belong to this map");
+    return nullptr;
   }
 
   InsertResult InsertOrAssign(const Digest& digest, std::string_view key,
                               const Value& value, bool key_complete = true) {
     if (Entry* existing = Find(digest, key); existing != nullptr) {
-      existing->value_ = value;
+      // The inline policy never changes representation. Specialized policies
+      // use ReplaceValue when a new value changes the concrete entry type.
+      assert(existing->can_assign(value));
+      existing->assign(value);
       return {existing, false};
     }
 
@@ -458,11 +552,12 @@ class ScanHashMap {
   // entries, so a caller can hand it to a background task and keep serving
   // reads from *this. O(1) — no entry is touched here.
   //
-  // Entry addresses are stable for as long as their map lives (expansion moves
-  // bucket pointers, never entries), so callers may cache a raw Entry*. Such a
-  // caller must be able to tell that a detach happened before dereferencing;
-  // this class does not track that, since the useful granularity is whatever
-  // set of maps the caller detaches together.
+  // Entry addresses are stable across expansion and ordinary assignment.
+  // ReplaceValue deliberately returns the detached old object when a storage
+  // policy changes concrete type, making the exceptional invalidation
+  // explicit to its caller. A raw-pointer cache must likewise detect detach
+  // before dereferencing; this class does not track that, since the useful
+  // granularity is whatever set of maps the caller detaches together.
   ScanHashMap Detach() noexcept {
     ScanHashMap detached;
     detached.tables_ = std::exchange(tables_, {});
@@ -877,5 +972,123 @@ class ScanHashMap {
   std::array<Table, 2> tables_{};
   std::size_t rehash_index_ = kNotRehashing;
 };
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
+    const Digest& digest, std::string_view key, const Value& value,
+    bool key_complete) {
+  if (key.size() >= kExternalKeyMask) {
+    throw std::bad_alloc();
+  }
+  const std::size_t tail_bytes =
+      key_complete ? key.size() : digest.bytes_.size();
+  const bool extended = EntryPolicy::HasExtraValue(value);
+  const std::size_t header_bytes =
+      extended ? sizeof(ExtendedEntry) : sizeof(Entry);
+  if (tail_bytes > std::numeric_limits<std::size_t>::max() - header_bytes) {
+    throw std::bad_alloc();
+  }
+  static_assert(alignof(Entry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+  static_assert(alignof(ExtendedEntry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+  void* storage = ::operator new(header_bytes + tail_bytes);
+  Entry* entry = nullptr;
+  try {
+    const std::uint32_t hash = static_cast<std::uint32_t>(Hash(digest));
+    const std::uint32_t key_size = static_cast<std::uint32_t>(key.size()) |
+                                   (key_complete ? 0 : kExternalKeyMask);
+    if (extended) {
+      entry =
+          new (storage) ExtendedEntry(hash, key_size, EntryPolicy::Store(value),
+                                      EntryPolicy::StoreExtra(value));
+    } else {
+      entry = new (storage) Entry(hash, key_size, EntryPolicy::Store(value));
+    }
+  } catch (...) {
+    ::operator delete(storage);
+    throw;
+  }
+  if (key_complete && !key.empty()) {
+    std::memcpy(entry->tail(), key.data(), key.size());
+  } else if (!key_complete) {
+    std::memcpy(entry->tail(), digest.bytes_.data(), digest.bytes_.size());
+  }
+  return entry;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
+    const Entry& source, const Value& value) {
+  const std::size_t tail_bytes = source.key_complete()
+                                     ? source.logical_key_size()
+                                     : Digest{}.bytes_.size();
+  const bool extended = EntryPolicy::HasExtraValue(value);
+  const std::size_t header_bytes =
+      extended ? sizeof(ExtendedEntry) : sizeof(Entry);
+  if (tail_bytes > std::numeric_limits<std::size_t>::max() - header_bytes) {
+    throw std::bad_alloc();
+  }
+  void* storage = ::operator new(header_bytes + tail_bytes);
+  Entry* entry = nullptr;
+  try {
+    if (extended) {
+      entry = new (storage) ExtendedEntry(source.hash_, source.key_size_,
+                                          EntryPolicy::Store(value),
+                                          EntryPolicy::StoreExtra(value));
+    } else {
+      entry = new (storage)
+          Entry(source.hash_, source.key_size_, EntryPolicy::Store(value));
+    }
+  } catch (...) {
+    ::operator delete(storage);
+    throw;
+  }
+  if (tail_bytes != 0) {
+    std::memcpy(entry->tail(), source.tail(), tail_bytes);
+  }
+  return entry;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+void ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Destroy(
+    Entry* entry) noexcept {
+  if (entry == nullptr) {
+    return;
+  }
+  if (entry->has_extra()) {
+    static_cast<ExtendedEntry*>(entry)->~ExtendedEntry();
+  } else {
+    entry->~Entry();
+  }
+  ::operator delete(entry);
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::EntryExtra*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::extra() noexcept {
+  return &static_cast<ExtendedEntry*>(this)->extra_;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+const typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::EntryExtra*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::extra()
+    const noexcept {
+  return &static_cast<const ExtendedEntry*>(this)->extra_;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+std::byte*
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::tail() noexcept {
+  return reinterpret_cast<std::byte*>(this) +
+         (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+const std::byte* ScanHashMap<Value, MaxBucketExponent,
+                             EntryPolicy>::Entry::tail() const noexcept {
+  return reinterpret_cast<const std::byte*>(this) +
+         (has_extra() ? sizeof(ExtendedEntry) : sizeof(Entry));
+}
 
 }  // namespace keylane::storage

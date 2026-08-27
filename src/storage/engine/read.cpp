@@ -112,9 +112,9 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     if (selected->key_complete()) {
       co_return std::optional<std::string>(std::string(selected->key()));
     }
-    const RecordIndex::Entry* identity = selected;
+    const std::uintptr_t identity = reinterpret_cast<std::uintptr_t>(selected);
     const std::uint64_t hash = selected->hash_;
-    const RecordLocation location = selected->value_;
+    const RecordLocation location = selected->value();
     const ExtentManifest extents = ExtentsFor(store, selected);
     const std::uint32_t key_bytes = selected->logical_key_size();
     const std::uint64_t index_generation = store.index_generations_[db_id];
@@ -123,13 +123,13 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     auto loaded =
         co_await LoadOutOfIndexKey(store, location, extents, key_bytes);
     if (!loaded.ok()) co_return loaded.status();
+    RecordIndex::Entry* current = index.FindAddress(identity, hash);
     if (store.index_generations_[db_id] != index_generation ||
         DbEpoch(db_id) != db_epoch ||
         partition.replication_epoch_ != replication_epoch ||
-        !index.Contains(identity, hash) ||
-        !identity->value_.SamePhysicalRecord(location) ||
-        identity->value_.kind() != RecordKind::kValue ||
-        IsExpired(identity->value_, UnixTimeMillis())) {
+        current == nullptr || !current->value_.SamePhysicalRecord(location) ||
+        current->value_.kind() != RecordKind::kValue ||
+        IsExpired(*current, UnixTimeMillis())) {
       co_return std::optional<std::string>{};
     }
     co_return std::optional<std::string>(std::move(*loaded));
@@ -170,7 +170,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     if (selected->value_.kind() != RecordKind::kValue) continue;
 
     const std::uint64_t now_ms = UnixTimeMillis();
-    if (IsExpired(selected->value_, now_ms)) {
+    if (IsExpired(*selected, now_ms)) {
       QueueExpiredCandidate(store, selected_partition->id_, db_id, *selected,
                             selected->key());
       continue;
@@ -190,7 +190,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     const std::uint64_t now_ms = UnixTimeMillis();
     index.ForEachWhile([&](RecordIndex::Entry& entry) {
       if (entry.value_.kind() != RecordKind::kValue) return true;
-      if (IsExpired(entry.value_, now_ms)) {
+      if (IsExpired(entry, now_ms)) {
         QueueExpiredCandidate(store, partition.id_, db_id, entry, entry.key());
       } else {
         selected = &entry;
@@ -241,7 +241,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
   }
   const std::uint64_t now_ms = UnixTimeMillis();
-  if (IsExpired(found->value_, now_ms)) {
+  if (IsExpired(*found, now_ms)) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     if (trace != nullptr) {
       trace->lookup_done_ns_ = ReadTraceNowNanos();
@@ -259,7 +259,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
   }
 
   auto loaded =
-      co_await LoadValue(store, partition, db_id, key, digest, found->value_,
+      co_await LoadValue(store, partition, db_id, key, digest, found->value(),
                          ExtentsFor(store, found), trace);
   if (!loaded.ok()) {
     co_return loaded.status();
@@ -306,7 +306,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
     if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
       continue;
     }
-    if (IsExpired(found->value_, now_ms)) {
+    if (IsExpired(*found, now_ms)) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, request.key_);
       continue;
     }
@@ -316,7 +316,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       continue;
     }
 
-    const RecordLocation location = found->value_;
+    const RecordLocation location = found->value();
     if (location.external() || location.block_owner() != store.worker_->id() ||
         location.in_memory()) {
       fallbacks.push_back(i);
@@ -559,8 +559,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
     found = *resolved;
   }
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
-      IsExpired(found->value_, UnixTimeMillis())) {
-    if (found != nullptr && IsExpired(found->value_, UnixTimeMillis())) {
+      IsExpired(*found, UnixTimeMillis())) {
+    if (found != nullptr && IsExpired(*found, UnixTimeMillis())) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     }
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
@@ -599,13 +599,13 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   if (found == nullptr || found->value_.kind() != RecordKind::kValue) {
     co_return ExpirationInfo{};
   }
-  if (IsExpired(found->value_, UnixTimeMillis())) {
+  if (IsExpired(*found, UnixTimeMillis())) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return ExpirationInfo{};
   }
   co_return ExpirationInfo{
       .exists_ = true,
-      .expire_at_ms_ = found->value_.expire_at_ms_,
+      .expire_at_ms_ = ExpireAt(*found),
       .value_type_ = found->value_.value_type(),
   };
 }
@@ -626,14 +626,14 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
     found = *resolved;
   }
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
-      IsExpired(found->value_, UnixTimeMillis())) {
+      IsExpired(*found, UnixTimeMillis())) {
     if (found != nullptr && found->value_.kind() == RecordKind::kValue) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     }
     co_return absl::NotFoundError("key not found");
   }
 
-  const RecordLocation location = found->value_;
+  const RecordLocation location = found->value();
   const ExtentManifest extents = ExtentsFor(store, found);
   const std::uint64_t index_generation = store.index_generations_[db_id];
   const std::uint64_t db_epoch = DbEpoch(db_id);
@@ -683,7 +683,7 @@ Task<bool> StorageEngine::Impl::KeyLive(std::uint8_t db_id,
     found = *resolved;
   }
   co_return found != nullptr && found->value_.kind() == RecordKind::kValue &&
-      !IsExpired(found->value_, UnixTimeMillis());
+      !IsExpired(*found, UnixTimeMillis());
 }
 
 Task<bool> StorageEngine::Impl::Exists(std::uint8_t db_id,
@@ -713,7 +713,7 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
   if (found == nullptr || found->value_.kind() != RecordKind::kValue) {
     co_return false;
   }
-  if (IsExpired(found->value_, UnixTimeMillis())) {
+  if (IsExpired(*found, UnixTimeMillis())) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return false;
   }
@@ -840,7 +840,7 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
       co_return absl::Status(absl::StatusCode::kInternal,
                              loaded.status().message());
     }
-    location = current->value_;
+    location = current->value();
     extents = ExtentsFor(key_store, current);
   }
 }
@@ -1126,7 +1126,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyExternalKey(
     co_return false;
   }
   if (!entry.value_.external()) {
-    co_return co_await VerifyInlineRecordKey(store, entry.value_, key);
+    co_return co_await VerifyInlineRecordKey(store, entry.value(), key);
   }
   co_return co_await VerifyExternalKeyExtents(store, ExtentsFor(store, &entry),
                                               key);
@@ -1282,7 +1282,7 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
                                        const Digest& digest,
                                        std::string_view key) {
   struct Candidate {
-    RecordIndex::Entry* entry_ = nullptr;
+    std::uintptr_t entry_address_ = 0;
     ExtentManifest extents_;
     RecordLocation location_{};
     std::uint64_t hash_ = 0;
@@ -1295,9 +1295,9 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
     std::vector<Candidate> candidates;
     for (RecordIndex::Entry* entry : index.FindCandidates(digest, key)) {
       candidates.push_back(Candidate{
-          .entry_ = entry,
+          .entry_address_ = reinterpret_cast<std::uintptr_t>(entry),
           .extents_ = ExtentsFor(store, entry),
-          .location_ = entry->value_,
+          .location_ = entry->value(),
           .hash_ = entry->hash_,
       });
     }
@@ -1311,9 +1311,11 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
         verified =
             co_await VerifyInlineRecordKey(store, candidate.location_, key);
       }
+      RecordIndex::Entry* current =
+          index.FindAddress(candidate.entry_address_, candidate.hash_);
       const bool still_current =
-          index.Contains(candidate.entry_, candidate.hash_) &&
-          candidate.entry_->value_.SamePhysicalRecord(candidate.location_);
+          current != nullptr &&
+          current->value_.SamePhysicalRecord(candidate.location_);
       if (!verified.ok()) {
         if (verified.status().code() == absl::StatusCode::kAborted &&
             !still_current) {
@@ -1330,7 +1332,7 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
         break;
       }
       if (*verified) {
-        co_return candidate.entry_;
+        co_return current;
       }
     }
     if (!changed) {

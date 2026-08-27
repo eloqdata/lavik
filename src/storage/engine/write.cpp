@@ -5,6 +5,45 @@
 
 namespace keylane::storage {
 
+RecordIndex::Entry* StorageEngine::Impl::ReplaceIndexLocation(
+    WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
+    const RecordLocation& location, TxUndoLog* tx_undo) {
+  RecordIndex::Entry* replaced = nullptr;
+  RecordIndex::Entry* current = index.ReplaceValue(entry, location, &replaced);
+  if (replaced == nullptr) {
+    return current;
+  }
+
+  // Staged records deliberately keep only the old address bits. Flush proves
+  // bucket membership before recovering a live pointer, so changing
+  // representation is O(1) in the number of pending records. Only the
+  // transaction that owns this key can retain a dereferenceable rollback
+  // handle: its exclusive key lock prevents any other transaction or
+  // foreground writer from observing the transition. Updating the handle's
+  // one current-pointer slot avoids scanning every prior write in a large
+  // transaction when many keys change TTL representation.
+  if (tx_undo != nullptr) {
+    tx_undo->Replace(replaced, current);
+  }
+
+  auto move_pointer_key = [replaced, current](auto& values) {
+    auto found = values.find(replaced);
+    if (found == values.end()) {
+      return;
+    }
+    auto value = std::move(found->second);
+    values.erase(found);
+    values.insert_or_assign(current, std::move(value));
+  };
+  move_pointer_key(store.external_manifests_);
+  move_pointer_key(store.recovery_external_keys_);
+  move_pointer_key(store.recovery_lsns_);
+  move_pointer_key(store.recovery_txids_);
+
+  RecordIndex::Entry::Destroy(replaced);
+  return current;
+}
+
 namespace {
 
 ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
@@ -64,7 +103,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   const std::uint64_t now_ms = UnixTimeMillis();
   const bool exists = found != nullptr &&
                       found->value_.kind() == RecordKind::kValue &&
-                      !IsExpired(found->value_, now_ms);
+                      !IsExpired(*found, now_ms);
   if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
   SetResult result;
   if (options.return_old_value_ && exists) {
@@ -74,7 +113,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     found->value_, ExtentsFor(store, found));
+                                     found->value(), ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -93,9 +132,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     co_return result;
   }
 
-  const std::uint64_t expire_at_ms = options.keep_ttl_ && exists
-                                         ? found->value_.expire_at_ms_
-                                         : options.expire_at_ms_;
+  const std::uint64_t expire_at_ms =
+      options.keep_ttl_ && exists ? ExpireAt(*found) : options.expire_at_ms_;
   if (replication != nullptr && expire_at_ms != 0) {
     replication->args_.emplace_back("PXAT");
     replication->args_.emplace_back(std::to_string(expire_at_ms));
@@ -145,10 +183,10 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
   }
   const std::uint64_t now_ms = UnixTimeMillis();
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
-      IsExpired(found->value_, now_ms)) {
+      IsExpired(*found, now_ms)) {
     co_return false;
   }
-  const std::uint64_t current = found->value_.expire_at_ms_;
+  const std::uint64_t current = ExpireAt(*found);
   bool condition_met = true;
   switch (condition) {
     case ExpirationCondition::kNone:
@@ -178,7 +216,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     co_return true;
   }
 
-  const RecordLocation previous = found->value_;
+  const RecordLocation previous = found->value();
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
   if (!loaded.ok()) {
@@ -228,7 +266,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
     co_return false;
   }
-  const bool expired = IsExpired(found->value_, UnixTimeMillis());
+  const bool expired = IsExpired(*found, UnixTimeMillis());
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
       ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);
@@ -648,27 +686,27 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
   if (found == store.tx_undo_.end()) {
     co_return absl::OkStatus();
   }
-  std::vector<TxUndoEntry> undo = std::move(found->second);
+  TxUndoLog undo = std::move(found->second);
   store.tx_undo_.erase(found);
   // Reverse order: a key written twice in one transaction unwinds through
   // its intermediate version back to the original.
-  for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+  for (auto it = undo.entries_.rbegin(); it != undo.entries_.rend(); ++it) {
     TxUndoEntry& entry = *it;
-    const RecordLocation applied = entry.entry_->value_;
+    RecordIndex::Entry* current = undo.Current(entry.entry_handle_);
+    const RecordLocation applied = current->value();
     std::string loaded_key;
-    if (!entry.entry_->key_complete()) [[unlikely]] {
-      auto key = co_await LoadOutOfIndexKey(store, entry.entry_->value_,
-                                            ExtentsFor(store, entry.entry_),
-                                            entry.entry_->logical_key_size());
+    if (!current->key_complete()) [[unlikely]] {
+      auto key = co_await LoadOutOfIndexKey(store, current->value(),
+                                            ExtentsFor(store, current),
+                                            current->logical_key_size());
       if (!key.ok()) {
         store.write_failed_ = true;
         co_return key.status();
       }
       loaded_key = std::move(*key);
     }
-    const std::string_view undo_key = entry.entry_->key_complete()
-                                          ? entry.entry_->key()
-                                          : std::string_view(loaded_key);
+    const std::string_view undo_key =
+        current->key_complete() ? current->key() : std::string_view(loaded_key);
     const Digest undo_digest = ComputeDigest(undo_key);
     auto& partition = PartitionForKey(store, undo_key);
     if (compensation != nullptr) {
@@ -708,7 +746,12 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       absl::Status appended = co_await AppendLocked(
           store, partition, entry.db_id_, undo_key, undo_digest,
           restored_payload, restored_kind, restored_type, restored_expiry,
-          compensation, restored_size);
+          compensation, restored_size,
+          /*commit_retirements=*/nullptr,
+          /*committed_sequence=*/nullptr,
+          /*replication=*/nullptr,
+          /*trace=*/nullptr,
+          /*capture_fullsync=*/true, &undo);
       if (!appended.ok()) {
         store.write_failed_ = true;
         co_return appended;
@@ -733,9 +776,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
       continue;
     }
     // Mirror the append-time counter math in reverse.
-    const ExtentManifest applied_extents = ExtentsFor(store, entry.entry_);
+    const ExtentManifest applied_extents = ExtentsFor(store, current);
     const ExtentManifest applied_dependent_extents =
-        DependentExtentsFor(store, entry.entry_);
+        DependentExtentsFor(store, current);
     const bool applied_live = applied.kind() == RecordKind::kValue;
     const bool restored_live = entry.previous_->kind() == RecordKind::kValue;
     if (applied_live != restored_live) {
@@ -757,12 +800,13 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         --partition.expiring_key_count_[entry.db_id_];
       }
     }
-    entry.entry_->value_ = *entry.previous_;
+    current = ReplaceIndexLocation(store, partition.indexes_[entry.db_id_],
+                                   current, *entry.previous_, &undo);
     if (entry.previous_->external()) {
-      store.external_manifests_.insert_or_assign(entry.entry_,
+      store.external_manifests_.insert_or_assign(current,
                                                  entry.previous_extents_);
     } else {
-      store.external_manifests_.erase(entry.entry_);
+      store.external_manifests_.erase(current);
     }
     if (applied.external() && !applied.key_external() &&
         applied_extents != nullptr) {
@@ -1104,7 +1148,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
     std::uint64_t expire_at_ms, TxShardWrites* tx, std::uint64_t logical_size,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     std::uint64_t* committed_sequence, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace, bool capture_fullsync) {
+    SetLatencyTrace* trace, bool capture_fullsync,
+    TxUndoLog* replacement_undo) {
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
@@ -1153,7 +1198,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         /*txid=*/0, mutation_sequence, false, true, true, key_external,
         logical_size, *extents, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
-        replica_write_root.has_value() ? &*replica_write_root : nullptr);
+        replica_write_root.has_value() ? &*replica_write_root : nullptr,
+        replacement_undo);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -1163,7 +1209,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         /*txid=*/0, mutation_sequence, false, true, false, key_external,
         logical_size, nullptr, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
-        replica_write_root.has_value() ? &*replica_write_root : nullptr);
+        replica_write_root.has_value() ? &*replica_write_root : nullptr,
+        replacement_undo);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -1456,7 +1503,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     RecordLocation* written_location, const RelocationSource* relocation,
     TxShardWrites* tx,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
-    SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root) {
+    SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
+    TxUndoLog* replacement_undo) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1756,7 +1804,7 @@ acquire_active_stream:
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
           ? std::nullopt
-          : std::optional<RecordLocation>(previous_entry->value_);
+          : std::optional<RecordLocation>(previous_entry->value());
   const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
   const ExtentManifest retired_value_extents = ExtentsNotReferencedBy(
       previous_extents, external && !key_external ? extents : nullptr);
@@ -1881,7 +1929,8 @@ acquire_active_stream:
           // Commit records never enter the key index. Their temporary
           // RecordLocation is used only to request the destination block's
           // flush, so encode the packed, index-only type state as its empty
-          // default rather than spending one of the five reserve bits.
+          // default rather than spending one of the four remaining reserve
+          // bits.
           kind == RecordKind::kTxCommit ? RecordKind::kValue : kind,
           value_type));
   if (transaction_append) {
@@ -1897,8 +1946,15 @@ acquire_active_stream:
   RecordIndex::Entry* inserted_entry = nullptr;
   if (index_ptr != nullptr) {
     if (previous_entry != nullptr) {
-      previous_entry->value_ = location;
-      inserted_entry = previous_entry;
+      TxUndoLog* current_tx_undo = replacement_undo;
+      if (current_tx_undo == nullptr && tx != nullptr && tx->collect_undo_) {
+        if (auto found = store.tx_undo_.find(txid);
+            found != store.tx_undo_.end()) {
+          current_tx_undo = &found->second;
+        }
+      }
+      inserted_entry = ReplaceIndexLocation(store, *index_ptr, previous_entry,
+                                            location, current_tx_undo);
     } else {
       inserted_entry =
           index_ptr->InsertNew(digest, key, location, !key_external);
@@ -1915,7 +1971,7 @@ acquire_active_stream:
   const bool defer_defrag_retirement =
       for_defrag && commit_retirements != nullptr;
   store.staged_records_[updated.block_id_].push_back(RecordIdentity{
-      .entry_ = inserted_entry,
+      .entry_address_ = reinterpret_cast<std::uintptr_t>(inserted_entry),
       .retired_extents_ = (!for_defrag || defer_defrag_retirement) &&
                                   !route_to_commit && previous.has_value() &&
                                   previous->external() &&
@@ -1929,11 +1985,16 @@ acquire_active_stream:
                              : std::nullopt,
       .tx_retirements_ = std::move(commit_retirements),
       .index_generation_ = store.index_generations_[db_id],
+      .entry_hash_ = inserted_entry == nullptr ? 0 : inserted_entry->hash_,
+      .partition_id_ =
+          partition_ptr == nullptr ? std::uint16_t{0} : partition_ptr->id_,
       .db_id_ = db_id,
   });
   if (tx != nullptr && tx->collect_undo_ && inserted_entry != nullptr) {
-    store.tx_undo_[txid].push_back(TxUndoEntry{
-        .entry_ = inserted_entry,
+    TxUndoLog& undo = store.tx_undo_[txid];
+    const std::uint32_t entry_handle = undo.Track(inserted_entry);
+    undo.entries_.push_back(TxUndoEntry{
+        .entry_handle_ = entry_handle,
         .previous_ = previous,
         .previous_extents_ = previous_extents,
         .db_id_ = db_id,

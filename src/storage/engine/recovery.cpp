@@ -652,24 +652,24 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       const bool was_live =
           found != nullptr && found->value_.kind() == RecordKind::kValue;
       const bool is_live = recovered.location_.kind() == RecordKind::kValue;
-      const bool was_expiring = was_live && found->value_.expire_at_ms_ != 0;
+      const bool was_expiring = was_live && ExpireAt(*found) != 0;
       const bool is_expiring =
           is_live && recovered.location_.expire_at_ms_ != 0;
       RecordLocation winner = recovered.location_;
       if (found != nullptr) {
-        winner.set_shielding(found->value_.shielding() ||
-                             (found->value_.kind() == RecordKind::kValue &&
-                              found->value_.mutation_sequence_ <
-                                  recovered.location_.mutation_sequence_ &&
-                              (found->value_.expire_at_ms_ == 0 ||
-                               found->value_.expire_at_ms_ >
-                                   std::max(recovered.location_.expire_at_ms_,
-                                            UnixTimeMillis()))));
+        winner.set_shielding(
+            found->value_.shielding() ||
+            (found->value_.kind() == RecordKind::kValue &&
+             found->value_.mutation_sequence_ <
+                 recovered.location_.mutation_sequence_ &&
+             (ExpireAt(*found) == 0 ||
+              ExpireAt(*found) > std::max(recovered.location_.expire_at_ms_,
+                                          UnixTimeMillis()))));
       }
       winner.set_tx_tagged(recovered.txid_ != 0);
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
-        winner_entry->value_ = winner;
+        winner_entry = ReplaceIndexLocation(store, index, winner_entry, winner);
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
                                        winner, !winner.key_external());
@@ -713,7 +713,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
                    found->value_.mutation_sequence_ &&
                (recovered.location_.expire_at_ms_ == 0 ||
                 recovered.location_.expire_at_ms_ >
-                    std::max(found->value_.expire_at_ms_, UnixTimeMillis()))) {
+                    std::max(ExpireAt(*found), UnixTimeMillis()))) {
       found->value_.set_shielding(true);
     }
   }

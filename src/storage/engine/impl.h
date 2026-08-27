@@ -95,7 +95,7 @@ struct HashValue {
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& bucket);
 
-struct RecordLocation {
+struct RecordLocationCore {
   // Runtime block identities need only the 27-bit local block id plus the
   // 16-bit configured device id. Pairing those 43 bits with a 53-bit
   // allocation epoch removes four bytes without weakening any practical
@@ -118,15 +118,16 @@ struct RecordLocation {
   // 20 bits each. The owner is process-local and InitMemoryLimit caps a
   // process at 1024 workers. Keep this as an explicitly masked runtime word,
   // rather than C++ bit-fields, so layout and overflow behavior are auditable.
-  // Five high bits remain reserved for future hot-path state; uncommon state
-  // should use a sparse side table instead of widening every key.
+  // One of the former five reserve bits discriminates the optional expiring
+  // entry subtype. Four high bits remain for future hot-path state; uncommon
+  // state should use a sparse side table instead of widening every key.
   class PackedMetadata {
    public:
     static constexpr unsigned kOffsetBits = 20;
     static constexpr unsigned kLengthBits = 20;
     static constexpr unsigned kOwnerBits = 10;
-    static constexpr unsigned kStateBits = 9;
-    static constexpr unsigned kReservedBits = 5;
+    static constexpr unsigned kStateBits = 10;
+    static constexpr unsigned kReservedBits = 4;
 
     static constexpr unsigned kLengthShift = kOffsetBits;
     static constexpr unsigned kOwnerShift = kLengthShift + kLengthBits;
@@ -137,6 +138,7 @@ struct RecordLocation {
     static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
     static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
     static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
+    static constexpr unsigned kHasExpiryShift = kTypeCodeShift + 3;
 
     static constexpr std::uint64_t kOffsetMask =
         (std::uint64_t{1} << kOffsetBits) - 1;
@@ -157,8 +159,8 @@ struct RecordLocation {
                                  std::uint16_t block_owner, bool in_memory,
                                  bool external, bool key_external,
                                  bool shielding, bool unclaimed, bool tx_tagged,
-                                 RecordKind kind,
-                                 ValueType value_type) noexcept {
+                                 RecordKind kind, ValueType value_type,
+                                 bool has_expiry = false) noexcept {
       assert(record_offset % kRecordAlignment == 0);
       assert(total_disk_bytes % kRecordAlignment == 0);
       assert((record_offset / kRecordAlignment) <= kOffsetMask);
@@ -185,6 +187,7 @@ struct RecordLocation {
       SetBit(&bits, kShieldingShift, shielding);
       SetBit(&bits, kUnclaimedShift, unclaimed);
       SetBit(&bits, kTxTaggedShift, tx_tagged);
+      SetBit(&bits, kHasExpiryShift, has_expiry);
       return PackedMetadata(bits);
     }
 
@@ -204,6 +207,7 @@ struct RecordLocation {
     bool shielding() const noexcept { return Bit(kShieldingShift); }
     bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
     bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
+    bool has_expiry() const noexcept { return Bit(kHasExpiryShift); }
     RecordKind kind() const noexcept {
       return type_code() == kTombstoneTypeCode ? RecordKind::kTombstone
                                                : RecordKind::kValue;
@@ -225,6 +229,9 @@ struct RecordLocation {
     }
     void set_tx_tagged(bool value) noexcept {
       SetBit(&bits_, kTxTaggedShift, value);
+    }
+    void set_has_expiry(bool value) noexcept {
+      SetBit(&bits_, kHasExpiryShift, value);
     }
 
    private:
@@ -252,13 +259,12 @@ struct RecordLocation {
                     PackedMetadata::kReservedBits ==
                 64);
 
-  RecordLocation() noexcept = default;
+  RecordLocationCore() noexcept = default;
 
-  RecordLocation(std::uint64_t block_id, std::uint64_t mutation_sequence,
-                 std::uint64_t allocation_epoch, std::uint64_t expire_at_ms,
-                 std::uint32_t logical_size, PackedMetadata metadata) noexcept
+  RecordLocationCore(std::uint64_t block_id, std::uint64_t mutation_sequence,
+                     std::uint64_t allocation_epoch, std::uint32_t logical_size,
+                     PackedMetadata metadata) noexcept
       : mutation_sequence_(mutation_sequence),
-        expire_at_ms_(expire_at_ms),
         block_and_epoch_low_(
             EncodeBlockAndEpochLow(block_id, allocation_epoch)),
         allocation_epoch_high_(EncodeAllocationEpochHigh(allocation_epoch)),
@@ -273,7 +279,6 @@ struct RecordLocation {
   }
 
   std::uint64_t mutation_sequence_ = 0;
-  std::uint64_t expire_at_ms_ = 0;
   // Low word: block id in bits [0, 42], low allocation-epoch bits in
   // [43, 63]. The remaining 32 epoch bits sit beside logical_size_, filling
   // what would otherwise be alignment padding before metadata_.
@@ -319,8 +324,9 @@ struct RecordLocation {
   bool unclaimed() const noexcept { return metadata_.unclaimed(); }
   // The on-disk record carries a nonzero transaction id. Retirement uses the
   // bit to remove its bytes from transaction-generation accounting; the
-  // 40-byte index location deliberately does not retain the full txid.
+  // 32-byte index core deliberately does not retain the full txid.
   bool tx_tagged() const noexcept { return metadata_.tx_tagged(); }
+  bool has_expiry() const noexcept { return metadata_.has_expiry(); }
   RecordKind kind() const noexcept { return metadata_.kind(); }
   ValueType value_type() const noexcept { return metadata_.value_type(); }
 
@@ -329,7 +335,7 @@ struct RecordLocation {
   void set_unclaimed(bool value) noexcept { metadata_.set_unclaimed(value); }
   void set_tx_tagged(bool value) noexcept { metadata_.set_tx_tagged(value); }
 
-  bool SamePhysicalRecord(const RecordLocation& other) const noexcept {
+  bool SamePhysicalRecord(const RecordLocationCore& other) const noexcept {
     return block_id() == other.block_id() &&
            record_offset() == other.record_offset() &&
            allocation_epoch() == other.allocation_epoch();
@@ -351,12 +357,74 @@ struct RecordLocation {
   }
 };
 
-using RecordIndex = ScanHashMap<RecordLocation>;
+struct RecordLocation final : RecordLocationCore {
+  RecordLocation() noexcept = default;
+
+  RecordLocation(std::uint64_t block_id, std::uint64_t mutation_sequence,
+                 std::uint64_t allocation_epoch, std::uint64_t expire_at_ms,
+                 std::uint32_t logical_size, PackedMetadata metadata) noexcept
+      : RecordLocationCore(block_id, mutation_sequence, allocation_epoch,
+                           logical_size, metadata),
+        expire_at_ms_(expire_at_ms) {
+    metadata_.set_has_expiry(expire_at_ms != 0);
+  }
+
+  RecordLocation(const RecordLocationCore& core,
+                 std::uint64_t expire_at_ms) noexcept
+      : RecordLocationCore(core), expire_at_ms_(expire_at_ms) {
+    assert(has_expiry() == (expire_at_ms != 0));
+  }
+
+  std::uint64_t expire_at_ms_ = 0;
+};
+
+// Record-index entries use a 40-byte common object for ordinary keys and a
+// derived 48-byte object only when an expiration timestamp exists. The
+// has-expiry bit is part of the common metadata word, so checking it before
+// the downcast makes the concrete type an explicit allocation invariant.
+struct RecordIndexEntryPolicy {
+  using StoredValue = RecordLocationCore;
+  using Extra = std::uint64_t;
+
+  static bool HasExtraValue(const RecordLocation& value) noexcept {
+    return value.expire_at_ms_ != 0;
+  }
+  static bool HasExtraStored(const StoredValue& value) noexcept {
+    return value.has_expiry();
+  }
+  static StoredValue Store(const RecordLocation& value) noexcept {
+    StoredValue stored = value;
+    stored.metadata_.set_has_expiry(value.expire_at_ms_ != 0);
+    return stored;
+  }
+  static Extra StoreExtra(const RecordLocation& value) noexcept {
+    return value.expire_at_ms_;
+  }
+  static RecordLocation Load(const StoredValue& value,
+                             const Extra* extra) noexcept {
+    assert(value.has_expiry() == (extra != nullptr));
+    return RecordLocation(value, extra == nullptr ? 0 : *extra);
+  }
+  static void Assign(StoredValue* stored, Extra* extra,
+                     const RecordLocation& value) noexcept {
+    *stored = value;
+    stored->metadata_.set_has_expiry(extra != nullptr);
+    if (extra != nullptr) {
+      *extra = value.expire_at_ms_;
+    }
+  }
+};
+
+using RecordIndex =
+    ScanHashMap<RecordLocation, std::numeric_limits<std::uint32_t>::digits,
+                RecordIndexEntryPolicy>;
 
 static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
+static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 48);
+static_assert(sizeof(RecordIndex::Entry) == 40);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 48);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -419,6 +487,19 @@ inline bool IsExpired(const RecordLocation& location,
                       std::uint64_t now_ms) noexcept {
   return location.kind() == RecordKind::kValue && location.expire_at_ms_ != 0 &&
          location.expire_at_ms_ <= now_ms;
+}
+
+inline std::uint64_t ExpireAt(const RecordIndex::Entry& entry) noexcept {
+  const std::uint64_t* expiry = entry.optional_extra();
+  assert(entry.value_.has_expiry() == (expiry != nullptr));
+  return expiry == nullptr ? 0 : *expiry;
+}
+
+inline bool IsExpired(const RecordIndex::Entry& entry,
+                      std::uint64_t now_ms) noexcept {
+  const std::uint64_t expire_at_ms = ExpireAt(entry);
+  return entry.value_.kind() == RecordKind::kValue && expire_at_ms != 0 &&
+         expire_at_ms <= now_ms;
 }
 
 inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>
@@ -685,21 +766,25 @@ struct RelocationSource {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t record_offset_ = 0;
 
-  bool Matches(const RecordLocation& location) const noexcept {
+  bool Matches(const RecordLocationCore& location) const noexcept {
     return location.block_id() == block_id_ &&
            location.allocation_epoch() == allocation_epoch_ &&
            location.record_offset() == record_offset_;
   }
 };
 
-// Back-pointer from a block to the index entries staged in its write buffer, so
-// the flush completion can flip them to on-disk reads without re-hashing every
-// key. The entry can outlive the index that owns it: FLUSHDB detaches every
-// partition index for one database while blocks are still in flight. Recording
-// which database generation produced the entry lets the completion detect that
-// and skip the entry instead of following a pointer into a freed population.
+// Address of the index entry associated with a record staged in a block's write
+// buffer, so flush completion can flip a still-current version to on-disk reads
+// without re-hashing the key. The address may outlive either the entry or its
+// owning index: representation changes free entries, while FLUSHDB detaches a
+// whole database population. Generation and bucket-membership checks reject
+// both cases before any Entry is dereferenced.
 struct RecordIdentity {
-  RecordIndex::Entry* entry_ = nullptr;
+  // Stored as address bits because a representation-changing overwrite may
+  // end the Entry lifetime before this physical record's FLUSH completes.
+  // The address is converted back to Entry* only when FindAddress proves a
+  // live bucket slot still owns it.
+  std::uintptr_t entry_address_ = 0;
   std::shared_ptr<const std::vector<ExtentRef>> retired_extents_;
   // The version this record superseded. Retired only when this record's
   // flush completes: until the replacement is durable, the old copy is the
@@ -713,17 +798,81 @@ struct RecordIdentity {
   // recovery drops the replacements and must still find the old copies.
   std::unique_ptr<std::vector<RetiredRecord>> tx_retirements_;
   std::uint64_t index_generation_ = 0;
+  // The flush uses the cached bucket hash and owner partition to prove the
+  // address is still a member of the live index. These fields occupy the
+  // former tail padding, so validation does not enlarge per-staged-record
+  // memory.
+  std::uint32_t entry_hash_ = 0;
+  std::uint16_t partition_id_ = 0;
   std::uint8_t db_id_ = 0;
 };
 
+static_assert(sizeof(RecordIdentity) == 136);
+
 // One journaled write of an in-flight multi-key transaction, enough to put
-// the index back exactly as it was: entries are address-stable, the key
-// locks are still held, and routed retirements never fired.
+// the index back exactly as it was. Multiple writes to one key share a stable
+// handle so replacing its concrete Entry object never requires editing every
+// earlier undo item.
 struct TxUndoEntry {
-  RecordIndex::Entry* entry_ = nullptr;
+  std::uint32_t entry_handle_ = 0;
   std::optional<RecordLocation> previous_;
   ExtentManifest previous_extents_;
   std::uint8_t db_id_ = 0;
+};
+
+struct TxUndoLog {
+  // Production callers hold the worker store mutex. Replace retargets the
+  // stable slot before the old Entry is destroyed, so current_entries_ never
+  // exposes a stale pointer to rollback even when the allocator later reuses
+  // that address.
+  std::uint32_t Track(RecordIndex::Entry* entry) {
+    assert(entry != nullptr);
+    const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(entry);
+    if (auto found = handle_by_address_.find(address);
+        found != handle_by_address_.end()) {
+      return found->second;
+    }
+    if (current_entries_.size() >= std::numeric_limits<std::uint32_t>::max()) {
+      throw std::bad_alloc();
+    }
+    const std::uint32_t handle =
+        static_cast<std::uint32_t>(current_entries_.size());
+    current_entries_.push_back(entry);
+    const bool inserted = handle_by_address_.emplace(address, handle).second;
+    assert(inserted);
+    return handle;
+  }
+
+  RecordIndex::Entry* Current(std::uint32_t handle) const noexcept {
+    assert(handle < current_entries_.size());
+    return current_entries_[handle];
+  }
+
+  void Replace(RecordIndex::Entry* previous, RecordIndex::Entry* current) {
+    assert(previous != nullptr);
+    assert(current != nullptr);
+    const std::uintptr_t previous_address =
+        reinterpret_cast<std::uintptr_t>(previous);
+    auto found = handle_by_address_.find(previous_address);
+    if (found == handle_by_address_.end()) {
+      return;
+    }
+    const std::uint32_t handle = found->second;
+    assert(handle < current_entries_.size());
+    current_entries_[handle] = current;
+    handle_by_address_.erase(found);
+    const bool inserted =
+        handle_by_address_
+            .emplace(reinterpret_cast<std::uintptr_t>(current), handle)
+            .second;
+    assert(inserted);
+  }
+
+  std::vector<TxUndoEntry> entries_;
+
+ private:
+  std::vector<RecordIndex::Entry*> current_entries_;
+  absl::flat_hash_map<std::uintptr_t, std::uint32_t> handle_by_address_;
 };
 
 struct ReplicaValueStage {
@@ -1416,8 +1565,9 @@ class StorageEngine::Impl {
     absl::flat_hash_map<std::uint64_t, std::vector<RecordIdentity>>
         staged_records_;
     // External manifests are exceptional and relatively large. Keeping them
-    // here, keyed by the address-stable index entry, avoids a shared_ptr in
-    // every ordinary key while preserving O(1) FLUSHDB detachment.
+    // here, keyed by the index entry (and migrated on a TTL type change),
+    // avoids a shared_ptr in every ordinary key while preserving O(1) FLUSHDB
+    // detachment.
     absl::flat_hash_map<const RecordIndex::Entry*, ExtentManifest>
         external_manifests_;
     // Bumped every time FLUSHDB detaches this database's partition indexes.
@@ -1465,7 +1615,7 @@ class StorageEngine::Impl {
     std::vector<RecoveryRecord> recovery_tx_records_;
     // Undo journals of in-flight multi-key writes on this shard, keyed by
     // txid; written and consumed under store_state_mutex.
-    absl::flat_hash_map<std::uint64_t, std::vector<TxUndoEntry>> tx_undo_;
+    absl::flat_hash_map<std::uint64_t, TxUndoLog> tx_undo_;
     // Relocation fences owed per source block. A salvage pass that fails
     // midway has already moved records whose copies are not yet durable; the
     // debt survives the pass here, and CleanBlockLocked settles every owed
@@ -1862,7 +2012,7 @@ class StorageEngine::Impl {
 
   struct ScanPartitionState {
     struct ExternalCandidate {
-      const RecordIndex::Entry* entry_ = nullptr;
+      std::uintptr_t entry_address_ = 0;
       ExtentManifest extents_;
       RecordLocation location_{};
       std::uint64_t hash_ = 0;
@@ -2464,7 +2614,8 @@ class StorageEngine::Impl {
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       std::uint64_t* committed_sequence = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr, bool capture_fullsync = true);
+      SetLatencyTrace* trace = nullptr, bool capture_fullsync = true,
+      TxUndoLog* replacement_undo = nullptr);
 
   Task<absl::Status> CaptureRdbSnapshotBeforeWriteLocked(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -2534,7 +2685,14 @@ class StorageEngine::Impl {
       const RelocationSource* relocation = nullptr, TxShardWrites* tx = nullptr,
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       SetLatencyTrace* trace = nullptr,
-      const ExplicitWriteRoot* explicit_root = nullptr);
+      const ExplicitWriteRoot* explicit_root = nullptr,
+      TxUndoLog* replacement_undo = nullptr);
+
+  RecordIndex::Entry* ReplaceIndexLocation(WorkerStore& store,
+                                           RecordIndex& index,
+                                           RecordIndex::Entry* entry,
+                                           const RecordLocation& location,
+                                           TxUndoLog* tx_undo = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 

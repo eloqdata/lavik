@@ -38,8 +38,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
   constexpr std::size_t kMaxQueuedExpiredCandidates = 4096;
   if (!expiration_authority_.load(std::memory_order_acquire) ||
       store.expired_candidates_.size() >= kMaxQueuedExpiredCandidates ||
-      entry.value_.kind() != RecordKind::kValue ||
-      entry.value_.expire_at_ms_ == 0) {
+      entry.value_.kind() != RecordKind::kValue || ExpireAt(entry) == 0) {
     return;
   }
   const std::string_view key = entry.key_complete() ? entry.key() : known_key;
@@ -52,7 +51,7 @@ void StorageEngine::Impl::QueueExpiredCandidate(WorkerStore& store,
       .digest_ = entry.key_complete() ? ComputeDigest(key)
                                       : entry.external_key_digest(),
       .mutation_sequence_ = entry.value_.mutation_sequence_,
-      .expire_at_ms_ = entry.value_.expire_at_ms_,
+      .expire_at_ms_ = ExpireAt(entry),
       .key_ = std::string(key),
   });
 }
@@ -91,8 +90,8 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   auto* current = *resolved;
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
       current->value_.mutation_sequence_ != candidate.mutation_sequence_ ||
-      current->value_.expire_at_ms_ != candidate.expire_at_ms_ ||
-      !IsExpired(current->value_, UnixTimeMillis())) {
+      ExpireAt(*current) != candidate.expire_at_ms_ ||
+      !IsExpired(*current, UnixTimeMillis())) {
     co_return absl::OkStatus();
   }
   // Prefer a durable delete so a later wall-clock rollback cannot expose the
@@ -111,7 +110,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
 
   tx::CurrentTxShard().MarkWatched(candidate.db_id_,
                                    tx::FingerprintOf(candidate.digest_));
-  const RecordLocation dropped = current->value_;
+  const RecordLocation dropped = current->value();
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
   const ExtentManifest dropped_dependent_extents =
       DependentExtentsFor(store, current);
@@ -129,11 +128,6 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
                          .value_ = {},
                      },
                      candidate.digest_);
-  }
-  for (auto& [block_id, identities] : store.staged_records_) {
-    for (RecordIdentity& identity : identities) {
-      if (identity.entry_ == current) identity.entry_ = nullptr;
-    }
   }
   --partition.live_key_count_[candidate.db_id_];
   --store.live_key_count_[candidate.db_id_];
@@ -191,7 +185,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
       } else {
         auto& index = partition.indexes_[db_id];
         struct ExternalExpired {
-          RecordIndex::Entry* entry_ = nullptr;
+          std::uintptr_t entry_address_ = 0;
           ExtentManifest extents_;
           RecordLocation location_{};
           std::uint64_t hash_ = 0;
@@ -200,14 +194,15 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
         std::vector<ExternalExpired> external_expired;
         store->expiry_scan_cursor_ = index.Scan(
             store->expiry_scan_cursor_, [&](RecordIndex::Entry& entry) {
-              if (IsExpired(entry.value_, now_ms)) {
+              if (IsExpired(entry, now_ms)) {
                 if (entry.key_complete()) [[likely]] {
                   QueueExpiredCandidate(*store, partition.id_, db_id, entry);
                 } else {
                   external_expired.push_back(ExternalExpired{
-                      .entry_ = &entry,
+                      .entry_address_ =
+                          reinterpret_cast<std::uintptr_t>(&entry),
                       .extents_ = ExtentsFor(*store, &entry),
-                      .location_ = entry.value_,
+                      .location_ = entry.value(),
                       .hash_ = entry.hash_,
                       .key_bytes_ = entry.logical_key_size(),
                   });
@@ -221,12 +216,11 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
           if (!key.ok()) {
             co_return key.status();
           }
-          if (!index.Contains(candidate.entry_, candidate.hash_)) {
-            continue;
-          }
-          RecordIndex::Entry* current = candidate.entry_;
+          RecordIndex::Entry* current =
+              index.FindAddress(candidate.entry_address_, candidate.hash_);
+          if (current == nullptr) continue;
           if (current->value_.SamePhysicalRecord(candidate.location_) &&
-              IsExpired(current->value_, now_ms)) {
+              IsExpired(*current, now_ms)) {
             QueueExpiredCandidate(*store, partition.id_, db_id, *current, *key);
           }
         }

@@ -163,7 +163,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
     } else {
       auto* current = *resolved;
       if (current != nullptr && current->value_.kind() == RecordKind::kValue) {
-        const RecordLocation location = current->value_;
+        const RecordLocation location = current->value();
         if (IsExpired(location, UnixTimeMillis())) {
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else {
@@ -266,7 +266,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
 
   const RecordIndex::Entry* current = *resolved;
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
-      IsExpired(current->value_, UnixTimeMillis())) {
+      IsExpired(*current, UnixTimeMillis())) {
     const std::uint64_t sequence =
         current == nullptr ? requested.mutation_sequence_
                            : std::max(requested.mutation_sequence_,
@@ -282,7 +282,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
     };
   }
 
-  const RecordLocation location = current->value_;
+  const RecordLocation location = current->value();
   const ExtentManifest extents = ExtentsFor(store, current);
   std::uint64_t value_bytes = location.logical_size_;
   if (location.external()) {
@@ -375,7 +375,7 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
     state->result_.cursor_ = state->index_->Scan(
         state->result_.cursor_, [&](const RecordIndex::Entry& entry) {
           if (entry.value_.kind() == RecordKind::kValue &&
-              !IsExpired(entry.value_, state->now_ms_)) {
+              !IsExpired(entry, state->now_ms_)) {
             if (entry.key_complete()) [[likely]] {
               add_bytes(entry.key().size());
               state->result_.keys_.emplace_back(entry.key());
@@ -410,9 +410,9 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                   value_bytes,
                   entry.value_.key_external() ? entry.logical_key_size() : 0);
               state->external_.push_back(ScanPartitionState::ExternalCandidate{
-                  .entry_ = &entry,
+                  .entry_address_ = reinterpret_cast<std::uintptr_t>(&entry),
                   .extents_ = std::move(extents),
-                  .location_ = entry.value_,
+                  .location_ = entry.value(),
                   .hash_ = entry.hash_,
                   .key_bytes_ = entry.logical_key_size(),
                   .value_bytes_ = value_bytes,
@@ -450,13 +450,12 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
       if (!key.ok()) {
         co_return key.status();
       }
-      if (!state.index_->Contains(candidate.entry_, candidate.hash_)) {
-        continue;
-      }
-      const RecordIndex::Entry* current = candidate.entry_;
+      const RecordIndex::Entry* current =
+          state.index_->FindAddress(candidate.entry_address_, candidate.hash_);
+      if (current == nullptr) continue;
       if (current->value_.SamePhysicalRecord(candidate.location_) &&
           current->value_.kind() == RecordKind::kValue &&
-          !IsExpired(current->value_, state.now_ms_)) {
+          !IsExpired(*current, state.now_ms_)) {
         add_bytes(key->size());
         state.result_.keys_.push_back(std::move(*key));
         state.result_.value_types_.push_back(current->value_.value_type());
@@ -1226,19 +1225,27 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
   };
   std::vector<OldKey> old_keys;
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-    std::vector<const RecordIndex::Entry*> external_entries;
+    struct ExternalKey {
+      RecordLocation location_;
+      ExtentManifest extents_;
+      std::uint32_t key_bytes_ = 0;
+    };
+    std::vector<ExternalKey> external_keys;
     partition.indexes_[db_id].ForEach([&](const RecordIndex::Entry& entry) {
       if (entry.key_complete()) [[likely]] {
         old_keys.push_back(
             OldKey{.db_id_ = db_id, .key_ = std::string(entry.key())});
       } else [[unlikely]] {
-        external_entries.push_back(&entry);
+        external_keys.push_back(ExternalKey{
+            .location_ = entry.value(),
+            .extents_ = ExtentsFor(store, &entry),
+            .key_bytes_ = entry.logical_key_size(),
+        });
       }
     });
-    for (const RecordIndex::Entry* entry : external_entries) {
-      auto key = co_await LoadOutOfIndexKey(store, entry->value_,
-                                            ExtentsFor(store, entry),
-                                            entry->logical_key_size());
+    for (const ExternalKey& external : external_keys) {
+      auto key = co_await LoadOutOfIndexKey(
+          store, external.location_, external.extents_, external.key_bytes_);
       if (!key.ok()) {
         co_return key.status();
       }

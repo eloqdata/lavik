@@ -615,7 +615,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
                 .key_ = entry.key_complete() ? std::string(entry.key())
                                              : std::string{},
                 .extents_ = DependentExtentsFor(store, &entry),
-                .location_ = entry.value_,
+                .location_ = entry.value(),
                 .key_bytes_ = entry.logical_key_size(),
                 .db_id_ = db_id,
             });
@@ -658,19 +658,12 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
         !entry->value_.unclaimed()) {
       continue;  // rewritten or claimed since collection
     }
-    const RecordLocation dropped = entry->value_;
+    const RecordLocation dropped = entry->value();
     const ExtentManifest dropped_dependent_extents =
         DependentExtentsFor(store, entry);
     // No watcher or replica cares: erasing a tombstone changes nothing a
-    // reader can observe. Only the flush completion's staged identities
-    // dereference the entry by pointer, so detach them before it is freed.
-    for (auto& [block_id, identities] : store.staged_records_) {
-      for (RecordIdentity& identity : identities) {
-        if (identity.entry_ == entry) {
-          identity.entry_ = nullptr;
-        }
-      }
-    }
+    // reader can observe. A staged physical record retains only address bits;
+    // flush completion rejects them after Erase removes the live bucket slot.
     store.external_manifests_.erase(entry);
     partition.indexes_[candidate.db_id_].Erase(entry);
     absl::Status dead = co_await MarkRecordDead(

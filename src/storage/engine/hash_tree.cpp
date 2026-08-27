@@ -69,7 +69,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       found != nullptr && found->value_.kind() == RecordKind::kValue;
   const std::uint64_t now_ms =
       operation.now_ms_ == 0 ? UnixTimeMillis() : operation.now_ms_;
-  const bool exists = stored_value && !IsExpired(found->value_, now_ms);
+  const bool exists = stored_value && !IsExpired(*found, now_ms);
   if (exists && found->value_.value_type() != value_type) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");
@@ -85,7 +85,7 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
             DbEpoch(db_id) != observed_db_epoch ||
             partition.replication_epoch_ != observed_replication_epoch);
   };
-  const RecordLocation location = exists ? found->value_ : RecordLocation{};
+  const RecordLocation location = exists ? found->value() : RecordLocation{};
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;

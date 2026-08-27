@@ -849,7 +849,7 @@ int main(int argc, char** argv) {
            "+OK", "enable tx cleaner during rollback");
     for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",
                                  "cleaner-undo-c", "cleaner-undo-d"}) {
-      Expect(rollback.Command({"SET", key, "old"}), "+OK",
+      Expect(rollback.Command({"SET", key, "old", "EX", "600"}), "+OK",
              "tx cleaner rollback seed");
     }
     const std::uint64_t rollback_cleaner_baseline =
@@ -865,6 +865,8 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
                Bulk("old") + "\r\n" + Bulk("old"),
            "UNDO values while tx cleaner is enabled");
+    Expect(rollback.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}), ":0",
+           "UNDO restores TTL representation");
     if (!WaitForCleanerRetirement(rollback, rollback_cleaner_baseline)) {
       Fail("transaction cleaner did not retire the rolled-back generation");
     }
@@ -879,6 +881,9 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
                Bulk("old") + "\r\n" + Bulk("old"),
            "UNDO values after cleaner restart");
+    Expect(
+        rollback_recovered.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}),
+        ":0", "UNDO TTL survives recovery");
     rollback_recovered_server.Stop();
 
     // The first transaction suspends after selecting the current generation's

@@ -225,12 +225,36 @@ block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
 
-The runtime index keeps its fixed entry header at 48 bytes. Its 40-byte
-`RecordLocation` combines the configured 43-bit block-ID range with a 53-bit
-allocation epoch, and packs aligned record offset, aligned length, current
-worker owner, type, and hot state into one 64-bit word with five reserve bits.
-These are runtime representations only: block and record headers retain their
-full durable fields. `ScanHashMap` caches the low 32 hash bits used for bucket
+The runtime index uses a 40-byte base entry for keys without expiration and a
+48-byte derived entry for keys with expiration. The common entry contains an
+8-byte hash/key prefix and a 32-byte `RecordLocationCore`; only the derived
+type adds the aligned 64-bit expiration timestamp. One bit in the packed state
+word discriminates the concrete allocation type and four bits remain reserved.
+A standalone 40-byte `RecordLocation` materializes the core plus optional
+timestamp when metadata crosses the index boundary. The core combines the
+configured 43-bit block-ID range with a 53-bit allocation epoch, and packs
+aligned record offset, aligned length, current worker owner, type, and hot
+state into one 64-bit word. These are runtime representations only: block and
+record headers retain their full durable fields.
+
+An overwrite whose TTL presence does not change updates the entry in place.
+Adding or removing TTL swaps the corresponding base or derived object into the
+same bucket slot while holding the worker store mutex. Staged physical records
+cache the partition and low hash bits in existing `RecordIdentity` padding;
+flush completion proves the cached entry address still belongs to that index
+before recovering a live pointer, so a representation change never scans
+pending blocks. Other coroutine paths that retain an entry identity across an
+await likewise store only its integer address and resume through the pointer
+returned by the index lookup; they never dereference the pointer value from the
+object whose lifetime ended.
+Transaction undo items for the same key share a transaction-local stable
+handle. An address-to-handle index retargets that handle's single live pointer
+in O(1) when the representation changes, while other sparse pointer-keyed
+metadata moves independently in O(1). This preserves the flush and rollback
+lifetime invariants without charging non-expiring keys for the timestamp,
+making large transactions scan prior undo items, or adding a hot-path side
+index.
+`ScanHashMap` caches the low 32 hash bits used for bucket
 addressing while each bucket slot carries its independent 8-bit lookup tag.
 Incremental rehash preserves that tag with the entry pointer. A table that has
 already reached `2^32` direct buckets stops expanding and accepts further

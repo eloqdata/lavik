@@ -913,7 +913,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       auto& index = partition.indexes_[db_id];
       index.ForEach([&](RecordIndex::Entry& entry) {
         if (entry.value_.kind() == RecordKind::kValue &&
-            IsExpired(entry.value_, recovery_now_ms)) {
+            IsExpired(entry, recovery_now_ms)) {
           std::string key;
           Digest digest;
           if (entry.key_complete()) {
@@ -973,7 +973,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       while (!exhausted) {
         exhausted = index.ScanStableWhile(
             &cursor, [&](const RecordIndex::Entry& entry) {
-              const RecordLocation& location = entry.value_;
+              const RecordLocation location = entry.value();
               if (location.block_owner() >= worker_count_) {
                 status = absl::InternalError(
                     "recovery live root has no scanned block owner");
@@ -1159,14 +1159,14 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         RecordIndex::Entry* current = *resolved;
         if (current == nullptr ||
             current->value_.kind() != RecordKind::kValue ||
-            !IsExpired(current->value_, recovery_now_ms)) {
+            !IsExpired(*current, recovery_now_ms)) {
           continue;
         }
         if (current->value_.shielding()) {
           Fail(deleted.status());
           co_return deleted.status();
         }
-        const RecordLocation dropped = current->value_;
+        const RecordLocation dropped = current->value();
         value_extents = ExtentsFor(store, current);
         retired = RetiredRecordOf(dropped, DependentExtentsFor(store, current));
         --partition.live_key_count_[expired.db_id_];
