@@ -4,20 +4,9 @@ Updated: 2026-08-21 UTC
 
 ## 2026-08-21 two-host 1-TiB ONLINE and rolling FULLSYNC retest
 
-The complete technical report is
-[perf_reports/keylane-primary-replica-rolling-fullsync-2026-08-21.html](perf_reports/keylane-primary-replica-rolling-fullsync-2026-08-21.html),
-with its reviewed source rows in
-[perf_reports/data/keylane-primary-replica-2026-08-21.csv](perf_reports/data/keylane-primary-replica-2026-08-21.csv).
-The portable report passed artifact validation and structural verification;
-browser-level verification was unavailable because this host has no installed
-Chromium.
-
-The canonical artifact JSON and reviewed CSV were updated at 11:46 UTC with
-the snapshot-reader A/B addendum below. The generated HTML still reflects the
-earlier report revision: this host currently has no `node`, `nodejs`, or `npm`,
-so the required portable report builder cannot be rerun. Do not hand-edit the
-generated HTML; regenerate it from the artifact JSON once a Node runtime is
-available.
+This Markdown handoff is the retained technical record. Generated HTML,
+artifact JSON, and reviewed CSV outputs were removed from the repository; the
+reviewed headline results and snapshot-reader A/B addendum remain below.
 
 ### 2026-08-21 snapshot reader A/B addendum
 
