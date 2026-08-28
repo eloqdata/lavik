@@ -540,8 +540,8 @@ class RecordIndexValue {
 
 static_assert(sizeof(RecordIndexValue) == 24);
 
-// Record-index entries use a 32-byte common object for ordinary keys and a
-// derived 40-byte object only when an expiration timestamp exists. The
+// Record-index entries use a 24-byte common object for ordinary keys and a
+// derived 32-byte object only when an expiration timestamp exists. The
 // has-expiry bit is part of the compact common value, so checking it before
 // the downcast makes the concrete type an explicit allocation invariant.
 struct RecordIndexEntryPolicy {
@@ -1727,6 +1727,10 @@ class StorageEngine::Impl {
     std::uint64_t next_lsn_ = 0;
     RegisteredBufferPool buffers_;
     std::vector<FixedFile> files_;
+    // Every primary index owned by this worker shares one handle namespace.
+    // Declaring the arena before partitions and detached populations makes it
+    // outlive every map during reverse-order WorkerStore destruction.
+    std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
     std::vector<PartitionStore> partitions_;
     struct RdbSnapshotSession {
       std::uint64_t id_ = 0;

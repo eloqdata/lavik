@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -13,10 +14,66 @@ namespace {
 using keylane::storage::ComputeDigest;
 using keylane::storage::Digest;
 using keylane::storage::ScanHashMap;
+using keylane::storage::ScanHashMapEntryArena;
 
 #define ASSERT_CHECK(condition, message) ASSERT_TRUE(condition) << message
 
 }  // namespace
+
+TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
+  auto arena = std::make_shared<ScanHashMapEntryArena>(1);
+  ScanHashMap<std::uint64_t> first(arena);
+  ScanHashMap<std::uint64_t> second(arena);
+
+  // These short-key entries use the 32-byte class. One 64 KiB page has 2,046
+  // slots after its 64-byte header; both maps must consume that same page.
+  constexpr std::size_t kSlotsPerPage = 2046;
+  for (std::size_t i = 0; i < kSlotsPerPage; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    auto& map = i % 2 == 0 ? first : second;
+    map.InsertNew(ComputeDigest(key), key, i);
+  }
+  EXPECT_EQ(arena->allocated_pages(), 1);
+  EXPECT_FALSE(first.CanAllocateEntry("overflow", true, false));
+  EXPECT_THROW(first.InsertNew(ComputeDigest("overflow"), "overflow", 1),
+               std::bad_alloc);
+
+  EXPECT_TRUE(first.Erase(ComputeDigest("k0"), "k0"));
+  EXPECT_TRUE(first.CanAllocateEntry("replacement", true, false));
+  first.InsertNew(ComputeDigest("replacement"), "replacement", 1);
+  EXPECT_EQ(arena->allocated_pages(), 1);
+
+  first.Clear();
+  second.Clear();
+  EXPECT_EQ(arena->allocated_pages(), 0);
+  EXPECT_TRUE(first.CanAllocateEntry("after-clear", true, false));
+  first.InsertNew(ComputeDigest("after-clear"), "after-clear", 1);
+  EXPECT_EQ(arena->allocated_pages(), 1);
+}
+
+TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
+  ScanHashMapEntryArena arena;
+  std::vector<ScanHashMapEntryArena::Handle> handles;
+  constexpr std::size_t kSlotsPerPage =
+      (ScanHashMapEntryArena::kPageBytes - 64) / 4096;
+  handles.reserve(ScanHashMapEntryArena::kPagesPerSpan * kSlotsPerPage);
+
+  for (std::size_t page = 0;
+       page < ScanHashMapEntryArena::kPagesPerSpan; ++page) {
+    for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
+      handles.push_back(arena.Allocate(4096).handle_);
+    }
+    EXPECT_EQ(arena.allocated_spans(), 1);
+  }
+  EXPECT_EQ(arena.allocated_pages(), ScanHashMapEntryArena::kPagesPerSpan);
+  EXPECT_EQ(arena.allocated_spans(), 1);
+
+  for (auto handle = handles.rbegin(); handle != handles.rend(); ++handle) {
+    arena.Deallocate(*handle);
+  }
+  EXPECT_EQ(arena.allocated_pages(), 0);
+  EXPECT_EQ(arena.allocated_spans(), 0);
+}
 
 TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ScanHashMap<std::uint64_t> map;

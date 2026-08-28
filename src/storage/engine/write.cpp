@@ -41,7 +41,7 @@ RecordIndex::Entry* StorageEngine::Impl::ReplaceIndexLocation(
   move_pointer_key(store.recovery_lsns_);
   move_pointer_key(store.recovery_txids_);
 
-  RecordIndex::Entry::Destroy(replaced);
+  index.DestroyDetached(replaced);
   return current;
 }
 
@@ -1803,6 +1803,19 @@ acquire_active_stream:
       active_stream()->committed_bytes_ + total_disk_bytes >
           kStorageBlockBytes) {
     goto acquire_active_stream;
+  }
+  const bool has_index_extra = expire_at_ms != 0;
+  const bool needs_index_allocation =
+      index_ptr != nullptr && (previous_entry == nullptr ||
+                               previous_entry->has_extra() != has_index_extra);
+  if (needs_index_allocation &&
+      !index_ptr->CanAllocateEntry(key, !key_external, has_index_extra)) {
+    // The handle's 21-bit page ID is a hard per-worker capacity boundary.
+    // Check it after every suspension and before mutating the staging buffer,
+    // so exhaustion is reported without leaving a durable record whose index
+    // entry cannot be published. Page IDs are never allowed to wrap.
+    co_return absl::ResourceExhaustedError(
+        "record index entry page capacity exhausted");
   }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr

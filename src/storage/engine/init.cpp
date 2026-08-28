@@ -673,16 +673,21 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (unsigned i = 0; i < worker_count; ++i) {
     stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_.back();
+    store.record_index_entry_arena_ = std::make_shared<ScanHashMapEntryArena>();
     store.partitions_.reserve((kLogicalStorageShards + worker_count - 1 - i) /
                               worker_count);
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;
          partition += worker_count) {
       store.partitions_.emplace_back();
-      store.partitions_.back().id_ = static_cast<std::uint16_t>(partition);
-      store.partitions_.back().replication_epoch_ =
+      WorkerStore::PartitionStore& partition_store = store.partitions_.back();
+      partition_store.id_ = static_cast<std::uint16_t>(partition);
+      for (RecordIndex& index : partition_store.indexes_) {
+        index.SetEntryArena(store.record_index_entry_arena_);
+      }
+      partition_store.replication_epoch_ =
           epoch_values_[kLogicalDatabaseCount + partition];
-      store.partitions_.back().replica_candidate_epoch_ =
-          store.partitions_.back().replication_epoch_;
+      partition_store.replica_candidate_epoch_ =
+          partition_store.replication_epoch_;
     }
   }
   absl::Status affinity = ConfigureWorkerDeviceAffinity();

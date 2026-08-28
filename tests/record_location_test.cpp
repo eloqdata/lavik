@@ -230,7 +230,7 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   const std::uint32_t ordinary_hash = RecordIndex::AddressHash(*replaced);
   const std::uintptr_t ordinary_address =
       reinterpret_cast<std::uintptr_t>(replaced);
-  RecordIndex::Entry::Destroy(replaced);
+  index.DestroyDetached(replaced);
   // FLUSH may retain this raw address after a representation change.
   // FindAddress must reject it without touching the freed object.
   EXPECT_EQ(index.FindAddress(ordinary_address, ordinary_hash), nullptr);
@@ -250,7 +250,7 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   const std::uint32_t expiring_hash = RecordIndex::AddressHash(*replaced);
   const std::uintptr_t expiring_address =
       reinterpret_cast<std::uintptr_t>(replaced);
-  RecordIndex::Entry::Destroy(replaced);
+  index.DestroyDetached(replaced);
   EXPECT_EQ(index.FindAddress(expiring_address, expiring_hash), nullptr);
   const RecordIndex& const_index = index;
   EXPECT_EQ(const_index.FindAddress(reinterpret_cast<std::uintptr_t>(ordinary),
@@ -280,7 +280,7 @@ TEST(RecordLocationTest, TxUndoLogRetargetsSharedHandleInConstantTime) {
                          ComputeDigest("key"), &replaced);
   ASSERT_EQ(replaced, expiring);
   undo.Replace(replaced, ordinary);
-  RecordIndex::Entry::Destroy(replaced);
+  index.DestroyDetached(replaced);
 
   EXPECT_EQ(undo.Current(key_handle), ordinary);
   EXPECT_EQ(undo.Track(ordinary), key_handle);
