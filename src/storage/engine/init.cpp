@@ -971,12 +971,13 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 
   // The winner index is already entirely resident at this point. Walk it once
   // with an exact resumable cursor, but send physical accounting to block
-  // owners in bounded batches instead of retaining one reference per live key
-  // until the whole pass completes. A single external value's manifest stays
-  // indivisible, so it may take a batch just over the target.
-  constexpr std::size_t kRecoveryAccountingBatchReferences = 1U << 20;
+  // owners in byte-bounded batches instead of retaining one reference per live
+  // key until the whole pass completes. A single external value's manifest
+  // stays indivisible, so it may take a batch just over the target.
+  const std::size_t batch_target_bytes =
+      RecoveryWorkerBatchTargetBytes(worker_count_);
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
-  std::size_t buffered_references = 0;
+  std::size_t buffered_bytes = 0;
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       auto& index = partition.indexes_[db_id];
@@ -1000,7 +1001,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                                    : 0,
                       .bytes_ = location.total_disk_bytes(),
                   });
-              ++buffered_references;
+              buffered_bytes += sizeof(RecoveryLiveReference);
               const ExtentManifest extents = ExtentsFor(store, &entry);
               if (location.external() && extents != nullptr) {
                 for (std::size_t extent_index = 0;
@@ -1021,23 +1022,23 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
                       .extent_index_ = static_cast<std::uint32_t>(extent_index),
                       .extent_payload_checksum_ = extent.payload_checksum_,
                   });
-                  ++buffered_references;
+                  buffered_bytes += sizeof(RecoveryLiveReference);
                 }
               }
-              return buffered_references < kRecoveryAccountingBatchReferences;
+              return buffered_bytes < batch_target_bytes;
             });
         if (!status.ok()) {
           Fail(status);
           co_return status;
         }
-        if (buffered_references >= kRecoveryAccountingBatchReferences) {
+        if (buffered_bytes >= batch_target_bytes) {
           status =
               co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
           if (!status.ok()) {
             Fail(status);
             co_return status;
           }
-          buffered_references = 0;
+          buffered_bytes = 0;
         }
       }
     }

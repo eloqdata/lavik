@@ -898,6 +898,21 @@ struct RecoveryLiveReference {
   std::uint32_t extent_payload_checksum_ = 0;
 };
 
+// Routing records and live-accounting references are held only until their
+// target workers consume a batch. Divide one process-wide target across scan
+// workers so recovery concurrency does not multiply temporary memory by the
+// configured worker count. A single record may exceed its worker's target.
+inline constexpr std::size_t kRecoveryProcessBatchTargetBytes =
+    64 * 1024 * 1024;
+
+constexpr std::size_t RecoveryWorkerBatchTargetBytes(
+    unsigned worker_count) noexcept {
+  return worker_count == 0
+             ? kRecoveryProcessBatchTargetBytes
+             : std::max<std::size_t>(
+                   1, kRecoveryProcessBatchTargetBytes / worker_count);
+}
+
 // A relocated record cannot make its source block reclaimable until the
 // destination block header durably covers this boundary. Keeping the fence
 // independent of the in-memory index also makes later overwrites harmless:

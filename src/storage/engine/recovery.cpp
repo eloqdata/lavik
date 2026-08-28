@@ -252,11 +252,13 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         "recovery block buffer is smaller than a storage block");
   }
   recovery.buffer_.size_ = kStorageBlockBytes;
-  // Merge recovered entries incrementally. Keeping every historical version
-  // until the entire device scan completes can exceed RAM even when the final
-  // live index fits comfortably.
-  constexpr std::size_t kRecoveryBatchItems = 1U << 20;
-  std::size_t buffered_items = 0;
+  // Merge recovered entries incrementally. The byte target is divided across
+  // scan workers, so adding recovery concurrency cannot multiply temporary
+  // routing memory without bound. One maximum-size key may overshoot its
+  // worker target, but it is flushed before another record is retained.
+  const std::size_t batch_target_bytes =
+      RecoveryWorkerBatchTargetBytes(worker_count_);
+  std::size_t buffered_bytes = 0;
 
   // Preserve the global striped ownership of physical blocks, but visit one
   // block from each device in turn. Scanning every device to completion in
@@ -375,16 +377,16 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
               .extent_index_ = block.extent_index_,
               .extent_payload_checksum_ = block.extent_payload_checksum_,
           }});
-      ++buffered_items;
+      buffered_bytes += sizeof(RecoveryBlock);
 
       if (block.kind_ == BlockKind::kPayloadExtent) {
         ReportRecoveryProgress(0, /*allocated=*/true);
-        if (buffered_items >= kRecoveryBatchItems) {
+        if (buffered_bytes >= batch_target_bytes) {
           absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
           if (!applied.ok()) {
             co_return applied;
           }
-          buffered_items = 0;
+          buffered_bytes = 0;
         }
         continue;
       }
@@ -449,9 +451,17 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                   .txid_ = record.txid_,
                   .bytes_ = record.total_disk_bytes_,
               });
-          ++buffered_items;
+          buffered_bytes += sizeof(RecoveryBatch::CommitRecord);
           record_offset += record.total_disk_bytes_;
           ++records;
+          if (buffered_bytes >= batch_target_bytes) {
+            absl::Status applied =
+                co_await ApplyRecoveryBatches(store, batches);
+            if (!applied.ok()) {
+              co_return applied;
+            }
+            buffered_bytes = 0;
+          }
           continue;
         }
         if (record.db_epoch_ != DbEpoch(record.db_id_)) {
@@ -512,10 +522,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           ++records;
           continue;
         }
-        const unsigned key_owner = partition_id % worker_count_;
-        batches->at(key_owner).records_.push_back(RecoveryRecord{
+        RecoveryRecord recovered{
             .digest_ = digest,
-            .key_ = std::string(key),
+            .key_ = record.key_external_ && record.external_
+                        ? std::move(loaded_key)
+                        : std::string(key),
             .db_id_ = record.db_id_,
             .txid_ = record.txid_,
             .lsn_ = record.lsn_,
@@ -528,11 +539,22 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                     record_offset, record.total_disk_bytes_, block_owner, false,
                     record.external_, record.key_external_, false, false,
                     record.txid_ != 0, record.kind_, record.value_type_)),
-            .extents_ = extents,
-        });
-        ++buffered_items;
+            .extents_ = extents};
+        buffered_bytes += sizeof(RecoveryRecord) + recovered.key_.capacity();
+        if (recovered.extents_ != nullptr) {
+          buffered_bytes += recovered.extents_->capacity() * sizeof(ExtentRef);
+        }
+        const unsigned key_owner = partition_id % worker_count_;
+        batches->at(key_owner).records_.push_back(std::move(recovered));
         record_offset += record.total_disk_bytes_;
         ++records;
+        if (buffered_bytes >= batch_target_bytes) {
+          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
+          if (!applied.ok()) {
+            co_return applied;
+          }
+          buffered_bytes = 0;
+        }
       }
       if (record_offset != block.committed_bytes_ ||
           records != block.record_count_) {
@@ -541,12 +563,12 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
             "block committed boundary does not match records");
       }
       ReportRecoveryProgress(records, /*allocated=*/true);
-      if (buffered_items >= kRecoveryBatchItems) {
+      if (buffered_bytes >= batch_target_bytes) {
         absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
         if (!applied.ok()) {
           co_return applied;
         }
-        buffered_items = 0;
+        buffered_bytes = 0;
       }
     }
     if (!scanned_block) break;
