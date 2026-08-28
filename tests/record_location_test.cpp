@@ -97,8 +97,8 @@ static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(sizeof(RecordIndexValue) == 24);
 static_assert(RecordIndexValue::kReservedBits == 5);
-static_assert(sizeof(RecordIndex::Entry) == 32);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 40);
+static_assert(sizeof(RecordIndex::Entry) == 24);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 32);
 
 RecordLocation MaterializeForTest(const RecordIndex::Entry& entry,
                                   std::uint64_t allocation_epoch,
@@ -221,13 +221,13 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
 
   RecordIndex::Entry* replaced = nullptr;
   RecordIndex::Entry* expiring = index.ReplaceValue(
-      ordinary, RecordLocation(5, 6, 7, 1234, 8, metadata), &replaced);
+      ordinary, RecordLocation(5, 6, 7, 1234, 8, metadata), digest, &replaced);
   ASSERT_NE(replaced, nullptr);
   EXPECT_NE(expiring, ordinary);
   ASSERT_TRUE(expiring->has_extra());
   EXPECT_EQ(MaterializeForTest(*expiring, 7).expire_at_ms_, 1234);
   EXPECT_EQ(expiring->key(), "key");
-  const std::uint32_t ordinary_hash = replaced->hash_;
+  const std::uint32_t ordinary_hash = RecordIndex::AddressHash(*replaced);
   const std::uintptr_t ordinary_address =
       reinterpret_cast<std::uintptr_t>(replaced);
   RecordIndex::Entry::Destroy(replaced);
@@ -235,28 +235,28 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   // FindAddress must reject it without touching the freed object.
   EXPECT_EQ(index.FindAddress(ordinary_address, ordinary_hash), nullptr);
   EXPECT_EQ(index.FindAddress(reinterpret_cast<std::uintptr_t>(expiring),
-                              expiring->hash_),
+                              RecordIndex::AddressHash(*expiring)),
             expiring);
-  EXPECT_TRUE(index.Contains(expiring, expiring->hash_));
+  EXPECT_TRUE(index.Contains(expiring, RecordIndex::AddressHash(*expiring)));
 
   replaced = nullptr;
   ordinary = index.ReplaceValue(
-      expiring, RecordLocation(9, 10, 11, 0, 12, metadata), &replaced);
+      expiring, RecordLocation(9, 10, 11, 0, 12, metadata), digest, &replaced);
   ASSERT_NE(replaced, nullptr);
   EXPECT_NE(ordinary, expiring);
   EXPECT_FALSE(ordinary->has_extra());
   EXPECT_EQ(MaterializeForTest(*ordinary, 11).expire_at_ms_, 0);
   EXPECT_EQ(ordinary->key(), "key");
-  const std::uint32_t expiring_hash = replaced->hash_;
+  const std::uint32_t expiring_hash = RecordIndex::AddressHash(*replaced);
   const std::uintptr_t expiring_address =
       reinterpret_cast<std::uintptr_t>(replaced);
   RecordIndex::Entry::Destroy(replaced);
   EXPECT_EQ(index.FindAddress(expiring_address, expiring_hash), nullptr);
   const RecordIndex& const_index = index;
   EXPECT_EQ(const_index.FindAddress(reinterpret_cast<std::uintptr_t>(ordinary),
-                                    ordinary->hash_),
+                                    RecordIndex::AddressHash(*ordinary)),
             ordinary);
-  EXPECT_TRUE(index.Contains(ordinary, ordinary->hash_));
+  EXPECT_TRUE(index.Contains(ordinary, RecordIndex::AddressHash(*ordinary)));
 }
 
 TEST(RecordLocationTest, TxUndoLogRetargetsSharedHandleInConstantTime) {
@@ -275,8 +275,9 @@ TEST(RecordLocationTest, TxUndoLogRetargetsSharedHandleInConstantTime) {
   EXPECT_NE(undo.Track(other), key_handle);
 
   RecordIndex::Entry* replaced = nullptr;
-  RecordIndex::Entry* ordinary = index.ReplaceValue(
-      expiring, RecordLocation(9, 10, 11, 0, 12, metadata), &replaced);
+  RecordIndex::Entry* ordinary =
+      index.ReplaceValue(expiring, RecordLocation(9, 10, 11, 0, 12, metadata),
+                         ComputeDigest("key"), &replaced);
   ASSERT_EQ(replaced, expiring);
   undo.Replace(replaced, ordinary);
   RecordIndex::Entry::Destroy(replaced);

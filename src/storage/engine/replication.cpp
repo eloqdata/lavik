@@ -413,7 +413,8 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
                   .entry_address_ = reinterpret_cast<std::uintptr_t>(&entry),
                   .extents_ = std::move(extents),
                   .location_ = MaterializeIndexLocation(entry),
-                  .hash_ = entry.hash_,
+                  .hash_ =
+                      RecordIndex::AddressHash(entry.external_key_digest()),
                   .key_bytes_ = entry.logical_key_size(),
                   .value_bytes_ = value_bytes,
               });

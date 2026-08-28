@@ -113,7 +113,8 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
       co_return std::optional<std::string>(std::string(selected->key()));
     }
     const std::uintptr_t identity = reinterpret_cast<std::uintptr_t>(selected);
-    const std::uint64_t hash = selected->hash_;
+    const std::uint32_t hash =
+        RecordIndex::AddressHash(selected->external_key_digest());
     const RecordLocation location = MaterializeIndexLocation(*selected);
     const ExtentManifest extents = ExtentsFor(store, selected);
     const std::uint32_t key_bytes = selected->logical_key_size();
@@ -1287,7 +1288,7 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
     std::uintptr_t entry_address_ = 0;
     ExtentManifest extents_;
     RecordLocation location_{};
-    std::uint64_t hash_ = 0;
+    std::uint32_t hash_ = 0;
   };
   for (;;) {
     RecordIndex::Entry* first = index.Find(digest, key);
@@ -1300,7 +1301,7 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
           .entry_address_ = reinterpret_cast<std::uintptr_t>(entry),
           .extents_ = ExtentsFor(store, entry),
           .location_ = MaterializeIndexLocation(*entry),
-          .hash_ = entry->hash_,
+          .hash_ = RecordIndex::AddressHash(entry->external_key_digest()),
       });
     }
     bool changed = false;

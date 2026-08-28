@@ -188,7 +188,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
           std::uintptr_t entry_address_ = 0;
           ExtentManifest extents_;
           RecordLocation location_{};
-          std::uint64_t hash_ = 0;
+          std::uint32_t hash_ = 0;
           std::uint32_t key_bytes_ = 0;
         };
         std::vector<ExternalExpired> external_expired;
@@ -203,7 +203,8 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
                           reinterpret_cast<std::uintptr_t>(&entry),
                       .extents_ = ExtentsFor(*store, &entry),
                       .location_ = MaterializeIndexLocation(entry),
-                      .hash_ = entry.hash_,
+                      .hash_ =
+                          RecordIndex::AddressHash(entry.external_key_digest()),
                       .key_bytes_ = entry.logical_key_size(),
                   });
                 }

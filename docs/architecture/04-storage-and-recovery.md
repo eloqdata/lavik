@@ -229,14 +229,21 @@ block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
 
-The runtime index uses a 32-byte base entry for keys without expiration and a
-40-byte derived entry for keys with expiration. The common entry contains an
-8-byte hash/key prefix and a 24-byte packed value; only the derived type adds
-the aligned 64-bit expiration timestamp. The packed value keeps the mutation
-sequence, 43-bit block ID, aligned record offset and length, logical size,
-type, and hot state. It does not repeat the physical block's allocation epoch
-or runtime owner for every key: those already live once in the dense
-`BlockState`, and five packed bits remain reserved.
+The runtime index uses a 24-byte base entry for keys without expiration and a
+32-byte derived entry for keys with expiration. The base is exactly the
+24-byte packed value; only the derived type adds the aligned 64-bit expiration
+timestamp. Logical key length plus the inline/external discriminator use a
+one-to-five-byte varint immediately before the key or digest tail. Entries do
+not cache a bucket hash: insertion and lookup use the caller's digest, while
+incremental rehash, pointer-only erase, and representation replacement
+recompute it from the live inline key or external digest. This trades growth-
+phase CPU for the smaller steady-state representation.
+
+The packed value keeps the mutation sequence, 43-bit block ID, aligned record
+offset and length, logical size, type, and hot state. It does not repeat the
+physical block's allocation epoch or runtime owner for every key: those
+already live once in the dense `BlockState`, and five packed bits remain
+reserved.
 
 Before a location crosses an index boundary, the key owner acquire-loads the
 block's atomic owner, reads its published immutable allocation epoch, and

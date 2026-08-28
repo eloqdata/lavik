@@ -64,6 +64,9 @@ template <typename Value,
           typename EntryPolicy = ScanHashMapInlineEntryPolicy<Value>>
 class ScanHashMap {
  public:
+  // Digest arguments for inline keys must equal ComputeDigest(key). Entries do
+  // not retain a bucket hash, so rehash and pointer-only mutation reconstruct
+  // it from the live key. External entries retain the supplied digest tail.
   static_assert(MaxBucketExponent <=
                 std::numeric_limits<std::uint32_t>::digits);
   static_assert(MaxBucketExponent < std::numeric_limits<std::size_t>::digits);
@@ -74,12 +77,13 @@ class ScanHashMap {
   struct ExtendedEntry;
 
   struct Entry {
-    static constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
+    static constexpr std::uint32_t kMaxLogicalKeySize =
+        (std::uint32_t{1} << 31) - 1;
 
-    // The bucket already owns an independent 8-bit tag. Entries retain only
-    // the low hash bits needed to find and redistribute their bucket.
-    std::uint32_t hash_ = 0;
-    std::uint32_t key_size_ = 0;
+    // Key length and inline/external representation live in a varint directly
+    // before the key tail. Keeping the aligned value first lets common entries
+    // use exactly the value's footprint instead of reserving another aligned
+    // word for fixed-width key metadata and a cached bucket hash.
     StoredValue value_{};
 
     bool has_extra() const noexcept {
@@ -105,24 +109,43 @@ class ScanHashMap {
     }
 
     bool key_complete() const noexcept {
-      return (key_size_ & kExternalKeyMask) == 0;
+      return DecodeKeyMetadata(tail()).key_complete_;
     }
 
     std::uint32_t logical_key_size() const noexcept {
-      return key_size_ & ~kExternalKeyMask;
+      return DecodeKeyMetadata(tail()).logical_size_;
+    }
+
+    // Returns bytes occupied by the tail key-metadata varint. Normal callers
+    // should use key(), key_complete(), and logical_key_size().
+    std::uint8_t key_metadata_bytes() const noexcept {
+      return DecodeKeyMetadata(tail()).encoded_bytes_;
+    }
+
+    // Returns the varint width without constructing an Entry. The external
+    // representation bit shares the same varint with the logical length.
+    static std::uint8_t KeyMetadataBytesFor(std::uint32_t logical_size,
+                                            bool key_complete) noexcept {
+      assert(logical_size <= kMaxLogicalKeySize);
+      return EncodedKeyMetadataBytes((logical_size << 1) |
+                                     static_cast<std::uint32_t>(!key_complete));
     }
 
     std::string_view key() const noexcept {
-      return key_complete()
-                 ? std::string_view(reinterpret_cast<const char*>(tail()),
-                                    logical_key_size())
+      const KeyMetadata metadata = DecodeKeyMetadata(tail());
+      return metadata.key_complete_
+                 ? std::string_view(reinterpret_cast<const char*>(
+                                        tail() + metadata.encoded_bytes_),
+                                    metadata.logical_size_)
                  : std::string_view{};
     }
 
     Digest external_key_digest() const noexcept {
       Digest digest;
-      if (!key_complete()) {
-        std::memcpy(digest.bytes_.data(), tail(), digest.bytes_.size());
+      const KeyMetadata metadata = DecodeKeyMetadata(tail());
+      if (!metadata.key_complete_) {
+        std::memcpy(digest.bytes_.data(), tail() + metadata.encoded_bytes_,
+                    digest.bytes_.size());
       }
       return digest;
     }
@@ -136,8 +159,20 @@ class ScanHashMap {
    private:
     friend struct ExtendedEntry;
 
-    Entry(std::uint32_t hash, std::uint32_t key_size, const StoredValue& value)
-        : hash_(hash), key_size_(key_size), value_(value) {}
+    struct KeyMetadata {
+      std::uint32_t logical_size_ = 0;
+      std::uint8_t encoded_bytes_ = 0;
+      bool key_complete_ = true;
+    };
+
+    explicit Entry(const StoredValue& value) : value_(value) {}
+
+    static std::uint8_t EncodedKeyMetadataBytes(std::uint32_t encoded) noexcept;
+    static std::uint8_t EncodeKeyMetadata(std::byte* output,
+                                          std::uint32_t logical_size,
+                                          bool key_complete) noexcept;
+    static KeyMetadata DecodeKeyMetadata(const std::byte* input) noexcept;
+    std::size_t tail_bytes() const noexcept;
 
     EntryExtra* extra() noexcept;
     const EntryExtra* extra() const noexcept;
@@ -151,9 +186,8 @@ class ScanHashMap {
    private:
     friend struct Entry;
 
-    ExtendedEntry(std::uint32_t hash, std::uint32_t key_size,
-                  const StoredValue& value, const EntryExtra& extra)
-        : Entry(hash, key_size, value), extra_(extra) {}
+    ExtendedEntry(const StoredValue& value, const EntryExtra& extra)
+        : Entry(value), extra_(extra) {}
   };
 
   struct InsertResult {
@@ -210,6 +244,17 @@ class ScanHashMap {
     return BucketCount(tables_[0]) + BucketCount(tables_[1]);
   }
 
+  // Returns the low bucket-address bits callers must retain with an Entry
+  // address across suspension. It is computed while the Entry is known live;
+  // FindAddress can then validate membership without dereferencing stale
+  // storage.
+  static std::uint32_t AddressHash(const Digest& digest) noexcept {
+    return static_cast<std::uint32_t>(Hash(digest));
+  }
+  static std::uint32_t AddressHash(const Entry& entry) noexcept {
+    return static_cast<std::uint32_t>(EntryHash(entry));
+  }
+
   Entry* Find(const Digest& digest, std::string_view key) {
     RehashStep();
     return FindWithoutStep(digest, key);
@@ -231,12 +276,12 @@ class ScanHashMap {
     return result;
   }
 
-  bool Contains(const Entry* entry, std::uint64_t hash) const noexcept {
+  bool Contains(const Entry* entry, std::uint32_t hash) const noexcept {
     return FindAddress(reinterpret_cast<std::uintptr_t>(entry), hash) !=
            nullptr;
   }
 
-  Entry* FindAddress(std::uintptr_t address, std::uint64_t hash) noexcept {
+  Entry* FindAddress(std::uintptr_t address, std::uint32_t hash) noexcept {
     return const_cast<Entry*>(std::as_const(*this).FindAddress(address, hash));
   }
 
@@ -246,7 +291,7 @@ class ScanHashMap {
   // membership check safe before any object lifetime is assumed. Callers must
   // use the returned live pointer rather than reconstructing one from address.
   const Entry* FindAddress(std::uintptr_t address,
-                           std::uint64_t hash) const noexcept {
+                           std::uint32_t hash) const noexcept {
     if (address == 0) {
       return nullptr;
     }
@@ -279,7 +324,8 @@ class ScanHashMap {
   // through `replaced`. Before destroying it, the caller must migrate caches
   // that assume a live object; asynchronous address-only caches can instead
   // use FindAddress to validate membership before dereferencing.
-  Entry* ReplaceValue(Entry* existing, const Value& value, Entry** replaced) {
+  Entry* ReplaceValue(Entry* existing, const Value& value, const Digest& digest,
+                      Entry** replaced) {
     assert(existing != nullptr);
     assert(replaced != nullptr);
     *replaced = nullptr;
@@ -290,7 +336,7 @@ class ScanHashMap {
 
     std::unique_ptr<Entry, void (*)(Entry*)> replacement(
         Entry::CreateReplacement(*existing, value), &Entry::Destroy);
-    const std::uint32_t hash = existing->hash_;
+    const std::uint64_t hash = Hash(digest);
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
@@ -330,8 +376,7 @@ class ScanHashMap {
     std::unique_ptr<Entry, void (*)(Entry*)> entry(
         Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
     Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw,
-               HashTag(Hash(digest)));
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw, Hash(digest));
     entry.release();
     return {raw, true};
   }
@@ -343,8 +388,7 @@ class ScanHashMap {
     std::unique_ptr<Entry, void (*)(Entry*)> entry(
         Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
     Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw,
-               HashTag(Hash(digest)));
+    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw, Hash(digest));
     entry.release();
     return raw;
   }
@@ -394,7 +438,7 @@ class ScanHashMap {
       return false;
     }
     RehashStep();
-    const std::uint32_t hash = entry->hash_;
+    const std::uint64_t hash = EntryHash(*entry);
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
@@ -646,6 +690,11 @@ class ScanHashMap {
     return static_cast<std::uint8_t>(hash >> 56);
   }
 
+  static std::uint64_t EntryHash(const Entry& entry) noexcept {
+    return Hash(entry.key_complete() ? ComputeDigest(entry.key())
+                                     : entry.external_key_digest());
+  }
+
   static bool KeyEquals(const Entry& entry, const Digest& digest,
                         std::string_view key) noexcept {
     if (entry.key_complete()) [[likely]] {
@@ -786,8 +835,8 @@ class ScanHashMap {
     return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
   }
 
-  static void AddToTable(Table& table, Entry* entry, std::uint8_t tag) {
-    const std::uint32_t hash = entry->hash_;
+  static void AddToTable(Table& table, Entry* entry, std::uint64_t hash) {
+    const std::uint8_t tag = HashTag(hash);
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     while (true) {
       const std::size_t slots =
@@ -862,9 +911,12 @@ class ScanHashMap {
       const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
       for (std::size_t slot = 0; slot < slots; ++slot) {
         if (Occupied(*bucket, slot)) {
-          // The tag contains hash bits that are intentionally absent from the
-          // compact entry. Carry it with the pointer across every rehash.
-          AddToTable(*target, bucket->entries_[slot], bucket->hashes_[slot]);
+          // Entries no longer retain a bucket hash. Recompute it while the
+          // source object is known live; external keys already carry their
+          // digest, while inline keys trade rehash CPU for the smaller steady
+          // state representation.
+          AddToTable(*target, bucket->entries_[slot],
+                     EntryHash(*bucket->entries_[slot]));
           ClearOccupied(bucket, slot);
         }
       }
@@ -974,15 +1026,84 @@ class ScanHashMap {
 };
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+std::uint8_t ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::
+    EncodedKeyMetadataBytes(std::uint32_t encoded) noexcept {
+  std::uint8_t bytes = 1;
+  while (encoded >= 0x80) {
+    encoded >>= 7;
+    ++bytes;
+  }
+  return bytes;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+std::uint8_t
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::EncodeKeyMetadata(
+    std::byte* output, std::uint32_t logical_size, bool key_complete) noexcept {
+  assert(output != nullptr);
+  assert(logical_size <= kMaxLogicalKeySize);
+  std::uint32_t encoded =
+      (logical_size << 1) | static_cast<std::uint32_t>(!key_complete);
+  const std::uint8_t bytes = EncodedKeyMetadataBytes(encoded);
+  for (std::uint8_t index = 0; index < bytes; ++index) {
+    std::uint8_t byte = static_cast<std::uint8_t>(encoded & 0x7f);
+    encoded >>= 7;
+    if (encoded != 0) {
+      byte |= 0x80;
+    }
+    output[index] = static_cast<std::byte>(byte);
+  }
+  return bytes;
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::KeyMetadata
+ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::DecodeKeyMetadata(
+    const std::byte* input) noexcept {
+  assert(input != nullptr);
+  std::uint32_t encoded = 0;
+  for (std::uint8_t index = 0; index < 5; ++index) {
+    const std::uint8_t byte = std::to_integer<std::uint8_t>(input[index]);
+    if (index == 4) {
+      assert((byte & 0xf0) == 0);
+    }
+    encoded |= static_cast<std::uint32_t>(byte & 0x7f) << (index * 7);
+    if ((byte & 0x80) == 0) {
+      return KeyMetadata{
+          .logical_size_ = encoded >> 1,
+          .encoded_bytes_ = static_cast<std::uint8_t>(index + 1),
+          .key_complete_ = (encoded & 1) == 0,
+      };
+    }
+  }
+  assert(false && "unterminated key metadata varint");
+  return {};
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
+std::size_t ScanHashMap<Value, MaxBucketExponent,
+                        EntryPolicy>::Entry::tail_bytes() const noexcept {
+  const KeyMetadata metadata = DecodeKeyMetadata(tail());
+  return metadata.encoded_bytes_ + (metadata.key_complete_
+                                        ? metadata.logical_size_
+                                        : Digest{}.bytes_.size());
+}
+
+template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
 typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
 ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
     const Digest& digest, std::string_view key, const Value& value,
     bool key_complete) {
-  if (key.size() >= kExternalKeyMask) {
+  if (key.size() > kMaxLogicalKeySize) {
     throw std::bad_alloc();
   }
-  const std::size_t tail_bytes =
+  const std::uint32_t logical_size = static_cast<std::uint32_t>(key.size());
+  const std::uint32_t encoded_metadata =
+      (logical_size << 1) | static_cast<std::uint32_t>(!key_complete);
+  const std::size_t metadata_bytes = EncodedKeyMetadataBytes(encoded_metadata);
+  const std::size_t payload_bytes =
       key_complete ? key.size() : digest.bytes_.size();
+  const std::size_t tail_bytes = metadata_bytes + payload_bytes;
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
       extended ? sizeof(ExtendedEntry) : sizeof(Entry);
@@ -994,24 +1115,24 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   void* storage = ::operator new(header_bytes + tail_bytes);
   Entry* entry = nullptr;
   try {
-    const std::uint32_t hash = static_cast<std::uint32_t>(Hash(digest));
-    const std::uint32_t key_size = static_cast<std::uint32_t>(key.size()) |
-                                   (key_complete ? 0 : kExternalKeyMask);
     if (extended) {
-      entry =
-          new (storage) ExtendedEntry(hash, key_size, EntryPolicy::Store(value),
-                                      EntryPolicy::StoreExtra(value));
+      entry = new (storage) ExtendedEntry(EntryPolicy::Store(value),
+                                          EntryPolicy::StoreExtra(value));
     } else {
-      entry = new (storage) Entry(hash, key_size, EntryPolicy::Store(value));
+      entry = new (storage) Entry(EntryPolicy::Store(value));
     }
   } catch (...) {
     ::operator delete(storage);
     throw;
   }
+  const std::uint8_t written_metadata =
+      EncodeKeyMetadata(entry->tail(), logical_size, key_complete);
+  assert(written_metadata == metadata_bytes);
+  std::byte* payload = entry->tail() + written_metadata;
   if (key_complete && !key.empty()) {
-    std::memcpy(entry->tail(), key.data(), key.size());
+    std::memcpy(payload, key.data(), key.size());
   } else if (!key_complete) {
-    std::memcpy(entry->tail(), digest.bytes_.data(), digest.bytes_.size());
+    std::memcpy(payload, digest.bytes_.data(), digest.bytes_.size());
   }
   return entry;
 }
@@ -1020,9 +1141,7 @@ template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
 typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
 ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
     const Entry& source, const Value& value) {
-  const std::size_t tail_bytes = source.key_complete()
-                                     ? source.logical_key_size()
-                                     : Digest{}.bytes_.size();
+  const std::size_t tail_bytes = source.tail_bytes();
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
       extended ? sizeof(ExtendedEntry) : sizeof(Entry);
@@ -1033,12 +1152,10 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
   Entry* entry = nullptr;
   try {
     if (extended) {
-      entry = new (storage) ExtendedEntry(source.hash_, source.key_size_,
-                                          EntryPolicy::Store(value),
+      entry = new (storage) ExtendedEntry(EntryPolicy::Store(value),
                                           EntryPolicy::StoreExtra(value));
     } else {
-      entry = new (storage)
-          Entry(source.hash_, source.key_size_, EntryPolicy::Store(value));
+      entry = new (storage) Entry(EntryPolicy::Store(value));
     }
   } catch (...) {
     ::operator delete(storage);

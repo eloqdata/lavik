@@ -7,9 +7,10 @@ namespace keylane::storage {
 
 RecordIndex::Entry* StorageEngine::Impl::ReplaceIndexLocation(
     WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
-    const RecordLocation& location, TxUndoLog* tx_undo) {
+    const Digest& digest, const RecordLocation& location, TxUndoLog* tx_undo) {
   RecordIndex::Entry* replaced = nullptr;
-  RecordIndex::Entry* current = index.ReplaceValue(entry, location, &replaced);
+  RecordIndex::Entry* current =
+      index.ReplaceValue(entry, location, digest, &replaced);
   if (replaced == nullptr) {
     return current;
   }
@@ -801,8 +802,9 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         --partition.expiring_key_count_[entry.db_id_];
       }
     }
-    current = ReplaceIndexLocation(store, partition.indexes_[entry.db_id_],
-                                   current, *entry.previous_, &undo);
+    current =
+        ReplaceIndexLocation(store, partition.indexes_[entry.db_id_], current,
+                             undo_digest, *entry.previous_, &undo);
     if (entry.previous_->external()) {
       store.external_manifests_.insert_or_assign(current,
                                                  entry.previous_extents_);
@@ -1956,7 +1958,7 @@ acquire_active_stream:
         }
       }
       inserted_entry = ReplaceIndexLocation(store, *index_ptr, previous_entry,
-                                            location, current_tx_undo);
+                                            digest, location, current_tx_undo);
     } else {
       inserted_entry =
           index_ptr->InsertNew(digest, key, location, !key_external);
@@ -1987,7 +1989,8 @@ acquire_active_stream:
                              : std::nullopt,
       .tx_retirements_ = std::move(commit_retirements),
       .index_generation_ = store.index_generations_[db_id],
-      .entry_hash_ = inserted_entry == nullptr ? 0 : inserted_entry->hash_,
+      .entry_hash_ =
+          inserted_entry == nullptr ? 0 : RecordIndex::AddressHash(digest),
       .partition_id_ =
           partition_ptr == nullptr ? std::uint16_t{0} : partition_ptr->id_,
       .db_id_ = db_id,

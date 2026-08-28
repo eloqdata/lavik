@@ -669,7 +669,8 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       winner.set_tx_tagged(recovered.txid_ != 0);
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
-        winner_entry = ReplaceIndexLocation(store, index, winner_entry, winner);
+        winner_entry = ReplaceIndexLocation(store, index, winner_entry,
+                                            recovered.digest_, winner);
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
                                        winner, !winner.key_external());

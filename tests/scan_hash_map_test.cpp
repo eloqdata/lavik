@@ -40,20 +40,21 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
     ASSERT_CHECK(found != nullptr && found->value_ == i, "lookup failed");
   }
 
-  Digest collision{};
-  auto first = map.InsertOrAssign(collision, "collision-a", 11);
-  auto second = map.InsertOrAssign(collision, "collision-b", 22);
+  const Digest first_digest = ComputeDigest("additional-a");
+  const Digest second_digest = ComputeDigest("additional-b");
+  auto first = map.InsertOrAssign(first_digest, "additional-a", 11);
+  auto second = map.InsertOrAssign(second_digest, "additional-b", 22);
   ASSERT_CHECK(first.inserted_ && second.inserted_ &&
-                   map.Find(collision, "collision-a")->value_ == 11 &&
-                   map.Find(collision, "collision-b")->value_ == 22,
-               "full-key collision handling failed");
+                   map.Find(first_digest, "additional-a")->value_ == 11 &&
+                   map.Find(second_digest, "additional-b")->value_ == 22,
+               "additional key lookup failed");
   for (std::uint64_t i = 0; i < 100; ++i) {
     const std::string key = "collision-chain-" + std::to_string(i);
-    map.InsertOrAssign(collision, key, i);
+    map.InsertOrAssign(ComputeDigest(key), key, i);
   }
   for (std::uint64_t i = 0; i < 100; ++i) {
     const std::string key = "collision-chain-" + std::to_string(i);
-    auto* found = map.Find(collision, key);
+    auto* found = map.Find(ComputeDigest(key), key);
     ASSERT_CHECK(found != nullptr && found->value_ == i,
                  "overflow-chain collision lookup failed");
   }
@@ -163,20 +164,21 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ASSERT_CHECK(erasable.size() == kErasePopulation,
                "reinsert after erase left a wrong count");
 
-  // Erase inside one overflow chain: all keys share a digest, so they pile
-  // into a single bucket chain and exercise the hole-filling compaction.
-  ScanHashMap<std::uint64_t> chained;
+  // A zero-bit direct table sends every real digest to one overflow chain,
+  // exercising hole-filling compaction without violating the digest contract.
+  ScanHashMap<std::uint64_t, 0> chained;
   for (std::uint64_t i = 0; i < 64; ++i) {
     const std::string key = "chain-" + std::to_string(i);
-    chained.InsertOrAssign(collision, key, i);
+    chained.InsertOrAssign(ComputeDigest(key), key, i);
   }
   for (std::uint64_t i = 0; i < 64; i += 3) {
     const std::string key = "chain-" + std::to_string(i);
-    ASSERT_CHECK(chained.Erase(collision, key), "chained erase failed");
+    ASSERT_CHECK(chained.Erase(ComputeDigest(key), key),
+                 "chained erase failed");
   }
   for (std::uint64_t i = 0; i < 64; ++i) {
     const std::string key = "chain-" + std::to_string(i);
-    auto* found = chained.Find(collision, key);
+    auto* found = chained.Find(ComputeDigest(key), key);
     if (i % 3 == 0) {
       ASSERT_CHECK(found == nullptr, "erased chained key is reachable");
     } else {
@@ -194,11 +196,12 @@ TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
         }
       });
     } while (drain_cursor != 0 && victim.empty());
-    ASSERT_CHECK(chained.Erase(collision, victim), "chain drain erase failed");
+    ASSERT_CHECK(chained.Erase(ComputeDigest(victim), victim),
+                 "chain drain erase failed");
   }
-  ASSERT_CHECK(
-      chained.Find(collision, "chain-1") == nullptr && chained.size() == 0,
-      "chain drain left residue");
+  ASSERT_CHECK(chained.Find(ComputeDigest("chain-1"), "chain-1") == nullptr &&
+                   chained.size() == 0,
+               "chain drain left residue");
 }
 
 TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
@@ -210,10 +213,47 @@ TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
   EXPECT_FALSE(inserted.entry_->key_complete());
   EXPECT_TRUE(inserted.entry_->key().empty());
   EXPECT_EQ(inserted.entry_->logical_key_size(), key.size());
+  EXPECT_EQ(inserted.entry_->key_metadata_bytes(), 3);
   EXPECT_EQ(inserted.entry_->external_key_digest(), digest);
+  const std::uintptr_t entry_address =
+      reinterpret_cast<std::uintptr_t>(inserted.entry_);
+  const std::uint32_t address_hash =
+      ScanHashMap<std::uint64_t>::AddressHash(*inserted.entry_);
+  EXPECT_EQ(map.FindAddress(entry_address, address_hash), inserted.entry_);
   EXPECT_EQ(map.Find(digest, key), inserted.entry_);
   EXPECT_TRUE(map.Erase(inserted.entry_));
+  EXPECT_EQ(map.FindAddress(entry_address, address_hash), nullptr);
   EXPECT_TRUE(map.empty());
+}
+
+TEST(ScanHashMapTest, KeyMetadataVarintUsesExpectedWidths) {
+  using Entry = ScanHashMap<std::uint64_t>::Entry;
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(0, true), 1);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(63, true), 1);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(64, true), 2);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(8191, false), 2);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(8192, false), 3);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(1'048'575, true), 3);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(1'048'576, true), 4);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(134'217'727, false), 4);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(134'217'728, false), 5);
+  EXPECT_EQ(Entry::KeyMetadataBytesFor(Entry::kMaxLogicalKeySize, true), 5);
+
+  ScanHashMap<std::uint64_t> map;
+  for (const std::size_t length :
+       {std::size_t{0}, std::size_t{1}, std::size_t{63}, std::size_t{64},
+        std::size_t{8191}, std::size_t{8192}}) {
+    const std::string key(length, static_cast<char>('a' + length % 26));
+    const Digest digest = ComputeDigest(key);
+    auto inserted = map.InsertOrAssign(digest, key, length);
+    ASSERT_TRUE(inserted.inserted_);
+    EXPECT_TRUE(inserted.entry_->key_complete());
+    EXPECT_EQ(inserted.entry_->logical_key_size(), length);
+    EXPECT_EQ(inserted.entry_->key(), key);
+    EXPECT_EQ(inserted.entry_->key_metadata_bytes(),
+              Entry::KeyMetadataBytesFor(length, true));
+    EXPECT_EQ(map.Find(digest, key), inserted.entry_);
+  }
 }
 
 TEST(ScanHashMapTest, SaturatedAddressSpaceUsesBucketChains) {

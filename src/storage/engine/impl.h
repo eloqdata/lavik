@@ -591,8 +591,8 @@ static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
 static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 32);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 40);
+static_assert(sizeof(RecordIndex::Entry) == 24);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 32);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -2205,7 +2205,7 @@ class StorageEngine::Impl {
       std::uintptr_t entry_address_ = 0;
       ExtentManifest extents_;
       RecordLocation location_{};
-      std::uint64_t hash_ = 0;
+      std::uint32_t hash_ = 0;
       std::uint32_t key_bytes_ = 0;
       std::size_t value_bytes_ = 0;
     };
@@ -2897,6 +2897,7 @@ class StorageEngine::Impl {
   RecordIndex::Entry* ReplaceIndexLocation(WorkerStore& store,
                                            RecordIndex& index,
                                            RecordIndex::Entry* entry,
+                                           const Digest& digest,
                                            const RecordLocation& location,
                                            TxUndoLog* tx_undo = nullptr);
 
