@@ -175,11 +175,31 @@ database at a time. Each `(partition, database)` moves through `unstarted`,
   command FIFO.
 
 Baseline values are captured under the key-ordering boundary. Large external
-values pin immutable extents and stream bounded chunks; ordinary values are
-materialized into bounded record batches. Transactions committed during the
-hidden rebuild publish their participant after-images only after the commit
-decision. `FLUSHDB` or `FLUSHALL` invalidates an active capture attempt so the
-next attempt starts from the new database epochs.
+values pin immutable extents and stream bounded value chunks between `begin`
+and `commit` frames. The target reserves key plus encoded-value staging
+capacity from its worker-local memory share before accepting a large value.
+Failure aborts the hidden rebuild rather than exposing a partial record.
+Ordinary values are materialized into bounded record batches. Transactions
+committed during the hidden rebuild publish their participant after-images
+only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
+capture attempt so the next attempt starts from the new database epochs.
+
+Before a source session becomes visible, each worker reserves coverage-map
+headroom for its largest `(partition, database)` scan, because only one such
+map is live at a time. It does not sum all 16 databases in a partition.
+Coverage entries for external keys retain only digest and logical length, like
+the record index, so their reservation does not charge the full on-disk key.
+The reservation belongs to that worker's fixed max-memory share and is
+released when the session ends.
+
+Native replication also admits transient materialization at the point where
+its size becomes known. Frame receive/send buffers, fragmented-command
+assembly, decoded record key/value strings, record vectors, and RDB strings
+reserve the corresponding mimalloc size class before allocation. The permit is
+released before any socket or storage suspension after the allocator hook has
+published the actual usable bytes. These checks cover both online replay and
+full-sync staging, so a replica cannot consume another worker's unused share
+or first materialize a large frame and reject it afterward.
 
 Runtime-only commands published while the key snapshot is in progress enter
 the same bounded full-sync command FIFOs without creating snapshot state.

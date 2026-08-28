@@ -65,6 +65,9 @@ class RespCommandParser {
   std::size_t bulk_remaining_ = 0;
   std::size_t terminator_bytes_ = 0;
   std::size_t command_bytes_ = 0;
+  // Aggregate allocator charge allowed without pre-admission so an
+  // over-limit worker can still decode a bounded shrinking command.
+  std::size_t unadmitted_bytes_ = 0;
   char argument_type_ = '$';
 };
 

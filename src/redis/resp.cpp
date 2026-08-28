@@ -4,7 +4,12 @@
 #include <cassert>
 #include <charconv>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <string_view>
+
+#include "keylane/memory.h"
+#include "mimalloc.h"
 
 namespace keylane {
 using namespace celer;
@@ -19,9 +24,133 @@ constexpr std::size_t kInitialArgCapacity = 1024;
 constexpr std::size_t kMaxBulkLen = 512ULL * 1024 * 1024;
 constexpr std::size_t kMaxCommandBytes = 1ULL * 1024 * 1024 * 1024;
 constexpr std::size_t kMaxLengthTextBytes = 32;
+// Parsing must remain possible after maxmemory is reached so DEL and other
+// shrinking commands can recover the worker. Keep that escape hatch bounded;
+// large arguments are admitted before their backing allocation is created.
+constexpr std::size_t kUnadmittedArgumentBytes = 64ULL * 1024;
+
+absl::StatusOr<std::optional<MemoryReservation>> AdmitAllocation(
+    std::size_t requested, std::size_t* unadmitted_bytes) {
+  const std::size_t usable = mi_good_size(requested);
+  if (usable < requested) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client request allocation is too large");
+  }
+  if (usable <= kUnadmittedArgumentBytes - *unadmitted_bytes) {
+    *unadmitted_bytes += usable;
+    return std::optional<MemoryReservation>{};
+  }
+  auto reservation = TryReserveMemory(usable);
+  if (!reservation.has_value()) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client request exceeds this worker's maxmemory share");
+  }
+  return std::move(reservation);
+}
+
+absl::Status ReserveArgument(std::string* output, std::size_t desired,
+                             std::size_t* unadmitted_bytes) {
+  if (desired <= output->capacity()) return absl::OkStatus();
+  std::size_t allocation_capacity = desired;
+  if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
+    allocation_capacity =
+        std::max(allocation_capacity, output->capacity() * 2);
+  } else {
+    allocation_capacity = std::numeric_limits<std::size_t>::max();
+  }
+  if (allocation_capacity == std::numeric_limits<std::size_t>::max()) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client argument exceeds this worker's maxmemory share");
+  }
+  auto admitted =
+      AdmitAllocation(allocation_capacity + 1, unadmitted_bytes);
+  if (!admitted.ok()) return admitted.status();
+  try {
+    // The reservation lives only across reserve(). operator new records the
+    // usable allocation before returning, so releasing the pending permit
+    // cannot expose an unaccounted interval to another connection.
+    output->reserve(desired);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("client argument allocation failed");
+  } catch (const std::length_error&) {
+    return absl::ResourceExhaustedError("client argument is too large");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status AppendArgument(std::string* output, std::string_view value,
+                            std::size_t* unadmitted_bytes) {
+  if (value.size() > std::numeric_limits<std::size_t>::max() - output->size()) {
+    return absl::ResourceExhaustedError("client argument is too large");
+  }
+  const std::size_t desired = output->size() + value.size();
+  absl::Status reserved =
+      ReserveArgument(output, desired, unadmitted_bytes);
+  if (!reserved.ok()) return reserved;
+  try {
+    output->append(value);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError("client argument allocation failed");
+  } catch (const std::length_error&) {
+    return absl::ResourceExhaustedError("client argument is too large");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ReserveArguments(std::vector<std::string>* output,
+                              std::size_t desired,
+                              std::size_t* unadmitted_bytes) {
+  if (desired <= output->capacity()) return absl::OkStatus();
+  std::size_t allocation_capacity = desired;
+  if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
+    allocation_capacity =
+        std::max(allocation_capacity, output->capacity() * 2);
+  } else {
+    return absl::ResourceExhaustedError("too many client arguments");
+  }
+  if (allocation_capacity >
+      std::numeric_limits<std::size_t>::max() / sizeof(std::string)) {
+    return absl::ResourceExhaustedError("too many client arguments");
+  }
+  auto admitted =
+      AdmitAllocation(allocation_capacity * sizeof(std::string),
+                      unadmitted_bytes);
+  if (!admitted.ok()) return admitted.status();
+  try {
+    output->reserve(desired);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client argument index allocation failed");
+  } catch (const std::length_error&) {
+    return absl::ResourceExhaustedError("too many client arguments");
+  }
+  return absl::OkStatus();
+}
+
+absl::Status PushArgument(std::vector<std::string>* output,
+                          std::string argument,
+                          std::size_t* unadmitted_bytes) {
+  absl::Status reserved =
+      ReserveArguments(output, output->size() + 1, unadmitted_bytes);
+  if (!reserved.ok()) return reserved;
+  try {
+    output->push_back(std::move(argument));
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "client argument index allocation failed");
+  }
+  return absl::OkStatus();
+}
 
 absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
-    std::string_view line) {
+    std::string_view line, std::size_t* unadmitted_bytes) {
   std::vector<std::string> args;
   std::size_t pos = 0;
   while (pos < line.size()) {
@@ -39,18 +168,21 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
       }
       if (quote == 0 && (value == ' ' || value == '\t')) break;
       if (value != '\\') {
-        argument.push_back(value);
+        absl::Status appended =
+            AppendArgument(&argument, std::string_view(&value, 1),
+                           unadmitted_bytes);
+        if (!appended.ok()) return appended;
         continue;
       }
       if (pos == line.size())
         return absl::InvalidArgumentError("unterminated inline escape");
       const char escaped = line[pos++];
       switch (escaped) {
-        case 'n': argument.push_back('\n'); break;
-        case 'r': argument.push_back('\r'); break;
-        case 't': argument.push_back('\t'); break;
-        case 'b': argument.push_back('\b'); break;
-        case 'a': argument.push_back('\a'); break;
+        case 'n': value = '\n'; break;
+        case 'r': value = '\r'; break;
+        case 't': value = '\t'; break;
+        case 'b': value = '\b'; break;
+        case 'a': value = '\a'; break;
         case 'x': {
           if (pos + 2 > line.size())
             return absl::InvalidArgumentError("invalid inline hex escape");
@@ -59,18 +191,24 @@ absl::StatusOr<std::vector<std::string>> ParseInlineArguments(
                                               line.data() + pos + 2, byte, 16);
           if (parsed.ec != std::errc{} || parsed.ptr != line.data() + pos + 2)
             return absl::InvalidArgumentError("invalid inline hex escape");
-          argument.push_back(static_cast<char>(byte));
+          value = static_cast<char>(byte);
           pos += 2;
           break;
         }
-        default: argument.push_back(escaped); break;
+        default: value = escaped; break;
       }
+      absl::Status appended =
+          AppendArgument(&argument, std::string_view(&value, 1),
+                         unadmitted_bytes);
+      if (!appended.ok()) return appended;
     }
     if (!closed)
       return absl::InvalidArgumentError("unterminated inline quote");
     if (quote != 0 && pos < line.size() && line[pos] != ' ' && line[pos] != '\t')
       return absl::InvalidArgumentError("characters after inline quote");
-    args.push_back(std::move(argument));
+    absl::Status pushed =
+        PushArgument(&args, std::move(argument), unadmitted_bytes);
+    if (!pushed.ok()) return pushed;
   }
   return args;
 }
@@ -86,6 +224,7 @@ void RespCommandParser::ResetCommand() {
   bulk_remaining_ = 0;
   terminator_bytes_ = 0;
   command_bytes_ = 0;
+  unadmitted_bytes_ = 0;
 }
 
 void RespCommandParser::Reset() { ResetCommand(); }
@@ -139,7 +278,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t end = newline == std::string_view::npos
                                     ? input.size()
                                     : newline + 1;
-        current_argument_.append(input.substr(pos, end - pos));
+        absl::Status appended =
+            AppendArgument(&current_argument_, input.substr(pos, end - pos),
+                           &unadmitted_bytes_);
+        if (!appended.ok()) return Error(appended, pos);
         if (!consume(end - pos)) {
           return Error(absl::ResourceExhaustedError(
                            "client request exceeds the query buffer limit"),
@@ -149,7 +291,8 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         current_argument_.pop_back();
         if (!current_argument_.empty() && current_argument_.back() == '\r')
           current_argument_.pop_back();
-        auto parsed = ParseInlineArguments(current_argument_);
+        auto parsed =
+            ParseInlineArguments(current_argument_, &unadmitted_bytes_);
         if (!parsed.ok()) return Error(parsed.status(), pos);
         if (parsed->empty()) {
           ResetCommand();
@@ -211,8 +354,11 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
                 break;
               }
               arguments_remaining_ = static_cast<std::size_t>(parsed);
-              command_.args_.reserve(
-                  std::min(arguments_remaining_, kInitialArgCapacity));
+              absl::Status reserved = ReserveArguments(
+                  &command_.args_,
+                  std::min(arguments_remaining_, kInitialArgCapacity),
+                  &unadmitted_bytes_);
+              if (!reserved.ok()) return Error(reserved, pos);
               state_ = State::kArgumentStart;
             } else {
               if (parsed > static_cast<long long>(kMaxBulkLen)) {
@@ -221,6 +367,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
               }
               bulk_remaining_ = static_cast<std::size_t>(parsed);
               current_argument_.clear();
+              absl::Status reserved =
+                  ReserveArgument(&current_argument_, bulk_remaining_,
+                                  &unadmitted_bytes_);
+              if (!reserved.ok()) return Error(reserved, pos);
               state_ = State::kBulkData;
             }
             break;
@@ -267,7 +417,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t end = newline == std::string_view::npos
                                     ? input.size()
                                     : newline + 1;
-        current_argument_.append(input.substr(pos, end - pos));
+        absl::Status appended =
+            AppendArgument(&current_argument_, input.substr(pos, end - pos),
+                           &unadmitted_bytes_);
+        if (!appended.ok()) return Error(appended, pos);
         if (!consume(end - pos)) {
           return Error(absl::ResourceExhaustedError(
                            "client request exceeds the query buffer limit"),
@@ -290,7 +443,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
             return Error(absl::InvalidArgumentError("invalid RESP boolean"),
                          pos);
         }
-        command_.args_.push_back(std::move(current_argument_));
+        absl::Status pushed = PushArgument(
+            &command_.args_, std::move(current_argument_),
+            &unadmitted_bytes_);
+        if (!pushed.ok()) return Error(pushed, pos);
         current_argument_.clear();
         --arguments_remaining_;
         if (arguments_remaining_ != 0) {
@@ -308,7 +464,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t available = input.size() - pos;
         const std::size_t take = std::min(available, bulk_remaining_);
         if (take != 0) {
-          current_argument_.append(input.substr(pos, take));
+          absl::Status appended =
+              AppendArgument(&current_argument_, input.substr(pos, take),
+                             &unadmitted_bytes_);
+          if (!appended.ok()) return Error(appended, pos);
           bulk_remaining_ -= take;
           if (!consume(take)) {
             return Error(absl::ResourceExhaustedError(
@@ -349,7 +508,10 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
           current_argument_.erase(0, 4);
         }
 
-        command_.args_.push_back(std::move(current_argument_));
+        absl::Status pushed = PushArgument(
+            &command_.args_, std::move(current_argument_),
+            &unadmitted_bytes_);
+        if (!pushed.ok()) return Error(pushed, pos);
         current_argument_.clear();
         --arguments_remaining_;
         if (arguments_remaining_ != 0) {

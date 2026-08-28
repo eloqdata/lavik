@@ -3,8 +3,11 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <new>
+#include <optional>
 
 #include "keylane/replication_command.h"
+#include "keylane/memory.h"
 
 namespace keylane {
 namespace {
@@ -67,6 +70,38 @@ void CopySegment(std::string_view segment, std::uint64_t* offset,
 
 absl::Status Malformed(std::string_view message) {
   return absl::Status(absl::StatusCode::kInvalidArgument, message);
+}
+
+absl::StatusOr<std::string> CopyArgumentAdmitted(std::string_view value) {
+  std::string output;
+  std::optional<MemoryReservation> reservation;
+  if (value.size() > output.capacity()) {
+    std::size_t capacity = value.size();
+    if (output.capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
+      capacity = std::max(capacity, output.capacity() * 2);
+    } else {
+      capacity = std::numeric_limits<std::size_t>::max();
+    }
+    if (capacity == std::numeric_limits<std::size_t>::max()) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "replication argument is too large");
+    }
+    reservation = TryReserveMemoryAllocation(capacity + 1);
+    if (!reservation.has_value()) {
+      RecordMemoryRejection();
+      return absl::ResourceExhaustedError(
+          "replication argument exceeds this worker's maxmemory share");
+    }
+  }
+  try {
+    output.assign(value);
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "replication argument allocation failed");
+  }
+  return output;
 }
 
 }  // namespace
@@ -168,7 +203,9 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
   }
   command.args_.reserve(argc);
   for (std::uint32_t length : lengths) {
-    command.args_.emplace_back(encoded.substr(offset, length));
+    auto argument = CopyArgumentAdmitted(encoded.substr(offset, length));
+    if (!argument.ok()) return argument.status();
+    command.args_.push_back(std::move(*argument));
     offset += length;
   }
   return command;

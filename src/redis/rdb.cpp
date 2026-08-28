@@ -16,6 +16,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <string>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "keylane/memory.h"
 #include "keylane/storage/format.h"
 
 namespace keylane::rdb {
@@ -68,6 +70,57 @@ constexpr std::uint8_t kEof = 255;
 
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
 constexpr std::string_view kListMagic = "KLL1";
+
+absl::Status MemoryExhausted(std::string_view operation) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError(
+      absl::StrCat(operation, " exceeds this worker's maxmemory share"));
+}
+
+absl::Status ReserveRdbString(std::string* output, std::size_t desired) {
+  if (desired <= output->capacity()) return absl::OkStatus();
+  std::size_t capacity = desired;
+  if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
+    capacity = std::max(capacity, output->capacity() * 2);
+  } else {
+    return MemoryExhausted("RDB string");
+  }
+  if (capacity == std::numeric_limits<std::size_t>::max()) {
+    return MemoryExhausted("RDB string");
+  }
+  auto reservation = TryReserveMemoryAllocation(capacity + 1);
+  if (!reservation.has_value()) return MemoryExhausted("RDB string");
+  try {
+    output->reserve(desired);
+  } catch (const std::bad_alloc&) {
+    return MemoryExhausted("RDB string allocation");
+  }
+  return absl::OkStatus();
+}
+
+absl::StatusOr<std::string> CopyStringAdmitted(std::string_view value) {
+  std::string output;
+  absl::Status reserved = ReserveRdbString(&output, value.size());
+  if (!reserved.ok()) return reserved;
+  try {
+    output.assign(value);
+  } catch (const std::bad_alloc&) {
+    return MemoryExhausted("RDB string allocation");
+  }
+  return output;
+}
+
+absl::StatusOr<std::string> AllocateStringAdmitted(std::size_t size) {
+  std::string output;
+  absl::Status reserved = ReserveRdbString(&output, size);
+  if (!reserved.ok()) return reserved;
+  try {
+    output.resize(size);
+  } catch (const std::bad_alloc&) {
+    return MemoryExhausted("expanded RDB string allocation");
+  }
+  return output;
+}
 constexpr std::string_view kZSetMagic = "KZS1";
 constexpr std::string_view kStreamMagicV1 = "KXS1";
 constexpr std::string_view kStreamMagicV2 = "KXS2";
@@ -286,7 +339,7 @@ absl::StatusOr<std::string> ReadString(Reader* reader) {
     }
     std::string_view value;
     reader->Bytes(static_cast<std::size_t>(length->value), &value);
-    return std::string(value);
+    return CopyStringAdmitted(value);
   }
   if (length->value <= 2) {
     const unsigned bytes = length->value == 0 ? 1 : length->value == 1 ? 2 : 4;
@@ -319,8 +372,10 @@ absl::StatusOr<std::string> ReadString(Reader* reader) {
   }
   std::string_view compressed;
   reader->Bytes(static_cast<std::size_t>(compressed_size->value), &compressed);
-  std::string output(static_cast<std::size_t>(output_size->value), '\0');
-  if (!LzfDecompress(compressed, &output)) return Bad("invalid LZF data");
+  auto output =
+      AllocateStringAdmitted(static_cast<std::size_t>(output_size->value));
+  if (!output.ok()) return output.status();
+  if (!LzfDecompress(compressed, &*output)) return Bad("invalid LZF data");
   return output;
 }
 

@@ -2104,7 +2104,8 @@ int RunServer(ServerOptions options) {
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
-      options.inline_key_max_bytes_, options.defrag_max_active_per_device_,
+      options.inline_key_max_bytes_,
+      options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
       options.defrag_paused_);
 

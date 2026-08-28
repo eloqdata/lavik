@@ -5175,6 +5175,16 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     std::this_thread::sleep_for(200ms);
     EXPECT_TRUE(client.Command({"SET", "must-be-rejected", "value"})
                     .starts_with("-OOM command not allowed"));
+    {
+      RespClient oversized(port);
+      const std::string oversized_key(128 * 1024, 'k');
+      // Large request materialization is rejected by closing only the
+      // offending connection; the worker must remain available to commands
+      // that release retained state.
+      EXPECT_TRUE(oversized.Command({"GET", oversized_key})
+                      .starts_with("-ERR client request exceeds this worker's "
+                                   "maxmemory share"));
+    }
     EXPECT_EQ(client.Command({"LPOP", "l"}), Bulk("a"));
     EXPECT_EQ(client.Command({"HDEL", "h", "f"}), ":1");
     EXPECT_EQ(client.Command({"SREM", "s", "m"}), ":1");

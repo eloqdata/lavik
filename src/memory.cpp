@@ -12,9 +12,11 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
+#include "mimalloc.h"
 #include "mimalloc-stats.h"
 
 namespace keylane {
@@ -27,7 +29,6 @@ struct alignas(64) MemoryGaugeCache {
   std::atomic<std::uint64_t> reserved_bytes_{0};
   std::atomic<std::uint64_t> peak_used_bytes_{0};
   std::atomic<std::uint64_t> max_bytes_{0};
-  std::atomic<std::uint64_t> fullsync_reserved_bytes_{0};
 };
 
 struct alignas(64) MemoryCounterCache {
@@ -36,6 +37,8 @@ struct alignas(64) MemoryCounterCache {
 
 struct alignas(64) AllocationShard {
   std::atomic<std::int64_t> bytes_{0};
+  std::atomic<std::uint64_t> admission_pending_bytes_{0};
+  std::atomic<std::uint64_t> fullsync_reserved_bytes_{0};
 };
 
 static_assert(sizeof(MemoryGaugeCache) == 64);
@@ -50,6 +53,8 @@ std::array<AllocationShard, kMaxMemoryWorkers + 1> g_allocation_shards;
 std::atomic<unsigned> g_accounted_workers{0};
 thread_local unsigned g_allocation_shard = 0;
 thread_local std::int64_t g_local_allocated_bytes = 0;
+thread_local std::uint64_t g_local_admission_pending_bytes = 0;
+thread_local std::uint64_t g_local_fullsync_reserved_bytes = 0;
 
 std::string ReadSmallFile(const char* path) {
   const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
@@ -158,6 +163,75 @@ std::uint64_t AllocatorUsed() noexcept {
   return total > 0 ? static_cast<std::uint64_t>(total) : 0;
 }
 
+std::uint64_t SumAdmissionPending() noexcept {
+  const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
+  std::uint64_t total = 0;
+  for (unsigned index = 0; index <= workers; ++index) {
+    const std::uint64_t value =
+        g_allocation_shards[index].admission_pending_bytes_.load(
+            std::memory_order_relaxed);
+    total = value > std::numeric_limits<std::uint64_t>::max() - total
+                ? std::numeric_limits<std::uint64_t>::max()
+                : total + value;
+  }
+  return total;
+}
+
+std::uint64_t SumFullSyncReserved() noexcept {
+  const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
+  std::uint64_t total = 0;
+  for (unsigned index = 0; index <= workers; ++index) {
+    const std::uint64_t value =
+        g_allocation_shards[index].fullsync_reserved_bytes_.load(
+            std::memory_order_relaxed);
+    total = value > std::numeric_limits<std::uint64_t>::max() - total
+                ? std::numeric_limits<std::uint64_t>::max()
+                : total + value;
+  }
+  return total;
+}
+
+std::uint64_t DistributedShare(std::uint64_t total, unsigned worker_id,
+                               unsigned workers) noexcept {
+  return total / workers + (worker_id < total % workers ? 1 : 0);
+}
+
+bool WorkerWouldExceed(std::size_t additional_bytes,
+                       std::uint64_t pending_bytes,
+                       std::uint64_t fullsync_bytes) noexcept {
+  const std::uint64_t maximum =
+      g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
+  if (maximum == 0) return false;
+  const unsigned workers = g_accounted_workers.load(std::memory_order_acquire);
+  if (g_allocation_shard == 0 || workers == 0) {
+    const std::uint64_t used = AllocatorUsed();
+    const std::uint64_t reserved = SumFullSyncReserved();
+    const std::uint64_t pending = SumAdmissionPending();
+    return used >= maximum || reserved > maximum - used ||
+           pending > maximum - used - reserved ||
+           additional_bytes > maximum - used - reserved - pending;
+  }
+
+  const unsigned worker_id = g_allocation_shard - 1;
+  const std::uint64_t capacity =
+      DistributedShare(maximum, worker_id, workers);
+  const std::int64_t fallback_signed =
+      g_allocation_shards[0].bytes_.load(std::memory_order_relaxed);
+  const std::uint64_t fallback =
+      fallback_signed > 0 ? static_cast<std::uint64_t>(fallback_signed) : 0;
+  const std::uint64_t shared =
+      DistributedShare(fallback, worker_id, workers);
+  const std::uint64_t owned =
+      g_local_allocated_bytes > 0
+          ? static_cast<std::uint64_t>(g_local_allocated_bytes)
+          : std::uint64_t{0};
+  return shared >= capacity || owned > capacity - shared ||
+         fullsync_bytes > capacity - shared - owned ||
+         pending_bytes > capacity - shared - owned - fullsync_bytes ||
+         additional_bytes >
+             capacity - shared - owned - fullsync_bytes - pending_bytes;
+}
+
 void UpdatePeak(std::uint64_t current) noexcept {
   std::uint64_t peak =
       g_memory_gauges.peak_used_bytes_.load(std::memory_order_relaxed);
@@ -220,6 +294,12 @@ void BindMemoryAccountingShard(unsigned worker_id) noexcept {
   g_allocation_shard = next;
   g_local_allocated_bytes =
       g_allocation_shards[next].bytes_.load(std::memory_order_relaxed);
+  g_local_admission_pending_bytes =
+      g_allocation_shards[next].admission_pending_bytes_.load(
+          std::memory_order_relaxed);
+  g_local_fullsync_reserved_bytes =
+      g_allocation_shards[next].fullsync_reserved_bytes_.load(
+          std::memory_order_relaxed);
 }
 
 void RefreshMemoryStats() noexcept {
@@ -258,50 +338,109 @@ MemoryStats GetMemoryStats() noexcept {
       .peak_used_bytes_ =
           g_memory_gauges.peak_used_bytes_.load(std::memory_order_relaxed),
       .max_bytes_ = g_memory_gauges.max_bytes_.load(std::memory_order_relaxed),
-      .fullsync_reserved_bytes_ = g_memory_gauges.fullsync_reserved_bytes_.load(
-          std::memory_order_relaxed),
+      .fullsync_reserved_bytes_ = SumFullSyncReserved(),
+      .admission_pending_bytes_ = SumAdmissionPending(),
       .rejected_commands_ =
           g_memory_counters.rejected_commands_.load(std::memory_order_relaxed),
   };
 }
 
 bool WouldExceedMemoryLimit(std::size_t additional_bytes) noexcept {
+  return WorkerWouldExceed(additional_bytes, g_local_admission_pending_bytes,
+                           g_local_fullsync_reserved_bytes);
+}
+
+MemoryReservation::MemoryReservation(MemoryReservation&& other) noexcept
+    : bytes_(std::exchange(other.bytes_, 0)),
+      shard_(std::exchange(other.shard_, 0)),
+      admitted_(std::exchange(other.admitted_, false)) {}
+
+MemoryReservation& MemoryReservation::operator=(
+    MemoryReservation&& other) noexcept {
+  if (this != &other) {
+    Release();
+    bytes_ = std::exchange(other.bytes_, 0);
+    shard_ = std::exchange(other.shard_, 0);
+    admitted_ = std::exchange(other.admitted_, false);
+  }
+  return *this;
+}
+
+MemoryReservation::~MemoryReservation() { Release(); }
+
+void MemoryReservation::Release() noexcept {
+  if (!admitted_) return;
+  admitted_ = false;
+  if (bytes_ == 0) return;
+  assert(shard_ == g_allocation_shard &&
+         "memory reservations must be released on their owning worker");
+  if (shard_ == 0) {
+    const std::uint64_t previous =
+        g_allocation_shards[0].admission_pending_bytes_.fetch_sub(
+            bytes_, std::memory_order_relaxed);
+    (void)previous;
+    assert(previous >= bytes_);
+    bytes_ = 0;
+    return;
+  }
+  assert(g_local_admission_pending_bytes >= bytes_);
+  g_local_admission_pending_bytes -= bytes_;
+  g_allocation_shards[shard_].admission_pending_bytes_.store(
+      g_local_admission_pending_bytes, std::memory_order_relaxed);
+  bytes_ = 0;
+}
+
+std::optional<MemoryReservation> TryReserveMemory(
+    std::size_t bytes) noexcept {
   const std::uint64_t maximum =
       g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
-  const std::uint64_t used =
-      g_memory_gauges.used_bytes_.load(std::memory_order_relaxed);
-  const std::uint64_t reserved =
-      g_memory_gauges.fullsync_reserved_bytes_.load(std::memory_order_relaxed);
-  return used >= maximum || reserved > maximum - used ||
-         additional_bytes > maximum - used - reserved;
+  if (bytes == 0 || maximum == 0) {
+    return MemoryReservation(0, g_allocation_shard, true);
+  }
+  if (WorkerWouldExceed(bytes, g_local_admission_pending_bytes,
+                        g_local_fullsync_reserved_bytes)) {
+    return std::nullopt;
+  }
+  if (g_allocation_shard == 0) {
+    g_allocation_shards[0].admission_pending_bytes_.fetch_add(
+        bytes, std::memory_order_relaxed);
+    return MemoryReservation(bytes, 0, true);
+  }
+  g_local_admission_pending_bytes += bytes;
+  g_allocation_shards[g_allocation_shard].admission_pending_bytes_.store(
+      g_local_admission_pending_bytes, std::memory_order_relaxed);
+  return MemoryReservation(bytes, g_allocation_shard, true);
+}
+
+std::optional<MemoryReservation> TryReserveMemoryAllocation(
+    std::size_t requested_bytes) noexcept {
+  if (requested_bytes == 0) return TryReserveMemory(0);
+  const std::size_t usable = mi_good_size(requested_bytes);
+  // Treat an allocator result smaller than the request as an overflow or
+  // unsupported-size signal. Admission must fail closed before new is called.
+  return TryReserveMemory(usable >= requested_bytes
+                              ? usable
+                              : std::numeric_limits<std::size_t>::max());
 }
 
 bool TryReserveFullSyncMemory(std::size_t bytes) noexcept {
   if (bytes == 0) return true;
-  const std::uint64_t maximum =
-      g_memory_gauges.max_bytes_.load(std::memory_order_relaxed);
-  const std::uint64_t used = AllocatorUsed();
-  std::uint64_t reserved =
-      g_memory_gauges.fullsync_reserved_bytes_.load(std::memory_order_relaxed);
-  for (;;) {
-    if (used >= maximum || reserved > maximum - used ||
-        bytes > maximum - used - reserved) {
-      return false;
-    }
-    if (g_memory_gauges.fullsync_reserved_bytes_.compare_exchange_weak(
-            reserved, reserved + bytes, std::memory_order_relaxed)) {
-      return true;
-    }
+  if (WorkerWouldExceed(bytes, g_local_admission_pending_bytes,
+                        g_local_fullsync_reserved_bytes)) {
+    return false;
   }
+  g_local_fullsync_reserved_bytes += bytes;
+  g_allocation_shards[g_allocation_shard].fullsync_reserved_bytes_.store(
+      g_local_fullsync_reserved_bytes, std::memory_order_relaxed);
+  return true;
 }
 
 void ReleaseFullSyncMemory(std::size_t bytes) noexcept {
   if (bytes == 0) return;
-  const std::uint64_t previous =
-      g_memory_gauges.fullsync_reserved_bytes_.fetch_sub(
-          bytes, std::memory_order_relaxed);
-  (void)previous;
-  assert(previous >= bytes);
+  assert(g_local_fullsync_reserved_bytes >= bytes);
+  g_local_fullsync_reserved_bytes -= bytes;
+  g_allocation_shards[g_allocation_shard].fullsync_reserved_bytes_.store(
+      g_local_fullsync_reserved_bytes, std::memory_order_relaxed);
 }
 
 void RecordMemoryRejection() noexcept {

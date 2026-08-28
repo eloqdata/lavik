@@ -267,9 +267,44 @@ logical pages in a partially live span remain available to any size class.
 Detached FLUSHDB populations keep shared ownership of the arena until their
 entries are reclaimed. Before a write that needs a new entry or changes the TTL
 representation, the owner checks that the
-required size class has a free slot or an encodable page ID. Exhaustion returns
-`ResourceExhausted` before bytes are appended to the staging block. Updates
-whose representation already has a slot can continue at this boundary.
+required size class has a free slot or an encodable page ID. If it needs a new
+1 MiB small-page span, dedicated large-entry page, direct bucket array, or
+overflow bucket, storage also reserves the conservative physical allocation
+from that worker's memory share before bytes are appended to the staging block.
+Each small span is 64 KiB-aligned and supplies sixteen logical 64 KiB pages;
+this amortizes mimalloc's alignment-size-class overhead without changing the
+handle's page/slot encoding. Empty logical pages are reusable by any size class,
+but their backing memory returns to mimalloc only when the whole span is empty.
+The permit stays live through index
+publication and then disappears after mimalloc's allocation hook has published
+the usable size. Page-ID or memory exhaustion therefore returns
+`ResourceExhausted` without leaving a durable record that cannot enter the
+index. Updates whose representation already has a slot continue without this
+slow-path check.
+
+`--max-memory` is divided deterministically across storage workers; a worker
+does not borrow another worker's unused balance. Process allocations made
+outside a bound worker are divided across the same shares for admission. Each
+worker owns its allocation, pending-permit, and full-sync-reservation counters
+on one cache line, so foreground admission performs no process-global atomic
+read-modify-write. INFO and metrics aggregate the shards off the hot path.
+
+Foreground command admission does not assign a fixed byte estimate to every
+key. A command that can grow retained state is rejected when its worker is
+already at its share, while arena pages and hash buckets reserve their actual
+allocator size class at the allocation site. Request strings are already
+charged by the allocation hook. The RESP parser additionally reserves the
+mimalloc usable-size class before materializing an argument larger than
+64 KiB, preventing a declared 512 MiB key or value from overshooting the share
+before command dispatch. Up to 64 KiB per in-flight parser remains an explicit
+recovery allowance so short `DEL` and other shrinking commands can still be
+decoded after maxmemory is reached; those bytes are still included in
+`used_memory`, just not rejected before allocation.
+
+Known-size RDB strings and external-key read buffers use the same short-lived
+allocation permit. A permit ends immediately after allocation and never spans
+storage or network suspension: the mimalloc hook publishes the actual usable
+bytes before the permit is released.
 
 The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
 obtained from the operating system. It is stable across workers for one

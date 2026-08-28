@@ -1539,10 +1539,6 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     co_return absl::Status(absl::StatusCode::kInvalidArgument,
                            "invalid value type or expiration metadata");
   }
-  if (key.size() > MaxKeyBytes()) {
-    co_return absl::Status(absl::StatusCode::kOutOfRange,
-                           "key exceeds the Redis-compatible 512 MiB limit");
-  }
   const bool invalid_logical_size =
       (value_type == ValueType::kString && logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
@@ -1816,6 +1812,20 @@ acquire_active_stream:
     // entry cannot be published. Page IDs are never allowed to wrap.
     co_return absl::ResourceExhaustedError(
         "record index entry page capacity exhausted");
+  }
+  std::optional<MemoryReservation> index_memory_reservation;
+  if (needs_index_allocation) {
+    const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
+        digest, key, !key_external, has_index_extra,
+        previous_entry == nullptr);
+    if (allocation_bytes != 0) {
+      index_memory_reservation = TryReserveMemory(allocation_bytes);
+      if (!index_memory_reservation.has_value()) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "record index allocation exceeds this worker's maxmemory share");
+      }
+    }
   }
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr

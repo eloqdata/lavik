@@ -241,7 +241,8 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
       } else {
         capture->second.key_phases_.InsertOrAssign(
             digest, coverage_key,
-            WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight);
+            WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight,
+            coverage_key.size() <= options_.inline_key_max_bytes_);
       }
     }
     // Release the shared key hold before waking the parent so foreground
@@ -502,16 +503,23 @@ absl::StatusOr<FullSyncSessionStart> StorageEngine::Impl::BeginFullSyncSession(
   // accounting, not an on-disk format constant.
   constexpr std::size_t kCoverageMetadataBytesPerKey = 320;
   constexpr std::size_t kCoverageFixedBytes = 64 * 1024;
-  std::size_t largest_partition_bytes = 0;
+  std::size_t largest_partition_db_bytes = 0;
   for (const auto& partition : store.partitions_) {
-    std::size_t bytes = kCoverageFixedBytes;
-    bool overflow = false;
     for (const auto& index : partition.indexes_) {
+      std::size_t bytes = kCoverageFixedBytes;
+      bool overflow = false;
       std::uint64_t cursor = 0;
       do {
         cursor = index.Scan(cursor, [&](const RecordIndex::Entry& entry) {
           if (overflow) return;
-          const std::size_t key_bytes = entry.logical_key_size();
+          // Coverage entries use the same inline threshold as the record
+          // index. External keys retain only their digest and logical length;
+          // charging the on-disk key bytes here would reserve memory that can
+          // never be allocated by this map.
+          const std::size_t key_bytes =
+              entry.logical_key_size() <= options_.inline_key_max_bytes_
+                  ? entry.logical_key_size()
+                  : sizeof(Digest);
           if (key_bytes > (std::numeric_limits<std::size_t>::max() -
                            kCoverageMetadataBytesPerKey) /
                               2 ||
@@ -523,16 +531,17 @@ absl::StatusOr<FullSyncSessionStart> StorageEngine::Impl::BeginFullSyncSession(
           bytes += kCoverageMetadataBytesPerKey + key_bytes * 2;
         });
       } while (cursor != 0 && !overflow);
+      if (overflow) {
+        store.fullsync_sessions_.erase(session);
+        return absl::ResourceExhaustedError(
+            "full-sync coverage reservation overflow");
+      }
+      largest_partition_db_bytes =
+          std::max(largest_partition_db_bytes, bytes);
     }
-    if (overflow) {
-      store.fullsync_sessions_.erase(session);
-      return absl::ResourceExhaustedError(
-          "full-sync coverage reservation overflow");
-    }
-    largest_partition_bytes = std::max(largest_partition_bytes, bytes);
   }
   const std::size_t reserve =
-      std::max(kCoverageFixedBytes, largest_partition_bytes);
+      std::max(kCoverageFixedBytes, largest_partition_db_bytes);
   if (!TryReserveFullSyncMemory(reserve)) {
     store.fullsync_sessions_.erase(session);
     return absl::ResourceExhaustedError(
@@ -587,6 +596,14 @@ StorageEngine::Impl::BeginPartitionReplication(std::uint64_t session_id,
       partition.fullsync_subscribers_.try_emplace(session_id);
   if (!inserted) {
     ClearFullSyncCapture(store, capture->second);
+  } else {
+    // The session's worker-local reservation covers this transient arena.
+    // Internal page admission would charge the same bytes twice while the
+    // logical headroom remains protected for the next partition/DB handoff.
+    capture->second.key_phases_.SetEntryArena(
+        std::make_shared<ScanHashMapEntryArena>(
+            ScanHashMapEntryArena::kMaximumPageId,
+            /*externally_admitted=*/true));
   }
   capture->second.baseline_version_ = partition.mutation_sequence_;
   capture->second.db_phases_.fill(
@@ -1010,7 +1027,8 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
             WorkerStore::FullSyncCapture::DbPhase::kScanning) {
       capture->second.key_phases_.InsertOrAssign(
           ComputeDigest(acknowledged.key_), acknowledged.key_,
-          WorkerStore::FullSyncCapture::KeyPhase::kTailing);
+          WorkerStore::FullSyncCapture::KeyPhase::kTailing,
+          acknowledged.key_.size() <= options_.inline_key_max_bytes_);
     }
   }
   if (capture->second.overrides_.empty()) {
@@ -1651,21 +1669,50 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
         co_return absl::Status(absl::StatusCode::kInvalidArgument,
                                "invalid replicated large value begin frame");
       }
-      partition.replica_value_stage_ = ReplicaValueStage{
-          .db_id_ = record.db_id_,
-          .db_epoch_ = record.db_epoch_,
-          .mutation_sequence_ = record.mutation_sequence_,
-          .expire_at_ms_ = record.expire_at_ms_,
-          .logical_size_ = value_logical_size,
-          .encoded_size_ = record.logical_size_,
-          .next_chunk_ = 0,
-          .chunk_count_ = record.chunk_count_,
-          .value_type_ = record.value_type_,
-          .key_ = record.key_,
-          .value_ = {},
-      };
-      partition.replica_value_stage_->value_.reserve(
-          static_cast<std::size_t>(record.logical_size_));
+      constexpr std::size_t kReplicaStageBookkeepingAllowance = 4096;
+      std::size_t stage_bytes = kReplicaStageBookkeepingAllowance;
+      if (record.key_.size() >
+              std::numeric_limits<std::size_t>::max() - stage_bytes ||
+          record.logical_size_ >
+              std::numeric_limits<std::size_t>::max() - stage_bytes -
+                  record.key_.size()) {
+        co_return absl::ResourceExhaustedError(
+            "replica large-value staging size overflow");
+      }
+      stage_bytes += record.key_.size() +
+                     static_cast<std::size_t>(record.logical_size_);
+      auto stage_reservation = TryReserveMemory(stage_bytes);
+      if (!stage_reservation.has_value()) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "replica large-value staging exceeds this worker's maxmemory "
+            "share");
+      }
+      try {
+        partition.replica_value_stage_ = ReplicaValueStage{
+            .db_id_ = record.db_id_,
+            .db_epoch_ = record.db_epoch_,
+            .mutation_sequence_ = record.mutation_sequence_,
+            .expire_at_ms_ = record.expire_at_ms_,
+            .logical_size_ = value_logical_size,
+            .encoded_size_ = record.logical_size_,
+            .next_chunk_ = 0,
+            .chunk_count_ = record.chunk_count_,
+            .value_type_ = record.value_type_,
+            .key_ = record.key_,
+            .value_ = {},
+        };
+        // Reserve once while the memory permit is live. Chunks append within
+        // this capacity, so a peer cannot create an unaccounted allocation at
+        // an arbitrary point later in the stream.
+        partition.replica_value_stage_->value_.reserve(
+            static_cast<std::size_t>(record.logical_size_));
+      } catch (const std::bad_alloc&) {
+        partition.replica_value_stage_.reset();
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "replica large-value staging allocation failed");
+      }
       continue;
     }
     if (record.kind_ == SnapshotRecord::Kind::kValueChunk) {

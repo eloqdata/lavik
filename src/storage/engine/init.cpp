@@ -673,7 +673,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (unsigned i = 0; i < worker_count; ++i) {
     stores_.push_back(std::make_unique<WorkerStore>());
     WorkerStore& store = *stores_.back();
-    store.record_index_entry_arena_ = std::make_shared<ScanHashMapEntryArena>();
+    // WriteRecordLocked reserves a new page together with any bucket growth
+    // before it mutates the durable staging block. The arena must not reserve
+    // the same bytes again after that point.
+    store.record_index_entry_arena_ =
+        std::make_shared<ScanHashMapEntryArena>(
+            ScanHashMapEntryArena::kMaximumPageId,
+            /*externally_admitted=*/true);
     store.partitions_.reserve((kLogicalStorageShards + worker_count - 1 - i) /
                               worker_count);
     for (std::uint32_t partition = i; partition < kLogicalStorageShards;

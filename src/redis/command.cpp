@@ -110,7 +110,6 @@ struct ClientConnectionRecord {
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
     g_worker_clients;
 
-constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
 constexpr std::string_view kReplicationTransactionEnvelope = "__KEYLANE_TX_V1";
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
@@ -138,8 +137,7 @@ std::size_t RequestArgumentBytes(const CommandRequest& request) noexcept {
   return result;
 }
 
-std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
-  std::size_t keys = 0;
+bool MayGrowMemory(const CommandRequest& request) noexcept {
   switch (request.kind_) {
     case CommandKind::kSet:
     case CommandKind::kSetEx:
@@ -175,28 +173,23 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kCopy:
     case CommandKind::kRestore:
     case CommandKind::kSort:
-      keys = 1;
-      break;
+      return true;
     case CommandKind::kXGroup:
       if (request.args_.size() > 1 &&
           (CmpCaseInsensitive(request.args_[1], "create") ||
            CmpCaseInsensitive(request.args_[1], "createconsumer")))
-        keys = 1;
-      else
-        return 0;
-      break;
+        return true;
+      return false;
     case CommandKind::kLMove:
     case CommandKind::kRPopLPush:
     case CommandKind::kBLMove:
     case CommandKind::kBRPopLPush:
     case CommandKind::kSMove:
-      keys = 2;
-      break;
+      return true;
     case CommandKind::kSDiffStore:
     case CommandKind::kSInterStore:
     case CommandKind::kSUnionStore:
-      keys = request.args_.size() > 1 ? request.args_.size() - 1 : 0;
-      break;
+      return request.args_.size() > 1;
     case CommandKind::kZDiffStore:
     case CommandKind::kZInterStore:
     case CommandKind::kZUnionStore:
@@ -204,28 +197,17 @@ std::size_t EstimatedMemoryGrowth(const CommandRequest& request) noexcept {
     case CommandKind::kGeoRadius:
     case CommandKind::kGeoRadiusByMember:
     case CommandKind::kGeoSearchStore:
-      keys = 1;
-      break;
+      return true;
     case CommandKind::kMSet:
     case CommandKind::kMSetNx:
-      keys = request.args_.size() > 1 ? (request.args_.size() - 1) / 2 : 0;
-      break;
+      return request.args_.size() > 1;
     default:
-      return 0;
+      return false;
   }
-  const std::size_t index_bytes =
-      keys > std::numeric_limits<std::size_t>::max() /
-                  kEstimatedIndexBytesPerKey
-          ? std::numeric_limits<std::size_t>::max()
-          : keys * kEstimatedIndexBytesPerKey;
-  // Include parsed arguments because the cached allocator sample can precede
-  // this request by up to 100ms. Actual process growth is reconciled from RSS
-  // by the background sampler.
-  return SaturatingAdd(RequestArgumentBytes(request), index_bytes);
 }
 
 bool RejectForMemory(std::size_t additional_bytes) noexcept {
-  if (additional_bytes == 0 || !WouldExceedMemoryLimit(additional_bytes)) {
+  if (!WouldExceedMemoryLimit(additional_bytes)) {
     return false;
   }
   RecordMemoryRejection();
@@ -3651,6 +3633,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "maxmemory_human:" + HumanReadableMemory(memory.max_bytes_) + "\r\n";
     info += "fullsync_reserved_memory:" +
             std::to_string(memory.fullsync_reserved_bytes_) + "\r\n";
+    info += "memory_admission_pending:" +
+            std::to_string(memory.admission_pending_bytes_) + "\r\n";
     info += "maxmemory_policy:noeviction\r\n";
     info +=
         "allocator_allocated:" + std::to_string(memory.used_bytes_) + "\r\n";
@@ -6191,8 +6175,8 @@ Task<std::string> ExecuteLuaRedisCall(
   const bool function_allows_oom =
       (lua_execution->function_flags() &
        (kLuaFunctionAllowOom | kLuaFunctionNoWrites)) != 0;
-  if (write && !function_allows_oom &&
-      RejectForMemory(EstimatedMemoryGrowth(command))) {
+  if (write && !function_allows_oom && MayGrowMemory(command) &&
+      RejectForMemory(0)) {
     co_return EncodeError(
         "OOM command not allowed when used memory > 'maxmemory'.");
   }
@@ -6643,7 +6627,7 @@ Task<std::string> ExecuteEvalWithTransaction(
           "READONLY Can not run script with write flag on readonly replica");
     }
     if ((flags & (kLuaFunctionAllowOom | kLuaFunctionNoWrites)) == 0 &&
-        RejectForMemory(RequestArgumentBytes(request))) {
+        RejectForMemory(0)) {
       co_return EncodeError(
           "OOM allow-oom flag is not set on the script, can not run it when "
           "used memory > 'maxmemory'");
@@ -7619,12 +7603,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
                                                      reply_builder);
   }
 
-  std::size_t exec_memory_growth = 0;
-  for (const CommandRequest& command : queued) {
-    exec_memory_growth =
-        SaturatingAdd(exec_memory_growth, EstimatedMemoryGrowth(command));
-  }
-  if (RejectForMemory(exec_memory_growth)) {
+  const bool exec_may_grow_memory =
+      std::any_of(queued.begin(), queued.end(), MayGrowMemory);
+  if (exec_may_grow_memory && RejectForMemory(0)) {
     co_await DropWatches(ctx);
     co_return BuiltReply(AppendOomError(reply_builder));
   }
@@ -9485,7 +9466,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       }
       ctx.multi_db_ = *local.selected_db_;
     }
-    if (RejectForMemory(RequestArgumentBytes(request))) {
+    if (MayGrowMemory(request) && RejectForMemory(0)) {
       ctx.multi_dirty_ = true;
       co_return BuiltReply(AppendOomError(reply_builder));
     }
@@ -9608,7 +9589,7 @@ Task<CommandReply> ExecuteCommandBody(
     co_return BuiltReply(reply_builder.AppendError(
         "READONLY You can't write against a read only replica."));
   }
-  if (!replication_origin && RejectForMemory(EstimatedMemoryGrowth(request))) {
+  if (!replication_origin && MayGrowMemory(request) && RejectForMemory(0)) {
     co_return BuiltReply(AppendOomError(reply_builder));
   }
   if (request.kind_ == CommandKind::kFlushDb ||

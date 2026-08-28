@@ -462,6 +462,11 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_fullsync_reserved_memory_bytes gauge\n"
       "keylane_fullsync_reserved_memory_bytes ",
       memory_metrics.fullsync_reserved_bytes_, "\n",
+      "# HELP keylane_memory_admission_pending_bytes Worker-local headroom "
+      "held while slow-path allocations become allocator-visible.\n"
+      "# TYPE keylane_memory_admission_pending_bytes gauge\n"
+      "keylane_memory_admission_pending_bytes ",
+      memory_metrics.admission_pending_bytes_, "\n",
       "# HELP keylane_memory_rejected_commands_total Commands rejected by "
       "the memory limit.\n"
       "# TYPE keylane_memory_rejected_commands_total counter\n"

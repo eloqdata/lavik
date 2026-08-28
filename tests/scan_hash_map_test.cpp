@@ -51,6 +51,25 @@ TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
   EXPECT_EQ(arena->allocated_pages(), 1);
 }
 
+TEST(ScanHashMapTest, ReportsPhysicalAllocationOnlyOnSlowPath) {
+  auto arena = std::make_shared<ScanHashMapEntryArena>();
+  ScanHashMap<std::uint64_t> map(arena);
+  const Digest first = ComputeDigest("first");
+  EXPECT_GE(map.RequiredAllocationBytes(first, "first", true, false, true),
+            ScanHashMapEntryArena::kSpanBytes);
+
+  map.InsertNew(first, "first", 1);
+  EXPECT_EQ(arena->allocated_pages(), 1);
+  const Digest second = ComputeDigest("second");
+  EXPECT_EQ(map.RequiredAllocationBytes(second, "second", true, false, true),
+            0);
+
+  map.Clear();
+  EXPECT_EQ(arena->allocated_pages(), 0);
+  EXPECT_GE(map.RequiredAllocationBytes(second, "second", true, false, true),
+            ScanHashMapEntryArena::kSpanBytes);
+}
+
 TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
   ScanHashMapEntryArena arena;
   std::vector<ScanHashMapEntryArena::Handle> handles;
@@ -64,7 +83,13 @@ TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
       handles.push_back(arena.Allocate(4096).handle_);
     }
     EXPECT_EQ(arena.allocated_spans(), 1);
+    if (page + 1 < ScanHashMapEntryArena::kPagesPerSpan) {
+      EXPECT_LT(arena.AllocationBytesIfNewPage(4096),
+                ScanHashMapEntryArena::kSpanBytes);
+    }
   }
+  EXPECT_GE(arena.AllocationBytesIfNewPage(4096),
+            ScanHashMapEntryArena::kSpanBytes);
   EXPECT_EQ(arena.allocated_pages(), ScanHashMapEntryArena::kPagesPerSpan);
   EXPECT_EQ(arena.allocated_spans(), 1);
 

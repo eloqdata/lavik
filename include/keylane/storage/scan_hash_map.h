@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "keylane/memory.h"
 #include "keylane/storage/format.h"
 
 namespace keylane::storage {
@@ -69,7 +70,8 @@ class ScanHashMapEntryArena {
   static_assert(std::has_single_bit(kPageBytes));
 
   explicit ScanHashMapEntryArena(
-      std::uint32_t maximum_page_id = kMaximumPageId);
+      std::uint32_t maximum_page_id = kMaximumPageId,
+      bool externally_admitted = false);
   ScanHashMapEntryArena(const ScanHashMapEntryArena&) = delete;
   ScanHashMapEntryArena& operator=(const ScanHashMapEntryArena&) = delete;
   ~ScanHashMapEntryArena();
@@ -78,6 +80,11 @@ class ScanHashMapEntryArena {
   // encodable page ID is already live. Physical allocator failure can still
   // throw std::bad_alloc when Allocate actually obtains the page.
   bool CanAllocate(std::size_t bytes) const noexcept;
+  // Returns conservative allocator headroom when bytes cannot reuse a live
+  // page. It includes alignment overhead and a small metadata allowance when
+  // an existing span supplies the backing page; map admission adds room for
+  // its own bucket and mutation bookkeeping.
+  std::size_t AllocationBytesIfNewPage(std::size_t bytes) const noexcept;
   Allocation Allocate(std::size_t bytes);
   void Deallocate(Handle handle) noexcept;
 
@@ -91,6 +98,7 @@ class ScanHashMapEntryArena {
   std::size_t allocated_pages() const noexcept { return allocated_pages_; }
   std::size_t allocated_spans() const noexcept { return small_spans_.size(); }
   std::uint32_t maximum_page_id() const noexcept { return maximum_page_id_; }
+  bool externally_admitted() const noexcept { return externally_admitted_; }
 
  private:
   static constexpr std::size_t kPageHeaderBytes = 64;
@@ -155,6 +163,7 @@ class ScanHashMapEntryArena {
   PageHeader* PageFor(Handle handle) const noexcept;
 
   std::uint32_t maximum_page_id_ = kMaximumPageId;
+  bool externally_admitted_ = false;
   std::size_t allocated_pages_ = 0;
   // Directory slot zero stays empty so handle zero is the null reference.
   // A normal descriptor packs the 64 KiB-aligned page address with
@@ -214,8 +223,9 @@ inline const std::array<std::uint8_t, 513> ScanHashMapEntryArena::kClassLookup =
     ScanHashMapEntryArena::BuildClassLookup();
 
 inline ScanHashMapEntryArena::ScanHashMapEntryArena(
-    std::uint32_t maximum_page_id)
-    : maximum_page_id_(std::min(maximum_page_id, kMaximumPageId)) {}
+    std::uint32_t maximum_page_id, bool externally_admitted)
+    : maximum_page_id_(std::min(maximum_page_id, kMaximumPageId)),
+      externally_admitted_(externally_admitted) {}
 
 inline ScanHashMapEntryArena::~ScanHashMapEntryArena() {
   for (std::size_t page_id = 1; page_id < page_directory_.size(); ++page_id) {
@@ -334,6 +344,16 @@ inline void ScanHashMapEntryArena::RemoveAvailableSpan(
 
 inline ScanHashMapEntryArena::SmallSpan*
 ScanHashMapEntryArena::AllocateSmallSpan() {
+  constexpr std::size_t kAlignmentAllowance = kPageBytes;
+  std::optional<MemoryReservation> memory_reservation;
+  if (!externally_admitted_) {
+    memory_reservation = TryReserveMemory(kSpanBytes + kAlignmentAllowance);
+    if (!memory_reservation.has_value()) {
+      RecordMemoryRejection();
+      throw std::bad_alloc();
+    }
+  }
+
   auto* span = new SmallSpan();
   try {
     span->storage_ = ::operator new(kSpanBytes, std::align_val_t{kPageBytes});
@@ -386,6 +406,38 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
   const std::size_t required = kPageHeaderBytes + block_size;
   const std::size_t allocation_bytes =
       large ? ((required + kPageBytes - 1) & ~(kPageBytes - 1)) : 0;
+  std::optional<MemoryReservation> memory_reservation;
+  if (!large && !externally_admitted_) {
+    // Directory and availability vectors may grow even when the backing span
+    // already exists. Keep a small permit until those fallible allocations
+    // have become visible to the worker's allocator shard.
+    memory_reservation = TryReserveMemory(4096);
+    if (!memory_reservation.has_value()) {
+      page_directory_[page_id] = 0;
+      free_page_ids_.push_back(page_id);
+      RecordMemoryRejection();
+      throw std::bad_alloc();
+    }
+  }
+  if (large && !externally_admitted_) {
+    constexpr std::size_t kPageBookkeepingAllowance = 4096;
+    constexpr std::size_t kAlignmentAllowance = kPageBytes;
+    if (allocation_bytes >
+        std::numeric_limits<std::size_t>::max() -
+            kPageBookkeepingAllowance - kAlignmentAllowance) {
+      page_directory_[page_id] = 0;
+      free_page_ids_.push_back(page_id);
+      throw std::bad_alloc();
+    }
+    memory_reservation = TryReserveMemory(
+        allocation_bytes + kAlignmentAllowance + kPageBookkeepingAllowance);
+    if (!memory_reservation.has_value()) {
+      page_directory_[page_id] = 0;
+      free_page_ids_.push_back(page_id);
+      RecordMemoryRejection();
+      throw std::bad_alloc();
+    }
+  }
   void* storage = nullptr;
   SmallSpan* small_span = nullptr;
   unsigned span_slot = 0;
@@ -455,6 +507,39 @@ inline bool ScanHashMapEntryArena::CanAllocate(
     return true;
   }
   return !free_page_ids_.empty() || page_directory_.size() <= maximum_page_id_;
+}
+
+inline std::size_t ScanHashMapEntryArena::AllocationBytesIfNewPage(
+    std::size_t bytes) const noexcept {
+  const std::uint8_t class_index = ClassFor(bytes);
+  if (class_index != kLargeClassMarker &&
+      !available_pages_[class_index].empty()) {
+    return 0;
+  }
+  if (class_index != kLargeClassMarker) {
+    // A logical page still grows directory/free-list metadata even when it can
+    // reuse a span. The caller adds its normal slow-path allowance on top.
+    return available_spans_.empty() ? kSpanBytes + kPageBytes : 4096;
+  }
+  const std::size_t block_size =
+      bytes > std::numeric_limits<std::size_t>::max() - 7
+          ? std::numeric_limits<std::size_t>::max()
+          : (bytes + 7) & ~std::size_t{7};
+  if (block_size > std::numeric_limits<std::size_t>::max() -
+                       kPageHeaderBytes) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  const std::size_t required = kPageHeaderBytes + block_size;
+  if (required > std::numeric_limits<std::size_t>::max() -
+                     (kPageBytes - 1)) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  const std::size_t allocation_bytes =
+      (required + kPageBytes - 1) & ~(kPageBytes - 1);
+  return allocation_bytes >
+                 std::numeric_limits<std::size_t>::max() - kPageBytes
+             ? std::numeric_limits<std::size_t>::max()
+             : allocation_bytes + kPageBytes;
 }
 
 inline ScanHashMapEntryArena::Allocation ScanHashMapEntryArena::Allocate(
@@ -779,6 +864,64 @@ class ScanHashMap {
     const std::size_t bytes = EntryAllocationBytes(
         static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
     return arena_ == nullptr || arena_->CanAllocate(bytes);
+  }
+
+  // Conservative physical allocation required before an entry replacement or
+  // insertion can be published. A zero result means the existing arena page
+  // and bucket storage suffice. Callers hold the returned process-memory
+  // reservation across the non-suspending mutation, closing the admission to
+  // allocator-accounting race without adding work to ordinary page reuse.
+  std::size_t RequiredAllocationBytes(const Digest& digest,
+                                      std::string_view key,
+                                      bool key_complete, bool has_extra,
+                                      bool inserting) const noexcept {
+    constexpr std::size_t kSlowPathBookkeepingAllowance = 4096;
+    auto add = [](std::size_t left, std::size_t right) noexcept {
+      return right > std::numeric_limits<std::size_t>::max() - left
+                 ? std::numeric_limits<std::size_t>::max()
+                 : left + right;
+    };
+
+    const std::size_t entry_bytes = EntryAllocationBytes(
+        static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
+    std::size_t required =
+        arena_ == nullptr
+            ? ScanHashMapEntryArena::kPageBytes
+            : arena_->AllocationBytesIfNewPage(entry_bytes);
+    if (required != 0) {
+      required = add(required, kSlowPathBookkeepingAllowance);
+    }
+    if (!inserting) return required;
+
+    if (tables_[0].buckets_ == nullptr) {
+      return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
+    }
+    if (!Rehashing() &&
+        tables_[0].used_ + 1 >
+            BucketCount(tables_[0]) * kTargetEntriesPerBucket &&
+        tables_[0].exponent_ < MaxBucketExponent) {
+      const std::size_t next_buckets =
+          std::size_t{1} << (tables_[0].exponent_ + 1);
+      if (next_buckets >
+          std::numeric_limits<std::size_t>::max() / sizeof(Bucket)) {
+        return std::numeric_limits<std::size_t>::max();
+      }
+      return add(required,
+                 add(next_buckets * sizeof(Bucket),
+                     kSlowPathBookkeepingAllowance));
+    }
+
+    const Table& target = Rehashing() ? tables_[1] : tables_[0];
+    const std::uint64_t hash = Hash(digest);
+    const Bucket* bucket = &target.buckets_[hash & BucketMask(target)];
+    while (bucket != nullptr) {
+      if (std::any_of(bucket->entries_.begin(), bucket->entries_.end(),
+                      [](EntryHandle handle) { return handle == 0; })) {
+        return required;
+      }
+      bucket = Chained(*bucket) ? Child(target, bucket) : nullptr;
+    }
+    return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
   }
 
   // Releases an old representation returned by ReplaceValue after its

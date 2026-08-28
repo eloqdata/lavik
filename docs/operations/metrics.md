@@ -20,11 +20,14 @@ dashboard and multi-node discovery, is available in
 and accepts byte-size suffixes such as `8GiB`. A value of zero, the default,
 uses 80% of the smaller of the host memory capacity and the process cgroup
 limit. Commands that may grow retained memory return a Redis-compatible OOM
-error when the cached allocator or RSS measurement would cross the limit.
+error when their worker's share would cross the limit.
 
-Allocator and RSS measurements are refreshed every 100ms outside command
-execution. The SET/MSET/INCR hot path performs relaxed atomic reads and a
-small allocation estimate; it does not query the allocator or `/proc`.
+The process budget is split evenly across workers and unused capacity is not
+borrowed across workers. Non-worker process allocations are apportioned across
+the same shares. SET/MSET/INCR performs one worker-local retained-growth check.
+Only a new record-index arena page or bucket allocation enters a slow path that
+temporarily reserves exact headroom; neither path updates a process-global
+balance. RSS and allocator diagnostics remain outside command execution.
 
 ## Business metrics
 
@@ -107,6 +110,9 @@ sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
 - `keylane_memory_reserved_bytes`: virtual address space reserved by mimalloc;
   diagnostic only.
 - `keylane_memory_max_bytes`: configured process memory limit.
+- `keylane_memory_admission_pending_bytes`: short-lived worker-local permits
+  held while page, bucket, or replica-staging allocations become visible to
+  allocator accounting.
 - `keylane_memory_rejected_commands_total`: commands rejected by the limit.
 
 The same values are available through Redis `INFO memory`, including
@@ -116,8 +122,8 @@ The same values are available through Redis `INFO memory`, including
 Worker 0 sums the cache-line-separated worker allocation counters every 100 ms.
 Release builds keep mimalloc's generic per-allocation statistics disabled and
 use Keylane's own lightweight usable-size accounting instead. The hot command
-path reads only the cached gauge and adds a conservative request-size estimate,
-so it performs no allocator aggregation or `/proc` I/O. RSS is diagnostic only
+path reads its own shard and adds a conservative retained-size estimate, so it
+performs no allocator aggregation or `/proc` I/O. RSS is diagnostic only
 and is sampled by the explicit metrics/INFO request.
 
 ## Update model
