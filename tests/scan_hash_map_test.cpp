@@ -51,6 +51,30 @@ TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
   EXPECT_EQ(arena->allocated_pages(), 1);
 }
 
+TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
+  ScanHashMapEntryArena arena;
+  std::vector<ScanHashMapEntryArena::Handle> handles;
+  constexpr std::size_t kSlotsPerPage =
+      (ScanHashMapEntryArena::kPageBytes - 64) / 4096;
+  handles.reserve(ScanHashMapEntryArena::kPagesPerSpan * kSlotsPerPage);
+
+  for (std::size_t page = 0;
+       page < ScanHashMapEntryArena::kPagesPerSpan; ++page) {
+    for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
+      handles.push_back(arena.Allocate(4096).handle_);
+    }
+    EXPECT_EQ(arena.allocated_spans(), 1);
+  }
+  EXPECT_EQ(arena.allocated_pages(), ScanHashMapEntryArena::kPagesPerSpan);
+  EXPECT_EQ(arena.allocated_spans(), 1);
+
+  for (auto handle = handles.rbegin(); handle != handles.rend(); ++handle) {
+    arena.Deallocate(*handle);
+  }
+  EXPECT_EQ(arena.allocated_pages(), 0);
+  EXPECT_EQ(arena.allocated_spans(), 0);
+}
+
 TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {
   ScanHashMap<std::uint64_t> map;
   ASSERT_CHECK(!map.has_allocated_storage(),

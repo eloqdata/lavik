@@ -247,21 +247,26 @@ recompute it from the live inline key or external digest. This trades growth-
 phase CPU for the smaller steady-state representation.
 
 Entries are allocated from one worker-local arena shared by every partition
-and logical-database index on that worker. The arena obtains 64 KiB-aligned
-pages from the process allocator and divides ordinary pages among 53 size
-classes from 32 bytes through 4 KiB; unusually large generic-map entries use a
-single-slot aligned span. Each bucket stores a 32-bit handle rather than a
-machine pointer. Its high 21 bits select the arena page and its low 11 bits
-select the slot, so a 64-byte bucket carries twelve handles, twelve independent
-8-bit lookup tags, and one overflow-bucket ID. Direct tables begin expanding at
-nine entries per bucket. The page directory costs one 64-bit descriptor per
-live or previously issued page ID, while the shared allocation domain prevents
-partition boundaries from stranding mostly empty pages.
+and logical-database index on that worker. The arena obtains 1 MiB,
+64 KiB-aligned spans from the process allocator and divides each into sixteen
+logical pages. This amortizes mimalloc's alignment size-class overhead across
+the span. Ordinary pages serve 53 size classes from 32 bytes through 4 KiB;
+unusually large generic-map entries use a dedicated single-slot aligned
+allocation. Each bucket stores a 32-bit handle rather than a machine pointer.
+Its high 21 bits select the arena page and its low 11 bits select the slot, so a
+64-byte bucket carries twelve handles, twelve independent 8-bit lookup tags,
+and one overflow-bucket ID. Direct tables begin expanding at nine entries per
+bucket. The page directory costs one 64-bit descriptor per live or previously
+issued page ID, while the shared allocation domain prevents partition
+boundaries from stranding mostly empty pages.
 
-Page ID zero is invalid and IDs never wrap. An empty page returns to the process
-allocator and its ID becomes reusable; detached FLUSHDB populations keep shared
-ownership of the arena until their entries are reclaimed. Before a write that
-needs a new entry or changes the TTL representation, the owner checks that the
+Page ID zero is invalid and IDs never wrap. An empty page returns to its span
+and its ID becomes reusable; an empty span returns to the process allocator.
+This trades 1 MiB reclaim granularity for sharply lower alignment waste; empty
+logical pages in a partially live span remain available to any size class.
+Detached FLUSHDB populations keep shared ownership of the arena until their
+entries are reclaimed. Before a write that needs a new entry or changes the TTL
+representation, the owner checks that the
 required size class has a free slot or an encodable page ID. Exhaustion returns
 `ResourceExhausted` before bytes are appended to the staging block. Updates
 whose representation already has a slot can continue at this boundary.

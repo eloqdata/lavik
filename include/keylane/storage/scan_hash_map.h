@@ -36,11 +36,15 @@
 
 namespace keylane::storage {
 
-// Worker-local backing store for compact hash-table entry handles. The arena
-// obtains 64 KiB aligned pages from the process allocator, so mimalloc remains
-// responsible for OS memory, accounting, and purge behavior; only sub-page
-// slots are managed here. A page belongs to one size class, and freed slots
-// carry their own intrusive free-list link.
+// Worker-local backing store for compact hash-table entry handles. Small pages
+// are carved from 1 MiB spans so mimalloc pays the 64 KiB alignment overhead
+// once per 16 logical pages instead of once per page. Large entries still own
+// dedicated 64 KiB-aligned allocations. Mimalloc remains responsible for OS
+// memory, accounting, and purge behavior; only slots and span pages are managed
+// here. A page belongs to one size class, and freed slots carry their own
+// intrusive free-list link. Empty logical pages are reusable immediately, but
+// their backing memory is returned only when all sixteen pages in the span are
+// empty; this is the reclaim-granularity cost of amortizing alignment waste.
 //
 // Handles are runtime-only. Zero is invalid; the high 21 bits select a page
 // directory entry and the low 11 bits select a slot in that page. Page IDs may
@@ -56,6 +60,8 @@ class ScanHashMapEntryArena {
   };
 
   static constexpr std::size_t kPageBytes = 64 * 1024;
+  static constexpr std::size_t kPagesPerSpan = 16;
+  static constexpr std::size_t kSpanBytes = kPagesPerSpan * kPageBytes;
   static constexpr unsigned kSlotBits = 11;
   static constexpr Handle kSlotMask = (Handle{1} << kSlotBits) - 1;
   static constexpr std::uint32_t kMaximumPageId =
@@ -83,6 +89,7 @@ class ScanHashMapEntryArena {
   Handle HandleOf(const void* pointer) const noexcept;
 
   std::size_t allocated_pages() const noexcept { return allocated_pages_; }
+  std::size_t allocated_spans() const noexcept { return small_spans_.size(); }
   std::uint32_t maximum_page_id() const noexcept { return maximum_page_id_; }
 
  private:
@@ -92,21 +99,35 @@ class ScanHashMapEntryArena {
   static constexpr std::uint8_t kLargeClassMarker = 0x3f;
   static constexpr std::size_t kSmallClassCount = 53;
 
+  struct SmallSpan;
+
   struct alignas(64) PageHeader {
     std::uint32_t page_id_ = 0;
     std::uint32_t allocation_bytes_ = 0;
     std::uint32_t block_size_ = 0;
     std::uint32_t available_index_ = 0;
+    SmallSpan* small_span_ = nullptr;
     std::uint16_t capacity_ = 0;
     std::uint16_t next_unused_ = 0;
     std::uint16_t free_head_ = kNoSlot;
     std::uint16_t live_count_ = 0;
     std::uint8_t class_index_ = 0;
+    std::uint8_t span_slot_ = 0;
     bool listed_available_ = false;
-    std::array<std::byte, 34> padding_{};
+    std::array<std::byte, 29> padding_{};
   };
 
   static_assert(sizeof(PageHeader) == kPageHeaderBytes);
+
+  struct SmallSpan {
+    void* storage_ = nullptr;
+    std::uint32_t arena_index_ = 0;
+    std::uint32_t available_index_ = 0;
+    std::uint16_t free_page_mask_ =
+        static_cast<std::uint16_t>((std::uint32_t{1} << kPagesPerSpan) - 1);
+    std::uint8_t live_pages_ = 0;
+    bool listed_available_ = false;
+  };
 
   static constexpr std::array<std::uint16_t, kSmallClassCount>
   BuildClassSizes() noexcept;
@@ -122,6 +143,10 @@ class ScanHashMapEntryArena {
                                       std::uint16_t slot) noexcept;
 
   std::uint32_t AllocatePageId();
+  SmallSpan* AllocateSmallSpan();
+  void ReleaseSmallSpan(SmallSpan* span) noexcept;
+  void AddAvailableSpan(SmallSpan* span);
+  void RemoveAvailableSpan(SmallSpan* span) noexcept;
   PageHeader* AllocatePage(std::uint8_t class_index,
                            std::size_t requested_bytes);
   void ReleasePage(PageHeader* page) noexcept;
@@ -138,6 +163,8 @@ class ScanHashMapEntryArena {
   std::vector<std::uint64_t> page_directory_{0};
   std::vector<std::uint32_t> free_page_ids_;
   std::array<std::vector<std::uint32_t>, kSmallClassCount> available_pages_;
+  std::vector<SmallSpan*> small_spans_;
+  std::vector<SmallSpan*> available_spans_;
 };
 
 constexpr std::array<std::uint16_t, ScanHashMapEntryArena::kSmallClassCount>
@@ -198,7 +225,13 @@ inline ScanHashMapEntryArena::~ScanHashMapEntryArena() {
         reinterpret_cast<PageHeader*>(descriptor & ~std::uint64_t{0xffff});
     assert(page->live_count_ == 0 &&
            "entry arena outlived a map that still owns entries");
-    ::operator delete(page, std::align_val_t{kPageBytes});
+    if (page->small_span_ == nullptr) {
+      ::operator delete(page, std::align_val_t{kPageBytes});
+    }
+  }
+  for (SmallSpan* span : small_spans_) {
+    ::operator delete(span->storage_, std::align_val_t{kPageBytes});
+    delete span;
   }
 }
 
@@ -276,6 +309,68 @@ inline void ScanHashMapEntryArena::RemoveAvailable(PageHeader* page) noexcept {
   page->listed_available_ = false;
 }
 
+inline void ScanHashMapEntryArena::AddAvailableSpan(SmallSpan* span) {
+  assert(span != nullptr && span->free_page_mask_ != 0 &&
+         !span->listed_available_);
+  span->available_index_ =
+      static_cast<std::uint32_t>(available_spans_.size());
+  available_spans_.push_back(span);
+  span->listed_available_ = true;
+}
+
+inline void ScanHashMapEntryArena::RemoveAvailableSpan(
+    SmallSpan* span) noexcept {
+  if (!span->listed_available_) return;
+  const std::size_t index = span->available_index_;
+  assert(index < available_spans_.size() && available_spans_[index] == span);
+  SmallSpan* moved = available_spans_.back();
+  available_spans_[index] = moved;
+  available_spans_.pop_back();
+  if (index < available_spans_.size()) {
+    moved->available_index_ = static_cast<std::uint32_t>(index);
+  }
+  span->listed_available_ = false;
+}
+
+inline ScanHashMapEntryArena::SmallSpan*
+ScanHashMapEntryArena::AllocateSmallSpan() {
+  auto* span = new SmallSpan();
+  try {
+    span->storage_ = ::operator new(kSpanBytes, std::align_val_t{kPageBytes});
+    span->arena_index_ = static_cast<std::uint32_t>(small_spans_.size());
+    small_spans_.push_back(span);
+    try {
+      AddAvailableSpan(span);
+    } catch (...) {
+      small_spans_.pop_back();
+      throw;
+    }
+  } catch (...) {
+    if (span->storage_ != nullptr) {
+      ::operator delete(span->storage_, std::align_val_t{kPageBytes});
+    }
+    delete span;
+    throw;
+  }
+  return span;
+}
+
+inline void ScanHashMapEntryArena::ReleaseSmallSpan(
+    SmallSpan* span) noexcept {
+  assert(span != nullptr && span->live_pages_ == 0);
+  RemoveAvailableSpan(span);
+  const std::size_t index = span->arena_index_;
+  assert(index < small_spans_.size() && small_spans_[index] == span);
+  SmallSpan* moved = small_spans_.back();
+  small_spans_[index] = moved;
+  small_spans_.pop_back();
+  if (index < small_spans_.size()) {
+    moved->arena_index_ = static_cast<std::uint32_t>(index);
+  }
+  ::operator delete(span->storage_, std::align_val_t{kPageBytes});
+  delete span;
+}
+
 inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
     std::uint8_t class_index, std::size_t requested_bytes) {
   const std::uint32_t page_id = AllocatePageId();
@@ -290,10 +385,25 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
   }
   const std::size_t required = kPageHeaderBytes + block_size;
   const std::size_t allocation_bytes =
-      large ? ((required + kPageBytes - 1) & ~(kPageBytes - 1)) : kPageBytes;
+      large ? ((required + kPageBytes - 1) & ~(kPageBytes - 1)) : 0;
   void* storage = nullptr;
+  SmallSpan* small_span = nullptr;
+  unsigned span_slot = 0;
   try {
-    storage = ::operator new(allocation_bytes, std::align_val_t{kPageBytes});
+    if (large) {
+      storage = ::operator new(allocation_bytes, std::align_val_t{kPageBytes});
+    } else {
+      small_span = available_spans_.empty() ? AllocateSmallSpan()
+                                            : available_spans_.back();
+      span_slot = std::countr_zero(small_span->free_page_mask_);
+      assert(span_slot < kPagesPerSpan);
+      small_span->free_page_mask_ &=
+          static_cast<std::uint16_t>(~(std::uint32_t{1} << span_slot));
+      ++small_span->live_pages_;
+      if (small_span->free_page_mask_ == 0) RemoveAvailableSpan(small_span);
+      storage = static_cast<std::byte*>(small_span->storage_) +
+                span_slot * kPageBytes;
+    }
   } catch (...) {
     page_directory_[page_id] = 0;
     free_page_ids_.push_back(page_id);
@@ -304,6 +414,10 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
   page->allocation_bytes_ = static_cast<std::uint32_t>(allocation_bytes);
   page->block_size_ = static_cast<std::uint32_t>(block_size);
   page->class_index_ = class_index;
+  if (!large) {
+    page->small_span_ = small_span;
+    page->span_slot_ = static_cast<std::uint8_t>(span_slot);
+  }
   page->capacity_ = large ? 1
                           : static_cast<std::uint16_t>(
                                 (kPageBytes - kPageHeaderBytes) / block_size);
@@ -376,10 +490,26 @@ inline void ScanHashMapEntryArena::ReleasePage(PageHeader* page) noexcept {
   assert(page != nullptr && page->live_count_ == 0);
   RemoveAvailable(page);
   const std::uint32_t page_id = page->page_id_;
-  const std::size_t allocation_bytes = page->allocation_bytes_;
+  SmallSpan* span = page->small_span_;
+  const std::uint8_t span_slot = page->span_slot_;
   page_directory_[page_id] = 0;
   page->~PageHeader();
-  ::operator delete(page, allocation_bytes, std::align_val_t{kPageBytes});
+  if (span == nullptr) {
+    ::operator delete(page, std::align_val_t{kPageBytes});
+  } else {
+    assert(span_slot < kPagesPerSpan && span->live_pages_ != 0);
+    const std::uint16_t page_bit =
+        static_cast<std::uint16_t>(std::uint32_t{1} << span_slot);
+    assert((span->free_page_mask_ & page_bit) == 0);
+    const bool was_full = span->free_page_mask_ == 0;
+    span->free_page_mask_ |= page_bit;
+    --span->live_pages_;
+    if (span->live_pages_ == 0) {
+      ReleaseSmallSpan(span);
+    } else if (was_full) {
+      AddAvailableSpan(span);
+    }
+  }
   free_page_ids_.push_back(page_id);
   assert(allocated_pages_ != 0);
   --allocated_pages_;
