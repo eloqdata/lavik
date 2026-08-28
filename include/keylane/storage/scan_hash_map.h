@@ -16,6 +16,7 @@
  * Valkey runtime dependencies and generic callbacks with Keylane-owned entries.
  */
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -34,6 +35,399 @@
 #include "keylane/storage/format.h"
 
 namespace keylane::storage {
+
+// Worker-local backing store for compact hash-table entry handles. The arena
+// obtains 64 KiB aligned pages from the process allocator, so mimalloc remains
+// responsible for OS memory, accounting, and purge behavior; only sub-page
+// slots are managed here. A page belongs to one size class, and freed slots
+// carry their own intrusive free-list link.
+//
+// Handles are runtime-only. Zero is invalid; the high 21 bits select a page
+// directory entry and the low 11 bits select a slot in that page. Page IDs may
+// be reused only after the last live slot is gone. Callers must therefore prove
+// bucket membership before resolving an identity retained across suspension.
+class ScanHashMapEntryArena {
+ public:
+  using Handle = std::uint32_t;
+
+  struct Allocation {
+    Handle handle_ = 0;
+    void* pointer_ = nullptr;
+  };
+
+  static constexpr std::size_t kPageBytes = 64 * 1024;
+  static constexpr unsigned kSlotBits = 11;
+  static constexpr Handle kSlotMask = (Handle{1} << kSlotBits) - 1;
+  static constexpr std::uint32_t kMaximumPageId =
+      (std::uint32_t{1} << (32 - kSlotBits)) - 1;
+  static_assert(std::has_single_bit(kPageBytes));
+
+  explicit ScanHashMapEntryArena(
+      std::uint32_t maximum_page_id = kMaximumPageId);
+  ScanHashMapEntryArena(const ScanHashMapEntryArena&) = delete;
+  ScanHashMapEntryArena& operator=(const ScanHashMapEntryArena&) = delete;
+  ~ScanHashMapEntryArena();
+
+  // Returns false only when this allocation would need a new page and every
+  // encodable page ID is already live. Physical allocator failure can still
+  // throw std::bad_alloc when Allocate actually obtains the page.
+  bool CanAllocate(std::size_t bytes) const noexcept;
+  Allocation Allocate(std::size_t bytes);
+  void Deallocate(Handle handle) noexcept;
+
+  // Resolve translates a live bucket handle; it does not independently track
+  // whether the selected slot is allocated.
+  void* Resolve(Handle handle) const noexcept;
+  // HandleOf accepts an address owned by this arena and returns zero when the
+  // aligned page belongs to a different arena.
+  Handle HandleOf(const void* pointer) const noexcept;
+
+  std::size_t allocated_pages() const noexcept { return allocated_pages_; }
+  std::uint32_t maximum_page_id() const noexcept { return maximum_page_id_; }
+
+ private:
+  static constexpr std::size_t kPageHeaderBytes = 64;
+  static constexpr std::uint16_t kNoSlot =
+      std::numeric_limits<std::uint16_t>::max();
+  static constexpr std::uint8_t kLargeClassMarker = 0x3f;
+  static constexpr std::size_t kSmallClassCount = 53;
+
+  struct alignas(64) PageHeader {
+    std::uint32_t page_id_ = 0;
+    std::uint32_t allocation_bytes_ = 0;
+    std::uint32_t block_size_ = 0;
+    std::uint32_t available_index_ = 0;
+    std::uint16_t capacity_ = 0;
+    std::uint16_t next_unused_ = 0;
+    std::uint16_t free_head_ = kNoSlot;
+    std::uint16_t live_count_ = 0;
+    std::uint8_t class_index_ = 0;
+    bool listed_available_ = false;
+    std::array<std::byte, 34> padding_{};
+  };
+
+  static_assert(sizeof(PageHeader) == kPageHeaderBytes);
+
+  static constexpr std::array<std::uint16_t, kSmallClassCount>
+  BuildClassSizes() noexcept;
+  static constexpr std::array<std::uint8_t, 513> BuildClassLookup() noexcept;
+
+  static const std::array<std::uint16_t, kSmallClassCount> kClassSizes;
+  static const std::array<std::uint8_t, 513> kClassLookup;
+
+  static std::uint8_t ClassFor(std::size_t bytes) noexcept;
+  static std::size_t ClassBytes(std::uint8_t class_index) noexcept;
+  static std::byte* SlotAddress(PageHeader* page, std::uint16_t slot) noexcept;
+  static const std::byte* SlotAddress(const PageHeader* page,
+                                      std::uint16_t slot) noexcept;
+
+  std::uint32_t AllocatePageId();
+  PageHeader* AllocatePage(std::uint8_t class_index,
+                           std::size_t requested_bytes);
+  void ReleasePage(PageHeader* page) noexcept;
+  void AddAvailable(PageHeader* page);
+  void RemoveAvailable(PageHeader* page) noexcept;
+  PageHeader* PageFor(Handle handle) const noexcept;
+
+  std::uint32_t maximum_page_id_ = kMaximumPageId;
+  std::size_t allocated_pages_ = 0;
+  // Directory slot zero stays empty so handle zero is the null reference.
+  // A normal descriptor packs the 64 KiB-aligned page address with
+  // class_index+1 in its low bits; the large marker reads block size from the
+  // page header. The vector grows only on the page-allocation slow path.
+  std::vector<std::uint64_t> page_directory_{0};
+  std::vector<std::uint32_t> free_page_ids_;
+  std::array<std::vector<std::uint32_t>, kSmallClassCount> available_pages_;
+};
+
+constexpr std::array<std::uint16_t, ScanHashMapEntryArena::kSmallClassCount>
+ScanHashMapEntryArena::BuildClassSizes() noexcept {
+  std::array<std::uint16_t, kSmallClassCount> sizes{};
+  std::size_t index = 0;
+  for (std::uint16_t size = 32; size <= 128; size += 8) {
+    sizes[index++] = size;
+  }
+  for (std::uint16_t size = 144; size <= 256; size += 16) {
+    sizes[index++] = size;
+  }
+  for (std::uint16_t size = 288; size <= 512; size += 32) {
+    sizes[index++] = size;
+  }
+  for (std::uint16_t size = 576; size <= 1024; size += 64) {
+    sizes[index++] = size;
+  }
+  for (std::uint16_t size = 1152; size <= 2048; size += 128) {
+    sizes[index++] = size;
+  }
+  for (std::uint16_t size = 2304; size <= 4096; size += 256) {
+    sizes[index++] = size;
+  }
+  assert(index == sizes.size());
+  return sizes;
+}
+
+constexpr std::array<std::uint8_t, 513>
+ScanHashMapEntryArena::BuildClassLookup() noexcept {
+  std::array<std::uint8_t, 513> lookup{};
+  for (std::size_t units = 0; units < lookup.size(); ++units) {
+    const std::size_t bytes = units * 8;
+    std::size_t index = 0;
+    while (index + 1 < kClassSizes.size() && kClassSizes[index] < bytes) {
+      ++index;
+    }
+    lookup[units] = static_cast<std::uint8_t>(index);
+  }
+  return lookup;
+}
+
+inline const std::array<std::uint16_t, ScanHashMapEntryArena::kSmallClassCount>
+    ScanHashMapEntryArena::kClassSizes =
+        ScanHashMapEntryArena::BuildClassSizes();
+inline const std::array<std::uint8_t, 513> ScanHashMapEntryArena::kClassLookup =
+    ScanHashMapEntryArena::BuildClassLookup();
+
+inline ScanHashMapEntryArena::ScanHashMapEntryArena(
+    std::uint32_t maximum_page_id)
+    : maximum_page_id_(std::min(maximum_page_id, kMaximumPageId)) {}
+
+inline ScanHashMapEntryArena::~ScanHashMapEntryArena() {
+  for (std::size_t page_id = 1; page_id < page_directory_.size(); ++page_id) {
+    const std::uint64_t descriptor = page_directory_[page_id];
+    if (descriptor == 0) continue;
+    auto* page =
+        reinterpret_cast<PageHeader*>(descriptor & ~std::uint64_t{0xffff});
+    assert(page->live_count_ == 0 &&
+           "entry arena outlived a map that still owns entries");
+    ::operator delete(page, std::align_val_t{kPageBytes});
+  }
+}
+
+inline std::uint8_t ScanHashMapEntryArena::ClassFor(
+    std::size_t bytes) noexcept {
+  if (bytes > 4096) return kLargeClassMarker;
+  const std::size_t units = (std::max<std::size_t>(bytes, 1) + 7) >> 3;
+  return kClassLookup[units];
+}
+
+inline std::size_t ScanHashMapEntryArena::ClassBytes(
+    std::uint8_t class_index) noexcept {
+  assert(class_index < kClassSizes.size());
+  return kClassSizes[class_index];
+}
+
+inline std::byte* ScanHashMapEntryArena::SlotAddress(
+    PageHeader* page, std::uint16_t slot) noexcept {
+  return reinterpret_cast<std::byte*>(page) + kPageHeaderBytes +
+         static_cast<std::size_t>(slot) * page->block_size_;
+}
+
+inline const std::byte* ScanHashMapEntryArena::SlotAddress(
+    const PageHeader* page, std::uint16_t slot) noexcept {
+  return reinterpret_cast<const std::byte*>(page) + kPageHeaderBytes +
+         static_cast<std::size_t>(slot) * page->block_size_;
+}
+
+inline std::uint32_t ScanHashMapEntryArena::AllocatePageId() {
+  if (!free_page_ids_.empty()) {
+    const std::uint32_t page_id = free_page_ids_.back();
+    free_page_ids_.pop_back();
+    assert(page_id != 0 && page_id < page_directory_.size() &&
+           page_directory_[page_id] == 0);
+    return page_id;
+  }
+  if (page_directory_.size() > maximum_page_id_) {
+    throw std::bad_alloc();
+  }
+  // Releasing a page is noexcept and must be able to return its ID without
+  // allocating. Grow the free-ID capacity on this already-fallible slow path
+  // before publishing another directory slot.
+  if (free_page_ids_.capacity() < page_directory_.size()) {
+    free_page_ids_.reserve(
+        std::max(page_directory_.size(), free_page_ids_.capacity() * 2));
+  }
+  const std::uint32_t page_id =
+      static_cast<std::uint32_t>(page_directory_.size());
+  page_directory_.push_back(0);
+  return page_id;
+}
+
+inline void ScanHashMapEntryArena::AddAvailable(PageHeader* page) {
+  assert(page != nullptr && page->class_index_ < kSmallClassCount &&
+         !page->listed_available_);
+  auto& pages = available_pages_[page->class_index_];
+  page->available_index_ = static_cast<std::uint32_t>(pages.size());
+  pages.push_back(page->page_id_);
+  page->listed_available_ = true;
+}
+
+inline void ScanHashMapEntryArena::RemoveAvailable(PageHeader* page) noexcept {
+  if (!page->listed_available_) return;
+  auto& pages = available_pages_[page->class_index_];
+  const std::size_t index = page->available_index_;
+  assert(index < pages.size() && pages[index] == page->page_id_);
+  const std::uint32_t moved_id = pages.back();
+  pages[index] = moved_id;
+  pages.pop_back();
+  if (index < pages.size()) {
+    PageHeader* moved = PageFor(moved_id << kSlotBits);
+    assert(moved != nullptr);
+    moved->available_index_ = static_cast<std::uint32_t>(index);
+  }
+  page->listed_available_ = false;
+}
+
+inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
+    std::uint8_t class_index, std::size_t requested_bytes) {
+  const std::uint32_t page_id = AllocatePageId();
+  const bool large = class_index == kLargeClassMarker;
+  const std::size_t block_size = large
+                                     ? ((requested_bytes + 7) & ~std::size_t{7})
+                                     : ClassBytes(class_index);
+  if (block_size > std::numeric_limits<std::size_t>::max() - kPageHeaderBytes) {
+    page_directory_[page_id] = 0;
+    free_page_ids_.push_back(page_id);
+    throw std::bad_alloc();
+  }
+  const std::size_t required = kPageHeaderBytes + block_size;
+  const std::size_t allocation_bytes =
+      large ? ((required + kPageBytes - 1) & ~(kPageBytes - 1)) : kPageBytes;
+  void* storage = nullptr;
+  try {
+    storage = ::operator new(allocation_bytes, std::align_val_t{kPageBytes});
+  } catch (...) {
+    page_directory_[page_id] = 0;
+    free_page_ids_.push_back(page_id);
+    throw;
+  }
+  auto* page = new (storage) PageHeader();
+  page->page_id_ = page_id;
+  page->allocation_bytes_ = static_cast<std::uint32_t>(allocation_bytes);
+  page->block_size_ = static_cast<std::uint32_t>(block_size);
+  page->class_index_ = class_index;
+  page->capacity_ = large ? 1
+                          : static_cast<std::uint16_t>(
+                                (kPageBytes - kPageHeaderBytes) / block_size);
+  assert(page->capacity_ != 0 && page->capacity_ <= (1U << kSlotBits));
+  const std::uint64_t descriptor =
+      reinterpret_cast<std::uintptr_t>(page) |
+      static_cast<std::uint64_t>(large ? kLargeClassMarker : class_index + 1);
+  page_directory_[page_id] = descriptor;
+  ++allocated_pages_;
+  if (!large) {
+    try {
+      AddAvailable(page);
+    } catch (...) {
+      ReleasePage(page);
+      throw;
+    }
+  }
+  return page;
+}
+
+inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::PageFor(
+    Handle handle) const noexcept {
+  const std::uint32_t page_id = handle >> kSlotBits;
+  if (page_id == 0 || page_id >= page_directory_.size()) return nullptr;
+  const std::uint64_t descriptor = page_directory_[page_id];
+  if (descriptor == 0) return nullptr;
+  return reinterpret_cast<PageHeader*>(descriptor & ~std::uint64_t{0xffff});
+}
+
+inline bool ScanHashMapEntryArena::CanAllocate(
+    std::size_t bytes) const noexcept {
+  const std::uint8_t class_index = ClassFor(bytes);
+  if (class_index != kLargeClassMarker &&
+      !available_pages_[class_index].empty()) {
+    return true;
+  }
+  return !free_page_ids_.empty() || page_directory_.size() <= maximum_page_id_;
+}
+
+inline ScanHashMapEntryArena::Allocation ScanHashMapEntryArena::Allocate(
+    std::size_t bytes) {
+  const std::uint8_t class_index = ClassFor(bytes);
+  PageHeader* page = nullptr;
+  if (class_index != kLargeClassMarker &&
+      !available_pages_[class_index].empty()) {
+    page = PageFor(available_pages_[class_index].back() << kSlotBits);
+    assert(page != nullptr);
+  } else {
+    page = AllocatePage(class_index, bytes);
+  }
+
+  std::uint16_t slot = 0;
+  if (page->free_head_ != kNoSlot) {
+    slot = page->free_head_;
+    std::memcpy(&page->free_head_, SlotAddress(page, slot), sizeof(slot));
+  } else {
+    assert(page->next_unused_ < page->capacity_);
+    slot = page->next_unused_++;
+  }
+  ++page->live_count_;
+  if (page->live_count_ == page->capacity_ && page->listed_available_) {
+    RemoveAvailable(page);
+  }
+  const Handle handle = (page->page_id_ << kSlotBits) | slot;
+  assert(handle != 0);
+  return {.handle_ = handle, .pointer_ = SlotAddress(page, slot)};
+}
+
+inline void ScanHashMapEntryArena::ReleasePage(PageHeader* page) noexcept {
+  assert(page != nullptr && page->live_count_ == 0);
+  RemoveAvailable(page);
+  const std::uint32_t page_id = page->page_id_;
+  const std::size_t allocation_bytes = page->allocation_bytes_;
+  page_directory_[page_id] = 0;
+  page->~PageHeader();
+  ::operator delete(page, allocation_bytes, std::align_val_t{kPageBytes});
+  free_page_ids_.push_back(page_id);
+  assert(allocated_pages_ != 0);
+  --allocated_pages_;
+}
+
+inline void ScanHashMapEntryArena::Deallocate(Handle handle) noexcept {
+  PageHeader* page = PageFor(handle);
+  assert(page != nullptr);
+  const std::uint16_t slot = static_cast<std::uint16_t>(handle & kSlotMask);
+  assert(slot < page->capacity_ && page->live_count_ != 0);
+  const bool was_full = page->live_count_ == page->capacity_;
+  std::memcpy(SlotAddress(page, slot), &page->free_head_, sizeof(slot));
+  page->free_head_ = slot;
+  --page->live_count_;
+  if (was_full && page->class_index_ != kLargeClassMarker) {
+    AddAvailable(page);
+  }
+  if (page->live_count_ == 0) ReleasePage(page);
+}
+
+inline void* ScanHashMapEntryArena::Resolve(Handle handle) const noexcept {
+  const PageHeader* page = PageFor(handle);
+  if (page == nullptr) return nullptr;
+  const std::uint16_t slot = static_cast<std::uint16_t>(handle & kSlotMask);
+  if (slot >= page->capacity_) return nullptr;
+  return const_cast<std::byte*>(SlotAddress(page, slot));
+}
+
+inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
+    const void* pointer) const noexcept {
+  if (pointer == nullptr) return 0;
+  const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+  const auto page_address = address & ~(kPageBytes - 1);
+  const auto* page = reinterpret_cast<const PageHeader*>(page_address);
+  const std::uintptr_t data = page_address + kPageHeaderBytes;
+  if (address < data || page->page_id_ == 0 || page->block_size_ == 0 ||
+      (address - data) % page->block_size_ != 0) {
+    return 0;
+  }
+  if (page->page_id_ >= page_directory_.size() ||
+      (page_directory_[page->page_id_] & ~std::uint64_t{0xffff}) !=
+          page_address) {
+    return 0;
+  }
+  const std::size_t slot = (address - data) / page->block_size_;
+  if (slot >= page->capacity_) return 0;
+  return (page->page_id_ << kSlotBits) | static_cast<Handle>(slot);
+}
 
 // The default policy stores every value directly in Entry. Specialized maps
 // may split a value into a common hot-path prefix and an optional derived
@@ -64,6 +458,7 @@ template <typename Value,
           typename EntryPolicy = ScanHashMapInlineEntryPolicy<Value>>
 class ScanHashMap {
  public:
+  using EntryHandle = ScanHashMapEntryArena::Handle;
   // Digest arguments for inline keys must equal ComputeDigest(key). Entries do
   // not retain a bucket hash, so rehash and pointer-only mutation reconstruct
   // it from the live key. External entries retain the supplied digest tail.
@@ -149,11 +544,17 @@ class ScanHashMap {
       return digest;
     }
 
-    static Entry* Create(const Digest& digest, std::string_view key,
-                         const Value& value, bool key_complete = true);
-    static Entry* CreateReplacement(const Entry& source, const Value& value);
+    struct Allocation {
+      Entry* entry_ = nullptr;
+      EntryHandle handle_ = 0;
+    };
 
-    static void Destroy(Entry* entry) noexcept;
+    static Allocation Create(ScanHashMapEntryArena& arena, const Digest& digest,
+                             std::string_view key, const Value& value,
+                             bool key_complete = true);
+    static Allocation CreateReplacement(ScanHashMapEntryArena& arena,
+                                        const Entry& source,
+                                        const Value& value);
 
    private:
     friend struct ExtendedEntry;
@@ -212,6 +613,8 @@ class ScanHashMap {
   };
 
   ScanHashMap() = default;
+  explicit ScanHashMap(std::shared_ptr<ScanHashMapEntryArena> arena)
+      : arena_(std::move(arena)) {}
   ScanHashMap(const ScanHashMap&) = delete;
   ScanHashMap& operator=(const ScanHashMap&) = delete;
 
@@ -226,6 +629,37 @@ class ScanHashMap {
   }
 
   ~ScanHashMap() { Clear(); }
+
+  // Binds an empty map to a worker-shared arena. Sharing keeps slab occupancy
+  // independent of the 16,384 partition and 16 database boundaries. Detached
+  // maps retain shared ownership so asynchronous FLUSHDB reclamation cannot
+  // outlive the allocation domain.
+  void SetEntryArena(std::shared_ptr<ScanHashMapEntryArena> arena) {
+    assert(arena != nullptr && empty() && !has_allocated_storage());
+    arena_ = std::move(arena);
+  }
+
+  // After the caller validates key length, a false result is the explicit
+  // 32-bit page-ID capacity boundary. Callers that publish other state before
+  // insertion must check this while mutation remains owner-serialized and
+  // report ResourceExhausted instead of allowing the handle namespace to wrap.
+  bool CanAllocateEntry(std::string_view key, bool key_complete,
+                        bool has_extra) const noexcept {
+    if (key.size() > Entry::kMaxLogicalKeySize) return false;
+    const std::size_t bytes = EntryAllocationBytes(
+        static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
+    return arena_ == nullptr || arena_->CanAllocate(bytes);
+  }
+
+  // Releases an old representation returned by ReplaceValue after its
+  // external pointer-keyed state has been migrated.
+  void DestroyDetached(Entry* entry) noexcept {
+    if (entry == nullptr) return;
+    assert(arena_ != nullptr);
+    const EntryHandle handle = arena_->HandleOf(entry);
+    assert(handle != 0);
+    DestroyEntry(entry, handle);
+  }
 
   std::size_t size() const noexcept {
     return tables_[0].used_ + tables_[1].used_;
@@ -302,16 +736,15 @@ class ScanHashMap {
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
       while (bucket != nullptr) {
-        const std::size_t slots =
-            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-        for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) &&
-              reinterpret_cast<std::uintptr_t>(bucket->entries_[slot]) ==
-                  address) {
-            return bucket->entries_[slot];
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot)) {
+            const Entry* entry = Resolve(bucket->entries_[slot]);
+            if (reinterpret_cast<std::uintptr_t>(entry) == address) {
+              return entry;
+            }
           }
         }
-        bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
       }
     }
     return nullptr;
@@ -333,8 +766,8 @@ class ScanHashMap {
       return existing;
     }
 
-    std::unique_ptr<Entry, void (*)(Entry*)> replacement(
-        Entry::CreateReplacement(*existing, value), &Entry::Destroy);
+    typename Entry::Allocation replacement =
+        Entry::CreateReplacement(EnsureArena(), *existing, value);
     const std::uint64_t hash = Hash(digest);
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
@@ -344,18 +777,18 @@ class ScanHashMap {
       }
       Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
       while (bucket != nullptr) {
-        const std::size_t slots =
-            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-        for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) && bucket->entries_[slot] == existing) {
-            bucket->entries_[slot] = replacement.get();
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot) &&
+              Resolve(bucket->entries_[slot]) == existing) {
+            bucket->entries_[slot] = replacement.handle_;
             *replaced = existing;
-            return replacement.release();
+            return replacement.entry_;
           }
         }
-        bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+        bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
       }
     }
+    DestroyEntry(replacement.entry_, replacement.handle_);
     assert(false && "replacement target must belong to this map");
     return nullptr;
   }
@@ -372,24 +805,32 @@ class ScanHashMap {
 
     EnsureTable();
     MaybeStartExpansion();
-    std::unique_ptr<Entry, void (*)(Entry*)> entry(
-        Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
-    Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw, Hash(digest));
-    entry.release();
-    return {raw, true};
+    typename Entry::Allocation allocation =
+        Entry::Create(EnsureArena(), digest, key, value, key_complete);
+    try {
+      AddToTable(Rehashing() ? tables_[1] : tables_[0], allocation.handle_,
+                 Hash(digest));
+    } catch (...) {
+      DestroyEntry(allocation.entry_, allocation.handle_);
+      throw;
+    }
+    return {allocation.entry_, true};
   }
 
   Entry* InsertNew(const Digest& digest, std::string_view key,
                    const Value& value, bool key_complete = true) {
     EnsureTable();
     MaybeStartExpansion();
-    std::unique_ptr<Entry, void (*)(Entry*)> entry(
-        Entry::Create(digest, key, value, key_complete), &Entry::Destroy);
-    Entry* raw = entry.get();
-    AddToTable(Rehashing() ? tables_[1] : tables_[0], raw, Hash(digest));
-    entry.release();
-    return raw;
+    typename Entry::Allocation allocation =
+        Entry::Create(EnsureArena(), digest, key, value, key_complete);
+    try {
+      AddToTable(Rehashing() ? tables_[1] : tables_[0], allocation.handle_,
+                 Hash(digest));
+    } catch (...) {
+      DestroyEntry(allocation.entry_, allocation.handle_);
+      throw;
+    }
+    return allocation.entry_;
   }
 
   // Deletes the matching entry, compacting its bucket chain the way Valkey's
@@ -413,17 +854,16 @@ class ScanHashMap {
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
       for (Bucket* bucket = top; bucket != nullptr;
-           bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
-        const std::size_t slots =
-            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-        for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-              KeyEquals(*bucket->entries_[slot], digest, key)) {
-            Entry::Destroy(bucket->entries_[slot]);
-            bucket->entries_[slot] = nullptr;
+           bucket = Chained(*bucket) ? Child(table, bucket) : nullptr) {
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+            Entry* entry = Resolve(bucket->entries_[slot]);
+            if (!KeyEquals(*entry, digest, key)) continue;
+            const EntryHandle handle = bucket->entries_[slot];
             ClearOccupied(bucket, slot);
+            DestroyEntry(entry, handle);
             --table.used_;
-            FillBucketHole(top, bucket, slot);
+            FillBucketHole(&table, top, bucket, slot);
             return true;
           }
         }
@@ -446,16 +886,15 @@ class ScanHashMap {
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
       for (Bucket* bucket = top; bucket != nullptr;
-           bucket = Chained(*bucket) ? Child(bucket) : nullptr) {
-        const std::size_t slots =
-            Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-        for (std::size_t slot = 0; slot < slots; ++slot) {
-          if (Occupied(*bucket, slot) && bucket->entries_[slot] == entry) {
-            Entry::Destroy(entry);
-            bucket->entries_[slot] = nullptr;
+           bucket = Chained(*bucket) ? Child(table, bucket) : nullptr) {
+        for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+          if (Occupied(*bucket, slot) &&
+              Resolve(bucket->entries_[slot]) == entry) {
+            const EntryHandle handle = bucket->entries_[slot];
             ClearOccupied(bucket, slot);
+            DestroyEntry(entry, handle);
             --table.used_;
-            FillBucketHole(top, bucket, slot);
+            FillBucketHole(&table, top, bucket, slot);
             return true;
           }
         }
@@ -500,13 +939,12 @@ class ScanHashMap {
       const Bucket* bucket = &table.buckets_[cursor->bucket_];
       for (std::size_t chain = 0; chain < cursor->chain_; ++chain) {
         assert(Chained(*bucket));
-        bucket = Child(bucket);
+        bucket = Child(table, bucket);
       }
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      while (cursor->slot_ < slots) {
+      while (cursor->slot_ < kEntriesPerBucket) {
         const std::size_t slot = cursor->slot_++;
-        if (Occupied(*bucket, slot) && !fn(*bucket->entries_[slot])) {
+        if (Occupied(*bucket, slot) &&
+            !fn(*const_cast<Entry*>(Resolve(bucket->entries_[slot])))) {
           return false;
         }
       }
@@ -602,63 +1040,106 @@ class ScanHashMap {
   // before dereferencing; this class does not track that, since the useful
   // granularity is whatever set of maps the caller detaches together.
   ScanHashMap Detach() noexcept {
-    ScanHashMap detached;
+    ScanHashMap detached(arena_);
     detached.tables_ = std::exchange(tables_, {});
     detached.rehash_index_ = std::exchange(rehash_index_, kNotRehashing);
     return detached;
   }
 
  private:
-  static constexpr std::size_t kEntriesPerBucket = 7;
-  static constexpr std::uint8_t kChainedBit = 0x80;
-  static constexpr std::size_t kChildSlot = kEntriesPerBucket - 1;
-  static constexpr std::size_t kTargetEntriesPerBucket = 6;
+  static constexpr std::size_t kEntriesPerBucket = 12;
+  static constexpr std::size_t kTargetEntriesPerBucket = 9;
   static constexpr std::size_t kNotRehashing =
       std::numeric_limits<std::size_t>::max();
 
   struct alignas(64) Bucket {
-    std::uint8_t presence_ = 0;
     std::array<std::uint8_t, kEntriesPerBucket> hashes_{};
-    std::array<Entry*, kEntriesPerBucket> entries_{};
+    std::array<EntryHandle, kEntriesPerBucket> entries_{};
+    // One-based index into Table::overflow_. Keeping the child separate means
+    // a chained bucket still carries all twelve entries.
+    std::uint32_t child_ = 0;
   };
 
   static_assert(sizeof(Bucket) == 64);
 
+  struct OverflowBuckets {
+    std::vector<std::unique_ptr<Bucket>> buckets_;
+    std::vector<std::uint32_t> free_ids_;
+  };
+
   struct Table {
     std::unique_ptr<Bucket[]> buckets_;
+    std::unique_ptr<OverflowBuckets> overflow_;
     std::uint8_t exponent_ = 0;
     std::size_t used_ = 0;
   };
 
   static bool Chained(const Bucket& bucket) noexcept {
-    return (bucket.presence_ & kChainedBit) != 0;
+    return bucket.child_ != 0;
   }
 
   static bool Occupied(const Bucket& bucket, std::size_t slot) noexcept {
-    return (bucket.presence_ & (std::uint8_t{1} << slot)) != 0;
-  }
-
-  static void SetOccupied(Bucket* bucket, std::size_t slot) noexcept {
-    bucket->presence_ |= std::uint8_t{1} << slot;
+    return bucket.entries_[slot] != 0;
   }
 
   static void ClearOccupied(Bucket* bucket, std::size_t slot) noexcept {
-    bucket->presence_ &= ~(std::uint8_t{1} << slot);
+    bucket->entries_[slot] = 0;
   }
 
-  static Bucket* Child(Bucket* bucket) noexcept {
+  static Bucket* Child(Table& table, Bucket* bucket) noexcept {
     assert(Chained(*bucket));
-    return reinterpret_cast<Bucket*>(bucket->entries_[kChildSlot]);
+    assert(table.overflow_ != nullptr &&
+           bucket->child_ <= table.overflow_->buckets_.size());
+    return table.overflow_->buckets_[bucket->child_ - 1].get();
   }
 
-  static const Bucket* Child(const Bucket* bucket) noexcept {
-    assert(Chained(*bucket));
-    return reinterpret_cast<const Bucket*>(bucket->entries_[kChildSlot]);
+  static const Bucket* Child(const Table& table,
+                             const Bucket* bucket) noexcept {
+    return Child(const_cast<Table&>(table), const_cast<Bucket*>(bucket));
   }
 
-  static void SetChild(Bucket* bucket, Bucket* child) noexcept {
-    bucket->presence_ |= kChainedBit;
-    bucket->entries_[kChildSlot] = reinterpret_cast<Entry*>(child);
+  struct ChildAllocation {
+    Bucket* bucket_ = nullptr;
+    std::uint32_t id_ = 0;
+  };
+
+  static ChildAllocation AllocateChild(Table* table) {
+    if (table->overflow_ == nullptr) {
+      table->overflow_ = std::make_unique<OverflowBuckets>();
+    }
+    auto& pool = *table->overflow_;
+    std::uint32_t index = 0;
+    if (!pool.free_ids_.empty()) {
+      auto bucket = std::make_unique<Bucket>();
+      index = pool.free_ids_.back();
+      pool.free_ids_.pop_back();
+      assert(index < pool.buckets_.size() && pool.buckets_[index] == nullptr);
+      pool.buckets_[index] = std::move(bucket);
+    } else {
+      if (pool.buckets_.size() >= std::numeric_limits<std::uint32_t>::max()) {
+        throw std::bad_alloc();
+      }
+      // FreeChild is noexcept. Reserve its bookkeeping slot while allocation
+      // is already allowed to fail, so erasing an overflow bucket never has
+      // to allocate memory merely to remember the reusable ID.
+      if (pool.free_ids_.capacity() < pool.buckets_.size() + 1) {
+        pool.free_ids_.reserve(
+            std::max(pool.buckets_.size() + 1,
+                     std::max<std::size_t>(1, pool.free_ids_.capacity() * 2)));
+      }
+      index = static_cast<std::uint32_t>(pool.buckets_.size());
+      pool.buckets_.push_back(std::make_unique<Bucket>());
+    }
+    return {.bucket_ = pool.buckets_[index].get(), .id_ = index + 1};
+  }
+
+  static void FreeChild(Table* table, std::uint32_t child_id) noexcept {
+    assert(child_id != 0 && table->overflow_ != nullptr);
+    const std::uint32_t index = child_id - 1;
+    assert(index < table->overflow_->buckets_.size() &&
+           table->overflow_->buckets_[index] != nullptr);
+    table->overflow_->buckets_[index].reset();
+    table->overflow_->free_ids_.push_back(index);
   }
 
   static std::size_t BucketCount(const Table& table) noexcept {
@@ -671,6 +1152,43 @@ class ScanHashMap {
 
   static std::uint64_t Hash(const Digest& digest) noexcept {
     return digest.value_;
+  }
+
+  ScanHashMapEntryArena& EnsureArena() {
+    if (arena_ == nullptr) {
+      arena_ = std::make_shared<ScanHashMapEntryArena>();
+    }
+    return *arena_;
+  }
+
+  Entry* Resolve(EntryHandle handle) noexcept {
+    assert(arena_ != nullptr);
+    return static_cast<Entry*>(arena_->Resolve(handle));
+  }
+
+  const Entry* Resolve(EntryHandle handle) const noexcept {
+    assert(arena_ != nullptr);
+    return static_cast<const Entry*>(arena_->Resolve(handle));
+  }
+
+  static std::size_t EntryAllocationBytes(std::uint32_t logical_size,
+                                          bool key_complete,
+                                          bool has_extra) noexcept {
+    const std::size_t metadata =
+        Entry::KeyMetadataBytesFor(logical_size, key_complete);
+    const std::size_t payload = key_complete ? logical_size : sizeof(Digest);
+    return (has_extra ? sizeof(ExtendedEntry) : sizeof(Entry)) + metadata +
+           payload;
+  }
+
+  void DestroyEntry(Entry* entry, EntryHandle handle) noexcept {
+    assert(entry != nullptr && handle != 0 && arena_ != nullptr);
+    if (entry->has_extra()) {
+      static_cast<ExtendedEntry*>(entry)->~ExtendedEntry();
+    } else {
+      entry->~Entry();
+    }
+    arena_->Deallocate(handle);
   }
 
   static std::uint8_t HashTag(std::uint64_t hash) noexcept {
@@ -756,50 +1274,58 @@ class ScanHashMap {
     }
   }
 
-  static Entry* FindInTable(Table& table, const Digest& digest,
-                            std::string_view key, std::uint64_t hash) {
+  Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
+                     std::uint64_t hash) {
     if (table.buckets_ == nullptr) {
       return nullptr;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-            KeyEquals(*bucket->entries_[slot], digest, key)) {
-          return bucket->entries_[slot];
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+          Entry* entry = Resolve(bucket->entries_[slot]);
+          if (KeyEquals(*entry, digest, key)) return entry;
         }
       }
-      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
     return nullptr;
   }
 
-  static const Entry* FindInTable(const Table& table, const Digest& digest,
-                                  std::string_view key, std::uint64_t hash) {
-    return FindInTable(const_cast<Table&>(table), digest, key, hash);
+  const Entry* FindInTable(const Table& table, const Digest& digest,
+                           std::string_view key, std::uint64_t hash) const {
+    if (table.buckets_ == nullptr) return nullptr;
+    const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
+    const std::uint8_t tag = HashTag(hash);
+    while (bucket != nullptr) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+          const Entry* entry = Resolve(bucket->entries_[slot]);
+          if (KeyEquals(*entry, digest, key)) return entry;
+        }
+      }
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    }
+    return nullptr;
   }
 
-  static void AppendCandidates(Table& table, const Digest& digest,
-                               std::string_view key, std::uint64_t hash,
-                               std::vector<Entry*>* result) {
+  void AppendCandidates(Table& table, const Digest& digest,
+                        std::string_view key, std::uint64_t hash,
+                        std::vector<Entry*>* result) {
     if (table.buckets_ == nullptr) {
       return;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag &&
-            KeyEquals(*bucket->entries_[slot], digest, key)) {
-          result->push_back(bucket->entries_[slot]);
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) && bucket->hashes_[slot] == tag) {
+          Entry* entry = Resolve(bucket->entries_[slot]);
+          if (KeyEquals(*entry, digest, key)) result->push_back(entry);
         }
       }
-      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
   }
 
@@ -822,43 +1348,33 @@ class ScanHashMap {
     return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
   }
 
-  static void AddToTable(Table& table, Entry* entry, std::uint64_t hash) {
+  void AddToTable(Table& table, EntryHandle entry, std::uint64_t hash) {
     const std::uint8_t tag = HashTag(hash);
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     while (true) {
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (!Occupied(*bucket, slot)) {
           bucket->entries_[slot] = entry;
           bucket->hashes_[slot] = tag;
-          SetOccupied(bucket, slot);
           ++table.used_;
           return;
         }
       }
       if (Chained(*bucket)) {
-        bucket = Child(bucket);
+        bucket = Child(table, bucket);
         continue;
       }
 
-      auto* child = new Bucket();
-      Entry* displaced = bucket->entries_[kChildSlot];
-      const std::uint8_t displaced_hash = bucket->hashes_[kChildSlot];
-      assert(Occupied(*bucket, kChildSlot));
-      ClearOccupied(bucket, kChildSlot);
-      SetChild(bucket, child);
-      child->entries_[0] = displaced;
-      child->hashes_[0] = displaced_hash;
-      SetOccupied(child, 0);
-      bucket = child;
+      const ChildAllocation child = AllocateChild(&table);
+      bucket->child_ = child.id_;
+      bucket = child.bucket_;
     }
   }
 
   // Moves the last entry of the chain into the freed slot and unlinks the
   // tail bucket once it empties. Only meaningful for chained tops: holes in
   // an unchained bucket are reused by AddToTable's slot scan.
-  static void FillBucketHole(Bucket* top, Bucket* holed,
+  static void FillBucketHole(Table* table, Bucket* top, Bucket* holed,
                              std::size_t hole_slot) {
     if (!Chained(*top)) {
       return;
@@ -867,7 +1383,7 @@ class ScanHashMap {
     Bucket* tail = top;
     while (Chained(*tail)) {
       parent = tail;
-      tail = Child(tail);
+      tail = Child(*table, tail);
     }
     std::size_t last = kEntriesPerBucket;
     for (std::size_t slot = kEntriesPerBucket; slot-- > 0;) {
@@ -879,72 +1395,69 @@ class ScanHashMap {
     if (last != kEntriesPerBucket && !(tail == holed && last == hole_slot)) {
       holed->entries_[hole_slot] = tail->entries_[last];
       holed->hashes_[hole_slot] = tail->hashes_[last];
-      SetOccupied(holed, hole_slot);
-      tail->entries_[last] = nullptr;
       ClearOccupied(tail, last);
     }
-    if (tail->presence_ == 0) {
-      parent->presence_ &= ~kChainedBit;
-      parent->entries_[kChildSlot] = nullptr;
-      delete tail;
+    if (std::none_of(tail->entries_.begin(), tail->entries_.end(),
+                     [](EntryHandle handle) { return handle != 0; })) {
+      const std::uint32_t child_id = parent->child_;
+      parent->child_ = 0;
+      FreeChild(table, child_id);
     }
   }
 
-  static void MoveBucketEntries(Bucket* top, Table* target) {
+  void MoveBucketEntries(Table* source, Bucket* top, Table* target) {
     Bucket* bucket = top;
+    std::uint32_t bucket_id = 0;
     while (bucket != nullptr) {
       const bool chained = Chained(*bucket);
-      Bucket* next = chained ? Child(bucket) : nullptr;
-      const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
+      Bucket* next = chained ? Child(*source, bucket) : nullptr;
+      const std::uint32_t next_id = bucket->child_;
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (Occupied(*bucket, slot)) {
           // Entries no longer retain a bucket hash. Recompute it while the
           // source object is known live; external keys already carry their
           // digest, while inline keys trade rehash CPU for the smaller steady
           // state representation.
-          AddToTable(*target, bucket->entries_[slot],
-                     EntryHash(*bucket->entries_[slot]));
+          const EntryHandle handle = bucket->entries_[slot];
+          AddToTable(*target, handle, EntryHash(*Resolve(handle)));
           ClearOccupied(bucket, slot);
         }
       }
-      if (bucket != top) {
-        delete bucket;
-      }
+      bucket->child_ = 0;
+      if (bucket_id != 0) FreeChild(source, bucket_id);
+      bucket_id = next_id;
       bucket = next;
     }
-    top->presence_ = 0;
-    top->entries_.fill(nullptr);
+    top->entries_.fill(0);
     top->hashes_.fill(0);
   }
 
   void MoveBucket(Bucket* top, Table* target) {
     const std::size_t before = target->used_;
-    MoveBucketEntries(top, target);
+    MoveBucketEntries(&tables_[0], top, target);
     const std::size_t moved = target->used_ - before;
     assert(tables_[0].used_ >= moved);
     tables_[0].used_ -= moved;
   }
 
   template <typename Fn>
-  static void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) {
+  void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) const {
     if (table.buckets_ == nullptr) {
       return;
     }
     const Bucket* bucket = &table.buckets_[index];
     while (bucket != nullptr) {
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
         if (Occupied(*bucket, slot)) {
-          fn(*bucket->entries_[slot]);
+          fn(*const_cast<Entry*>(Resolve(bucket->entries_[slot])));
         }
       }
-      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
   }
 
   template <typename Fn>
-  static void ForEachTable(Table& table, Fn& fn) {
+  void ForEachTable(Table& table, Fn& fn) {
     const std::size_t count = BucketCount(table);
     for (std::size_t index = 0; index < count; ++index) {
       EmitBucket(table, index, fn);
@@ -952,24 +1465,23 @@ class ScanHashMap {
   }
 
   template <typename Fn>
-  static bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) {
+  bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) const {
     if (table.buckets_ == nullptr) return true;
     const Bucket* bucket = &table.buckets_[index];
     while (bucket != nullptr) {
-      const std::size_t slots =
-          Chained(*bucket) ? kChildSlot : kEntriesPerBucket;
-      for (std::size_t slot = 0; slot < slots; ++slot) {
-        if (Occupied(*bucket, slot) && !fn(*bucket->entries_[slot])) {
+      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
+        if (Occupied(*bucket, slot) &&
+            !fn(*const_cast<Entry*>(Resolve(bucket->entries_[slot])))) {
           return false;
         }
       }
-      bucket = Chained(*bucket) ? Child(bucket) : nullptr;
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
     }
     return true;
   }
 
   template <typename Fn>
-  static bool ForEachTableWhile(Table& table, Fn& fn) {
+  bool ForEachTableWhile(Table& table, Fn& fn) {
     const std::size_t count = BucketCount(table);
     for (std::size_t index = 0; index < count; ++index) {
       if (!EmitBucketWhile(table, index, fn)) return false;
@@ -977,24 +1489,21 @@ class ScanHashMap {
     return true;
   }
 
-  static void DestroyTable(Table& table, bool destroy_entries) noexcept {
+  void DestroyTable(Table& table, bool destroy_entries) noexcept {
     const std::size_t count = BucketCount(table);
     for (std::size_t index = 0; index < count; ++index) {
       Bucket* top = &table.buckets_[index];
       Bucket* bucket = top;
       while (bucket != nullptr) {
         const bool chained = Chained(*bucket);
-        Bucket* next = chained ? Child(bucket) : nullptr;
-        const std::size_t slots = chained ? kChildSlot : kEntriesPerBucket;
+        Bucket* next = chained ? Child(table, bucket) : nullptr;
         if (destroy_entries) {
-          for (std::size_t slot = 0; slot < slots; ++slot) {
+          for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
             if (Occupied(*bucket, slot)) {
-              Entry::Destroy(bucket->entries_[slot]);
+              const EntryHandle handle = bucket->entries_[slot];
+              DestroyEntry(Resolve(handle), handle);
             }
           }
-        }
-        if (bucket != top) {
-          delete bucket;
         }
         bucket = next;
       }
@@ -1003,6 +1512,7 @@ class ScanHashMap {
   }
 
   void MoveFrom(ScanHashMap&& other) noexcept {
+    arena_ = std::move(other.arena_);
     tables_ = std::move(other.tables_);
     rehash_index_ = std::exchange(other.rehash_index_, kNotRehashing);
     other.tables_ = {};
@@ -1010,6 +1520,7 @@ class ScanHashMap {
 
   std::array<Table, 2> tables_{};
   std::size_t rehash_index_ = kNotRehashing;
+  std::shared_ptr<ScanHashMapEntryArena> arena_;
 };
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
@@ -1076,10 +1587,10 @@ std::size_t ScanHashMap<Value, MaxBucketExponent,
 }
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Allocation
 ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
-    const Digest& digest, std::string_view key, const Value& value,
-    bool key_complete) {
+    ScanHashMapEntryArena& arena, const Digest& digest, std::string_view key,
+    const Value& value, bool key_complete) {
   if (key.size() > kMaxLogicalKeySize) {
     throw std::bad_alloc();
   }
@@ -1097,7 +1608,9 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   }
   static_assert(alignof(Entry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
   static_assert(alignof(ExtendedEntry) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
-  void* storage = ::operator new(header_bytes + tail_bytes);
+  const ScanHashMapEntryArena::Allocation allocation =
+      arena.Allocate(header_bytes + tail_bytes);
+  void* storage = allocation.pointer_;
   Entry* entry = nullptr;
   try {
     if (extended) {
@@ -1107,7 +1620,7 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
       entry = new (storage) Entry(EntryPolicy::Store(value));
     }
   } catch (...) {
-    ::operator delete(storage);
+    arena.Deallocate(allocation.handle_);
     throw;
   }
   const std::uint8_t written_metadata =
@@ -1119,13 +1632,13 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   } else if (!key_complete) {
     std::memcpy(payload, &digest, sizeof(digest));
   }
-  return entry;
+  return {.entry_ = entry, .handle_ = allocation.handle_};
 }
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry*
+typename ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Allocation
 ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
-    const Entry& source, const Value& value) {
+    ScanHashMapEntryArena& arena, const Entry& source, const Value& value) {
   const std::size_t tail_bytes = source.tail_bytes();
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
@@ -1133,7 +1646,9 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
   if (tail_bytes > std::numeric_limits<std::size_t>::max() - header_bytes) {
     throw std::bad_alloc();
   }
-  void* storage = ::operator new(header_bytes + tail_bytes);
+  const ScanHashMapEntryArena::Allocation allocation =
+      arena.Allocate(header_bytes + tail_bytes);
+  void* storage = allocation.pointer_;
   Entry* entry = nullptr;
   try {
     if (extended) {
@@ -1143,27 +1658,13 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::CreateReplacement(
       entry = new (storage) Entry(EntryPolicy::Store(value));
     }
   } catch (...) {
-    ::operator delete(storage);
+    arena.Deallocate(allocation.handle_);
     throw;
   }
   if (tail_bytes != 0) {
     std::memcpy(entry->tail(), source.tail(), tail_bytes);
   }
-  return entry;
-}
-
-template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
-void ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Destroy(
-    Entry* entry) noexcept {
-  if (entry == nullptr) {
-    return;
-  }
-  if (entry->has_extra()) {
-    static_cast<ExtendedEntry*>(entry)->~ExtendedEntry();
-  } else {
-    entry->~Entry();
-  }
-  ::operator delete(entry);
+  return {.entry_ = entry, .handle_ = allocation.handle_};
 }
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>

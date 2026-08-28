@@ -246,6 +246,26 @@ incremental rehash, pointer-only erase, and representation replacement
 recompute it from the live inline key or external digest. This trades growth-
 phase CPU for the smaller steady-state representation.
 
+Entries are allocated from one worker-local arena shared by every partition
+and logical-database index on that worker. The arena obtains 64 KiB-aligned
+pages from the process allocator and divides ordinary pages among 53 size
+classes from 32 bytes through 4 KiB; unusually large generic-map entries use a
+single-slot aligned span. Each bucket stores a 32-bit handle rather than a
+machine pointer. Its high 21 bits select the arena page and its low 11 bits
+select the slot, so a 64-byte bucket carries twelve handles, twelve independent
+8-bit lookup tags, and one overflow-bucket ID. Direct tables begin expanding at
+nine entries per bucket. The page directory costs one 64-bit descriptor per
+live or previously issued page ID, while the shared allocation domain prevents
+partition boundaries from stranding mostly empty pages.
+
+Page ID zero is invalid and IDs never wrap. An empty page returns to the process
+allocator and its ID becomes reusable; detached FLUSHDB populations keep shared
+ownership of the arena until their entries are reclaimed. Before a write that
+needs a new entry or changes the TTL representation, the owner checks that the
+required size class has a free slot or an encodable page ID. Exhaustion returns
+`ResourceExhausted` before bytes are appended to the staging block. Updates
+whose representation already has a slot can continue at this boundary.
+
 The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
 obtained from the operating system. It is stable across workers for one
 process, changes on restart, and does not affect Redis-slot routing. External
@@ -288,8 +308,9 @@ making large transactions scan prior undo items, or adding a hot-path side
 index.
 Coroutine identities and staged records cache the low 32 hash bits needed to
 revalidate a saved entry address, while each bucket slot carries its independent
-8-bit lookup tag. The entry itself stores neither value. Incremental rehash
-reconstructs the SipHash from the inline key or retained external digest. A
+8-bit lookup tag. The entry itself stores neither a lookup tag nor a bucket
+hash. Incremental rehash reconstructs the SipHash from the inline key or
+retained external digest. A
 table that has already reached `2^32` direct buckets stops expanding and accepts
 further entries through its existing bucket chains, so the address-width limit
 changes load factor and lookup cost rather than correctness or capacity.
