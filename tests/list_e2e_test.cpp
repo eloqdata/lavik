@@ -5471,6 +5471,12 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
                     .Command({"XREADGROUP", "GROUP", "g", "c", "COUNT", "1",
                               "STREAMS", "x", ">"})
                     .starts_with("*1\r\n"));
+    // Keep enough keys in one partition to require direct-bucket growth when
+    // the index is rebuilt by the low-memory restart below.
+    for (int i = 0; i < 16; ++i) {
+      const std::string key = "{memory-recovery}:" + std::to_string(i);
+      EXPECT_EQ(client.Command({"SET", key, "value"}), "+OK");
+    }
     ASSERT_TRUE(WaitForDurability(client));
     server.Stop();
   }
@@ -5481,6 +5487,10 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
     std::this_thread::sleep_for(200ms);
     EXPECT_TRUE(client.Command({"SET", "must-be-rejected", "value"})
                     .starts_with("-OOM command not allowed"));
+    for (int i = 0; i < 16; ++i) {
+      const std::string key = "{memory-recovery}:" + std::to_string(i);
+      EXPECT_EQ(client.Command({"GET", key}), Bulk("value"));
+    }
     {
       RespClient oversized(port);
       const std::string oversized_key(128 * 1024, 'k');

@@ -60,6 +60,10 @@ headroom further. Operators requiring the publisher copy to remain inside the
 retained boundary should configure
 `replication-publish-queue-mb-per-worker` at least as large as their largest
 accepted replicated command.
+Recovery bounds its avoidable routing and live-accounting allocations with a
+64 MiB process-wide batch target divided across scan workers. A single record
+or external-value manifest is indivisible and may exceed one worker's share,
+but that batch is applied before the worker retains another record.
 Ordinary temporary allocations do not reserve headroom:
 the official mimalloc global new/delete override performs no Keylane
 accounting. RSS and allocator diagnostics remain outside command execution.

@@ -8,6 +8,17 @@
 namespace keylane::storage {
 namespace {
 
+TEST(RecoveryMemoryTest, DividesTemporaryBatchTargetAcrossWorkers) {
+  EXPECT_EQ(RecoveryWorkerBatchTargetBytes(0),
+            kRecoveryProcessBatchTargetBytes);
+  EXPECT_EQ(RecoveryWorkerBatchTargetBytes(1),
+            kRecoveryProcessBatchTargetBytes);
+  EXPECT_EQ(RecoveryWorkerBatchTargetBytes(8),
+            kRecoveryProcessBatchTargetBytes / 8);
+  EXPECT_EQ(RecoveryWorkerBatchTargetBytes(kMaxMemoryWorkers),
+            kRecoveryProcessBatchTargetBytes / kMaxMemoryWorkers);
+}
+
 TEST(RecordLocationTest, PackedMetadataRoundTripsMaximumValues) {
   constexpr std::uint32_t offset =
       static_cast<std::uint32_t>(kStorageBlockBytes - kRecordAlignment);

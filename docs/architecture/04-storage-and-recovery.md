@@ -211,6 +211,11 @@ Recovery proceeds as follows:
    is skipped, while record bounds, allocation epochs, topology, keys, and
    checksums are validated. Recovery computes each winning key's runtime
    digest from the recovered complete key instead of loading one from disk.
+   Recovered records are routed to key owners in byte-targeted batches. The
+   process-wide target is 64 MiB divided across active scan workers, rather
+   than an item limit repeated independently by every worker; one indivisible
+   record may exceed its worker target and is flushed before another record is
+   retained.
 4. Records from obsolete database or partition replication epochs are ignored.
    Commit decisions are collected independently of those keyed-record filters.
    Tagged records remain parked until every worker has contributed to the
@@ -219,9 +224,14 @@ Recovery proceeds as follows:
    physical relocation copies of one logical version, so the higher physical
    LSN wins. Recovery also rebuilds whether the winner shields an older,
    potentially live value.
-6. A second cross-worker pass charges every winning root and referenced extent
-   exactly once to its physical block owner and verifies each live manifest
-   against the recovered extent headers.
+6. A second cross-worker pass walks each in-memory winner index once and
+   charges every winning root and referenced extent exactly once to its
+   physical block owner. A resumable stable cursor pauses at the same
+   process-wide byte target divided across workers, applies the per-owner
+   batches, and then continues at the next entry; it neither rescans storage
+   nor restarts an index scan. One external value's manifest remains an
+   indivisible unit. The owner also verifies every live manifest against the
+   recovered extent headers before the batch is released.
 7. Recovery reconstructs ready and cold-free allocator state, reclaims orphan
    extents before it needs new space, and handles expired winners. Expired
    versions participate in winner selection first, then normally receive a
