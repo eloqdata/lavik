@@ -380,7 +380,7 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (current_entry == nullptr) {
         continue;
       }
-      RecordLocationCore& current = current_entry->value_;
+      RecordIndexValue& current = current_entry->value_;
       // The entry may no longer hold the version this identity was staged
       // for. Matching on block and epoch alone was enough when a block
       // flushed once: an overwrite necessarily landed in a different block.
@@ -390,7 +390,6 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       // allocation only grow, so the boundary check identifies stale
       // versions exactly.
       if (current.block_id() == pending->block_id_ &&
-          current.allocation_epoch() == pending->allocation_epoch_ &&
           current.record_offset() + current.total_disk_bytes() <=
               pending->committed_bytes_) {
         current.set_in_memory(false);

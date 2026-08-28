@@ -211,7 +211,8 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
             DbEpoch(db_id) != observed_db_epoch ||
             partition.replication_epoch_ != observed_replication_epoch);
   };
-  const RecordLocation location = exists ? found->value() : RecordLocation{};
+  const RecordLocation location =
+      exists ? MaterializeIndexLocation(*found) : RecordLocation{};
   const ExtentManifest extents =
       exists ? ExtentsFor(store, found) : ExtentManifest{};
   const std::uint64_t expire_at_ms = exists ? location.expire_at_ms_ : 0;

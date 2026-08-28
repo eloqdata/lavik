@@ -551,10 +551,10 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
   WorkerStore& store = *stores_[target];
   for (const RecoveryBlock& recovered : batch.blocks_) {
     const ActiveBlock& block = recovered.block_;
-    BlockState& state = CreateBlockState(store, block.block_id_);
+    BlockState& state =
+        CreateBlockState(store, block.block_id_, block.allocation_epoch_);
     state.writer_id_ = block.writer_id_;
     state.layout_worker_count_ = block.layout_worker_count_;
-    state.allocation_epoch_ = block.allocation_epoch_;
     state.committed_bytes_ = block.committed_bytes_;
     state.allocated_ = true;
     state.kind_ = block.kind_;

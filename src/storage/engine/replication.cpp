@@ -163,7 +163,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
     } else {
       auto* current = *resolved;
       if (current != nullptr && current->value_.kind() == RecordKind::kValue) {
-        const RecordLocation location = current->value();
+        const RecordLocation location = MaterializeIndexLocation(*current);
         if (IsExpired(location, UnixTimeMillis())) {
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else {
@@ -282,7 +282,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
     };
   }
 
-  const RecordLocation location = current->value();
+  const RecordLocation location = MaterializeIndexLocation(*current);
   const ExtentManifest extents = ExtentsFor(store, current);
   std::uint64_t value_bytes = location.logical_size_;
   if (location.external()) {
@@ -380,7 +380,7 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
               add_bytes(entry.key().size());
               state->result_.keys_.emplace_back(entry.key());
               state->result_.value_types_.push_back(entry.value_.value_type());
-              std::size_t value_bytes = entry.value_.logical_size_;
+              std::size_t value_bytes = entry.value_.logical_size();
               if (entry.value_.value_type() != ValueType::kString) {
                 value_bytes = entry.value_.total_disk_bytes();
               }
@@ -412,7 +412,7 @@ bool StorageEngine::Impl::ScanPartitionInline(ScanPartitionState* state) {
               state->external_.push_back(ScanPartitionState::ExternalCandidate{
                   .entry_address_ = reinterpret_cast<std::uintptr_t>(&entry),
                   .extents_ = std::move(extents),
-                  .location_ = entry.value(),
+                  .location_ = MaterializeIndexLocation(entry),
                   .hash_ = entry.hash_,
                   .key_bytes_ = entry.logical_key_size(),
                   .value_bytes_ = value_bytes,
@@ -453,7 +453,8 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
       const RecordIndex::Entry* current =
           state.index_->FindAddress(candidate.entry_address_, candidate.hash_);
       if (current == nullptr) continue;
-      if (current->value_.SamePhysicalRecord(candidate.location_) &&
+      if (MaterializeIndexLocation(*current).SamePhysicalRecord(
+              candidate.location_) &&
           current->value_.kind() == RecordKind::kValue &&
           !IsExpired(*current, state.now_ms_)) {
         add_bytes(key->size());
@@ -1237,7 +1238,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ResetReplicaPartition(
             OldKey{.db_id_ = db_id, .key_ = std::string(entry.key())});
       } else [[unlikely]] {
         external_keys.push_back(ExternalKey{
-            .location_ = entry.value(),
+            .location_ = MaterializeIndexLocation(entry),
             .extents_ = ExtentsFor(store, &entry),
             .key_bytes_ = entry.logical_key_size(),
         });

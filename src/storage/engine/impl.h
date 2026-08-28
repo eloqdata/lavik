@@ -378,12 +378,174 @@ struct RecordLocation final : RecordLocationCore {
   std::uint64_t expire_at_ms_ = 0;
 };
 
-// Record-index entries use a 40-byte common object for ordinary keys and a
-// derived 48-byte object only when an expiration timestamp exists. The
-// has-expiry bit is part of the common metadata word, so checking it before
+// The index retains only key-specific location state. A block's allocation
+// epoch and runtime owner are already stored once in its dense BlockState;
+// repeating them in every record from the same 8 MiB allocation would cost
+// another word per key. Callers materialize a full RecordLocation from this
+// value and the current BlockState before carrying the identity across an
+// await. Live-byte accounting keeps the allocation live while a current index
+// entry references one of its records, so the shared identity remains stable
+// for that operation.
+class RecordIndexValue {
+ public:
+  static constexpr unsigned kBlockIdBits = RecordLocation::kBlockIdBits;
+  static constexpr unsigned kLogicalSizeBits = 30;
+  static constexpr unsigned kLogicalSizeLowBits = 64 - kBlockIdBits;
+  static constexpr unsigned kLogicalSizeHighBits =
+      kLogicalSizeBits - kLogicalSizeLowBits;
+  static constexpr unsigned kOffsetBits = 20;
+  static constexpr unsigned kLengthBits = 20;
+  static constexpr unsigned kStateBits = 10;
+  static constexpr unsigned kReservedBits =
+      64 - kLogicalSizeHighBits - kOffsetBits - kLengthBits - kStateBits;
+
+  static constexpr unsigned kOffsetShift = kLogicalSizeHighBits;
+  static constexpr unsigned kLengthShift = kOffsetShift + kOffsetBits;
+  static constexpr unsigned kInMemoryShift = kLengthShift + kLengthBits;
+  static constexpr unsigned kExternalShift = kInMemoryShift + 1;
+  static constexpr unsigned kKeyExternalShift = kExternalShift + 1;
+  static constexpr unsigned kShieldingShift = kKeyExternalShift + 1;
+  static constexpr unsigned kUnclaimedShift = kShieldingShift + 1;
+  static constexpr unsigned kTxTaggedShift = kUnclaimedShift + 1;
+  static constexpr unsigned kTypeCodeShift = kTxTaggedShift + 1;
+  static constexpr unsigned kHasExpiryShift = kTypeCodeShift + 3;
+
+  static constexpr std::uint64_t kBlockIdMask =
+      (std::uint64_t{1} << kBlockIdBits) - 1;
+  static constexpr std::uint64_t kLogicalSizeMask =
+      (std::uint64_t{1} << kLogicalSizeBits) - 1;
+  static constexpr std::uint64_t kLogicalSizeLowMask =
+      (std::uint64_t{1} << kLogicalSizeLowBits) - 1;
+  static constexpr std::uint64_t kLogicalSizeHighMask =
+      (std::uint64_t{1} << kLogicalSizeHighBits) - 1;
+  static constexpr std::uint64_t kOffsetMask =
+      (std::uint64_t{1} << kOffsetBits) - 1;
+  static constexpr std::uint64_t kLengthMask =
+      (std::uint64_t{1} << kLengthBits) - 1;
+  static constexpr std::uint8_t kTypeCodeMask = 0x7;
+  static constexpr std::uint8_t kTombstoneTypeCode = 0x7;
+
+  static_assert(kBlockIdBits == 43);
+  static_assert(kLogicalSizeLowBits == 21);
+  static_assert(kLogicalSizeHighBits == 9);
+  static_assert(kReservedBits == 5);
+  static_assert(kMaxBitmapBytes <= kLogicalSizeMask);
+  static_assert(kStorageBlockBytes / kRecordAlignment - 1 <= kOffsetMask);
+  static_assert((kStorageBlockBytes - kBlockHeaderBytes) / kRecordAlignment <=
+                kLengthMask);
+
+  RecordIndexValue() noexcept = default;
+  explicit RecordIndexValue(const RecordLocation& value) noexcept
+      : mutation_sequence_(value.mutation_sequence_),
+        block_and_logical_low_(
+            (value.block_id() & kBlockIdMask) |
+            ((static_cast<std::uint64_t>(value.logical_size_) &
+              kLogicalSizeLowMask)
+             << kBlockIdBits)),
+        metadata_(EncodeMetadata(value)) {
+    assert(value.logical_size_ <= kLogicalSizeMask);
+  }
+
+  std::uint64_t mutation_sequence_ = 0;
+
+  std::uint64_t block_id() const noexcept {
+    return block_and_logical_low_ & kBlockIdMask;
+  }
+  std::uint32_t logical_size() const noexcept {
+    const std::uint64_t low = block_and_logical_low_ >> kBlockIdBits;
+    const std::uint64_t high = metadata_ & kLogicalSizeHighMask;
+    return static_cast<std::uint32_t>(low | (high << kLogicalSizeLowBits));
+  }
+  std::uint32_t record_offset() const noexcept {
+    return static_cast<std::uint32_t>((metadata_ >> kOffsetShift) &
+                                      kOffsetMask) *
+           kRecordAlignment;
+  }
+  std::uint32_t total_disk_bytes() const noexcept {
+    return static_cast<std::uint32_t>((metadata_ >> kLengthShift) &
+                                      kLengthMask) *
+           kRecordAlignment;
+  }
+  bool in_memory() const noexcept { return Bit(kInMemoryShift); }
+  bool external() const noexcept { return Bit(kExternalShift); }
+  bool key_external() const noexcept { return Bit(kKeyExternalShift); }
+  bool shielding() const noexcept { return Bit(kShieldingShift); }
+  bool unclaimed() const noexcept { return Bit(kUnclaimedShift); }
+  bool tx_tagged() const noexcept { return Bit(kTxTaggedShift); }
+  bool has_expiry() const noexcept { return Bit(kHasExpiryShift); }
+  RecordKind kind() const noexcept {
+    return type_code() == kTombstoneTypeCode ? RecordKind::kTombstone
+                                             : RecordKind::kValue;
+  }
+  ValueType value_type() const noexcept {
+    return type_code() == kTombstoneTypeCode
+               ? ValueType::kNone
+               : static_cast<ValueType>(type_code());
+  }
+
+  void set_in_memory(bool value) noexcept {
+    SetBit(&metadata_, kInMemoryShift, value);
+  }
+  void set_shielding(bool value) noexcept {
+    SetBit(&metadata_, kShieldingShift, value);
+  }
+  void set_unclaimed(bool value) noexcept {
+    SetBit(&metadata_, kUnclaimedShift, value);
+  }
+  void set_tx_tagged(bool value) noexcept {
+    SetBit(&metadata_, kTxTaggedShift, value);
+  }
+
+ private:
+  static std::uint64_t EncodeMetadata(const RecordLocation& value) noexcept {
+    assert(value.record_offset() % kRecordAlignment == 0);
+    assert(value.total_disk_bytes() % kRecordAlignment == 0);
+    std::uint64_t bits =
+        (static_cast<std::uint64_t>(value.logical_size_) >>
+         kLogicalSizeLowBits) |
+        (static_cast<std::uint64_t>(value.record_offset() / kRecordAlignment)
+         << kOffsetShift) |
+        (static_cast<std::uint64_t>(value.total_disk_bytes() / kRecordAlignment)
+         << kLengthShift) |
+        (static_cast<std::uint64_t>(
+             value.kind() == RecordKind::kTombstone
+                 ? kTombstoneTypeCode
+                 : static_cast<std::uint8_t>(value.value_type()))
+         << kTypeCodeShift);
+    SetBit(&bits, kInMemoryShift, value.in_memory());
+    SetBit(&bits, kExternalShift, value.external());
+    SetBit(&bits, kKeyExternalShift, value.key_external());
+    SetBit(&bits, kShieldingShift, value.shielding());
+    SetBit(&bits, kUnclaimedShift, value.unclaimed());
+    SetBit(&bits, kTxTaggedShift, value.tx_tagged());
+    SetBit(&bits, kHasExpiryShift, value.has_expiry());
+    return bits;
+  }
+
+  static void SetBit(std::uint64_t* bits, unsigned shift, bool value) noexcept {
+    const std::uint64_t mask = std::uint64_t{1} << shift;
+    *bits = value ? (*bits | mask) : (*bits & ~mask);
+  }
+  bool Bit(unsigned shift) const noexcept {
+    return (metadata_ & (std::uint64_t{1} << shift)) != 0;
+  }
+  std::uint8_t type_code() const noexcept {
+    return static_cast<std::uint8_t>((metadata_ >> kTypeCodeShift) &
+                                     kTypeCodeMask);
+  }
+
+  std::uint64_t block_and_logical_low_ = 0;
+  std::uint64_t metadata_ = 0;
+};
+
+static_assert(sizeof(RecordIndexValue) == 24);
+
+// Record-index entries use a 32-byte common object for ordinary keys and a
+// derived 40-byte object only when an expiration timestamp exists. The
+// has-expiry bit is part of the compact common value, so checking it before
 // the downcast makes the concrete type an explicit allocation invariant.
 struct RecordIndexEntryPolicy {
-  using StoredValue = RecordLocationCore;
+  using StoredValue = RecordIndexValue;
   using Extra = std::uint64_t;
 
   static bool HasExtraValue(const RecordLocation& value) noexcept {
@@ -393,22 +555,28 @@ struct RecordIndexEntryPolicy {
     return value.has_expiry();
   }
   static StoredValue Store(const RecordLocation& value) noexcept {
-    StoredValue stored = value;
-    stored.metadata_.set_has_expiry(value.expire_at_ms_ != 0);
-    return stored;
+    return StoredValue(value);
   }
   static Extra StoreExtra(const RecordLocation& value) noexcept {
     return value.expire_at_ms_;
   }
-  static RecordLocation Load(const StoredValue& value,
-                             const Extra* extra) noexcept {
+  static RecordLocation Load(const StoredValue& value, const Extra* extra,
+                             std::uint64_t allocation_epoch,
+                             std::uint16_t block_owner) noexcept {
     assert(value.has_expiry() == (extra != nullptr));
-    return RecordLocation(value, extra == nullptr ? 0 : *extra);
+    return RecordLocation(
+        value.block_id(), value.mutation_sequence_, allocation_epoch,
+        extra == nullptr ? 0 : *extra, value.logical_size(),
+        RecordLocation::PackedMetadata::Encode(
+            value.record_offset(), value.total_disk_bytes(), block_owner,
+            value.in_memory(), value.external(), value.key_external(),
+            value.shielding(), value.unclaimed(), value.tx_tagged(),
+            value.kind(), value.value_type(), value.has_expiry()));
   }
   static void Assign(StoredValue* stored, Extra* extra,
                      const RecordLocation& value) noexcept {
-    *stored = value;
-    stored->metadata_.set_has_expiry(extra != nullptr);
+    *stored = StoredValue(value);
+    assert(stored->has_expiry() == (extra != nullptr));
     if (extra != nullptr) {
       *extra = value.expire_at_ms_;
     }
@@ -423,8 +591,8 @@ static_assert(static_cast<std::uint8_t>(ValueType::kStream) < (1U << 3));
 static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
 static_assert(alignof(RecordLocation) == 8);
-static_assert(sizeof(RecordIndex::Entry) == 40);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 48);
+static_assert(sizeof(RecordIndex::Entry) == 32);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 40);
 
 inline bool IsNewer(const RecordLocation& candidate,
                     const RecordLocation& current) noexcept {
@@ -599,11 +767,15 @@ inline constexpr std::uint16_t kUnownedBlock =
 // These live in a dense per-device array, so aligning to 32 keeps every entry
 // inside one cache line rather than letting some straddle two.
 //
-// The array is shared: any worker can address any entry. Only `owner` may be
-// read by a worker that does not own the block, which is why it alone is
-// atomic. Everything else is the owner's exclusive property, reached only
+// The array is shared: any worker can address any entry. A key-index owner may
+// read the immutable allocation epoch after acquiring `owner`; all other
+// non-atomic fields are the physical owner's exclusive property, reached only
 // after FindBlockState has confirmed ownership.
 struct alignas(32) BlockState {
+  // Reset initializes this before publishing owner_ with release semantics.
+  // Live-byte accounting keeps the allocation live while an index entry
+  // references it, so the epoch is immutable until no reader can materialize
+  // such an entry and the block can be retired.
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t committed_bytes_ = 0;
   std::uint32_t live_bytes_ = 0;
@@ -628,10 +800,12 @@ struct alignas(32) BlockState {
   bool release_pending_ : 1 = false;
   BlockKind kind_ = BlockKind::kRecords;
 
-  // The atomic member makes this non-assignable, and clearing an entry has to
-  // publish the new owner last so no one observes a half-reset block.
-  void Reset(std::uint16_t new_owner) noexcept {
-    allocation_epoch_ = 0;
+  // The atomic owner makes this non-assignable. Initialization and clearing
+  // publish the new owner last so an acquire load never observes a
+  // half-reset identity.
+  void Reset(std::uint16_t new_owner,
+             std::uint64_t new_allocation_epoch = 0) noexcept {
+    allocation_epoch_ = new_allocation_epoch;
     committed_bytes_ = 0;
     live_bytes_ = 0;
     pins_ = 0;
@@ -657,6 +831,22 @@ struct alignas(32) BlockState {
 // anything only an extent block needs belongs in the recovery-scoped map.
 static_assert(sizeof(BlockState) == 32);
 static_assert(alignof(BlockState) == 32);
+
+// Rebuild the self-contained runtime identity from a compact index entry. The
+// acquire owner load observes the epoch initialized before publication; live-
+// byte accounting prevents either field from changing while the entry is
+// current.
+inline RecordLocation MaterializePublishedIndexLocation(
+    const RecordIndex::Entry& entry, const BlockState& state) noexcept {
+  const std::uint16_t owner = state.owner_.load(std::memory_order_acquire);
+  const std::uint64_t allocation_epoch = state.allocation_epoch_;
+  assert(owner < kMaxMemoryWorkers);
+  assert(allocation_epoch != 0);
+  assert(RecordLocation::CanEncodeBlockIdentity(entry.value_.block_id(),
+                                                allocation_epoch));
+  return RecordIndexEntryPolicy::Load(entry.value_, entry.optional_extra(),
+                                      allocation_epoch, owner);
+}
 
 struct ExtentIdentity {
   std::uint32_t extent_index_ = 0;
@@ -2295,9 +2485,11 @@ class StorageEngine::Impl {
     return state.allocated_ ? &state : nullptr;
   }
 
-  BlockState& CreateBlockState(WorkerStore& store, std::uint64_t block_id) {
+  BlockState& CreateBlockState(WorkerStore& store, std::uint64_t block_id,
+                               std::uint64_t allocation_epoch) {
     BlockState& state = BlockStateAt(block_id);
-    state.Reset(static_cast<std::uint16_t>(store.worker_->id()));
+    state.Reset(static_cast<std::uint16_t>(store.worker_->id()),
+                allocation_epoch);
     return state;
   }
 
@@ -2431,8 +2623,8 @@ class StorageEngine::Impl {
     return device_block_states_[device_index][local - device.data_block_begin_];
   }
 
-  // Which worker owns a block, or kUnownedBlock if it is free. This is the one
-  // field a non-owner may read, so it is the only one that is atomic.
+  // Which worker owns a block, or kUnownedBlock if it is free. Along with the
+  // immutable allocation epoch, this is safe for a key owner to read directly.
   std::uint16_t BlockOwner(std::uint64_t block_id) const noexcept {
     const std::size_t device_index = DeviceIndexForBlock(block_id);
     const StorageDevice& device = devices_[device_index];
@@ -2443,6 +2635,20 @@ class StorageEngine::Impl {
     }
     return device_block_states_[device_index][local - device.data_block_begin_]
         .owner_.load(std::memory_order_acquire);
+  }
+
+  // Materialize the self-contained identity only while the entry is known to
+  // be current. Publication charges its record to an allocated BlockState,
+  // and retirement cannot reset that state until the index stops referencing
+  // it. The returned value then owns the epoch snapshot and is safe to carry
+  // across suspension even if a later relocation replaces the index entry.
+  RecordLocation MaterializeIndexLocation(
+      const RecordIndex::Entry& entry) const noexcept {
+    const std::uint64_t block_id = entry.value_.block_id();
+    const BlockState& state = const_cast<Impl*>(this)->BlockStateAt(block_id);
+    RecordLocation location = MaterializePublishedIndexLocation(entry, state);
+    assert(location.block_owner() < worker_count_);
+    return location;
   }
 
   std::uint16_t RecoveredBlockOwner(const BlockHeader& block,

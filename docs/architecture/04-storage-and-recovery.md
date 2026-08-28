@@ -48,8 +48,12 @@ each live transaction generation. Physical streams are per worker, not per
 logical partition, so active 8 MiB staging buffers scale with workers and live
 transaction generations rather than with 16,384 slots. A worker also owns the
 `BlockState` objects assigned to it, including committed and live byte counts,
-pins, staging identity, flush state, and defrag state. Other workers use Celer
-cross-core submissions to read or mutate owner-local state.
+pins, staging identity, flush state, and defrag state. The runtime owner and
+allocation epoch form immutable identity after publication and are the only
+fields a key-index owner may read directly. The owner is published atomically
+after epoch initialization, so an acquire owner read makes the immutable epoch
+visible without an extra worker hop. Other state remains owner-local and other
+workers use Celer cross-core submissions to read or mutate it.
 
 Logical key locks come from the transaction subsystem. Storage's pre-locked
 interfaces require the caller to run on the key owner with the correct shared
@@ -225,17 +229,23 @@ block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
 
-The runtime index uses a 40-byte base entry for keys without expiration and a
-48-byte derived entry for keys with expiration. The common entry contains an
-8-byte hash/key prefix and a 32-byte `RecordLocationCore`; only the derived
-type adds the aligned 64-bit expiration timestamp. One bit in the packed state
-word discriminates the concrete allocation type and four bits remain reserved.
-A standalone 40-byte `RecordLocation` materializes the core plus optional
-timestamp when metadata crosses the index boundary. The core combines the
-configured 43-bit block-ID range with a 53-bit allocation epoch, and packs
-aligned record offset, aligned length, current worker owner, type, and hot
-state into one 64-bit word. These are runtime representations only: block and
-record headers retain their full durable fields.
+The runtime index uses a 32-byte base entry for keys without expiration and a
+40-byte derived entry for keys with expiration. The common entry contains an
+8-byte hash/key prefix and a 24-byte packed value; only the derived type adds
+the aligned 64-bit expiration timestamp. The packed value keeps the mutation
+sequence, 43-bit block ID, aligned record offset and length, logical size,
+type, and hot state. It does not repeat the physical block's allocation epoch
+or runtime owner for every key: those already live once in the dense
+`BlockState`, and five packed bits remain reserved.
+
+Before a location crosses an index boundary, the key owner acquire-loads the
+block's atomic owner, reads its published immutable allocation epoch, and
+materializes a standalone 40-byte `RecordLocation`. That snapshot remains
+self-contained across suspension and is validated by the physical owner, so
+removing the duplicate index fields does not weaken block-reuse/ABA protection
+or add a cross-core submission.
+These are runtime representations only: block and record headers retain their
+full durable fields.
 
 An overwrite whose TTL presence does not change updates the entry in place.
 Adding or removing TTL swaps the corresponding base or derived object into the

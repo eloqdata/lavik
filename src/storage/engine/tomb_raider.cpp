@@ -615,7 +615,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
                 .key_ = entry.key_complete() ? std::string(entry.key())
                                              : std::string{},
                 .extents_ = DependentExtentsFor(store, &entry),
-                .location_ = entry.value(),
+                .location_ = MaterializeIndexLocation(entry),
                 .key_bytes_ = entry.logical_key_size(),
                 .db_id_ = db_id,
             });
@@ -658,7 +658,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
         !entry->value_.unclaimed()) {
       continue;  // rewritten or claimed since collection
     }
-    const RecordLocation dropped = entry->value();
+    const RecordLocation dropped = MaterializeIndexLocation(*entry);
     const ExtentManifest dropped_dependent_extents =
         DependentExtentsFor(store, entry);
     // No watcher or replica cares: erasing a tombstone changes nothing a

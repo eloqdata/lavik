@@ -214,7 +214,7 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     }
 
     SnapshotValue old{
-        .location_ = current->value(),
+        .location_ = MaterializeIndexLocation(*current),
         .extents_ = ExtentsFor(store, current),
         .phase_ = Phase::kOldValue,
     };
@@ -282,7 +282,7 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     }
     current = *resolved;
     if (current != nullptr &&
-        current->value_.SamePhysicalRecord(old.location_)) {
+        MaterializeIndexLocation(*current).SamePhysicalRecord(old.location_)) {
       capture->dirty_keys_.InsertNew(map_digest, map_key, old);
       assert(capture->capture_admissions_ != 0);
       --capture->capture_admissions_;
@@ -351,7 +351,7 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
             "post-cut RDB key has no ABSENT/old-value capture");
       }
       SavedValue candidate{
-          .location_ = current->value(),
+          .location_ = MaterializeIndexLocation(*current),
           .extents_ = ExtentsFor(store, current),
           .phase_ = Phase::kInflight,
       };
@@ -369,7 +369,8 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
       }
       current = *resolved;
       if (current != nullptr &&
-          current->value_.SamePhysicalRecord(saved->value_.location_)) {
+          MaterializeIndexLocation(*current).SamePhysicalRecord(
+              saved->value_.location_)) {
         break;
       }
       (void)co_await ReleaseRdbSnapshotValue(&saved->value_);

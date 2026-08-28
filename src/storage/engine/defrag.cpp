@@ -374,7 +374,8 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   RecordIndex::Entry* current = nullptr;
   for (RecordIndex::Entry* candidate :
        index.FindCandidates(record.digest_, key)) {
-    if (candidate->value_.SamePhysicalRecord(source_location)) {
+    if (MaterializeIndexLocation(*candidate)
+            .SamePhysicalRecord(source_location)) {
       current = candidate;
       break;
     }

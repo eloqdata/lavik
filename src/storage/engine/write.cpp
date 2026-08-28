@@ -113,7 +113,8 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
           "WRONGTYPE Operation against a key holding the wrong kind of value");
     }
     auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                     found->value(), ExtentsFor(store, found));
+                                     MaterializeIndexLocation(*found),
+                                     ExtentsFor(store, found));
     if (!loaded.ok()) {
       co_return loaded.status();
     }
@@ -216,7 +217,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::UpdateExpirationLocked(
     co_return true;
   }
 
-  const RecordLocation previous = found->value();
+  const RecordLocation previous = MaterializeIndexLocation(*found);
   auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
                                    previous, ExtentsFor(store, found));
   if (!loaded.ok()) {
@@ -693,12 +694,12 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
   for (auto it = undo.entries_.rbegin(); it != undo.entries_.rend(); ++it) {
     TxUndoEntry& entry = *it;
     RecordIndex::Entry* current = undo.Current(entry.entry_handle_);
-    const RecordLocation applied = current->value();
+    const RecordLocation applied = MaterializeIndexLocation(*current);
     std::string loaded_key;
     if (!current->key_complete()) [[unlikely]] {
-      auto key = co_await LoadOutOfIndexKey(store, current->value(),
-                                            ExtentsFor(store, current),
-                                            current->logical_key_size());
+      auto key = co_await LoadOutOfIndexKey(
+          store, MaterializeIndexLocation(*current), ExtentsFor(store, current),
+          current->logical_key_size());
       if (!key.ok()) {
         store.write_failed_ = true;
         co_return key.status();
@@ -980,10 +981,10 @@ StorageEngine::Impl::WriteExtentValueLocked(WorkerStore& store,
     const std::size_t payload_bytes =
         static_cast<std::size_t>(std::min<std::uint64_t>(
             kExtentPayloadBytes, logical_bytes - payload_offset));
-    BlockState& state = CreateBlockState(store, reserved->block_id_);
+    BlockState& state = CreateBlockState(store, reserved->block_id_,
+                                         reserved->allocation_epoch_);
     state.writer_id_ = store.worker_->id();
     state.layout_worker_count_ = worker_count_;
-    state.allocation_epoch_ = reserved->allocation_epoch_;
     state.committed_bytes_ =
         static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes);
     // An extent block is written whole right here and never enters the flush
@@ -1704,10 +1705,10 @@ acquire_active_stream:
           .kind_ = append_block_kind,
           .tx_generation_ = tx_generation,
       };
-      BlockState& state = CreateBlockState(store, block_id);
+      BlockState& state = CreateBlockState(
+          store, block_id, active_stream()->allocation_epoch_);
       state.writer_id_ = writer_id;
       state.layout_worker_count_ = worker_count_;
-      state.allocation_epoch_ = active_stream()->allocation_epoch_;
       state.committed_bytes_ = kBlockHeaderBytes;
       state.live_bytes_ = 0;
       state.pins_ = 0;
@@ -1761,7 +1762,7 @@ acquire_active_stream:
        partition_ptr->replication_epoch_ != relocation->replication_epoch_ ||
        store.index_generations_[db_id] != relocation->index_generation_ ||
        previous_entry == nullptr ||
-       !relocation->Matches(previous_entry->value_))) {
+       !relocation->Matches(MaterializeIndexLocation(*previous_entry)))) {
     co_return absl::Status(absl::StatusCode::kAborted,
                            "relocation source changed while waiting");
   }
@@ -1804,7 +1805,8 @@ acquire_active_stream:
   const std::optional<RecordLocation> previous =
       previous_entry == nullptr
           ? std::nullopt
-          : std::optional<RecordLocation>(previous_entry->value());
+          : std::optional<RecordLocation>(
+                MaterializeIndexLocation(*previous_entry));
   const ExtentManifest previous_extents = ExtentsFor(store, previous_entry);
   const ExtentManifest retired_value_extents = ExtentsNotReferencedBy(
       previous_extents, external && !key_external ? extents : nullptr);

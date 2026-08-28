@@ -1,4 +1,6 @@
+#include <atomic>
 #include <limits>
+#include <thread>
 
 #include "../src/storage/engine/impl.h"
 #include "gtest/gtest.h"
@@ -93,8 +95,116 @@ static_assert(sizeof(RecordLocation::PackedMetadata) == sizeof(std::uint64_t));
 static_assert(RecordLocation::PackedMetadata::kReservedBits == 4);
 static_assert(sizeof(RecordLocationCore) == 32);
 static_assert(sizeof(RecordLocation) == 40);
-static_assert(sizeof(RecordIndex::Entry) == 40);
-static_assert(sizeof(RecordIndex::ExtendedEntry) == 48);
+static_assert(sizeof(RecordIndexValue) == 24);
+static_assert(RecordIndexValue::kReservedBits == 5);
+static_assert(sizeof(RecordIndex::Entry) == 32);
+static_assert(sizeof(RecordIndex::ExtendedEntry) == 40);
+
+RecordLocation MaterializeForTest(const RecordIndex::Entry& entry,
+                                  std::uint64_t allocation_epoch,
+                                  std::uint16_t block_owner = 0) {
+  return RecordIndexEntryPolicy::Load(entry.value_, entry.optional_extra(),
+                                      allocation_epoch, block_owner);
+}
+
+TEST(RecordLocationTest, CompactIndexValueMaterializesCompleteBlockIdentity) {
+  constexpr std::uint64_t expiry = 4'102'444'800'123ULL;
+  constexpr std::uint16_t owner = kMaxMemoryWorkers - 1;
+  const RecordLocation location(
+      RecordLocation::kBlockIdMask, std::numeric_limits<std::uint64_t>::max(),
+      RecordLocation::kAllocationEpochMask, expiry,
+      static_cast<std::uint32_t>(kMaxBitmapBytes),
+      RecordLocation::PackedMetadata::Encode(
+          kStorageBlockBytes - kRecordAlignment,
+          kStorageBlockBytes - kBlockHeaderBytes, owner, true, true, true, true,
+          true, true, RecordKind::kTombstone, ValueType::kNone));
+
+  const RecordIndexValue compact(location);
+  const RecordLocation restored = RecordIndexEntryPolicy::Load(
+      compact, &expiry, location.allocation_epoch(), owner);
+
+  EXPECT_EQ(restored.block_id(), location.block_id());
+  EXPECT_EQ(restored.allocation_epoch(), location.allocation_epoch());
+  EXPECT_EQ(restored.block_owner(), owner);
+  EXPECT_EQ(restored.mutation_sequence_, location.mutation_sequence_);
+  EXPECT_EQ(restored.logical_size_, location.logical_size_);
+  EXPECT_EQ(restored.record_offset(), location.record_offset());
+  EXPECT_EQ(restored.total_disk_bytes(), location.total_disk_bytes());
+  EXPECT_EQ(restored.expire_at_ms_, expiry);
+  EXPECT_TRUE(restored.in_memory());
+  EXPECT_TRUE(restored.external());
+  EXPECT_TRUE(restored.key_external());
+  EXPECT_TRUE(restored.shielding());
+  EXPECT_TRUE(restored.unclaimed());
+  EXPECT_TRUE(restored.tx_tagged());
+  EXPECT_TRUE(restored.has_expiry());
+  EXPECT_EQ(restored.kind(), RecordKind::kTombstone);
+}
+
+TEST(RecordLocationTest, RemoteMaterializationRejectsReusedBlockByEpoch) {
+  constexpr std::uint64_t block_id = 37;
+  constexpr std::uint64_t old_epoch = 101;
+  constexpr std::uint64_t new_epoch = 102;
+  constexpr std::uint16_t remote_owner = 3;
+  const auto metadata = RecordLocation::PackedMetadata::Encode(
+      kBlockHeaderBytes, kRecordAlignment, remote_owner, false, false, false,
+      false, false, false, RecordKind::kValue, ValueType::kString);
+
+  RecordIndex old_index;
+  RecordIndex::Entry* old_entry = old_index.InsertNew(
+      ComputeDigest("old"), "old",
+      RecordLocation(block_id, 1, old_epoch, 0, 7, metadata));
+  RecordIndex new_index;
+  const RecordIndex::Entry* new_entry = new_index.InsertNew(
+      ComputeDigest("new"), "new",
+      RecordLocation(block_id, 2, new_epoch, 0, 7, metadata));
+
+  BlockState state;
+  state.Reset(remote_owner, old_epoch);
+  state.allocated_ = true;
+
+  std::atomic<bool> old_materialized{false};
+  std::atomic<bool> block_reused{false};
+  RecordLocation old_location;
+  RecordLocation current_location;
+  std::thread remote_reader([&] {
+    old_location = MaterializePublishedIndexLocation(*old_entry, state);
+    old_materialized.store(true, std::memory_order_release);
+    while (!block_reused.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    current_location = MaterializePublishedIndexLocation(*new_entry, state);
+  });
+
+  while (!old_materialized.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  const bool retired = old_index.Erase(old_entry);
+  state.Reset(kUnownedBlock);
+  state.Reset(remote_owner, new_epoch);
+  state.allocated_ = true;
+  block_reused.store(true, std::memory_order_release);
+  remote_reader.join();
+
+  ASSERT_TRUE(retired);
+  EXPECT_EQ(old_location.block_id(), current_location.block_id());
+  EXPECT_EQ(old_location.block_owner(), current_location.block_owner());
+  EXPECT_EQ(old_location.record_offset(), current_location.record_offset());
+  EXPECT_NE(old_location.allocation_epoch(),
+            current_location.allocation_epoch());
+  EXPECT_FALSE(old_location.SamePhysicalRecord(current_location));
+
+  // Physical-owner validation observes the same block and owner after reuse;
+  // only the self-contained epoch prevents the old snapshot from being
+  // accepted as the new allocation.
+  const auto is_current_allocation = [&](const RecordLocation& location) {
+    const std::uint16_t owner = state.owner_.load(std::memory_order_acquire);
+    return owner == location.block_owner() &&
+           state.allocation_epoch_ == location.allocation_epoch();
+  };
+  EXPECT_FALSE(is_current_allocation(old_location));
+  EXPECT_TRUE(is_current_allocation(current_location));
+}
 
 TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   const auto metadata = RecordLocation::PackedMetadata::Encode(
@@ -106,7 +216,7 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   RecordIndex::Entry* ordinary =
       index.InsertNew(digest, "key", RecordLocation(1, 2, 3, 0, 4, metadata));
   ASSERT_FALSE(ordinary->has_extra());
-  EXPECT_EQ(ordinary->value().expire_at_ms_, 0);
+  EXPECT_EQ(MaterializeForTest(*ordinary, 3).expire_at_ms_, 0);
   EXPECT_EQ(ordinary->key(), "key");
 
   RecordIndex::Entry* replaced = nullptr;
@@ -115,7 +225,7 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   ASSERT_NE(replaced, nullptr);
   EXPECT_NE(expiring, ordinary);
   ASSERT_TRUE(expiring->has_extra());
-  EXPECT_EQ(expiring->value().expire_at_ms_, 1234);
+  EXPECT_EQ(MaterializeForTest(*expiring, 7).expire_at_ms_, 1234);
   EXPECT_EQ(expiring->key(), "key");
   const std::uint32_t ordinary_hash = replaced->hash_;
   const std::uintptr_t ordinary_address =
@@ -135,7 +245,7 @@ TEST(RecordLocationTest, RecordIndexAllocatesExpirySubtypeOnlyWhenNeeded) {
   ASSERT_NE(replaced, nullptr);
   EXPECT_NE(ordinary, expiring);
   EXPECT_FALSE(ordinary->has_extra());
-  EXPECT_EQ(ordinary->value().expire_at_ms_, 0);
+  EXPECT_EQ(MaterializeForTest(*ordinary, 11).expire_at_ms_, 0);
   EXPECT_EQ(ordinary->key(), "key");
   const std::uint32_t expiring_hash = replaced->hash_;
   const std::uintptr_t expiring_address =

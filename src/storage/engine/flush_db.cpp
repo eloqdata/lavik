@@ -328,9 +328,10 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
     // folded into the per-block totals.
     std::vector<std::shared_ptr<const std::vector<ExtentRef>>> dead_extents;
     detached.index_.ForEach([&](const RecordIndex::Entry& entry) {
-      BlockDelta& delta = dead_by_block[std::pair(
-          entry.value_.block_id(), entry.value_.allocation_epoch())];
-      delta.block_owner_ = entry.value_.block_owner();
+      const RecordLocation location = MaterializeIndexLocation(entry);
+      BlockDelta& delta = dead_by_block[std::pair(location.block_id(),
+                                                  location.allocation_epoch())];
+      delta.block_owner_ = location.block_owner();
       delta.bytes_ += entry.value_.total_disk_bytes();
       if (entry.value_.tx_tagged()) {
         delta.tagged_bytes_ += entry.value_.total_disk_bytes();

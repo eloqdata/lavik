@@ -110,7 +110,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
 
   tx::CurrentTxShard().MarkWatched(candidate.db_id_,
                                    tx::FingerprintOf(candidate.digest_));
-  const RecordLocation dropped = current->value();
+  const RecordLocation dropped = MaterializeIndexLocation(*current);
   const ExtentManifest dropped_extents = ExtentsFor(store, current);
   const ExtentManifest dropped_dependent_extents =
       DependentExtentsFor(store, current);
@@ -202,7 +202,7 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
                       .entry_address_ =
                           reinterpret_cast<std::uintptr_t>(&entry),
                       .extents_ = ExtentsFor(*store, &entry),
-                      .location_ = entry.value(),
+                      .location_ = MaterializeIndexLocation(entry),
                       .hash_ = entry.hash_,
                       .key_bytes_ = entry.logical_key_size(),
                   });
@@ -219,7 +219,8 @@ Task<absl::Status> StorageEngine::Impl::ActiveExpiration(WorkerStore* store) {
           RecordIndex::Entry* current =
               index.FindAddress(candidate.entry_address_, candidate.hash_);
           if (current == nullptr) continue;
-          if (current->value_.SamePhysicalRecord(candidate.location_) &&
+          if (MaterializeIndexLocation(*current).SamePhysicalRecord(
+                  candidate.location_) &&
               IsExpired(*current, now_ms)) {
             QueueExpiredCandidate(*store, partition.id_, db_id, *current, *key);
           }

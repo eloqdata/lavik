@@ -114,7 +114,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     }
     const std::uintptr_t identity = reinterpret_cast<std::uintptr_t>(selected);
     const std::uint64_t hash = selected->hash_;
-    const RecordLocation location = selected->value();
+    const RecordLocation location = MaterializeIndexLocation(*selected);
     const ExtentManifest extents = ExtentsFor(store, selected);
     const std::uint32_t key_bytes = selected->logical_key_size();
     const std::uint64_t index_generation = store.index_generations_[db_id];
@@ -127,7 +127,8 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     if (store.index_generations_[db_id] != index_generation ||
         DbEpoch(db_id) != db_epoch ||
         partition.replication_epoch_ != replication_epoch ||
-        current == nullptr || !current->value_.SamePhysicalRecord(location) ||
+        current == nullptr ||
+        !MaterializeIndexLocation(*current).SamePhysicalRecord(location) ||
         current->value_.kind() != RecordKind::kValue ||
         IsExpired(*current, UnixTimeMillis())) {
       co_return std::optional<std::string>{};
@@ -258,9 +259,9 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     trace->lookup_done_ns_ = ReadTraceNowNanos();
   }
 
-  auto loaded =
-      co_await LoadValue(store, partition, db_id, key, digest, found->value(),
-                         ExtentsFor(store, found), trace);
+  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                   MaterializeIndexLocation(*found),
+                                   ExtentsFor(store, found), trace);
   if (!loaded.ok()) {
     co_return loaded.status();
   }
@@ -316,7 +317,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       continue;
     }
 
-    const RecordLocation location = found->value();
+    const RecordLocation location = MaterializeIndexLocation(*found);
     if (location.external() || location.block_owner() != store.worker_->id() ||
         location.in_memory()) {
       fallbacks.push_back(i);
@@ -570,7 +571,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
         absl::StatusCode::kInvalidArgument,
         "WRONGTYPE Operation against a key holding the wrong kind of value");
   }
-  co_return found->value_.logical_size_;
+  co_return found->value_.logical_size();
 }
 
 Task<ExpirationInfo> StorageEngine::Impl::GetExpiration(std::uint8_t db_id,
@@ -633,7 +634,7 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
     co_return absl::NotFoundError("key not found");
   }
 
-  const RecordLocation location = found->value();
+  const RecordLocation location = MaterializeIndexLocation(*found);
   const ExtentManifest extents = ExtentsFor(store, found);
   const std::uint64_t index_generation = store.index_generations_[db_id];
   const std::uint64_t db_epoch = DbEpoch(db_id);
@@ -834,13 +835,13 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
       // skip NotFound and foreground GET produces a nil reply.
       co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
     }
-    if (current->value_.SamePhysicalRecord(location)) {
+    if (MaterializeIndexLocation(*current).SamePhysicalRecord(location)) {
       // The index still endorses the location that failed validation, so this
       // is corruption rather than a relocation race. Preserve a hard error.
       co_return absl::Status(absl::StatusCode::kInternal,
                              loaded.status().message());
     }
-    location = current->value();
+    location = MaterializeIndexLocation(*current);
     extents = ExtentsFor(key_store, current);
   }
 }
@@ -1126,7 +1127,8 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::VerifyExternalKey(
     co_return false;
   }
   if (!entry.value_.external()) {
-    co_return co_await VerifyInlineRecordKey(store, entry.value(), key);
+    co_return co_await VerifyInlineRecordKey(
+        store, MaterializeIndexLocation(entry), key);
   }
   co_return co_await VerifyExternalKeyExtents(store, ExtentsFor(store, &entry),
                                               key);
@@ -1297,7 +1299,7 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
       candidates.push_back(Candidate{
           .entry_address_ = reinterpret_cast<std::uintptr_t>(entry),
           .extents_ = ExtentsFor(store, entry),
-          .location_ = entry->value(),
+          .location_ = MaterializeIndexLocation(*entry),
           .hash_ = entry->hash_,
       });
     }
@@ -1315,7 +1317,8 @@ StorageEngine::Impl::FindVerifiedEntry(WorkerStore& store, RecordIndex& index,
           index.FindAddress(candidate.entry_address_, candidate.hash_);
       const bool still_current =
           current != nullptr &&
-          current->value_.SamePhysicalRecord(candidate.location_);
+          MaterializeIndexLocation(*current).SamePhysicalRecord(
+              candidate.location_);
       if (!verified.ok()) {
         if (verified.status().code() == absl::StatusCode::kAborted &&
             !still_current) {

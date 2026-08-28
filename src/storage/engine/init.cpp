@@ -973,7 +973,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       while (!exhausted) {
         exhausted = index.ScanStableWhile(
             &cursor, [&](const RecordIndex::Entry& entry) {
-              const RecordLocation location = entry.value();
+              const RecordLocation location = MaterializeIndexLocation(entry);
               if (location.block_owner() >= worker_count_) {
                 status = absl::InternalError(
                     "recovery live root has no scanned block owner");
@@ -1166,7 +1166,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
           Fail(deleted.status());
           co_return deleted.status();
         }
-        const RecordLocation dropped = current->value();
+        const RecordLocation dropped = MaterializeIndexLocation(*current);
         value_extents = ExtentsFor(store, current);
         retired = RetiredRecordOf(dropped, DependentExtentsFor(store, current));
         --partition.live_key_count_[expired.db_id_];
