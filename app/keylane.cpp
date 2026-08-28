@@ -129,6 +129,10 @@ int main(int argc, char** argv) {
   app.add_option("-t,--threads", options.thread_count_, "Worker thread count")
       ->capture_default_str()
       ->check(CLI::PositiveNumber);
+  app.add_option("--maxclients", options.max_clients_,
+                 "Maximum concurrent client connections")
+      ->capture_default_str()
+      ->check(CLI::PositiveNumber);
   app.add_flag("--pin-workers,!--no-pin-workers", options.pin_workers_,
                "Pin workers one-to-one to CPUs in the inherited affinity mask")
       ->capture_default_str();

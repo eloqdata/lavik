@@ -5,6 +5,7 @@
 #include <openssl/sha.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -40,6 +42,7 @@
 #include "celer/net/tcp_stream.h"
 #include "celer/net/tls.h"
 #include "celer/runtime/sync.h"
+#include "client_limit.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/config.h"
@@ -73,6 +76,50 @@ constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
     1,    2,    3,    4,    5,    8,     10,    15,   20,  30,
     40,   50,   75,   100,  150,  200,   300,   500,  750, 1000,
     1500, 2000, 3000, 5000, 8000, 10000, 20000, 50000};
+
+// Client sockets must never consume the descriptors needed by listeners,
+// io_uring, storage, replication, metrics, logging, and transient maintenance
+// work. This is deliberately larger than Redis's reserve because Keylane has
+// several multi-worker subsystems that keep descriptors open.
+constexpr std::uint64_t kMaxClientsFileDescriptorReserve = 256;
+
+absl::StatusOr<std::uint64_t> MaxClientsAllowedByFileLimit(
+    std::uint64_t requested) {
+  rlimit limit{};
+  if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+    return absl::InternalError(
+        absl::StrCat("unable to read RLIMIT_NOFILE: ", std::strerror(errno)));
+  }
+  if (limit.rlim_cur == RLIM_INFINITY) return requested;
+
+  const rlim_t rlim_max = std::numeric_limits<rlim_t>::max();
+  const bool wanted_is_infinite =
+      requested > rlim_max - kMaxClientsFileDescriptorReserve;
+  const rlim_t wanted =
+      wanted_is_infinite
+          ? RLIM_INFINITY
+          : static_cast<rlim_t>(requested + kMaxClientsFileDescriptorReserve);
+  if (limit.rlim_cur < wanted) {
+    const rlim_t target = limit.rlim_max == RLIM_INFINITY
+                              ? wanted
+                              : std::min(wanted, limit.rlim_max);
+    if (target > limit.rlim_cur) {
+      rlimit raised = limit;
+      raised.rlim_cur = target;
+      if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+        limit.rlim_cur = target;
+      } else {
+        spdlog::warn("unable to raise RLIMIT_NOFILE from {} to {}: {}",
+                     limit.rlim_cur, target, std::strerror(errno));
+      }
+    }
+  }
+
+  if (limit.rlim_cur == RLIM_INFINITY) return requested;
+  if (limit.rlim_cur <= kMaxClientsFileDescriptorReserve) return 0;
+  return std::min<std::uint64_t>(
+      requested, limit.rlim_cur - kMaxClientsFileDescriptorReserve);
+}
 
 struct LatencyDistribution {
   std::uint64_t sum_ns_ = 0;
@@ -603,18 +650,20 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
 class RequestInputBuffer;
 class CommandBatch;
 
-class RedisService final : public TcpService {
+class RedisService final : public TcpService, public ClientLimit {
  public:
   RedisService(std::uint16_t port, storage::StorageEngine* storage,
                ReplicationManager* replication,
                long online_mimalloc_purge_delay_ms,
-               std::string_view requirepass, std::string load_rdb_file)
+               std::string_view requirepass, std::string load_rdb_file,
+               std::uint64_t max_clients)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
         online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms),
         authenticator_(requirepass),
-        load_rdb_file_(std::move(load_rdb_file)) {}
+        load_rdb_file_(std::move(load_rdb_file)),
+        max_clients_(max_clients) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -627,8 +676,14 @@ class RedisService final : public TcpService {
   bool ready() const noexcept { return ready_.load(std::memory_order_acquire); }
   void StopAcceptingRequests() noexcept;
   void WaitForRequestsDrained() const noexcept;
+  std::uint64_t max_clients() const noexcept override {
+    return max_clients_.load(std::memory_order_acquire);
+  }
+  absl::Status SetMaxClients(std::uint64_t value) override;
 
  protected:
+  bool AdmitConnection(int fd, bool tls_endpoint) noexcept override;
+  void OnConnectionClosed() noexcept override;
   Task<absl::Status> Serve(TcpStream stream) override;
 
  private:
@@ -673,6 +728,10 @@ class RedisService final : public TcpService {
   long online_mimalloc_purge_delay_ms_;
   PasswordAuthenticator authenticator_;
   std::string load_rdb_file_;
+  // Only RedisService owns these counters. Other TcpService users, including
+  // the metrics HTTP service, never participate in maxclients admission.
+  std::atomic<std::uint64_t> max_clients_;
+  std::atomic<std::uint64_t> active_clients_{0};
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
   std::unique_ptr<CoroutineBarrier> online_allocator_barrier_;
@@ -684,7 +743,56 @@ class RedisService final : public TcpService {
   std::atomic<std::uint64_t> request_gate_{0};
 };
 
+bool RedisService::AdmitConnection(int fd, bool tls_endpoint) noexcept {
+  std::uint64_t active = active_clients_.load(std::memory_order_relaxed);
+  while (active < max_clients_.load(std::memory_order_acquire)) {
+    if (active_clients_.compare_exchange_weak(active, active + 1,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+
+  if (tls_endpoint) return false;
+
+  constexpr std::string_view kMaxClientsError =
+      "-ERR max number of clients reached\r\n";
+  std::string_view remaining = kMaxClientsError;
+  while (!remaining.empty()) {
+    const ssize_t sent = ::send(fd, remaining.data(), remaining.size(),
+                                MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (sent > 0) {
+      remaining.remove_prefix(static_cast<std::size_t>(sent));
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    return false;
+  }
+  return false;
+}
+
+absl::Status RedisService::SetMaxClients(std::uint64_t value) {
+  auto allowed = MaxClientsAllowedByFileLimit(value);
+  if (!allowed.ok()) return allowed.status();
+  if (*allowed < value) {
+    return absl::ResourceExhaustedError(absl::StrCat(
+        "maxclients ", value, " cannot preserve ",
+        kMaxClientsFileDescriptorReserve,
+        " file descriptors with the current RLIMIT_NOFILE; maximum is ",
+        *allowed));
+  }
+  max_clients_.store(value, std::memory_order_release);
+  return absl::OkStatus();
+}
+
+void RedisService::OnConnectionClosed() noexcept {
+  const std::uint64_t previous =
+      active_clients_.fetch_sub(1, std::memory_order_acq_rel);
+  assert(previous != 0);
+}
+
 void RedisService::Prepare(unsigned thread_count) {
+  active_clients_.store(0, std::memory_order_relaxed);
   TcpService::Prepare(thread_count);
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
@@ -1821,6 +1929,27 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
+  auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
+  if (!allowed_max_clients.ok()) {
+    spdlog::error("maxclients file-descriptor setup failed: {}",
+                  allowed_max_clients.status().message());
+    return 1;
+  }
+  if (*allowed_max_clients == 0) {
+    spdlog::error(
+        "RLIMIT_NOFILE cannot preserve the {} file descriptors reserved "
+        "outside maxclients",
+        kMaxClientsFileDescriptorReserve);
+    return 1;
+  }
+  if (*allowed_max_clients < options.max_clients_) {
+    spdlog::warn(
+        "reducing maxclients from {} to {} to preserve {} file descriptors "
+        "under RLIMIT_NOFILE",
+        options.max_clients_, *allowed_max_clients,
+        kMaxClientsFileDescriptorReserve);
+    options.max_clients_ = *allowed_max_clients;
+  }
   if (options.load_rdb_replace_) {
     // Never erase storage for a missing, corrupt, or unsupported source.
     // ImportRdb validates again immediately before application so a source
@@ -1947,7 +2076,9 @@ int RunServer(ServerOptions options) {
       mi_option_get(mi_option_arena_eager_commit),
       mi_option_get(mi_option_allow_thp));
   spdlog::info(
-      "keylane version={} listening on {}:{} tls_port={} metrics_port={} threads={} "
+      "keylane version={} listening on {}:{} tls_port={} metrics_port={} "
+      "threads={} "
+      "maxclients={} maxclients_fd_reserve={} "
       "pin_workers={} "
       "idle_timeout_ms={} "
       "busy_poll_us={} foreground_budget_us={} background_budget_us={} "
@@ -1963,10 +2094,11 @@ int RunServer(ServerOptions options) {
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
       "defrag_record_sleep_us={} defrag_paused={}",
       kVersion, bind_display, options.port_, options.tls_port_,
-      options.metrics_port_,
-      options.thread_count_, options.pin_workers_, options.idle_timeout_ms_,
-      options.busy_poll_us_, options.foreground_budget_us_,
-      options.background_budget_us_, options.background_warrant_percent_,
+      options.metrics_port_, options.thread_count_, options.max_clients_,
+      kMaxClientsFileDescriptorReserve, options.pin_workers_,
+      options.idle_timeout_ms_, options.busy_poll_us_,
+      options.foreground_budget_us_, options.background_budget_us_,
+      options.background_warrant_percent_,
       options.spdk_max_completions_per_poll_,
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
@@ -2075,7 +2207,8 @@ int RunServer(ServerOptions options) {
 
   RedisService redis(options.port_, &storage, &replication,
                      options.mimalloc_purge_delay_ms_, options.requirepass_,
-                     std::move(options.load_rdb_file_));
+                     std::move(options.load_rdb_file_), options.max_clients_);
+  InitClientLimit(&redis);
   if (tls_server_context != nullptr) {
     redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));
   }
@@ -2117,6 +2250,7 @@ int RunServer(ServerOptions options) {
     server.RequestStop();
   }
   server.WaitUntilStopped();
+  InitClientLimit(nullptr);
   const int exit_code = redis.startup_failed() || shutdown_exit_code != 0
                             ? 1
                             : server.exit_code();

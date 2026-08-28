@@ -14,6 +14,7 @@
 namespace keylane {
 
 inline constexpr long kDefaultMimallocPurgeDelayMs = 60'000;
+inline constexpr std::uint64_t kDefaultMaxClients = 10'000;
 
 struct ServerOptions {
   std::string config_file_;
@@ -31,6 +32,7 @@ struct ServerOptions {
   std::string masteruser_ = "default";
   std::string masterauth_;
   unsigned thread_count_ = 1;
+  std::uint64_t max_clients_ = kDefaultMaxClients;
   bool pin_workers_ = true;
   int idle_timeout_ms_ = -1;
   unsigned recv_buffer_count_ = 1024;

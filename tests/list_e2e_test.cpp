@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <future>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -191,6 +193,29 @@ int ConnectSocket(std::uint16_t port) {
     return -1;
   }
   return fd;
+}
+
+std::string HttpGet(std::uint16_t port, std::string_view target) {
+  const auto deadline = std::chrono::steady_clock::now() + 30s;
+  int fd = -1;
+  while (fd < 0 && std::chrono::steady_clock::now() < deadline) {
+    fd = ConnectSocket(port);
+    if (fd < 0) std::this_thread::sleep_for(10ms);
+  }
+  if (fd < 0) throw std::runtime_error("timed out connecting to HTTP port");
+
+  SendAll(fd, "GET " + std::string(target) +
+                  " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  std::string response;
+  char buffer[4096];
+  while (true) {
+    const ssize_t received = ::recv(fd, buffer, sizeof(buffer), 0);
+    if (received < 0 && errno == EINTR) continue;
+    if (received <= 0) break;
+    response.append(buffer, static_cast<std::size_t>(received));
+  }
+  ::close(fd);
+  return response;
 }
 
 class RespClient {
@@ -481,12 +506,18 @@ class ServerProcess {
       std::string_view crash_point = {},
       std::vector<std::string> extra_arguments = {},
       std::vector<std::pair<std::string, std::string>> environment = {},
-      std::string_view config_path = {}) {
+      std::string_view config_path = {},
+      std::optional<rlim_t> nofile_limit = std::nullopt) {
     pid_ = ::fork();
     if (pid_ < 0) {
       throw std::runtime_error("fork failed");
     }
     if (pid_ == 0) {
+      if (nofile_limit.has_value()) {
+        const rlimit limit{.rlim_cur = *nofile_limit,
+                           .rlim_max = *nofile_limit};
+        if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) _exit(126);
+      }
       if (!crash_point.empty()) {
         (void)::setenv("KEYLANE_CRASH_POINT", std::string(crash_point).c_str(),
                        1);
@@ -2990,6 +3021,107 @@ TEST(ListE2eTest, ReplicationUsesConfiguredTlsForControlAndEveryFlow) {
   mismatch.Stop();
   replica.Stop();
   source.Stop();
+}
+
+TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-maxclients-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int data_fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(data_fd, 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 256ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(data_fd), 0);
+
+  const std::string tls_dir = std::string(KEYLANE_SOURCE_DIR) + "/tests/tls";
+  const std::uint16_t port = FindFreePort();
+  std::uint16_t tls_port = FindFreePort();
+  while (tls_port == port) tls_port = FindFreePort();
+  std::uint16_t metrics_port = FindFreePort();
+  while (metrics_port == port || metrics_port == tls_port) {
+    metrics_port = FindFreePort();
+  }
+  ServerProcess server(
+      g_keylane_binary, port, data_path, log_path, 2, {},
+      {"--maxclients", "3", "--tls-port", std::to_string(tls_port),
+       "--metrics-port", std::to_string(metrics_port), "--tls-cert-file",
+       tls_dir + "/server.crt", "--tls-key-file", tls_dir + "/server.key"},
+      {}, {}, 258);
+
+  auto first = std::make_unique<RespClient>(port);
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "maxclients"}),
+            BulkArray({"maxclients", "2"}));
+  EXPECT_NE(first->Command({"INFO", "clients"}).find("maxclients:2\r\n"),
+            std::string::npos);
+  EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "1"}), "+OK");
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "maxclients"}),
+            BulkArray({"maxclients", "1"}));
+  EXPECT_NE(first->Command({"INFO", "clients"}).find("maxclients:1\r\n"),
+            std::string::npos);
+  EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "0"}),
+            "-ERR value is not a positive integer or is out of range");
+  const std::string over_file_limit =
+      first->Command({"CONFIG", "SET", "maxclients", "3"});
+  EXPECT_NE(over_file_limit.find("cannot preserve 256 file descriptors"),
+            std::string::npos);
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "maxclients"}),
+            BulkArray({"maxclients", "1"}));
+
+  // Metrics is a separate HTTP service and remains available while the only
+  // Redis client slot is occupied.
+  EXPECT_TRUE(HttpGet(metrics_port, "/metrics").starts_with("HTTP/1.1 200"));
+
+  const int rejected_plain = ConnectSocket(port);
+  ASSERT_GE(rejected_plain, 0);
+  std::string plaintext_reply;
+  char buffer[128];
+  while (true) {
+    const ssize_t received = ::recv(rejected_plain, buffer, sizeof(buffer), 0);
+    if (received > 0) {
+      plaintext_reply.append(buffer, static_cast<std::size_t>(received));
+      continue;
+    }
+    if (received < 0 && errno == EINTR) continue;
+    ASSERT_TRUE(received == 0 || errno == ECONNRESET) << std::strerror(errno);
+    break;
+  }
+  EXPECT_EQ(plaintext_reply, "-ERR max number of clients reached\r\n");
+  ASSERT_EQ(::close(rejected_plain), 0);
+
+  // The TLS endpoint shares the same admission counter. It closes a rejected
+  // socket without emitting plaintext or allocating handshake state.
+  const int rejected_tls = ConnectSocket(tls_port);
+  ASSERT_GE(rejected_tls, 0);
+  const ssize_t tls_received = ::recv(rejected_tls, buffer, sizeof(buffer), 0);
+  EXPECT_TRUE(tls_received == 0 || (tls_received < 0 && errno == ECONNRESET))
+      << "TLS rejection returned " << tls_received << " bytes: "
+      << std::string(buffer, tls_received > 0
+                                 ? static_cast<std::size_t>(tls_received)
+                                 : 0);
+  ASSERT_EQ(::close(rejected_tls), 0);
+
+  EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "2"}), "+OK");
+  auto second = std::make_unique<RespClient>(port);
+  EXPECT_EQ(second->Command({"PING"}), "+PONG");
+  EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "1"}), "+OK");
+
+  const int rejected_after_lowering = ConnectSocket(port);
+  ASSERT_GE(rejected_after_lowering, 0);
+  EXPECT_EQ(ReadRespLine(rejected_after_lowering),
+            "-ERR max number of clients reached");
+  ASSERT_EQ(::close(rejected_after_lowering), 0);
+
+  // Lowering the limit never evicts existing clients. Once both close, the
+  // one remaining slot is reusable.
+  second.reset();
+  first.reset();
+  RespClient replacement(port);
+  EXPECT_EQ(replacement.Command({"PING"}), "+PONG");
+  server.Stop();
 }
 
 TEST(ListE2eTest, FlushDbDuringFullSyncCancelsAndRestartsWithoutOldKeys) {

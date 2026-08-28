@@ -28,6 +28,7 @@
 #include "absl/strings/str_cat.h"
 #include "backup.h"
 #include "blocking_wait.h"
+#include "client_limit.h"
 #include "celer/io/storage.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/cycle_clock.h"
@@ -70,6 +71,7 @@ namespace {
 
 storage::StorageEngine* g_storage = nullptr;
 ReplicationManager* g_replication = nullptr;
+ClientLimit* g_client_limit = nullptr;
 bool g_replica_read_only = false;
 std::uint16_t g_server_port = 0;
 unsigned g_server_threads = 0;
@@ -952,6 +954,7 @@ constexpr std::string_view kSlowLogThresholdConfig = "slowlog-log-slower-than";
 constexpr std::string_view kSlowLogMaxLenConfig = "slowlog-max-len";
 constexpr std::string_view kLuaTimeLimitConfig = "lua-time-limit";
 constexpr std::string_view kBusyReplyThresholdConfig = "busy-reply-threshold";
+constexpr std::string_view kMaxClientsConfig = "maxclients";
 
 enum class RuntimeConfigKey : std::uint8_t {
   kSnapshotReadConcurrency,
@@ -976,6 +979,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kSlowLogThreshold,
   kSlowLogMaxLen,
   kLuaTimeLimit,
+  kMaxClients,
 };
 
 struct RuntimeConfigDescriptor {
@@ -1031,6 +1035,7 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kLuaTimeLimit},
     RuntimeConfigDescriptor{kBusyReplyThresholdConfig,
                             RuntimeConfigKey::kLuaTimeLimit},
+    RuntimeConfigDescriptor{kMaxClientsConfig, RuntimeConfigKey::kMaxClients},
 };
 
 absl::StatusOr<std::uint32_t> ParseDailySecond(std::string_view text);
@@ -1187,6 +1192,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return std::to_string(SlowLogMaxLen());
         case RuntimeConfigKey::kLuaTimeLimit:
           return std::to_string(LuaScriptBusyThresholdMs());
+        case RuntimeConfigKey::kMaxClients:
+          return std::to_string(g_client_limit->max_clients());
       }
       return {};
     };
@@ -1271,6 +1278,13 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured =
             g_replication->SetReplicaPriority(static_cast<unsigned>(value));
+      }
+    } else if (config->key_ == RuntimeConfigKey::kMaxClients) {
+      if (!ParseUint64(args[3], &value) || value == 0) {
+        configured = absl::InvalidArgumentError(
+            "value is not a positive integer or is out of range");
+      } else {
+        configured = g_client_limit->SetMaxClients(value);
       }
     } else if (config->key_ == RuntimeConfigKey::kDefragPaused) {
       const std::optional<bool> paused = ParseConfigYesNo(args[3]);
@@ -3607,6 +3621,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
     info += "# Clients\r\n";
     info += "connected_clients:" +
             std::to_string(runtime_metrics->connected_clients_) + "\r\n";
+    info += "maxclients:" + std::to_string(g_client_limit->max_clients()) +
+            "\r\n";
     info +=
         "blocked_clients:" + std::to_string(runtime_metrics->blocked_clients_) +
         "\r\n\r\n";
@@ -8487,6 +8503,8 @@ void InitStorage(storage::StorageEngine* engine,
   g_replication = replication;
   g_replica_read_only = replication != nullptr && replication->is_replica();
 }
+
+void InitClientLimit(ClientLimit* limit) noexcept { g_client_limit = limit; }
 
 void ReplicationCommandCapture::MarkHandled() {
   std::lock_guard lock(mutex_);

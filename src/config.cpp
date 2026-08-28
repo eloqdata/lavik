@@ -334,6 +334,10 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->thread_count_, false);
   }
+  if (name == "maxclients") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    return ParseUnsigned(directive[1], name, &options->max_clients_, false);
+  }
   if (name == "replicaof" || name == "redis-replicaof") {
     if (directive.size() != 3) return WrongArgumentCount(name);
     if (directive[1].empty()) {
@@ -495,6 +499,9 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
     if (address.empty()) {
       return absl::InvalidArgumentError("bind address must not be empty");
     }
+  }
+  if (options.max_clients_ == 0) {
+    return absl::InvalidArgumentError("maxclients must be nonzero");
   }
   if (options.port_ == 0 && options.tls_port_ == 0) {
     return absl::InvalidArgumentError(

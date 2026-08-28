@@ -28,6 +28,23 @@ counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
 WATCH state.
 
+`RedisService` applies one process-wide `maxclients` limit across its plaintext
+and TLS endpoints before registering an accepted socket or starting TLS. The
+limit and active count belong to the Redis protocol service; other Celer TCP
+services such as the metrics HTTP endpoint do not participate. A
+plaintext connection rejected at the limit receives Redis's max-clients error;
+a TLS connection is closed without plaintext output or handshake work. Pending
+TLS and replication handshakes consume slots because their eventual role is not
+known before protocol negotiation. Every session owns its slot through TLS
+setup and serving, so handshake failures and all disconnect paths release it.
+`CONFIG SET maxclients` changes admission immediately; lowering it below the
+active count leaves existing connections intact and rejects new ones until the
+count falls below the new limit. Keylane keeps 256 file descriptors outside the
+client budget. Startup attempts to raise `RLIMIT_NOFILE` and reduces the
+effective initial limit when the process hard limit is insufficient; a runtime
+increase that cannot preserve the reserve fails without changing the live
+limit.
+
 Connections start in RESP2. `HELLO 2` or `HELLO 3` can combine protocol
 selection with `AUTH` and `SETNAME`; validation finishes before authentication,
 name, or reply-version state is changed. The selected version follows every
@@ -194,6 +211,10 @@ storage admission boundary. Runtime `replica-priority` controls promotion
 eligibility and preference, while `CONFIG REWRITE` persists the current
 single-upstream role configuration.
 
+`CONFIG GET/SET maxclients` exposes the live connection limit, while `INFO clients`
+reports it alongside the active client gauges. The startup
+`maxclients` directive and command-line option establish the initial value.
+
 ## Failure and backpressure behavior
 
 Parse errors are returned to the connection and end that malformed session.
@@ -226,7 +247,7 @@ real server executable.
 
 | Claim | Repository source |
 |---|---|
-| Celer service integration, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `src/redis/server.cpp` |
+| Celer service integration, pre-TLS connection admission, connection setup/cleanup, parsing loop, batching, reply paths, and handshake transfer | `celer/include/celer/net/tcp_service.h`, `celer/src/net/tcp_service.cpp`, `src/redis/server.cpp` |
 | Per-connection database, authentication, reply version, MULTI, WATCH, monitor, Pub/Sub, and client identity state | `include/keylane/session.h`, `include/keylane/resp_version.h` |
 | Incremental RESP parser and version-aware reusable reply builder | `include/keylane/resp.h`, `src/redis/resp.cpp` |
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/keylane/command.h` |
@@ -238,4 +259,4 @@ real server executable.
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/keylane/slowlog.h`, `src/redis/slowlog.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |
-| Parser, metadata, configuration, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/list_e2e_test.cpp` |
+| Parser, metadata, configuration, max-client admission, and end-to-end command coverage | `tests/resp_test.cpp`, `tests/command_table_test.cpp`, `tests/config_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/metrics_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/list_e2e_test.cpp` |
