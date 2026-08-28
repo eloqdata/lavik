@@ -9,6 +9,17 @@
 
 #include "keylane/storage/format.h"
 
+TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
+  using namespace keylane::storage;
+  static_assert(sizeof(Digest) == sizeof(std::uint64_t));
+  static_assert(sizeof(RecordHeader) == 104);
+
+  const Digest first = ComputeDigest("key");
+  EXPECT_TRUE(first == ComputeDigest("key"));
+  EXPECT_FALSE(first == ComputeDigest("other-key"));
+  EXPECT_EQ(DigestHash{}(first), first.value_);
+}
+
 TEST(StorageFormatTest, ComputesRedisClusterSlots) {
   using keylane::storage::RedisSlot;
 
@@ -192,7 +203,6 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
       .db_id_ = 3,
       .value_type_ = ValueType::kString,
       .external_ = false,
-      .digest_ = ComputeDigest(key),
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = value.size(),
       .payload_bytes_ = static_cast<std::uint32_t>(value.size()),
@@ -276,7 +286,6 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
       .value_type_ = ValueType::kNone,
       .external_ = false,
       .key_external_ = true,
-      .digest_ = ComputeDigest(key),
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = 0,
       .payload_bytes_ = static_cast<std::uint32_t>(key.size()),
@@ -360,7 +369,6 @@ TEST(StorageFormatTest, RejectsOversizedInlineHeaderBeforeChecksumCopy) {
       .kind_ = RecordKind::kValue,
       .db_id_ = 0,
       .value_type_ = ValueType::kString,
-      .digest_ = ComputeDigest("corrupt"),
       .key_bytes_ = key_bytes,
       .logical_size_ = 1,
       .payload_bytes_ = 0,

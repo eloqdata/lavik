@@ -46,8 +46,8 @@ The caller-facing interfaces are:
 owner's slice. Callback slices retain duplicate arguments and full digests.
 The lock set is separately deduplicated by `(database, fingerprint)`, with an
 exclusive occurrence upgrading a shared occurrence. The fingerprint is the
-first eight bytes of the storage digest; callbacks still access storage by full
-digest and key, so a collision can add contention but cannot alias records.
+process-random 64-bit storage SipHash; callbacks still access storage by digest
+and full key, so a collision can add contention but cannot alias records.
 
 Each logical database has a separate lock table on every worker. A lock entry
 has two counter layers:

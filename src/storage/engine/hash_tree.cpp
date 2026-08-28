@@ -13,8 +13,7 @@ namespace keylane::storage {
 namespace {
 
 bool DigestLess(const Digest& left, const Digest& right) {
-  return std::lexicographical_compare(left.bytes_.begin(), left.bytes_.end(),
-                                      right.bytes_.begin(), right.bytes_.end());
+  return left.value_ < right.value_;
 }
 
 bool EntryLess(const HashEntry& left, const HashEntry& right) {

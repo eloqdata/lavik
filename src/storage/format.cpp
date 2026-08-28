@@ -1,9 +1,13 @@
 #include "keylane/storage/format.h"
 
+#include <sys/random.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cassert>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 
 #include "absl/crc/crc32c.h"
@@ -11,65 +15,88 @@
 namespace keylane::storage {
 namespace {
 
-std::uint32_t LoadBigEndian(const std::uint8_t* input) noexcept {
-  return (static_cast<std::uint32_t>(input[0]) << 24) |
-         (static_cast<std::uint32_t>(input[1]) << 16) |
-         (static_cast<std::uint32_t>(input[2]) << 8) |
-         static_cast<std::uint32_t>(input[3]);
+std::uint64_t LoadLittleEndian(const std::uint8_t* input) noexcept {
+  std::uint64_t value = 0;
+  std::memcpy(&value, input, sizeof(value));
+  if constexpr (std::endian::native == std::endian::big) {
+    value = std::byteswap(value);
+  }
+  return value;
 }
 
-void StoreBigEndian(std::uint32_t value, std::uint8_t* output) noexcept {
-  output[0] = static_cast<std::uint8_t>(value >> 24);
-  output[1] = static_cast<std::uint8_t>(value >> 16);
-  output[2] = static_cast<std::uint8_t>(value >> 8);
-  output[3] = static_cast<std::uint8_t>(value);
+void SipRound(std::uint64_t* v0, std::uint64_t* v1, std::uint64_t* v2,
+              std::uint64_t* v3) noexcept {
+  *v0 += *v1;
+  *v1 = std::rotl(*v1, 13);
+  *v1 ^= *v0;
+  *v0 = std::rotl(*v0, 32);
+  *v2 += *v3;
+  *v3 = std::rotl(*v3, 16);
+  *v3 ^= *v2;
+  *v0 += *v3;
+  *v3 = std::rotl(*v3, 21);
+  *v3 ^= *v0;
+  *v2 += *v1;
+  *v1 = std::rotl(*v1, 17);
+  *v1 ^= *v2;
+  *v2 = std::rotl(*v2, 32);
 }
 
-void Sha1Compress(const std::uint8_t* block,
-                  std::array<std::uint32_t, 5>* state) noexcept {
-  std::array<std::uint32_t, 80> words{};
-  for (std::size_t i = 0; i < 16; ++i) {
-    words[i] = LoadBigEndian(block + i * 4);
-  }
-  for (std::size_t i = 16; i < words.size(); ++i) {
-    words[i] = std::rotl(
-        words[i - 3] ^ words[i - 8] ^ words[i - 14] ^ words[i - 16], 1);
-  }
-
-  std::uint32_t a = (*state)[0];
-  std::uint32_t b = (*state)[1];
-  std::uint32_t c = (*state)[2];
-  std::uint32_t d = (*state)[3];
-  std::uint32_t e = (*state)[4];
-  for (std::size_t i = 0; i < 80; ++i) {
-    std::uint32_t function = 0;
-    std::uint32_t constant = 0;
-    if (i < 20) {
-      function = (b & c) | ((~b) & d);
-      constant = 0x5a827999U;
-    } else if (i < 40) {
-      function = b ^ c ^ d;
-      constant = 0x6ed9eba1U;
-    } else if (i < 60) {
-      function = (b & c) | (b & d) | (c & d);
-      constant = 0x8f1bbcdcU;
-    } else {
-      function = b ^ c ^ d;
-      constant = 0xca62c1d6U;
+const std::array<std::uint8_t, 16>& DigestSeed() noexcept {
+  static const std::array<std::uint8_t, 16> seed = [] {
+    std::array<std::uint8_t, 16> generated{};
+    std::size_t offset = 0;
+    while (offset != generated.size()) {
+      const ssize_t bytes =
+          ::getrandom(generated.data() + offset, generated.size() - offset, 0);
+      if (bytes > 0) {
+        offset += static_cast<std::size_t>(bytes);
+      } else if (bytes < 0 && errno == EINTR) {
+        continue;
+      } else {
+        // A predictable fallback would make collision flooding possible. The
+        // server is Linux-only and cannot safely run without an OS hash seed.
+        std::abort();
+      }
     }
-    const std::uint32_t temp =
-        std::rotl(a, 5) + function + e + constant + words[i];
-    e = d;
-    d = c;
-    c = std::rotl(b, 30);
-    b = a;
-    a = temp;
+    return generated;
+  }();
+  return seed;
+}
+
+std::uint64_t SipHash12(std::string_view input,
+                        const std::array<std::uint8_t, 16>& seed) noexcept {
+  // Keep Valkey's one compression round and two finalization rounds: this is
+  // the hash-flooding defense on every command, so changing to SipHash-2-4 is
+  // a deliberate security/performance trade rather than a format concern.
+  const std::uint64_t k0 = LoadLittleEndian(seed.data());
+  const std::uint64_t k1 = LoadLittleEndian(seed.data() + sizeof(k0));
+  std::uint64_t v0 = 0x736f6d6570736575ULL ^ k0;
+  std::uint64_t v1 = 0x646f72616e646f6dULL ^ k1;
+  std::uint64_t v2 = 0x6c7967656e657261ULL ^ k0;
+  std::uint64_t v3 = 0x7465646279746573ULL ^ k1;
+
+  const auto* bytes = reinterpret_cast<const std::uint8_t*>(input.data());
+  const std::size_t complete_bytes = input.size() & ~std::size_t{7};
+  for (std::size_t offset = 0; offset != complete_bytes; offset += 8) {
+    const std::uint64_t word = LoadLittleEndian(bytes + offset);
+    v3 ^= word;
+    SipRound(&v0, &v1, &v2, &v3);
+    v0 ^= word;
   }
-  (*state)[0] += a;
-  (*state)[1] += b;
-  (*state)[2] += c;
-  (*state)[3] += d;
-  (*state)[4] += e;
+
+  std::uint64_t tail = static_cast<std::uint64_t>(input.size()) << 56;
+  for (std::size_t index = complete_bytes; index != input.size(); ++index) {
+    tail |= static_cast<std::uint64_t>(bytes[index])
+            << (8 * (index - complete_bytes));
+  }
+  v3 ^= tail;
+  SipRound(&v0, &v1, &v2, &v3);
+  v0 ^= tail;
+  v2 ^= 0xff;
+  SipRound(&v0, &v1, &v2, &v3);
+  SipRound(&v0, &v1, &v2, &v3);
+  return v0 ^ v1 ^ v2 ^ v3;
 }
 
 constexpr std::array<std::uint16_t, 256> MakeRedisCrc16Table() noexcept {
@@ -111,45 +138,11 @@ std::string_view HashTag(std::string_view key) noexcept {
 }  // namespace
 
 std::size_t DigestHash::operator()(const Digest& digest) const noexcept {
-  std::uint64_t first = 0;
-  std::uint64_t second = 0;
-  std::memcpy(&first, digest.bytes_.data(), sizeof(first));
-  std::memcpy(&second, digest.bytes_.data() + sizeof(first), sizeof(second));
-  first ^= second + 0x9e3779b97f4a7c15ULL + (first << 6) + (first >> 2);
-  return static_cast<std::size_t>(first);
+  return static_cast<std::size_t>(digest.value_);
 }
 
 Digest ComputeDigest(std::string_view key) noexcept {
-  std::array<std::uint32_t, 5> state{0x67452301U, 0xefcdab89U, 0x98badcfeU,
-                                     0x10325476U, 0xc3d2e1f0U};
-  const auto* input = reinterpret_cast<const std::uint8_t*>(key.data());
-  std::size_t remaining = key.size();
-  while (remaining >= 64) {
-    Sha1Compress(input, &state);
-    input += 64;
-    remaining -= 64;
-  }
-
-  std::array<std::uint8_t, 128> tail{};
-  if (remaining != 0) {
-    std::memcpy(tail.data(), input, remaining);
-  }
-  tail[remaining] = 0x80;
-  const std::size_t tail_bytes = remaining < 56 ? 64 : 128;
-  const std::uint64_t bit_length = static_cast<std::uint64_t>(key.size()) * 8;
-  for (unsigned i = 0; i < 8; ++i) {
-    tail[tail_bytes - 1 - i] = static_cast<std::uint8_t>(bit_length >> (i * 8));
-  }
-  Sha1Compress(tail.data(), &state);
-  if (tail_bytes == 128) {
-    Sha1Compress(tail.data() + 64, &state);
-  }
-
-  Digest digest;
-  for (std::size_t i = 0; i < state.size(); ++i) {
-    StoreBigEndian(state[i], digest.bytes_.data() + i * 4);
-  }
-  return digest;
+  return Digest{.value_ = SipHash12(key, DigestSeed())};
 }
 
 std::uint16_t RedisSlot(std::string_view key) noexcept {

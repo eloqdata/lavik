@@ -467,7 +467,7 @@ Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
       RecordHeader record{};
       std::string_view disk_key;
       if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
-          record.db_id_ != db_id || record.digest_ != request.digest_ ||
+          record.db_id_ != db_id ||
           (!record.key_external_ && disk_key != request.key_) ||
           record.kind_ != RecordKind::kValue ||
           record.db_epoch_ != DbEpoch(db_id) ||
@@ -791,19 +791,19 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
       loaded = co_await LoadExternalValueLocal(
           key_store, location, std::move(extents), key.size(), trace);
     } else if (location.block_owner() == key_store.worker_->id()) {
-      loaded = co_await LoadValueLocal(key_store, db_id, key, digest, location,
+      loaded = co_await LoadValueLocal(key_store, db_id, key, location,
                                        replication_epoch, trace);
     } else {
       const unsigned owner = location.block_owner();
       std::string owned_key(key);
       loaded = co_await celer::SubmitTaskTo(
           owner,
-          [this, owner, db_id, key = std::move(owned_key), digest, location,
+          [this, owner, db_id, key = std::move(owned_key), location,
            replication_epoch,
            trace]() mutable -> Task<absl::StatusOr<LoadedValue>> {
             co_return co_await LoadValueLocal(*stores_[owner], db_id, key,
-                                              digest, location,
-                                              replication_epoch, trace);
+                                              location, replication_epoch,
+                                              trace);
           });
     }
     // Replica reset is partition-wide and does not take each key lock. Reject
@@ -1466,7 +1466,7 @@ StorageEngine::Impl::LoadExternalValueLocal(WorkerStore& store,
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>
 StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
-                                    std::string_view key, const Digest& digest,
+                                    std::string_view key,
                                     RecordLocation location,
                                     std::uint64_t replication_epoch,
                                     ReadLatencyTrace* trace) {
@@ -1545,8 +1545,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
     if (!DecodeRecordHeader(std::span<const std::byte>(
                                 record_bytes, location.total_disk_bytes()),
                             &record, &disk_key) ||
-        record.db_id_ != db_id || record.digest_ != digest ||
-        (!record.key_external_ && disk_key != key) ||
+        record.db_id_ != db_id || (!record.key_external_ && disk_key != key) ||
         record.kind_ != RecordKind::kValue ||
         record.db_epoch_ != DbEpoch(db_id) ||
         record.mutation_sequence_ != location.mutation_sequence_ ||
@@ -1641,8 +1640,7 @@ StorageEngine::Impl::LoadValueLocal(WorkerStore& store, std::uint8_t db_id,
   std::span<const std::byte> record_bytes(record_data,
                                           location.total_disk_bytes());
   if (!DecodeRecordHeader(record_bytes, &record, &disk_key) ||
-      record.db_id_ != db_id || record.digest_ != digest ||
-      (!record.key_external_ && disk_key != key) ||
+      record.db_id_ != db_id || (!record.key_external_ && disk_key != key) ||
       record.kind_ != RecordKind::kValue ||
       record.db_epoch_ != DbEpoch(db_id) ||
       record.mutation_sequence_ != location.mutation_sequence_ ||

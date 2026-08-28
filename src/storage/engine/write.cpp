@@ -1852,7 +1852,6 @@ acquire_active_stream:
       .value_type_ = value_type,
       .external_ = external,
       .key_external_ = key_external,
-      .digest_ = digest,
       .key_bytes_ = static_cast<std::uint32_t>(key.size()),
       .logical_size_ = static_cast<std::uint32_t>(logical_size),
       .payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),

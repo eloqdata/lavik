@@ -115,11 +115,17 @@ higher allocation epoch and then the higher header sequence. Current block
 kinds are ordinary records, payload extents, and transaction generations;
 on-disk enum value 3 remains deliberately unassigned.
 
-Records are 8-byte aligned and carry their database and value type, key digest
-and key representation, logical and physical sizes, transaction ID, database
-and replication epochs, logical mutation sequence, absolute expiration time,
-physical LSN, allocation epoch, and payload and header checksums. Record kinds
-are value, tombstone, and keyless transaction commit decision.
+Records are 8-byte aligned and carry their database and value type, key
+representation, logical and physical sizes, transaction ID, database and
+replication epochs, logical mutation sequence, absolute expiration time,
+physical LSN, allocation epoch, and payload and header checksums. A key digest
+is deliberately absent: it is process-random runtime state reconstructed from
+the complete key. Record kinds are value, tombstone, and keyless transaction
+commit decision.
+
+The current version-1 record and compact Hash/Set layouts directly replaced
+their earlier digest-bearing forms; there is no compatibility decoder. Media
+written by that earlier layout must be reset before this build starts.
 
 Keys that do not fit the configured inline header limit move into the payload.
 Large key/value payloads use a root record containing an extent manifest. Each
@@ -182,8 +188,9 @@ Recovery proceeds as follows:
    is ignored without rewriting the bitmap.
 3. A valid extent header contributes extent identity. A valid records or
    transaction block is read through its committed boundary; zero page padding
-   is skipped, while record bounds, allocation epochs, topology, digests, and
-   checksums are validated.
+   is skipped, while record bounds, allocation epochs, topology, keys, and
+   checksums are validated. Recovery computes each winning key's runtime
+   digest from the recovered complete key instead of loading one from disk.
 4. Records from obsolete database or partition replication epochs are ignored.
    Commit decisions are collected independently of those keyed-record filters.
    Tagged records remain parked until every worker has contributed to the
@@ -239,6 +246,14 @@ incremental rehash, pointer-only erase, and representation replacement
 recompute it from the live inline key or external digest. This trades growth-
 phase CPU for the smaller steady-state representation.
 
+The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
+obtained from the operating system. It is stable across workers for one
+process, changes on restart, and does not affect Redis-slot routing. External
+index keys retain this digest so collisions can be verified against the full
+key on storage. Hash and Set field digests are likewise reconstructed whenever
+their durable compact value is decoded; neither record headers nor compact
+values persist process-local fingerprints.
+
 The packed value keeps the mutation sequence, 43-bit block ID, aligned record
 offset and length, logical size, type, and hot state. It does not repeat the
 physical block's allocation epoch or runtime owner for every key: those
@@ -251,8 +266,8 @@ materializes a standalone 40-byte `RecordLocation`. That snapshot remains
 self-contained across suspension and is validated by the physical owner, so
 removing the duplicate index fields does not weaken block-reuse/ABA protection
 or add a cross-core submission.
-These are runtime representations only: block and record headers retain their
-full durable fields.
+These are runtime representations only: block and record headers retain the
+durable location and lifecycle fields required for validation.
 
 An overwrite whose TTL presence does not change updates the entry in place.
 Adding or removing TTL swaps the corresponding base or derived object into the
@@ -271,12 +286,13 @@ metadata moves independently in O(1). This preserves the flush and rollback
 lifetime invariants without charging non-expiring keys for the timestamp,
 making large transactions scan prior undo items, or adding a hot-path side
 index.
-`ScanHashMap` caches the low 32 hash bits used for bucket
-addressing while each bucket slot carries its independent 8-bit lookup tag.
-Incremental rehash preserves that tag with the entry pointer. A table that has
-already reached `2^32` direct buckets stops expanding and accepts further
-entries through its existing bucket chains, so the address-width limit changes
-load factor and lookup cost rather than correctness or capacity.
+Coroutine identities and staged records cache the low 32 hash bits needed to
+revalidate a saved entry address, while each bucket slot carries its independent
+8-bit lookup tag. The entry itself stores neither value. Incremental rehash
+reconstructs the SipHash from the inline key or retained external digest. A
+table that has already reached `2^32` direct buckets stops expanding and accepts
+further entries through its existing bucket chains, so the address-width limit
+changes load factor and lookup cost rather than correctness or capacity.
 
 Extent construction is synchronous with the foreground write. Each extent's
 payload and unused header slot are written and synchronized before its header

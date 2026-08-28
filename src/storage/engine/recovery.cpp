@@ -494,11 +494,11 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           }
         }
         const std::uint16_t partition_id = RedisSlot(key);
-        if (record.digest_ != ComputeDigest(key) ||
-            partition_id % block.layout_worker_count_ != block.writer_id_) {
+        if (partition_id % block.layout_worker_count_ != block.writer_id_) {
           co_return absl::Status(absl::StatusCode::kInternal,
                                  "invalid or corrupt committed record header");
         }
+        const Digest digest = ComputeDigest(key);
         if (record.replication_epoch_ !=
             epoch_values_[kLogicalDatabaseCount + partition_id]) {
           record_offset += record.total_disk_bytes_;
@@ -507,7 +507,7 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
         }
         const unsigned key_owner = partition_id % worker_count_;
         batches->at(key_owner).records_.push_back(RecoveryRecord{
-            .digest_ = record.digest_,
+            .digest_ = digest,
             .key_ = std::string(key),
             .db_id_ = record.db_id_,
             .txid_ = record.txid_,

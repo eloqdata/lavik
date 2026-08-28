@@ -539,7 +539,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         pending[key_owner].push_back(TombClaim{
             .mutation_sequence_ = record.mutation_sequence_,
             .replication_epoch_ = record.replication_epoch_,
-            .digest_ = record.digest_,
+            .digest_ = ComputeDigest(disk_key),
             .key_ = std::string(disk_key),
             .db_id_ = record.db_id_,
         });

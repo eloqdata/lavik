@@ -2745,8 +2745,8 @@ class StorageEngine::Impl {
 
   Task<absl::StatusOr<LoadedValue>> LoadValueLocal(
       WorkerStore& store, std::uint8_t db_id, std::string_view key,
-      const Digest& digest, RecordLocation location,
-      std::uint64_t replication_epoch, ReadLatencyTrace* trace = nullptr);
+      RecordLocation location, std::uint64_t replication_epoch,
+      ReadLatencyTrace* trace = nullptr);
 
   std::uint64_t ForegroundBlocksForDevice(
       std::size_t device_index) const noexcept {

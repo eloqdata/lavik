@@ -53,8 +53,7 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
       header.encoded_bytes_ != payload.size()) {
     return absl::InternalError("invalid Hash value header");
   }
-  constexpr std::size_t kMinimumEntryBytes =
-      sizeof(Digest) + 2 * sizeof(std::uint32_t);
+  constexpr std::size_t kMinimumEntryBytes = 2 * sizeof(std::uint32_t);
   const std::size_t encoded_entries_bytes = payload.size() - sizeof(header);
   if (header.element_count_ > encoded_entries_bytes / kMinimumEntryBytes) {
     return absl::InternalError("Hash element count exceeds encoded payload");
@@ -64,12 +63,7 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
   value.entries_.reserve(header.element_count_);
   std::size_t offset = sizeof(header);
   for (std::uint32_t index = 0; index < header.element_count_; ++index) {
-    if (offset > payload.size() || payload.size() - offset < sizeof(Digest)) {
-      return absl::InternalError("Hash entry is truncated");
-    }
     HashEntry entry;
-    std::memcpy(&entry.digest_, payload.data() + offset, sizeof(Digest));
-    offset += sizeof(Digest);
     std::uint32_t field_bytes = 0;
     std::uint32_t value_bytes = 0;
     if (!ReadU32(payload, &offset, &field_bytes) ||
@@ -82,9 +76,9 @@ absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload) {
     offset += field_bytes;
     entry.value_.assign(payload.substr(offset, value_bytes));
     offset += value_bytes;
-    if (entry.digest_ != ComputeDigest(entry.field_)) {
-      return absl::InternalError("Hash entry digest does not match field");
-    }
+    // Digests use a process-random seed and are therefore reconstructed from
+    // the durable field rather than encoded in the value.
+    entry.digest_ = ComputeDigest(entry.field_);
     value.entries_.push_back(std::move(entry));
   }
   if (offset != payload.size()) {
@@ -101,16 +95,14 @@ absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
   std::uint64_t bytes = sizeof(HashValueHeader);
   for (const HashEntry& entry : value.entries_) {
     if (entry.field_.size() > kMaxStringBytes ||
-        entry.value_.size() > kMaxStringBytes ||
-        bytes > kMaxStringBytes - sizeof(Digest) - 8 ||
-        entry.field_.size() >
-            kMaxStringBytes - bytes - sizeof(Digest) - 8 ||
-        entry.value_.size() > kMaxStringBytes - bytes - sizeof(Digest) -
-                                  8 - entry.field_.size()) {
+        entry.value_.size() > kMaxStringBytes || bytes > kMaxStringBytes - 8 ||
+        entry.field_.size() > kMaxStringBytes - bytes - 8 ||
+        entry.value_.size() >
+            kMaxStringBytes - bytes - 8 - entry.field_.size()) {
       return absl::OutOfRangeError(
           "Hash field or value exceeds Redis-compatible limits");
     }
-    bytes += sizeof(Digest) + 8 + entry.field_.size() + entry.value_.size();
+    bytes += 8 + entry.field_.size() + entry.value_.size();
   }
 
   const HashValueHeader header{
@@ -125,8 +117,6 @@ absl::StatusOr<std::string> EncodeHashValue(const HashValue& value) {
   output.reserve(static_cast<std::size_t>(bytes));
   output.append(reinterpret_cast<const char*>(&header), sizeof(header));
   for (const HashEntry& entry : value.entries_) {
-    output.append(reinterpret_cast<const char*>(&entry.digest_),
-                  sizeof(entry.digest_));
     AppendU32(&output, static_cast<std::uint32_t>(entry.field_.size()));
     AppendU32(&output, static_cast<std::uint32_t>(entry.value_.size()));
     output.append(entry.field_);

@@ -130,23 +130,22 @@ constexpr std::uint64_t LocalBlockOffset(std::uint64_t block_id) noexcept {
 }
 
 struct Digest {
-  std::array<std::uint8_t, 20> bytes_{};
+  std::uint64_t value_ = 0;
 
   bool operator==(const Digest&) const noexcept = default;
 };
 
 inline std::uint64_t ScanCursorPrefix(const Digest& digest) noexcept {
-  std::uint64_t prefix = 0;
-  for (std::size_t i = 0; i < sizeof(prefix); ++i) {
-    prefix = (prefix << 8) | digest.bytes_[i];
-  }
-  return prefix;
+  return digest.value_;
 }
 
 struct DigestHash {
   std::size_t operator()(const Digest& digest) const noexcept;
 };
 
+// Returns a process-local SipHash-1-2 fingerprint. The process-wide random
+// seed deliberately changes at restart, so a Digest is runtime identity and
+// must never be persisted or exchanged as durable protocol state.
 Digest ComputeDigest(std::string_view key) noexcept;
 std::uint16_t RedisSlot(std::string_view key) noexcept;
 std::uint32_t StorageShardForKey(std::string_view key) noexcept;
@@ -164,7 +163,7 @@ enum class BlockKind : std::uint8_t {
   kRecords = 1,
   kPayloadExtent = 2,
   // Value 3 was used by an unreleased runtime-backlog experiment. It remains
-  // unassigned so the version-1 on-disk enum values do not move.
+  // unassigned so the on-disk enum values do not move.
   // Short-lived transaction generation: tagged keyed records and their
   // TxCommit decisions share this block class until the cleaner promotes the
   // committed winners to ordinary kRecords blocks with txid zero.
@@ -278,7 +277,6 @@ struct RecordHeader {
   // fixed on-disk header layout.
   bool external_ : 1 = false;
   bool key_external_ : 1 = false;
-  Digest digest_{};
   std::uint32_t key_bytes_ = 0;
   // Redis-visible bytes/cardinality.
   std::uint32_t logical_size_ = 0;
@@ -328,7 +326,7 @@ static_assert(sizeof(DeviceLabel) <= kDirectIoAlignment);
 static_assert(sizeof(MetadataPageHeader) < kDirectIoAlignment);
 static_assert(kMetadataPagePayloadBytes % sizeof(std::uint64_t) == 0);
 static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
-static_assert(sizeof(RecordHeader) == 120);
+static_assert(sizeof(RecordHeader) == 104);
 static_assert(sizeof(ReplicationFrameHeader) == 56);
 static_assert(sizeof(ExtentManifestHeader) == 16);
 static_assert(sizeof(ExtentRef) == 24);

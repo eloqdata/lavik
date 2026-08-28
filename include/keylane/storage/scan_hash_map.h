@@ -144,8 +144,7 @@ class ScanHashMap {
       Digest digest;
       const KeyMetadata metadata = DecodeKeyMetadata(tail());
       if (!metadata.key_complete_) {
-        std::memcpy(digest.bytes_.data(), tail() + metadata.encoded_bytes_,
-                    digest.bytes_.size());
+        std::memcpy(&digest, tail() + metadata.encoded_bytes_, sizeof(digest));
       }
       return digest;
     }
@@ -671,19 +670,7 @@ class ScanHashMap {
   }
 
   static std::uint64_t Hash(const Digest& digest) noexcept {
-    std::uint64_t first = 0;
-    std::uint64_t second = 0;
-    std::uint32_t tail = 0;
-    std::memcpy(&first, digest.bytes_.data(), sizeof(first));
-    std::memcpy(&second, digest.bytes_.data() + sizeof(first), sizeof(second));
-    std::memcpy(&tail, digest.bytes_.data() + 2 * sizeof(first), sizeof(tail));
-    first ^= second + 0x9e3779b97f4a7c15ULL + (first << 6) + (first >> 2);
-    first ^= static_cast<std::uint64_t>(tail) * 0xbf58476d1ce4e5b9ULL;
-    first ^= first >> 30;
-    first *= 0xbf58476d1ce4e5b9ULL;
-    first ^= first >> 27;
-    first *= 0x94d049bb133111ebULL;
-    return first ^ (first >> 31);
+    return digest.value_;
   }
 
   static std::uint8_t HashTag(std::uint64_t hash) noexcept {
@@ -1084,9 +1071,8 @@ template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
 std::size_t ScanHashMap<Value, MaxBucketExponent,
                         EntryPolicy>::Entry::tail_bytes() const noexcept {
   const KeyMetadata metadata = DecodeKeyMetadata(tail());
-  return metadata.encoded_bytes_ + (metadata.key_complete_
-                                        ? metadata.logical_size_
-                                        : Digest{}.bytes_.size());
+  return metadata.encoded_bytes_ +
+         (metadata.key_complete_ ? metadata.logical_size_ : sizeof(Digest));
 }
 
 template <typename Value, unsigned MaxBucketExponent, typename EntryPolicy>
@@ -1101,8 +1087,7 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   const std::uint32_t encoded_metadata =
       (logical_size << 1) | static_cast<std::uint32_t>(!key_complete);
   const std::size_t metadata_bytes = EncodedKeyMetadataBytes(encoded_metadata);
-  const std::size_t payload_bytes =
-      key_complete ? key.size() : digest.bytes_.size();
+  const std::size_t payload_bytes = key_complete ? key.size() : sizeof(digest);
   const std::size_t tail_bytes = metadata_bytes + payload_bytes;
   const bool extended = EntryPolicy::HasExtraValue(value);
   const std::size_t header_bytes =
@@ -1132,7 +1117,7 @@ ScanHashMap<Value, MaxBucketExponent, EntryPolicy>::Entry::Create(
   if (key_complete && !key.empty()) {
     std::memcpy(payload, key.data(), key.size());
   } else if (!key_complete) {
-    std::memcpy(payload, digest.bytes_.data(), digest.bytes_.size());
+    std::memcpy(payload, &digest, sizeof(digest));
   }
   return entry;
 }

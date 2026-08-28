@@ -2,23 +2,19 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 
 #include "keylane/storage/format.h"
 
 namespace keylane::tx {
 
-// Lock fingerprint: the first 8 bytes of the key's SHA-1 digest, which the
-// engine computes for index lookups anyway. Collisions are correctness-neutral
-// (two keys sharing a lock entry only causes false contention): execution
-// order is arbitrated by the per-shard TxQueue and data access still compares
-// the full digest and key.
+// Lock fingerprint: the key's process-random SipHash digest, which the engine
+// computes for index lookups anyway. Collisions are correctness-neutral (two
+// keys sharing a lock entry only causes false contention): execution order is
+// arbitrated by the per-shard TxQueue and data access still compares the key.
 using LockFp = std::uint64_t;
 
 inline LockFp FingerprintOf(const storage::Digest& digest) noexcept {
-  LockFp fp;
-  std::memcpy(&fp, digest.bytes_.data(), sizeof(fp));
-  return fp;
+  return digest.value_;
 }
 
 // The fingerprint is already uniformly distributed; hash maps keyed by it use

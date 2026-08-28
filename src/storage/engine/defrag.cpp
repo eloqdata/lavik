@@ -371,9 +371,9 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
 
   auto& partition = PartitionForKey(key_store, key);
   auto& index = partition.indexes_[record.db_id_];
+  const Digest digest = ComputeDigest(key);
   RecordIndex::Entry* current = nullptr;
-  for (RecordIndex::Entry* candidate :
-       index.FindCandidates(record.digest_, key)) {
+  for (RecordIndex::Entry* candidate : index.FindCandidates(digest, key)) {
     if (MaterializeIndexLocation(*candidate)
             .SamePhysicalRecord(source_location)) {
       current = candidate;
@@ -401,7 +401,7 @@ StorageEngine::Impl::RelocateIfCurrent(unsigned key_owner, std::string_view key,
   RecordLocation relocated;
   absl::Status written = co_await WriteRecordLocked(
       key_store, record.db_id_, key, value, record.kind_, record.value_type_,
-      record.expire_at_ms_, record.digest_, clear_txid ? 0 : record.txid_,
+      record.expire_at_ms_, digest, clear_txid ? 0 : record.txid_,
       record.mutation_sequence_, true, true, record.external_,
       record.key_external_, record.logical_size_,
       ExtentsFor(key_store, current), &relocated, &source);

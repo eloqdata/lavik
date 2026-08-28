@@ -1213,16 +1213,11 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
     Pairs pairs;
     pairs.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) {
-      std::string_view digest_bytes, field, value;
+      std::string_view field, value;
       std::uint32_t fs = 0, vs = 0;
-      if (!reader.Bytes(sizeof(storage::Digest), &digest_bytes) ||
-          !reader.Le32(&fs) || !reader.Le32(&vs) || !reader.Bytes(fs, &field) ||
+      if (!reader.Le32(&fs) || !reader.Le32(&vs) || !reader.Bytes(fs, &field) ||
           !reader.Bytes(vs, &value))
         return Bad("truncated Keylane Hash");
-      storage::Digest digest{};
-      std::memcpy(&digest, digest_bytes.data(), sizeof(digest));
-      if (digest != storage::ComputeDigest(field))
-        return Bad("invalid Keylane Hash digest");
       pairs.emplace_back(std::string(field), std::string(value));
     }
     if (!reader.done()) return Bad("trailing Keylane Hash data");
@@ -1347,7 +1342,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
 void AppendHashRaw(std::string* output, const Pairs& pairs) {
   std::uint64_t bytes = 32;
   for (const auto& [field, value] : pairs)
-    bytes += sizeof(storage::Digest) + 8 + field.size() + value.size();
+    bytes += 8 + field.size() + value.size();
   PutLe64(output, storage::kHashValueMagic);
   PutLe32(output, storage::kStorageFormatVersion);
   PutLe32(output, 32);
@@ -1355,8 +1350,6 @@ void AppendHashRaw(std::string* output, const Pairs& pairs) {
   PutLe32(output, 0);
   PutLe64(output, bytes);
   for (const auto& [field, value] : pairs) {
-    const storage::Digest digest = storage::ComputeDigest(field);
-    output->append(reinterpret_cast<const char*>(&digest), sizeof(digest));
     PutLe32(output, static_cast<std::uint32_t>(field.size()));
     PutLe32(output, static_cast<std::uint32_t>(value.size()));
     output->append(field);
@@ -1401,9 +1394,9 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
       pairs.emplace_back(std::move(value), std::string());
     std::uint64_t bytes = 32;
     for (const auto& [field, value] : pairs) {
-      if (!add_size(&bytes, sizeof(storage::Digest) + 8) ||
-          !add_size(&bytes, field.size()) || !add_size(&bytes, value.size()) ||
-          field.size() > UINT32_MAX || value.size() > UINT32_MAX)
+      if (!add_size(&bytes, 8) || !add_size(&bytes, field.size()) ||
+          !add_size(&bytes, value.size()) || field.size() > UINT32_MAX ||
+          value.size() > UINT32_MAX)
         return Bad("value exceeds Keylane limits");
     }
     raw.logical_size_ = pairs.size();
@@ -1414,9 +1407,9 @@ absl::StatusOr<storage::RawValue> EncodeRaw(LogicalValue logical) {
     std::sort(pairs.begin(), pairs.end());
     std::uint64_t bytes = 32;
     for (const auto& [field, value] : pairs) {
-      if (!add_size(&bytes, sizeof(storage::Digest) + 8) ||
-          !add_size(&bytes, field.size()) || !add_size(&bytes, value.size()) ||
-          field.size() > UINT32_MAX || value.size() > UINT32_MAX)
+      if (!add_size(&bytes, 8) || !add_size(&bytes, field.size()) ||
+          !add_size(&bytes, value.size()) || field.size() > UINT32_MAX ||
+          value.size() > UINT32_MAX)
         return Bad("value exceeds Keylane limits");
     }
     raw.logical_size_ = pairs.size();
