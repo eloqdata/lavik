@@ -16,6 +16,8 @@
  * Valkey runtime dependencies and generic callbacks with Keylane-owned entries.
  */
 
+#include <mimalloc.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -36,6 +38,140 @@
 #include "keylane/storage/format.h"
 
 namespace keylane::storage {
+
+// Identifies which worker owns a retained allocation and whether an enclosing
+// operation already supplied admission or accounting. Primary indexes admit a
+// whole mutation before touching storage but still account actual allocator
+// bytes here; full-sync coverage is both admitted and conservatively accounted
+// by its reusable session credit.
+struct RetainedAllocationDomain {
+  unsigned owner_shard_ = CurrentMemoryAccountingShard();
+  bool externally_admitted_ = false;
+  bool externally_accounted_ = false;
+};
+
+inline void* AllocateRetainedBytes(const RetainedAllocationDomain& domain,
+                                   std::size_t bytes, std::size_t alignment) {
+  if (bytes == 0) bytes = 1;
+  std::optional<MemoryReservation> reservation;
+  if (!domain.externally_admitted_ && !domain.externally_accounted_) {
+    std::size_t admission_bytes = AllocatorUsableSizeForRequest(bytes);
+    if (admission_bytes == std::numeric_limits<std::size_t>::max()) {
+      throw std::bad_alloc();
+    }
+    if (alignment > __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+      if (alignment >
+          std::numeric_limits<std::size_t>::max() - admission_bytes) {
+        throw std::bad_alloc();
+      }
+      admission_bytes += alignment;
+    }
+    reservation = TryReserveMemory(admission_bytes);
+    if (!reservation.has_value()) {
+      RecordMemoryRejection();
+      throw std::bad_alloc();
+    }
+  }
+
+  // Retained domains call mimalloc directly so library users and unit tests do
+  // not depend on the final executable having installed the global C++
+  // override. Ordinary application new/delete still use the official header.
+  void* pointer = alignment > __STDCPP_DEFAULT_NEW_ALIGNMENT__
+                      ? mi_malloc_aligned(bytes, alignment)
+                      : mi_malloc(bytes);
+  if (pointer == nullptr) throw std::bad_alloc();
+  if (!domain.externally_accounted_) {
+    const std::size_t usable = mi_usable_size(pointer);
+    if (reservation.has_value()) {
+      reservation->Commit(usable);
+    } else {
+      AccountRetainedMemory(domain.owner_shard_, usable);
+    }
+  }
+  return pointer;
+}
+
+inline void DeallocateRetainedBytes(const RetainedAllocationDomain& domain,
+                                    void* pointer,
+                                    std::size_t /*alignment*/) noexcept {
+  if (pointer == nullptr) return;
+  if (!domain.externally_accounted_) {
+    ReleaseRetainedMemory(domain.owner_shard_, mi_usable_size(pointer));
+  }
+  mi_free(pointer);
+}
+
+template <typename T>
+class RetainedAllocator {
+ public:
+  using value_type = T;
+  using propagate_on_container_move_assignment = std::true_type;
+
+  RetainedAllocator() noexcept = default;
+  explicit RetainedAllocator(RetainedAllocationDomain domain) noexcept
+      : domain_(domain) {}
+
+  template <typename U>
+  RetainedAllocator(const RetainedAllocator<U>& other) noexcept
+      : domain_(other.domain()) {}
+
+  [[nodiscard]] T* allocate(std::size_t count) {
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+      throw std::bad_array_new_length();
+    }
+    return static_cast<T*>(
+        AllocateRetainedBytes(domain_, count * sizeof(T), alignof(T)));
+  }
+
+  void deallocate(T* pointer, std::size_t) noexcept {
+    DeallocateRetainedBytes(domain_, pointer, alignof(T));
+  }
+
+  const RetainedAllocationDomain& domain() const noexcept { return domain_; }
+
+  template <typename U>
+  bool operator==(const RetainedAllocator<U>& other) const noexcept {
+    const auto& right = other.domain();
+    return domain_.owner_shard_ == right.owner_shard_ &&
+           domain_.externally_admitted_ == right.externally_admitted_ &&
+           domain_.externally_accounted_ == right.externally_accounted_;
+  }
+
+ private:
+  RetainedAllocationDomain domain_;
+};
+
+template <typename T>
+struct RetainedObjectDeleter {
+  RetainedAllocator<T> allocator_;
+
+  void operator()(T* pointer) noexcept {
+    if (pointer == nullptr) return;
+    std::destroy_at(pointer);
+    allocator_.deallocate(pointer, 1);
+  }
+};
+
+template <typename T, typename... Args>
+std::unique_ptr<T, RetainedObjectDeleter<T>> MakeRetainedUnique(
+    RetainedAllocationDomain domain, Args&&... args) {
+  RetainedAllocator<T> allocator(domain);
+  T* pointer = allocator.allocate(1);
+  try {
+    std::construct_at(pointer, std::forward<Args>(args)...);
+  } catch (...) {
+    allocator.deallocate(pointer, 1);
+    throw;
+  }
+  return std::unique_ptr<T, RetainedObjectDeleter<T>>(
+      pointer, RetainedObjectDeleter<T>{allocator});
+}
+
+template <typename T>
+void DestroyRetainedObject(RetainedAllocationDomain domain,
+                           T* pointer) noexcept {
+  RetainedObjectDeleter<T>{RetainedAllocator<T>(domain)}(pointer);
+}
 
 // Worker-local backing store for compact hash-table entry handles. Small pages
 // are carved from 1 MiB spans so mimalloc pays the 64 KiB alignment overhead
@@ -63,6 +199,11 @@ class ScanHashMapEntryArena {
   static constexpr std::size_t kPageBytes = 64 * 1024;
   static constexpr std::size_t kPagesPerSpan = 16;
   static constexpr std::size_t kSpanBytes = kPagesPerSpan * kPageBytes;
+  // A 64 KiB-aligned allocation may consume one extra alignment unit in the
+  // allocator size class. External admission users must cover this whole
+  // first-span cost because the arena deliberately skips its own reservation.
+  static constexpr std::size_t kSmallSpanAdmissionBytes =
+      kSpanBytes + kPageBytes;
   static constexpr unsigned kSlotBits = 11;
   static constexpr Handle kSlotMask = (Handle{1} << kSlotBits) - 1;
   static constexpr std::uint32_t kMaximumPageId =
@@ -71,7 +212,8 @@ class ScanHashMapEntryArena {
 
   explicit ScanHashMapEntryArena(
       std::uint32_t maximum_page_id = kMaximumPageId,
-      bool externally_admitted = false);
+      bool externally_admitted = false, bool externally_accounted = false,
+      unsigned owner_shard = CurrentMemoryAccountingShard());
   ScanHashMapEntryArena(const ScanHashMapEntryArena&) = delete;
   ScanHashMapEntryArena& operator=(const ScanHashMapEntryArena&) = delete;
   ~ScanHashMapEntryArena();
@@ -81,9 +223,10 @@ class ScanHashMapEntryArena {
   // throw std::bad_alloc when Allocate actually obtains the page.
   bool CanAllocate(std::size_t bytes) const noexcept;
   // Returns conservative allocator headroom when bytes cannot reuse a live
-  // page. It includes alignment overhead and a small metadata allowance when
-  // an existing span supplies the backing page; map admission adds room for
-  // its own bucket and mutation bookkeeping.
+  // page. It includes the exact retained growth of the directory array plus
+  // aligned page/span storage. Availability and recycled-ID metadata are
+  // intrusive and require no separate capacity growth; map admission adds room
+  // for its own bucket and mutation bookkeeping.
   std::size_t AllocationBytesIfNewPage(std::size_t bytes) const noexcept;
   Allocation Allocate(std::size_t bytes);
   void Deallocate(Handle handle) noexcept;
@@ -96,16 +239,24 @@ class ScanHashMapEntryArena {
   Handle HandleOf(const void* pointer) const noexcept;
 
   std::size_t allocated_pages() const noexcept { return allocated_pages_; }
-  std::size_t allocated_spans() const noexcept { return small_spans_.size(); }
+  std::size_t allocated_spans() const noexcept { return allocated_spans_; }
   std::uint32_t maximum_page_id() const noexcept { return maximum_page_id_; }
   bool externally_admitted() const noexcept { return externally_admitted_; }
+  bool externally_accounted() const noexcept {
+    return allocation_domain_.externally_accounted_;
+  }
+  const RetainedAllocationDomain& allocation_domain() const noexcept {
+    return allocation_domain_;
+  }
 
  private:
   static constexpr std::size_t kPageHeaderBytes = 64;
   static constexpr std::uint16_t kNoSlot =
       std::numeric_limits<std::uint16_t>::max();
   static constexpr std::uint8_t kLargeClassMarker = 0x3f;
+  static constexpr std::uint8_t kFreePageMarker = 0x3e;
   static constexpr std::size_t kSmallClassCount = 53;
+  static constexpr std::size_t kInitialDirectoryCapacity = 4096;
 
   struct SmallSpan;
 
@@ -113,7 +264,8 @@ class ScanHashMapEntryArena {
     std::uint32_t page_id_ = 0;
     std::uint32_t allocation_bytes_ = 0;
     std::uint32_t block_size_ = 0;
-    std::uint32_t available_index_ = 0;
+    std::uint32_t available_previous_ = 0;
+    std::uint32_t available_next_ = 0;
     SmallSpan* small_span_ = nullptr;
     std::uint16_t capacity_ = 0;
     std::uint16_t next_unused_ = 0;
@@ -122,15 +274,17 @@ class ScanHashMapEntryArena {
     std::uint8_t class_index_ = 0;
     std::uint8_t span_slot_ = 0;
     bool listed_available_ = false;
-    std::array<std::byte, 29> padding_{};
+    std::array<std::byte, 21> padding_{};
   };
 
   static_assert(sizeof(PageHeader) == kPageHeaderBytes);
 
   struct SmallSpan {
     void* storage_ = nullptr;
-    std::uint32_t arena_index_ = 0;
-    std::uint32_t available_index_ = 0;
+    SmallSpan* all_previous_ = nullptr;
+    SmallSpan* all_next_ = nullptr;
+    SmallSpan* available_previous_ = nullptr;
+    SmallSpan* available_next_ = nullptr;
     std::uint16_t free_page_mask_ =
         static_cast<std::uint16_t>((std::uint32_t{1} << kPagesPerSpan) - 1);
     std::uint8_t live_pages_ = 0;
@@ -150,7 +304,14 @@ class ScanHashMapEntryArena {
   static const std::byte* SlotAddress(const PageHeader* page,
                                       std::uint16_t slot) noexcept;
 
+  std::uint64_t DirectoryDescriptor(std::uint32_t page_id) const noexcept;
+  void SetDirectoryDescriptor(std::uint32_t page_id,
+                              std::uint64_t descriptor) noexcept;
+  std::size_t NextDirectoryCapacity() const noexcept;
+  void EnsureDirectoryCapacity();
+  std::size_t DirectoryGrowthBytesForNextPage() const noexcept;
   std::uint32_t AllocatePageId();
+  void ReleasePageId(std::uint32_t page_id) noexcept;
   SmallSpan* AllocateSmallSpan();
   void ReleaseSmallSpan(SmallSpan* span) noexcept;
   void AddAvailableSpan(SmallSpan* span);
@@ -164,16 +325,24 @@ class ScanHashMapEntryArena {
 
   std::uint32_t maximum_page_id_ = kMaximumPageId;
   bool externally_admitted_ = false;
+  RetainedAllocationDomain allocation_domain_;
   std::size_t allocated_pages_ = 0;
+  std::size_t allocated_spans_ = 0;
   // Directory slot zero stays empty so handle zero is the null reference.
   // A normal descriptor packs the 64 KiB-aligned page address with
   // class_index+1 in its low bits; the large marker reads block size from the
-  // page header. The vector grows only on the page-allocation slow path.
-  std::vector<std::uint64_t> page_directory_{0};
-  std::vector<std::uint32_t> free_page_ids_;
-  std::array<std::vector<std::uint32_t>, kSmallClassCount> available_pages_;
-  std::vector<SmallSpan*> small_spans_;
-  std::vector<SmallSpan*> available_spans_;
+  // page header. The directory is a raw, deliberately uninitialized array with
+  // an explicit growth policy. Fresh IDs advance monotonically, so only the
+  // copied prefix and newly published slot are ever read. Released slots encode
+  // the next free ID in-band, eliminating a second capacity-growing array while
+  // keeping ReleasePage noexcept.
+  std::uint64_t* directory_ = nullptr;
+  std::size_t directory_capacity_ = 0;
+  std::uint32_t next_page_id_ = 1;
+  std::uint32_t free_page_id_head_ = 0;
+  std::array<std::uint32_t, kSmallClassCount> available_page_heads_{};
+  SmallSpan* small_spans_head_ = nullptr;
+  SmallSpan* available_spans_head_ = nullptr;
 };
 
 constexpr std::array<std::uint16_t, ScanHashMapEntryArena::kSmallClassCount>
@@ -223,25 +392,38 @@ inline const std::array<std::uint8_t, 513> ScanHashMapEntryArena::kClassLookup =
     ScanHashMapEntryArena::BuildClassLookup();
 
 inline ScanHashMapEntryArena::ScanHashMapEntryArena(
-    std::uint32_t maximum_page_id, bool externally_admitted)
+    std::uint32_t maximum_page_id, bool externally_admitted,
+    bool externally_accounted, unsigned owner_shard)
     : maximum_page_id_(std::min(maximum_page_id, kMaximumPageId)),
-      externally_admitted_(externally_admitted) {}
+      externally_admitted_(externally_admitted),
+      allocation_domain_{.owner_shard_ = owner_shard,
+                         .externally_admitted_ = externally_admitted,
+                         .externally_accounted_ = externally_accounted} {}
 
 inline ScanHashMapEntryArena::~ScanHashMapEntryArena() {
-  for (std::size_t page_id = 1; page_id < page_directory_.size(); ++page_id) {
-    const std::uint64_t descriptor = page_directory_[page_id];
-    if (descriptor == 0) continue;
+  for (std::uint32_t page_id = 1; page_id < next_page_id_; ++page_id) {
+    const std::uint64_t descriptor = DirectoryDescriptor(page_id);
+    if (descriptor == 0 ||
+        (descriptor & std::uint64_t{0xffff}) == kFreePageMarker) {
+      continue;
+    }
     auto* page =
         reinterpret_cast<PageHeader*>(descriptor & ~std::uint64_t{0xffff});
     assert(page->live_count_ == 0 &&
            "entry arena outlived a map that still owns entries");
     if (page->small_span_ == nullptr) {
-      ::operator delete(page, std::align_val_t{kPageBytes});
+      DeallocateRetainedBytes(allocation_domain_, page, kPageBytes);
     }
   }
-  for (SmallSpan* span : small_spans_) {
-    ::operator delete(span->storage_, std::align_val_t{kPageBytes});
-    delete span;
+  while (small_spans_head_ != nullptr) {
+    SmallSpan* span = small_spans_head_;
+    small_spans_head_ = span->all_next_;
+    DeallocateRetainedBytes(allocation_domain_, span->storage_, kPageBytes);
+    DestroyRetainedObject(allocation_domain_, span);
+  }
+  if (directory_ != nullptr) {
+    DeallocateRetainedBytes(allocation_domain_, directory_,
+                            alignof(std::uint64_t));
   }
 }
 
@@ -270,125 +452,206 @@ inline const std::byte* ScanHashMapEntryArena::SlotAddress(
          static_cast<std::size_t>(slot) * page->block_size_;
 }
 
-inline std::uint32_t ScanHashMapEntryArena::AllocatePageId() {
-  if (!free_page_ids_.empty()) {
-    const std::uint32_t page_id = free_page_ids_.back();
-    free_page_ids_.pop_back();
-    assert(page_id != 0 && page_id < page_directory_.size() &&
-           page_directory_[page_id] == 0);
-    return page_id;
+inline std::uint64_t ScanHashMapEntryArena::DirectoryDescriptor(
+    std::uint32_t page_id) const noexcept {
+  assert(page_id != 0 && page_id < next_page_id_);
+  assert(directory_ != nullptr && page_id < directory_capacity_);
+  return directory_[page_id];
+}
+
+inline void ScanHashMapEntryArena::SetDirectoryDescriptor(
+    std::uint32_t page_id, std::uint64_t descriptor) noexcept {
+  assert(page_id != 0 && page_id < next_page_id_);
+  assert(directory_ != nullptr && page_id < directory_capacity_);
+  directory_[page_id] = descriptor;
+}
+
+inline std::size_t ScanHashMapEntryArena::NextDirectoryCapacity()
+    const noexcept {
+  const std::size_t maximum_capacity =
+      static_cast<std::size_t>(maximum_page_id_) + 1;
+  if (directory_capacity_ >= maximum_capacity) return directory_capacity_;
+  if (directory_capacity_ == 0) {
+    return std::min(kInitialDirectoryCapacity, maximum_capacity);
   }
-  if (page_directory_.size() > maximum_page_id_) {
+  return std::min(directory_capacity_ * 2, maximum_capacity);
+}
+
+inline void ScanHashMapEntryArena::EnsureDirectoryCapacity() {
+  if (next_page_id_ < directory_capacity_) return;
+  const std::size_t next_capacity = NextDirectoryCapacity();
+  if (next_capacity <= directory_capacity_ ||
+      next_capacity >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t)) {
     throw std::bad_alloc();
   }
-  // Releasing a page is noexcept and must be able to return its ID without
-  // allocating. Grow the free-ID capacity on this already-fallible slow path
-  // before publishing another directory slot.
-  if (free_page_ids_.capacity() < page_directory_.size()) {
-    free_page_ids_.reserve(
-        std::max(page_directory_.size(), free_page_ids_.capacity() * 2));
+  auto* next = static_cast<std::uint64_t*>(AllocateRetainedBytes(
+      allocation_domain_, next_capacity * sizeof(std::uint64_t),
+      alignof(std::uint64_t)));
+  // Slot zero is permanently invalid. Copy only descriptors that have been
+  // published; the unused suffix stays uninitialized until fresh IDs consume
+  // it, avoiding vector value-initialization and a capacity-sized memset.
+  if (directory_ != nullptr && next_page_id_ > 1) {
+    std::memcpy(next + 1, directory_ + 1,
+                (next_page_id_ - 1) * sizeof(std::uint64_t));
   }
-  const std::uint32_t page_id =
-      static_cast<std::uint32_t>(page_directory_.size());
-  page_directory_.push_back(0);
+  if (directory_ != nullptr) {
+    DeallocateRetainedBytes(allocation_domain_, directory_,
+                            alignof(std::uint64_t));
+  }
+  directory_ = next;
+  directory_capacity_ = next_capacity;
+}
+
+inline std::size_t ScanHashMapEntryArena::DirectoryGrowthBytesForNextPage()
+    const noexcept {
+  if (free_page_id_head_ != 0 || next_page_id_ > maximum_page_id_) return 0;
+  if (next_page_id_ < directory_capacity_) return 0;
+  const std::size_t next_capacity = NextDirectoryCapacity();
+  if (next_capacity <= directory_capacity_ ||
+      next_capacity >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::uint64_t)) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  const std::size_t next_bytes =
+      AllocatorUsableSizeForRequest(next_capacity * sizeof(std::uint64_t));
+  const std::size_t current_bytes =
+      directory_ == nullptr ? 0 : mi_usable_size(directory_);
+  return next_bytes >= current_bytes ? next_bytes - current_bytes
+                                     : std::numeric_limits<std::size_t>::max();
+}
+
+inline std::uint32_t ScanHashMapEntryArena::AllocatePageId() {
+  if (free_page_id_head_ != 0) {
+    const std::uint32_t page_id = free_page_id_head_;
+    const std::uint64_t descriptor = DirectoryDescriptor(page_id);
+    assert((descriptor & std::uint64_t{0xffff}) == kFreePageMarker);
+    free_page_id_head_ = static_cast<std::uint32_t>(descriptor >> 16);
+    SetDirectoryDescriptor(page_id, 0);
+    return page_id;
+  }
+  if (next_page_id_ > maximum_page_id_) throw std::bad_alloc();
+  const std::uint32_t page_id = next_page_id_;
+  EnsureDirectoryCapacity();
+  ++next_page_id_;
+  SetDirectoryDescriptor(page_id, 0);
   return page_id;
+}
+
+inline void ScanHashMapEntryArena::ReleasePageId(
+    std::uint32_t page_id) noexcept {
+  assert(page_id != 0 && page_id < next_page_id_ &&
+         DirectoryDescriptor(page_id) == 0);
+  SetDirectoryDescriptor(
+      page_id,
+      (static_cast<std::uint64_t>(free_page_id_head_) << 16) | kFreePageMarker);
+  free_page_id_head_ = page_id;
 }
 
 inline void ScanHashMapEntryArena::AddAvailable(PageHeader* page) {
   assert(page != nullptr && page->class_index_ < kSmallClassCount &&
          !page->listed_available_);
-  auto& pages = available_pages_[page->class_index_];
-  page->available_index_ = static_cast<std::uint32_t>(pages.size());
-  pages.push_back(page->page_id_);
+  std::uint32_t& head = available_page_heads_[page->class_index_];
+  page->available_previous_ = 0;
+  page->available_next_ = head;
+  if (head != 0) {
+    PageHeader* next = PageFor(head << kSlotBits);
+    assert(next != nullptr);
+    next->available_previous_ = page->page_id_;
+  }
+  head = page->page_id_;
   page->listed_available_ = true;
 }
 
 inline void ScanHashMapEntryArena::RemoveAvailable(PageHeader* page) noexcept {
   if (!page->listed_available_) return;
-  auto& pages = available_pages_[page->class_index_];
-  const std::size_t index = page->available_index_;
-  assert(index < pages.size() && pages[index] == page->page_id_);
-  const std::uint32_t moved_id = pages.back();
-  pages[index] = moved_id;
-  pages.pop_back();
-  if (index < pages.size()) {
-    PageHeader* moved = PageFor(moved_id << kSlotBits);
-    assert(moved != nullptr);
-    moved->available_index_ = static_cast<std::uint32_t>(index);
+  if (page->available_previous_ == 0) {
+    std::uint32_t& head = available_page_heads_[page->class_index_];
+    assert(head == page->page_id_);
+    head = page->available_next_;
+  } else {
+    PageHeader* previous = PageFor(page->available_previous_ << kSlotBits);
+    assert(previous != nullptr);
+    previous->available_next_ = page->available_next_;
   }
+  if (page->available_next_ != 0) {
+    PageHeader* next = PageFor(page->available_next_ << kSlotBits);
+    assert(next != nullptr);
+    next->available_previous_ = page->available_previous_;
+  }
+  page->available_previous_ = 0;
+  page->available_next_ = 0;
   page->listed_available_ = false;
 }
 
 inline void ScanHashMapEntryArena::AddAvailableSpan(SmallSpan* span) {
   assert(span != nullptr && span->free_page_mask_ != 0 &&
          !span->listed_available_);
-  span->available_index_ =
-      static_cast<std::uint32_t>(available_spans_.size());
-  available_spans_.push_back(span);
+  span->available_previous_ = nullptr;
+  span->available_next_ = available_spans_head_;
+  if (available_spans_head_ != nullptr) {
+    available_spans_head_->available_previous_ = span;
+  }
+  available_spans_head_ = span;
   span->listed_available_ = true;
 }
 
 inline void ScanHashMapEntryArena::RemoveAvailableSpan(
     SmallSpan* span) noexcept {
   if (!span->listed_available_) return;
-  const std::size_t index = span->available_index_;
-  assert(index < available_spans_.size() && available_spans_[index] == span);
-  SmallSpan* moved = available_spans_.back();
-  available_spans_[index] = moved;
-  available_spans_.pop_back();
-  if (index < available_spans_.size()) {
-    moved->available_index_ = static_cast<std::uint32_t>(index);
+  if (span->available_previous_ == nullptr) {
+    assert(available_spans_head_ == span);
+    available_spans_head_ = span->available_next_;
+  } else {
+    span->available_previous_->available_next_ = span->available_next_;
   }
+  if (span->available_next_ != nullptr) {
+    span->available_next_->available_previous_ = span->available_previous_;
+  }
+  span->available_previous_ = nullptr;
+  span->available_next_ = nullptr;
   span->listed_available_ = false;
 }
 
 inline ScanHashMapEntryArena::SmallSpan*
 ScanHashMapEntryArena::AllocateSmallSpan() {
-  constexpr std::size_t kAlignmentAllowance = kPageBytes;
-  std::optional<MemoryReservation> memory_reservation;
-  if (!externally_admitted_) {
-    memory_reservation = TryReserveMemory(kSpanBytes + kAlignmentAllowance);
-    if (!memory_reservation.has_value()) {
-      RecordMemoryRejection();
-      throw std::bad_alloc();
-    }
-  }
-
-  auto* span = new SmallSpan();
+  auto span_owner = MakeRetainedUnique<SmallSpan>(allocation_domain_);
+  auto* span = span_owner.get();
   try {
-    span->storage_ = ::operator new(kSpanBytes, std::align_val_t{kPageBytes});
-    span->arena_index_ = static_cast<std::uint32_t>(small_spans_.size());
-    small_spans_.push_back(span);
-    try {
-      AddAvailableSpan(span);
-    } catch (...) {
-      small_spans_.pop_back();
-      throw;
-    }
+    span->storage_ =
+        AllocateRetainedBytes(allocation_domain_, kSpanBytes, kPageBytes);
   } catch (...) {
     if (span->storage_ != nullptr) {
-      ::operator delete(span->storage_, std::align_val_t{kPageBytes});
+      DeallocateRetainedBytes(allocation_domain_, span->storage_, kPageBytes);
+      span->storage_ = nullptr;
     }
-    delete span;
     throw;
   }
-  return span;
+  span->all_previous_ = nullptr;
+  span->all_next_ = small_spans_head_;
+  if (small_spans_head_ != nullptr) small_spans_head_->all_previous_ = span;
+  small_spans_head_ = span;
+  ++allocated_spans_;
+  AddAvailableSpan(span);
+  return span_owner.release();
 }
 
-inline void ScanHashMapEntryArena::ReleaseSmallSpan(
-    SmallSpan* span) noexcept {
+inline void ScanHashMapEntryArena::ReleaseSmallSpan(SmallSpan* span) noexcept {
   assert(span != nullptr && span->live_pages_ == 0);
   RemoveAvailableSpan(span);
-  const std::size_t index = span->arena_index_;
-  assert(index < small_spans_.size() && small_spans_[index] == span);
-  SmallSpan* moved = small_spans_.back();
-  small_spans_[index] = moved;
-  small_spans_.pop_back();
-  if (index < small_spans_.size()) {
-    moved->arena_index_ = static_cast<std::uint32_t>(index);
+  if (span->all_previous_ == nullptr) {
+    assert(small_spans_head_ == span);
+    small_spans_head_ = span->all_next_;
+  } else {
+    span->all_previous_->all_next_ = span->all_next_;
   }
-  ::operator delete(span->storage_, std::align_val_t{kPageBytes});
-  delete span;
+  if (span->all_next_ != nullptr) {
+    span->all_next_->all_previous_ = span->all_previous_;
+  }
+  assert(allocated_spans_ != 0);
+  --allocated_spans_;
+  DeallocateRetainedBytes(allocation_domain_, span->storage_, kPageBytes);
+  DestroyRetainedObject(allocation_domain_, span);
 }
 
 inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
@@ -399,54 +662,22 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
                                      ? ((requested_bytes + 7) & ~std::size_t{7})
                                      : ClassBytes(class_index);
   if (block_size > std::numeric_limits<std::size_t>::max() - kPageHeaderBytes) {
-    page_directory_[page_id] = 0;
-    free_page_ids_.push_back(page_id);
+    ReleasePageId(page_id);
     throw std::bad_alloc();
   }
   const std::size_t required = kPageHeaderBytes + block_size;
   const std::size_t allocation_bytes =
       large ? ((required + kPageBytes - 1) & ~(kPageBytes - 1)) : 0;
-  std::optional<MemoryReservation> memory_reservation;
-  if (!large && !externally_admitted_) {
-    // Directory and availability vectors may grow even when the backing span
-    // already exists. Keep a small permit until those fallible allocations
-    // have become visible to the worker's allocator shard.
-    memory_reservation = TryReserveMemory(4096);
-    if (!memory_reservation.has_value()) {
-      page_directory_[page_id] = 0;
-      free_page_ids_.push_back(page_id);
-      RecordMemoryRejection();
-      throw std::bad_alloc();
-    }
-  }
-  if (large && !externally_admitted_) {
-    constexpr std::size_t kPageBookkeepingAllowance = 4096;
-    constexpr std::size_t kAlignmentAllowance = kPageBytes;
-    if (allocation_bytes >
-        std::numeric_limits<std::size_t>::max() -
-            kPageBookkeepingAllowance - kAlignmentAllowance) {
-      page_directory_[page_id] = 0;
-      free_page_ids_.push_back(page_id);
-      throw std::bad_alloc();
-    }
-    memory_reservation = TryReserveMemory(
-        allocation_bytes + kAlignmentAllowance + kPageBookkeepingAllowance);
-    if (!memory_reservation.has_value()) {
-      page_directory_[page_id] = 0;
-      free_page_ids_.push_back(page_id);
-      RecordMemoryRejection();
-      throw std::bad_alloc();
-    }
-  }
   void* storage = nullptr;
   SmallSpan* small_span = nullptr;
   unsigned span_slot = 0;
   try {
     if (large) {
-      storage = ::operator new(allocation_bytes, std::align_val_t{kPageBytes});
+      storage = AllocateRetainedBytes(allocation_domain_, allocation_bytes,
+                                      kPageBytes);
     } else {
-      small_span = available_spans_.empty() ? AllocateSmallSpan()
-                                            : available_spans_.back();
+      small_span = available_spans_head_ == nullptr ? AllocateSmallSpan()
+                                                    : available_spans_head_;
       span_slot = std::countr_zero(small_span->free_page_mask_);
       assert(span_slot < kPagesPerSpan);
       small_span->free_page_mask_ &=
@@ -457,8 +688,7 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
                 span_slot * kPageBytes;
     }
   } catch (...) {
-    page_directory_[page_id] = 0;
-    free_page_ids_.push_back(page_id);
+    ReleasePageId(page_id);
     throw;
   }
   auto* page = new (storage) PageHeader();
@@ -477,25 +707,19 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
   const std::uint64_t descriptor =
       reinterpret_cast<std::uintptr_t>(page) |
       static_cast<std::uint64_t>(large ? kLargeClassMarker : class_index + 1);
-  page_directory_[page_id] = descriptor;
+  SetDirectoryDescriptor(page_id, descriptor);
   ++allocated_pages_;
-  if (!large) {
-    try {
-      AddAvailable(page);
-    } catch (...) {
-      ReleasePage(page);
-      throw;
-    }
-  }
+  if (!large) AddAvailable(page);
   return page;
 }
 
 inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::PageFor(
     Handle handle) const noexcept {
   const std::uint32_t page_id = handle >> kSlotBits;
-  if (page_id == 0 || page_id >= page_directory_.size()) return nullptr;
-  const std::uint64_t descriptor = page_directory_[page_id];
-  if (descriptor == 0) return nullptr;
+  if (page_id == 0 || page_id >= next_page_id_) return nullptr;
+  const std::uint64_t descriptor = DirectoryDescriptor(page_id);
+  const std::uint64_t marker = descriptor & std::uint64_t{0xffff};
+  if (descriptor == 0 || marker == kFreePageMarker) return nullptr;
   return reinterpret_cast<PageHeader*>(descriptor & ~std::uint64_t{0xffff});
 }
 
@@ -503,43 +727,48 @@ inline bool ScanHashMapEntryArena::CanAllocate(
     std::size_t bytes) const noexcept {
   const std::uint8_t class_index = ClassFor(bytes);
   if (class_index != kLargeClassMarker &&
-      !available_pages_[class_index].empty()) {
+      available_page_heads_[class_index] != 0) {
     return true;
   }
-  return !free_page_ids_.empty() || page_directory_.size() <= maximum_page_id_;
+  return free_page_id_head_ != 0 || next_page_id_ <= maximum_page_id_;
 }
 
 inline std::size_t ScanHashMapEntryArena::AllocationBytesIfNewPage(
     std::size_t bytes) const noexcept {
   const std::uint8_t class_index = ClassFor(bytes);
   if (class_index != kLargeClassMarker &&
-      !available_pages_[class_index].empty()) {
+      available_page_heads_[class_index] != 0) {
     return 0;
   }
+  const std::size_t directory_bytes = DirectoryGrowthBytesForNextPage();
+  auto add = [](std::size_t left, std::size_t right) noexcept {
+    return right > std::numeric_limits<std::size_t>::max() - left
+               ? std::numeric_limits<std::size_t>::max()
+               : left + right;
+  };
   if (class_index != kLargeClassMarker) {
-    // A logical page still grows directory/free-list metadata even when it can
-    // reuse a span. The caller adds its normal slow-path allowance on top.
-    return available_spans_.empty() ? kSpanBytes + kPageBytes : 4096;
+    // Existing spans and intrusive availability lists need no heap growth. Any
+    // retained directory-array growth is charged exactly; a new span retains
+    // the alignment allowance because mimalloc may round the 64 KiB-aligned
+    // mapping upward.
+    return available_spans_head_ == nullptr
+               ? add(kSmallSpanAdmissionBytes, directory_bytes)
+               : directory_bytes;
   }
   const std::size_t block_size =
       bytes > std::numeric_limits<std::size_t>::max() - 7
           ? std::numeric_limits<std::size_t>::max()
           : (bytes + 7) & ~std::size_t{7};
-  if (block_size > std::numeric_limits<std::size_t>::max() -
-                       kPageHeaderBytes) {
+  if (block_size > std::numeric_limits<std::size_t>::max() - kPageHeaderBytes) {
     return std::numeric_limits<std::size_t>::max();
   }
   const std::size_t required = kPageHeaderBytes + block_size;
-  if (required > std::numeric_limits<std::size_t>::max() -
-                     (kPageBytes - 1)) {
+  if (required > std::numeric_limits<std::size_t>::max() - (kPageBytes - 1)) {
     return std::numeric_limits<std::size_t>::max();
   }
   const std::size_t allocation_bytes =
       (required + kPageBytes - 1) & ~(kPageBytes - 1);
-  return allocation_bytes >
-                 std::numeric_limits<std::size_t>::max() - kPageBytes
-             ? std::numeric_limits<std::size_t>::max()
-             : allocation_bytes + kPageBytes;
+  return add(add(allocation_bytes, kPageBytes), directory_bytes);
 }
 
 inline ScanHashMapEntryArena::Allocation ScanHashMapEntryArena::Allocate(
@@ -547,8 +776,8 @@ inline ScanHashMapEntryArena::Allocation ScanHashMapEntryArena::Allocate(
   const std::uint8_t class_index = ClassFor(bytes);
   PageHeader* page = nullptr;
   if (class_index != kLargeClassMarker &&
-      !available_pages_[class_index].empty()) {
-    page = PageFor(available_pages_[class_index].back() << kSlotBits);
+      available_page_heads_[class_index] != 0) {
+    page = PageFor(available_page_heads_[class_index] << kSlotBits);
     assert(page != nullptr);
   } else {
     page = AllocatePage(class_index, bytes);
@@ -577,10 +806,10 @@ inline void ScanHashMapEntryArena::ReleasePage(PageHeader* page) noexcept {
   const std::uint32_t page_id = page->page_id_;
   SmallSpan* span = page->small_span_;
   const std::uint8_t span_slot = page->span_slot_;
-  page_directory_[page_id] = 0;
+  SetDirectoryDescriptor(page_id, 0);
   page->~PageHeader();
   if (span == nullptr) {
-    ::operator delete(page, std::align_val_t{kPageBytes});
+    DeallocateRetainedBytes(allocation_domain_, page, kPageBytes);
   } else {
     assert(span_slot < kPagesPerSpan && span->live_pages_ != 0);
     const std::uint16_t page_bit =
@@ -595,7 +824,7 @@ inline void ScanHashMapEntryArena::ReleasePage(PageHeader* page) noexcept {
       AddAvailableSpan(span);
     }
   }
-  free_page_ids_.push_back(page_id);
+  ReleasePageId(page_id);
   assert(allocated_pages_ != 0);
   --allocated_pages_;
 }
@@ -634,8 +863,8 @@ inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
       (address - data) % page->block_size_ != 0) {
     return 0;
   }
-  if (page->page_id_ >= page_directory_.size() ||
-      (page_directory_[page->page_id_] & ~std::uint64_t{0xffff}) !=
+  if (page->page_id_ >= next_page_id_ ||
+      (DirectoryDescriptor(page->page_id_) & ~std::uint64_t{0xffff}) !=
           page_address) {
     return 0;
   }
@@ -872,10 +1101,9 @@ class ScanHashMap {
   // reservation across the non-suspending mutation, closing the admission to
   // allocator-accounting race without adding work to ordinary page reuse.
   std::size_t RequiredAllocationBytes(const Digest& digest,
-                                      std::string_view key,
-                                      bool key_complete, bool has_extra,
+                                      std::string_view key, bool key_complete,
+                                      bool has_extra,
                                       bool inserting) const noexcept {
-    constexpr std::size_t kSlowPathBookkeepingAllowance = 4096;
     auto add = [](std::size_t left, std::size_t right) noexcept {
       return right > std::numeric_limits<std::size_t>::max() - left
                  ? std::numeric_limits<std::size_t>::max()
@@ -884,31 +1112,29 @@ class ScanHashMap {
 
     const std::size_t entry_bytes = EntryAllocationBytes(
         static_cast<std::uint32_t>(key.size()), key_complete, has_extra);
-    std::size_t required =
-        arena_ == nullptr
-            ? ScanHashMapEntryArena::kPageBytes
-            : arena_->AllocationBytesIfNewPage(entry_bytes);
+    std::size_t required = arena_ == nullptr
+                               ? ScanHashMapEntryArena::kPageBytes
+                               : arena_->AllocationBytesIfNewPage(entry_bytes);
     if (required != 0) {
       required = add(required, kSlowPathBookkeepingAllowance);
     }
     if (!inserting) return required;
 
-    if (tables_[0].buckets_ == nullptr) {
+    if (tables_[0].buckets_.empty()) {
       return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
     }
     if (!Rehashing() &&
         tables_[0].used_ + 1 >
             BucketCount(tables_[0]) * kTargetEntriesPerBucket &&
         tables_[0].exponent_ < MaxBucketExponent) {
-      const std::size_t next_buckets =
-          std::size_t{1} << (tables_[0].exponent_ + 1);
+      const std::size_t next_buckets = std::size_t{1}
+                                       << (tables_[0].exponent_ + 1);
       if (next_buckets >
           std::numeric_limits<std::size_t>::max() / sizeof(Bucket)) {
         return std::numeric_limits<std::size_t>::max();
       }
-      return add(required,
-                 add(next_buckets * sizeof(Bucket),
-                     kSlowPathBookkeepingAllowance));
+      return add(required, add(next_buckets * sizeof(Bucket),
+                               kSlowPathBookkeepingAllowance));
     }
 
     const Table& target = Rehashing() ? tables_[1] : tables_[0];
@@ -921,7 +1147,7 @@ class ScanHashMap {
       }
       bucket = Chained(*bucket) ? Child(target, bucket) : nullptr;
     }
-    return add(required, sizeof(Bucket) + kSlowPathBookkeepingAllowance);
+    return add(required, OverflowChildAllocationBytes(target, 1));
   }
 
   // Releases an old representation returned by ReplaceValue after its
@@ -941,7 +1167,7 @@ class ScanHashMap {
   bool empty() const noexcept { return size() == 0; }
 
   bool has_allocated_storage() const noexcept {
-    return tables_[0].buckets_ != nullptr || tables_[1].buckets_ != nullptr;
+    return !tables_[0].buckets_.empty() || !tables_[1].buckets_.empty();
   }
 
   // Includes both tables during incremental expansion. Primarily useful for
@@ -949,6 +1175,8 @@ class ScanHashMap {
   std::size_t allocated_bucket_count() const noexcept {
     return BucketCount(tables_[0]) + BucketCount(tables_[1]);
   }
+  // Exposes incremental-expansion state for capacity diagnostics and tests.
+  bool rehashing() const noexcept { return Rehashing(); }
 
   // Returns the low bucket-address bits callers must retain with an Entry
   // address across suspension. It is computed while the Entry is known live;
@@ -1004,7 +1232,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       const Table& table = tables_[t];
-      if (table.buckets_ == nullptr) {
+      if (table.buckets_.empty()) {
         continue;
       }
       const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1045,7 +1273,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_ == nullptr) {
+      if (table.buckets_.empty()) {
         continue;
       }
       Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1076,6 +1304,7 @@ class ScanHashMap {
       return {existing, false};
     }
 
+    EnsureArena();
     EnsureTable();
     MaybeStartExpansion();
     typename Entry::Allocation allocation =
@@ -1092,6 +1321,7 @@ class ScanHashMap {
 
   Entry* InsertNew(const Digest& digest, std::string_view key,
                    const Value& value, bool key_complete = true) {
+    EnsureArena();
     EnsureTable();
     MaybeStartExpansion();
     typename Entry::Allocation allocation =
@@ -1122,7 +1352,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_ == nullptr) {
+      if (table.buckets_.empty()) {
         continue;
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
@@ -1154,7 +1384,7 @@ class ScanHashMap {
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
       Table& table = tables_[t];
-      if (table.buckets_ == nullptr) {
+      if (table.buckets_.empty()) {
         continue;
       }
       Bucket* top = &table.buckets_[hash & BucketMask(table)];
@@ -1322,6 +1552,7 @@ class ScanHashMap {
  private:
   static constexpr std::size_t kEntriesPerBucket = 12;
   static constexpr std::size_t kTargetEntriesPerBucket = 9;
+  static constexpr std::size_t kSlowPathBookkeepingAllowance = 4096;
   static constexpr std::size_t kNotRehashing =
       std::numeric_limits<std::size_t>::max();
 
@@ -1335,14 +1566,34 @@ class ScanHashMap {
 
   static_assert(sizeof(Bucket) == 64);
 
+  using BucketOwner = std::unique_ptr<Bucket, RetainedObjectDeleter<Bucket>>;
+  using BucketOwnerVector =
+      std::vector<BucketOwner, RetainedAllocator<BucketOwner>>;
+  using OverflowFreeIds =
+      std::vector<std::uint32_t, RetainedAllocator<std::uint32_t>>;
+  using DirectBuckets = std::vector<Bucket, RetainedAllocator<Bucket>>;
+
   struct OverflowBuckets {
-    std::vector<std::unique_ptr<Bucket>> buckets_;
-    std::vector<std::uint32_t> free_ids_;
+    explicit OverflowBuckets(RetainedAllocationDomain domain)
+        : buckets_(RetainedAllocator<BucketOwner>(domain)),
+          free_ids_(RetainedAllocator<std::uint32_t>(domain)) {}
+
+    BucketOwnerVector buckets_;
+    OverflowFreeIds free_ids_;
   };
 
+  using OverflowOwner =
+      std::unique_ptr<OverflowBuckets, RetainedObjectDeleter<OverflowBuckets>>;
+
   struct Table {
-    std::unique_ptr<Bucket[]> buckets_;
-    std::unique_ptr<OverflowBuckets> overflow_;
+    Table() = default;
+    explicit Table(RetainedAllocationDomain domain)
+        : buckets_(RetainedAllocator<Bucket>(domain)),
+          overflow_(nullptr, RetainedObjectDeleter<OverflowBuckets>{
+                                 RetainedAllocator<OverflowBuckets>(domain)}) {}
+
+    DirectBuckets buckets_;
+    OverflowOwner overflow_;
     std::uint8_t exponent_ = 0;
     std::size_t used_ = 0;
   };
@@ -1376,32 +1627,121 @@ class ScanHashMap {
     std::uint32_t id_ = 0;
   };
 
-  static ChildAllocation AllocateChild(Table* table) {
-    if (table->overflow_ == nullptr) {
-      table->overflow_ = std::make_unique<OverflowBuckets>();
+  static std::size_t VectorCapacityFor(std::size_t current,
+                                       std::size_t required) noexcept {
+    if (required <= current) return current;
+    const std::size_t doubled =
+        current > std::numeric_limits<std::size_t>::max() / 2
+            ? std::numeric_limits<std::size_t>::max()
+            : std::max<std::size_t>(1, current * 2);
+    return std::max(required, doubled);
+  }
+
+  static bool AddUsableAllocation(std::size_t requested,
+                                  std::size_t* total) noexcept {
+    const std::size_t usable = AllocatorUsableSizeForRequest(requested);
+    if (usable == std::numeric_limits<std::size_t>::max() ||
+        usable > std::numeric_limits<std::size_t>::max() - *total) {
+      *total = std::numeric_limits<std::size_t>::max();
+      return false;
     }
+    *total += usable;
+    return true;
+  }
+
+  static std::size_t OverflowChildAllocationBytes(const Table& table,
+                                                  std::size_t count) noexcept {
+    if (count == 0) return 0;
+    std::size_t total = 0;
+    const OverflowBuckets* pool = table.overflow_.get();
+    if (pool == nullptr &&
+        !AddUsableAllocation(sizeof(OverflowBuckets), &total)) {
+      return total;
+    }
+    const std::size_t reusable =
+        pool == nullptr ? 0 : std::min(count, pool->free_ids_.size());
+    const std::size_t appended = count - reusable;
+    const std::size_t current_size =
+        pool == nullptr ? 0 : pool->buckets_.size();
+    if (appended > std::numeric_limits<std::size_t>::max() - current_size) {
+      return std::numeric_limits<std::size_t>::max();
+    }
+    const std::size_t final_size = current_size + appended;
+    const std::size_t free_capacity =
+        pool == nullptr ? 0 : pool->free_ids_.capacity();
+    if (final_size > free_capacity) {
+      const std::size_t capacity = VectorCapacityFor(free_capacity, final_size);
+      if (capacity >
+              std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t) ||
+          !AddUsableAllocation(capacity * sizeof(std::uint32_t), &total)) {
+        return std::numeric_limits<std::size_t>::max();
+      }
+    }
+    const std::size_t bucket_capacity =
+        pool == nullptr ? 0 : pool->buckets_.capacity();
+    if (final_size > bucket_capacity) {
+      const std::size_t capacity =
+          VectorCapacityFor(bucket_capacity, final_size);
+      if (capacity >
+              std::numeric_limits<std::size_t>::max() / sizeof(BucketOwner) ||
+          !AddUsableAllocation(capacity * sizeof(BucketOwner), &total)) {
+        return std::numeric_limits<std::size_t>::max();
+      }
+    }
+    const std::size_t bucket_bytes =
+        AllocatorUsableSizeForRequest(sizeof(Bucket));
+    if (bucket_bytes == std::numeric_limits<std::size_t>::max() ||
+        count >
+            (std::numeric_limits<std::size_t>::max() - total) / bucket_bytes) {
+      return std::numeric_limits<std::size_t>::max();
+    }
+    total += count * bucket_bytes;
+    return total;
+  }
+
+  static void PrepareChildCapacity(Table* table, std::size_t count) {
+    if (count == 0) return;
+    if (table->overflow_ == nullptr) {
+      const RetainedAllocationDomain domain =
+          table->buckets_.get_allocator().domain();
+      table->overflow_ = MakeRetainedUnique<OverflowBuckets>(domain, domain);
+    }
+    auto& pool = *table->overflow_;
+    const std::size_t reusable = std::min(count, pool.free_ids_.size());
+    const std::size_t appended = count - reusable;
+    if (appended >
+        std::numeric_limits<std::size_t>::max() - pool.buckets_.size()) {
+      throw std::bad_alloc();
+    }
+    const std::size_t final_size = pool.buckets_.size() + appended;
+    if (final_size > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::bad_alloc();
+    }
+    if (final_size > pool.free_ids_.capacity()) {
+      pool.free_ids_.reserve(
+          VectorCapacityFor(pool.free_ids_.capacity(), final_size));
+    }
+    if (final_size > pool.buckets_.capacity()) {
+      pool.buckets_.reserve(
+          VectorCapacityFor(pool.buckets_.capacity(), final_size));
+    }
+  }
+
+  static ChildAllocation AllocateChild(Table* table) {
+    PrepareChildCapacity(table, 1);
     auto& pool = *table->overflow_;
     std::uint32_t index = 0;
     if (!pool.free_ids_.empty()) {
-      auto bucket = std::make_unique<Bucket>();
+      auto bucket =
+          MakeRetainedUnique<Bucket>(pool.buckets_.get_allocator().domain());
       index = pool.free_ids_.back();
       pool.free_ids_.pop_back();
       assert(index < pool.buckets_.size() && pool.buckets_[index] == nullptr);
       pool.buckets_[index] = std::move(bucket);
     } else {
-      if (pool.buckets_.size() >= std::numeric_limits<std::uint32_t>::max()) {
-        throw std::bad_alloc();
-      }
-      // FreeChild is noexcept. Reserve its bookkeeping slot while allocation
-      // is already allowed to fail, so erasing an overflow bucket never has
-      // to allocate memory merely to remember the reusable ID.
-      if (pool.free_ids_.capacity() < pool.buckets_.size() + 1) {
-        pool.free_ids_.reserve(
-            std::max(pool.buckets_.size() + 1,
-                     std::max<std::size_t>(1, pool.free_ids_.capacity() * 2)));
-      }
       index = static_cast<std::uint32_t>(pool.buckets_.size());
-      pool.buckets_.push_back(std::make_unique<Bucket>());
+      pool.buckets_.push_back(
+          MakeRetainedUnique<Bucket>(pool.buckets_.get_allocator().domain()));
     }
     return {.bucket_ = pool.buckets_[index].get(), .id_ = index + 1};
   }
@@ -1416,7 +1756,7 @@ class ScanHashMap {
   }
 
   static std::size_t BucketCount(const Table& table) noexcept {
-    return table.buckets_ == nullptr ? 0 : std::size_t{1} << table.exponent_;
+    return table.buckets_.empty() ? 0 : std::size_t{1} << table.exponent_;
   }
 
   static std::uint64_t BucketMask(const Table& table) noexcept {
@@ -1504,8 +1844,10 @@ class ScanHashMap {
   bool Rehashing() const noexcept { return rehash_index_ != kNotRehashing; }
 
   void EnsureTable() {
-    if (tables_[0].buckets_ == nullptr) {
-      tables_[0].buckets_ = std::make_unique<Bucket[]>(1);
+    if (tables_[0].buckets_.empty()) {
+      assert(arena_ != nullptr);
+      tables_[0] = Table(arena_->allocation_domain());
+      tables_[0].buckets_.resize(1);
       tables_[0].exponent_ = 0;
     }
   }
@@ -1525,9 +1867,10 @@ class ScanHashMap {
     if (tables_[0].exponent_ >= MaxBucketExponent) {
       return;
     }
+    assert(arena_ != nullptr);
+    tables_[1] = Table(arena_->allocation_domain());
     tables_[1].exponent_ = tables_[0].exponent_ + 1;
-    tables_[1].buckets_ =
-        std::make_unique<Bucket[]>(std::size_t{1} << tables_[1].exponent_);
+    tables_[1].buckets_.resize(std::size_t{1} << tables_[1].exponent_);
     tables_[1].used_ = 0;
     rehash_index_ = 0;
   }
@@ -1537,19 +1880,119 @@ class ScanHashMap {
       return;
     }
 
+    // A source chain can split into only two target chains when the direct
+    // table doubles. Prepare every overflow bucket before clearing a source
+    // slot, so admission failure or allocator OOM merely delays maintenance
+    // and never leaves a partially migrated map. This also covers rehash work
+    // initiated by reads, which have no enclosing write reservation.
+    if (!PrepareRehashCapacity(&tables_[0].buckets_[rehash_index_],
+                               &tables_[1])) {
+      return;
+    }
+
     MoveBucket(&tables_[0].buckets_[rehash_index_], &tables_[1]);
     ++rehash_index_;
     if (rehash_index_ == BucketCount(tables_[0])) {
       assert(tables_[0].used_ == 0);
       tables_[0] = std::move(tables_[1]);
-      tables_[1] = Table{};
+      tables_[1] = Table(arena_->allocation_domain());
       rehash_index_ = kNotRehashing;
     }
   }
 
+  static std::size_t FreeSlots(const Table& table,
+                               std::size_t bucket_index) noexcept {
+    const Bucket* bucket = &table.buckets_[bucket_index];
+    std::size_t free = 0;
+    while (bucket != nullptr) {
+      free += static_cast<std::size_t>(std::count(
+          bucket->entries_.begin(), bucket->entries_.end(), EntryHandle{0}));
+      bucket = Chained(*bucket) ? Child(table, bucket) : nullptr;
+    }
+    return free;
+  }
+
+  static std::size_t OverflowBucketsNeeded(const Table& table,
+                                           std::size_t bucket_index,
+                                           std::size_t entries) noexcept {
+    const std::size_t free = FreeSlots(table, bucket_index);
+    if (entries <= free) return 0;
+    const std::size_t missing = entries - free;
+    return (missing + kEntriesPerBucket - 1) / kEntriesPerBucket;
+  }
+
+  static void AppendEmptyBuckets(Table* table, std::size_t bucket_index,
+                                 std::size_t count) {
+    Bucket* tail = &table->buckets_[bucket_index];
+    while (Chained(*tail)) tail = Child(*table, tail);
+    while (count-- != 0) {
+      const ChildAllocation child = AllocateChild(table);
+      tail->child_ = child.id_;
+      tail = child.bucket_;
+    }
+  }
+
+  bool PrepareRehashCapacity(Bucket* source, Table* target) {
+    const std::size_t old_bucket_count = BucketCount(tables_[0]);
+    const std::array<std::size_t, 2> target_indexes = {
+        rehash_index_, rehash_index_ + old_bucket_count};
+    std::array<std::size_t, 2> demand{};
+    for (Bucket* bucket = source; bucket != nullptr;
+         bucket = Chained(*bucket) ? Child(tables_[0], bucket) : nullptr) {
+      for (EntryHandle handle : bucket->entries_) {
+        if (handle == 0) continue;
+        const std::size_t index = static_cast<std::size_t>(
+            EntryHash(*Resolve(handle)) & BucketMask(*target));
+        assert(index == target_indexes[0] || index == target_indexes[1]);
+        ++demand[index == target_indexes[0] ? 0 : 1];
+      }
+    }
+
+    std::array<std::size_t, 2> needed{};
+    for (std::size_t split = 0; split < needed.size(); ++split) {
+      needed[split] =
+          OverflowBucketsNeeded(*target, target_indexes[split], demand[split]);
+    }
+    if (needed[0] > std::numeric_limits<std::size_t>::max() - needed[1]) {
+      return false;
+    }
+    const std::size_t total_needed = needed[0] + needed[1];
+    const std::size_t allocation_bytes =
+        OverflowChildAllocationBytes(*target, total_needed);
+    if (allocation_bytes == std::numeric_limits<std::size_t>::max()) {
+      return false;
+    }
+
+    std::optional<MemoryReservation> reservation;
+    const RetainedAllocationDomain domain =
+        target->buckets_.get_allocator().domain();
+    if (allocation_bytes != 0 && domain.externally_admitted_ &&
+        !domain.externally_accounted_) {
+      // Primary-index mutations admit composite growth at the storage layer,
+      // but a later read may execute this maintenance step without such an
+      // enclosing permit. Reserve the complete split before moving entries.
+      reservation = TryReserveMemory(allocation_bytes);
+      if (!reservation.has_value()) return false;
+    }
+    try {
+      // Each retained allocator performs admission before it changes a vector
+      // or publishes a bucket. Partial success leaves only empty capacity, so
+      // a later read or write can retry without a partially moved source.
+      PrepareChildCapacity(target, total_needed);
+      for (std::size_t split = 0; split < needed.size(); ++split) {
+        AppendEmptyBuckets(target, target_indexes[split], needed[split]);
+      }
+    } catch (const std::bad_alloc&) {
+      // Any buckets attached before failure are empty and valid. A later step
+      // counts them as free capacity and retries only the missing allocation.
+      return false;
+    }
+    return true;
+  }
+
   Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
                      std::uint64_t hash) {
-    if (table.buckets_ == nullptr) {
+    if (table.buckets_.empty()) {
       return nullptr;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1568,7 +2011,7 @@ class ScanHashMap {
 
   const Entry* FindInTable(const Table& table, const Digest& digest,
                            std::string_view key, std::uint64_t hash) const {
-    if (table.buckets_ == nullptr) return nullptr;
+    if (table.buckets_.empty()) return nullptr;
     const Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
     const std::uint8_t tag = HashTag(hash);
     while (bucket != nullptr) {
@@ -1586,7 +2029,7 @@ class ScanHashMap {
   void AppendCandidates(Table& table, const Digest& digest,
                         std::string_view key, std::uint64_t hash,
                         std::vector<Entry*>* result) {
-    if (table.buckets_ == nullptr) {
+    if (table.buckets_.empty()) {
       return;
     }
     Bucket* bucket = &table.buckets_[hash & BucketMask(table)];
@@ -1715,7 +2158,7 @@ class ScanHashMap {
 
   template <typename Fn>
   void EmitBucket(const Table& table, std::uint64_t index, Fn& fn) const {
-    if (table.buckets_ == nullptr) {
+    if (table.buckets_.empty()) {
       return;
     }
     const Bucket* bucket = &table.buckets_[index];
@@ -1739,7 +2182,7 @@ class ScanHashMap {
 
   template <typename Fn>
   bool EmitBucketWhile(const Table& table, std::uint64_t index, Fn& fn) const {
-    if (table.buckets_ == nullptr) return true;
+    if (table.buckets_.empty()) return true;
     const Bucket* bucket = &table.buckets_[index];
     while (bucket != nullptr) {
       for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {

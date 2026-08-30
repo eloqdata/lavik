@@ -627,14 +627,14 @@
       "targets": [
         {
           "editorMode": "code",
-          "expr": "100 * keylane_memory_current_bytes{instance=~\"$instance\"} / keylane_memory_max_bytes{instance=~\"$instance\"}",
+          "expr": "100 * (keylane_memory_current_bytes{instance=~\"$instance\"} + keylane_fullsync_reserved_memory_bytes{instance=~\"$instance\"} + keylane_memory_admission_pending_bytes{instance=~\"$instance\"}) / (0.9 * keylane_memory_max_bytes{instance=~\"$instance\"})",
           "instant": true,
           "legendFormat": "{{instance}}",
           "range": false,
           "refId": "A"
         }
       ],
-      "title": "Memory Limit Utilization",
+      "title": "Retained Admission Utilization",
       "type": "gauge"
     },
     {

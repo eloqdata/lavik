@@ -17,6 +17,8 @@ namespace {
 
 using keylane::ApplyRedisConfigDirective;
 using keylane::LoadRedisConfigFile;
+using keylane::ParseClientBufferLimit;
+using keylane::ParseClientQueryBufferLimit;
 using keylane::ParseMemorySize;
 using keylane::ParseRedisConfigLine;
 using keylane::ParseReplicaOfRequest;
@@ -72,6 +74,33 @@ TEST(RedisConfigTest, ParsesRedisMemorySizes) {
   EXPECT_FALSE(ParseMemorySize("8xb").ok());
 }
 
+TEST(RedisConfigTest, ParsesClientBufferPercentAndAbsoluteLimits) {
+  auto percentage = ParseClientBufferLimit("7%");
+  ASSERT_TRUE(percentage.ok()) << percentage.status();
+  EXPECT_TRUE(percentage->percentage_);
+  EXPECT_EQ(percentage->value_, 7);
+
+  auto bytes = ParseClientBufferLimit("256mb");
+  ASSERT_TRUE(bytes.ok()) << bytes.status();
+  EXPECT_FALSE(bytes->percentage_);
+  EXPECT_EQ(bytes->value_, 256ULL * 1024 * 1024);
+
+  auto disabled = ParseClientBufferLimit("0");
+  ASSERT_TRUE(disabled.ok()) << disabled.status();
+  EXPECT_FALSE(disabled->percentage_);
+  EXPECT_EQ(disabled->value_, 0);
+  EXPECT_FALSE(ParseClientBufferLimit("101%").ok());
+  EXPECT_FALSE(ParseClientBufferLimit("%").ok());
+}
+
+TEST(RedisConfigTest, ParsesRedisClientQueryBufferLimitRange) {
+  EXPECT_EQ(*ParseClientQueryBufferLimit("1gb"), 1ULL * 1024 * 1024 * 1024);
+  EXPECT_EQ(*ParseClientQueryBufferLimit("1048576"), 1ULL * 1024 * 1024);
+  EXPECT_FALSE(ParseClientQueryBufferLimit("1048575").ok());
+  EXPECT_FALSE(ParseClientQueryBufferLimit("0").ok());
+  EXPECT_FALSE(ParseClientQueryBufferLimit("5%").ok());
+}
+
 TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ServerOptions options;
   ASSERT_TRUE(ApplyRedisConfigDirective(
@@ -81,6 +110,11 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   ASSERT_TRUE(ApplyRedisConfigDirective({"io-threads", "4"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"maxclients", "12000"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"maxmemory-clients", "7%"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"client-query-buffer-limit", "64mb"}, &options)
+                  .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"replicaof", "redis.internal", "6379"},
                                         &options)
                   .ok());
@@ -144,6 +178,9 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_EQ(options.port_, 6380);
   EXPECT_EQ(options.thread_count_, 4u);
   EXPECT_EQ(options.max_clients_, 12000u);
+  EXPECT_TRUE(options.maxmemory_clients_.percentage_);
+  EXPECT_EQ(options.maxmemory_clients_.value_, 7u);
+  EXPECT_EQ(options.client_query_buffer_limit_bytes_, 64ULL * 1024 * 1024);
   ASSERT_TRUE(options.replicaof_.has_value());
   EXPECT_EQ(options.replicaof_->host_, "redis.internal");
   EXPECT_EQ(options.replicaof_->port_, 6379);
@@ -273,6 +310,11 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"slowlog-max-len", "-1"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"maxclients", "0"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"maxmemory-clients", "101%"}, &options).ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective(
+                   {"client-query-buffer-limit", "512kb"}, &options)
+                   .ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"maxclients", "many"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"appendonly", "yes"}, &options).ok());

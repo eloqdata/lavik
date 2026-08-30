@@ -325,6 +325,7 @@ if (BUILD_TESTING)
     tests/cross_core_active_sender_test.cpp
     tests/device_affinity_test.cpp
     tests/logging_test.cpp
+    tests/memory_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
     tests/command_table_test.cpp

@@ -395,7 +395,9 @@ std::vector<std::string> EncodeReplicationCommandEffects(
     std::vector<CapturedReplicationCommand> commands);
 
 // Reserves one ordered replication marker on every shard participating in a
-// standalone cross-key command. Destruction aborts an unresolved marker.
+// standalone cross-key command. Construction may fail retained-memory
+// admission, so callers must check status() before scheduling the transaction
+// or entering storage. Destruction aborts an unresolved marker.
 class ReplicationTransactionGuard {
  public:
   using ParticipantsEnteredHook = void (*)(void*) noexcept;
@@ -412,9 +414,14 @@ class ReplicationTransactionGuard {
   ~ReplicationTransactionGuard();
 
   void Commit() noexcept;
-  void SetCommandArgs(std::vector<std::string> canonical_args);
+  // Replaces the canonical body while the transaction is pending. The method
+  // obtains retained-memory headroom before growing the shared envelope, so a
+  // caller can place this boundary before making its primary mutation visible.
+  absl::Status TrySetCommandArgs(
+      std::vector<std::string> canonical_args) noexcept;
+  void SetCommandArgs(std::vector<std::string> canonical_args) noexcept;
   void SetFinalExpirations(
-      std::span<const storage::TxShardWrites> shard_writes);
+      std::span<const storage::TxShardWrites> shard_writes) noexcept;
   // Runs exactly once, on the worker that enqueues the final participant
   // marker. The hook must be nonblocking and remain alive until the first
   // transaction hop completes.
@@ -422,11 +429,13 @@ class ReplicationTransactionGuard {
                                   void* context) noexcept;
   void EnterCurrentShard() noexcept;
   bool active() const noexcept { return transaction_ != nullptr; }
+  const absl::Status& status() const noexcept { return status_; }
 
  private:
   void Initialize(const CommandRequest& request,
                   std::vector<unsigned> participants,
                   std::vector<std::string> canonical_args);
+  void InvalidatePayload() noexcept;
   void EnterShard(unsigned shard_id) noexcept;
   static void EnterShardHook(void* context, unsigned shard_id);
 
@@ -434,6 +443,8 @@ class ReplicationTransactionGuard {
   std::atomic<unsigned> entered_participants_{0};
   ParticipantsEnteredHook participants_entered_hook_ = nullptr;
   void* participants_entered_context_ = nullptr;
+  int uncaught_exceptions_ = 0;
+  absl::Status status_ = absl::OkStatus();
 };
 
 // Static facts INFO reports. Call once before the server starts.

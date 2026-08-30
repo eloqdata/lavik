@@ -37,6 +37,10 @@ CommandReply Built(std::string_view encoded) {
 }
 
 std::string StorageError(const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return EncodeError(status.message());
+  }
   return status.message().starts_with("WRONGTYPE ")
              ? EncodeError(status.message())
              : EncodeError(absl::StrCat("ERR ", status.message()));
@@ -64,9 +68,8 @@ ReadOptionalStringLocked(std::uint8_t db_id, std::string_view key,
 absl::StatusOr<std::uint64_t> ParseExpireAt(std::string_view text, bool seconds,
                                             bool absolute,
                                             std::string_view command) {
-  return ParseRedisExpirationDeadline(
-      text, seconds, absolute, command,
-      PastExpirationPolicy::kRejectNonPositive);
+  return ParseRedisExpirationDeadline(text, seconds, absolute, command,
+                                      PastExpirationPolicy::kRejectNonPositive);
 }
 
 std::string_view Range(std::string_view value, std::int64_t start,
@@ -467,8 +470,8 @@ absl::StatusOr<bool> ParseBitmapUnit(std::string_view unit) {
 celer::Task<std::string> RunBitmapLocked(const CommandRequest& request,
                                          const storage::Digest& digest,
                                          storage::TxShardWrites* tx) {
-  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
-                                   : std::nullopt;
+  auto replication =
+      tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   const auto& args = request.args_;
   const std::uint8_t db = request.db_id_;
   const std::string_view key = args[1];
@@ -696,10 +699,10 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
     default:
       break;
   }
-  auto replication = tx == nullptr && request.kind_ != CommandKind::kGetEx
-                         ? PrepareReplicationCommand(request,
-                                                     std::move(canonical_args))
-                         : std::nullopt;
+  auto replication =
+      tx == nullptr && request.kind_ != CommandKind::kGetEx
+          ? PrepareReplicationCommand(request, std::move(canonical_args))
+          : std::nullopt;
   std::optional<std::uint64_t> getex_deadline;
 
   if (request.kind_ == CommandKind::kSetEx ||
@@ -716,9 +719,8 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
         co_await g_storage->SetLocked(db, key, digest, args[3], options, tx,
                                       replication ? &*replication : nullptr);
     if (result.ok() && result->applied_) {
-      CaptureReplicationCommand(
-          request, {"SET", args[1], args[3], "PXAT",
-                    std::to_string(*expire_at)});
+      CaptureReplicationCommand(request, {"SET", args[1], args[3], "PXAT",
+                                          std::to_string(*expire_at)});
     }
     co_return result.ok() ? EncodeSimpleString("OK")
                           : StorageError(result.status());
@@ -774,8 +776,7 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       co_return EncodeError("ERR syntax error");
     }
     if (tx == nullptr && persist) {
-      replication =
-          PrepareReplicationCommand(request, {"PERSIST", args[1]});
+      replication = PrepareReplicationCommand(request, {"PERSIST", args[1]});
     } else if (expiration) {
       if (tx == nullptr) {
         // Redis validates the option shape before lookup, but parses the TTL
@@ -838,14 +839,12 @@ celer::Task<std::string> RunStringLocked(const CommandRequest& request,
       const bool ex = RedisEqualsIgnoreCase(args[2], "ex");
       const bool exat = RedisEqualsIgnoreCase(args[2], "exat");
       const bool pxat = RedisEqualsIgnoreCase(args[2], "pxat");
-      auto parsed =
-          ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
+      auto parsed = ParseExpireAt(args[3], ex || exat, exat || pxat, "getex");
       if (!parsed.ok()) {
         return parsed.status();
       }
       getex_deadline = *parsed;
-      captured_args = {"PEXPIREAT", args[1],
-                       std::to_string(*getex_deadline)};
+      captured_args = {"PEXPIREAT", args[1], std::to_string(*getex_deadline)};
       if (replication.has_value()) replication->args_ = captured_args;
       if (*getex_deadline <= RedisUnixTimeMillis()) {
         return storage::CompactValueUpdate{.changed_ = true,
@@ -1037,12 +1036,6 @@ absl::StatusOr<std::string> BuildLcsReply(std::string_view a,
           "Insufficient memory, transient memory for LCS exceeds "
           "proto-max-bulk-len");
     }
-    const std::size_t bytes = row_cells * 2 * sizeof(std::uint32_t);
-    if (WouldExceedMemoryLimit(bytes)) {
-      RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "Insufficient memory, failed allocating transient memory for LCS");
-    }
     std::vector<std::uint32_t> previous;
     std::vector<std::uint32_t> current;
     try {
@@ -1077,12 +1070,6 @@ absl::StatusOr<std::string> BuildLcsReply(std::string_view a,
     return absl::ResourceExhaustedError(
         "Insufficient memory, transient memory for LCS exceeds "
         "proto-max-bulk-len");
-  }
-  const std::size_t bytes = cells * sizeof(std::uint32_t);
-  if (WouldExceedMemoryLimit(bytes)) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "Insufficient memory, failed allocating transient memory for LCS");
   }
   std::vector<std::uint32_t> table;
   try {
@@ -1252,7 +1239,37 @@ struct BitOpContext {
   BitOp operation_ = BitOp::kAnd;
   std::vector<std::string> inputs_;
   std::string output_;
+  ReplicationTransactionGuard* replication_ = nullptr;
 };
+
+absl::Status PrepareBitOpReplication(BitOpContext* context) noexcept {
+  if (context->replication_ == nullptr || !context->replication_->active()) {
+    return absl::OkStatus();
+  }
+  try {
+    std::vector<std::string> canonical_args;
+    canonical_args.reserve(context->output_.empty() ? 2 : 3);
+    canonical_args.emplace_back(context->output_.empty() ? "DEL" : "SET");
+    canonical_args.emplace_back(context->request_->args_[2]);
+    if (!context->output_.empty()) {
+      canonical_args.emplace_back(context->output_);
+    }
+
+    // The transaction envelope was allocated for the original BITOP, which
+    // has at least four arguments, so replacing its body with this two- or
+    // three-argument after-image only moves already-owned strings. Preparing
+    // the value copy here is the last potentially failing allocation and must
+    // happen before WriteBitOpDestination mutates the primary index.
+    return context->replication_->TrySetCommandArgs(std::move(canonical_args));
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "OOM command not allowed when used memory > 'maxmemory'.");
+  } catch (const std::length_error&) {
+    return absl::ResourceExhaustedError(
+        "BITOP replication command is too large");
+  }
+}
 
 celer::Task<absl::Status> ReadBitOpSources(BitOpContext* context,
                                            const tx::ShardSlice& slice) {
@@ -1304,6 +1321,8 @@ celer::Task<absl::Status> BitOpSingleShardCallback(
   absl::Status read = co_await ReadBitOpSources(context, slice);
   if (!read.ok()) co_return read;
   context->output_ = ComputeBitOp(context->operation_, context->inputs_);
+  absl::Status prepared = PrepareBitOpReplication(context);
+  if (!prepared.ok()) co_return prepared;
   for (const tx::TxKey& key : slice.keys_) {
     if (key.arg_index_ == 2) {
       co_return co_await WriteBitOpDestination(context, key.digest_, nullptr);
@@ -1342,8 +1361,8 @@ celer::Task<CommandReply> ExecuteStringCommandLocked(
       co_return Built(reply_builder.AppendError(
           "ERR value is not an integer or out of range"));
     }
-    auto current = co_await ReadOptionalStringLocked(
-        request.db_id_, request.args_[1], digest);
+    auto current = co_await ReadOptionalStringLocked(request.db_id_,
+                                                     request.args_[1], digest);
     if (!current.ok()) {
       co_return Built(reply_builder.AppendRaw(StorageError(current.status())));
     }
@@ -1393,6 +1412,10 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   }
   transaction.Seal();
   ReplicationTransactionGuard replication(request, &transaction);
+  if (!replication.status().ok()) {
+    co_return Built(
+        reply_builder.AppendRaw(StorageError(replication.status())));
+  }
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) {
     co_return Built(
@@ -1403,6 +1426,7 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
       .operation_ = *operation,
       .inputs_ = std::vector<std::string>(request.args_.size()),
       .output_ = {},
+      .replication_ = &replication,
   };
   if (transaction.single_shard()) {
     status =
@@ -1411,8 +1435,13 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
     status = co_await transaction.Execute(&BitOpReadCallback, &context, false);
     if (status.ok()) {
       context.output_ = ComputeBitOp(context.operation_, context.inputs_);
-      status =
-          co_await transaction.Execute(&BitOpWriteCallback, &context, true);
+      status = PrepareBitOpReplication(&context);
+      if (status.ok()) {
+        status =
+            co_await transaction.Execute(&BitOpWriteCallback, &context, true);
+      } else {
+        (void)co_await transaction.Release();
+      }
     } else if (!transaction.releasing()) {
       (void)co_await transaction.Release();
     }
@@ -1420,11 +1449,6 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
   if (!status.ok()) {
     co_return Built(reply_builder.AppendRaw(StorageError(status)));
   }
-  replication.SetCommandArgs(
-      context.output_.empty()
-          ? std::vector<std::string>{"DEL", request.args_[2]}
-          : std::vector<std::string>{"SET", request.args_[2],
-                                     context.output_});
   replication.Commit();
   co_return Built(reply_builder.AppendInteger(context.output_.size()));
 }
@@ -1477,10 +1501,10 @@ celer::Task<std::string> ExecuteBitOpLocked(
           : co_await celer::SubmitTaskTo(destination->owner_, write);
   if (!status.ok()) co_return StorageError(status);
   CaptureReplicationCommand(
-      request, context.output_.empty()
-                   ? std::vector<std::string>{"DEL", request.args_[2]}
-                   : std::vector<std::string>{"SET", request.args_[2],
-                                              context.output_});
+      request,
+      context.output_.empty()
+          ? std::vector<std::string>{"DEL", request.args_[2]}
+          : std::vector<std::string>{"SET", request.args_[2], context.output_});
   co_return EncodeInteger(context.output_.size());
 }
 
@@ -1551,8 +1575,8 @@ celer::Task<std::string> ExecuteLcsLocked(
   if (!options.ok()) {
     co_return EncodeError(absl::StrCat("ERR ", options.status().message()));
   }
-  auto result = BuildLcsReply(values[0], values[1], *options,
-                              request.resp_version_);
+  auto result =
+      BuildLcsReply(values[0], values[1], *options, request.resp_version_);
   co_return result.ok()
       ? std::move(*result)
       : EncodeError(absl::StrCat("ERR ", result.status().message()));

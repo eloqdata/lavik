@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "keylane/memory.h"
 #include "keylane/storage/format.h"
 
 namespace {
@@ -55,8 +56,9 @@ TEST(ScanHashMapTest, ReportsPhysicalAllocationOnlyOnSlowPath) {
   auto arena = std::make_shared<ScanHashMapEntryArena>();
   ScanHashMap<std::uint64_t> map(arena);
   const Digest first = ComputeDigest("first");
-  EXPECT_GE(map.RequiredAllocationBytes(first, "first", true, false, true),
-            ScanHashMapEntryArena::kSpanBytes);
+  const std::size_t first_allocation =
+      map.RequiredAllocationBytes(first, "first", true, false, true);
+  EXPECT_GE(first_allocation, ScanHashMapEntryArena::kSpanBytes);
 
   map.InsertNew(first, "first", 1);
   EXPECT_EQ(arena->allocated_pages(), 1);
@@ -66,8 +68,52 @@ TEST(ScanHashMapTest, ReportsPhysicalAllocationOnlyOnSlowPath) {
 
   map.Clear();
   EXPECT_EQ(arena->allocated_pages(), 0);
-  EXPECT_GE(map.RequiredAllocationBytes(second, "second", true, false, true),
-            ScanHashMapEntryArena::kSpanBytes);
+  const std::size_t after_directory_allocation =
+      map.RequiredAllocationBytes(second, "second", true, false, true);
+  EXPECT_GE(after_directory_allocation, ScanHashMapEntryArena::kSpanBytes);
+  // The first slow path admits the initial raw 32 KiB directory array.
+  // Clearing entries retains that array for reuse, so the next span no longer
+  // pays or initializes directory capacity.
+  EXPECT_GE(first_allocation, after_directory_allocation + 32 * 1024);
+}
+
+TEST(ScanHashMapTest, DirectoryCapacityDoesNotInflateEmptyArena) {
+  // The complete handle namespace needs 16 MiB of descriptors, but the raw
+  // array starts at 32 KiB and grows only as page IDs are consumed. An empty
+  // map must not embed that maximum in every arena instance.
+  EXPECT_LT(sizeof(ScanHashMapEntryArena), 1024);
+}
+
+TEST(ScanHashMapTest, RetainedArenaAccountingFollowsStorageLifetime) {
+  ASSERT_TRUE(keylane::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
+  keylane::BindMemoryAccountingShard(0);
+  const std::int64_t before = keylane::WorkerMemoryAccountingBytes(0);
+
+  {
+    auto arena = std::make_shared<ScanHashMapEntryArena>();
+    ScanHashMap<std::uint64_t> map(arena);
+    map.InsertNew(ComputeDigest("retained"), "retained", 1);
+    EXPECT_GT(keylane::WorkerMemoryAccountingBytes(0), before);
+  }
+
+  EXPECT_EQ(keylane::WorkerMemoryAccountingBytes(0), before);
+  keylane::BindMemoryAccountingShard(keylane::kMaxMemoryWorkers);
+}
+
+TEST(ScanHashMapTest, AccountsForOverflowPoolVectorGrowth) {
+  auto arena = std::make_shared<ScanHashMapEntryArena>();
+  ScanHashMap<std::uint64_t, 0> map(arena);
+  constexpr std::size_t kDirectAndOverflowEntries = 12 * (1 + 512);
+  for (std::size_t i = 0; i < kDirectAndOverflowEntries; ++i) {
+    const std::string key = "k" + std::to_string(i);
+    map.InsertNew(Digest{0}, key, i);
+  }
+
+  // The next child crosses both vectors' 512-element capacity boundary. Its
+  // admission must include those backing reallocations, not only one bucket.
+  const std::string next = "next";
+  EXPECT_GT(map.RequiredAllocationBytes(Digest{0}, next, true, false, true),
+            8ULL * 1024);
 }
 
 TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
@@ -77,8 +123,8 @@ TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
       (ScanHashMapEntryArena::kPageBytes - 64) / 4096;
   handles.reserve(ScanHashMapEntryArena::kPagesPerSpan * kSlotsPerPage);
 
-  for (std::size_t page = 0;
-       page < ScanHashMapEntryArena::kPagesPerSpan; ++page) {
+  for (std::size_t page = 0; page < ScanHashMapEntryArena::kPagesPerSpan;
+       ++page) {
     for (std::size_t slot = 0; slot < kSlotsPerPage; ++slot) {
       handles.push_back(arena.Allocate(4096).handle_);
     }
@@ -98,6 +144,56 @@ TEST(ScanHashMapTest, AmortizesAlignmentAcrossSixteenLogicalPages) {
   }
   EXPECT_EQ(arena.allocated_pages(), 0);
   EXPECT_EQ(arena.allocated_spans(), 0);
+}
+
+TEST(ScanHashMapTest, RehashDefersOverflowAllocationWhenAdmissionIsFull) {
+  constexpr std::size_t kLimit = 4 * 1024 * 1024;
+  ASSERT_TRUE(keylane::InitMemoryLimit(kLimit, 1).ok());
+  keylane::BindMemoryAccountingShard(0);
+
+  std::vector<std::pair<Digest, std::string>> colliding;
+  for (std::uint64_t candidate = 0; colliding.size() < 19; ++candidate) {
+    std::string key = "rehash-collision-" + std::to_string(candidate);
+    Digest digest = ComputeDigest(key);
+    if ((digest.value_ & 3) == 0) {
+      colliding.emplace_back(digest, std::move(key));
+    }
+  }
+
+  ScanHashMap<std::uint64_t> map;
+  for (std::size_t index = 0; index < 10; ++index) {
+    map.InsertNew(colliding[index].first, colliding[index].second, index);
+  }
+  ASSERT_TRUE(map.rehashing());
+  ASSERT_NE(map.Find(colliding[0].first, colliding[0].second), nullptr);
+  ASSERT_FALSE(map.rehashing());
+
+  for (std::size_t index = 10; index < colliding.size(); ++index) {
+    map.InsertNew(colliding[index].first, colliding[index].second, index);
+  }
+  ASSERT_TRUE(map.rehashing());
+
+  keylane::RefreshMemoryStats();
+  const std::uint64_t used = keylane::GetMemoryStats().used_bytes_;
+  const std::uint64_t steady_limit = kLimit - kLimit / 10;
+  ASSERT_LT(used, steady_limit);
+  auto blocker = keylane::TryReserveMemory(steady_limit - used);
+  ASSERT_TRUE(blocker.has_value());
+  EXPECT_NE(map.Find(colliding[0].first, colliding[0].second), nullptr);
+  EXPECT_TRUE(map.rehashing());
+
+  blocker.reset();
+  EXPECT_NE(map.Find(colliding[0].first, colliding[0].second), nullptr);
+  EXPECT_TRUE(map.rehashing());
+  EXPECT_NE(map.Find(colliding[0].first, colliding[0].second), nullptr);
+  EXPECT_FALSE(map.rehashing());
+  EXPECT_EQ(map.size(), colliding.size());
+
+  // This test deliberately fills a small global admission limit. Restore a
+  // normal limit before the following allocator-backed tests run in the same
+  // process; rebinding the thread alone does not reset process policy.
+  ASSERT_TRUE(keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  keylane::BindMemoryAccountingShard(keylane::kMaxMemoryWorkers);
 }
 
 TEST(ScanHashMapTest, InsertScanMoveDetachAndErase) {

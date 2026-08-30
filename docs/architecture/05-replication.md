@@ -105,6 +105,46 @@ in-progress full-sync streams, but their journal records disappear when the
 process-local replication history is replaced. The Function catalog itself is
 runtime state captured explicitly at full-sync and RDB boundaries.
 
+An active worker log holds one fixed retained-memory staging budget equal to
+its configured publisher waterline. Each active full-sync session holds one
+additional fixed budget and releases it when the session ends. Queue admission
+uses an allocator-independent footprint: argument bytes, one `std::string`
+element per argument, and a conservative fixed item allowance. This keeps
+high-arity short-argument commands bounded without consulting mimalloc size
+classes on every write. The ring allocators are externally accounted because
+their retained high-water capacity is covered by the same fixed budget. A
+runtime decrease applies the lower admission waterline immediately, but an
+already-grown ring keeps its former charge until the log or session is
+destroyed. One item larger than the waterline may still proceed only as the
+exclusive queued item. Its surplus is not converted into a per-item retained
+charge and can remain heap-resident while publication is backpressured. The
+protocol command-size limit bounds the surplus, but the 10% outside retained
+admission does not reserve or guarantee enough space for it. With the default
+client-buffer quota, five percentage points may also be occupied by the source
+request until command retirement; a larger absolute client quota or a disabled
+client quota removes even that default headroom assumption. This is an explicit
+single-item escape hatch for forward progress, not a strict `--max-memory` or
+RSS bound. Operators that require the publisher copy to stay inside retained
+admission must configure the publisher waterline at least as large as their
+largest accepted replicated command.
+
+Full-sync sessions share one immutable command copy, although each session's
+fixed budget is intentionally conservative and can cover its own FIFO. A
+transaction owns one immutable shared envelope;
+participant markers retain that object rather than deep-copying the final
+canonical payload on every worker. The coordinating worker that owns this
+shared envelope reserves its own worker-local memory share before constructing
+it and converts that reservation into the lifetime charge; participant-worker
+publisher budgets do not substitute for owner admission. Admission owns a
+distinct future slot for every destination. Physical ring growth is completed
+before mutation from the fixed staging budget, and the post-mutation enqueue
+is therefore allocation-free on the normal path. A physical allocation
+failure at a publication boundary becomes
+Redis OOM before mutation or invalidates the affected history/full-sync attempt
+after mutation; it never escapes the publisher coroutine. Backlog blocks and
+their sparse frame indexes use the same explicit retained allocator and return
+their actual mimalloc usable size when evicted.
+
 Source publishers normally target 2 MiB and are capped at 128 frames per
 batch. The first frame is admitted even when it exceeds the byte target, so a
 one-frame batch can be larger than 2 MiB. Before a socket write can yield, the
@@ -153,10 +193,15 @@ enqueued, an entry hook releases the order slot before storage I/O and
 durability completion. A one-worker `MSET` releases the slot without a
 cross-flow marker. This preserves a common flow order without serializing
 unrelated storage work. Queue exhaustion therefore backpressures the client
-before commit instead of silently dropping publication. Encoding or backlog
-allocation failure after admission marks the history invalid: the primary
-dataset remains usable, but the manager assigns a new history ID, cancels
-downstream sessions, clears all worker logs, and requires full sync.
+before commit instead of silently dropping publication. Encoding, late
+canonicalization, or backlog allocation failure after admission marks the
+history invalid: the primary dataset remains usable, but the manager assigns a
+new history ID, cancels downstream sessions, clears all worker logs, and
+requires full sync. If late canonicalization makes the oldest already-admitted
+transaction larger than the configured queue waterline, the single consumer
+publishes that head item and temporarily reports an over-waterline queue; it
+must not wait for later items that only the same consumer can drain. New
+admissions remain blocked until occupancy falls back under the limit.
 
 ## Full-sync lifecycle
 
@@ -188,18 +233,34 @@ Before a source session becomes visible, each worker reserves coverage-map
 headroom for its largest `(partition, database)` scan, because only one such
 map is live at a time. It does not sum all 16 databases in a partition.
 Coverage entries for external keys retain only digest and logical length, like
-the record index, so their reservation does not charge the full on-disk key.
-The reservation belongs to that worker's fixed max-memory share and is
-released when the session ends.
+the record index, so the baseline reservation does not charge their complete
+on-disk key. If a post-fence mutation replaces one with full-key map owners,
+the expansion must consume unused session credit or invalidate the attempt
+before allocation.
+Even an empty or one-key scan reserves the coverage arena's first physical
+allocation: one 1 MiB span, a 64 KiB alignment allowance, and fixed bucket and
+control metadata. Coverage arenas then run in externally admitted and
+externally accounted mode, so their allocations consume the parent session
+credit without being counted twice.
+Before a first-seen identity grows the arena or replacement maps, a
+conservative per-key slice moves from the worker-local logical reservation to
+retained session accounting. Clearing the partition destroys those
+containers before restoring their slices, which prevents reservation and live
+allocation from being counted twice while still allowing the next partition
+to reuse the largest-map budget. If post-fence writes introduce more identities
+than that budget covers, their durable mutations remain successful but the
+lower-priority full-sync session is invalidated; the replica reconnects and
+starts a new attempt. The reservation shares that worker's 90% retained-memory
+boundary with the dataset, index, backlog, and queued subscriber copies; any
+unconsumed remainder is released when the session ends.
 
-Native replication also admits transient materialization at the point where
-its size becomes known. Frame receive/send buffers, fragmented-command
-assembly, decoded record key/value strings, record vectors, and RDB strings
-reserve the corresponding mimalloc size class before allocation. The permit is
-released before any socket or storage suspension after the allocator hook has
-published the actual usable bytes. These checks cover both online replay and
-full-sync staging, so a replica cannot consume another worker's unused share
-or first materialize a large frame and reject it afterward.
+Native replication frame receive/send buffers, fragmented-command assembly,
+decoded record key/value strings, record vectors, and RDB strings are bounded
+temporary materializations. They rely on protocol size limits and checked
+allocation rather than max-memory reservations. State that can accumulate or
+survive an individual frame is still admitted against retained memory: this
+includes journal/backlog ownership, full-sync coverage and subscriber queues,
+and the replica's multi-frame large-value staging buffer.
 
 Runtime-only commands published while the key snapshot is in progress enter
 the same bounded full-sync command FIFOs without creating snapshot state.
@@ -370,7 +431,7 @@ reattachment.
 | `CONFIG REWRITE` | Atomically persists the current single upstream mode and `replica-priority`; unavailable without a config file or with multiple Redis Cluster sources |
 | `tls-replication`, `masteruser`, `masterauth` | Outgoing control and every data connection; only the `default` user is supported |
 | `repl-backlog-size` | Startup/CLI/runtime global backlog, default 1 GiB; at least one 8 MiB block per worker |
-| `replication-publish-queue-mb-per-worker` | Startup/CLI/runtime publisher waterline, default 16 MiB per worker |
+| `replication-publish-queue-mb-per-worker` | Startup/CLI/runtime staging waterline, default 16 MiB per active worker log and per active full-sync session |
 | `replication-snapshot-batch-size` | Startup/CLI/runtime scan scheduling batch, default 64 |
 | `replication-snapshot-read-concurrency` | Runtime-only read concurrency, default 16 and maximum 128 |
 | `redis-export-backpressure` | Startup/CLI selection between cursor pinning and disconnect-on-gap |

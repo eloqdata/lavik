@@ -363,8 +363,8 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   const std::size_t header_bytes =
       RecordHeaderBytes(key.size(), header.key_external_);
   if (header.magic_ != kRecordMagic ||
-      header.version_ != kStorageFormatVersion || key.size() > MaxKeyBytes() ||
-      key.size() != header.key_bytes_ ||
+      header.version_ != kStorageFormatVersion ||
+      !ValidRecordKeySize(key.size()) || key.size() != header.key_bytes_ ||
       (header.key_external_ && key.empty()) ||
       header.db_id_ >= kLogicalDatabaseCount ||
       static_cast<std::uint8_t>(header.value_type_) >
@@ -435,7 +435,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.value_type_ == ValueType::kString &&
        decoded.logical_size_ > kMaxBitmapBytes) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
-      decoded.key_bytes_ > MaxKeyBytes() ||
+      !ValidRecordKeySize(decoded.key_bytes_) ||
       decoded.header_bytes_ !=
           RecordHeaderBytes(decoded.key_bytes_, decoded.key_external_) ||
       decoded.header_bytes_ > kMaxRecordHeaderBytes ||

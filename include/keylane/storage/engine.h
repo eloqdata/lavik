@@ -16,6 +16,7 @@
 
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
+#include "keylane/memory.h"
 #include "keylane/read_trace.h"
 #include "keylane/set_trace.h"
 #include "keylane/storage/buffer_pool.h"
@@ -443,6 +444,20 @@ struct ReplicationCommandAppend {
   std::vector<std::string> args_;
 };
 
+// Conservative owner/ring metadata included in each command's fixed staging
+// waterline. Compile-time checks beside both queue types keep this allowance
+// from silently falling below their inline node footprint.
+inline constexpr std::size_t kReplicationPublisherItemMetadataBytes = 256;
+
+// Returns the queue-budget footprint of one staged replication command.
+// This deliberately uses stable C++ object sizes rather than allocator size
+// classes: the fixed queue budget absorbs allocator rounding while high-arity
+// commands still pay for every owned string element. nullopt means overflow.
+std::optional<std::size_t> ReplicationCommandStagingBytes(
+    std::span<const std::string> args) noexcept;
+std::optional<std::size_t> ReplicationCommandStagingBytes(
+    std::span<const std::string_view> args) noexcept;
+
 struct FullSyncPublishItem {
   std::uint64_t id_ = 0;
   std::shared_ptr<const ReplicationCommandAppend> command_;
@@ -480,6 +495,10 @@ enum class ReplicationTransactionResolution : std::uint8_t {
   kPending,
   kPublish,
   kDiscard,
+  // The primary mutation may already be visible, but its canonical payload
+  // could not be represented. Every participant invalidates incremental
+  // history instead of silently omitting the committed mutation.
+  kInvalidate,
 };
 
 // Shared by the source workers participating in one cross-key command. Each
@@ -491,9 +510,23 @@ struct ReplicationTransaction {
   std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
   std::vector<std::string> envelope_args_;
+  // All participant markers share this object. Charge the envelope once on
+  // its origin shard so participant workers neither duplicate the payload nor
+  // return its bytes to whichever worker releases the last shared_ptr.
+  RetainedMemoryCharge retained_charge_;
   std::atomic<ReplicationTransactionResolution> resolution_{
       ReplicationTransactionResolution::kPending};
 };
+
+// Returns a conservative pre-allocation reservation for a transaction and the
+// retained footprint after its prefix has been materialized. The participant
+// capacity is included because that vector moves into the shared owner.
+std::optional<std::size_t> ReplicationTransactionReservationBytes(
+    std::size_t participant_capacity, std::size_t participant_count,
+    std::span<const std::string> command_args) noexcept;
+std::optional<std::size_t> ReplicationTransactionAllocationBytes(
+    std::size_t participant_capacity, std::span<const std::string> prefix,
+    std::span<const std::string> command_args) noexcept;
 
 enum class ListOperationKind : std::uint8_t {
   kPushLeft,
@@ -913,9 +946,10 @@ class StorageEngine {
   ReplicationLogInfo LocalReplicationLogInfo() const;
   bool ReplicationLogActive() const noexcept;
   // Worker-local high-water admission acquired before a source write enters
-  // command/transaction gates. It reserves the shared backlog publisher and
-  // every active full-sync session FIFO. A request larger than the normal
-  // limit is admitted only when it can be the sole staged item.
+  // command/transaction gates. The log and each full-sync session already
+  // hold fixed retained-memory budgets; this token reserves byte waterline and
+  // ring-slot credit in their FIFOs. A request larger than the normal limit is
+  // admitted only when it can be the sole staged item.
   celer::Task<absl::StatusOr<ReplicationPublisherAdmission>>
   AcquireReplicationPublisherAdmission(
       std::size_t logical_bytes,

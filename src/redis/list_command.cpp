@@ -101,6 +101,10 @@ bool ParseRespBulk(std::string_view encoded, std::size_t* offset,
 
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
                                     const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return reply_builder.AppendError(status.message());
+  }
   return status.message().starts_with("WRONGTYPE ")
              ? reply_builder.AppendError(status.message())
              : reply_builder.AppendError("ERR ", status.message());
@@ -123,9 +127,8 @@ absl::StatusOr<bool> ParseListLeft(std::string_view value) {
 }
 
 std::vector<std::string> EncodeListMoveEffects(
-    std::uint8_t db_id, std::string_view source,
-    std::string_view destination, bool source_left, bool destination_left,
-    std::string_view value) {
+    std::uint8_t db_id, std::string_view source, std::string_view destination,
+    bool source_left, bool destination_left, std::string_view value) {
   std::vector<CapturedReplicationCommand> effects;
   effects.reserve(2);
   effects.push_back(CapturedReplicationCommand{
@@ -137,8 +140,7 @@ std::vector<std::string> EncodeListMoveEffects(
   return EncodeReplicationCommandEffects(std::move(effects));
 }
 
-std::vector<std::string> EncodeListPopEffect(std::string_view key,
-                                             bool left,
+std::vector<std::string> EncodeListPopEffect(std::string_view key, bool left,
                                              std::size_t count) {
   return {left ? "LPOP" : "RPOP", std::string(key), std::to_string(count)};
 }
@@ -158,8 +160,7 @@ struct SingleShardListOutcome {
 Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     std::uint8_t db_id, std::vector<std::string> keys, bool move,
     bool source_left, bool destination_left, bool pop_left,
-    std::uint64_t pop_count,
-    ReplicationTransactionGuard* replication) {
+    std::uint64_t pop_count, ReplicationTransactionGuard* replication) {
   std::vector<tx::KeyRef> locks;
   locks.reserve(keys.size());
   for (const std::string& key : keys) {
@@ -227,9 +228,9 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
     }
     (void)co_await g_storage->DiscardTxUndoLocal(txid);
     if (replication != nullptr) {
-      replication->SetCommandArgs(EncodeListMoveEffects(
-          db_id, source, destination, source_left, destination_left,
-          result->values_.front()));
+      replication->SetCommandArgs(
+          EncodeListMoveEffects(db_id, source, destination, source_left,
+                                destination_left, result->values_.front()));
       replication->SetFinalExpirations(
           std::span<const storage::TxShardWrites>(&writes, 1));
     }
@@ -275,9 +276,9 @@ Task<SingleShardListOutcome> ExecuteSingleShardListMulti(
   }
   (void)co_await g_storage->DiscardTxUndoLocal(txid);
   if (replication != nullptr) {
-    replication->SetCommandArgs(EncodeListMoveEffects(
-        db_id, source, destination, source_left, destination_left,
-        popped->values_.front()));
+    replication->SetCommandArgs(
+        EncodeListMoveEffects(db_id, source, destination, source_left,
+                              destination_left, popped->values_.front()));
     replication->SetFinalExpirations(
         std::span<const storage::TxShardWrites>(&writes, 1));
   }
@@ -422,17 +423,15 @@ Task<CommandReply> ExecuteSingleListCommandImpl(const CommandRequest& request,
   }
 
   absl::StatusOr<storage::ListResult> result;
-  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
-                                   : std::nullopt;
+  auto replication =
+      tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {
     result = co_await g_storage->ExecuteList(
-        request.db_id_, args[1], op,
-        replication ? &*replication : nullptr);
+        request.db_id_, args[1], op, replication ? &*replication : nullptr);
   } else {
-    result = co_await g_storage->ExecuteListLocked(request.db_id_, args[1],
-                                                   *digest, op, tx,
-                                                   replication ? &*replication
-                                                               : nullptr);
+    result = co_await g_storage->ExecuteListLocked(
+        request.db_id_, args[1], *digest, op, tx,
+        replication ? &*replication : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
@@ -618,11 +617,14 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   if (single_shard) {
     ReplicationTransactionGuard replication(request,
                                             std::vector<unsigned>{first_owner});
+    if (!replication.status().ok()) {
+      co_return BuiltReply(
+          AppendStorageError(reply_builder, replication.status()));
+    }
     SingleShardListOutcome outcome = co_await celer::SubmitTaskTo(
-        first_owner,
-        [db_id = request.db_id_, keys = std::move(keys), move, source_left,
-         destination_left, pop_left, pop_count,
-         replication = &replication]() mutable {
+        first_owner, [db_id = request.db_id_, keys = std::move(keys), move,
+                      source_left, destination_left, pop_left, pop_count,
+                      replication = &replication]() mutable {
           return ExecuteSingleShardListMulti(db_id, std::move(keys), move,
                                              source_left, destination_left,
                                              pop_left, pop_count, replication);
@@ -636,8 +638,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                                 : reply_builder.AppendNullArray());
     }
     if (!move) {
-      replication.SetCommandArgs(EncodeListPopEffect(
-          outcome.key_, pop_left, outcome.values_.size()));
+      replication.SetCommandArgs(
+          EncodeListPopEffect(outcome.key_, pop_left, outcome.values_.size()));
     }
     replication.Commit();
     for (std::size_t arg : key_args) {
@@ -661,6 +663,10 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   }
   txn.Seal();
   ReplicationTransactionGuard replication(request, &txn);
+  if (!replication.status().ok()) {
+    co_return BuiltReply(
+        AppendStorageError(reply_builder, replication.status()));
+  }
   absl::Status status = co_await txn.Schedule();
   if (!status.ok()) {
     co_return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
@@ -699,8 +705,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           co_return BuiltReply(
               reply_builder.AppendError("ERR ", status.message()));
         }
-        replication.SetCommandArgs(EncodeListPopEffect(
-            args[arg], pop_left, popped->values_.size()));
+        replication.SetCommandArgs(
+            EncodeListPopEffect(args[arg], pop_left, popped->values_.size()));
         replication.Commit();
         reply_builder.AppendArrayHeader(2);
         reply_builder.AppendBulkString(args[arg]);
@@ -941,8 +947,7 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     // argument is the pop direction. Validate before reserve/indexing: BLMPOP
     // reaches this code before the nonblocking LMPOP parser runs.
     if (nonblocking.args_.size() < 3 ||
-        static_cast<std::uint64_t>(key_count) >
-        nonblocking.args_.size() - 3) {
+        static_cast<std::uint64_t>(key_count) > nonblocking.args_.size() - 3) {
       co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
     }
     specs.reserve(static_cast<std::size_t>(key_count));
@@ -956,8 +961,8 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     register_key(nonblocking.args_[1]);
   }
 
-  auto attempt = [&](BlockingWakeCascade* cascade)
-      -> Task<BlockingAttemptResult> {
+  auto attempt =
+      [&](BlockingWakeCascade* cascade) -> Task<BlockingAttemptResult> {
     nonblocking.blocking_wake_cascade_ = cascade;
     ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool unavailable = false;

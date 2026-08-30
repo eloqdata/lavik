@@ -7,11 +7,13 @@
 #include <string_view>
 #include <vector>
 
+#include "keylane/memory.h"
+
 namespace keylane {
 namespace {
 
 TEST(RespParserTest, AcceptsMoreThan1024ArrayElements) {
-  constexpr std::size_t kArgumentCount = 2048;
+  constexpr std::size_t kArgumentCount = 1025;
   std::string request = "*" + std::to_string(kArgumentCount) + "\r\n";
   for (std::size_t i = 0; i < kArgumentCount; ++i) {
     request.append("$0\r\n\r\n");
@@ -22,8 +24,83 @@ TEST(RespParserTest, AcceptsMoreThan1024ArrayElements) {
   EXPECT_EQ(result.state_, RespParseState::kOk);
   EXPECT_EQ(result.consumed_, request.size());
   ASSERT_EQ(result.command_.args_.size(), kArgumentCount);
+  // The first element beyond the Valkey-compatible initial capacity grows the
+  // index geometrically; an exact 1025-slot allocation would make subsequent
+  // arguments repeatedly reallocate and move the whole vector.
+  EXPECT_GE(result.command_.args_.capacity(), 2048);
   EXPECT_EQ(result.command_.args_.front(), "");
   EXPECT_EQ(result.command_.args_.back(), "");
+}
+
+TEST(RespParserTest, ParsingDoesNotConsumeMaxmemoryAdmission) {
+  ASSERT_TRUE(InitMemoryLimit(/*configured_max_bytes=*/1,
+                              /*worker_count=*/1)
+                  .ok());
+  BindMemoryAccountingShard(0);
+  std::string request = "*1\r\n$48000\r\n";
+  request.append(48000, 'x');
+  request.append("\r\n");
+
+  RespCommandParser parser;
+  RespParseResult parsed = parser.Parse(request);
+  ASSERT_EQ(parsed.state_, RespParseState::kOk);
+  ASSERT_EQ(parsed.command_.args_.size(), 1);
+  EXPECT_EQ(parsed.command_.args_[0].size(), 48000);
+
+  // Restore fallback accounting for unrelated tests on this runner thread.
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(1);
+}
+
+TEST(RespParserTest, DoesNotAllocateDeclaredBulkBeforePayloadArrives) {
+  ASSERT_TRUE(InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
+  BindMemoryAccountingShard(0);
+  const std::int64_t before = WorkerMemoryAccountingBytes(0);
+
+  RespCommandParser parser;
+  RespParseResult parsed = parser.Parse("*1\r\n$536870912\r\n");
+
+  EXPECT_EQ(parsed.state_, RespParseState::kNeedMoreData);
+  const std::int64_t after = WorkerMemoryAccountingBytes(0);
+  ASSERT_GE(after, before);
+  EXPECT_LT(after - before, 1024 * 1024);
+  BindMemoryAccountingShard(1);
+}
+
+TEST(RespParserTest, EnforcesConfiguredQueryBufferLimitAcrossFragments) {
+  const std::string request = "*2\r\n$3\r\nSET\r\n$5\r\nvalue\r\n";
+  RespCommandParser parser(request.size() - 1);
+
+  RespParseResult first = parser.Parse(request.substr(0, 12));
+  ASSERT_EQ(first.state_, RespParseState::kNeedMoreData);
+  RespParseResult second = parser.Parse(request.substr(12));
+
+  EXPECT_EQ(second.state_, RespParseState::kError);
+  EXPECT_EQ(second.status_.code(), absl::StatusCode::kResourceExhausted);
+  EXPECT_EQ(second.status_.message(),
+            "client request exceeds the query buffer limit");
+}
+
+TEST(RespParserTest, AcceptsCommandExactlyAtConfiguredQueryBufferLimit) {
+  const std::string request = "*1\r\n$4\r\nPING\r\n";
+  RespCommandParser parser(request.size());
+
+  RespParseResult parsed = parser.Parse(request);
+
+  ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_.message();
+  EXPECT_EQ(parsed.command_.args_, (std::vector<std::string>{"PING"}));
+}
+
+TEST(RespParserTest, AppliesLowerRuntimeLimitToIncompleteCommand) {
+  RespCommandParser parser(1024);
+  RespParseResult partial = parser.Parse("*1\r\n$20\r\n123456789012345");
+  ASSERT_EQ(partial.state_, RespParseState::kNeedMoreData);
+
+  parser.SetQueryBufferLimit(16);
+  RespParseResult rejected = parser.Parse("6");
+
+  EXPECT_EQ(rejected.state_, RespParseState::kError);
+  EXPECT_EQ(rejected.status_.code(), absl::StatusCode::kResourceExhausted);
 }
 
 TEST(RespParserTest, RejectsArrayLengthsAboveValkeyLimit) {
@@ -134,9 +211,9 @@ TEST(RespParserTest, AcceptsResp3ScalarAndVerbatimArguments) {
       ",1.5\r\n#t\r\n";
   RespParseResult parsed = ParseRespCommand(request);
   ASSERT_EQ(parsed.state_, RespParseState::kOk) << parsed.status_.message();
-  EXPECT_EQ(parsed.command_.args_,
-            (std::vector<std::string>{"SET", "key", "value", "42", "1.5",
-                                      "1"}));
+  EXPECT_EQ(
+      parsed.command_.args_,
+      (std::vector<std::string>{"SET", "key", "value", "42", "1.5", "1"}));
 }
 
 TEST(ReplyBuilderTest, EncodesScalarAndCompositeReplies) {

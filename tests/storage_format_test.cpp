@@ -20,6 +20,12 @@ TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
   EXPECT_EQ(DigestHash{}(first), first.value_);
 }
 
+TEST(StorageFormatTest, KeepsRuntimeAndRecoveryKeyLimitsIdentical) {
+  using namespace keylane::storage;
+  EXPECT_TRUE(ValidRecordKeySize(MaxKeyBytes()));
+  EXPECT_FALSE(ValidRecordKeySize(MaxKeyBytes() + 1));
+}
+
 TEST(StorageFormatTest, ComputesRedisClusterSlots) {
   using keylane::storage::RedisSlot;
 

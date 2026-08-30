@@ -147,7 +147,7 @@ void PutString(std::string& output, std::string_view value) {
 absl::Status ReplicationMemoryExhausted(std::string_view operation) {
   RecordMemoryRejection();
   return absl::ResourceExhaustedError(
-      absl::StrCat(operation, " exceeds this worker's maxmemory share"));
+      absl::StrCat("insufficient memory for ", operation));
 }
 
 absl::Status ReserveReplicationString(std::string* output,
@@ -163,15 +163,12 @@ absl::Status ReserveReplicationString(std::string* output,
   if (allocation_capacity == std::numeric_limits<std::size_t>::max()) {
     return ReplicationMemoryExhausted("replication buffer");
   }
-  auto reservation =
-      TryReserveMemoryAllocation(allocation_capacity + 1);
-  if (!reservation.has_value()) {
-    return ReplicationMemoryExhausted("replication buffer");
-  }
   try {
-    output->reserve(desired);
+    output->reserve(allocation_capacity);
   } catch (const std::bad_alloc&) {
     return ReplicationMemoryExhausted("replication buffer allocation");
+  } catch (const std::length_error&) {
+    return absl::ResourceExhaustedError("replication buffer is too large");
   }
   return absl::OkStatus();
 }
@@ -184,11 +181,7 @@ absl::Status AppendReplicationString(std::string* output,
   absl::Status reserved =
       ReserveReplicationString(output, output->size() + value.size());
   if (!reserved.ok()) return reserved;
-  try {
-    output->append(value);
-  } catch (const std::bad_alloc&) {
-    return ReplicationMemoryExhausted("replication buffer allocation");
-  }
+  output->append(value);
   return absl::OkStatus();
 }
 
@@ -234,12 +227,7 @@ class DataReader {
     }
     absl::Status reserved = ReserveReplicationString(value, size);
     if (!reserved.ok()) return reserved;
-    try {
-      value->assign(input_.data() + position_, size);
-    } catch (const std::bad_alloc&) {
-      return ReplicationMemoryExhausted(
-          "replication record string allocation");
-    }
+    value->assign(input_.data() + position_, size);
     position_ += size;
     return absl::OkStatus();
   }
@@ -291,8 +279,11 @@ absl::Status EncodeRecords(std::uint16_t partition_id,
   return absl::OkStatus();
 }
 
+// The returned records own every key and value copied from the frame. Catch at
+// this ownership boundary so reserve, per-record strings, and vector growth
+// share one failure path.
 absl::StatusOr<std::pair<std::uint16_t, std::vector<SnapshotRecord>>>
-DecodeRecords(std::string_view payload) {
+DecodeRecords(std::string_view payload) try {
   DataReader reader(payload);
   std::uint16_t partition_id = 0;
   std::uint32_t count = 0;
@@ -301,19 +292,7 @@ DecodeRecords(std::string_view payload) {
     return absl::InvalidArgumentError("malformed replication records frame");
   }
   std::vector<SnapshotRecord> records;
-  const std::size_t records_bytes =
-      static_cast<std::size_t>(count) * sizeof(SnapshotRecord);
-  auto records_reservation = TryReserveMemoryAllocation(records_bytes);
-  if (!records_reservation.has_value()) {
-    return ReplicationMemoryExhausted("replication record index");
-  }
-  try {
-    records.reserve(count);
-  } catch (const std::bad_alloc&) {
-    return ReplicationMemoryExhausted(
-        "replication record index allocation");
-  }
-  records_reservation.reset();
+  records.reserve(count);
   for (std::uint32_t i = 0; i < count; ++i) {
     SnapshotRecord record;
     std::uint8_t kind = 0, value_type = 0;
@@ -344,6 +323,11 @@ DecodeRecords(std::string_view payload) {
     return absl::InvalidArgumentError("trailing replication record payload");
   }
   return std::make_pair(partition_id, std::move(records));
+} catch (const std::bad_alloc&) {
+  return ReplicationMemoryExhausted("replication record payload");
+} catch (const std::length_error&) {
+  return absl::ResourceExhaustedError(
+      "replication record payload is too large");
 }
 
 bool EqualCaseInsensitive(std::string_view left,
@@ -430,14 +414,7 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
   std::string result;
   absl::Status reserved = ReserveReplicationString(&result, size);
   if (!reserved.ok()) co_return reserved;
-  try {
-    result.resize(size);
-  } catch (const std::bad_alloc&) {
-    co_return ReplicationMemoryExhausted(
-        "replication read buffer allocation");
-  }
-  // ReserveReplicationString releases its worker-local permit after the
-  // allocator hook publishes the usable bytes and before socket suspension.
+  result.resize(size);
   std::size_t offset = 0;
   while (offset < size) {
     auto read = co_await stream.ReadSome(std::span<std::byte>(

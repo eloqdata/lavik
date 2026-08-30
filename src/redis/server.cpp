@@ -656,14 +656,16 @@ class RedisService final : public TcpService, public ClientLimit {
                ReplicationManager* replication,
                long online_mimalloc_purge_delay_ms,
                std::string_view requirepass, std::string load_rdb_file,
-               std::uint64_t max_clients)
+               std::uint64_t max_clients,
+               std::size_t client_query_buffer_limit_bytes)
       : TcpService(port),
         storage_(storage),
         replication_(replication),
         online_mimalloc_purge_delay_ms_(online_mimalloc_purge_delay_ms),
         authenticator_(requirepass),
         load_rdb_file_(std::move(load_rdb_file)),
-        max_clients_(max_clients) {}
+        max_clients_(max_clients),
+        client_query_buffer_limit_bytes_(client_query_buffer_limit_bytes) {}
 
   void Prepare(unsigned thread_count) override;
   Task<absl::Status> Run(Worker& worker, ServiceContext ctx) override;
@@ -680,6 +682,10 @@ class RedisService final : public TcpService, public ClientLimit {
     return max_clients_.load(std::memory_order_acquire);
   }
   absl::Status SetMaxClients(std::uint64_t value) override;
+  std::size_t client_query_buffer_limit() const noexcept override {
+    return client_query_buffer_limit_bytes_.load(std::memory_order_acquire);
+  }
+  absl::Status SetClientQueryBufferLimit(std::size_t value) override;
 
  protected:
   bool AdmitConnection(int fd, bool tls_endpoint) noexcept override;
@@ -691,11 +697,17 @@ class RedisService final : public TcpService, public ClientLimit {
   Task<absl::Status> ReadSubscribedCommands(
       TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
       RespCommandParser* parser, CommandBatch* ready,
+      ClientBufferReservation* client_buffers,
+      std::size_t* unassigned_input_bytes,
+      std::size_t* multi_input_bytes,
       std::optional<absl::Status>* deferred_read_error,
       std::shared_ptr<PubSubSession> session);
   Task<absl::Status> ServeSubscribed(
       TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
       RespCommandParser* parser, CommandBatch* ready,
+      ClientBufferReservation* client_buffers,
+      std::size_t* unassigned_input_bytes,
+      std::size_t* multi_input_bytes,
       std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
 
@@ -731,6 +743,8 @@ class RedisService final : public TcpService, public ClientLimit {
   // Only RedisService owns these counters. Other TcpService users, including
   // the metrics HTTP service, never participate in maxclients admission.
   std::atomic<std::uint64_t> max_clients_;
+  // Loaded once per socket-read parsing round, not once per RESP token.
+  std::atomic<std::size_t> client_query_buffer_limit_bytes_;
   std::atomic<std::uint64_t> active_clients_{0};
   std::unique_ptr<CoroutineBarrier> recovery_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_collect_barrier_;
@@ -782,6 +796,16 @@ absl::Status RedisService::SetMaxClients(std::uint64_t value) {
         *allowed));
   }
   max_clients_.store(value, std::memory_order_release);
+  return absl::OkStatus();
+}
+
+absl::Status RedisService::SetClientQueryBufferLimit(std::size_t value) {
+  if (value < kMinimumClientQueryBufferLimit ||
+      value > static_cast<std::size_t>(std::numeric_limits<long>::max())) {
+    return absl::InvalidArgumentError(
+        "client-query-buffer-limit must be between 1mb and LONG_MAX bytes");
+  }
+  client_query_buffer_limit_bytes_.store(value, std::memory_order_release);
   return absl::OkStatus();
 }
 
@@ -1083,17 +1107,22 @@ class CommandBatch {
  public:
   static constexpr std::size_t kMaxCommands = 128;
 
+  struct BufferedCommand {
+    RespCommand command_;
+    std::size_t input_bytes_ = 0;
+  };
+
   bool empty() const noexcept { return next_ == commands_.size(); }
   std::size_t size() const noexcept { return commands_.size() - next_; }
 
-  void Push(RespCommand command) {
+  void Push(RespCommand command, std::size_t input_bytes) {
     assert(commands_.size() < kMaxCommands);
-    commands_.push_back(std::move(command));
+    commands_.push_back(BufferedCommand{std::move(command), input_bytes});
   }
 
-  RespCommand PopFront() {
+  BufferedCommand PopFront() {
     assert(!empty());
-    RespCommand command = std::move(commands_[next_++]);
+    BufferedCommand command = std::move(commands_[next_++]);
     if (next_ == commands_.size()) {
       commands_.clear();
       next_ = 0;
@@ -1104,18 +1133,52 @@ class CommandBatch {
  private:
   // Most clients send one command at a time. Keep short pipelines allocation
   // free while retaining contiguous storage for larger batches.
-  absl::InlinedVector<RespCommand, 4> commands_;
+  absl::InlinedVector<BufferedCommand, 4> commands_;
   std::size_t next_ = 0;
+};
+
+class CommandBufferGuard {
+ public:
+  CommandBufferGuard(ClientBufferReservation* reservation,
+                     std::size_t bytes) noexcept
+      : reservation_(reservation), bytes_(bytes) {}
+  CommandBufferGuard(const CommandBufferGuard&) = delete;
+  CommandBufferGuard& operator=(const CommandBufferGuard&) = delete;
+  ~CommandBufferGuard() { Release(); }
+
+  std::size_t Detach() noexcept { return std::exchange(bytes_, 0); }
+
+  void Release() noexcept {
+    if (bytes_ == 0) return;
+    reservation_->Release(bytes_);
+    bytes_ = 0;
+  }
+
+ private:
+  ClientBufferReservation* reservation_;
+  std::size_t bytes_;
 };
 
 Task<absl::Status> ReadCommandBatch(
     TcpStream& stream, RequestInputBuffer* input, RespCommandParser* parser,
-    CommandBatch* ready, std::optional<absl::Status>* deferred_error) {
+    CommandBatch* ready, ClientBufferReservation* client_buffers,
+    const std::atomic<std::size_t>* query_buffer_limit,
+    std::size_t* unassigned_input_bytes,
+    std::optional<absl::Status>* deferred_error) {
   while (ready->empty()) {
+    // CONFIG SET may run on another worker while this coroutine is suspended
+    // in ReadSome(). Refresh once per parsing round; token-level loads would
+    // add needless atomic traffic to every request.
+    parser->SetQueryBufferLimit(
+        query_buffer_limit->load(std::memory_order_acquire));
     while (!input->View().empty() &&
            ready->size() < CommandBatch::kMaxCommands) {
       RespParseResult parsed = parser->Parse(input->View());
       input->Consume(parsed.consumed_);
+      assert(parsed.consumed_ <=
+             std::numeric_limits<std::size_t>::max() -
+                 *unassigned_input_bytes);
+      *unassigned_input_bytes += parsed.consumed_;
       if (parsed.state_ == RespParseState::kError) {
         if (!ready->empty()) {
           deferred_error->emplace(std::move(parsed.status_));
@@ -1124,8 +1187,16 @@ Task<absl::Status> ReadCommandBatch(
         co_return parsed.status_;
       }
       if (parsed.state_ == RespParseState::kOk) {
-        ready->Push(std::move(parsed.command_));
+        ready->Push(std::move(parsed.command_), *unassigned_input_bytes);
+        *unassigned_input_bytes = 0;
         continue;
+      }
+      if (parser->idle()) {
+        // Blank lines and empty arrays retain no parser state. Retire them
+        // immediately instead of letting meaningless traffic consume the
+        // worker's client-buffer quota until disconnect.
+        client_buffers->Release(*unassigned_input_bytes);
+        *unassigned_input_bytes = 0;
       }
       // A trailing CR is deliberately left unread until its LF arrives.
       // Everything before it is now parser-owned and already consumed.
@@ -1140,6 +1211,14 @@ Task<absl::Status> ReadCommandBatch(
     }
     if (*read_result == 0) [[unlikely]] {
       co_return absl::UnavailableError("peer closed connection");
+    }
+    // Read into the already allocated socket buffer first, then charge once
+    // for the bytes that the parser may retain. This keeps admission out of
+    // every string append while bounding stalled and pipelined clients.
+    if (!client_buffers->TryAcquire(*read_result)) [[unlikely]] {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError(
+          "client request buffers exceed the memory limit");
     }
     input->Commit(*read_result);
   }
@@ -1385,6 +1464,8 @@ Task<absl::Status> BreakStalledStream(StreamStallRef state, int fd) {
 Task<absl::Status> RedisService::ReadSubscribedCommands(
     TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
     RespCommandParser* parser, CommandBatch* ready,
+    ClientBufferReservation* client_buffers,
+    std::size_t* unassigned_input_bytes, std::size_t* multi_input_bytes,
     std::optional<absl::Status>* deferred_read_error,
     std::shared_ptr<PubSubSession> session) {
   struct ReaderDone {
@@ -1426,7 +1507,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         deferred_read_error->reset();
       } else {
         read_status = co_await ReadCommandBatch(
-            stream, input, parser, ready, deferred_read_error);
+            stream, input, parser, ready, client_buffers,
+            &client_query_buffer_limit_bytes_,
+            unassigned_input_bytes, deferred_read_error);
       }
     }
     if (!read_status.ok()) {
@@ -1441,7 +1524,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       ClosePubSubSession(session);
       co_return absl::OkStatus();
     }
-    RespCommand command = ready->PopFront();
+    CommandBatch::BufferedCommand buffered = ready->PopFront();
+    CommandBufferGuard command_memory(client_buffers, buffered.input_bytes_);
+    RespCommand command = std::move(buffered.command_);
 
     if (!TryBeginRequest()) [[unlikely]] {
       builder.Reset();
@@ -1467,8 +1552,15 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
           request->db_id_, ctx.peer_address_, request->args_, &*request));
     }
     if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
+      const std::size_t queued_before = ctx.queued_.size();
       CommandReply reply =
           co_await DispatchCommand(ctx, std::move(*request), builder);
+      if (ctx.queued_.size() > queued_before) {
+        *multi_input_bytes += command_memory.Detach();
+      } else if (queued_before != 0 && ctx.queued_.empty()) {
+        client_buffers->Release(*multi_input_bytes);
+        *multi_input_bytes = 0;
+      }
       const bool succeeded =
           reply.encoded_.empty() || reply.encoded_.front() != '-';
       (void)co_await enqueue_command_reply(std::move(reply));
@@ -1516,8 +1608,15 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       continue;
     }
 
+    const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply =
         co_await DispatchCommand(ctx, std::move(*request), builder);
+    if (ctx.queued_.size() > queued_before) {
+      *multi_input_bytes += command_memory.Detach();
+    } else if (queued_before != 0 && ctx.queued_.empty()) {
+      client_buffers->Release(*multi_input_bytes);
+      *multi_input_bytes = 0;
+    }
     const bool succeeded =
         reply.encoded_.empty() || reply.encoded_.front() != '-';
     if (reply.selected_db_.has_value()) ctx.selected_db_ = *reply.selected_db_;
@@ -1545,12 +1644,18 @@ Task<absl::Status> RedisService::ServeSubscribed(TcpStream& stream,
                                                  RequestInputBuffer* input,
                                                  RespCommandParser* parser,
                                                  CommandBatch* ready,
+                                                 ClientBufferReservation*
+                                                     client_buffers,
+                                                 std::size_t*
+                                                     unassigned_input_bytes,
+                                                 std::size_t* multi_input_bytes,
                                                  std::optional<absl::Status>*
                                                      deferred_read_error) {
   std::shared_ptr<PubSubSession> session = ctx.pubsub_session_;
   MarkPubSubReaderStarted(session);
   ThisWorker().self_->Spawn(ReadSubscribedCommands(
-      stream, ctx, input, parser, ready, deferred_read_error, session));
+      stream, ctx, input, parser, ready, client_buffers,
+      unassigned_input_bytes, multi_input_bytes, deferred_read_error, session));
 
   absl::Status streamed = co_await StreamPubSubMessages(stream, session);
   const bool normal_exit = PubSubSubscriptionCount(session) == 0;
@@ -1571,8 +1676,11 @@ Task<absl::Status> RedisService::ServeSubscribed(TcpStream& stream,
 Task<absl::Status> RedisService::Serve(TcpStream& stream,
                                        ConnectionContext& ctx) {
   RequestInputBuffer input;
-  RespCommandParser parser;
+  RespCommandParser parser(client_query_buffer_limit());
   CommandBatch ready;
+  ClientBufferReservation client_buffers;
+  std::size_t unassigned_input_bytes = 0;
+  std::size_t multi_input_bytes = 0;
   std::optional<absl::Status> deferred_read_error;
   PendingReplyBatch pending_replies;
 
@@ -1589,6 +1697,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         deferred_read_error.reset();
       } else {
         read_status = co_await ReadCommandBatch(stream, &input, &parser, &ready,
+                                                &client_buffers,
+                                                &client_query_buffer_limit_bytes_,
+                                                &unassigned_input_bytes,
                                                 &deferred_read_error);
       }
       if (!read_status.ok()) [[unlikely]] {
@@ -1607,7 +1718,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         co_return read_status;
       }
     }
-    RespCommand command = ready.PopFront();
+    CommandBatch::BufferedCommand buffered = ready.PopFront();
+    CommandBufferGuard command_memory(&client_buffers, buffered.input_bytes_);
+    RespCommand command = std::move(buffered.command_);
 
     const auto& args = command.args_;
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "HELLO") &&
@@ -1704,6 +1817,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
       const bool tls = stream.IsTls();
       UnregisterClientConnection(ctx.conn_id_);
+      command_memory.Release();
       co_return co_await replication_->ServeRedisExportConnection(
           stream, std::move(command.args_), ctx.conn_id_, address, tls,
           ctx.redis_replica_eof_);
@@ -1723,6 +1837,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           peer_address.ok() ? std::move(*peer_address) : std::string("?:0");
       const bool tls = stream.IsTls();
       UnregisterClientConnection(ctx.conn_id_);
+      command_memory.Release();
       co_return co_await replication_->ServeNativeConnection(
           stream, std::move(command.args_), ctx.conn_id_, address, tls);
     }
@@ -1743,6 +1858,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 
     auto request_result =
         BuildCommandRequest(std::move(command), ctx.selected_db_);
+    const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply;
     std::shared_ptr<const std::string> monitor_message;
     bool publish_monitor_after_dispatch = false;
@@ -1787,6 +1903,12 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       }
       reply = co_await DispatchCommand(ctx, std::move(*request_result),
                                        ctx.reply_builder_);
+    }
+    if (ctx.queued_.size() > queued_before) {
+      multi_input_bytes += command_memory.Detach();
+    } else if (queued_before != 0 && ctx.queued_.empty()) {
+      client_buffers.Release(multi_input_bytes);
+      multi_input_bytes = 0;
     }
     if (monitor_message != nullptr) [[unlikely]] {
       PublishMonitorMessage(std::move(monitor_message));
@@ -1896,6 +2018,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
       if (!flushed.ok()) co_return flushed;
       request_guard.Release();
+      command_memory.Release();
       co_return co_await StreamMonitorMessages(stream, ctx.monitor_session_);
     }
     if (PubSubSubscriptionCount(ctx.pubsub_session_) != 0) [[unlikely]] {
@@ -1905,8 +2028,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       absl::Status flushed = co_await FlushReplyBatch(stream, &pending_replies);
       if (!flushed.ok()) co_return flushed;
       request_guard.Release();
+      command_memory.Release();
       absl::Status subscribed = co_await ServeSubscribed(
-          stream, ctx, &input, &parser, &ready, &deferred_read_error);
+          stream, ctx, &input, &parser, &ready, &client_buffers,
+          &unassigned_input_bytes, &multi_input_bytes, &deferred_read_error);
       if (!subscribed.ok()) co_return subscribed;
       continue;
     }
@@ -2088,6 +2213,8 @@ int RunServer(ServerOptions options) {
       "storage_write_buffers={} "
       "storage_read_buffer_bytes={} "
       "replication_publish_queue_bytes={} per worker max_memory={} "
+      "maxmemory_clients={} "
+      "client_query_buffer_limit={} "
       "flush_max_ms={} "
       "flush_size_bytes={} "
       "inline_key_max_bytes={} "
@@ -2103,6 +2230,8 @@ int RunServer(ServerOptions options) {
       options.spdk_foreground_pre_poll_us_, options.registered_buffer_bytes_,
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
+      FormatClientBufferLimit(options.maxmemory_clients_),
+      options.client_query_buffer_limit_bytes_,
       options.flush_max_ms_, options.flush_size_bytes_,
       options.inline_key_max_bytes_,
       options.defrag_max_active_per_device_,
@@ -2110,7 +2239,8 @@ int RunServer(ServerOptions options) {
       options.defrag_paused_);
 
   const absl::Status memory_status =
-      InitMemoryLimit(options.max_memory_bytes_, options.thread_count_);
+      InitMemoryLimit(options.max_memory_bytes_, options.thread_count_,
+                      options.maxmemory_clients_);
   if (!memory_status.ok()) {
     spdlog::error("memory limit setup failed: {}", memory_status.message());
     return 1;
@@ -2208,7 +2338,8 @@ int RunServer(ServerOptions options) {
 
   RedisService redis(options.port_, &storage, &replication,
                      options.mimalloc_purge_delay_ms_, options.requirepass_,
-                     std::move(options.load_rdb_file_), options.max_clients_);
+                     std::move(options.load_rdb_file_), options.max_clients_,
+                     options.client_query_buffer_limit_bytes_);
   InitClientLimit(&redis);
   if (tls_server_context != nullptr) {
     redis.AddTlsEndpoint(options.tls_port_, std::move(tls_server_context));

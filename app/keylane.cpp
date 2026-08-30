@@ -63,6 +63,10 @@ int main(int argc, char** argv) {
       options.replication_publish_queue_bytes_ / (1024ULL * 1024));
   unsigned storage_read_buffer_kb =
       static_cast<unsigned>(options.storage_read_buffer_bytes_ / 1024ULL);
+  std::string maxmemory_clients =
+      keylane::FormatClientBufferLimit(options.maxmemory_clients_);
+  std::string client_query_buffer_limit =
+      std::to_string(options.client_query_buffer_limit_bytes_);
   unsigned flush_size_kb = 128;
   std::vector<std::string> redis_replicaof_cli;
 
@@ -234,6 +238,12 @@ int main(int argc, char** argv) {
                  "Maximum process memory (0 uses 80% of memory capacity)")
       ->capture_default_str()
       ->transform(CLI::AsSizeValue(false));
+  app.add_option("--maxmemory-clients", maxmemory_clients,
+                 "Ordinary client request-buffer limit (bytes or percentage)")
+      ->capture_default_str();
+  app.add_option("--client-query-buffer-limit", client_query_buffer_limit,
+                 "Per-connection request-buffer hard limit")
+      ->capture_default_str();
   app.add_option("--flush-max-ms", options.flush_max_ms_,
                  "Maximum age of a partial write block before flush")
       ->capture_default_str()
@@ -303,6 +313,22 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+  auto parsed_client_limit =
+      keylane::ParseClientBufferLimit(maxmemory_clients);
+  if (!parsed_client_limit.ok()) {
+    std::cerr << "Configuration error: " << parsed_client_limit.status().message()
+              << '\n';
+    return 2;
+  }
+  options.maxmemory_clients_ = *parsed_client_limit;
+  auto parsed_query_buffer_limit =
+      keylane::ParseClientQueryBufferLimit(client_query_buffer_limit);
+  if (!parsed_query_buffer_limit.ok()) {
+    std::cerr << "Configuration error: "
+              << parsed_query_buffer_limit.status().message() << '\n';
+    return 2;
+  }
+  options.client_query_buffer_limit_bytes_ = *parsed_query_buffer_limit;
   const absl::Status validated = keylane::ValidateServerOptions(options);
   if (!validated.ok()) {
     std::cerr << "Configuration error: " << validated.message() << '\n';

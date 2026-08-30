@@ -20,14 +20,49 @@ dashboard and multi-node discovery, is available in
 and accepts byte-size suffixes such as `8GiB`. A value of zero, the default,
 uses 80% of the smaller of the host memory capacity and the process cgroup
 limit. Commands that may grow retained memory return a Redis-compatible OOM
-error when their worker's share would cross the limit.
+error when their worker's share would cross 90% of the limit. The remaining 10%
+is passive headroom, not a separately admitted temporary-memory pool. The
+default 5% client-request quota can occupy half of that space. Bounded command,
+IO, and protocol scratch may briefly push process memory above `--max-memory`,
+so this setting is a retained-memory waterline rather than a strict
+instantaneous RSS ceiling.
+
+`--maxmemory-clients` bounds ordinary client request and queued `MULTI` bytes.
+It accepts either a percentage such as `5%` or an absolute size such as
+`512mb`; the default is `5%`, and `0` disables this client-specific limit.
+Every nonzero value has a 128 KiB effective minimum so an accidentally tiny
+setting does not make administrative commands unusable. The process-wide value
+is divided into fixed worker shares and checked once after each socket read.
+
+`--client-query-buffer-limit` is the independent per-connection hard limit for
+an incomplete command. It accepts an absolute Redis-style memory size, defaults
+to `1gb`, and must be at least `1mb`. The same
+`client-query-buffer-limit 1gb` directive is accepted in Redis-style
+configuration files. The connection closes if incremental parsing crosses the
+limit; completed commands continue to count against `maxmemory-clients` until
+execution or transaction teardown releases them. `CONFIG GET/SET
+client-query-buffer-limit` reads or changes the live process-wide value;
+existing connections apply a change before their next parsing round.
 
 The process budget is split evenly across workers and unused capacity is not
-borrowed across workers. Non-worker process allocations are apportioned across
-the same shares. SET/MSET/INCR performs one worker-local retained-growth check.
-Only a new record-index arena page or bucket allocation enters a slow path that
-temporarily reserves exact headroom; neither path updates a process-global
-balance. RSS and allocator diagnostics remain outside command execution.
+borrowed across workers. SET/MSET/INCR performs one worker-local retained-growth
+check. Only a new record-index arena page or bucket allocation enters a slow
+path that temporarily reserves exact headroom. Full-sync coverage, replication
+backlog ownership, fixed source-publisher/full-sync FIFO budgets, and
+multi-frame replica staging also share the 90% retained budget because they
+can accumulate beyond one request. Publisher admission normally stays within
+the fixed queue budget. One command larger than that waterline may enter only
+as the exclusive item; its surplus is not retained-accounted and can remain
+allocated while publication is backpressured. The protocol limit bounds this
+exception, but neither the passive 10% nor `maxmemory-clients` guarantees that
+it fits. Increasing or disabling the default client quota reduces the assumed
+headroom further. Operators requiring the publisher copy to remain inside the
+retained boundary should configure
+`replication-publish-queue-mb-per-worker` at least as large as their largest
+accepted replicated command.
+Ordinary temporary allocations do not reserve headroom:
+the official mimalloc global new/delete override performs no Keylane
+accounting. RSS and allocator diagnostics remain outside command execution.
 
 ## Business metrics
 
@@ -100,9 +135,10 @@ sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
 
 ## Memory metrics
 
-- `keylane_memory_current_bytes`: cached allocator usable bytes used for limit
-  enforcement.
-- `keylane_memory_used_bytes`: allocator usable bytes.
+- `keylane_memory_current_bytes`: cached explicitly retained bytes used for
+  limit enforcement.
+- `keylane_memory_used_bytes`: explicitly retained bytes. This is not total
+  process heap usage; compare RSS and mimalloc diagnostics for that view.
 - `keylane_memory_rss_bytes`: resident process memory, refreshed when metrics
   or `INFO memory` is requested.
 - `keylane_memory_committed_bytes`: pages committed by mimalloc; diagnostic
@@ -110,21 +146,44 @@ sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
 - `keylane_memory_reserved_bytes`: virtual address space reserved by mimalloc;
   diagnostic only.
 - `keylane_memory_max_bytes`: configured process memory limit.
+- `keylane_client_request_buffer_limit_bytes`: effective client request-buffer
+  limit after resolving percentages and the nonzero 128 KiB floor.
+- `keylane_client_buffered_request_bytes`: wire bytes currently retained by
+  ordinary parsers, ready command batches, and queued transactions.
+- `keylane_fullsync_reserved_memory_bytes`: reusable retained-memory headroom
+  promised to active full-sync coverage maps.
 - `keylane_memory_admission_pending_bytes`: short-lived worker-local permits
-  held while page, bucket, or replica-staging allocations become visible to
-  allocator accounting.
+  held while retained page, bucket, replication-owner, or replica-staging
+  ownership is constructed.
 - `keylane_memory_rejected_commands_total`: commands rejected by the limit.
+
+The provisioned Grafana **Retained Admission Utilization** gauge approximates
+the process-wide admission decision as:
+
+```promql
+100 * (
+  keylane_memory_current_bytes
+  + keylane_fullsync_reserved_memory_bytes
+  + keylane_memory_admission_pending_bytes
+) / (0.9 * keylane_memory_max_bytes)
+```
+
+Admission is enforced per worker, so a single worker can still reject growth
+before this process-wide aggregate reaches 100%. Oversized publisher surplus,
+client buffers, temporary heap usage, and RSS are intentionally absent from
+this retained-admission gauge.
 
 The same values are available through Redis `INFO memory`, including
 `used_memory`, `used_memory_rss`, `maxmemory`, and
 `oom_rejected_commands`.
 
-Worker 0 sums the cache-line-separated worker allocation counters every 100 ms.
-Release builds keep mimalloc's generic per-allocation statistics disabled and
-use Keylane's own lightweight usable-size accounting instead. The hot command
-path reads its own shard and adds a conservative retained-size estimate, so it
-performs no allocator aggregation or `/proc` I/O. RSS is diagnostic only
-and is sampled by the explicit metrics/INFO request.
+Worker 0 sums the cache-line-separated worker retained counters every 100 ms.
+Release builds use mimalloc's official global C++ override without Keylane
+hooks. Explicit retained allocators query `mi_usable_size` only on their much
+rarer allocation/free paths. The hot command path reads its own shard and adds
+a conservative retained-size estimate, so it performs no allocator aggregation
+or `/proc` I/O. RSS is diagnostic only and is sampled by the explicit
+metrics/INFO request.
 
 ## Update model
 

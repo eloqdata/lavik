@@ -13,6 +13,11 @@
 #include <string>
 #include <string_view>
 
+#include "../src/redis/list_command.h"
+#include "../src/redis/set_command.h"
+#include "../src/redis/sort_command.h"
+#include "../src/redis/string_command.h"
+#include "../src/redis/zset_command.h"
 #include "celer/net/server.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
@@ -21,6 +26,8 @@
 #include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
+#include "keylane/storage/format.h"
+#include "keylane/storage/scan_hash_map.h"
 #include "keylane/tx/tx_shard.h"
 
 namespace {
@@ -33,6 +40,7 @@ using keylane::storage::ReplicationLogAppend;
 using keylane::storage::ReplicationLogCursor;
 using keylane::storage::ReplicationLogPayloadSource;
 using keylane::storage::ReplicationLogState;
+using keylane::storage::ScanHashMapEntryArena;
 using keylane::storage::StorageEngine;
 using keylane::storage::StorageEngineOptions;
 
@@ -168,6 +176,117 @@ class ReplicationLogService final : public celer::Service {
                                  std::string(expected_reply) + "'");
     }
     co_return absl::OkStatus();
+  }
+
+  absl::Status LimitRetainedHeadroom() {
+    keylane::RefreshMemoryStats();
+    const std::uint64_t used = keylane::GetMemoryStats().used_bytes_;
+    constexpr std::uint64_t kAdmissionHeadroom = 128 * 1024;
+    if (used > std::numeric_limits<std::uint64_t>::max() - kAdmissionHeadroom) {
+      return absl::ResourceExhaustedError(
+          "cannot construct transaction-guard admission test limit");
+    }
+    const std::uint64_t steady_target = used + kAdmissionHeadroom;
+    const std::uint64_t steady_allowance = steady_target / 19 + 1;
+    if (steady_target >
+        std::numeric_limits<std::uint64_t>::max() - steady_allowance) {
+      return absl::ResourceExhaustedError(
+          "transaction-guard admission test limit overflows");
+    }
+    // InitMemoryLimit withholds five percent. Choose a configured limit whose
+    // steady portion leaves a small positive margin, then bypass top-level
+    // dispatch so this specifically exercises each handler's guard check.
+    return keylane::InitMemoryLimit(steady_target + steady_allowance, 1);
+  }
+
+  celer::Task<absl::Status> ExerciseTransactionGuardAdmission(
+      std::vector<std::string> args) {
+    auto request = keylane::BuildCommandRequest(
+        keylane::RespCommand{.args_ = std::move(args)}, 0);
+    if (!request.ok()) co_return request.status();
+
+    absl::Status status = LimitRetainedHeadroom();
+    if (!status.ok()) co_return status;
+
+    keylane::ReplyBuilder builder;
+    keylane::CommandReply reply;
+    switch (request->kind_) {
+      case keylane::CommandKind::kLMPop:
+        reply = co_await keylane::ExecuteListMultiKey(*request, builder);
+        break;
+      case keylane::CommandKind::kSUnionStore:
+        reply = co_await keylane::ExecuteSetMultiKey(*request, builder);
+        break;
+      case keylane::CommandKind::kZUnionStore:
+        reply = co_await keylane::ExecuteZSetMultiKey(*request, builder);
+        break;
+      case keylane::CommandKind::kSort:
+        reply = co_await keylane::ExecuteSortCommand(*request, builder);
+        break;
+      default:
+        status = absl::InvalidArgumentError(
+            "unsupported transaction-guard admission test command");
+        break;
+    }
+
+    const absl::Status restored = keylane::InitMemoryLimit(512 * kMiB, 1);
+    if (!restored.ok()) co_return restored;
+    if (!status.ok()) co_return status;
+    constexpr std::string_view kExpected =
+        "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
+    if (reply.encoded_ != kExpected) {
+      co_return absl::FailedPreconditionError("transaction guard returned '" +
+                                              std::string(reply.encoded_) +
+                                              "' instead of a Redis OOM error");
+    }
+    co_return absl::OkStatus();
+  }
+
+  celer::Task<absl::Status> ExerciseBitOpPayloadAdmission() {
+    std::vector<std::string> source_args{"SET", "bitop-admission-source",
+                                         std::string(kMiB, 'B')};
+    absl::Status status =
+        co_await ExecuteClientCommand(0, std::move(source_args), "+OK\r\n");
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        0, {"SET", "bitop-admission-destination", "old"}, "+OK\r\n");
+    if (!status.ok()) co_return status;
+    // Do not tighten maxmemory while either setup event still owns a pending
+    // publisher reservation; the test targets canonical payload growth, not
+    // backlog materialization.
+    status = co_await WaitForReplicationTail(2);
+    if (!status.ok()) co_return status;
+
+    auto request = keylane::BuildCommandRequest(
+        keylane::RespCommand{.args_ = {"BITOP", "OR",
+                                       "bitop-admission-destination",
+                                       "bitop-admission-source"}},
+        0);
+    if (!request.ok()) co_return request.status();
+    status = LimitRetainedHeadroom();
+    if (!status.ok()) co_return status;
+    {
+      auto probe = keylane::TryReserveMemory(kMiB);
+      if (probe.has_value()) {
+        co_return absl::FailedPreconditionError(
+            "transaction admission test left at least one MiB of headroom");
+      }
+    }
+
+    keylane::ReplyBuilder builder;
+    keylane::CommandReply reply =
+        co_await keylane::ExecuteBitOpCommand(*request, builder);
+    const absl::Status restored = keylane::InitMemoryLimit(512 * kMiB, 1);
+    if (!restored.ok()) co_return restored;
+    constexpr std::string_view kExpected =
+        "-OOM command not allowed when used memory > 'maxmemory'.\r\n";
+    if (reply.encoded_ != kExpected) {
+      co_return absl::FailedPreconditionError(
+          "BITOP payload admission returned '" + std::string(reply.encoded_) +
+          "' instead of a Redis OOM error");
+    }
+    co_return co_await ExecuteClientCommand(
+        0, {"GET", "bitop-admission-destination"}, "$3\r\nold\r\n");
   }
 
   celer::Task<absl::Status> WaitForReplicationTail(
@@ -432,12 +551,37 @@ class ReplicationLogService final : public celer::Service {
     auto bumped = co_await storage_->Set(kDb, sequence_bump, "bump", {});
     if (!bumped.ok()) co_return bumped.status();
 
+    // A session must obtain its fixed publisher staging budget before it can
+    // expose any coverage state. Prove a deliberately tight worker limit
+    // rejects the session without leaving partial ownership behind.
+    absl::Status tight_limit = keylane::InitMemoryLimit(
+        ScanHashMapEntryArena::kSmallSpanAdmissionBytes - 1, 1);
+    if (!tight_limit.ok()) co_return tight_limit;
+    auto under_reserved = storage_->BeginFullSyncSession(100);
+    Check(!under_reserved.ok(),
+          "full-sync session bypassed first-span admission");
+    absl::Status restored_limit = keylane::InitMemoryLimit(512 * kMiB, 1);
+    if (!restored_limit.ok()) co_return restored_limit;
+
+    keylane::RefreshMemoryStats();
+    const std::uint64_t retained_before_staging =
+        keylane::GetMemoryStats().used_bytes_;
     auto first_session = storage_->BeginFullSyncSession(kFirstSession);
     if (!first_session.ok()) co_return first_session.status();
     auto second_session = storage_->BeginFullSyncSession(kSecondSession);
     if (!second_session.ok()) co_return second_session.status();
-    Check(keylane::GetMemoryStats().fullsync_reserved_bytes_ > reserved_before,
-          "full-sync sessions did not reserve coverage headroom");
+    keylane::RefreshMemoryStats();
+    const std::uint64_t staging_capacity =
+        storage_->LocalReplicationLogInfo().publish_queue_capacity_bytes_;
+    Check(keylane::GetMemoryStats().used_bytes_ >=
+              retained_before_staging + 2 * staging_capacity,
+          "full-sync sessions did not hold fixed publisher staging budgets");
+    const std::uint64_t reserved_after =
+        keylane::GetMemoryStats().fullsync_reserved_bytes_;
+    Check(reserved_after >=
+              reserved_before +
+                  2 * ScanHashMapEntryArena::kSmallSpanAdmissionBytes,
+          "full-sync sessions did not reserve their first arena spans");
     auto first_start_result =
         storage_->BeginPartitionReplication(kFirstSession, partition_id);
     if (!first_start_result.ok()) co_return first_start_result.status();
@@ -456,6 +600,8 @@ class ReplicationLogService final : public celer::Service {
               first_start.baseline_version_ >= 2,
           "full-sync sessions did not fence the current runtime version");
 
+    const std::uint64_t reserved_before_snapshot =
+        keylane::GetMemoryStats().fullsync_reserved_bytes_;
     bool found_old_record = false;
     std::uint64_t cursor = 0;
     do {
@@ -472,6 +618,9 @@ class ReplicationLogService final : public celer::Service {
       cursor = snapshot->cursor_;
     } while (cursor != 0);
     Check(found_old_record, "full-sync baseline did not enumerate the old key");
+    Check(keylane::GetMemoryStats().fullsync_reserved_bytes_ <
+              reserved_before_snapshot,
+          "full-sync coverage allocation did not consume reserved credit");
 
     auto first = co_await storage_->Set(kDb, key, "first", {});
     if (!first.ok()) co_return first.status();
@@ -538,6 +687,41 @@ class ReplicationLogService final : public celer::Service {
     storage_->EndFullSyncSession(kSecondSession);
     Check(keylane::GetMemoryStats().fullsync_reserved_bytes_ == reserved_before,
           "full-sync coverage reservation was not released");
+
+    // A post-fence identity can be larger than the pre-scanned map budget.
+    // The primary write remains durable, while the lower-priority attempt is
+    // invalidated before its override maps allocate beyond that credit.
+    constexpr std::uint64_t kBudgetSession = 225;
+    const std::uint64_t budget_before =
+        keylane::GetMemoryStats().fullsync_reserved_bytes_;
+    auto budget_session = storage_->BeginFullSyncSession(kBudgetSession);
+    if (!budget_session.ok()) co_return budget_session.status();
+    const std::uint64_t budget_after =
+        keylane::GetMemoryStats().fullsync_reserved_bytes_;
+    const std::uint64_t budget_bytes = budget_after - budget_before;
+    if (budget_bytes / 2 + 1 > keylane::storage::MaxKeyBytes()) {
+      co_return absl::ResourceExhaustedError(
+          "full-sync test reservation cannot form a valid oversized key");
+    }
+    std::string budget_key(static_cast<std::size_t>(budget_bytes / 2 + 1), 'B');
+    const std::uint16_t budget_partition =
+        keylane::storage::RedisSlot(budget_key);
+    auto budget_start =
+        storage_->BeginPartitionReplication(kBudgetSession, budget_partition);
+    if (!budget_start.ok()) co_return budget_start.status();
+    absl::Status budget_db = storage_->BeginPartitionDbReplication(
+        kBudgetSession, budget_partition, kDb);
+    if (!budget_db.ok()) co_return budget_db;
+    auto budget_write = co_await storage_->Set(kDb, budget_key, "kept", {});
+    if (!budget_write.ok()) co_return budget_write.status();
+    Check(!storage_->FullSyncSessionValid(kBudgetSession),
+          "coverage exhaustion did not invalidate full sync");
+    Check(co_await storage_->Exists(kDb, budget_key),
+          "coverage exhaustion rolled back the foreground write");
+    storage_->EndPartitionReplication(kBudgetSession, budget_partition);
+    storage_->EndFullSyncSession(kBudgetSession);
+    auto budget_removed = co_await storage_->Delete(kDb, budget_key);
+    if (!budget_removed.ok()) co_return budget_removed.status();
 
     constexpr std::uint64_t kTxSession = 250;
     const std::string tx_key = "fullsync-tx{coalesce}";
@@ -1167,8 +1351,56 @@ class ReplicationLogService final : public celer::Service {
               admission_request({"mset", "a", "1", "b", "2"})),
           "single-shard MSET still took the replication order gate");
 
+    keylane::RefreshMemoryStats();
+    const std::uint64_t retained_before_publisher =
+        keylane::GetMemoryStats().used_bytes_;
     status = co_await storage_->EnableReplicationLog(3, 8 * kMiB);
     if (!status.ok()) co_return status;
+    keylane::RefreshMemoryStats();
+    const std::uint64_t publisher_capacity =
+        storage_->LocalReplicationLogInfo().publish_queue_capacity_bytes_;
+    Check(keylane::GetMemoryStats().used_bytes_ >=
+              retained_before_publisher + publisher_capacity,
+          "replication log did not hold its fixed publisher staging budget");
+
+    const std::string oversized_transaction_key(kMiB, 'T');
+    status = co_await ExerciseTransactionGuardAdmission(
+        {"LMPOP", "2", oversized_transaction_key, "list-other", "LEFT"});
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseTransactionGuardAdmission(
+        {"SUNIONSTORE", "set-destination", oversized_transaction_key});
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseTransactionGuardAdmission(
+        {"ZUNIONSTORE", "zset-destination", "1", oversized_transaction_key});
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseTransactionGuardAdmission(
+        {"SORT", oversized_transaction_key, "STORE", "sort-destination"});
+    if (!status.ok()) co_return status;
+    status = co_await ExerciseBitOpPayloadAdmission();
+    if (!status.ok()) co_return status;
+
+    // The parsed request already owns this value. Leave enough headroom for
+    // command dispatch itself but not the replication journal's second copy;
+    // SET must fail before publishing either durable state or a log event.
+    std::vector<std::string> admission_args{"SET", "replication-copy-oom",
+                                            std::string(kMiB, 'M')};
+    keylane::RefreshMemoryStats();
+    const std::uint64_t used = keylane::GetMemoryStats().used_bytes_;
+    if (used > std::numeric_limits<std::uint64_t>::max() - 128 * 1024) {
+      co_return absl::ResourceExhaustedError(
+          "cannot construct replication-copy admission test limit");
+    }
+    status = keylane::InitMemoryLimit(used + 128 * 1024, 1);
+    if (!status.ok()) co_return status;
+    status = co_await ExecuteClientCommand(
+        0, std::move(admission_args),
+        "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    if (!status.ok()) co_return status;
+    Check(!co_await storage_->Exists(0, "replication-copy-oom"),
+          "rejected replication copy still mutated storage");
+    status = keylane::InitMemoryLimit(512 * kMiB, 1);
+    if (!status.ok()) co_return status;
+
     status = co_await ExercisePartitionHandoff();
     if (!status.ok()) co_return status;
     RepeatedByteSource too_large(9 * kMiB, 'x');
@@ -1611,6 +1843,86 @@ class ReplicationLogService final : public celer::Service {
     storage_->ReleaseReplicationLogRetention(78);
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
+
+    {
+      // A transaction can canonicalize to an after-image larger than both its
+      // request and the queue waterline. Keep another command behind it: the
+      // single publisher must process the admitted head even though the byte
+      // metric is temporarily above the waterline, rather than waiting for its
+      // own tail to disappear.
+      status = co_await storage_->EnableReplicationLog(18, 4 * 8 * kMiB);
+      if (!status.ok()) co_return status;
+      status = co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+      if (!status.ok()) co_return status;
+      auto head_admission =
+          co_await storage_->AcquireReplicationPublisherAdmission(128);
+      if (!head_admission.ok()) co_return head_admission.status();
+      auto transaction =
+          std::make_shared<keylane::storage::ReplicationTransaction>();
+      transaction->id_ = 9001;
+      transaction->db_id_ = 0;
+      transaction->participants_ = {worker_->id()};
+      transaction->envelope_args_ = {"__KEYLANE_TX_V1", "9001", "1", "0", "SET",
+                                     "canonical-head",  "small"};
+      auto transaction_bytes =
+          keylane::storage::ReplicationTransactionAllocationBytes(
+              transaction->participants_.capacity(),
+              transaction->envelope_args_, std::span<const std::string>{});
+      Check(transaction_bytes.has_value(),
+            "transaction retained size was not representable");
+      transaction->retained_charge_.Account(
+          keylane::CurrentMemoryAccountingShard(), *transaction_bytes);
+      Check(storage_->TryEnqueueReplicationTransaction(transaction),
+            "canonical head transaction was not enqueued");
+
+      auto tail_admission =
+          co_await storage_->AcquireReplicationPublisherAdmission(128);
+      if (!tail_admission.ok()) co_return tail_admission.status();
+      Check(storage_->TryEnqueueReplicationCommand(
+                keylane::storage::ReplicationCommandAppend{
+                    .kind_ = ReplicationEventKind::kMutation,
+                    .db_id_ = 0,
+                    .partition_id_ = 0,
+                    .partition_sequence_ = 9002,
+                    .args_ = {"SET", "canonical-tail", "value"},
+                }),
+            "canonical tail command was not enqueued");
+
+      const std::size_t prefix_size = 4;
+      std::vector<std::string> final_command{"SET", "canonical-head",
+                                             std::string(2 * kMiB, 'c')};
+      const auto final_bytes =
+          keylane::storage::ReplicationTransactionAllocationBytes(
+              transaction->participants_.capacity(),
+              std::span<const std::string>(transaction->envelope_args_)
+                  .first(prefix_size),
+              final_command);
+      Check(final_bytes.has_value() && *final_bytes >= *transaction_bytes,
+            "canonical transaction growth was not representable");
+      auto canonical_growth = keylane::TryReserveMemory(
+          *final_bytes - transaction->retained_charge_.bytes());
+      if (!canonical_growth.has_value()) {
+        co_return absl::ResourceExhaustedError(
+            "canonical transaction test growth was not admitted");
+      }
+      std::vector<std::string> final_envelope(
+          transaction->envelope_args_.begin(),
+          transaction->envelope_args_.begin() + prefix_size);
+      final_envelope.insert(final_envelope.end(), final_command.begin(),
+                            final_command.end());
+      transaction->envelope_args_.swap(final_envelope);
+      transaction->retained_charge_.Resize(*final_bytes);
+      canonical_growth->Release();
+      transaction->resolution_.store(
+          keylane::storage::ReplicationTransactionResolution::kPublish,
+          std::memory_order_release);
+      storage_->ReleaseReplicationPublisherAdmission(*tail_admission, 128);
+      storage_->ReleaseReplicationPublisherAdmission(*head_admission, 128);
+      status = co_await WaitForReplicationTail(2);
+      if (!status.ok()) co_return status;
+      status = co_await storage_->DisableReplicationLog();
+      if (!status.ok()) co_return status;
+    }
 
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and

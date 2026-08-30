@@ -43,7 +43,7 @@ snapshots.
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Replication | Manage node role and sessions, publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
-| Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account process memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
+| Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
 
@@ -144,15 +144,17 @@ state explicitly.
   requests before the final storage flush.
 - Replication and full-sync queues use admission/backpressure. They must not
   silently drop an already accepted logical write.
-- Process-memory admission is a conservative sampled guard, not an allocator
-  hard wall; diagnostics and enforcement have distinct update paths.
+- `maxmemory` admission uses explicit worker-owned retained allocations rather
+  than global allocation hooks. RSS and mimalloc committed/reserved statistics
+  remain diagnostic, so the retained waterline is not an instantaneous RSS
+  hard wall.
 
 ## External integrations
 
 | Integration | Boundary |
 |---|---|
 | Celer | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
-| mimalloc | Pinned allocator submodule plus Keylane new/delete accounting hooks |
+| mimalloc | Pinned allocator submodule; the official global new/delete override serves ordinary C++ allocations, while retained storage calls mimalloc through explicitly accounted domains |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
 | Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |

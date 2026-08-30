@@ -10,12 +10,6 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
     co_return absl::Status(absl::StatusCode::kInternal,
                            "recovered external key manifest is invalid");
   }
-  auto reservation = TryReserveMemoryAllocation(key_bytes + 1);
-  if (!reservation.has_value()) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "recovered external key exceeds this worker's maxmemory share");
-  }
   std::string key;
   try {
     key.resize(key_bytes);
@@ -24,7 +18,6 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
     co_return absl::ResourceExhaustedError(
         "recovered external key allocation failed");
   }
-  reservation.reset();
   std::size_t offset = 0;
   for (std::size_t index = 0; index < extents->size() && offset < key.size();
        ++index) {

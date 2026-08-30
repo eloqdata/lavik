@@ -121,7 +121,9 @@ replication epochs, logical mutation sequence, absolute expiration time,
 physical LSN, allocation epoch, and payload and header checksums. A key digest
 is deliberately absent: it is process-random runtime state reconstructed from
 the complete key. Record kinds are value, tombstone, and keyless transaction
-commit decision.
+commit decision. Both the storage write boundary and recovery decoder enforce
+the durable 512 MiB maximum key length; a wider internal or replication
+protocol argument limit cannot create a record that a restart would reject.
 
 The current version-1 record and compact Hash/Set layouts directly replaced
 their earlier digest-bearing forms; there is no compatibility decoder. Media
@@ -269,42 +271,97 @@ entries are reclaimed. Before a write that needs a new entry or changes the TTL
 representation, the owner checks that the
 required size class has a free slot or an encodable page ID. If it needs a new
 1 MiB small-page span, dedicated large-entry page, direct bucket array, or
-overflow bucket, storage also reserves the conservative physical allocation
+overflow bucket, storage also reserves the physical allocation
 from that worker's memory share before bytes are appended to the staging block.
+Incremental rehash prepares and admits any target overflow buckets before it
+clears the source chain. If that maintenance reservation is unavailable, a
+read or mutation still searches both tables and leaves the rehash step pending;
+allocator failure therefore cannot expose a partially migrated chain. Overflow
+admission includes the exact mimalloc size classes for the bucket objects and
+for both vector backings at their explicitly selected next capacities; crossing
+a large pool's capacity boundary is therefore charged before rehash mutates it.
 Each small span is 64 KiB-aligned and supplies sixteen logical 64 KiB pages;
 this amortizes mimalloc's alignment-size-class overhead without changing the
 handle's page/slot encoding. Empty logical pages are reusable by any size class,
 but their backing memory returns to mimalloc only when the whole span is empty.
-The permit stays live through index
-publication and then disappears after mimalloc's allocation hook has published
-the usable size. Page-ID or memory exhaustion therefore returns
+The 21-bit arena page directory is one raw descriptor array, so handle
+resolution remains a direct `directory[page_id]` lookup. It starts with room
+for 4,096 descriptors and doubles on demand up to the encodable page-ID limit.
+The unused suffix is deliberately uninitialized, and growth copies only the
+published prefix instead of value-initializing the new capacity. Before growth,
+admission charges the exact retained increase between the allocator's new and
+old usable sizes; the short-lived overlap while copying the arrays is covered
+by the process headroom outside the retained limit. Released directory slots
+encode the next free page ID, while available pages and spans use intrusive
+lists stored in their existing headers, so those paths need no additional
+capacity-growing metadata. The permit stays live through index publication.
+Arena spans and the directory array, bucket arrays, overflow objects, and their
+vector backings call mimalloc through a retained allocation domain; successful
+allocation publishes its actual usable size and destruction returns that same
+size to the domain's owner shard. Page-ID or memory exhaustion therefore returns
 `ResourceExhausted` without leaving a durable record that cannot enter the
 index. Updates whose representation already has a slot continue without this
 slow-path check.
 
 `--max-memory` is divided deterministically across storage workers; a worker
-does not borrow another worker's unused balance. Process allocations made
-outside a bound worker are divided across the same shares for admission. Each
-worker owns its allocation, pending-permit, and full-sync-reservation counters
-on one cache line, so foreground admission performs no process-global atomic
-read-modify-write. INFO and metrics aggregate the shards off the hot path.
+does not borrow another worker's unused balance. Retained allocations use 90%
+of each share. The remaining 10% stays outside retained admission. Client
+request buffers have a separate 5% quota by default, so even when retained
+state and client buffers are both full, 5% remains for allocator, request, and
+IO peaks rather than becoming an admission pool for individual temporary
+allocations. Ordinary `new` and `delete` use mimalloc's official override
+without touching admission counters. A retained allocation domain stores its
+owner shard, so destruction returns bytes to the allocation origin even if the
+final owner runs elsewhere; no pointer-to-heap ownership index is required.
+Retained allocation and release occur at page, bucket, backlog-block, fixed
+replication-publisher budget, or staging granularity rather than for every
+temporary object. An active source log holds one configured publisher budget
+on its worker, and every active full-sync session holds one more. Queue items
+consume a stable estimate of argument bytes, `std::string` elements, and item
+metadata; their individual mimalloc size classes are deliberately not charged.
+Each worker also owns its pending-permit and
+full-sync-reservation counters. INFO and metrics aggregate the shards off the
+hot path.
 
 Foreground command admission does not assign a fixed byte estimate to every
 key. A command that can grow retained state is rejected when its worker is
-already at its share, while arena pages and hash buckets reserve their actual
-allocator size class at the allocation site. Request strings are already
-charged by the allocation hook. The RESP parser additionally reserves the
-mimalloc usable-size class before materializing an argument larger than
-64 KiB, preventing a declared 512 MiB key or value from overshooting the share
-before command dispatch. Up to 64 KiB per in-flight parser remains an explicit
-recovery allowance so short `DEL` and other shrinking commands can still be
-decoded after maxmemory is reached; those bytes are still included in
-`used_memory`, just not rejected before allocation.
+already at the 90% steady-state boundary, while arena pages and hash buckets
+reserve their actual allocator size class at the allocation site. Ordinary
+client request bytes have a separate hard 5% process budget by default, divided
+into the same fixed worker shares. `maxmemory-clients` accepts either a
+percentage of effective maxmemory or an absolute byte size; zero disables the
+client-specific cap without changing the retained 90% waterline. The server
+charges that budget once after each socket read and releases a command's wire
+bytes after execution; it does not run an
+admission check for every parser append. A declared bulk length does not
+allocate its complete buffer: the argument grows only as payload arrives.
+Protocol bulk and command-size limits remain independent safety boundaries.
+Every nonzero aggregate client allowance has Valkey's 128 KiB minimum so very
+small synthetic limits do not make the protocol unusable.
+Explicit retained allocator size-class overhead is charged to `used_memory`,
+while ordinary temporary allocator usage is visible through RSS and mimalloc
+diagnostics. The client
+budget deliberately counts stable wire bytes so its hot path does not inspect
+every string and vector capacity. This connection-abuse quota is independent
+of the retained-memory waterline and therefore adds no per-parser-allocation
+reservation path.
 
-Known-size RDB strings and external-key read buffers use the same short-lived
-allocation permit. A permit ends immediately after allocation and never spans
-storage or network suspension: the mimalloc hook publishes the actual usable
-bytes before the permit is released.
+Bounded request-time scratch such as RDB strings, replication frame buffers,
+LCS workspaces, random-result arrays, and external-key read buffers does not
+participate in max-memory admission. Protocol and object-size limits bound
+untrusted sizes, and allocation failure is converted to `ResourceExhausted`
+where the operation can fail safely. This deliberately allows short-lived RSS
+peaks above `--max-memory`; after the default client-buffer quota, the remaining
+5% absorbs ordinary peaks without adding reservation bookkeeping to normal
+reads and commands.
+
+Full-sync coverage is different because it scales with the key set and lives
+for the synchronization session, so it pre-reserves a reusable logical budget
+inside the 90% retained-memory boundary.
+Before a capture identity allocates map storage, its conservative slice moves
+from the session reservation into retained accounting. Coverage containers use
+ordinary allocation because the parent credit already owns their conservative
+footprint; the slice is restored only after those containers are destroyed.
 
 The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
 obtained from the operating system. It is stable across workers for one

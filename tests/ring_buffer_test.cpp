@@ -1,8 +1,8 @@
+#include "../src/storage/ring_buffer.h"
+
 #include <gtest/gtest.h>
 
 #include <memory>
-
-#include "../src/storage/ring_buffer.h"
 
 namespace {
 
@@ -19,11 +19,13 @@ struct MoveOnlyValue {
 
 TEST(RingBufferTest, PreservesFifoAcrossWrapAndResize) {
   keylane::storage::RingBuffer<MoveOnlyValue> buffer;
+  EXPECT_EQ(buffer.growth_bytes_if_push(), 64 * sizeof(MoveOnlyValue));
 
   for (int value = 0; value < 64; ++value) {
     buffer.push_back(MoveOnlyValue(value));
   }
   EXPECT_EQ(buffer.capacity(), 64);
+  EXPECT_EQ(buffer.growth_bytes_if_push(), 128 * sizeof(MoveOnlyValue));
   for (int value = 0; value < 48; ++value) {
     ASSERT_NE(buffer.front().value_, nullptr);
     EXPECT_EQ(*buffer.front().value_, value);
@@ -59,6 +61,25 @@ TEST(RingBufferTest, ClearReleasesContentsAndRetainsCapacity) {
   buffer.push_back(MoveOnlyValue(7));
   ASSERT_NE(buffer.front().value_, nullptr);
   EXPECT_EQ(*buffer.front().value_, 7);
+}
+
+TEST(RingBufferTest, PreparedPushUsesReservedSlotWithoutGrowth) {
+  keylane::storage::RingBuffer<MoveOnlyValue> buffer;
+  buffer.PrepareCapacity(65);
+  ASSERT_EQ(buffer.capacity(), 128);
+  const std::size_t prepared_capacity = buffer.capacity();
+
+  for (int value = 0; value < 65; ++value) {
+    buffer.push_back_prepared(MoveOnlyValue(value));
+  }
+
+  EXPECT_EQ(buffer.size(), 65);
+  EXPECT_EQ(buffer.capacity(), prepared_capacity);
+  for (int value = 0; value < 65; ++value) {
+    ASSERT_NE(buffer.front().value_, nullptr);
+    EXPECT_EQ(*buffer.front().value_, value);
+    buffer.pop_front();
+  }
 }
 
 }  // namespace

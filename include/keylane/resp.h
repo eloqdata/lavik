@@ -12,6 +12,11 @@
 
 namespace keylane {
 
+inline constexpr std::size_t kDefaultClientQueryBufferLimit =
+    1ULL * 1024 * 1024 * 1024;
+inline constexpr std::size_t kMinimumClientQueryBufferLimit =
+    1ULL * 1024 * 1024;
+
 struct RespCommand {
   std::vector<std::string> args_;
 };
@@ -34,9 +39,22 @@ struct RespParseResult {
 // caller. One parser belongs to one connection.
 class RespCommandParser {
  public:
+  // The limit applies to the wire bytes retained while assembling one command.
+  // Completed commands transfer ownership to the caller and no longer count
+  // toward this parser-local guard.
+  explicit RespCommandParser(
+      std::size_t query_buffer_limit = kDefaultClientQueryBufferLimit) noexcept
+      : query_buffer_limit_(query_buffer_limit) {}
+
   RespParseResult Parse(std::string_view input);
 
   void Reset();
+  // Changes the guard without disturbing partially parsed state. If the new
+  // limit is already below the retained command size, the next input byte is
+  // rejected rather than abandoning bytes that the connection already owns.
+  void SetQueryBufferLimit(std::size_t value) noexcept {
+    query_buffer_limit_ = value;
+  }
   [[nodiscard]] bool idle() const noexcept {
     return state_ == State::kArrayStart;
   }
@@ -65,9 +83,7 @@ class RespCommandParser {
   std::size_t bulk_remaining_ = 0;
   std::size_t terminator_bytes_ = 0;
   std::size_t command_bytes_ = 0;
-  // Aggregate allocator charge allowed without pre-admission so an
-  // over-limit worker can still decode a bounded shrinking command.
-  std::size_t unadmitted_bytes_ = 0;
+  std::size_t query_buffer_limit_ = kDefaultClientQueryBufferLimit;
   char argument_type_ = '$';
 };
 

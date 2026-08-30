@@ -74,53 +74,9 @@ constexpr std::string_view kListMagic = "KLL1";
 absl::Status MemoryExhausted(std::string_view operation) {
   RecordMemoryRejection();
   return absl::ResourceExhaustedError(
-      absl::StrCat(operation, " exceeds this worker's maxmemory share"));
+      absl::StrCat("insufficient memory for ", operation));
 }
 
-absl::Status ReserveRdbString(std::string* output, std::size_t desired) {
-  if (desired <= output->capacity()) return absl::OkStatus();
-  std::size_t capacity = desired;
-  if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
-    capacity = std::max(capacity, output->capacity() * 2);
-  } else {
-    return MemoryExhausted("RDB string");
-  }
-  if (capacity == std::numeric_limits<std::size_t>::max()) {
-    return MemoryExhausted("RDB string");
-  }
-  auto reservation = TryReserveMemoryAllocation(capacity + 1);
-  if (!reservation.has_value()) return MemoryExhausted("RDB string");
-  try {
-    output->reserve(desired);
-  } catch (const std::bad_alloc&) {
-    return MemoryExhausted("RDB string allocation");
-  }
-  return absl::OkStatus();
-}
-
-absl::StatusOr<std::string> CopyStringAdmitted(std::string_view value) {
-  std::string output;
-  absl::Status reserved = ReserveRdbString(&output, value.size());
-  if (!reserved.ok()) return reserved;
-  try {
-    output.assign(value);
-  } catch (const std::bad_alloc&) {
-    return MemoryExhausted("RDB string allocation");
-  }
-  return output;
-}
-
-absl::StatusOr<std::string> AllocateStringAdmitted(std::size_t size) {
-  std::string output;
-  absl::Status reserved = ReserveRdbString(&output, size);
-  if (!reserved.ok()) return reserved;
-  try {
-    output.resize(size);
-  } catch (const std::bad_alloc&) {
-    return MemoryExhausted("expanded RDB string allocation");
-  }
-  return output;
-}
 constexpr std::string_view kZSetMagic = "KZS1";
 constexpr std::string_view kStreamMagicV1 = "KXS1";
 constexpr std::string_view kStreamMagicV2 = "KXS2";
@@ -327,7 +283,10 @@ bool LzfDecompress(std::string_view compressed, std::string* output) {
   return op == output->size();
 }
 
-absl::StatusOr<std::string> ReadString(Reader* reader) {
+// RDB strings become owned values at this boundary. One catch covers plain,
+// integer-expanded, and decompressed representations without adding exception
+// handling to each string operation.
+absl::StatusOr<std::string> ReadString(Reader* reader) try {
   auto length = ReadLength(reader);
   if (!length.ok()) return length.status();
   if (!length->encoded) {
@@ -339,7 +298,7 @@ absl::StatusOr<std::string> ReadString(Reader* reader) {
     }
     std::string_view value;
     reader->Bytes(static_cast<std::size_t>(length->value), &value);
-    return CopyStringAdmitted(value);
+    return std::string(value);
   }
   if (length->value <= 2) {
     const unsigned bytes = length->value == 0 ? 1 : length->value == 1 ? 2 : 4;
@@ -372,11 +331,13 @@ absl::StatusOr<std::string> ReadString(Reader* reader) {
   }
   std::string_view compressed;
   reader->Bytes(static_cast<std::size_t>(compressed_size->value), &compressed);
-  auto output =
-      AllocateStringAdmitted(static_cast<std::size_t>(output_size->value));
-  if (!output.ok()) return output.status();
-  if (!LzfDecompress(compressed, &*output)) return Bad("invalid LZF data");
+  std::string output(static_cast<std::size_t>(output_size->value), '\0');
+  if (!LzfDecompress(compressed, &output)) return Bad("invalid LZF data");
   return output;
+} catch (const std::bad_alloc&) {
+  return MemoryExhausted("RDB string");
+} catch (const std::length_error&) {
+  return absl::ResourceExhaustedError("RDB string is too large");
 }
 
 absl::Status SkipModuleBody(Reader* reader) {

@@ -217,25 +217,6 @@ Task<absl::StatusOr<HashResult>> StorageEngine::Impl::ExecuteHashLikeLocked(
       return absl::OutOfRangeError("value is out of range");
     const std::uint64_t requested = static_cast<std::uint64_t>(
         operation.count_ < 0 ? -operation.count_ : operation.count_);
-    if (tx != nullptr && operation.kind_ == HashOperationKind::kRandomFields) {
-      const std::uint64_t slots =
-          operation.with_values_ &&
-                  requested <= std::numeric_limits<std::uint64_t>::max() / 2
-              ? requested * 2
-              : requested;
-      constexpr std::size_t kMinimumResultSlotBytes =
-          sizeof(std::optional<std::string>);
-      const std::size_t growth =
-          slots > std::numeric_limits<std::size_t>::max() /
-                      kMinimumResultSlotBytes
-              ? std::numeric_limits<std::size_t>::max()
-              : static_cast<std::size_t>(slots) * kMinimumResultSlotBytes;
-      if (WouldExceedMemoryLimit(growth)) {
-        RecordMemoryRejection();
-        return absl::ResourceExhaustedError(
-            "transactional random reply exceeds maxmemory");
-      }
-    }
     return requested;
   };
 

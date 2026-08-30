@@ -3060,6 +3060,23 @@ TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
   EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "1"}), "+OK");
   EXPECT_EQ(first->Command({"CONFIG", "GET", "maxclients"}),
             BulkArray({"maxclients", "1"}));
+
+  EXPECT_EQ(first->Command(
+                {"CONFIG", "GET", "client-query-buffer-limit"}),
+            BulkArray({"client-query-buffer-limit", "1073741824"}));
+  EXPECT_EQ(first->Command(
+                {"CONFIG", "SET", "client-query-buffer-limit", "2mb"}),
+            "+OK");
+  EXPECT_EQ(first->Command(
+                {"CONFIG", "GET", "client-query-buffer-limit"}),
+            BulkArray({"client-query-buffer-limit", "2097152"}));
+  EXPECT_EQ(first->Command(
+                {"CONFIG", "SET", "client-query-buffer-limit", "512kb"}),
+            "-ERR client-query-buffer-limit must be between 1mb and LONG_MAX "
+            "bytes");
+  EXPECT_EQ(first->Command(
+                {"CONFIG", "GET", "client-query-buffer-limit"}),
+            BulkArray({"client-query-buffer-limit", "2097152"}));
   EXPECT_NE(first->Command({"INFO", "clients"}).find("maxclients:1\r\n"),
             std::string::npos);
   EXPECT_EQ(first->Command({"CONFIG", "SET", "maxclients", "0"}),
@@ -5182,8 +5199,8 @@ TEST(CollectionE2eTest, MemoryLimitStillAllowsShrinkingCommands) {
       // offending connection; the worker must remain available to commands
       // that release retained state.
       EXPECT_TRUE(oversized.Command({"GET", oversized_key})
-                      .starts_with("-ERR client request exceeds this worker's "
-                                   "maxmemory share"));
+                      .starts_with("-ERR client request buffers exceed the "
+                                   "memory limit"));
     }
     EXPECT_EQ(client.Command({"LPOP", "l"}), Bulk("a"));
     EXPECT_EQ(client.Command({"HDEL", "h", "f"}), ":1");

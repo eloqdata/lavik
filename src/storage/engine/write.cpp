@@ -1,5 +1,8 @@
+#include <new>
+
 #include "absl/strings/str_cat.h"
 #include "impl.h"
+#include "keylane/memory.h"
 #include "keylane/metrics.h"
 #include "keylane/replication_command.h"
 
@@ -46,6 +49,30 @@ RecordIndex::Entry* StorageEngine::Impl::ReplaceIndexLocation(
 }
 
 namespace {
+
+template <typename Queue>
+bool TryPreparePostMutationQueueSlot(Queue* queue,
+                                     std::size_t admitted_items) noexcept {
+  // One command can yield several full-sync after-images. The ordinary
+  // admission owns one slot; if later effects exhaust it, grow inside the
+  // session's fixed staging budget. Failure invalidates only the
+  // lower-priority full-sync attempt at the caller.
+  const std::size_t additional_slots = std::max<std::size_t>(admitted_items, 1);
+  if (queue->size() >
+      std::numeric_limits<std::size_t>::max() - additional_slots) {
+    return false;
+  }
+  const std::size_t minimum_capacity = queue->size() + additional_slots;
+  if (minimum_capacity <= queue->capacity()) return true;
+  try {
+    queue->PrepareCapacity(minimum_capacity);
+    return true;
+  } catch (const std::bad_alloc&) {
+    return false;
+  } catch (const std::length_error&) {
+    return false;
+  }
+}
 
 ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
                                       ExtentManifest replacement) {
@@ -1156,9 +1183,9 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (logical_size == std::numeric_limits<std::uint64_t>::max()) {
     logical_size = value.size();
   }
-  // Every real keyspace modification funnels through here (client writes,
-  // deletes, expiration rewrites, active expiry): invalidate watchers.
-  tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
+  if (!ValidRecordKeySize(key.size())) {
+    co_return absl::OutOfRangeError("record key exceeds storage limit");
+  }
   std::optional<ExplicitWriteRoot> replica_write_root;
   std::optional<std::uint64_t> replica_mutation_sequence;
   if (replica_loading_.load(std::memory_order_acquire)) [[unlikely]] {
@@ -1181,6 +1208,38 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   const std::uint64_t mutation_sequence = replica_mutation_sequence.has_value()
                                               ? *replica_mutation_sequence
                                               : ++partition.mutation_sequence_;
+  std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
+  if (replication != nullptr) {
+    try {
+      AppendReplicationExpirationEffect(
+          &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
+          kind == RecordKind::kValue ? expire_at_ms : 0);
+    } catch (const std::bad_alloc&) {
+      RecordMemoryRejection();
+      co_return absl::ResourceExhaustedError(
+          "OOM replication command allocation failed");
+    }
+    replication->db_id_ = db_id;
+    replication->partition_id_ = partition.id_;
+    replication->partition_sequence_ = mutation_sequence;
+    if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
+      try {
+        // Build the subscriber-owned copy before writing. Once the durable
+        // mutation succeeds, publishing cannot discover a new OOM failure.
+        // Active sessions already hold fixed staging budgets for this copy.
+        fullsync_command =
+            std::make_shared<ReplicationCommandAppend>(*replication);
+      } catch (const std::bad_alloc&) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "OOM full-sync replication copy allocation failed");
+      }
+    }
+  }
+  // Every real keyspace modification funnels through here (client writes,
+  // deletes, expiration rewrites, active expiry). Replication-copy admission
+  // happens first so a rejected write does not spuriously invalidate WATCH.
+  tx::CurrentTxShard().MarkWatched(db_id, tx::FingerprintOf(digest));
   absl::Status status = absl::OkStatus();
   const bool key_external = key.size() > options_.inline_key_max_bytes_;
   const std::uint64_t logical_payload_bytes =
@@ -1234,18 +1293,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   if (status.ok() && tx == nullptr) {
     RecordDatasetChanges();
   }
-  std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
   if (status.ok() && replication != nullptr) {
-    AppendReplicationExpirationEffect(
-        &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
-        kind == RecordKind::kValue ? expire_at_ms : 0);
-    replication->db_id_ = db_id;
-    replication->partition_id_ = partition.id_;
-    replication->partition_sequence_ = mutation_sequence;
-    if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
-      fullsync_command =
-          std::make_shared<const ReplicationCommandAppend>(*replication);
-    }
     (void)TryEnqueueReplicationCommand(std::move(*replication));
   }
   if (status.ok() && capture_fullsync &&
@@ -1292,27 +1340,162 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
   co_return status;
 }
 
-std::string StorageEngine::Impl::FullSyncOverrideKey(std::uint8_t db_id,
-                                                     std::string_view key) {
-  std::string result;
-  result.reserve(key.size() + 1);
-  result.push_back(static_cast<char>(db_id));
-  result.append(key);
-  return result;
+void StorageEngine::Impl::InvalidateFullSyncSession(WorkerStore& store,
+                                                    std::uint64_t session_id) {
+  auto session = store.fullsync_sessions_.find(session_id);
+  if (session != store.fullsync_sessions_.end()) {
+    session->second.db_epoch_invalidated_ = true;
+  }
+  store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+}
+
+bool StorageEngine::Impl::TryConsumeFullSyncCoverageCredit(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture, std::size_t key_bytes,
+    bool allocates_arena_entry) {
+  constexpr std::size_t kArenaFixedBytes =
+      ScanHashMapEntryArena::kSmallSpanAdmissionBytes;
+  std::size_t bytes = kFullSyncReplacementMetadataBytes;
+  if (key_bytes > (std::numeric_limits<std::size_t>::max() - bytes) / 2) {
+    RecordMemoryRejection();
+    InvalidateFullSyncSession(store, session_id);
+    return false;
+  }
+  bytes += key_bytes * 2;
+  // The first identity also pays for the arena span, direct bucket, and
+  // container control allocations. The caller performs its first arena
+  // insertion synchronously after this conversion, so foreground admission
+  // cannot consume the gap between logical and allocator accounting.
+  const bool consume_arena_credit =
+      allocates_arena_entry && !capture.arena_credit_consumed_;
+  if (consume_arena_credit) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - kArenaFixedBytes) {
+      RecordMemoryRejection();
+      InvalidateFullSyncSession(store, session_id);
+      return false;
+    }
+    bytes += kArenaFixedBytes;
+  } else if (!capture.arena_credit_consumed_) {
+    // Override-only identities may use per-key credit, but they cannot spend
+    // the physical-span slice that a later scanner/ACK needs to allocate the
+    // arena. The separate control allowance remains available for a bounded
+    // number of post-fence identities in an otherwise empty DB.
+    auto session = store.fullsync_sessions_.find(session_id);
+    if (session == store.fullsync_sessions_.end() ||
+        session->second.db_epoch_invalidated_ ||
+        session->second.available_memory_bytes_ < kArenaFixedBytes ||
+        bytes > session->second.available_memory_bytes_ - kArenaFixedBytes) {
+      RecordMemoryRejection();
+      InvalidateFullSyncSession(store, session_id);
+      return false;
+    }
+  }
+  if (!TryConsumeFullSyncCredit(store, session_id, capture, bytes)) {
+    return false;
+  }
+  if (consume_arena_credit) {
+    try {
+      capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
+          ScanHashMapEntryArena::kMaximumPageId,
+          /*externally_admitted=*/true,
+          /*externally_accounted=*/true));
+    } catch (const std::bad_alloc&) {
+      RecordMemoryRejection();
+      InvalidateFullSyncSession(store, session_id);
+      return false;
+    }
+    capture.arena_credit_consumed_ = true;
+  }
+  return true;
+}
+
+bool StorageEngine::Impl::TryConsumeFullSyncCredit(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture, std::size_t bytes) {
+  auto session = store.fullsync_sessions_.find(session_id);
+  if (session == store.fullsync_sessions_.end() ||
+      session->second.db_epoch_invalidated_ ||
+      bytes > session->second.available_memory_bytes_ ||
+      bytes > std::numeric_limits<std::size_t>::max() -
+                  capture.memory_credit_bytes_) {
+    RecordMemoryRejection();
+    InvalidateFullSyncSession(store, session_id);
+    return false;
+  }
+  ConsumeFullSyncMemory(bytes);
+  session->second.available_memory_bytes_ -= bytes;
+  capture.memory_credit_bytes_ += bytes;
+  return true;
+}
+
+bool StorageEngine::Impl::TryConsumeFullSyncArenaCredit(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture) {
+  if (capture.arena_credit_consumed_) return true;
+  constexpr std::size_t kArenaFixedBytes =
+      ScanHashMapEntryArena::kSmallSpanAdmissionBytes;
+  if (!TryConsumeFullSyncCredit(store, session_id, capture, kArenaFixedBytes)) {
+    return false;
+  }
+  try {
+    capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId,
+        /*externally_admitted=*/true,
+        /*externally_accounted=*/true));
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    InvalidateFullSyncSession(store, session_id);
+    return false;
+  }
+  capture.arena_credit_consumed_ = true;
+  return true;
+}
+
+void StorageEngine::Impl::RestoreFullSyncCoverageCredit(
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture) {
+  if (capture.memory_credit_bytes_ == 0) return;
+  auto session = store.fullsync_sessions_.find(session_id);
+  assert(session != store.fullsync_sessions_.end());
+  assert(session->second.available_memory_bytes_ <=
+         session->second.reserved_memory_bytes_);
+  assert(capture.memory_credit_bytes_ <=
+         session->second.reserved_memory_bytes_ -
+             session->second.available_memory_bytes_);
+  RestoreFullSyncMemory(capture.memory_credit_bytes_);
+  session->second.available_memory_bytes_ += capture.memory_credit_bytes_;
+  capture.memory_credit_bytes_ = 0;
+  capture.arena_credit_consumed_ = false;
 }
 
 void StorageEngine::Impl::ClearFullSyncCapture(
-    WorkerStore& store, WorkerStore::FullSyncCapture& capture) {
+    WorkerStore& store, std::uint64_t session_id,
+    WorkerStore::FullSyncCapture& capture) {
   for (auto& [_, pinned] : capture.pinned_values_) {
     store.worker_->Spawn(ReleaseFullSyncExtents(std::move(pinned.extents_)));
   }
   capture.pinned_values_.clear();
+  capture.pinned_values_.rehash(0);
   capture.overrides_.clear();
-  capture.latest_by_key_.clear();
+  for (auto& latest : capture.latest_by_key_) {
+    latest.clear();
+    latest.rehash(0);
+  }
   capture.replacement_credit_bytes_ = 0;
   capture.key_phases_.Clear();
-  capture.pending_snapshot_keys_.clear();
+  // Clear() releases entries and buckets, but the map still owns its arena
+  // directory. Destroy that arena before restoring the logical credit; doing
+  // so preserves the invariant that every consumed byte is either live in an
+  // allocator-owned capture structure or available in the session reserve.
+  capture.key_phases_ = ScanHashMap<WorkerStore::FullSyncCapture::KeyPhase>{};
+  decltype(capture.pending_snapshot_keys_){}.swap(
+      capture.pending_snapshot_keys_);
   capture.pending_snapshot_cursor_ = 0;
+
+  // Container destruction publishes allocator frees synchronously. Restore
+  // the logical reservation afterwards, so the next partition can consume the
+  // same credit without ever hiding live coverage bytes from admission.
+  RestoreFullSyncCoverageCredit(store, session_id, capture);
 }
 
 void StorageEngine::Impl::FullSyncOnCommit(
@@ -1331,6 +1514,11 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
     const Digest& digest,
     std::shared_ptr<const ReplicationCommandAppend> command,
     bool transaction_effect) {
+  const auto active_session = store.fullsync_sessions_.find(session_id);
+  if (active_session == store.fullsync_sessions_.end() ||
+      active_session->second.db_epoch_invalidated_) {
+    return;
+  }
   const auto db_phase = capture.db_phases_[record.db_id_];
   if (db_phase == WorkerStore::FullSyncCapture::DbPhase::kUnstarted) {
     return;
@@ -1354,27 +1542,46 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
   // no independently replayable command, is represented by its latest
   // after-image. A later scanner observation skips this key; an older ACK can
   // never erase the newer sequence below.
+  auto& latest_by_key = capture.latest_by_key_[record.db_id_];
+  auto found = latest_by_key.find(record.key_);
+  const bool replacing = found != latest_by_key.end();
+  const bool transfers_coverage_credit = phase != nullptr;
+  if (!replacing && !transfers_coverage_credit &&
+      !TryConsumeFullSyncCoverageCredit(store, session_id, capture,
+                                        record.key_.size(),
+                                        /*allocates_arena_entry=*/false)) {
+    // The durable foreground mutation remains valid. Full sync is the
+    // lower-priority consumer, so invalidate only that session before any
+    // unbudgeted override container allocation can occur.
+    return;
+  }
+  if (phase != nullptr &&
+      phase->value_ !=
+          WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit &&
+      record.key_.size() > options_.inline_key_max_bytes_) {
+    assert(record.key_.size() >= sizeof(Digest));
+    const std::size_t additional_key_bytes =
+        (record.key_.size() - sizeof(Digest)) * 2;
+    if (!TryConsumeFullSyncCredit(store, session_id, capture,
+                                  additional_key_bytes)) {
+      return;
+    }
+  }
   if (phase != nullptr) {
     capture.key_phases_.Erase(phase);
   }
-  const std::string key = FullSyncOverrideKey(record.db_id_, record.key_);
-  const bool replacing = capture.latest_by_key_.contains(key);
-  if (auto found = capture.latest_by_key_.find(key);
-      found != capture.latest_by_key_.end()) {
+  if (found != latest_by_key.end()) {
     auto previous = capture.overrides_.find(found->second);
     assert(previous != capture.overrides_.end());
     capture.overrides_.erase(previous);
-    capture.latest_by_key_.erase(found);
+    latest_by_key.erase(found);
   }
   if (!replacing) {
     auto session = store.fullsync_sessions_.find(session_id);
     std::size_t credit = kFullSyncReplacementMetadataBytes;
     if (record.key_.size() >
         (std::numeric_limits<std::size_t>::max() - credit) / 2) {
-      if (session != store.fullsync_sessions_.end()) {
-        session->second.db_epoch_invalidated_ = true;
-      }
-      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+      InvalidateFullSyncSession(store, session_id);
       return;
     }
     credit += record.key_.size() * 2;
@@ -1383,41 +1590,55 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
                      session->second.publish_queue_bytes_ ||
         credit > std::numeric_limits<std::size_t>::max() -
                      capture.replacement_credit_bytes_) {
-      if (session != store.fullsync_sessions_.end()) {
-        session->second.db_epoch_invalidated_ = true;
-      }
-      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+      InvalidateFullSyncSession(store, session_id);
       return;
     }
     session->second.publish_queue_bytes_ += credit;
     capture.replacement_credit_bytes_ += credit;
   }
-  capture.overrides_.emplace(record.mutation_sequence_, record);
-  capture.latest_by_key_.emplace(std::move(key), record.mutation_sequence_);
+  try {
+    auto [override, inserted] =
+        capture.overrides_.emplace(record.mutation_sequence_, record);
+    if (!inserted) {
+      InvalidateFullSyncSession(store, session_id);
+      return;
+    }
+    try {
+      auto [latest, latest_inserted] = latest_by_key.emplace(
+          std::string(record.key_), record.mutation_sequence_);
+      (void)latest;
+      if (!latest_inserted) {
+        capture.overrides_.erase(override);
+        InvalidateFullSyncSession(store, session_id);
+      }
+    } catch (const std::bad_alloc&) {
+      capture.overrides_.erase(override);
+      throw;
+    }
+  } catch (const std::bad_alloc&) {
+    RecordMemoryRejection();
+    InvalidateFullSyncSession(store, session_id);
+  }
 }
 
 bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
     WorkerStore& store, std::uint64_t session_id,
     std::shared_ptr<const ReplicationCommandAppend> command) {
+  static_assert(sizeof(WorkerStore::FullSyncSessionState::PendingCommand) <=
+                kReplicationPublisherItemMetadataBytes);
   auto session = store.fullsync_sessions_.find(session_id);
   if (session == store.fullsync_sessions_.end() ||
       session->second.db_epoch_invalidated_ || command == nullptr ||
       command->args_.empty()) {
     return false;
   }
-  std::size_t logical_bytes = sizeof(command->kind_) + sizeof(command->db_id_) +
-                              sizeof(command->partition_id_) +
-                              sizeof(command->partition_sequence_);
-  for (const std::string& arg : command->args_) {
-    if (arg.size() > std::numeric_limits<std::size_t>::max() - logical_bytes ||
-        sizeof(std::uint32_t) > std::numeric_limits<std::size_t>::max() -
-                                    logical_bytes - arg.size()) {
-      session->second.db_epoch_invalidated_ = true;
-      store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
-      return false;
-    }
-    logical_bytes += sizeof(std::uint32_t) + arg.size();
+  const auto staging_bytes = ReplicationCommandStagingBytes(command->args_);
+  if (!staging_bytes.has_value()) {
+    session->second.db_epoch_invalidated_ = true;
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
   }
+  const std::size_t logical_bytes = *staging_bytes;
   auto& state = session->second;
   if (state.next_publish_id_ == 0) {
     state.db_epoch_invalidated_ = true;
@@ -1432,10 +1653,18 @@ bool StorageEngine::Impl::TryEnqueueFullSyncCommand(
   }
   const std::uint64_t id = state.next_publish_id_++;
   state.publish_queue_bytes_ += logical_bytes;
-  state.publish_queue_.push_back(
+  if (!TryPreparePostMutationQueueSlot(&state.publish_queue_,
+                                       state.publisher_admitted_items_)) {
+    state.publish_queue_bytes_ -= logical_bytes;
+    state.db_epoch_invalidated_ = true;
+    RecordMemoryRejection();
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  state.publish_queue_.push_back_prepared(
       WorkerStore::FullSyncSessionState::PendingCommand{
           .id_ = id,
-          .logical_bytes_ = logical_bytes,
+          .staging_bytes_ = logical_bytes,
           .command_ = std::move(command),
           .record_ = std::nullopt,
       });
@@ -1468,13 +1697,32 @@ bool StorageEngine::Impl::TryEnqueueFullSyncRecord(
   }
   const std::uint64_t id = state.next_publish_id_++;
   state.publish_queue_bytes_ += logical_bytes;
-  state.publish_queue_.push_back(
-      WorkerStore::FullSyncSessionState::PendingCommand{
-          .id_ = id,
-          .logical_bytes_ = logical_bytes,
-          .command_ = nullptr,
-          .record_ = record,
-      });
+  if (!TryPreparePostMutationQueueSlot(&state.publish_queue_,
+                                       state.publisher_admitted_items_)) {
+    state.publish_queue_bytes_ -= logical_bytes;
+    state.db_epoch_invalidated_ = true;
+    RecordMemoryRejection();
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
+  try {
+    WorkerStore::FullSyncSessionState::PendingCommand pending{
+        .id_ = id,
+        .staging_bytes_ = logical_bytes,
+        .command_ = nullptr,
+        .record_ = record,
+    };
+    state.publish_queue_.push_back_prepared(std::move(pending));
+  } catch (const std::bad_alloc&) {
+    // This is a post-commit subscriber copy. The primary history remains
+    // complete; abandoning this lower-priority full-sync attempt is the only
+    // safe recovery if the already-admitted physical allocation still fails.
+    state.publish_queue_bytes_ -= logical_bytes;
+    state.db_epoch_invalidated_ = true;
+    RecordMemoryRejection();
+    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
+    return false;
+  }
   return true;
 }
 
@@ -1543,7 +1791,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
       (value_type == ValueType::kString && logical_size > kMaxBitmapBytes) ||
       logical_size > std::numeric_limits<std::uint32_t>::max();
   const std::uint64_t key_prefix = key_external ? key.size() : 0;
-  if (invalid_logical_size || value.size() > kMaxRecordPayloadBytes ||
+  if (!ValidRecordKeySize(key.size()) || invalid_logical_size ||
+      value.size() > kMaxRecordPayloadBytes ||
       key_prefix > kMaxRecordPayloadBytes - value.size()) {
     co_return absl::Status(absl::StatusCode::kOutOfRange,
                            "record key and value exceed storage limits");
@@ -1703,8 +1952,8 @@ acquire_active_stream:
           .kind_ = append_block_kind,
           .tx_generation_ = tx_generation,
       };
-      BlockState& state = CreateBlockState(
-          store, block_id, active_stream()->allocation_epoch_);
+      BlockState& state =
+          CreateBlockState(store, block_id, active_stream()->allocation_epoch_);
       state.writer_id_ = writer_id;
       state.layout_worker_count_ = worker_count_;
       state.committed_bytes_ = kBlockHeaderBytes;
@@ -1816,8 +2065,7 @@ acquire_active_stream:
   std::optional<MemoryReservation> index_memory_reservation;
   if (needs_index_allocation) {
     const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
-        digest, key, !key_external, has_index_extra,
-        previous_entry == nullptr);
+        digest, key, !key_external, has_index_extra, previous_entry == nullptr);
     if (allocation_bytes != 0) {
       index_memory_reservation = TryReserveMemory(allocation_bytes);
       if (!index_memory_reservation.has_value()) {

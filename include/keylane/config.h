@@ -16,6 +16,16 @@ namespace keylane {
 // "1gb". A suffix is optional; unsuffixed values are bytes.
 absl::StatusOr<std::size_t> ParseMemorySize(std::string_view text);
 
+// Parses Valkey-compatible maxmemory-clients values: an ordinary memory size,
+// a percentage from 0% through 100%, or zero to disable the limit.
+absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
+    std::string_view text);
+std::string FormatClientBufferLimit(ClientBufferLimit limit);
+
+// Parses Redis-compatible client-query-buffer-limit values. Redis constrains
+// this per-connection hard limit to the range [1 MiB, LONG_MAX].
+absl::StatusOr<std::size_t> ParseClientQueryBufferLimit(std::string_view text);
+
 // Tokenizes one Redis configuration line. Whitespace separates arguments,
 // single and double quotes preserve whitespace, and an unquoted '#' starts a
 // comment. An empty/comment-only line returns an empty vector.

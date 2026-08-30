@@ -107,8 +107,7 @@ absl::StatusOr<SortOptions> ParseSortOptions(const CommandRequest& request) {
       options.dont_sort_ = options.by_->find('*') == std::string_view::npos;
     } else if (EqualCi(args[i], "get") && i + 1 < args.size()) {
       options.gets_.push_back(args[++i]);
-    } else if (!read_only && EqualCi(args[i], "store") &&
-               i + 1 < args.size()) {
+    } else if (!read_only && EqualCi(args[i], "store") && i + 1 < args.size()) {
       options.store_arg_ = ++i;
     } else {
       return absl::InvalidArgumentError("syntax error");
@@ -118,6 +117,10 @@ absl::StatusOr<SortOptions> ParseSortOptions(const CommandRequest& request) {
 }
 
 std::string EncodeSortError(const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return EncodeError(status.message());
+  }
   if (status.message().starts_with("WRONGTYPE ") ||
       status.message().starts_with("ERR ")) {
     return EncodeError(status.message());
@@ -127,6 +130,10 @@ std::string EncodeSortError(const absl::Status& status) {
 
 std::string_view AppendSortError(ReplyBuilder& builder,
                                  const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return builder.AppendError(status.message());
+  }
   if (status.message().starts_with("WRONGTYPE ") ||
       status.message().starts_with("ERR ")) {
     return builder.AppendError(status.message());
@@ -160,8 +167,8 @@ Task<absl::Status> HoldSortLocks(void*, const tx::ShardSlice&) {
   co_return absl::OkStatus();
 }
 
-Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(
-    std::uint8_t db_id, const LockedKey& key) {
+Task<absl::StatusOr<SortSource>> ReadSortSourceLocked(std::uint8_t db_id,
+                                                      const LockedKey& key) {
   auto read = [&]() -> Task<absl::StatusOr<SortSource>> {
     const storage::ExpirationInfo info =
         co_await g_storage->GetExpirationLocked(db_id, key.name_, key.digest_);
@@ -220,8 +227,7 @@ std::optional<PatternReference> ResolvePattern(std::string_view pattern,
   reference.key_.reserve(star + substitute.size() + key_suffix_end - star - 1);
   reference.key_.append(pattern.substr(0, star));
   reference.key_.append(substitute);
-  reference.key_.append(pattern.substr(star + 1,
-                                       key_suffix_end - star - 1));
+  reference.key_.append(pattern.substr(star + 1, key_suffix_end - star - 1));
   if (hash_field) reference.field_.emplace(pattern.substr(arrow + 2));
   return reference;
 }
@@ -270,11 +276,10 @@ Task<absl::StatusOr<std::optional<std::string>>> ReadPatternReferenceLocked(
       if (result->values_.empty() || !result->values_.front().has_value()) {
         co_return std::optional<std::string>{};
       }
-      co_return std::optional<std::string>{
-          std::move(*result->values_.front())};
+      co_return std::optional<std::string>{std::move(*result->values_.front())};
     }
-    auto raw = co_await g_storage->ReadRawValueLocked(db_id, key->name_,
-                                                       key->digest_);
+    auto raw =
+        co_await g_storage->ReadRawValueLocked(db_id, key->name_, key->digest_);
     if (!raw.ok()) {
       if (raw.status().code() == absl::StatusCode::kNotFound) {
         co_return std::optional<std::string>{};
@@ -300,8 +305,7 @@ Task<absl::StatusOr<std::optional<std::string>>> LookupPatternValue(
   if (cached != cache->end()) {
     co_return cached->second;
   }
-  auto value =
-      co_await ReadPatternReferenceLocked(db_id, *reference, keys);
+  auto value = co_await ReadPatternReferenceLocked(db_id, *reference, keys);
   if (!value.ok()) co_return value.status();
   cache->emplace(std::move(cache_key), *value);
   co_return *value;
@@ -314,9 +318,8 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
   std::vector<SortItem> items;
   items.reserve(source.elements_.size());
   for (std::string& element : source.elements_) {
-    SortItem item{.value_ = std::move(element),
-                  .comparison_ = std::nullopt,
-                  .score_ = 0};
+    SortItem item{
+        .value_ = std::move(element), .comparison_ = std::nullopt, .score_ = 0};
     if (!options.dont_sort_) {
       if (options.by_.has_value()) {
         auto comparison = co_await LookupPatternValue(
@@ -403,8 +406,8 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
         product.reply_values_.emplace_back(items[i].value_);
         continue;
       }
-      auto value = co_await LookupPatternValue(
-          request.db_id_, pattern, items[i].value_, keys, &cache);
+      auto value = co_await LookupPatternValue(request.db_id_, pattern,
+                                               items[i].value_, keys, &cache);
       if (!value.ok()) co_return value.status();
       product.reply_values_.push_back(std::move(*value));
     }
@@ -443,8 +446,8 @@ std::vector<std::string> SortReplicationEffects(
     const CommandRequest& request, std::string_view destination,
     std::span<const std::string> values) {
   std::vector<CapturedReplicationCommand> effects;
-  effects.push_back(
-      CapturedReplicationCommand{request.db_id_, {"DEL", std::string(destination)}});
+  effects.push_back(CapturedReplicationCommand{
+      request.db_id_, {"DEL", std::string(destination)}});
   if (!values.empty()) {
     std::vector<std::string> push{"RPUSH", std::string(destination)};
     push.insert(push.end(), values.begin(), values.end());
@@ -500,6 +503,9 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     if (options->store_arg_.has_value()) {
       replication =
           std::make_unique<ReplicationTransactionGuard>(request, &transaction);
+      if (!replication->status().ok()) {
+        co_return Built(AppendSortError(reply_builder, replication->status()));
+      }
     }
     absl::Status status = co_await transaction.Schedule();
     if (!status.ok()) {
@@ -532,8 +538,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       continue;
     }
 
-    auto product = co_await BuildSortProduct(request, *options,
-                                              std::move(*source), keys);
+    auto product =
+        co_await BuildSortProduct(request, *options, std::move(*source), keys);
     if (!product.ok()) {
       (void)co_await ReleaseSortTransaction(&transaction);
       co_return Built(AppendSortError(reply_builder, product.status()));
@@ -547,8 +553,7 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       co_return Built(reply_builder.View());
     }
 
-    const std::string& destination_name =
-        request.args_[*options->store_arg_];
+    const std::string& destination_name = request.args_[*options->store_arg_];
     const LockedKey* destination = FindLockedKey(keys, destination_name);
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
     std::vector<storage::TxShardWrites> writes(g_storage->worker_count());
@@ -622,7 +627,8 @@ Task<std::string> ExecuteSortCommandLocked(
                  tx::LockMode::kExclusive);
   }
   const LockedKey* source_key = FindLockedKey(keys, request.args_[1]);
-  if (source_key == nullptr) co_return EncodeError("ERR SORT source is missing");
+  if (source_key == nullptr)
+    co_return EncodeError("ERR SORT source is missing");
   auto source = co_await ReadSortSourceLocked(request.db_id_, *source_key);
   if (!source.ok()) co_return EncodeSortError(source.status());
   for (const std::string& pattern_key :
@@ -632,8 +638,8 @@ Task<std::string> ExecuteSortCommandLocked(
           "ERR SORT BY/GET pattern keys are not supported inside MULTI");
     }
   }
-  auto product = co_await BuildSortProduct(request, *options,
-                                            std::move(*source), keys);
+  auto product =
+      co_await BuildSortProduct(request, *options, std::move(*source), keys);
   if (!product.ok()) co_return EncodeSortError(product.status());
   if (!options->store_arg_.has_value()) {
     ReplyBuilder builder(request.resp_version_);
@@ -641,8 +647,7 @@ Task<std::string> ExecuteSortCommandLocked(
     co_return std::string(builder.View());
   }
 
-  const std::string& destination_name =
-      request.args_[*options->store_arg_];
+  const std::string& destination_name = request.args_[*options->store_arg_];
   const LockedKey* destination = FindLockedKey(keys, destination_name);
   if (destination == nullptr) {
     co_return EncodeError("ERR SORT destination is missing");
@@ -662,19 +667,17 @@ Task<std::string> ExecuteSortCommandLocked(
     absl::Status restored;
     if (prior_missing) {
       auto deleted = co_await SubmitTaskTo(
-          destination->owner_,
-          [db = request.db_id_, name = destination->name_,
-           digest = destination->digest_,
-           writes = &tx_writes[destination->owner_]] {
+          destination->owner_, [db = request.db_id_, name = destination->name_,
+                                digest = destination->digest_,
+                                writes = &tx_writes[destination->owner_]] {
             return g_storage->DeleteLocked(db, name, digest, writes);
           });
       restored = deleted.ok() ? absl::OkStatus() : deleted.status();
     } else {
       restored = co_await SubmitTaskTo(
-          destination->owner_,
-          [db = request.db_id_, name = destination->name_,
-           digest = destination->digest_, value = &*prior,
-           writes = &tx_writes[destination->owner_]] {
+          destination->owner_, [db = request.db_id_, name = destination->name_,
+                                digest = destination->digest_, value = &*prior,
+                                writes = &tx_writes[destination->owner_]] {
             return g_storage->WriteRawValueLocked(db, name, digest, *value,
                                                   writes);
           });

@@ -457,6 +457,16 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# TYPE keylane_memory_max_bytes gauge\n"
       "keylane_memory_max_bytes ",
       memory_metrics.max_bytes_, "\n",
+      "# HELP keylane_client_request_buffer_limit_bytes Effective ordinary "
+      "client request-buffer limit.\n"
+      "# TYPE keylane_client_request_buffer_limit_bytes gauge\n"
+      "keylane_client_request_buffer_limit_bytes ",
+      memory_metrics.client_buffer_limit_bytes_, "\n",
+      "# HELP keylane_client_buffered_request_bytes Ordinary client request "
+      "bytes read but not yet retired.\n"
+      "# TYPE keylane_client_buffered_request_bytes gauge\n"
+      "keylane_client_buffered_request_bytes ",
+      memory_metrics.client_buffered_bytes_, "\n",
       "# HELP keylane_fullsync_reserved_memory_bytes Memory headroom "
       "reserved for active full-sync coverage maps.\n"
       "# TYPE keylane_fullsync_reserved_memory_bytes gauge\n"

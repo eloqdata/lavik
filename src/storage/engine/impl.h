@@ -32,6 +32,7 @@
 #include <utility>
 #include <vector>
 
+#include "../ring_buffer.h"
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "celer/io/spdk_storage.h"
@@ -44,7 +45,6 @@
 #include "keylane/storage/format.h"
 #include "keylane/storage/scan_hash_map.h"
 #include "keylane/storage/tx_cleaner.h"
-#include "../ring_buffer.h"
 #include "keylane/tx/tx_shard.h"
 #include "spdlog/spdlog.h"
 
@@ -1079,6 +1079,10 @@ struct ReplicaValueStage {
   ValueType value_type_ = ValueType::kNone;
   std::string key_;
   std::string value_;
+  // The staged key/value survives multiple received frames, so its
+  // conservative reservation becomes retained ownership until commit, abort,
+  // or session teardown destroys this object.
+  RetainedMemoryCharge memory_charge_;
 };
 
 // One partition's worth of entries taken out of service by FLUSHDB. The entries
@@ -1547,14 +1551,32 @@ class StorageEngine::Impl {
       std::uint32_t byte_offset_ = 0;
     };
 
+    struct RetainedByteDeleter {
+      RetainedAllocationDomain domain_;
+
+      void operator()(std::byte* pointer) noexcept {
+        DeallocateRetainedBytes(domain_, pointer, alignof(std::max_align_t));
+      }
+    };
+
     struct ReplicationLogBlock {
-      std::unique_ptr<std::byte[]> bytes_;
+      using ByteOwner = std::unique_ptr<std::byte, RetainedByteDeleter>;
+      using SparseOffsets =
+          std::vector<ReplicationSparseOffset,
+                      RetainedAllocator<ReplicationSparseOffset>>;
+
+      ReplicationLogBlock()
+          : bytes_(nullptr, RetainedByteDeleter{RetainedAllocationDomain{}}),
+            sparse_offsets_(RetainedAllocator<ReplicationSparseOffset>(
+                RetainedAllocationDomain{})) {}
+
+      ByteOwner bytes_;
       std::uint64_t first_lsn_ = 0;
       std::uint64_t last_lsn_ = 0;
       std::uint32_t committed_bytes_ = 0;
       std::uint32_t frame_count_ = 0;
       bool sealed_ = false;
-      std::vector<ReplicationSparseOffset> sparse_offsets_;
+      SparseOffsets sparse_offsets_;
     };
 
     struct ReplicationLogRuntime {
@@ -1568,7 +1590,7 @@ class StorageEngine::Impl {
 
       struct PendingCommand {
         std::uint64_t log_epoch_ = 0;
-        std::size_t logical_bytes_ = 0;
+        std::size_t staging_bytes_ = 0;
         ReplicationCommandAppend append_;
         std::shared_ptr<PublishFence> fence_;
         std::shared_ptr<ReplicationTransaction> transaction_;
@@ -1582,9 +1604,20 @@ class StorageEngine::Impl {
       std::deque<ReplicationLogBlock> blocks_;
       bool capacity_backpressured_ = false;
       std::uint64_t capacity_waits_ = 0;
-      RingBuffer<PendingCommand> publish_queue_;
+      // The fixed staging charge covers both payloads and retained ring
+      // capacity. The allocator must therefore neither admit nor account the
+      // same backing allocation a second time.
+      RingBuffer<PendingCommand, RetainedAllocator<PendingCommand>>
+          publish_queue_{RetainedAllocator<PendingCommand>(
+              RetainedAllocationDomain{.externally_admitted_ = true,
+                                       .externally_accounted_ = true})};
+      RetainedMemoryCharge publisher_staging_charge_;
       std::size_t publish_queue_bytes_ = 0;
       std::size_t publisher_admitted_bytes_ = 0;
+      // Each outstanding publisher admission owns one future ring slot. This
+      // prevents several suspended commands from relying on the same spare
+      // capacity before any of them has enqueued its marker.
+      std::size_t publisher_admitted_items_ = 0;
       bool publisher_running_ = false;
       AsyncNotification publisher_capacity_ready_;
       absl::flat_hash_map<std::uint64_t, std::uint64_t>
@@ -1604,6 +1637,9 @@ class StorageEngine::Impl {
       enum class KeyPhase : std::uint8_t {
         kBaselineInflight,
         kTailing,
+        // The key returned from an override to coverage without returning its
+        // full-key map credit. A later replacement can reuse that credit.
+        kTailingWithOverrideCredit,
       };
 
       enum class DbPhase : std::uint8_t {
@@ -1614,8 +1650,18 @@ class StorageEngine::Impl {
 
       std::uint64_t baseline_version_ = 0;
       std::map<std::uint64_t, SnapshotRecord> overrides_;
-      absl::flat_hash_map<std::string, std::uint64_t> latest_by_key_;
+      // Database-local maps allow allocation-free string_view probes on the
+      // write path. A combined "db byte + key" temporary would itself allocate
+      // before the full-sync credit decision it is meant to protect.
+      std::array<absl::flat_hash_map<std::string, std::uint64_t>,
+                 kLogicalDatabaseCount>
+          latest_by_key_;
       std::size_t replacement_credit_bytes_ = 0;
+      // Logical coverage credit converted into live allocator bytes by this
+      // partition. It is restored only after all capture containers are
+      // cleared, allowing the session to reuse one largest-partition budget.
+      std::size_t memory_credit_bytes_ = 0;
+      bool arena_credit_consumed_ = false;
       ScanHashMap<KeyPhase> key_phases_;
       struct PendingSnapshotKey {
         std::string key_;
@@ -1638,16 +1684,24 @@ class StorageEngine::Impl {
     struct FullSyncSessionState {
       struct PendingCommand {
         std::uint64_t id_ = 0;
-        std::size_t logical_bytes_ = 0;
+        std::size_t staging_bytes_ = 0;
         std::shared_ptr<const ReplicationCommandAppend> command_;
         std::optional<SnapshotRecord> record_;
       };
 
       std::array<std::uint64_t, kLogicalDatabaseCount> db_epochs_{};
       std::size_t reserved_memory_bytes_ = 0;
-      RingBuffer<PendingCommand> publish_queue_;
+      std::size_t available_memory_bytes_ = 0;
+      RingBuffer<PendingCommand, RetainedAllocator<PendingCommand>>
+          publish_queue_{RetainedAllocator<PendingCommand>(
+              RetainedAllocationDomain{.externally_admitted_ = true,
+                                       .externally_accounted_ = true})};
+      // One fixed owner-local budget covers this session's FIFO, shared
+      // command references, and retained ring high-water capacity.
+      RetainedMemoryCharge publisher_staging_charge_;
       std::size_t publish_queue_bytes_ = 0;
       std::size_t publisher_admitted_bytes_ = 0;
+      std::size_t publisher_admitted_items_ = 0;
       std::uint64_t next_publish_id_ = 1;
       // Exact keyed admissions that observed this (partition,DB) before scan
       // start. BeginPartitionDbReplication waits for them to finish before
@@ -2138,10 +2192,8 @@ class StorageEngine::Impl {
             tx_commit_input_fences_.load(std::memory_order_acquire),
         .merged_fences_ =
             tx_commit_merged_fences_.load(std::memory_order_acquire),
-        .queue_depth_ =
-            tx_commit_queue_depth_.load(std::memory_order_acquire),
-        .queue_peak_ =
-            tx_commit_queue_peak_.load(std::memory_order_acquire),
+        .queue_depth_ = tx_commit_queue_depth_.load(std::memory_order_acquire),
+        .queue_peak_ = tx_commit_queue_peak_.load(std::memory_order_acquire),
         .backpressure_waits_ =
             tx_commit_backpressure_waits_.load(std::memory_order_acquire),
         .queue_high_watermark_ = kTxCommitQueueHighWatermark,
@@ -2855,9 +2907,22 @@ class StorageEngine::Impl {
       std::shared_ptr<const ReplicationCommandAppend> command);
   bool TryEnqueueFullSyncRecord(WorkerStore& store, std::uint64_t session_id,
                                 const SnapshotRecord& record);
-  static std::string FullSyncOverrideKey(std::uint8_t db_id,
-                                         std::string_view key);
-  void ClearFullSyncCapture(WorkerStore& store,
+  bool TryConsumeFullSyncCoverageCredit(WorkerStore& store,
+                                        std::uint64_t session_id,
+                                        WorkerStore::FullSyncCapture& capture,
+                                        std::size_t key_bytes,
+                                        bool allocates_arena_entry);
+  bool TryConsumeFullSyncCredit(WorkerStore& store, std::uint64_t session_id,
+                                WorkerStore::FullSyncCapture& capture,
+                                std::size_t bytes);
+  bool TryConsumeFullSyncArenaCredit(WorkerStore& store,
+                                     std::uint64_t session_id,
+                                     WorkerStore::FullSyncCapture& capture);
+  void InvalidateFullSyncSession(WorkerStore& store, std::uint64_t session_id);
+  void RestoreFullSyncCoverageCredit(WorkerStore& store,
+                                     std::uint64_t session_id,
+                                     WorkerStore::FullSyncCapture& capture);
+  void ClearFullSyncCapture(WorkerStore& store, std::uint64_t session_id,
                             WorkerStore::FullSyncCapture& capture);
   Task<absl::Status> PinFullSyncExtents(ExtentManifest extents);
   Task<absl::Status> ReleaseFullSyncExtents(ExtentManifest extents);

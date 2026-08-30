@@ -6,8 +6,8 @@
 #include <new>
 #include <optional>
 
-#include "keylane/replication_command.h"
 #include "keylane/memory.h"
+#include "keylane/replication_command.h"
 
 namespace keylane {
 namespace {
@@ -72,43 +72,14 @@ absl::Status Malformed(std::string_view message) {
   return absl::Status(absl::StatusCode::kInvalidArgument, message);
 }
 
-absl::StatusOr<std::string> CopyArgumentAdmitted(std::string_view value) {
-  std::string output;
-  std::optional<MemoryReservation> reservation;
-  if (value.size() > output.capacity()) {
-    std::size_t capacity = value.size();
-    if (output.capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
-      capacity = std::max(capacity, output.capacity() * 2);
-    } else {
-      capacity = std::numeric_limits<std::size_t>::max();
-    }
-    if (capacity == std::numeric_limits<std::size_t>::max()) {
-      RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "replication argument is too large");
-    }
-    reservation = TryReserveMemoryAllocation(capacity + 1);
-    if (!reservation.has_value()) {
-      RecordMemoryRejection();
-      return absl::ResourceExhaustedError(
-          "replication argument exceeds this worker's maxmemory share");
-    }
-  }
-  try {
-    output.assign(value);
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "replication argument allocation failed");
-  }
-  return output;
-}
-
 }  // namespace
 
+// This is the ownership boundary for the source's header and view table. A
+// single catch keeps allocation failure out of callers without wrapping each
+// vector or string operation separately.
 absl::StatusOr<ReplicationCommandPayloadSource>
 ReplicationCommandPayloadSource::Create(
-    std::uint8_t db_id, std::span<const std::string_view> args) {
+    std::uint8_t db_id, std::span<const std::string_view> args) try {
   if (db_id >= storage::kLogicalDatabaseCount) {
     return Malformed("replication command database is out of range");
   }
@@ -137,6 +108,27 @@ ReplicationCommandPayloadSource::Create(
     source.size_ += arg.size();
   }
   return source;
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError(
+      "replication command source allocation failed");
+} catch (const std::length_error&) {
+  return absl::ResourceExhaustedError("replication command is too large");
+}
+
+absl::StatusOr<ReplicationCommandPayloadSource>
+ReplicationCommandPayloadSource::Create(std::uint8_t db_id,
+                                        std::span<const std::string> args) try {
+  std::vector<std::string_view> views;
+  views.reserve(args.size());
+  for (const std::string& arg : args) views.push_back(arg);
+  return Create(db_id, views);
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError(
+      "replication command view allocation failed");
+} catch (const std::length_error&) {
+  return absl::ResourceExhaustedError("replication command is too large");
 }
 
 celer::Task<absl::Status> ReplicationCommandPayloadSource::Read(
@@ -159,8 +151,11 @@ celer::Task<absl::Status> ReplicationCommandPayloadSource::Read(
   co_return absl::OkStatus();
 }
 
+// Argument views point into the disposable frame, so decoding must create all
+// owned strings here. Treat the complete decode as one fallible allocation
+// boundary instead of checking each argument copy independently.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
-    std::string_view encoded) {
+    std::string_view encoded) try {
   if (encoded.size() < kFixedHeaderBytes ||
       encoded.substr(0, kMagic.size()) != kMagic) {
     return Malformed("invalid replication command magic");
@@ -203,18 +198,22 @@ absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
   }
   command.args_.reserve(argc);
   for (std::uint32_t length : lengths) {
-    auto argument = CopyArgumentAdmitted(encoded.substr(offset, length));
-    if (!argument.ok()) return argument.status();
-    command.args_.push_back(std::move(*argument));
+    command.args_.emplace_back(encoded.data() + offset, length);
     offset += length;
   }
   return command;
+} catch (const std::bad_alloc&) {
+  RecordMemoryRejection();
+  return absl::ResourceExhaustedError("replication command allocation failed");
+} catch (const std::length_error&) {
+  return absl::ResourceExhaustedError("replication command is too large");
 }
 
-void AppendReplicationExpirationEffect(
-    std::vector<std::string>* args, std::uint8_t command_db_id,
-    std::uint8_t effect_db_id, std::string_view key, bool exists,
-    std::uint64_t expire_at_ms) {
+void AppendReplicationExpirationEffect(std::vector<std::string>* args,
+                                       std::uint8_t command_db_id,
+                                       std::uint8_t effect_db_id,
+                                       std::string_view key, bool exists,
+                                       std::uint64_t expire_at_ms) {
   if (args == nullptr || args->empty() || !exists) return;
   // SET already clears the previous TTL, while SetLocked canonicalizes a
   // requested or retained TTL to an absolute PXAT argument before publishing

@@ -267,6 +267,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     session.publish_queue_.clear();
     session.publish_queue_bytes_ = 0;
     session.publisher_admitted_bytes_ = 0;
+    session.publisher_admitted_items_ = 0;
   }
   // A DB epoch is part of every physical record validation. Keep FLUSHDB
   // online and bounded by invalidating an active RDB job; its coordinator
@@ -294,8 +295,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     ++partition.mutation_sequence_;
     if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
       for (auto& [session_id, capture] : partition.fullsync_subscribers_) {
-        (void)session_id;
-        ClearFullSyncCapture(store, capture);
+        ClearFullSyncCapture(store, session_id, capture);
       }
     }
   }

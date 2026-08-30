@@ -410,6 +410,10 @@ absl::StatusOr<storage::CompactValueUpdate> Changed(ZSet set) {
 
 std::string_view StorageError(ReplyBuilder& builder,
                               const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return builder.AppendError(status.message());
+  }
   return status.message().starts_with("WRONGTYPE ")
              ? builder.AppendError(status.message())
              : builder.AppendError("ERR " + std::string(status.message()));
@@ -424,11 +428,9 @@ Task<absl::Status> RunCompact(const CommandRequest& request,
                          ? PrepareReplicationCommand(request)
                          : std::nullopt;
   if (digest == nullptr) {
-    co_return co_await g_storage->ExecuteCompact(request.db_id_, key,
-                                                 storage::ValueType::kSortedSet,
-                                                 read_only, callback, 0,
-                                                 replication ? &*replication
-                                                             : nullptr);
+    co_return co_await g_storage->ExecuteCompact(
+        request.db_id_, key, storage::ValueType::kSortedSet, read_only,
+        callback, 0, replication ? &*replication : nullptr);
   }
   co_return co_await g_storage->ExecuteCompactLocked(
       request.db_id_, key, *digest, storage::ValueType::kSortedSet, read_only,
@@ -442,8 +444,9 @@ struct MultiPopShape {
   std::uint64_t count_ = 1;
 };
 
-std::vector<std::string> CanonicalSelectedZSetPop(
-    std::string_view key, bool maximum, std::size_t count) {
+std::vector<std::string> CanonicalSelectedZSetPop(std::string_view key,
+                                                  bool maximum,
+                                                  std::size_t count) {
   return {maximum ? "ZPOPMAX" : "ZPOPMIN", std::string(key),
           std::to_string(count)};
 }
@@ -537,8 +540,7 @@ Task<absl::StatusOr<std::vector<Element>>> PopZSetLocked(
       for (std::uint64_t i = 0; i < wanted; ++i) {
         popped.push_back(std::move(set[static_cast<std::size_t>(i)]));
       }
-      set.erase(set.begin(),
-                set.begin() + static_cast<std::ptrdiff_t>(wanted));
+      set.erase(set.begin(), set.begin() + static_cast<std::ptrdiff_t>(wanted));
     }
     has_remaining = !set.empty();
     return popped.empty()
@@ -659,6 +661,9 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
   }
   transaction.Seal();
   ReplicationTransactionGuard replication(request, &transaction);
+  if (!replication.status().ok()) {
+    co_return Built(StorageError(builder, replication.status()));
+  }
   absl::Status status = co_await transaction.Schedule();
   if (!status.ok()) co_return Built(StorageError(builder, status));
   if (transaction.single_shard()) {
@@ -675,9 +680,9 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendNullArray());
     }
-    replication.SetCommandArgs(CanonicalSelectedZSetPop(
-        request.args_[context.selected_arg_], shape.maximum_,
-        context.popped_.size()));
+    replication.SetCommandArgs(
+        CanonicalSelectedZSetPop(request.args_[context.selected_arg_],
+                                 shape.maximum_, context.popped_.size()));
     replication.Commit();
     AppendMultiPopReply(builder, request.args_[context.selected_arg_],
                         context.popped_, shape.flat_reply_);
@@ -1449,11 +1454,9 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   std::optional<std::string> scalar;
   std::vector<std::optional<std::string>> output;
   std::uint64_t next_cursor = 0;
-  const bool reply_with_scores =
-      std::any_of(a.begin() + std::min<std::size_t>(2, a.size()), a.end(),
-                  [](std::string_view arg) {
-                    return EqualCi(arg, "withscores");
-                  });
+  const bool reply_with_scores = std::any_of(
+      a.begin() + std::min<std::size_t>(2, a.size()), a.end(),
+      [](std::string_view arg) { return EqualCi(arg, "withscores"); });
   if ((request.kind_ == CommandKind::kZRank ||
        request.kind_ == CommandKind::kZRevRank) &&
       a.size() == 4 && !EqualCi(a[3], "withscore")) {
@@ -1564,20 +1567,6 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
           return absl::InvalidArgumentError("value is out of range");
         }
         if (set.empty()) return NoChange();
-        if (tx != nullptr && count < 0) {
-          const std::uint64_t requested = static_cast<std::uint64_t>(-count);
-          const std::uint64_t slots = with_scores ? requested * 2 : requested;
-          const std::size_t growth =
-              slots > std::numeric_limits<std::size_t>::max() /
-                          sizeof(std::string)
-                  ? std::numeric_limits<std::size_t>::max()
-                  : static_cast<std::size_t>(slots) * sizeof(std::string);
-          if (WouldExceedMemoryLimit(growth)) {
-            RecordMemoryRejection();
-            return absl::ResourceExhaustedError(
-                "transactional random reply exceeds maxmemory");
-          }
-        }
         std::vector<std::uint64_t> indexes;
         if (count >= 0) {
           if (static_cast<std::uint64_t>(count) >= set.size()) {
@@ -1847,9 +1836,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
                                        : builder.AppendBulkString(*output[0]));
       if (reply_with_scores) {
         const std::size_t pairs = output.size() / 2;
-        builder.AppendArrayHeader(builder.version() == RespVersion::k3
-                                      ? pairs
-                                      : output.size());
+        builder.AppendArrayHeader(
+            builder.version() == RespVersion::k3 ? pairs : output.size());
         for (std::size_t i = 0; i < pairs; ++i) {
           if (builder.version() == RespVersion::k3)
             builder.AppendArrayHeader(2);
@@ -1869,9 +1857,7 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
     case CommandKind::kZPopMax: {
       const std::size_t pairs = output.size() / 2;
       const bool nested = builder.version() == RespVersion::k3 && a.size() == 3;
-      builder.AppendArrayHeader(nested
-                                    ? pairs
-                                    : output.size());
+      builder.AppendArrayHeader(nested ? pairs : output.size());
       for (std::size_t i = 0; i < pairs; ++i) {
         if (nested) builder.AppendArrayHeader(2);
         builder.AppendBulkString(*output[i * 2]);
@@ -1884,9 +1870,8 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
   }
   if (reply_with_scores) {
     const std::size_t pairs = output.size() / 2;
-    builder.AppendArrayHeader(builder.version() == RespVersion::k3
-                                  ? pairs
-                                  : output.size());
+    builder.AppendArrayHeader(
+        builder.version() == RespVersion::k3 ? pairs : output.size());
     for (std::size_t i = 0; i < pairs; ++i) {
       if (builder.version() == RespVersion::k3) builder.AppendArrayHeader(2);
       builder.AppendBulkString(*output[i * 2]);
@@ -2511,8 +2496,7 @@ Task<CommandReply> ExecuteZSetCommand(const CommandRequest& request,
 }
 
 Task<absl::StatusOr<std::vector<std::string>>> ZSetMembersSnapshotLocked(
-    std::uint8_t db_id, std::string_view key,
-    const storage::Digest& digest) {
+    std::uint8_t db_id, std::string_view key, const storage::Digest& digest) {
   auto elements = co_await ReadZSetOnlyLocked(db_id, key, digest);
   if (!elements.ok()) co_return elements.status();
   Sort(&*elements);
@@ -2670,6 +2654,9 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
   }
   transaction.Seal();
   ReplicationTransactionGuard replication(request, &transaction);
+  if (!replication.status().ok()) {
+    co_return Built(StorageError(builder, replication.status()));
+  }
   context.single_shard_ = transaction.single_shard();
   std::uint64_t txid = 0;
   if (context.store_) {
@@ -2700,10 +2687,9 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(StorageError(builder, status));
   }
   if (context.store_) {
-    replication.SetCommandArgs(EncodeReplicationCommandEffects(
-        BuildZSetReplacement(request,
-                             context.store_shape_->destination_arg_,
-                             context.output_)));
+    replication.SetCommandArgs(
+        EncodeReplicationCommandEffects(BuildZSetReplacement(
+            request, context.store_shape_->destination_arg_, context.output_)));
     replication.SetFinalExpirations(context.writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
@@ -2721,10 +2707,10 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     co_return Built(
         builder.AppendInteger(limit == 0 ? size : std::min(size, limit)));
   }
-  builder.AppendArrayHeader(
-      with_scores && builder.version() == RespVersion::k3
-          ? context.output_.size()
-          : context.output_.size() * (with_scores ? 2 : 1));
+  builder.AppendArrayHeader(with_scores && builder.version() == RespVersion::k3
+                                ? context.output_.size()
+                                : context.output_.size() *
+                                      (with_scores ? 2 : 1));
   for (const Element& element : context.output_) {
     if (with_scores)
       AppendMemberScore(builder, element.member_, element.score_);
@@ -2968,10 +2954,10 @@ Task<std::string> ExecuteZSetMultiKeyLocked(
     co_return EncodeInteger(
         static_cast<long long>(limit == 0 ? size : std::min(size, limit)));
   }
-  builder.AppendArrayHeader(
-      with_scores && builder.version() == RespVersion::k3
-          ? context.output_.size()
-          : context.output_.size() * (with_scores ? 2 : 1));
+  builder.AppendArrayHeader(with_scores && builder.version() == RespVersion::k3
+                                ? context.output_.size()
+                                : context.output_.size() *
+                                      (with_scores ? 2 : 1));
   for (const Element& element : context.output_) {
     if (with_scores)
       AppendMemberScore(builder, element.member_, element.score_);
@@ -3040,8 +3026,8 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   const auto& args = request.args_;
   auto deadline = ParseBlockingZSetDeadline(request);
   if (!deadline.ok()) {
-    co_return Built(builder.AppendError(
-        absl::StrCat("ERR ", deadline.status().message())));
+    co_return Built(
+        builder.AppendError(absl::StrCat("ERR ", deadline.status().message())));
   }
   auto shape = ParseMultiPopShape(request);
   if (!shape.ok()) {
@@ -3061,27 +3047,24 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
     });
   }
   CommandRequest nonblocking = request;
-  auto attempt = [&](BlockingWakeCascade* cascade)
-      -> Task<BlockingAttemptResult> {
+  auto attempt =
+      [&](BlockingWakeCascade* cascade) -> Task<BlockingAttemptResult> {
     nonblocking.blocking_wake_cascade_ = cascade;
     ReplyBuilder attempt_builder(nonblocking.resp_version_);
     bool empty = false;
     CommandReply result = co_await ExecuteZSetMultiPopAttempt(
         nonblocking, attempt_builder, &empty);
     if (empty) co_return BlockingAttemptResult{};
-    co_return BlockingAttemptResult{
-        BlockingAttemptState::kComplete,
-        Built(builder.AppendRaw(result.encoded_))};
+    co_return BlockingAttemptResult{BlockingAttemptState::kComplete,
+                                    Built(builder.AppendRaw(result.encoded_))};
   };
-  auto timeout_reply = [&] {
-    return Built(builder.AppendNullArray());
-  };
+  auto timeout_reply = [&] { return Built(builder.AppendNullArray()); };
   auto status_reply = [&](const absl::Status& status) {
     return Built(StorageError(builder, status));
   };
   auto unblock_error_reply = [&] {
-    return Built(builder.AppendError(
-        "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
+    return Built(
+        builder.AppendError("UNBLOCKED client unblocked via CLIENT UNBLOCK"));
   };
   co_return co_await ExecuteBlockingWaitLoop(
       client_id, request.db_id_, std::move(specs), *deadline,

@@ -344,6 +344,11 @@ constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes) noexcept {
 }
 
 constexpr std::size_t MaxKeyBytes() noexcept { return kMaxStringBytes; }
+// The storage API and recovery decoder must enforce the same durable key
+// boundary; protocol-specific argument limits are intentionally not enough.
+constexpr bool ValidRecordKeySize(std::size_t bytes) noexcept {
+  return bytes <= MaxKeyBytes();
+}
 
 constexpr std::size_t MaxInlineKeyBytes() noexcept {
   return kMaxRecordHeaderBytes - sizeof(RecordHeader);

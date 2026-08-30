@@ -964,12 +964,6 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
     co_return absl::Status(absl::StatusCode::kInternal,
                            "external key has no valid extent manifest");
   }
-  auto reservation = TryReserveMemoryAllocation(key_bytes + 1);
-  if (!reservation.has_value()) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "external key read exceeds this worker's maxmemory share");
-  }
   std::string key;
   try {
     key.resize(key_bytes);
@@ -978,9 +972,6 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
     co_return absl::ResourceExhaustedError(
         "external key read allocation failed");
   }
-  // Reservations are worker-local and must not cross IO suspension. The new
-  // hook has already published key's usable allocation at this point.
-  reservation.reset();
   std::size_t offset = 0;
   for (std::size_t index = 0; index < extents->size() && offset < key.size();
        ++index) {
@@ -996,7 +987,16 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
     if (ref.payload_bytes_ <= remaining) {
       destination = reinterpret_cast<std::byte*>(key.data() + offset);
     } else {
-      partial.resize(ref.payload_bytes_);
+      try {
+        partial.resize(ref.payload_bytes_);
+      } catch (const std::bad_alloc&) {
+        RecordMemoryRejection();
+        co_return absl::ResourceExhaustedError(
+            "external key extent buffer allocation failed");
+      } catch (const std::length_error&) {
+        co_return absl::ResourceExhaustedError(
+            "external key extent buffer is too large");
+      }
       destination = partial.data();
     }
     absl::Status read = absl::OkStatus();

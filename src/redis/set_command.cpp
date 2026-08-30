@@ -37,6 +37,10 @@ CommandReply BuiltReply(std::string_view encoded) {
 
 std::string_view AppendStorageError(ReplyBuilder& builder,
                                     const absl::Status& status) {
+  if (status.code() == absl::StatusCode::kResourceExhausted &&
+      status.message().starts_with("OOM ")) {
+    return builder.AppendError(status.message());
+  }
   if (status.message().starts_with("WRONGTYPE ")) {
     return builder.AppendError(status.message());
   }
@@ -158,17 +162,16 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
 
   absl::StatusOr<storage::HashResult> result =
       absl::UnknownError("Set command was not dispatched");
-  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
-                                   : std::nullopt;
+  auto replication =
+      tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {
-    result = co_await g_storage->ExecuteSet(
-        request.db_id_, args[1], operation,
-        replication ? &*replication : nullptr);
+    result =
+        co_await g_storage->ExecuteSet(request.db_id_, args[1], operation,
+                                       replication ? &*replication : nullptr);
   } else {
-    result = co_await g_storage->ExecuteSetLocked(request.db_id_, args[1],
-                                                  *digest, operation, tx,
-                                                  replication ? &*replication
-                                                              : nullptr);
+    result = co_await g_storage->ExecuteSetLocked(
+        request.db_id_, args[1], *digest, operation, tx,
+        replication ? &*replication : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
@@ -392,8 +395,8 @@ Task<absl::Status> SetReadShardCallback(void* opaque,
           request.db_id_, request.args_[1], key.digest_, contains);
       if (!result.ok()) co_return result.status();
       context->source_exists_ = result->key_exists_;
-      context->source_contains_ = !result->values_.empty() &&
-                                  result->values_.front().has_value();
+      context->source_contains_ =
+          !result->values_.empty() && result->values_.front().has_value();
       continue;
     }
     storage::HashOperation read;
@@ -516,8 +519,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
           !EqualsIgnoreCase(args[option], "limit")) {
         co_return BuiltReply(reply_builder.AppendError("ERR syntax error"));
       }
-      if (!ParseInteger(args[option + 1], &parsed_limit) ||
-          parsed_limit < 0) {
+      if (!ParseInteger(args[option + 1], &parsed_limit) || parsed_limit < 0) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR LIMIT can't be negative"));
       }
@@ -547,16 +549,19 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   tx::Transaction transaction;
   for (std::size_t i = key_view->first_; i <= key_view->last_;
        i += key_view->step_) {
-    const tx::LockMode lock_mode =
-        move || (store && i == 1) ? tx::LockMode::kExclusive
-                                  : tx::LockMode::kShared;
-    transaction.AddKey(
-        g_storage->OwnerForKey(args[i]), request.db_id_,
-        storage::ComputeDigest(args[i]), static_cast<std::uint32_t>(i),
-        lock_mode);
+    const tx::LockMode lock_mode = move || (store && i == 1)
+                                       ? tx::LockMode::kExclusive
+                                       : tx::LockMode::kShared;
+    transaction.AddKey(g_storage->OwnerForKey(args[i]), request.db_id_,
+                       storage::ComputeDigest(args[i]),
+                       static_cast<std::uint32_t>(i), lock_mode);
   }
   transaction.Seal();
   ReplicationTransactionGuard replication(request, &transaction);
+  if (!replication.status().ok()) {
+    co_return BuiltReply(
+        AppendStorageError(reply_builder, replication.status()));
+  }
   context.single_shard_ = transaction.single_shard();
 
   std::uint64_t txid = 0;
@@ -583,8 +588,7 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
                           const tx::ShardSlice& slice) -> Task<absl::Status> {
       auto* ctx = static_cast<SetMultiContext*>(opaque);
       absl::Status read = co_await SetReadShardCallback(opaque, slice);
-      if (!read.ok() ||
-          ctx->request_->args_[1] == ctx->request_->args_[2] ||
+      if (!read.ok() || ctx->request_->args_[1] == ctx->request_->args_[2] ||
           !ctx->source_exists_) {
         co_return read;
       }
@@ -616,8 +620,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   if (move) {
     if (args[1] == args[2]) {
       if (!context.single_shard_) (void)co_await transaction.Release();
-      co_return BuiltReply(reply_builder.AppendInteger(
-          context.source_contains_ ? 1 : 0));
+      co_return BuiltReply(
+          reply_builder.AppendInteger(context.source_contains_ ? 1 : 0));
     }
     if (!context.source_exists_) {
       if (!context.single_shard_) (void)co_await transaction.Release();
@@ -663,9 +667,9 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   }
 
   if (write) {
-    replication.SetCommandArgs(move ? EncodeSetMoveEffects(request)
-                                    : EncodeSetReplacement(request,
-                                                           context.output_));
+    replication.SetCommandArgs(
+        move ? EncodeSetMoveEffects(request)
+             : EncodeSetReplacement(request, context.output_));
     replication.SetFinalExpirations(context.tx_writes_);
     replication.Commit();
     g_storage->NoteTxCommitStarted();
@@ -681,9 +685,8 @@ Task<CommandReply> ExecuteSetMultiKey(const CommandRequest& request,
   if (request.kind_ == CommandKind::kSInterCard) {
     const std::uint64_t cardinality = context.output_.size();
     co_return BuiltReply(reply_builder.AppendInteger(
-        cardinality_limit == 0
-            ? cardinality
-            : std::min(cardinality, cardinality_limit)));
+        cardinality_limit == 0 ? cardinality
+                               : std::min(cardinality, cardinality_limit)));
   }
   reply_builder.AppendSetHeader(context.output_.size());
   for (const std::string& member : context.output_) {
