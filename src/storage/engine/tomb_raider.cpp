@@ -665,7 +665,13 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
     // reader can observe. A staged physical record retains only address bits;
     // flush completion rejects them after Erase removes the live bucket slot.
     store.external_manifests_.erase(entry);
-    partition.indexes_[candidate.db_id_].Erase(entry);
+    const std::size_t logical_key_bytes = entry->logical_key_size();
+    const bool erased = partition.indexes_[candidate.db_id_].Erase(entry);
+    assert(erased);
+    if (erased) {
+      RemoveFullSyncCoverageEntry(partition, candidate.db_id_,
+                                  logical_key_bytes);
+    }
     absl::Status dead = co_await MarkRecordDead(
         RetiredRecordOf(dropped, dropped_dependent_extents));
     if (!dead.ok()) {

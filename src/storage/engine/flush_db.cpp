@@ -290,6 +290,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
           .db_id_ = db_id,
       });
     }
+    partition.fullsync_coverage_bytes_[db_id] = 0;
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;
     ++partition.mutation_sequence_;

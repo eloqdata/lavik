@@ -1747,6 +1747,13 @@ class StorageEngine::Impl {
 
       std::uint16_t id_ = 0;
       std::array<RecordIndex, kLogicalDatabaseCount> indexes_;
+      // Conservative full-sync coverage ownership for each index. The owner
+      // worker updates this only when an index identity is created or erased;
+      // value and TTL replacements leave it unchanged. Keeping the aggregate
+      // beside the fixed index array lets session admission inspect a bounded
+      // number of counters instead of synchronously scanning every key.
+      std::array<std::uint64_t, kLogicalDatabaseCount>
+          fullsync_coverage_bytes_{};
       std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
       std::array<std::size_t, kLogicalDatabaseCount> expiring_key_count_{};
       std::uint64_t mutation_sequence_ = 0;
@@ -2284,6 +2291,15 @@ class StorageEngine::Impl {
 
   bool ScanPartitionInline(ScanPartitionState* state);
   Task<absl::StatusOr<ScanBatch>> ResumeScanPartition(ScanPartitionState state);
+
+  std::uint64_t FullSyncCoverageEntryBytes(
+      std::size_t logical_key_bytes) const noexcept;
+  void AddFullSyncCoverageEntry(WorkerStore::PartitionStore& partition,
+                                std::uint8_t db_id,
+                                std::size_t logical_key_bytes) noexcept;
+  void RemoveFullSyncCoverageEntry(WorkerStore::PartitionStore& partition,
+                                   std::uint8_t db_id,
+                                   std::size_t logical_key_bytes) noexcept;
 
   absl::Status BeginRdbSnapshot(std::uint64_t session_id,
                                 std::uint64_t snapshot_time_ms);

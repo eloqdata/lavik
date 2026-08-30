@@ -133,7 +133,12 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   --store.live_key_count_[candidate.db_id_];
   --partition.expiring_key_count_[candidate.db_id_];
   store.external_manifests_.erase(current);
-  partition.indexes_[candidate.db_id_].Erase(current);
+  const std::size_t logical_key_bytes = current->logical_key_size();
+  const bool erased = partition.indexes_[candidate.db_id_].Erase(current);
+  assert(erased);
+  if (erased) {
+    RemoveFullSyncCoverageEntry(partition, candidate.db_id_, logical_key_bytes);
+  }
   if (dropped.external() && !dropped.key_external()) {
     SpawnExtentReclaim(store, dropped_extents);
   }

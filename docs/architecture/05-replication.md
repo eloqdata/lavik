@@ -231,7 +231,15 @@ capture attempt so the next attempt starts from the new database epochs.
 
 Before a source session becomes visible, each worker reserves coverage-map
 headroom for its largest `(partition, database)` scan, because only one such
-map is live at a time. It does not sum all 16 databases in a partition.
+map is live at a time. It does not sum all 16 databases in a partition. Every
+partition keeps a fixed 16-element array of conservative coverage bytes. A new
+index identity adds its metadata allowance and either twice its inline key
+length or twice the digest size; physical erase subtracts the same amount,
+while value and TTL replacement do not change it. Recovery builds the counters
+with the indexes, and FLUSH or replica reset clears the detached database
+slots. Session startup therefore takes the maximum of a bounded number of
+worker-local counters instead of synchronously scanning all keys and blocking
+the worker for O(dataset size).
 Coverage entries for external keys retain only digest and logical length, like
 the record index, so the baseline reservation does not charge their complete
 on-disk key. If a post-fence mutation replaces one with full-key map owners,

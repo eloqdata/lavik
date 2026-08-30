@@ -543,6 +543,41 @@ Task<absl::StatusOr<ScanBatch>> StorageEngine::Impl::ResumeScanPartition(
   }
 }
 
+std::uint64_t StorageEngine::Impl::FullSyncCoverageEntryBytes(
+    std::size_t logical_key_bytes) const noexcept {
+  // Coverage uses the current inline threshold even when recovery materialized
+  // a record written under a different threshold. Larger keys contribute only
+  // the digest retained by the coverage map. The factor of two matches the
+  // worst case where key identity is present in both owners during replacement.
+  const std::uint64_t retained_key_bytes =
+      logical_key_bytes <= options_.inline_key_max_bytes_
+          ? static_cast<std::uint64_t>(logical_key_bytes)
+          : sizeof(Digest);
+  assert(retained_key_bytes <= (std::numeric_limits<std::uint64_t>::max() -
+                                kFullSyncReplacementMetadataBytes) /
+                                   2);
+  return kFullSyncReplacementMetadataBytes + retained_key_bytes * 2;
+}
+
+void StorageEngine::Impl::AddFullSyncCoverageEntry(
+    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+    std::size_t logical_key_bytes) noexcept {
+  assert(db_id < kLogicalDatabaseCount);
+  const std::uint64_t bytes = FullSyncCoverageEntryBytes(logical_key_bytes);
+  assert(partition.fullsync_coverage_bytes_[db_id] <=
+         std::numeric_limits<std::uint64_t>::max() - bytes);
+  partition.fullsync_coverage_bytes_[db_id] += bytes;
+}
+
+void StorageEngine::Impl::RemoveFullSyncCoverageEntry(
+    WorkerStore::PartitionStore& partition, std::uint8_t db_id,
+    std::size_t logical_key_bytes) noexcept {
+  assert(db_id < kLogicalDatabaseCount);
+  const std::uint64_t bytes = FullSyncCoverageEntryBytes(logical_key_bytes);
+  assert(partition.fullsync_coverage_bytes_[db_id] >= bytes);
+  partition.fullsync_coverage_bytes_[db_id] -= bytes;
+}
+
 absl::StatusOr<FullSyncSessionStart> StorageEngine::Impl::BeginFullSyncSession(
     std::uint64_t session_id) {
   WorkerStore& store = CurrentStore();
@@ -578,44 +613,22 @@ absl::StatusOr<FullSyncSessionStart> StorageEngine::Impl::BeginFullSyncSession(
   // excluded. Keep a conservative fixed allowance for bucket/node/control
   // overhead and both possible logical key copies. This is reservation
   // accounting, not an on-disk format constant.
-  constexpr std::size_t kCoverageMetadataBytesPerKey = 320;
   constexpr std::size_t kCoverageControlBytes = 64 * 1024;
   constexpr std::size_t kCoverageFixedBytes =
       ScanHashMapEntryArena::kSmallSpanAdmissionBytes + kCoverageControlBytes;
   std::size_t largest_partition_db_bytes = 0;
   for (const auto& partition : store.partitions_) {
-    for (const auto& index : partition.indexes_) {
-      std::size_t bytes = kCoverageFixedBytes;
-      bool overflow = false;
-      std::uint64_t cursor = 0;
-      do {
-        cursor = index.Scan(cursor, [&](const RecordIndex::Entry& entry) {
-          if (overflow) return;
-          // Coverage entries use the same inline threshold as the record
-          // index. External keys retain only their digest and logical length;
-          // a later full-key replacement must consume spare session credit or
-          // invalidate this attempt before allocating its larger owners.
-          const std::size_t key_bytes =
-              entry.logical_key_size() <= options_.inline_key_max_bytes_
-                  ? entry.logical_key_size()
-                  : sizeof(Digest);
-          if (key_bytes > (std::numeric_limits<std::size_t>::max() -
-                           kCoverageMetadataBytesPerKey) /
-                              2 ||
-              kCoverageMetadataBytesPerKey + key_bytes * 2 >
-                  std::numeric_limits<std::size_t>::max() - bytes) {
-            overflow = true;
-            return;
-          }
-          bytes += kCoverageMetadataBytesPerKey + key_bytes * 2;
-        });
-      } while (cursor != 0 && !overflow);
-      if (overflow) {
+    for (const std::uint64_t coverage_bytes :
+         partition.fullsync_coverage_bytes_) {
+      if (coverage_bytes >
+          std::numeric_limits<std::size_t>::max() - kCoverageFixedBytes) {
         store.fullsync_sessions_.erase(session);
         return absl::ResourceExhaustedError(
             "full-sync coverage reservation overflow");
       }
-      largest_partition_db_bytes = std::max(largest_partition_db_bytes, bytes);
+      largest_partition_db_bytes = std::max(
+          largest_partition_db_bytes,
+          kCoverageFixedBytes + static_cast<std::size_t>(coverage_bytes));
     }
   }
   const std::size_t reserve =
@@ -1496,6 +1509,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
             .db_id_ = db_id,
         });
       }
+      partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
           [[unlikely]] {
         co_return absl::InternalError(
@@ -1602,6 +1616,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
         store.detached_indexes_.push_back(DetachedIndex{
             .index_ = partition.indexes_[db_id].Detach(), .db_id_ = db_id});
       }
+      partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id]) {
         co_return absl::InternalError(
             "targeted reset found inconsistent live-key accounting");
@@ -2131,6 +2146,7 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
                 .db_id_ = db_id,
             });
           }
+          partition.fullsync_coverage_bytes_[db_id] = 0;
           if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
               [[unlikely]] {
             co_return absl::InternalError(

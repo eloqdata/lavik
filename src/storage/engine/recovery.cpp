@@ -681,6 +681,8 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
                                        winner, !winner.key_external());
+        AddFullSyncCoverageEntry(partition, recovered.db_id_,
+                                 recovered.key_.size());
       }
       store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
       if (recovered.txid_ != 0) {

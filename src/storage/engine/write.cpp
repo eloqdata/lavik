@@ -2232,6 +2232,8 @@ acquire_active_stream:
     } else {
       inserted_entry =
           index_ptr->InsertNew(digest, key, location, !key_external);
+      assert(partition_ptr != nullptr);
+      AddFullSyncCoverageEntry(*partition_ptr, db_id, key.size());
     }
     if (external) {
       store.external_manifests_.insert_or_assign(inserted_entry, extents);
