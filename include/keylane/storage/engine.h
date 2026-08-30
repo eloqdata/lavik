@@ -1011,7 +1011,10 @@ class StorageEngine {
   celer::Task<absl::StatusOr<SetResult>> Set(
       std::uint8_t db_id, std::string_view key, std::string_view value,
       SetOptions options = {}, ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      // Source command dispatch may carry the already validated Redis slot.
+      // When present it must equal RedisSlot(key) and belong to this worker.
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
   celer::Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,
       std::span<const std::string_view> values,

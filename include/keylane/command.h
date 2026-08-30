@@ -314,6 +314,13 @@ struct CommandRequest {
   // bypass replica read-only checks and must not be published again.
   bool replication_origin_ = false;
   const CommandSpec* spec_ = nullptr;
+  // Populated by source-write dispatch after DetermineKeys proves there is
+  // exactly one key. The request remains alive across its cross-core handoff,
+  // so publisher admission, command dispatch, and storage lookup can all reuse
+  // the Redis slot. Consumers must also match the argument index; zero means
+  // there is no reusable key route.
+  std::optional<std::uint16_t> routed_partition_id_;
+  std::size_t routed_key_argument_ = 0;
   std::vector<std::string> args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
   std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;
@@ -507,7 +514,7 @@ bool RequestSpansMultipleShards(const CommandRequest& request);
 // Route `request` to the worker owning its Redis hash-slot partition. Async
 // disk operations use SubmitTaskTo and return on the connection's original
 // worker.
-Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
                                   std::uint64_t client_id = 0);
 

@@ -96,7 +96,7 @@ ExtentManifest ExtentsNotReferencedBy(ExtentManifest previous,
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
     std::uint8_t db_id, std::string_view key, std::string_view value,
     SetOptions options, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace) {
+    SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   if (trace != nullptr) trace->key_lock_start_ns_ = SetTraceNowNanos();
@@ -104,16 +104,24 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::Set(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kExclusive);
   if (trace != nullptr) trace->key_lock_acquired_ns_ = SetTraceNowNanos();
   co_return co_await SetLocked(db_id, key, digest, value, options, nullptr,
-                               replication, trace);
+                               replication, trace, routed_partition_id);
 }
 
 Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
     std::string_view value, SetOptions options, TxShardWrites* tx,
-    ReplicationCommandAppend* replication, SetLatencyTrace* trace) {
+    ReplicationCommandAppend* replication, SetLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
-  auto& partition = PartitionForKey(store, key);
+  // The route hint is produced from this exact key immediately before the
+  // cross-core handoff. Debug builds recheck that contract; optimized builds
+  // avoid another Redis CRC16 calculation on every source SET.
+  assert(!routed_partition_id.has_value() ||
+         *routed_partition_id == RedisSlot(key));
+  auto& partition = routed_partition_id.has_value()
+                        ? PartitionFor(store, *routed_partition_id)
+                        : PartitionForKey(store, key);
   if (trace != nullptr) trace->store_lock_start_ns_ = SetTraceNowNanos();
   co_await store.store_state_mutex_.Lock();
   if (trace != nullptr) trace->store_lock_acquired_ns_ = SetTraceNowNanos();

@@ -413,8 +413,9 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(
 Task<absl::StatusOr<SetResult>> StorageEngine::Set(
     std::uint8_t db_id, std::string_view key, std::string_view value,
     SetOptions options, ReplicationCommandAppend* replication,
-    SetLatencyTrace* trace) {
-  return impl_->Set(db_id, key, value, options, replication, trace);
+    SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id) {
+  return impl_->Set(db_id, key, value, options, replication, trace,
+                    routed_partition_id);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::ListPush(

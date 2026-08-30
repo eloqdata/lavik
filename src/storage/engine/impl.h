@@ -1988,18 +1988,18 @@ class StorageEngine::Impl {
                                                          std::string_view key,
                                                          const Digest& digest);
 
-  Task<absl::StatusOr<SetResult>> Set(std::uint8_t db_id, std::string_view key,
-                                      std::string_view value,
-                                      SetOptions options,
-                                      ReplicationCommandAppend* replication,
-                                      SetLatencyTrace* trace);
+  Task<absl::StatusOr<SetResult>> Set(
+      std::uint8_t db_id, std::string_view key, std::string_view value,
+      SetOptions options, ReplicationCommandAppend* replication,
+      SetLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id);
 
   // Caller holds the key lock (exclusive); takes store_state_mutex internally.
   Task<absl::StatusOr<SetResult>> SetLocked(
       std::uint8_t db_id, std::string_view key, const Digest& digest,
       std::string_view value, SetOptions options, TxShardWrites* tx = nullptr,
       ReplicationCommandAppend* replication = nullptr,
-      SetLatencyTrace* trace = nullptr);
+      SetLatencyTrace* trace = nullptr,
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
 
   Task<absl::StatusOr<std::uint64_t>> ListPush(
       std::uint8_t db_id, std::string_view key,

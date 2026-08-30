@@ -1903,11 +1903,15 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
     if (keys.ok() && !keys->empty()) {
       if (keys->count() == 1) {
         const std::string& key = request->args_[keys->first_];
+        const bool routed = request->routed_partition_id_.has_value() &&
+                            request->routed_key_argument_ == keys->first_;
+        const std::uint16_t partition_id =
+            routed ? *request->routed_partition_id_ : storage::RedisSlot(key);
         scopes.push_back(WorkerScope{
-            .worker_ = ShardForKey(key),
+            .worker_ = partition_id % g_storage->worker_count(),
             .target_ =
                 storage::ReplicationPublisherTarget{
-                    .partition_id_ = storage::RedisSlot(key),
+                    .partition_id_ = partition_id,
                     .db_id_ = request->db_id_,
                 },
         });
@@ -3280,7 +3284,9 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       }
       auto result = co_await g_storage->Set(
           request.db_id_, args[1], args[2], *options,
-          replication ? &*replication : nullptr, set_trace);
+          replication ? &*replication : nullptr, set_trace,
+          request.routed_key_argument_ == 1 ? request.routed_partition_id_
+                                            : std::nullopt);
       if (!result.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, result.status());
         co_return reply;
@@ -10115,7 +10121,13 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kRestore:
     case CommandKind::kType:
       if (args.size() >= 2) {
-        const unsigned target = ShardForKey(args[1]);
+        // ExecuteCommand already moved a proven single-key source write to
+        // its owner. Reuse that decision instead of hashing args[1] again;
+        // other paths retain the normal defensive route calculation.
+        const bool routed = request.routed_partition_id_.has_value() &&
+                            request.routed_key_argument_ == 1;
+        const unsigned target =
+            routed ? ThisWorker().id_ : ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE
         if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;
@@ -10201,7 +10213,9 @@ namespace {
 // the command body dispatches to. Resolving that owner out here leaves
 // admission, body, and release on their existing "already on the target"
 // inline paths, so the write pays one cross-core round trip instead of three.
-std::optional<unsigned> SingleKeyWriteOwner(const CommandRequest& request) {
+std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
+  request.routed_partition_id_.reset();
+  request.routed_key_argument_ = 0;
   if (request.spec_ == nullptr || g_storage == nullptr) {
     return std::nullopt;
   }
@@ -10225,7 +10239,11 @@ std::optional<unsigned> SingleKeyWriteOwner(const CommandRequest& request) {
   // count() == 1 rather than !empty(): XGROUP HELP resolves to no key at all
   // and must keep the all-worker admission fan-out.
   if (!keys.ok() || keys->count() != 1) return std::nullopt;
-  return ShardForKey(request.args_[keys->first_]);
+  const std::uint16_t partition_id =
+      storage::RedisSlot(request.args_[keys->first_]);
+  request.routed_partition_id_ = partition_id;
+  request.routed_key_argument_ = keys->first_;
+  return partition_id % g_storage->worker_count();
 }
 
 // The acquire must stay ahead of the DB gate that ExecuteCommandBody takes.
@@ -10285,7 +10303,7 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
 
 }  // namespace
 
-Task<CommandReply> ExecuteCommand(const CommandRequest& request,
+Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
                                   std::uint64_t client_id) {
   const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
