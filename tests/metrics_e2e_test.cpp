@@ -539,6 +539,24 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   EXPECT_GT(MetricValue(body, "keylane_memory_rss_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_memory_max_bytes"), 1073741824);
   EXPECT_EQ(MetricValue(body, "keylane_memory_rejected_commands_total"), 0);
+  constexpr std::uint64_t kWorkerRetainedLimit =
+      (1073741824ULL - 1073741824ULL / 10) / 2;
+  for (unsigned worker = 0; worker < 2; ++worker) {
+    const std::string label = "{worker=\"" + std::to_string(worker) + "\"}";
+    EXPECT_EQ(MetricValue(body, "keylane_worker_memory_limit_bytes" + label),
+              kWorkerRetainedLimit);
+    EXPECT_NE(body.find("keylane_worker_retained_memory_bytes" + label + " "),
+              std::string_view::npos);
+    EXPECT_NE(body.find("keylane_worker_memory_admission_pending_bytes" +
+                        label + " "),
+              std::string_view::npos);
+    EXPECT_NE(body.find("keylane_worker_fullsync_reserved_memory_bytes" +
+                        label + " "),
+              std::string_view::npos);
+    EXPECT_NE(
+        body.find("keylane_worker_client_buffered_request_bytes" + label + " "),
+        std::string_view::npos);
+  }
   EXPECT_GT(
       MetricValue(body,
                   "keylane_storage_io_operations_total{operation=\"write\"}"),

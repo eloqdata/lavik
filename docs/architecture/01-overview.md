@@ -30,7 +30,9 @@ Redis/Valkey clients, Sentinels, and replicas
  file, block-device, or SPDK I/O
 
 Prometheus scrapes a separate Celer HTTP service backed by worker/storage
-snapshots.
+snapshots. Memory scrapes read the existing cache-line-separated admission
+counters directly to expose bounded per-worker retained, pending, full-sync,
+client-buffer, and limit gauges; they do not add updates to command execution.
 ```
 
 ## Component responsibilities

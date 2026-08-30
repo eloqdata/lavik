@@ -207,6 +207,36 @@ TEST(MemoryTest, CrossWorkerRetainedReleaseReturnsBytesToExplicitOrigin) {
   EXPECT_EQ(releaser_after, releaser_before);
 }
 
+TEST(MemoryTest, WorkerSnapshotsMatchAdmissionShares) {
+  constexpr std::uint64_t kMaximum = 1024ULL * 1024 * 1024;
+  ASSERT_TRUE(keylane::InitMemoryLimit(kMaximum, 2).ok());
+  ASSERT_EQ(keylane::MemoryAccountingWorkerCount(), 2u);
+
+  const keylane::WorkerMemoryStats before0 = keylane::GetWorkerMemoryStats(0);
+  const keylane::WorkerMemoryStats before1 = keylane::GetWorkerMemoryStats(1);
+  EXPECT_EQ(before0.retained_limit_bytes_ + before1.retained_limit_bytes_,
+            kMaximum - kMaximum / 10);
+
+  // Slot zero is distributed deterministically because it participates in
+  // every worker's admission decision even though it has no worker owner.
+  constexpr std::size_t kFallbackBytes = 4;
+  constexpr std::size_t kOwnedBytes = 5;
+  keylane::AccountRetainedMemory(/*owner_shard=*/0, kFallbackBytes);
+  keylane::AccountRetainedMemory(/*owner_shard=*/1, kOwnedBytes);
+  const keylane::WorkerMemoryStats after0 = keylane::GetWorkerMemoryStats(0);
+  const keylane::WorkerMemoryStats after1 = keylane::GetWorkerMemoryStats(1);
+  EXPECT_EQ(after0.retained_bytes_ - before0.retained_bytes_, 7u);
+  EXPECT_EQ(after1.retained_bytes_ - before1.retained_bytes_, 2u);
+
+  keylane::ReleaseRetainedMemory(/*owner_shard=*/1, kOwnedBytes);
+  keylane::ReleaseRetainedMemory(/*owner_shard=*/0, kFallbackBytes);
+  EXPECT_EQ(keylane::GetWorkerMemoryStats(0).retained_bytes_,
+            before0.retained_bytes_);
+  EXPECT_EQ(keylane::GetWorkerMemoryStats(1).retained_bytes_,
+            before1.retained_bytes_);
+  EXPECT_EQ(keylane::GetWorkerMemoryStats(2).retained_limit_bytes_, 0u);
+}
+
 TEST(MemoryTest, RetainedChargeTransfersOwnershipWithoutGlobalNewHooks) {
   ASSERT_TRUE(keylane::InitMemoryLimit(1024ULL * 1024 * 1024, 1).ok());
   keylane::BindMemoryAccountingShard(0);

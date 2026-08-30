@@ -215,6 +215,12 @@ std::uint64_t DistributedShare(std::uint64_t total, unsigned worker_id,
   return total / workers + (worker_id < total % workers ? 1 : 0);
 }
 
+std::uint64_t SaturatingAdd(std::uint64_t left, std::uint64_t right) noexcept {
+  return right > std::numeric_limits<std::uint64_t>::max() - left
+             ? std::numeric_limits<std::uint64_t>::max()
+             : left + right;
+}
+
 bool WorkerWouldExceed(std::uint64_t maximum, std::size_t additional_bytes,
                        std::uint64_t pending_bytes,
                        std::uint64_t fullsync_bytes) noexcept {
@@ -371,6 +377,33 @@ std::int64_t WorkerMemoryAccountingBytes(unsigned worker_id) noexcept {
                      std::numeric_limits<std::int64_t>::max())
              ? std::numeric_limits<std::int64_t>::max()
              : static_cast<std::int64_t>(bytes);
+}
+
+unsigned MemoryAccountingWorkerCount() noexcept {
+  return g_accounted_workers.load(std::memory_order_acquire);
+}
+
+WorkerMemoryStats GetWorkerMemoryStats(unsigned worker_id) noexcept {
+  const unsigned workers = MemoryAccountingWorkerCount();
+  if (worker_id >= workers || workers == 0) return {};
+
+  const AllocationShard& shard = g_allocation_shards[worker_id + 1];
+  const std::uint64_t fallback =
+      g_allocation_shards[0].retained_bytes_.load(std::memory_order_relaxed);
+  const std::uint64_t owned =
+      shard.retained_bytes_.load(std::memory_order_relaxed);
+  return WorkerMemoryStats{
+      .retained_bytes_ =
+          SaturatingAdd(owned, DistributedShare(fallback, worker_id, workers)),
+      .admission_pending_bytes_ =
+          shard.admission_pending_bytes_.load(std::memory_order_relaxed),
+      .fullsync_reserved_bytes_ =
+          shard.fullsync_reserved_bytes_.load(std::memory_order_relaxed),
+      .client_buffered_bytes_ =
+          shard.client_buffered_bytes_.load(std::memory_order_relaxed),
+      .retained_limit_bytes_ =
+          DistributedShare(SteadyMemoryLimit(), worker_id, workers),
+  };
 }
 
 void RefreshMemoryStats() noexcept {

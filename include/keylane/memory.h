@@ -37,6 +37,19 @@ struct MemoryStats {
   std::uint64_t rejected_commands_ = 0;
 };
 
+// Snapshot of the accounting inputs used by one worker's memory gates.
+// Retained bytes include that worker's deterministic share of allocations
+// created outside a bound worker, so retained + pending + full-sync reserved
+// reconciles with the worker-local admission decision. Temporary allocations
+// and RSS remain process-wide diagnostics and are intentionally absent.
+struct WorkerMemoryStats {
+  std::uint64_t retained_bytes_ = 0;
+  std::uint64_t admission_pending_bytes_ = 0;
+  std::uint64_t fullsync_reserved_bytes_ = 0;
+  std::uint64_t client_buffered_bytes_ = 0;
+  std::uint64_t retained_limit_bytes_ = 0;
+};
+
 // Holds retained-memory headroom while a long-lived allocation is being
 // constructed. It is intentionally short-lived: the retained owner takes over
 // the actual usable bytes once allocation succeeds.
@@ -153,6 +166,12 @@ void ReleaseRetainedMemory(unsigned owner_shard, std::size_t bytes) noexcept;
 // Returns retained bytes owned by one worker. Ordinary C++ and request-
 // temporary allocations remain visible through RSS and allocator diagnostics.
 std::int64_t WorkerMemoryAccountingBytes(unsigned worker_id) noexcept;
+
+// Exposes bounded, scrape-time worker snapshots without adding counters to the
+// command path. The returned worker count is stable after server startup; an
+// out-of-range worker ID returns an empty snapshot.
+unsigned MemoryAccountingWorkerCount() noexcept;
+WorkerMemoryStats GetWorkerMemoryStats(unsigned worker_id) noexcept;
 
 // Periodically publishes the cheap per-worker retained-counter sum.
 void RefreshMemoryStats() noexcept;

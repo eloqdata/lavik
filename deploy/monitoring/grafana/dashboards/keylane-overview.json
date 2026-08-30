@@ -1357,6 +1357,19 @@
       "type": "row"
     },
     {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "id": 23,
+      "panels": [],
+      "title": "Connections and Storage",
+      "type": "row"
+    },
+    {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -1416,7 +1429,7 @@
         "h": 8,
         "w": 10,
         "x": 0,
-        "y": 22
+        "y": 23
       },
       "id": 11,
       "options": {
@@ -1514,7 +1527,7 @@
         "h": 8,
         "w": 14,
         "x": 10,
-        "y": 22
+        "y": 23
       },
       "id": 12,
       "options": {
@@ -1597,7 +1610,7 @@
         "h": 6,
         "w": 24,
         "x": 0,
-        "y": 30
+        "y": 31
       },
       "id": 13,
       "options": {
@@ -1637,7 +1650,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 36
+        "y": 37
       },
       "id": 22,
       "panels": [
@@ -1700,7 +1713,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 37
+        "y": 38
       },
       "id": 16,
       "options": {
@@ -1754,6 +1767,94 @@
         }
       ],
       "title": "Memory History",
+      "type": "row"
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 38
+      },
+      "id": 24,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "description": "Worker-local retained bytes plus pending allocation and full-sync reservations as a percentage of that worker's fixed retained-memory share.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "thresholds"
+              },
+              "decimals": 1,
+              "mappings": [],
+              "max": 100,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 80
+                  },
+                  {
+                    "color": "red",
+                    "value": 95
+                  }
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 10,
+            "w": 24,
+            "x": 0,
+            "y": 39
+          },
+          "id": 25,
+          "options": {
+            "displayMode": "gradient",
+            "maxVizHeight": 1000,
+            "minVizHeight": 18,
+            "minVizWidth": 8,
+            "namePlacement": "left",
+            "orientation": "horizontal",
+            "reduceOptions": {
+              "calcs": [
+                "lastNotNull"
+              ],
+              "fields": "",
+              "values": false
+            },
+            "showUnfilled": true,
+            "sizing": "auto",
+            "valueMode": "color"
+          },
+          "targets": [
+            {
+              "editorMode": "code",
+              "expr": "100 * (keylane_worker_retained_memory_bytes{instance=~\"$instance\"} + keylane_worker_memory_admission_pending_bytes{instance=~\"$instance\"} + keylane_worker_fullsync_reserved_memory_bytes{instance=~\"$instance\"}) / keylane_worker_memory_limit_bytes{instance=~\"$instance\"}",
+              "instant": true,
+              "legendFormat": "{{instance}} worker {{worker}}",
+              "range": false,
+              "refId": "A"
+            }
+          ],
+          "title": "Worker Retained Admission Utilization",
+          "type": "bargauge"
+        }
+      ],
+      "title": "Worker Memory",
       "type": "row"
     }
   ],
@@ -1811,6 +1912,6 @@
   "timezone": "browser",
   "title": "Keylane Overview",
   "uid": "keylane-overview",
-  "version": 6,
+  "version": 7,
   "weekStart": ""
 }

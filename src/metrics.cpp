@@ -491,6 +491,36 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "file's filesystem.\n"
       "# TYPE keylane_filesystem_available_bytes gauge\n");
   output.append(
+      "# HELP keylane_worker_retained_memory_bytes Retained bytes charged "
+      "to this worker's admission share.\n"
+      "# TYPE keylane_worker_retained_memory_bytes gauge\n"
+      "# HELP keylane_worker_memory_admission_pending_bytes Headroom held "
+      "by this worker while retained allocations become visible.\n"
+      "# TYPE keylane_worker_memory_admission_pending_bytes gauge\n"
+      "# HELP keylane_worker_fullsync_reserved_memory_bytes Retained "
+      "headroom reserved by this worker's active full-sync coverage maps.\n"
+      "# TYPE keylane_worker_fullsync_reserved_memory_bytes gauge\n"
+      "# HELP keylane_worker_client_buffered_request_bytes Client request "
+      "bytes currently charged to this worker's separate buffer quota.\n"
+      "# TYPE keylane_worker_client_buffered_request_bytes gauge\n"
+      "# HELP keylane_worker_memory_limit_bytes Retained-memory admission "
+      "limit assigned to this worker.\n"
+      "# TYPE keylane_worker_memory_limit_bytes gauge\n");
+  const unsigned memory_workers = MemoryAccountingWorkerCount();
+  for (unsigned worker = 0; worker < memory_workers; ++worker) {
+    const WorkerMemoryStats memory = GetWorkerMemoryStats(worker);
+    absl::StrAppend(&output, "keylane_worker_retained_memory_bytes{worker=\"",
+                    worker, "\"} ", memory.retained_bytes_, "\n",
+                    "keylane_worker_memory_admission_pending_bytes{worker=\"",
+                    worker, "\"} ", memory.admission_pending_bytes_, "\n",
+                    "keylane_worker_fullsync_reserved_memory_bytes{worker=\"",
+                    worker, "\"} ", memory.fullsync_reserved_bytes_, "\n",
+                    "keylane_worker_client_buffered_request_bytes{worker=\"",
+                    worker, "\"} ", memory.client_buffered_bytes_, "\n",
+                    "keylane_worker_memory_limit_bytes{worker=\"", worker,
+                    "\"} ", memory.retained_limit_bytes_, "\n");
+  }
+  output.append(
       "# HELP keylane_replication_backlog_bytes Allocated shared in-memory "
       "replication backlog bytes.\n"
       "# TYPE keylane_replication_backlog_bytes gauge\n"
@@ -598,8 +628,8 @@ std::unique_ptr<celer::Service> CreateMetricsService(
           const celer::HttpRequest&,
           celer::HttpResponse* response) -> celer::Task<absl::Status> {
         response->content_type_ = "text/plain; version=0.0.4; charset=utf-8";
-        co_return co_await RenderPrometheusMetrics(
-            *storage, server_ready(), &response->body_);
+        co_return co_await RenderPrometheusMetrics(*storage, server_ready(),
+                                                   &response->body_);
       });
   return service;
 }

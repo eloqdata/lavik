@@ -156,6 +156,17 @@ sum by (result) (rate(keylane_storage_defrag_runs_total[5m]))
   held while retained page, bucket, replication-owner, or replica-staging
   ownership is constructed.
 - `keylane_memory_rejected_commands_total`: commands rejected by the limit.
+- `keylane_worker_retained_memory_bytes{worker}`: retained bytes charged to
+  one worker's admission share, including its deterministic share of retained
+  allocations created outside a bound worker.
+- `keylane_worker_memory_admission_pending_bytes{worker}`: that worker's
+  short-lived allocation permits.
+- `keylane_worker_fullsync_reserved_memory_bytes{worker}`: that worker's
+  reusable full-sync coverage reservation.
+- `keylane_worker_client_buffered_request_bytes{worker}`: request bytes charged
+  to that worker's independent client-buffer quota.
+- `keylane_worker_memory_limit_bytes{worker}`: the worker's fixed share of the
+  90% retained-memory waterline.
 
 The provisioned Grafana **Retained Admission Utilization** gauge approximates
 the process-wide admission decision as:
@@ -172,6 +183,11 @@ Admission is enforced per worker, so a single worker can still reject growth
 before this process-wide aggregate reaches 100%. Oversized publisher surplus,
 client buffers, temporary heap usage, and RSS are intentionally absent from
 this retained-admission gauge.
+
+The provisioned Grafana dashboard keeps the per-worker retained-admission bars
+in a collapsed **Worker Memory** row. Expanding it shows
+`100 * (retained + pending + full-sync reserved) / worker limit` for every
+selected instance and worker without adding any command-path accounting.
 
 The same values are available through Redis `INFO memory`, including
 `used_memory`, `used_memory_rss`, `maxmemory`, and
