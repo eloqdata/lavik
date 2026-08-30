@@ -37,6 +37,28 @@ option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OF
 option(KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfers (test builds only)" OFF)
 option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
 
+if (KEYLANE_ENABLE_OPT)
+  include(CheckIPOSupported)
+  check_ipo_supported(
+    RESULT KEYLANE_IPO_SUPPORTED
+    OUTPUT KEYLANE_IPO_ERROR
+    LANGUAGES C CXX
+  )
+  if (KEYLANE_IPO_SUPPORTED)
+    # IPO properties are initialized when a target is created. Keep these
+    # defaults ahead of every bundled target so Celer, Abseil, mimalloc, and
+    # Lua participate in the same link-time optimization as the server.
+    # Debug deliberately stays non-IPO so local builds do not pay an
+    # optimization cost that is unrelated to correctness.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
+  else()
+    message(WARNING
+      "IPO is unavailable; continuing without LTO: ${KEYLANE_IPO_ERROR}")
+  endif()
+endif()
+
 set(KEYLANE_ASAN_BUILD OFF)
 string(CONCAT KEYLANE_COMPILER_AND_LINKER_FLAGS
   "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} "
@@ -155,26 +177,6 @@ add_library(keylane_lua STATIC
 target_include_directories(keylane_lua PUBLIC ${KEYLANE_LUA_SOURCE_DIR})
 target_compile_definitions(keylane_lua PRIVATE LUA_USE_POSIX)
 target_link_libraries(keylane_lua PUBLIC m)
-
-if (KEYLANE_ENABLE_OPT)
-  include(CheckIPOSupported)
-  check_ipo_supported(
-    RESULT KEYLANE_IPO_SUPPORTED
-    OUTPUT KEYLANE_IPO_ERROR
-    LANGUAGES CXX
-  )
-  if (KEYLANE_IPO_SUPPORTED)
-    # Initialize every Keylane target created below with matching compile and
-    # link-time IPO flags. Debug deliberately stays non-IPO so local builds do
-    # not pay an optimization cost that is unrelated to correctness.
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
-    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
-  else()
-    message(WARNING
-      "IPO is unavailable; continuing without LTO: ${KEYLANE_IPO_ERROR}")
-  endif()
-endif()
 
 if (TARGET format AND TARGET celer-format)
   add_dependencies(format celer-format)
@@ -333,6 +335,14 @@ if (UNIX)
 endif()
 
 if (BUILD_TESTING)
+  # Test-only executables do not ship, and their intentionally oversized
+  # coroutine stress cases have triggered GCC IPO compiler ICEs. Preserve LTO
+  # on the already-created production graph without adding IPO-specific risk
+  # to those test sources.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE FALSE)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO FALSE)
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL FALSE)
+
   include(FetchContent)
 
   add_test(NAME keylane_version COMMAND keylane --version)
