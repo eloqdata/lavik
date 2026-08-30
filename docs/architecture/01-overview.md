@@ -120,7 +120,11 @@ state explicitly.
 
 - Worker-affine mutable state is accessed on its owner worker; cross-worker
   work uses Celer submission primitives. Coroutine coordinators resume on their
-  origin worker.
+  origin worker. A source worker release-publishes the first message to a
+  sender/receiver lane immediately, coalesces later same-round posts, and, when
+  needed, republishes the lane once before the batched target wake. The receiver
+  bulk-drains active lanes and uses an active-state close/recheck handshake so
+  posts racing with a drain cannot be stranded.
 - Logical database identity is carried in each command and durable record; it
   is not inferred from the worker executing a request.
 - The command table is the shared classification source for arity, key

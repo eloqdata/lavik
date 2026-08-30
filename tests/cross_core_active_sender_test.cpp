@@ -53,23 +53,46 @@ TEST(CrossCoreActiveSenderTest, BitmapAddressesAndClearsSenderGroups) {
   EXPECT_EQ(cross_core.TakeActiveSenders(129, 2), 0U);
 }
 
-TEST(CrossCoreActiveSenderTest, RepeatedPostsCoalesceOneSenderBit) {
+TEST(CrossCoreActiveSenderTest, RepeatedPostsBatchLaterLanePublications) {
   CrossCore cross_core(4);
   SetThisWorker(2, &cross_core, nullptr);
   RemoteWork first;
   RemoteWork second;
 
   PostRequest(&cross_core, 1, &first);
-  PostRequest(&cross_core, 1, &second);
+  EXPECT_EQ(cross_core.TakeActiveSenders(1, 0), std::uint64_t{1} << 2);
+  ASSERT_EQ(ThisWorker().wake_list_.size(), 1U);
+  EXPECT_EQ(ThisWorker().wake_list_.front(), 1U);
 
+  // Model the receiver completing the first lane visit before the next post.
+  cross_core.lane(1, 2).active_.store(false, std::memory_order_release);
+  RemoteWork* drained[2]{};
+  EXPECT_EQ(cross_core.lane(1, 2).requests_.try_dequeue_bulk(drained, 1), 1U);
+  EXPECT_EQ(drained[0], &first);
+
+  PostRequest(&cross_core, 1, &second);
+  EXPECT_EQ(cross_core.TakeActiveSenders(1, 0), 0U);
+  EXPECT_EQ(ThisWorker().wake_pending_[1], 2U);
+
+  // FlushWakes performs this one final publication for all later posts.
+  PublishCrossCoreLane(1);
   EXPECT_EQ(cross_core.TakeActiveSenders(1, 0), std::uint64_t{1} << 2);
   EXPECT_EQ(cross_core.TakeActiveSenders(1, 0), 0U);
   EXPECT_TRUE(cross_core.lane(1, 2).active_.load(std::memory_order_acquire));
 
-  RemoteWork* drained[2]{};
-  EXPECT_EQ(cross_core.lane(1, 2).requests_.try_dequeue_bulk(drained, 2), 2U);
-  EXPECT_EQ(drained[0], &first);
-  EXPECT_EQ(drained[1], &second);
+  EXPECT_EQ(cross_core.lane(1, 2).requests_.try_dequeue_bulk(drained, 2), 1U);
+  EXPECT_EQ(drained[0], &second);
+}
+
+TEST(CrossCoreActiveSenderTest, SelfPostActivatesImmediately) {
+  CrossCore cross_core(2);
+  SetThisWorker(1, &cross_core, nullptr);
+  RemoteWork work;
+
+  PostReply(&cross_core, 1, &work);
+
+  EXPECT_TRUE(ThisWorker().wake_list_.empty());
+  EXPECT_EQ(cross_core.TakeActiveSenders(1, 0), std::uint64_t{1} << 1);
 }
 
 TEST(CrossCoreActiveSenderTest, ConcurrentDrainReactivatesNonemptyLanes) {
