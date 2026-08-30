@@ -1360,8 +1360,9 @@ class ReplicationLogService final : public celer::Service {
     const std::uint64_t publisher_capacity =
         storage_->LocalReplicationLogInfo().publish_queue_capacity_bytes_;
     Check(keylane::GetMemoryStats().used_bytes_ >=
-              retained_before_publisher + publisher_capacity,
-          "replication log did not hold its fixed publisher staging budget");
+              retained_before_publisher + publisher_capacity + 8 * kMiB,
+          "replication log did not hold publisher staging plus one standby "
+          "backlog block");
 
     const std::string oversized_transaction_key(kMiB, 'T');
     status = co_await ExerciseTransactionGuardAdmission(

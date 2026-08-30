@@ -55,6 +55,26 @@ after epoch initialization, so an acquire owner read makes the immutable epoch
 visible without an extra worker hop. Other state remains owner-local and other
 workers use Celer cross-core submissions to read or mutate it.
 
+Foreground append-stream rollover is single-flight per stream. Immediately
+after publishing each ordinary active block, the worker prefetches one reserved
+successor ID under the same allocation gate; it does not acquire the 8 MiB
+staging buffer until rollover. Appending records therefore performs no
+occupancy-threshold check. Rollover consumes the successor and immediately
+starts replenishing it.
+The first writer that observes a missing or full stream consumes that standby
+or releases the worker's store-state mutex and allocates a replacement;
+followers release the mutex while waiting on the ordinary stream's or
+transaction generation's allocation gate. After wake-up they reacquire the
+store-state mutex and reuse the published stream when it has room. Allocation
+failure wakes the next waiter to retry, and transaction gate lifetime follows
+the generation's active lease, so neither shutdown nor generation retirement
+can strand a waiter. Shutdown waits for an ordinary prefetch to finish and
+returns an unused reservation. Different transaction generations retain
+independent gates and may allocate concurrently. Maintenance rewrites that
+intentionally retain the store-state mutex do not wait on these gates; their
+concurrency is separately bounded, and a colliding spare block is returned
+instead of replacing an already published stream.
+
 Logical key locks come from the transaction subsystem. Storage's pre-locked
 interfaces require the caller to run on the key owner with the correct shared
 or exclusive lock. Background expiry, relocation, snapshot, and replica work

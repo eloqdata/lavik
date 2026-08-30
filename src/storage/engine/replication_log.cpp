@@ -216,6 +216,11 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
         "insufficient retained-memory budget for replication publisher "
         "staging");
   }
+  // Establish the standby invariant before publishing an active history. If
+  // maxmemory cannot cover the successor, enabling replication fails cleanly
+  // instead of letting the first rollover discover the missing reservation.
+  auto standby = AllocateReplicationLogBlock();
+  if (!standby.ok()) co_return standby.status();
   log.publisher_staging_charge_.Adopt(&*staging, staging_bytes);
   log.state_ = ReplicationLogState::kActive;
   log.log_epoch_ = log_epoch;
@@ -223,6 +228,8 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.max_blocks_ =
       std::max<std::size_t>(1, capacity_bytes / kStorageBlockBytes);
   log.publish_queue_.clear();
+  log.standby_block_.emplace(std::move(*standby));
+  log.standby_refill_pending_ = false;
   log.publish_queue_bytes_ = 0;
   log.publisher_admitted_bytes_ = 0;
   log.publisher_admitted_items_ = 0;
@@ -1100,6 +1107,84 @@ Task<absl::Status> StorageEngine::Impl::ReclaimReplicationLogPrefix(
   co_return absl::OkStatus();
 }
 
+auto StorageEngine::Impl::AllocateReplicationLogBlock()
+    -> absl::StatusOr<WorkerStore::ReplicationLogBlock> {
+  const std::size_t sparse_bytes = AllocatorUsableSizeForRequest(
+      kMaximumSparseOffsetsPerBlock *
+      sizeof(WorkerStore::ReplicationSparseOffset));
+  const std::size_t block_bytes =
+      AllocatorUsableSizeForRequest(kStorageBlockBytes);
+  if (sparse_bytes == std::numeric_limits<std::size_t>::max() ||
+      block_bytes == std::numeric_limits<std::size_t>::max() ||
+      sparse_bytes > std::numeric_limits<std::size_t>::max() - block_bytes) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "maxmemory cannot allocate an in-memory replication backlog block");
+  }
+  auto reservation = TryReserveMemory(sparse_bytes + block_bytes);
+  if (!reservation.has_value()) {
+    RecordMemoryRejection();
+    return absl::ResourceExhaustedError(
+        "maxmemory cannot allocate an in-memory replication backlog block");
+  }
+
+  // One permit covers both retained allocations. Once admitted, physical
+  // allocator exhaustion follows the process-wide fail-fast policy rather
+  // than exposing a second maxmemory decision after half a block is live.
+  const RetainedAllocationDomain domain{.externally_admitted_ = true};
+  WorkerStore::ReplicationLogBlock block(domain);
+  block.sparse_offsets_.reserve(kMaximumSparseOffsetsPerBlock);
+  block.bytes_.reset(static_cast<std::byte*>(AllocateRetainedBytes(
+      domain, kStorageBlockBytes, alignof(std::max_align_t))));
+  reservation->Release();
+  return block;
+}
+
+void StorageEngine::Impl::EnsureReplicationLogStandby(WorkerStore& store) {
+  auto& log = store.replication_log_;
+  if (log.state_ != ReplicationLogState::kActive ||
+      log.standby_block_.has_value() || log.standby_refill_pending_) {
+    return;
+  }
+  if (shutdown_flush_requested_.load(std::memory_order_acquire)) return;
+  log.standby_refill_pending_ = true;
+  store.worker_->Spawn(RefillReplicationLogStandby(&store, log.log_epoch_));
+}
+
+Task<absl::Status> StorageEngine::Impl::RefillReplicationLogStandby(
+    WorkerStore* store, std::uint64_t log_epoch) {
+  auto& log = store->replication_log_;
+  co_await log.mutex_.Lock();
+  const bool should_allocate =
+      log.standby_refill_pending_ &&
+      log.state_ == ReplicationLogState::kActive &&
+      log.log_epoch_ == log_epoch && !log.standby_block_.has_value() &&
+      !shutdown_flush_requested_.load(std::memory_order_acquire);
+  log.mutex_.Unlock(*store->worker_);
+
+  absl::StatusOr<WorkerStore::ReplicationLogBlock> allocated{
+      absl::CancelledError("replication backlog standby is no longer needed")};
+  if (should_allocate) allocated = AllocateReplicationLogBlock();
+
+  co_await log.mutex_.Lock();
+  bool published = false;
+  if (allocated.ok() && log.standby_refill_pending_ &&
+      log.state_ == ReplicationLogState::kActive &&
+      log.log_epoch_ == log_epoch && !log.standby_block_.has_value() &&
+      !shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    log.standby_block_.emplace(std::move(*allocated));
+    published = true;
+  }
+  // Keep this true through allocation and stale-owner destruction. Disable
+  // and shutdown use it as a completion handshake before worker state dies.
+  if (!published && allocated.ok()) {
+    allocated = absl::CancelledError("replication standby became stale");
+  }
+  log.standby_refill_pending_ = false;
+  log.mutex_.Unlock(*store->worker_);
+  co_return absl::OkStatus();
+}
+
 Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     WorkerStore& store, std::uint64_t protected_lsn) {
   auto& log = store.replication_log_;
@@ -1198,36 +1283,15 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     evict_event();
   }
 
-  const std::size_t sparse_bytes = AllocatorUsableSizeForRequest(
-      kMaximumSparseOffsetsPerBlock *
-      sizeof(WorkerStore::ReplicationSparseOffset));
-  const std::size_t block_bytes =
-      AllocatorUsableSizeForRequest(kStorageBlockBytes);
-  if (sparse_bytes == std::numeric_limits<std::size_t>::max() ||
-      block_bytes == std::numeric_limits<std::size_t>::max() ||
-      sparse_bytes > std::numeric_limits<std::size_t>::max() - block_bytes) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "maxmemory cannot allocate an in-memory replication backlog block");
+  if (log.standby_block_.has_value()) {
+    log.blocks_.push_back(std::move(*log.standby_block_));
+    log.standby_block_.reset();
+  } else {
+    auto allocated = AllocateReplicationLogBlock();
+    if (!allocated.ok()) co_return allocated.status();
+    log.blocks_.push_back(std::move(*allocated));
   }
-  auto reservation = TryReserveMemory(sparse_bytes + block_bytes);
-  if (!reservation.has_value()) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "maxmemory cannot allocate an in-memory replication backlog block");
-  }
-
-  // Establish all block-lifetime sparse-index capacity under one permit. The
-  // allocation domain still records exact retained usable bytes, but skips a
-  // second maxmemory decision that could otherwise reject one half after the
-  // other half had already become live.
-  const RetainedAllocationDomain domain{.externally_admitted_ = true};
-  WorkerStore::ReplicationLogBlock block(domain);
-  block.sparse_offsets_.reserve(kMaximumSparseOffsetsPerBlock);
-  block.bytes_.reset(static_cast<std::byte*>(AllocateRetainedBytes(
-      domain, kStorageBlockBytes, alignof(std::max_align_t))));
-  log.blocks_.push_back(std::move(block));
-  reservation->Release();
+  EnsureReplicationLogStandby(store);
   co_return absl::OkStatus();
 }
 
@@ -1585,36 +1649,50 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   co_await log.mutex_.Lock();
-  UnlockGuard unlock(&log.mutex_, store.worker_);
-  if (log.state_ == ReplicationLogState::kDisabled) {
-    co_return absl::OkStatus();
+  if (log.state_ != ReplicationLogState::kDisabled) {
+    absl::Status reclaimed =
+        co_await ReclaimReplicationLogPrefix(store, 0, /*force_all=*/true);
+    if (!reclaimed.ok()) {
+      log.mutex_.Unlock(*store.worker_);
+      co_return reclaimed;
+    }
+    log.state_ = ReplicationLogState::kDisabled;
+    log.log_epoch_ = 0;
+    log.next_lsn_ = 1;
+    log.max_blocks_ = 0;
+    log.capacity_backpressured_ = false;
+    for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
+      auto& pending = log.publish_queue_[index];
+      if (pending.fence_ == nullptr) continue;
+      pending.fence_->status_ =
+          InvalidState("replication log disabled before publisher fence");
+      pending.fence_->complete_ = true;
+      pending.fence_->ready_.NotifyAll(*store.worker_);
+    }
+    log.publish_queue_.clear();
+    log.publish_queue_bytes_ = 0;
+    log.publisher_admitted_bytes_ = 0;
+    log.publisher_admitted_items_ = 0;
+    log.publisher_staging_charge_.Reset();
+    log.retained_lsn_by_session_.clear();
+    log.retention_advanced_.NotifyAll(*store.worker_);
+    log.publisher_capacity_ready_.NotifyAll(*store.worker_);
   }
-  absl::Status reclaimed =
-      co_await ReclaimReplicationLogPrefix(store, 0, /*force_all=*/true);
-  if (!reclaimed.ok()) {
-    co_return reclaimed;
+  log.standby_block_.reset();
+  log.mutex_.Unlock(*store.worker_);
+
+  // A refill may have dropped the log mutex while allocating. Let it observe
+  // the disabled epoch and destroy its stale owner before this API returns;
+  // callers may tear down the worker immediately afterward.
+  for (;;) {
+    co_await log.mutex_.Lock();
+    const bool pending = log.standby_refill_pending_;
+    log.mutex_.Unlock(*store.worker_);
+    if (!pending) break;
+    absl::Status waited = co_await celer::SleepFor(
+        *store.worker_, std::chrono::milliseconds(1));
+    if (!waited.ok()) co_return waited;
   }
-  log.state_ = ReplicationLogState::kDisabled;
-  log.log_epoch_ = 0;
-  log.next_lsn_ = 1;
-  log.max_blocks_ = 0;
-  log.capacity_backpressured_ = false;
-  for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
-    auto& pending = log.publish_queue_[index];
-    if (pending.fence_ == nullptr) continue;
-    pending.fence_->status_ =
-        InvalidState("replication log disabled before publisher fence");
-    pending.fence_->complete_ = true;
-    pending.fence_->ready_.NotifyAll(*store.worker_);
-  }
-  log.publish_queue_.clear();
-  log.publish_queue_bytes_ = 0;
-  log.publisher_admitted_bytes_ = 0;
-  log.publisher_admitted_items_ = 0;
-  log.publisher_staging_charge_.Reset();
-  log.retained_lsn_by_session_.clear();
-  log.retention_advanced_.NotifyAll(*store.worker_);
-  log.publisher_capacity_ready_.NotifyAll(*store.worker_);
   co_return absl::OkStatus();
 }
 

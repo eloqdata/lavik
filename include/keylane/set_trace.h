@@ -42,6 +42,7 @@ struct SetLatencyTrace {
   bool remote_ = false;
   bool replication_ = false;
   bool allocated_block_ = false;
+  bool standby_block_ = false;
 };
 
 }  // namespace keylane

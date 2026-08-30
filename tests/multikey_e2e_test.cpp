@@ -203,7 +203,8 @@ class ServerProcess {
                 std::string_view fail_tx_write = {},
                 std::string_view tx_active_pause_ms = {},
                 bool fail_tx_cleaner_once = false, unsigned threads = 4,
-                std::string_view order_hold_ms = {}) {
+                std::string_view order_hold_ms = {},
+                std::string_view standby_pause_ms = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -225,6 +226,10 @@ class ServerProcess {
       if (!order_hold_ms.empty()) {
         (void)::setenv("KEYLANE_REPLICATION_ORDER_HOLD_MS",
                        std::string(order_hold_ms).c_str(), 1);
+      }
+      if (!standby_pause_ms.empty()) {
+        (void)::setenv("KEYLANE_STANDBY_PREFETCH_PAUSE_MS",
+                       std::string(standby_pause_ms).c_str(), 1);
       }
       if (fail_tx_cleaner_once) {
         (void)::setenv("KEYLANE_FAIL_TX_CLEANER_ONCE", "1", 1);
@@ -370,6 +375,8 @@ int main(int argc, char** argv) {
       "/tmp/keylane-multikey-gate-source-" + suffix + ".data";
   const std::string gate_replica_data =
       "/tmp/keylane-multikey-gate-replica-" + suffix + ".data";
+  const std::string standby_data =
+      "/tmp/keylane-multikey-standby-" + suffix + ".data";
   const std::string gate_log_path =
       "/tmp/keylane-multikey-gate-" + suffix + ".log";
   (void)::unlink(data_path.c_str());
@@ -378,6 +385,7 @@ int main(int argc, char** argv) {
   (void)::unlink(replica_data.c_str());
   (void)::unlink(gate_source_data.c_str());
   (void)::unlink(gate_replica_data.c_str());
+  (void)::unlink(standby_data.c_str());
   (void)::unlink(gate_log_path.c_str());
 
   int exit_code = 0;
@@ -886,52 +894,103 @@ int main(int argc, char** argv) {
         ":0", "UNDO TTL survives recovery");
     rollback_recovered_server.Stop();
 
-    // The first transaction suspends after selecting the current generation's
-    // append stream and releasing store_state_mutex for block allocation. A
-    // completed peer write lets the cleaner rotate, then the next generation
-    // inserts into the same flat_hash_map while the first writer is suspended.
-    // The resumed writer must re-find the old generation rather than
-    // dereference storage invalidated by that insertion's rehash.
-    ServerProcess rehash_server(argv[1], port, data_path, log_path, {}, "3000");
-    RespClient rehash_control = Connect(port);
-    Expect(rehash_control.Command(
-               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
-           "+OK", "enable cleaner for active transaction map rehash");
-    std::this_thread::sleep_for(100ms);
-    const std::uint64_t rehash_round_baseline =
-        InfoStat(rehash_control, "tx_cleaner_rounds:");
-    auto paused_write = std::async(std::launch::async, [port] {
+#ifndef NDEBUG
+    // The first transaction holds the generation's allocation gate while the
+    // test hook suspends physical allocation. A same-worker peer in that
+    // generation must remain queued: completing early would mean rollover
+    // fanned out into a second allocation. Both writes must resume once the
+    // elected allocator publishes the shared stream.
+    ServerProcess allocation_server(argv[1], port, data_path, log_path, {},
+                                    "1000");
+    RespClient allocation_control = Connect(port);
+    auto elected_write = std::async(std::launch::async, [port] {
       RespClient client = Connect(port);
-      return client.Command({"MSET", "rehash-paused-a{tx-map}", "paused-a",
-                             "rehash-paused-b{tx-map}", "paused-b"});
+      return client.Command({"MSET", "allocation-leader-a{tx-stream}",
+                             "leader-a", "allocation-leader-b{tx-stream}",
+                             "leader-b"});
     });
-    std::this_thread::sleep_for(100ms);
-    Expect(rehash_control.Command(
-               {"MSET", "rehash-seed-a{tx-map}", "seed-a",
-                "rehash-seed-b{tx-map}", "seed-b"}),
-           "+OK", "seed generation while allocation is paused");
-    if (!WaitForCleanerStat(rehash_control, "tx_cleaner_rounds:",
-                            rehash_round_baseline)) {
-      Fail("cleaner did not rotate the paused transaction generation");
+    const auto allocation_marker_deadline =
+        std::chrono::steady_clock::now() + 30s;
+    bool allocation_marker_seen = false;
+    while (!allocation_marker_seen &&
+           std::chrono::steady_clock::now() < allocation_marker_deadline) {
+      allocation_marker_seen =
+          ReadFile(log_path).find("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS pausing") !=
+          std::string::npos;
+      if (!allocation_marker_seen) std::this_thread::sleep_for(20ms);
     }
-    Expect(rehash_control.Command(
-               {"MSET", "rehash-trigger-a{tx-map}", "trigger-a",
-                "rehash-trigger-b{tx-map}", "trigger-b"}),
-           "+OK", "insert a new active transaction generation");
-    if (paused_write.wait_for(5s) != std::future_status::ready) {
-      Fail("paused transaction did not resume after active map rehash");
+    if (!allocation_marker_seen) {
+      Fail("transaction append allocator pause did not engage");
     }
-    Expect(paused_write.get(), "+OK", "paused transaction after map rehash");
-    Expect(rehash_control.Command(
-               {"MGET", "rehash-paused-a{tx-map}",
-                "rehash-paused-b{tx-map}", "rehash-seed-a{tx-map}",
-                "rehash-seed-b{tx-map}", "rehash-trigger-a{tx-map}",
-                "rehash-trigger-b{tx-map}"}),
-           "*6\r\n" + Bulk("paused-a") + "\r\n" + Bulk("paused-b") +
-               "\r\n" + Bulk("seed-a") + "\r\n" + Bulk("seed-b") +
-               "\r\n" + Bulk("trigger-a") + "\r\n" + Bulk("trigger-b"),
-           "values after active transaction map rehash");
-    rehash_server.Stop();
+    auto waiting_write = std::async(std::launch::async, [port] {
+      RespClient client = Connect(port);
+      return client.Command({"MSET", "allocation-follower-a{tx-stream}",
+                             "follower-a", "allocation-follower-b{tx-stream}",
+                             "follower-b"});
+    });
+    if (waiting_write.wait_for(200ms) == std::future_status::ready) {
+      Fail("same-stream transaction bypassed the allocation gate");
+    }
+    if (elected_write.wait_for(5s) != std::future_status::ready ||
+        waiting_write.wait_for(5s) != std::future_status::ready) {
+      Fail("transaction allocation gate stranded a writer");
+    }
+    Expect(elected_write.get(), "+OK", "elected allocation writer");
+    Expect(waiting_write.get(), "+OK", "waiting allocation writer");
+    Expect(allocation_control.Command({"MGET", "allocation-leader-a{tx-stream}",
+                                       "allocation-leader-b{tx-stream}",
+                                       "allocation-follower-a{tx-stream}",
+                                       "allocation-follower-b{tx-stream}"}),
+           "*4\r\n" + Bulk("leader-a") + "\r\n" + Bulk("leader-b") + "\r\n" +
+               Bulk("follower-a") + "\r\n" + Bulk("follower-b"),
+           "values after transaction allocation single-flight");
+    allocation_server.Stop();
+
+    // Ordinary rollover shares its allocation gate with the prefetch task.
+    // Publishing the first active block requests its successor immediately;
+    // holding that task proves a writer cannot bypass it and allocate a
+    // duplicate. Installing the successor requests another standby, so
+    // graceful shutdown also exercises returning an unused reservation.
+    // The suite's shared fixture can be physically full by this point. A
+    // fresh device makes readiness mean "the writer bypassed the gate"
+    // instead of also allowing an immediate out-of-space reply.
+    CreateDataFile(standby_data, 128ULL * 1024 * 1024);
+    ServerProcess standby_server(argv[1], port, standby_data, log_path, {}, {},
+                                 false, 4, {}, "1000");
+    RespClient standby_control = Connect(port);
+    const std::string standby_payload(7 * 1024 * 1024, 's');
+    Expect(standby_control.Command(
+               {"SET", "standby-leader{standby}", standby_payload}),
+           "+OK", "create ordinary stream and request its standby");
+    const auto standby_marker_deadline = std::chrono::steady_clock::now() + 30s;
+    bool standby_marker_seen = false;
+    while (!standby_marker_seen &&
+           std::chrono::steady_clock::now() < standby_marker_deadline) {
+      standby_marker_seen =
+          ReadFile(log_path).find(
+              "KEYLANE_STANDBY_PREFETCH_PAUSE_MS pausing") != std::string::npos;
+      if (!standby_marker_seen) std::this_thread::sleep_for(20ms);
+    }
+    if (!standby_marker_seen) Fail("standby prefetch pause did not engage");
+    auto standby_waiter =
+        std::async(std::launch::async, [port, &standby_payload] {
+          RespClient client = Connect(port);
+          return client.Command(
+              {"SET", "standby-follower{standby}", standby_payload});
+        });
+    if (standby_waiter.wait_for(200ms) == std::future_status::ready) {
+      Fail("ordinary rollover bypassed an in-flight standby prefetch");
+    }
+    if (standby_waiter.wait_for(5s) != std::future_status::ready) {
+      Fail("standby prefetch stranded an ordinary rollover");
+    }
+    Expect(standby_waiter.get(), "+OK", "ordinary standby rollover");
+    Expect(standby_control.Command({"STRLEN", "standby-leader{standby}"}),
+           ":7340032", "standby leader value length");
+    Expect(standby_control.Command({"STRLEN", "standby-follower{standby}"}),
+           ":7340032", "standby follower value length");
+    standby_server.Stop();
+#endif
 
     // A retryable cleaner failure is observable but must not terminate the
     // periodic flush coroutine or report a shutdown drain as complete. The
@@ -1287,6 +1346,7 @@ int main(int argc, char** argv) {
   (void)::unlink(replica_data.c_str());
   (void)::unlink(gate_source_data.c_str());
   (void)::unlink(gate_replica_data.c_str());
+  (void)::unlink(standby_data.c_str());
   (void)::unlink(gate_log_path.c_str());
   std::cout << (exit_code == 0 ? "multikey e2e passed\n" : "") << std::flush;
   return exit_code;

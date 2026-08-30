@@ -1469,10 +1469,48 @@ Task<absl::Status> StorageEngine::Impl::FlushWorkerForShutdown(
     }
   }
 
+  // Replication's in-memory backlog owns a separately replenished standby.
+  // Shutdown prevents new refills, then joins an in-flight allocation before
+  // releasing the unused 8 MiB owner.
+  for (;;) {
+    co_await store->replication_log_.mutex_.Lock();
+    const bool pending = store->replication_log_.standby_refill_pending_;
+    store->replication_log_.mutex_.Unlock(*store->worker_);
+    if (!pending) break;
+    absl::Status status =
+        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    if (!status.ok()) co_return status;
+  }
+  co_await store->replication_log_.mutex_.Lock();
+  store->replication_log_.standby_block_.reset();
+  store->replication_log_.mutex_.Unlock(*store->worker_);
+
+  // A prefetch task may be off-worker in the device allocator. Its pending bit
+  // remains set until any stale reservation has been returned, so WorkerStore
+  // and the allocator cannot be torn down under that detached coroutine.
+  while (true) {
+    co_await store->store_state_mutex_.Lock();
+    const bool prefetch_pending = store->standby_prefetch_pending_;
+    store->store_state_mutex_.Unlock(*store->worker_);
+    if (!prefetch_pending) break;
+    absl::Status status =
+        co_await celer::SleepFor(*store->worker_, std::chrono::milliseconds(1));
+    if (!status.ok()) co_return status;
+  }
+
+  co_await store->active_block_allocation_mutex_.Lock();
+  UnlockGuard allocation_guard(&store->active_block_allocation_mutex_,
+                               store->worker_);
+  std::optional<ReservedBlock> standby;
   co_await store->store_state_mutex_.Lock();
   {
     UnlockGuard guard(&store->store_state_mutex_, store->worker_);
+    standby = std::exchange(store->standby_block_, std::nullopt);
     SealActiveBlocks(*store);
+  }
+  if (standby.has_value()) {
+    absl::Status returned = co_await ReturnReservedBlock(*standby);
+    if (!returned.ok()) co_return returned;
   }
 
   while (true) {

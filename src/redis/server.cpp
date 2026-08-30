@@ -327,6 +327,7 @@ struct SetLatencyStats {
   std::uint64_t remote_ = 0;
   std::uint64_t replication_ = 0;
   std::uint64_t allocated_blocks_ = 0;
+  std::uint64_t standby_blocks_ = 0;
   std::uint64_t next_report_ns_ = 0;
   LatencyDistribution total_;
   LatencyDistribution non_network_;
@@ -351,6 +352,7 @@ void RecordSetLatency(const SetLatencyTrace& trace) {
   stats.remote_ += trace.remote_;
   stats.replication_ += trace.replication_;
   stats.allocated_blocks_ += trace.allocated_block_;
+  stats.standby_blocks_ += trace.standby_block_;
   stats.total_.Add(Elapsed(trace.send_complete_ns_, trace.request_start_ns_));
   stats.non_network_.Add(
       Elapsed(trace.send_start_ns_, trace.request_start_ns_));
@@ -388,7 +390,8 @@ void RecordSetLatency(const SetLatencyTrace& trace) {
   };
   spdlog::info(
       "set-latency worker={} n={} remote={:.1f}% replication={:.1f}% "
-      "block-alloc={:.3f}% avg-us total={:.1f} non-network={:.1f} "
+      "block-alloc={:.3f}% standby-hit={:.3f}% avg-us total={:.1f} "
+      "non-network={:.1f} "
       "route-out={:.1f} owner={:.1f} key-lock={:.1f} store-lock={:.1f} "
       "lookup={:.1f} append={:.1f} block={:.1f} encode={:.1f} index={:.1f} "
       "repl-publish={:.1f} route-back={:.1f} send={:.1f}",
@@ -396,6 +399,7 @@ void RecordSetLatency(const SetLatencyTrace& trace) {
       100.0 * static_cast<double>(stats.remote_) / stats.count_,
       100.0 * static_cast<double>(stats.replication_) / stats.count_,
       100.0 * static_cast<double>(stats.allocated_blocks_) / stats.count_,
+      100.0 * static_cast<double>(stats.standby_blocks_) / stats.count_,
       avg(stats.total_), avg(stats.non_network_), avg(stats.route_out_),
       avg(stats.owner_), avg(stats.key_lock_), avg(stats.store_lock_),
       avg(stats.lookup_), avg(stats.append_), avg(stats.block_),

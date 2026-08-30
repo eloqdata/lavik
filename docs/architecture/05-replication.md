@@ -176,10 +176,17 @@ wall-clock limit.
 Each source worker has one heap-backed backlog shared by all downstream native
 sessions and the Redis exporter. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
-8 MiB blocks; allocation is lazy. Per-worker LSNs start at one for a new
-history and increase monotonically. The log remains active across downstream
-disconnects and is cleared only when disabled, the process exits, or the
-history is invalidated.
+8 MiB blocks. Enabling a worker log admits one additional prepared standby
+block, including its 8 MiB payload and maximum sparse frame index; published
+history remains lazy and is the only part counted against `repl-backlog-size`.
+A rollover consumes the standby without allocating on its append path and
+schedules its replacement immediately. The replacement still uses the same
+all-or-nothing retained-memory permit and maxmemory admission as a published
+block. Disable and shutdown join any in-flight refill and release the unused
+block. Per-worker
+LSNs start at one for a new history and increase monotonically. The log remains
+active across downstream disconnects and is cleared only when disabled, the
+process exits, or the history is invalidated.
 
 A connected native downstream pins its first unacknowledged LSN. The publisher
 must wait rather than evict required history. At capacity it sleeps until ACKs

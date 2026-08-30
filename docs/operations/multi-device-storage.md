@@ -129,7 +129,10 @@ then set and persist the allocation bit before publishing the ID as ready.
 
 ## Worker write affinity
 
-Each worker has at most one active block plus one prefetched standby ID.
+Each worker has one ordinary active append block and may have one transaction
+append block for each live transaction generation. The ordinary stream retains
+at most one prefetched standby ID; transaction streams allocate per generation
+on demand and do not reserve standby capacity.
 
 - Every device protects its last eight allocatable blocks for defrag. Device
   weight is its remaining foreground data-block count after that reserve.
@@ -140,11 +143,20 @@ Each worker has at most one active block plus one prefetched standby ID.
   lowest allocated-blocks/weight ratio.
 - Allocation falls back to other devices when the preferred device is full.
 
-The standby request starts when an active block reaches 75% occupancy. This
-keeps the usual rollover off the latency-critical path without reserving an
-8 MiB memory buffer per standby or per device. Weighting is computed at startup
-and allocation counters are worker-local; the hot path does not read a shared
-global free-space counter.
+The standby request starts immediately after an ordinary active block is
+installed, and starts again after rollover consumes that standby. Appends do
+not calculate an occupancy threshold. The request uses the same stateful
+allocation gate as rollover: if rollover catches the prefetch, it waits for the
+task and then consumes the published ID, without relying on an edge-triggered
+notification. An unused reservation is returned after failure or during
+shutdown. No 8 MiB staging buffer is attached until the ID becomes active.
+
+If no standby is available, rollover allocates inline from the chosen device's
+ready pool. When that pool falls within 32 blocks of the defrag reserve, the
+device owner starts a background 256-block refill. This normally keeps bitmap
+persistence out of the inline allocation path. Weighting is computed at
+startup and allocation counters are worker-local; the hot path does not read a
+shared global free-space counter.
 
 Defrag scheduling is also per device. A device has its own ready queue and a
 runtime-configurable active-job limit, capped at eight to match its eight-block

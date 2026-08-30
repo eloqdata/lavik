@@ -908,9 +908,10 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
     store.store_state_mutex_.Unlock(*store.worker_);
   }
 #ifndef NDEBUG
-  // Deterministically expose the active_tx_blocks_ rehash window: another
-  // transaction generation may install its append stream while this writer
-  // owns no store-state lock. Only the first foreground allocation pauses.
+  // Deterministically hold the elected foreground allocator after it releases
+  // store_state_mutex_. Tests use this to prove that a peer for the same
+  // stream waits on the allocation gate instead of allocating a spare block.
+  // Only the first foreground allocation pauses.
   static std::atomic<bool> tx_active_pause_claimed = false;
   const char* tx_active_pause_text =
       std::getenv("KEYLANE_TX_ACTIVE_BLOCK_PAUSE_MS");
@@ -954,7 +955,13 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AcquireWriteBlock(
   if (allocated.ok() && store.write_failed_) {
     // The writer fail-stopped while the allocation waited; report that
     // instead of appending into a stream that will never flush.
-    co_await ReturnReservedBlock(*allocated);
+    if (unlock_writer) {
+      store.store_state_mutex_.Unlock(*store.worker_);
+    }
+    (void)co_await ReturnReservedBlock(*allocated);
+    if (unlock_writer) {
+      co_await store.store_state_mutex_.Lock();
+    }
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
                            "storage writer is stopped after an IO failure");
   }
@@ -977,6 +984,104 @@ Task<absl::Status> StorageEngine::Impl::ReturnReservedBlock(
         allocator.ready_blocks_.push_back(block.block_id_);
         co_return absl::OkStatus();
       });
+}
+
+void StorageEngine::Impl::EnsureStandbyBlock(WorkerStore& store) {
+  if (!store.active_block_.has_value() || store.standby_block_.has_value() ||
+      store.standby_prefetch_pending_ ||
+      store.standby_prefetch_for_block_ == store.active_block_->block_id_ ||
+      store.write_failed_ ||
+      shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    return;
+  }
+  const std::uint64_t source_block_id = store.active_block_->block_id_;
+  const std::uint64_t source_epoch = store.active_block_->allocation_epoch_;
+  store.standby_prefetch_for_block_ = source_block_id;
+  store.standby_prefetch_pending_ = true;
+  store.worker_->Spawn(
+      PrefetchStandbyBlock(&store, source_block_id, source_epoch));
+}
+
+Task<absl::Status> StorageEngine::Impl::PrefetchStandbyBlock(
+    WorkerStore* store, std::uint64_t source_block_id,
+    std::uint64_t source_epoch) {
+  // The same stateful gate used by rollover is the completion handshake: a
+  // writer that reaches the end of the active block waits behind this task,
+  // then observes either the published standby or a normal inline retry.
+  // There is no edge-triggered notification that can fire before it waits.
+  co_await store->active_block_allocation_mutex_.Lock();
+  UnlockGuard allocation_unlock(&store->active_block_allocation_mutex_,
+                                store->worker_);
+
+  co_await store->store_state_mutex_.Lock();
+  const bool should_allocate =
+      store->standby_prefetch_pending_ &&
+      store->standby_prefetch_for_block_ == source_block_id &&
+      !store->standby_block_.has_value() && store->active_block_.has_value() &&
+      store->active_block_->block_id_ == source_block_id &&
+      store->active_block_->allocation_epoch_ == source_epoch &&
+      !store->write_failed_ &&
+      !shutdown_flush_requested_.load(std::memory_order_acquire);
+  store->store_state_mutex_.Unlock(*store->worker_);
+
+  absl::StatusOr<ReservedBlock> allocated{
+      absl::CancelledError("standby prefetch is no longer needed")};
+  if (should_allocate) {
+    absl::Status pause_status = absl::OkStatus();
+#ifndef NDEBUG
+    static std::atomic<bool> standby_pause_claimed = false;
+    const char* standby_pause_text =
+        std::getenv("KEYLANE_STANDBY_PREFETCH_PAUSE_MS");
+    bool expected_standby_pause = false;
+    if (standby_pause_text != nullptr &&
+        standby_pause_claimed.compare_exchange_strong(
+            expected_standby_pause, true, std::memory_order_acq_rel)) {
+      char* end = nullptr;
+      const unsigned long pause_ms = std::strtoul(standby_pause_text, &end, 10);
+      if (end != standby_pause_text && *end == '\0' && pause_ms != 0) {
+        spdlog::warn(
+            "KEYLANE_STANDBY_PREFETCH_PAUSE_MS pausing standby prefetch "
+            "for {} ms",
+            pause_ms);
+        pause_status = co_await celer::SleepFor(
+            *store->worker_, std::chrono::milliseconds(pause_ms));
+      }
+    }
+#endif
+    if (pause_status.ok()) {
+      allocated =
+          co_await AllocateBlock(*store, AllocationPurpose::kForeground);
+    } else {
+      allocated = pause_status;
+    }
+  }
+
+  co_await store->store_state_mutex_.Lock();
+  const bool publish =
+      allocated.ok() && store->standby_prefetch_pending_ &&
+      store->standby_prefetch_for_block_ == source_block_id &&
+      !store->standby_block_.has_value() && store->active_block_.has_value() &&
+      store->active_block_->block_id_ == source_block_id &&
+      store->active_block_->allocation_epoch_ == source_epoch &&
+      !store->write_failed_ &&
+      !shutdown_flush_requested_.load(std::memory_order_acquire);
+  if (publish) {
+    store->standby_block_ = *allocated;
+    store->standby_prefetch_pending_ = false;
+    store->store_state_mutex_.Unlock(*store->worker_);
+    co_return absl::OkStatus();
+  }
+  store->store_state_mutex_.Unlock(*store->worker_);
+
+  // Keep pending true until a stale reservation is back in the device pool.
+  // Shutdown polls this bit before destroying WorkerStore and allocator state.
+  if (allocated.ok()) {
+    (void)co_await ReturnReservedBlock(*allocated);
+  }
+  co_await store->store_state_mutex_.Lock();
+  store->standby_prefetch_pending_ = false;
+  store->store_state_mutex_.Unlock(*store->worker_);
+  co_return absl::OkStatus();
 }
 
 Task<absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>>
@@ -1868,26 +1973,75 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     return transaction_append ? store.active_tx_blocks_[tx_generation]
                               : store.active_block_;
   };
+  AsyncMutex* allocation_mutex = &store.active_block_allocation_mutex_;
+  if (transaction_append) {
+    auto& gate = store.active_tx_block_allocation_mutexes_[tx_generation];
+    if (gate == nullptr) gate = std::make_unique<AsyncMutex>();
+    allocation_mutex = gate.get();
+  }
+  // Return paths normally run on the allocator owner. Never make unrelated
+  // appends wait on that cross-core hop: the per-stream allocation gate keeps
+  // other allocators out while store_state_mutex_ is released, and every
+  // caller revalidates the active stream after this helper resumes.
+  auto return_reserved = [&](ReservedBlock block) -> Task<absl::Status> {
+    if (unlock_writer_while_waiting) {
+      store.store_state_mutex_.Unlock(*store.worker_);
+    }
+    absl::Status returned = co_await ReturnReservedBlock(block);
+    if (unlock_writer_while_waiting) {
+      co_await store.store_state_mutex_.Lock();
+    }
+    co_return returned;
+  };
 acquire_active_stream:
   if (trace != nullptr) trace->block_wait_start_ns_ = SetTraceNowNanos();
   while (!active_stream().has_value() ||
          active_stream()->committed_bytes_ + total_disk_bytes >
              kStorageBlockBytes) {
-    if (trace != nullptr) trace->allocated_block_ = true;
+    // Waiting for a physical block must not hold store_state_mutex_: the
+    // allocator, flush completion, and the elected writer may all need this
+    // worker's state before the new stream can be published. The gate is per
+    // append stream, so unrelated transaction generations remain concurrent.
+    std::optional<UnlockGuard> allocation_unlock;
+    if (unlock_writer_while_waiting) {
+      store.store_state_mutex_.Unlock(*store.worker_);
+      co_await allocation_mutex->Lock();
+      allocation_unlock.emplace(allocation_mutex, store.worker_);
+      co_await store.store_state_mutex_.Lock();
+
+      // The elected allocator may have installed a stream before this waiter
+      // reached the front. Reuse it instead of allocating a spare block.
+      if (active_stream().has_value() &&
+          active_stream()->committed_bytes_ + total_disk_bytes <=
+              kStorageBlockBytes) {
+        continue;
+      }
+    }
     if (active_stream().has_value()) {
       RequestFlush(store, active_stream()->block_id_);
       active_stream().reset();
     }
-    auto allocated = co_await AcquireWriteBlock(store, for_defrag,
-                                                unlock_writer_while_waiting);
+    absl::StatusOr<ReservedBlock> allocated{
+        absl::UnavailableError("no standby block is available")};
+    if (!transaction_append && store.standby_block_.has_value()) {
+      allocated = *store.standby_block_;
+      store.standby_block_.reset();
+      if (trace != nullptr) trace->standby_block_ = true;
+    } else {
+      if (trace != nullptr) trace->allocated_block_ = true;
+      allocated = co_await AcquireWriteBlock(store, for_defrag,
+                                             unlock_writer_while_waiting);
+    }
     if (!allocated.ok()) {
       co_return allocated.status();
     }
     // Another writer may have installed an active block while this coroutine
-    // had store_state_mutex released. Keep that one and hand the spare back to
-    // the pool instead of overwriting it; the loop re-checks the fit.
+    // had store_state_mutex released. This is now limited to maintenance paths
+    // that deliberately retain store_state_mutex across an atomic rewrite;
+    // ordinary writers for this stream are held behind allocation_mutex.
     if (active_stream().has_value()) {
-      co_await ReturnReservedBlock(*allocated);
+      absl::Status returned = co_await return_reserved(*allocated);
+      if (!returned.ok()) co_return returned;
       continue;
     }
     {
@@ -1899,7 +2053,8 @@ acquire_active_stream:
           // across an atomic rewrite cannot wait for a flush that needs the
           // same lock. Their concurrency is separately bounded.
           if (!store.buffers_.TryAcquireHeapWriteBuffer(&heap_buffer)) {
-            co_await ReturnReservedBlock(*allocated);
+            absl::Status returned = co_await return_reserved(*allocated);
+            if (!returned.ok()) co_return returned;
             co_return absl::Status(absl::StatusCode::kResourceExhausted,
                                    "no storage write buffer is available");
           }
@@ -1915,7 +2070,8 @@ acquire_active_stream:
           // return both resources and let the outer loop append to it.
           if (active_stream().has_value()) {
             store.buffers_.ReleaseWriteBuffer(write_buffer_id);
-            co_await ReturnReservedBlock(*allocated);
+            absl::Status returned = co_await return_reserved(*allocated);
+            if (!returned.ok()) co_return returned;
             continue;
           }
         }
@@ -1932,7 +2088,8 @@ acquire_active_stream:
         } else {
           store.buffers_.ReleaseHeapWriteBuffer(heap_buffer);
         }
-        co_await ReturnReservedBlock(*allocated);
+        absl::Status returned = co_await return_reserved(*allocated);
+        if (!returned.ok()) co_return returned;
         co_return absl::Status(absl::StatusCode::kInternal,
                                "active write staging allocation is invalid");
       }
@@ -1952,6 +2109,9 @@ acquire_active_stream:
           .kind_ = append_block_kind,
           .tx_generation_ = tx_generation,
       };
+      if (!transaction_append) {
+        store.standby_prefetch_for_block_.reset();
+      }
       BlockState& state =
           CreateBlockState(store, block_id, active_stream()->allocation_epoch_);
       state.writer_id_ = writer_id;
@@ -1983,6 +2143,13 @@ acquire_active_stream:
       // The header region stays zero in staging until a flush encodes it
       // into the slot it is about to write. Encoding it here, or on every
       // append, would race the flush that is reading the same page.
+      if (!transaction_append) {
+        // Replenish immediately after installation. All later records use the
+        // active block without testing an occupancy threshold; rollover either
+        // consumes this successor or waits behind its stateful allocation
+        // gate.
+        EnsureStandbyBlock(store);
+      }
     }
   }
   if (trace != nullptr) trace->block_ready_ns_ = SetTraceNowNanos();

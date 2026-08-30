@@ -359,6 +359,9 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
       DestroyBlockState(store, block_id);
     }
     store.active_tx_blocks_.erase(generation);
+    // Retirement requires active_transactions_ == 0, so no writer can still
+    // be queued on or own this generation's allocation gate.
+    store.active_tx_block_allocation_mutexes_.erase(generation);
   }
   if (released.empty()) co_return absl::OkStatus();
   const std::size_t released_count = released.size();

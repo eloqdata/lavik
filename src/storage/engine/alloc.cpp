@@ -660,10 +660,14 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
   }
 #endif
   while (true) {
+    if (purpose == AllocationPurpose::kForeground &&
+        shutdown_flush_requested_.load(std::memory_order_acquire)) {
+      co_return absl::UnavailableError("storage is shutting down");
+    }
     if (store.write_failed_ ||
         epoch_metadata_failed_.load(std::memory_order_acquire)) {
-      co_return absl::Status(absl::StatusCode::kFailedPrecondition,
-                             "storage writer is stopped after an IO failure");
+      co_return absl::FailedPreconditionError(
+          "storage writer is stopped after an IO failure");
     }
     const std::uint64_t generation_before =
         space_reclaim_generation_.load(std::memory_order_acquire);

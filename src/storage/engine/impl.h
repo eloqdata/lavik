@@ -1607,6 +1607,13 @@ class StorageEngine::Impl {
       std::uint64_t next_lsn_ = 1;
       std::size_t max_blocks_ = 0;
       std::deque<ReplicationLogBlock> blocks_;
+      // The history quota counts published blocks only. This fully prepared
+      // successor is admitted and accounted normally, but stays outside
+      // blocks_ until rollover consumes it. Reserving both the 8 MiB payload
+      // and maximum sparse index here preserves the all-or-nothing retained-
+      // memory boundary while keeping both allocations off the append path.
+      std::optional<ReplicationLogBlock> standby_block_;
+      bool standby_refill_pending_ = false;
       bool capacity_backpressured_ = false;
       std::uint64_t capacity_waits_ = 0;
       // The fixed staging charge covers both payloads and retained ring
@@ -1841,10 +1848,28 @@ class StorageEngine::Impl {
     std::array<std::size_t, kLogicalDatabaseCount> live_key_count_{};
     ReplicationLogRuntime replication_log_;
     std::optional<ActiveBlock> active_block_;
+    // The ordinary stream prefetches only an ID; its 8 MiB staging buffer is
+    // still acquired at rollover. The pending bit covers the complete task,
+    // including returning a stale reservation, so shutdown can wait for the
+    // detached coroutine before worker state is destroyed.
+    std::optional<ReservedBlock> standby_block_;
+    std::optional<std::uint64_t> standby_prefetch_for_block_;
+    bool standby_prefetch_pending_ = false;
+    // A missing ordinary append stream has exactly one allocator. Followers
+    // drop store_state_mutex_ before waiting here, then revalidate the stream
+    // after taking both locks. This prevents one rollover from fanning out
+    // into many physical allocations without serializing ordinary appends.
+    AsyncMutex active_block_allocation_mutex_;
     // Usually current and draining generations only. An old transaction may
     // finish after rotation, so append streams are keyed by generation.
     absl::flat_hash_map<std::uint64_t, std::optional<ActiveBlock>>
         active_tx_blocks_;
+    // Transaction generations can allocate independently, but writers within
+    // one generation single-flight rollover. The mutex objects are indirect
+    // so active_tx_blocks_ rehash cannot invalidate a suspended waiter's gate;
+    // retirement erases a gate only after that generation has no live lease.
+    absl::flat_hash_map<std::uint64_t, std::unique_ptr<AsyncMutex>>
+        active_tx_block_allocation_mutexes_;
     // Owner-local MPSC is unnecessary: commands and the drain coroutine both
     // run on this worker. Keeping receipts here replaces one detached
     // coroutine frame per transaction with one bounded-size batch runner.
@@ -2451,6 +2476,11 @@ class StorageEngine::Impl {
 
   Task<absl::Status> EnsureReplicationLogActiveBlock(
       WorkerStore& store, std::uint64_t protected_lsn);
+  absl::StatusOr<WorkerStore::ReplicationLogBlock>
+  AllocateReplicationLogBlock();
+  void EnsureReplicationLogStandby(WorkerStore& store);
+  Task<absl::Status> RefillReplicationLogStandby(WorkerStore* store,
+                                                 std::uint64_t log_epoch);
   Task<absl::Status> SealReplicationLogActiveBlock(WorkerStore& store);
   Task<absl::Status> ReclaimReplicationLogPrefix(WorkerStore& store,
                                                  std::uint64_t keep_from_lsn,
@@ -2957,6 +2987,14 @@ class StorageEngine::Impl {
                                                         bool unlock_writer);
 
   Task<absl::Status> ReturnReservedBlock(ReservedBlock block);
+
+  // Called once after publishing each ordinary active block. It maintains one
+  // reserved successor without adding an occupancy check to every append.
+  void EnsureStandbyBlock(WorkerStore& store);
+
+  Task<absl::Status> PrefetchStandbyBlock(WorkerStore* store,
+                                          std::uint64_t source_block_id,
+                                          std::uint64_t source_epoch);
 
   struct ExplicitWriteRoot {
     RecordIndex* index_ = nullptr;
