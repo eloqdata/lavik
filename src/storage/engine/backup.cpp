@@ -11,6 +11,22 @@ std::string SnapshotMapKey(std::uint8_t db_id, std::string_view key) {
   return result;
 }
 
+template <typename Map>
+std::optional<MemoryReservation> ReserveSnapshotMapInsert(
+    Map& map, const Digest& digest, std::string_view key) noexcept {
+  if (!map.CanAllocateEntry(key, /*key_complete=*/true,
+                            /*has_extra=*/false)) {
+    return std::nullopt;
+  }
+  const std::size_t required = map.RequiredAllocationBytes(
+      digest, key, /*key_complete=*/true, /*has_extra=*/false,
+      /*inserting=*/true);
+  if (required == std::numeric_limits<std::size_t>::max()) {
+    return std::nullopt;
+  }
+  return TryReserveMemory(required);
+}
+
 }  // namespace
 
 absl::Status StorageEngine::Impl::BeginRdbSnapshot(
@@ -27,14 +43,23 @@ absl::Status StorageEngine::Impl::BeginRdbSnapshot(
       .id_ = session_id,
       .snapshot_time_ms_ = snapshot_time_ms,
   });
+  // Dirty keys from every partition share one worker-local arena. Its
+  // allocation domain relies on the explicit per-insert reservation below;
+  // a successful reservation makes all subsequent physical growth a
+  // fail-fast allocator boundary rather than an exception-based admission
+  // decision.
+  auto dirty_key_arena = std::make_shared<ScanHashMapEntryArena>(
+      ScanHashMapEntryArena::kMaximumPageId,
+      /*externally_admitted=*/true);
   for (auto& partition : store.partitions_) {
-    partition.rdb_snapshot_.emplace(
+    auto& capture = partition.rdb_snapshot_.emplace(
         WorkerStore::PartitionStore::RdbSnapshotCapture{
             .session_id_ = session_id,
             .cut_sequence_ = partition.mutation_sequence_,
             .snapshot_time_ms_ = snapshot_time_ms,
             .dirty_keys_ = {},
         });
+    capture.dirty_keys_.SetEntryArena(dirty_key_arena);
   }
   return absl::OkStatus();
 }
@@ -203,12 +228,26 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
         current->value_.mutation_sequence_ > capture->cut_sequence_ ||
         IsExpired(*current, capture->snapshot_time_ms_)) {
-      capture->dirty_keys_.InsertNew(map_digest, map_key,
-                                     SnapshotValue{
-                                         .location_ = {},
-                                         .extents_ = nullptr,
-                                         .phase_ = Phase::kAbsent,
-                                     });
+      auto reservation =
+          ReserveSnapshotMapInsert(capture->dirty_keys_, map_digest, map_key);
+      if (!reservation.has_value()) {
+        // The write has already entered snapshot capture and must remain
+        // available to make progress near maxmemory. Losing the ABSENT marker
+        // makes this cut unusable, so invalidate only the RDB session and let
+        // the foreground mutation continue.
+        RecordMemoryRejection();
+        if (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id) {
+          store.rdb_snapshot_->invalidated_ = true;
+        }
+      } else {
+        capture->dirty_keys_.InsertNew(map_digest, map_key,
+                                       SnapshotValue{
+                                           .location_ = {},
+                                           .extents_ = nullptr,
+                                           .phase_ = Phase::kAbsent,
+                                       });
+        reservation->Release();
+      }
       --capture->capture_admissions_;
       co_return absl::OkStatus();
     }
@@ -283,7 +322,23 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
     current = *resolved;
     if (current != nullptr &&
         MaterializeIndexLocation(*current).SamePhysicalRecord(old.location_)) {
-      capture->dirty_keys_.InsertNew(map_digest, map_key, old);
+      auto reservation =
+          ReserveSnapshotMapInsert(capture->dirty_keys_, map_digest, map_key);
+      if (!reservation.has_value()) {
+        // No map entry took ownership of the pin. Release it before settling
+        // capture_admissions_; EndRdbSnapshot waits on that count before it
+        // can destroy the partition capture.
+        RecordMemoryRejection();
+        if (store.rdb_snapshot_ && store.rdb_snapshot_->id_ == session_id) {
+          store.rdb_snapshot_->invalidated_ = true;
+        }
+        store.store_state_mutex_.Unlock(*store.worker_);
+        (void)co_await ReleaseRdbSnapshotValue(&old);
+        co_await store.store_state_mutex_.Lock();
+      } else {
+        capture->dirty_keys_.InsertNew(map_digest, map_key, old);
+        reservation->Release();
+      }
       assert(capture->capture_admissions_ != 0);
       --capture->capture_admissions_;
       co_return absl::OkStatus();
@@ -337,12 +392,21 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
       RecordIndex::Entry* current = *resolved;
       if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
           IsExpired(*current, capture->snapshot_time_ms_)) {
+        auto reservation =
+            ReserveSnapshotMapInsert(capture->dirty_keys_, map_digest, map_key);
+        if (!reservation.has_value()) {
+          RecordMemoryRejection();
+          store.rdb_snapshot_->invalidated_ = true;
+          co_return absl::ResourceExhaustedError(
+              "RDB snapshot dirty-key allocation failed");
+        }
         capture->dirty_keys_.InsertNew(map_digest, map_key,
                                        SavedValue{
                                            .location_ = {},
                                            .extents_ = nullptr,
                                            .phase_ = Phase::kDone,
                                        });
+        reservation->Release();
         co_return std::optional<RdbSnapshotValue>{};
       }
       if (current->value_.mutation_sequence_ > capture->cut_sequence_) {
@@ -355,7 +419,16 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
           .extents_ = ExtentsFor(store, current),
           .phase_ = Phase::kInflight,
       };
+      auto reservation =
+          ReserveSnapshotMapInsert(capture->dirty_keys_, map_digest, map_key);
+      if (!reservation.has_value()) {
+        RecordMemoryRejection();
+        store.rdb_snapshot_->invalidated_ = true;
+        co_return absl::ResourceExhaustedError(
+            "RDB snapshot dirty-key allocation failed");
+      }
       saved = capture->dirty_keys_.InsertNew(map_digest, map_key, candidate);
+      reservation->Release();
       absl::Status pinned = co_await PinRdbSnapshotValue(&saved->value_);
       if (!pinned.ok()) {
         capture->dirty_keys_.Erase(saved);

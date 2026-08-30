@@ -138,12 +138,24 @@ it and converts that reservation into the lifetime charge; participant-worker
 publisher budgets do not substitute for owner admission. Admission owns a
 distinct future slot for every destination. Physical ring growth is completed
 before mutation from the fixed staging budget, and the post-mutation enqueue
-is therefore allocation-free on the normal path. A physical allocation
-failure at a publication boundary becomes
-Redis OOM before mutation or invalidates the affected history/full-sync attempt
-after mutation; it never escapes the publisher coroutine. Backlog blocks and
-their sparse frame indexes use the same explicit retained allocator and return
-their actual mimalloc usable size when evicted.
+is therefore allocation-free on the normal path. A maxmemory rejection before
+mutation becomes Redis OOM; one discovered after mutation invalidates the
+affected history or full-sync attempt. Once an explicit permit has covered a
+retained allocation, unexpected physical allocator exhaustion is process-fatal
+rather than translated into a second admission result. Backlog blocks reserve
+their 8 MiB payload and maximum block-lifetime sparse frame index as one unit,
+then materialize both through an externally admitted retained domain. That
+domain still records exact usable bytes but cannot perform a second maxmemory
+decision after half the block is live. Sparse offset publication therefore
+cannot discover a later maxmemory rejection. Both allocations return their
+actual mimalloc usable size when the block is evicted.
+
+Replication-log fences consume the same conservative per-item metadata bytes
+as command markers while queued, even though they have no command payload.
+They wait for publisher waterline capacity, cannot steal bytes promised to an
+outstanding write admission, and release that charge on completion or queue
+invalidation. This bounds concurrent full-sync and Redis-export fences within
+the externally accounted ring budget.
 
 Source publishers normally target 2 MiB and are capped at 128 frames per
 batch. The first frame is admitted even when it exceeds the byte target, so a
@@ -272,6 +284,13 @@ and the replica's multi-frame large-value staging buffer.
 
 Runtime-only commands published while the key snapshot is in progress enter
 the same bounded full-sync command FIFOs without creating snapshot state.
+Partition reset epochs are installed on the target in bounded batches, so a
+channel-sharded `PUBLISH` may arrive before its transport partition's batch.
+The target still validates its partition range, frame order, fragmentation,
+and KRC1 body, but only decoded `PUBLISH` is exempt from the installed-epoch
+check because it cannot touch the hidden dataset. Durable commands and runtime
+envelopes that can apply storage effects continue to require that epoch before
+replay.
 Unlike durable writes, however, direct `PUBLISH` and the ephemeral publication
 phase of a `PUBLISH`-only `EXEC` are not protected by the snapshot or database
 admission gates. At the native cut, a publish can land in both the full-sync

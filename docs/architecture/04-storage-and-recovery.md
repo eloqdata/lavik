@@ -370,6 +370,16 @@ from the session reservation into retained accounting. Coverage containers use
 ordinary allocation because the parent credit already owns their conservative
 footprint; the slice is restored only after those containers are destroyed.
 
+Redis-compatible RDB snapshots retain dirty-key identities in one shared
+worker-local entry arena. Each first capture explicitly reserves the arena and
+map growth before insertion. A maxmemory rejection invalidates only that
+snapshot: a foreground write still completes, its capture admission is
+settled, and any old physical value pinned before the rejection is released.
+Snapshot materialization reports `ResourceExhausted` instead of publishing an
+incomplete cut. Once explicit admission succeeds, unexpected physical
+allocator exhaustion at this boundary follows the process fail-fast policy
+rather than becoming a second admission signal.
+
 The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
 obtained from the operating system. It is stable across workers for one
 process, changes on restart, and does not affect Redis-slot routing. External

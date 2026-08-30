@@ -156,6 +156,26 @@ target_include_directories(keylane_lua PUBLIC ${KEYLANE_LUA_SOURCE_DIR})
 target_compile_definitions(keylane_lua PRIVATE LUA_USE_POSIX)
 target_link_libraries(keylane_lua PUBLIC m)
 
+if (KEYLANE_ENABLE_OPT)
+  include(CheckIPOSupported)
+  check_ipo_supported(
+    RESULT KEYLANE_IPO_SUPPORTED
+    OUTPUT KEYLANE_IPO_ERROR
+    LANGUAGES CXX
+  )
+  if (KEYLANE_IPO_SUPPORTED)
+    # Initialize every Keylane target created below with matching compile and
+    # link-time IPO flags. Debug deliberately stays non-IPO so local builds do
+    # not pay an optimization cost that is unrelated to correctness.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL TRUE)
+  else()
+    message(WARNING
+      "IPO is unavailable; continuing without LTO: ${KEYLANE_IPO_ERROR}")
+  endif()
+endif()
+
 if (TARGET format AND TARGET celer-format)
   add_dependencies(format celer-format)
   add_dependencies(format-check celer-format-check)
@@ -274,7 +294,7 @@ target_link_libraries(keylane PRIVATE keylane::module)
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   if (KEYLANE_ENABLE_OPT)
-    set(KEYLANE_OPT_COMPILE_OPTIONS -O3 -flto=auto)
+    set(KEYLANE_OPT_COMPILE_OPTIONS -O3)
     if (NOT KEYLANE_MARCH STREQUAL "")
       list(APPEND KEYLANE_OPT_COMPILE_OPTIONS "-march=${KEYLANE_MARCH}")
     endif()
@@ -286,7 +306,6 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     if (NOT KEYLANE_MARCH STREQUAL "")
       target_compile_options(mimalloc-static PRIVATE "-march=${KEYLANE_MARCH}")
     endif()
-    target_link_options(keylane PRIVATE -flto=auto)
   endif()
   if (KEYLANE_STATIC_CXX_RUNTIME)
     target_link_options(keylane PRIVATE -static-libstdc++ -static-libgcc)

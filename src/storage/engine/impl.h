@@ -1570,6 +1570,11 @@ class StorageEngine::Impl {
             sparse_offsets_(RetainedAllocator<ReplicationSparseOffset>(
                 RetainedAllocationDomain{})) {}
 
+      explicit ReplicationLogBlock(RetainedAllocationDomain domain)
+          : bytes_(nullptr, RetainedByteDeleter{domain}),
+            sparse_offsets_(
+                RetainedAllocator<ReplicationSparseOffset>(domain)) {}
+
       ByteOwner bytes_;
       std::uint64_t first_lsn_ = 0;
       std::uint64_t last_lsn_ = 0;

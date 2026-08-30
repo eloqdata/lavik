@@ -9,6 +9,12 @@ namespace keylane::storage {
 namespace {
 
 constexpr std::size_t kSparseFrameStride = 64;
+constexpr std::size_t kMinimumReplicationFrameBytes =
+    AlignRecord(sizeof(ReplicationFrameHeader));
+constexpr std::size_t kMaximumSparseOffsetsPerBlock =
+    (kStorageBlockBytes / kMinimumReplicationFrameBytes + kSparseFrameStride -
+     1) /
+    kSparseFrameStride;
 
 bool AddAllocationCharge(std::size_t requested, std::size_t* total) noexcept {
   const std::size_t usable = AllocatorUsableSizeForRequest(requested);
@@ -784,35 +790,57 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
     co_return InvalidState("replication log is not active");
   }
 
-  std::shared_ptr<WorkerStore::ReplicationLogRuntime::PublishFence> fence;
-  try {
-    fence =
-        std::make_shared<WorkerStore::ReplicationLogRuntime::PublishFence>();
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "replication publisher fence allocation failed");
+  constexpr std::size_t kFenceStagingBytes =
+      kReplicationPublisherItemMetadataBytes;
+  for (;;) {
+    const std::size_t capacity =
+        replication_publish_queue_bytes_.load(std::memory_order_acquire);
+    if (PublisherHasCapacity(kFenceStagingBytes, capacity,
+                             log.publish_queue_bytes_,
+                             log.publisher_admitted_bytes_)) {
+      break;
+    }
+    co_await log.publisher_capacity_ready_.Wait();
+    if (log.state_ != ReplicationLogState::kActive) {
+      co_return InvalidState(
+          "replication log stopped while waiting for publisher fence space");
+    }
   }
+
+  auto fence =
+      std::make_shared<WorkerStore::ReplicationLogRuntime::PublishFence>();
   {
-    try {
-      PrepareAdmittedQueueSlot(&log.publish_queue_,
-                               log.publisher_admitted_items_);
-    } catch (const std::bad_alloc&) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "replication publisher fence queue allocation failed");
-    } catch (const std::length_error&) {
+    if (log.publisher_admitted_items_ ==
+            std::numeric_limits<std::size_t>::max() ||
+        log.publish_queue_.size() > std::numeric_limits<std::size_t>::max() -
+                                        log.publisher_admitted_items_ - 1) {
       co_return absl::ResourceExhaustedError(
           "replication publisher fence queue is too large");
     }
+    const std::size_t minimum_capacity =
+        log.publish_queue_.size() + log.publisher_admitted_items_ + 1;
+    if (log.publish_queue_.growth_bytes_for_capacity(minimum_capacity) ==
+        std::numeric_limits<std::size_t>::max()) {
+      co_return absl::ResourceExhaustedError(
+          "replication publisher fence queue is too large");
+    }
+    // The fixed publisher charge already admitted this ring capacity. A
+    // physical allocation failure here is process OOM and follows the
+    // fail-fast policy instead of being confused with maxmemory rejection.
+    log.publish_queue_.PrepareCapacity(minimum_capacity);
     log.publish_queue_.push_back_prepared(
         WorkerStore::ReplicationLogRuntime::PendingCommand{
             .log_epoch_ = log.log_epoch_,
-            .staging_bytes_ = 0,
+            .staging_bytes_ = kFenceStagingBytes,
             .append_ = {},
             .fence_ = fence,
             .transaction_ = nullptr,
         });
+    // Fence payloads are small, but an arbitrary number may wait behind a
+    // pending transaction. Charging the same conservative metadata allowance
+    // as ordinary items keeps the externally-accounted ring within its fixed
+    // staging budget.
+    log.publish_queue_bytes_ += kFenceStagingBytes;
   }
   if (!log.publisher_running_) {
     log.publisher_running_ = true;
@@ -842,6 +870,10 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       }
       pending.fence_->complete_ = true;
       pending.fence_->ready_.NotifyAll(*store->worker_);
+      if (log.publish_queue_bytes_ >= pending.staging_bytes_) {
+        log.publish_queue_bytes_ -= pending.staging_bytes_;
+      }
+      log.publisher_capacity_ready_.NotifyAll(*store->worker_);
       continue;
     }
     if (pending.transaction_ != nullptr) {
@@ -1166,19 +1198,36 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
     evict_event();
   }
 
-  const RetainedAllocationDomain domain{};
-  WorkerStore::ReplicationLogBlock::ByteOwner bytes(
-      nullptr, WorkerStore::RetainedByteDeleter{domain});
-  try {
-    bytes.reset(static_cast<std::byte*>(AllocateRetainedBytes(
-        domain, kStorageBlockBytes, alignof(std::max_align_t))));
-  } catch (const std::bad_alloc&) {
+  const std::size_t sparse_bytes = AllocatorUsableSizeForRequest(
+      kMaximumSparseOffsetsPerBlock *
+      sizeof(WorkerStore::ReplicationSparseOffset));
+  const std::size_t block_bytes =
+      AllocatorUsableSizeForRequest(kStorageBlockBytes);
+  if (sparse_bytes == std::numeric_limits<std::size_t>::max() ||
+      block_bytes == std::numeric_limits<std::size_t>::max() ||
+      sparse_bytes > std::numeric_limits<std::size_t>::max() - block_bytes) {
+    RecordMemoryRejection();
     co_return absl::ResourceExhaustedError(
-        "maxmemory cannot allocate an in-memory replication backlog chunk");
+        "maxmemory cannot allocate an in-memory replication backlog block");
   }
-  WorkerStore::ReplicationLogBlock block;
-  block.bytes_ = std::move(bytes);
+  auto reservation = TryReserveMemory(sparse_bytes + block_bytes);
+  if (!reservation.has_value()) {
+    RecordMemoryRejection();
+    co_return absl::ResourceExhaustedError(
+        "maxmemory cannot allocate an in-memory replication backlog block");
+  }
+
+  // Establish all block-lifetime sparse-index capacity under one permit. The
+  // allocation domain still records exact retained usable bytes, but skips a
+  // second maxmemory decision that could otherwise reject one half after the
+  // other half had already become live.
+  const RetainedAllocationDomain domain{.externally_admitted_ = true};
+  WorkerStore::ReplicationLogBlock block(domain);
+  block.sparse_offsets_.reserve(kMaximumSparseOffsetsPerBlock);
+  block.bytes_.reset(static_cast<std::byte*>(AllocateRetainedBytes(
+      domain, kStorageBlockBytes, alignof(std::max_align_t))));
   log.blocks_.push_back(std::move(block));
+  reservation->Release();
   co_return absl::OkStatus();
 }
 
@@ -1323,6 +1372,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::AppendReplicationLog(
                              "failed to encode replication frame");
     }
     if (block.frame_count_ % kSparseFrameStride == 0) {
+      assert(block.sparse_offsets_.size() < block.sparse_offsets_.capacity());
       block.sparse_offsets_.push_back({
           .lsn_ = lsn,
           .fragment_index_ = fragment_index,

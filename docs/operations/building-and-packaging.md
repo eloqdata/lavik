@@ -16,6 +16,11 @@ and `libcrypto.a`).
 
 For a different local CPU target, configure CMake directly with
 `-DKEYLANE_MARCH=<target>`. An empty value disables the explicit `-march` flag.
+When aggressive optimization is enabled, CMake's IPO support configures both
+compilation and linking for every non-Debug Keylane target. Optimized Clang
+builds can therefore link the server and test executables without setting
+`CMAKE_EXE_LINKER_FLAGS` manually. Debug builds omit IPO to keep iteration
+time predictable; LTO is not required for functional correctness.
 
 AddressSanitizer builds use Clang so coroutine symmetric transfers remain tail
 calls under sanitizer instrumentation:

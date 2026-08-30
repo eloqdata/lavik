@@ -13,8 +13,10 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -72,7 +74,9 @@ class TempDirectory {
 
 class ChildProcess {
  public:
-  ChildProcess(std::vector<std::string> args, const std::string& log) {
+  ChildProcess(
+      std::vector<std::string> args, const std::string& log,
+      const std::vector<std::pair<std::string, std::string>>& environment = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ != 0) return;
@@ -81,6 +85,9 @@ class ChildProcess {
       (void)::dup2(log_fd, STDOUT_FILENO);
       (void)::dup2(log_fd, STDERR_FILENO);
       ::close(log_fd);
+    }
+    for (const auto& [name, value] : environment) {
+      if (::setenv(name.c_str(), value.c_str(), 1) != 0) _exit(127);
     }
     std::vector<char*> argv;
     for (std::string& arg : args) argv.push_back(arg.data());
@@ -255,6 +262,13 @@ std::string Bulk(std::string_view value) {
   return "$" + std::to_string(value.size()) + "\r\n" + std::string(value);
 }
 
+std::string ReadFile(const std::string& path) {
+  std::ifstream input(path);
+  if (!input) Fail("failed to read " + path);
+  return std::string(std::istreambuf_iterator<char>(input),
+                     std::istreambuf_iterator<char>());
+}
+
 std::size_t Count(std::string_view haystack, std::string_view needle) {
   std::size_t count = 0;
   for (std::size_t offset = 0;
@@ -300,7 +314,8 @@ int main(int argc, char** argv) {
                         root.path() + "/master.log");
     ChildProcess preferred(
         KeylaneArgs(argv[1], preferred_config, preferred_data),
-        root.path() + "/preferred.log");
+        root.path() + "/preferred.log",
+        {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_RESET_MS", "1000"}});
     ChildProcess other(KeylaneArgs(argv[1], other_config, other_data),
                        root.path() + "/other.log");
 
@@ -396,6 +411,16 @@ int main(int argc, char** argv) {
       return client.Command({"ROLE"}).starts_with("*3\r\n$6\r\nmaster");
     });
     WaitUntil("remaining replica follows promoted master", 60s, [&] {
+      // Keep a runtime-only event queued while the promoted source is paused
+      // after its first 64-partition reset batch. This channel hashes to slot
+      // 7127, so accepting it proves PUBLISH does not incorrectly depend on
+      // that slot's not-yet-installed target epoch.
+      RespClient promoted = Connect(preferred_port);
+      if (!promoted
+               .Command({"PUBLISH", "fullsync-epoch-race", "probe"})
+               .starts_with(':')) {
+        return false;
+      }
       RespClient client = Connect(other_port);
       const std::string info = client.Command({"INFO", "replication"});
       return info.find("master_port:" + std::to_string(preferred_port)) !=
@@ -423,6 +448,11 @@ int main(int argc, char** argv) {
     other.Stop();
     preferred.Stop();
     master.Stop();
+    if (ReadFile(root.path() + "/other.log")
+            .find("malformed full-sync published command") !=
+        std::string::npos) {
+      Fail("PUBLISH raced ahead of its full-sync partition reset");
+    }
     std::cout << "sentinel e2e passed\n";
     return 0;
   } catch (const std::exception& error) {

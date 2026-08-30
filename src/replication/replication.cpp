@@ -4813,7 +4813,7 @@ class ReplicationManager::Impl {
             !reader.U32(&fragment) || !reader.U8(&flags) ||
             sequence != expected_fullsync_sequence || partition_sequence == 0 ||
             source_lsn == 0 || reader.remaining() == 0 ||
-            epochs.find(partition_id) == epochs.end()) {
+            partition_id >= storage::kLogicalStorageShards) {
           co_return absl::InvalidArgumentError(
               "malformed full-sync published command");
         }
@@ -4849,11 +4849,24 @@ class ReplicationManager::Impl {
         ++next_command_fragment;
         if (last) {
           auto command = DecodeReplicationCommand(staged_command);
-          const bool ephemeral =
+          const bool publish =
               command.ok() && !command->args_.empty() &&
-              (EqualCaseInsensitive(command->args_[0], "PUBLISH") ||
-               command->args_[0] == kReplicatedExecCommand ||
-               EqualCaseInsensitive(command->args_[0], "FUNCTION"));
+              EqualCaseInsensitive(command->args_[0], "PUBLISH");
+          // PUBLISH is routed by its channel slot only to spread transport
+          // work; it owns no partition state. Sentinel traffic can therefore
+          // reach the bounded full-sync FIFO before that slot's reset batch.
+          // Reassemble and validate it normally, but keep the installed-epoch
+          // invariant for every command that can touch the hidden dataset.
+          if (command.ok() && !publish &&
+              epochs.find(partition_id) == epochs.end()) {
+            co_return absl::InvalidArgumentError(
+                "full-sync mutation precedes partition reset");
+          }
+          const bool ephemeral =
+              publish ||
+              (command.ok() && !command->args_.empty() &&
+               (command->args_[0] == kReplicatedExecCommand ||
+                EqualCaseInsensitive(command->args_[0], "FUNCTION")));
           if (!ephemeral) {
             absl::Status begun = co_await celer::SubmitTaskTo(
                 owner, [this, session, partition_id, partition_sequence]() {
