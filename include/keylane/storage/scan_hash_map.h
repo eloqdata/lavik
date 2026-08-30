@@ -34,6 +34,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "keylane/memory.h"
 #include "keylane/storage/format.h"
 
@@ -1598,6 +1599,19 @@ class ScanHashMap {
     std::size_t used_ = 0;
   };
 
+  // A rehash plan exists only within one owner-serialized RehashStep. The
+  // common direct-bucket case stays inline; an adversarial overflow chain may
+  // allocate temporary plan storage, but failure occurs before either table is
+  // mutated and simply leaves this rehash step pending.
+  struct RehashMove {
+    EntryHandle handle_ = 0;
+    Bucket* target_bucket_ = nullptr;
+    std::uint8_t target_slot_ = 0;
+    std::uint8_t tag_ = 0;
+    std::uint8_t split_ = 0;
+  };
+  using RehashPlan = absl::InlinedVector<RehashMove, kEntriesPerBucket>;
+
   static bool Chained(const Bucket& bucket) noexcept {
     return bucket.child_ != 0;
   }
@@ -1885,12 +1899,13 @@ class ScanHashMap {
     // slot, so admission failure or allocator OOM merely delays maintenance
     // and never leaves a partially migrated map. This also covers rehash work
     // initiated by reads, which have no enclosing write reservation.
-    if (!PrepareRehashCapacity(&tables_[0].buckets_[rehash_index_],
-                               &tables_[1])) {
+    RehashPlan plan;
+    if (!PrepareRehashPlan(&tables_[0].buckets_[rehash_index_], &tables_[1],
+                           &plan)) {
       return;
     }
 
-    MoveBucket(&tables_[0].buckets_[rehash_index_], &tables_[1]);
+    MoveBucket(&tables_[0].buckets_[rehash_index_], &tables_[1], plan);
     ++rehash_index_;
     if (rehash_index_ == BucketCount(tables_[0])) {
       assert(tables_[0].used_ == 0);
@@ -1932,20 +1947,62 @@ class ScanHashMap {
     }
   }
 
-  bool PrepareRehashCapacity(Bucket* source, Table* target) {
+  static bool AssignRehashDestinations(
+      Table* target, const std::array<std::size_t, 2>& target_indexes,
+      RehashPlan* plan) noexcept {
+    struct Cursor {
+      Bucket* bucket_ = nullptr;
+      std::size_t slot_ = 0;
+    };
+    std::array<Cursor, 2> cursors = {
+        Cursor{.bucket_ = &target->buckets_[target_indexes[0]]},
+        Cursor{.bucket_ = &target->buckets_[target_indexes[1]]}};
+    for (RehashMove& move : *plan) {
+      Cursor& cursor = cursors[move.split_];
+      while (cursor.bucket_ != nullptr) {
+        while (cursor.slot_ < kEntriesPerBucket &&
+               Occupied(*cursor.bucket_, cursor.slot_)) {
+          ++cursor.slot_;
+        }
+        if (cursor.slot_ < kEntriesPerBucket) break;
+        cursor.bucket_ =
+            Chained(*cursor.bucket_) ? Child(*target, cursor.bucket_) : nullptr;
+        cursor.slot_ = 0;
+      }
+      if (cursor.bucket_ == nullptr) return false;
+      move.target_bucket_ = cursor.bucket_;
+      move.target_slot_ = static_cast<std::uint8_t>(cursor.slot_++);
+    }
+    return true;
+  }
+
+  bool PrepareRehashPlan(Bucket* source, Table* target, RehashPlan* plan) {
     const std::size_t old_bucket_count = BucketCount(tables_[0]);
     const std::array<std::size_t, 2> target_indexes = {
         rehash_index_, rehash_index_ + old_bucket_count};
     std::array<std::size_t, 2> demand{};
-    for (Bucket* bucket = source; bucket != nullptr;
-         bucket = Chained(*bucket) ? Child(tables_[0], bucket) : nullptr) {
-      for (EntryHandle handle : bucket->entries_) {
-        if (handle == 0) continue;
-        const std::size_t index = static_cast<std::size_t>(
-            EntryHash(*Resolve(handle)) & BucketMask(*target));
-        assert(index == target_indexes[0] || index == target_indexes[1]);
-        ++demand[index == target_indexes[0] ? 0 : 1];
+    try {
+      for (Bucket* bucket = source; bucket != nullptr;
+           bucket = Chained(*bucket) ? Child(tables_[0], bucket) : nullptr) {
+        for (EntryHandle handle : bucket->entries_) {
+          if (handle == 0) continue;
+          const std::uint64_t hash = EntryHash(*Resolve(handle));
+          const std::size_t index =
+              static_cast<std::size_t>(hash & BucketMask(*target));
+          assert(index == target_indexes[0] || index == target_indexes[1]);
+          const std::uint8_t split =
+              static_cast<std::uint8_t>(index == target_indexes[1]);
+          plan->push_back(RehashMove{
+              .handle_ = handle,
+              .tag_ = HashTag(hash),
+              .split_ = split,
+          });
+          ++demand[split];
+        }
       }
+    } catch (const std::bad_alloc&) {
+      plan->clear();
+      return false;
     }
 
     std::array<std::size_t, 2> needed{};
@@ -1987,7 +2044,10 @@ class ScanHashMap {
       // counts them as free capacity and retries only the missing allocation.
       return false;
     }
-    return true;
+    // All physical growth is complete. Assign exact empty slots now so plan
+    // consumption performs only fixed stores and cannot discover a new
+    // allocation failure after it starts clearing the source chain.
+    return AssignRehashDestinations(target, target_indexes, plan);
   }
 
   Entry* FindInTable(Table& table, const Digest& digest, std::string_view key,
@@ -2121,24 +2181,26 @@ class ScanHashMap {
     }
   }
 
-  void MoveBucketEntries(Table* source, Bucket* top, Table* target) {
+  void MoveBucketEntries(Table* source, Bucket* top, Table* target,
+                         const RehashPlan& plan) {
+    for (const RehashMove& move : plan) {
+      assert(move.target_bucket_ != nullptr &&
+             move.target_slot_ < kEntriesPerBucket &&
+             !Occupied(*move.target_bucket_, move.target_slot_));
+      move.target_bucket_->entries_[move.target_slot_] = move.handle_;
+      move.target_bucket_->hashes_[move.target_slot_] = move.tag_;
+      ++target->used_;
+    }
+
+    // Target capacity and exact slots were fixed before publication. Source
+    // cleanup only walks child links to return overflow objects; it no longer
+    // revisits entries, resolves inline keys, or recomputes SipHash.
     Bucket* bucket = top;
     std::uint32_t bucket_id = 0;
     while (bucket != nullptr) {
       const bool chained = Chained(*bucket);
       Bucket* next = chained ? Child(*source, bucket) : nullptr;
       const std::uint32_t next_id = bucket->child_;
-      for (std::size_t slot = 0; slot < kEntriesPerBucket; ++slot) {
-        if (Occupied(*bucket, slot)) {
-          // Entries no longer retain a bucket hash. Recompute it while the
-          // source object is known live; external keys already carry their
-          // digest, while inline keys trade rehash CPU for the smaller steady
-          // state representation.
-          const EntryHandle handle = bucket->entries_[slot];
-          AddToTable(*target, handle, EntryHash(*Resolve(handle)));
-          ClearOccupied(bucket, slot);
-        }
-      }
       bucket->child_ = 0;
       if (bucket_id != 0) FreeChild(source, bucket_id);
       bucket_id = next_id;
@@ -2148,10 +2210,9 @@ class ScanHashMap {
     top->hashes_.fill(0);
   }
 
-  void MoveBucket(Bucket* top, Table* target) {
-    const std::size_t before = target->used_;
-    MoveBucketEntries(&tables_[0], top, target);
-    const std::size_t moved = target->used_ - before;
+  void MoveBucket(Bucket* top, Table* target, const RehashPlan& plan) {
+    MoveBucketEntries(&tables_[0], top, target, plan);
+    const std::size_t moved = plan.size();
     assert(tables_[0].used_ >= moved);
     tables_[0].used_ -= moved;
   }

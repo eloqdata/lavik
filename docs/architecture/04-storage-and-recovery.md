@@ -280,6 +280,13 @@ allocator failure therefore cannot expose a partially migrated chain. Overflow
 admission includes the exact mimalloc size classes for the bucket objects and
 for both vector backings at their explicitly selected next capacities; crossing
 a large pool's capacity boundary is therefore charged before rehash mutates it.
+The preparation scan also builds a step-local migration plan containing each
+entry handle, its already-computed lookup tag, and its exact target slot. The
+common twelve-entry source bucket keeps that plan inline. After admission,
+publication consumes only the plan and source-chain cleanup, so inline keys pay
+one SipHash calculation and one entry scan while the no-partial-migration OOM
+invariant remains intact. Allocation failure while an unusually long overflow
+chain grows the temporary plan likewise leaves both tables unchanged.
 Each small span is 64 KiB-aligned and supplies sixteen logical 64 KiB pages;
 this amortizes mimalloc's alignment-size-class overhead without changing the
 handle's page/slot encoding. Empty logical pages are reusable by any size class,
