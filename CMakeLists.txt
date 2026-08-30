@@ -299,8 +299,17 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
       list(APPEND KEYLANE_OPT_COMPILE_OPTIONS "-march=${KEYLANE_MARCH}")
     endif()
     # Celer is compiled as part of Keylane, so local native builds should tune
-    # the transport and runtime too, not only the Redis/storage layer.
-    foreach(target IN ITEMS celer celer_rpc keylane_module keylane)
+    # the transport and runtime too, not only the Redis/storage layer. Abseil's
+    # accelerated CRC engines are compile-gated by architecture feature
+    # macros; apply the explicit target to those translation units as well or
+    # a native Keylane build silently uses the generic table-based checksum.
+    foreach(target IN ITEMS
+        absl_crc_internal
+        absl_crc32c
+        celer
+        celer_rpc
+        keylane_module
+        keylane)
       target_compile_options(${target} PRIVATE ${KEYLANE_OPT_COMPILE_OPTIONS})
     endforeach()
     if (NOT KEYLANE_MARCH STREQUAL "")

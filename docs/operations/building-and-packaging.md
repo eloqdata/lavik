@@ -8,8 +8,12 @@ Optimized local builds use the current machine's instruction set by default:
 ./scripts/build_release.sh
 ```
 
-This configures `KEYLANE_MARCH=native`, including Celer and mimalloc. OpenSSL
-is linked statically, so the resulting executable does not depend on
+This configures `KEYLANE_MARCH=native`, including Celer, mimalloc, and the
+Abseil CRC translation units used by the durable storage format. The latter is
+important because Abseil compiles its hardware CRC engine only when the target
+exposes the required instruction macros; leaving those translation units at
+the compiler baseline silently selects its generic table implementation.
+OpenSSL is linked statically, so the resulting executable does not depend on
 `libssl.so` or `libcrypto.so`. The build machine still needs the OpenSSL
 headers and static archives (`libssl-dev` on Ubuntu, which provides `libssl.a`
 and `libcrypto.a`).
