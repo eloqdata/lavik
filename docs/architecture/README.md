@@ -1,9 +1,10 @@
 # Architecture index
 
 This is the only documentation directory maintained as a current explanation
-of Keylane's code. It describes the system as implemented; source code and tests
-remain authoritative when they disagree. Files under `docs/design-docs/` are
-historical references rather than current architecture.
+of Keylane's core design. It is a compact model of the implemented system, not
+an implementation reference or release history. Source code and tests remain
+authoritative when they disagree. Files under `docs/design-docs/` are historical
+references rather than current architecture.
 
 ## Subsystem map
 
@@ -19,13 +20,48 @@ Metrics, memory accounting, logging, configuration, and the Celer runtime cross
 several subsystems and are summarized in the system overview rather than
 treated as independent durable modules.
 
+## Authoring standard
+
+Architecture changes are claim-driven. For an implementation change, identify
+the current claim or core model that would otherwise become false or materially
+incomplete. An update is warranted when the change affects a durable module
+boundary, primary control or data flow, ownership or lifecycle, durable or wire
+format, external integration, or system-level correctness, safety, or
+compatibility invariant. If no such claim exists, leave the architecture
+unchanged. Dedicated documentation work may correct an inaccuracy, fill a
+known core-design gap, or consolidate existing sediment.
+
+Write the resulting design in the present tense and at the highest useful
+level of abstraction. Preserve rationale that explains a stable constraint or
+tradeoff. Revise or replace existing prose so the document stands on its own;
+a reader should not need the originating commit to understand it.
+
+Use the narrowest durable home for each kind of information:
+
+| Information | Home |
+|---|---|
+| Core module responsibility, ownership, lifecycle, cross-module flow, durable or wire contract, and system-level invariant | `docs/architecture/` |
+| Significant historical decision, alternatives, and superseded design context | `docs/design-docs/` |
+| Supported operational procedure, prerequisite, or safety boundary | `docs/operations/` |
+| Local algorithm, runtime representation, tuning mechanism, or code-level invariant | Nearby source or API documentation |
+| Motivation for this change, before/after behavior, benchmark result, and implementation journey | Pull request or commit |
+
+For example, a record-format change that removes a persisted field and makes
+older media unreadable belongs here because it changes a durable contract and
+compatibility boundary. The exact byte size of a runtime index entry, the
+number of handles in an internal bucket, or a cached rehash plan belongs near
+the implementation. Likewise, architecture may state that cross-worker
+delivery preserves worker affinity and cannot strand accepted work; the exact
+wake-coalescing handshake that currently realizes that invariant belongs near
+the messaging code.
+
 ## Maintenance rule
 
-Update the relevant focused document and its source map in the same change as a
-module boundary, core flow, lifecycle, durable format, or external integration.
-Add, split, merge, or remove focused documents when the durable module map
-changes. Keep proposals and design history outside this directory; they do not
-substitute for a current architecture update.
+Update the relevant focused document and its source map when the authoring test
+above passes. Add, split, merge, or remove focused documents when the durable
+module map changes. Keep proposals, design history, task investigations, and
+change narratives outside this directory; they do not substitute for a current
+architecture update.
 
 ## Source map
 

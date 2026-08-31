@@ -19,3 +19,22 @@
 - Operations: before changing build or packaging, metrics and monitoring,
   storage provisioning or maintenance, or IRQ tuning, read the
   [operations index](docs/operations/README.md) and the relevant linked guide.
+
+## Architecture documentation
+
+- Architecture updates are claim-driven. For an implementation change,
+  identify the current architectural claim or core model that the change makes
+  false or materially incomplete; leave architecture unchanged when there is
+  none. Dedicated documentation work may correct inaccuracies, fill a known
+  core-design gap, or consolidate existing sediment.
+- Keep architecture as a compact, present-tense model of Keylane's core module
+  boundaries, control and data flows, ownership and lifecycles, durable or wire
+  formats, external integrations, and system-level correctness, safety, and
+  compatibility invariants.
+- Preserve stable design rationale and tradeoffs needed to understand that
+  model. Put change-specific motivation and before/after explanation in the
+  pull request or commit, and keep local algorithms, representation details,
+  and performance mechanics near the affected code.
+- Revise and consolidate existing prose so the result stands on its own without
+  knowledge of the change that produced it. Use the authoring standard and
+  examples in [the architecture index](docs/architecture/README.md).

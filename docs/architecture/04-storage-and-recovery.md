@@ -55,25 +55,13 @@ after epoch initialization, so an acquire owner read makes the immutable epoch
 visible without an extra worker hop. Other state remains owner-local and other
 workers use Celer cross-core submissions to read or mutate it.
 
-Foreground append-stream rollover is single-flight per stream. Immediately
-after publishing each ordinary active block, the worker prefetches one reserved
-successor ID under the same allocation gate; it does not acquire the 8 MiB
-staging buffer until rollover. Appending records therefore performs no
-occupancy-threshold check. Rollover consumes the successor and immediately
-starts replenishing it.
-The first writer that observes a missing or full stream consumes that standby
-or releases the worker's store-state mutex and allocates a replacement;
-followers release the mutex while waiting on the ordinary stream's or
-transaction generation's allocation gate. After wake-up they reacquire the
-store-state mutex and reuse the published stream when it has room. Allocation
-failure wakes the next waiter to retry, and transaction gate lifetime follows
-the generation's active lease, so neither shutdown nor generation retirement
-can strand a waiter. Shutdown waits for an ordinary prefetch to finish and
-returns an unused reservation. Different transaction generations retain
-independent gates and may allocate concurrently. Maintenance rewrites that
-intentionally retain the store-state mutex do not wait on these gates; their
-concurrency is separately bounded, and a colliding spare block is returned
-instead of replacing an already published stream.
+Append-stream creation and rollover are single-flight within each stream. A
+writer may release owner-local store state while physical allocation waits,
+but it revalidates the current stream before publication and returns any
+unused reservation to the device allocator. This prevents duplicate stream
+publication without serializing independent transaction generations. Staging
+buffers remain tied to active streams, and shutdown or generation retirement
+waits for outstanding allocation work before destroying its state.
 
 Logical key locks come from the transaction subsystem. Storage's pre-locked
 interfaces require the caller to run on the key owner with the correct shared
@@ -221,14 +209,9 @@ Recovery proceeds as follows:
    physical relocation copies of one logical version, so the higher physical
    LSN wins. Recovery also rebuilds whether the winner shields an older,
    potentially live value.
-6. A second cross-worker pass walks each in-memory winner index once and
-   charges every winning root and referenced extent exactly once to its
-   physical block owner. A resumable stable cursor pauses at a bounded
-   reference target, applies the per-owner batches, and then continues at the
-   next entry; it neither rescans storage nor restarts an index scan. One
-   external value's manifest remains an indivisible unit. The owner also
-   verifies every live manifest against the recovered extent headers before
-   the batch is released.
+6. A second cross-worker pass charges every winning root and referenced extent
+   exactly once to its physical block owner and verifies each live manifest
+   against the recovered extent headers.
 7. Recovery reconstructs ready and cold-free allocator state, reclaims orphan
    extents before it needs new space, and handles expired winners. Expired
    versions participate in winner selection first, then normally receive a
@@ -258,196 +241,62 @@ block. The in-memory index is updated immediately and may point at staged bytes
 that have not crossed a crash-durability boundary. Staged reads use that buffer
 directly.
 
-The runtime index uses a 24-byte base entry for keys without expiration and a
-32-byte derived entry for keys with expiration. The base is exactly the
-24-byte packed value; only the derived type adds the aligned 64-bit expiration
-timestamp. Logical key length plus the inline/external discriminator use a
-one-to-five-byte varint immediately before the key or digest tail. Entries do
-not cache a bucket hash: insertion and lookup use the caller's digest, while
-incremental rehash, pointer-only erase, and representation replacement
-recompute it from the live inline key or external digest. This trades growth-
-phase CPU for the smaller steady-state representation.
+Runtime indexes retain key identity, logical version, record coordinates, and
+the state needed to serve the current value. The physical block's owner and
+allocation epoch live once in `BlockState` rather than being repeated for
+every key. Before a location crosses an ownership boundary or a suspension,
+the key owner reads that published immutable block identity and materializes a
+self-contained `RecordLocation`. The physical owner validates the snapshot on
+use, preserving block-reuse and ABA protection. These index representations
+are runtime-only; durable block and record headers retain the fields needed for
+restart validation.
 
-Entries are allocated from one worker-local arena shared by every partition
-and logical-database index on that worker. The arena obtains 1 MiB,
-64 KiB-aligned spans from the process allocator and divides each into sixteen
-logical pages. This amortizes mimalloc's alignment size-class overhead across
-the span. Ordinary pages serve 53 size classes from 32 bytes through 4 KiB;
-unusually large generic-map entries use a dedicated single-slot aligned
-allocation. Each bucket stores a 32-bit handle rather than a machine pointer.
-Its high 21 bits select the arena page and its low 11 bits select the slot, so a
-64-byte bucket carries twelve handles, twelve independent 8-bit lookup tags,
-and one overflow-bucket ID. Direct tables begin expanding at nine entries per
-bucket. The page directory costs one 64-bit descriptor per live or previously
-issued page ID, while the shared allocation domain prevents partition
-boundaries from stranding mostly empty pages.
+Runtime key digests use one operating-system-seeded SipHash key per process.
+They are consistent across workers for that process, change on restart, and do
+not affect Redis-slot routing. External keys and decoded Hash or Set fields
+retain or reconstruct a digest only as a lookup aid; collisions are verified
+against complete keys, and process-local fingerprints are never persisted.
 
-Page ID zero is invalid and IDs never wrap. An empty page returns to its span
-and its ID becomes reusable; an empty span returns to the process allocator.
-This trades 1 MiB reclaim granularity for sharply lower alignment waste; empty
-logical pages in a partially live span remain available to any size class.
-Detached FLUSHDB populations keep shared ownership of the arena until their
-entries are reclaimed. Before a write that needs a new entry or changes the TTL
-representation, the owner checks that the
-required size class has a free slot or an encodable page ID. If it needs a new
-1 MiB small-page span, dedicated large-entry page, direct bucket array, or
-overflow bucket, storage also reserves the physical allocation
-from that worker's memory share before bytes are appended to the staging block.
-Incremental rehash prepares and admits any target overflow buckets before it
-clears the source chain. If that maintenance reservation is unavailable, a
-read or mutation still searches both tables and leaves the rehash step pending;
-allocator failure therefore cannot expose a partially migrated chain. Overflow
-admission includes the exact mimalloc size classes for the bucket objects and
-for both vector backings at their explicitly selected next capacities; crossing
-a large pool's capacity boundary is therefore charged before rehash mutates it.
-The preparation scan also builds a step-local migration plan containing each
-entry handle, its already-computed lookup tag, and its exact target slot. The
-common twelve-entry source bucket keeps that plan inline. After admission,
-publication consumes only the plan and source-chain cleanup, so inline keys pay
-one SipHash calculation and one entry scan while the no-partial-migration OOM
-invariant remains intact. Allocation failure while an unusually long overflow
-chain grows the temporary plan likewise leaves both tables unchanged.
-Each small span is 64 KiB-aligned and supplies sixteen logical 64 KiB pages;
-this amortizes mimalloc's alignment-size-class overhead without changing the
-handle's page/slot encoding. Empty logical pages are reusable by any size class,
-but their backing memory returns to mimalloc only when the whole span is empty.
-The 21-bit arena page directory is one raw descriptor array, so handle
-resolution remains a direct `directory[page_id]` lookup. It starts with room
-for 4,096 descriptors and doubles on demand up to the encodable page-ID limit.
-The unused suffix is deliberately uninitialized, and growth copies only the
-published prefix instead of value-initializing the new capacity. Before growth,
-admission charges the exact retained increase between the allocator's new and
-old usable sizes; the short-lived overlap while copying the arrays is covered
-by the process headroom outside the retained limit. Released directory slots
-encode the next free page ID, while available pages and spans use intrusive
-lists stored in their existing headers, so those paths need no additional
-capacity-growing metadata. The permit stays live through index publication.
-Arena spans and the directory array, bucket arrays, overflow objects, and their
-vector backings call mimalloc through a retained allocation domain; successful
-allocation publishes its actual usable size and destruction returns that same
-size to the domain's owner shard. Page-ID or memory exhaustion therefore returns
-`ResourceExhausted` without leaving a durable record that cannot enter the
-index. Updates whose representation already has a slot continue without this
-slow-path check.
+All partition and logical-database indexes on a worker allocate entries from a
+shared worker-local arena, so sparse indexes share capacity instead of
+stranding it at partition boundaries. A population detached by `FLUSHDB`
+retains ownership of that arena until asynchronous reclamation finishes.
+Optional per-key state such as expiration may change an entry's concrete
+representation. Those replacements are owner-serialized, and staged flush,
+coroutine, and transaction-undo state revalidates or retargets its saved entry
+identity before use rather than relying on an object's former lifetime.
 
-`--max-memory` is divided deterministically across storage workers; a worker
-does not borrow another worker's unused balance. Retained allocations use 90%
-of each share. The remaining 10% stays outside retained admission. Client
-request buffers have a separate 5% quota by default, so even when retained
-state and client buffers are both full, 5% remains for allocator, request, and
-IO peaks rather than becoming an admission pool for individual temporary
-allocations. Ordinary `new` and `delete` use mimalloc's official override
-without touching admission counters. A retained allocation domain stores its
-owner shard, so destruction returns bytes to the allocation origin even if the
-final owner runs elsewhere; no pointer-to-heap ownership index is required.
-Retained allocation and release occur at page, bucket, backlog-block, fixed
-replication-publisher budget, or staging granularity rather than for every
-temporary object. An active source log holds one configured publisher budget
-on its worker, and every active full-sync session holds one more. Queue items
-consume a stable estimate of argument bytes, `std::string` elements, and item
-metadata; their individual mimalloc size classes are deliberately not charged.
-Each worker also owns its pending-permit and
-full-sync-reservation counters. INFO and metrics aggregate the shards off the
-hot path.
+Index growth is failure-atomic. Before appending a record whose publication
+needs a new or replacement entry, storage admits the required entry and table
+capacity from the current worker's memory share. Incremental expansion likewise
+prepares its destination capacity before removing source entries. Admission or
+index-capacity failure returns `ResourceExhausted` without publishing a record
+that cannot enter the index; allocation failure during expansion leaves both
+tables searchable and the maintenance step retryable.
 
-Foreground command admission does not assign a fixed byte estimate to every
-key. A command that can grow retained state is rejected when its worker is
-already at the 90% steady-state boundary, while arena pages and hash buckets
-reserve their actual allocator size class at the allocation site. Ordinary
-client request bytes have a separate hard 5% process budget by default, divided
-into the same fixed worker shares. `maxmemory-clients` accepts either a
-percentage of effective maxmemory or an absolute byte size; zero disables the
-client-specific cap without changing the retained 90% waterline. The server
-charges that budget once after each socket read and releases a command's wire
-bytes after execution; it does not run an
-admission check for every parser append. A declared bulk length does not
-allocate its complete buffer: the argument grows only as payload arrives.
-Protocol bulk and command-size limits remain independent safety boundaries.
-Every nonzero aggregate client allowance has Valkey's 128 KiB minimum so very
-small synthetic limits do not make the protocol unusable.
-Explicit retained allocator size-class overhead is charged to `used_memory`,
-while ordinary temporary allocator usage is visible through RSS and mimalloc
-diagnostics. The client
-budget deliberately counts stable wire bytes so its hot path does not inspect
-every string and vector capacity. This connection-abuse quota is independent
-of the retained-memory waterline and therefore adds no per-parser-allocation
-reservation path.
+`--max-memory` is divided into fixed worker shares; a worker does not borrow
+another worker's unused balance. Retained state is admitted up to 90 percent of
+each share. Its accounting ownership remains bound to the allocation's origin,
+so destruction credits the same worker even when it occurs elsewhere. INFO and
+metrics aggregate those worker-owned counters without changing foreground
+ownership.
 
-Bounded request-time scratch such as RDB strings, replication frame buffers,
-LCS workspaces, random-result arrays, and external-key read buffers does not
-participate in max-memory admission. Protocol and object-size limits bound
-untrusted sizes, and allocation failure is converted to `ResourceExhausted`
-where the operation can fail safely. This deliberately allows short-lived RSS
-peaks above `--max-memory`; after the default client-buffer quota, the remaining
-5% absorbs ordinary peaks without adding reservation bookkeeping to normal
-reads and commands.
+Ordinary client request buffers use a separate quota, five percent by default,
+which `maxmemory-clients` can express as a percentage or absolute size or
+disable. Bounded request-time scratch is not admitted allocation by allocation;
+protocol and object-size limits bound untrusted inputs, and safe failure paths
+report `ResourceExhausted`. Consequently `--max-memory` bounds accumulating
+retained state rather than acting as a strict RSS ceiling, while the remaining
+headroom absorbs allocator, request, and I/O peaks.
 
-Full-sync coverage is different because it scales with the key set and lives
-for the synchronization session, so it pre-reserves a reusable logical budget
-inside the 90% retained-memory boundary.
-Before a capture identity allocates map storage, its conservative slice moves
-from the session reservation into retained accounting. Coverage containers use
-ordinary allocation because the parent credit already owns their conservative
-footprint; the slice is restored only after those containers are destroyed.
-
-Redis-compatible RDB snapshots retain dirty-key identities in one shared
-worker-local entry arena. Each first capture explicitly reserves the arena and
-map growth before insertion. A maxmemory rejection invalidates only that
-snapshot: a foreground write still completes, its capture admission is
-settled, and any old physical value pinned before the rejection is released.
-Snapshot materialization reports `ResourceExhausted` instead of publishing an
-incomplete cut. Once explicit admission succeeds, unexpected physical
-allocator exhaustion at this boundary follows the process fail-fast policy
-rather than becoming a second admission signal.
-
-The digest is a 64-bit SipHash-1-2 value under one 128-bit process-wide seed
-obtained from the operating system. It is stable across workers for one
-process, changes on restart, and does not affect Redis-slot routing. External
-index keys retain this digest so collisions can be verified against the full
-key on storage. Hash and Set field digests are likewise reconstructed whenever
-their durable compact value is decoded; neither record headers nor compact
-values persist process-local fingerprints.
-
-The packed value keeps the mutation sequence, 43-bit block ID, aligned record
-offset and length, logical size, type, and hot state. It does not repeat the
-physical block's allocation epoch or runtime owner for every key: those
-already live once in the dense `BlockState`, and five packed bits remain
-reserved.
-
-Before a location crosses an index boundary, the key owner acquire-loads the
-block's atomic owner, reads its published immutable allocation epoch, and
-materializes a standalone 40-byte `RecordLocation`. That snapshot remains
-self-contained across suspension and is validated by the physical owner, so
-removing the duplicate index fields does not weaken block-reuse/ABA protection
-or add a cross-core submission.
-These are runtime representations only: block and record headers retain the
-durable location and lifecycle fields required for validation.
-
-An overwrite whose TTL presence does not change updates the entry in place.
-Adding or removing TTL swaps the corresponding base or derived object into the
-same bucket slot while holding the worker store mutex. Staged physical records
-cache the partition and low hash bits in existing `RecordIdentity` padding;
-flush completion proves the cached entry address still belongs to that index
-before recovering a live pointer, so a representation change never scans
-pending blocks. Other coroutine paths that retain an entry identity across an
-await likewise store only its integer address and resume through the pointer
-returned by the index lookup; they never dereference the pointer value from the
-object whose lifetime ended.
-Transaction undo items for the same key share a transaction-local stable
-handle. An address-to-handle index retargets that handle's single live pointer
-in O(1) when the representation changes, while other sparse pointer-keyed
-metadata moves independently in O(1). This preserves the flush and rollback
-lifetime invariants without charging non-expiring keys for the timestamp,
-making large transactions scan prior undo items, or adding a hot-path side
-index.
-Coroutine identities and staged records cache the low 32 hash bits needed to
-revalidate a saved entry address, while each bucket slot carries its independent
-8-bit lookup tag. The entry itself stores neither a lookup tag nor a bucket
-hash. Incremental rehash reconstructs the SipHash from the inline key or
-retained external digest. A
-table that has already reached `2^32` direct buckets stops expanding and accepts
-further entries through its existing bucket chains, so the address-width limit
-changes load factor and lookup cost rather than correctness or capacity.
+Full-sync coverage scales with the key set and lifetime of a session, so it
+pre-reserves reusable credit within the retained-memory boundary. Redis-
+compatible RDB snapshots similarly reserve capacity before retaining dirty-key
+identities. If snapshot capture cannot be admitted, only that snapshot is
+invalidated: the foreground mutation still completes, and materialization
+reports `ResourceExhausted` instead of publishing an incomplete cut. Once
+explicit admission succeeds, unexpected physical allocation failure follows
+the process fail-fast policy rather than becoming a second admission result.
 
 Extent construction is synchronous with the foreground write. Each extent's
 payload and unused header slot are written and synchronized before its header
@@ -734,13 +583,15 @@ current source code are authoritative for present storage behavior.
 | Claim | Repository source |
 |---|---|
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/keylane/storage/engine.h` |
-| Worker, partition, block, staging, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h`, `include/keylane/storage/scan_hash_map.h` |
+| Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
+| Runtime index representation, shared entry arena, process-local key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/keylane/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
 | Append streams, extent construction, index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
+| Worker-sharded retained-memory admission and ownership, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
 | Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |
