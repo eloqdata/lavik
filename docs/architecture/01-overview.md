@@ -29,10 +29,8 @@ Redis/Valkey clients, Sentinels, and replicas
           |
  file, block-device, or SPDK I/O
 
-Prometheus scrapes a separate Celer HTTP service backed by worker/storage
-snapshots. Memory scrapes read the existing cache-line-separated admission
-counters directly to expose bounded per-worker retained, pending, full-sync,
-client-buffer, and limit gauges; they do not add updates to command execution.
+Prometheus scrapes a separate Celer HTTP service backed by worker and storage
+snapshots.
 ```
 
 ## Component responsibilities
@@ -49,9 +47,8 @@ client-buffer, and limit gauges; they do not add updates to command execution.
 
 ## Process lifecycle
 
-1. `main` applies mimalloc defaults, optionally loads a Redis-style config
-   file, parses CLI overrides, validates the combined options, and initializes
-   logging.
+1. `main` loads an optional Redis-style config file, applies CLI overrides,
+   validates the combined options, and initializes logging.
 2. `RunServer` initializes the memory budget, signal handling, storage engine,
    replication manager, command/storage bindings, metrics shards, transaction
    runtime, and Celer service graph.
@@ -79,10 +76,9 @@ handles connection-scoped state such as authentication, `HELLO`, `SELECT`,
 `MULTI`/`EXEC`, `WATCH`, Pub/Sub subscriptions, and replica read routing. Keyed
 work runs on the owning worker, using transaction coordination when the command
 spans keys or requires ordered multi-hop work. MGET holds one shared-lock
-transactional view while each participant batches ordinary-size disk reads in
-waves paced by its fixed read-buffer pool and uses aligned overflow leases for
-oversized reads. The result is encoded into a reusable reply buffer, sent
-directly from a storage read lease, or emitted as bounded streamed chunks.
+transactional view while the participating workers resolve their keys. Replies
+use the connection's negotiated protocol, with large results emitted as bounded
+streamed chunks.
 
 Lua `EVAL`/`EVALSHA` and stored `FCALL` invocations run in a persistent
 worker-local VM. Their declared keys establish the transaction boundary;
@@ -92,12 +88,10 @@ outer invocation. Script-cache mutations fan out to every worker before the
 mutation command returns, while Function invocations and catalog operations
 share a catalog barrier that hides staged Function updates.
 
-Pub/Sub keeps subscription registries on each connection's worker. A subscribed
-connection uses separate reader and writer coroutines joined at exit: commands
-and publications enqueue negotiated RESP2 arrays or RESP3 push frames, while a
-single writer drains the socket. Per-session frame limits and a worker-wide
-pending-byte limit close a slow subscriber instead of permitting unbounded
-output growth.
+Pub/Sub keeps subscription registries on each connection's worker. Commands and
+cross-worker publications feed bounded per-session output encoded for the
+connection's negotiated protocol; a slow subscriber is closed rather than
+permitted unbounded output growth.
 
 ### Durable write and publication
 
@@ -120,11 +114,9 @@ state explicitly.
 
 - Worker-affine mutable state is accessed on its owner worker; cross-worker
   work uses Celer submission primitives. Coroutine coordinators resume on their
-  origin worker. A source worker release-publishes the first message to a
-  sender/receiver lane immediately, coalesces later same-round posts, and, when
-  needed, republishes the lane once before the batched target wake. The receiver
-  bulk-drains active lanes and uses an active-state close/recheck handshake so
-  posts racing with a drain cannot be stranded.
+  origin worker. Celer may batch cross-worker delivery, but accepted work
+  remains discoverable across concurrent posts, drains, and worker wakeups and
+  cannot be stranded.
 - Logical database identity is carried in each command and durable record; it
   is not inferred from the worker executing a request.
 - The command table is the shared classification source for arity, key

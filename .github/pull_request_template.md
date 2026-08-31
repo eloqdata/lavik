@@ -23,3 +23,7 @@ List exact commands run and their results.
 
 ## Follow-up work
 <!-- END bootstrap-project: pull-request-template -->
+
+Update architecture documentation only when this change makes an existing core
+claim false or materially incomplete, keeping the result focused on the current
+system; see the [architecture authoring standard](https://github.com/thweetkomputer/keylane/blob/main/docs/architecture/README.md#authoring-standard).

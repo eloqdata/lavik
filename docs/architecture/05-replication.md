@@ -44,16 +44,12 @@ admission. After a simple transport loss, it can retain and promote a completed
 native or standalone-Redis dataset while the old root remains intact and marked
 valid. An explicit source switch clears that validity; issuing `REPLICAOF NO
 ONE` before the replacement reaches its cut then discards the partial population
-and publishes an empty writable master. A same-source native reconnect that
-misses the backlog is a different edge case: destructive full-sync reset can
-detach the old indexes without clearing the validity flag, and cancelling that
-partial rebuild can consequently publish an empty master despite the stale
-flag. Multi-source Redis Cluster promotion has the opposite edge case: any one
-valid source currently prevents discard, even while the topology is incomplete
-or another source is still syncing, so promotion can expose a partial slot
-population. Native reconnects return to LOADING while rebuilding. A standalone
-Redis follower whose process-local dataset remains valid can stay online and
-serve its local read-only copy during a transient source disconnect.
+and publishes an empty writable master. Native reconnects return to LOADING
+while rebuilding. A standalone Redis follower whose process-local dataset
+remains valid can stay online and serve its local read-only copy during a
+transient source disconnect. Known validity edge cases during native reset and
+multi-source Redis Cluster promotion are listed under
+[current limitations](#invariants-failures-and-current-limitations).
 
 Redis Sentinel drives these same transitions through Redis-compatible `ROLE`,
 `INFO replication`, `REPLICAOF`/`SLAVEOF`, `CONFIG REWRITE`, and `CLIENT KILL`
@@ -88,7 +84,7 @@ client write
   -> worker-local publisher FIFO
   -> shared in-memory replication frames
   -> duplex KLFLOW sender and ACK receiver
-  -> target reassembly queue (at most 256 complete commands)
+  -> bounded target reassembly queue
   -> strict FIFO trusted apply
   -> target resume-cursor publication
   -> ACK
@@ -105,122 +101,59 @@ in-progress full-sync streams, but their journal records disappear when the
 process-local replication history is replaced. The Function catalog itself is
 runtime state captured explicitly at full-sync and RDB boundaries.
 
-An active worker log holds one fixed retained-memory staging budget equal to
-its configured publisher waterline. Each active full-sync session holds one
-additional fixed budget and releases it when the session ends. Queue admission
-uses an allocator-independent footprint: argument bytes, one `std::string`
-element per argument, and a conservative fixed item allowance. This keeps
-high-arity short-argument commands bounded without consulting mimalloc size
-classes on every write. The ring allocators are externally accounted because
-their retained high-water capacity is covered by the same fixed budget. A
-runtime decrease applies the lower admission waterline immediately, but an
-already-grown ring keeps its former charge until the log or session is
-destroyed. One item larger than the waterline may still proceed only as the
-exclusive queued item. Its surplus is not converted into a per-item retained
-charge and can remain heap-resident while publication is backpressured. The
-protocol command-size limit bounds the surplus, but the 10% outside retained
-admission does not reserve or guarantee enough space for it. With the default
-client-buffer quota, five percentage points may also be occupied by the source
-request until command retirement; a larger absolute client quota or a disabled
-client quota removes even that default headroom assumption. This is an explicit
-single-item escape hatch for forward progress, not a strict `--max-memory` or
-RSS bound. Operators that require the publisher copy to stay inside retained
-admission must configure the publisher waterline at least as large as their
-largest accepted replicated command.
+Publisher queues, full-sync subscriber queues, backlog blocks, full-sync
+coverage, and multi-frame target staging are retained replication state. They
+are admitted against the owning worker before they can accumulate. Each active
+worker log and full-sync session owns a bounded publisher budget; sessions and
+transaction participants share immutable command envelopes rather than
+duplicating payloads. Admission reserves every destination before mutation, so
+a successful primary write is not silently omitted from a valid history.
 
-Full-sync sessions share one immutable command copy, although each session's
-fixed budget is intentionally conservative and can cover its own FIFO. A
-transaction owns one immutable shared envelope;
-participant markers retain that object rather than deep-copying the final
-canonical payload on every worker. The coordinating worker that owns this
-shared envelope reserves its own worker-local memory share before constructing
-it and converts that reservation into the lifetime charge; participant-worker
-publisher budgets do not substitute for owner admission. Admission owns a
-distinct future slot for every destination. Physical ring growth is completed
-before mutation from the fixed staging budget, and the post-mutation enqueue
-is therefore allocation-free on the normal path. A maxmemory rejection before
-mutation becomes Redis OOM; one discovered after mutation invalidates the
-affected history or full-sync attempt. Once an explicit permit has covered a
-retained allocation, unexpected physical allocator exhaustion is process-fatal
-rather than translated into a second admission result. Backlog blocks reserve
-their 8 MiB payload and maximum block-lifetime sparse frame index as one unit,
-then materialize both through an externally admitted retained domain. That
-domain still records exact usable bytes but cannot perform a second maxmemory
-decision after half the block is live. Sparse offset publication therefore
-cannot discover a later maxmemory rejection. Both allocations return their
-actual mimalloc usable size when the block is evicted.
+One command larger than its publisher waterline may proceed only as the sole
+queued item so the queue cannot deadlock on an item that no consumer can make
+smaller. Protocol limits still bound that exception, but the waterline remains
+a backpressure threshold rather than a strict process-RSS bound. A foreground
+publication-admission failure before mutation is returned as Redis OOM. A
+recoverable encoding or backlog failure discovered after a mutation invalidates
+the affected history or full-sync attempt and requires a new full sync. Once
+explicit retained-memory admission succeeds, unexpected physical allocation
+failure is process-fatal rather than converted to a second admission result.
 
-Replication-log fences consume the same conservative per-item metadata bytes
-as command markers while queued, even though they have no command payload.
-They wait for publisher waterline capacity, cannot steal bytes promised to an
-outstanding write admission, and release that charge on completion or queue
-invalidation. This bounds concurrent full-sync and Redis-export fences within
-the externally accounted ring budget.
-
-Source publishers normally target 2 MiB and are capped at 128 frames per
-batch. The first frame is admitted even when it exceeds the byte target, so a
-one-frame batch can be larger than 2 MiB. Before a socket write can yield, the
-sender appends every complete event in the batch to an expected-ACK FIFO. A
-separate receiver coroutine validates ACKs in that order and advances the
-session's retained cursor while the sender continues reading and transmitting
-later batches. The sender never stops at an arbitrary batch boundary waiting
-for a transaction ACK whose other participant may be in another flow's next
-batch; socket backpressure bounds outstanding wire output instead. A flow with
-no tail data sleeps briefly. A full-sync flow that makes no protocol progress,
-or an online flow with unacknowledged work that makes no backlog ACK progress,
-for ten minutes is cancelled; a progressing full sync has no overall
-wall-clock limit.
+The source sends bounded batches while a separate receiver validates ACK order
+and advances the retained cursor. Sending can continue across batch boundaries
+so every participant of a cross-flow transaction can reach its rendezvous;
+socket backpressure bounds outstanding output. A full-sync flow that stalls, or
+an online flow with unacknowledged work whose ACK cursor stops advancing, is
+eventually cancelled. A progressing full sync has no overall wall-clock limit.
 
 ## Runtime backlog and backpressure
 
 Each source worker has one heap-backed backlog shared by all downstream native
 sessions and the Redis exporter. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
-8 MiB blocks. Enabling a worker log admits one additional prepared standby
-block, including its 8 MiB payload and maximum sparse frame index; published
-history remains lazy and is the only part counted against `repl-backlog-size`.
-A rollover consumes the standby without allocating on its append path and
-schedules its replacement immediately. The replacement still uses the same
-all-or-nothing retained-memory permit and maxmemory admission as a published
-block. Disable and shutdown join any in-flight refill and release the unused
-block. Per-worker
-LSNs start at one for a new history and increase monotonically. The log remains
-active across downstream disconnects and is cleared only when disabled, the
-process exits, or the history is invalidated.
+8 MiB blocks, and block ownership is covered by worker-local retained-memory
+admission. Per-worker LSNs start at one for a new history and increase
+monotonically. The log remains active across downstream disconnects and is
+cleared only when disabled, the process exits, or the history is invalidated.
 
 A connected native downstream pins its first unacknowledged LSN. The publisher
 must wait rather than evict required history. At capacity it sleeps until ACKs
-raise the retention point beyond the oldest sealed block's last LSN. Reclamation
-then removes that block and any immediately following sealed blocks containing
-the rest of its final spanning event, and the waiting publisher receives one
-block-granular allocation opportunity immediately. There is no percentage or
-quarter-window low-water hysteresis. Disconnect releases the pin immediately,
+make the oldest complete event reclaimable. Disconnect releases the pin,
 wakes writers, and leaves the remaining capacity as a circular reconnect
 window. Shrinking below pinned history establishes a target quota rather than
-deleting required events. A single oversized event can own multiple blocks and
-temporarily exceed the ordinary quota, but eviction and trim never retain only
-part of an event.
+deleting required events. A single oversized event can temporarily exceed the
+ordinary quota, but eviction and trim never retain only part of an event.
 
 Writes reserve the worker publisher queue and all relevant active full-sync
 queues before entering database or key gates. Multi-participant requests
-normally reserve workers sequentially in worker-ID order. A replicated
-standalone `MSET` is the intentional exception: it first acquires the global
-cross-flow publication-order slot, then, when it spans more than one worker,
-waits for its actual participant workers' publisher credits in parallel. Once
-the transaction owns its shard locks and every participant marker has been
-enqueued, an entry hook releases the order slot before storage I/O and
-durability completion. A one-worker `MSET` releases the slot without a
-cross-flow marker. This preserves a common flow order without serializing
-unrelated storage work. Queue exhaustion therefore backpressures the client
-before commit instead of silently dropping publication. Encoding, late
-canonicalization, or backlog allocation failure after admission marks the
-history invalid: the primary dataset remains usable, but the manager assigns a
-new history ID, cancels downstream sessions, clears all worker logs, and
-requires full sync. If late canonicalization makes the oldest already-admitted
-transaction larger than the configured queue waterline, the single consumer
-publishes that head item and temporarily reports an over-waterline queue; it
-must not wait for later items that only the same consumer can drain. New
-admissions remain blocked until occupancy falls back under the limit.
+reserve every destination while the cross-flow ordering boundary keeps worker
+FIFOs consistent. Queue exhaustion therefore backpressures the client before
+commit instead of silently dropping publication. A post-mutation encoding or
+backlog failure leaves the primary dataset usable but invalidates the history:
+the manager assigns a new history ID, cancels downstream sessions, clears all
+worker logs, and requires full sync. An already-admitted head item may drain
+above the current waterline to preserve forward progress; new admissions remain
+blocked until occupancy falls below it.
 
 ## Full-sync lifecycle
 
@@ -250,36 +183,14 @@ capture attempt so the next attempt starts from the new database epochs.
 
 Before a source session becomes visible, each worker reserves coverage-map
 headroom for its largest `(partition, database)` scan, because only one such
-map is live at a time. It does not sum all 16 databases in a partition. Every
-partition keeps a fixed 16-element array of conservative coverage bytes. A new
-index identity adds its metadata allowance and either twice its inline key
-length or twice the digest size; physical erase subtracts the same amount,
-while value and TTL replacement do not change it. Recovery builds the counters
-with the indexes, and FLUSH or replica reset clears the detached database
-slots. Session startup therefore takes the maximum of a bounded number of
-worker-local counters instead of synchronously scanning all keys and blocking
-the worker for O(dataset size).
-Coverage entries for external keys retain only digest and logical length, like
-the record index, so the baseline reservation does not charge their complete
-on-disk key. If a post-fence mutation replaces one with full-key map owners,
-the expansion must consume unused session credit or invalidate the attempt
-before allocation.
-Even an empty or one-key scan reserves the coverage arena's first physical
-allocation: one 1 MiB span, a 64 KiB alignment allowance, and fixed bucket and
-control metadata. Coverage arenas then run in externally admitted and
-externally accounted mode, so their allocations consume the parent session
-credit without being counted twice.
-Before a first-seen identity grows the arena or replacement maps, a
-conservative per-key slice moves from the worker-local logical reservation to
-retained session accounting. Clearing the partition destroys those
-containers before restoring their slices, which prevents reservation and live
-allocation from being counted twice while still allowing the next partition
-to reuse the largest-map budget. If post-fence writes introduce more identities
-than that budget covers, their durable mutations remain successful but the
-lower-priority full-sync session is invalidated; the replica reconnects and
-starts a new attempt. The reservation shares that worker's 90% retained-memory
-boundary with the dataset, index, backlog, and queued subscriber copies; any
-unconsumed remainder is released when the session ends.
+map is live at a time. The estimate comes from per-database summaries maintained
+with the indexes, so session startup does not scan the dataset. Coverage stores
+key identity rather than value bytes; external baseline keys use their digest,
+while later replacements can consume additional reserved credit. The
+reservation is reused as partitions hand off and released when the session
+ends. If post-fence writes introduce more identities than it covers, the
+durable foreground mutations remain valid but the lower-priority full-sync
+attempt is invalidated and retried.
 
 Native replication frame receive/send buffers, fragmented-command assembly,
 decoded record key/value strings, record vectors, and RDB strings are bounded
@@ -330,8 +241,8 @@ drains and detaches the partial population rather than exposing it.
 
 The target disables socket read-ahead on native flow connections. Its online
 receiver validates frame identity and fragment order, reassembles and decodes
-complete KRC1 commands, and places at most 256 commands in an owner-local FIFO.
-A separate consumer removes them in receive order and performs strict replay.
+complete KRC1 commands, and places them in a bounded owner-local FIFO. A
+separate consumer removes them in receive order and performs strict replay.
 Only successful application, including any cross-flow rendezvous, publishes
 the next in-memory resume cursor; the consumer then writes the ACK. If that ACK
 detects a disconnect, reconnect does not repeat an already applied `APPEND`,
@@ -352,38 +263,20 @@ fragment reassembly, and KRC1 decode failures instead cancel the session
 without explicitly invalidating the prior continuation state.
 
 Source-side cross-flow transaction and control publication uses one
-process-global ordering slot. Unless its concrete key set lands on a single
-shard (see the dynamic admission below), a replicated standalone `MSET`
-acquires it before publisher admission or database gating, admits its
-participant workers in parallel, and releases it as soon as every participant
-marker is queued rather than holding it across storage I/O. `EXEC` and
-database-control publication use the same slot for their ordering boundary;
-`FLUSH` acquires it before closing database gates, and full-sync cut closes
-and drains the snapshot-transaction gate before database gates. The shared
-command-layer helper cooperatively yields while the slot is held, but blocking
-List and Sorted Set attempt paths still retry the same acquisition after
-1 ms sleeps.
+process-global ordering slot so independent worker FIFOs agree on rendezvous
+order. A request whose complete, concrete key set maps to one shard skips the
+slot because it cannot participate in a cross-flow cycle. Requests whose
+execution can discover additional participants serialize conservatively, as
+does `EXEC`.
 
-Admission onto the slot is dynamic rather than static-flag based. A request
-whose command kind carries `kCmdKeyViewComplete` and whose concrete
-`DetermineKeys` view maps to a single shard skips the slot entirely: a
-single-flow envelope cannot join a cross-flow rendezvous cycle, so ordering it
-against other flows buys nothing. Gate-eligible writes whose execution-time
-participant sets can exceed their key view keep serializing on it, including
-`SORT` with BY/GET patterns, `GEORADIUS` with STORE/STOREDIST, and the
-aggregate sorted-set STORE variants; command kinds without the proven-complete
-flag fail conservative and always serialize. `EXEC` keeps the slot regardless
-of how many shards its queued writes touch.
-
-The MSET pre-acquisition fixes only that command's order-slot/DB inversion. Its
-body still acquires database admission before snapshot-transaction admission,
-while a full-sync cut closes and drains the snapshot gate before draining the
-database gates, so `MSET` can still participate in a DB/snapshot hold-and-wait
-cycle. Other multi-shard paths can additionally acquire database admission
-before the publication-order slot. `FLUSH` takes the order slot before draining
-database gates. These inverse orders have no deterministic regression proof;
-the current implementation must not be described as deadlock-free or as
-providing a fairness deadline.
+A replicated standalone `MSET` acquires the slot before publisher admission or
+database gating, admits its participant workers in parallel, and releases it
+as soon as every participant marker is queued rather than holding it across
+storage I/O. Database-control publication uses the same ordering boundary:
+`FLUSH` acquires it before closing database gates, while a full-sync cut closes
+and drains snapshot-transaction admission before database gates. These gates
+do not have one global acquisition order, so the remaining hold-and-wait risk
+is documented under [current limitations](#invariants-failures-and-current-limitations).
 
 ## Redis interoperability
 
@@ -509,12 +402,12 @@ retention/backpressure, full-sync queue/session, and connection metrics.
   KRC1 decode failures cancel the session without explicitly invalidating the
   target's prior continuation state; rendezvous and command-apply failures do
   invalidate it.
-- The global publication-order slot has no fairness deadline. Its marker hook
-  shortens replicated `MSET` ownership and its early acquisition fixes the
-  MSET order/DB inversion, but `MSET` remains exposed to the DB/snapshot
-  inversion and other paths retain DB/order inversions. These gates still admit
-  hold-and-wait cycles. Blocking List and Sorted Set attempts also retain 1 ms
-  polling rather than cooperative yield.
+- The global publication-order slot has no fairness deadline. `MSET` can still
+  acquire database admission before snapshot-transaction admission, other
+  multi-shard paths can acquire database admission before the order slot, and
+  `FLUSH` acquires the order slot before draining database gates. These inverse
+  orders still admit hold-and-wait cycles, so replication is not documented as
+  deadlock-free.
 - Native reset can leave a stale dataset-valid flag after detaching the last
   completed root, while Redis Cluster promotion treats any one valid source as
   sufficient. `REPLICAOF NO ONE` can therefore publish an empty native dataset
@@ -534,12 +427,11 @@ flush during full sync, exact-once non-idempotent effects, tight queue
 waterlines, multiple replicas, Function-catalog full sync and incremental
 mutation, config rewrite, and transaction/control fault injection.
 
-`tests/multikey_e2e_test.cpp` covers concurrent wide replicated `MSET`, early
-order-slot release after all participant markers, and changing participant sets
-across several wire batches; this is the regression coverage for duplex source
-sending and cross-flow rendezvous progress. `tests/pubsub_e2e_test.cpp` covers
-local and replicated `PUBLISH`, runtime-only publish transactions, mixed
-durable/Pub-Sub transactions, and RESP2/RESP3 subscribers.
+`tests/multikey_e2e_test.cpp` covers concurrent wide replicated `MSET`, changing
+participant sets, duplex source sending, and cross-flow rendezvous progress.
+`tests/pubsub_e2e_test.cpp` covers local and replicated `PUBLISH`, runtime-only
+publish transactions, mixed durable/Pub-Sub transactions, and RESP2/RESP3
+subscribers.
 
 `tests/redis_cluster_psync_e2e.sh` covers multi-source Redis Cluster discovery,
 slot ownership, online writes, disconnect, and partial resynchronization.
