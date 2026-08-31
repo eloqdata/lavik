@@ -2929,6 +2929,10 @@ std::string_view AppendStorageError(ReplyBuilder& reply_builder,
 absl::StatusOr<storage::SetOptions> ParseSetOptions(
     const std::vector<std::string>& args) {
   storage::SetOptions options;
+  // Plain SET is the dominant write path. Expiration parsing is the only
+  // reason this routine needs wall time, so do not read the clock when there
+  // are no options to interpret.
+  if (args.size() == 3) return options;
   bool condition_seen = false;
   bool expiration_seen = false;
   bool get_seen = false;
@@ -3298,9 +3302,12 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
           reply.encoded_ = reply_builder.AppendNull();
         }
       } else {
-        reply.encoded_ = result->applied_
-                             ? reply_builder.AppendSimpleString("OK")
-                             : reply_builder.AppendNull();
+        // A routed SET executes on the key owner, while ReplyBuilder belongs
+        // to the connection worker. The successful response is identical in
+        // RESP2 and RESP3, so use immutable process storage instead of writing
+        // five bytes into a remote worker's connection-private buffer.
+        reply.encoded_ = result->applied_ ? std::string_view("+OK\r\n")
+                                          : reply_builder.AppendNull();
       }
       co_return reply;
     }
@@ -9714,24 +9721,29 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest request,
                                    ReplyBuilder& reply_builder) {
-  BlockingWakeCascade cascade;
+  const CommandKind kind = request.kind_;
+  // Plain SET cannot make list, sorted-set, or stream waiters ready. Avoid an
+  // atomic cascade object and its completion check on this high-volume path;
+  // commands with broader effects retain the conservative cascade lifetime.
+  std::optional<BlockingWakeCascade> cascade;
+  if (kind != CommandKind::kSet) cascade.emplace();
   BlockingWakeCascade* previous_cascade = ctx.blocking_wake_cascade_;
-  ctx.blocking_wake_cascade_ = &cascade;
-  request.blocking_wake_cascade_ = &cascade;
+  ctx.blocking_wake_cascade_ = cascade.has_value() ? &*cascade
+                                                   : previous_cascade;
+  request.blocking_wake_cascade_ = ctx.blocking_wake_cascade_;
   struct RestoreCascade {
     ConnectionContext& ctx_;
     BlockingWakeCascade* previous_ = nullptr;
     ~RestoreCascade() { ctx_.blocking_wake_cascade_ = previous_; }
   } restore{ctx, previous_cascade};
   request.resp_version_ = ctx.resp_version();
-  const CommandKind kind = request.kind_;
   const bool may_block =
       request.spec_ != nullptr && (request.spec_->flags_ & kCmdMayBlock) != 0;
   const std::uint64_t started = celer::ReadCycleCounter();
   CommandReply reply =
       co_await DispatchCommandImpl(ctx, request, reply_builder);
-  if (!cascade.empty()) {
-    (void)co_await DrainBlockingWakeCascade(cascade);
+  if (cascade.has_value() && !cascade->empty()) {
+    (void)co_await DrainBlockingWakeCascade(*cascade);
   }
   const std::uint64_t elapsed_ticks = celer::ReadCycleCounter() - started;
   RecordCommandMetric(kind, elapsed_ticks);

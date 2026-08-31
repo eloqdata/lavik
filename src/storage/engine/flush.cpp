@@ -348,8 +348,8 @@ Task<absl::Status> StorageEngine::Impl::FlushPendingBlocks(WorkerStore* store) {
       if (identity.retired_extents_ != nullptr) {
         SpawnExtentReclaim(*store, identity.retired_extents_);
       }
-      if (identity.retired_record_.has_value()) {
-        retired_records.push_back(*identity.retired_record_);
+      if (identity.retired_record_.present_) {
+        retired_records.push_back(identity.retired_record_.Materialize());
       }
       if (identity.tx_retirements_ != nullptr) {
         // A commit record just became durable: its transaction's superseded

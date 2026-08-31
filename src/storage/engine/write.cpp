@@ -136,10 +136,15 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     }
     found = *resolved;
   }
-  const std::uint64_t now_ms = UnixTimeMillis();
-  const bool exists = found != nullptr &&
-                      found->value_.kind() == RecordKind::kValue &&
-                      !IsExpired(*found, now_ms);
+  bool exists = found != nullptr &&
+                found->value_.kind() == RecordKind::kValue;
+  // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
+  // not read wall time for the ordinary overwrite path; it is irrelevant when
+  // the index entry cannot expire.
+  if (exists && found->value_.has_expiry() &&
+      IsExpired(*found, UnixTimeMillis())) {
+    exists = false;
+  }
   if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
   SetResult result;
   if (options.return_old_value_ && exists) {
@@ -1374,7 +1379,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         logical_size, *extents, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo);
+        replacement_undo, &partition);
     if (!status.ok()) {
       store.worker_->Spawn(ReclaimExtents(&store, *extents));
     }
@@ -1385,7 +1390,7 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
         logical_size, nullptr, nullptr, nullptr, tx,
         std::move(commit_retirements), trace,
         replica_write_root.has_value() ? &*replica_write_root : nullptr,
-        replacement_undo);
+        replacement_undo, &partition);
   }
   if (status.ok() && committed_sequence != nullptr) {
     *committed_sequence = mutation_sequence;
@@ -1868,7 +1873,8 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     TxShardWrites* tx,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
-    TxUndoLog* replacement_undo) {
+    TxUndoLog* replacement_undo,
+    WorkerStore::PartitionStore* known_partition) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -1952,7 +1958,11 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
   // wherever their coordinator runs, and recovery reads them independently
   // of any partition's epochs.
   WorkerStore::PartitionStore* partition_ptr =
-      kind == RecordKind::kTxCommit ? nullptr : &PartitionForKey(store, key);
+      kind == RecordKind::kTxCommit
+          ? nullptr
+          : (known_partition != nullptr ? known_partition
+                                        : &PartitionForKey(store, key));
+  assert(known_partition == nullptr || known_partition->id_ == RedisSlot(key));
   RecordIndex* index_ptr =
       explicit_root != nullptr
           ? explicit_root->index_
@@ -2288,7 +2298,12 @@ acquire_active_stream:
     co_return absl::Status(absl::StatusCode::kInternal,
                            "invalid active staging block");
   }
-  std::fill_n(staging.data_ + record_offset, total_disk_bytes, std::byte{0});
+  // The encoder overwrites the complete header and the copies below overwrite
+  // the complete payload. Preserve deterministic on-disk padding without
+  // clearing those bytes twice on every append.
+  const std::size_t encoded_record_bytes = record_header_bytes + payload_bytes;
+  std::fill_n(staging.data_ + record_offset + encoded_record_bytes,
+              total_disk_bytes - encoded_record_bytes, std::byte{0});
   RecordHeader record{
       .magic_ = kRecordMagic,
       .version_ = kStorageFormatVersion,
@@ -2431,9 +2446,9 @@ acquire_active_stream:
                               : nullptr,
       .retired_record_ = (!for_defrag || defer_defrag_retirement) &&
                                  !route_to_commit && previous.has_value()
-                             ? std::optional<RetiredRecord>(RetiredRecordOf(
-                                   *previous, previous_dependent_extents))
-                             : std::nullopt,
+                             ? StagedRetiredRecordOf(
+                                   *previous, previous_dependent_extents)
+                             : StagedRetiredRecord{},
       .tx_retirements_ = std::move(commit_retirements),
       .index_generation_ = store.index_generations_[db_id],
       .entry_hash_ =

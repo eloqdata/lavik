@@ -30,6 +30,10 @@ constexpr std::size_t ToIndex(CommandKind kind) noexcept {
 // adjacent workers from sharing a cache line.
 struct alignas(64) WorkerMetricsShard {
   std::array<CommandMetricTotals, kCommandKindCount> commands_{};
+  // Command latencies are strongly clustered under steady load. This is a
+  // routing hint only; every miss still performs the exact lower_bound, so
+  // Prometheus histogram semantics and bucket boundaries remain unchanged.
+  std::array<std::uint8_t, kCommandKindCount> last_latency_buckets_{};
   std::uint64_t connected_clients_ = 0;
   std::uint64_t blocked_clients_ = 0;
   std::uint64_t replication_control_connections_ = 0;
@@ -168,11 +172,24 @@ void RecordCommandMetric(CommandKind kind,
       g_worker_metrics[worker].commands_[command_index];
   ++metric.calls_;
   metric.latency_ticks_ += elapsed_ticks;
-  const auto bucket =
-      std::lower_bound(g_latency_bucket_upper_ticks.begin(),
-                       g_latency_bucket_upper_ticks.end(), elapsed_ticks);
-  ++metric.latency_bins_[static_cast<std::size_t>(
-      bucket - g_latency_bucket_upper_ticks.begin())];
+  WorkerMetricsShard& shard = g_worker_metrics[worker];
+  std::size_t bucket = shard.last_latency_buckets_[command_index];
+  const bool above_lower =
+      bucket == 0 ||
+      elapsed_ticks > g_latency_bucket_upper_ticks[bucket - 1];
+  const bool below_upper =
+      bucket == g_latency_bucket_upper_ticks.size() ||
+      elapsed_ticks <= g_latency_bucket_upper_ticks[bucket];
+  if (!above_lower || !below_upper) {
+    bucket = static_cast<std::size_t>(std::lower_bound(
+                                         g_latency_bucket_upper_ticks.begin(),
+                                         g_latency_bucket_upper_ticks.end(),
+                                         elapsed_ticks) -
+                                     g_latency_bucket_upper_ticks.begin());
+    shard.last_latency_buckets_[command_index] =
+        static_cast<std::uint8_t>(bucket);
+  }
+  ++metric.latency_bins_[bucket];
 }
 
 celer::Task<WorkerMetricsSnapshot> CollectWorkerMetrics() {

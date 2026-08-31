@@ -386,7 +386,6 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
       header.header_bytes_ != header_bytes || output.size() != header_bytes) {
     return false;
   }
-  std::fill(output.begin(), output.end(), std::byte{0});
   RecordHeader encoded = header;
   encoded.value_type_ =
       static_cast<ValueType>(static_cast<std::uint8_t>(encoded.value_type_) |
@@ -397,9 +396,16 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
   encoded.key_external_ = false;
   encoded.header_checksum_ = 0;
   std::memcpy(output.data(), &encoded, sizeof(encoded));
+  std::size_t encoded_bytes = sizeof(encoded);
   if (!header.key_external_) {
     std::memcpy(output.data() + sizeof(encoded), key.data(), key.size());
+    encoded_bytes += key.size();
   }
+  // Every non-padding byte is overwritten above. Clear only the alignment
+  // tail because it participates in the durable header checksum; clearing the
+  // complete header first would write the header and inline key twice on every
+  // record append.
+  std::fill(output.begin() + encoded_bytes, output.end(), std::byte{0});
   encoded.header_checksum_ = Crc32c(output);
   std::memcpy(output.data(), &encoded, sizeof(encoded));
   return true;

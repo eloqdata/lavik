@@ -926,6 +926,40 @@ struct RetiredRecord {
   std::shared_ptr<const std::vector<ExtentManifest>> extra_dependent_extents_;
 };
 
+// Ordinary writes only need one dependent extent owner while waiting for the
+// replacement record to flush. Keep this common staging representation apart
+// from RetiredRecord: transaction commits and FLUSHDB need its additional
+// ownership forms, but charging those three shared_ptr slots to every SET
+// increases cache traffic on both the append and flush paths.
+struct StagedRetiredRecord {
+  ExtentManifest dependent_extents_;
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t total_disk_bytes_ = 0;
+  std::uint16_t block_owner_ = 0;
+  std::uint32_t record_offset_ = 0;
+  bool tx_tagged_ = false;
+  bool present_ = false;
+
+  RetiredRecord Materialize() const {
+    assert(present_);
+    return RetiredRecord{
+        .block_id_ = block_id_,
+        .allocation_epoch_ = allocation_epoch_,
+        .total_disk_bytes_ = total_disk_bytes_,
+        .block_owner_ = block_owner_,
+        .record_offset_ = record_offset_,
+        .tx_tagged_ = tx_tagged_,
+        .dependency_pinned_ = false,
+        .dependent_extents_ = dependent_extents_,
+        .immediate_extents_ = nullptr,
+        .extra_dependent_extents_ = nullptr,
+    };
+  }
+};
+
+static_assert(sizeof(StagedRetiredRecord) == 48);
+
 struct TxGenerationBlock {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
@@ -981,7 +1015,7 @@ struct RecordIdentity {
   // only durable version of the key, and subtracting it from live_bytes any
   // earlier lets the block reach zero and be durably freed — a crash before
   // the flush then loses a value that had already been made durable.
-  std::optional<RetiredRecord> retired_record_;
+  StagedRetiredRecord retired_record_;
   // A kTxCommit record additionally carries every retirement of its
   // transaction: the superseded versions may only leave their blocks'
   // accounting once the commit itself is durable, since without the commit
@@ -997,7 +1031,7 @@ struct RecordIdentity {
   std::uint8_t db_id_ = 0;
 };
 
-static_assert(sizeof(RecordIdentity) == 136);
+static_assert(sizeof(RecordIdentity) == 96);
 
 // One journaled write of an in-flight multi-key transaction, enough to put
 // the index back exactly as it was. Multiple writes to one key share a stable
@@ -2900,6 +2934,21 @@ class StorageEngine::Impl {
     };
   }
 
+  static StagedRetiredRecord StagedRetiredRecordOf(
+      const RecordLocation& location,
+      ExtentManifest dependent_extents = {}) {
+    return StagedRetiredRecord{
+        .dependent_extents_ = std::move(dependent_extents),
+        .block_id_ = location.block_id(),
+        .allocation_epoch_ = location.allocation_epoch(),
+        .total_disk_bytes_ = location.total_disk_bytes(),
+        .block_owner_ = location.block_owner(),
+        .record_offset_ = location.record_offset(),
+        .tx_tagged_ = location.tx_tagged(),
+        .present_ = true,
+    };
+  }
+
   void NoteTxRecordLocal(WorkerStore& store, std::uint64_t block_id,
                          std::uint64_t allocation_epoch,
                          std::uint64_t generation, std::uint64_t txid,
@@ -3020,7 +3069,8 @@ class StorageEngine::Impl {
       std::unique_ptr<std::vector<RetiredRecord>> commit_retirements = nullptr,
       SetLatencyTrace* trace = nullptr,
       const ExplicitWriteRoot* explicit_root = nullptr,
-      TxUndoLog* replacement_undo = nullptr);
+      TxUndoLog* replacement_undo = nullptr,
+      WorkerStore::PartitionStore* known_partition = nullptr);
 
   RecordIndex::Entry* ReplaceIndexLocation(WorkerStore& store,
                                            RecordIndex& index,
