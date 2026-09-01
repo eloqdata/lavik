@@ -136,14 +136,23 @@ sessions and the Redis exporter. Downstreams own only their cursors and
 retention pins. `repl-backlog-size` is a global quota divided across workers in
 8 MiB blocks, and block ownership is covered by worker-local retained-memory
 admission. Per-worker LSNs start at one for a new history and increase
-monotonically. The log remains active across downstream disconnects and is
-cleared only when disabled, the process exits, or the history is invalidated.
+monotonically. The log remains active across a downstream disconnect while that
+replica can still resume from the circular reconnect window. Each online native
+session records the next LSN after its highest completely written socket batch
+on every flow; this is a conservative upper bound even when the final ACK is
+lost. Once one flow's floor advances beyond that upper bound, the all-flow
+native session can no longer continue. After every disconnected native replica
+reaches that state and no native session or Redis exporter is active, the
+manager rotates the history ID and disables all worker logs. A later downstream
+must full-sync and re-enables a fresh history before its snapshot cut.
 
 A connected native downstream pins its first unacknowledged LSN. The publisher
 must wait rather than evict required history. At capacity it sleeps until ACKs
-make the oldest complete event reclaimable. Disconnect releases the pin,
-wakes writers, and leaves the remaining capacity as a circular reconnect
-window. Shrinking below pinned history establishes a target quota rather than
+make the oldest complete event reclaimable. Disconnect releases the pin, wakes
+writers, and leaves the remaining capacity as a circular reconnect window. The
+reconnect lease uses the highest-sent bound rather than the last ACK cursor so
+an ACK lost during disconnect cannot expire a history that the target may still
+consume. Shrinking below pinned history establishes a target quota rather than
 deleting required events. A single oversized event can temporarily exceed the
 ordinary quota, but eviction and trim never retain only part of an event.
 

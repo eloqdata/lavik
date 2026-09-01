@@ -615,6 +615,16 @@ class ServerProcess {
     pid_ = -1;
   }
 
+  void Pause() {
+    ASSERT_GT(pid_, 0);
+    ASSERT_EQ(::kill(pid_, SIGSTOP), 0);
+  }
+
+  void Resume() {
+    ASSERT_GT(pid_, 0);
+    ASSERT_EQ(::kill(pid_, SIGCONT), 0);
+  }
+
   void WaitForCrash() {
     ASSERT_GT(pid_, 0);
     const auto deadline = std::chrono::steady_clock::now() + 30s;
@@ -2906,6 +2916,121 @@ TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
             "+OK");
   EXPECT_TRUE(wait_for_value("after-client-kill-type", "three"));
 
+  replica.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-expired-replica-lease-e2e-" +
+      std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data), replica_cleanup(replica_data),
+      source_log_cleanup(source_log), replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  // Two workers require at least two 8 MiB backlog blocks. Keeping that
+  // minimum makes the disconnected cursor expire after a small bounded write
+  // set instead of making this test depend on the production 1 GiB default.
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       2, {}, {"--repl-backlog-size", "16777216"});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2);
+  RespClient source_client(source_port);
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+  auto wait_online = [&]() {
+    const auto deadline = std::chrono::steady_clock::now() + 60s;
+    std::string info;
+    do {
+      info = replica_client.Command({"INFO", "replication"});
+      if (info.find("keylane_replication_state:online") != std::string::npos) {
+        return info;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return info;
+  };
+  auto history_id = [](const std::string& info) {
+    constexpr std::string_view marker = "master_replid:";
+    const std::size_t begin = info.find(marker);
+    if (begin == std::string::npos) return std::string{};
+    const std::size_t value_begin = begin + marker.size();
+    const std::size_t end = info.find("\r\n", value_begin);
+    return info.substr(value_begin, end - value_begin);
+  };
+  ASSERT_NE(wait_online().find("keylane_replication_state:online"),
+            std::string::npos);
+  const std::string old_history =
+      history_id(source_client.Command({"INFO", "replication"}));
+  ASSERT_EQ(old_history.size(), 40U);
+
+  // Freeze the target before severing its sockets so it cannot reconnect and
+  // advance its process-local cursor while the source overwrites the window.
+  replica.Pause();
+  ASSERT_EQ(source_client.Command({"CLIENT", "KILL", "TYPE", "REPLICA"}),
+            ":3");
+  const auto disconnected_deadline = std::chrono::steady_clock::now() + 10s;
+  std::string source_info;
+  do {
+    source_info = source_client.Command({"INFO", "replication"});
+    if (source_info.find("connected_slaves:0") != std::string::npos) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < disconnected_deadline);
+  ASSERT_NE(source_info.find("connected_slaves:0"), std::string::npos);
+  EXPECT_EQ(history_id(source_info), old_history);
+
+  const std::string hot_key = KeyForWorker("expired-replica-lease", 0, 2);
+  const std::string payload(2 * 1024 * 1024, 'x');
+  for (unsigned write = 0; write < 8; ++write) {
+    ASSERT_EQ(source_client.Command(
+                  {"SET", hot_key, payload + std::to_string(write)}),
+              "+OK");
+  }
+  std::string new_history;
+  const auto expired_deadline = std::chrono::steady_clock::now() + 30s;
+  do {
+    new_history =
+        history_id(source_client.Command({"INFO", "replication"}));
+    if (!new_history.empty() && new_history != old_history) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < expired_deadline);
+  ASSERT_EQ(new_history.size(), 40U);
+  ASSERT_NE(new_history, old_history);
+
+  replica.Resume();
+  std::string resumed_info;
+  const auto resumed_deadline = std::chrono::steady_clock::now() + 60s;
+  do {
+    resumed_info = replica_client.Command({"INFO", "replication"});
+    if (resumed_info.find("keylane_replication_state:online") !=
+            std::string::npos &&
+        history_id(resumed_info) == new_history) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < resumed_deadline);
+  ASSERT_NE(resumed_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  EXPECT_EQ(history_id(resumed_info), new_history);
+  EXPECT_EQ(replica_client.Command({"STRLEN", hot_key}),
+            ":" + std::to_string(payload.size() + 1));
   replica.Stop();
   source.Stop();
 }

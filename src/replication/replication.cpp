@@ -2080,6 +2080,10 @@ struct ReplicaFlowProgress {
   std::atomic<std::uint16_t> current_partition_{0};
   std::atomic<std::uint64_t> partition_sequence_{0};
   std::atomic<std::uint64_t> activity_generation_{1};
+  // Upper bound on what the peer could have consumed. The sender advances it
+  // only after a complete socket write; unlike the ACK cursor, it remains a
+  // safe reconnect bound when the final ACK was lost with the connection.
+  std::atomic<std::uint64_t> highest_sent_next_lsn_{0};
 };
 
 struct ReplicaFlowProgressSnapshot {
@@ -2110,11 +2114,13 @@ class ReplicationConnectionMetricGuard {
 
 struct MasterSession {
   MasterSession(std::uint64_t id, unsigned worker_count, std::string node_id,
-                std::string host, std::uint16_t port, bool allow_continue)
+                std::string host, std::uint16_t port,
+                std::string source_history_id, bool allow_continue)
       : id_(id),
         node_id_(std::move(node_id)),
         host_(std::move(host)),
         port_(port),
+        source_history_id_(std::move(source_history_id)),
         allow_continue_(allow_continue),
         flow_fds_(worker_count, -1),
         flows_(worker_count),
@@ -2241,6 +2247,27 @@ struct MasterSession {
     progress.activity_generation_.fetch_add(1, std::memory_order_release);
   }
 
+  void SetHighestSentNextLsn(unsigned flow_id, std::uint64_t next_lsn) {
+    if (flow_id >= flows_.size() || next_lsn == 0) return;
+    auto& highest = flows_[flow_id].highest_sent_next_lsn_;
+    std::uint64_t observed = highest.load(std::memory_order_relaxed);
+    while (observed < next_lsn &&
+           !highest.compare_exchange_weak(observed, next_lsn,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+    }
+  }
+
+  std::vector<std::uint64_t> HighestSentNextLsns() const {
+    std::vector<std::uint64_t> result;
+    result.reserve(flows_.size());
+    for (const ReplicaFlowProgress& flow : flows_) {
+      result.push_back(
+          flow.highest_sent_next_lsn_.load(std::memory_order_acquire));
+    }
+    return result;
+  }
+
   void TouchProgress(unsigned flow_id) {
     if (cancelled_.load(std::memory_order_acquire) ||
         flow_id >= flows_.size()) {
@@ -2321,7 +2348,14 @@ struct MasterSession {
     return result == std::numeric_limits<std::uint64_t>::max() ? 0 : result;
   }
 
-  void MarkOnline() noexcept { online_.store(true, std::memory_order_release); }
+  void MarkOnline() noexcept {
+    ever_online_.store(true, std::memory_order_release);
+    online_.store(true, std::memory_order_release);
+  }
+
+  bool ever_online() const noexcept {
+    return ever_online_.load(std::memory_order_acquire);
+  }
 
   bool online() const noexcept {
     return online_.load(std::memory_order_acquire) && !cancelled();
@@ -2347,6 +2381,7 @@ struct MasterSession {
   const std::string node_id_;
   const std::string host_;
   const std::uint16_t port_ = 0;
+  const std::string source_history_id_;
   const bool allow_continue_ = false;
 
  private:
@@ -2363,8 +2398,15 @@ struct MasterSession {
   celer::CoroutineBarrier snapshot_capture_stopped_;
   std::atomic<unsigned> snapshot_scans_complete_{0};
   std::atomic<unsigned> connected_flows_{0};
+  std::atomic<bool> ever_online_{false};
   std::atomic<bool> online_{false};
   std::atomic<bool> cancelled_{false};
+};
+
+struct DisconnectedReplicaLease {
+  std::uint64_t session_id_ = 0;
+  std::string history_id_;
+  std::vector<std::uint64_t> highest_sent_next_lsns_;
 };
 
 struct RedisSource {
@@ -3012,6 +3054,14 @@ class ReplicationManager::Impl {
       std::atomic<bool>* active_;
       ~ActiveGuard() { active_->store(false, std::memory_order_release); }
     } active_guard{&redis_export_active_};
+    if (celer::ThisWorker().id_ == 0) {
+      StartIdleReplicationHistoryMonitor();
+    } else {
+      (void)co_await celer::SubmitTo(0, [this] {
+        StartIdleReplicationHistoryMonitor();
+        return true;
+      });
+    }
 
     absl::Status configured = ConfigureConnectedFd(stream.NativeFd());
     if (!configured.ok()) co_return configured;
@@ -6443,6 +6493,7 @@ class ReplicationManager::Impl {
           "malformed replication backlog cursor ACK");
     }
     session->SetBacklogCursor(flow_id, ReplicationPhase::kReady, cursor);
+    session->SetHighestSentNextLsn(flow_id, cursor.lsn_);
     celer::ThisWorker().self_->Spawn(
         MonitorBacklogStall(session, flow_id, stream.NativeFd(),
                             session->ProgressGeneration(flow_id)));
@@ -6613,6 +6664,9 @@ class ReplicationManager::Impl {
           sender_status = sent;
           break;
         }
+        // A successful vectored write is the furthest the peer could possibly
+        // have consumed even if its corresponding ACK is lost on disconnect.
+        session->SetHighestSentNextLsn(flow_id, batch->next_.lsn_);
       }
       // Keep sending independently from the durable cursor. In particular,
       // never stop a source flow at an arbitrary batch boundary waiting for a
@@ -6693,6 +6747,12 @@ class ReplicationManager::Impl {
         (args[3] != "?" && !IsReplicationId(args[3]))) {
       co_return absl::InvalidArgumentError("invalid KLPSYNC handshake");
     }
+    active_master_controls_.fetch_add(1, std::memory_order_acq_rel);
+    struct ControlGuard {
+      std::atomic<unsigned>* active_;
+      ~ControlGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
+    } control_guard{&active_master_controls_};
+    StartIdleReplicationHistoryMonitor();
     const bool protocol_probe = args[2] == "?";
     absl::Status history_ready = co_await EnsureReplicationHistoryReady();
     if (!history_ready.ok()) co_return history_ready;
@@ -6728,7 +6788,8 @@ class ReplicationManager::Impl {
     const bool allow_continue = args[3] == source_history_id;
     auto session = std::make_shared<MasterSession>(
         session_id, storage_->worker_count(), std::move(replica_node_id),
-        std::move(replica_host), replica_port, allow_continue);
+        std::move(replica_host), replica_port, source_history_id,
+        allow_continue);
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
@@ -6824,6 +6885,14 @@ class ReplicationManager::Impl {
       co_return sent;
     }
     session->MarkOnline();
+    {
+      std::lock_guard lock(master_mutex_);
+      const auto lease = disconnected_replica_leases_.find(session->node_id_);
+      if (lease != disconnected_replica_leases_.end() &&
+          lease->second.session_id_ < session->id_) {
+        disconnected_replica_leases_.erase(lease);
+      }
+    }
     spdlog::info("accepted replication session {} with {} data flows",
                  session_id, session->worker_count());
     absl::Status waited = co_await WaitForClose(stream);
@@ -6933,9 +7002,156 @@ class ReplicationManager::Impl {
       const auto found = master_sessions_.find(session->id_);
       if (found != master_sessions_.end() && found->second == session) {
         master_sessions_.erase(found);
+        // Flow coroutines are owner-worker tasks and can outlive the control
+        // socket. Keep the session until every flow has observed cancellation;
+        // only then is its highest-sent reconnect bound stable.
+        retired_master_sessions_.push_back(session);
       }
     }
     session->Cancel();
+  }
+
+  void FinalizeRetiredMasterSessionsLocked() {
+    auto retired = retired_master_sessions_.begin();
+    while (retired != retired_master_sessions_.end()) {
+      const std::shared_ptr<MasterSession>& session = *retired;
+      if (session->connected_flows() != 0) {
+        ++retired;
+        continue;
+      }
+      if (session->ever_online() && !session->node_id_.empty()) {
+        std::vector<std::uint64_t> upper = session->HighestSentNextLsns();
+        const bool reconnectable =
+            upper.size() == storage_->worker_count() &&
+            std::all_of(upper.begin(), upper.end(),
+                        [](std::uint64_t lsn) { return lsn != 0; });
+        if (reconnectable) {
+          DisconnectedReplicaLease lease{
+              .session_id_ = session->id_,
+              .history_id_ = session->source_history_id_,
+              .highest_sent_next_lsns_ = std::move(upper),
+          };
+          auto existing = disconnected_replica_leases_.find(session->node_id_);
+          if (existing == disconnected_replica_leases_.end()) {
+            disconnected_replica_leases_.emplace(session->node_id_,
+                                                  std::move(lease));
+          } else if (existing->second.session_id_ < session->id_) {
+            existing->second = std::move(lease);
+          }
+        }
+      }
+      retired = retired_master_sessions_.erase(retired);
+    }
+  }
+
+  bool MasterHistoryHasConsumersLocked() const {
+    return !master_sessions_.empty() || !retired_master_sessions_.empty() ||
+           active_master_controls_.load(std::memory_order_acquire) != 0 ||
+           redis_export_active_.load(std::memory_order_acquire);
+  }
+
+  void StartIdleReplicationHistoryMonitor() {
+    assert(celer::ThisWorker().id_ == 0);
+    if (idle_history_monitor_running_) return;
+    idle_history_monitor_running_ = true;
+    celer::ThisWorker().self_->Spawn(MonitorIdleReplicationHistory());
+  }
+
+  Task<absl::Status> MonitorIdleReplicationHistory() {
+    assert(celer::ThisWorker().id_ == 0);
+    struct MonitorGuard {
+      bool* running_;
+      ~MonitorGuard() { *running_ = false; }
+    } monitor_guard{&idle_history_monitor_running_};
+
+    for (;;) {
+      absl::Status slept = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(10));
+      if (!slept.ok()) co_return slept;
+
+      std::string history_id;
+      std::vector<storage::ReplicationLogInfo> logs;
+      {
+        std::lock_guard lock(master_mutex_);
+        FinalizeRetiredMasterSessionsLocked();
+        if (MasterHistoryHasConsumersLocked()) continue;
+        history_id = history_id_;
+      }
+
+      logs.resize(storage_->worker_count());
+      for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+        if (worker == 0) {
+          logs[worker] = storage_->LocalReplicationLogInfo();
+        } else {
+          logs[worker] = co_await celer::SubmitTo(
+              worker, [this] { return storage_->LocalReplicationLogInfo(); });
+        }
+      }
+
+      bool no_reconnectable_replica = false;
+      {
+        std::lock_guard lock(master_mutex_);
+        FinalizeRetiredMasterSessionsLocked();
+        if (MasterHistoryHasConsumersLocked()) continue;
+        for (auto lease = disconnected_replica_leases_.begin();
+             lease != disconnected_replica_leases_.end();) {
+          const DisconnectedReplicaLease& candidate = lease->second;
+          bool expired = candidate.history_id_ != history_id_ ||
+                         candidate.highest_sent_next_lsns_.size() != logs.size();
+          for (std::size_t worker = 0; !expired && worker < logs.size();
+               ++worker) {
+            // Native continuation is all-flow: one flow whose oldest retained
+            // LSN is beyond the furthest frame possibly sent makes the entire
+            // disconnected replica require full synchronization.
+            expired = logs[worker].state_ !=
+                          storage::ReplicationLogState::kActive ||
+                      logs[worker].floor_lsn_ >
+                          candidate.highest_sent_next_lsns_[worker];
+          }
+          if (expired) {
+            spdlog::info(
+                "replication reconnect lease expired node={} session={}",
+                lease->first, candidate.session_id_);
+            const auto expired_lease = lease++;
+            disconnected_replica_leases_.erase(expired_lease);
+          } else {
+            ++lease;
+          }
+        }
+        no_reconnectable_replica = disconnected_replica_leases_.empty();
+      }
+      if (!no_reconnectable_replica || history_reset_running_) continue;
+
+      // Serialize with history reset and handshake setup. A handshake that
+      // arrives after this point waits, observes the new history id, and must
+      // full-sync; one already in progress is caught by the final recheck.
+      history_reset_running_ = true;
+      bool disable = false;
+      {
+        std::lock_guard lock(master_mutex_);
+        FinalizeRetiredMasterSessionsLocked();
+        disable = !MasterHistoryHasConsumersLocked() &&
+                  disconnected_replica_leases_.empty();
+        if (disable) history_id_ = NewReplicationId();
+      }
+      if (!disable) {
+        history_reset_running_ = false;
+        continue;
+      }
+
+      absl::Status disabled = absl::OkStatus();
+      for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+        disabled = co_await celer::SubmitTaskTo(
+            worker, [this]() { return storage_->DisableReplicationLog(); });
+        if (!disabled.ok()) break;
+      }
+      history_reset_running_ = false;
+      if (!disabled.ok()) co_return disabled;
+      spdlog::info(
+          "disabled replication history after all disconnected replicas "
+          "fell behind the backlog");
+      co_return absl::OkStatus();
+    }
   }
 
   Task<absl::Status> ResetInvalidReplicationHistory() {
@@ -6981,6 +7197,7 @@ class ReplicationManager::Impl {
         cancelled.push_back(session);
       }
       master_sessions_.clear();
+      disconnected_replica_leases_.clear();
       history_id_ = NewReplicationId();
     }
     for (const auto& session : cancelled) session->Cancel();
@@ -7043,9 +7260,14 @@ class ReplicationManager::Impl {
   bool redis_topology_monitor_started_ = false;  // worker 0 only
   celer::AsyncMutex redis_fullsync_mutex_;       // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
+  std::atomic<unsigned> active_master_controls_{0};
   mutable std::mutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
+  std::vector<std::shared_ptr<MasterSession>> retired_master_sessions_;
+  absl::flat_hash_map<std::string, DisconnectedReplicaLease>
+      disconnected_replica_leases_;
+  bool idle_history_monitor_running_ = false;  // worker 0 only
 };
 
 ReplicationManager::ReplicationManager(
