@@ -112,7 +112,7 @@ struct ClientConnectionRecord {
 std::array<std::vector<ClientConnectionRecord>, storage::kLogicalStorageShards>
     g_worker_clients;
 
-constexpr std::string_view kReplicationTransactionEnvelope = "__KEYLANE_TX_V1";
+constexpr std::size_t kEstimatedIndexBytesPerKey = 512;
 
 bool CmpCaseInsensitive(std::string_view a, std::string_view b);
 std::string_view AppendStorageError(ReplyBuilder& reply_builder,
@@ -8627,7 +8627,6 @@ std::optional<storage::ReplicationCommandAppend> PrepareReplicationCommand(
 namespace {
 
 std::atomic<std::uint64_t> g_next_replication_transaction_id{1};
-
 }  // namespace
 
 ReplicationTransactionGuard::ReplicationTransactionGuard(
@@ -8685,20 +8684,28 @@ void ReplicationTransactionGuard::Initialize(
     transaction->id_ = id;
     transaction->db_id_ = request.db_id_;
     transaction->participants_ = std::move(participants);
-    auto& envelope = transaction->envelope_args_;
-    envelope.reserve(3 + transaction->participants_.size() +
-                     command_args.size());
-    envelope.emplace_back(kReplicationTransactionEnvelope);
-    envelope.push_back(std::to_string(id));
-    envelope.push_back(std::to_string(transaction->participants_.size()));
-    for (unsigned participant : transaction->participants_) {
-      envelope.push_back(std::to_string(participant));
+    // Rotate the one payload-bearing marker across the participant set. A
+    // fixed flow would make that flow's bounded backlog the throughput limit
+    // for otherwise balanced cross-flow transactions.
+    transaction->payload_flow_ = transaction->participants_[
+        id % transaction->participants_.size()];
+    auto metadata = EncodeReplicationTransactionEnvelope(
+        ReplicationTransactionEnvelope{
+            .id_ = id,
+            .payload_flow_ = transaction->payload_flow_,
+            .participants_ = transaction->participants_,
+        });
+    if (!metadata.ok()) {
+      status_ = metadata.status();
+      return;
     }
-    envelope.insert(envelope.end(), command_args.begin(), command_args.end());
+    transaction->envelope_metadata_ = std::move(*metadata);
+    transaction->command_args_.assign(command_args.begin(), command_args.end());
     const auto allocation_bytes =
         storage::ReplicationTransactionAllocationBytes(
-            transaction->participants_.capacity(), envelope,
-            std::span<const std::string>{});
+            transaction->participants_.capacity(),
+            std::span<const std::string>(&transaction->envelope_metadata_, 1),
+            transaction->command_args_);
     if (!allocation_bytes.has_value() ||
         *allocation_bytes > reservation->bytes()) {
       RecordMemoryRejection();
@@ -8753,15 +8760,13 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
           storage::ReplicationTransactionResolution::kPending) {
     return absl::OkStatus();
   }
-  const std::size_t prefix_size = 3 + transaction_->participants_.size();
-  auto& envelope = transaction_->envelope_args_;
-  if (envelope.size() < prefix_size) {
+  if (transaction_->envelope_metadata_.empty()) {
     return absl::FailedPreconditionError(
         "replication transaction envelope is incomplete");
   }
   const auto target_bytes = storage::ReplicationTransactionAllocationBytes(
       transaction_->participants_.capacity(),
-      std::span<const std::string>(envelope).first(prefix_size),
+      std::span<const std::string>(&transaction_->envelope_metadata_, 1),
       canonical_args);
   if (!target_bytes.has_value()) {
     RecordMemoryRejection();
@@ -8779,17 +8784,15 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
     }
   }
   try {
-    // Build a complete replacement before touching the shared envelope. This
+    // Build a complete replacement before touching the shared payload. This
     // gives pre-mutation callers a strong failure boundary; publisher workers
     // continue seeing the old immutable body until the noexcept swap.
     std::vector<std::string> replacement;
-    replacement.reserve(prefix_size + canonical_args.size());
-    replacement.insert(replacement.end(), envelope.begin(),
-                       envelope.begin() + prefix_size);
+    replacement.reserve(canonical_args.size());
     replacement.insert(replacement.end(),
                        std::make_move_iterator(canonical_args.begin()),
                        std::make_move_iterator(canonical_args.end()));
-    envelope.swap(replacement);
+    transaction_->command_args_.swap(replacement);
     transaction_->retained_charge_.Resize(
         std::max(current_bytes, *target_bytes));
     return absl::OkStatus();
@@ -8832,13 +8835,9 @@ void ReplicationTransactionGuard::SetFinalExpirations(
     }
     if (final_effects.empty()) return;
 
-    auto& envelope = transaction_->envelope_args_;
-    const std::size_t prefix = 3 + transaction_->participants_.size();
-    if (envelope.size() <= prefix) return;
-    std::vector<std::string> command_args;
-    command_args.reserve(envelope.size() - prefix + final_effects.size() * 4);
-    std::move(envelope.begin() + prefix, envelope.end(),
-              std::back_inserter(command_args));
+    if (transaction_->command_args_.empty()) return;
+    std::vector<std::string> command_args = transaction_->command_args_;
+    command_args.reserve(command_args.size() + final_effects.size() * 4);
     for (const auto& effect : final_effects) {
       AppendReplicationExpirationEffect(&command_args, transaction_->db_id_,
                                         effect.db_id_, effect.key_,

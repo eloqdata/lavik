@@ -65,7 +65,9 @@ Redis listener. Worker 0 owns the `KLPSYNC` control connection. The source has
 one `KLFLOW` data connection per source worker and adopts each flow socket onto
 that worker. A target may have a different worker count; it assigns source flow
 `n` to target worker `n % target_worker_count` without changing the source flow
-identity.
+identity. Native protocol version 1 identifies the sparse binary
+transaction-envelope format described below; peers reject a different protocol
+version during the control and flow handshakes.
 
 The control handshake exchanges a session ID, node IDs, the source history ID,
 and source worker count. Each flow then presents its requested `(lsn,
@@ -84,10 +86,11 @@ client write
   -> worker-local publisher FIFO
   -> shared in-memory replication frames
   -> duplex KLFLOW sender and ACK receiver
-  -> bounded target reassembly queue
-  -> strict FIFO trusted apply
+  -> target reassembly queue (at most 256 complete commands)
+  -> ordered staging and cross-flow transaction scheduler
+  -> trusted apply
   -> target resume-cursor publication
-  -> ACK
+  -> per-flow ordered ACK
 ```
 
 Canonical commands use the KRC1 version-1 encoding: explicit logical database,
@@ -239,28 +242,39 @@ drains and detaches the partial population rather than exposing it.
 
 ## Online apply and rendezvous
 
-The target disables socket read-ahead on native flow connections. Its online
-receiver validates frame identity and fragment order, reassembles and decodes
-complete KRC1 commands, and places them in a bounded owner-local FIFO. A
-separate consumer removes them in receive order and performs strict replay.
-Only successful application, including any cross-flow rendezvous, publishes
-the next in-memory resume cursor; the consumer then writes the ACK. If that ACK
-detects a disconnect, reconnect does not repeat an already applied `APPEND`,
-`INCR`, or similar effect. An ingress or apply failure cancels the whole
-session and joins the consumer before the flow returns, so no detached apply
-coroutine can strand another flow at a transaction barrier.
+The target disables transport-level socket read-ahead on native flow
+connections. Its application receiver nevertheless validates frame identity
+and fragment order, reassembles and decodes complete KRC1 commands, and places
+at most 256 commands in an owner-local FIFO. A staging coroutine consumes that
+FIFO in flow order. Ordinary commands are applied there; transaction markers
+are registered with the cross-flow scheduler without waiting for apply, up to
+a second bounded completion FIFO of 256 entries. An ordinary command or control
+barrier is a hard staging boundary and waits for the preceding transaction on
+that flow, preserving its mixed-event order.
 
-Multi-participant writes carry identical `__KEYLANE_TX_V1` envelopes on every
-participant flow. The target groups arrivals by transaction ID, verifies the
-participant set and body, applies the command once after every participant is
-present, and advances all participant cursors before any flow ACKs. `FLUSHDB`
-and `FLUSHALL` use a shared barrier ID copied to every source flow; the target
-waits for all copies, installs one database epoch change, then advances the
-whole cursor vector. Transaction/control rendezvous failures and command apply
-failures invalidate the target's continuation state so a retry cannot continue
-from an uncertain cut. Online ingress protocol, frame identity or ordering,
-fragment reassembly, and KRC1 decode failures instead cancel the session
-without explicitly invalidating the prior continuation state.
+Each registered transaction depends on the previous registered transaction on
+each of its participant flows. Once every marker and the one canonical payload
+have arrived, a detached task waits those predecessors and applies the command.
+Transactions with disjoint participant sets have no dependency and may apply
+concurrently; transactions sharing any flow retain source order. A separate
+ACK coroutine drains the completion FIFO in receive order. Only successful
+application publishes the next in-memory resume cursor and permits its ACK. If
+an ACK detects a disconnect, reconnect does not repeat an already applied
+`APPEND`, `INCR`, or similar effect. An ingress, staging, ACK, rendezvous, or
+apply failure cancels the whole session and joins both flow-local coroutines
+and every detached transaction task before replacement, so no task can retain
+the old stream or storage mutation lifetime.
+
+Multi-participant writes carry a binary V1 `KTX1` metadata argument on every
+participant flow. Its little-endian layout is the four-byte magic, transaction
+ID (`u64`), payload flow (`u16`), participant-bitmap length (`u16`), and the
+canonical bitmap with no trailing zero byte. The named flow carries the
+canonical command as the remaining KRC1 arguments while the other flows carry
+only the metadata argument. Payload-flow selection rotates across the
+participants so one bounded backlog does not become a hotspot. The target
+verifies and groups these markers by transaction ID, applies the command once,
+and advances all participant cursors before any flow ACKs. This representation
+is shared by every cross-flow command and does not encode a Redis command kind.
 
 Source-side cross-flow transaction and control publication uses one
 process-global ordering slot so independent worker FIFOs agree on rendezvous

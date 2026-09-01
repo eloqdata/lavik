@@ -502,14 +502,17 @@ enum class ReplicationTransactionResolution : std::uint8_t {
 };
 
 // Shared by the source workers participating in one cross-key command. Each
-// worker queues the same immutable envelope while the command holds its shard
-// locks; resolution decides whether that queued envelope is published after
-// the command's atomic outcome is known. It is not a wire-level commit state.
+// worker queues a reference to the same canonical command while the command
+// holds its shard locks; resolution publishes its final contents. A publisher
+// then derives one payload record and participant-local marker records from
+// the binary metadata. This object is not wire-level commit state.
 struct ReplicationTransaction {
   std::uint64_t id_ = 0;
   std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
-  std::vector<std::string> envelope_args_;
+  unsigned payload_flow_ = 0;
+  std::string envelope_metadata_;
+  std::vector<std::string> command_args_;
   // All participant markers share this object. Charge the envelope once on
   // its origin shard so participant workers neither duplicate the payload nor
   // return its bytes to whichever worker releases the last shared_ptr.

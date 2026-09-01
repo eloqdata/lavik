@@ -96,9 +96,30 @@ absl::Status InvalidState(std::string_view message) {
 }
 
 std::optional<std::size_t> TransactionStagingBytes(
-    const ReplicationTransaction& transaction) {
-  return CommandStagingBytes(
-      std::span<const std::string>(transaction.envelope_args_));
+    const ReplicationTransaction& transaction, unsigned worker) noexcept {
+  const bool carries_payload = worker == transaction.payload_flow_;
+  const std::size_t argument_count =
+      1 + (carries_payload ? transaction.command_args_.size() : 0);
+  std::size_t total = kReplicationPublisherItemMetadataBytes;
+  if (argument_count >
+      (std::numeric_limits<std::size_t>::max() - total) / sizeof(std::string)) {
+    return std::nullopt;
+  }
+  total += argument_count * sizeof(std::string);
+  if (transaction.envelope_metadata_.size() >
+      std::numeric_limits<std::size_t>::max() - total) {
+    return std::nullopt;
+  }
+  total += transaction.envelope_metadata_.size();
+  if (carries_payload) {
+    for (const std::string& arg : transaction.command_args_) {
+      if (arg.size() > std::numeric_limits<std::size_t>::max() - total) {
+        return std::nullopt;
+      }
+      total += arg.size();
+    }
+  }
+  return total;
 }
 
 bool PublisherHasCapacity(std::size_t logical_bytes, std::size_t capacity,
@@ -131,7 +152,7 @@ std::optional<std::size_t> TransactionOwnerAllocationBytes(
     std::size_t participant_capacity, std::size_t prefix_count,
     std::span<const std::string> prefix,
     std::span<const std::string> command_args,
-    bool reserve_maximum_transaction_id) noexcept {
+    bool reserve_maximum_metadata) noexcept {
   if (prefix_count >
       std::numeric_limits<std::size_t>::max() - command_args.size()) {
     return std::nullopt;
@@ -150,12 +171,14 @@ std::optional<std::size_t> TransactionOwnerAllocationBytes(
        !AddAllocationCharge(participant_capacity * sizeof(unsigned), &total))) {
     return std::nullopt;
   }
-  // The decimal transaction ID is the only generated prefix string that can
-  // exceed the implementation's SSO capacity. Reserve its maximum uint64
-  // representation before any prefix allocation exists.
-  if ((reserve_maximum_transaction_id &&
-       !AddAllocationCharge(std::numeric_limits<std::uint64_t>::digits10 + 2,
-                            &total)) ||
+  // KTX1 uses one generated metadata string. Reserve its largest valid bitmap
+  // before allocation exists so source admission still covers the eventual
+  // retained owner on every supported worker count.
+  constexpr std::size_t kMaximumMetadataBytes =
+      4 + sizeof(std::uint64_t) + 2 * sizeof(std::uint16_t) +
+      (kLogicalStorageShards + 7) / 8;
+  if ((reserve_maximum_metadata &&
+       !AddAllocationCharge(kMaximumMetadataBytes + 1, &total)) ||
       !AddCommandArgumentAllocationBytes(prefix, &total) ||
       !AddCommandArgumentAllocationBytes(command_args, &total) ||
       !AddAllocationCharge(sizeof(ReplicationTransaction) + 64, &total)) {
@@ -169,13 +192,13 @@ std::optional<std::size_t> TransactionOwnerAllocationBytes(
 std::optional<std::size_t> ReplicationTransactionReservationBytes(
     std::size_t participant_capacity, std::size_t participant_count,
     std::span<const std::string> command_args) noexcept {
-  if (participant_count > std::numeric_limits<std::size_t>::max() - 3) {
+  if (participant_count == 0 || participant_count > kLogicalStorageShards) {
     return std::nullopt;
   }
   return TransactionOwnerAllocationBytes(
-      participant_capacity, 3 + participant_count,
+      participant_capacity, 1,
       std::span<const std::string>{}, command_args,
-      /*reserve_maximum_transaction_id=*/true);
+      /*reserve_maximum_metadata=*/true);
 }
 
 std::optional<std::size_t> ReplicationTransactionAllocationBytes(
@@ -187,7 +210,7 @@ std::optional<std::size_t> ReplicationTransactionAllocationBytes(
   }
   return TransactionOwnerAllocationBytes(
       participant_capacity, prefix.size(), prefix, command_args,
-      /*reserve_maximum_transaction_id=*/false);
+      /*reserve_maximum_metadata=*/false);
 }
 
 Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
@@ -749,12 +772,13 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   if (log.state_ != ReplicationLogState::kActive || transaction == nullptr ||
-      transaction->envelope_args_.empty()) {
+      transaction->envelope_metadata_.empty() ||
+      transaction->command_args_.empty()) {
     return false;
   }
 
-  const auto staging_bytes =
-      ReplicationCommandStagingBytes(transaction->envelope_args_);
+  const auto staging_bytes = TransactionStagingBytes(
+      *transaction, celer::ThisWorker().id_);
   if (!staging_bytes.has_value()) {
     log.state_ = ReplicationLogState::kInvalid;
     spdlog::warn("replication transaction staging size overflow");
@@ -789,6 +813,36 @@ bool StorageEngine::Impl::TryEnqueueReplicationTransaction(
   }
   return true;
 }
+
+namespace {
+
+std::vector<std::string> BuildReplicationTransactionEnvelope(
+    const ReplicationTransaction& transaction, unsigned worker) {
+  assert(!transaction.participants_.empty());
+  const unsigned payload_flow = transaction.payload_flow_;
+  assert(std::find(transaction.participants_.begin(),
+                   transaction.participants_.end(), payload_flow) !=
+         transaction.participants_.end());
+  assert(IsReplicationTransactionEnvelope(transaction.envelope_metadata_));
+  assert(!transaction.command_args_.empty());
+
+  // Every participant must retain an ordered log record so reconnect cursors
+  // can advance atomically. Only the deterministic payload flow needs the
+  // canonical command, however; the other records are rendezvous markers.
+  // The canonical envelope fixes that choice before workers publish, so the
+  // durable representation is independent of which worker finishes first.
+  std::vector<std::string> envelope;
+  const bool carries_payload = worker == payload_flow;
+  envelope.reserve(carries_payload ? 1 + transaction.command_args_.size() : 1);
+  envelope.push_back(transaction.envelope_metadata_);
+  if (carries_payload) {
+    envelope.insert(envelope.end(), transaction.command_args_.begin(),
+                    transaction.command_args_.end());
+  }
+  return envelope;
+}
+
+}  // namespace
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::FenceReplicationLog() {
   WorkerStore& store = CurrentStore();
@@ -908,8 +962,8 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             "history");
         break;
       }
-      const auto final_staging_bytes =
-          TransactionStagingBytes(*pending.transaction_);
+      const auto final_staging_bytes = TransactionStagingBytes(
+          *pending.transaction_, celer::ThisWorker().id_);
       if (!final_staging_bytes.has_value()) {
         log.state_ = ReplicationLogState::kInvalid;
         spdlog::warn("replication transaction queue size overflow");
@@ -940,6 +994,30 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
         log.publisher_capacity_ready_.NotifyAll(*store->worker_);
       }
       pending.staging_bytes_ = *final_staging_bytes;
+      try {
+        pending.append_ = ReplicationCommandAppend{
+            .kind_ = ReplicationEventKind::kTransaction,
+            .db_id_ = pending.transaction_->db_id_,
+            .partition_id_ =
+                static_cast<std::uint16_t>(celer::ThisWorker().id_),
+            .partition_sequence_ = pending.transaction_->id_,
+            .args_ = BuildReplicationTransactionEnvelope(
+                *pending.transaction_, celer::ThisWorker().id_),
+        };
+      } catch (const std::bad_alloc&) {
+        log.state_ = ReplicationLogState::kInvalid;
+        RecordMemoryRejection();
+        spdlog::warn(
+            "replication transaction marker allocation failed; "
+            "invalidating history");
+        break;
+      } catch (const std::length_error&) {
+        log.state_ = ReplicationLogState::kInvalid;
+        spdlog::warn(
+            "replication transaction marker is too large; invalidating "
+            "history");
+        break;
+      }
     }
     if (log.state_ != ReplicationLogState::kActive ||
         pending.log_epoch_ != log.log_epoch_) {
@@ -950,14 +1028,8 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       continue;
     }
 
-    const bool transaction = pending.transaction_ != nullptr;
-    const std::uint8_t db_id =
-        transaction ? pending.transaction_->db_id_ : pending.append_.db_id_;
-    const auto args =
-        transaction
-            ? std::span<const std::string>(pending.transaction_->envelope_args_)
-            : std::span<const std::string>(pending.append_.args_);
-    auto source = ReplicationCommandPayloadSource::Create(db_id, args);
+    auto source = ReplicationCommandPayloadSource::Create(
+        pending.append_.db_id_, pending.append_.args_);
     if (!source.ok()) {
       log.state_ = ReplicationLogState::kInvalid;
       spdlog::warn("replication command encoding failed: {}",
@@ -965,14 +1037,9 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
       break;
     }
     auto appended = co_await AppendReplicationLog(ReplicationLogAppend{
-        .kind_ = transaction ? ReplicationEventKind::kTransaction
-                             : pending.append_.kind_,
-        .partition_id_ =
-            transaction ? static_cast<std::uint16_t>(celer::ThisWorker().id_)
-                        : pending.append_.partition_id_,
-        .partition_sequence_ = transaction
-                                   ? pending.transaction_->id_
-                                   : pending.append_.partition_sequence_,
+        .kind_ = pending.append_.kind_,
+        .partition_id_ = pending.append_.partition_id_,
+        .partition_sequence_ = pending.append_.partition_sequence_,
         .payload_ = {},
         .payload_source_ = &*source,
     });

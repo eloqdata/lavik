@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -55,13 +56,41 @@ TEST(ReplicationCommandTest, TransactionReservationCoversMaterializedPrefix) {
           kParticipantCapacity, 2, command_args);
   ASSERT_TRUE(reserved.has_value());
 
-  std::vector<std::string> prefix{"__KEYLANE_TX_V1", "18446744073709551615",
-                                  "2", "0", "1"};
+  auto encoded = keylane::EncodeReplicationTransactionEnvelope(
+      keylane::ReplicationTransactionEnvelope{
+          .id_ = std::numeric_limits<std::uint64_t>::max(),
+          .payload_flow_ = 0,
+          .participants_ = {0, 1},
+      });
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  std::vector<std::string> prefix{std::move(*encoded)};
   const auto materialized =
       keylane::storage::ReplicationTransactionAllocationBytes(
           kParticipantCapacity, prefix, command_args);
   ASSERT_TRUE(materialized.has_value());
   EXPECT_GE(*reserved, *materialized);
+}
+
+TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
+  auto encoded = keylane::EncodeReplicationTransactionEnvelope(
+      keylane::ReplicationTransactionEnvelope{
+          .id_ = 0x8877665544332211ULL,
+          .payload_flow_ = 3,
+          .participants_ = {7, 0, 3},
+      });
+  ASSERT_TRUE(encoded.ok()) << encoded.status();
+  EXPECT_TRUE(keylane::IsReplicationTransactionEnvelope(*encoded));
+  auto decoded = keylane::DecodeReplicationTransactionEnvelope(*encoded);
+  ASSERT_TRUE(decoded.ok()) << decoded.status();
+  EXPECT_EQ(decoded->id_, 0x8877665544332211ULL);
+  EXPECT_EQ(decoded->payload_flow_, 3U);
+  EXPECT_EQ(decoded->participants_, (std::vector<unsigned>{0, 3, 7}));
+
+  std::string noncanonical = *encoded;
+  noncanonical.push_back('\0');
+  noncanonical[14] = 2;
+  EXPECT_FALSE(
+      keylane::DecodeReplicationTransactionEnvelope(noncanonical).ok());
 }
 
 }  // namespace

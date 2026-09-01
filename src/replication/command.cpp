@@ -17,6 +17,11 @@ constexpr std::uint8_t kVersion = 1;
 constexpr std::size_t kFixedHeaderBytes = 8;
 constexpr std::size_t kMaxArgumentCount = 1024;
 constexpr std::size_t kMaxArgumentBytes = 1024ULL * 1024 * 1024;
+constexpr std::string_view kTransactionMagic = "KTX1";
+constexpr std::size_t kTransactionFixedBytes = 16;
+constexpr std::size_t kMaxTransactionBitmapBytes =
+    (static_cast<std::size_t>(std::numeric_limits<std::uint16_t>::max()) + 1) /
+    8;
 
 void PutU16(std::string* output, std::uint16_t value) {
   output->push_back(static_cast<char>(value));
@@ -25,6 +30,12 @@ void PutU16(std::string* output, std::uint16_t value) {
 
 void PutU32(std::string* output, std::uint32_t value) {
   for (unsigned shift = 0; shift < 32; shift += 8) {
+    output->push_back(static_cast<char>(value >> shift));
+  }
+}
+
+void PutU64(std::string* output, std::uint64_t value) {
+  for (unsigned shift = 0; shift < 64; shift += 8) {
     output->push_back(static_cast<char>(value >> shift));
   }
 }
@@ -54,6 +65,20 @@ bool ReadU32(std::string_view input, std::size_t* offset,
   return true;
 }
 
+bool ReadU64(std::string_view input, std::size_t* offset,
+             std::uint64_t* value) {
+  if (*offset > input.size() || input.size() - *offset < 8) return false;
+  std::uint64_t decoded = 0;
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    decoded |= static_cast<std::uint64_t>(
+                   static_cast<std::uint8_t>(input[*offset + byte]))
+               << (byte * 8);
+  }
+  *offset += 8;
+  *value = decoded;
+  return true;
+}
+
 void CopySegment(std::string_view segment, std::uint64_t* offset,
                  std::span<std::byte>* output) {
   if (output->empty()) return;
@@ -73,6 +98,94 @@ absl::Status Malformed(std::string_view message) {
 }
 
 }  // namespace
+
+absl::StatusOr<std::string> EncodeReplicationTransactionEnvelope(
+    const ReplicationTransactionEnvelope& envelope) {
+  if (envelope.id_ == 0 || envelope.participants_.empty() ||
+      envelope.payload_flow_ > std::numeric_limits<std::uint16_t>::max()) {
+    return Malformed("replication transaction identity is out of range");
+  }
+  unsigned maximum = 0;
+  for (unsigned participant : envelope.participants_) {
+    if (participant > std::numeric_limits<std::uint16_t>::max()) {
+      return Malformed("replication transaction participant is out of range");
+    }
+    maximum = std::max(maximum, participant);
+  }
+  const std::size_t bitmap_bytes = static_cast<std::size_t>(maximum) / 8 + 1;
+  std::string encoded;
+  encoded.reserve(kTransactionFixedBytes + bitmap_bytes);
+  encoded.append(kTransactionMagic);
+  PutU64(&encoded, envelope.id_);
+  PutU16(&encoded, static_cast<std::uint16_t>(envelope.payload_flow_));
+  PutU16(&encoded, static_cast<std::uint16_t>(bitmap_bytes));
+  encoded.resize(kTransactionFixedBytes + bitmap_bytes, '\0');
+  for (unsigned participant : envelope.participants_) {
+    char& byte = encoded[kTransactionFixedBytes + participant / 8];
+    const auto mask = static_cast<std::uint8_t>(1U << (participant % 8));
+    if ((static_cast<std::uint8_t>(byte) & mask) != 0) {
+      return Malformed("replication transaction participant is duplicated");
+    }
+    byte = static_cast<char>(static_cast<std::uint8_t>(byte) | mask);
+  }
+  const unsigned payload = envelope.payload_flow_;
+  if (payload > maximum ||
+      (static_cast<std::uint8_t>(
+           encoded[kTransactionFixedBytes + payload / 8]) &
+       static_cast<std::uint8_t>(1U << (payload % 8))) == 0) {
+    return Malformed(
+        "replication transaction payload flow is not a participant");
+  }
+  return encoded;
+}
+
+absl::StatusOr<ReplicationTransactionEnvelope>
+DecodeReplicationTransactionEnvelope(std::string_view encoded) {
+  if (encoded.size() <= kTransactionFixedBytes ||
+      encoded.substr(0, kTransactionMagic.size()) != kTransactionMagic) {
+    return Malformed("invalid replication transaction envelope magic");
+  }
+  std::size_t offset = kTransactionMagic.size();
+  ReplicationTransactionEnvelope envelope;
+  std::uint16_t payload_flow = 0;
+  std::uint16_t bitmap_bytes = 0;
+  if (!ReadU64(encoded, &offset, &envelope.id_) || envelope.id_ == 0 ||
+      !ReadU16(encoded, &offset, &payload_flow) ||
+      !ReadU16(encoded, &offset, &bitmap_bytes) || bitmap_bytes == 0 ||
+      bitmap_bytes > kMaxTransactionBitmapBytes ||
+      encoded.size() != kTransactionFixedBytes + bitmap_bytes ||
+      static_cast<std::uint8_t>(encoded.back()) == 0) {
+    return Malformed("malformed replication transaction envelope");
+  }
+  envelope.payload_flow_ = payload_flow;
+  if (static_cast<std::size_t>(payload_flow) >=
+          static_cast<std::size_t>(bitmap_bytes) * 8 ||
+      (static_cast<std::uint8_t>(
+           encoded[kTransactionFixedBytes + payload_flow / 8]) &
+       static_cast<std::uint8_t>(1U << (payload_flow % 8))) == 0) {
+    return Malformed(
+        "replication transaction payload flow is not a participant");
+  }
+  for (std::size_t byte = 0; byte < bitmap_bytes; ++byte) {
+    const std::uint8_t bits =
+        static_cast<std::uint8_t>(encoded[kTransactionFixedBytes + byte]);
+    for (unsigned bit = 0; bit < 8; ++bit) {
+      if ((bits & static_cast<std::uint8_t>(1U << bit)) != 0) {
+        envelope.participants_.push_back(
+            static_cast<unsigned>(byte * 8 + bit));
+      }
+    }
+  }
+  if (envelope.participants_.empty()) {
+    return Malformed("replication transaction participant set is empty");
+  }
+  return envelope;
+}
+
+bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept {
+  return encoded.size() >= kTransactionMagic.size() &&
+         encoded.substr(0, kTransactionMagic.size()) == kTransactionMagic;
+}
 
 // This is the ownership boundary for the source's header and view table. A
 // single catch keeps allocation failure out of callers without wrapping each

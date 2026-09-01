@@ -84,17 +84,58 @@ std::vector<std::string> ReplicatedEffectAt(const ReplicatedCommand& command,
 }
 
 ReplicatedCommand ReplicationTransactionBody(ReplicatedCommand command) {
-  if (command.args_.empty() || command.args_.front() != "__KEYLANE_TX_V1") {
+  if (command.args_.empty() ||
+      !keylane::IsReplicationTransactionEnvelope(command.args_.front())) {
     return command;
   }
-  Check(command.args_.size() >= 3,
-        "replication transaction envelope is truncated");
-  const std::size_t participants = std::stoull(command.args_[2]);
-  const std::size_t body = 3 + participants;
-  Check(body < command.args_.size(),
+  auto envelope =
+      keylane::DecodeReplicationTransactionEnvelope(command.args_.front());
+  Check(envelope.ok(), "replication transaction envelope is malformed");
+  Check(command.args_.size() > 1,
         "replication transaction command body is missing");
-  command.args_.erase(command.args_.begin(), command.args_.begin() + body);
+  command.args_.erase(command.args_.begin());
   return command;
+}
+
+void CheckReplicationTransactionEnvelopeCodec() {
+  auto encoded = keylane::EncodeReplicationTransactionEnvelope(
+      keylane::ReplicationTransactionEnvelope{
+          .id_ = 0x8877665544332211ULL,
+          .payload_flow_ = 3,
+          .participants_ = {7, 0, 3},
+      });
+  Check(encoded.ok() && encoded->size() == 17 &&
+            keylane::IsReplicationTransactionEnvelope(*encoded),
+        "transaction envelope was not encoded as compact V1 metadata");
+  auto decoded = keylane::DecodeReplicationTransactionEnvelope(*encoded);
+  Check(decoded.ok() && decoded->id_ == 0x8877665544332211ULL &&
+            decoded->payload_flow_ == 3 &&
+            decoded->participants_ == std::vector<unsigned>({0, 3, 7}),
+        "transaction envelope V1 metadata did not round trip");
+
+  std::string noncanonical = *encoded;
+  noncanonical.push_back('\0');
+  noncanonical[14] = 2;
+  Check(!keylane::DecodeReplicationTransactionEnvelope(noncanonical).ok(),
+        "transaction envelope accepted a trailing zero bitmap byte");
+  Check(!keylane::EncodeReplicationTransactionEnvelope(
+             keylane::ReplicationTransactionEnvelope{
+                 .id_ = 1, .payload_flow_ = 0, .participants_ = {0, 0}})
+             .ok(),
+        "transaction envelope accepted a duplicate participant");
+}
+
+std::string EncodeTestTransactionEnvelope(
+    std::uint64_t id, unsigned payload_flow,
+    const std::vector<unsigned>& participants) {
+  auto encoded = keylane::EncodeReplicationTransactionEnvelope(
+      keylane::ReplicationTransactionEnvelope{
+          .id_ = id,
+          .payload_flow_ = payload_flow,
+          .participants_ = participants,
+      });
+  Check(encoded.ok(), "test transaction envelope encoding failed");
+  return std::move(*encoded);
 }
 
 void CreateDataFile(const std::string& path) {
@@ -304,6 +345,83 @@ class ReplicationLogService final : public celer::Service {
     }
     co_return absl::Status(absl::StatusCode::kDeadlineExceeded,
                            "replication publisher did not reach the tail");
+  }
+
+  celer::Task<absl::Status> ExerciseCanonicalTransactionGrowth() {
+    // A transaction can canonicalize to an after-image larger than both its
+    // request and the queue waterline. Keep another command behind it: the
+    // single publisher must process the admitted head even though the byte
+    // metric is temporarily above the waterline, rather than waiting for its
+    // own tail to disappear.
+    absl::Status status =
+        co_await storage_->EnableReplicationLog(18, 4 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
+    if (!status.ok()) co_return status;
+    auto head_admission =
+        co_await storage_->AcquireReplicationPublisherAdmission(128);
+    if (!head_admission.ok()) co_return head_admission.status();
+    auto transaction =
+        std::make_shared<keylane::storage::ReplicationTransaction>();
+    transaction->id_ = 9001;
+    transaction->db_id_ = 0;
+    transaction->participants_ = {worker_->id()};
+    transaction->payload_flow_ = worker_->id();
+    transaction->envelope_metadata_ = EncodeTestTransactionEnvelope(
+        transaction->id_, transaction->payload_flow_,
+        transaction->participants_);
+    transaction->command_args_ = {"SET", "canonical-head", "small"};
+    auto transaction_bytes =
+        keylane::storage::ReplicationTransactionAllocationBytes(
+            transaction->participants_.capacity(),
+            std::span<const std::string>(&transaction->envelope_metadata_, 1),
+            transaction->command_args_);
+    Check(transaction_bytes.has_value(),
+          "transaction retained size was not representable");
+    transaction->retained_charge_.Account(
+        keylane::CurrentMemoryAccountingShard(), *transaction_bytes);
+    Check(storage_->TryEnqueueReplicationTransaction(transaction),
+          "canonical head transaction was not enqueued");
+
+    auto tail_admission =
+        co_await storage_->AcquireReplicationPublisherAdmission(128);
+    if (!tail_admission.ok()) co_return tail_admission.status();
+    Check(storage_->TryEnqueueReplicationCommand(
+              keylane::storage::ReplicationCommandAppend{
+                  .kind_ = ReplicationEventKind::kMutation,
+                  .db_id_ = 0,
+                  .partition_id_ = 0,
+                  .partition_sequence_ = 9002,
+                  .args_ = {"SET", "canonical-tail", "value"},
+              }),
+          "canonical tail command was not enqueued");
+
+    std::vector<std::string> final_command{
+        "SET", "canonical-head", std::string(2 * kMiB, 'c')};
+    const auto final_bytes =
+        keylane::storage::ReplicationTransactionAllocationBytes(
+            transaction->participants_.capacity(),
+            std::span<const std::string>(&transaction->envelope_metadata_, 1),
+            final_command);
+    Check(final_bytes.has_value() && *final_bytes >= *transaction_bytes,
+          "canonical transaction growth was not representable");
+    auto canonical_growth = keylane::TryReserveMemory(
+        *final_bytes - transaction->retained_charge_.bytes());
+    if (!canonical_growth.has_value()) {
+      co_return absl::ResourceExhaustedError(
+          "canonical transaction test growth was not admitted");
+    }
+    transaction->command_args_.swap(final_command);
+    transaction->retained_charge_.Resize(*final_bytes);
+    canonical_growth->Release();
+    transaction->resolution_.store(
+        keylane::storage::ReplicationTransactionResolution::kPublish,
+        std::memory_order_release);
+    storage_->ReleaseReplicationPublisherAdmission(*tail_admission, 128);
+    storage_->ReleaseReplicationPublisherAdmission(*head_admission, 128);
+    status = co_await WaitForReplicationTail(2);
+    if (!status.ok()) co_return status;
+    co_return co_await storage_->DisableReplicationLog();
   }
 
   celer::Task<absl::Status> PrepareSourceAfterImagesPartOne() {
@@ -1845,85 +1963,8 @@ class ReplicationLogService final : public celer::Service {
     status = co_await storage_->DisableReplicationLog();
     if (!status.ok()) co_return status;
 
-    {
-      // A transaction can canonicalize to an after-image larger than both its
-      // request and the queue waterline. Keep another command behind it: the
-      // single publisher must process the admitted head even though the byte
-      // metric is temporarily above the waterline, rather than waiting for its
-      // own tail to disappear.
-      status = co_await storage_->EnableReplicationLog(18, 4 * 8 * kMiB);
-      if (!status.ok()) co_return status;
-      status = co_await storage_->SetReplicationPublishQueueCapacity(kMiB);
-      if (!status.ok()) co_return status;
-      auto head_admission =
-          co_await storage_->AcquireReplicationPublisherAdmission(128);
-      if (!head_admission.ok()) co_return head_admission.status();
-      auto transaction =
-          std::make_shared<keylane::storage::ReplicationTransaction>();
-      transaction->id_ = 9001;
-      transaction->db_id_ = 0;
-      transaction->participants_ = {worker_->id()};
-      transaction->envelope_args_ = {"__KEYLANE_TX_V1", "9001", "1", "0", "SET",
-                                     "canonical-head",  "small"};
-      auto transaction_bytes =
-          keylane::storage::ReplicationTransactionAllocationBytes(
-              transaction->participants_.capacity(),
-              transaction->envelope_args_, std::span<const std::string>{});
-      Check(transaction_bytes.has_value(),
-            "transaction retained size was not representable");
-      transaction->retained_charge_.Account(
-          keylane::CurrentMemoryAccountingShard(), *transaction_bytes);
-      Check(storage_->TryEnqueueReplicationTransaction(transaction),
-            "canonical head transaction was not enqueued");
-
-      auto tail_admission =
-          co_await storage_->AcquireReplicationPublisherAdmission(128);
-      if (!tail_admission.ok()) co_return tail_admission.status();
-      Check(storage_->TryEnqueueReplicationCommand(
-                keylane::storage::ReplicationCommandAppend{
-                    .kind_ = ReplicationEventKind::kMutation,
-                    .db_id_ = 0,
-                    .partition_id_ = 0,
-                    .partition_sequence_ = 9002,
-                    .args_ = {"SET", "canonical-tail", "value"},
-                }),
-            "canonical tail command was not enqueued");
-
-      const std::size_t prefix_size = 4;
-      std::vector<std::string> final_command{"SET", "canonical-head",
-                                             std::string(2 * kMiB, 'c')};
-      const auto final_bytes =
-          keylane::storage::ReplicationTransactionAllocationBytes(
-              transaction->participants_.capacity(),
-              std::span<const std::string>(transaction->envelope_args_)
-                  .first(prefix_size),
-              final_command);
-      Check(final_bytes.has_value() && *final_bytes >= *transaction_bytes,
-            "canonical transaction growth was not representable");
-      auto canonical_growth = keylane::TryReserveMemory(
-          *final_bytes - transaction->retained_charge_.bytes());
-      if (!canonical_growth.has_value()) {
-        co_return absl::ResourceExhaustedError(
-            "canonical transaction test growth was not admitted");
-      }
-      std::vector<std::string> final_envelope(
-          transaction->envelope_args_.begin(),
-          transaction->envelope_args_.begin() + prefix_size);
-      final_envelope.insert(final_envelope.end(), final_command.begin(),
-                            final_command.end());
-      transaction->envelope_args_.swap(final_envelope);
-      transaction->retained_charge_.Resize(*final_bytes);
-      canonical_growth->Release();
-      transaction->resolution_.store(
-          keylane::storage::ReplicationTransactionResolution::kPublish,
-          std::memory_order_release);
-      storage_->ReleaseReplicationPublisherAdmission(*tail_admission, 128);
-      storage_->ReleaseReplicationPublisherAdmission(*head_admission, 128);
-      status = co_await WaitForReplicationTail(2);
-      if (!status.ok()) co_return status;
-      status = co_await storage_->DisableReplicationLog();
-      if (!status.ok()) co_return status;
-    }
+    status = co_await ExerciseCanonicalTransactionGrowth();
+    if (!status.ok()) co_return status;
 
     // Client command dispatch transfers committed writes to the asynchronous
     // publisher. Large arguments may span replication frames, but decode and
@@ -2426,6 +2467,7 @@ int RunOnce(const std::string& path, bool exercise) {
 
 int main(int argc, char** argv) {
   try {
+    CheckReplicationTransactionEnvelopeCodec();
     if (argc == 3 && std::string_view(argv[1]) == "--recover") {
       return RunOnce(argv[2], false);
     }

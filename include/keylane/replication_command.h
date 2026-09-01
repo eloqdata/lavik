@@ -20,6 +20,28 @@ struct ReplicatedCommand {
   std::vector<std::string> args_;
 };
 
+// Native V1 cross-flow transaction identity. The encoded form uses a bitmap
+// so its size tracks the source worker range rather than repeating decimal
+// participant IDs in every flow-local marker.
+struct ReplicationTransactionEnvelope {
+  std::uint64_t id_ = 0;
+  unsigned payload_flow_ = 0;
+  std::vector<unsigned> participants_;
+};
+
+// Encodes the metadata argument shared by every participant record. The
+// canonical command, when present, follows this argument only on payload_flow.
+absl::StatusOr<std::string> EncodeReplicationTransactionEnvelope(
+    const ReplicationTransactionEnvelope& envelope);
+
+// Decodes one complete V1 metadata argument and rejects non-canonical bitmaps.
+absl::StatusOr<ReplicationTransactionEnvelope>
+DecodeReplicationTransactionEnvelope(std::string_view encoded);
+
+// Returns true for the V1 binary transaction magic, including malformed
+// records that must be routed to the strict decoder instead of command replay.
+bool IsReplicationTransactionEnvelope(std::string_view encoded) noexcept;
+
 // Streams one encoded command into the runtime-only in-memory replication log
 // without flattening large arguments into another contiguous allocation.
 // Replication log frames may split this byte stream, but the receiver still

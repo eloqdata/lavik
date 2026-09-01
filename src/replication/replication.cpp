@@ -107,7 +107,6 @@ constexpr std::size_t kBacklogBatchFrames = 128;
 constexpr std::size_t kFullSyncReadyWaitCommands = kBacklogBatchFrames;
 constexpr std::uint16_t kResetBatchAckPartition =
     std::numeric_limits<std::uint16_t>::max();
-constexpr std::string_view kReplicationTransactionEnvelope = "__KEYLANE_TX_V1";
 using RedisSlotSet = std::bitset<storage::kLogicalStorageShards>;
 
 enum class DataFrameKind : std::uint8_t {
@@ -1093,6 +1092,8 @@ constexpr std::string_view kRedisExportBacklogGapMessage =
 struct RedisExportTransaction {
   std::uint64_t id_ = 0;
   std::vector<unsigned> participants_;
+  unsigned payload_flow_ = 0;
+  bool has_payload_ = false;
   ReplicatedCommand command_;
 };
 
@@ -1183,31 +1184,24 @@ Task<absl::StatusOr<std::optional<RedisExportEvent>>> ReadLocalRedisExportEvent(
 absl::StatusOr<RedisExportTransaction> ParseRedisExportTransaction(
     const RedisExportEvent& event) {
   const auto& args = event.command_.args_;
-  if (args.size() < 4 || args[0] != kReplicationTransactionEnvelope) {
+  if (args.empty() || !IsReplicationTransactionEnvelope(args[0])) {
     return absl::InvalidArgumentError(
         "malformed Redis export transaction envelope");
   }
-  std::uint64_t id = 0;
-  unsigned count = 0;
-  if (!ParseUnsigned(args[1], &id) || id == 0 ||
-      !ParseUnsigned(args[2], &count) || count == 0 ||
-      args.size() <= 3 + count) {
-    return absl::InvalidArgumentError(
-        "malformed Redis export transaction metadata");
-  }
+  auto metadata = DecodeReplicationTransactionEnvelope(args[0]);
+  if (!metadata.ok()) return metadata.status();
   RedisExportTransaction transaction;
-  transaction.id_ = id;
+  transaction.id_ = metadata->id_;
   transaction.command_.db_id_ = event.command_.db_id_;
-  transaction.participants_.reserve(count);
-  for (unsigned index = 0; index < count; ++index) {
-    unsigned participant = 0;
-    if (!ParseUnsigned(args[3 + index], &participant)) {
-      return absl::InvalidArgumentError(
-          "malformed Redis export transaction participant");
-    }
-    transaction.participants_.push_back(participant);
+  transaction.payload_flow_ = metadata->payload_flow_;
+  transaction.participants_ = std::move(metadata->participants_);
+  transaction.has_payload_ = args.size() > 1;
+  const bool event_is_payload = event.worker_ == transaction.payload_flow_;
+  if (event_is_payload != transaction.has_payload_) {
+    return absl::InvalidArgumentError(
+        "Redis export transaction payload arrived on the wrong flow");
   }
-  transaction.command_.args_.assign(args.begin() + 3 + count, args.end());
+  transaction.command_.args_.assign(args.begin() + 1, args.end());
   return transaction;
 }
 
@@ -1324,8 +1318,8 @@ Task<absl::Status> SendRedisExportMutation(TcpStream& stream,
       continue;
     }
     if (!state->heads_[worker]->command_.args_.empty() &&
-        state->heads_[worker]->command_.args_[0] ==
-            kReplicationTransactionEnvelope) {
+        IsReplicationTransactionEnvelope(
+            state->heads_[worker]->command_.args_[0])) {
       co_return absl::InternalError(
           "transaction envelope was journaled as a mutation");
     }
@@ -1365,6 +1359,7 @@ Task<absl::Status> SendRedisExportTransaction(TcpStream& stream,
     if (!transaction.ok()) co_return transaction.status();
     bool ready = true;
     std::vector<std::uint8_t> included(workers, 0);
+    std::optional<ReplicatedCommand> payload;
     for (unsigned participant : transaction->participants_) {
       if (participant >= workers || included[participant]) {
         co_return absl::InvalidArgumentError(
@@ -1379,15 +1374,35 @@ Task<absl::Status> SendRedisExportTransaction(TcpStream& stream,
       }
       auto peer = ParseRedisExportTransaction(*state->heads_[participant]);
       if (!peer.ok()) co_return peer.status();
-      if (peer->id_ != transaction->id_) ready = false;
+      if (peer->id_ != transaction->id_) {
+        ready = false;
+        continue;
+      }
+      if (peer->participants_ != transaction->participants_ ||
+          peer->payload_flow_ != transaction->payload_flow_ ||
+          peer->command_.db_id_ != transaction->command_.db_id_) {
+        co_return absl::InvalidArgumentError(
+            "conflicting Redis export transaction envelope");
+      }
+      if (peer->has_payload_) {
+        if (payload.has_value()) {
+          co_return absl::InvalidArgumentError(
+              "duplicate Redis export transaction payload");
+        }
+        payload = peer->command_;
+      }
     }
     if (!included[worker]) {
       co_return absl::InvalidArgumentError(
           "transaction does not name its source worker");
     }
     if (!ready) continue;
-    auto encoded = EncodeRedisExportCommand(transaction->command_, true,
-                                            &state->selected_db_);
+    if (!payload.has_value()) {
+      co_return absl::InvalidArgumentError(
+          "Redis export transaction payload is missing");
+    }
+    auto encoded =
+        EncodeRedisExportCommand(*payload, true, &state->selected_db_);
     if (!encoded.ok()) co_return encoded.status();
     absl::Status sent = co_await WriteText(stream, *encoded);
     if (!sent.ok()) co_return sent;
@@ -1776,13 +1791,148 @@ struct ReplicaCursorState {
   std::atomic<std::uint64_t> total_lsn_{0};
 };
 
-struct ReplicaTransactionArrival {
-  explicit ReplicaTransactionArrival(unsigned participants)
-      : completion_(participants) {}
+// Transaction apply is detached from flow staging, so both participant ACK
+// tasks and later dependency tasks may begin waiting after completion. This
+// one-shot latch closes that race and resumes each coroutine on its owner
+// worker without polling or blocking a runtime thread.
+class ReplicaCompletionLatch {
+  struct Waiter {
+    celer::Worker* worker_ = nullptr;
+    std::coroutine_handle<> handle_{};
+    Waiter* next_ = nullptr;
+  };
 
+ public:
+  class Awaiter {
+   public:
+    Awaiter(ReplicaCompletionLatch* latch, celer::Worker* worker) noexcept
+        : latch_(latch) {
+      waiter_.worker_ = worker;
+    }
+
+    bool await_ready() const noexcept {
+      return latch_->resolution() !=
+             storage::ReplicationTransactionResolution::kPending;
+    }
+    bool await_suspend(std::coroutine_handle<> awaiting) noexcept {
+      return latch_->Register(&waiter_, awaiting);
+    }
+    storage::ReplicationTransactionResolution await_resume() const noexcept {
+      return latch_->resolution();
+    }
+
+   private:
+    ReplicaCompletionLatch* latch_ = nullptr;
+    Waiter waiter_;
+  };
+
+  Awaiter Wait(celer::Worker& worker) noexcept {
+    return Awaiter(this, &worker);
+  }
+
+  storage::ReplicationTransactionResolution resolution() const noexcept {
+    return resolution_.load(std::memory_order_acquire);
+  }
+
+  bool ResolveOnce(
+      storage::ReplicationTransactionResolution resolution) noexcept {
+    if (resolution == storage::ReplicationTransactionResolution::kPending) {
+      return false;
+    }
+    Lock();
+    storage::ReplicationTransactionResolution expected =
+        storage::ReplicationTransactionResolution::kPending;
+    if (!resolution_.compare_exchange_strong(expected, resolution,
+                                             std::memory_order_release,
+                                             std::memory_order_relaxed)) {
+      Unlock();
+      return false;
+    }
+    Waiter* wake = waiters_head_;
+    waiters_head_ = nullptr;
+    waiters_tail_ = nullptr;
+    Unlock();
+
+    const celer::CurrentWorker& current = celer::ThisWorker();
+    while (wake != nullptr) {
+      Waiter* waiter = wake;
+      wake = wake->next_;
+      if (waiter->worker_->id() == current.id_) {
+        waiter->worker_->Enqueue(waiter->handle_);
+      } else {
+        celer::PostNotification(
+            current.cross_core_, waiter->worker_->id(),
+            celer::RemoteNotification{
+                .context_ = waiter->worker_,
+                .value_ = static_cast<std::uint64_t>(
+                    reinterpret_cast<std::uintptr_t>(
+                        waiter->handle_.address())),
+                .run_fn_ = &ReplicaCompletionLatch::ResumeRemote,
+            });
+      }
+    }
+    return true;
+  }
+
+ private:
+  static void ResumeRemote(void* context, std::uint64_t value) noexcept {
+    static_cast<celer::Worker*>(context)->Enqueue(
+        std::coroutine_handle<>::from_address(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
+  }
+
+  void Lock() noexcept {
+    while (lock_.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+      asm volatile("yield" ::: "memory");
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+  }
+
+  void Unlock() noexcept { lock_.clear(std::memory_order_release); }
+
+  bool Register(Waiter* waiter,
+                std::coroutine_handle<> awaiting) noexcept {
+    Lock();
+    if (resolution_.load(std::memory_order_acquire) !=
+        storage::ReplicationTransactionResolution::kPending) {
+      Unlock();
+      return false;
+    }
+    waiter->handle_ = awaiting;
+    waiter->next_ = nullptr;
+    if (waiters_tail_ == nullptr) {
+      waiters_head_ = waiter;
+    } else {
+      waiters_tail_->next_ = waiter;
+    }
+    waiters_tail_ = waiter;
+    Unlock();
+    return true;
+  }
+
+  std::atomic<storage::ReplicationTransactionResolution> resolution_{
+      storage::ReplicationTransactionResolution::kPending};
+  std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+  Waiter* waiters_head_ = nullptr;
+  Waiter* waiters_tail_ = nullptr;
+};
+
+struct ReplicaTransactionArrival {
+  std::uint64_t id_ = 0;
   std::uint8_t db_id_ = 0;
   std::vector<unsigned> participants_;
   std::vector<std::string> command_args_;
+  // One predecessor per distinct participant-flow tail is sufficient to
+  // preserve the source partial order. Transactions with disjoint flow sets
+  // deliberately have no dependency and may apply concurrently.
+  std::vector<std::shared_ptr<ReplicaTransactionArrival>> predecessors_;
+  unsigned payload_flow_ = 0;
+  bool payload_arrived_ = false;
   std::vector<bool> arrived_;
   std::vector<std::uint64_t> lsns_;
   std::size_t arrival_count_ = 0;
@@ -1790,7 +1940,10 @@ struct ReplicaTransactionArrival {
   bool applying_ = false;
   absl::Status status_ =
       absl::UnknownError("replicated transaction has not completed");
-  celer::CoroutineBarrier completion_;
+  // This cross-worker latch is producer-resolved rather than arrival-counted:
+  // flow staging may register later transactions before ACK consumers wait on
+  // earlier ones, and dependency tasks also need to observe completion.
+  ReplicaCompletionLatch completion_;
 };
 
 struct ReplicaControlArrival {
@@ -1819,12 +1972,16 @@ struct ReplicaSession {
   // session cannot start a replacement while old flows are still mutating
   // replica storage or holding network buffers.
   std::atomic<unsigned> active_flows_{0};
+  std::atomic<unsigned> active_transaction_applies_{0};
   std::atomic<unsigned> connected_flows_{0};
   SocketSet sockets_;
   std::atomic<bool> cancelled_{false};
   std::mutex transaction_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaTransactionArrival>>
       transactions_;
+  // Updated only under transaction_mutex_. A weak tail prevents a completed
+  // transaction from being retained after every participant ACKs it.
+  std::vector<std::weak_ptr<ReplicaTransactionArrival>> transaction_tails_;
   std::mutex control_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaControlArrival>>
       controls_;
@@ -1837,14 +1994,18 @@ struct ReplicaSession {
       std::lock_guard lock(transaction_mutex_);
       arrivals.reserve(transactions_.size());
       for (auto& [_, arrival] : transactions_) {
+        arrival->status_ =
+            absl::CancelledError("replication session cancelled");
         arrivals.push_back(std::move(arrival));
       }
       transactions_.clear();
+      transaction_tails_.clear();
     }
     const absl::Status cancelled =
         absl::CancelledError("replication session cancelled");
     for (const auto& arrival : arrivals) {
-      arrival->completion_.Abort(cancelled);
+      (void)arrival->completion_.ResolveOnce(
+          storage::ReplicationTransactionResolution::kDiscard);
     }
     std::vector<std::shared_ptr<ReplicaControlArrival>> controls;
     {
@@ -4044,7 +4205,7 @@ class ReplicationManager::Impl {
     }
 
     StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
-    // Native protocol version 1 carries the replica node identity separately
+    // The native protocol carries the replica node identity separately
     // from the history id it wants to continue.
     const std::vector<std::string> sync_args{
         "KLPSYNC", std::string(kProtocolVersion),
@@ -4082,6 +4243,7 @@ class ReplicationManager::Impl {
     }
     session->session_id_ = session_id;
     session->source_worker_count_ = source_workers;
+    session->transaction_tails_.resize(source_workers);
     session->fullsync_cut_ =
         std::make_unique<celer::CoroutineBarrier>(source_workers);
     session->root_swap_complete_ =
@@ -4159,13 +4321,19 @@ class ReplicationManager::Impl {
     session->Cancel();
     auto next_warning =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (session->active_flows_.load(std::memory_order_acquire) != 0) {
+    while (session->active_flows_.load(std::memory_order_acquire) != 0 ||
+           session->active_transaction_applies_.load(
+               std::memory_order_acquire) != 0) {
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return slept;
       if (std::chrono::steady_clock::now() >= next_warning) {
-        spdlog::warn("waiting for {} cancelled replication flow(s) to finish",
-                     session->active_flows_.load(std::memory_order_acquire));
+        spdlog::warn(
+            "waiting for {} cancelled replication flow(s) and {} transaction "
+            "apply task(s) to finish",
+            session->active_flows_.load(std::memory_order_acquire),
+            session->active_transaction_applies_.load(
+                std::memory_order_acquire));
         next_warning =
             std::chrono::steady_clock::now() + std::chrono::seconds(5);
       }
@@ -4249,137 +4417,208 @@ class ReplicationManager::Impl {
     co_return data_status;
   }
 
-  Task<absl::Status> ApplyReplicaTransaction(
+  Task<absl::Status> WaitForReplicaTransaction(
+      const std::shared_ptr<ReplicaSession>& session,
+      const std::shared_ptr<ReplicaTransactionArrival>& arrival) {
+    const storage::ReplicationTransactionResolution resolution =
+        co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
+    std::lock_guard lock(session->transaction_mutex_);
+    if (resolution == storage::ReplicationTransactionResolution::kDiscard &&
+        arrival->status_.ok()) {
+      co_return absl::CancelledError(
+          "replicated transaction was discarded before completion");
+    }
+    co_return arrival->status_;
+  }
+
+  Task<absl::Status> WaitForReplicaTransactionParticipant(
+      const std::shared_ptr<ReplicaSession>& session,
+      const std::shared_ptr<ReplicaTransactionArrival>& arrival) {
+    absl::Status result = co_await WaitForReplicaTransaction(session, arrival);
+    std::lock_guard lock(session->transaction_mutex_);
+    auto found = session->transactions_.find(arrival->id_);
+    if (found != session->transactions_.end() &&
+        found->second == arrival) {
+      ++arrival->departure_count_;
+      if (arrival->departure_count_ == arrival->participants_.size()) {
+        session->transactions_.erase(found);
+      }
+    }
+    co_return result;
+  }
+
+  Task<absl::Status> ApplyReadyReplicaTransaction(
+      std::shared_ptr<ReplicaSession> session,
+      std::shared_ptr<ReplicaTransactionArrival> arrival) {
+    // This coroutine is detached from the registration stack. Own both
+    // objects in its frame; reference parameters would dangle as soon as
+    // RegisterReplicaTransaction returns.
+    ReplicaFlowActivityGuard active(&session->active_transaction_applies_);
+    std::vector<std::shared_ptr<ReplicaTransactionArrival>> predecessors;
+    ReplicatedCommand command;
+    {
+      std::lock_guard lock(session->transaction_mutex_);
+      predecessors = arrival->predecessors_;
+      command.db_id_ = arrival->db_id_;
+      command.args_ = std::move(arrival->command_args_);
+    }
+
+    absl::Status status = absl::OkStatus();
+    for (const auto& predecessor : predecessors) {
+      status = co_await WaitForReplicaTransaction(session, predecessor);
+      if (!status.ok()) break;
+    }
+    if (status.ok() && session->cancelled()) {
+      status = absl::CancelledError(
+          "replication session ended before transaction apply");
+    }
+    if (status.ok()) status = co_await ApplyReplicatedCommand(command);
+
+    bool cancelled = false;
+    {
+      std::lock_guard lock(session->transaction_mutex_);
+      // The local copy above keeps every predecessor alive while it is
+      // awaited. Drop the durable edges before publishing completion so a
+      // long transaction stream does not retain its entire completed chain.
+      arrival->predecessors_.clear();
+      cancelled = session->cancelled();
+      if (cancelled) {
+        arrival->status_ = absl::CancelledError(
+            "replication session ended during transaction apply");
+      } else {
+        arrival->status_ = std::move(status);
+        if (arrival->status_.ok()) {
+          // Cursor publication precedes completion resolution, so every flow
+          // ACK observes one atomic resumable cut for the participant set.
+          for (unsigned participant : arrival->participants_) {
+            session->cursors_->Store(participant,
+                                     arrival->lsns_[participant] + 1, 0);
+          }
+        }
+      }
+    }
+    (void)arrival->completion_.ResolveOnce(
+        cancelled ? storage::ReplicationTransactionResolution::kDiscard
+                  : storage::ReplicationTransactionResolution::kPublish);
+    co_return absl::OkStatus();
+  }
+
+  absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>
+  RegisterReplicaTransaction(
       const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
       std::uint64_t lsn, ReplicatedCommand envelope) {
     const auto& args = envelope.args_;
-    if (args.size() < 5 || args[0] != kReplicationTransactionEnvelope) {
-      co_return absl::InvalidArgumentError(
+    if (args.empty() || !IsReplicationTransactionEnvelope(args[0])) {
+      return absl::InvalidArgumentError(
           "malformed replicated transaction envelope");
     }
-    auto parse_uint = [](std::string_view text,
-                         std::uint64_t* output) noexcept {
-      const char* begin = text.data();
-      const char* end = begin + text.size();
-      const auto parsed = std::from_chars(begin, end, *output);
-      return parsed.ec == std::errc{} && parsed.ptr == end;
-    };
-    std::uint64_t txid = 0;
-    std::uint64_t participant_count = 0;
-    if (!parse_uint(args[1], &txid) || txid == 0 ||
-        !parse_uint(args[2], &participant_count) || participant_count == 0 ||
-        participant_count > session->source_worker_count_ ||
-        participant_count > args.size() - 4) {
-      co_return absl::InvalidArgumentError(
-          "invalid replicated transaction identity");
+    auto metadata = DecodeReplicationTransactionEnvelope(args[0]);
+    if (!metadata.ok()) return metadata.status();
+    const std::uint64_t txid = metadata->id_;
+    const unsigned payload_flow = metadata->payload_flow_;
+    if (payload_flow >= session->source_worker_count_ ||
+        metadata->participants_.size() > session->source_worker_count_) {
+      return absl::InvalidArgumentError(
+          "replicated transaction metadata exceeds the source flow set");
     }
-    const std::size_t command_begin = 3 + participant_count;
-    if (command_begin >= args.size()) {
-      co_return absl::InvalidArgumentError(
-          "replicated transaction has no command");
-    }
-    std::vector<unsigned> participants;
-    participants.reserve(participant_count);
+    const bool has_payload = args.size() > 1;
+    std::vector<unsigned> participants = std::move(metadata->participants_);
     bool current_flow_participates = false;
-    for (std::size_t index = 0; index < participant_count; ++index) {
-      std::uint64_t participant = 0;
-      if (!parse_uint(args[3 + index], &participant) ||
-          participant >= session->source_worker_count_ ||
-          std::find(participants.begin(), participants.end(), participant) !=
-              participants.end()) {
-        co_return absl::InvalidArgumentError(
+    for (unsigned participant : participants) {
+      if (participant >= session->source_worker_count_) {
+        return absl::InvalidArgumentError(
             "invalid replicated transaction participant");
       }
-      participants.push_back(static_cast<unsigned>(participant));
       current_flow_participates |= participant == flow_id;
     }
     if (!current_flow_participates) {
-      co_return absl::InvalidArgumentError(
+      return absl::InvalidArgumentError(
           "replicated transaction arrived on a non-participant flow");
+    }
+    if ((flow_id == payload_flow) != has_payload ||
+        std::find(participants.begin(), participants.end(), payload_flow) ==
+            participants.end()) {
+      return absl::InvalidArgumentError(
+          "replicated transaction payload does not match its flow");
     }
     // `envelope` is owned by this arrival coroutine. Move its command tail
     // before taking the session mutex so the first arrival only transfers a
-    // vector allocation while locked; a large MSET must not copy all of its
-    // key/value payload into ReplicaTransactionArrival under the mutex.
+    // vector allocation while locked; a large transaction must not copy its
+    // canonical payload into ReplicaTransactionArrival under the mutex.
     std::vector<std::string> command_args;
-    command_args.reserve(args.size() - command_begin);
-    std::move(envelope.args_.begin() + command_begin, envelope.args_.end(),
-              std::back_inserter(command_args));
+    if (has_payload) {
+      command_args.reserve(args.size() - 1);
+      std::move(envelope.args_.begin() + 1, envelope.args_.end(),
+                std::back_inserter(command_args));
+    }
 
     std::shared_ptr<ReplicaTransactionArrival> arrival;
-    bool apply_here = false;
-    std::vector<std::string> apply_command_args;
+    bool start_apply = false;
     {
       std::lock_guard lock(session->transaction_mutex_);
       if (session->cancelled()) {
-        co_return absl::CancelledError(
+        return absl::CancelledError(
             "replication session ended before transaction arrival");
       }
       auto [it, inserted] = session->transactions_.try_emplace(txid);
       if (inserted) {
-        it->second = std::make_shared<ReplicaTransactionArrival>(
-            static_cast<unsigned>(participants.size()));
+        it->second = std::make_shared<ReplicaTransactionArrival>();
+        it->second->id_ = txid;
         it->second->db_id_ = envelope.db_id_;
         it->second->participants_ = participants;
-        it->second->command_args_ = std::move(command_args);
+        it->second->payload_flow_ = payload_flow;
+        if (has_payload) {
+          it->second->command_args_ = std::move(command_args);
+          it->second->payload_arrived_ = true;
+        }
         it->second->arrived_.resize(session->source_worker_count_);
         it->second->lsns_.resize(session->source_worker_count_);
       }
       arrival = it->second;
       if (arrival->db_id_ != envelope.db_id_ ||
           arrival->participants_ != participants ||
-          (!inserted && arrival->command_args_ != command_args) ||
+          arrival->payload_flow_ != payload_flow ||
           arrival->arrived_[flow_id]) {
-        co_return absl::InvalidArgumentError(
+        return absl::InvalidArgumentError(
             "conflicting replicated transaction envelope");
       }
+      if (!inserted && has_payload) {
+        if (arrival->payload_arrived_) {
+          return absl::InvalidArgumentError(
+              "duplicate replicated transaction payload");
+        }
+        arrival->command_args_ = std::move(command_args);
+        arrival->payload_arrived_ = true;
+      }
+      if (flow_id >= session->transaction_tails_.size()) {
+        return absl::InternalError(
+            "replica transaction tail vector is incomplete");
+      }
+      if (auto predecessor = session->transaction_tails_[flow_id].lock();
+          predecessor != nullptr && predecessor != arrival &&
+          std::find(arrival->predecessors_.begin(),
+                    arrival->predecessors_.end(), predecessor) ==
+              arrival->predecessors_.end()) {
+        arrival->predecessors_.push_back(std::move(predecessor));
+      }
+      session->transaction_tails_[flow_id] = arrival;
       arrival->arrived_[flow_id] = true;
       arrival->lsns_[flow_id] = lsn;
       ++arrival->arrival_count_;
       if (arrival->arrival_count_ == arrival->participants_.size() &&
-          !arrival->applying_) {
+          arrival->payload_arrived_ && !arrival->applying_) {
         arrival->applying_ = true;
-        apply_here = true;
-        apply_command_args = std::move(arrival->command_args_);
+        start_apply = true;
       }
     }
 
-    if (apply_here) {
-      ReplicatedCommand command{.db_id_ = envelope.db_id_,
-                                .args_ = std::move(apply_command_args)};
-      absl::Status status = co_await ApplyReplicatedCommand(command);
-      std::lock_guard lock(session->transaction_mutex_);
-      arrival->status_ = std::move(status);
-      if (arrival->status_.ok()) {
-        // Advance every participant together before any flow sends its ACK.
-        // After an asymmetric disconnect the replacement session therefore
-        // either requests all copies again or skips all of them; it can never
-        // replay a transaction that was already applied once.
-        for (unsigned participant : arrival->participants_) {
-          session->cursors_->Store(participant, arrival->lsns_[participant] + 1,
-                                   0);
-        }
-      }
+    if (start_apply) {
+      session->active_transaction_applies_.fetch_add(1,
+                                                     std::memory_order_acq_rel);
+      celer::ThisWorker().self_->Spawn(
+          ApplyReadyReplicaTransaction(session, arrival));
     }
-
-    // Every participant arrives exactly once. Non-executing flows suspend
-    // here immediately; the elected flow only arrives after apply and cursor
-    // publication complete. CoroutineBarrier resumes each waiter on its
-    // original worker, without polling the session mutex.
-    absl::Status completed =
-        co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
-    if (!completed.ok()) co_return completed;
-
-    absl::Status result;
-    {
-      std::lock_guard lock(session->transaction_mutex_);
-      result = arrival->status_;
-      ++arrival->departure_count_;
-      if (arrival->departure_count_ == arrival->participants_.size()) {
-        session->transactions_.erase(txid);
-      }
-    }
-    co_return result;
+    return arrival;
   }
 
   Task<absl::Status> ApplyReplicaControl(
@@ -4471,31 +4710,36 @@ class ReplicationManager::Impl {
     ReplicatedCommand command_;
   };
 
-  struct ReplicaOnlineApplyState {
-    std::deque<ReplicaOnlineCommand> commands_;
-    celer::AsyncNotification command_ready_;
-    celer::AsyncNotification capacity_ready_;
-    celer::AsyncNotification apply_done_ready_;
-    absl::Status receiver_status_ =
-        absl::UnknownError("replication flow receiver is running");
-    absl::Status apply_status_ =
-        absl::UnknownError("replication flow apply queue is running");
-    bool receiver_done_ = false;
-    bool apply_done_ = false;
+  struct ReplicaOnlineCompletion {
+    std::uint64_t lsn_ = 0;
+    std::shared_ptr<ReplicaTransactionArrival> transaction_;
   };
 
-  Task<absl::Status> ApplyReplicaOnlineCommands(
-      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id,
-      const std::shared_ptr<ReplicaOnlineApplyState>& state) {
-    auto send_ack = [&stream](std::uint64_t lsn) -> Task<absl::Status> {
-      std::string payload;
-      payload.reserve(10);
-      PutU16(payload, 0);
-      PutU64(payload, lsn);
-      co_return co_await WriteDataFrame(stream, DataFrameKind::kAck, payload);
-    };
+  struct ReplicaOnlineApplyState {
+    std::deque<ReplicaOnlineCommand> commands_;
+    std::deque<ReplicaOnlineCompletion> completions_;
+    celer::AsyncNotification command_ready_;
+    celer::AsyncNotification capacity_ready_;
+    celer::AsyncNotification completion_ready_;
+    celer::AsyncNotification completion_capacity_ready_;
+    celer::AsyncNotification stage_done_ready_;
+    celer::AsyncNotification ack_done_ready_;
+    absl::Status receiver_status_ =
+        absl::UnknownError("replication flow receiver is running");
+    absl::Status stage_status_ =
+        absl::UnknownError("replication flow staging queue is running");
+    absl::Status ack_status_ =
+        absl::UnknownError("replication flow ACK queue is running");
+    bool receiver_done_ = false;
+    bool stage_done_ = false;
+    bool ack_done_ = false;
+  };
 
+  Task<absl::Status> StageReplicaOnlineCommands(
+      const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    constexpr std::size_t kOnlineCompletionCommands = 256;
+    std::shared_ptr<ReplicaTransactionArrival> last_transaction;
     for (;;) {
       while (state->commands_.empty() && !state->receiver_done_) {
         co_await state->command_ready_.Wait();
@@ -4516,30 +4760,100 @@ class ReplicationManager::Impl {
       state->capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
       const bool transaction =
           !pending.command_.args_.empty() &&
-          pending.command_.args_[0] == kReplicationTransactionEnvelope;
-      const bool control =
-          !pending.command_.args_.empty() &&
-          (pending.command_.args_[0] == "FLUSHDB" ||
-           pending.command_.args_[0] == "FLUSHALL");
-      absl::Status applied;
+          IsReplicationTransactionEnvelope(pending.command_.args_[0]);
+      const bool control = !pending.command_.args_.empty() &&
+                           (pending.command_.args_[0] == "FLUSHDB" ||
+                            pending.command_.args_[0] == "FLUSHALL");
+      std::shared_ptr<ReplicaTransactionArrival> transaction_arrival;
+      absl::Status applied = absl::OkStatus();
       if (transaction) {
-        applied = co_await ApplyReplicaTransaction(
+        auto registered = RegisterReplicaTransaction(
             session, flow_id, pending.lsn_, std::move(pending.command_));
-      } else if (control) {
-        applied = co_await ApplyReplicaControl(
-            session, flow_id, pending.lsn_, std::move(pending.command_));
+        if (!registered.ok()) {
+          applied = registered.status();
+        } else {
+          transaction_arrival = std::move(*registered);
+          last_transaction = transaction_arrival;
+        }
       } else {
-        applied = co_await ApplyReplicatedCommand(pending.command_);
+        // A non-transaction event is a hard boundary for read-ahead on this
+        // flow. Waiting only on the tail is enough because transaction
+        // registration linked every earlier flow-local transaction into its
+        // predecessor chain.
+        if (last_transaction != nullptr) {
+          applied =
+              co_await WaitForReplicaTransaction(session, last_transaction);
+          last_transaction.reset();
+        }
+        if (applied.ok() && control) {
+          applied = co_await ApplyReplicaControl(
+              session, flow_id, pending.lsn_, std::move(pending.command_));
+        } else if (applied.ok()) {
+          applied = co_await ApplyReplicatedCommand(pending.command_);
+        }
+      }
+      if (!applied.ok()) {
+        InvalidateReplicaContinuation(session);
+        co_return applied;
+      }
+      while (state->completions_.size() >= kOnlineCompletionCommands &&
+             !state->ack_done_) {
+        co_await state->completion_capacity_ready_.Wait();
+      }
+      if (state->ack_done_) co_return state->ack_status_;
+      state->completions_.push_back(ReplicaOnlineCompletion{
+          .lsn_ = pending.lsn_,
+          .transaction_ = std::move(transaction_arrival),
+      });
+      state->completion_ready_.NotifyAll(*celer::ThisWorker().self_);
+    }
+  }
+
+  Task<absl::Status> AckReplicaOnlineCommands(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    auto send_ack = [&stream](std::uint64_t lsn) -> Task<absl::Status> {
+      std::string payload;
+      payload.reserve(10);
+      PutU16(payload, 0);
+      PutU64(payload, lsn);
+      co_return co_await WriteDataFrame(stream, DataFrameKind::kAck, payload);
+    };
+
+    for (;;) {
+      while (state->completions_.empty() && !state->stage_done_) {
+        co_await state->completion_ready_.Wait();
+      }
+      if (session->cancelled()) {
+        co_return absl::CancelledError(
+            "replication session ended while acknowledging commands");
+      }
+      if (state->stage_done_ && !state->stage_status_.ok()) {
+        co_return state->stage_status_;
+      }
+      if (state->completions_.empty()) {
+        co_return absl::UnavailableError(
+            "replication flow staging queue closed");
+      }
+
+      ReplicaOnlineCompletion pending =
+          std::move(state->completions_.front());
+      state->completions_.pop_front();
+      state->completion_capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+      const bool transaction = pending.transaction_ != nullptr;
+      absl::Status applied = absl::OkStatus();
+      if (transaction) {
+        applied = co_await WaitForReplicaTransactionParticipant(
+            session, pending.transaction_);
       }
       if (!applied.ok()) {
         InvalidateReplicaContinuation(session);
         co_return applied;
       }
 
-      // Preserve the old durability contract: receipt alone never advances a
-      // cursor. The per-flow apply queue is strictly FIFO, and progress becomes
-      // resumable only after the command (or every transaction participant)
-      // has completed.
+      // Transaction apply published every participant cursor before resolving
+      // its completion latch. Re-storing this flow is harmless and keeps the
+      // single-flow and transaction ACK paths structurally identical.
       session->cursors_->Store(flow_id, pending.lsn_ + 1, 0);
       if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
         co_return absl::UnavailableError(
@@ -4554,18 +4868,32 @@ class ReplicationManager::Impl {
     }
   }
 
-  Task<absl::Status> TrackReplicaOnlineApply(
+  Task<absl::Status> TrackReplicaOnlineStage(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id,
-      const std::shared_ptr<ReplicaOnlineApplyState>& state) {
-    state->apply_status_ =
-        co_await ApplyReplicaOnlineCommands(stream, session, flow_id, state);
-    state->apply_done_ = true;
-    state->apply_done_ready_.NotifyAll(*celer::ThisWorker().self_);
-    if (!state->apply_status_.ok()) {
+      unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    state->stage_status_ =
+        co_await StageReplicaOnlineCommands(session, flow_id, state);
+    state->stage_done_ = true;
+    state->stage_done_ready_.NotifyAll(*celer::ThisWorker().self_);
+    state->completion_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!state->stage_status_.ok()) {
       (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
     }
-    co_return state->apply_status_;
+    co_return state->stage_status_;
+  }
+
+  Task<absl::Status> TrackReplicaOnlineAcks(
+      TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
+      unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+    state->ack_status_ =
+        co_await AckReplicaOnlineCommands(stream, session, flow_id, state);
+    state->ack_done_ = true;
+    state->ack_done_ready_.NotifyAll(*celer::ThisWorker().self_);
+    state->completion_capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
+    if (!state->ack_status_.ok()) {
+      (void)::shutdown(stream.NativeFd(), SHUT_RDWR);
+    }
+    co_return state->ack_status_;
   }
 
   Task<absl::Status> RunReplicaOnlineFlowData(
@@ -4574,7 +4902,9 @@ class ReplicationManager::Impl {
       std::pair<DataFrameKind, std::string> first_frame) {
     auto state = std::make_shared<ReplicaOnlineApplyState>();
     celer::ThisWorker().self_->Spawn(
-        TrackReplicaOnlineApply(stream, session, flow_id, state));
+        TrackReplicaOnlineStage(stream, session, flow_id, state));
+    celer::ThisWorker().self_->Spawn(
+        TrackReplicaOnlineAcks(stream, session, flow_id, state));
 
     std::uint64_t staged_command_lsn = 0;
     std::uint32_t next_command_fragment = 0;
@@ -4585,8 +4915,9 @@ class ReplicationManager::Impl {
     absl::Status receiver_status = absl::OkStatus();
     constexpr std::size_t kOnlineQueueCommands = 256;
     while (stream.IsOpen()) {
-      if (state->apply_done_) {
-        receiver_status = state->apply_status_;
+      if (state->stage_done_ || state->ack_done_) {
+        receiver_status = state->stage_done_ ? state->stage_status_
+                                             : state->ack_status_;
         break;
       }
       absl::StatusOr<std::pair<DataFrameKind, std::string>> frame =
@@ -4661,11 +4992,12 @@ class ReplicationManager::Impl {
         break;
       }
       while (state->commands_.size() >= kOnlineQueueCommands &&
-             !state->apply_done_) {
+             !state->stage_done_ && !state->ack_done_) {
         co_await state->capacity_ready_.Wait();
       }
-      if (state->apply_done_) {
-        receiver_status = state->apply_status_;
+      if (state->stage_done_ || state->ack_done_) {
+        receiver_status = state->stage_done_ ? state->stage_status_
+                                             : state->ack_status_;
         break;
       }
       state->commands_.push_back(ReplicaOnlineCommand{
@@ -4690,16 +5022,20 @@ class ReplicationManager::Impl {
     state->receiver_status_ = receiver_status;
     state->receiver_done_ = true;
     state->command_ready_.NotifyAll(*celer::ThisWorker().self_);
-    if (!state->apply_done_) {
-      // A broken ingress flow can strand another flow at a transaction
-      // barrier. Cancel the whole session before joining so every waiter is
-      // released and no detached apply coroutine can retain `stream`.
+    if (!state->stage_done_ || !state->ack_done_) {
+      // A broken ingress flow can strand staging, ACK, and predecessor tasks.
+      // Cancel the whole session before joining so every cross-worker latch is
+      // resolved and neither worker-local task can retain `stream`.
       session->Cancel();
-      while (!state->apply_done_) {
-        co_await state->apply_done_ready_.Wait();
+      while (!state->stage_done_) {
+        co_await state->stage_done_ready_.Wait();
+      }
+      while (!state->ack_done_) {
+        co_await state->ack_done_ready_.Wait();
       }
     }
-    if (!state->apply_status_.ok()) co_return state->apply_status_;
+    if (!state->stage_status_.ok()) co_return state->stage_status_;
+    if (!state->ack_status_.ok()) co_return state->ack_status_;
     co_return receiver_status;
   }
 
@@ -4879,7 +5215,7 @@ class ReplicationManager::Impl {
           if (!command.ok()) {
             applied = command.status();
           } else if (!command->args_.empty() &&
-                     (command->args_[0] == kReplicationTransactionEnvelope ||
+                     (IsReplicationTransactionEnvelope(command->args_[0]) ||
                       command->args_[0] == "FLUSHDB" ||
                       command->args_[0] == "FLUSHALL")) {
             applied = absl::InvalidArgumentError(
@@ -6374,7 +6710,7 @@ class ReplicationManager::Impl {
     }
     // Anonymous KLPSYNC is reserved for protocol detection. It deliberately
     // avoids leaving a ten-minute flow-stall session or appearing in INFO as
-    // a downstream replica. Real protocol-v1 replicas always advertise their
+    // a downstream replica. Real native replicas always advertise their
     // node id and listening port.
     if (protocol_probe) {
       RemoveMasterSession(session);
