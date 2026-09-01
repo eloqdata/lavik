@@ -133,9 +133,19 @@ commit decision. Both the storage write boundary and recovery decoder enforce
 the durable 512 MiB maximum key length; a wider internal or replication
 protocol argument limit cannot create a record that a restart would reject.
 
-The current version-1 record and compact Hash/Set layouts directly replaced
-their earlier digest-bearing forms; there is no compatibility decoder. Media
-written by that earlier layout must be reset before this build starts.
+The version-1 record wire layout has a 72-byte base header at explicit byte
+offsets. A nonzero transaction ID and expiration timestamp each add one aligned
+8-byte extension, so fixed metadata is 72, 80, or 88 bytes. The base packs
+record kind, database, value type, external-payload state, external-key state,
+and extension presence into one 16-bit word. Header length is derived from
+those flags and key length; total record length is derived from header and
+payload length. Neither derived length is stored. The decoded `RecordHeader`
+is a runtime view rather than a persisted C++ object representation.
+
+This compact version-1 record layout directly replaces the earlier 104-byte
+version-1 layout without changing the format number; there is no compatibility
+decoder. Media written by the earlier layout must be reset before this build
+starts. Compact Hash/Set values likewise retain version 1.
 
 Keys that do not fit the configured inline header limit move into the payload.
 Large key/value payloads use a root record containing an extent manifest. Each

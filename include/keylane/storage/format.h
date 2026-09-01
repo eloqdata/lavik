@@ -44,8 +44,6 @@ inline constexpr std::uint64_t kMaxStringBytes = 512ULL * 1024 * 1024;
 // at the final legal offset can extend through eight additional bytes.
 inline constexpr std::uint64_t kMaxBitmapBytes = kMaxStringBytes + 8;
 inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
-inline constexpr std::uint8_t kExternalValueMask = 0x80;
-inline constexpr std::uint32_t kExternalKeyMask = std::uint32_t{1} << 31;
 inline constexpr std::uint64_t kMetadataPageMagic =
     0x31475041544d4c4bULL;  // KLMETAP1
 inline constexpr std::uint32_t kLogicalStorageShards = 16384;
@@ -266,17 +264,15 @@ struct DeviceLabel {
 };
 
 struct RecordHeader {
-  std::uint64_t magic_ = kRecordMagic;
-  std::uint32_t version_ = kStorageFormatVersion;
+  // Derived during encoding and decoding; this does not occupy a durable
+  // field. Keeping it in the decoded form avoids duplicating framing
+  // arithmetic throughout storage callers.
   std::uint16_t header_bytes_ = 0;
   RecordKind kind_ = RecordKind::kValue;
   std::uint8_t db_id_ = 0;
   ValueType value_type_ = ValueType::kNone;
-  // Transient decoded form. This byte is zero on disk; the flags are encoded
-  // in value_type_ and key_bytes_. Keeping them as bit fields preserves the
-  // fixed on-disk header layout.
-  bool external_ : 1 = false;
-  bool key_external_ : 1 = false;
+  bool external_ = false;
+  bool key_external_ = false;
   std::uint32_t key_bytes_ = 0;
   // Redis-visible bytes/cardinality.
   std::uint32_t logical_size_ = 0;
@@ -285,6 +281,7 @@ struct RecordHeader {
   // the same logical concatenation. Small keys remain in the header and an
   // external payload then contains only the value.
   std::uint32_t payload_bytes_ = 0;
+  // Derived from header_bytes_ and payload_bytes_; not stored durably.
   std::uint32_t total_disk_bytes_ = 0;
   // Multi-key transaction id, or 0 for a standalone write. Recovery keeps a
   // tagged record only if it also finds the transaction's kTxCommit record;
@@ -325,8 +322,6 @@ static_assert(sizeof(BlockHeader) <= kBlockHeaderBytes);
 static_assert(sizeof(DeviceLabel) <= kDirectIoAlignment);
 static_assert(sizeof(MetadataPageHeader) < kDirectIoAlignment);
 static_assert(kMetadataPagePayloadBytes % sizeof(std::uint64_t) == 0);
-static_assert(sizeof(RecordHeader) <= kMaxRecordHeaderBytes);
-static_assert(sizeof(RecordHeader) == 104);
 static_assert(sizeof(ReplicationFrameHeader) == 56);
 static_assert(sizeof(ExtentManifestHeader) == 16);
 static_assert(sizeof(ExtentRef) == 24);
@@ -339,8 +334,27 @@ constexpr std::size_t AlignRecord(std::size_t size) noexcept {
   return (size + kRecordAlignment - 1) & ~(kRecordAlignment - 1);
 }
 
-constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes) noexcept {
-  return AlignRecord(sizeof(RecordHeader) + key_bytes);
+// The durable record prefix stores fields at explicit offsets rather than
+// copying RecordHeader's C++ object representation. txid and expiration are
+// sparse extensions, so the overwhelmingly common standalone non-expiring
+// record pays only for the 72-byte base. Every extension is one aligned word.
+inline constexpr std::size_t kRecordHeaderBaseBytes = 72;
+inline constexpr std::size_t kRecordHeaderOptionalBytes = 8;
+inline constexpr std::size_t kMaxRecordFixedHeaderBytes =
+    kRecordHeaderBaseBytes + 2 * kRecordHeaderOptionalBytes;
+
+constexpr std::size_t RecordFixedHeaderBytes(bool has_txid,
+                                             bool has_expiry) noexcept {
+  return kRecordHeaderBaseBytes + (has_txid ? kRecordHeaderOptionalBytes : 0) +
+         (has_expiry ? kRecordHeaderOptionalBytes : 0);
+}
+
+constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
+                                        bool key_external = false,
+                                        bool has_txid = false,
+                                        bool has_expiry = false) noexcept {
+  return AlignRecord(RecordFixedHeaderBytes(has_txid, has_expiry) +
+                     (key_external ? 0 : key_bytes));
 }
 
 constexpr std::size_t MaxKeyBytes() noexcept { return kMaxStringBytes; }
@@ -351,7 +365,10 @@ constexpr bool ValidRecordKeySize(std::size_t bytes) noexcept {
 }
 
 constexpr std::size_t MaxInlineKeyBytes() noexcept {
-  return kMaxRecordHeaderBytes - sizeof(RecordHeader);
+  // The configured limit must remain valid for a transaction record carrying
+  // an expiration, even though ordinary records could use the extension space
+  // for a slightly larger inline key.
+  return kMaxRecordHeaderBytes - kMaxRecordFixedHeaderBytes;
 }
 
 inline constexpr std::size_t kDefaultInlineKeyBytes = MaxInlineKeyBytes();
@@ -362,13 +379,8 @@ constexpr std::size_t ExtentManifestBytes(std::size_t logical_bytes) noexcept {
              sizeof(ExtentRef);
 }
 
-constexpr std::size_t RecordHeaderBytes(std::size_t key_bytes,
-                                        bool key_external) noexcept {
-  return AlignRecord(sizeof(RecordHeader) + (key_external ? 0 : key_bytes));
-}
-
 static_assert(RecordHeaderBytes(kMaxStringBytes, true) ==
-              AlignRecord(sizeof(RecordHeader)));
+              kRecordHeaderBaseBytes);
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
 

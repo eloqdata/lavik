@@ -1364,7 +1364,8 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
       static_cast<std::uint64_t>(value.size()) +
       (key_external ? key.size() : 0);
   const std::size_t inline_bytes =
-      AlignRecord(RecordHeaderBytes(key.size(), key_external) +
+      AlignRecord(RecordHeaderBytes(key.size(), key_external, tx != nullptr,
+                                    expire_at_ms != 0) +
                   static_cast<std::size_t>(logical_payload_bytes));
   if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
     auto extents = co_await WriteExtentValueLocked(
@@ -1939,7 +1940,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
                            "inline string length mismatch");
   }
   const std::size_t record_header_bytes =
-      RecordHeaderBytes(key.size(), key_external);
+      RecordHeaderBytes(key.size(), key_external, txid != 0, expire_at_ms != 0);
   const std::size_t payload_bytes =
       value.size() + (key_external && !external ? key.size() : 0);
   const std::size_t total_disk_bytes =
@@ -2305,8 +2306,6 @@ acquire_active_stream:
   std::fill_n(staging.data_ + record_offset + encoded_record_bytes,
               total_disk_bytes - encoded_record_bytes, std::byte{0});
   RecordHeader record{
-      .magic_ = kRecordMagic,
-      .version_ = kStorageFormatVersion,
       .header_bytes_ = static_cast<std::uint16_t>(record_header_bytes),
       .kind_ = kind,
       .db_id_ = db_id,

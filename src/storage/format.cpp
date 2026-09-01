@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include "absl/crc/crc32c.h"
 
@@ -134,6 +135,74 @@ std::string_view HashTag(std::string_view key) noexcept {
   }
   return key.substr(open + 1, close - open - 1);
 }
+
+// Record fields use fixed byte offsets so the durable layout is
+// independent of C++ padding and RecordHeader remains only a decoded view.
+// All multi-byte fields retain the storage format's native-endian convention.
+constexpr std::size_t kRecordMagicOffset = 0;
+constexpr std::size_t kRecordKeyBytesOffset = 8;
+constexpr std::size_t kRecordLogicalSizeOffset = 12;
+constexpr std::size_t kRecordPayloadBytesOffset = 16;
+constexpr std::size_t kRecordMetadataOffset = 20;
+constexpr std::size_t kRecordReplicationEpochOffset = 24;
+constexpr std::size_t kRecordDbEpochOffset = 32;
+constexpr std::size_t kRecordMutationSequenceOffset = 40;
+constexpr std::size_t kRecordLsnOffset = 48;
+constexpr std::size_t kRecordAllocationEpochOffset = 56;
+constexpr std::size_t kRecordPayloadChecksumOffset = 64;
+constexpr std::size_t kRecordHeaderChecksumOffset = 68;
+constexpr std::size_t kRecordOptionalOffset = kRecordHeaderBaseBytes;
+
+constexpr unsigned kRecordKindShift = 0;
+constexpr unsigned kRecordDbShift = 2;
+constexpr unsigned kRecordTypeShift = 6;
+constexpr unsigned kRecordExternalShift = 9;
+constexpr unsigned kRecordKeyExternalShift = 10;
+constexpr unsigned kRecordHasTxidShift = 11;
+constexpr unsigned kRecordHasExpiryShift = 12;
+constexpr std::uint16_t kRecordKindMask = 0x3;
+constexpr std::uint16_t kRecordDbMask = 0xf;
+constexpr std::uint16_t kRecordTypeMask = 0x7;
+constexpr std::uint16_t kRecordReservedMask = 0xe000;
+
+template <typename T>
+void StoreRecordField(std::span<std::byte> output, std::size_t offset,
+                      T value) noexcept {
+  static_assert(std::is_integral_v<T>);
+  assert(offset + sizeof(value) <= output.size());
+  std::memcpy(output.data() + offset, &value, sizeof(value));
+}
+
+template <typename T>
+T LoadRecordField(std::span<const std::byte> input,
+                  std::size_t offset) noexcept {
+  static_assert(std::is_integral_v<T>);
+  assert(offset + sizeof(T) <= input.size());
+  T value = 0;
+  std::memcpy(&value, input.data() + offset, sizeof(value));
+  return value;
+}
+
+constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
+  return static_cast<std::uint16_t>(
+      (static_cast<std::uint16_t>(header.kind_) << kRecordKindShift) |
+      (static_cast<std::uint16_t>(header.db_id_) << kRecordDbShift) |
+      (static_cast<std::uint16_t>(header.value_type_) << kRecordTypeShift) |
+      (static_cast<std::uint16_t>(header.external_) << kRecordExternalShift) |
+      (static_cast<std::uint16_t>(header.key_external_)
+       << kRecordKeyExternalShift) |
+      (static_cast<std::uint16_t>(header.txid_ != 0) << kRecordHasTxidShift) |
+      (static_cast<std::uint16_t>(header.expire_at_ms_ != 0)
+       << kRecordHasExpiryShift));
+}
+
+constexpr bool RecordMetadataBit(std::uint16_t metadata,
+                                 unsigned shift) noexcept {
+  return (metadata & (std::uint16_t{1} << shift)) != 0;
+}
+
+static_assert(kRecordHeaderChecksumOffset + sizeof(std::uint32_t) ==
+              kRecordHeaderBaseBytes);
 
 }  // namespace
 
@@ -360,13 +429,20 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
 
 bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
                         std::span<std::byte> output) noexcept {
+  const bool has_txid = header.txid_ != 0;
+  const bool has_expiry = header.expire_at_ms_ != 0;
+  const std::size_t fixed_header_bytes =
+      RecordFixedHeaderBytes(has_txid, has_expiry);
   const std::size_t header_bytes =
-      RecordHeaderBytes(key.size(), header.key_external_);
-  if (header.magic_ != kRecordMagic ||
-      header.version_ != kStorageFormatVersion ||
-      !ValidRecordKeySize(key.size()) || key.size() != header.key_bytes_ ||
+      RecordHeaderBytes(key.size(), header.key_external_, has_txid, has_expiry);
+  const std::size_t total_disk_bytes =
+      AlignRecord(header_bytes + header.payload_bytes_);
+  if (!ValidRecordKeySize(key.size()) || key.size() != header.key_bytes_ ||
       (header.key_external_ && key.empty()) ||
       header.db_id_ >= kLogicalDatabaseCount ||
+      (header.kind_ != RecordKind::kValue &&
+       header.kind_ != RecordKind::kTombstone &&
+       header.kind_ != RecordKind::kTxCommit) ||
       static_cast<std::uint8_t>(header.value_type_) >
           static_cast<std::uint8_t>(ValueType::kStream) ||
       (header.kind_ == RecordKind::kValue &&
@@ -383,52 +459,136 @@ bool EncodeRecordHeader(const RecordHeader& header, std::string_view key,
         header.external_ || header.expire_at_ms_ != 0 ||
         header.value_type_ != ValueType::kNone || header.txid_ == 0 ||
         header.key_bytes_ != 0 || header.key_external_)) ||
-      header.header_bytes_ != header_bytes || output.size() != header_bytes) {
+      header.replication_epoch_ == 0 || header.db_epoch_ == 0 ||
+      header.header_bytes_ != header_bytes ||
+      header.total_disk_bytes_ != total_disk_bytes ||
+      total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes ||
+      header_bytes > kMaxRecordHeaderBytes || output.size() != header_bytes) {
     return false;
   }
-  RecordHeader encoded = header;
-  encoded.value_type_ =
-      static_cast<ValueType>(static_cast<std::uint8_t>(encoded.value_type_) |
-                             (encoded.external_ ? kExternalValueMask : 0));
-  encoded.external_ = false;
-  encoded.key_bytes_ = static_cast<std::uint32_t>(encoded.key_bytes_) |
-                       (encoded.key_external_ ? kExternalKeyMask : 0);
-  encoded.key_external_ = false;
-  encoded.header_checksum_ = 0;
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
-  std::size_t encoded_bytes = sizeof(encoded);
+  StoreRecordField(output, kRecordMagicOffset, kRecordMagic);
+  StoreRecordField(output, kRecordKeyBytesOffset, header.key_bytes_);
+  StoreRecordField(output, kRecordLogicalSizeOffset, header.logical_size_);
+  StoreRecordField(output, kRecordPayloadBytesOffset, header.payload_bytes_);
+  StoreRecordField(output, kRecordMetadataOffset, RecordMetadata(header));
+  // Packed metadata occupies two bytes in an aligned four-byte slot. Clear
+  // the reserved half explicitly so the common encoder does not rewrite the
+  // complete header before storing every field.
+  StoreRecordField(output, kRecordMetadataOffset + sizeof(std::uint16_t),
+                   std::uint16_t{0});
+  StoreRecordField(output, kRecordReplicationEpochOffset,
+                   header.replication_epoch_);
+  StoreRecordField(output, kRecordDbEpochOffset, header.db_epoch_);
+  StoreRecordField(output, kRecordMutationSequenceOffset,
+                   header.mutation_sequence_);
+  StoreRecordField(output, kRecordLsnOffset, header.lsn_);
+  StoreRecordField(output, kRecordAllocationEpochOffset,
+                   header.allocation_epoch_);
+  StoreRecordField(output, kRecordPayloadChecksumOffset,
+                   header.payload_checksum_);
+  std::size_t optional_offset = kRecordOptionalOffset;
+  if (has_txid) {
+    StoreRecordField(output, optional_offset, header.txid_);
+    optional_offset += kRecordHeaderOptionalBytes;
+  }
+  if (has_expiry) {
+    StoreRecordField(output, optional_offset, header.expire_at_ms_);
+    optional_offset += kRecordHeaderOptionalBytes;
+  }
+  assert(optional_offset == fixed_header_bytes);
+  std::size_t encoded_bytes = fixed_header_bytes;
   if (!header.key_external_) {
-    std::memcpy(output.data() + sizeof(encoded), key.data(), key.size());
+    std::memcpy(output.data() + fixed_header_bytes, key.data(), key.size());
     encoded_bytes += key.size();
   }
-  // Every non-padding byte is overwritten above. Clear only the alignment
-  // tail because it participates in the durable header checksum; clearing the
-  // complete header first would write the header and inline key twice on every
-  // record append.
+  // Every durable field and inline key byte was overwritten above. Only the
+  // alignment tail still needs deterministic zeroes for the header checksum.
   std::fill(output.begin() + encoded_bytes, output.end(), std::byte{0});
-  encoded.header_checksum_ = Crc32c(output);
-  std::memcpy(output.data(), &encoded, sizeof(encoded));
+  StoreRecordField(output, kRecordHeaderChecksumOffset, std::uint32_t{0});
+  StoreRecordField(output, kRecordHeaderChecksumOffset, Crc32c(output));
   return true;
 }
 
 bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
                         std::string_view* key) noexcept {
   if (header == nullptr || key == nullptr ||
-      input.size() < sizeof(RecordHeader)) {
+      input.size() < kRecordHeaderBaseBytes) {
     return false;
   }
-  RecordHeader decoded{};
-  std::memcpy(&decoded, input.data(), sizeof(decoded));
-  const std::uint8_t encoded_type =
-      static_cast<std::uint8_t>(decoded.value_type_);
-  decoded.external_ = (encoded_type & kExternalValueMask) != 0;
-  decoded.value_type_ =
-      static_cast<ValueType>(encoded_type & ~kExternalValueMask);
-  const std::uint32_t encoded_key_bytes = decoded.key_bytes_;
-  decoded.key_external_ = (encoded_key_bytes & kExternalKeyMask) != 0;
-  decoded.key_bytes_ = encoded_key_bytes & ~kExternalKeyMask;
-  if (decoded.magic_ != kRecordMagic ||
-      decoded.version_ != kStorageFormatVersion ||
+  if (LoadRecordField<std::uint64_t>(input, kRecordMagicOffset) !=
+      kRecordMagic) {
+    return false;
+  }
+  const std::uint16_t metadata =
+      LoadRecordField<std::uint16_t>(input, kRecordMetadataOffset);
+  if ((metadata & kRecordReservedMask) != 0) {
+    return false;
+  }
+  const bool has_txid = RecordMetadataBit(metadata, kRecordHasTxidShift);
+  const bool has_expiry = RecordMetadataBit(metadata, kRecordHasExpiryShift);
+  const bool key_external =
+      RecordMetadataBit(metadata, kRecordKeyExternalShift);
+  const std::uint32_t key_bytes =
+      LoadRecordField<std::uint32_t>(input, kRecordKeyBytesOffset);
+  const std::uint32_t payload_bytes =
+      LoadRecordField<std::uint32_t>(input, kRecordPayloadBytesOffset);
+  const std::size_t fixed_header_bytes =
+      RecordFixedHeaderBytes(has_txid, has_expiry);
+  const std::size_t header_bytes =
+      RecordHeaderBytes(key_bytes, key_external, has_txid, has_expiry);
+  if (!ValidRecordKeySize(key_bytes) ||
+      header_bytes > kMaxRecordHeaderBytes ||
+      header_bytes > input.size()) {
+    return false;
+  }
+  const std::size_t total_disk_bytes =
+      AlignRecord(header_bytes + payload_bytes);
+  if (total_disk_bytes > kStorageBlockBytes - kBlockHeaderBytes) {
+    return false;
+  }
+
+  RecordHeader decoded{
+      .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
+      .kind_ = static_cast<RecordKind>((metadata >> kRecordKindShift) &
+                                       kRecordKindMask),
+      .db_id_ = static_cast<std::uint8_t>((metadata >> kRecordDbShift) &
+                                          kRecordDbMask),
+      .value_type_ = static_cast<ValueType>((metadata >> kRecordTypeShift) &
+                                            kRecordTypeMask),
+      .external_ = RecordMetadataBit(metadata, kRecordExternalShift),
+      .key_external_ = key_external,
+      .key_bytes_ = key_bytes,
+      .logical_size_ =
+          LoadRecordField<std::uint32_t>(input, kRecordLogicalSizeOffset),
+      .payload_bytes_ = payload_bytes,
+      .total_disk_bytes_ = static_cast<std::uint32_t>(total_disk_bytes),
+      .replication_epoch_ =
+          LoadRecordField<std::uint64_t>(input, kRecordReplicationEpochOffset),
+      .db_epoch_ = LoadRecordField<std::uint64_t>(input, kRecordDbEpochOffset),
+      .mutation_sequence_ =
+          LoadRecordField<std::uint64_t>(input, kRecordMutationSequenceOffset),
+      .lsn_ = LoadRecordField<std::uint64_t>(input, kRecordLsnOffset),
+      .allocation_epoch_ =
+          LoadRecordField<std::uint64_t>(input, kRecordAllocationEpochOffset),
+      .payload_checksum_ =
+          LoadRecordField<std::uint32_t>(input, kRecordPayloadChecksumOffset),
+      .header_checksum_ =
+          LoadRecordField<std::uint32_t>(input, kRecordHeaderChecksumOffset),
+  };
+  std::size_t optional_offset = kRecordOptionalOffset;
+  if (has_txid) {
+    decoded.txid_ = LoadRecordField<std::uint64_t>(input, optional_offset);
+    optional_offset += kRecordHeaderOptionalBytes;
+  }
+  if (has_expiry) {
+    decoded.expire_at_ms_ =
+        LoadRecordField<std::uint64_t>(input, optional_offset);
+    optional_offset += kRecordHeaderOptionalBytes;
+  }
+  assert(optional_offset == fixed_header_bytes);
+
+  if ((has_txid && decoded.txid_ == 0) ||
+      (has_expiry && decoded.expire_at_ms_ == 0) ||
       (decoded.kind_ != RecordKind::kValue &&
        decoded.kind_ != RecordKind::kTombstone &&
        decoded.kind_ != RecordKind::kTxCommit) ||
@@ -441,15 +601,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.value_type_ == ValueType::kString &&
        decoded.logical_size_ > kMaxBitmapBytes) ||
       decoded.replication_epoch_ == 0 || decoded.db_epoch_ == 0 ||
-      !ValidRecordKeySize(decoded.key_bytes_) ||
-      decoded.header_bytes_ !=
-          RecordHeaderBytes(decoded.key_bytes_, decoded.key_external_) ||
-      decoded.header_bytes_ > kMaxRecordHeaderBytes ||
-      decoded.header_bytes_ > input.size() ||
-      decoded.total_disk_bytes_ !=
-          AlignRecord(static_cast<std::size_t>(decoded.header_bytes_) +
-                      decoded.payload_bytes_) ||
-      decoded.total_disk_bytes_ > kStorageBlockBytes - kBlockHeaderBytes) {
+      (decoded.key_external_ && decoded.key_bytes_ == 0)) {
     return false;
   }
   if (decoded.kind_ != RecordKind::kValue &&
@@ -469,18 +621,12 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.key_external_)) {
     return false;
   }
-  const std::uint32_t expected = decoded.header_checksum_;
   std::array<std::byte, kMaxRecordHeaderBytes> copy{};
-  std::memcpy(copy.data(), input.data(), decoded.header_bytes_);
-  RecordHeader checksum_header = decoded;
-  checksum_header.value_type_ = static_cast<ValueType>(encoded_type);
-  checksum_header.external_ = false;
-  checksum_header.key_bytes_ = encoded_key_bytes;
-  checksum_header.key_external_ = false;
-  checksum_header.header_checksum_ = 0;
-  std::memcpy(copy.data(), &checksum_header, sizeof(checksum_header));
-  if (Crc32c(std::span<const std::byte>(copy.data(), decoded.header_bytes_)) !=
-      expected) {
+  std::memcpy(copy.data(), input.data(), header_bytes);
+  StoreRecordField(std::span<std::byte>(copy.data(), header_bytes),
+                   kRecordHeaderChecksumOffset, std::uint32_t{0});
+  if (Crc32c(std::span<const std::byte>(copy.data(), header_bytes)) !=
+      decoded.header_checksum_) {
     return false;
   }
   *header = decoded;
@@ -488,7 +634,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
     *key = {};
   } else {
     *key = std::string_view(
-        reinterpret_cast<const char*>(input.data() + sizeof(RecordHeader)),
+        reinterpret_cast<const char*>(input.data() + fixed_header_bytes),
         decoded.key_bytes_);
   }
   return true;

@@ -12,7 +12,8 @@
 TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
   using namespace keylane::storage;
   static_assert(sizeof(Digest) == sizeof(std::uint64_t));
-  static_assert(sizeof(RecordHeader) == 104);
+  static_assert(kRecordHeaderBaseBytes == 72);
+  static_assert(kMaxRecordFixedHeaderBytes == 88);
 
   const Digest first = ComputeDigest("key");
   EXPECT_TRUE(first == ComputeDigest("key"));
@@ -200,10 +201,9 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   constexpr std::string_view key = "typed-expiring-key";
   constexpr std::string_view value = "value";
-  const std::size_t record_header_bytes = RecordHeaderBytes(key.size());
+  const std::size_t record_header_bytes =
+      RecordHeaderBytes(key.size(), false, true, true);
   RecordHeader record{
-      .magic_ = kRecordMagic,
-      .version_ = kStorageFormatVersion,
       .header_bytes_ = static_cast<std::uint16_t>(record_header_bytes),
       .kind_ = RecordKind::kValue,
       .db_id_ = 3,
@@ -289,8 +289,6 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   const std::size_t header_bytes = RecordHeaderBytes(key.size(), true);
   ASSERT_LE(header_bytes, kMaxRecordHeaderBytes);
   RecordHeader record{
-      .magic_ = kRecordMagic,
-      .version_ = kStorageFormatVersion,
       .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
       .kind_ = RecordKind::kTombstone,
       .db_id_ = 2,
@@ -319,8 +317,56 @@ TEST(StorageFormatTest, EncodesOutOfIndexKeyWithoutHeaderBytes) {
   EXPECT_TRUE(decoded.key_external_);
   EXPECT_TRUE(decoded_key.empty());
   EXPECT_EQ(decoded.key_bytes_, key.size());
-  EXPECT_EQ(decoded.header_bytes_, AlignRecord(sizeof(RecordHeader)));
+  EXPECT_EQ(decoded.header_bytes_, kRecordHeaderBaseBytes);
   EXPECT_EQ(decoded.payload_bytes_, key.size());
+}
+
+TEST(StorageFormatTest, UsesSparseRecordHeaderExtensions) {
+  using namespace keylane::storage;
+
+  EXPECT_EQ(RecordFixedHeaderBytes(false, false), 72);
+  EXPECT_EQ(RecordFixedHeaderBytes(true, false), 80);
+  EXPECT_EQ(RecordFixedHeaderBytes(false, true), 80);
+  EXPECT_EQ(RecordFixedHeaderBytes(true, true), 88);
+
+  for (const std::uint64_t txid : {std::uint64_t{0}, std::uint64_t{17}}) {
+    for (const std::uint64_t expiry :
+         {std::uint64_t{0}, std::uint64_t{1'900'000'000'123ULL}}) {
+      const std::size_t header_bytes =
+          RecordHeaderBytes(0, false, txid != 0, expiry != 0);
+      RecordHeader record{
+          .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
+          .kind_ = RecordKind::kValue,
+          .db_id_ = 3,
+          .value_type_ = ValueType::kString,
+          .key_bytes_ = 0,
+          .logical_size_ = 1,
+          .payload_bytes_ = 1,
+          .total_disk_bytes_ =
+              static_cast<std::uint32_t>(AlignRecord(header_bytes + 1)),
+          .txid_ = txid,
+          .replication_epoch_ = 5,
+          .db_epoch_ = 6,
+          .mutation_sequence_ = 7,
+          .expire_at_ms_ = expiry,
+          .lsn_ = 9,
+          .allocation_epoch_ = 10,
+      };
+      std::array<std::byte, kMaxRecordFixedHeaderBytes> encoded{};
+      ASSERT_TRUE(EncodeRecordHeader(
+          record, {}, std::span<std::byte>(encoded.data(), header_bytes)));
+
+      RecordHeader decoded{};
+      std::string_view key;
+      ASSERT_TRUE(DecodeRecordHeader(
+          std::span<const std::byte>(encoded.data(), header_bytes), &decoded,
+          &key));
+      EXPECT_EQ(decoded.header_bytes_, header_bytes);
+      EXPECT_EQ(decoded.txid_, txid);
+      EXPECT_EQ(decoded.expire_at_ms_, expiry);
+      EXPECT_TRUE(key.empty());
+    }
+  }
 }
 
 TEST(StorageFormatTest, EncodesMemoryReplicationFrames) {
@@ -373,23 +419,12 @@ TEST(StorageFormatTest, RejectsOversizedInlineHeaderBeforeChecksumCopy) {
   ASSERT_GT(header_bytes, kMaxRecordHeaderBytes);
   ASSERT_LE(header_bytes, std::numeric_limits<std::uint16_t>::max());
   std::vector<std::byte> input(header_bytes);
-  RecordHeader corrupt{
-      .magic_ = kRecordMagic,
-      .version_ = kStorageFormatVersion,
-      .header_bytes_ = static_cast<std::uint16_t>(header_bytes),
-      .kind_ = RecordKind::kValue,
-      .db_id_ = 0,
-      .value_type_ = ValueType::kString,
-      .key_bytes_ = key_bytes,
-      .logical_size_ = 1,
-      .payload_bytes_ = 0,
-      .total_disk_bytes_ =
-          static_cast<std::uint32_t>(AlignRecord(header_bytes)),
-      .replication_epoch_ = 1,
-      .db_epoch_ = 1,
-      .mutation_sequence_ = 1,
-  };
-  std::memcpy(input.data(), &corrupt, sizeof(corrupt));
+  // The compact layout starts with the 64-bit magic followed by key_bytes. Only
+  // fields are needed to prove the decoder rejects the derived oversized
+  // header before copying into its bounded checksum buffer.
+  const std::uint64_t magic = kRecordMagic;
+  std::memcpy(input.data(), &magic, sizeof(magic));
+  std::memcpy(input.data() + sizeof(magic), &key_bytes, sizeof(key_bytes));
 
   RecordHeader decoded{};
   std::string_view key;

@@ -1948,7 +1948,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
         static_cast<std::uint64_t>(applied.value_.size()) +
         (key_external ? applied.key_.size() : 0);
     const std::size_t inline_bytes =
-        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_external) +
+        AlignRecord(RecordHeaderBytes(applied.key_.size(), key_external, false,
+                                      applied.expire_at_ms_ != 0) +
                     static_cast<std::size_t>(logical_payload_bytes));
     if (inline_bytes > kStorageBlockBytes - kBlockHeaderBytes) [[unlikely]] {
       auto extents = co_await WriteExtentValueLocked(
