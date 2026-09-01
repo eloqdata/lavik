@@ -1936,7 +1936,6 @@ struct ReplicaTransactionArrival {
   std::vector<bool> arrived_;
   std::vector<std::uint64_t> lsns_;
   std::size_t arrival_count_ = 0;
-  std::size_t departure_count_ = 0;
   bool applying_ = false;
   absl::Status status_ =
       absl::UnknownError("replicated transaction has not completed");
@@ -1944,6 +1943,18 @@ struct ReplicaTransactionArrival {
   // flow staging may register later transactions before ACK consumers wait on
   // earlier ones, and dependency tasks also need to observe completion.
   ReplicaCompletionLatch completion_;
+};
+
+struct PreparedReplicaTransactionArrival {
+  std::uint64_t id_ = 0;
+  std::uint8_t db_id_ = 0;
+  std::vector<unsigned> participants_;
+  std::vector<std::string> command_args_;
+  std::shared_ptr<ReplicaTransactionArrival> predecessor_;
+  unsigned payload_flow_ = 0;
+  unsigned flow_id_ = 0;
+  std::uint64_t lsn_ = 0;
+  bool has_payload_ = false;
 };
 
 struct ReplicaControlArrival {
@@ -1961,24 +1972,12 @@ struct ReplicaControlArrival {
   celer::CoroutineBarrier completion_;
 };
 
-class ReplicaTransactionSpinLock {
- public:
-  void lock() noexcept {
-    while (locked_.test_and_set(std::memory_order_acquire)) {
-#if defined(__x86_64__) || defined(__i386__)
-      __builtin_ia32_pause();
-#elif defined(__aarch64__) || defined(__arm__)
-      asm volatile("yield" ::: "memory");
-#else
-      std::atomic_signal_fence(std::memory_order_seq_cst);
-#endif
-    }
-  }
-
-  void unlock() noexcept { locked_.clear(std::memory_order_release); }
-
- private:
-  std::atomic_flag locked_ = ATOMIC_FLAG_INIT;
+struct ReplicaTransactionOwner {
+  // This table is initialized before flow startup and thereafter touched only
+  // by the worker whose id indexes the owner vector. Cross-worker flow
+  // coroutines submit registrations to that worker instead of sharing a lock.
+  absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaTransactionArrival>>
+      transactions_;
 };
 
 struct ReplicaSession {
@@ -1996,17 +1995,7 @@ struct ReplicaSession {
   std::atomic<unsigned> connected_flows_{0};
   SocketSet sockets_;
   std::atomic<bool> cancelled_{false};
-  // Transaction registration crosses worker threads but its critical sections
-  // never suspend. Keep the workers runnable in userspace instead of parking
-  // an entire coroutine executor in the kernel behind std::mutex. Cancellation
-  // may hold this lock longer while draining the table, but it is off the
-  // steady-state path and concurrently closes every flow.
-  ReplicaTransactionSpinLock transaction_mutex_;
-  absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaTransactionArrival>>
-      transactions_;
-  // Updated only under transaction_mutex_. A weak tail prevents a completed
-  // transaction from being retained after every participant ACKs it.
-  std::vector<std::weak_ptr<ReplicaTransactionArrival>> transaction_tails_;
+  std::vector<std::unique_ptr<ReplicaTransactionOwner>> transaction_owners_;
   std::mutex control_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaControlArrival>>
       controls_;
@@ -2014,24 +2003,6 @@ struct ReplicaSession {
   void Cancel() {
     if (cancelled_.exchange(true, std::memory_order_acq_rel)) return;
     sockets_.Cancel();
-    std::vector<std::shared_ptr<ReplicaTransactionArrival>> arrivals;
-    {
-      std::lock_guard lock(transaction_mutex_);
-      arrivals.reserve(transactions_.size());
-      for (auto& [_, arrival] : transactions_) {
-        arrival->status_ =
-            absl::CancelledError("replication session cancelled");
-        arrivals.push_back(std::move(arrival));
-      }
-      transactions_.clear();
-      transaction_tails_.clear();
-    }
-    const absl::Status cancelled =
-        absl::CancelledError("replication session cancelled");
-    for (const auto& arrival : arrivals) {
-      (void)arrival->completion_.ResolveOnce(
-          storage::ReplicationTransactionResolution::kDiscard);
-    }
     std::vector<std::shared_ptr<ReplicaControlArrival>> controls;
     {
       std::lock_guard lock(control_mutex_);
@@ -2041,6 +2012,8 @@ struct ReplicaSession {
       }
       controls_.clear();
     }
+    const absl::Status cancelled =
+        absl::CancelledError("replication session cancelled");
     for (const auto& arrival : controls) {
       arrival->completion_.Abort(cancelled);
     }
@@ -4268,7 +4241,11 @@ class ReplicationManager::Impl {
     }
     session->session_id_ = session_id;
     session->source_worker_count_ = source_workers;
-    session->transaction_tails_.resize(source_workers);
+    session->transaction_owners_.reserve(storage_->worker_count());
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      session->transaction_owners_.push_back(
+          std::make_unique<ReplicaTransactionOwner>());
+    }
     session->fullsync_cut_ =
         std::make_unique<celer::CoroutineBarrier>(source_workers);
     session->root_swap_complete_ =
@@ -4344,6 +4321,37 @@ class ReplicationManager::Impl {
   Task<absl::Status> CancelAndWaitForReplicaFlows(
       const std::shared_ptr<ReplicaSession>& session) {
     session->Cancel();
+    // Transaction tables are worker-owned, so cancellation must visit them on
+    // their owner threads. Resolve every incomplete arrival before waiting for
+    // detached apply tasks; otherwise an apply waiting on a predecessor from a
+    // disconnected flow could keep the old session alive indefinitely.
+    for (unsigned owner = 0; owner < session->transaction_owners_.size();
+         ++owner) {
+      auto cancel_owner = [session, owner]() {
+        auto& transactions =
+            session->transaction_owners_[owner]->transactions_;
+        std::vector<std::shared_ptr<ReplicaTransactionArrival>> arrivals;
+        arrivals.reserve(transactions.size());
+        for (auto& [_, arrival] : transactions) {
+          arrival->status_ =
+              absl::CancelledError("replication session cancelled");
+          arrivals.push_back(std::move(arrival));
+        }
+        transactions.clear();
+        for (const auto& arrival : arrivals) {
+          (void)arrival->completion_.ResolveOnce(
+              storage::ReplicationTransactionResolution::kDiscard);
+        }
+        return absl::OkStatus();
+      };
+      absl::Status cancelled;
+      if (owner == celer::ThisWorker().id_) {
+        cancelled = cancel_owner();
+      } else {
+        cancelled = co_await celer::SubmitTo(owner, cancel_owner);
+      }
+      if (!cancelled.ok()) co_return cancelled;
+    }
     auto next_warning =
         std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (session->active_flows_.load(std::memory_order_acquire) != 0 ||
@@ -4443,11 +4451,9 @@ class ReplicationManager::Impl {
   }
 
   Task<absl::Status> WaitForReplicaTransaction(
-      const std::shared_ptr<ReplicaSession>& session,
       const std::shared_ptr<ReplicaTransactionArrival>& arrival) {
     const storage::ReplicationTransactionResolution resolution =
         co_await arrival->completion_.Wait(*celer::ThisWorker().self_);
-    std::lock_guard lock(session->transaction_mutex_);
     if (resolution == storage::ReplicationTransactionResolution::kDiscard &&
         arrival->status_.ok()) {
       co_return absl::CancelledError(
@@ -4456,41 +4462,24 @@ class ReplicationManager::Impl {
     co_return arrival->status_;
   }
 
-  Task<absl::Status> WaitForReplicaTransactionParticipant(
-      const std::shared_ptr<ReplicaSession>& session,
-      const std::shared_ptr<ReplicaTransactionArrival>& arrival) {
-    absl::Status result = co_await WaitForReplicaTransaction(session, arrival);
-    std::lock_guard lock(session->transaction_mutex_);
-    auto found = session->transactions_.find(arrival->id_);
-    if (found != session->transactions_.end() &&
-        found->second == arrival) {
-      ++arrival->departure_count_;
-      if (arrival->departure_count_ == arrival->participants_.size()) {
-        session->transactions_.erase(found);
-      }
-    }
-    co_return result;
-  }
-
   Task<absl::Status> ApplyReadyReplicaTransaction(
       std::shared_ptr<ReplicaSession> session,
+      unsigned owner,
       std::shared_ptr<ReplicaTransactionArrival> arrival) {
-    // This coroutine is detached from the registration stack. Own both
-    // objects in its frame; reference parameters would dangle as soon as
-    // RegisterReplicaTransaction returns.
+    // The registration leaf spawns this coroutine on the transaction owner.
+    // Keep all mutable arrival state on that worker until completion; waiters
+    // observe status only after the latch's release/acquire publication.
     ReplicaFlowActivityGuard active(&session->active_transaction_applies_);
-    std::vector<std::shared_ptr<ReplicaTransactionArrival>> predecessors;
-    ReplicatedCommand command;
-    {
-      std::lock_guard lock(session->transaction_mutex_);
-      predecessors = arrival->predecessors_;
-      command.db_id_ = arrival->db_id_;
-      command.args_ = std::move(arrival->command_args_);
-    }
+    std::vector<std::shared_ptr<ReplicaTransactionArrival>> predecessors =
+        std::move(arrival->predecessors_);
+    ReplicatedCommand command{
+        .db_id_ = arrival->db_id_,
+        .args_ = std::move(arrival->command_args_),
+    };
 
     absl::Status status = absl::OkStatus();
     for (const auto& predecessor : predecessors) {
-      status = co_await WaitForReplicaTransaction(session, predecessor);
+      status = co_await WaitForReplicaTransaction(predecessor);
       if (!status.ok()) break;
     }
     if (status.ok() && session->cancelled()) {
@@ -4499,28 +4488,29 @@ class ReplicationManager::Impl {
     }
     if (status.ok()) status = co_await ApplyReplicatedCommand(command);
 
-    bool cancelled = false;
-    {
-      std::lock_guard lock(session->transaction_mutex_);
-      // The local copy above keeps every predecessor alive while it is
-      // awaited. Drop the durable edges before publishing completion so a
-      // long transaction stream does not retain its entire completed chain.
-      arrival->predecessors_.clear();
-      cancelled = session->cancelled();
-      if (cancelled) {
-        arrival->status_ = absl::CancelledError(
-            "replication session ended during transaction apply");
-      } else {
-        arrival->status_ = std::move(status);
-        if (arrival->status_.ok()) {
-          // Cursor publication precedes completion resolution, so every flow
-          // ACK observes one atomic resumable cut for the participant set.
-          for (unsigned participant : arrival->participants_) {
-            session->cursors_->Store(participant,
-                                     arrival->lsns_[participant] + 1, 0);
-          }
+    const bool cancelled = session->cancelled();
+    if (cancelled) {
+      arrival->status_ = absl::CancelledError(
+          "replication session ended during transaction apply");
+    } else {
+      arrival->status_ = std::move(status);
+      if (arrival->status_.ok()) {
+        // Cursor publication precedes completion resolution, so every flow
+        // ACK observes one atomic resumable cut for the participant set.
+        for (unsigned participant : arrival->participants_) {
+          session->cursors_->Store(participant,
+                                   arrival->lsns_[participant] + 1, 0);
         }
       }
+    }
+    auto& transactions =
+        session->transaction_owners_[owner]->transactions_;
+    auto found = transactions.find(arrival->id_);
+    if (found != transactions.end() && found->second == arrival) {
+      // All declared participants arrived before apply started. Their flow
+      // queues retain the shared arrival until ACK, so the owner table no
+      // longer needs to extend its lifetime after publishing the result.
+      transactions.erase(found);
     }
     (void)arrival->completion_.ResolveOnce(
         cancelled ? storage::ReplicationTransactionResolution::kDiscard
@@ -4528,10 +4518,11 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
-  absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>
-  RegisterReplicaTransaction(
+  absl::StatusOr<PreparedReplicaTransactionArrival>
+  PrepareReplicaTransactionArrival(
       const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
-      std::uint64_t lsn, ReplicatedCommand envelope) {
+      std::uint64_t lsn, ReplicatedCommand envelope,
+      std::shared_ptr<ReplicaTransactionArrival> predecessor) {
     const auto& args = envelope.args_;
     if (args.empty() || !IsReplicationTransactionEnvelope(args[0])) {
       return absl::InvalidArgumentError(
@@ -4566,10 +4557,9 @@ class ReplicationManager::Impl {
       return absl::InvalidArgumentError(
           "replicated transaction payload does not match its flow");
     }
-    // `envelope` is owned by this arrival coroutine. Move its command tail
-    // before taking the session mutex so the first arrival only transfers a
-    // vector allocation while locked; a large transaction must not copy its
-    // canonical payload into ReplicaTransactionArrival under the mutex.
+    // Move the sole payload before crossing workers. SubmitTo retains this
+    // prepared object in the originating coroutine frame and transfers only
+    // its vector owners; the canonical command body is never copied.
     std::vector<std::string> command_args;
     if (has_payload) {
       command_args.reserve(args.size() - 1);
@@ -4577,73 +4567,107 @@ class ReplicationManager::Impl {
                 std::back_inserter(command_args));
     }
 
+    return PreparedReplicaTransactionArrival{
+        .id_ = txid,
+        .db_id_ = envelope.db_id_,
+        .participants_ = std::move(participants),
+        .command_args_ = std::move(command_args),
+        .predecessor_ = std::move(predecessor),
+        .payload_flow_ = payload_flow,
+        .flow_id_ = flow_id,
+        .lsn_ = lsn,
+        .has_payload_ = has_payload,
+    };
+  }
+
+  absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>
+  RegisterReplicaTransactionOnOwner(
+      const std::shared_ptr<ReplicaSession>& session, unsigned owner,
+      PreparedReplicaTransactionArrival prepared) {
+    assert(owner == celer::ThisWorker().id_);
+    if (session->cancelled()) {
+      return absl::CancelledError(
+          "replication session ended before transaction arrival");
+    }
+    auto& transactions =
+        session->transaction_owners_[owner]->transactions_;
     std::shared_ptr<ReplicaTransactionArrival> arrival;
     bool start_apply = false;
-    {
-      std::lock_guard lock(session->transaction_mutex_);
-      if (session->cancelled()) {
-        return absl::CancelledError(
-            "replication session ended before transaction arrival");
+    auto [it, inserted] = transactions.try_emplace(prepared.id_);
+    if (inserted) {
+      it->second = std::make_shared<ReplicaTransactionArrival>();
+      it->second->id_ = prepared.id_;
+      it->second->db_id_ = prepared.db_id_;
+      it->second->participants_ = prepared.participants_;
+      it->second->payload_flow_ = prepared.payload_flow_;
+      if (prepared.has_payload_) {
+        it->second->command_args_ = std::move(prepared.command_args_);
+        it->second->payload_arrived_ = true;
       }
-      auto [it, inserted] = session->transactions_.try_emplace(txid);
-      if (inserted) {
-        it->second = std::make_shared<ReplicaTransactionArrival>();
-        it->second->id_ = txid;
-        it->second->db_id_ = envelope.db_id_;
-        it->second->participants_ = participants;
-        it->second->payload_flow_ = payload_flow;
-        if (has_payload) {
-          it->second->command_args_ = std::move(command_args);
-          it->second->payload_arrived_ = true;
-        }
-        it->second->arrived_.resize(session->source_worker_count_);
-        it->second->lsns_.resize(session->source_worker_count_);
-      }
-      arrival = it->second;
-      if (arrival->db_id_ != envelope.db_id_ ||
-          arrival->participants_ != participants ||
-          arrival->payload_flow_ != payload_flow ||
-          arrival->arrived_[flow_id]) {
+      it->second->arrived_.resize(session->source_worker_count_);
+      it->second->lsns_.resize(session->source_worker_count_);
+    }
+    arrival = it->second;
+    if (arrival->db_id_ != prepared.db_id_ ||
+        arrival->participants_ != prepared.participants_ ||
+        arrival->payload_flow_ != prepared.payload_flow_ ||
+        arrival->arrived_[prepared.flow_id_]) {
+      return absl::InvalidArgumentError(
+          "conflicting replicated transaction envelope");
+    }
+    if (!inserted && prepared.has_payload_) {
+      if (arrival->payload_arrived_) {
         return absl::InvalidArgumentError(
-            "conflicting replicated transaction envelope");
+            "duplicate replicated transaction payload");
       }
-      if (!inserted && has_payload) {
-        if (arrival->payload_arrived_) {
-          return absl::InvalidArgumentError(
-              "duplicate replicated transaction payload");
-        }
-        arrival->command_args_ = std::move(command_args);
-        arrival->payload_arrived_ = true;
-      }
-      if (flow_id >= session->transaction_tails_.size()) {
-        return absl::InternalError(
-            "replica transaction tail vector is incomplete");
-      }
-      if (auto predecessor = session->transaction_tails_[flow_id].lock();
-          predecessor != nullptr && predecessor != arrival &&
-          std::find(arrival->predecessors_.begin(),
-                    arrival->predecessors_.end(), predecessor) ==
-              arrival->predecessors_.end()) {
-        arrival->predecessors_.push_back(std::move(predecessor));
-      }
-      session->transaction_tails_[flow_id] = arrival;
-      arrival->arrived_[flow_id] = true;
-      arrival->lsns_[flow_id] = lsn;
-      ++arrival->arrival_count_;
-      if (arrival->arrival_count_ == arrival->participants_.size() &&
-          arrival->payload_arrived_ && !arrival->applying_) {
-        arrival->applying_ = true;
-        start_apply = true;
-      }
+      arrival->command_args_ = std::move(prepared.command_args_);
+      arrival->payload_arrived_ = true;
+    }
+    if (prepared.predecessor_ != nullptr &&
+        prepared.predecessor_ != arrival &&
+        std::find(arrival->predecessors_.begin(),
+                  arrival->predecessors_.end(), prepared.predecessor_) ==
+            arrival->predecessors_.end()) {
+      arrival->predecessors_.push_back(std::move(prepared.predecessor_));
+    }
+    arrival->arrived_[prepared.flow_id_] = true;
+    arrival->lsns_[prepared.flow_id_] = prepared.lsn_;
+    ++arrival->arrival_count_;
+    if (arrival->arrival_count_ == arrival->participants_.size() &&
+        arrival->payload_arrived_ && !arrival->applying_) {
+      arrival->applying_ = true;
+      start_apply = true;
     }
 
     if (start_apply) {
       session->active_transaction_applies_.fetch_add(1,
                                                      std::memory_order_acq_rel);
       celer::ThisWorker().self_->Spawn(
-          ApplyReadyReplicaTransaction(session, arrival));
+          ApplyReadyReplicaTransaction(session, owner, arrival));
     }
     return arrival;
+  }
+
+  Task<absl::StatusOr<std::shared_ptr<ReplicaTransactionArrival>>>
+  RegisterReplicaTransaction(
+      const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
+      std::uint64_t lsn, ReplicatedCommand envelope,
+      std::shared_ptr<ReplicaTransactionArrival> predecessor) {
+    auto prepared = PrepareReplicaTransactionArrival(
+        session, flow_id, lsn, std::move(envelope), std::move(predecessor));
+    if (!prepared.ok()) co_return prepared.status();
+    if (session->transaction_owners_.empty()) {
+      co_return absl::InternalError(
+          "replica transaction owners are not initialized");
+    }
+    const unsigned owner = static_cast<unsigned>(
+        prepared->id_ % session->transaction_owners_.size());
+    auto register_on_owner =
+        [this, session, owner, prepared = std::move(*prepared)]() mutable {
+          return RegisterReplicaTransactionOnOwner(
+              session, owner, std::move(prepared));
+        };
+    co_return co_await celer::SubmitTo(owner, std::move(register_on_owner));
   }
 
   Task<absl::Status> ApplyReplicaControl(
@@ -4792,8 +4816,9 @@ class ReplicationManager::Impl {
       std::shared_ptr<ReplicaTransactionArrival> transaction_arrival;
       absl::Status applied = absl::OkStatus();
       if (transaction) {
-        auto registered = RegisterReplicaTransaction(
-            session, flow_id, pending.lsn_, std::move(pending.command_));
+        auto registered = co_await RegisterReplicaTransaction(
+            session, flow_id, pending.lsn_, std::move(pending.command_),
+            last_transaction);
         if (!registered.ok()) {
           applied = registered.status();
         } else {
@@ -4806,8 +4831,7 @@ class ReplicationManager::Impl {
         // registration linked every earlier flow-local transaction into its
         // predecessor chain.
         if (last_transaction != nullptr) {
-          applied =
-              co_await WaitForReplicaTransaction(session, last_transaction);
+          applied = co_await WaitForReplicaTransaction(last_transaction);
           last_transaction.reset();
         }
         if (applied.ok() && control) {
@@ -4868,8 +4892,7 @@ class ReplicationManager::Impl {
       const bool transaction = pending.transaction_ != nullptr;
       absl::Status applied = absl::OkStatus();
       if (transaction) {
-        applied = co_await WaitForReplicaTransactionParticipant(
-            session, pending.transaction_);
+        applied = co_await WaitForReplicaTransaction(pending.transaction_);
       }
       if (!applied.ok()) {
         InvalidateReplicaContinuation(session);

@@ -252,18 +252,27 @@ a second bounded completion FIFO of 256 entries. An ordinary command or control
 barrier is a hard staging boundary and waits for the preceding transaction on
 that flow, preserving its mixed-event order.
 
-Each registered transaction depends on the previous registered transaction on
-each of its participant flows. Once every marker and the one canonical payload
-have arrived, a detached task waits those predecessors and applies the command.
-Transactions with disjoint participant sets have no dependency and may apply
-concurrently; transactions sharing any flow retain source order. A separate
-ACK coroutine drains the completion FIFO in receive order. Only successful
-application publishes the next in-memory resume cursor and permits its ACK. If
-an ACK detects a disconnect, reconnect does not repeat an already applied
-`APPEND`, `INCR`, or similar effect. An ingress, staging, ACK, rendezvous, or
-apply failure cancels the whole session and joins both flow-local coroutines
-and every detached transaction task before replacement, so no task can retain
-the old stream or storage mutation lifetime.
+Each flow retains its previous registered transaction and submits that
+predecessor with the next marker. A transaction ID deterministically selects a
+target worker; registration crosses through the runtime's sender-to-owner SPSC
+lane, and only that worker accesses the corresponding rendezvous table. Each
+flow has at most one registration submission in flight, retaining bounded
+pressure without a process-wide transaction lock. Once every marker and the
+one canonical payload have arrived, a detached task on the transaction owner
+waits those predecessors and applies the command. Transactions with disjoint
+participant sets have no dependency and may apply concurrently across owners;
+transactions sharing any flow retain source order even when their IDs select
+different owners.
+
+A separate ACK coroutine drains the completion FIFO in receive order. Only
+successful application publishes the next in-memory resume cursor and permits
+its ACK. If an ACK detects a disconnect, reconnect does not repeat an already
+applied `APPEND`, `INCR`, or similar effect. An ingress, staging, ACK,
+rendezvous, or apply failure cancels the whole session. Cancellation visits
+each rendezvous table on its owner worker, resolves incomplete arrivals, and
+joins both flow-local coroutines and every detached transaction task before
+replacement, so no task can retain the old stream or storage mutation
+lifetime.
 
 Multi-participant writes carry a binary V1 `KTX1` metadata argument on every
 participant flow. Its little-endian layout is the four-byte magic, transaction
