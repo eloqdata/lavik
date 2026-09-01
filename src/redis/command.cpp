@@ -1617,7 +1617,126 @@ static_assert(sizeof(WorkerCommandGates) % 64 == 0);
 
 std::array<WorkerCommandGates, storage::kLogicalStorageShards>
     g_worker_command_gates{};
-std::atomic<bool> g_replication_transaction_order{false};
+
+class ReplicationTransactionOrderGate {
+ private:
+  struct Waiter {
+    celer::Worker* worker_ = nullptr;
+    std::coroutine_handle<> handle_{};
+    Waiter* next_ = nullptr;
+  };
+
+ public:
+  class Awaiter {
+   public:
+    Awaiter(ReplicationTransactionOrderGate* gate, celer::Worker* worker)
+        : gate_(gate) {
+      waiter_.worker_ = worker;
+    }
+
+    bool await_ready() const noexcept { return false; }
+    bool await_suspend(std::coroutine_handle<> handle) noexcept {
+      return gate_->AcquireOrQueue(&waiter_, handle);
+    }
+    void await_resume() const noexcept {}
+
+   private:
+    ReplicationTransactionOrderGate* gate_ = nullptr;
+    Waiter waiter_;
+  };
+
+  Awaiter Acquire(celer::Worker& worker) noexcept {
+    return Awaiter(this, &worker);
+  }
+
+  bool TryAcquire() noexcept {
+    Lock();
+    if (held_) {
+      Unlock();
+      return false;
+    }
+    held_ = true;
+    Unlock();
+    return true;
+  }
+
+  void Release() noexcept {
+    Lock();
+    Waiter* wake = waiters_head_;
+    if (wake == nullptr) {
+      held_ = false;
+      Unlock();
+      return;
+    }
+    waiters_head_ = wake->next_;
+    if (waiters_head_ == nullptr) waiters_tail_ = nullptr;
+    // Keep held_ set while handing ownership to the FIFO head. A newcomer
+    // must queue behind it even if the resumed coroutine has not run yet.
+    Unlock();
+
+    const celer::CurrentWorker& current = celer::ThisWorker();
+    if (wake->worker_->id() == current.id_) {
+      wake->worker_->Enqueue(wake->handle_);
+    } else {
+      celer::PostNotification(
+          current.cross_core_, wake->worker_->id(),
+          celer::RemoteNotification{
+              .context_ = wake->worker_,
+              .value_ = static_cast<std::uint64_t>(
+                  reinterpret_cast<std::uintptr_t>(wake->handle_.address())),
+              .run_fn_ = &ReplicationTransactionOrderGate::ResumeRemote,
+          });
+    }
+  }
+
+ private:
+  static void ResumeRemote(void* context, std::uint64_t value) noexcept {
+    static_cast<celer::Worker*>(context)->Enqueue(
+        std::coroutine_handle<>::from_address(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
+  }
+
+  bool AcquireOrQueue(Waiter* waiter,
+                      std::coroutine_handle<> handle) noexcept {
+    waiter->handle_ = handle;
+    waiter->next_ = nullptr;
+    Lock();
+    if (!held_) {
+      held_ = true;
+      Unlock();
+      return false;
+    }
+    if (waiters_tail_ == nullptr) {
+      waiters_head_ = waiter;
+    } else {
+      waiters_tail_->next_ = waiter;
+    }
+    waiters_tail_ = waiter;
+    Unlock();
+    return true;
+  }
+
+  void Lock() noexcept {
+    while (lock_.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+      asm volatile("yield" ::: "memory");
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+  }
+
+  void Unlock() noexcept { lock_.clear(std::memory_order_release); }
+
+  std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+  bool held_ = false;
+  Waiter* waiters_head_ = nullptr;
+  Waiter* waiters_tail_ = nullptr;
+};
+
+ReplicationTransactionOrderGate g_replication_transaction_order;
 
 unsigned DbGateWorkerCount() noexcept {
   constexpr unsigned kMaxDbGateWorkers = storage::kLogicalStorageShards;
@@ -2021,9 +2140,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
 
 Task<absl::Status> BeginReplicationTransactionOrder(
     ReplicationTransactionOrderGuard* guard) {
-  while (!TryBeginReplicationTransactionOrder()) {
-    co_await celer::Yield(*ThisWorker().self_);
-  }
+  co_await g_replication_transaction_order.Acquire(*ThisWorker().self_);
   guard->Activate();
 #ifndef NDEBUG
   // Test-only hold for the order-gate e2e: once per process, keep the freshly
@@ -8510,13 +8627,11 @@ bool SnapshotTransactionsActive() noexcept {
 }
 
 bool TryBeginReplicationTransactionOrder() noexcept {
-  bool expected = false;
-  return g_replication_transaction_order.compare_exchange_strong(
-      expected, true, std::memory_order_acq_rel, std::memory_order_acquire);
+  return g_replication_transaction_order.TryAcquire();
 }
 
 void EndReplicationTransactionOrder() noexcept {
-  g_replication_transaction_order.store(false, std::memory_order_release);
+  g_replication_transaction_order.Release();
 }
 
 bool RequestSpansMultipleShards(const CommandRequest& request) {
