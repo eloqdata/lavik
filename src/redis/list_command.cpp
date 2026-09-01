@@ -968,9 +968,17 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
     bool unavailable = false;
     CommandReply result = co_await ExecuteListMultiKey(
         nonblocking, attempt_builder, &unavailable);
-    if (unavailable) co_return BlockingAttemptResult{};
-    co_return BlockingAttemptResult{BlockingAttemptState::kComplete,
-                                    finish_attempt(result)};
+    // Clang 18 cannot lower a temporary non-trivial aggregate through this
+    // coroutine promise. A named frame object preserves the same move
+    // semantics and makes the reply lifetime explicit.
+    if (unavailable) {
+      BlockingAttemptResult retry;
+      co_return retry;
+    }
+    BlockingAttemptResult completed;
+    completed.state_ = BlockingAttemptState::kComplete;
+    completed.reply_ = finish_attempt(result);
+    co_return completed;
   };
   auto status_reply = [&](const absl::Status& status) {
     return BuiltReply(reply_builder.AppendError("ERR ", status.message()));

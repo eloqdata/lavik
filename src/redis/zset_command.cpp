@@ -3054,9 +3054,16 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
     bool empty = false;
     CommandReply result = co_await ExecuteZSetMultiPopAttempt(
         nonblocking, attempt_builder, &empty);
-    if (empty) co_return BlockingAttemptResult{};
-    co_return BlockingAttemptResult{BlockingAttemptState::kComplete,
-                                    Built(builder.AppendRaw(result.encoded_))};
+    // Keep the result named for the same Clang 18 coroutine codegen constraint
+    // as the blocking List path; the wait loop takes ownership after return.
+    if (empty) {
+      BlockingAttemptResult retry;
+      co_return retry;
+    }
+    BlockingAttemptResult completed;
+    completed.state_ = BlockingAttemptState::kComplete;
+    completed.reply_ = Built(builder.AppendRaw(result.encoded_));
+    co_return completed;
   };
   auto timeout_reply = [&] { return Built(builder.AppendNullArray()); };
   auto status_reply = [&](const absl::Status& status) {
