@@ -1961,6 +1961,26 @@ struct ReplicaControlArrival {
   celer::CoroutineBarrier completion_;
 };
 
+class ReplicaTransactionSpinLock {
+ public:
+  void lock() noexcept {
+    while (locked_.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+      __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+      asm volatile("yield" ::: "memory");
+#else
+      std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+    }
+  }
+
+  void unlock() noexcept { locked_.clear(std::memory_order_release); }
+
+ private:
+  std::atomic_flag locked_ = ATOMIC_FLAG_INIT;
+};
+
 struct ReplicaSession {
   std::uint64_t session_id_ = 0;
   unsigned source_worker_count_ = 0;
@@ -1976,7 +1996,12 @@ struct ReplicaSession {
   std::atomic<unsigned> connected_flows_{0};
   SocketSet sockets_;
   std::atomic<bool> cancelled_{false};
-  std::mutex transaction_mutex_;
+  // Transaction registration crosses worker threads but its critical sections
+  // never suspend. Keep the workers runnable in userspace instead of parking
+  // an entire coroutine executor in the kernel behind std::mutex. Cancellation
+  // may hold this lock longer while draining the table, but it is off the
+  // steady-state path and concurrently closes every flow.
+  ReplicaTransactionSpinLock transaction_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<ReplicaTransactionArrival>>
       transactions_;
   // Updated only under transaction_mutex_. A weak tail prevents a completed
