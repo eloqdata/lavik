@@ -108,6 +108,55 @@ struct StorageDurabilityStats {
   }
 };
 
+inline constexpr std::size_t kMaxFunctionCatalogBytes =
+    1ULL * 1024 * 1024 * 1024;
+
+// A process-local reference to one crash-durable catalog generation. It is
+// deliberately not a replication identity: peers continue to exchange the
+// original Redis Function command and derive their own local generation.
+struct CatalogDurabilityToken {
+  std::uint64_t catalog_generation_ = 0;
+  std::uint64_t dump_crc64_ = 0;
+
+  bool operator==(const CatalogDurabilityToken&) const noexcept = default;
+};
+
+struct RecoveredFunctionCatalog {
+  std::string dump_;
+  CatalogDurabilityToken token_{};
+};
+
+// The frontier is the next incomplete event on every flow. Storage treats the
+// context and accumulator as opaque bytes while enforcing the durability
+// barrier that promotion needs before authority can move.
+struct DurabilityFrontier {
+  std::string history_context_;
+  std::vector<std::uint64_t> flow_cursors_;
+};
+
+struct PopulationToken {
+  // Identifies the locally durable key population installed by a completed
+  // full sync. Zero is the sentinel for "no population eligible to promote".
+  std::uint64_t generation_ = 0;
+  std::uint64_t digest_ = 0;
+
+  bool operator==(const PopulationToken&) const noexcept = default;
+};
+
+struct PromotionBase {
+  // All fields describe one atomically captured parent state. The storage
+  // commit accepts it only while the referenced local population and catalog
+  // tokens are still current.
+  std::string group_id_;
+  std::string parent_history_id_;
+  DurabilityFrontier parent_frontier_;
+  PopulationToken population_token_{};
+  CatalogDurabilityToken catalog_token_{};
+  std::string storage_accumulator_;
+
+  bool operator==(const PromotionBase&) const = default;
+};
+
 enum class TombRaiderMode : std::uint8_t {
   kOff,
   kInterval,
@@ -172,7 +221,7 @@ struct StorageReplicationLogMetrics {
   unsigned worker_id_ = 0;
   std::uint64_t floor_lsn_ = 1;
   std::uint64_t tail_lsn_ = 0;
-  std::uint64_t backpressure_waits_ = 0;
+  std::uint64_t coverage_revocations_ = 0;
   std::size_t chunk_count_ = 0;
   std::size_t capacity_bytes_ = 0;
   std::size_t publish_queue_bytes_ = 0;
@@ -184,7 +233,6 @@ struct StorageReplicationLogMetrics {
   std::size_t pinned_cursors_ = 0;
   std::uint64_t fullsync_backpressure_waits_ = 0;
   bool active_ = false;
-  bool capacity_backpressured_ = false;
 };
 
 struct StorageMetricsSnapshot {
@@ -363,9 +411,8 @@ struct ReplicationLogInfo {
   std::size_t fullsync_publish_queue_capacity_bytes_ = 0;
   std::size_t fullsync_session_count_ = 0;
   std::size_t retained_cursor_count_ = 0;
-  std::uint64_t backpressure_waits_ = 0;
+  std::uint64_t coverage_revocations_ = 0;
   std::uint64_t fullsync_backpressure_waits_ = 0;
-  bool capacity_backpressured_ = false;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -483,6 +530,24 @@ struct ReplicationPublisherAdmission {
   std::uint64_t log_epoch_ = 0;
   std::vector<std::uint64_t> fullsync_session_ids_;
   std::vector<UnstartedGuard> fullsync_unstarted_guards_;
+};
+
+// One command whose backlog-owned and full-sync-owned copies were allocated
+// before the associated mutation became durable. Publishing only moves these
+// values into queue slots already reserved by ReplicationPublisherAdmission.
+struct PreparedReplicationCommandPublication {
+  std::optional<ReplicationCommandAppend> backlog_command_;
+  std::shared_ptr<const ReplicationCommandAppend> fullsync_command_;
+
+  PreparedReplicationCommandPublication() = default;
+  PreparedReplicationCommandPublication(
+      const PreparedReplicationCommandPublication&) = delete;
+  PreparedReplicationCommandPublication& operator=(
+      const PreparedReplicationCommandPublication&) = delete;
+  PreparedReplicationCommandPublication(
+      PreparedReplicationCommandPublication&&) noexcept = default;
+  PreparedReplicationCommandPublication& operator=(
+      PreparedReplicationCommandPublication&&) noexcept = default;
 };
 
 // Optional owner-local scope for publisher admission. A simple keyed command
@@ -805,6 +870,45 @@ class StorageEngine {
   // behavior and sanitizer exit-time leak checking remains effective.
   bool AbandonWorkerStateForProcessExit() noexcept;
 
+  // Atomically replaces the node-global Function catalog dump. The body is
+  // committed before a mirrored system-state root publishes the generation.
+  celer::Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
+      std::string_view dump);
+  // Returns the catalog selected during startup recovery. Absence means a new
+  // storage set that has not committed its first (empty) catalog yet.
+  absl::StatusOr<std::optional<RecoveredFunctionCatalog>>
+  RecoverFunctionCatalog() const;
+
+  // Flushes all accepted storage work before a promotion base is committed.
+  // The frontier and accumulator are validated but otherwise opaque to
+  // storage; callers must already have quiesced replication and DB admission.
+  celer::Task<absl::Status> MakeDurable(const DurabilityFrontier& frontier,
+                                        std::string_view opaque_accumulator);
+  // Atomically publishes a promotion base while retaining the current catalog
+  // root. A population/catalog mismatch fails without changing durable state.
+  celer::Task<absl::Status> CommitPromotionBase(PromotionBase base);
+  // Recovery returns absence when this storage lineage has never committed a
+  // promotion base or when full-sync invalidation cleared it.
+  absl::StatusOr<std::optional<PromotionBase>> RecoverPromotionBase() const;
+  // Returns the currently promotion-eligible population; absence is reported
+  // as FailedPrecondition rather than a zero token.
+  absl::StatusOr<PopulationToken> RecoverPopulationToken() const;
+
+  // Full sync is a destructive replacement. Invalidation is durable before
+  // the first partition reset; a restart remains fenced until the matching
+  // population and Function catalog have both reached the final cut. Begin is
+  // idempotent for the same nonzero session. Complete accepts only that active
+  // session, atomically makes it readable, and never rolls back the
+  // replacement on failure.
+  celer::Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  celer::Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
+                                                    PopulationToken population);
+  bool ReplicaRecoveryFenced() const noexcept;
+  // Irreversibly fences request serving in this process after a durable
+  // mutation can no longer be reconciled with its replication history.
+  // Recovery is the only authority that may choose the valid durable state.
+  void FenceRequestServingUntilRestart() noexcept;
+
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;
   std::size_t LocalSize(std::uint8_t db_id) const noexcept;
@@ -979,6 +1083,28 @@ class StorageEngine {
   // full-sync FIFO, but never becomes persistent keyspace state.
   celer::Task<absl::Status> PublishEphemeralReplicationCommand(
       std::uint16_t partition_id, std::vector<std::string> args);
+  // Preallocates the online-backlog command and its active-full-sync copy.
+  // An absent fullsync_projection copies args, an empty projection omits the
+  // event from full sync, and a non-empty projection replaces only the
+  // full-sync payload. This lets a final snapshot object supersede part of a
+  // live event without changing the canonical online history.
+  absl::StatusOr<PreparedReplicationCommandPublication>
+  PrepareAdmittedReplicationCommand(
+      const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+      std::uint16_t partition_id, std::vector<std::string> args,
+      std::optional<std::vector<std::string>> fullsync_projection =
+          std::nullopt);
+  absl::Status PublishPreparedReplicationCommand(
+      const ReplicationPublisherAdmission& admission,
+      PreparedReplicationCommandPublication publication);
+  // Outcome-dependent EXEC effects cannot be prepared before execution. If
+  // their allocation fails, invalidate the admitted history instead of
+  // leaving a durable mutation outside an otherwise resumable history.
+  absl::Status PublishLateAdmittedReplicationCommand(
+      const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+      std::uint16_t partition_id, std::vector<std::string> args,
+      std::optional<std::vector<std::string>> fullsync_projection =
+          std::nullopt);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 

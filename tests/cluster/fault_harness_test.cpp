@@ -305,6 +305,10 @@ TEST(ClusterInvariantTest, AcceptsGoodReferenceSnapshot) {
   snapshot.promotion_ = PromotionObservation{
       .candidate_selected_ = true,
       .durability_barrier_complete_ = true,
+      .promotion_base_committed_ = true,
+      .population_token_valid_ = true,
+      .captured_catalog_generation_ = CatalogGeneration{10},
+      .current_catalog_generation_ = CatalogGeneration{10},
       .child_history_ready_ = true,
       .candidate_activated_ = true,
       .write_gate_open_ = true,
@@ -390,6 +394,26 @@ TEST(ClusterInvariantTest, CoversRemainingMatrixRows) {
   incomplete_activation.promotion_.candidate_activated_ = true;
   incomplete_activation.promotion_.another_replica_reset_ = true;
   expect(incomplete_activation, "promotion.safe-activation");
+
+  ClusterSnapshot catalog_ack;
+  catalog_ack.function_catalog_.applied_cursor_advanced_ = true;
+  catalog_ack.function_catalog_.replica_ack_sent_ = true;
+  expect(catalog_ack, "function.catalog-durable-before-ack");
+
+  ClusterSnapshot full_sync;
+  full_sync.full_sync_.in_progress_ = true;
+  expect(full_sync, "fullsync.destructive-invalidation-before-transfer");
+
+  ClusterSnapshot stale_catalog;
+  stale_catalog.promotion_.candidate_selected_ = true;
+  stale_catalog.promotion_.durability_barrier_complete_ = true;
+  stale_catalog.promotion_.promotion_base_committed_ = true;
+  stale_catalog.promotion_.population_token_valid_ = true;
+  stale_catalog.promotion_.captured_catalog_generation_ = CatalogGeneration{1};
+  stale_catalog.promotion_.current_catalog_generation_ = CatalogGeneration{2};
+  stale_catalog.promotion_.child_history_ready_ = true;
+  stale_catalog.promotion_.candidate_activated_ = true;
+  expect(stale_catalog, "promotion.catalog-token-current");
 
   ClusterSnapshot candidate;
   const CompatibilityDomain domain{.source_boot_ = BootId{1},

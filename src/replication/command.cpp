@@ -16,7 +16,8 @@ constexpr std::string_view kMagic = "KRC1";
 constexpr std::uint8_t kVersion = 1;
 constexpr std::size_t kFixedHeaderBytes = 8;
 constexpr std::size_t kMaxArgumentCount = 1024;
-constexpr std::size_t kMaxArgumentBytes = 1024ULL * 1024 * 1024;
+constexpr std::size_t kMaxArgumentBytes =
+    static_cast<std::size_t>(kMaxNativeReplicationEventBytes);
 constexpr std::string_view kTransactionMagic = "KTX1";
 constexpr std::size_t kTransactionFixedBytes = 16;
 constexpr std::size_t kMaxTransactionBitmapBytes =
@@ -171,8 +172,7 @@ DecodeReplicationTransactionEnvelope(std::string_view encoded) {
         static_cast<std::uint8_t>(encoded[kTransactionFixedBytes + byte]);
     for (unsigned bit = 0; bit < 8; ++bit) {
       if ((bits & static_cast<std::uint8_t>(1U << bit)) != 0) {
-        envelope.participants_.push_back(
-            static_cast<unsigned>(byte * 8 + bit));
+        envelope.participants_.push_back(static_cast<unsigned>(byte * 8 + bit));
       }
     }
   }
@@ -209,12 +209,20 @@ ReplicationCommandPayloadSource::Create(
   source.header_.push_back(static_cast<char>(db_id));
   PutU16(&source.header_, static_cast<std::uint16_t>(args.size()));
   source.size_ = source.header_.size() + args.size() * sizeof(std::uint32_t);
+  if (source.size_ > kMaxNativeReplicationEventBytes) {
+    return absl::ResourceExhaustedError(
+        "replication command exceeds the native event limit");
+  }
   source.args_.reserve(args.size());
   for (std::string_view arg : args) {
     if (arg.size() > kMaxArgumentBytes ||
         arg.size() > std::numeric_limits<std::uint32_t>::max() ||
         source.size_ > std::numeric_limits<std::uint64_t>::max() - arg.size()) {
       return Malformed("replication command argument is too large");
+    }
+    if (source.size_ > kMaxNativeReplicationEventBytes - arg.size()) {
+      return absl::ResourceExhaustedError(
+          "replication command exceeds the native event limit");
     }
     PutU32(&source.header_, static_cast<std::uint32_t>(arg.size()));
     source.args_.push_back(arg);
@@ -261,6 +269,10 @@ celer::Task<absl::Status> ReplicationCommandPayloadSource::Read(
 // boundary instead of checking each argument copy independently.
 absl::StatusOr<ReplicatedCommand> DecodeReplicationCommand(
     std::string_view encoded) try {
+  if (encoded.size() > kMaxNativeReplicationEventBytes) {
+    return absl::ResourceExhaustedError(
+        "replication command exceeds the native event limit");
+  }
   if (encoded.size() < kFixedHeaderBytes ||
       encoded.substr(0, kMagic.size()) != kMagic) {
     return Malformed("invalid replication command magic");

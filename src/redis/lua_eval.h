@@ -35,6 +35,11 @@ struct LuaFunctionLibrary {
   std::vector<LuaFunctionInfo> functions_;
 };
 
+// Parses only the library name from a Function shebang, returning nullopt when
+// the declaration is absent or malformed.
+std::optional<std::string> LuaFunctionLibraryNameFromCode(
+    std::string_view code);
+
 struct LuaRedisCall {
   bool protected_call_ = false;
   std::vector<std::string> args_;
@@ -115,19 +120,18 @@ void ClearStoredLuaScripts();
 // with SCRIPT LOAD/EVAL insertion and SCRIPT FLUSH.
 std::size_t StoredLuaScriptCount();
 
-// FUNCTION LOAD is staged independently on every worker. Callers commit only
-// after every worker compiled the source and registered an identical function
-// set; abort discards the unpublished registry references.
-absl::StatusOr<LuaFunctionLibrary> StageLuaFunctionLibraryLocally(
-    std::string_view code, bool replace);
-void CommitStagedLuaFunctionLibraryLocally();
-void AbortStagedLuaFunctionLibraryLocally();
-bool DeleteLuaFunctionLibraryLocally(std::string_view name);
-void ClearLuaFunctionLibrariesLocally();
+// Builds a complete replacement Function registry in a hidden Lua runtime.
+// Callers commit only after every worker compiled the whole catalog and
+// registered identical metadata; commit is a non-failing pointer swap. An
+// execution retains the runtime that created its Lua thread, so replacing the
+// current catalog cannot invalidate a suspended EVAL or FCALL.
+absl::StatusOr<std::vector<LuaFunctionLibrary>>
+StageCompleteLuaFunctionCatalogLocally(
+    std::span<const std::string> library_codes);
+void CommitStagedLuaFunctionCatalogLocally();
+void AbortStagedLuaFunctionCatalogLocally();
 
-void StoreLuaFunctionLibrary(LuaFunctionLibrary library);
-bool DeleteStoredLuaFunctionLibrary(std::string_view name);
-void ClearStoredLuaFunctionLibraries();
+void ReplaceStoredLuaFunctionCatalog(std::vector<LuaFunctionLibrary> libraries);
 std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries();
 
 LuaScriptKillResult RequestLuaScriptKill(bool function);

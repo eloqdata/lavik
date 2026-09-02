@@ -163,7 +163,7 @@ RespClient Connect(std::uint16_t port) {
 void CreateDataFile(const std::string& path) {
   const int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
   if (fd < 0) Fail("failed to open data file");
-  const int allocated = ::posix_fallocate(fd, 0, 128ULL * 1024 * 1024);
+  const int allocated = ::posix_fallocate(fd, 0, 160ULL * 1024 * 1024);
   const int closed = ::close(fd);
   if (allocated != 0 || closed != 0) Fail("failed to create data file");
 }

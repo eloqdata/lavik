@@ -970,7 +970,7 @@ TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
   const int fd =
       ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);
-  ASSERT_EQ(::posix_fallocate(fd, 0, 80 * 1024 * 1024), 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 88 * 1024 * 1024), 0);
   ASSERT_EQ(::close(fd), 0);
   struct Cleanup {
     std::string path_;

@@ -93,4 +93,21 @@ TEST(ReplicationCommandTest, TransactionEnvelopeRoundTripsCanonicalBitmap) {
       keylane::DecodeReplicationTransactionEnvelope(noncanonical).ok());
 }
 
+TEST(ReplicationCommandTest, EnforcesCompleteEncodingLimit) {
+  const std::string one_mebibyte(1024 * 1024, 'x');
+  std::vector<std::string_view> args(1024, one_mebibyte);
+  constexpr std::size_t kHeaderBytes = 8 + 1024 * sizeof(std::uint32_t);
+  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes);
+
+  auto exact = keylane::ReplicationCommandPayloadSource::Create(0, args);
+  ASSERT_TRUE(exact.ok()) << exact.status();
+  EXPECT_EQ(exact->size(), keylane::kMaxNativeReplicationEventBytes);
+
+  args.back() = std::string_view(one_mebibyte).substr(kHeaderBytes - 1);
+  auto oversized = keylane::ReplicationCommandPayloadSource::Create(0, args);
+
+  EXPECT_FALSE(oversized.ok());
+  EXPECT_EQ(oversized.status().code(), absl::StatusCode::kResourceExhausted);
+}
+
 }  // namespace

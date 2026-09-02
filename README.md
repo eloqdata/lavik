@@ -207,7 +207,8 @@ For production storage:
 
 - use persistent absolute paths rather than `/tmp`;
 - provision every file before startup;
-- make each fresh file an 8 MiB multiple and at least 80 MiB;
+- make each fresh file an 8 MiB multiple and at least 80 MiB; Function catalog
+  updates use the same foreground capacity as ordinary data;
 - repeat `--data-file` to use multiple files or devices;
 - always provide the complete device set when restarting an initialized
   multi-device instance.

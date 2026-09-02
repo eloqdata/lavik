@@ -684,8 +684,8 @@ void FunctionLoadInstructionHook(lua_State* state, lua_Debug*) {
 
 class LuaWorkerRuntime {
  public:
-  static absl::StatusOr<std::unique_ptr<LuaWorkerRuntime>> Create() {
-    auto runtime = std::unique_ptr<LuaWorkerRuntime>(new LuaWorkerRuntime());
+  static absl::StatusOr<std::shared_ptr<LuaWorkerRuntime>> Create() {
+    auto runtime = std::shared_ptr<LuaWorkerRuntime>(new LuaWorkerRuntime());
     runtime->root_ = luaL_newstate();
     if (runtime->root_ == nullptr) {
       return absl::ResourceExhaustedError("unable to create Lua interpreter");
@@ -799,8 +799,21 @@ class LuaWorkerRuntime {
     (void)lua_gc(root_, LUA_GCCOLLECT, 0);
   }
 
+  absl::Status CopyScriptsTo(LuaWorkerRuntime* target) const {
+    if (target == nullptr) {
+      return absl::InvalidArgumentError("missing target Lua runtime");
+    }
+    for (const auto& [key, script] : scripts_) {
+      if (!target->Cache(std::string_view(key.data(), key.size()),
+                         script.bytecode_)) {
+        return absl::InternalError("failed to clone Lua script cache");
+      }
+    }
+    return absl::OkStatus();
+  }
+
   absl::StatusOr<LuaFunctionLibrary> StageFunctionLibrary(
-      std::string_view code, bool replace) {
+      std::string_view code) {
     if (staged_library_ != nullptr) {
       return absl::FailedPreconditionError(
           "another function library is already staged");
@@ -809,7 +822,7 @@ class LuaWorkerRuntime {
     if (!metadata.ok()) return metadata.status();
     const std::string& library_name = metadata->first;
     const auto existing_library = libraries_.find(library_name);
-    if (existing_library != libraries_.end() && !replace) {
+    if (existing_library != libraries_.end()) {
       return absl::AlreadyExistsError(
           absl::StrCat("Library '", library_name, "' already exists"));
     }
@@ -853,20 +866,15 @@ class LuaWorkerRuntime {
     }
     lua_settop(root_, base);
 
-    LocalLuaLibrary* replaced =
-        existing_library == libraries_.end() ? nullptr
-                                              : existing_library->second.get();
     for (const StagedLuaFunction& function : staged->functions_) {
       const auto collision = functions_.find(FoldFunctionName(function.info_.name_));
-      if (collision != functions_.end() &&
-          (!replace || collision->second.library_ != replaced)) {
+      if (collision != functions_.end()) {
         const std::string name = function.info_.name_;
         ReleaseStaged(staged.get());
         return absl::AlreadyExistsError(
             absl::StrCat("Function ", name, " already exists"));
       }
     }
-    staged_replace_ = replace;
     LuaFunctionLibrary info = staged->info_;
     staged_library_ = std::move(staged);
     return info;
@@ -875,7 +883,6 @@ class LuaWorkerRuntime {
   void CommitStagedFunctionLibrary() {
     if (staged_library_ == nullptr) return;
     const std::string name = staged_library_->info_.name_;
-    if (staged_replace_) DeleteFunctionLibrary(name);
 
     auto library = std::make_unique<LocalLuaLibrary>();
     library->name_ = name;
@@ -895,41 +902,6 @@ class LuaWorkerRuntime {
           folded, LocalLuaFunctionLookup{library_ptr, &function});
     }
     staged_library_.reset();
-    staged_replace_ = false;
-  }
-
-  void AbortStagedFunctionLibrary() {
-    if (staged_library_ == nullptr) return;
-    ReleaseStaged(staged_library_.get());
-    staged_library_.reset();
-    staged_replace_ = false;
-  }
-
-  bool DeleteFunctionLibrary(std::string_view name) {
-    auto found = libraries_.find(std::string(name));
-    if (found == libraries_.end()) return false;
-    for (auto& [folded, function] : found->second->functions_) {
-      functions_.erase(folded);
-      luaL_unref(root_, LUA_REGISTRYINDEX, function.registry_ref_);
-      function.registry_ref_ = LUA_NOREF;
-    }
-    libraries_.erase(found);
-    (void)lua_gc(root_, LUA_GCSTEP, 50);
-    return true;
-  }
-
-  void ClearFunctionLibraries() {
-    for (auto& [name, library] : libraries_) {
-      (void)name;
-      for (auto& [folded, function] : library->functions_) {
-        (void)folded;
-        luaL_unref(root_, LUA_REGISTRYINDEX, function.registry_ref_);
-      }
-    }
-    functions_.clear();
-    libraries_.clear();
-    AbortStagedFunctionLibrary();
-    (void)lua_gc(root_, LUA_GCCOLLECT, 0);
   }
 
   bool PushFunction(lua_State* thread, std::string_view name,
@@ -960,19 +932,19 @@ class LuaWorkerRuntime {
   absl::flat_hash_map<std::string, std::unique_ptr<LocalLuaLibrary>> libraries_;
   absl::flat_hash_map<std::string, LocalLuaFunctionLookup> functions_;
   std::unique_ptr<StagedLuaLibrary> staged_library_;
-  bool staged_replace_ = false;
   std::uint64_t completed_executions_ = 0;
 };
 
-thread_local std::unique_ptr<LuaWorkerRuntime> g_lua_runtime;
+thread_local std::shared_ptr<LuaWorkerRuntime> g_lua_runtime;
+thread_local std::shared_ptr<LuaWorkerRuntime> g_staged_lua_runtime;
 
-absl::StatusOr<LuaWorkerRuntime*> WorkerLuaRuntime() {
+absl::StatusOr<std::shared_ptr<LuaWorkerRuntime>> WorkerLuaRuntime() {
   if (g_lua_runtime == nullptr) {
     auto runtime = LuaWorkerRuntime::Create();
     if (!runtime.ok()) return runtime.status();
     g_lua_runtime = std::move(*runtime);
   }
-  return g_lua_runtime.get();
+  return g_lua_runtime;
 }
 
 absl::Status ReadLine(std::string_view encoded, std::size_t* position,
@@ -1443,7 +1415,10 @@ LuaExecutionStep KilledStep(bool function) {
 }  // namespace
 
 struct LuaExecution::Impl {
-  LuaWorkerRuntime* runtime_ = nullptr;
+  // Catalog replacement swaps the worker's current runtime while an EVAL or
+  // FCALL coroutine may be suspended in a Redis call. Keep that retired VM
+  // alive until this execution releases its Lua thread.
+  std::shared_ptr<LuaWorkerRuntime> runtime_;
   lua_State* state_ = nullptr;
   int thread_ref_ = LUA_NOREF;
   LuaRunControl run_control_;
@@ -1747,48 +1722,48 @@ std::size_t StoredLuaScriptCount() {
   return g_script_bodies.size();
 }
 
-absl::StatusOr<LuaFunctionLibrary> StageLuaFunctionLibraryLocally(
-    std::string_view code, bool replace) {
-  auto runtime = WorkerLuaRuntime();
-  if (!runtime.ok()) return runtime.status();
-  return (*runtime)->StageFunctionLibrary(code, replace);
-}
-
-void CommitStagedLuaFunctionLibraryLocally() {
-  if (g_lua_runtime != nullptr) {
-    g_lua_runtime->CommitStagedFunctionLibrary();
+absl::StatusOr<std::vector<LuaFunctionLibrary>>
+StageCompleteLuaFunctionCatalogLocally(
+    std::span<const std::string> library_codes) {
+  if (g_staged_lua_runtime != nullptr) {
+    return absl::FailedPreconditionError(
+        "another complete Function catalog is already staged");
   }
-}
+  auto current = WorkerLuaRuntime();
+  if (!current.ok()) return current.status();
+  auto staged = LuaWorkerRuntime::Create();
+  if (!staged.ok()) return staged.status();
+  absl::Status scripts = (*current)->CopyScriptsTo(staged->get());
+  if (!scripts.ok()) return scripts;
 
-void AbortStagedLuaFunctionLibraryLocally() {
-  if (g_lua_runtime != nullptr) {
-    g_lua_runtime->AbortStagedFunctionLibrary();
+  std::vector<LuaFunctionLibrary> libraries;
+  libraries.reserve(library_codes.size());
+  for (const std::string& code : library_codes) {
+    auto library = (*staged)->StageFunctionLibrary(code);
+    if (!library.ok()) return library.status();
+    (*staged)->CommitStagedFunctionLibrary();
+    libraries.push_back(std::move(*library));
   }
+  g_staged_lua_runtime = std::move(*staged);
+  return libraries;
 }
 
-bool DeleteLuaFunctionLibraryLocally(std::string_view name) {
-  return g_lua_runtime != nullptr &&
-         g_lua_runtime->DeleteFunctionLibrary(name);
+void CommitStagedLuaFunctionCatalogLocally() {
+  if (g_staged_lua_runtime == nullptr) return;
+  g_lua_runtime.swap(g_staged_lua_runtime);
+  g_staged_lua_runtime.reset();
 }
 
-void ClearLuaFunctionLibrariesLocally() {
-  if (g_lua_runtime != nullptr) g_lua_runtime->ClearFunctionLibraries();
-}
+void AbortStagedLuaFunctionCatalogLocally() { g_staged_lua_runtime.reset(); }
 
-void StoreLuaFunctionLibrary(LuaFunctionLibrary library) {
-  std::lock_guard lock(g_function_catalog_mutex);
-  const std::string name = library.name_;
-  g_function_libraries.insert_or_assign(name, std::move(library));
-}
-
-bool DeleteStoredLuaFunctionLibrary(std::string_view name) {
-  std::lock_guard lock(g_function_catalog_mutex);
-  return g_function_libraries.erase(std::string(name)) != 0;
-}
-
-void ClearStoredLuaFunctionLibraries() {
+void ReplaceStoredLuaFunctionCatalog(
+    std::vector<LuaFunctionLibrary> libraries) {
   std::lock_guard lock(g_function_catalog_mutex);
   g_function_libraries.clear();
+  for (LuaFunctionLibrary& library : libraries) {
+    const std::string name = library.name_;
+    g_function_libraries.emplace(name, std::move(library));
+  }
 }
 
 std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries() {
@@ -1805,6 +1780,13 @@ std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries() {
               return left.name_ < right.name_;
             });
   return libraries;
+}
+
+std::optional<std::string> LuaFunctionLibraryNameFromCode(
+    std::string_view code) {
+  auto metadata = ParseLibraryMetadata(code);
+  if (!metadata.ok()) return std::nullopt;
+  return metadata->first;
 }
 
 LuaScriptKillResult RequestLuaScriptKill(bool function) {

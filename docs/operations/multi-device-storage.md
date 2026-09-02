@@ -27,7 +27,11 @@ tail capacity is ignored until online expansion has an explicit design.
 
 Every device must have room for fixed metadata, an eight-block defrag reserve,
 and at least one foreground data block. With the current metadata layout this
-makes 80 MiB the minimum size of every device.
+makes 80 MiB the minimum size of every device. A fresh set represents an absent
+durable Function catalog as the canonical empty catalog, so it does not spend
+that last block during startup. Catalog commits use ordinary foreground
+capacity; when it is exhausted, the Function mutation fails without changing
+the current catalog.
 
 ## Add devices without clearing existing data
 
@@ -103,9 +107,17 @@ existing set by adding more `--data-file` arguments. Existing data and device
 IDs are preserved; new device IDs are appended independently of argument order.
 
 The label is followed by capacity-derived fixed A/B metadata pages for database
-epochs, partition epochs, and the recovery scan bitmap. Data begins at the next
-8 MiB boundary; it is not hard-coded to local block one. See
-[Recovery Metadata Layout](../design-docs/recovery-metadata-design.md).
+epochs, partition epochs, the recovery scan bitmap, and a process-global
+system-state root. The root is mirrored on every configured device and points
+to the Function catalog, full-sync eligibility, and promotion base manifest.
+Data begins at the next 8 MiB boundary; it is not hard-coded to local block
+one. See the current
+[storage and recovery architecture](../architecture/04-storage-and-recovery.md).
+
+This build writes storage format version 2 and deliberately has no version-1
+decoder. Starting it on version-1 media fails closed. Upgrade or rollback
+across that boundary requires a backup plus reset/restore, or a full sync from
+a compatible source; replacing only the binary is not sufficient.
 
 ## Per-device allocator ownership
 
@@ -117,9 +129,11 @@ allocator_owner = device_id % worker_count
 
 The owner exclusively maintains the device's ready/cold vectors, pristine
 cursor, allocation epoch, bitmap, epoch-page image, and metadata generations.
-These are ordinary owner-local structures. A non-owner requests an ID or epoch
-page update through a cross-worker task; there is no shared MPMC free queue,
-bitmap CAS, global metadata-page owner, or special worker-zero writer.
+These allocator structures are ordinary owner-local state. A non-owner
+requests an ID or epoch-page update through a cross-worker task; there is no
+shared MPMC free queue or bitmap CAS. Separately, worker zero is the unique
+writer for the process-global system-state manifest so catalog and promotion
+updates cannot overwrite one another.
 
 Fresh block IDs are activated in batches of 256. The owner makes their bitmap
 bits durable before adding them to its ready pool. Reclaimed blocks follow a
@@ -181,7 +195,11 @@ affinity. No data rewrite is required when worker count changes.
 
 Device addition is an offline operation: stop Keylane, provision zero-label
 devices, and restart with the complete old set plus the new paths. Keylane
-initializes each new device's fixed metadata, mirrors the current epochs, then
-publishes the larger member count. Interrupted expansion is safe to retry with
-the same complete path list. Removing a device and adding devices while the
-server is running are not implemented.
+initializes each new device's fixed metadata, mirrors the current epochs and
+highest system-state root common to the old members, then publishes the larger
+member count. Normal recovery accepts only the highest valid system-state
+generation whose exact root is present on every configured device. A torn root
+update therefore falls back to the prior common generation; a set with no
+common valid generation fails startup. Interrupted expansion is safe to retry
+with the same complete path list. Removing a device and adding devices while
+the server is running are not implemented.

@@ -43,6 +43,7 @@
 #include "celer/net/tls.h"
 #include "celer/runtime/sync.h"
 #include "client_limit.h"
+#include "function_catalog.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/config.h"
@@ -1017,8 +1018,11 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     co_return status;
   }
 
-  if (worker.id() == 0 && !load_rdb_file_.empty()) {
-    absl::Status imported = co_await ImportRdb();
+  if (worker.id() == 0) {
+    absl::Status imported = co_await GlobalFunctionCatalog().RecoverAtStartup();
+    if (imported.ok() && !load_rdb_file_.empty()) {
+      imported = co_await ImportRdb();
+    }
     std::lock_guard lock(rdb_import_status_mutex_);
     rdb_import_status_ = std::move(imported);
   }
@@ -1033,7 +1037,8 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
   if (!status.ok()) [[unlikely]] {
     startup_failed_.store(true, std::memory_order_release);
     if (worker.id() == 0) {
-      spdlog::error("RDB startup import failed: {}", status.message());
+      spdlog::error("startup catalog/RDB recovery failed: {}",
+                    status.message());
     }
     worker.RequestStop();
     co_return status;

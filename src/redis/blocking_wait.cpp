@@ -731,7 +731,7 @@ void FinishBlockingWait(BlockingWaitHandle& handle) {
 }
 
 Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint64_t client_id, std::uint8_t db_id,
+    std::uint64_t client_id, const CommandRequest& request,
     std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,
@@ -781,7 +781,7 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       }
     } cascade_completion{attempt_cascade};
 
-    while (!TryBeginCommandDbOperation(db_id)) {
+    while (!TryBeginCommandDbOperation(request.db_id_)) {
       if (deadline && std::chrono::steady_clock::now() >= *deadline) {
         co_return timeout_reply();
       }
@@ -789,7 +789,11 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) co_return status_reply(slept);
     }
-    AttemptDbGuard gate(db_id);
+    AttemptDbGuard gate(request.db_id_);
+    if (!CommandWriteAdmissionIsCurrent(request)) {
+      co_return status_reply(
+          absl::AbortedError("replication role changed; retry command"));
+    }
 
     BlockingAttemptResult result = co_await attempt(attempt_cascade);
     cascade_completion.Finish();
@@ -802,9 +806,8 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
 
     if (!waiter) {
       gate.Release();
-      auto registered =
-          co_await RegisterBlockingWait(db_id, std::move(specs), client_id,
-                                        deadline);
+      auto registered = co_await RegisterBlockingWait(
+          request.db_id_, std::move(specs), client_id, deadline);
       if (!registered.ok()) co_return status_reply(registered.status());
       waiter = std::move(*registered);
       continue;  // closes the unavailable-check/register race

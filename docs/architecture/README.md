@@ -12,6 +12,7 @@ references rather than current architecture.
 |---|---|---|
 | System composition | Process lifecycle, runtime dependency, cross-cutting flows, and integrations | [System overview](01-overview.md) |
 | Request and Redis serving | TCP/TLS sessions, RESP2/RESP3 negotiation, command dispatch, connection state, Lua/Functions, Pub/Sub, replies, and command handlers | [Request and Redis serving](02-request-serving.md) |
+| Function catalog | Process-global Function ownership, hidden staging, crash-durable catalog commits, startup recovery, and replication integration | [Function catalog](06-function-catalog.md) |
 | Transaction coordination | Per-worker intent arbitration, cross-worker scheduling, multi-hop execution, WATCH, and transaction completion | [Transaction coordination](03-transaction-coordination.md) |
 | Storage and recovery | Logical indexes, append/read paths, durable format, devices, recovery, shutdown checkpoints, flushing, expiry, and reclamation | [Storage and recovery](04-storage-and-recovery.md), [Shutdown index checkpoints](06-shutdown-index-checkpoints.md) |
 | Replication | Native Keylane replication, Redis PSYNC interoperability, full sync, online logs, Sentinel-managed role changes, and replay | [Replication](05-replication.md) |
@@ -68,7 +69,8 @@ architecture update.
 | Claim | Repository source |
 |---|---|
 | The process composes one executable and one main Keylane library around Celer | `CMakeLists.txt`, `app/keylane.cpp`, `src/redis/server.cpp` |
-| Request serving has distinct RESP-version, session, command, scripting, Pub/Sub, and observability boundaries | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `include/keylane/pubsub.h`, `include/keylane/slowlog.h`, `src/redis/` |
+| Request serving has distinct RESP-version, session, command, scripting, Function-catalog, Pub/Sub, and observability boundaries | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `include/keylane/pubsub.h`, `include/keylane/slowlog.h`, `src/redis/` |
+| The Function catalog is a durable module with one complete-catalog commit boundary | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Transaction coordination has its own interfaces and implementation lifecycle | `include/keylane/tx/`, `src/tx/` |
 | Storage exposes a durable engine boundary with focused implementation units | `include/keylane/storage/`, `src/storage/` |
 | Shutdown checkpoints are optional one-shot recovery accelerators published through fixed metadata | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/recovery.cpp` |

@@ -19,7 +19,10 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-inline constexpr std::uint32_t kStorageFormatVersion = 1;
+// Version 2 adds the mirrored system-state root used by the durable Function
+// catalog and promotion base. Version 1 media is intentionally rejected: the
+// system-state lineage cannot be inferred safely from the old layout.
+inline constexpr std::uint32_t kStorageFormatVersion = 2;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -46,6 +49,8 @@ inline constexpr std::uint64_t kMaxBitmapBytes = kMaxStringBytes + 8;
 inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
 inline constexpr std::uint64_t kMetadataPageMagic =
     0x31475041544d4c4bULL;  // KLMETAP1
+inline constexpr std::uint64_t kSystemStateRootMagic =
+    0x32525453534c4bULL;  // KLSSTR2
 inline constexpr std::uint32_t kLogicalStorageShards = 16384;
 inline constexpr std::uint8_t kLogicalDatabaseCount = 16;
 inline constexpr std::uint64_t kDeviceLabelOffset = 0;
@@ -54,6 +59,7 @@ enum class MetadataPageKind : std::uint16_t {
   kEpochs = 1,
   kScanBitmap = 2,
   kCheckpointBitmap = 3,
+  kSystemState = 4,
 };
 
 struct MetadataPageHeader {
@@ -113,10 +119,15 @@ inline constexpr std::uint64_t CheckpointBitmapMetadataOffset(
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
 }
 
-constexpr std::uint64_t FixedMetadataBytes(
+constexpr std::uint64_t SystemStateMetadataOffset(
     std::uint64_t capacity_blocks) noexcept {
   return CheckpointBitmapMetadataOffset(capacity_blocks) +
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
+}
+
+constexpr std::uint64_t FixedMetadataBytes(
+    std::uint64_t capacity_blocks) noexcept {
+  return SystemStateMetadataOffset(capacity_blocks) + 2 * kDirectIoAlignment;
 }
 
 constexpr std::uint32_t DataBlockBegin(std::uint64_t capacity_blocks) noexcept {
@@ -211,6 +222,10 @@ enum class ReplicationEventKind : std::uint8_t {
   // PUBLISH. They live in online/full-sync memory streams and vanish at
   // restart with the replication history.
   kEphemeral = 4,
+  // A durable node-global Function catalog transition. The payload remains
+  // the original Redis FUNCTION command; this kind only keeps it distinct
+  // from runtime-only PUBLISH events in backlog policy and observability.
+  kCatalogMutation = 5,
 };
 
 enum class ReplicationFrameFlag : std::uint8_t {
@@ -347,7 +362,27 @@ struct ExtentRef {
   std::uint64_t allocation_epoch_ = 0;
   std::uint32_t payload_bytes_ = 0;
   std::uint32_t payload_checksum_ = 0;
+
+  bool operator==(const ExtentRef&) const noexcept = default;
 };
+
+// The only mutable pointer in fixed system metadata. The referenced manifest
+// is a normal COW payload extent containing the complete Function-catalog
+// extent list and latest promotion state. Mirroring this compact root on every
+// configured device makes a generation committed only when all devices expose
+// the same valid value.
+struct SystemStateRoot {
+  std::uint64_t magic_ = kSystemStateRootMagic;
+  std::uint32_t version_ = kStorageFormatVersion;
+  std::uint32_t root_bytes_ = 0;
+  std::uint64_t generation_ = 0;
+  ExtentRef manifest_{};
+  std::uint64_t manifest_bytes_ = 0;
+
+  bool operator==(const SystemStateRoot&) const noexcept = default;
+};
+
+static_assert(sizeof(SystemStateRoot) <= kMetadataPagePayloadBytes);
 
 inline constexpr std::size_t kExtentPayloadBytes =
     kStorageBlockBytes - kBlockHeaderBytes;
@@ -419,6 +454,13 @@ static_assert(RecordHeaderBytes(kMaxStringBytes, true) ==
               kRecordHeaderBaseBytes);
 
 std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept;
+// Redis-compatible CRC64 used for the Function dump durability token.
+std::uint64_t Crc64(std::span<const std::byte> bytes) noexcept;
+
+void EncodeSystemStateRoot(const SystemStateRoot& root,
+                           std::span<std::byte> output) noexcept;
+bool DecodeSystemStateRoot(std::span<const std::byte> input,
+                           SystemStateRoot* root) noexcept;
 
 void EncodeDeviceLabel(
     const DeviceLabel& label,

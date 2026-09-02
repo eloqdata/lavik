@@ -98,7 +98,7 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
               .worker_id_ = target,
               .floor_lsn_ = log.floor_lsn_,
               .tail_lsn_ = log.tail_lsn_,
-              .backpressure_waits_ = log.backpressure_waits_,
+              .coverage_revocations_ = log.coverage_revocations_,
               .chunk_count_ = log.block_count_,
               .capacity_bytes_ = log.capacity_bytes_,
               .publish_queue_bytes_ = log.publish_queue_bytes_,
@@ -114,7 +114,6 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
               .pinned_cursors_ = log.retained_cursor_count_,
               .fullsync_backpressure_waits_ = log.fullsync_backpressure_waits_,
               .active_ = log.state_ == ReplicationLogState::kActive,
-              .capacity_backpressured_ = log.capacity_backpressured_,
           };
         }));
   }

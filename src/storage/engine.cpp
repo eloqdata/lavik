@@ -29,6 +29,52 @@ bool StorageEngine::AbandonWorkerStateForProcessExit() noexcept {
   return impl_->AbandonWorkerStateForProcessExit();
 }
 
+Task<absl::StatusOr<CatalogDurabilityToken>>
+StorageEngine::CommitFunctionCatalog(std::string_view dump) {
+  return impl_->CommitFunctionCatalog(dump);
+}
+
+absl::StatusOr<std::optional<RecoveredFunctionCatalog>>
+StorageEngine::RecoverFunctionCatalog() const {
+  return impl_->RecoverFunctionCatalog();
+}
+
+Task<absl::Status> StorageEngine::MakeDurable(
+    const DurabilityFrontier& frontier, std::string_view opaque_accumulator) {
+  return impl_->MakeDurable(frontier, opaque_accumulator);
+}
+
+Task<absl::Status> StorageEngine::CommitPromotionBase(PromotionBase base) {
+  return impl_->CommitPromotionBase(std::move(base));
+}
+
+absl::StatusOr<std::optional<PromotionBase>>
+StorageEngine::RecoverPromotionBase() const {
+  return impl_->RecoverPromotionBase();
+}
+
+absl::StatusOr<PopulationToken> StorageEngine::RecoverPopulationToken() const {
+  return impl_->RecoverPopulationToken();
+}
+
+Task<absl::Status> StorageEngine::BeginReplicaFullSync(
+    std::uint64_t session_id) {
+  return impl_->BeginReplicaFullSync(session_id);
+}
+
+Task<absl::Status> StorageEngine::CompleteReplicaFullSync(
+    std::uint64_t session_id, PopulationToken population) {
+  return impl_->CompleteReplicaFullSync(session_id, population);
+}
+
+bool StorageEngine::ReplicaRecoveryFenced() const noexcept {
+  return impl_->ReplicaRecoveryFenced();
+}
+
+void StorageEngine::FenceRequestServingUntilRestart() noexcept {
+  impl_->FenceRequestServingUntilRestart();
+}
+
 unsigned StorageEngine::OwnerForKey(std::string_view key) const noexcept {
   return impl_->OwnerForKey(key);
 }
@@ -300,6 +346,32 @@ Task<absl::Status> StorageEngine::PublishEphemeralReplicationCommand(
     std::uint16_t partition_id, std::vector<std::string> args) {
   return impl_->PublishEphemeralReplicationCommand(partition_id,
                                                    std::move(args));
+}
+
+absl::StatusOr<PreparedReplicationCommandPublication>
+StorageEngine::PrepareAdmittedReplicationCommand(
+    const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+    std::uint16_t partition_id, std::vector<std::string> args,
+    std::optional<std::vector<std::string>> fullsync_projection) {
+  return impl_->PrepareAdmittedReplicationCommand(
+      admission, kind, partition_id, std::move(args),
+      std::move(fullsync_projection));
+}
+
+absl::Status StorageEngine::PublishPreparedReplicationCommand(
+    const ReplicationPublisherAdmission& admission,
+    PreparedReplicationCommandPublication publication) {
+  return impl_->PublishPreparedReplicationCommand(admission,
+                                                  std::move(publication));
+}
+
+absl::Status StorageEngine::PublishLateAdmittedReplicationCommand(
+    const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+    std::uint16_t partition_id, std::vector<std::string> args,
+    std::optional<std::vector<std::string>> fullsync_projection) {
+  return impl_->PublishLateAdmittedReplicationCommand(
+      admission, kind, partition_id, std::move(args),
+      std::move(fullsync_projection));
 }
 
 bool StorageEngine::TryEnqueueReplicationTransaction(

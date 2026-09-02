@@ -314,6 +314,10 @@ struct CommandRequest {
   // Set only for commands applied from the replication stream. Such commands
   // bypass replica read-only checks and must not be published again.
   bool replication_origin_ = false;
+  // Captured when a client write chooses its source-publication path. A DB
+  // gate that reopens under a different role must reject the stale request
+  // before mutation, including when writable replicas are enabled.
+  std::optional<std::uint64_t> write_admission_role_epoch_;
   const CommandSpec* spec_ = nullptr;
   // Populated by source-write dispatch after DetermineKeys proves there is
   // exactly one key. The request remains alive across its cross-core handoff,
@@ -410,9 +414,12 @@ class ReplicationTransactionGuard {
  public:
   using ParticipantsEnteredHook = void (*)(void*) noexcept;
 
-  ReplicationTransactionGuard(const CommandRequest& request,
-                              tx::Transaction* transaction,
-                              std::vector<std::string> canonical_args = {});
+  // Additional participants carry no storage keys and therefore have no
+  // transaction entry hook; the caller must enter each marker explicitly.
+  ReplicationTransactionGuard(
+      const CommandRequest& request, tx::Transaction* transaction,
+      std::vector<std::string> canonical_args = {},
+      std::vector<unsigned> additional_participants = {});
   ReplicationTransactionGuard(const CommandRequest& request,
                               std::vector<unsigned> participants,
                               std::vector<std::string> canonical_args = {});
@@ -421,7 +428,8 @@ class ReplicationTransactionGuard {
       delete;
   ~ReplicationTransactionGuard();
 
-  void Commit() noexcept;
+  // Returns false when a participant already made publication impossible.
+  bool Commit() noexcept;
   // Replaces the canonical body while the transaction is pending. The method
   // obtains retained-memory headroom before growing the shared envelope, so a
   // caller can place this boundary before making its primary mutation visible.
@@ -482,6 +490,10 @@ void UnregisterClientConnection(std::uint64_t id) noexcept;
 // FLUSHDB from draining in-flight database operations.
 bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept;
 void EndCommandDbOperation(std::uint8_t db_id) noexcept;
+// True unless a client write crossed a replication role transition after its
+// publication decision. Replication-origin and read-only requests have no
+// captured epoch and therefore remain valid.
+bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept;
 bool CloseAllCommandDbGates() noexcept;
 void OpenAllCommandDbGates() noexcept;
 bool CommandDbOperationsActive() noexcept;

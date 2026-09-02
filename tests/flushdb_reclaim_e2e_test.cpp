@@ -490,7 +490,7 @@ int main(int argc, char** argv) {
   try {
     const std::uint16_t port = FindFreePort();
     const std::string value(900 * 1024, 'v');
-    CreateDataFile(data_path, 80ULL * 1024 * 1024);
+    CreateDataFile(data_path, 96ULL * 1024 * 1024);
 
     {
       ServerProcess server(argv[1], port, {data_path}, log_path);
@@ -552,6 +552,9 @@ int main(int argc, char** argv) {
     // retire those records in memory, allowing defrag to reclaim their block
     // and restore write availability.
     if (!stale_header_only) {
+      // Keep one foreground block after the fixed defrag reserve. This
+      // scenario needs every expiring record in the same reclaim candidate;
+      // it must not depend on an empty Function catalog consuming capacity.
       CreateDataFile(expiry_full_path, 80ULL * 1024 * 1024);
       {
         ServerProcess server(argv[1], port, {expiry_full_path}, log_path);
@@ -626,7 +629,7 @@ int main(int argc, char** argv) {
     // image by putting a CRC-valid committed header in another activated but
     // unwritten physical block. Recovery must ignore the block-id mismatch,
     // retain current data, and leave the bitmap unchanged.
-    CreateDataFile(stale_header_path, 80ULL * 1024 * 1024);
+    CreateDataFile(stale_header_path, 96ULL * 1024 * 1024);
     {
       ServerProcess server(argv[1], port, {stale_header_path}, log_path, 10);
       RespClient client = Connect(port);
@@ -666,8 +669,8 @@ int main(int argc, char** argv) {
       server.Stop();
     }
 
-    CreateDataFile(unequal_path_a, 80ULL * 1024 * 1024);
-    CreateDataFile(unequal_path_b, 88ULL * 1024 * 1024);
+    CreateDataFile(unequal_path_a, 88ULL * 1024 * 1024);
+    CreateDataFile(unequal_path_b, 96ULL * 1024 * 1024);
     {
       ServerProcess server(argv[1], port, {unequal_path_a, unequal_path_b},
                            log_path);

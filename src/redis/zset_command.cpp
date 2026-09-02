@@ -3071,6 +3071,10 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
   };
   auto timeout_reply = [&] { return Built(builder.AppendNullArray()); };
   auto status_reply = [&](const absl::Status& status) {
+    if (absl::IsAborted(status)) {
+      return Built(
+          builder.AppendError("TRYAGAIN " + std::string(status.message())));
+    }
     return Built(StorageError(builder, status));
   };
   auto unblock_error_reply = [&] {
@@ -3078,7 +3082,7 @@ Task<CommandReply> ExecuteBlockingZSetCommand(const CommandRequest& request,
         builder.AppendError("UNBLOCKED client unblocked via CLIENT UNBLOCK"));
   };
   co_return co_await ExecuteBlockingWaitLoop(
-      client_id, request.db_id_, std::move(specs), *deadline,
+      client_id, request, std::move(specs), *deadline,
       "blocking Sorted Set wait cancelled", std::move(attempt), timeout_reply,
       unblock_error_reply, status_reply);
 }

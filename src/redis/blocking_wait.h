@@ -133,7 +133,7 @@ void FinishBlockingWait(BlockingWaitHandle& handle);
 // unavailable value from a completed command, so reply encodings never become
 // control-flow signals.
 celer::Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint64_t client_id, std::uint8_t db_id,
+    std::uint64_t client_id, const CommandRequest& request,
     std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,

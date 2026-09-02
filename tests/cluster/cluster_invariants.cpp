@@ -62,12 +62,76 @@ std::optional<Finding> CheckPromotion(const ClusterSnapshot& snapshot) {
     return Finding{.invariant_id_ = "history.child-ready-before-write",
                    .witness_ = "write-gate-open-before-child-history"};
   }
+  if ((promotion.candidate_activated_ || promotion.write_gate_open_) &&
+      (!promotion.promotion_base_committed_ ||
+       !promotion.population_token_valid_)) {
+    return Finding{.invariant_id_ = "promotion.durable-base-before-activation",
+                   .witness_ = "promotion-used-uncommitted-base-or-population"};
+  }
+  if ((promotion.candidate_activated_ || promotion.write_gate_open_) &&
+      promotion.captured_catalog_generation_ !=
+          promotion.current_catalog_generation_) {
+    return Finding{.invariant_id_ = "promotion.catalog-token-current",
+                   .witness_ = "catalog-changed-after-promotion-prepare"};
+  }
   if (promotion.another_replica_reset_ &&
       (!promotion.candidate_activated_ ||
        !promotion.durability_barrier_complete_ ||
        !promotion.child_history_ready_)) {
     return Finding{.invariant_id_ = "promotion.keep-replicas-until-activation",
                    .witness_ = "replica-reset-before-candidate-active"};
+  }
+  return std::nullopt;
+}
+
+std::optional<Finding> CheckFunctionCatalog(const ClusterSnapshot& snapshot) {
+  const FunctionCatalogObservation& catalog = snapshot.function_catalog_;
+  if (catalog.staging_visible_) {
+    return Finding{.invariant_id_ = "function.catalog-staging-hidden",
+                   .witness_ = "staged-function-catalog-visible"};
+  }
+  if ((catalog.applied_cursor_advanced_ || catalog.replica_ack_sent_) &&
+      !catalog.durable_commit_complete_) {
+    return Finding{.invariant_id_ = "function.catalog-durable-before-ack",
+                   .witness_ = "replica-progress-before-durable-catalog"};
+  }
+  if ((catalog.runtime_swapped_ || catalog.replication_published_) &&
+      !catalog.durable_commit_complete_) {
+    return Finding{.invariant_id_ = "function.catalog-durable-before-visible",
+                   .witness_ = "function-catalog-visible-before-durable-root"};
+  }
+  if ((catalog.replication_published_ || catalog.applied_cursor_advanced_ ||
+       catalog.replica_ack_sent_) &&
+      !catalog.runtime_swapped_) {
+    return Finding{
+        .invariant_id_ = "function.catalog-installed-before-progress",
+        .witness_ = "replication-progress-before-runtime-swap"};
+  }
+  return std::nullopt;
+}
+
+std::optional<Finding> CheckFullSync(const ClusterSnapshot& snapshot) {
+  const FullSyncObservation& full_sync = snapshot.full_sync_;
+  if (full_sync.in_progress_ &&
+      (!full_sync.old_population_invalidated_ ||
+       !full_sync.old_promotion_base_invalidated_ ||
+       !full_sync.old_catalog_readiness_invalidated_)) {
+    return Finding{
+        .invariant_id_ = "fullsync.destructive-invalidation-before-transfer",
+        .witness_ = "full-sync-started-with-old-recovery-evidence",
+    };
+  }
+  if (full_sync.serving_ &&
+      (full_sync.in_progress_ || !full_sync.activation_complete_)) {
+    return Finding{.invariant_id_ = "fullsync.fenced-until-activation",
+                   .witness_ = "full-sync-target-served-before-activation"};
+  }
+  if (full_sync.activation_complete_ &&
+      (!full_sync.catalog_ready_ || !full_sync.population_ready_)) {
+    return Finding{
+        .invariant_id_ = "fullsync.catalog-and-population-ready",
+        .witness_ = "full-sync-activated-with-incomplete-catalog-or-population",
+    };
   }
   return std::nullopt;
 }
@@ -297,6 +361,12 @@ std::optional<Finding> CheckClusterInvariants(const ClusterSnapshot& snapshot) {
     return finding;
   }
   if (auto finding = CheckPromotion(snapshot); finding.has_value()) {
+    return finding;
+  }
+  if (auto finding = CheckFunctionCatalog(snapshot); finding.has_value()) {
+    return finding;
+  }
+  if (auto finding = CheckFullSync(snapshot); finding.has_value()) {
     return finding;
   }
   if (auto finding = CheckResume(snapshot); finding.has_value()) return finding;

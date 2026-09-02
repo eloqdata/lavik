@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -35,6 +36,7 @@
 #include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
 #include "client_limit.h"
+#include "function_catalog.h"
 #include "hash_command.h"
 #include "keylane/command_table.h"
 #include "keylane/config.h"
@@ -80,7 +82,6 @@ unsigned g_server_threads = 0;
 std::string g_server_bind_ip = "127.0.0.1";
 std::string g_server_config_file;
 std::chrono::steady_clock::time_point g_server_start;
-std::atomic_flag g_lua_script_cache_operation = ATOMIC_FLAG_INIT;
 // Cached closures share the worker VM's KEYS/ARGV globals. Keep Lua scripts
 // serialized across redis.call() yields on a worker; ordinary commands are
 // not subject to this gate.
@@ -134,6 +135,31 @@ std::size_t SaturatingAdd(std::size_t left, std::size_t right) noexcept {
 std::size_t RequestArgumentBytes(const CommandRequest& request) noexcept {
   const auto bytes = storage::ReplicationCommandStagingBytes(request.args_);
   return bytes.value_or(std::numeric_limits<std::size_t>::max());
+}
+
+std::size_t CanonicalCommandBytes(const CommandRequest& request) noexcept {
+  std::size_t bytes = SaturatingAdd(8, request.args_.size() * 4);
+  for (const std::string& argument : request.args_) {
+    bytes = SaturatingAdd(bytes, argument.size());
+  }
+  return bytes;
+}
+
+bool ReplicationEventExceedsBacklog(std::size_t bytes) noexcept {
+  if (bytes > kMaxNativeReplicationEventBytes) return true;
+  if (g_replication == nullptr || g_storage == nullptr) return false;
+  const std::size_t total_blocks =
+      g_replication->backlog_size_bytes() / storage::kStorageBlockBytes;
+  const std::size_t minimum_flow_blocks =
+      total_blocks / g_storage->worker_count();
+  const std::size_t per_block_payload =
+      storage::kStorageBlockBytes - sizeof(storage::ReplicationFrameHeader);
+  const std::size_t capacity =
+      minimum_flow_blocks >
+              std::numeric_limits<std::size_t>::max() / per_block_payload
+          ? std::numeric_limits<std::size_t>::max()
+          : minimum_flow_blocks * per_block_payload;
+  return minimum_flow_blocks == 0 || bytes > capacity;
 }
 
 bool MayGrowMemory(const CommandRequest& request) noexcept {
@@ -486,7 +512,10 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
     upstream = ReplicaOfConfig{*parsed->host_, parsed->port_};
   }
   absl::Status configured =
-      co_await g_replication->SetUpstream(std::move(upstream));
+      co_await g_replication->ApplyDirective(ReplicationDirective{
+          .kind_ = ReplicationDirective::Kind::kSetUpstream,
+          .upstream_ = std::move(upstream),
+      });
   if (!configured.ok()) {
     co_return BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", configured.message())));
@@ -508,8 +537,11 @@ Task<CommandReply> ExecuteAddReplicaOf(const CommandRequest& request,
     co_return BuiltReply(
         reply_builder.AppendError("ERR replication backend is unavailable"));
   }
-  absl::Status configured = co_await g_replication->AddUpstream(
-      ReplicaOfConfig{*parsed->host_, parsed->port_});
+  absl::Status configured =
+      co_await g_replication->ApplyDirective(ReplicationDirective{
+          .kind_ = ReplicationDirective::Kind::kAddUpstream,
+          .upstream_ = ReplicaOfConfig{*parsed->host_, parsed->port_},
+      });
   if (!configured.ok()) {
     co_return BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", configured.message())));
@@ -602,7 +634,7 @@ Task<std::optional<std::string>> ReplicaMovedError(
   if (!keys.ok() || keys->empty()) {
     co_return std::nullopt;
   }
-  const ReplicationStatus replication = co_await g_replication->status();
+  const ReplicationStatus replication = co_await g_replication->Observe();
   if (!replication.upstream_.has_value()) {
     co_return std::nullopt;
   }
@@ -627,7 +659,7 @@ Task<CommandReply> ExecuteCluster(const CommandRequest& request,
         "ERR wrong number of arguments for 'cluster' command"));
   }
   ReplicationStatus replication;
-  if (g_replication != nullptr) replication = co_await g_replication->status();
+  if (g_replication != nullptr) replication = co_await g_replication->Observe();
   if (CmpCaseInsensitive(request.args_[1], "SLOTS")) {
     co_return BuildClusterSlotsReply(replication, reply_builder);
   }
@@ -1093,7 +1125,7 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       co_return BuiltReply(
           reply_builder.AppendError("ERR replication backend is unavailable"));
     }
-    const ReplicationStatus replication = co_await g_replication->status();
+    const ReplicationStatus replication = co_await g_replication->Observe();
     if (replication.redis_sources_.size() > 1) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR CONFIG REWRITE cannot persist multiple Redis Cluster "
@@ -1225,8 +1257,12 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         configured = absl::InvalidArgumentError(
             "value is not an integer or out of range");
       } else {
-        configured = g_replication->SetSnapshotReadConcurrency(
-            static_cast<unsigned>(value));
+        configured =
+            co_await g_replication->ApplyDirective(ReplicationDirective{
+                .kind_ = ReplicationDirective::Kind::kSnapshotReadConcurrency,
+                .upstream_ = std::nullopt,
+                .value_ = value,
+            });
       }
     } else if (config->key_ == RuntimeConfigKey::kSnapshotBatchSize) {
       if (g_replication == nullptr) {
@@ -1237,8 +1273,12 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         configured = absl::InvalidArgumentError(
             "value is not an integer or out of range");
       } else {
-        configured = g_replication->SetSnapshotBatchSize(
-            static_cast<std::size_t>(value));
+        configured =
+            co_await g_replication->ApplyDirective(ReplicationDirective{
+                .kind_ = ReplicationDirective::Kind::kSnapshotBatchSize,
+                .upstream_ = std::nullopt,
+                .value_ = value,
+            });
       }
     } else if (config->key_ == RuntimeConfigKey::kReplicationBacklogSize) {
       if (g_replication == nullptr) {
@@ -1249,7 +1289,12 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         if (!bytes.ok()) {
           configured = bytes.status();
         } else {
-          configured = co_await g_replication->SetBacklogSizeBytes(*bytes);
+          configured =
+              co_await g_replication->ApplyDirective(ReplicationDirective{
+                  .kind_ = ReplicationDirective::Kind::kBacklogBytes,
+                  .upstream_ = std::nullopt,
+                  .value_ = *bytes,
+              });
         }
       }
     } else if (config->key_ == RuntimeConfigKey::kReplicationPublishQueue) {
@@ -1262,8 +1307,12 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
         configured = absl::InvalidArgumentError(
             "value is not a positive MiB integer or is out of range");
       } else {
-        configured = co_await g_replication->SetPublishQueueBytesPerWorker(
-            static_cast<std::size_t>(value * kMiB));
+        configured =
+            co_await g_replication->ApplyDirective(ReplicationDirective{
+                .kind_ = ReplicationDirective::Kind::kPublishQueueBytes,
+                .upstream_ = std::nullopt,
+                .value_ = value * kMiB,
+            });
       }
     } else if (config->key_ == RuntimeConfigKey::kReplicaPriority) {
       if (g_replication == nullptr) {
@@ -1275,7 +1324,11 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured =
-            g_replication->SetReplicaPriority(static_cast<unsigned>(value));
+            co_await g_replication->ApplyDirective(ReplicationDirective{
+                .kind_ = ReplicationDirective::Kind::kReplicaPriority,
+                .upstream_ = std::nullopt,
+                .value_ = value,
+            });
       }
     } else if (config->key_ == RuntimeConfigKey::kMaxClients) {
       if (!ParseUint64(args[3], &value) || value == 0) {
@@ -1706,8 +1759,7 @@ class ReplicationTransactionOrderGate {
             reinterpret_cast<void*>(static_cast<std::uintptr_t>(value))));
   }
 
-  bool AcquireOrQueue(Waiter* waiter,
-                      std::coroutine_handle<> handle) noexcept {
+  bool AcquireOrQueue(Waiter* waiter, std::coroutine_handle<> handle) noexcept {
     waiter->handle_ = handle;
     waiter->next_ = nullptr;
     Lock();
@@ -1790,6 +1842,25 @@ bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
     }
   }
   return false;
+}
+
+Task<absl::Status> MaybePauseBeforeCommandDbAdmission() {
+  const char* configured =
+      std::getenv("KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS");
+  if (configured == nullptr) co_return absl::OkStatus();
+  std::uint64_t milliseconds = 0;
+  const std::size_t length = std::strlen(configured);
+  const auto parsed =
+      std::from_chars(configured, configured + length, milliseconds);
+  static std::atomic<bool> pause_used = false;
+  if (parsed.ec != std::errc{} || parsed.ptr != configured + length ||
+      milliseconds == 0 || milliseconds > 60000 ||
+      pause_used.exchange(true, std::memory_order_acq_rel)) {
+    co_return absl::OkStatus();
+  }
+  spdlog::info("client write admitted; pausing before database admission");
+  co_return co_await celer::SleepFor(*ThisWorker().self_,
+                                     std::chrono::milliseconds(milliseconds));
 }
 
 void EndDbOperation(std::uint8_t db_id) noexcept {
@@ -1968,6 +2039,27 @@ struct ReplicationPublisherAdmission {
   std::vector<WorkerToken> worker_tokens_;
 };
 
+thread_local const ReplicationPublisherAdmission*
+    g_active_replication_publisher_admission = nullptr;
+
+class ActivePublisherAdmissionGuard {
+ public:
+  explicit ActivePublisherAdmissionGuard(
+      const ReplicationPublisherAdmission* admission)
+      : previous_(g_active_replication_publisher_admission) {
+    g_active_replication_publisher_admission = admission;
+  }
+  ActivePublisherAdmissionGuard(const ActivePublisherAdmissionGuard&) = delete;
+  ActivePublisherAdmissionGuard& operator=(
+      const ActivePublisherAdmissionGuard&) = delete;
+  ~ActivePublisherAdmissionGuard() {
+    g_active_replication_publisher_admission = previous_;
+  }
+
+ private:
+  const ReplicationPublisherAdmission* previous_;
+};
+
 std::size_t FullSyncReplacementAdmissionBytes(
     const CommandRequest& request) noexcept {
   if (request.spec_ == nullptr) return 0;
@@ -1983,6 +2075,27 @@ std::size_t FullSyncReplacementAdmissionBytes(
                           ? std::numeric_limits<std::size_t>::max()
                           : key_bytes * 2);
     bytes = SaturatingAdd(bytes, identity);
+    if (keys->last_ - index < keys->step_) break;
+  }
+  return bytes;
+}
+
+std::size_t ReplicationEventAdmissionBytes(
+    const CommandRequest& request) noexcept {
+  std::size_t bytes = CanonicalCommandBytes(request);
+  if (request.spec_ == nullptr) return bytes;
+  const auto keys = DetermineKeys(*request.spec_, request.args_);
+  if (!keys.ok()) {
+    return SaturatingAdd(bytes, RequestArgumentBytes(request));
+  }
+  for (std::uint16_t index = keys->first_;
+       !keys->empty() && index <= keys->last_;
+       index = static_cast<std::uint16_t>(index + keys->step_)) {
+    // A committed command may append a final PERSIST/PEXPIREAT after-image.
+    // Reserve for the duplicated key and its command envelope before the
+    // mutation; the actual canonical event is usually smaller.
+    bytes =
+        SaturatingAdd(bytes, SaturatingAdd(request.args_[index].size(), 64));
     if (keys->last_ - index < keys->step_) break;
   }
   return bytes;
@@ -2336,6 +2449,11 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
               absl::StrCat("ERR ", waited.message())));
         }
       }
+    }
+
+    if (!CommandWriteAdmissionIsCurrent(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "TRYAGAIN replication role changed; retry command"));
     }
 
     if (request.kind_ == CommandKind::kFlushAll) {
@@ -3667,7 +3785,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
 
 Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
   ReplicationStatus replication;
-  if (g_replication != nullptr) replication = co_await g_replication->status();
+  if (g_replication != nullptr) replication = co_await g_replication->Observe();
   if (replication.role_ == ReplicationRole::kMaster) {
     reply_builder.AppendArrayHeader(3);
     reply_builder.AppendBulkString("master");
@@ -3742,7 +3860,7 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
       section == "default" || section == "all" || section == "everything";
   auto wants = [&](std::string_view name) { return all || section == name; };
   ReplicationStatus replication;
-  if (g_replication != nullptr) replication = co_await g_replication->status();
+  if (g_replication != nullptr) replication = co_await g_replication->Observe();
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats") || wants("persistence") ||
@@ -3943,6 +4061,18 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::string(ReplicationRoleName(replication.role_)) + "\r\n";
     info += "keylane_replication_role_epoch:" +
             std::to_string(replication.role_epoch_) + "\r\n";
+    info += "keylane_replication_group_id:" + replication.group_id_ + "\r\n";
+    info += "keylane_replication_boot_id:" + replication.boot_id_ + "\r\n";
+    info += "keylane_replica_incarnation:" + replication.replica_incarnation_ +
+            "\r\n";
+    auto catalog_operation = co_await AcquireFunctionCatalogOperation();
+    const storage::CatalogDurabilityToken catalog_token =
+        GlobalFunctionCatalog().durability_token();
+    catalog_operation.reset();
+    info += "keylane_function_catalog_generation:" +
+            std::to_string(catalog_token.catalog_generation_) + "\r\n";
+    info += "keylane_function_catalog_crc64:" +
+            std::to_string(catalog_token.dump_crc64_) + "\r\n";
     info += "master_replid:" +
             (replication.upstream_history_id_.has_value()
                  ? *replication.upstream_history_id_
@@ -4828,6 +4958,10 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
        !db_guard.Add(options->destination_db_))) {
     co_return BuiltReply(
         reply_builder.AppendError("TRYAGAIN database flush is in progress"));
+  }
+  if (!CommandWriteAdmissionIsCurrent(request)) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "TRYAGAIN replication role changed; retry command"));
   }
 
   tx::Transaction transaction;
@@ -6548,24 +6682,6 @@ Task<std::string> ExecuteLuaRedisCall(
   co_return reply;
 }
 
-Task<bool> BeginLuaScriptCacheOperation() {
-  while (g_lua_script_cache_operation.test_and_set(std::memory_order_acquire)) {
-    co_await Yield(*ThisWorker().self_);
-  }
-  co_return true;
-}
-
-class LuaScriptCacheOperationGuard {
- public:
-  LuaScriptCacheOperationGuard() = default;
-  LuaScriptCacheOperationGuard(const LuaScriptCacheOperationGuard&) = delete;
-  LuaScriptCacheOperationGuard& operator=(const LuaScriptCacheOperationGuard&) =
-      delete;
-  ~LuaScriptCacheOperationGuard() {
-    g_lua_script_cache_operation.clear(std::memory_order_release);
-  }
-};
-
 Task<bool> BeginLuaExecution() {
   while (g_lua_execution_active) {
     co_await Yield(*ThisWorker().self_);
@@ -6584,8 +6700,7 @@ class LuaExecutionGuard {
 
 Task<bool> CacheLuaScriptOnAllWorkers(const std::string& sha,
                                       std::string_view bytecode) {
-  (void)co_await BeginLuaScriptCacheOperation();
-  LuaScriptCacheOperationGuard operation;
+  auto operation = co_await AcquireFunctionCatalogOperation();
   bytecode = StoreLuaScript(sha, bytecode);
   if (bytecode.empty()) co_return false;
   for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
@@ -6604,8 +6719,7 @@ Task<bool> CacheLuaScriptOnAllWorkers(const std::string& sha,
 }
 
 Task<bool> FlushLuaScriptCacheOnAllWorkers() {
-  (void)co_await BeginLuaScriptCacheOperation();
-  LuaScriptCacheOperationGuard operation;
+  auto operation = co_await AcquireFunctionCatalogOperation();
   for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
     auto clear = [] {
       ClearLocalLuaScriptCache();
@@ -6623,154 +6737,80 @@ Task<bool> FlushLuaScriptCacheOnAllWorkers() {
   co_return true;
 }
 
-bool SameFunctionLibrary(const LuaFunctionLibrary& left,
-                         const LuaFunctionLibrary& right) {
-  if (left.name_ != right.name_ || left.engine_ != right.engine_ ||
-      left.code_ != right.code_ ||
-      left.functions_.size() != right.functions_.size()) {
-    return false;
-  }
-  for (std::size_t index = 0; index < left.functions_.size(); ++index) {
-    const LuaFunctionInfo& a = left.functions_[index];
-    const LuaFunctionInfo& b = right.functions_[index];
-    if (a.name_ != b.name_ || a.description_ != b.description_ ||
-        a.flags_ != b.flags_) {
-      return false;
-    }
-  }
-  return true;
-}
+struct PreparedFunctionMutationPublication {
+  storage::ReplicationPublisherAdmission admission_;
+  storage::PreparedReplicationCommandPublication publication_;
+};
 
-Task<absl::StatusOr<LuaFunctionLibrary>> StageFunctionLibraryOnAllWorkers(
-    std::string code, bool replace) {
-  std::optional<LuaFunctionLibrary> library;
-  unsigned staged = 0;
-  for (; staged < g_storage->worker_count(); ++staged) {
-    auto stage = [code, replace]() -> Task<absl::StatusOr<LuaFunctionLibrary>> {
-      (void)co_await BeginLuaExecution();
-      LuaExecutionGuard execution;
-      co_return StageLuaFunctionLibraryLocally(code, replace);
-    };
-    absl::StatusOr<LuaFunctionLibrary> result =
-        staged == ThisWorker().id_
-            ? co_await stage()
-            : co_await SubmitTaskTo(staged, std::move(stage));
-    if (!result.ok() ||
-        (library.has_value() && !SameFunctionLibrary(*library, *result))) {
-      const absl::Status failure =
-          result.ok() ? absl::InternalError(
-                            "workers registered different function metadata")
-                      : result.status();
-      const unsigned staged_count = result.ok() ? staged + 1 : staged;
-      for (unsigned worker = 0; worker < staged_count; ++worker) {
-        auto abort = [] {
-          AbortStagedLuaFunctionLibraryLocally();
-          return true;
-        };
-        if (worker == ThisWorker().id_) {
-          abort();
-        } else {
-          (void)co_await SubmitTo(worker, std::move(abort));
-        }
-      }
-      co_return failure;
-    }
-    if (!library.has_value()) library = std::move(*result);
-  }
-  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
-    auto commit = [] {
-      CommitStagedLuaFunctionLibraryLocally();
-      return true;
-    };
-    if (worker == ThisWorker().id_) {
-      commit();
-    } else {
-      (void)co_await SubmitTo(worker, std::move(commit));
-    }
-  }
-  if (!library.has_value()) {
-    co_return absl::FailedPreconditionError("Lua runtime has no workers");
-  }
-  StoreLuaFunctionLibrary(*library);
-  co_return std::move(*library);
-}
-
-Task<bool> DeleteFunctionLibraryOnAllWorkers(std::string name) {
-  bool exists = false;
-  for (const LuaFunctionLibrary& library : SnapshotLuaFunctionLibraries()) {
-    if (library.name_ == name) {
-      exists = true;
-      break;
-    }
-  }
-  if (!exists) co_return false;
-  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
-    auto erase = [name] { return DeleteLuaFunctionLibraryLocally(name); };
-    if (worker == ThisWorker().id_) {
-      (void)erase();
-    } else {
-      (void)co_await SubmitTo(worker, std::move(erase));
-    }
-  }
-  (void)DeleteStoredLuaFunctionLibrary(name);
-  co_return true;
-}
-
-Task<bool> FlushFunctionLibrariesOnAllWorkers() {
-  for (unsigned worker = 0; worker < g_storage->worker_count(); ++worker) {
-    auto clear = [] {
-      ClearLuaFunctionLibrariesLocally();
-      return true;
-    };
-    if (worker == ThisWorker().id_) {
-      clear();
-    } else {
-      (void)co_await SubmitTo(worker, std::move(clear));
-    }
-  }
-  ClearStoredLuaFunctionLibraries();
-  co_return true;
-}
-
-Task<absl::Status> RebuildFunctionCatalog(
-    const std::vector<LuaFunctionLibrary>& target,
-    const std::vector<LuaFunctionLibrary>& rollback) {
-  (void)co_await FlushFunctionLibrariesOnAllWorkers();
-  for (const LuaFunctionLibrary& library : target) {
-    auto loaded =
-        co_await StageFunctionLibraryOnAllWorkers(library.code_, false);
-    if (loaded.ok()) continue;
-    const absl::Status failure = loaded.status();
-    (void)co_await FlushFunctionLibrariesOnAllWorkers();
-    for (const LuaFunctionLibrary& prior : rollback) {
-      auto restored =
-          co_await StageFunctionLibraryOnAllWorkers(prior.code_, false);
-      if (!restored.ok()) {
-        co_return absl::InternalError(
-            absl::StrCat("FUNCTION RESTORE failed: ", failure.message(),
-                         "; rollback failed: ", restored.status().message()));
-      }
-    }
-    co_return failure;
-  }
-  co_return absl::OkStatus();
-}
-
-Task<absl::Status> PublishFunctionMutation(const CommandRequest& request) {
+Task<absl::StatusOr<std::optional<PreparedFunctionMutationPublication>>>
+PrepareFunctionMutationPublication(const CommandRequest& request) {
   if (request.replication_capture_ != nullptr) {
-    CaptureReplicationCommand(request, request.args_);
-    co_return absl::OkStatus();
+    co_return std::nullopt;
   }
   if (request.replication_origin_ || g_storage == nullptr ||
       !g_storage->ReplicationLogActive() ||
       (g_replication != nullptr && g_replication->is_replica())) {
+    co_return std::nullopt;
+  }
+  if (g_active_replication_publisher_admission == nullptr) {
+    co_return absl::FailedPreconditionError(
+        "Function mutation has no worker-zero publisher reservation");
+  }
+  const auto found = std::find_if(
+      g_active_replication_publisher_admission->worker_tokens_.begin(),
+      g_active_replication_publisher_admission->worker_tokens_.end(),
+      [](const ReplicationPublisherAdmission::WorkerToken& token) {
+        return token.worker_ == 0;
+      });
+  if (found == g_active_replication_publisher_admission->worker_tokens_.end()) {
+    co_return absl::FailedPreconditionError(
+        "Function mutation did not reserve the catalog flow");
+  }
+  storage::ReplicationPublisherAdmission admission = found->token_;
+  std::vector<std::string> args = request.args_;
+  if (ThisWorker().id_ == 0) {
+    auto publication = g_storage->PrepareAdmittedReplicationCommand(
+        admission, storage::ReplicationEventKind::kCatalogMutation, 0,
+        std::move(args), std::vector<std::string>{});
+    if (!publication.ok()) co_return publication.status();
+    co_return PreparedFunctionMutationPublication{
+        .admission_ = std::move(admission),
+        .publication_ = std::move(*publication),
+    };
+  }
+  co_return co_await SubmitTaskTo(
+      0,
+      [admission = std::move(admission), args = std::move(args)]() mutable
+      -> Task<
+          absl::StatusOr<std::optional<PreparedFunctionMutationPublication>>> {
+        auto publication = g_storage->PrepareAdmittedReplicationCommand(
+            admission, storage::ReplicationEventKind::kCatalogMutation, 0,
+            std::move(args), std::vector<std::string>{});
+        if (!publication.ok()) co_return publication.status();
+        co_return PreparedFunctionMutationPublication{
+            .admission_ = std::move(admission),
+            .publication_ = std::move(*publication),
+        };
+      });
+}
+
+Task<absl::Status> PublishFunctionMutation(
+    const CommandRequest& request,
+    std::optional<PreparedFunctionMutationPublication> prepared) {
+  if (request.replication_capture_ != nullptr) {
+    CaptureReplicationCommand(request, request.args_);
     co_return absl::OkStatus();
   }
-  auto publish = [args = request.args_]() mutable {
-    return g_storage->PublishEphemeralReplicationCommand(0, std::move(args));
-  };
-  if (ThisWorker().id_ == 0) co_return co_await publish();
-  co_return co_await SubmitTaskTo(0, std::move(publish));
+  if (!prepared.has_value()) co_return absl::OkStatus();
+  if (ThisWorker().id_ == 0) {
+    co_return g_storage->PublishPreparedReplicationCommand(
+        prepared->admission_, std::move(prepared->publication_));
+  }
+  co_return co_await SubmitTaskTo(
+      0, [prepared = std::move(*prepared)]() mutable -> Task<absl::Status> {
+        co_return g_storage->PublishPreparedReplicationCommand(
+            prepared.admission_, std::move(prepared.publication_));
+      });
 }
 
 bool IsEvalCommand(const CommandRequest& request) {
@@ -6800,6 +6840,17 @@ bool ExecCommandMayReplicate(const CommandRequest& request) {
           (kCmdWrite | kCmdMayReplicate | kCmdDynamicWrite)) != 0;
 }
 
+bool IsFunctionCatalogMutation(const CommandRequest& request) {
+  if (request.kind_ != CommandKind::kFunction || request.args_.size() < 2) {
+    return false;
+  }
+  const std::string_view subcommand = request.args_[1];
+  return CmpCaseInsensitive(subcommand, "load") ||
+         CmpCaseInsensitive(subcommand, "delete") ||
+         CmpCaseInsensitive(subcommand, "flush") ||
+         CmpCaseInsensitive(subcommand, "restore");
+}
+
 Task<std::string> ExecuteEvalWithTransaction(
     const CommandRequest& request, tx::Transaction* transaction,
     std::vector<storage::TxShardWrites>* tx_writes,
@@ -6813,10 +6864,9 @@ Task<std::string> ExecuteEvalWithTransaction(
 
   const bool source_kind = IsEvalSourceKind(request.kind_);
   const bool function_kind = IsFCallCommand(request);
-  std::unique_ptr<LuaScriptCacheOperationGuard> function_catalog_guard;
+  std::unique_ptr<FunctionCatalogOperationGuard> function_catalog_guard;
   if (function_kind) {
-    (void)co_await BeginLuaScriptCacheOperation();
-    function_catalog_guard = std::make_unique<LuaScriptCacheOperationGuard>();
+    function_catalog_guard = co_await AcquireFunctionCatalogOperation();
   }
   std::string_view script;
   std::string sha;
@@ -6878,8 +6928,9 @@ Task<std::string> ExecuteEvalWithTransaction(
           "OOM allow-oom flag is not set on the script, can not run it when "
           "used memory > 'maxmemory'");
     }
-    // The callback is now rooted on this Lua coroutine's stack, so deleting
-    // or replacing its registry entry cannot invalidate the in-flight call.
+    // The callback is rooted on this coroutine's stack, and LuaExecution owns
+    // the worker runtime that created the thread. Catalog replacement can
+    // therefore retire that whole VM without invalidating the in-flight call.
     // Keep the catalog barrier only around lookup instead of serializing all
     // FCALL execution process-wide.
     function_catalog_guard.reset();
@@ -7159,27 +7210,46 @@ bool FunctionMutationRejected(const CommandRequest& request) {
                                   : g_replica_read_only;
 }
 
-std::optional<std::string> FunctionLibraryNameFromCode(std::string_view code) {
-  const std::size_t newline = code.find('\n');
-  if (!code.starts_with("#!") || newline == std::string_view::npos) {
-    return std::nullopt;
+Task<absl::Status> ApplyFunctionCatalogTarget(
+    std::vector<LuaFunctionLibrary> target, const CommandRequest& request) {
+  auto staged =
+      co_await GlobalFunctionCatalog().StageCompleteCatalog(std::move(target));
+  if (!staged.ok()) co_return staged.status();
+  auto publication = co_await PrepareFunctionMutationPublication(request);
+  if (!publication.ok()) {
+    co_await GlobalFunctionCatalog().AbortStagedCatalog(&*staged);
+    co_return publication.status();
   }
-  std::string_view header = code.substr(2, newline - 2);
-  while (!header.empty()) {
-    while (!header.empty() &&
-           std::isspace(static_cast<unsigned char>(header.front())) != 0) {
-      header.remove_prefix(1);
-    }
-    if (header.empty()) break;
-    const std::size_t end = header.find_first_of(" \t\r");
-    const std::string_view token = header.substr(0, end);
-    if (token.starts_with("name=") && token.size() > 5) {
-      return std::string(token.substr(5));
-    }
-    header =
-        end == std::string_view::npos ? std::string_view{} : header.substr(end);
+  auto durable =
+      co_await GlobalFunctionCatalog().MakeStagedCatalogDurable(*staged);
+  if (!durable.ok()) {
+    co_await GlobalFunctionCatalog().AbortStagedCatalog(&*staged);
+    co_return durable.status();
   }
-  return std::nullopt;
+  absl::Status installed = co_await GlobalFunctionCatalog().CommitStagedCatalog(
+      std::move(*staged), *durable);
+  if (!installed.ok()) co_return installed;
+  absl::Status published =
+      co_await PublishFunctionMutation(request, std::move(*publication));
+  if (!published.ok()) {
+    g_storage->FenceRequestServingUntilRestart();
+    co_return absl::DataLossError(absl::StrCat(
+        "durable Function catalog committed but replication publish failed: ",
+        published.message()));
+  }
+  co_return absl::OkStatus();
+}
+
+CommandReply FunctionMutationError(ReplyBuilder& reply_builder,
+                                   const absl::Status& status) {
+  CommandReply reply = BuiltReply(reply_builder.AppendError(
+      absl::StrCat("ERR Error registering functions: ", status.message())));
+  // Unknown means the A/B root may or may not have committed; DataLoss means
+  // the catalog committed but its reserved history event did not publish.
+  // In both cases a retry on this connection could observe an unsafe answer.
+  reply.close_connection_ = status.code() == absl::StatusCode::kUnknown ||
+                            status.code() == absl::StatusCode::kDataLoss;
+  return reply;
 }
 
 Task<CommandReply> ExecuteFunction(const CommandRequest& request,
@@ -7257,20 +7327,28 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
     }
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
-    auto library =
-        co_await StageFunctionLibraryOnAllWorkers(std::string(code), replace);
-    if (!library.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR Error registering functions: ", library.status().message())));
+    auto operation = co_await AcquireFunctionCatalogOperation();
+    std::vector<LuaFunctionLibrary> target = SnapshotLuaFunctionLibraries();
+    const std::optional<std::string> name =
+        LuaFunctionLibraryNameFromCode(code);
+    if (name.has_value() && replace) {
+      std::erase_if(target, [&](const LuaFunctionLibrary& library) {
+        return library.name_ == *name;
+      });
     }
-    absl::Status published = co_await PublishFunctionMutation(request);
-    if (!published.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR function replication publish failed: ", published.message())));
+    target.push_back(LuaFunctionLibrary{
+        .name_ = name.value_or(""),
+        .engine_ = "LUA",
+        .code_ = std::string(code),
+        .functions_ = {},
+    });
+    absl::Status applied =
+        co_await ApplyFunctionCatalogTarget(std::move(target), request);
+    if (!applied.ok()) {
+      co_return FunctionMutationError(reply_builder, applied);
     }
-    co_return BuiltReply(reply_builder.AppendBulkString(library->name_));
+    co_return BuiltReply(
+        reply_builder.AppendBulkString(name.value_or(std::string{})));
   }
 
   if (CmpCaseInsensitive(subcommand, "delete")) {
@@ -7282,15 +7360,19 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
     }
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
-    if (!(co_await DeleteFunctionLibraryOnAllWorkers(request.args_[2]))) {
+    auto operation = co_await AcquireFunctionCatalogOperation();
+    std::vector<LuaFunctionLibrary> target = SnapshotLuaFunctionLibraries();
+    const std::size_t erased =
+        std::erase_if(target, [&](const LuaFunctionLibrary& library) {
+          return library.name_ == request.args_[2];
+        });
+    if (erased == 0) {
       co_return BuiltReply(reply_builder.AppendError("ERR Library not found"));
     }
-    absl::Status published = co_await PublishFunctionMutation(request);
-    if (!published.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR function replication publish failed: ", published.message())));
+    absl::Status applied =
+        co_await ApplyFunctionCatalogTarget(std::move(target), request);
+    if (!applied.ok()) {
+      co_return FunctionMutationError(reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
@@ -7307,29 +7389,18 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
     }
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
-    (void)co_await FlushFunctionLibrariesOnAllWorkers();
-    absl::Status published = co_await PublishFunctionMutation(request);
-    if (!published.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR function replication publish failed: ", published.message())));
+    auto operation = co_await AcquireFunctionCatalogOperation();
+    absl::Status applied = co_await ApplyFunctionCatalogTarget({}, request);
+    if (!applied.ok()) {
+      co_return FunctionMutationError(reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
 
   if (CmpCaseInsensitive(subcommand, "dump") && request.args_.size() == 2) {
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
-    const std::vector<LuaFunctionLibrary> libraries =
-        SnapshotLuaFunctionLibraries();
-    std::vector<std::string> codes;
-    codes.reserve(libraries.size());
-    for (const LuaFunctionLibrary& library : libraries) {
-      codes.push_back(library.code_);
-    }
+    auto operation = co_await AcquireFunctionCatalogOperation();
     co_return BuiltReply(
-        reply_builder.AppendBulkString(rdb::EncodeFunctionDump(codes)));
+        reply_builder.AppendBulkString(GlobalFunctionCatalog().SnapshotDump()));
   }
 
   if (CmpCaseInsensitive(subcommand, "restore")) {
@@ -7361,15 +7432,15 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       co_return BuiltReply(reply_builder.AppendError(
           "READONLY You can't write against a read only replica."));
     }
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
+    auto operation = co_await AcquireFunctionCatalogOperation();
     const std::vector<LuaFunctionLibrary> previous =
         SnapshotLuaFunctionLibraries();
     std::vector<LuaFunctionLibrary> target =
         policy == RestorePolicy::kFlush ? std::vector<LuaFunctionLibrary>{}
                                         : previous;
     for (const std::string& code : *decoded) {
-      const std::optional<std::string> name = FunctionLibraryNameFromCode(code);
+      const std::optional<std::string> name =
+          LuaFunctionLibraryNameFromCode(code);
       if (!name.has_value()) {
         co_return BuiltReply(reply_builder.AppendError(
             "ERR Error registering functions: Missing library metadata"));
@@ -7387,22 +7458,16 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
       target.push_back(LuaFunctionLibrary{
           .name_ = *name, .engine_ = "LUA", .code_ = code, .functions_ = {}});
     }
-    absl::Status rebuilt = co_await RebuildFunctionCatalog(target, previous);
-    if (!rebuilt.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR Error registering functions: ", rebuilt.message())));
-    }
-    absl::Status published = co_await PublishFunctionMutation(request);
-    if (!published.ok()) {
-      co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-          "ERR function replication publish failed: ", published.message())));
+    absl::Status applied =
+        co_await ApplyFunctionCatalogTarget(std::move(target), request);
+    if (!applied.ok()) {
+      co_return FunctionMutationError(reply_builder, applied);
     }
     co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
   }
 
   if (CmpCaseInsensitive(subcommand, "list")) {
-    (void)co_await BeginLuaScriptCacheOperation();
-    LuaScriptCacheOperationGuard operation;
+    auto operation = co_await AcquireFunctionCatalogOperation();
     std::optional<std::string_view> pattern;
     bool with_code = false;
     for (std::size_t index = 2; index < request.args_.size(); ++index) {
@@ -7457,6 +7522,7 @@ Task<CommandReply> ExecuteFunction(const CommandRequest& request,
   }
 
   if (CmpCaseInsensitive(subcommand, "stats") && request.args_.size() == 2) {
+    auto operation = co_await AcquireFunctionCatalogOperation();
     const std::optional<LuaRunningInvocation> running =
         SnapshotLuaRunningInvocation();
     if (running.has_value() && !running->is_function_) {
@@ -7955,8 +8021,11 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
   }
 }
 
-Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
-                                   ReplyBuilder& reply_builder) {
+Task<CommandReply> ExecuteExecBody(
+    ConnectionContext& ctx, ReplyBuilder& reply_builder,
+    std::optional<std::uint64_t> write_admission_role_epoch,
+    const ReplicationPublisherAdmission* publisher_admission = nullptr,
+    bool* publisher_admission_released = nullptr) {
   const RespVersion exec_reply_version = ctx.resp_version();
   std::vector<CommandRequest> queued = std::move(ctx.queued_);
   const bool dirty = ctx.multi_dirty_;
@@ -8000,8 +8069,25 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
                                  return !command.replication_origin_ &&
                                         ExecCommandMayWrite(command);
                                });
+  const bool reject_writes = g_replication != nullptr
+                                 ? g_replication->reject_writes()
+                                 : g_replica_read_only;
+  const bool source_static_write =
+      std::any_of(queued.begin(), queued.end(), [](const auto& command) {
+        return !command.replication_origin_ && command.spec_ != nullptr &&
+               (command.spec_->flags_ & kCmdWrite) != 0;
+      });
+  // Dynamic Lua commands can be read-only at runtime. Execute them so the
+  // script guard can return a per-command READONLY error only if a write is
+  // actually attempted, preserving EXEC's continue-on-error replies.
+  if (source_static_write && reject_writes) {
+    co_await DropWatches(ctx);
+    co_return BuiltReply(reply_builder.AppendError(
+        "READONLY You can't write against a read only replica."));
+  }
   const bool source_replicable =
-      has_replicable &&
+      has_replicable && g_storage != nullptr &&
+      g_storage->ReplicationLogActive() &&
       (g_replication == nullptr || !g_replication->is_replica()) &&
       std::any_of(queued.begin(), queued.end(),
                   [](const CommandRequest& command) {
@@ -8151,6 +8237,11 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
   std::vector<std::string> replies(queued.size());
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
+  bool close_after_exec = false;
+  auto finalize_exec_reply = [&](CommandReply reply) {
+    reply.close_connection_ = reply.close_connection_ || close_after_exec;
+    return reply;
+  };
   auto run_keyless = [&](const CommandRequest& cmd) -> Task<std::string> {
     if (IsLuaInvocationCommand(cmd)) {
       std::vector<CapturedReplicationCommand> effects;
@@ -8167,6 +8258,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     if (cmd.kind_ == CommandKind::kFunction) {
       ReplyBuilder local_builder(ctx.resp_version());
       CommandReply local = co_await ExecuteFunction(cmd, local_builder);
+      close_after_exec = close_after_exec || local.close_connection_;
       co_return std::string(local.encoded_);
     }
     ReplyBuilder local_builder(ctx.resp_version());
@@ -8214,14 +8306,36 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     co_return std::string(local.encoded_);
   };
 
+  std::optional<DbOperationGuard> keyless_write_gate;
+  if (dbs.empty() && source_write) {
+    if (!TryBeginDbOperation(queued.front().db_id_)) {
+      co_await DropWatches(ctx);
+      co_return finalize_exec_reply(BuiltReply(
+          reply_builder.AppendError("TRYAGAIN database flush is in progress")));
+    }
+    keyless_write_gate.emplace(queued.front().db_id_);
+    if (write_admission_role_epoch.has_value() && g_replication != nullptr &&
+        g_replication->role_epoch() != *write_admission_role_epoch) {
+      co_await DropWatches(ctx);
+      co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+          "TRYAGAIN replication role changed; retry command")));
+    }
+  }
+
   if (!dbs.empty()) {
     MultiDbOperationGuard db_guard;
     for (const std::uint8_t db : dbs) {
       if (!db_guard.Add(db)) {
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendError(
-            "TRYAGAIN database flush is in progress"));
+        co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+            "TRYAGAIN database flush is in progress")));
       }
+    }
+    if (write_admission_role_epoch.has_value() && g_replication != nullptr &&
+        g_replication->role_epoch() != *write_admission_role_epoch) {
+      co_await DropWatches(ctx);
+      co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+          "TRYAGAIN replication role changed; retry command")));
     }
 
     // One write id for the whole EXEC: every record any of its commands
@@ -8250,12 +8364,23 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         owners.push_back(watched.owner_);
       }
     }
+    // Function mutations are keyless but their catalog history belongs to
+    // flow zero. A mixed EXEC must include that flow in the same rendezvous as
+    // its key owners or a later catalog mutation can overtake it there.
+    const bool contains_catalog_replication_mutation =
+        source_replicable &&
+        std::any_of(queued.begin(), queued.end(), IsFunctionCatalogMutation);
+    const bool needs_catalog_replication_participant =
+        contains_catalog_replication_mutation &&
+        std::find(owners.begin(), owners.end(), 0) == owners.end();
 
     const CommandRequest* replication_request = nullptr;
-    for (const CommandRequest& command : queued) {
-      if (ExecCommandMayWrite(command)) {
-        replication_request = &command;
-        break;
+    if (source_replicable) {
+      for (const CommandRequest& command : queued) {
+        if (ExecCommandMayWrite(command)) {
+          replication_request = &command;
+          break;
+        }
       }
     }
     std::vector<std::string> replication_args;
@@ -8297,13 +8422,113 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       }
       return EncodeReplicationCommandEffects(std::move(commands));
     };
-    auto commit_replication = [&](ReplicationTransactionGuard* replication) {
-      if (replication == nullptr) return;
+    auto catalog_mutation_succeeded = [&]() {
+      if (!contains_catalog_replication_mutation) return false;
+      for (std::size_t index = 0; index < queued.size(); ++index) {
+        if (IsFunctionCatalogMutation(queued[index]) &&
+            !replies[index].empty() && replies[index].front() != '-') {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto commit_replication =
+        [&](ReplicationTransactionGuard* replication) -> absl::StatusOr<bool> {
+      if (replication == nullptr) return false;
+      const bool catalog_mutation_committed = catalog_mutation_succeeded();
       std::vector<std::string> resolved = resolved_replication_args();
-      if (resolved.size() < 2 || resolved[1] == "0") return;
+      if (resolved.size() < 2 || resolved[1] == "0") {
+        if (catalog_mutation_committed) {
+          return absl::DataLossError(
+              "durable Function catalog has no replication body");
+        }
+        return false;
+      }
       replication->SetCommandArgs(std::move(resolved));
       replication->SetFinalExpirations(tx_writes);
-      replication->Commit();
+      if (!replication->Commit()) {
+        if (catalog_mutation_committed) {
+          return absl::DataLossError(
+              "durable Function catalog transaction could not be published");
+        }
+        return false;
+      }
+      return catalog_mutation_committed;
+    };
+    auto enter_catalog_replication_participant =
+        [](ReplicationTransactionGuard* replication) -> Task<absl::Status> {
+      if (ThisWorker().id_ == 0) {
+        replication->EnterCurrentShard();
+        co_return absl::OkStatus();
+      }
+      co_return co_await SubmitTaskTo(0, [replication] -> Task<absl::Status> {
+        replication->EnterCurrentShard();
+        co_return absl::OkStatus();
+      });
+    };
+    auto fence_catalog_replication = [&]() -> Task<absl::Status> {
+      const std::size_t participant_count =
+          owners.size() + (needs_catalog_replication_participant ? 1 : 0);
+      co_return co_await ForEachParticipantParallel(
+          participant_count, [&](std::size_t index) {
+            const unsigned worker = index < owners.size() ? owners[index] : 0;
+            return std::pair{
+                worker, []() -> Task<absl::Status> {
+                  auto fence = co_await g_storage->FenceReplicationLog();
+                  co_return fence.ok() ? absl::OkStatus() : fence.status();
+                }};
+          });
+    };
+    auto publish_committed_catalog_replication = [&]() -> Task<absl::Status> {
+      if (publisher_admission == nullptr ||
+          publisher_admission_released == nullptr) {
+        co_return absl::FailedPreconditionError(
+            "catalog transaction has no publisher admission");
+      }
+      if (*publisher_admission_released) {
+        co_return absl::FailedPreconditionError(
+            "catalog transaction publisher admission was already released");
+      }
+#ifndef NDEBUG
+      if (const char* configured = std::getenv(
+              "KEYLANE_EXEC_PAUSE_BEFORE_CATALOG_REPLICATION_FENCE_MS");
+          configured != nullptr) {
+        std::uint64_t pause_ms = 0;
+        const std::size_t length = std::strlen(configured);
+        const auto parsed =
+            std::from_chars(configured, configured + length, pause_ms);
+        static std::atomic<bool> pause_used = false;
+        if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+            pause_ms != 0 && pause_ms <= 60000 &&
+            !pause_used.exchange(true, std::memory_order_acq_rel)) {
+          spdlog::info(
+              "catalog EXEC committed; pausing before replication fence");
+          absl::Status paused = co_await celer::SleepFor(
+              *ThisWorker().self_, std::chrono::milliseconds(pause_ms));
+          if (!paused.ok()) co_return paused;
+        }
+      }
+#endif
+      // Every after-image and participant marker is now enqueued. Release the
+      // outer EXEC admission before waiting for the log fence: the fence must
+      // cross the same admitted-bytes waterline, so retaining it here would
+      // wait on this transaction's own reservation forever.
+      absl::Status released =
+          co_await ReleaseReplicationPublisherAdmission(*publisher_admission);
+      *publisher_admission_released = true;
+      if (!released.ok()) co_return released;
+      co_return co_await fence_catalog_replication();
+    };
+    auto fail_catalog_replication =
+        [&](absl::Status status) -> Task<CommandReply> {
+      g_storage->FenceRequestServingUntilRestart();
+      co_await DropWatches(ctx);
+      CommandReply reply = BuiltReply(reply_builder.AppendError(absl::StrCat(
+          "ERR durable Function catalog committed but EXEC replication "
+          "failed: ",
+          status.message())));
+      reply.close_connection_ = true;
+      co_return finalize_exec_reply(std::move(reply));
     };
 
     const bool contains_eval =
@@ -8311,14 +8536,25 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     if (owners.size() == 1 && !contains_eval) {
       std::unique_ptr<ReplicationTransactionGuard> replication;
       if (replication_request != nullptr) {
+        std::vector<unsigned> participants{
+            static_cast<unsigned>(owners.front())};
+        if (needs_catalog_replication_participant) participants.push_back(0);
         replication = std::make_unique<ReplicationTransactionGuard>(
-            *replication_request,
-            std::vector<unsigned>{static_cast<unsigned>(owners.front())},
+            *replication_request, std::move(participants),
             std::move(replication_args));
         if (!replication->status().ok()) {
           co_await DropWatches(ctx);
-          co_return BuiltReply(
-              AppendStorageError(reply_builder, replication->status()));
+          co_return finalize_exec_reply(BuiltReply(
+              AppendStorageError(reply_builder, replication->status())));
+        }
+        if (needs_catalog_replication_participant) {
+          absl::Status entered =
+              co_await enter_catalog_replication_participant(replication.get());
+          if (!entered.ok()) {
+            co_await DropWatches(ctx);
+            co_return finalize_exec_reply(
+                BuiltReply(AppendStorageError(reply_builder, entered)));
+          }
         }
       }
       // Whole transaction on one shard: hop once, take the fast-path guard
@@ -8378,12 +8614,13 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           });
       if (!status.ok()) {
         co_await DropWatches(ctx);
-        co_return BuiltReply(
-            reply_builder.AppendError(absl::StrCat("ERR ", status.message())));
+        co_return finalize_exec_reply(BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", status.message()))));
       }
       if (watch_aborted) {
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendNullArray());
+        co_return finalize_exec_reply(
+            BuiltReply(reply_builder.AppendNullArray()));
       }
       // Publish from the connection's coordinator worker after the shard hop
       // returns. EXEC is published from this same worker, preserving the
@@ -8391,11 +8628,25 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       if (HasMonitorSessions()) [[unlikely]] {
         PublishExecMonitorCommands(ctx, queued);
       }
+      absl::StatusOr<bool> committed_catalog = false;
       if (replication != nullptr) {
-        commit_replication(replication.get());
+        committed_catalog = commit_replication(replication.get());
+        if (!committed_catalog.ok()) {
+          g_storage->FenceRequestServingUntilRestart();
+        }
       }
       if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
         co_await g_storage->WaitForTxCommitCapacity();
+      }
+      if (!committed_catalog.ok()) {
+        co_return co_await fail_catalog_replication(committed_catalog.status());
+      }
+      if (*committed_catalog) {
+        absl::Status published =
+            co_await publish_committed_catalog_replication();
+        if (!published.ok()) {
+          co_return co_await fail_catalog_replication(std::move(published));
+        }
       }
     } else {
       tx::Transaction txn;
@@ -8423,18 +8674,29 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       std::unique_ptr<ReplicationTransactionGuard> replication;
       if (replication_request != nullptr) {
         replication = std::make_unique<ReplicationTransactionGuard>(
-            *replication_request, &txn, std::move(replication_args));
+            *replication_request, &txn, std::move(replication_args),
+            needs_catalog_replication_participant ? std::vector<unsigned>{0}
+                                                  : std::vector<unsigned>{});
         if (!replication->status().ok()) {
           co_await DropWatches(ctx);
-          co_return BuiltReply(
-              AppendStorageError(reply_builder, replication->status()));
+          co_return finalize_exec_reply(BuiltReply(
+              AppendStorageError(reply_builder, replication->status())));
+        }
+        if (needs_catalog_replication_participant) {
+          absl::Status entered =
+              co_await enter_catalog_replication_participant(replication.get());
+          if (!entered.ok()) {
+            co_await DropWatches(ctx);
+            co_return finalize_exec_reply(
+                BuiltReply(AppendStorageError(reply_builder, entered)));
+          }
         }
       }
       absl::Status scheduled = co_await txn.Schedule();
       if (!scheduled.ok()) {
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendError(
-            absl::StrCat("ERR ", scheduled.message())));
+        co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", scheduled.message()))));
       }
       // Acquire and retain every shard's holds before the coordinator runs
       // argument-ordered commands such as LMPOP one key at a time.
@@ -8443,14 +8705,15 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       if (!armed.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
-        co_return BuiltReply(
-            reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
+        co_return finalize_exec_reply(BuiltReply(
+            reply_builder.AppendError(absl::StrCat("ERR ", armed.message()))));
       }
       if (!ctx.watched_.empty()) {
         if (!co_await CheckConnectionWatches(ctx)) {
           (void)co_await txn.Release();
           co_await DropWatches(ctx);
-          co_return BuiltReply(reply_builder.AppendNullArray());
+          co_return finalize_exec_reply(
+              BuiltReply(reply_builder.AppendNullArray()));
         }
       }
       if (HasMonitorSessions()) [[unlikely]] {
@@ -8517,8 +8780,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       if (!published.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendError(
-            absl::StrCat("ERR ", published.message())));
+        co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", published.message()))));
       }
       absl::Status released = co_await txn.Release();
       if (!released.ok()) {
@@ -8527,21 +8790,36 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         // its outcome, and stale entries would falsely abort every later
         // EXEC on this connection.
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendError(
-            absl::StrCat("ERR ", released.message())));
+        co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR ", released.message()))));
       }
+      absl::StatusOr<bool> committed_catalog = false;
       if (replication != nullptr) {
-        commit_replication(replication.get());
+        committed_catalog = commit_replication(replication.get());
+        if (!committed_catalog.ok()) {
+          g_storage->FenceRequestServingUntilRestart();
+        }
       }
       if (!g_storage->EnqueueTxCommit(exec_txid, std::move(tx_writes))) {
         co_await g_storage->WaitForTxCommitCapacity();
+      }
+      if (!committed_catalog.ok()) {
+        co_return co_await fail_catalog_replication(committed_catalog.status());
+      }
+      if (*committed_catalog) {
+        absl::Status published =
+            co_await publish_committed_catalog_replication();
+        if (!published.ok()) {
+          co_return co_await fail_catalog_replication(std::move(published));
+        }
       }
     }
   } else {
     // Keyless-only transaction.
     if (!ctx.watched_.empty() && !co_await CheckConnectionWatches(ctx)) {
       co_await DropWatches(ctx);
-      co_return BuiltReply(reply_builder.AppendNullArray());
+      co_return finalize_exec_reply(
+          BuiltReply(reply_builder.AppendNullArray()));
     }
     if (HasMonitorSessions()) [[unlikely]] {
       PublishExecMonitorCommands(ctx, queued);
@@ -8581,24 +8859,82 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       }
     }
     if (!commands.empty()) {
+      const bool catalog_mutation =
+          std::any_of(commands.begin(), commands.end(), [](const auto& item) {
+            return !item.args_.empty() &&
+                   CmpCaseInsensitive(item.args_.front(), "function");
+          });
+      const auto publish =
+          std::find_if(commands.begin(), commands.end(), [](const auto& item) {
+            return item.args_.size() > 1 &&
+                   CmpCaseInsensitive(item.args_.front(), "publish");
+          });
+      const auto* active_admission = g_active_replication_publisher_admission;
+      if ((!catalog_mutation && publish == commands.end()) ||
+          active_admission == nullptr) {
+        CommandReply reply = BuiltReply(reply_builder.AppendError(
+            "ERR admitted EXEC replication token is missing"));
+        reply.close_connection_ = true;
+        co_await DropWatches(ctx);
+        co_return reply;
+      }
       const std::uint16_t partition_id =
-          !commands.front().args_.empty() &&
-                  CmpCaseInsensitive(commands.front().args_.front(), "function")
-              ? 0
-              : storage::RedisSlot(commands.front().args_[1]);
+          catalog_mutation ? 0 : storage::RedisSlot(publish->args_[1]);
       const unsigned source_worker = partition_id % g_storage->worker_count();
+      std::optional<std::vector<std::string>> fullsync_projection;
+      if (catalog_mutation) {
+        std::vector<CapturedReplicationCommand> non_catalog_commands;
+        non_catalog_commands.reserve(commands.size());
+        for (const CapturedReplicationCommand& command : commands) {
+          if (command.args_.empty() ||
+              !CmpCaseInsensitive(command.args_.front(), "function")) {
+            non_catalog_commands.push_back(command);
+          }
+        }
+        // The final full-sync cut installs one authoritative complete catalog.
+        // Retain PUBLISH or other non-catalog effects from a mixed EXEC, but
+        // do not replay its Function children against the discarded catalog.
+        fullsync_projection = non_catalog_commands.empty()
+                                  ? std::vector<std::string>{}
+                                  : EncodeReplicationCommandEffects(
+                                        std::move(non_catalog_commands));
+      }
       std::vector<std::string> effects =
           EncodeReplicationCommandEffects(std::move(commands));
-      absl::Status published = co_await celer::SubmitTaskTo(
+      const auto token = std::find_if(active_admission->worker_tokens_.begin(),
+                                      active_admission->worker_tokens_.end(),
+                                      [source_worker](const auto& item) {
+                                        return item.worker_ == source_worker;
+                                      });
+      if (token == active_admission->worker_tokens_.end()) {
+        CommandReply reply = BuiltReply(reply_builder.AppendError(
+            "ERR admitted EXEC replication token is missing"));
+        reply.close_connection_ = true;
+        co_await DropWatches(ctx);
+        co_return reply;
+      }
+      storage::ReplicationPublisherAdmission storage_admission = token->token_;
+      const storage::ReplicationEventKind event_kind =
+          catalog_mutation ? storage::ReplicationEventKind::kCatalogMutation
+                           : storage::ReplicationEventKind::kEphemeral;
+      absl::Status published = co_await celer::SubmitTo(
           source_worker,
-          [partition_id, effects = std::move(effects)]() mutable {
-            return g_storage->PublishEphemeralReplicationCommand(
-                partition_id, std::move(effects));
+          [storage_admission = std::move(storage_admission), event_kind,
+           partition_id, effects = std::move(effects),
+           fullsync_projection = std::move(fullsync_projection)]() mutable {
+            return g_storage->PublishLateAdmittedReplicationCommand(
+                storage_admission, event_kind, partition_id, std::move(effects),
+                std::move(fullsync_projection));
           });
       if (!published.ok()) {
+        if (catalog_mutation) {
+          g_storage->FenceRequestServingUntilRestart();
+        }
         co_await DropWatches(ctx);
-        co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
-            "ERR ephemeral EXEC replication failed: ", published.message())));
+        CommandReply reply = BuiltReply(reply_builder.AppendError(absl::StrCat(
+            "ERR EXEC replication failed: ", published.message())));
+        reply.close_connection_ = true;
+        co_return reply;
       }
     }
   }
@@ -8607,8 +8943,10 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       *blocking_notifications, ctx.blocking_wake_cascade_);
   if (!notified.ok()) {
     co_await DropWatches(ctx);
-    co_return BuiltReply(
+    CommandReply reply = BuiltReply(
         reply_builder.AppendError(absl::StrCat("ERR ", notified.message())));
+    reply.close_connection_ = close_after_exec;
+    co_return reply;
   }
   co_await DropWatches(ctx);
   if (ctx.strict_replication_apply_) {
@@ -8617,7 +8955,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
           return !encoded.empty() && encoded.front() == '-';
         });
     if (failed != replies.end()) {
-      co_return BuiltReply(reply_builder.AppendRaw(*failed));
+      co_return finalize_exec_reply(
+          BuiltReply(reply_builder.AppendRaw(*failed)));
     }
   }
   const bool streamed = std::any_of(
@@ -8632,6 +8971,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     }
   }
   CommandReply reply = BuiltReply(reply_builder.View());
+  reply.close_connection_ = close_after_exec;
   reply_builder.SetVersion(connection_version);
   // HELLO may have run on a key-owner worker while EXEC held that shard's
   // locks. Refresh the connection metadata on its owning worker after the
@@ -8650,26 +8990,49 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
 
 Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
                                ReplyBuilder& reply_builder) {
+  std::optional<std::uint64_t> write_admission_role_epoch;
+  if (g_replication != nullptr &&
+      std::any_of(ctx.queued_.begin(), ctx.queued_.end(),
+                  [](const CommandRequest& command) {
+                    return !command.replication_origin_ &&
+                           ExecCommandMayWrite(command);
+                  })) {
+    write_admission_role_epoch = g_replication->role_epoch();
+  }
   std::size_t logical_bytes = 0;
-  bool source_write = false;
+  std::size_t event_bytes = 64;
+  bool source_replicable = false;
   for (const CommandRequest& command : ctx.queued_) {
     if (!command.replication_origin_ && command.spec_ != nullptr &&
-        (command.spec_->flags_ & kCmdWrite) != 0 &&
+        ExecCommandMayReplicate(command) &&
         (g_replication == nullptr || !g_replication->is_replica())) {
-      source_write = true;
+      source_replicable = true;
       logical_bytes =
           SaturatingAdd(logical_bytes, RequestArgumentBytes(command));
       logical_bytes = SaturatingAdd(logical_bytes,
                                     FullSyncReplacementAdmissionBytes(command));
+      event_bytes = SaturatingAdd(
+          event_bytes,
+          SaturatingAdd(ReplicationEventAdmissionBytes(command), 32));
     }
   }
-  source_write =
-      source_write && g_storage != nullptr && g_storage->ReplicationLogActive();
-  if (!source_write) [[likely]] {
-    co_return co_await ExecuteExecBody(ctx, reply_builder);
+  source_replicable = source_replicable && g_storage != nullptr &&
+                      g_storage->ReplicationLogActive();
+  if (!source_replicable) [[likely]] {
+    co_return co_await ExecuteExecBody(ctx, reply_builder,
+                                       write_admission_role_epoch);
+  }
+  if (ReplicationEventExceedsBacklog(event_bytes)) {
+    ctx.ResetMulti();
+    co_await DropWatches(ctx);
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR replication publisher admission failed: canonical EXEC event "
+        "exceeds repl-backlog-size or the 1 GiB event limit"));
   }
   auto admission = co_await AcquireReplicationPublisherAdmission(logical_bytes);
   if (!admission.ok()) {
+    ctx.ResetMulti();
+    co_await DropWatches(ctx);
     if (absl::IsResourceExhausted(admission.status())) {
       co_return BuiltReply(AppendOomError(reply_builder));
     }
@@ -8677,13 +9040,21 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
-  CommandReply reply = co_await ExecuteExecBody(ctx, reply_builder);
-  absl::Status released =
-      co_await ReleaseReplicationPublisherAdmission(*admission);
-  if (!released.ok()) {
-    co_return BuiltReply(reply_builder.AppendError(
-        absl::StrCat("ERR replication publisher admission release failed: ",
-                     released.message())));
+  ActivePublisherAdmissionGuard active_admission(&*admission);
+  bool admission_released = false;
+  CommandReply reply =
+      co_await ExecuteExecBody(ctx, reply_builder, write_admission_role_epoch,
+                               &*admission, &admission_released);
+  if (!admission_released) {
+    absl::Status released =
+        co_await ReleaseReplicationPublisherAdmission(*admission);
+    if (!released.ok()) {
+      CommandReply failed = BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR replication publisher admission release failed: ",
+                       released.message())));
+      failed.close_connection_ = reply.close_connection_;
+      co_return failed;
+    }
   }
   co_return reply;
 }
@@ -8692,48 +9063,16 @@ Task<CommandReply> ExecuteExec(ConnectionContext& ctx,
 
 Task<absl::Status> ReplaceLuaFunctionCatalog(
     const std::vector<std::string>& library_codes) {
-  (void)co_await BeginLuaScriptCacheOperation();
-  LuaScriptCacheOperationGuard operation;
-  const std::vector<LuaFunctionLibrary> previous =
-      SnapshotLuaFunctionLibraries();
-  std::vector<LuaFunctionLibrary> target;
-  target.reserve(library_codes.size());
-  for (const std::string& code : library_codes) {
-    const std::optional<std::string> name = FunctionLibraryNameFromCode(code);
-    if (!name.has_value()) {
-      co_return absl::InvalidArgumentError("Missing library metadata");
-    }
-    target.push_back(LuaFunctionLibrary{
-        .name_ = *name, .engine_ = "LUA", .code_ = code, .functions_ = {}});
-  }
-  co_return co_await RebuildFunctionCatalog(target, previous);
+  auto operation = co_await AcquireFunctionCatalogOperation();
+  co_return co_await GlobalFunctionCatalog().ReplaceFromLibraryCodes(
+      library_codes);
 }
 
 Task<absl::Status> ValidateLuaFunctionCatalog(
     const std::vector<std::string>& library_codes) {
-  (void)co_await BeginLuaScriptCacheOperation();
-  LuaScriptCacheOperationGuard operation;
-  const std::vector<LuaFunctionLibrary> previous =
-      SnapshotLuaFunctionLibraries();
-  std::vector<LuaFunctionLibrary> target;
-  target.reserve(library_codes.size());
-  for (const std::string& code : library_codes) {
-    const std::optional<std::string> name = FunctionLibraryNameFromCode(code);
-    if (!name.has_value()) {
-      co_return absl::InvalidArgumentError("Missing library metadata");
-    }
-    target.push_back(LuaFunctionLibrary{
-        .name_ = *name, .engine_ = "LUA", .code_ = code, .functions_ = {}});
-  }
-  absl::Status validated = co_await RebuildFunctionCatalog(target, previous);
-  if (!validated.ok()) co_return validated;
-  absl::Status restored = co_await RebuildFunctionCatalog(previous, target);
-  if (!restored.ok()) {
-    co_return absl::InternalError(absl::StrCat(
-        "validated FUNCTION catalog but failed to restore current catalog: ",
-        restored.message()));
-  }
-  co_return absl::OkStatus();
+  auto operation = co_await AcquireFunctionCatalogOperation();
+  co_return co_await GlobalFunctionCatalog().ValidateLibraryCodes(
+      library_codes);
 }
 
 bool TryBeginCommandDbOperation(std::uint8_t db_id) noexcept {
@@ -8859,6 +9198,7 @@ bool RequestSpansMultipleShards(const CommandRequest& request) {
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication) {
   g_storage = engine;
+  InitFunctionCatalog(engine);
   InitBlockingWaitStorage(engine);
   InitHashCommandStorage(engine);
   InitListCommandStorage(engine);
@@ -8949,10 +9289,18 @@ std::atomic<std::uint64_t> g_next_replication_transaction_id{1};
 
 ReplicationTransactionGuard::ReplicationTransactionGuard(
     const CommandRequest& request, tx::Transaction* transaction,
-    std::vector<std::string> canonical_args) {
+    std::vector<std::string> canonical_args,
+    std::vector<unsigned> additional_participants) {
   uncaught_exceptions_ = std::uncaught_exceptions();
   if (transaction == nullptr) return;
-  Initialize(request, transaction->shard_ids(), std::move(canonical_args));
+  std::vector<unsigned> participants = transaction->shard_ids();
+  for (const unsigned participant : additional_participants) {
+    if (std::find(participants.begin(), participants.end(), participant) ==
+        participants.end()) {
+      participants.push_back(participant);
+    }
+  }
+  Initialize(request, std::move(participants), std::move(canonical_args));
   if (transaction_ != nullptr) {
     transaction->SetShardEntryHook(&ReplicationTransactionGuard::EnterShardHook,
                                    this);
@@ -9005,10 +9353,10 @@ void ReplicationTransactionGuard::Initialize(
     // Rotate the one payload-bearing marker across the participant set. A
     // fixed flow would make that flow's bounded backlog the throughput limit
     // for otherwise balanced cross-flow transactions.
-    transaction->payload_flow_ = transaction->participants_[
-        id % transaction->participants_.size()];
-    auto metadata = EncodeReplicationTransactionEnvelope(
-        ReplicationTransactionEnvelope{
+    transaction->payload_flow_ =
+        transaction->participants_[id % transaction->participants_.size()];
+    auto metadata =
+        EncodeReplicationTransactionEnvelope(ReplicationTransactionEnvelope{
             .id_ = id,
             .payload_flow_ = transaction->payload_flow_,
             .participants_ = transaction->participants_,
@@ -9057,14 +9405,15 @@ ReplicationTransactionGuard::~ReplicationTransactionGuard() {
   }
 }
 
-void ReplicationTransactionGuard::Commit() noexcept {
+bool ReplicationTransactionGuard::Commit() noexcept {
   if (transaction_ != nullptr) {
     storage::ReplicationTransactionResolution expected =
         storage::ReplicationTransactionResolution::kPending;
-    transaction_->resolution_.compare_exchange_strong(
+    return transaction_->resolution_.compare_exchange_strong(
         expected, storage::ReplicationTransactionResolution::kPublish,
         std::memory_order_release, std::memory_order_relaxed);
   }
+  return false;
 }
 
 absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
@@ -10058,8 +10407,8 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
   std::optional<BlockingWakeCascade> cascade;
   if (kind != CommandKind::kSet) cascade.emplace();
   BlockingWakeCascade* previous_cascade = ctx.blocking_wake_cascade_;
-  ctx.blocking_wake_cascade_ = cascade.has_value() ? &*cascade
-                                                   : previous_cascade;
+  ctx.blocking_wake_cascade_ =
+      cascade.has_value() ? &*cascade : previous_cascade;
   request.blocking_wake_cascade_ = ctx.blocking_wake_cascade_;
   struct RestoreCascade {
     ConnectionContext& ctx_;
@@ -10122,6 +10471,14 @@ Task<CommandReply> ExecuteCommandBody(
                                    request.kind_ == CommandKind::kCopy;
   std::optional<DbOperationGuard> db_guard;
   if (uses_db && !manages_own_db_gate) {
+    if (!replication_origin &&
+        (cmd_flags & (kCmdWrite | kCmdDynamicWrite)) != 0) {
+      absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+      if (!paused.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(
+            absl::StrCat("ERR database admission failed: ", paused.message())));
+      }
+    }
     while (!TryBeginDbOperation(request.db_id_)) {
       absl::Status waited = co_await celer::SleepFor(
           *ThisWorker().self_, std::chrono::milliseconds(1));
@@ -10131,6 +10488,10 @@ Task<CommandReply> ExecuteCommandBody(
       }
     }
     db_guard.emplace(request.db_id_);
+    if (!CommandWriteAdmissionIsCurrent(request)) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "TRYAGAIN replication role changed; retry command"));
+    }
   }
 
   // Take the DB admission before the transaction gates. FULLSYNC_CUT closes
@@ -10608,6 +10969,11 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
     co_return co_await ExecuteCommandBody(request, reply_builder, client_id,
                                           connection);
   }
+  if (ReplicationEventExceedsBacklog(ReplicationEventAdmissionBytes(request))) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR replication publisher admission failed: canonical event exceeds "
+        "repl-backlog-size or the 1 GiB event limit"));
+  }
   // Preacquire the order gate across publisher admission so a suspending
   // admission cannot invert the order of two wide MSETs. Single-shard MSETs
   // skip the gate for the same reason ExecuteCommandBody skips it: one
@@ -10636,6 +11002,7 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
         absl::StrCat("ERR replication publisher admission failed: ",
                      admission.status().message())));
   }
+  ActivePublisherAdmissionGuard active_admission(&*admission);
   CommandReply reply = co_await ExecuteCommandBody(
       request, reply_builder, client_id, connection,
       ordered_mset ? &replication_order : nullptr, mset_spans_multiple_shards);
@@ -10651,10 +11018,21 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
 
 }  // namespace
 
+bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
+  return !request.write_admission_role_epoch_.has_value() ||
+         g_replication == nullptr ||
+         g_replication->role_epoch() == *request.write_admission_role_epoch_;
+}
+
 Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
                                   std::uint64_t client_id,
                                   ConnectionContext* connection) {
+  if (!request.replication_origin_ && request.spec_ != nullptr &&
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
+      g_replication != nullptr) {
+    request.write_admission_role_epoch_ = g_replication->role_epoch();
+  }
   const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
   // Lua invocations carry a non-owning pointer to their connection's WAIT
   // watermark. Dynamic-write scripting commands never take the single-key
@@ -10893,9 +11271,12 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
     RespCommand wire{.args_ = command.args_};
     auto request = BuildCommandRequest(std::move(wire), command.db_id_);
     if (!request.ok()) co_return request.status();
+    const bool function_mutation = request->kind_ == CommandKind::kFunction;
     if (request->spec_ == nullptr ||
-        (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) != 0 ||
-        (request->spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0 ||
+        (!function_mutation &&
+         (request->spec_->flags_ & (kCmdGlobal | kCmdMayBlock)) != 0) ||
+        (!function_mutation &&
+         (request->spec_->flags_ & (kCmdWrite | kCmdMayReplicate)) == 0) ||
         request->kind_ == CommandKind::kMulti ||
         request->kind_ == CommandKind::kExec ||
         request->kind_ == CommandKind::kDiscard ||

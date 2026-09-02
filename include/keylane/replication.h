@@ -32,13 +32,13 @@ struct ReplicaOfConfig {
 };
 
 struct ReplicationOptions {
-  // Consulted only while this node has an upstream. REPLICAOF NO ONE makes
-  // the node writable immediately.
+  // Consulted only while this node has an upstream. REPLICAOF NO ONE opens
+  // writes only after the shared promotion durability path succeeds.
   bool replica_read_only_ = true;
   // Redis Sentinel promotes only replicas with a nonzero priority and prefers
   // lower values. This is runtime mutable through CONFIG SET.
   unsigned replica_priority_ = 100;
-  // Advertised to the source during the version-1 control handshake so INFO
+  // Advertised to the source during the version-2 control handshake so INFO
   // and CLUSTER NODES can identify the replica's Redis endpoint.
   std::uint16_t listen_port_ = 6379;
   bool use_tls_ = false;
@@ -100,6 +100,9 @@ struct ReplicationStatus {
   unsigned source_worker_count_ = 0;
   unsigned connected_flows_ = 0;
   std::string local_node_id_;
+  std::string group_id_;
+  std::string boot_id_;
+  std::string replica_incarnation_;
   std::string local_history_id_;
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
@@ -122,9 +125,29 @@ struct NativeReplicationWatermark {
   std::vector<std::uint64_t> next_lsns_;
 };
 
-// Owns replication role and connection lifetime. Replica connections are
-// initiated on worker 0 for control and on one target worker per source flow.
-// Source-side accepted flow sockets are adopted by the matching source worker.
+struct ReplicationDirective {
+  // kSetUpstream consumes upstream_; an empty endpoint requests promotion.
+  // kAddUpstream requires upstream_ and adds another Redis Cluster source to
+  // this node's sole group. The remaining kinds consume value_ in bytes,
+  // commands, or unitless counts as named by the kind.
+  enum class Kind : std::uint8_t {
+    kSetUpstream,
+    kAddUpstream,
+    kBacklogBytes,
+    kPublishQueueBytes,
+    kSnapshotReadConcurrency,
+    kSnapshotBatchSize,
+    kReplicaPriority,
+  };
+
+  Kind kind_ = Kind::kSetUpstream;
+  std::optional<ReplicaOfConfig> upstream_;
+  std::uint64_t value_ = 0;
+};
+
+// Owns exactly one replication group. Replica connections are initiated on
+// worker 0 for control and on one target worker per source flow. Source-side
+// accepted flow sockets are adopted by the matching source worker.
 class ReplicationManager {
  public:
   ReplicationManager(storage::StorageEngine* storage,
@@ -136,31 +159,19 @@ class ReplicationManager {
 
   void StorageReady(celer::Worker& worker);
 
-  // Atomically replaces the desired upstream. A null upstream implements
-  // REPLICAOF NO ONE. Connection establishment continues asynchronously.
-  celer::Task<absl::Status> SetUpstream(
-      std::optional<ReplicaOfConfig> upstream);
-  // Adds one more master from the same Redis Cluster. The source's advertised
-  // slots must be disjoint from every already registered source.
-  celer::Task<absl::Status> AddUpstream(ReplicaOfConfig upstream);
+  // The deep group interface: administrative changes enter as directives,
+  // peer sockets enter through the handlers below, and Observe returns one
+  // coherent control-plane snapshot without blocking the caller's runtime
+  // worker while another worker updates the native session registry.
+  celer::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
+  celer::Task<ReplicationStatus> Observe() const;
 
-  // Controls the number of snapshot value reads each source flow may keep in
-  // flight during a full sync. The value is sampled for every snapshot batch,
-  // so CONFIG SET takes effect without reconnecting the replica.
-  absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept;
+  // Current runtime settings; all mutations enter through ApplyDirective.
   unsigned snapshot_read_concurrency() const noexcept;
-  absl::Status SetSnapshotBatchSize(std::size_t count) noexcept;
   std::size_t snapshot_batch_size() const noexcept;
 
-  // Changes the global in-memory backlog quota. Growth preserves the current
-  // history; shrinkage may advance individual flow floors at event boundaries.
-  celer::Task<absl::Status> SetBacklogSizeBytes(std::size_t bytes);
   std::size_t backlog_size_bytes() const noexcept;
-
-  celer::Task<absl::Status> SetPublishQueueBytesPerWorker(std::size_t bytes);
   std::size_t publish_queue_bytes_per_worker() const noexcept;
-
-  absl::Status SetReplicaPriority(unsigned priority) noexcept;
   unsigned replica_priority() const noexcept;
 
   // KLPSYNC and KLFLOW arrive as RESP commands on the ordinary Redis port.
@@ -175,9 +186,6 @@ class ReplicationManager {
       std::uint64_t client_id, std::string client_address, bool tls,
       bool eof_capable);
 
-  // Collects a consistent control-plane snapshot without blocking the caller's
-  // runtime worker when another worker is updating the native session registry.
-  celer::Task<ReplicationStatus> status() const;
   // Captures all source commands already queued on every worker. A missing
   // value means no native replication history is currently active; callers
   // may retry if they are waiting for a replica to connect.
@@ -193,6 +201,10 @@ class ReplicationManager {
   bool is_replica() const noexcept;
   bool is_loading() const noexcept;
   bool reject_writes() const noexcept;
+  // Changes before a topology directive retires or creates a publication
+  // history. Command admission uses it to reject writes delayed across that
+  // boundary.
+  std::uint64_t role_epoch() const noexcept;
   // Native Keylane replicas participate in cluster-style redirection. A
   // standalone Redis PSYNC follower instead serves its local read-only copy.
   bool redirects_clients_to_upstream() const noexcept;
@@ -201,8 +213,8 @@ class ReplicationManager {
   }
 
  private:
-  class Impl;
-  std::unique_ptr<Impl> impl_;
+  class ReplicationGroup;
+  std::unique_ptr<ReplicationGroup> group_;
   ReplicationOptions options_;
 };
 

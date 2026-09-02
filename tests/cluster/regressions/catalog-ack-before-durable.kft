@@ -1,0 +1,11 @@
+KFT1
+mode	exact-model
+scenario	cluster-mutant-catalog-ack-before-durable
+schema	1
+seed	7
+initial	CA65593EB675E5B7
+record	0	observation	world	phase%3D0%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	choice	action	acknowledge-catalog%3B0%3B
+record	1	ack	acknowledge-catalog	applied
+record	1	observation	world	phase%3D1%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	finding	function.catalog-durable-before-ack	replica-progress-before-durable-catalog

@@ -69,7 +69,7 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace keylane::storage;
-  static_assert(kStorageFormatVersion == 1);
+  static_assert(kStorageFormatVersion == 2);
 
   constexpr std::uint64_t device_id = kDeviceIdLimit - 2;
   constexpr std::uint32_t local_block =
@@ -134,6 +134,28 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   metadata_page.back() ^= std::byte{1};
   ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 11,
                                   &metadata_generation, decoded_payload));
+
+  SystemStateRoot system_root{
+      .magic_ = kSystemStateRootMagic,
+      .version_ = kStorageFormatVersion,
+      .root_bytes_ = sizeof(SystemStateRoot),
+      .generation_ = 41,
+      .manifest_ =
+          ExtentRef{
+              .block_id_ = block_id,
+              .allocation_epoch_ = 19,
+              .payload_bytes_ = 123,
+              .payload_checksum_ = 0x12345678,
+          },
+      .manifest_bytes_ = 123,
+  };
+  std::array<std::byte, sizeof(SystemStateRoot)> system_root_bytes{};
+  EncodeSystemStateRoot(system_root, system_root_bytes);
+  SystemStateRoot decoded_system_root;
+  ASSERT_TRUE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
+  EXPECT_EQ(decoded_system_root, system_root);
+  system_root_bytes[8] = std::byte{1};  // Version 1 is intentionally rejected.
+  EXPECT_FALSE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
 
   constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;
   static_assert(ScanBitmapBytes(one_pib_blocks) == 16 * 1024 * 1024);

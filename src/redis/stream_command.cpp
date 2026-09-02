@@ -1013,6 +1013,11 @@ Task<CommandReply> ExecuteRead(
       if (!slept.ok()) co_return Built(StorageError(builder, slept));
     }
     AttemptDbGuard db_guard(request.db_id_, owns_attempt_gate);
+    if (group_read && owns_attempt_gate &&
+        !CommandWriteAdmissionIsCurrent(request)) {
+      co_return Built(builder.AppendError(
+          "TRYAGAIN replication role changed; retry command"));
+    }
     std::vector<std::pair<std::string, std::vector<ReadOneResult::Item>>> found;
     for (std::size_t k = 0; k < key_count; ++k) {
       std::string key = a[first_key + k];

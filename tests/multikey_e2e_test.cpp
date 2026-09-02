@@ -55,6 +55,22 @@ class RespClient {
     return ReadReply();
   }
 
+  bool WaitForClose(std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      char byte = 0;
+      const ssize_t received = ::recv(fd_, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+      if (received == 0) return true;
+      if (received < 0 && errno != EINTR && errno != EAGAIN &&
+          errno != EWOULDBLOCK) {
+        Fail("recv failed while waiting for close: " +
+             std::string(std::strerror(errno)));
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    return false;
+  }
+
  private:
   std::string ReadReply() {
     const std::string line = ReadLine();
@@ -204,7 +220,8 @@ class ServerProcess {
                 std::string_view tx_active_pause_ms = {},
                 bool fail_tx_cleaner_once = false, unsigned threads = 4,
                 std::string_view order_hold_ms = {},
-                std::string_view standby_pause_ms = {}) {
+                std::string_view standby_pause_ms = {},
+                std::string_view fail_replication_transaction_containing = {}) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -230,6 +247,11 @@ class ServerProcess {
       if (!standby_pause_ms.empty()) {
         (void)::setenv("KEYLANE_STANDBY_PREFETCH_PAUSE_MS",
                        std::string(standby_pause_ms).c_str(), 1);
+      }
+      if (!fail_replication_transaction_containing.empty()) {
+        (void)::setenv(
+            "KEYLANE_FAIL_REPLICATION_TRANSACTION_CONTAINING_ONCE",
+            std::string(fail_replication_transaction_containing).c_str(), 1);
       }
       if (fail_tx_cleaner_once) {
         (void)::setenv("KEYLANE_FAIL_TX_CLEANER_ONCE", "1", 1);
@@ -309,21 +331,26 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-std::uint64_t InfoStat(RespClient& client, std::string_view marker) {
-  const std::string info = client.Command({"INFO", "STATS"});
+std::uint64_t InfoUnsigned(RespClient& client, std::string_view section,
+                           std::string_view marker) {
+  const std::string info = client.Command({"INFO", section});
   const std::size_t begin = info.find(marker);
   if (begin == std::string::npos) Fail("INFO field is missing");
   const std::size_t value_begin = begin + marker.size();
   const std::size_t value_end = info.find("\r\n", value_begin);
   if (value_end == std::string::npos) Fail("malformed INFO field");
-  std::uint64_t retired = 0;
+  std::uint64_t value = 0;
   const char* first = info.data() + value_begin;
   const char* last = info.data() + value_end;
-  const auto [parsed, error] = std::from_chars(first, last, retired);
+  const auto [parsed, error] = std::from_chars(first, last, value);
   if (error != std::errc{} || parsed != last) {
     Fail("invalid INFO counter");
   }
-  return retired;
+  return value;
+}
+
+std::uint64_t InfoStat(RespClient& client, std::string_view marker) {
+  return InfoUnsigned(client, "STATS", marker);
 }
 
 std::uint64_t TxCleanerRetiredGenerations(RespClient& client) {
@@ -1046,7 +1073,8 @@ int main(int argc, char** argv) {
       // Both log to log_path: the likeliest failures here are replica-side,
       // and that is the log the failure handler prints.
       ServerProcess replication_source(argv[1], source_port, source_data,
-                                       log_path);
+                                       log_path, {}, {}, false, 4, {}, {},
+                                       "catalog_failure");
       ServerProcess replication_replica(argv[1], replica_port, replica_data,
                                         log_path, {}, {}, false, 2);
       RespClient source_client = Connect(source_port);
@@ -1071,6 +1099,90 @@ int main(int argc, char** argv) {
       // opts into serving them locally.
       Expect(replica_client.Command({"READONLY"}), "+OK",
              "serve reads from the replica");
+
+      // Pin flow zero as the minimum acknowledged cursor by advancing every
+      // other source flow. The mixed EXEC below can then advance the scalar
+      // minimum only if its keyless catalog mutation contributes a real flow
+      // zero participant marker to the same replication transaction.
+      Expect(source_client.Command({"CLUSTER", "KEYSLOT", "bar"}), ":5061",
+             "catalog transaction worker-one key");
+      Expect(source_client.Command({"CLUSTER", "KEYSLOT", "foo"}), ":12182",
+             "catalog transaction worker-two key");
+      Expect(
+          source_client.Command({"CLUSTER", "KEYSLOT", "{user1000}.following"}),
+          ":3443", "catalog transaction worker-three key");
+      std::uint64_t catalog_flow_floor =
+          InfoUnsigned(source_client, "replication", "master_repl_offset:");
+      bool flow_zero_is_floor = false;
+      for (unsigned attempt = 0; attempt < 8 && !flow_zero_is_floor;
+           ++attempt) {
+        const std::string value = "floor:" + std::to_string(attempt);
+        Expect(source_client.Command({"MSET", "bar", value, "foo", value,
+                                      "{user1000}.following", value}),
+               "+OK", "advance non-catalog replication flows");
+        Expect(source_client.Command({"WAIT", "1", "30000"}), ":1",
+               "ack non-catalog replication flows");
+        const std::uint64_t next_floor =
+            InfoUnsigned(source_client, "replication", "master_repl_offset:");
+        flow_zero_is_floor = next_floor == catalog_flow_floor;
+        catalog_flow_floor = next_floor;
+      }
+      if (!flow_zero_is_floor) {
+        Fail("could not isolate flow zero as the acknowledged cursor floor");
+      }
+
+      constexpr std::string_view catalog_transaction_library =
+          "#!lua name=catalog_transaction\n"
+          "redis.register_function{function_name='catalog_transaction', "
+          "callback=function() return 1 end, flags={'no-writes'}}";
+      Expect(source_client.Command({"MULTI"}), "+OK",
+             "begin mixed catalog transaction");
+      Expect(source_client.Command({"MSET", "bar", "mixed", "foo", "mixed",
+                                    "{user1000}.following", "mixed"}),
+             "+QUEUED", "queue keyed catalog transaction child");
+      Expect(source_client.Command(
+                 {"FUNCTION", "LOAD", catalog_transaction_library}),
+             "+QUEUED", "queue Function catalog transaction child");
+      Expect(source_client.Command({"EXEC"}),
+             "*2\r\n+OK\r\n" + Bulk("catalog_transaction"),
+             "commit keyed Function catalog transaction");
+      Expect(source_client.Command({"WAIT", "1", "30000"}), ":1",
+             "ack keyed Function catalog transaction");
+      const std::uint64_t catalog_transaction_floor =
+          InfoUnsigned(source_client, "replication", "master_repl_offset:");
+      if (catalog_transaction_floor != catalog_flow_floor + 1) {
+        Fail("keyed Function EXEC did not publish one marker on every flow");
+      }
+      Expect(replica_client.Command({"FCALL_RO", "catalog_transaction", "0"}),
+             ":1", "replica applied Function child of keyed EXEC");
+
+      // The configured one-megabyte publisher waterline admits an oversized
+      // event only while it is exclusive. Waiting for a publication fence
+      // while retaining that reservation deadlocks against the fence's own
+      // admission. This mixed single-owner EXEC must release its outer
+      // reservation after every marker is committed and then finish normally.
+      std::string large_catalog_transaction_library =
+          "#!lua name=large_catalog_transaction\n--";
+      large_catalog_transaction_library.append(1200 * 1024, 'x');
+      large_catalog_transaction_library.append(
+          "\nredis.register_function{function_name="
+          "'large_catalog_transaction', callback=function() return 2 end, "
+          "flags={'no-writes'}}");
+      Expect(source_client.Command({"MULTI"}), "+OK",
+             "begin oversized catalog transaction");
+      Expect(source_client.Command({"SET", "bar", "oversized"}), "+QUEUED",
+             "queue oversized catalog transaction key");
+      Expect(source_client.Command(
+                 {"FUNCTION", "LOAD", large_catalog_transaction_library}),
+             "+QUEUED", "queue oversized Function catalog child");
+      Expect(source_client.Command({"EXEC"}),
+             "*2\r\n+OK\r\n" + Bulk("large_catalog_transaction"),
+             "commit oversized keyed Function catalog transaction");
+      Expect(source_client.Command({"WAIT", "1", "30000"}), ":1",
+             "ack oversized keyed Function catalog transaction");
+      Expect(replica_client.Command(
+                 {"FCALL_RO", "large_catalog_transaction", "0"}),
+             ":2", "replica applied oversized Function child");
 
       constexpr int kWideKeys = 24;
       constexpr int kWideRounds = 120;
@@ -1225,6 +1337,38 @@ int main(int argc, char** argv) {
       // admitted simply never answers.
       Expect(source_client.Command({"SET", "wide-multikey:after", "ok"}), "+OK",
              "source write after the wide multi-key burst");
+
+#ifndef NDEBUG
+      // Once a Function child has durably installed a catalog, losing any
+      // participant's transaction marker makes the source history unsafe.
+      // Inject that exact failure and require a top-level fail-closed EXEC;
+      // the process-wide LOADING fence must reject a fresh connection too.
+      constexpr std::string_view catalog_failure_library =
+          "#!lua name=catalog_failure\n"
+          "redis.register_function{function_name='catalog_failure', "
+          "callback=function() return 3 end, flags={'no-writes'}}";
+      Expect(source_client.Command({"MULTI"}), "+OK",
+             "begin failing catalog transaction");
+      Expect(source_client.Command({"SET", "bar", "catalog-failure"}),
+             "+QUEUED", "queue failing catalog transaction key");
+      Expect(
+          source_client.Command({"FUNCTION", "LOAD", catalog_failure_library}),
+          "+QUEUED", "queue failing Function catalog child");
+      const std::string failed_catalog_exec = source_client.Command({"EXEC"});
+      if (!failed_catalog_exec.starts_with(
+              "-ERR durable Function catalog committed but EXEC replication "
+              "failed:")) {
+        Fail("catalog publication failure returned '" + failed_catalog_exec +
+             "'");
+      }
+      if (!source_client.WaitForClose(5s)) {
+        Fail("catalog publication failure did not close the client");
+      }
+      RespClient fenced_source_client = Connect(source_port);
+      Expect(fenced_source_client.Command({"GET", "bar"}),
+             "-LOADING Keylane is loading the dataset from the primary",
+             "process fence after catalog publication failure");
+#endif
     }
 
 #ifndef NDEBUG
