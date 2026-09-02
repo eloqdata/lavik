@@ -7,8 +7,6 @@ namespace {
 
 constexpr std::uint64_t kCheckpointChunkMagic =
     0x314b4e5548434c4bULL;  // KLCHUNK1
-constexpr std::uint64_t kCheckpointEntryMagic =
-    0x315952544e454c4bULL;  // KLENTRY1
 constexpr std::uint32_t kCheckpointWireVersion = 1;
 
 enum CheckpointEntryFlag : std::uint8_t {
@@ -16,7 +14,25 @@ enum CheckpointEntryFlag : std::uint8_t {
   kKeyExternal = 1U << 1,
   kShielding = 1U << 2,
   kUnclaimed = 1U << 3,
+  kHasExpiry = 1U << 4,
 };
+
+constexpr std::uint32_t kCheckpointOwnerShift = 0;
+constexpr std::uint32_t kCheckpointDbShift = 10;
+constexpr std::uint32_t kCheckpointKindShift = 14;
+constexpr std::uint32_t kCheckpointTypeShift = 16;
+constexpr std::uint32_t kCheckpointFlagsShift = 19;
+constexpr std::uint32_t kCheckpointOwnerMask = 0x3ffU;
+constexpr std::uint32_t kCheckpointDbMask = 0xfU;
+constexpr std::uint32_t kCheckpointKindMask = 0x3U;
+constexpr std::uint32_t kCheckpointTypeMask = 0x7U;
+constexpr std::uint32_t kCheckpointFlagsMask = 0x1fU;
+constexpr std::uint32_t kCheckpointMetadataMask =
+    (kCheckpointOwnerMask << kCheckpointOwnerShift) |
+    (kCheckpointDbMask << kCheckpointDbShift) |
+    (kCheckpointKindMask << kCheckpointKindShift) |
+    (kCheckpointTypeMask << kCheckpointTypeShift) |
+    (kCheckpointFlagsMask << kCheckpointFlagsShift);
 
 struct CheckpointChunkHeader {
   std::uint64_t magic_ = kCheckpointChunkMagic;
@@ -28,29 +44,64 @@ struct CheckpointChunkHeader {
 };
 
 struct CheckpointEntryHeader {
-  std::uint64_t magic_ = kCheckpointEntryMagic;
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t mutation_sequence_ = 0;
-  std::uint64_t expire_at_ms_ = 0;
   std::uint64_t replication_epoch_ = 0;
-  std::uint32_t header_bytes_ = sizeof(CheckpointEntryHeader);
-  std::uint32_t entry_bytes_ = 0;
   std::uint32_t key_bytes_ = 0;
   std::uint32_t logical_size_ = 0;
   std::uint32_t record_offset_ = 0;
   std::uint32_t total_disk_bytes_ = 0;
   std::uint32_t extent_count_ = 0;
-  std::uint16_t block_owner_ = 0;
-  std::uint8_t db_id_ = 0;
-  RecordKind kind_ = RecordKind::kValue;
-  ValueType value_type_ = ValueType::kNone;
-  std::uint8_t flags_ = 0;
-  std::uint16_t reserved_ = 0;
+  // Owner, database, kind, value type, and flags occupy 24 bits. The upper
+  // bits must remain zero so format extensions cannot be misread silently.
+  std::uint32_t metadata_ = 0;
 };
 
 static_assert(std::is_trivially_copyable_v<CheckpointChunkHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
+static_assert(sizeof(CheckpointEntryHeader) == 56);
+static_assert(kMaxMemoryWorkers <= kCheckpointOwnerMask + 1);
+static_assert(kLogicalDatabaseCount <= kCheckpointDbMask + 1);
+static_assert(static_cast<std::uint8_t>(RecordKind::kTxCommit) <=
+              kCheckpointKindMask);
+static_assert(static_cast<std::uint8_t>(ValueType::kStream) <=
+              kCheckpointTypeMask);
+
+constexpr std::uint32_t EncodeCheckpointMetadata(
+    std::uint16_t block_owner, std::uint8_t db_id, RecordKind kind,
+    ValueType value_type, std::uint8_t flags) noexcept {
+  return (static_cast<std::uint32_t>(block_owner) << kCheckpointOwnerShift) |
+         (static_cast<std::uint32_t>(db_id) << kCheckpointDbShift) |
+         (static_cast<std::uint32_t>(kind) << kCheckpointKindShift) |
+         (static_cast<std::uint32_t>(value_type) << kCheckpointTypeShift) |
+         (static_cast<std::uint32_t>(flags) << kCheckpointFlagsShift);
+}
+
+constexpr std::uint16_t CheckpointBlockOwner(std::uint32_t metadata) noexcept {
+  return static_cast<std::uint16_t>((metadata >> kCheckpointOwnerShift) &
+                                    kCheckpointOwnerMask);
+}
+
+constexpr std::uint8_t CheckpointDb(std::uint32_t metadata) noexcept {
+  return static_cast<std::uint8_t>((metadata >> kCheckpointDbShift) &
+                                   kCheckpointDbMask);
+}
+
+constexpr RecordKind CheckpointKind(std::uint32_t metadata) noexcept {
+  return static_cast<RecordKind>((metadata >> kCheckpointKindShift) &
+                                 kCheckpointKindMask);
+}
+
+constexpr ValueType CheckpointValueType(std::uint32_t metadata) noexcept {
+  return static_cast<ValueType>((metadata >> kCheckpointTypeShift) &
+                                kCheckpointTypeMask);
+}
+
+constexpr std::uint8_t CheckpointFlags(std::uint32_t metadata) noexcept {
+  return static_cast<std::uint8_t>((metadata >> kCheckpointFlagsShift) &
+                                   kCheckpointFlagsMask);
+}
 
 template <typename T>
 void AppendPod(std::vector<std::byte>* output, const T& value) {
@@ -303,9 +354,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
           co_return absl::ResourceExhaustedError(
               "checkpoint extent manifest is too large");
         }
-        const std::size_t entry_bytes = sizeof(CheckpointEntryHeader) +
-                                        key.size() +
-                                        extent_count * sizeof(ExtentRef);
+        const bool has_expiry = location.expire_at_ms_ != 0;
+        const std::size_t entry_bytes =
+            sizeof(CheckpointEntryHeader) +
+            (has_expiry ? sizeof(std::uint64_t) : 0) + key.size() +
+            extent_count * sizeof(ExtentRef);
         if (entry_bytes > kExtentPayloadBytes - sizeof(CheckpointChunkHeader)) {
           co_return absl::ResourceExhaustedError(
               "one checkpoint index entry exceeds a storage block");
@@ -319,25 +372,25 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         if (location.key_external()) flags |= kKeyExternal;
         if (location.shielding()) flags |= kShielding;
         if (location.unclaimed()) flags |= kUnclaimed;
+        if (has_expiry) flags |= kHasExpiry;
         CheckpointEntryHeader encoded{
             .block_id_ = location.block_id(),
             .allocation_epoch_ = location.allocation_epoch(),
             .mutation_sequence_ = location.mutation_sequence_,
-            .expire_at_ms_ = location.expire_at_ms_,
             .replication_epoch_ = partition.replication_epoch_,
-            .entry_bytes_ = static_cast<std::uint32_t>(entry_bytes),
             .key_bytes_ = static_cast<std::uint32_t>(key.size()),
             .logical_size_ = location.logical_size_,
             .record_offset_ = location.record_offset(),
             .total_disk_bytes_ = location.total_disk_bytes(),
             .extent_count_ = static_cast<std::uint32_t>(extent_count),
-            .block_owner_ = location.block_owner(),
-            .db_id_ = db_id,
-            .kind_ = location.kind(),
-            .value_type_ = location.value_type(),
-            .flags_ = flags,
+            .metadata_ = EncodeCheckpointMetadata(
+                location.block_owner(), db_id, location.kind(),
+                location.value_type(), flags),
         };
         AppendPod(&payload, encoded);
+        if (has_expiry) {
+          AppendPod(&payload, location.expire_at_ms_);
+        }
         payload.insert(
             payload.end(), reinterpret_cast<const std::byte*>(key.data()),
             reinterpret_cast<const std::byte*>(key.data()) + key.size());
@@ -514,6 +567,29 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   if (!checkpoint_active_.load(std::memory_order_acquire)) {
     co_return absl::OkStatus();
   }
+  auto add_live_reference =
+      [result](RecoveryLiveReference reference) -> absl::Status {
+    auto [position, inserted] = result->live_by_block_.try_emplace(
+        reference.block_id_, reference);
+    if (inserted) return absl::OkStatus();
+    RecoveryLiveReference& aggregate = position->second;
+    if (aggregate.allocation_epoch_ != reference.allocation_epoch_ ||
+        aggregate.txid_ != reference.txid_ ||
+        aggregate.expected_owner_ != reference.expected_owner_ ||
+        aggregate.extent_ != reference.extent_ ||
+        (aggregate.extent_ &&
+         (aggregate.extent_payload_bytes_ != reference.extent_payload_bytes_ ||
+          aggregate.extent_index_ != reference.extent_index_ ||
+          aggregate.extent_payload_checksum_ !=
+              reference.extent_payload_checksum_)) ||
+        reference.bytes_ >
+            std::numeric_limits<std::uint32_t>::max() - aggregate.bytes_) {
+      return absl::InternalError(
+          "checkpoint has inconsistent live references for one block");
+    }
+    aggregate.bytes_ += reference.bytes_;
+    return absl::OkStatus();
+  };
   auto* data = static_cast<std::byte*>(celer::AllocateStorageBuffer(
       kStorageBlockBytes, options_.buffers_.alignment_));
   if (data == nullptr) {
@@ -671,22 +747,27 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         }
         CheckpointEntryHeader entry{};
         std::memcpy(&entry, cursor, sizeof(entry));
-        if (entry.magic_ != kCheckpointEntryMagic ||
-            entry.header_bytes_ != sizeof(entry) ||
-            entry.entry_bytes_ < sizeof(entry) ||
-            entry.entry_bytes_ > static_cast<std::size_t>(end - cursor) ||
-            entry.db_id_ >= kLogicalDatabaseCount ||
-            entry.block_owner_ >= worker_count_ ||
-            entry.replication_epoch_ == 0 || entry.reserved_ != 0 ||
-            (entry.flags_ &
-             ~(kExternal | kKeyExternal | kShielding | kUnclaimed)) != 0 ||
-            (entry.kind_ != RecordKind::kValue &&
-             entry.kind_ != RecordKind::kTombstone) ||
-            (entry.kind_ == RecordKind::kTombstone &&
-             entry.value_type_ != ValueType::kNone) ||
-            (entry.kind_ == RecordKind::kValue &&
-             (entry.value_type_ < ValueType::kString ||
-              entry.value_type_ > ValueType::kStream)) ||
+        const std::uint16_t block_owner =
+            CheckpointBlockOwner(entry.metadata_);
+        const std::uint8_t db_id = CheckpointDb(entry.metadata_);
+        const RecordKind kind = CheckpointKind(entry.metadata_);
+        const ValueType value_type = CheckpointValueType(entry.metadata_);
+        const std::uint8_t flags = CheckpointFlags(entry.metadata_);
+        const bool has_expiry = (flags & kHasExpiry) != 0;
+        const std::size_t fixed_bytes =
+            sizeof(entry) + (has_expiry ? sizeof(std::uint64_t) : 0);
+        if ((entry.metadata_ & ~kCheckpointMetadataMask) != 0 ||
+            db_id >= kLogicalDatabaseCount || block_owner >= worker_count_ ||
+            entry.replication_epoch_ == 0 ||
+            (flags & ~(kExternal | kKeyExternal | kShielding | kUnclaimed |
+                       kHasExpiry)) != 0 ||
+            (kind != RecordKind::kValue &&
+             kind != RecordKind::kTombstone) ||
+            (kind == RecordKind::kTombstone &&
+             value_type != ValueType::kNone) ||
+            (kind == RecordKind::kValue &&
+             (value_type < ValueType::kString ||
+              value_type > ValueType::kStream)) ||
             entry.logical_size_ > RecordIndexValue::kLogicalSizeMask ||
             entry.record_offset_ < kBlockHeaderBytes ||
             entry.record_offset_ % kRecordAlignment != 0 ||
@@ -695,14 +776,29 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             static_cast<std::uint64_t>(entry.record_offset_) +
                     entry.total_disk_bytes_ >
                 kStorageBlockBytes ||
-            entry.entry_bytes_ !=
-                sizeof(entry) + entry.key_bytes_ +
-                    static_cast<std::size_t>(entry.extent_count_) *
-                        sizeof(ExtentRef)) {
+            fixed_bytes > static_cast<std::size_t>(end - cursor) ||
+            entry.key_bytes_ >
+                static_cast<std::size_t>(end - cursor) - fixed_bytes ||
+            entry.extent_count_ >
+                (static_cast<std::size_t>(end - cursor) - fixed_bytes -
+                 entry.key_bytes_) /
+                    sizeof(ExtentRef)) {
           co_return absl::InternalError("invalid checkpoint entry");
         }
+        const std::size_t entry_bytes =
+            fixed_bytes + entry.key_bytes_ +
+            static_cast<std::size_t>(entry.extent_count_) * sizeof(ExtentRef);
+        std::uint64_t expire_at_ms = 0;
+        if (has_expiry) {
+          std::memcpy(&expire_at_ms, cursor + sizeof(entry),
+                      sizeof(expire_at_ms));
+          if (expire_at_ms == 0) {
+            co_return absl::InternalError(
+                "checkpoint expiry extension is zero");
+          }
+        }
         const char* key_data =
-            reinterpret_cast<const char*>(cursor + sizeof(entry));
+            reinterpret_cast<const char*>(cursor + fixed_bytes);
         std::string key(key_data, entry.key_bytes_);
         if (RedisSlot(key) % worker_count_ != block.extent_index_) {
           co_return absl::InternalError("checkpoint key is in the wrong shard");
@@ -712,12 +808,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           auto mutable_extents =
               std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
           std::memcpy(mutable_extents->data(),
-                      cursor + sizeof(entry) + entry.key_bytes_,
+                      cursor + fixed_bytes + entry.key_bytes_,
                       entry.extent_count_ * sizeof(ExtentRef));
           extents = std::move(mutable_extents);
         }
-        const bool external = (entry.flags_ & kExternal) != 0;
-        const bool key_external = (entry.flags_ & kKeyExternal) != 0;
+        const bool external = (flags & kExternal) != 0;
+        const bool key_external = (flags & kKeyExternal) != 0;
         if (external != (extents != nullptr) ||
             !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
                                                     entry.allocation_epoch_)) {
@@ -727,24 +823,47 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         RecoveryRecord record{
             .digest_ = digest,
             .key_ = std::move(key),
-            .db_id_ = entry.db_id_,
+            .db_id_ = db_id,
             .txid_ = 0,
             .lsn_ = std::numeric_limits<std::uint64_t>::max(),
             .replication_epoch_ = entry.replication_epoch_,
             .location_ = RecordLocation(
                 entry.block_id_, entry.mutation_sequence_,
-                entry.allocation_epoch_, entry.expire_at_ms_,
+                entry.allocation_epoch_, expire_at_ms,
                 entry.logical_size_,
                 RecordLocation::PackedMetadata::Encode(
                     entry.record_offset_, entry.total_disk_bytes_,
-                    entry.block_owner_, false, external, key_external,
-                    (entry.flags_ & kShielding) != 0,
-                    (entry.flags_ & kUnclaimed) != 0, false, entry.kind_,
-                    entry.value_type_)),
+                    block_owner, false, external, key_external,
+                    (flags & kShielding) != 0,
+                    (flags & kUnclaimed) != 0, false, kind, value_type)),
             .extents_ = std::move(extents),
+            .checkpoint_snapshot_ = true,
         };
+        absl::Status live = add_live_reference(RecoveryLiveReference{
+            .block_id_ = entry.block_id_,
+            .allocation_epoch_ = entry.allocation_epoch_,
+            .bytes_ = entry.total_disk_bytes_,
+            .expected_owner_ = block_owner,
+        });
+        if (!live.ok()) co_return live;
+        if (record.extents_ != nullptr) {
+          for (std::size_t extent_index = 0;
+               extent_index < record.extents_->size(); ++extent_index) {
+            const ExtentRef& extent = record.extents_->at(extent_index);
+            live = add_live_reference(RecoveryLiveReference{
+                .block_id_ = extent.block_id_,
+                .allocation_epoch_ = extent.allocation_epoch_,
+                .bytes_ = extent.payload_bytes_,
+                .extent_ = true,
+                .extent_payload_bytes_ = extent.payload_bytes_,
+                .extent_index_ = static_cast<std::uint32_t>(extent_index),
+                .extent_payload_checksum_ = extent.payload_checksum_,
+            });
+            if (!live.ok()) co_return live;
+          }
+        }
         recovered.records_.push_back(std::move(record));
-        cursor += entry.entry_bytes_;
+        cursor += entry_bytes;
         ++result->entry_count_;
       }
       if (cursor != end) {

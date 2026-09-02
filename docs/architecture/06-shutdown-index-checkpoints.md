@@ -51,10 +51,12 @@ per-device 1 PiB limit).
 Each worker serializes its frozen indexes into one or more 8 MiB checkpoint
 index blocks. An entry contains the complete key, database and partition
 epoch, physical record location, logical type and size, expiry and shielding
-state, and any extent manifest. It never stores the process-random key digest;
-startup recomputes that digest from the complete key. Each index block carries
-its generation, shard, entry count, payload size, and payload checksum in its
-existing block header.
+state, and any extent manifest. The fixed entry header packs owner, database,
+type and flags into one metadata word, derives entry bounds from the chunk and
+field lengths, and stores expiry only when present. It never stores the
+process-random key digest; startup recomputes that digest from the complete
+key. Each index block carries its generation, shard, entry count, payload size,
+and payload checksum in its existing block header.
 
 Publication order is:
 
@@ -124,10 +126,13 @@ O(allocated block headers + checkpoint bytes + transaction block bytes)
 ```
 
 Recovery still walks the rebuilt winner indexes once to charge live roots and
-extents to physical block owners. The speedup comes from replacing full
-ordinary-block reads and obsolete-version decoding with a compact sequential
-representation of current index entries; it does not make startup independent
-of allocated-block count.
+extents to physical block owners after a cold scan. A successful checkpoint
+load instead aggregates those references by physical block while decoding and
+applies the aggregates after the block-header scan establishes their runtime
+owners. The speedup comes from replacing full ordinary-block reads,
+obsolete-version decoding, and the second winner-index walk with a compact
+sequential representation of current index entries; it does not make startup
+independent of allocated-block count.
 
 ## Source map
 

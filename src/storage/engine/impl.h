@@ -869,6 +869,13 @@ struct RecoveryRecord {
   std::uint64_t replication_epoch_ = 1;
   RecordLocation location_{};
   ExtentManifest extents_;
+  // A validated checkpoint entry already names the winner selected at clean
+  // shutdown. Successful checkpoint recovery must not retain a second
+  // pointer-to-LSN hash table for every key merely to protect that winner
+  // from equal-sequence copies; checkpoint_active_ provides that protection.
+  // If validation later falls back to a cold scan, InitializeWorker first
+  // materializes the equivalent UINT64_MAX markers for the loaded prefix.
+  bool checkpoint_snapshot_ = false;
 };
 
 struct RecoveryBlock {
@@ -892,8 +899,18 @@ struct RecoveryLiveReference {
   std::uint64_t block_id_ = 0;
   std::uint64_t allocation_epoch_ = 0;
   std::uint64_t txid_ = 0;
+  // Total bytes charged for live references. Shared extents can contribute
+  // the same physical payload more than once, so this may exceed the block's
+  // committed payload size after checkpoint aggregation.
   std::uint32_t bytes_ = 0;
+  // Checkpoint decoding happens before block headers establish runtime
+  // ownership. Root records retain the owner serialized in their location;
+  // extents leave this unowned and resolve it after the header scan.
+  std::uint16_t expected_owner_ = kUnownedBlock;
   bool extent_ = false;
+  // The physical payload size used to validate one extent block. Keep it
+  // separate from bytes_, which is reference-counted accounting.
+  std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_index_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
 };
@@ -1407,6 +1424,11 @@ struct CheckpointLoadResult {
   std::vector<std::uint64_t> blocks_;
   std::uint64_t entry_count_ = 0;
   std::vector<bool> saw_shards_;
+  // Successful checkpoint recovery already visits every winner while
+  // decoding. Aggregate physical live bytes by block here so startup need not
+  // walk the complete rebuilt key index a second time. A failed checkpoint
+  // discards these tentative aggregates and cold recovery accounts winners.
+  absl::flat_hash_map<std::uint64_t, RecoveryLiveReference> live_by_block_;
 };
 
 struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
@@ -3418,6 +3440,10 @@ class StorageEngine::Impl {
   std::uint64_t recovery_allocated_blocks_ = 0;
   std::atomic<std::int64_t> recovery_next_log_ms_{0};
   std::atomic<bool> recovery_complete_logged_{false};
+  // A structurally invalid checkpoint can leave a validated prefix installed
+  // before ordinary recovery takes over. Workers use this flag to materialize
+  // winner-order markers for that prefix before scanning record bodies.
+  std::atomic<bool> checkpoint_load_fell_back_{false};
   std::int64_t recovery_started_ms_ = 0;
   static constexpr std::size_t kDefragReserveBlocksPerDevice = 8;
   std::array<std::atomic<std::uint64_t>, kLogicalDatabaseCount> db_epochs_{};

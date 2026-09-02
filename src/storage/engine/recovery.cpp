@@ -687,11 +687,18 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
     // whichever version currently wins learns whether a strictly older,
     // still-unexpired value remains on disk. Equal sequences are relocated
     // copies of the same version and shield nothing.
-    const std::uint64_t current_lsn =
-        found == nullptr ? 0
-                         : (store.recovery_lsns_.contains(found)
-                                ? store.recovery_lsns_.at(found)
-                                : 0);
+    std::uint64_t current_lsn = 0;
+    if (found != nullptr) {
+      const auto recovered_lsn = store.recovery_lsns_.find(found);
+      if (recovered_lsn != store.recovery_lsns_.end()) {
+        current_lsn = recovered_lsn->second;
+      } else if (checkpoint_active_.load(std::memory_order_acquire)) {
+        // Checkpoint entries are the clean-shutdown winners. Avoid retaining
+        // one redundant hash-table node per key on the successful path while
+        // still preventing an equal-sequence stale copy from replacing one.
+        current_lsn = std::numeric_limits<std::uint64_t>::max();
+      }
+    }
     const bool candidate_newer = found == nullptr ||
                                  recovered.location_.mutation_sequence_ >
                                      found->value_.mutation_sequence_ ||
@@ -727,22 +734,24 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
         AddFullSyncCoverageEntry(partition, recovered.db_id_,
                                  recovered.key_.size());
       }
-      store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
+      if (!recovered.checkpoint_snapshot_) {
+        store.recovery_lsns_.insert_or_assign(winner_entry, recovered.lsn_);
+      }
       if (recovered.txid_ != 0) {
         store.recovery_txids_.insert_or_assign(winner_entry, recovered.txid_);
-      } else {
+      } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
         store.recovery_txids_.erase(winner_entry);
       }
       if (winner.external()) {
         store.external_manifests_.insert_or_assign(winner_entry,
                                                    recovered.extents_);
-      } else {
+      } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
         store.external_manifests_.erase(winner_entry);
       }
       if (winner.key_external()) [[unlikely]] {
         store.recovery_external_keys_.insert_or_assign(winner_entry,
                                                        recovered.key_);
-      } else {
+      } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
         store.recovery_external_keys_.erase(winner_entry);
       }
       if (was_live != is_live) {

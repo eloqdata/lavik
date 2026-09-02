@@ -859,7 +859,9 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
           const auto found =
               owner_store.recovered_extents_.find(reference.block_id_);
           if (state->kind_ != BlockKind::kPayloadExtent ||
-              state->committed_bytes_ != kBlockHeaderBytes + reference.bytes_ ||
+              reference.extent_payload_bytes_ == 0 ||
+              state->committed_bytes_ !=
+                  kBlockHeaderBytes + reference.extent_payload_bytes_ ||
               found == owner_store.recovered_extents_.end() ||
               found->second.extent_index_ != reference.extent_index_ ||
               found->second.payload_checksum_ !=
@@ -1025,6 +1027,7 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
             "shutdown checkpoint generation={} is unusable; falling back "
             "to record scan: {}",
             checkpoint_root_.generation_, load_status.message());
+        checkpoint_load_fell_back_.store(true, std::memory_order_release);
         checkpoint_active_.store(false, std::memory_order_release);
       } else {
         checkpoint_loaded_block_count_ = loaded_blocks;
@@ -1065,10 +1068,28 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     }
   } else {
     checkpoint_load.blocks_.clear();
+    checkpoint_load.live_by_block_.clear();
+    checkpoint_load.live_by_block_.rehash(0);
   }
 
   status = co_await checkpoint_retired_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
+
+  if (checkpoint_load_fell_back_.load(std::memory_order_acquire)) {
+    // Checkpoint chunks become visible only after their CRC and structure
+    // validate, but a later chunk can still invalidate the whole snapshot.
+    // Mark the already-installed prefix as newer than equal-sequence disk
+    // copies before the cold scan merges them. The successful path avoids
+    // this O(keys) auxiliary hash table entirely.
+    for (auto& partition : store.partitions_) {
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        partition.indexes_[db_id].ForEach([&](RecordIndex::Entry& entry) {
+          store.recovery_lsns_.insert_or_assign(
+              &entry, std::numeric_limits<std::uint64_t>::max());
+        });
+      }
+    }
+  }
 
   absl::flat_hash_set<std::uint64_t> committed_txids;
   status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
@@ -1199,76 +1220,111 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         std::memory_order_relaxed);
   }
 
-  // The winner index is already entirely resident at this point. Walk it once
-  // with an exact resumable cursor, but send physical accounting to block
-  // owners in byte-bounded batches instead of retaining one reference per live
-  // key until the whole pass completes. A single external value's manifest
-  // stays indivisible, so it may take a batch just over the target.
   const std::size_t batch_target_bytes =
       RecoveryWorkerBatchTargetBytes(worker_count_);
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
   std::size_t buffered_bytes = 0;
-  for (auto& partition : store.partitions_) {
-    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      auto& index = partition.indexes_[db_id];
-      RecordIndex::StableScanCursor cursor;
-      bool exhausted = false;
-      while (!exhausted) {
-        exhausted = index.ScanStableWhile(
-            &cursor, [&](const RecordIndex::Entry& entry) {
-              const RecordLocation location = MaterializeIndexLocation(entry);
-              if (location.block_owner() >= worker_count_) {
-                status = absl::InternalError(
-                    "recovery live root has no scanned block owner");
-                return false;
-              }
-              live_by_owner[location.block_owner()].push_back(
-                  RecoveryLiveReference{
-                      .block_id_ = location.block_id(),
-                      .allocation_epoch_ = location.allocation_epoch(),
-                      .txid_ = store.recovery_txids_.contains(&entry)
-                                   ? store.recovery_txids_.at(&entry)
-                                   : 0,
-                      .bytes_ = location.total_disk_bytes(),
-                  });
-              buffered_bytes += sizeof(RecoveryLiveReference);
-              const ExtentManifest extents = ExtentsFor(store, &entry);
-              if (location.external() && extents != nullptr) {
-                for (std::size_t extent_index = 0;
-                     extent_index < extents->size(); ++extent_index) {
-                  const ExtentRef& extent = extents->at(extent_index);
-                  const std::uint16_t extent_owner =
-                      BlockOwner(extent.block_id_);
-                  if (extent_owner >= worker_count_) {
-                    status = absl::InternalError(
-                        "manifest references an unscanned extent");
-                    return false;
-                  }
-                  live_by_owner[extent_owner].push_back(RecoveryLiveReference{
-                      .block_id_ = extent.block_id_,
-                      .allocation_epoch_ = extent.allocation_epoch_,
-                      .bytes_ = extent.payload_bytes_,
-                      .extent_ = true,
-                      .extent_index_ = static_cast<std::uint32_t>(extent_index),
-                      .extent_payload_checksum_ = extent.payload_checksum_,
-                  });
-                  buffered_bytes += sizeof(RecoveryLiveReference);
-                }
-              }
-              return buffered_bytes < batch_target_bytes;
-            });
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
+    // Decoding already aggregated the clean snapshot by physical block. Route
+    // those bounded aggregates now that the header scan has established block
+    // owners, avoiding a second O(keys) walk over the rebuilt index.
+    for (auto& [block_id, reference] : checkpoint_load.live_by_block_) {
+      const std::uint16_t owner = BlockOwner(block_id);
+      if (owner >= worker_count_ ||
+          (reference.expected_owner_ != kUnownedBlock &&
+           reference.expected_owner_ != owner)) {
+        status = absl::InternalError(
+            "checkpoint live reference has no matching scanned block owner");
+        Fail(status);
+        co_return status;
+      }
+      live_by_owner[owner].push_back(reference);
+      buffered_bytes += sizeof(RecoveryLiveReference);
+      if (buffered_bytes >= batch_target_bytes) {
+        status =
+            co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
         if (!status.ok()) {
           Fail(status);
           co_return status;
         }
-        if (buffered_bytes >= batch_target_bytes) {
-          status =
-              co_await ApplyRecoveryLiveReferenceBatches(store, &live_by_owner);
+        buffered_bytes = 0;
+      }
+    }
+    checkpoint_load.live_by_block_.clear();
+    checkpoint_load.live_by_block_.rehash(0);
+  } else {
+    // Cold recovery can install multiple versions before choosing winners.
+    // Walk the final index with an exact resumable cursor and send physical
+    // accounting in bounded batches instead of retaining one reference per
+    // live key until the complete pass finishes.
+    for (auto& partition : store.partitions_) {
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        auto& index = partition.indexes_[db_id];
+        RecordIndex::StableScanCursor cursor;
+        bool exhausted = false;
+        while (!exhausted) {
+          exhausted = index.ScanStableWhile(
+              &cursor, [&](const RecordIndex::Entry& entry) {
+                const RecordLocation location = MaterializeIndexLocation(entry);
+                if (location.block_owner() >= worker_count_) {
+                  status = absl::InternalError(
+                      "recovery live root has no scanned block owner");
+                  return false;
+                }
+                live_by_owner[location.block_owner()].push_back(
+                    RecoveryLiveReference{
+                        .block_id_ = location.block_id(),
+                        .allocation_epoch_ = location.allocation_epoch(),
+                        .txid_ = store.recovery_txids_.contains(&entry)
+                                     ? store.recovery_txids_.at(&entry)
+                                     : 0,
+                        .bytes_ = location.total_disk_bytes(),
+                        .expected_owner_ = location.block_owner(),
+                    });
+                buffered_bytes += sizeof(RecoveryLiveReference);
+                const ExtentManifest extents = ExtentsFor(store, &entry);
+                if (location.external() && extents != nullptr) {
+                  for (std::size_t extent_index = 0;
+                       extent_index < extents->size(); ++extent_index) {
+                    const ExtentRef& extent = extents->at(extent_index);
+                    const std::uint16_t extent_owner =
+                        BlockOwner(extent.block_id_);
+                    if (extent_owner >= worker_count_) {
+                      status = absl::InternalError(
+                          "manifest references an unscanned extent");
+                      return false;
+                    }
+                    live_by_owner[extent_owner].push_back(
+                        RecoveryLiveReference{
+                            .block_id_ = extent.block_id_,
+                            .allocation_epoch_ = extent.allocation_epoch_,
+                            .bytes_ = extent.payload_bytes_,
+                            .expected_owner_ = extent_owner,
+                            .extent_ = true,
+                            .extent_payload_bytes_ = extent.payload_bytes_,
+                            .extent_index_ =
+                                static_cast<std::uint32_t>(extent_index),
+                            .extent_payload_checksum_ =
+                                extent.payload_checksum_,
+                        });
+                    buffered_bytes += sizeof(RecoveryLiveReference);
+                  }
+                }
+                return buffered_bytes < batch_target_bytes;
+              });
           if (!status.ok()) {
             Fail(status);
             co_return status;
           }
-          buffered_bytes = 0;
+          if (buffered_bytes >= batch_target_bytes) {
+            status = co_await ApplyRecoveryLiveReferenceBatches(
+                store, &live_by_owner);
+            if (!status.ok()) {
+              Fail(status);
+              co_return status;
+            }
+            buffered_bytes = 0;
+          }
         }
       }
     }
