@@ -731,7 +731,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   const bool checkpoint_root_valid =
       checkpoint_root_.generation_ != 0 &&
       checkpoint_root_.generation_ > checkpoint_root_.consumed_generation_ &&
-      checkpoint_root_.block_count_ >= worker_count_ &&
+      checkpoint_root_.block_count_ >= 2 * worker_count_ &&
       checkpoint_root_.block_count_ <= recovery_allocated_blocks_;
   const bool checkpoint_bitmaps_valid = std::all_of(
       device_allocators_.begin(), device_allocators_.end(),
@@ -831,6 +831,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   checkpoint_load_results_.resize(worker_count);
   for (CheckpointLoadResult& result : checkpoint_load_results_) {
     result.saw_shards_.resize(worker_count, false);
+    result.saw_accounting_shards_.resize(worker_count, false);
   }
   return absl::OkStatus();
 }
@@ -870,7 +871,16 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryLiveReferenceBatches(
                                 "live extent header does not match manifest");
           }
         }
-        state->live_bytes_ += reference.bytes_;
+        if (reference.replace_live_bytes_) {
+          if (reference.txid_ != 0 || state->live_bytes_ != 0) {
+            return absl::Status(
+                absl::StatusCode::kInternal,
+                "checkpoint accounting repeats an initialized block");
+          }
+          state->live_bytes_ = reference.bytes_;
+        } else {
+          state->live_bytes_ += reference.bytes_;
+        }
         if (reference.txid_ != 0) {
           const auto tx_block =
               owner_store.tx_blocks_.find(reference.block_id_);
@@ -986,7 +996,9 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       absl::Status load_status = absl::OkStatus();
       std::uint64_t loaded_blocks = 0;
       std::uint64_t loaded_entries = 0;
+      std::uint64_t loaded_accounting_entries = 0;
       std::vector<bool> saw_shards(worker_count_, false);
+      std::vector<bool> saw_accounting_shards(worker_count_, false);
       for (const CheckpointLoadResult& loaded : checkpoint_load_results_) {
         if (load_status.ok() && !loaded.status_.ok()) {
           load_status = loaded.status_;
@@ -994,7 +1006,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         if (std::numeric_limits<std::uint64_t>::max() - loaded_blocks <
                 loaded.blocks_.size() ||
             std::numeric_limits<std::uint64_t>::max() - loaded_entries <
-                loaded.entry_count_) {
+                loaded.entry_count_ ||
+            std::numeric_limits<std::uint64_t>::max() -
+                    loaded_accounting_entries <
+                loaded.accounting_entry_count_) {
           if (load_status.ok()) {
             load_status =
                 absl::InternalError("checkpoint decoded totals overflow");
@@ -1003,9 +1018,13 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         }
         loaded_blocks += loaded.blocks_.size();
         loaded_entries += loaded.entry_count_;
+        loaded_accounting_entries += loaded.accounting_entry_count_;
         for (unsigned shard = 0; shard < worker_count_; ++shard) {
           saw_shards[shard] =
               saw_shards[shard] || loaded.saw_shards_[shard];
+          saw_accounting_shards[shard] =
+              saw_accounting_shards[shard] ||
+              loaded.saw_accounting_shards_[shard];
         }
       }
       if (load_status.ok() &&
@@ -1022,6 +1041,13 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
         load_status =
             absl::InternalError("checkpoint bitmap omits a worker shard");
       }
+      if (load_status.ok() &&
+          std::find(saw_accounting_shards.begin(),
+                    saw_accounting_shards.end(), false) !=
+              saw_accounting_shards.end()) {
+        load_status = absl::InternalError(
+            "checkpoint bitmap omits a worker accounting shard");
+      }
       if (!load_status.ok()) {
         spdlog::warn(
             "shutdown checkpoint generation={} is unusable; falling back "
@@ -1032,10 +1058,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       } else {
         checkpoint_loaded_block_count_ = loaded_blocks;
         spdlog::info(
-            "loaded shutdown checkpoint generation={} entries={} blocks={} "
-            "scan-workers={}",
-            checkpoint_root_.generation_, loaded_entries, loaded_blocks,
-            worker_count_);
+            "loaded shutdown checkpoint generation={} entries={} "
+            "accounting-entries={} blocks={} scan-workers={}",
+            checkpoint_root_.generation_, loaded_entries,
+            loaded_accounting_entries, loaded_blocks, worker_count_);
       }
     }
 
@@ -1225,9 +1251,10 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
   std::size_t buffered_bytes = 0;
   if (checkpoint_active_.load(std::memory_order_acquire)) {
-    // Decoding already aggregated the clean snapshot by physical block. Route
-    // those bounded aggregates now that the header scan has established block
-    // owners, avoiding a second O(keys) walk over the rebuilt index.
+    // The checkpoint persisted one absolute live-byte value per physical
+    // block. Route that bounded table now that the header scan has established
+    // block owners, avoiding both per-key aggregation and a second O(keys)
+    // walk over the rebuilt index.
     for (auto& [block_id, reference] : checkpoint_load.live_by_block_) {
       const std::uint16_t owner = BlockOwner(block_id);
       if (owner >= worker_count_ ||

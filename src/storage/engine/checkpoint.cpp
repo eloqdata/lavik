@@ -9,6 +9,11 @@ constexpr std::uint64_t kCheckpointChunkMagic =
     0x314b4e5548434c4bULL;  // KLCHUNK1
 constexpr std::uint32_t kCheckpointWireVersion = 1;
 
+enum class CheckpointChunkKind : std::uint32_t {
+  kIndexEntries = 1,
+  kBlockAccounting = 2,
+};
+
 enum CheckpointEntryFlag : std::uint8_t {
   kExternal = 1U << 0,
   kKeyExternal = 1U << 1,
@@ -40,7 +45,9 @@ struct CheckpointChunkHeader {
   std::uint32_t version_ = kCheckpointWireVersion;
   std::uint32_t header_bytes_ = sizeof(CheckpointChunkHeader);
   std::uint32_t shard_id_ = 0;
+  CheckpointChunkKind kind_ = CheckpointChunkKind::kIndexEntries;
   std::uint32_t entry_count_ = 0;
+  std::uint32_t reserved_ = 0;
 };
 
 struct CheckpointEntryHeader {
@@ -58,9 +65,28 @@ struct CheckpointEntryHeader {
   std::uint32_t metadata_ = 0;
 };
 
+struct CheckpointAccountingEntry {
+  std::uint64_t block_id_ = 0;
+  std::uint64_t allocation_epoch_ = 0;
+  std::uint32_t live_bytes_ = 0;
+  // Extent identity remains outside the dense runtime BlockState. Persist it
+  // here so restoring accounting preserves the same manifest/header checks as
+  // cold recovery without charging ordinary blocks more resident memory.
+  std::uint32_t extent_payload_bytes_ = 0;
+  std::uint32_t extent_index_ = 0;
+  std::uint32_t extent_payload_checksum_ = 0;
+  std::uint16_t owner_ = kUnownedBlock;
+  std::uint8_t extent_ = 0;
+  std::uint8_t reserved_ = 0;
+  std::uint32_t reserved_tail_ = 0;
+};
+
 static_assert(std::is_trivially_copyable_v<CheckpointChunkHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
+static_assert(std::is_trivially_copyable_v<CheckpointAccountingEntry>);
+static_assert(sizeof(CheckpointChunkHeader) == 40);
 static_assert(sizeof(CheckpointEntryHeader) == 56);
+static_assert(sizeof(CheckpointAccountingEntry) == 40);
 static_assert(kMaxMemoryWorkers <= kCheckpointOwnerMask + 1);
 static_assert(kLogicalDatabaseCount <= kCheckpointDbMask + 1);
 static_assert(static_cast<std::uint8_t>(RecordKind::kTxCommit) <=
@@ -124,6 +150,205 @@ bool CheckpointBlockAllocated(
   return (std::to_integer<unsigned>(allocator.scan_bitmap_[local / 8]) &
           (1U << (local % 8))) != 0;
 }
+
+// A checkpoint reader alternates two of these slots. Each slot submits the
+// header immediately and chains the payload read from that completion, so the
+// next block remains in flight while the worker decodes the current block.
+// State and its DMA buffer outlive the owning coroutine if recovery abandons a
+// prefetch after detecting corruption; the I/O completion then reclaims both.
+class CheckpointPrefetchSlot {
+  struct State;
+
+ public:
+  using Result = absl::StatusOr<std::optional<BlockHeader>>;
+
+  CheckpointPrefetchSlot() = default;
+  CheckpointPrefetchSlot(const CheckpointPrefetchSlot&) = delete;
+  CheckpointPrefetchSlot& operator=(const CheckpointPrefetchSlot&) = delete;
+  ~CheckpointPrefetchSlot() { Release(); }
+
+  absl::Status Initialize(std::size_t alignment) {
+    assert(state_ == nullptr);
+    State* state = new (std::nothrow) State(alignment);
+    if (state == nullptr || state->data_ == nullptr) {
+      delete state;
+      return absl::ResourceExhaustedError(
+          "failed to allocate checkpoint prefetch buffer");
+    }
+    state_ = state;
+    return absl::OkStatus();
+  }
+
+  void Start(Worker& worker, FixedFile file, std::uint64_t offset,
+             std::uint64_t block_id, std::uint64_t generation,
+             unsigned worker_count) {
+    assert(state_ != nullptr);
+    assert(!state_->active_);
+    state_->Start(worker, file, offset, block_id, generation, worker_count);
+  }
+
+  struct Awaiter {
+    State* state_;
+
+    bool await_ready() const noexcept { return state_->complete_; }
+
+    bool await_suspend(std::coroutine_handle<> awaiting) noexcept {
+      assert(!state_->complete_);
+      assert(!state_->waiter_);
+      state_->waiter_ = awaiting;
+      return true;
+    }
+
+    Result await_resume() {
+      assert(state_->complete_);
+      assert(state_->result_.has_value());
+      state_->active_ = false;
+      state_->complete_ = false;
+      Result result = std::move(*state_->result_);
+      state_->result_.reset();
+      return result;
+    }
+  };
+
+  Awaiter Wait() noexcept {
+    assert(state_ != nullptr);
+    assert(state_->active_);
+    return Awaiter{state_};
+  }
+
+  std::byte* data() const noexcept {
+    assert(state_ != nullptr);
+    return state_->data_;
+  }
+
+ private:
+  struct State final : celer::IoCompletion {
+    explicit State(std::size_t alignment)
+        : data_(static_cast<std::byte*>(
+              celer::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
+          alignment_(alignment) {}
+
+    ~State() override {
+      celer::FreeStorageBuffer(data_, alignment_);
+    }
+
+    void Start(Worker& worker, FixedFile file, std::uint64_t offset,
+               std::uint64_t block_id, std::uint64_t generation,
+               unsigned worker_count) {
+      worker_ = &worker;
+      file_ = file;
+      offset_ = offset;
+      block_id_ = block_id;
+      generation_ = generation;
+      worker_count_ = worker_count;
+      phase_ = Phase::kHeader;
+      active_ = true;
+      complete_ = false;
+      orphaned_ = false;
+      waiter_ = {};
+      result_.reset();
+      absl::Status submitted = Submit(kBlockHeaderBytes);
+      if (!submitted.ok()) Finish(std::move(submitted));
+    }
+
+    void Complete(Worker& worker, int result, unsigned flags) override {
+      (void)flags;
+      assert(&worker == worker_);
+      if (result < 0) {
+        Finish(absl::ErrnoToStatus(-result, "checkpoint read failed"));
+        return;
+      }
+      const std::size_t bytes = static_cast<std::size_t>(result);
+      worker.RecordStorageReadCompletion(bytes);
+      const std::size_t expected =
+          phase_ == Phase::kHeader ? kBlockHeaderBytes : payload_read_bytes_;
+      if (bytes != expected) {
+        Finish(absl::InternalError(phase_ == Phase::kHeader
+                                       ? "short checkpoint header read"
+                                       : "short checkpoint payload read"));
+        return;
+      }
+      if (phase_ == Phase::kPayload) {
+        Finish(std::optional<BlockHeader>{header_});
+        return;
+      }
+
+      BlockHeader header{};
+      if (!DecodeBlockHeaderPages(
+              std::span<const std::byte, kBlockHeaderBytes>(
+                  data_, kBlockHeaderBytes),
+              &header) ||
+          header.block_id_ != block_id_ ||
+          header.kind_ != BlockKind::kCheckpointIndex ||
+          header.tx_generation_ != generation_ ||
+          header.layout_worker_count_ != worker_count_) {
+        // The discovery bitmap can retain blocks from an interrupted
+        // generation. Do not spend a full-block read on a non-matching header.
+        Finish(std::optional<BlockHeader>{});
+        return;
+      }
+      header_ = header;
+      payload_read_bytes_ = AlignDirect(header.committed_bytes_);
+      phase_ = Phase::kPayload;
+      absl::Status submitted = Submit(payload_read_bytes_);
+      if (!submitted.ok()) {
+        Finish(std::move(submitted));
+        return;
+      }
+    }
+
+    absl::Status Submit(std::size_t bytes) {
+      return worker_->SubmitRead(
+          file_, std::span<std::byte>(data_, bytes), offset_, this);
+    }
+
+    void Finish(Result result) {
+      result_.emplace(std::move(result));
+      complete_ = true;
+      if (orphaned_) {
+        delete this;
+        return;
+      }
+      if (waiter_) {
+        worker_->Enqueue(std::exchange(waiter_, {}));
+      }
+    }
+
+    enum class Phase : std::uint8_t { kHeader, kPayload };
+
+    std::byte* data_ = nullptr;
+    std::size_t alignment_ = 0;
+    Worker* worker_ = nullptr;
+    FixedFile file_{};
+    std::uint64_t offset_ = 0;
+    std::uint64_t block_id_ = 0;
+    std::uint64_t generation_ = 0;
+    unsigned worker_count_ = 0;
+    std::size_t payload_read_bytes_ = 0;
+    BlockHeader header_{};
+    Phase phase_ = Phase::kHeader;
+    bool active_ = false;
+    bool complete_ = false;
+    bool orphaned_ = false;
+    std::coroutine_handle<> waiter_{};
+    std::optional<Result> result_;
+  };
+
+  void Release() noexcept {
+    if (state_ == nullptr) return;
+    if (state_->active_ && !state_->complete_) {
+      // Completion owns the state from here. Clearing waiter_ prevents a
+      // shutdown-destroyed recovery coroutine from being resumed later.
+      state_->orphaned_ = true;
+      state_->waiter_ = {};
+    } else {
+      delete state_;
+    }
+    state_ = nullptr;
+  }
+
+  State* state_ = nullptr;
+};
 
 }  // namespace
 
@@ -298,6 +523,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
   AppendPod(&payload, chunk);
   std::uint32_t chunk_entries = 0;
+  absl::flat_hash_map<std::uint64_t, RecoveryLiveReference>
+      extent_identities;
 
   auto flush_chunk = [this, &store, generation, &result, &payload,
                       &chunk_entries]() -> Task<absl::Status> {
@@ -399,13 +626,133 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
               reinterpret_cast<const std::byte*>(extents->data());
           payload.insert(payload.end(), begin,
                          begin + extents->size() * sizeof(ExtentRef));
+          for (std::size_t extent_index = 0;
+               extent_index < extents->size(); ++extent_index) {
+            const ExtentRef& extent = extents->at(extent_index);
+            RecoveryLiveReference identity{
+                .block_id_ = extent.block_id_,
+                .allocation_epoch_ = extent.allocation_epoch_,
+                .bytes_ = extent.payload_bytes_,
+                .extent_ = true,
+                .extent_payload_bytes_ = extent.payload_bytes_,
+                .extent_index_ = static_cast<std::uint32_t>(extent_index),
+                .extent_payload_checksum_ = extent.payload_checksum_,
+            };
+            auto [position, inserted] = extent_identities.try_emplace(
+                extent.block_id_, identity);
+            if (!inserted) {
+              const RecoveryLiveReference& existing = position->second;
+              if (existing.allocation_epoch_ != identity.allocation_epoch_ ||
+                  existing.extent_payload_bytes_ !=
+                      identity.extent_payload_bytes_ ||
+                  existing.extent_index_ != identity.extent_index_ ||
+                  existing.extent_payload_checksum_ !=
+                      identity.extent_payload_checksum_ ||
+                  identity.bytes_ >
+                      std::numeric_limits<std::uint32_t>::max() -
+                          position->second.bytes_) {
+                co_return absl::InternalError(
+                    "checkpoint has inconsistent extent identities");
+              }
+              position->second.bytes_ += identity.bytes_;
+            }
+          }
         }
         ++chunk_entries;
         ++result.entry_count_;
       }
     }
   }
-  co_return co_await flush_chunk();
+  absl::Status flushed = co_await flush_chunk();
+  if (!flushed.ok()) co_return flushed;
+
+  payload.clear();
+  CheckpointChunkHeader accounting_chunk{
+      .generation_ = generation,
+      .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+      .kind_ = CheckpointChunkKind::kBlockAccounting,
+  };
+  AppendPod(&payload, accounting_chunk);
+  chunk_entries = 0;
+  auto flush_accounting_chunk =
+      [this, &store, generation, &result, &payload,
+       &chunk_entries]() -> Task<absl::Status> {
+    auto* header = reinterpret_cast<CheckpointChunkHeader*>(payload.data());
+    header->entry_count_ = chunk_entries;
+    auto written = co_await WriteCheckpointBlock(
+        store, generation, store.worker_->id(), chunk_entries, payload);
+    if (!written.ok()) co_return written.status();
+    result.blocks_.push_back(*written);
+    payload.clear();
+    CheckpointChunkHeader next{
+        .generation_ = generation,
+        .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+        .kind_ = CheckpointChunkKind::kBlockAccounting,
+    };
+    AppendPod(&payload, next);
+    chunk_entries = 0;
+    co_return absl::OkStatus();
+  };
+
+  const std::uint16_t owner =
+      static_cast<std::uint16_t>(store.worker_->id());
+  for (std::size_t device_index = 0; device_index < devices_.size();
+       ++device_index) {
+    const StorageDevice& device = devices_[device_index];
+    std::vector<BlockState>& states = device_block_states_[device_index];
+    for (std::size_t slot = 0; slot < states.size(); ++slot) {
+      BlockState& state = states[slot];
+      if (state.owner_.load(std::memory_order_acquire) != owner ||
+          !state.allocated_ || state.live_bytes_ == 0) {
+        continue;
+      }
+      // Extent ownership is reassigned from the physical block id during
+      // recovery and need not match the key-index shard. Their sparse
+      // accounting is emitted from the manifests below instead.
+      if (state.kind_ == BlockKind::kPayloadExtent) continue;
+      const std::uint64_t block_id = MakeBlockId(
+          device.id_,
+          static_cast<std::uint32_t>(slot + device.data_block_begin_));
+      CheckpointAccountingEntry entry{
+          .block_id_ = block_id,
+          .allocation_epoch_ = state.allocation_epoch_,
+          .live_bytes_ = state.live_bytes_,
+          .owner_ = owner,
+      };
+      if (state.kind_ != BlockKind::kRecords) {
+        co_return absl::FailedPreconditionError(
+            "checkpoint accounting found a live non-record block");
+      }
+      if (payload.size() + sizeof(entry) > kExtentPayloadBytes) {
+        flushed = co_await flush_accounting_chunk();
+        if (!flushed.ok()) co_return flushed;
+      }
+      AppendPod(&payload, entry);
+      ++chunk_entries;
+      ++result.accounting_entry_count_;
+    }
+  }
+  for (const auto& [block_id, identity] : extent_identities) {
+    CheckpointAccountingEntry entry{
+        .block_id_ = block_id,
+        .allocation_epoch_ = identity.allocation_epoch_,
+        .live_bytes_ = identity.bytes_,
+        .extent_payload_bytes_ = identity.extent_payload_bytes_,
+        .extent_index_ = identity.extent_index_,
+        .extent_payload_checksum_ = identity.extent_payload_checksum_,
+        // The block-header scan determines the current physical owner.
+        .owner_ = kUnownedBlock,
+        .extent_ = 1,
+    };
+    if (payload.size() + sizeof(entry) > kExtentPayloadBytes) {
+      flushed = co_await flush_accounting_chunk();
+      if (!flushed.ok()) co_return flushed;
+    }
+    AppendPod(&payload, entry);
+    ++chunk_entries;
+    ++result.accounting_entry_count_;
+  }
+  co_return co_await flush_accounting_chunk();
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
@@ -539,9 +886,9 @@ Task<absl::Status> StorageEngine::Impl::PublishShutdownCheckpoint(
     entry_count += shard.entry_count_;
     blocks.insert(blocks.end(), shard.blocks_.begin(), shard.blocks_.end());
   }
-  if (blocks.size() < worker_count_) {
+  if (blocks.size() < 2 * worker_count_) {
     co_return absl::InternalError(
-        "checkpoint bitmap does not contain every worker shard");
+        "checkpoint bitmap does not contain both chunks for every worker");
   }
   std::sort(blocks.begin(), blocks.end());
   if (std::adjacent_find(blocks.begin(), blocks.end()) != blocks.end()) {
@@ -564,98 +911,16 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   assert(result != nullptr);
   *result = {};
   result->saw_shards_.resize(worker_count_, false);
+  result->saw_accounting_shards_.resize(worker_count_, false);
   if (!checkpoint_active_.load(std::memory_order_acquire)) {
     co_return absl::OkStatus();
   }
-  auto add_live_reference =
-      [result](RecoveryLiveReference reference) -> absl::Status {
-    auto [position, inserted] = result->live_by_block_.try_emplace(
-        reference.block_id_, reference);
-    if (inserted) return absl::OkStatus();
-    RecoveryLiveReference& aggregate = position->second;
-    if (aggregate.allocation_epoch_ != reference.allocation_epoch_ ||
-        aggregate.txid_ != reference.txid_ ||
-        aggregate.expected_owner_ != reference.expected_owner_ ||
-        aggregate.extent_ != reference.extent_ ||
-        (aggregate.extent_ &&
-         (aggregate.extent_payload_bytes_ != reference.extent_payload_bytes_ ||
-          aggregate.extent_index_ != reference.extent_index_ ||
-          aggregate.extent_payload_checksum_ !=
-              reference.extent_payload_checksum_)) ||
-        reference.bytes_ >
-            std::numeric_limits<std::uint32_t>::max() - aggregate.bytes_) {
-      return absl::InternalError(
-          "checkpoint has inconsistent live references for one block");
-    }
-    aggregate.bytes_ += reference.bytes_;
-    return absl::OkStatus();
-  };
-  auto* data = static_cast<std::byte*>(celer::AllocateStorageBuffer(
-      kStorageBlockBytes, options_.buffers_.alignment_));
-  if (data == nullptr) {
-    co_return absl::ResourceExhaustedError(
-        "failed to allocate checkpoint recovery buffer");
+  std::array<CheckpointPrefetchSlot, 2> prefetch;
+  for (CheckpointPrefetchSlot& slot : prefetch) {
+    absl::Status initialized =
+        slot.Initialize(options_.buffers_.alignment_);
+    if (!initialized.ok()) co_return initialized;
   }
-  struct BufferGuard {
-    std::byte* data_;
-    std::size_t alignment_;
-    ~BufferGuard() { celer::FreeStorageBuffer(data_, alignment_); }
-  } guard{data, options_.buffers_.alignment_};
-
-  auto read_block = [this, &store, data](std::uint64_t block_id)
-      -> Task<absl::StatusOr<std::optional<BlockHeader>>> {
-    if (!CheckpointBlockAllocated(device_allocators_, block_id)) {
-      co_return std::optional<BlockHeader>{};
-    }
-    const auto [file_id, offset] = FileOffset(block_id);
-    FixedBuffer io{.data_ = data, .size_ = kBlockHeaderBytes, .index_ = 0};
-    auto read = co_await ReadStorageBuffer(
-        *store.worker_, store.files_[file_id], io, false, offset);
-    if (!read.ok() || *read != kBlockHeaderBytes) {
-      co_return read.ok() ? absl::InternalError("short checkpoint header read")
-                          : read.status();
-    }
-    BlockHeader header{};
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                    data, kBlockHeaderBytes),
-                                &header) ||
-        header.block_id_ != block_id ||
-        header.kind_ != BlockKind::kCheckpointIndex ||
-        header.tx_generation_ != checkpoint_root_.generation_ ||
-        header.layout_worker_count_ != worker_count_) {
-      // The bitmap is allowed to retain false positives from an interrupted
-      // generation. Only a self-validating block stamped with the selected
-      // generation participates in completeness checks.
-      co_return std::optional<BlockHeader>{};
-    }
-    io.size_ = AlignDirect(header.committed_bytes_);
-    read = co_await ReadStorageBuffer(*store.worker_, store.files_[file_id], io,
-                                      false, offset);
-    if (!read.ok() || *read != io.size_) {
-      co_return read.ok() ? absl::InternalError("short checkpoint payload read")
-                          : read.status();
-    }
-    BlockHeader reread{};
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                    data, kBlockHeaderBytes),
-                                &reread) ||
-        reread.block_id_ != block_id ||
-        reread.allocation_epoch_ != header.allocation_epoch_ ||
-        reread.kind_ != BlockKind::kCheckpointIndex ||
-        reread.tx_generation_ != checkpoint_root_.generation_ ||
-        reread.extent_index_ != header.extent_index_ ||
-        reread.extent_payload_bytes_ != header.extent_payload_bytes_ ||
-        reread.extent_payload_checksum_ != header.extent_payload_checksum_ ||
-        reread.record_count_ != header.record_count_) {
-      co_return absl::InternalError("checkpoint header changed while reading");
-    }
-    const auto payload = std::span<const std::byte>(
-        data + kBlockHeaderBytes, header.extent_payload_bytes_);
-    if (Crc32c(payload) != header.extent_payload_checksum_) {
-      co_return absl::InternalError("checkpoint payload checksum mismatch");
-    }
-    co_return std::optional<BlockHeader>{header};
-  };
 
   // Use the same topology-aware striped ownership as ordinary recovery. On
   // io_uring every worker scans a disjoint global stripe; with SPDK only a
@@ -683,6 +948,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     device_linear_begin += device.data_block_count_;
   }
 
+  std::vector<std::uint64_t> checkpoint_blocks;
   while (true) {
     bool scanned_block = false;
     for (std::size_t device_index = 0; device_index < devices_.size();
@@ -705,184 +971,263 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         continue;
       }
       const std::uint64_t block_id = MakeBlockId(device.id_, local);
-      auto candidate = co_await read_block(block_id);
-      if (!candidate.ok()) co_return candidate.status();
-      if (!candidate->has_value()) continue;
-      const BlockHeader& block = **candidate;
-      if (block.extent_index_ >= worker_count_) {
-        co_return absl::InternalError("checkpoint block has an invalid shard");
+      if (CheckpointBlockAllocated(device_allocators_, block_id)) {
+        checkpoint_blocks.push_back(block_id);
       }
-      result->saw_shards_[block.extent_index_] = true;
-      const std::byte* cursor = data + kBlockHeaderBytes;
-      const std::byte* end = cursor + block.extent_payload_bytes_;
-      if (static_cast<std::size_t>(end - cursor) <
-          sizeof(CheckpointChunkHeader)) {
-        co_return absl::InternalError("checkpoint chunk is truncated");
-      }
-      CheckpointChunkHeader chunk{};
-      std::memcpy(&chunk, cursor, sizeof(chunk));
-      cursor += sizeof(chunk);
-      if (chunk.magic_ != kCheckpointChunkMagic ||
-          chunk.version_ != kCheckpointWireVersion ||
-          chunk.header_bytes_ != sizeof(chunk) ||
-          chunk.generation_ != checkpoint_root_.generation_ ||
-          chunk.shard_id_ != block.extent_index_ ||
-          chunk.entry_count_ != block.record_count_ ||
-          chunk.entry_count_ >
-              static_cast<std::size_t>(end - cursor) /
-                  sizeof(CheckpointEntryHeader)) {
-        co_return absl::InternalError("invalid checkpoint chunk header");
-      }
-      // Decode only this physical chunk. It is fully checked before any of
-      // its entries become visible, then immediately handed to its shard so
-      // recovery memory is bounded by one checkpoint block rather than the
-      // complete dataset. If a later chunk fails, ordinary scanning merges
-      // with this already validated prefix and fills the missing keys.
-      RecoveryBatch recovered;
-      recovered.records_.reserve(chunk.entry_count_);
-      for (std::uint32_t i = 0; i < chunk.entry_count_; ++i) {
-        if (static_cast<std::size_t>(end - cursor) <
-            sizeof(CheckpointEntryHeader)) {
-          co_return absl::InternalError("checkpoint entry is truncated");
-        }
-        CheckpointEntryHeader entry{};
-        std::memcpy(&entry, cursor, sizeof(entry));
-        const std::uint16_t block_owner =
-            CheckpointBlockOwner(entry.metadata_);
-        const std::uint8_t db_id = CheckpointDb(entry.metadata_);
-        const RecordKind kind = CheckpointKind(entry.metadata_);
-        const ValueType value_type = CheckpointValueType(entry.metadata_);
-        const std::uint8_t flags = CheckpointFlags(entry.metadata_);
-        const bool has_expiry = (flags & kHasExpiry) != 0;
-        const std::size_t fixed_bytes =
-            sizeof(entry) + (has_expiry ? sizeof(std::uint64_t) : 0);
-        if ((entry.metadata_ & ~kCheckpointMetadataMask) != 0 ||
-            db_id >= kLogicalDatabaseCount || block_owner >= worker_count_ ||
-            entry.replication_epoch_ == 0 ||
-            (flags & ~(kExternal | kKeyExternal | kShielding | kUnclaimed |
-                       kHasExpiry)) != 0 ||
-            (kind != RecordKind::kValue &&
-             kind != RecordKind::kTombstone) ||
-            (kind == RecordKind::kTombstone &&
-             value_type != ValueType::kNone) ||
-            (kind == RecordKind::kValue &&
-             (value_type < ValueType::kString ||
-              value_type > ValueType::kStream)) ||
-            entry.logical_size_ > RecordIndexValue::kLogicalSizeMask ||
-            entry.record_offset_ < kBlockHeaderBytes ||
-            entry.record_offset_ % kRecordAlignment != 0 ||
-            entry.total_disk_bytes_ == 0 ||
-            entry.total_disk_bytes_ % kRecordAlignment != 0 ||
-            static_cast<std::uint64_t>(entry.record_offset_) +
-                    entry.total_disk_bytes_ >
-                kStorageBlockBytes ||
-            fixed_bytes > static_cast<std::size_t>(end - cursor) ||
-            entry.key_bytes_ >
-                static_cast<std::size_t>(end - cursor) - fixed_bytes ||
-            entry.extent_count_ >
-                (static_cast<std::size_t>(end - cursor) - fixed_bytes -
-                 entry.key_bytes_) /
-                    sizeof(ExtentRef)) {
-          co_return absl::InternalError("invalid checkpoint entry");
-        }
-        const std::size_t entry_bytes =
-            fixed_bytes + entry.key_bytes_ +
-            static_cast<std::size_t>(entry.extent_count_) * sizeof(ExtentRef);
-        std::uint64_t expire_at_ms = 0;
-        if (has_expiry) {
-          std::memcpy(&expire_at_ms, cursor + sizeof(entry),
-                      sizeof(expire_at_ms));
-          if (expire_at_ms == 0) {
-            co_return absl::InternalError(
-                "checkpoint expiry extension is zero");
-          }
-        }
-        const char* key_data =
-            reinterpret_cast<const char*>(cursor + fixed_bytes);
-        std::string key(key_data, entry.key_bytes_);
-        if (RedisSlot(key) % worker_count_ != block.extent_index_) {
-          co_return absl::InternalError("checkpoint key is in the wrong shard");
-        }
-        ExtentManifest extents;
-        if (entry.extent_count_ != 0) {
-          auto mutable_extents =
-              std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
-          std::memcpy(mutable_extents->data(),
-                      cursor + fixed_bytes + entry.key_bytes_,
-                      entry.extent_count_ * sizeof(ExtentRef));
-          extents = std::move(mutable_extents);
-        }
-        const bool external = (flags & kExternal) != 0;
-        const bool key_external = (flags & kKeyExternal) != 0;
-        if (external != (extents != nullptr) ||
-            !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
-                                                    entry.allocation_epoch_)) {
-          co_return absl::InternalError("invalid checkpoint record location");
-        }
-        const Digest digest = ComputeDigest(key);
-        RecoveryRecord record{
-            .digest_ = digest,
-            .key_ = std::move(key),
-            .db_id_ = db_id,
-            .txid_ = 0,
-            .lsn_ = std::numeric_limits<std::uint64_t>::max(),
-            .replication_epoch_ = entry.replication_epoch_,
-            .location_ = RecordLocation(
-                entry.block_id_, entry.mutation_sequence_,
-                entry.allocation_epoch_, expire_at_ms,
-                entry.logical_size_,
-                RecordLocation::PackedMetadata::Encode(
-                    entry.record_offset_, entry.total_disk_bytes_,
-                    block_owner, false, external, key_external,
-                    (flags & kShielding) != 0,
-                    (flags & kUnclaimed) != 0, false, kind, value_type)),
-            .extents_ = std::move(extents),
-            .checkpoint_snapshot_ = true,
-        };
-        absl::Status live = add_live_reference(RecoveryLiveReference{
-            .block_id_ = entry.block_id_,
-            .allocation_epoch_ = entry.allocation_epoch_,
-            .bytes_ = entry.total_disk_bytes_,
-            .expected_owner_ = block_owner,
-        });
-        if (!live.ok()) co_return live;
-        if (record.extents_ != nullptr) {
-          for (std::size_t extent_index = 0;
-               extent_index < record.extents_->size(); ++extent_index) {
-            const ExtentRef& extent = record.extents_->at(extent_index);
-            live = add_live_reference(RecoveryLiveReference{
-                .block_id_ = extent.block_id_,
-                .allocation_epoch_ = extent.allocation_epoch_,
-                .bytes_ = extent.payload_bytes_,
-                .extent_ = true,
-                .extent_payload_bytes_ = extent.payload_bytes_,
-                .extent_index_ = static_cast<std::uint32_t>(extent_index),
-                .extent_payload_checksum_ = extent.payload_checksum_,
-            });
-            if (!live.ok()) co_return live;
-          }
-        }
-        recovered.records_.push_back(std::move(record));
-        cursor += entry_bytes;
-        ++result->entry_count_;
-      }
-      if (cursor != end) {
-        co_return absl::InternalError("checkpoint chunk has trailing bytes");
-      }
-      const unsigned owner = block.extent_index_;
-      if (owner == store.worker_->id()) {
-        ApplyRecovery(owner, std::move(recovered));
-      } else {
-        absl::Status applied = co_await celer::SubmitTo(
-            owner, [this, owner, recovered = std::move(recovered)]() mutable {
-              ApplyRecovery(owner, std::move(recovered));
-              return absl::OkStatus();
-        });
-        if (!applied.ok()) co_return applied;
-      }
-      result->blocks_.push_back(block_id);
     }
     if (!scanned_block) break;
+  }
+
+  auto decode_block = [this, &store, result](
+                          std::uint64_t block_id, const std::byte* data,
+                          BlockHeader block) -> Task<absl::Status> {
+    BlockHeader reread{};
+    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                    data, kBlockHeaderBytes),
+                                &reread) ||
+        reread.block_id_ != block_id ||
+        reread.allocation_epoch_ != block.allocation_epoch_ ||
+        reread.kind_ != BlockKind::kCheckpointIndex ||
+        reread.tx_generation_ != checkpoint_root_.generation_ ||
+        reread.extent_index_ != block.extent_index_ ||
+        reread.extent_payload_bytes_ != block.extent_payload_bytes_ ||
+        reread.extent_payload_checksum_ != block.extent_payload_checksum_ ||
+        reread.record_count_ != block.record_count_) {
+      co_return absl::InternalError("checkpoint header changed while reading");
+    }
+    const auto payload = std::span<const std::byte>(
+        data + kBlockHeaderBytes, block.extent_payload_bytes_);
+    if (Crc32c(payload) != block.extent_payload_checksum_) {
+      co_return absl::InternalError("checkpoint payload checksum mismatch");
+    }
+    if (block.extent_index_ >= worker_count_) {
+      co_return absl::InternalError("checkpoint block has an invalid shard");
+    }
+    const std::byte* cursor = data + kBlockHeaderBytes;
+    const std::byte* end = cursor + block.extent_payload_bytes_;
+    if (static_cast<std::size_t>(end - cursor) <
+        sizeof(CheckpointChunkHeader)) {
+      co_return absl::InternalError("checkpoint chunk is truncated");
+    }
+    CheckpointChunkHeader chunk{};
+    std::memcpy(&chunk, cursor, sizeof(chunk));
+    cursor += sizeof(chunk);
+    if (chunk.magic_ != kCheckpointChunkMagic ||
+        chunk.version_ != kCheckpointWireVersion ||
+        chunk.header_bytes_ != sizeof(chunk) ||
+        chunk.generation_ != checkpoint_root_.generation_ ||
+        chunk.shard_id_ != block.extent_index_ ||
+        chunk.entry_count_ != block.record_count_ ||
+        chunk.reserved_ != 0 ||
+        (chunk.kind_ != CheckpointChunkKind::kIndexEntries &&
+         chunk.kind_ != CheckpointChunkKind::kBlockAccounting)) {
+      co_return absl::InternalError("invalid checkpoint chunk header");
+    }
+    if (chunk.kind_ == CheckpointChunkKind::kBlockAccounting) {
+      if (chunk.entry_count_ > static_cast<std::size_t>(end - cursor) /
+                                   sizeof(CheckpointAccountingEntry) ||
+          static_cast<std::size_t>(end - cursor) !=
+              static_cast<std::size_t>(chunk.entry_count_) *
+                  sizeof(CheckpointAccountingEntry)) {
+        co_return absl::InternalError(
+            "invalid checkpoint accounting chunk size");
+      }
+      for (std::uint32_t i = 0; i < chunk.entry_count_; ++i) {
+        CheckpointAccountingEntry entry{};
+        std::memcpy(&entry, cursor, sizeof(entry));
+        cursor += sizeof(entry);
+        if (entry.live_bytes_ == 0 || entry.allocation_epoch_ == 0 ||
+            entry.extent_ > 1 ||
+            (entry.extent_ && entry.owner_ != kUnownedBlock) ||
+            (!entry.extent_ &&
+             (entry.owner_ != block.extent_index_ ||
+              entry.owner_ >= worker_count_)) ||
+            entry.reserved_ != 0 ||
+            entry.reserved_tail_ != 0 ||
+            !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
+                                                    entry.allocation_epoch_) ||
+            (entry.extent_ &&
+             (entry.extent_payload_bytes_ == 0 ||
+              entry.extent_payload_bytes_ > kExtentPayloadBytes)) ||
+            (!entry.extent_ &&
+             (entry.extent_payload_bytes_ != 0 || entry.extent_index_ != 0 ||
+              entry.extent_payload_checksum_ != 0))) {
+          co_return absl::InternalError(
+              "invalid checkpoint accounting entry");
+        }
+        RecoveryLiveReference reference{
+            .block_id_ = entry.block_id_,
+            .allocation_epoch_ = entry.allocation_epoch_,
+            .bytes_ = entry.live_bytes_,
+            .expected_owner_ = entry.owner_,
+            .extent_ = entry.extent_ != 0,
+            .replace_live_bytes_ = true,
+            .extent_payload_bytes_ = entry.extent_payload_bytes_,
+            .extent_index_ = entry.extent_index_,
+            .extent_payload_checksum_ = entry.extent_payload_checksum_,
+        };
+        if (!result->live_by_block_
+                 .try_emplace(entry.block_id_, reference)
+                 .second) {
+          co_return absl::InternalError(
+              "checkpoint accounting repeats a physical block");
+        }
+        ++result->accounting_entry_count_;
+      }
+      result->saw_accounting_shards_[block.extent_index_] = true;
+      result->blocks_.push_back(block_id);
+      co_return absl::OkStatus();
+    }
+    if (chunk.entry_count_ > static_cast<std::size_t>(end - cursor) /
+                                 sizeof(CheckpointEntryHeader)) {
+      co_return absl::InternalError("invalid checkpoint index entry count");
+    }
+    result->saw_shards_[block.extent_index_] = true;
+    // Only the next block's I/O buffer overlaps this decode. Entries become
+    // visible one completely validated chunk at a time, preserving bounded
+    // recovery memory and cold-scan fallback semantics.
+    RecoveryBatch recovered;
+    recovered.records_.reserve(chunk.entry_count_);
+    for (std::uint32_t i = 0; i < chunk.entry_count_; ++i) {
+      if (static_cast<std::size_t>(end - cursor) <
+          sizeof(CheckpointEntryHeader)) {
+        co_return absl::InternalError("checkpoint entry is truncated");
+      }
+      CheckpointEntryHeader entry{};
+      std::memcpy(&entry, cursor, sizeof(entry));
+      const std::uint16_t block_owner =
+          CheckpointBlockOwner(entry.metadata_);
+      const std::uint8_t db_id = CheckpointDb(entry.metadata_);
+      const RecordKind kind = CheckpointKind(entry.metadata_);
+      const ValueType value_type = CheckpointValueType(entry.metadata_);
+      const std::uint8_t flags = CheckpointFlags(entry.metadata_);
+      const bool has_expiry = (flags & kHasExpiry) != 0;
+      const std::size_t fixed_bytes =
+          sizeof(entry) + (has_expiry ? sizeof(std::uint64_t) : 0);
+      if ((entry.metadata_ & ~kCheckpointMetadataMask) != 0 ||
+          db_id >= kLogicalDatabaseCount || block_owner >= worker_count_ ||
+          entry.replication_epoch_ == 0 ||
+          (flags & ~(kExternal | kKeyExternal | kShielding | kUnclaimed |
+                     kHasExpiry)) != 0 ||
+          (kind != RecordKind::kValue && kind != RecordKind::kTombstone) ||
+          (kind == RecordKind::kTombstone &&
+           value_type != ValueType::kNone) ||
+          (kind == RecordKind::kValue &&
+           (value_type < ValueType::kString ||
+            value_type > ValueType::kStream)) ||
+          entry.logical_size_ > RecordIndexValue::kLogicalSizeMask ||
+          entry.record_offset_ < kBlockHeaderBytes ||
+          entry.record_offset_ % kRecordAlignment != 0 ||
+          entry.total_disk_bytes_ == 0 ||
+          entry.total_disk_bytes_ % kRecordAlignment != 0 ||
+          static_cast<std::uint64_t>(entry.record_offset_) +
+                  entry.total_disk_bytes_ >
+              kStorageBlockBytes ||
+          fixed_bytes > static_cast<std::size_t>(end - cursor) ||
+          entry.key_bytes_ >
+              static_cast<std::size_t>(end - cursor) - fixed_bytes ||
+          entry.extent_count_ >
+              (static_cast<std::size_t>(end - cursor) - fixed_bytes -
+               entry.key_bytes_) /
+                  sizeof(ExtentRef)) {
+        co_return absl::InternalError("invalid checkpoint entry");
+      }
+      const std::size_t entry_bytes =
+          fixed_bytes + entry.key_bytes_ +
+          static_cast<std::size_t>(entry.extent_count_) * sizeof(ExtentRef);
+      std::uint64_t expire_at_ms = 0;
+      if (has_expiry) {
+        std::memcpy(&expire_at_ms, cursor + sizeof(entry),
+                    sizeof(expire_at_ms));
+        if (expire_at_ms == 0) {
+          co_return absl::InternalError("checkpoint expiry extension is zero");
+        }
+      }
+      const char* key_data =
+          reinterpret_cast<const char*>(cursor + fixed_bytes);
+      std::string key(key_data, entry.key_bytes_);
+      if (RedisSlot(key) % worker_count_ != block.extent_index_) {
+        co_return absl::InternalError("checkpoint key is in the wrong shard");
+      }
+      ExtentManifest extents;
+      if (entry.extent_count_ != 0) {
+        auto mutable_extents =
+            std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
+        std::memcpy(mutable_extents->data(),
+                    cursor + fixed_bytes + entry.key_bytes_,
+                    entry.extent_count_ * sizeof(ExtentRef));
+        extents = std::move(mutable_extents);
+      }
+      const bool external = (flags & kExternal) != 0;
+      const bool key_external = (flags & kKeyExternal) != 0;
+      if (external != (extents != nullptr) ||
+          !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
+                                                  entry.allocation_epoch_)) {
+        co_return absl::InternalError("invalid checkpoint record location");
+      }
+      const Digest digest = ComputeDigest(key);
+      RecoveryRecord record{
+          .digest_ = digest,
+          .key_ = std::move(key),
+          .db_id_ = db_id,
+          .txid_ = 0,
+          .lsn_ = std::numeric_limits<std::uint64_t>::max(),
+          .replication_epoch_ = entry.replication_epoch_,
+          .location_ = RecordLocation(
+              entry.block_id_, entry.mutation_sequence_,
+              entry.allocation_epoch_, expire_at_ms, entry.logical_size_,
+              RecordLocation::PackedMetadata::Encode(
+                  entry.record_offset_, entry.total_disk_bytes_, block_owner,
+                  false, external, key_external,
+                  (flags & kShielding) != 0, (flags & kUnclaimed) != 0, false,
+                  kind, value_type)),
+          .extents_ = std::move(extents),
+          .checkpoint_snapshot_ = true,
+      };
+      recovered.records_.push_back(std::move(record));
+      cursor += entry_bytes;
+      ++result->entry_count_;
+    }
+    if (cursor != end) {
+      co_return absl::InternalError("checkpoint chunk has trailing bytes");
+    }
+    const unsigned owner = block.extent_index_;
+    if (owner == store.worker_->id()) {
+      ApplyRecovery(owner, std::move(recovered));
+    } else {
+      absl::Status applied = co_await celer::SubmitTo(
+          owner, [this, owner, recovered = std::move(recovered)]() mutable {
+            ApplyRecovery(owner, std::move(recovered));
+            return absl::OkStatus();
+          });
+      if (!applied.ok()) co_return applied;
+    }
+    result->blocks_.push_back(block_id);
+    co_return absl::OkStatus();
+  };
+
+  auto start_prefetch = [this, &store](CheckpointPrefetchSlot& slot,
+                                       std::uint64_t block_id) {
+    const auto [file_id, offset] = FileOffset(block_id);
+    slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
+               checkpoint_root_.generation_, worker_count_);
+  };
+  if (!checkpoint_blocks.empty()) {
+    start_prefetch(prefetch[0], checkpoint_blocks[0]);
+  }
+  for (std::size_t index = 0; index < checkpoint_blocks.size(); ++index) {
+    CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
+    auto candidate = co_await current.Wait();
+    if (!candidate.ok()) co_return candidate.status();
+    if (index + 1 < checkpoint_blocks.size()) {
+      start_prefetch(prefetch[(index + 1) % prefetch.size()],
+                     checkpoint_blocks[index + 1]);
+    }
+    if (!candidate->has_value()) continue;
+    absl::Status decoded =
+        co_await decode_block(checkpoint_blocks[index], current.data(),
+                              **candidate);
+    if (!decoded.ok()) co_return decoded;
   }
   co_return absl::OkStatus();
 }

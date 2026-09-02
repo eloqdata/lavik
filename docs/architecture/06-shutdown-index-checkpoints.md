@@ -29,8 +29,8 @@ Four values at the end of mirrored epoch metadata form the checkpoint root:
 
 - the monotonically increasing published generation;
 - the highest consumed generation;
-- the expected checkpoint index-block count;
-- the expected checkpoint entry count.
+- the expected checkpoint block count;
+- the expected checkpoint index-entry count.
 
 These fields and the checkpoint block kinds directly extend development
 storage format version 1. There is no compatibility decoder; existing media
@@ -48,20 +48,32 @@ contiguous block range. Its raw payload is `ceil(capacity_blocks / 8)` bytes;
 the A/B copies consume twice that amount plus page headers (32 MiB at the
 per-device 1 PiB limit).
 
-Each worker serializes its frozen indexes into one or more 8 MiB checkpoint
-index blocks. An entry contains the complete key, database and partition
-epoch, physical record location, logical type and size, expiry and shielding
-state, and any extent manifest. The fixed entry header packs owner, database,
-type and flags into one metadata word, derives entry bounds from the chunk and
-field lengths, and stores expiry only when present. It never stores the
-process-random key digest; startup recomputes that digest from the complete
-key. Each index block carries its generation, shard, entry count, payload size,
-and payload checksum in its existing block header.
+Each worker serializes two chunk kinds into ordinary 8 MiB checkpoint blocks.
+Index chunks contain the complete key, database and partition epoch, physical
+record location, logical type and size, expiry and shielding state, and any
+extent manifest. Their fixed entry header packs owner, database, type and flags
+into one metadata word, derives entry bounds from the chunk and field lengths,
+and stores expiry only when present. It never stores the process-random key
+digest; startup recomputes that digest from the complete key.
+
+Block-accounting chunks contain one entry for every live ordinary or extent
+block owned by the shard, not one entry per key. Each entry stores the block
+identity, owner, aggregate live bytes, and the extra extent identity needed to
+validate a manifest against its physical header. The dense runtime block table
+is the authority for ordinary-block aggregates. While performing the required
+index serialization pass, the builder aggregates the sparse extent manifests
+because extent identity deliberately does not occupy every runtime
+`BlockState`, and an extent's recovery owner can differ from its key-index
+shard. The restored extent entry therefore resolves its physical owner only
+after the block-header scan.
+Index and accounting chunks share the checkpoint block kind, generation,
+bitmap, publication lifecycle, and payload CRC; an explicit chunk-kind field
+selects their entry layout.
 
 Publication order is:
 
 ```text
-write and synchronize every checkpoint index block
+write and synchronize every checkpoint index and accounting block
 write and synchronize the checkpoint bitmap on every device
 publish the generation and expected counts through the root on every device
 ```
@@ -95,15 +107,20 @@ allocated block has a self-validating checkpoint header for the selected
 generation. For matching blocks each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
 checksums, then submits the complete decoded block to its index-owning worker.
-I/O, decoding, and index construction therefore proceed concurrently. Each
-scanner holds at most one 8 MiB block and its decoded batch, so temporary entry
-memory is bounded by worker count rather than dataset size. A barrier reduces
-the per-scanner block, entry, and shard results; totals must exactly match the
-root and every worker shard must be represented. If a block or the final
-completeness check fails, startup disables ordinary-body skipping and performs
-the full record scan. Entries from already validated checkpoint blocks remain
-installed and participate in the normal winner merge; the full scan supplies
-every missing key.
+Each scanner double-buffers checkpoint reads: after a block completes I/O it
+submits the next block before decoding and installing the current one. I/O,
+decoding, and index construction therefore proceed concurrently both within
+and across scanners. A scanner holds at most two 8 MiB buffers and one decoded
+batch, so temporary entry memory remains bounded by worker count rather than
+dataset size. A barrier reduces the per-scanner block, index-entry,
+accounting-entry, and shard results. Block and index-entry totals must exactly
+match the root, and every worker must have both chunk kinds represented. The
+published total block count makes a missing accounting chunk detectable
+without adding another root field. If a block or the final completeness check
+fails, startup
+disables ordinary-body skipping and performs the full record scan. Entries
+from already validated checkpoint blocks remain installed and participate in
+the normal winner merge; the full scan supplies every missing key.
 
 After the one load attempt, startup writes an all-zero checkpoint bitmap before
 the parallel storage scan. On success, every matching index block is already
@@ -127,12 +144,14 @@ O(allocated block headers + checkpoint bytes + transaction block bytes)
 
 Recovery still walks the rebuilt winner indexes once to charge live roots and
 extents to physical block owners after a cold scan. A successful checkpoint
-load instead aggregates those references by physical block while decoding and
-applies the aggregates after the block-header scan establishes their runtime
-owners. The speedup comes from replacing full ordinary-block reads,
-obsolete-version decoding, and the second winner-index walk with a compact
-sequential representation of current index entries; it does not make startup
-independent of allocated-block count.
+load instead restores the persisted block-accounting table after the
+block-header scan establishes runtime owners. Each absolute value is installed
+once; a duplicate table entry or a mismatch with the scanned block identity is
+a checkpoint failure. This removes both the second winner-index walk and the
+per-key hash aggregation formerly performed while decoding the checkpoint.
+The speedup still does not make startup independent of index-entry or allocated
+block count: every checkpoint key must be decoded and every allocated block
+header must be scanned.
 
 ## Source map
 

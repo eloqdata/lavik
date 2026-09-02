@@ -908,6 +908,10 @@ struct RecoveryLiveReference {
   // extents leave this unowned and resolve it after the header scan.
   std::uint16_t expected_owner_ = kUnownedBlock;
   bool extent_ = false;
+  // A checkpoint accounting entry is an already-aggregated absolute value.
+  // Recovery must install it once, rather than add it like a cold-scan key
+  // reference; this also turns duplicate table entries into a hard failure.
+  bool replace_live_bytes_ = false;
   // The physical payload size used to validate one extent block. Keep it
   // separate from bytes_, which is reference-counted accounting.
   std::uint32_t extent_payload_bytes_ = 0;
@@ -1417,17 +1421,20 @@ struct CheckpointShardResult {
   absl::Status status_ = absl::OkStatus();
   std::vector<std::uint64_t> blocks_;
   std::uint64_t entry_count_ = 0;
+  std::uint64_t accounting_entry_count_ = 0;
 };
 
 struct CheckpointLoadResult {
   absl::Status status_ = absl::OkStatus();
   std::vector<std::uint64_t> blocks_;
   std::uint64_t entry_count_ = 0;
+  std::uint64_t accounting_entry_count_ = 0;
   std::vector<bool> saw_shards_;
-  // Successful checkpoint recovery already visits every winner while
-  // decoding. Aggregate physical live bytes by block here so startup need not
-  // walk the complete rebuilt key index a second time. A failed checkpoint
-  // discards these tentative aggregates and cold recovery accounts winners.
+  std::vector<bool> saw_accounting_shards_;
+  // The durable accounting chunks contain one entry per live physical block.
+  // Keep the decoded table bounded by block count while the header scan
+  // establishes runtime ownership. A failed checkpoint discards these
+  // tentative values and cold recovery accounts winners from the index.
   absl::flat_hash_map<std::uint64_t, RecoveryLiveReference> live_by_block_;
 };
 

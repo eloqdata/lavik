@@ -62,15 +62,17 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
                          checkpoint_publish_status_.message());
           } else if (barrier.ok() && store->worker_->id() == 0) {
             std::uint64_t entries = 0;
+            std::uint64_t accounting_entries = 0;
             std::size_t blocks = 0;
             for (const CheckpointShardResult& completed : checkpoint_shards_) {
               entries += completed.entry_count_;
+              accounting_entries += completed.accounting_entry_count_;
               blocks += completed.blocks_.size();
             }
             spdlog::info(
                 "published shutdown checkpoint generation={} entries={} "
-                "index-blocks={}",
-                generation, entries, blocks);
+                "accounting-entries={} blocks={}",
+                generation, entries, accounting_entries, blocks);
           }
         }
         if (!barrier.ok() && status.ok()) status = barrier;
