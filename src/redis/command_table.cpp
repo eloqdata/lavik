@@ -348,7 +348,7 @@ constexpr CommandSpec kCommandTable[] = {
      kCmdNoKeys | kCmdGlobal | kCmdAdmin},
     {"info", CommandKind::kInfo, 1, 2, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"role", CommandKind::kRole, 1, 1, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
-    {"cluster", CommandKind::kCluster, 2, 2, 0, 0, 1,
+    {"cluster", CommandKind::kCluster, 2, 3, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"command", CommandKind::kCommand, 1, 0, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},

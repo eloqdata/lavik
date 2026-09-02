@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <vector>
 
 #include "keylane/storage/format.h"
@@ -27,13 +28,25 @@ TEST(StorageFormatTest, KeepsRuntimeAndRecoveryKeyLimitsIdentical) {
   EXPECT_FALSE(ValidRecordKeySize(MaxKeyBytes() + 1));
 }
 
-TEST(StorageFormatTest, ComputesRedisClusterSlots) {
+TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
   using keylane::storage::RedisSlot;
 
   EXPECT_EQ(RedisSlot("123456789"), 12'739);
   EXPECT_EQ(RedisSlot("foo"), 12'182);
+  EXPECT_EQ(RedisSlot("bar"), 5'061);
   EXPECT_EQ(RedisSlot("{user1000}.following"), 3'443);
   EXPECT_EQ(RedisSlot("{user1000}.followers"), 3'443);
+
+  // Redis hashes only the first non-empty {...} tag; malformed or empty tags
+  // deliberately fall back to hashing the complete binary-safe key.
+  EXPECT_EQ(RedisSlot("foo{bar}{zap}"), RedisSlot("bar"));
+  EXPECT_EQ(RedisSlot("foo{{bar}}zap"), RedisSlot("{bar"));
+  EXPECT_EQ(RedisSlot("foo{}{bar}"), RedisSlot("foo{}{bar}"));
+  EXPECT_EQ(RedisSlot("foo{bar"), RedisSlot("foo{bar"));
+
+  const std::string_view binary_tag("a{b\0c}d", 7);
+  const std::string_view binary_value("b\0c", 3);
+  EXPECT_EQ(RedisSlot(binary_tag), RedisSlot(binary_value));
 }
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {

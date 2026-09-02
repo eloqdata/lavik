@@ -613,6 +613,15 @@ std::optional<std::string> ReplicaMovedError(const ConnectionContext& ctx,
 
 Task<CommandReply> ExecuteCluster(const CommandRequest& request,
                                   ReplyBuilder& reply_builder) {
+  if (request.args_.size() >= 2 &&
+      CmpCaseInsensitive(request.args_[1], "KEYSLOT")) {
+    if (request.args_.size() != 3) {
+      co_return BuiltReply(reply_builder.AppendError(
+          "ERR wrong number of arguments for 'cluster' command"));
+    }
+    co_return BuiltReply(
+        reply_builder.AppendInteger(storage::RedisSlot(request.args_[2])));
+  }
   if (request.args_.size() != 2) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR wrong number of arguments for 'cluster' command"));
@@ -624,7 +633,8 @@ Task<CommandReply> ExecuteCluster(const CommandRequest& request,
   }
   if (!CmpCaseInsensitive(request.args_[1], "NODES")) {
     co_return BuiltReply(reply_builder.AppendError(
-        "ERR only CLUSTER NODES and CLUSTER SLOTS are supported"));
+        "ERR only CLUSTER KEYSLOT, CLUSTER NODES and CLUSTER SLOTS are "
+        "supported"));
   }
   std::string nodes;
   const std::string local_address =

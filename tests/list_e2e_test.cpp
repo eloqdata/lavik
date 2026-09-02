@@ -2315,6 +2315,12 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_NE(source_nodes.find(" slave "), std::string::npos);
   EXPECT_NE(source_nodes.find(":" + std::to_string(replica_port) + "@0"),
             std::string::npos);
+  EXPECT_EQ(source_client.Command({"CLUSTER", "KEYSLOT", "foo"}), ":12182");
+  EXPECT_EQ(
+      source_client.Command({"CLUSTER", "KEYSLOT", "{user1000}.following"}),
+      ":3443");
+  EXPECT_EQ(source_client.Command({"CLUSTER", "KEYSLOT"}),
+            "-ERR wrong number of arguments for 'cluster' command");
   const std::string source_slots = source_client.Command({"CLUSTER", "SLOTS"});
   std::size_t source_slots_offset = 0;
   const ParsedRespValue parsed_source_slots =
