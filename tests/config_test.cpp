@@ -147,6 +147,9 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
           .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"load-rdb-replace", "yes"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"shutdown-checkpoint", "yes"},
+                                        &options)
+                  .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"dir", "/backup"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"dbfilename", "snapshot.rdb"}, &options).ok());
@@ -181,6 +184,7 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
   EXPECT_TRUE(options.maxmemory_clients_.percentage_);
   EXPECT_EQ(options.maxmemory_clients_.value_, 7u);
   EXPECT_EQ(options.client_query_buffer_limit_bytes_, 64ULL * 1024 * 1024);
+  EXPECT_TRUE(options.shutdown_checkpoint_);
   ASSERT_TRUE(options.replicaof_.has_value());
   EXPECT_EQ(options.replicaof_->host_, "redis.internal");
   EXPECT_EQ(options.replicaof_->port_, 6379);
@@ -270,6 +274,9 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
       ApplyRedisConfigDirective({"replicaof", "host", "zero"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"replica-read-only", "maybe"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"shutdown-checkpoint", "maybe"}, &options)
+          .ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"replica-priority", "-1"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"redis-export-backpressure", "maybe"},

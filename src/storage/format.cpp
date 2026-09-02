@@ -391,7 +391,8 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
   }
   if ((decoded.kind_ != BlockKind::kRecords &&
        decoded.kind_ != BlockKind::kPayloadExtent &&
-       decoded.kind_ != BlockKind::kTransaction) ||
+       decoded.kind_ != BlockKind::kTransaction &&
+       decoded.kind_ != BlockKind::kCheckpointIndex) ||
       decoded.reserved_ != std::array<std::uint8_t, 3>{}) {
     return false;
   }
@@ -412,6 +413,14 @@ bool DecodeBlockHeader(std::span<const std::byte, kBlockHeaderSlotBytes> input,
             kBlockHeaderBytes + decoded.extent_payload_bytes_ ||
         decoded.reserved_runtime_ != std::array<std::uint64_t, 3>{} ||
         decoded.tx_generation_ != 0) {
+      return false;
+    }
+  } else {
+    if (decoded.tx_generation_ == 0 || decoded.extent_payload_bytes_ == 0 ||
+        decoded.extent_payload_bytes_ > kExtentPayloadBytes ||
+        decoded.committed_bytes_ !=
+            kBlockHeaderBytes + decoded.extent_payload_bytes_ ||
+        decoded.reserved_runtime_ != std::array<std::uint64_t, 3>{}) {
       return false;
     }
   }

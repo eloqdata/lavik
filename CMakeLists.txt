@@ -207,6 +207,7 @@ add_library(keylane_module
   src/storage/engine.cpp
   src/storage/engine/alloc.cpp
   src/storage/engine/backup.cpp
+  src/storage/engine/checkpoint.cpp
   src/storage/engine/compact_api.cpp
   src/storage/engine/defrag.cpp
   src/storage/engine/expire.cpp

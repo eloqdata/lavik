@@ -1381,6 +1381,32 @@ struct ReservedBlock {
 enum class AllocationPurpose : std::uint8_t {
   kForeground,
   kDefrag,
+  // A clean-shutdown checkpoint may allocate after foreground writes have
+  // been frozen, but it never waits for reclamation or consumes the reserve
+  // that guarantees defrag can make progress.
+  kCheckpoint,
+};
+
+struct CheckpointRoot {
+  std::uint64_t generation_ = 0;
+  std::uint64_t consumed_generation_ = 0;
+  std::uint64_t block_count_ = 0;
+  std::uint64_t entry_count_ = 0;
+
+  bool operator==(const CheckpointRoot&) const noexcept = default;
+};
+
+struct CheckpointShardResult {
+  absl::Status status_ = absl::OkStatus();
+  std::vector<std::uint64_t> blocks_;
+  std::uint64_t entry_count_ = 0;
+};
+
+struct CheckpointLoadResult {
+  absl::Status status_ = absl::OkStatus();
+  std::vector<std::uint64_t> blocks_;
+  std::uint64_t entry_count_ = 0;
+  std::vector<bool> saw_shards_;
 };
 
 struct alignas(kCacheLineBytes) RecoveryDeviceCursor {
@@ -1400,6 +1426,11 @@ struct DeviceAllocator {
   std::vector<std::uint64_t> cold_free_;
   std::vector<std::byte> scan_bitmap_;
   std::vector<MetadataPageState> bitmap_pages_;
+  // This is a discovery index for one-shot shutdown checkpoint blocks. It is
+  // independent of scan_bitmap_, which remains the allocation authority.
+  std::vector<std::byte> checkpoint_bitmap_;
+  std::vector<MetadataPageState> checkpoint_bitmap_pages_;
+  bool checkpoint_bitmap_valid_ = true;
   std::vector<MetadataPageState> epoch_pages_;
   std::vector<std::uint64_t> epoch_values_;
   std::vector<std::uint64_t> durable_epoch_values_;
@@ -2735,6 +2766,11 @@ class StorageEngine::Impl {
   Task<absl::Status> PersistEpochValues(
       std::span<const std::pair<std::size_t, std::uint64_t>> values);
 
+  Task<absl::Status> PersistCheckpointRootOnDeviceLocal(
+      std::size_t device_index, const CheckpointRoot& root);
+
+  Task<absl::Status> PersistCheckpointRoot(const CheckpointRoot& root);
+
   // Takes the database out of service on this worker. Everything here is O(the
   // partition count) and runs without suspending, so the caller's FLUSHDB gate
   // stays closed for a bounded time no matter how many keys the database holds.
@@ -3105,6 +3141,25 @@ class StorageEngine::Impl {
 
   Task<absl::Status> FlushWorkerForShutdown(WorkerStore* store);
 
+  Task<absl::Status> BuildShutdownCheckpointShard(WorkerStore& store,
+                                                  std::uint64_t generation);
+
+  Task<absl::StatusOr<std::uint64_t>> WriteCheckpointBlock(
+      WorkerStore& store, std::uint64_t generation, std::uint32_t shard_id,
+      std::uint32_t record_count, std::span<const std::byte> payload);
+
+  Task<absl::Status> PersistCheckpointBitmapOnDeviceLocal(
+      std::size_t device_index, std::vector<std::uint64_t> block_ids);
+
+  Task<absl::Status> PersistCheckpointBitmap(
+      std::span<const std::uint64_t> block_ids);
+
+  Task<absl::Status> PublishShutdownCheckpoint(
+      std::uint64_t generation);
+
+  Task<absl::Status> LoadCheckpoint(WorkerStore& store,
+                                    CheckpointLoadResult* result);
+
   void CompleteShutdownFlush(const absl::Status& status);
 
   void AdvanceExpiryMap(WorkerStore& store);
@@ -3147,6 +3202,11 @@ class StorageEngine::Impl {
 
   Task<absl::Status> MaybeRunTxCleaner();
   Task<absl::Status> RunTxCleaner();
+
+  // Shutdown has stopped new transaction admission and drained commit chains.
+  // Force generation promotion regardless of the online cooldown so a
+  // checkpoint never needs to encode transaction-tagged winners.
+  Task<absl::Status> DrainTxCleanerForShutdown();
   Task<absl::StatusOr<TxGenerationLocalState>> InspectTxGenerationLocal(
       WorkerStore& store, std::uint64_t generation, bool seal);
 
@@ -3272,6 +3332,14 @@ class StorageEngine::Impl {
       defrag_ready_by_device_;
   std::unique_ptr<RecoveryDeviceCursor[]> recovery_device_cursors_;
   std::vector<std::uint64_t> epoch_values_;
+  CheckpointRoot checkpoint_root_{};
+  bool checkpoint_root_coherent_ = true;
+  std::atomic<bool> checkpoint_active_{false};
+  std::vector<CheckpointShardResult> checkpoint_shards_;
+  std::vector<CheckpointLoadResult> checkpoint_load_results_;
+  std::uint64_t checkpoint_loaded_block_count_ = 0;
+  absl::Status checkpoint_tx_cleanup_status_ = absl::OkStatus();
+  absl::Status checkpoint_publish_status_ = absl::OkStatus();
   std::atomic<bool> epoch_metadata_failed_{false};
   // Cold branch on every logical write. It is set only while this node is
   // destructively rebuilding its single data root; foreground commands are
@@ -3311,11 +3379,18 @@ class StorageEngine::Impl {
   std::atomic<std::uint64_t> tomb_raider_refreshed_{0};
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_consumed_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_loaded_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_retired_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_accounting_barrier_;
   std::unique_ptr<CoroutineBarrier> free_list_barrier_;
   std::unique_ptr<CoroutineBarrier> orphan_extent_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_ready_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_tx_cleaned_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_built_barrier_;
+  std::unique_ptr<CoroutineBarrier> shutdown_checkpoint_published_barrier_;
   std::atomic<std::uint64_t> recovery_scanned_blocks_{0};
   std::atomic<std::uint64_t> recovery_scanned_records_{0};
   std::atomic<std::uint64_t> recovery_max_txid_{0};

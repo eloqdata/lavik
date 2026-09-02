@@ -556,4 +556,50 @@ Task<absl::Status> StorageEngine::Impl::RunTxCleaner() {
   co_return absl::OkStatus();
 }
 
+Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
+  if (active_tx_commits_.load(std::memory_order_acquire) != 0) {
+    co_return absl::FailedPreconditionError(
+        "transaction commits are still active at shutdown");
+  }
+
+  // Every worker has completed its normal shutdown flush and reached the
+  // checkpoint-ready barrier, so no online cleaner can still be running.
+  // Keep the ownership check nonetheless: checkpoint publication is optional,
+  // and an invariant violation must degrade to cold recovery instead of racing
+  // two generation coordinators.
+  bool expected = false;
+  if (!tx_cleaner_running_.compare_exchange_strong(
+          expected, true, std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    co_return absl::FailedPreconditionError(
+        "transaction cleaner is still running at shutdown");
+  }
+  struct RunningGuard {
+    std::atomic<bool>* running_;
+    ~RunningGuard() { running_->store(false, std::memory_order_release); }
+  } guard{&tx_cleaner_running_};
+
+  // Promotion and retirement can make another pass necessary (for example,
+  // after relocation releases the last dependency pin). Bound only the number
+  // of fixed-point passes, not their I/O duration: returning an error leaves
+  // the durable transaction records intact for normal cold recovery.
+  constexpr unsigned kMaxShutdownCleanerRounds = 8;
+  for (unsigned round = 0; round < kMaxShutdownCleanerRounds; ++round) {
+    tx_cleaner_dirty_.store(false, std::memory_order_release);
+    tx_cleaner_rounds_.fetch_add(1, std::memory_order_relaxed);
+    absl::Status status = co_await RunTxCleaner();
+    if (!status.ok()) {
+      tx_cleaner_failures_.fetch_add(1, std::memory_order_relaxed);
+      tx_cleaner_dirty_.store(true, std::memory_order_release);
+      co_return status;
+    }
+    if (!tx_cleaner_dirty_.load(std::memory_order_acquire)) {
+      co_return absl::OkStatus();
+    }
+  }
+
+  co_return absl::FailedPreconditionError(
+      "transaction generations did not quiesce during shutdown");
+}
+
 }  // namespace keylane::storage

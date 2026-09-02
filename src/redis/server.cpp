@@ -2224,7 +2224,7 @@ int RunServer(ServerOptions options) {
       "flush_size_bytes={} "
       "inline_key_max_bytes={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
-      "defrag_record_sleep_us={} defrag_paused={}",
+      "defrag_record_sleep_us={} defrag_paused={} shutdown_checkpoint={}",
       kVersion, bind_display, options.port_, options.tls_port_,
       options.metrics_port_, options.thread_count_, options.max_clients_,
       kMaxClientsFileDescriptorReserve, options.pin_workers_,
@@ -2241,7 +2241,7 @@ int RunServer(ServerOptions options) {
       options.inline_key_max_bytes_,
       options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
-      options.defrag_paused_);
+      options.defrag_paused_, options.shutdown_checkpoint_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_,
@@ -2265,6 +2265,7 @@ int RunServer(ServerOptions options) {
   storage::StorageEngineOptions storage_options;
   storage_options.data_files_ = std::move(options.data_files_);
   storage_options.reset_data_files_ = options.load_rdb_replace_;
+  storage_options.shutdown_checkpoint_ = options.shutdown_checkpoint_;
   storage_options.flush_max_ms_ = options.flush_max_ms_;
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.replication_publish_queue_bytes_ =

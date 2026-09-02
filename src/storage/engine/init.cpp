@@ -7,6 +7,12 @@
 namespace keylane::storage {
 namespace {
 
+std::vector<std::uint64_t> InitialEpochValues() {
+  std::vector<std::uint64_t> values(kEpochValueCount, 1);
+  std::fill(values.begin() + kCheckpointGenerationIndex, values.end(), 0);
+  return values;
+}
+
 absl::Status ResetStorageMetadata(const std::string& path,
                                   std::uint64_t capacity_blocks) {
   constexpr std::size_t kResetChunkBytes = 128 * 1024;
@@ -101,6 +107,23 @@ absl::Status InitializeAddedDeviceMetadata(
     status = WriteExactlyAt(
         path, zero,
         MetadataPageSlotOffset(kScanBitmapMetadataOffset, page_index, 1), true);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  const std::uint64_t checkpoint_bitmap_offset =
+      CheckpointBitmapMetadataOffset(capacity_blocks);
+  for (std::size_t page_index = 0; page_index < bitmap_pages; ++page_index) {
+    status = WriteExactlyAt(
+        path, zero,
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 0),
+        false);
+    if (!status.ok()) {
+      return status;
+    }
+    status = WriteExactlyAt(
+        path, zero,
+        MetadataPageSlotOffset(checkpoint_bitmap_offset, page_index, 1), true);
     if (!status.ok()) {
       return status;
     }
@@ -426,7 +449,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   }
 
   if (has_existing_device && configured_device_count > previous_device_count) {
-    std::vector<std::uint64_t> canonical_epochs(kEpochValueCount, 1);
+    std::vector<std::uint64_t> canonical_epochs = InitialEpochValues();
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (!labels[i].has_value()) {
         continue;
@@ -452,8 +475,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
               &value,
               loaded->payload_.data() + value_index * sizeof(std::uint64_t),
               sizeof(value));
-          canonical_epochs[first_value + value_index] =
-              std::max(canonical_epochs[first_value + value_index], value);
+          if (first_value + value_index < kCheckpointGenerationIndex) {
+            canonical_epochs[first_value + value_index] =
+                std::max(canonical_epochs[first_value + value_index], value);
+          }
         }
       }
     }
@@ -547,7 +572,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
                options_.flush_size_bytes_);
 
   worker_count_ = worker_count;
-  epoch_values_.assign(kEpochValueCount, 1);
+  epoch_values_ = InitialEpochValues();
+  std::vector<CheckpointRoot> loaded_checkpoint_roots;
+  loaded_checkpoint_roots.reserve(devices_.size());
   device_allocators_.clear();
   device_allocators_.reserve(devices_.size());
   for (std::size_t device_index = 0; device_index < devices_.size();
@@ -563,9 +590,11 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     allocator->next_pristine_ = device.data_block_begin_;
     allocator->scan_bitmap_.resize(bitmap_bytes, std::byte{0});
     allocator->bitmap_pages_.resize(bitmap_page_count);
+    allocator->checkpoint_bitmap_.resize(bitmap_bytes, std::byte{0});
+    allocator->checkpoint_bitmap_pages_.resize(bitmap_page_count);
     allocator->epoch_pages_.resize(kEpochMetadataPageCount);
-    allocator->epoch_values_.assign(kEpochValueCount, 1);
-    allocator->durable_epoch_values_.assign(kEpochValueCount, 1);
+    allocator->epoch_values_ = InitialEpochValues();
+    allocator->durable_epoch_values_ = InitialEpochValues();
 
     absl::Status load_status = absl::OkStatus();
     for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
@@ -590,12 +619,27 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
             &value,
             loaded->payload_.data() + value_index * sizeof(std::uint64_t),
             sizeof(value));
-        value = std::max<std::uint64_t>(value, 1);
+        if (first_value + value_index < kCheckpointGenerationIndex) {
+          value = std::max<std::uint64_t>(value, 1);
+        }
         allocator->durable_epoch_values_[first_value + value_index] = value;
-        epoch_values_[first_value + value_index] =
-            std::max(epoch_values_[first_value + value_index], value);
+        if (first_value + value_index < kCheckpointGenerationIndex) {
+          epoch_values_[first_value + value_index] =
+              std::max(epoch_values_[first_value + value_index], value);
+        }
       }
     }
+    loaded_checkpoint_roots.push_back(CheckpointRoot{
+        .generation_ =
+            allocator->durable_epoch_values_[kCheckpointGenerationIndex],
+        .consumed_generation_ =
+            allocator
+                ->durable_epoch_values_[kCheckpointConsumedGenerationIndex],
+        .block_count_ =
+            allocator->durable_epoch_values_[kCheckpointBlockCountIndex],
+        .entry_count_ =
+            allocator->durable_epoch_values_[kCheckpointEntryCountIndex],
+    });
     for (std::size_t page_index = 0;
          load_status.ok() && page_index < bitmap_page_count; ++page_index) {
       const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
@@ -611,6 +655,28 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       }
       allocator->bitmap_pages_[page_index] = loaded->state_;
       std::memcpy(allocator->scan_bitmap_.data() + byte_offset,
+                  loaded->payload_.data(), payload_bytes);
+    }
+    const std::uint64_t checkpoint_bitmap_offset =
+        CheckpointBitmapMetadataOffset(device.capacity_blocks_);
+    for (std::size_t page_index = 0; page_index < bitmap_page_count;
+         ++page_index) {
+      const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
+      const std::size_t payload_bytes =
+          std::min(kMetadataPagePayloadBytes, bitmap_bytes - byte_offset);
+      auto loaded = ReadMetadataPagePair(
+          device.path_, checkpoint_bitmap_offset,
+          MetadataPageKind::kCheckpointBitmap,
+          static_cast<std::uint32_t>(page_index), payload_bytes);
+      if (!loaded.ok()) {
+        // Checkpoint discovery metadata is only an accelerator. A damaged page
+        // disables this generation and is overwritten with zero at startup;
+        // it must not make authoritative record recovery unavailable.
+        allocator->checkpoint_bitmap_valid_ = false;
+        continue;
+      }
+      allocator->checkpoint_bitmap_pages_[page_index] = loaded->state_;
+      std::memcpy(allocator->checkpoint_bitmap_.data() + byte_offset,
                   loaded->payload_.data(), payload_bytes);
     }
     if (!load_status.ok()) {
@@ -649,6 +715,39 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     }
     device_allocators_.push_back(std::move(allocator));
   }
+  checkpoint_root_ = {};
+  for (const CheckpointRoot& root : loaded_checkpoint_roots) {
+    if (root.generation_ > checkpoint_root_.generation_) {
+      checkpoint_root_ = root;
+    } else if (root.generation_ == checkpoint_root_.generation_ &&
+               root.consumed_generation_ >
+                   checkpoint_root_.consumed_generation_) {
+      checkpoint_root_ = root;
+    }
+  }
+  checkpoint_root_coherent_ = std::all_of(
+      loaded_checkpoint_roots.begin(), loaded_checkpoint_roots.end(),
+      [this](const CheckpointRoot& root) { return root == checkpoint_root_; });
+  const bool checkpoint_root_valid =
+      checkpoint_root_.generation_ != 0 &&
+      checkpoint_root_.generation_ > checkpoint_root_.consumed_generation_ &&
+      checkpoint_root_.block_count_ >= worker_count_ &&
+      checkpoint_root_.block_count_ <= recovery_allocated_blocks_;
+  const bool checkpoint_bitmaps_valid = std::all_of(
+      device_allocators_.begin(), device_allocators_.end(),
+      [](const std::unique_ptr<DeviceAllocator>& allocator) {
+        return allocator->checkpoint_bitmap_valid_;
+      });
+  checkpoint_active_.store(options_.shutdown_checkpoint_ &&
+                               checkpoint_root_coherent_ &&
+                               checkpoint_root_valid &&
+                               checkpoint_bitmaps_valid,
+                           std::memory_order_relaxed);
+  epoch_values_[kCheckpointGenerationIndex] = checkpoint_root_.generation_;
+  epoch_values_[kCheckpointConsumedGenerationIndex] =
+      checkpoint_root_.consumed_generation_;
+  epoch_values_[kCheckpointBlockCountIndex] = checkpoint_root_.block_count_;
+  epoch_values_[kCheckpointEntryCountIndex] = checkpoint_root_.entry_count_;
   // Runtime device owners start from the canonical component-wise maximum.
   // durable_epoch_values retains what each device actually contained, so a
   // later update to the same page also repairs stale mirror fields.
@@ -708,12 +807,31 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
     db_epochs_[db_id].store(epoch_values_[db_id], std::memory_order_relaxed);
   }
   open_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_consumed_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_loaded_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   metadata_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_retired_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   recovery_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   recovery_accounting_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   free_list_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   orphan_extent_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_checkpoint_ready_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_checkpoint_tx_cleaned_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_checkpoint_built_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  shutdown_checkpoint_published_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_shards_.resize(worker_count);
+  checkpoint_load_results_.resize(worker_count);
+  for (CheckpointLoadResult& result : checkpoint_load_results_) {
+    result.saw_shards_.resize(worker_count, false);
+  }
   return absl::OkStatus();
 }
 
@@ -833,13 +951,125 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
     co_return status;
   }
 
+  std::vector<RecoveryBatch> batches(worker_count_);
+  std::vector<std::uint64_t> zero_blocks;
+  CheckpointLoadResult& checkpoint_load =
+      checkpoint_load_results_[worker.id()];
+  if (worker.id() == 0) {
+    if (!checkpoint_root_coherent_ ||
+        checkpoint_root_.generation_ >
+            checkpoint_root_.consumed_generation_) {
+      CheckpointRoot consumed = checkpoint_root_;
+      consumed.consumed_generation_ = consumed.generation_;
+      status = co_await PersistCheckpointRoot(consumed);
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
+    }
+  }
+
+  status = co_await checkpoint_consumed_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
+    checkpoint_load.status_ = co_await LoadCheckpoint(store, &checkpoint_load);
+  }
+
+  status = co_await checkpoint_loaded_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (worker.id() == 0) {
+    if (checkpoint_active_.load(std::memory_order_acquire)) {
+      absl::Status load_status = absl::OkStatus();
+      std::uint64_t loaded_blocks = 0;
+      std::uint64_t loaded_entries = 0;
+      std::vector<bool> saw_shards(worker_count_, false);
+      for (const CheckpointLoadResult& loaded : checkpoint_load_results_) {
+        if (load_status.ok() && !loaded.status_.ok()) {
+          load_status = loaded.status_;
+        }
+        if (std::numeric_limits<std::uint64_t>::max() - loaded_blocks <
+                loaded.blocks_.size() ||
+            std::numeric_limits<std::uint64_t>::max() - loaded_entries <
+                loaded.entry_count_) {
+          if (load_status.ok()) {
+            load_status =
+                absl::InternalError("checkpoint decoded totals overflow");
+          }
+          continue;
+        }
+        loaded_blocks += loaded.blocks_.size();
+        loaded_entries += loaded.entry_count_;
+        for (unsigned shard = 0; shard < worker_count_; ++shard) {
+          saw_shards[shard] =
+              saw_shards[shard] || loaded.saw_shards_[shard];
+        }
+      }
+      if (load_status.ok() &&
+          loaded_blocks != checkpoint_root_.block_count_) {
+        load_status = absl::InternalError("checkpoint block count mismatch");
+      }
+      if (load_status.ok() &&
+          loaded_entries != checkpoint_root_.entry_count_) {
+        load_status = absl::InternalError("checkpoint entry count mismatch");
+      }
+      if (load_status.ok() &&
+          std::find(saw_shards.begin(), saw_shards.end(), false) !=
+              saw_shards.end()) {
+        load_status =
+            absl::InternalError("checkpoint bitmap omits a worker shard");
+      }
+      if (!load_status.ok()) {
+        spdlog::warn(
+            "shutdown checkpoint generation={} is unusable; falling back "
+            "to record scan: {}",
+            checkpoint_root_.generation_, load_status.message());
+        checkpoint_active_.store(false, std::memory_order_release);
+      } else {
+        checkpoint_loaded_block_count_ = loaded_blocks;
+        spdlog::info(
+            "loaded shutdown checkpoint generation={} entries={} blocks={} "
+            "scan-workers={}",
+            checkpoint_root_.generation_, loaded_entries, loaded_blocks,
+            worker_count_);
+      }
+    }
+
+    // The discovery bitmap is one-use even if loading was disabled or failed.
+    // The consumed root prevents reuse if clearing itself is interrupted.
+    const absl::Status cleared = co_await PersistCheckpointBitmap({});
+    if (!cleared.ok()) {
+      spdlog::warn("failed to clear checkpoint bitmap: {}",
+                   cleared.message());
+    }
+  }
+
   status = co_await metadata_barrier_->Wait(worker);
   if (!status.ok()) {
     co_return status;
   }
 
-  std::vector<RecoveryBatch> batches(worker_count_);
-  std::vector<std::uint64_t> zero_blocks;
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
+    if (worker.id() == 0) {
+      assert(recovery_allocated_blocks_ >= checkpoint_loaded_block_count_);
+      recovery_allocated_blocks_ -= checkpoint_loaded_block_count_;
+    }
+    // Every scan worker retires the blocks it validated. Allocation-bitmap
+    // updates remain serialized by each device owner, while devices and
+    // independent metadata pages can progress concurrently.
+    status = co_await ReturnColdBlocks(std::move(checkpoint_load.blocks_));
+    if (!status.ok()) {
+      Fail(status);
+      co_return status;
+    }
+  } else {
+    checkpoint_load.blocks_.clear();
+  }
+
+  status = co_await checkpoint_retired_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
   absl::flat_hash_set<std::uint64_t> committed_txids;
   status = co_await ScanAssignedBlocks(store, &batches, &zero_blocks,
                                        &committed_txids);
@@ -1257,11 +1487,18 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
 
 void StorageEngine::Impl::Fail(const absl::Status& status) {
   open_barrier_->Abort(status);
+  checkpoint_consumed_barrier_->Abort(status);
+  checkpoint_loaded_barrier_->Abort(status);
   metadata_barrier_->Abort(status);
+  checkpoint_retired_barrier_->Abort(status);
   recovery_barrier_->Abort(status);
   recovery_accounting_barrier_->Abort(status);
   free_list_barrier_->Abort(status);
   orphan_extent_barrier_->Abort(status);
+  shutdown_checkpoint_ready_barrier_->Abort(status);
+  shutdown_checkpoint_tx_cleaned_barrier_->Abort(status);
+  shutdown_checkpoint_built_barrier_->Abort(status);
+  shutdown_checkpoint_published_barrier_->Abort(status);
 }
 
 absl::Status StorageEngine::Impl::ConfigureWorkerDeviceAffinity() {

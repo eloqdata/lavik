@@ -103,6 +103,14 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   }
   ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kScanBitmap,
                                   11, &metadata_generation, decoded_payload));
+  EncodeMetadataPage(MetadataPageKind::kCheckpointBitmap, 7, 29,
+                     metadata_payload, metadata_page);
+  ASSERT_TRUE(DecodeMetadataPage(metadata_page,
+                                 MetadataPageKind::kCheckpointBitmap, 7,
+                                 &metadata_generation, decoded_payload));
+  ASSERT_EQ(metadata_generation, 29);
+  EncodeMetadataPage(MetadataPageKind::kEpochs, 11, 23, metadata_payload,
+                     metadata_page);
   ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 12,
                                   &metadata_generation, decoded_payload));
   metadata_page.back() ^= std::byte{1};
@@ -111,6 +119,8 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;
   static_assert(ScanBitmapBytes(one_pib_blocks) == 16 * 1024 * 1024);
+  static_assert(CheckpointBitmapMetadataOffset(one_pib_blocks) >
+                kScanBitmapMetadataOffset);
   static_assert(DataBlockBegin(one_pib_blocks) >= 3);
   static_assert(FixedMetadataBytes(one_pib_blocks) <=
                 static_cast<std::uint64_t>(DataBlockBegin(one_pib_blocks)) *
@@ -207,6 +217,19 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   transaction_header.tx_generation_ = 0;
   EncodeBlockHeader(transaction_header, block_page);
   EXPECT_FALSE(DecodeBlockHeader(block_page, &decoded_header));
+
+  BlockHeader checkpoint_header = header;
+  checkpoint_header.kind_ = BlockKind::kCheckpointIndex;
+  checkpoint_header.tx_generation_ = 23;
+  checkpoint_header.extent_index_ = 2;
+  checkpoint_header.extent_payload_bytes_ = 4096;
+  checkpoint_header.extent_payload_checksum_ = 0x87654321U;
+  checkpoint_header.record_count_ = 11;
+  checkpoint_header.committed_bytes_ = kBlockHeaderBytes + 4096;
+  EncodeBlockHeader(checkpoint_header, block_page);
+  ASSERT_TRUE(DecodeBlockHeader(block_page, &decoded_header));
+  EXPECT_EQ(decoded_header.kind_, BlockKind::kCheckpointIndex);
+  EXPECT_EQ(decoded_header.tx_generation_, 23);
   BlockHeader records_with_generation = header;
   records_with_generation.tx_generation_ = 17;
   EncodeBlockHeader(records_with_generation, block_page);

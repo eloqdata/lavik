@@ -234,7 +234,12 @@ StorageEngine::Impl::AllocateFromDeviceLocal(std::size_t device_index,
   }
   const std::uint64_t block_id = allocator.ready_blocks_.back();
   allocator.ready_blocks_.pop_back();
-  MaybeRefillDeviceInBackground(device_index, allocator);
+  if (purpose != AllocationPurpose::kCheckpoint) {
+    // Shutdown waits only for the explicit checkpoint barriers. Starting an
+    // allocator refill here would create new background work after the normal
+    // drain has already declared the worker quiescent.
+    MaybeRefillDeviceInBackground(device_index, allocator);
+  }
   co_return ReservedBlock{
       .block_id_ = block_id,
       .allocation_epoch_ = allocator.next_allocation_epoch_++,
@@ -691,9 +696,12 @@ Task<absl::StatusOr<ReservedBlock>> StorageEngine::Impl::AllocateBlock(
     // Defrag allocations consume the protected reserve. Waiting for another
     // defrag from inside DefragOne would deadlock when the reserve is truly
     // exhausted, so only foreground allocation waits for reclaim progress.
-    if (purpose == AllocationPurpose::kDefrag) {
+    if (purpose == AllocationPurpose::kDefrag ||
+        purpose == AllocationPurpose::kCheckpoint) {
       co_return absl::Status(absl::StatusCode::kResourceExhausted,
-                             "defrag reserve is exhausted");
+                             purpose == AllocationPurpose::kDefrag
+                                 ? "defrag reserve is exhausted"
+                                 : "checkpoint space is exhausted");
     }
     const std::uint64_t generation_after =
         space_reclaim_generation_.load(std::memory_order_acquire);

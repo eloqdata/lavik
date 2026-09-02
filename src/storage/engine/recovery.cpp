@@ -362,6 +362,16 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
                 block.allocation_epoch_ + 1);
       AtomicMax(&recovery_max_lsn_, block.max_lsn_);
 
+      if (block.kind_ == BlockKind::kCheckpointIndex) {
+        // Checkpoint blocks are acceleration state, not record ownership.
+        // The selected generation was already loaded through its bitmap;
+        // every selected or stale checkpoint block becomes ordinary free space
+        // once this startup completes.
+        zero_blocks->push_back(block_id);
+        ReportRecoveryProgress(0, /*allocated=*/true);
+        continue;
+      }
+
       const std::uint16_t block_owner = RecoveredBlockOwner(block, block_id);
       batches->at(block_owner)
           .blocks_.push_back(RecoveryBlock{ActiveBlock{
@@ -386,6 +396,17 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
           if (!applied.ok()) {
             co_return applied;
           }
+          buffered_bytes = 0;
+        }
+        continue;
+      }
+
+      if (block.kind_ == BlockKind::kRecords &&
+          checkpoint_active_.load(std::memory_order_acquire)) {
+        ReportRecoveryProgress(0, /*allocated=*/true);
+        if (buffered_bytes >= batch_target_bytes) {
+          absl::Status applied = co_await ApplyRecoveryBatches(store, batches);
+          if (!applied.ok()) co_return applied;
           buffered_bytes = 0;
         }
         continue;

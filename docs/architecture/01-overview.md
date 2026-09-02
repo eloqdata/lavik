@@ -59,11 +59,14 @@ snapshots.
 4. Worker 0 performs an optional validated RDB import before the readiness flag
    is published. Replication is notified only after worker storage is ready.
 5. On a shutdown signal, new requests and accepts are closed, active requests
-   and RDB backup work drain, and storage is durably flushed. Celer then stops
-   each worker; after that worker's I/O and coroutine frames are gone but before
-   its native thread exits and is joined, `RedisService::FinalizeWorker` calls
-   `StorageEngine::FinalizeWorker` to release worker-owned indexes and storage
-   state.
+   and RDB backup work drain, and storage is durably flushed. When configured,
+   shutdown transaction cleaning first relocates committed tagged winners into
+   durable ordinary records; a shutdown checkpoint then serializes the frozen
+   key indexes and publishes them before worker teardown. Celer then stops
+   each worker; after that worker's I/O and coroutine frames are gone but
+   before its native thread exits and is joined,
+   `RedisService::FinalizeWorker` calls `StorageEngine::FinalizeWorker` to
+   release worker-owned indexes and storage state.
 
 ## Primary flows
 

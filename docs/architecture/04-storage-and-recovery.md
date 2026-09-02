@@ -17,8 +17,10 @@ and request admission; the transaction subsystem owns key arbitration; and the
 replication subsystem owns role and session lifecycle. Storage supplies the
 durable records and epochs those modules act on.
 
-The top-level key indexes are runtime state, not a separate persistent lookup
-structure. Recovery rebuilds them from committed records. Collection values
+The top-level key indexes are runtime authority. An optional clean-shutdown
+checkpoint serializes them as a one-shot recovery accelerator, but committed
+records remain the durable source of truth and recovery falls back to scanning
+them whenever a checkpoint is absent or invalid. Collection values
 may contain storage-managed tree or compact encodings, but their current root
 is still selected through the same top-level record index.
 
@@ -102,11 +104,14 @@ device to 2^27 8 MiB blocks, or 1 PiB. Startup requires the complete initialized
 member set, rejects duplicate or foreign devices, preserves labeled capacity
 when a regular file has grown, and rejects a backing object that has shrunk.
 
-Epoch metadata contains 16 database epochs followed by 16,384 partition
-replication epochs. The allocation bitmap has one bit per physical block. Each
-logical metadata page has independent 4 KiB A/B slots with a generation and
-CRC32C checksum. Readers select the valid higher generation. An all-zero pair
-is uninitialized logical zero; a nonzero pair with no valid slot is corruption.
+Epoch metadata contains 16 database epochs, 16,384 partition replication
+epochs, and the published and consumed checkpoint generations plus the
+expected checkpoint block and entry counts. The allocation bitmap and the
+independent checkpoint-discovery bitmap each have one bit per physical block.
+Each logical metadata page has independent 4 KiB A/B slots with a generation
+and CRC32C checksum. Readers select the valid higher generation. An all-zero
+pair is uninitialized logical zero; a nonzero pair with no valid slot is
+corruption.
 
 Every data block is 8 MiB:
 
@@ -120,8 +125,9 @@ The alternating header slots record block identity, writer topology,
 allocation epoch, committed boundary, record count, maximum physical LSN,
 header sequence, kind, and kind-specific metadata. Slot selection prefers the
 higher allocation epoch and then the higher header sequence. Current block
-kinds are ordinary records, payload extents, and transaction generations;
-on-disk enum value 3 remains deliberately unassigned.
+kinds are ordinary records, payload extents, transaction generations,
+and checkpoint index chunks; on-disk enum value 3 remains deliberately
+unassigned.
 
 Records are 8-byte aligned and carry their database and value type, key
 representation, logical and physical sizes, transaction ID, database and
@@ -145,7 +151,9 @@ is a runtime view rather than a persisted C++ object representation.
 This compact version-1 record layout directly replaces the earlier 104-byte
 version-1 layout without changing the format number; there is no compatibility
 decoder. Media written by the earlier layout must be reset before this build
-starts. Compact Hash/Set values likewise retain version 1.
+starts. The checkpoint root, bitmap, and block kind make the same
+development-stage direct replacement under format version 1. Compact Hash/Set
+values likewise retain version 1.
 
 Keys that do not fit the configured inline header limit move into the payload.
 Large key/value payloads use a root record containing an extent manifest. Each
@@ -182,6 +190,23 @@ page on every device. Epochs only increase, so the runtime vector is the
 component-wise maximum of all device copies; a later mirrored update also
 repairs stale fields on a lagging member.
 
+If fixed metadata names an unconsumed checkpoint, worker 0 first advances its
+consumed generation on every device. All recovery workers then walk disjoint
+topology-aware stripes of the checkpoint bitmap. Each holds at most one block,
+validates it, and submits its decoded batch to the index-owning worker, so block
+I/O and index construction run concurrently with worker-bounded temporary
+memory. A barrier reduces per-worker block, entry, and shard totals. The root's
+expected counts make missing bitmap bits disable the fast path; stale bits are
+ignored unless their block header names the selected generation. Once the
+complete checkpoint is resident, its discovery bitmap is zeroed, each scanner
+returns its validated blocks through the cold-free lifecycle, and another
+barrier precedes ordinary recovery. A missing block, generation or topology
+mismatch, invalid bound, or checksum failure disables ordinary-body skipping
+and retains the full record scan. Entries from an already installed valid
+checkpoint prefix merge with that scan rather than requiring an unbounded
+rollback buffer. Startup also zeroes stale checkpoint bitmap state when no
+checkpoint is usable.
+
 ### Per-worker initialization and teardown
 
 `InitializeWorker` creates the worker's aligned buffer pool, registers the
@@ -206,11 +231,15 @@ Recovery proceeds as follows:
    activation false positive and becomes reusable. A valid header whose
    embedded block ID does not match its physical location is stale media and
    is ignored without rewriting the bitmap.
-3. A valid extent header contributes extent identity. A valid records or
-   transaction block is read through its committed boundary; zero page padding
-   is skipped, while record bounds, allocation epochs, topology, keys, and
-   checksums are validated. Recovery computes each winning key's runtime
-   digest from the recovered complete key instead of loading one from disk.
+3. A valid extent header contributes extent identity. With a validated
+   checkpoint, an ordinary record block contributes only its header because
+   the checkpoint already supplies its winning index entries. Without one,
+   ordinary record blocks are read through their committed boundary.
+   Transaction blocks are always read through their committed boundary; zero
+   page padding is skipped, while record bounds, allocation epochs, topology,
+   keys, and checksums are validated. Recovery computes each winning key's
+   runtime digest from the recovered complete key instead of loading one from
+   disk.
    Recovered records are routed to key owners in byte-targeted batches. The
    process-wide target is 64 MiB divided across active scan workers, rather
    than an item limit repeated independently by every worker; one indivisible
@@ -407,8 +436,16 @@ flushes, and pending transaction decisions for operators and tests that need a
 durability fence. Graceful shutdown gives accepted queued and explicitly
 background transaction commits up to five seconds to append their decisions,
 then seals every active stream and drains flushes, extent reclaims, and
-retirement accounting. An I/O failure fail-stops further writes and retains
-staging buffers so already staged reads do not follow recycled memory.
+retirement accounting. If `shutdown-checkpoint yes` is configured, every
+worker first reaches a shutdown barrier, then worker 0 forces transaction
+cleaning to promote all committed tagged winners into durable ordinary records.
+After every worker observes that result, each serializes its frozen index shard
+and worker 0 publishes their discovery bitmap and generation root through fixed
+metadata. Transaction cleanup or checkpoint failure is best effort: it leaves
+the previous generation consumed and shutdown continues with authoritative
+ordinary and transaction records durable. An I/O failure fail-stops further
+writes and retains staging buffers so already staged reads do not follow
+recycled memory.
 
 ## Allocation and maintenance lifecycles
 
@@ -506,7 +543,10 @@ Transaction cleaning rotates record-bearing generations, seals and flushes
 their blocks, collects committed decisions, and relocates current committed
 tagged winners into ordinary untagged record blocks. A generation is returned
 through the cold-free lifecycle only when it is sealed and durable and has no
-active transaction leases, live tagged bytes, or dependency pins.
+active transaction leases, live tagged bytes, or dependency pins. When a
+shutdown checkpoint is enabled, worker 0 ignores the online cooldown and runs
+this lifecycle to a fixed point after commit and flush drain; failure skips the
+checkpoint rather than weakening cold recovery.
 
 ## Crash-consistency invariants and failure behavior
 
@@ -528,6 +568,10 @@ active transaction leases, live tagged bytes, or dependency pins.
   relocations so delayed work cannot affect a later incarnation of one block.
 - Fixed-metadata and storage write ambiguity is fail-stop. The engine does not
   continue allocating or appending after it can no longer prove durable state.
+- Checkpoint blocks become reachable only after all index chunks and their
+  discovery bitmap are durable and the generation root is published. Startup
+  consumes a generation before using it, so a later crash cannot reuse a
+  snapshot from before that process ran.
 
 ## Observability and verification
 
@@ -588,6 +632,7 @@ Current test evidence includes:
 - [System overview](01-overview.md)
 - [Transaction coordination](03-transaction-coordination.md)
 - [Replication](05-replication.md)
+- [Shutdown index checkpoints](06-shutdown-index-checkpoints.md)
 - [Recovery metadata layout](../design-docs/recovery-metadata-design.md)
 - [Worker-count-independent storage ownership](../design-docs/storage-block-ownership.md)
 - [Multi-device storage](../operations/multi-device-storage.md)
@@ -606,6 +651,7 @@ current source code are authoritative for present storage behavior.
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
 | Runtime index representation, shared entry arena, process-local key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
+| Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/keylane/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |

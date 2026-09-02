@@ -34,6 +34,9 @@ struct StorageEngineOptions {
   // before assigning a fresh storage-set identity. Data blocks are left
   // physically intact but become unreachable.
   bool reset_data_files_ = false;
+  // Publish a best-effort index checkpoint during a clean shutdown so the next
+  // startup can avoid decoding ordinary record-block bodies.
+  bool shutdown_checkpoint_ = false;
   std::uint32_t flush_max_ms_ = 1000;
   // Minimum delay between transaction-generation rotations/cleaning rounds.
   // Zero disables the cleaner; it can be changed at runtime through CONFIG.

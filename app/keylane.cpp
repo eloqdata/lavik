@@ -275,6 +275,9 @@ int main(int argc, char** argv) {
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--defrag-paused", options.defrag_paused_,
                "Queue defrag candidates without running relocation jobs");
+  app.add_flag("--shutdown-checkpoint,!--no-shutdown-checkpoint",
+               options.shutdown_checkpoint_,
+               "Write an index checkpoint during clean shutdown");
   app.add_option(
          "--data-file", options.data_files_,
          "Existing data file or block device; repeat for multiple paths")

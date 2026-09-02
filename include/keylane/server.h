@@ -60,6 +60,9 @@ struct ServerOptions {
   std::uint32_t flush_max_ms_ = 1000;
   std::size_t flush_size_bytes_ = 128ULL * 1024;
   std::vector<std::string> data_files_{"keylane.data"};
+  // Build and publish an index checkpoint after a clean shutdown drain. The
+  // default keeps the existing recovery and shutdown cost unchanged.
+  bool shutdown_checkpoint_ = false;
   // RDB output always uses a normal filesystem directory, independently of
   // whether data_files_ names regular files, block devices, or SPDK devices.
   std::string rdb_dir_{"."};

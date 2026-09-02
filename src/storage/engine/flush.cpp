@@ -16,6 +16,65 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
+      if (options_.shutdown_checkpoint_) {
+        // Stop ordinary append activity before worker 0 promotes every
+        // committed transaction-tagged winner. All workers must observe that
+        // result before freezing their index shard; the remaining barriers
+        // keep shard construction and bitmap/root publication ordered.
+        absl::Status barrier =
+            co_await shutdown_checkpoint_ready_barrier_->Wait(*store->worker_);
+        if (barrier.ok()) {
+          if (store->worker_->id() == 0) {
+            checkpoint_tx_cleanup_status_ =
+                co_await DrainTxCleanerForShutdown();
+          }
+          barrier = co_await shutdown_checkpoint_tx_cleaned_barrier_->Wait(
+              *store->worker_);
+        }
+        if (barrier.ok()) {
+          const std::uint64_t generation = checkpoint_root_.generation_ + 1;
+          CheckpointShardResult& shard =
+              checkpoint_shards_[store->worker_->id()];
+          if (!status.ok()) {
+            shard.status_ = status;
+          } else if (!checkpoint_tx_cleanup_status_.ok()) {
+            shard.status_ = checkpoint_tx_cleanup_status_;
+          } else if (generation == 0) {
+            shard.status_ = absl::ResourceExhaustedError(
+                "checkpoint generation is exhausted");
+          } else {
+            shard.status_ =
+                co_await BuildShutdownCheckpointShard(*store, generation);
+          }
+          barrier = co_await shutdown_checkpoint_built_barrier_->Wait(
+              *store->worker_);
+          if (barrier.ok() && store->worker_->id() == 0) {
+            checkpoint_publish_status_ =
+                co_await PublishShutdownCheckpoint(generation);
+          }
+          if (barrier.ok()) {
+            barrier = co_await shutdown_checkpoint_published_barrier_->Wait(
+                *store->worker_);
+          }
+          if (barrier.ok() && !checkpoint_publish_status_.ok() &&
+              store->worker_->id() == 0) {
+            spdlog::warn("shutdown checkpoint was not published: {}",
+                         checkpoint_publish_status_.message());
+          } else if (barrier.ok() && store->worker_->id() == 0) {
+            std::uint64_t entries = 0;
+            std::size_t blocks = 0;
+            for (const CheckpointShardResult& completed : checkpoint_shards_) {
+              entries += completed.entry_count_;
+              blocks += completed.blocks_.size();
+            }
+            spdlog::info(
+                "published shutdown checkpoint generation={} entries={} "
+                "index-blocks={}",
+                generation, entries, blocks);
+          }
+        }
+        if (!barrier.ok() && status.ok()) status = barrier;
+      }
       CompleteShutdownFlush(status);
       co_return status;
     }

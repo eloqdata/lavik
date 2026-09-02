@@ -373,6 +373,13 @@ absl::Status ApplyRedisConfigDirective(
     options->load_rdb_replace_ = *enabled;
     return absl::OkStatus();
   }
+  if (name == "shutdown-checkpoint") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->shutdown_checkpoint_ = *enabled;
+    return absl::OkStatus();
+  }
   if (name == "threads" || name == "io-threads") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->thread_count_, false);

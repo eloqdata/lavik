@@ -53,6 +53,7 @@ inline constexpr std::uint64_t kDeviceLabelOffset = 0;
 enum class MetadataPageKind : std::uint16_t {
   kEpochs = 1,
   kScanBitmap = 2,
+  kCheckpointBitmap = 3,
 };
 
 struct MetadataPageHeader {
@@ -70,12 +71,26 @@ struct MetadataPageHeader {
 inline constexpr std::size_t kMetadataPagePayloadBytes =
     kDirectIoAlignment - sizeof(MetadataPageHeader);
 inline constexpr std::size_t kEpochValueCount =
+    kLogicalDatabaseCount + kLogicalStorageShards + 4;
+inline constexpr std::size_t kCheckpointGenerationIndex =
     kLogicalDatabaseCount + kLogicalStorageShards;
+inline constexpr std::size_t kCheckpointConsumedGenerationIndex =
+    kCheckpointGenerationIndex + 1;
+inline constexpr std::size_t kCheckpointBlockCountIndex =
+    kCheckpointGenerationIndex + 2;
+inline constexpr std::size_t kCheckpointEntryCountIndex =
+    kCheckpointGenerationIndex + 3;
 inline constexpr std::size_t kEpochMetadataBytes =
     kEpochValueCount * sizeof(std::uint64_t);
 inline constexpr std::size_t kEpochMetadataPageCount =
     (kEpochMetadataBytes + kMetadataPagePayloadBytes - 1) /
     kMetadataPagePayloadBytes;
+static_assert(kEpochMetadataPageCount ==
+                  ((kLogicalDatabaseCount + kLogicalStorageShards) *
+                       sizeof(std::uint64_t) +
+                   kMetadataPagePayloadBytes - 1) /
+                      kMetadataPagePayloadBytes,
+              "checkpoint root must fit existing fixed-metadata pages");
 inline constexpr std::uint64_t kEpochMetadataOffset = kDirectIoAlignment;
 inline constexpr std::uint64_t kScanBitmapMetadataOffset =
     kEpochMetadataOffset + kEpochMetadataPageCount * 2 * kDirectIoAlignment;
@@ -90,9 +105,17 @@ constexpr std::size_t ScanBitmapPageCount(
          kMetadataPagePayloadBytes;
 }
 
-constexpr std::uint64_t FixedMetadataBytes(
+// Checkpoint discovery uses the same capacity-derived coverage as the
+// allocation bitmap but a separate A/B page range.
+inline constexpr std::uint64_t CheckpointBitmapMetadataOffset(
     std::uint64_t capacity_blocks) noexcept {
   return kScanBitmapMetadataOffset +
+         ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
+}
+
+constexpr std::uint64_t FixedMetadataBytes(
+    std::uint64_t capacity_blocks) noexcept {
+  return CheckpointBitmapMetadataOffset(capacity_blocks) +
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
 }
 
@@ -166,6 +189,10 @@ enum class BlockKind : std::uint8_t {
   // TxCommit decisions share this block class until the cleaner promotes the
   // committed winners to ordinary kRecords blocks with txid zero.
   kTransaction = 4,
+  // A shutdown checkpoint is published only after all of its index blocks and
+  // the checkpoint bitmap naming them are durable. These blocks are recovery
+  // accelerators, never authoritative user data.
+  kCheckpointIndex = 5,
 };
 
 enum class ReplicationEventKind : std::uint8_t {
@@ -224,7 +251,8 @@ struct BlockHeader {
   std::uint32_t extent_payload_bytes_ = 0;
   std::uint32_t extent_payload_checksum_ = 0;
   std::array<std::uint64_t, 3> reserved_runtime_{};
-  // Nonzero only for kTransaction.
+  // Nonzero for kTransaction and kCheckpointIndex. For checkpoint blocks it
+  // identifies the metadata generation that may make them live.
   std::uint64_t tx_generation_ = 0;
 };
 
