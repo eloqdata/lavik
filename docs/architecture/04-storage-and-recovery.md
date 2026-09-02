@@ -358,8 +358,14 @@ authoritative records or replication protocols.
 
 All partition and logical-database indexes on a worker allocate entries from a
 shared worker-local arena, so sparse indexes share capacity instead of
-stranding it at partition boundaries. A population detached by `FLUSHDB`
-retains ownership of that arena until asynchronous reclamation finishes.
+stranding it at partition boundaries. A population detached by `FLUSHDB`, a
+replica reset, or a replica abort retains ownership of that arena until
+reclamation finishes. Replica promotion and abort reuse the same worker-local
+detached-index drain as synchronous database flushes, so a completed lifecycle
+cannot leave old index arenas or record-block live-byte accounting queued for a
+later rebuild. The drain covers the worker FIFO; it is not partitioned by
+replication attempt.
+
 Ordinary online growth remains incremental. Shutdown-checkpoint recovery knows
 each final population exactly and allocates its settled bucket table before
 installing entries, avoiding intermediate rehash tables without changing the
@@ -555,6 +561,14 @@ publish block ID to the ready pool
 assign a fresh allocation epoch
 ```
 
+A destructive replica reset makes the prior records logically obsolete by
+epoch; it does not make their blocks immediately allocatable. Partial-attempt
+blocks and retired-but-unreclaimed blocks remain excluded from reported
+available capacity until they complete this lifecycle. Full rebuild therefore
+uses ordinary allocator and retained-memory admission instead of reserving a
+second full dataset up front, and it may report resource exhaustion when the
+in-place transition has insufficient reclaimable capacity.
+
 A crash before the bit is cleared still scans the old allocation. A crash
 afterward skips the stale body. A crash during reactivation sees either a clear
 bit or a durably zero header, never a recoverable record from the cold block's
@@ -598,15 +612,28 @@ time, and the freed block can restore write capacity. A shielding value cannot
 use this escape valve because an older durable value could reappear.
 
 Tomb Raider is a separate, optional cleanup loop launched at worker startup
-only when the node is then the expiration authority. Once launched, the loop
-does not recheck that authority: a later `REPLICAOF` role change can leave it
-scheduled on a replica. It marks tombstones and shielding values as initially
-unclaimed, sweeps all ordinary record blocks including staged prefixes, claims
-candidates for which an older unexpired value still exists, and only then
-clears stale shielding or erases unclaimed tombstones. The round state is
-process-local. A crash or shutdown can forfeit a round because recovery
-reconstructs the conservative tombstone and shielding state and the next round
-repeats the proof.
+only when the node is then the expiration authority. Cluster-managed startup
+does not grant that authority and therefore does not launch the loop. Once
+launched, the loop does not recheck authority on its own; the standalone
+`REPLICAOF` transition therefore explicitly quiesces it before installing an
+upstream. Native FULL mode also quiesces it at the session-wide boundary before
+the first destructive reset. It marks tombstones and shielding values as
+initially unclaimed, sweeps all ordinary record blocks
+including staged prefixes, claims candidates for which an older unexpired
+value still exists, and only then clears stale shielding or erases unclaimed
+tombstones. The round state is process-local. A crash or shutdown can forfeit a
+round because recovery reconstructs the conservative tombstone and shielding
+state and the next round repeats the proof.
+
+The internal `QuiesceTombRaiderForReplica` boundary is stronger than the
+user-facing `TOMBRAIDER OFF`: it disables future rounds, requests an in-flight
+round to forfeit at its next safe phase or block checkpoint, and waits until no
+round is running. The ordinary OFF command continues to let an in-flight round
+finish. Standalone role transition and the native FULL-begin barrier invoke
+this boundary while client database gates are closed. The callable cluster
+rebuild adapter uses that same native FULL path; cluster startup also avoids
+the pre-directive race by never launching Tomb Raider while authority is
+withheld.
 
 ### Database and transaction-generation cleanup
 
@@ -618,12 +645,37 @@ database is observably empty after detach; SYNC waits for detached-index
 retirement, while ASYNC ensures the same background reclaimer runs without
 waiting for it.
 
+Native FULL rebuild uses the analogous partition-epoch boundary for all 16,384
+physical partitions, even when the desired cluster manifest is sparse. Each
+reset batch persists a fresh target-local candidate epoch before it detaches
+the prior index, and returns that epoch to replication so the logical manifest
+epoch can be bound to the exact local incarnation at handoff. Snapshot and tail
+records populate the new in-place indexes while the server is LOADING; there is
+no parallel staging root or retained active root. Promotion verifies every
+partition reached handoff, drains replica writes and the worker-local
+detached-index queue, then persists database epochs and clears the sync state.
+Abort performs the same write drain, detaches the partial attempt, and drains
+that queue before it allows a later attempt to reuse runtime index capacity.
+Detached-index completion covers index destruction and record-block live-byte
+settlement. Value extents continue through the existing asynchronous retirement
+path, and external-key extents remain a `retired-unreclaimed` dependency until
+the parent record block's allocation bit is durably clear; allocator capacity
+excludes both forms of debt until they actually reach the cold-free state.
+
+Epoch invalidation is durable, but cluster readiness is not a storage property.
+After restart, storage may recover records from the latest local epochs while
+the replication layer constructs a new boot-scoped `NOT_READY` group and keeps
+serving closed until a fresh directive proves a complete population.
+
 Transaction cleaning rotates record-bearing generations, seals and flushes
 their blocks, collects committed decisions, and relocates current committed
 tagged winners into ordinary untagged record blocks. A generation is returned
 through the cold-free lifecycle only when it is sealed and durable and has no
 active transaction leases, live tagged bytes, or dependency pins. When a
-shutdown checkpoint is enabled, worker 0 ignores the online cooldown and runs
+transaction block is durably retired, its deferred external-key extent debt is
+released through the same asynchronous reclaim path as an ordinary record
+block. When a shutdown checkpoint is enabled, worker 0 ignores the online
+cooldown and runs
 this lifecycle to a fixed point after commit and flush drain; failure skips the
 checkpoint rather than weakening cold recovery.
 
@@ -641,6 +693,9 @@ checkpoint rather than weakening cold recovery.
   decision; a missing decision drops the complete transaction at recovery.
 - Database and partition epochs are persisted before logical invalidation is
   published, so recovery cannot resurrect a detached population.
+- A replica handoff belongs to the target-local epoch returned by its reset;
+  logical control-plane epochs never substitute for the storage epoch that
+  filters recovery.
 - Recovery considers an expired or tombstone winner before older versions;
   cleanup cannot remove its suppression while an older live record remains.
 - Allocation epochs accompany physical references, reads, accounting, and
@@ -681,7 +736,7 @@ Current test evidence includes:
 | `tests/extent_recovery_e2e_test.cpp` | External keys and values, manifest/extent recovery, reclamation, and repeated worker-count changes |
 | `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
 | `tests/ttl_e2e_test.cpp` | TTL mutation, disk-resident rewrite, expired/live restart behavior, and extent-backed values |
-| `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling plus retain/reap behavior for buried persistent or expired values |
+| `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling, retain/reap behavior for buried persistent or expired values, user OFF completion semantics, and bounded internal replica quiescence |
 | `tests/multikey_e2e_test.cpp`, `tests/tx_cleaner_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-generation rotation, recovery, FLUSHDB invalidation, rollback, retry, and exact retirement readiness |
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
 | `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
@@ -695,9 +750,15 @@ Current test evidence includes:
   activation and first flush for reset media or a reused zero-label added
   device. Operators should provision genuinely empty added media when that
   property matters.
-- A runtime role change can revoke expiration authority without stopping an
-  already launched Tomb Raider loop; the loop does not currently recheck the
-  role before later cleanup rounds.
+- Tomb Raider does not recheck replication authority independently. Supported
+  standalone role transition and the callable cluster rebuild adapter both
+  reach its quiesce boundary through native FULL, while cluster-managed startup
+  withholds authority from the outset. Any authority transition that bypasses
+  those replication paths must invoke the same boundary.
+- Storage persists partition and database epochs, not the cluster
+  `ReplicationGroup`, its ready token, or the process-global Function catalog
+  proof. There is no built-in Meta transport or durable Function-catalog
+  recovery proof, so recovered records alone never authorize cluster serving.
 - The `tx-commit-append` crash hook exists to isolate a transaction after all
   tagged data is durable but before its decision is appended, but no current
   test arms that named hook directly.
@@ -744,13 +805,13 @@ current source code are authoritative for present storage behavior.
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
 | Parallel scans, block reassignment, epoch filtering, transaction decision collection, winner selection, and recovery accounting | `src/storage/engine/recovery.cpp`, `src/storage/engine/init.cpp` |
 | Append streams, extent construction, index publication, replacement accounting, transaction fences, commit batching and backpressure, commit decisions, caller wait policy, and rollback | `src/storage/engine/write.cpp`, `src/redis/command.cpp`, `src/redis/list_command.cpp`, `src/redis/sort_command.cpp` |
-| Worker-sharded retained-memory admission and ownership, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
+| Worker-sharded retained-memory admission and ownership, detached-index reclaim, client-buffer quotas, full-sync reservations, and RDB snapshot admission failure | `include/keylane/memory.h`, `src/memory.cpp`, `include/keylane/storage/scan_hash_map.h`, `src/storage/engine/replication.cpp`, `src/storage/engine/backup.cpp` |
 | Staged and disk reads, bounded BatchGet waves, validation, pins, relocation retry, external-value assembly, and disk-backed reply leases | `src/storage/engine/read.cpp`, `include/keylane/storage/engine.h` |
 | Periodic flush snapshots, data-before-header ordering, alternating header commits, dirty-tail ordering, and retirement settlement | `src/storage/engine/flush.cpp` |
 | Extent reclaim, defrag candidate selection, relocation durability fences, source retirement, and pacing | `src/storage/engine/defrag.cpp` |
 | Lazy and active expiration, authority and quiescence, durable tombstones, and the full-device escape valve | `src/storage/engine/expire.cpp` |
-| Tombstone and shielding mark/sweep/reap lifecycle, startup authority check, and runtime role limitation | `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/replication/replication.cpp` |
-| Durable database epoch advance, bounded index detach, and online detached-index reclaim | `src/storage/engine/flush_db.cpp` |
+| Tombstone and shielding mark/sweep/reap lifecycle, startup authority check, internal replica quiescence, and runtime role limitation | `include/keylane/storage/engine.h`, `src/storage/engine/tomb_raider.cpp`, `src/storage/engine/init.cpp`, `src/replication/replication.cpp` |
+| Durable database and replica-partition epoch advance, bounded index detach, replica reset/promotion/abort, and detached-index reclaim | `src/storage/engine/flush_db.cpp`, `src/storage/engine/replication.cpp` |
 | Transaction-generation rotation, promotion, readiness, and cold retirement | `src/storage/engine/tx_cleaner.cpp`, `include/keylane/storage/tx_cleaner.h` |
 | Device, durability, recovery, storage-I/O, Defrag, Tomb Raider, and transaction-cleaner observability | `include/keylane/storage/engine.h`, `src/storage/engine/metrics.cpp`, `src/storage/engine/recovery.cpp`, `src/metrics.cpp` |
 | Format, capacity, catalog recovery, crash-window, expiration, reclamation, transaction-cleaner, and buffer-pool verification | `tests/storage_format_test.cpp`, `tests/storage_capacity_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/extent_recovery_e2e_test.cpp`, `tests/flushdb_reclaim_e2e_test.cpp`, `tests/ttl_e2e_test.cpp`, `tests/tomb_raider_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/tx_cleaner_test.cpp`, `tests/buffer_pool_test.cpp` |

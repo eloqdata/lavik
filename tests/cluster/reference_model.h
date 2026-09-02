@@ -34,6 +34,10 @@ using ManifestId = StrongId<struct ManifestIdTag>;
 using PartitionEpoch = StrongId<struct PartitionEpochTag>;
 using HistoryId = StrongId<struct HistoryIdTag>;
 using OperationId = StrongId<struct OperationIdTag>;
+using AssignmentId = StrongId<struct AssignmentIdTag>;
+using AuthorityId = StrongId<struct AuthorityIdTag>;
+using DirectiveRevision = StrongId<struct DirectiveRevisionTag>;
+using AttemptId = StrongId<struct AttemptIdTag>;
 using EvidenceId = StrongId<struct EvidenceIdTag>;
 using FlowId = StrongId<struct FlowIdTag>;
 using CatalogGeneration = StrongId<struct CatalogGenerationTag>;
@@ -138,13 +142,75 @@ struct ResumeObservation {
   bool partial_resume_selected_ = false;
 };
 
+// Identifies every control-plane and process incarnation that scopes one
+// destructive rebuild attempt. Readiness evidence must match the whole value;
+// comparing only a term, history, or attempt number is insufficient.
+struct PopulationAttemptIdentity {
+  GroupId group_;
+  AssignmentId assignment_;
+  GroupTerm term_;
+  DirectiveRevision directive_revision_;
+  AuthorityId authority_;
+  NodeId source_node_;
+  BootId source_boot_;
+  HistoryId source_history_;
+  NodeId target_node_;
+  BootId target_boot_;
+  OperationId operation_;
+  AttemptId attempt_;
+
+  bool operator==(const PopulationAttemptIdentity&) const = default;
+};
+
 // Staging is never client-visible, and active population state must represent
-// a complete, durably activated generation after recovery.
+// a complete, durably activated generation after recovery. A node boot may
+// accept directives for only its assigned replication group. Safety evidence
+// defaults absent so new scenarios cannot accidentally become fail-open by
+// setting only an exposure or destructive-reset flag.
 struct PopulationObservation {
   bool active_ = true;
   bool complete_ = true;
   bool activation_durable_ = true;
   bool staging_visible_ = false;
+  bool group_assigned_ = false;
+  GroupId assigned_group_;
+  bool directive_accepted_ = false;
+  GroupId directive_group_;
+  // safe_source_active_ is the assertion bound to the accepted directive, not
+  // a continuously sampled liveness signal after reset authorization.
+  bool destructive_reset_started_ = false;
+  bool safe_source_active_ = false;
+  PopulationAttemptIdentity expected_identity_;
+  PopulationAttemptIdentity published_identity_;
+  ManifestId expected_manifest_;
+  ManifestId published_manifest_;
+  bool ready_ = false;
+  bool readable_ = false;
+  bool candidate_eligible_ = false;
+  // These proofs are scoped to published_identity_ and collectively cover the
+  // manifest handoff, partitionless Function lane, every declared source
+  // flow, storage root promotion, and completion of queued apply work.
+  bool manifest_complete_ = false;
+  bool function_catalog_complete_ = false;
+  bool all_flow_cuts_complete_ = false;
+  bool storage_promoted_ = false;
+  bool no_inflight_apply_ = false;
+  // Optional resource-accounting observation. A zero capacity disables this
+  // row for scenarios that do not model storage resources. Retired units stay
+  // unavailable until reclaim completes; a completed abort must return
+  // attempt-local index units to the pre-attempt baseline.
+  std::uint64_t capacity_units_ = 0;
+  std::uint64_t committed_live_units_ = 0;
+  std::uint64_t partial_attempt_units_ = 0;
+  std::uint64_t retired_unreclaimed_units_ = 0;
+  std::uint64_t reported_available_units_ = 0;
+  std::uint64_t baseline_index_units_ = 0;
+  std::uint64_t current_index_units_ = 0;
+  bool abort_reclaim_complete_ = false;
+  // FAILED_STOPPED is a current-boot terminal latch. retry_started_ records an
+  // accepted retry, not merely a rejected retry request.
+  bool failed_stopped_ = false;
+  bool retry_started_ = false;
 };
 
 // Candidate vectors use the componentwise partial order above; scalar sums or

@@ -24,12 +24,12 @@ KFT1 or the scenario interface.
   reference machine. It is not a Raft implementation.
 - `reference_model.*` defines scenarios and their protocol-independent
   observations; `cluster_invariants.cpp` evaluates stable assertion IDs for
-  authority, promotion, replication evidence, population activation, applied
-  vectors, Meta directives, migration, client outcomes, and Redis-compatible
-  control errors. The positive HA scenario composes all deterministic controls,
-  then explores independent fault, delivery, disconnect, persistence, Meta
-  recovery/directive replay, fencing, activation, and response-decision orders
-  from the supplied seed.
+  authority, promotion, replication evidence, single-group population
+  readiness, applied vectors, Meta directives, migration, client outcomes, and
+  Redis-compatible control errors. The positive HA scenario composes all
+  deterministic controls, then explores independent fault, delivery,
+  disconnect, persistence, Meta recovery/directive replay, fencing, readiness,
+  and response-decision orders from the supplied seed.
 - `../support/process.*` provides process groups, pause/resume/stop, bounded
   waits, retained failure artifacts, and loopback port reservations. Real
   process tests use this support; a restart is a new `ChildProcess` using the
@@ -50,17 +50,46 @@ packaging explicitly disables the option.
 
 ## Verification matrix
 
+Population observations in this matrix are protocol-independent reference
+model fields. In particular, `staging-hidden` and `atomic-activation` name an
+abstract exposure boundary; they do not imply that production keeps a second
+staging root or performs a physical root swap. Native production full sync is
+a destructive in-place reset hidden by LOADING. The cluster-managed production
+path starts fail-closed and exposes callable manager APIs to apply a complete
+rebuild directive, query boot-scoped status, and authorize or revoke an exact
+source export. That adapter drives `ReplicationGroup` through the existing
+native reset/snapshot/tail/promote/abort path. Status exposes `NOT_READY` and
+`REBUILDING` while no population is published, then may expose a ready token or
+a group-identity-bound terminal `FAILED_STOPPED` result. There is no in-process
+Meta transport yet; #20 must call this boundary, so the process tests cannot
+currently inject a real Meta message.
+
+Runtime reset still spans all 16,384 physical partitions; an authorized source
+scans baseline data only for manifest members and sends empty handoffs for
+non-members.
+The Function-catalog row proves completion at the current native cut and uses
+the durable catalog generation installed by storage. Population readiness is
+still boot-scoped, so every restarted cluster process begins `NOT_READY`.
+
 | Safety claim | Stable invariant | Fast model coverage |
 |---|---|---|
 | One full authority incarnation (node, boot, term, grant) covers admission, in-flight work, background mutation, and success decisions | `authority.single-writer`, `client.operation-single-authority`, `client.valid-authority-at-admission`, `client.safe-success-decision` | same-node-incarnation assertions, dual-authority KFT1 regression, and client history assertions |
 | Candidate selection is separate from durable activation | `promotion.safe-activation`, `promotion.durable-before-write-authority` | snapshot assertions and composed failover scenario |
 | Promotion binds the durable base to the validated population and current durable Function catalog generation | `promotion.durable-base-before-activation`, `promotion.catalog-token-current` | snapshot assertions and stale-catalog-promotion KFT1 regression |
 | Other replicas remain intact until activation and child history is ready before writes | `promotion.keep-replicas-until-activation`, `history.child-ready-before-write` | snapshot assertions |
-| Restart invalidates old partial-sync evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression |
+| Restart invalidates old partial-sync and population-readiness evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression, group-API reconstruction checks at each rebuild boundary, and real-process recovery of partial and promoted SSD images |
 | Live reparent requires compatible domains, an exact cursor, contiguous retained events, and a complete transaction boundary | `replication.compatible-resume-domain`, `replication.reparent-requires-complete-history` | vector tests and history-gap KFT1 regression |
 | A crashed rebuild cannot expose staging or a half-active population | `population.staging-hidden`, `population.atomic-activation` | storage controls and partial-activation KFT1 regression |
 | Function mutations keep staging hidden and make the complete catalog durable and installed before publication, cursor advancement, or ACK | `function.catalog-staging-hidden`, `function.catalog-durable-before-visible`, `function.catalog-installed-before-progress`, `function.catalog-durable-before-ack` | snapshot assertions and catalog-ack-before-durable KFT1 regression |
 | Full sync durably invalidates old population, promotion, and catalog-readiness evidence before transfer and stays fenced until catalog plus population activation | `fullsync.destructive-invalidation-before-transfer`, `fullsync.fenced-until-activation`, `fullsync.catalog-and-population-ready` | snapshot assertions and fullsync-retains-old-state KFT1 regression |
+| One process boot accepts directives for at most one replication group | `population.one-node-one-group` | assigned/directive group mismatch and matching-group assertions |
+| Destructive reset requires safe-source authority bound to the accepted directive | `population.safe-source-before-destructive-reset` | reset-without-authority mutant and positive assertion |
+| Readiness, readability, and candidacy use the exact boot-scoped rebuild identity and manifest | `population.readiness-identity-bound` | mutations of every identity component and manifest identity |
+| Readiness requires all 16,384 reset/handoffs, exact logical-to-target-local epoch mapping, the Function catalog, every flow cut, storage promotion, and no in-flight apply | `population.readiness-proof-complete` | one missing-proof mutant per evidence component plus sparse-manifest/local-epoch group tests |
+| A partial in-place rebuild remains hidden, and abstract readiness is exposed only for a complete durable population | `population.staging-hidden`, `population.atomic-activation` | abstract storage/exposure controls and partial-activation KFT1 regression |
+| A failed-stopped population neither retries nor becomes ready, readable, or candidate-eligible | `population.failed-stopped-terminal` | retry and every exposure mutant, group-identity API checks, and native manager current-boot failure integration |
+| Available capacity excludes committed, partial-attempt, and retired-unreclaimed populations | `population.capacity-excludes-unreclaimed` | over-reported-capacity mutant and exact-bound positive state |
+| A completed abort returns runtime index use to its baseline | `population.abort-reclaims-runtime` | retained-index mutant and reclaimed positive state; production reset/abort reuse the worker-local detached-index drain |
 | Candidate ordering is componentwise within one compatibility domain | `candidate.componentwise-applied-order` | vector partial-order tests |
 | Meta publication/replay cannot regress committed state, and directive replay cannot reuse evidence after a target restart | `meta.committed-state-monotonic`, `meta.directive-evidence-scoped` | composed replay controls, snapshot assertions, and stale-directive KFT1 regression |
 | Migration has one serving owner and a complete target | `migration.single-owner`, `migration.complete-before-serving` | snapshot assertions |
@@ -70,6 +99,41 @@ An operation with `ClientOutcome::kNotReturned` may already be durable; this is
 the explicit uncertain-outcome state. It must never be silently promoted to a
 successful response. A success is accepted only when both durability and the
 authority-at-decision evidence are true.
+
+`population_integration_test.cpp` is the current real-process cluster-admission
+test: it proves `cluster-enabled` starts LOADING, permits `PING`, and rejects
+standalone `REPLICAOF`. `replication_group_test.cpp` covers directive
+monotonicity, one-group assignment, safe-source/reset authorization, complete
+physical reset, sparse-manifest handoff, logical-to-local epoch matching,
+all-flow cuts, ready/fail-stop publication, proof invalidation, and a fresh
+`NOT_READY` group after API reconstruction at each rebuild boundary.
+`rebuild_protocol_integration_test.cpp` also kills a real target after an
+acknowledged partial handoff, proves recovery rejects the mixed SSD population,
+performs a fresh full sync, and proves a post-promotion restart still begins
+cluster-managed service in LOADING. The production
+manager consumes that API, but a real-process Meta-to-adapter test remains
+blocked on the #20 transport rather than on the rebuild seam itself.
+`replication_manager_integration_test.cpp` calls that manager seam directly in
+a real single-worker storage/runtime service. A stalling loopback native peer
+keeps attempts deterministic while the test proves that cluster startup ignores
+a standalone initial upstream, plus validation, REBUILDING status, exact and
+endpoint-conflicting replay, monotonic whole-session supersession, cold-source
+rejection, and idempotent empty revocation without adding a test-only control
+protocol. `source_authorization_test.cpp` separately proves same-revision
+multi-target grants, exact replay, revision supersession, revoked-watermark
+rejection, and idempotent empty revocation.
+`serving_generation_integration_test.cpp` proves a blocked request cannot cross
+into a replacement dataset, and `rebuild_failure_integration_test.cpp` proves
+an uncertain native promotion stops the current boot without retrying.
+`rebuild_protocol_integration_test.cpp` exercises adversarial source behavior:
+the target must reject `KLONLINE` before its local flow proof and must reject a
+reset after the full-sync cut without losing the promoted population. It also
+injects a divergent online LSN and proves that every continuation cursor is
+discarded before the replacement full rebuild returns online, and verifies
+that an acknowledged full-sync cut cannot leave only part of the resume vector
+installed when the connection drops. A corrupted data frame forces a fresh
+full sync, and target process crashes verify recovery of both partial and
+promoted SSD images remains fail-closed.
 
 ## Running and extending
 

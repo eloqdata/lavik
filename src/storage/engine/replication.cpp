@@ -1468,9 +1468,10 @@ StorageEngine::Impl::ResetReplicaPartitions(
     epoch_updates.emplace_back(kLogicalDatabaseCount + reset.partition_id_,
                                partition.replica_candidate_epoch_ + 1);
   }
-  // Reserving the candidate epochs before detaching the old population makes
-  // recovery discard both old records and an interrupted partial rebuild.
-  // A replica always restarts in LOADING and begins a fresh full sync.
+  // The persisted candidate partition epochs exclude the old population.
+  // Candidate writes also carry local_db_epochs (current + 1), which promotion
+  // alone persists; recovery's earlier DB-epoch filter therefore excludes an
+  // interrupted partial candidate before it decodes or follows its extents.
   absl::Status persisted = co_await PersistEpochValues(epoch_updates);
   if (!persisted.ok()) co_return persisted;
 
@@ -1492,12 +1493,7 @@ StorageEngine::Impl::ResetReplicaPartitions(
     sync->source_db_epochs_ = reset.db_epochs_;
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
       sync->local_db_epochs_[db_id] = local_db_epochs[db_id];
-      if (partition.indexes_[db_id].has_allocated_storage()) {
-        store.detached_indexes_.push_back(DetachedIndex{
-            .index_ = partition.indexes_[db_id].Detach(),
-            .db_id_ = db_id,
-        });
-      }
+      QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
           [[unlikely]] {
@@ -1601,10 +1597,7 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
   for (std::size_t i = 0; i < partition_ids.size(); ++i) {
     auto& partition = PartitionFor(store, partition_ids[i]);
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      if (partition.indexes_[db_id].has_allocated_storage()) {
-        store.detached_indexes_.push_back(DetachedIndex{
-            .index_ = partition.indexes_[db_id].Detach(), .db_id_ = db_id});
-      }
+      QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
       partition.fullsync_coverage_bytes_[db_id] = 0;
       if (store.live_key_count_[db_id] < partition.live_key_count_[db_id]) {
         co_return absl::InternalError(
@@ -2046,6 +2039,16 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
     if (!drained.ok()) co_return drained;
   }
 
+  for (unsigned target = 0; target < worker_count_; ++target) {
+    auto settle = [this, target]() {
+      return AwaitDetachedReclaim(*stores_[target]);
+    };
+    absl::Status settled = target == 0
+                               ? co_await settle()
+                               : co_await celer::SubmitTaskTo(target, settle);
+    if (!settled.ok()) co_return settled;
+  }
+
   std::vector<std::pair<std::size_t, std::uint64_t>> epoch_updates;
   epoch_updates.reserve(kLogicalDatabaseCount);
   for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
@@ -2124,44 +2127,44 @@ Task<absl::Status> StorageEngine::Impl::AbortReplicaRoot(
   for (unsigned target = 0; target < worker_count_; ++target) {
     auto discard = [this, target, session_id]() -> Task<absl::Status> {
       WorkerStore& store = *stores_[target];
-      co_await store.replica_apply_mutex_.Lock();
-      UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
-      co_await store.store_state_mutex_.Lock();
-      UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
-      bool discarded_any = false;
-      for (auto& partition : store.partitions_) {
-        auto* sync = partition.replica_sync_.get();
-        if (sync == nullptr || sync->session_id_ != session_id) continue;
-        discarded_any = true;
-        for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-          if (partition.indexes_[db_id].has_allocated_storage()) {
-            store.detached_indexes_.push_back(DetachedIndex{
-                .index_ = partition.indexes_[db_id].Detach(),
-                .db_id_ = db_id,
-            });
+      {
+        co_await store.replica_apply_mutex_.Lock();
+        UnlockGuard replica_unlock(&store.replica_apply_mutex_, store.worker_);
+        co_await store.store_state_mutex_.Lock();
+        UnlockGuard write_unlock(&store.store_state_mutex_, store.worker_);
+        bool discarded_any = false;
+        for (auto& partition : store.partitions_) {
+          auto* sync = partition.replica_sync_.get();
+          if (sync == nullptr || sync->session_id_ != session_id) continue;
+          discarded_any = true;
+          for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+            QueueDetachedIndex(store, partition.indexes_[db_id], db_id);
+            partition.fullsync_coverage_bytes_[db_id] = 0;
+            if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
+                [[unlikely]] {
+              co_return absl::InternalError(
+                  "replica abort found inconsistent live-key accounting");
+            }
+            store.live_key_count_[db_id] -= partition.live_key_count_[db_id];
+            partition.live_key_count_[db_id] = 0;
+            partition.expiring_key_count_[db_id] = 0;
           }
-          partition.fullsync_coverage_bytes_[db_id] = 0;
-          if (store.live_key_count_[db_id] < partition.live_key_count_[db_id])
-              [[unlikely]] {
-            co_return absl::InternalError(
-                "replica abort found inconsistent live-key accounting");
+          partition.mutation_sequence_ = 0;
+          partition.replica_value_stage_.reset();
+          partition.replica_sync_.reset();
+        }
+        if (discarded_any) {
+          for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+            ++store.index_generations_[db_id];
+            tx::CurrentTxShard().MarkAllWatched(db_id);
           }
-          store.live_key_count_[db_id] -= partition.live_key_count_[db_id];
-          partition.live_key_count_[db_id] = 0;
-          partition.expiring_key_count_[db_id] = 0;
         }
-        partition.mutation_sequence_ = 0;
-        partition.replica_value_stage_.reset();
-        partition.replica_sync_.reset();
+        EnsureDetachedReclaim(store);
       }
-      if (discarded_any) {
-        for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-          ++store.index_generations_[db_id];
-          tx::CurrentTxShard().MarkAllWatched(db_id);
-        }
-      }
-      EnsureDetachedReclaim(store);
-      co_return absl::OkStatus();
+      // Abort is the resource handoff between attempts. Reuse the existing
+      // worker-local detached-index drain so rapid retries cannot accumulate
+      // old index arenas or unsettled record-block accounting.
+      co_return co_await AwaitDetachedReclaim(store);
     };
     absl::Status discarded =
         target == 0 ? co_await discard()

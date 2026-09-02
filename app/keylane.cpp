@@ -95,6 +95,10 @@ int main(int argc, char** argv) {
                options.tls_replication_,
                "Use TLS for outgoing replication connections")
       ->capture_default_str();
+  app.add_flag("--cluster-enabled,!--no-cluster-enabled",
+               options.replication_options_.cluster_enabled_,
+               "Enable fail-closed one-node-one-replication-group mode")
+      ->capture_default_str();
   app.add_option("--requirepass", options.requirepass_,
                  "Password required by AUTH");
   app.add_option("--masteruser", options.masteruser_,

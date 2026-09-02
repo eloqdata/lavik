@@ -244,6 +244,7 @@ add_library(keylane_module
   src/memory.cpp
   src/metrics.cpp
   src/replication/command.cpp
+  src/replication/replication_group.cpp
   src/replication/replication.cpp
   src/redis/resp.cpp
   src/redis/rdb.cpp
@@ -490,6 +491,110 @@ if (BUILD_TESTING)
         LABELS cluster-integration
         TIMEOUT 15
     )
+
+    add_executable(keylane_cluster_population_integration_test
+      tests/cluster/population_integration_test.cpp
+    )
+    target_link_libraries(keylane_cluster_population_integration_test PRIVATE
+      keylane_test_support
+      GTest::gtest
+    )
+    add_test(
+      NAME cluster_integration.population_fail_closed
+      COMMAND keylane_cluster_population_integration_test $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(cluster_integration.population_fail_closed PROPERTIES
+      LABELS cluster-integration
+      TIMEOUT 30
+      RUN_SERIAL TRUE
+    )
+
+    add_executable(keylane_cluster_replication_manager_integration_test
+      tests/cluster/replication_manager_integration_test.cpp
+    )
+    target_link_libraries(keylane_cluster_replication_manager_integration_test PRIVATE
+      keylane::module
+      keylane_test_support
+      GTest::gtest_main
+    )
+    add_test(
+      NAME cluster_integration.replication_manager_control_api
+      COMMAND keylane_cluster_replication_manager_integration_test
+    )
+    set_tests_properties(
+      cluster_integration.replication_manager_control_api PROPERTIES
+      LABELS cluster-integration
+      TIMEOUT 30
+      RUN_SERIAL TRUE
+    )
+
+    add_executable(keylane_cluster_serving_generation_integration_test
+      tests/cluster/serving_generation_integration_test.cpp
+    )
+    target_link_libraries(keylane_cluster_serving_generation_integration_test PRIVATE
+      keylane_test_support
+      GTest::gtest
+    )
+    add_dependencies(keylane_cluster_serving_generation_integration_test keylane)
+    add_test(
+      NAME cluster_integration.serving_generation_fence
+      COMMAND keylane_cluster_serving_generation_integration_test
+              $<TARGET_FILE:keylane>
+    )
+    set_tests_properties(cluster_integration.serving_generation_fence PROPERTIES
+      LABELS cluster-integration
+      TIMEOUT 45
+      RUN_SERIAL TRUE
+    )
+
+    # The injection hook is compiled only into Debug or the explicitly
+    # non-packageable fault server. Do not register a release test that would
+    # silently run without its fault.
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR TARGET keylane_fault_server)
+      set(KEYLANE_REBUILD_FAILURE_SERVER_TARGET keylane)
+      if (TARGET keylane_fault_server)
+        set(KEYLANE_REBUILD_FAILURE_SERVER_TARGET keylane_fault_server)
+      endif()
+      add_executable(keylane_cluster_rebuild_failure_integration_test
+        tests/cluster/rebuild_failure_integration_test.cpp
+      )
+      target_link_libraries(keylane_cluster_rebuild_failure_integration_test PRIVATE
+        keylane_test_support
+        GTest::gtest
+      )
+      add_dependencies(keylane_cluster_rebuild_failure_integration_test
+        ${KEYLANE_REBUILD_FAILURE_SERVER_TARGET})
+      add_test(
+        NAME cluster_integration.rebuild_failure_stops
+        COMMAND keylane_cluster_rebuild_failure_integration_test
+                $<TARGET_FILE:${KEYLANE_REBUILD_FAILURE_SERVER_TARGET}>
+      )
+      set_tests_properties(cluster_integration.rebuild_failure_stops PROPERTIES
+        LABELS cluster-integration
+        TIMEOUT 45
+        RUN_SERIAL TRUE
+      )
+
+      add_executable(keylane_cluster_rebuild_protocol_integration_test
+        tests/cluster/rebuild_protocol_integration_test.cpp
+      )
+      target_link_libraries(keylane_cluster_rebuild_protocol_integration_test PRIVATE
+        keylane_test_support
+        GTest::gtest
+      )
+      add_dependencies(keylane_cluster_rebuild_protocol_integration_test
+        ${KEYLANE_REBUILD_FAILURE_SERVER_TARGET})
+      add_test(
+        NAME cluster_integration.rebuild_protocol_guards
+        COMMAND keylane_cluster_rebuild_protocol_integration_test
+                $<TARGET_FILE:${KEYLANE_REBUILD_FAILURE_SERVER_TARGET}>
+      )
+      set_tests_properties(cluster_integration.rebuild_protocol_guards PROPERTIES
+        LABELS cluster-integration
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+      )
+    endif()
   endif()
 
   add_executable(keylane_unit_tests
@@ -507,12 +612,14 @@ if (BUILD_TESTING)
     tests/memory_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
+    tests/source_authorization_test.cpp
     tests/command_table_test.cpp
     tests/random_sample_test.cpp
     tests/rdb_test.cpp
     tests/record_location_test.cpp
     tests/request_gate_test.cpp
     tests/replication_command_test.cpp
+    tests/replication_group_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_lock_test.cpp
     tests/storage_format_test.cpp
@@ -584,6 +691,19 @@ if (BUILD_TESTING)
       COMMAND keylane_replication_log_e2e_test
     )
     set_tests_properties(keylane_replication_log_e2e PROPERTIES TIMEOUT 120)
+
+    add_executable(keylane_replica_abort_reclaim_e2e_test
+      tests/replica_abort_reclaim_e2e_test.cpp
+    )
+    target_link_libraries(keylane_replica_abort_reclaim_e2e_test
+      PRIVATE keylane::module
+    )
+    add_test(
+      NAME keylane_replica_abort_reclaim_e2e
+      COMMAND keylane_replica_abort_reclaim_e2e_test
+    )
+    set_tests_properties(keylane_replica_abort_reclaim_e2e PROPERTIES
+      TIMEOUT 30)
 
     add_executable(keylane_pubsub_e2e_test
       tests/pubsub_e2e_test.cpp

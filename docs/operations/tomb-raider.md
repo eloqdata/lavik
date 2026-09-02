@@ -23,8 +23,21 @@ starts in off mode.
 ## Replication role changes
 
 The cleanup loop is launched only when the node has expiration authority at
-startup. Once launched, it does not recheck that authority after a runtime
-`REPLICAOF` role change, so scheduled rounds can continue after the node becomes
-a replica. To stop future cleanup before changing role, issue `TOMBRAIDER OFF`
-and account for any round already in progress completing. This setting is not
-persisted across restart.
+startup. `cluster-enabled` startup withholds that authority, so the loop is not
+launched in that mode. The native FULL path also closes command database
+admission and crosses the storage quiesce boundary before its first destructive
+reset; the callable cluster rebuild adapter reaches that same path.
+
+On a standalone node, an already launched loop does not recheck authority on
+its own. Runtime `REPLICAOF host port` closes client database admission,
+invokes the internal replica-quiesce API, and waits until the current round has
+forfeited before installing the upstream. Tomb Raider remains OFF if that node
+is later detached with `REPLICAOF NO ONE`; explicitly configure the desired
+schedule when it becomes an expiration authority again. OFF is not persisted
+across restart.
+
+Storage's replica-quiesce seam can forfeit a running round at a safe checkpoint
+and wait for it to exit. It has no operator command. Standalone role transition
+and native FULL mode use it while command database gates are closed; the
+cluster-managed adapter reuses native FULL rather than maintaining a separate
+maintenance path.

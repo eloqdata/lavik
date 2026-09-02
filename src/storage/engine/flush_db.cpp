@@ -284,12 +284,7 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
   ++store.index_generations_[db_id];
   for (auto& partition : store.partitions_) {
     auto& index = partition.indexes_[db_id];
-    if (index.has_allocated_storage()) {
-      store.detached_indexes_.push_back(DetachedIndex{
-          .index_ = index.Detach(),
-          .db_id_ = db_id,
-      });
-    }
+    QueueDetachedIndex(store, index, db_id);
     partition.fullsync_coverage_bytes_[db_id] = 0;
     partition.live_key_count_[db_id] = 0;
     partition.expiring_key_count_[db_id] = 0;
@@ -301,6 +296,16 @@ void StorageEngine::Impl::DetachDbLocal(WorkerStore& store,
     }
   }
   store.live_key_count_[db_id] = 0;
+}
+
+void StorageEngine::Impl::QueueDetachedIndex(WorkerStore& store,
+                                             RecordIndex& index,
+                                             std::uint8_t db_id) {
+  if (!index.has_allocated_storage()) return;
+  store.detached_indexes_.push_back(DetachedIndex{
+      .index_ = index.Detach(),
+      .db_id_ = db_id,
+  });
 }
 
 Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
@@ -366,8 +371,7 @@ Task<absl::Status> StorageEngine::Impl::ReclaimDetachedIndexes(
           [[unlikely]] {
         store.write_failed_ = true;
         co_return absl::InternalError(
-            "FLUSHDB detached mixed tagged and untagged records from one "
-            "block");
+            "detached index mixed tagged and untagged records in one block");
       }
       RetiredRecord aggregate{
           .block_id_ = block.first,
@@ -422,6 +426,11 @@ Task<absl::Status> StorageEngine::Impl::RunDetachedReclaim(WorkerStore* store) {
   if (!status.ok()) {
     spdlog::error("worker[{}] detached index reclaim failed: {}",
                   store->worker_->id(), status.message());
+  } else {
+    // An enqueue can observe the old runner while it is in its final
+    // SealDeadActiveBlock await. Recheck after publishing false so that work
+    // cannot be stranded without a runner in that handoff window.
+    EnsureDetachedReclaim(*store);
   }
   co_return status;
 }
@@ -445,7 +454,7 @@ Task<absl::Status> StorageEngine::Impl::AwaitDetachedReclaim(
   if (store.write_failed_) {
     co_return absl::Status(
         absl::StatusCode::kInternal,
-        "storage writer stopped while reclaiming flushed keys");
+        "storage writer stopped while reclaiming detached indexes");
   }
   co_return absl::OkStatus();
 }

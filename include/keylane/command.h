@@ -323,12 +323,18 @@ struct alignas(64) CommandRequest {
   std::uint8_t connection_tls_ : 1 = false;
   std::uint8_t cluster_slot_sample_count_ : 2 = 0;
   std::uint8_t write_admission_role_epoch_valid_ : 1 = false;
+  std::uint8_t serving_generation_valid_ : 1 = false;
   // Captured when a client write chooses its source-publication path. A DB
   // gate that reopens under a different role must reject the stale request
   // before mutation, including when writable replicas are enabled. Its valid
   // bit shares the control byte above, retaining every uint64_t epoch value
   // while avoiding optional<uint64_t>'s extra word.
   std::uint64_t write_admission_role_epoch_ = 0;
+  // External data commands capture the currently open dataset generation at
+  // dispatch. A zero token records admission while serving was closed;
+  // internal/nested execution is unscoped because its outer command already
+  // owns the fence. Its valid bit shares the compact control byte above.
+  std::uint64_t serving_generation_ = 0;
   const CommandSpec* spec_ = nullptr;
   // Cluster admission needs the first slot plus at most one different-slot
   // witness: two distinct slots already make the request terminally
@@ -448,6 +454,13 @@ struct ConnectionContext;
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest& request,
                                    ReplyBuilder& reply_builder);
+
+// Revalidates an external data command after it obtains a database gate.
+// Replication-origin and internally nested requests are intentionally
+// unscoped. A mismatch returns a Redis wire error body (without RESP framing)
+// so every execution path reports the same LOADING/TRYAGAIN outcome.
+std::optional<std::string_view> CommandServingGenerationError(
+    const CommandRequest& request) noexcept;
 
 // Unregisters every WATCH this connection holds (connection close, UNWATCH,
 // DISCARD, and the end of every EXEC).

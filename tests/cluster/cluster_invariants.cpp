@@ -18,6 +18,18 @@ bool CanExerciseAuthority(const AuthorityObservation& observation) {
          observation.can_decide_success_;
 }
 
+bool HasPopulationAttemptIdentity(const PopulationAttemptIdentity& identity) {
+  return identity.group_.value_ != 0 && identity.assignment_.value_ != 0 &&
+         identity.term_.value_ != 0 &&
+         identity.directive_revision_.value_ != 0 &&
+         identity.authority_.value_ != 0 && identity.source_node_.value_ != 0 &&
+         identity.source_boot_.value_ != 0 &&
+         identity.source_history_.value_ != 0 &&
+         identity.target_node_.value_ != 0 &&
+         identity.target_boot_.value_ != 0 && identity.operation_.value_ != 0 &&
+         identity.attempt_.value_ != 0;
+}
+
 std::optional<Finding> CheckAuthority(const ClusterSnapshot& snapshot) {
   using AuthorityIdentity = std::tuple<NodeId, BootId, GroupTerm, GrantId>;
   std::map<GroupId, std::set<AuthorityIdentity>> capable_authorities;
@@ -160,6 +172,84 @@ std::optional<Finding> CheckResume(const ClusterSnapshot& snapshot) {
 
 std::optional<Finding> CheckPopulation(const ClusterSnapshot& snapshot) {
   const PopulationObservation& population = snapshot.population_;
+  if (population.group_assigned_ && population.directive_accepted_ &&
+      population.assigned_group_ != population.directive_group_) {
+    return Finding{
+        .invariant_id_ = "population.one-node-one-group",
+        .witness_ = absl::StrCat(
+            "assigned-group=", population.assigned_group_.value_,
+            ",directive-group=", population.directive_group_.value_),
+    };
+  }
+  if (population.destructive_reset_started_ &&
+      !population.safe_source_active_) {
+    return Finding{
+        .invariant_id_ = "population.safe-source-before-destructive-reset",
+        .witness_ = "destructive-reset-without-safe-source",
+    };
+  }
+  if (population.failed_stopped_ &&
+      (population.retry_started_ || population.ready_ || population.readable_ ||
+       population.candidate_eligible_)) {
+    return Finding{
+        .invariant_id_ = "population.failed-stopped-terminal",
+        .witness_ = population.retry_started_ ? "retry-after-failed-stopped"
+                                              : "exposure-after-failed-stopped",
+    };
+  }
+  if (population.capacity_units_ != 0) {
+    std::uint64_t safely_available = population.capacity_units_;
+    for (const std::uint64_t unavailable :
+         {population.committed_live_units_, population.partial_attempt_units_,
+          population.retired_unreclaimed_units_}) {
+      safely_available =
+          unavailable >= safely_available ? 0 : safely_available - unavailable;
+    }
+    if (population.reported_available_units_ > safely_available) {
+      return Finding{
+          .invariant_id_ = "population.capacity-excludes-unreclaimed",
+          .witness_ = "retired-or-partial-bytes-reported-free",
+      };
+    }
+    if (population.abort_reclaim_complete_ &&
+        population.partial_attempt_units_ == 0 &&
+        population.current_index_units_ > population.baseline_index_units_) {
+      return Finding{
+          .invariant_id_ = "population.abort-reclaims-runtime",
+          .witness_ = "attempt-local-index-units-remain-after-reclaim",
+      };
+    }
+  }
+  const bool readiness_exposed = population.ready_ || population.readable_ ||
+                                 population.candidate_eligible_;
+  if (readiness_exposed &&
+      (!HasPopulationAttemptIdentity(population.expected_identity_) ||
+       population.expected_manifest_.value_ == 0 ||
+       population.expected_identity_ != population.published_identity_ ||
+       population.expected_manifest_ != population.published_manifest_)) {
+    return Finding{
+        .invariant_id_ = "population.readiness-identity-bound",
+        .witness_ = "ready-readable-or-candidate-identity-or-manifest-mismatch",
+    };
+  }
+  std::string_view missing_readiness_proof;
+  if (!population.manifest_complete_) {
+    missing_readiness_proof = "manifest";
+  } else if (!population.function_catalog_complete_) {
+    missing_readiness_proof = "function-catalog";
+  } else if (!population.all_flow_cuts_complete_) {
+    missing_readiness_proof = "all-flow-cuts";
+  } else if (!population.storage_promoted_) {
+    missing_readiness_proof = "storage-promoted";
+  } else if (!population.no_inflight_apply_) {
+    missing_readiness_proof = "no-inflight-apply";
+  }
+  if (readiness_exposed && !missing_readiness_proof.empty()) {
+    return Finding{
+        .invariant_id_ = "population.readiness-proof-complete",
+        .witness_ = absl::StrCat("missing-", missing_readiness_proof, "-proof"),
+    };
+  }
   if (population.staging_visible_) {
     return Finding{.invariant_id_ = "population.staging-hidden",
                    .witness_ = "staging-population-visible"};

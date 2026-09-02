@@ -1,6 +1,7 @@
 #include "tests/cluster/fault_harness.h"
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <set>
@@ -53,6 +54,56 @@ class NoisyFailureScenario final : public Scenario {
     return std::make_unique<NoisyFailureWorld>();
   }
 };
+
+PopulationAttemptIdentity PopulationIdentity() {
+  return {
+      .group_ = GroupId{1},
+      .assignment_ = AssignmentId{2},
+      .term_ = GroupTerm{3},
+      .directive_revision_ = DirectiveRevision{4},
+      .authority_ = AuthorityId{5},
+      .source_node_ = NodeId{6},
+      .source_boot_ = BootId{7},
+      .source_history_ = HistoryId{8},
+      .target_node_ = NodeId{9},
+      .target_boot_ = BootId{10},
+      .operation_ = OperationId{11},
+      .attempt_ = AttemptId{12},
+  };
+}
+
+PopulationObservation ProvenPopulation() {
+  PopulationObservation population;
+  population.expected_identity_ = PopulationIdentity();
+  population.published_identity_ = PopulationIdentity();
+  population.expected_manifest_ = ManifestId{13};
+  population.published_manifest_ = ManifestId{13};
+  population.manifest_complete_ = true;
+  population.function_catalog_complete_ = true;
+  population.all_flow_cuts_complete_ = true;
+  population.storage_promoted_ = true;
+  population.no_inflight_apply_ = true;
+  return population;
+}
+
+struct PopulationFlag {
+  std::string_view name_;
+  bool PopulationObservation::*member_;
+};
+
+constexpr std::array<PopulationFlag, 3> kReadinessExposures{{
+    {"ready", &PopulationObservation::ready_},
+    {"readable", &PopulationObservation::readable_},
+    {"candidate", &PopulationObservation::candidate_eligible_},
+}};
+
+constexpr std::array<PopulationFlag, 5> kReadinessProofs{{
+    {"manifest", &PopulationObservation::manifest_complete_},
+    {"function-catalog", &PopulationObservation::function_catalog_complete_},
+    {"all-flow-cuts", &PopulationObservation::all_flow_cuts_complete_},
+    {"storage-promoted", &PopulationObservation::storage_promoted_},
+    {"no-inflight-apply", &PopulationObservation::no_inflight_apply_},
+}};
 
 TEST(KftTraceTest, HasCanonicalRoundTripAndGoldenEncoding) {
   Trace trace{
@@ -366,6 +417,199 @@ TEST(ClusterInvariantTest, AcceptsGoodReferenceSnapshot) {
   snapshot.server_control_reply_ = "-CLUSTERDOWN no safe owner";
   EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
   snapshot.server_control_reply_ = "-MOVED 42 127.0.0.1:6379";
+  EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+}
+
+TEST(ClusterInvariantTest, RejectsDirectiveForAnotherReplicationGroup) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.group_assigned_ = true;
+  snapshot.population_.assigned_group_ = GroupId{1};
+  snapshot.population_.directive_accepted_ = true;
+  snapshot.population_.directive_group_ = GroupId{2};
+
+  const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->invariant_id_, "population.one-node-one-group");
+}
+
+TEST(ClusterInvariantTest, AcceptsDirectiveForTheAssignedReplicationGroup) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.group_assigned_ = true;
+  snapshot.population_.assigned_group_ = GroupId{1};
+  snapshot.population_.directive_accepted_ = true;
+  snapshot.population_.directive_group_ = GroupId{1};
+
+  EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+}
+
+TEST(ClusterInvariantTest, RejectsDestructiveResetWithoutSafeSource) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.destructive_reset_started_ = true;
+  snapshot.population_.safe_source_active_ = false;
+
+  const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->invariant_id_,
+            "population.safe-source-before-destructive-reset");
+}
+
+TEST(ClusterInvariantTest, AcceptsDestructiveResetWithSafeSourceAssertion) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.destructive_reset_started_ = true;
+  snapshot.population_.safe_source_active_ = true;
+
+  EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+}
+
+TEST(ClusterInvariantTest,
+     RejectsEveryReadinessExposureWithMismatchedIdentityOrManifest) {
+  std::vector<PopulationAttemptIdentity> mismatched_identities(
+      12, PopulationIdentity());
+  mismatched_identities[0].group_ = GroupId{99};
+  mismatched_identities[1].assignment_ = AssignmentId{99};
+  mismatched_identities[2].term_ = GroupTerm{99};
+  mismatched_identities[3].directive_revision_ = DirectiveRevision{99};
+  mismatched_identities[4].authority_ = AuthorityId{99};
+  mismatched_identities[5].source_node_ = NodeId{99};
+  mismatched_identities[6].source_boot_ = BootId{99};
+  mismatched_identities[7].source_history_ = HistoryId{99};
+  mismatched_identities[8].target_node_ = NodeId{99};
+  mismatched_identities[9].target_boot_ = BootId{99};
+  mismatched_identities[10].operation_ = OperationId{99};
+  mismatched_identities[11].attempt_ = AttemptId{99};
+
+  for (const PopulationFlag& exposure : kReadinessExposures) {
+    SCOPED_TRACE(exposure.name_);
+    for (std::size_t index = 0; index < mismatched_identities.size(); ++index) {
+      SCOPED_TRACE(index);
+      ClusterSnapshot snapshot;
+      snapshot.population_ = ProvenPopulation();
+      snapshot.population_.*exposure.member_ = true;
+      snapshot.population_.published_identity_ = mismatched_identities[index];
+      const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+      ASSERT_TRUE(finding.has_value());
+      EXPECT_EQ(finding->invariant_id_, "population.readiness-identity-bound");
+    }
+
+    ClusterSnapshot manifest_mismatch;
+    manifest_mismatch.population_ = ProvenPopulation();
+    manifest_mismatch.population_.*exposure.member_ = true;
+    manifest_mismatch.population_.published_manifest_ = ManifestId{99};
+    const std::optional<Finding> finding =
+        CheckClusterInvariants(manifest_mismatch);
+    ASSERT_TRUE(finding.has_value());
+    EXPECT_EQ(finding->invariant_id_, "population.readiness-identity-bound");
+
+    ClusterSnapshot missing_manifest;
+    missing_manifest.population_ = ProvenPopulation();
+    missing_manifest.population_.*exposure.member_ = true;
+    missing_manifest.population_.expected_manifest_ = ManifestId{};
+    missing_manifest.population_.published_manifest_ = ManifestId{};
+    const std::optional<Finding> missing_manifest_finding =
+        CheckClusterInvariants(missing_manifest);
+    ASSERT_TRUE(missing_manifest_finding.has_value());
+    EXPECT_EQ(missing_manifest_finding->invariant_id_,
+              "population.readiness-identity-bound");
+  }
+}
+
+TEST(ClusterInvariantTest, RejectsEveryReadinessExposureWithoutIdentity) {
+  for (const PopulationFlag& exposure : kReadinessExposures) {
+    SCOPED_TRACE(exposure.name_);
+    ClusterSnapshot snapshot;
+    snapshot.population_.*exposure.member_ = true;
+
+    const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+    ASSERT_TRUE(finding.has_value());
+    EXPECT_EQ(finding->invariant_id_, "population.readiness-identity-bound");
+  }
+}
+
+TEST(ClusterInvariantTest, AcceptsEveryFullyProvenReadinessExposure) {
+  for (const PopulationFlag& exposure : kReadinessExposures) {
+    SCOPED_TRACE(exposure.name_);
+    ClusterSnapshot snapshot;
+    snapshot.population_ = ProvenPopulation();
+    snapshot.population_.*exposure.member_ = true;
+    EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+  }
+}
+
+TEST(ClusterInvariantTest, RejectsEveryIncompleteReadinessProof) {
+  for (const PopulationFlag& exposure : kReadinessExposures) {
+    for (const PopulationFlag& proof : kReadinessProofs) {
+      SCOPED_TRACE(testing::Message() << exposure.name_ << "/" << proof.name_);
+      ClusterSnapshot snapshot;
+      snapshot.population_ = ProvenPopulation();
+      snapshot.population_.*exposure.member_ = true;
+      snapshot.population_.*proof.member_ = false;
+
+      const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+      ASSERT_TRUE(finding.has_value());
+      EXPECT_EQ(finding->invariant_id_, "population.readiness-proof-complete");
+    }
+  }
+}
+
+TEST(ClusterInvariantTest, RejectsRetryAfterPopulationFailedStopped) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.failed_stopped_ = true;
+  snapshot.population_.retry_started_ = true;
+
+  const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->invariant_id_, "population.failed-stopped-terminal");
+}
+
+TEST(ClusterInvariantTest, RejectsEveryExposureAfterPopulationFailedStopped) {
+  for (const PopulationFlag& exposure : kReadinessExposures) {
+    SCOPED_TRACE(exposure.name_);
+    ClusterSnapshot snapshot;
+    snapshot.population_ = ProvenPopulation();
+    snapshot.population_.failed_stopped_ = true;
+    snapshot.population_.*exposure.member_ = true;
+
+    const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+    ASSERT_TRUE(finding.has_value());
+    EXPECT_EQ(finding->invariant_id_, "population.failed-stopped-terminal");
+  }
+}
+
+TEST(ClusterInvariantTest, AcceptsQuiescentFailedStoppedPopulation) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.failed_stopped_ = true;
+
+  EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+}
+
+TEST(ClusterInvariantTest,
+     RetiredPopulationCapacityRemainsUnavailableUntilReclaim) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.capacity_units_ = 100;
+  snapshot.population_.committed_live_units_ = 20;
+  snapshot.population_.partial_attempt_units_ = 10;
+  snapshot.population_.retired_unreclaimed_units_ = 30;
+  snapshot.population_.reported_available_units_ = 41;
+
+  const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->invariant_id_, "population.capacity-excludes-unreclaimed");
+  snapshot.population_.reported_available_units_ = 40;
+  EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
+}
+
+TEST(ClusterInvariantTest, RepeatedAbortMustReturnRuntimeIndexToBaseline) {
+  ClusterSnapshot snapshot;
+  snapshot.population_.capacity_units_ = 100;
+  snapshot.population_.reported_available_units_ = 100;
+  snapshot.population_.baseline_index_units_ = 7;
+  snapshot.population_.current_index_units_ = 8;
+  snapshot.population_.abort_reclaim_complete_ = true;
+
+  const std::optional<Finding> finding = CheckClusterInvariants(snapshot);
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->invariant_id_, "population.abort-reclaims-runtime");
+  snapshot.population_.current_index_units_ = 7;
   EXPECT_FALSE(CheckClusterInvariants(snapshot).has_value());
 }
 

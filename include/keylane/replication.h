@@ -12,6 +12,7 @@
 #include "absl/status/statusor.h"
 #include "celer/net/tcp_stream.h"
 #include "celer/runtime/task.h"
+#include "keylane/replication_group.h"
 
 namespace celer {
 class TlsContext;
@@ -32,6 +33,10 @@ struct ReplicaOfConfig {
 };
 
 struct ReplicationOptions {
+  // Cluster-managed replication is fail-closed and assigns this process to at
+  // most one replication group. The manager must not infer standalone
+  // REPLICAOF or import state as an activated cluster population.
+  bool cluster_enabled_ = false;
   // Consulted only while this node has an upstream. REPLICAOF NO ONE opens
   // writes only after the shared promotion durability path succeeds.
   bool replica_read_only_ = true;
@@ -119,6 +124,28 @@ struct ReplicationStatus {
   unsigned replica_priority_ = 100;
   bool redis_cluster_ = false;
   bool redis_topology_fault_ = false;
+  // A current-boot terminal latch for a target-side outcome whose storage
+  // effects cannot be proven. The node remains LOADING and rejects role
+  // changes until restart rather than retrying or becoming writable.
+  bool failed_stopped_ = false;
+  // Nonempty exactly when failed_stopped_ is true and describes the outcome
+  // whose effects could not be proven.
+  std::string failure_reason_;
+};
+
+// Typed current-boot result exposed to the future Meta control adapter. A
+// missing ready token means the population must not be reported as readable
+// or candidate-eligible even if partial records exist on disk.
+struct ClusterPopulationStatus {
+  // The control adapter needs both values before it can construct a directive;
+  // the node identity names this process in the current native implementation,
+  // while the boot identity scopes every readiness proof and authorization.
+  std::string local_node_id_;
+  std::string local_boot_id_;
+  ReplicationGroupState state_ = ReplicationGroupState::kNotReady;
+  std::optional<ReadyToken> ready_token_;
+  // Nonempty exactly while state_ is kFailedStopped.
+  std::string failure_reason_;
 };
 
 // A source-history-local cut across Keylane's worker replication logs. Native
@@ -171,6 +198,35 @@ class ReplicationManager {
   celer::Task<absl::Status> ApplyDirective(ReplicationDirective directive);
   celer::Task<ReplicationStatus> Observe() const;
 
+  // Applies one already-validated Meta full-rebuild directive to the single
+  // local replication group. This is the #16 runtime orchestration seam: it
+  // validates the complete identity and safe-source capability, forces a
+  // fresh native FULL, and drives the existing reset/snapshot/tail/promote/
+  // abort path. #20 supplies the control transport and calls this method.
+  celer::Task<absl::Status> ApplyClusterRebuildDirective(
+      ReplicaOfConfig upstream, RebuildDirective directive,
+      PopulationManifest manifest);
+
+  // Returns one coherent boot-scoped population snapshot for the future
+  // control adapter.
+  celer::Task<ClusterPopulationStatus> cluster_population_status() const;
+
+  // Installs one safe-source authorization delivered by the future Meta
+  // adapter. A cluster node exports a population only when it is itself ready
+  // and activated as the local primary with no upstream, and the incoming
+  // native handshake presents this exact rebuild identity. Revisions are
+  // monotonic: a newer one revokes and joins older exports before becoming
+  // active, and a revoked version cannot be replayed. #21 supplies the
+  // primary-activation transition and its authority fence.
+  celer::Task<absl::Status> AuthorizeClusterRebuildSource(
+      RebuildDirective directive);
+
+  // Revokes every downstream destructive-reset capability and reconnect lease
+  // (for example, when this node loses primary authority). An accepted
+  // directive remains the version watermark, preventing its replay after
+  // revocation; revoking an empty ledger is an idempotent no-op.
+  celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
+
   // Current runtime settings; all mutations enter through ApplyDirective.
   unsigned snapshot_read_concurrency() const noexcept;
   std::size_t snapshot_batch_size() const noexcept;
@@ -211,6 +267,12 @@ class ReplicationManager {
   // history. Command admission uses it to reject writes delayed across that
   // boundary.
   std::uint64_t role_epoch() const noexcept;
+  // Returns one opaque packed generation/open token for lock-free client
+  // admission. Zero means the dataset is not open for data commands.
+  std::uint64_t CaptureServingGeneration() const noexcept;
+  // A command may touch storage only while its captured nonzero token still
+  // exactly matches the current packed generation/open state.
+  bool ServingGenerationMatches(std::uint64_t generation) const noexcept;
   // Native Keylane replicas participate in cluster-style redirection. A
   // standalone Redis PSYNC follower instead serves its local read-only copy.
   bool redirects_clients_to_upstream() const noexcept;

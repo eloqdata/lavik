@@ -17,7 +17,16 @@ Task<absl::Status> StorageEngine::Impl::ReclaimExtentsCounted(
       engine_->active_extent_reclaims_.fetch_sub(1, std::memory_order_acq_rel);
     }
   } guard{this};
-  co_return co_await ReclaimExtents(store, std::move(extents));
+  absl::Status status = co_await ReclaimExtents(store, std::move(extents));
+  if (!status.ok()) {
+    // Most callers detach this task and have nobody to receive its result; the
+    // failure must therefore fail-stop storage rather than masquerade as
+    // reusable capacity.
+    store->write_failed_ = true;
+    spdlog::error("worker[{}] extent reclaim failed: {}", store->worker_->id(),
+                  status.message());
+  }
+  co_return status;
 }
 
 Task<absl::StatusOr<bool>> StorageEngine::Impl::ReclaimExtentLocal(

@@ -25,9 +25,17 @@
 #include <utility>
 #include <vector>
 
+#include "celer/net/server.h"
+#include "keylane/memory.h"
+#include "keylane/metrics.h"
+#include "keylane/storage/engine.h"
+#include "keylane/tx/tx_shard.h"
+
 namespace {
 
 using namespace std::chrono_literals;
+
+constexpr std::uint64_t kMiB = 1024 * 1024;
 
 [[noreturn]] void Fail(std::string message) {
   throw std::runtime_error(std::move(message));
@@ -144,6 +152,119 @@ void CreateDataFile(const std::string& path, std::uint64_t bytes) {
   if (allocated != 0 || close_error != 0) Fail("failed to size data file");
 }
 
+class TombRaiderQuiesceService final : public celer::Service {
+ public:
+  explicit TombRaiderQuiesceService(keylane::storage::StorageEngine* storage)
+      : storage_(storage) {}
+
+  void Prepare(unsigned thread_count) override {
+    if (thread_count != 1) {
+      Fail("tomb raider quiesce test requires one worker");
+    }
+  }
+
+  celer::Task<absl::Status> Run(celer::Worker& worker,
+                                celer::ServiceContext) override {
+    keylane::BindMemoryAccountingShard(worker.id());
+    keylane::tx::TxRuntime::Get()->shard(worker.id()).Bind(worker);
+    result_ = co_await storage_->InitializeWorker(worker);
+    if (result_.ok()) {
+      auto seeded = co_await storage_->Set(0, "quiesce-running-round", "v");
+      if (!seeded.ok()) result_ = seeded.status();
+    }
+
+    const auto running_deadline = std::chrono::steady_clock::now() + 10s;
+    while (result_.ok() && !storage_->TombRaiderStats().running_ &&
+           std::chrono::steady_clock::now() < running_deadline) {
+      result_ = co_await celer::SleepFor(worker, 1ms);
+    }
+    if (result_.ok() && !storage_->TombRaiderStats().running_) {
+      result_ = absl::Status(absl::StatusCode::kDeadlineExceeded,
+                             "tomb raider round did not start");
+    }
+
+    // User OFF only closes scheduler admission; it intentionally leaves the
+    // current maintenance round alone. Replica quiesce is the stronger path.
+    if (result_.ok()) {
+      result_ = co_await storage_->ConfigureTombRaider(
+          {.action_ = keylane::storage::TombRaiderConfigAction::kOff});
+    }
+    const auto user_off = storage_->TombRaiderStats();
+    if (result_.ok() && (user_off.enabled_ || !user_off.running_)) {
+      result_ = absl::Status(
+          absl::StatusCode::kFailedPrecondition,
+          "user tomb raider OFF changed in-flight round semantics");
+    }
+
+    const std::uint64_t rounds_before = storage_->TombRaiderStats().rounds_;
+    const auto quiesce_started = std::chrono::steady_clock::now();
+    if (result_.ok()) {
+      result_ = co_await storage_->QuiesceTombRaiderForReplica();
+    }
+    const auto quiesce_elapsed =
+        std::chrono::steady_clock::now() - quiesce_started;
+    const auto quiesced = storage_->TombRaiderStats();
+    if (result_.ok() && quiesce_elapsed > 2s) {
+      result_ = absl::Status(absl::StatusCode::kDeadlineExceeded,
+                             "tomb raider quiesce was not bounded");
+    }
+    if (result_.ok() && (quiesced.enabled_ || quiesced.running_ ||
+                         quiesced.rounds_ != rounds_before)) {
+      result_ = absl::Status(
+          absl::StatusCode::kFailedPrecondition,
+          "quiesce did not forfeit the running round and disable scheduling");
+    }
+
+    if (result_.ok()) result_ = co_await celer::SleepFor(worker, 100ms);
+    const auto stayed_quiesced = storage_->TombRaiderStats();
+    if (result_.ok() && (stayed_quiesced.enabled_ || stayed_quiesced.running_ ||
+                         stayed_quiesced.rounds_ != rounds_before)) {
+      result_ = absl::Status(absl::StatusCode::kFailedPrecondition,
+                             "tomb raider restarted after replica quiesce");
+    }
+    worker.RequestStop();
+    co_return result_;
+  }
+
+  void Stop() noexcept override {}
+
+  const absl::Status& result() const noexcept { return result_; }
+
+ private:
+  keylane::storage::StorageEngine* storage_ = nullptr;
+  absl::Status result_ =
+      absl::UnknownError("tomb raider quiesce service did not run");
+};
+
+void VerifyReplicaQuiesce(const std::string& path) {
+  keylane::storage::StorageEngineOptions options;
+  options.data_files_ = {path};
+  options.buffers_.registered_bytes_ = 64 * kMiB;
+  options.tomb_raider_interval_ms_ = 1;
+  // A normal round would remain in this pacing sleep for a minute. Quiesce
+  // must wake at a bounded checkpoint rather than waiting for it to finish.
+  options.tomb_raider_sleep_ms_ = 60'000;
+  keylane::storage::StorageEngine storage(std::move(options));
+  keylane::InitWorkerMetrics(1);
+  const absl::Status memory = keylane::InitMemoryLimit(512 * kMiB, 1);
+  if (!memory.ok()) Fail(std::string(memory.message()));
+  const absl::Status prepared = storage.Prepare(1);
+  if (!prepared.ok()) Fail(std::string(prepared.message()));
+  keylane::tx::TxRuntime::Create(1);
+
+  TombRaiderQuiesceService service(&storage);
+  celer::Server server;
+  server.AddService(&service);
+  celer::ServerOptions runtime;
+  runtime.thread_count_ = 1;
+  runtime.pin_workers_ = false;
+  runtime.recv_buffer_count_ = 0;
+  const absl::Status started = server.Start(runtime);
+  if (!started.ok()) Fail(std::string(started.message()));
+  server.WaitUntilStopped();
+  if (!service.result().ok()) Fail(std::string(service.result().message()));
+}
+
 RespClient Connect(std::uint16_t port) {
   const auto deadline = std::chrono::steady_clock::now() + 20s;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -158,7 +279,16 @@ RespClient Connect(std::uint16_t port) {
     address.sin_port = htons(port);
     if (::connect(fd, reinterpret_cast<const sockaddr*>(&address),
                   sizeof(address)) == 0) {
-      return RespClient(fd);
+      try {
+        RespClient client(fd);
+        if (client.Command({"PING"}) == "+PONG") return client;
+      } catch (const std::exception&) {
+        // The listener may be bound before storage recovery has installed the
+        // worker services. That connection is reset during initialization;
+        // reconnect until the command path itself is ready.
+      }
+      std::this_thread::sleep_for(10ms);
+      continue;
     }
     ::close(fd);
     std::this_thread::sleep_for(10ms);
@@ -325,13 +455,16 @@ int main(int argc, char** argv) {
   const std::string prefix =
       "/tmp/keylane-tombraider-" + std::to_string(::getpid());
   const std::string data_path = prefix + ".data";
+  const std::string quiesce_path = prefix + ".quiesce.data";
   const std::string log_path = prefix + ".log";
   (void)::unlink(data_path.c_str());
+  (void)::unlink(quiesce_path.c_str());
   (void)::unlink(log_path.c_str());
 
   try {
     const std::uint16_t port = FindFreePort();
     CreateDataFile(data_path, 192ULL * 1024 * 1024);
+    CreateDataFile(quiesce_path, 192ULL * 1024 * 1024);
     {
       ServerProcess server(argv[1], port, data_path, log_path);
       RespClient client = Connect(port);
@@ -477,14 +610,17 @@ int main(int argc, char** argv) {
              "restart control GET");
       server.Stop();
     }
+    VerifyReplicaQuiesce(quiesce_path);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
     std::cerr << "--- Keylane log ---\n" << ReadFile(log_path);
     (void)::unlink(data_path.c_str());
+    (void)::unlink(quiesce_path.c_str());
     (void)::unlink(log_path.c_str());
     return 1;
   }
   (void)::unlink(data_path.c_str());
+  (void)::unlink(quiesce_path.c_str());
   (void)::unlink(log_path.c_str());
   std::cout << "tomb raider e2e passed\n";
   return 0;

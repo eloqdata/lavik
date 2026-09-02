@@ -10,6 +10,11 @@ observation. Multiple Redis Cluster source connections are participants
 in that one group, not independent replication groups. The Redis command layer
 captures committed logical effects; and the storage engine owns the source
 backlog, full-sync capture state, target rebuild state, and durable state.
+In cluster mode that deep group also owns one boot-scoped population identity
+and readiness proof. Its callable cluster adapter binds the proof to the native
+reset, transfer, cut, promotion, and abort path.
+The process does not receive Meta directives over a control-plane transport;
+external control integration calls the adapter rather than bypassing it.
 
 Replication moves deterministic logical commands, snapshot records, and the
 process-global Redis Function catalog, not physical block addresses or record
@@ -29,6 +34,8 @@ state are process-local. Every process boot creates a new boot ID, history ID,
 and replica incarnation; a restart therefore requires whole-group full sync.
 
 ## Roles and lifecycle
+
+### Standalone and Sentinel-managed mode
 
 The externally reported roles are `master`, `connecting`, `syncing`, and
 `online`. `connecting` and `syncing` are LOADING states: ordinary data commands
@@ -94,6 +101,108 @@ reported as `slave_priority`; Sentinel treats zero as ineligible and otherwise
 prefers the lower value. Sentinel-specific transaction handling and config
 persistence are described under [Redis interoperability](#sentinel-managed-failover).
 
+### Cluster-managed startup mode
+
+`cluster-enabled yes` (or `--cluster-enabled`) selects a separate,
+fail-closed startup mode for a process that may own at most one replication
+group. The manager starts in `connecting`, ordinary reads and writes return
+LOADING, and storage starts without expiration authority. Startup rejects
+`replicaof`, `redis-replicaof`, and `load-rdb`; runtime `REPLICAOF`/`SLAVEOF`
+(including `NO ONE`) and `ADDREPLICAOF` are also rejected. These restrictions
+prevent standalone role control or imported data from being mistaken for an
+authorized cluster population.
+
+The process has no built-in Meta transport or directive receiver. Instead,
+`ReplicationManager` exposes a callable boundary for the external control
+integration: `cluster_population_status()` reports the local node/boot and the
+boot-scoped state or ready/failure evidence,
+`ApplyClusterRebuildDirective()` starts one authorized rebuild, and
+`AuthorizeClusterRebuildSource()` plus its revocation method control exact
+downstream export capabilities. Meta transport and message adaptation are
+outside this process boundary. Until an external caller supplies a valid
+directive, a cluster-enabled process remains LOADING after recovery. `PING` and
+the management/diagnostic surfaces needed to observe the process remain
+available, but recovered keyspace is not made readable or writable merely
+because storage initialization succeeded.
+
+## Single-group population coordination contract
+
+A cluster data node has one physical dataset and accepts at most one
+replication-group assignment during a process boot. `PopulationManifest`
+content-addresses the desired `(partition, logical epoch)` set; it may be
+empty, sparse, or complete. Its logical epochs belong to the control-plane
+population identity and are distinct from storage's target-local replication
+epochs.
+
+One rebuild identity binds the group and assignment, authority term, directive
+revision and authority identity, source node/boot/history, target node/boot,
+operation and attempt, and manifest identity. `BeginRebuild` accepts only the
+local target boot and a matching manifest, rejects assignment to another
+group, and requires the directive's safe-source assertion before returning a
+destructive-reset authorization. Safe source is therefore bound to the
+accepted boot-scoped directive, not inferred from a reachable socket or a
+source name. Accepted directives advance monotonically by `(term,
+directive_revision)`; exact in-progress retries are idempotent, while stale or
+conflicting revisions and reused attempt identities are rejected. An exact
+retry is idempotent only while its proof remains valid and its source endpoint
+is unchanged; after invalidation the control plane must issue a fresh attempt
+identity. A newer directive is fully validated before admission closes, then
+the old session is cancelled, joined, aborted, and proof-invalidated before
+the replacement capability is installed. Every later proof operation must
+revalidate the complete identity, so an authorization from an older attempt
+cannot complete a replacement attempt.
+
+The transfer set and physical reset domain are deliberately different. A
+destructive rebuild must reset all 16,384 physical partitions, including
+partitions absent from a sparse desired manifest, so no record outside the
+desired population can survive. The source scans baseline data only for
+manifest members, and the target refuses to install out-of-manifest records or
+full-sync tail commands; reset and handoff still cover the full physical domain.
+Every reset returns a nonzero target-local storage epoch. Completion evidence
+maps each partition's saved logical manifest epoch (zero for a non-member) to
+that exact target-local epoch, so a handoff from a prior attempt cannot satisfy
+the current proof. It also covers the partitionless Function catalog, one
+immutable stable cut for every declared source flow, and storage finalization
+before publishing a boot-scoped ready token. A sparse manifest never permits a
+sparse physical reset.
+
+`ApplyClusterRebuildDirective()` consumes this contract in production. It
+calls `BeginRebuild`, retains the resulting destructive-reset capability, and
+revalidates that capability immediately before each storage reset batch. The
+native flows feed reset epochs and manifest handoffs into the same
+`ReplicationGroup`. After the all-flow cut rendezvous, flow zero records the
+complete cut vector and Function-catalog proof before storage promotion. Only
+then does the manager publish its ready token and open the serving generation.
+Exact replay of the current completed directive returns that existing result
+without calling `BeginRebuild` again. A partial attempt is cancelled and joined
+as one session, its candidate population is aborted, and a cluster retry after
+proof loss requires a fresh directive identity. An uncertain promotion, cut
+installation,
+cancellation/join, proof invalidation, or abort enters a group-identity-bound
+current-boot failure latch: the process remains LOADING and accepts no later
+attempt until restart.
+
+A source-side cluster export is separately fail-closed. The control adapter
+may authorize a downstream identity only while the local population has a
+valid ready token for the same group, assignment, and manifest, the native
+dataset is valid, the local role is primary with no upstream, and the directive
+names the current source node, boot, history, and flow layout. Authorization is
+exact to the complete rebuild identity and can be revoked by cancelling and
+joining the affected source sessions. One revision may authorize multiple
+targets only when their group, assignment, authority,
+source incarnation/history, manifest, and flow layout agree. A newer revision
+first revokes and joins every older export. Revocation clears active grants but
+retains the accepted directive as a term/revision watermark, removes its
+sessions from the registry, and discards their reconnect leases. The revoked
+revision and any older directive therefore cannot resurrect authority; a
+revocation before any directive was accepted is an idempotent no-op.
+Authorization and revocation share the source-session registry lock, and grants
+stay closed while revoked flows are joined. The
+safe-source assertion alone does not promote an `Online` follower or permit
+unsupported native cascading. Cluster-primary activation and upstream
+detachment are outside this adapter; without that role transition, source
+authorization remains fail-closed.
+
 ## Native control and data flow
 
 Native replication uses authenticated, isolated RESP commands on the ordinary
@@ -112,6 +221,12 @@ selection waits for every flow: identical group/history context, the exact
 control-vector component, and complete retained event coverage on every flow
 selects `CONTINUE`; any restart, mismatch, gap, or missing event selects full
 sync for the whole group. Mixed continue/full sessions are not allowed.
+Every native data frame carries a payload CRC32C that the receiver verifies
+before parsing, applying, or acknowledging it. A cluster rebuild additionally
+carries the complete `POPULATION` identity in `KLPSYNC`; the source returns its
+current boot identity and accepts the session only when that identity exactly
+matches an installed source authorization and the connecting target node. A
+cluster-enabled source rejects an anonymous or standalone native export.
 
 The steady-state source path is:
 
@@ -236,12 +351,15 @@ blocked until occupancy falls below it.
 
 ## Full-sync lifecycle
 
-Full sync rebuilds one target population in place; there is no parallel serving
-root. The source registers a bounded full-sync session queue on every worker
-and captures a database epoch vector plus each partition's baseline mutation
-sequence. A flow scans the source partitions assigned to it, one logical
-database at a time. Each `(partition, database)` moves through `unstarted`,
-`scanning`, and `tailing`:
+Full sync destructively rebuilds one target population in place. It neither
+allocates a parallel staging root nor retains the previous active root for
+rollback. LOADING admission, rather than a root swap, prevents clients from
+observing the indexes while they are reset and repopulated. The source
+registers a bounded full-sync session queue on every worker and captures a
+database epoch vector plus each partition's baseline mutation sequence. A flow
+scans the source partitions assigned to it, one logical database at a time.
+Each `(partition, database)` moves through `unstarted`, `scanning`, and
+`tailing`:
 
 - an unstarted database needs no capture because its later scan sees committed
   state;
@@ -254,9 +372,9 @@ Baseline values are captured under the key-ordering boundary. Large external
 values pin immutable extents and stream bounded value chunks between `begin`
 and `commit` frames. The target reserves key plus encoded-value staging
 capacity from its worker-local memory share before accepting a large value.
-Failure aborts the hidden rebuild rather than exposing a partial record.
+Failure aborts the LOADING rebuild rather than exposing a partial record.
 Ordinary values are materialized into bounded record batches. Transactions
-committed during the hidden rebuild publish their participant after-images
+committed during the LOADING rebuild publish their participant after-images
 only after the commit decision. `FLUSHDB` or `FLUSHALL` invalidates an active
 capture attempt so the next attempt starts from the new database epochs.
 
@@ -285,9 +403,9 @@ Partition reset epochs are installed on the target in bounded batches, so a
 channel-sharded `PUBLISH` may arrive before its transport partition's batch.
 The target still validates its partition range, frame order, fragmentation,
 and KRC1 body, but only decoded `PUBLISH` is exempt from the installed-epoch
-check because it cannot touch the hidden dataset. Durable commands and runtime
-envelopes that can apply storage effects continue to require that epoch before
-replay.
+check because it cannot touch the rebuilding dataset. Durable commands and
+runtime envelopes that can apply storage effects continue to require that epoch
+before replay.
 Unlike durable writes, however, direct `PUBLISH` and the ephemeral publication
 phase of a `PUBLISH`-only `EXEC` are not protected by the snapshot or database
 admission gates. At the native cut, a publish can land in both the full-sync
@@ -312,12 +430,35 @@ the durable fence only when the population token and catalog readiness both
 belong to that full-sync session; restart while the fence exists restarts the
 whole group instead of serving the old root.
 
-Before target records are accepted, `ResetReplicaPartitions` persists new
-candidate replication epochs in batches and then detaches the old indexes.
-Recovery can consequently reject both prior-epoch records and records from an
-interrupted partial rebuild. Baseline, replacement, and tail records all enter
-the same in-place indexes while LOADING. Partition handoff marks that its
-databases have reached tailing.
+Before any target reset, every flow must select the same FULL mode. Flow zero
+then closes command database admission, drains work admitted against the old
+serving generation, and quiesces Tomb Raider and expiration while all other
+flows wait at a session barrier. Admission reopens only after that boundary so
+trusted replica apply can proceed; external commands remain fenced by the
+closed serving generation. This makes the first destructive reset, rather than
+the final cut, the boundary after which no request admitted against the old
+serving generation, Tomb Raider round, or expiration task can mutate or
+publish the old logical population. Physical maintenance such as defrag and
+transaction cleanup may continue; epoch, index-generation, and record-location
+revalidation prevents that stale work from publishing into the replacement.
+
+After that boundary, the native flows collectively call
+`ResetReplicaPartitions` for all 16,384 physical partitions, including empty
+ones. Each bounded reset batch persists new candidate replication epochs and
+then detaches the old indexes. Recovery rejects the old population because its
+partition epochs are stale. Candidate records use the next database epochs,
+which are persisted only by successful promotion, so recovery also rejects an
+interrupted or aborted candidate. Cluster restart independently creates a fresh
+`NOT_READY` proof domain and remains LOADING. Baseline, replacement, and tail
+records all enter the same indexes while LOADING. For a cluster population, the
+source opens partition snapshot capture and scans baseline data only for
+partitions present in the authorized manifest; non-member partitions proceed
+directly from reset to an empty handoff. The target also discards
+out-of-manifest records and full-sync commands as a final guard. Partition
+handoff still covers every physical partition: it records the manifest's
+logical epoch, including zero for a non-member, against the exact target-local
+epoch returned by reset. On the target, every handoff marks the corresponding
+empty or populated partition as tailing.
 
 At the final cut, the source closes and drains snapshot-transaction admission,
 closes and drains command database gates, drains replacement and session
@@ -325,8 +466,48 @@ queues, fences each shared backlog, pins each returned stable cursor, stops
 capture on every flow, and reopens foreground admission before waiting for the
 network cut ACK. The target waits for every flow's cut, closes its own command
 gates, validates every partition, drains staged storage writes, persists the
-new database epochs, removes sync state, and only then becomes online. Abort
-drains and detaches the partial population rather than exposing it.
+new database epochs, removes sync state, and only then becomes eligible to go
+online. Each flow follows a local protocol phase machine: FULL rebuild frames
+are accepted only before its cut, the first online cursor must match the
+installed stable cut, and later reset/snapshot/cut frames are rejected;
+CONTINUE accepts no reset/snapshot frames and requires its first cursor to
+match the exact cursor requested in `KLFLOW`. A cut also rejects an unfinished
+command fragment before any promotion work. The target records every flow's
+stable next-LSN cut and, after storage promotion,
+installs the complete cut vector into shared continuation state before it
+releases the all-flow completion barrier or acknowledges any cut. Online cursor
+frames must agree with that installed vector, so reconnect cannot retain a
+partially updated set of flow cursors. The source's final `KLONLINE` is only a
+notification: the target opens its serving generation only after every flow
+has completed its cursor handoff, the FULL cut vector is installed (or the
+CONTINUE population was already valid), every flow remains connected, and the
+session is not cancelled. For a cluster rebuild, the same cut proof marks the
+Function catalog complete, records every immutable flow cursor, records
+successful storage promotion, and publishes the boot-scoped `ReadyToken`.
+Storage promotion first drains each worker's existing detached-index queue, so
+successive successful destructive rebuilds cannot accumulate old index arenas
+or unsettled record-block accounting. This reuses the storage engine's existing
+synchronous reclaim boundary rather than adding per-attempt tracking. These
+proofs are runtime state; durable Function-catalog recovery is outside this
+boundary.
+
+When an ordinary failure leaves a partial rebuild, teardown cancels the whole
+session, resolves every cross-flow rendezvous, joins every detached flow and
+transaction apply, and only then aborts and detaches that partial population.
+Storage does not report abort complete until each worker's detached-index drain
+has reclaimed detached prior-generation and candidate index RAM and settled
+record live-block accounting. Value extents may continue through asynchronous
+retirement after that boundary; allocator capacity excludes them as
+`retired-unreclaimed` debt until their blocks are actually reusable. An
+uncertain promotion, cut installation, join, proof invalidation, or abort
+instead enters the current-boot terminal latch; the manager cannot safely
+start another attempt in the same physical indexes.
+
+Role transitions also fence client work with a packed serving generation.
+Closing a population advances the generation and wakes all blocking registries;
+commands revalidate after reacquiring database admission, so a waiter from the
+previous population cannot observe the rebuilt indexes. Replication-origin
+apply bypasses this client fence while the population is closed.
 
 ## Online apply and rendezvous
 
@@ -420,12 +601,15 @@ The online stream handles `SELECT`, `PING`, `REPLCONF GETACK`, `PUBLISH`,
 Function mutations, keyed writes, and strict `MULTI`/`EXEC`. `PUBLISH` is
 delivered locally without being forwarded again. The offset advances only
 after successful apply.
-For Redis Cluster, each source must be a slot-owning master; `ADDREPLICAOF`
-accepts only a source with disjoint slots and the same complete topology. The
-node becomes online only when registered sources cover all 16,384 slots, the
-source count matches the topology's master count, every source dataset is
-valid, and the topology is not faulted. Two consecutive incompatible topology
-observations fault the topology and return the node to loading.
+In standalone Redis PSYNC compatibility mode, one Keylane process can follow
+multiple masters of one Redis Cluster; these are sources for one imported
+dataset, not multiple cluster-managed replication groups. Each source must be
+a slot-owning master, and `ADDREPLICAOF` accepts only a source with disjoint
+slots and the same complete topology. The node becomes online only when
+registered sources cover all 16,384 slots, the source count matches the
+topology's master count, every source dataset is valid, and the topology is not
+faulted. Two consecutive incompatible topology observations fault the topology
+and return the node to loading.
 
 ### Exporting to Redis
 
@@ -474,9 +658,11 @@ reattachment.
 
 | Setting or command | Current scope and behavior |
 |---|---|
-| `replicaof host port` / `REPLICAOF` | Redis-style config or runtime role change; native-first protocol discovery |
-| `redis-replicaof host port` / `--redis-replicaof` | Explicit startup Redis PSYNC source |
-| `ADDREPLICAOF host port` | Runtime addition of a disjoint master from the active Redis Cluster |
+| `cluster-enabled` / `--cluster-enabled` | One-node-one-group, fail-closed startup; incompatible with startup `replicaof`, `redis-replicaof`, and `load-rdb`; the public manager also ignores a standalone initial upstream supplied by a direct embedder |
+| Cluster control adapter | Callable `ApplyClusterRebuildDirective`, population status, and source authorize/revoke APIs; not a Redis command or an in-process Meta transport |
+| `replicaof host port` / `REPLICAOF` | Standalone Redis-style config or runtime role change with native-first discovery; rejected in cluster-managed mode |
+| `redis-replicaof host port` / `--redis-replicaof` | Explicit standalone startup Redis PSYNC source; rejected in cluster-managed mode |
+| `ADDREPLICAOF host port` | Standalone runtime addition of a disjoint master from the active Redis Cluster; rejected in cluster-managed mode |
 | `replica-read-only` | Startup write policy; `REPLICAOF NO ONE` is writable regardless |
 | `replica-priority` | Startup/runtime Sentinel election priority, default 100; zero is ineligible and lower nonzero values are preferred |
 | `CONFIG REWRITE` | Atomically persists the current single upstream mode and `replica-priority`; unavailable without a config file or with multiple Redis Cluster sources |
@@ -492,17 +678,28 @@ reattachment.
 fields alongside group, boot and replica-incarnation IDs, upstream identity,
 native session/flow counts, history IDs, local Function-catalog generation and
 CRC64, downstreams, Redis sources, dataset validity, priority, and topology
-fault state. Replica and Sentinel Pub/Sub connections are registered in CLIENT
-metadata. Prometheus exposes per-worker backlog, publisher queue,
-retention/backpressure, full-sync queue/session, and connection metrics.
+fault state. The callable cluster status separately reports the local node/boot,
+`NOT_READY`/`REBUILDING`/`READY`/`FAILED_STOPPED` state, a ready token only in
+`READY`, and the terminal failure reason. Replica and Sentinel Pub/Sub
+connections are registered in CLIENT metadata. Prometheus exposes per-worker
+backlog, publisher queue, retention/backpressure, full-sync queue/session, and
+connection metrics.
 
 ## Invariants, failures, and current limitations
 
 - Role epoch, history ID, session ID, flow LSN, partition mutation sequence,
   database epoch, and target replication epoch are separate identity domains.
   None can substitute for another.
+- A cluster-managed process accepts at most one replication-group assignment
+  during one boot. Safe-source authority and readiness evidence are bound to
+  the complete rebuild directive and target boot. A cluster source accepts
+  only an exact authorized population handshake from its named target.
 - All native flows continue together or full-sync together. A target publishes
   online only after all partitions and the all-flow cut validate.
+- A native full sync destructively resets every physical partition in place;
+  it has neither a retained old active root nor a separate staging root. The
+  target installs the complete all-flow cut vector before acknowledging any
+  cut, never one flow cursor at a time.
 - Replay never republishes itself, and a replica never performs authoritative
   active expiration.
 - Runtime-only `kEphemeral` events consume normal publication and retention
@@ -527,10 +724,12 @@ retention/backpressure, full-sync queue/session, and connection metrics.
   FLUSHDB drain-then-detach; concurrent apply can therefore make the announced
   KEYS array length disagree with emitted elements or violate FLUSHDB
   exclusivity.
-- Online ingress protocol, frame identity or ordering, fragment reassembly, and
-  KRC1 decode failures cancel the session without explicitly invalidating the
-  target's prior continuation state; rendezvous and command-apply failures do
-  invalidate it.
+- Malformed, gapped, or divergent online command ingress, including frame
+  identity/order, fragment reassembly, KRC1 decode, rendezvous, and
+  command-apply failures, invalidates the whole continuation domain. Serving
+  closes immediately, every flow is cancelled and joined, and a standalone
+  target selects a fresh all-flow FULL; a cluster target discards the ready
+  proof and waits for a fresh directive identity.
 - The global publication-order slot has no fairness deadline. `MSET` can still
   acquire database admission before snapshot-transaction admission, other
   multi-shard paths can acquire database admission before the order slot, and
@@ -539,6 +738,12 @@ retention/backpressure, full-sync queue/session, and connection metrics.
   deadlock-free.
 - Redis PSYNC cursors and native continuation cursors do not survive restart.
   Durable target data does not imply crash-resumable replication history.
+- A `ReplicationGroup`, its reset capability, and its ready token are
+  current-boot state. Every cluster restart constructs a new `NOT_READY`
+  group and remains LOADING even when storage recovered records written by a
+  prior boot; old directives and proof tokens cannot reactivate them.
+- The callable cluster adapter does not receive, authenticate, or persist Meta
+  messages and does not itself publish candidate state to a quorum.
 
 ## Verification and known gaps
 
@@ -551,7 +756,11 @@ counts, large values, role changes, reconnects, TLS on control and all flows,
 flush during full sync, exact-once non-idempotent effects, tight queue
 waterlines, multiple replicas, connection-scoped `WAIT` across flow ACKs,
 Function-catalog full sync and incremental mutation, config rewrite, and
-transaction/control fault injection.
+transaction/control fault injection and destructive replacement of the
+previous population. Cluster model and integration coverage checks boot-scoped
+identity, safe-source reset authorization, all-partition reset and handoff,
+all-flow cut publication, fail-closed admission and failure, serving fences,
+and reclaim accounting. `tests/cluster/README.md` is the cluster test inventory.
 
 `tests/multikey_e2e_test.cpp` covers concurrent wide replicated `MSET`, changing
 participant sets, duplex source sending, and cross-flow rendezvous progress.
@@ -581,9 +790,10 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Claim | Repository source |
 |---|---|
 | Public roles, options, status, and manager boundary | `include/keylane/replication.h` |
-| Native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `src/replication/replication.cpp` |
+| Single-group rebuild identity, safe-source authorization, logical/local epoch mapping, manifest/reset proof, readiness, restart invalidation, and fail-stop contract | `include/keylane/replication_group.h`, `src/replication/replication_group.cpp` |
+| Callable cluster directive/status/source-authorization adapter, native control/data protocol, duplex online flow, role lifecycle, Redis follower/export, topology, Function full sync, and reconnect behavior | `include/keylane/replication.h`, `src/replication/replication.cpp` |
 | Canonical command format and deterministic expiration effects | `include/keylane/replication_command.h`, `src/replication/command.cpp` |
-| REPLICAOF/Sentinel commands, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/keylane/command.h`, `src/redis/command.cpp`, `src/redis/command_table.cpp` |
+| REPLICAOF/Sentinel commands, serving-generation fencing, blocking-wait invalidation, MSET publication admission/order, Function and PUBLISH capture, transaction/control capture, and trusted replay | `include/keylane/command.h`, `src/redis/command.cpp`, `src/redis/blocking_wait.cpp`, `src/redis/command_table.cpp` |
 | Authenticated listener handoff and module construction | `src/redis/server.cpp` |
 | Redis RDB Function catalog import/export and `FUNCTION2` encoding | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/function_catalog.cpp`, `src/redis/server.cpp` |
 | Pub/Sub delivery and connection/session state used by replicated PUBLISH and Sentinel | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
@@ -591,7 +801,7 @@ FLUSH/full-sync interleavings. Two legacy replication tests in
 | Durable catalog, full-sync invalidation, population eligibility, and promotion base | `src/storage/engine/system_state.cpp`, `src/storage/engine/init.cpp` |
 | Backlog blocks, publisher/session queues, capture state, and target sync state | `src/storage/engine/impl.h` |
 | In-memory append/read/fence/retention, capacity, invalidation, and control publication | `src/storage/engine/replication_log.cpp` |
-| Full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, non-publishing apply, and DB-gate limitation | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
+| Manifest-filtered full-sync scanning, replacements, handoff, target reset/apply/promotion/abort, detached-index reclaim, cascade and DB-gate limitations | `src/storage/engine/replication.cpp`, `src/storage/engine/write.cpp` |
 | Frame layout, event kinds, fragmentation, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
-| Startup/runtime replication configuration and atomic CONFIG REWRITE | `app/keylane.cpp`, `include/keylane/server.h`, `src/config.cpp`, `src/redis/command.cpp` |
-| Native, log, MSET, Pub/Sub, Sentinel, Redis PSYNC/export, RDB, format, and configuration verification | `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |
+| Startup/runtime replication configuration, cluster fail-closed admission, and atomic CONFIG REWRITE | `app/keylane.cpp`, `include/keylane/server.h`, `src/config.cpp`, `src/redis/command.cpp`, `src/redis/server.cpp` |
+| Native, group-model, cluster-startup/manager/generation/failure/protocol-guard, log, MSET, Pub/Sub, Sentinel, Redis PSYNC/export, RDB, format, and configuration verification | `tests/replication_group_test.cpp`, `tests/cluster/cluster_invariants.cpp`, `tests/cluster/fault_harness_test.cpp`, `tests/cluster/population_integration_test.cpp`, `tests/cluster/replication_manager_integration_test.cpp`, `tests/cluster/serving_generation_integration_test.cpp`, `tests/cluster/rebuild_failure_integration_test.cpp`, `tests/cluster/rebuild_protocol_integration_test.cpp`, `tests/replication_log_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/pubsub_e2e_test.cpp`, `tests/sentinel_e2e_test.cpp`, `tests/redis_cluster_psync_e2e.sh`, `tests/redis_export_e2e.sh`, `tests/multi_exec_e2e_test.cpp`, `tests/rdb_test.cpp`, `tests/replication_command_test.cpp`, `tests/storage_format_test.cpp`, `tests/config_test.cpp` |

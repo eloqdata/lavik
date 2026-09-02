@@ -1019,7 +1019,7 @@ Task<CommandReply> ExecuteBlockingListCommand(const CommandRequest& request,
         "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
   };
   co_return co_await ExecuteBlockingWaitLoop(
-      client_id, request, std::move(specs), *wait_deadline,
+      request, reply_builder, client_id, std::move(specs), *wait_deadline,
       "blocking List wait cancelled", std::move(attempt), timeout_reply,
       unblock_error_reply, status_reply,
       request.kind_ == CommandKind::kBLMove ||

@@ -133,13 +133,18 @@ void FinishBlockingWait(BlockingWaitHandle& handle);
 // unavailable value from a completed command, so reply encodings never become
 // control-flow signals.
 celer::Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint64_t client_id, const CommandRequest& request,
-    std::vector<BlockingWaitSpec> specs,
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,
     BlockingReplyFactory timeout_reply,
     BlockingReplyFactory unblock_error_reply,
     BlockingStatusReplyFactory status_reply, bool yield_before_retry = false);
+
+// Dataset generation changes invalidate every currently blocked external
+// request, independent of its key or FIFO lane. The broadcast is asynchronous
+// across workers and is a no-op before the runtime starts.
+void NotifyServingGenerationChanged() noexcept;
 
 // Called on the worker owning the blocked command coroutine. CLIENT UNBLOCK
 // fans out to these worker-local indexes without introducing a shared mutex.
