@@ -401,6 +401,9 @@ int main(int argc, char** argv) {
         "redis.register_function{function_name='keylane_get', "
         "callback=function(keys, args) return redis.call('GET', keys[1]) "
         "end, description='read a value', flags={'no-writes'}}\n"
+        "redis.register_function{function_name='keylane_wait', "
+        "callback=function(keys, args) return redis.call('WAIT', args[1], "
+        "args[2]) end, flags={'no-writes'}}\n"
         "redis.register_function{function_name='keylane_no_writes_set', "
         "callback=function(keys, args) return redis.call('SET', keys[1], "
         "args[1]) end, flags={'no-writes'}}\n"
@@ -423,6 +426,8 @@ int main(int argc, char** argv) {
            Bulk("fn:value"), "FCALL read function");
     Expect(client.Command({"FCALL_RO", "keylane_get", "1", "function:key"}),
            Bulk("fn:value"), "FCALL_RO no-writes function");
+    Expect(client.Command({"FCALL_RO", "keylane_wait", "0", "1", "0"}), ":0",
+           "FCALL_RO WAIT returns immediately");
     Expect(client.Command({"FCALL_RO", "keylane_no_writes_set", "1",
                            "function:key", "blocked"}),
            "-ERR Write commands are not allowed from read-only scripts.",
@@ -835,6 +840,21 @@ int main(int argc, char** argv) {
            Bulk("9007199254740991"), "Lua numeric command argument precision");
 
     Expect(client.Command({"SET", "lua:ro", "seed"}), "+OK", "EVAL_RO seed");
+    Expect(client.Command({"EVAL_RO", "return redis.call('WAIT',1,0)", "0"}),
+           ":0", "EVAL_RO WAIT returns immediately");
+    Expect(client.Command({"SADD", "lua:sort", "a", "b", "aa"}), ":3",
+           "Lua deterministic SORT fixture");
+    Expect(client.Command({"EVAL", "return redis.call('SORT',KEYS[1],'BY','_')",
+                           "1", "lua:sort"}),
+           "*3\r\n" + Bulk("a") + "\r\n" + Bulk("aa") + "\r\n" + Bulk("b"),
+           "Lua SORT constant BY orders Set deterministically");
+    ExpectContains(
+        client.Command(
+            {"EVAL",
+             "return redis.call('SORT',KEYS[1],'BY','_','GET','#','GET','_:*')",
+             "1", "lua:sort"}),
+        "SORT BY/GET pattern keys are not supported inside MULTI",
+        "Lua SORT rejects dynamically derived pattern keys");
     Expect(client.Command(
                {"EVAL_RO", "return redis.call('GET',KEYS[1])", "1", "lua:ro"}),
            Bulk("seed"), "EVAL_RO read");

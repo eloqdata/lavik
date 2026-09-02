@@ -313,7 +313,8 @@ Task<absl::StatusOr<std::optional<std::string>>> LookupPatternValue(
 
 Task<absl::StatusOr<SortProduct>> BuildSortProduct(
     const CommandRequest& request, const SortOptions& options,
-    SortSource source, std::span<const LockedKey> keys) {
+    SortSource source, std::span<const LockedKey> keys,
+    bool deterministic_set_order) {
   PatternCache cache;
   std::vector<SortItem> items;
   items.reserve(source.elements_.size());
@@ -343,7 +344,7 @@ Task<absl::StatusOr<SortProduct>> BuildSortProduct(
   bool dont_sort = options.dont_sort_;
   bool alpha = options.alpha_;
   if (dont_sort && source.type_ == storage::ValueType::kSet &&
-      options.store_arg_.has_value()) {
+      (options.store_arg_.has_value() || deterministic_set_order)) {
     dont_sort = false;
     alpha = true;
     for (SortItem& item : items) item.comparison_ = item.value_;
@@ -539,7 +540,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
     }
 
     auto product =
-        co_await BuildSortProduct(request, *options, std::move(*source), keys);
+        co_await BuildSortProduct(request, *options, std::move(*source), keys,
+                                  /*deterministic_set_order=*/false);
     if (!product.ok()) {
       (void)co_await ReleaseSortTransaction(&transaction);
       co_return Built(AppendSortError(reply_builder, product.status()));
@@ -610,7 +612,8 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
 
 Task<std::string> ExecuteSortCommandLocked(
     const CommandRequest& request, std::span<const SortExecKey> exec_keys,
-    std::vector<storage::TxShardWrites>& tx_writes) {
+    std::vector<storage::TxShardWrites>& tx_writes,
+    bool deterministic_set_order) {
   if (request.kind_ == CommandKind::kSort) {
     MarkReplicationCommandHandled(request);
   }
@@ -638,8 +641,8 @@ Task<std::string> ExecuteSortCommandLocked(
           "ERR SORT BY/GET pattern keys are not supported inside MULTI");
     }
   }
-  auto product =
-      co_await BuildSortProduct(request, *options, std::move(*source), keys);
+  auto product = co_await BuildSortProduct(
+      request, *options, std::move(*source), keys, deterministic_set_order);
   if (!product.ok()) co_return EncodeSortError(product.status());
   if (!options->store_arg_.has_value()) {
     ReplyBuilder builder(request.resp_version_);

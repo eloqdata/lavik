@@ -5379,14 +5379,16 @@ Task<std::string> ExecuteExecSequentialStreamRead(
 
 Task<std::string> ExecuteExecSequentialSort(
     const CommandRequest& command, const std::vector<ExecKey>& keys,
-    std::vector<storage::TxShardWrites>& tx_writes) {
+    std::vector<storage::TxShardWrites>& tx_writes,
+    bool deterministic_set_order) {
   std::vector<SortExecKey> sort_keys;
   sort_keys.reserve(keys.size());
   for (const ExecKey& key : keys) {
     sort_keys.push_back(SortExecKey{
         .digest_ = key.digest_, .owner_ = key.owner_, .arg_ = key.arg_});
   }
-  co_return co_await ExecuteSortCommandLocked(command, sort_keys, tx_writes);
+  co_return co_await ExecuteSortCommandLocked(command, sort_keys, tx_writes,
+                                              deterministic_set_order);
 }
 
 // EXEC uses one write receipt per shard for all commands. A command such as
@@ -6162,7 +6164,8 @@ Task<std::string> ExecuteExecSequentialListMove(
 Task<std::string> ExecuteExecSequentialCommand(
     ExecSequentialFamily family, const CommandRequest& command,
     const std::vector<ExecKey>& keys,
-    std::vector<storage::TxShardWrites>& tx_writes) {
+    std::vector<storage::TxShardWrites>& tx_writes,
+    bool script_context = false) {
   switch (family) {
     case ExecSequentialFamily::kListPop:
       co_return co_await ExecuteExecSequentialListPop(command, keys, tx_writes);
@@ -6186,7 +6189,9 @@ Task<std::string> ExecuteExecSequentialCommand(
       co_return co_await ExecuteExecSequentialStreamRead(command, keys,
                                                          tx_writes);
     case ExecSequentialFamily::kSort:
-      co_return co_await ExecuteExecSequentialSort(command, keys, tx_writes);
+      co_return co_await ExecuteExecSequentialSort(
+          command, keys, tx_writes,
+          /*deterministic_set_order=*/script_context);
     case ExecSequentialFamily::kNone:
       co_return EncodeError("ERR internal EXEC sequential routing error");
   }
@@ -6329,13 +6334,18 @@ void CollectLuaReplicationEffects(
                   std::make_move_iterator(captured.commands_.end()));
 }
 
+Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
+                               const CommandRequest& request,
+                               ReplyBuilder& reply_builder, bool allow_blocking,
+                               bool unresolved_write);
+
 Task<std::string> ExecuteLuaRedisCall(
     const CommandRequest& eval_request, LuaRedisCall call,
     std::span<const std::string> declared_keys, tx::Transaction* transaction,
     std::vector<storage::TxShardWrites>* tx_writes,
     const std::shared_ptr<BlockingNotificationCapture>& notifications,
     std::vector<CapturedReplicationCommand>* effects,
-    LuaExecution* lua_execution) {
+    LuaExecution* lua_execution, ConnectionContext* connection) {
   RespCommand wire{.args_ = std::move(call.args_)};
   auto built = BuildCommandRequest(std::move(wire), eval_request.db_id_);
   if (!built.ok() || built->spec_ == nullptr) {
@@ -6356,6 +6366,23 @@ Task<std::string> ExecuteLuaRedisCall(
   auto keys = DetermineKeys(*command.spec_, command.args_);
   if (!keys.ok()) {
     co_return EncodeError(absl::StrCat("ERR ", keys.status().message()));
+  }
+  if (command.kind_ == CommandKind::kWait) {
+    if (command.args_.size() != 3) {
+      co_return EncodeError("ERR wrong number of arguments for 'wait' command");
+    }
+    // The outer script owns its transaction and publishes only after Lua
+    // returns. Waiting for a write already performed by this invocation would
+    // deadlock that publication. Reuse the caller's pre-script watermark when
+    // available, but force zero once the script has an unresolved write.
+    ConnectionContext fallback;
+    ConnectionContext& wait_context =
+        connection != nullptr ? *connection : fallback;
+    ReplyBuilder local_builder(RespVersion::k2);
+    CommandReply local = co_await ExecuteWait(
+        wait_context, command, local_builder, /*allow_blocking=*/false,
+        /*unresolved_write=*/connection == nullptr || !effects->empty());
+    co_return std::string(local.encoded_);
   }
   const std::uint32_t flags = command.spec_->flags_;
   const bool immediate_blocking = IsLuaImmediateBlockingCommand(command.kind_);
@@ -6459,7 +6486,8 @@ Task<std::string> ExecuteLuaRedisCall(
   std::string reply;
   if (routed_multi && sequential != ExecSequentialFamily::kNone) {
     reply = co_await ExecuteExecSequentialCommand(sequential, command,
-                                                  command_keys, *tx_writes);
+                                                  command_keys, *tx_writes,
+                                                  /*script_context=*/true);
     CollectLuaReplicationEffects(command, reply, effects);
     co_return reply;
   }
@@ -6781,7 +6809,8 @@ Task<std::string> ExecuteEvalWithTransaction(
     const CommandRequest& request, tx::Transaction* transaction,
     std::vector<storage::TxShardWrites>* tx_writes,
     const std::shared_ptr<BlockingNotificationCapture>& notifications,
-    std::vector<CapturedReplicationCommand>* effects) {
+    std::vector<CapturedReplicationCommand>* effects,
+    ConnectionContext* connection) {
   auto key_view = DetermineKeys(*request.spec_, request.args_);
   if (!key_view.ok()) {
     co_return EncodeError(absl::StrCat("ERR ", key_view.status().message()));
@@ -6883,7 +6912,7 @@ Task<std::string> ExecuteEvalWithTransaction(
     if (!step.call_.has_value()) break;
     std::string command_reply = co_await ExecuteLuaRedisCall(
         request, std::move(*step.call_), declared_keys, transaction, tx_writes,
-        notifications, effects, execution->get());
+        notifications, effects, execution->get(), connection);
     step = (*execution)->Resume(command_reply);
   }
   co_return std::move(step.reply_);
@@ -6900,7 +6929,8 @@ void StoreEvalReplicationEffects(
 }
 
 Task<CommandReply> ExecuteEval(const CommandRequest& request,
-                               ReplyBuilder& reply_builder) {
+                               ReplyBuilder& reply_builder,
+                               ConnectionContext* connection) {
   auto key_view = DetermineKeys(*request.spec_, request.args_);
   if (!key_view.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -6958,7 +6988,8 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
 
   std::string eval_reply = co_await ExecuteEvalWithTransaction(
       request, transaction.has_value() ? &*transaction : nullptr,
-      tx_writes.empty() ? nullptr : &tx_writes, notifications, &effects);
+      tx_writes.empty() ? nullptr : &tx_writes, notifications, &effects,
+      connection);
 
   if (transaction.has_value()) {
     if (!read_only) {
@@ -7802,8 +7833,8 @@ Task<CommandReply> ExecuteSentinelManagementExec(
 
 Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
                                const CommandRequest& request,
-                               ReplyBuilder& reply_builder,
-                               bool allow_blocking) {
+                               ReplyBuilder& reply_builder, bool allow_blocking,
+                               bool unresolved_write) {
   std::uint64_t required = 0;
   std::uint64_t timeout_ms = 0;
   if (!ParseUint64(request.args_[1], &required) ||
@@ -7812,6 +7843,9 @@ Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
         "ERR value is not an integer or out of range"));
   }
   if (g_replication == nullptr || g_replication->is_replica()) {
+    co_return BuiltReply(reply_builder.AppendInteger(0));
+  }
+  if (unresolved_write) {
     co_return BuiltReply(reply_builder.AppendInteger(0));
   }
 
@@ -8126,7 +8160,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
     if (IsLuaInvocationCommand(cmd)) {
       std::vector<CapturedReplicationCommand> effects;
       std::string reply = co_await ExecuteEvalWithTransaction(
-          cmd, nullptr, nullptr, blocking_notifications, &effects);
+          cmd, nullptr, nullptr, blocking_notifications, &effects, &ctx);
       StoreEvalReplicationEffects(cmd, std::move(effects));
       co_return reply;
     }
@@ -8162,7 +8196,8 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       local = co_await ExecuteRole(local_builder);
     } else if (cmd.kind_ == CommandKind::kWait) {
       local = co_await ExecuteWait(ctx, cmd, local_builder,
-                                   /*allow_blocking=*/false);
+                                   /*allow_blocking=*/false,
+                                   /*unresolved_write=*/false);
     } else if (cmd.kind_ == CommandKind::kRandomKey) {
       local = co_await ExecuteRandomKey(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kXGroup ||
@@ -8447,7 +8482,7 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
         if (IsLuaInvocationCommand(cmd)) {
           std::vector<CapturedReplicationCommand> effects;
           replies[i] = co_await ExecuteEvalWithTransaction(
-              cmd, &txn, &tx_writes, blocking_notifications, &effects);
+              cmd, &txn, &tx_writes, blocking_notifications, &effects, &ctx);
           StoreEvalReplicationEffects(cmd, std::move(effects));
           ++i;
           continue;
@@ -10000,7 +10035,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return co_await ExecuteClient(ctx, request, reply_builder);
     case CommandKind::kWait:
       co_return co_await ExecuteWait(ctx, request, reply_builder,
-                                     /*allow_blocking=*/true);
+                                     /*allow_blocking=*/true,
+                                     /*unresolved_write=*/false);
     case CommandKind::kPublish:
     case CommandKind::kPubSub:
     case CommandKind::kPSubscribe:
@@ -10011,7 +10047,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
     default:
       break;
   }
-  co_return co_await ExecuteCommand(request, reply_builder, ctx.conn_id_);
+  co_return co_await ExecuteCommand(request, reply_builder, ctx.conn_id_, &ctx);
 }
 
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
@@ -10072,7 +10108,7 @@ Task<absl::Status> ReleaseConnectionWatches(ConnectionContext& ctx) {
 
 Task<CommandReply> ExecuteCommandBody(
     const CommandRequest& request, ReplyBuilder& reply_builder,
-    std::uint64_t client_id,
+    std::uint64_t client_id, ConnectionContext* connection,
     ReplicationTransactionOrderGuard* preacquired_order = nullptr,
     std::optional<bool> precomputed_spans_multiple_shards = std::nullopt) {
   const bool replication_origin = request.replication_origin_;
@@ -10180,7 +10216,7 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kEvalShaRo:
     case CommandKind::kFCall:
     case CommandKind::kFCallRo:
-      co_return co_await ExecuteEval(request, reply_builder);
+      co_return co_await ExecuteEval(request, reply_builder, connection);
 
     case CommandKind::kScript:
       co_return co_await ExecuteScript(request, reply_builder);
@@ -10578,13 +10614,15 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
 // FLUSHDB and FULLSYNC_CUT drain waiting for the gate counts to reach zero.
 Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
                                           ReplyBuilder& reply_builder,
-                                          std::uint64_t client_id) {
+                                          std::uint64_t client_id,
+                                          ConnectionContext* connection) {
   const bool source_write =
       !request.replication_origin_ && request.spec_ != nullptr &&
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       g_storage != nullptr && g_storage->ReplicationLogActive();
   if (!source_write) [[likely]] {
-    co_return co_await ExecuteCommandBody(request, reply_builder, client_id);
+    co_return co_await ExecuteCommandBody(request, reply_builder, client_id,
+                                          connection);
   }
   // Preacquire the order gate across publisher admission so a suspending
   // admission cannot invert the order of two wide MSETs. Single-shard MSETs
@@ -10615,7 +10653,7 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
                      admission.status().message())));
   }
   CommandReply reply = co_await ExecuteCommandBody(
-      request, reply_builder, client_id,
+      request, reply_builder, client_id, connection,
       ordered_mset ? &replication_order : nullptr, mset_spans_multiple_shards);
   absl::Status released =
       co_await ReleaseReplicationPublisherAdmission(*admission);
@@ -10631,16 +10669,25 @@ Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
 
 Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
-                                  std::uint64_t client_id) {
+                                  std::uint64_t client_id,
+                                  ConnectionContext* connection) {
   const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
+  // Lua invocations carry a non-owning pointer to their connection's WAIT
+  // watermark. Dynamic-write scripting commands never take the single-key
+  // owner fast path, so that connection-owned state stays on its worker.
+  assert(connection == nullptr || !IsLuaInvocationCommand(request) ||
+         !owner.has_value());
   if (owner.has_value() && *owner != ThisWorker().id_) {
-    co_return co_await SubmitTaskTo(
-        *owner, [&request, &reply_builder, client_id]() -> Task<CommandReply> {
-          co_return co_await ExecuteAdmittedCommand(request, reply_builder,
-                                                    client_id);
-        });
+    co_return co_await SubmitTaskTo(*owner,
+                                    [&request, &reply_builder, client_id,
+                                     connection]() -> Task<CommandReply> {
+                                      co_return co_await ExecuteAdmittedCommand(
+                                          request, reply_builder, client_id,
+                                          connection);
+                                    });
   }
-  co_return co_await ExecuteAdmittedCommand(request, reply_builder, client_id);
+  co_return co_await ExecuteAdmittedCommand(request, reply_builder, client_id,
+                                            connection);
 }
 
 Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {

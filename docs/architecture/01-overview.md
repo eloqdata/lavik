@@ -136,8 +136,9 @@ state explicitly.
 - Lua calls cannot escape their declared-key transaction or recursively enter
   administrative, global, or scripting commands. Blocking list and sorted-set
   operations execute one immediate attempt without registering a waiter;
-  stream reads allow only the non-`BLOCK` form. Worker-local Lua executions are
-  serialized because cached closures share VM globals. Ordinary commands do
+  stream reads allow only the non-`BLOCK` form, and `WAIT` immediately checks
+  the caller's pre-script replication watermark. Worker-local Lua executions
+  are serialized because cached closures share VM globals. Ordinary commands do
   not take that worker-local execution gate, but once an invocation exceeds
   `lua-time-limit`, a process-wide busy flag rejects ordinary client commands
   until it finishes or an eligible kill succeeds.

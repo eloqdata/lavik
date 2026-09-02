@@ -21,9 +21,12 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
 
 // EXEC already owns all statically discoverable SORT keys. Pattern-derived
 // BY/GET keys cannot be added after EXEC has acquired its global lock set and
-// are rejected unless they alias one of those keys.
+// are rejected unless they alias one of those keys. Script callers request
+// deterministic ordering for Set input with a constant BY pattern, matching
+// Valkey's replication-safe Lua behavior.
 Task<std::string> ExecuteSortCommandLocked(
     const CommandRequest& request, std::span<const SortExecKey> keys,
-    std::vector<storage::TxShardWrites>& tx_writes);
+    std::vector<storage::TxShardWrites>& tx_writes,
+    bool deterministic_set_order);
 
 }  // namespace keylane

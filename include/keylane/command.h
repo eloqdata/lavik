@@ -517,7 +517,8 @@ bool RequestSpansMultipleShards(const CommandRequest& request);
 // worker.
 Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
-                                  std::uint64_t client_id = 0);
+                                  std::uint64_t client_id = 0,
+                                  ConnectionContext* connection = nullptr);
 
 // RDB loaders validate complete FUNCTION2 catalogs before applying keys, then
 // install the same source set at the dataset cut.

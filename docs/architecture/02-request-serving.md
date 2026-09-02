@@ -196,6 +196,14 @@ or otherwise unsafe commands are rejected. Blocking list and sorted-set pops
 and moves reuse the transaction's locked EXEC helpers for one immediate
 attempt; they never register a waiter. `XREAD` and `XREADGROUP` similarly use
 one locked read when `BLOCK` is absent and reject an explicit `BLOCK` option.
+`WAIT` validates its ordinary arguments but never registers a waiter: it
+checks the connection's pre-script replication watermark immediately, and
+returns zero after any write in the current invocation because that write's
+replication envelope cannot publish until Lua returns and commits.
+For the same deterministic-replication reason, `SORT` over a Set with a
+constant `BY` pattern forces alphabetic ordering in scripts. Pattern-derived
+`BY`/`GET` keys remain rejected because they are absent from the declared-key
+transaction and cannot be locked after it has started.
 Write effects, blocking notifications, durable transaction receipts, and
 replication effects remain attached to the outer invocation rather than
 becoming independent commands.
