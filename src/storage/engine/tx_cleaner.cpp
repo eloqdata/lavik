@@ -32,6 +32,7 @@ void StorageEngine::Impl::InitializeTxWrites(std::uint64_t txid,
         const std::uint64_t previous =
             state->active_transactions_.fetch_sub(1, std::memory_order_acq_rel);
         assert(previous != 0);
+        (void)previous;
         tx_cleaner_dirty_.store(true, std::memory_order_release);
       });
   state->active_transactions_.fetch_add(1, std::memory_order_release);

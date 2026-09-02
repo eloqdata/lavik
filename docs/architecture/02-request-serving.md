@@ -191,14 +191,21 @@ one transaction before starting Lua. The `_RO` command variants use shared
 holds; ordinary `EVAL`, `EVALSHA`, and `FCALL` use exclusive holds regardless
 of the Function's runtime flags. Calls made through `redis.call` or
 `redis.pcall` re-enter command metadata and keyed execution inside those
-retained holds. Undeclared keys and global, blocking, administrative, nested
-scripting, or otherwise unsafe commands are rejected. Write effects, blocking
-notifications, durable transaction receipts, and replication effects remain
-attached to the outer invocation rather than becoming independent commands.
+retained holds. Undeclared keys and global, administrative, nested scripting,
+or otherwise unsafe commands are rejected. Blocking list and sorted-set pops
+and moves reuse the transaction's locked EXEC helpers for one immediate
+attempt; they never register a waiter. `XREAD` and `XREADGROUP` similarly use
+one locked read when `BLOCK` is absent and reject an explicit `BLOCK` option.
+Write effects, blocking notifications, durable transaction receipts, and
+replication effects remain attached to the outer invocation rather than
+becoming independent commands.
 
 Cached closures share VM globals, so Lua invocations are serialized per worker
-even when a script yields to execute a command on another owner. Ordinary
-commands do not take this worker-local Lua gate. Once an invocation exceeds
+even when a script yields to execute a command on another owner. The persistent
+global table and its lookup metatable are recursively read-only; reads of
+absent globals fail instead of returning nil, matching the Redis sandbox and
+preventing scripts from probing disabled libraries. Ordinary commands do not
+take this worker-local Lua gate. Once an invocation exceeds
 `lua-time-limit`, however, a process-wide busy flag makes ordinary non-replay
 commands return `BUSY`; the matching `SCRIPT KILL` or `FUNCTION KILL` and
 `FUNCTION STATS` remain available. An invocation that has written or came from

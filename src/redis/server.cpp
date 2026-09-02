@@ -817,6 +817,7 @@ void RedisService::OnConnectionClosed() noexcept {
   const std::uint64_t previous =
       active_clients_.fetch_sub(1, std::memory_order_acq_rel);
   assert(previous != 0);
+  (void)previous;
 }
 
 void RedisService::Prepare(unsigned thread_count) {

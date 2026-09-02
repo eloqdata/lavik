@@ -40,7 +40,7 @@ set ::tls_module 0
 set ::stack_logging 0
 set ::verbose 0
 set ::quiet 0
-set ::denytags {resp3}
+set ::denytags {}
 set ::skiptests {}
 set ::skipunits {}
 set ::no_latency 0

@@ -6,14 +6,14 @@ streams, plus the generic `SORT` suite. The upstream snapshot is Valkey commit
 `d2c8a4b91e8c0e6aefd1f5bc0bf582cddbe046b7`, which reports Redis compatibility
 version 7.2.4; its BSD license is in `COPYING`.
 
-The test cases are copied unchanged. The harness has two Keylane-specific
-changes: it limits the default suite list to the vendored data-structure files,
-external-server cleanup tolerates the unsupported `FUNCTION FLUSH` command,
+The test cases are copied unchanged. The harness has Keylane-specific changes:
+it limits the default suite list to the vendored data-structure files,
+external-server cleanup tolerates unavailable housekeeping commands,
 Valkey-only object-encoding configuration is emulated inside the harness, and
 Valkey's internal `MEMORY USAGE` coverage probe returns a nonzero placeholder.
 The runner uses one database, ignores server-internal object encoding, and
-skips slow, replication, debug-only, RESP3-only, and large-memory cases. All
-data structure command semantics are still checked by the original assertions.
+skips slow, replication, debug-only, and large-memory cases. RESP2 and RESP3
+command semantics are both checked by the original assertions.
 
 Build Keylane, then run all currently vendored suites:
 

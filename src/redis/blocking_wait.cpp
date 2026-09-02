@@ -33,6 +33,7 @@ void BlockingWakeCascade::Done() noexcept {
   const std::uint64_t previous =
       pending_.fetch_sub(1, std::memory_order_acq_rel);
   assert(previous != 0);
+  (void)previous;
 }
 
 Task<absl::Status> DrainBlockingWakeCascade(BlockingWakeCascade& cascade) {

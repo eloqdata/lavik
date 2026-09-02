@@ -414,6 +414,11 @@ void ScriptInstructionHook(lua_State* state, lua_Debug*) {
   if (control == nullptr) return;
   if (control->state_.load(std::memory_order_acquire) ==
       LuaRunState::kKillRequested) {
+    // A count hook error can be caught by Lua pcall. Once a kill is pending,
+    // run this hook at every line boundary so a script cannot catch the error
+    // and return to an outer loop indefinitely. Backward jumps also generate
+    // line-hook events, which covers single-line loops used by Redis clients.
+    lua_sethook(state, ScriptInstructionHook, LUA_MASKLINE, 0);
     (void)luaL_error(
         state, control->is_function_
                    ? "Script killed by user with FUNCTION KILL..."
@@ -428,8 +433,7 @@ void ScriptInstructionHook(lua_State* state, lua_Debug*) {
         "You can try killing the script using the {} KILL command. "
         "Script name is: {}.",
         g_script_busy_threshold_ms.load(std::memory_order_acquire),
-        control->is_function_ ? "FUNCTION" : "SCRIPT",
-        control->script_name_);
+        control->is_function_ ? "FUNCTION" : "SCRIPT", control->script_name_);
   }
   // After the busy threshold, yield the coroutine so this worker can process
   // pending requests including SCRIPT KILL without aborting the script.
@@ -461,6 +465,9 @@ int YieldRedisCall(lua_State* state) {
 }
 
 int Sha1Hex(lua_State* state) {
+  if (lua_gettop(state) != 1) {
+    return luaL_error(state, "wrong number of arguments");
+  }
   std::size_t size = 0;
   const char* text = luaL_checklstring(state, 1, &size);
   const std::string sha = LuaScriptSha1(std::string_view(text, size));
@@ -491,6 +498,7 @@ function redis.pcall(...)
 end
 
 function redis.error_reply(message)
+  if message == '' then message = 'ERR' end
   return {err = message}
 end
 
@@ -533,8 +541,7 @@ void SetGlobalNil(lua_State* state, const char* name) {
   lua_enablereadonlytable(state, LUA_GLOBALSINDEX, 1);
 }
 
-void PushStringArray(lua_State* state,
-                     std::span<const std::string> values) {
+void PushStringArray(lua_State* state, std::span<const std::string> values) {
   lua_createtable(state, static_cast<int>(values.size()), 0);
   for (std::size_t i = 0; i < values.size(); ++i) {
     lua_pushlstring(state, values[i].data(), values[i].size());
@@ -560,6 +567,36 @@ void ProtectTableRecursively(lua_State* state, int index) {
     ProtectTableRecursively(state, -1);
     lua_pop(state, 1);
   }
+}
+
+int ProtectedGlobalIndex(lua_State* state) {
+  if (lua_gettop(state) != 2) {
+    return luaL_error(state,
+                      "Wrong number of arguments to protected global lookup");
+  }
+  std::size_t size = 0;
+  const char* name = lua_tolstring(state, 2, &size);
+  if (name == nullptr) {
+    return luaL_error(state, "Global variable name must be a string or number");
+  }
+  // luaL_error's Lua 5.1 formatter does not support precision-qualified %s.
+  // Build the value on the Lua stack so arbitrary-length names remain intact
+  // without crossing a C++ destructor with lua_error's longjmp.
+  lua_pushliteral(state,
+                  "Script attempted to access nonexistent global variable '");
+  lua_pushlstring(state, name, size);
+  lua_pushliteral(state, "'");
+  lua_concat(state, 3);
+  return lua_error(state);
+}
+
+void InstallProtectedGlobalMetatable(lua_State* state) {
+  lua_pushvalue(state, LUA_GLOBALSINDEX);
+  lua_createtable(state, 0, 1);
+  lua_pushcfunction(state, ProtectedGlobalIndex);
+  lua_setfield(state, -2, "__index");
+  lua_setmetatable(state, -2);
+  lua_pop(state, 1);
 }
 
 struct CachedLuaFunction {
@@ -678,8 +715,7 @@ class LuaWorkerRuntime {
 
     lua_getglobal(state, "redis");
     SetTableFunction(state, -1, "log", RedisLog);
-    SetTableFunction(state, -1, "replicate_commands",
-                     RedisReplicateCommands);
+    SetTableFunction(state, -1, "replicate_commands", RedisReplicateCommands);
     SetTableFunction(state, -1, "setresp", RedisSetResp);
     SetTableFunction(state, -1, "register_function", RedisRegisterFunction);
     lua_pop(state, 1);
@@ -690,7 +726,10 @@ class LuaWorkerRuntime {
 
     // Valkey protects its persistent global environment recursively. KEYS and
     // ARGV are replaced by the host between serialized executions by briefly
-    // opening only the global table itself.
+    // opening only the global table itself. Its protected __index also rejects
+    // reads of absent globals; returning nil would let pcall hide sandbox
+    // violations and would expose loadfile/dofile/print as ordinary nils.
+    InstallProtectedGlobalMetatable(state);
     lua_pushvalue(state, LUA_GLOBALSINDEX);
     ProtectTableRecursively(state, -1);
     lua_pop(state, 1);
@@ -1374,10 +1413,21 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
 }
 
 LuaExecutionStep RuntimeErrorStep(lua_State* state) {
+  std::string error = LuaError(state);
+  // Redis-library boundary validation and execution-policy rejections are
+  // already complete protocol errors. Valkey returns them directly; syntax
+  // and runtime failures in user code retain the Error-running-script
+  // envelope.
+  if (error.starts_with("ERR Lua redis lib command arguments ") ||
+      error.starts_with("ERR Please specify at least one argument ") ||
+      error ==
+          "ERR Write commands are not allowed from read-only scripts.") {
+    return LuaExecutionStep{.call_ = std::nullopt,
+                            .reply_ = EncodeError(error)};
+  }
   return LuaExecutionStep{
       .call_ = std::nullopt,
-      .reply_ = EncodeError(
-          absl::StrCat("ERR Error running script: ", LuaError(state))),
+      .reply_ = EncodeError(absl::StrCat("ERR Error running script: ", error)),
   };
 }
 
@@ -1445,19 +1495,35 @@ struct LuaExecution::Impl {
       }
 
       const int count = lua_gettop(state_);
+      const bool missing_command = count < 2;
       bool valid = count >= 2 && lua_isboolean(state_, 1);
       LuaRedisCall call;
       if (valid) {
         call.protected_call_ = lua_toboolean(state_, 1) != 0;
         call.args_.reserve(static_cast<std::size_t>(count - 1));
         for (int i = 2; i <= count; ++i) {
-          std::size_t size = 0;
-          const char* value = lua_tolstring(state_, i, &size);
-          if (value == nullptr) {
-            valid = false;
-            break;
+          if (lua_type(state_, i) == LUA_TNUMBER) {
+            // Lua 5.1's lua_tolstring uses a precision-losing format. Redis
+            // uses a shortest round-trippable conversion so integer-valued
+            // doubles such as 2^53-1 remain exact command arguments.
+            char buffer[128];
+            const auto formatted =
+                std::to_chars(buffer, buffer + sizeof(buffer),
+                              static_cast<double>(lua_tonumber(state_, i)));
+            if (formatted.ec != std::errc{}) {
+              valid = false;
+              break;
+            }
+            call.args_.emplace_back(buffer, formatted.ptr);
+          } else {
+            std::size_t size = 0;
+            const char* value = lua_tolstring(state_, i, &size);
+            if (value == nullptr) {
+              valid = false;
+              break;
+            }
+            call.args_.emplace_back(value, size);
           }
-          call.args_.emplace_back(value, size);
         }
       }
       if (valid && !call.args_.empty()) {
@@ -1466,8 +1532,12 @@ struct LuaExecution::Impl {
 
       lua_settop(state_, 0);
       lua_pushboolean(state_, 0);
-      constexpr std::string_view error =
-          "ERR Lua redis() command arguments must be strings or integers";
+      const std::string_view error =
+          missing_command
+              ? "ERR Please specify at least one argument for this redis lib "
+                "call"
+              : "ERR Lua redis lib command arguments must be strings or "
+                "integers";
       lua_pushlstring(state_, error.data(), error.size());
       resume_args = 2;
     }
@@ -1670,6 +1740,11 @@ void ClearLocalLuaScriptCache() {
 void ClearStoredLuaScripts() {
   std::lock_guard<std::mutex> lock(g_script_bodies_mutex);
   g_script_bodies.clear();
+}
+
+std::size_t StoredLuaScriptCount() {
+  std::lock_guard<std::mutex> lock(g_script_bodies_mutex);
+  return g_script_bodies.size();
 }
 
 absl::StatusOr<LuaFunctionLibrary> StageLuaFunctionLibraryLocally(

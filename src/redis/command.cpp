@@ -3810,6 +3810,9 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(memory.admission_pending_bytes_) + "\r\n";
     info += "maxmemory_policy:noeviction\r\n";
     info +=
+        "number_of_cached_scripts:" + std::to_string(StoredLuaScriptCount()) +
+        "\r\n";
+    info +=
         "allocator_allocated:" + std::to_string(memory.used_bytes_) + "\r\n";
     info +=
         "allocator_active:" + std::to_string(memory.committed_bytes_) + "\r\n";
@@ -5287,6 +5290,31 @@ bool IsExecSequentialStreamRead(CommandKind kind) {
   return kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup;
 }
 
+bool IsLuaImmediateBlockingCommand(CommandKind kind) {
+  // A script owns its declared-key transaction until it returns, so entering
+  // the normal waiter path would deadlock the producer that could wake it.
+  // Valkey instead gives these commands one immediate attempt. Keep this list
+  // explicit: other kCmdMayBlock commands require their own script semantics.
+  return kind == CommandKind::kBLPop || kind == CommandKind::kBRPop ||
+         kind == CommandKind::kBLMove || kind == CommandKind::kBRPopLPush ||
+         kind == CommandKind::kBZPopMin || kind == CommandKind::kBZPopMax ||
+         kind == CommandKind::kXRead || kind == CommandKind::kXReadGroup;
+}
+
+bool LuaStreamReadHasBlockOption(const CommandRequest& command) {
+  if (command.kind_ != CommandKind::kXRead &&
+      command.kind_ != CommandKind::kXReadGroup) {
+    return false;
+  }
+  const std::size_t option_begin =
+      command.kind_ == CommandKind::kXReadGroup ? 4 : 1;
+  for (std::size_t i = option_begin; i < command.args_.size(); ++i) {
+    if (CmpCaseInsensitive(command.args_[i], "streams")) break;
+    if (CmpCaseInsensitive(command.args_[i], "block")) return true;
+  }
+  return false;
+}
+
 bool IsExecSequentialSort(CommandKind kind) {
   return kind == CommandKind::kSort || kind == CommandKind::kSortRo;
 }
@@ -6330,8 +6358,9 @@ Task<std::string> ExecuteLuaRedisCall(
     co_return EncodeError(absl::StrCat("ERR ", keys.status().message()));
   }
   const std::uint32_t flags = command.spec_->flags_;
-  if ((flags & (kCmdGlobal | kCmdMayBlock | kCmdAdmin | kCmdDynamicWrite)) !=
-          0 ||
+  const bool immediate_blocking = IsLuaImmediateBlockingCommand(command.kind_);
+  if ((flags & (kCmdGlobal | kCmdAdmin | kCmdDynamicWrite)) != 0 ||
+      ((flags & kCmdMayBlock) != 0 && !immediate_blocking) ||
       command.kind_ == CommandKind::kEval ||
       command.kind_ == CommandKind::kEvalSha ||
       command.kind_ == CommandKind::kEvalRo ||
@@ -6341,6 +6370,11 @@ Task<std::string> ExecuteLuaRedisCall(
       command.kind_ == CommandKind::kScript ||
       command.kind_ == CommandKind::kFunction) {
     co_return EncodeError("ERR command is not allowed from script");
+  }
+  if (LuaStreamReadHasBlockOption(command)) {
+    co_return EncodeError(
+        absl::StrCat("ERR ", command.spec_->name_,
+                     " command is not allowed with BLOCK option from scripts"));
   }
   if ((command.kind_ == CommandKind::kMSet ||
        command.kind_ == CommandKind::kMSetNx) &&

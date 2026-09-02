@@ -23,6 +23,5 @@ exec "$TCLSH" tests/test_helper.tcl \
     --singledb \
     --ignore-encoding \
     --durable \
-    --tags "-slow -needs:debug -needs:repl -large-memory -resp3" \
-    --skiptest "/RESP3" \
+    --tags "-slow -needs:debug -needs:repl -large-memory" \
     "$@"

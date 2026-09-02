@@ -175,7 +175,12 @@ add_library(keylane_lua STATIC
   ${KEYLANE_LUA_SOURCE_DIR}/lua_bit.c
 )
 target_include_directories(keylane_lua PUBLIC ${KEYLANE_LUA_SOURCE_DIR})
-target_compile_definitions(keylane_lua PRIVATE LUA_USE_POSIX)
+target_compile_definitions(keylane_lua PRIVATE
+  LUA_USE_POSIX
+  # luaopen_cjson returns its module table but only publishes the Redis/Valkey
+  # global when this compatibility define is enabled.
+  ENABLE_CJSON_GLOBAL
+)
 target_link_libraries(keylane_lua PUBLIC m)
 
 if (TARGET format AND TARGET celer-format)

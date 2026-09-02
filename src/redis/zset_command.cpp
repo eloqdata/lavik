@@ -1376,6 +1376,10 @@ Task<CommandReply> ExecuteImpl(const CommandRequest& request,
       if (ascending || descending || (count.has_value() && !count_any)) {
         std::sort(results.begin(), results.end(),
                   [&](const auto& x, const auto& y) {
+                    if (x.has_value() != y.has_value()) {
+                      return x.has_value();
+                    }
+                    if (!x.has_value()) return false;
                     if (descending) return x->distance_m_ > y->distance_m_;
                     return x->distance_m_ < y->distance_m_;
                   });

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -110,6 +111,9 @@ bool CacheLuaScriptLocally(std::string_view sha, std::string_view bytecode);
 std::optional<std::string_view> FindCachedLuaScript(std::string_view sha);
 void ClearLocalLuaScriptCache();
 void ClearStoredLuaScripts();
+// Returns the process-wide SCRIPT cache population. The count is synchronized
+// with SCRIPT LOAD/EVAL insertion and SCRIPT FLUSH.
+std::size_t StoredLuaScriptCount();
 
 // FUNCTION LOAD is staged independently on every worker. Callers commit only
 // after every worker compiled the source and registered an identical function

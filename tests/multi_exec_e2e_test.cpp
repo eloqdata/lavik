@@ -401,27 +401,41 @@ int main(int argc, char** argv) {
         "redis.register_function{function_name='keylane_get', "
         "callback=function(keys, args) return redis.call('GET', keys[1]) "
         "end, description='read a value', flags={'no-writes'}}\n"
+        "redis.register_function{function_name='keylane_no_writes_set', "
+        "callback=function(keys, args) return redis.call('SET', keys[1], "
+        "args[1]) end, flags={'no-writes'}}\n"
         "redis.register_function{function_name='keylane_loop', "
         "callback=function(keys, args) while true do "
         "redis.call('GET', keys[1]) end end, flags={'no-writes'}}\n"
         "redis.register_function{function_name='keylane_globals', "
         "callback=function(keys, args) return type(KEYS)..':'..type(ARGV) "
-        "end, flags={'no-writes'}}";
+        "end, flags={'no-writes'}}\n"
+        "redis.register_function{function_name='keylane_json', "
+        "callback=function(keys, args) local value=cjson.decode(args[1]); "
+        "return cjson.encode({answer=value.number + 1}) end, "
+        "flags={'no-writes'}}";
     Expect(client.Command({"FUNCTION", "LOAD", function_library}),
            Bulk("keylane_test"), "FUNCTION LOAD");
-    Expect(client.Command({"FCALL", "keylane_set", "1", "function:key",
-                           "value"}),
-           "+OK", "FCALL write function");
+    Expect(
+        client.Command({"FCALL", "keylane_set", "1", "function:key", "value"}),
+        "+OK", "FCALL write function");
     Expect(client.Command({"FCALL", "keylane_get", "1", "function:key"}),
            Bulk("fn:value"), "FCALL read function");
-    Expect(client.Command(
-               {"FCALL_RO", "keylane_get", "1", "function:key"}),
+    Expect(client.Command({"FCALL_RO", "keylane_get", "1", "function:key"}),
            Bulk("fn:value"), "FCALL_RO no-writes function");
-    Expect(client.Command({"FCALL_RO", "keylane_globals", "0"}),
-           Bulk("nil:nil"), "FCALL does not inherit EVAL globals");
+    Expect(client.Command({"FCALL_RO", "keylane_no_writes_set", "1",
+                           "function:key", "blocked"}),
+           "-ERR Write commands are not allowed from read-only scripts.",
+           "FCALL_RO returns the direct read-only write error");
+    ExpectContains(client.Command({"FCALL_RO", "keylane_globals", "0"}),
+                   "Script attempted to access nonexistent global variable "
+                   "'KEYS'",
+                   "FCALL does not inherit EVAL globals");
+    Expect(client.Command({"FCALL_RO", "keylane_json", "0", "{\"number\":41}"}),
+           Bulk("{\"answer\":42}"), "FCALL cjson encode and decode");
     ExpectContains(
-        client.Command({"FCALL_RO", "keylane_set", "1", "function:key",
-                        "blocked"}),
+        client.Command(
+            {"FCALL_RO", "keylane_set", "1", "function:key", "blocked"}),
         "Can not execute a script with write flag using *_ro command",
         "FCALL_RO rejects write function");
     const std::string function_list =
@@ -539,6 +553,42 @@ int main(int argc, char** argv) {
                    "Script killed by user with FUNCTION KILL",
                    "killed function reply");
 
+    // SCRIPT/FUNCTION KILL must remain effective when Lua pcall catches the
+    // first hook error and the script immediately retries from an outer loop.
+    // Redis switches the kill hook to line granularity after the first catch.
+    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "10"}), "+OK",
+           "short Lua time limit for pcall kill");
+    RespClient pcall_script = Connect(port);
+    pcall_script.SendCommand(
+        {"EVAL",
+         "local f=function() while true do redis.call('PING') end end "
+         "while true do pcall(f) end",
+         "0"});
+    std::this_thread::sleep_for(100ms);
+    Expect(script_killer.Command({"SCRIPT", "KILL"}), "+OK",
+           "SCRIPT KILL escapes pcall");
+    ExpectContains(pcall_script.ReadPush(),
+                   "Script killed by user with SCRIPT KILL",
+                   "pcall cannot swallow SCRIPT KILL");
+
+    const std::string pcall_function_library =
+        "#!lua name=pcall_kill_library\n"
+        "redis.register_function('pcall_kill', function() "
+        "local f=function() while true do redis.call('PING') end end "
+        "while true do pcall(f) end end)";
+    Expect(client.Command({"FUNCTION", "LOAD", pcall_function_library}),
+           Bulk("pcall_kill_library"), "load pcall kill function");
+    RespClient pcall_function = Connect(port);
+    pcall_function.SendCommand({"FCALL", "pcall_kill", "0"});
+    std::this_thread::sleep_for(100ms);
+    Expect(script_killer.Command({"FUNCTION", "KILL"}), "+OK",
+           "FUNCTION KILL escapes pcall");
+    ExpectContains(pcall_function.ReadPush(),
+                   "Script killed by user with FUNCTION KILL",
+                   "pcall cannot swallow FUNCTION KILL");
+    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}),
+           "+OK", "restore Lua time limit after pcall kill");
+
     RespClient dirty_script = Connect(port);
     dirty_script.SendCommand(
         {"EVAL",
@@ -567,9 +617,21 @@ int main(int argc, char** argv) {
            ":459268", "Lua numeric Redis compatibility version");
     Expect(client.Command({"EVAL", "return redis.replicate_commands()", "0"}),
            ":1", "redis.replicate_commands compatibility no-op");
+    ExpectContains(client.Command({"EVAL", "return redis.call()", "0"}),
+                   "at least one argument",
+                   "redis.call requires a command argument");
+    ExpectContains(
+        client.Command({"EVAL", "return redis.call('PING',{})", "0"}),
+        "Lua redis lib command arguments must be strings or integers",
+        "redis.call argument type validation");
+    ExpectContains(client.Command({"EVAL", "return redis.sha1hex()", "0"}),
+                   "wrong number of arguments", "redis.sha1hex arity");
+    Expect(client.Command({"EVAL", "return redis.error_reply('')", "0"}),
+           "-ERR", "redis.error_reply empty normalization");
     constexpr std::string_view seeded_random_script =
         "math.randomseed(ARGV[1]); return "
-        "tostring(math.random())..':'..math.random(100)..':'..math.random(-5,5)";
+        "tostring(math.random())..':'..math.random(100)..':'..math.random(-5,"
+        "5)";
     const std::string seeded_random =
         client.Command({"EVAL", seeded_random_script, "0", "10"});
     Expect(client.Command({"EVAL", seeded_random_script, "0", "10"}),
@@ -578,15 +640,13 @@ int main(int argc, char** argv) {
         seeded_random) {
       Fail("different math.random seeds returned the same sequence");
     }
-    constexpr std::string_view lua_log_marker =
-        "keylane-lua-log-e2e-marker";
+    constexpr std::string_view lua_log_marker = "keylane-lua-log-e2e-marker";
     Expect(client.Command(
-               {"EVAL",
-                "redis.log(redis.LOG_WARNING,ARGV[1],42); return true", "0",
-                lua_log_marker}),
+               {"EVAL", "redis.log(redis.LOG_WARNING,ARGV[1],42); return true",
+                "0", lua_log_marker}),
            ":1", "redis.log warning");
-    ExpectContains(ReadFile(log_path),
-                   std::string(lua_log_marker) + " 42", "redis.log output");
+    ExpectContains(ReadFile(log_path), std::string(lua_log_marker) + " 42",
+                   "redis.log output");
     ExpectContains(client.Command({"EVAL", "redis.log(4,'bad')", "0"}),
                    "Invalid debug level", "redis.log level validation");
     ExpectContains(client.Command({"EVAL", "redis.log(redis.LOG_NOTICE)", "0"}),
@@ -594,65 +654,57 @@ int main(int argc, char** argv) {
                    "redis.log arity validation");
     ExpectContains(client.Command({"EVAL", "redis.setresp(4)", "0"}),
                    "RESP version must be 2 or 3", "redis.setresp validation");
-    Expect(client.Command({"HSET", "lua:resp3:hash", "field", "value"}),
-           ":1", "RESP3 Lua hash seed");
-    Expect(client.Command(
-               {"EVAL",
-                "redis.setresp(3); return "
-                "redis.call('HGETALL',KEYS[1]).map.field",
-                "1", "lua:resp3:hash"}),
+    Expect(client.Command({"HSET", "lua:resp3:hash", "field", "value"}), ":1",
+           "RESP3 Lua hash seed");
+    Expect(client.Command({"EVAL",
+                           "redis.setresp(3); return "
+                           "redis.call('HGETALL',KEYS[1]).map.field",
+                           "1", "lua:resp3:hash"}),
            Bulk("value"), "RESP3 map to Lua");
     Expect(client.Command({"SADD", "lua:resp3:set", "member"}), ":1",
            "RESP3 Lua set seed");
-    Expect(client.Command(
-               {"EVAL",
-                "redis.setresp(3); return "
-                "redis.call('SMEMBERS',KEYS[1]).set.member",
-                "1", "lua:resp3:set"}),
+    Expect(client.Command({"EVAL",
+                           "redis.setresp(3); return "
+                           "redis.call('SMEMBERS',KEYS[1]).set.member",
+                           "1", "lua:resp3:set"}),
            ":1", "RESP3 set to Lua");
-    Expect(client.Command({"ZADD", "lua:resp3:zset", "1.5", "member"}),
-           ":1", "RESP3 Lua double seed");
-    Expect(client.Command(
-               {"EVAL",
-                "redis.setresp(3); return "
-                "redis.call('ZSCORE',KEYS[1],'member').double ~= nil",
-                "1", "lua:resp3:zset"}),
-           ":1", "RESP3 double to Lua");
+    Expect(client.Command({"ZADD", "lua:resp3:zset", "1.5", "member"}), ":1",
+           "RESP3 Lua double seed");
+    Expect(
+        client.Command({"EVAL",
+                        "redis.setresp(3); return "
+                        "redis.call('ZSCORE',KEYS[1],'member').double ~= nil",
+                        "1", "lua:resp3:zset"}),
+        ":1", "RESP3 double to Lua");
     Expect(client.Command(
                {"EVAL",
                 "redis.setresp(3); return redis.call('GET',KEYS[1]) == nil",
                 "1", "lua:resp3:missing"}),
            ":1", "RESP3 null to Lua");
-    Expect(client.Command(
-               {"EVAL", "return redis.call('GET',KEYS[1]) == false", "1",
-                "lua:resp2:missing"}),
+    Expect(client.Command({"EVAL", "return redis.call('GET',KEYS[1]) == false",
+                           "1", "lua:resp2:missing"}),
            ":1", "RESP2 null remains false in Lua");
 
     RespClient resp3_client = Connect(port);
-    ExpectContains(resp3_client.Command({"HELLO", "3"}), "%",
-                   "HELLO RESP3");
+    ExpectContains(resp3_client.Command({"HELLO", "3"}), "%", "HELLO RESP3");
     Expect(resp3_client.Command({"EVAL", "return true", "0"}), ":1",
            "RESP2 script boolean to RESP3 client");
-    Expect(resp3_client.Command(
-               {"EVAL", "redis.setresp(3); return true", "0"}),
+    Expect(resp3_client.Command({"EVAL", "redis.setresp(3); return true", "0"}),
            "#t", "RESP3 script boolean");
     Expect(resp3_client.Command({"EVAL", "return false", "0"}), "_",
            "RESP2 script false to RESP3 null");
-    Expect(resp3_client.Command(
-               {"EVAL", "return {map={one='two'}}", "0"}),
-           "%1\r\n" + Bulk("one") + "\r\n" + Bulk("two"),
-           "Lua map to RESP3");
-    Expect(resp3_client.Command(
-               {"EVAL", "return {set={one=true}}", "0"}),
+    Expect(resp3_client.Command({"EVAL", "return {map={one='two'}}", "0"}),
+           "%1\r\n" + Bulk("one") + "\r\n" + Bulk("two"), "Lua map to RESP3");
+    Expect(resp3_client.Command({"EVAL", "return {set={one=true}}", "0"}),
            "~1\r\n" + Bulk("one"), "Lua set to RESP3");
-    Expect(resp3_client.Command({"EVAL", "return {double=1.5}", "0"}),
-           ",1.5", "Lua double to RESP3");
+    Expect(resp3_client.Command({"EVAL", "return {double=1.5}", "0"}), ",1.5",
+           "Lua double to RESP3");
     Expect(resp3_client.Command(
                {"EVAL", "return {big_number='12345678901234567890'}", "0"}),
            "(12345678901234567890", "Lua big number to RESP3");
     Expect(resp3_client.Command(
-               {"EVAL",
-                "return {verbatim_string={format='txt',string='hey'}}", "0"}),
+               {"EVAL", "return {verbatim_string={format='txt',string='hey'}}",
+                "0"}),
            "=7\r\ntxt:hey", "Lua verbatim string to RESP3");
     Expect(
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
@@ -691,8 +743,7 @@ int main(int argc, char** argv) {
     Expect(client.Command({"EVALSHA", uppercase_loaded_sha, "0"}),
            Bulk("loaded"), "EVALSHA accepts uppercase SHA");
     Expect(client.Command(
-               {"EVALSHA_RO", "b534286061D4B9E4026607613b95C06C06015aE8",
-                "0"}),
+               {"EVALSHA_RO", "b534286061D4B9E4026607613b95C06C06015aE8", "0"}),
            Bulk("loaded"), "EVALSHA_RO accepts mixed-case SHA");
     Expect(client.Command({"SCRIPT", "EXISTS", uppercase_loaded_sha}),
            "*1\r\n:0", "SCRIPT EXISTS preserves exact SHA matching");
@@ -705,6 +756,9 @@ int main(int argc, char** argv) {
            "SCRIPT FLUSH ASYNC");
     Expect(client.Command({"SCRIPT", "EXISTS", loaded_sha}), "*1\r\n:0",
            "SCRIPT EXISTS after FLUSH");
+    ExpectContains(client.Command({"INFO", "MEMORY"}),
+                   "number_of_cached_scripts:0",
+                   "INFO MEMORY script count after flush");
     for (unsigned i = 0; i < 16; ++i) {
       RespClient cache_client = Connect(port);
       Expect(cache_client.Command({"EVALSHA", loaded_sha, "0"}),
@@ -720,6 +774,9 @@ int main(int argc, char** argv) {
     // EVAL also stores the compiled chunk after FLUSH.
     Expect(client.Command({"EVAL", argv_script, "0", "recompiled"}),
            Bulk("recompiled"), "EVAL compiled cache after FLUSH");
+    ExpectContains(client.Command({"INFO", "MEMORY"}),
+                   "number_of_cached_scripts:1",
+                   "INFO MEMORY script count after EVAL");
     Expect(
         client.Command({"EVALSHA", "098e0f0d1448c0a81dafe820f66d460eb09263da",
                         "0", "compiled-cache"}),
@@ -743,9 +800,39 @@ int main(int argc, char** argv) {
         "Attempt to modify a readonly table", "Lua shared library is readonly");
     Expect(client.Command({"EVAL", "return math.abs(-3)", "0"}), ":3",
            "Lua shared library remains intact");
+    Expect(client.Command({"EVAL",
+                           "local value=cjson.decode(ARGV[1]); "
+                           "return {value.number,value.text}",
+                           "0", "{\"number\":42,\"text\":\"hello\"}"}),
+           "*2\r\n:42\r\n" + Bulk("hello"), "EVAL cjson decode");
+    ExpectContains(
+        client.Command(
+            {"EVAL", "cjson.encode=function() return 'broken' end", "0"}),
+        "Attempt to modify a readonly table", "Lua cjson table is readonly");
+    Expect(client.Command({"EVAL", "return cjson.encode({answer=42})", "0"}),
+           Bulk("{\"answer\":42}"), "Lua cjson table remains intact");
+    ExpectContains(client.Command({"EVAL", "return missing_global", "0"}),
+                   "Script attempted to access nonexistent global variable "
+                   "'missing_global'",
+                   "Lua global reads are protected");
+    ExpectContains(client.Command({"EVAL", "return loadfile()", "0"}),
+                   "Script attempted to access nonexistent global variable "
+                   "'loadfile'",
+                   "Lua unsafe globals are protected");
+    ExpectContains(
+        client.Command({"EVAL", "local g=getmetatable(_G); g.__index={}", "0"}),
+        "Attempt to modify a readonly table",
+        "Lua global protection metatable is readonly");
     ExpectContains(
         client.Command({"EVAL", "keylane_persistent_global=1; return 1", "0"}),
         "Attempt to modify a readonly table", "Lua global table is readonly");
+
+    Expect(client.Command(
+               {"EVAL",
+                "redis.call('SET',KEYS[1],9007199254740991); "
+                "return redis.call('GET',KEYS[1])",
+                "1", "lua:number-precision"}),
+           Bulk("9007199254740991"), "Lua numeric command argument precision");
 
     Expect(client.Command({"SET", "lua:ro", "seed"}), "+OK", "EVAL_RO seed");
     Expect(client.Command(
@@ -755,11 +842,11 @@ int main(int argc, char** argv) {
                            "098e0f0d1448c0a81dafe820f66d460eb09263da", "0",
                            "readonly-cache"}),
            Bulk("readonly-cache"), "EVALSHA_RO shared compiled cache");
-    ExpectContains(
-        client.Command({"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])",
-                        "1", "lua:ro", "changed"}),
-        "Write commands are not allowed from read-only scripts",
-        "EVAL_RO rejects write");
+    Expect(client.Command(
+               {"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])", "1",
+                "lua:ro", "changed"}),
+           "-ERR Write commands are not allowed from read-only scripts.",
+           "EVAL_RO returns the direct read-only write error");
     Expect(client.Command({"GET", "lua:ro"}), Bulk("seed"),
            "EVAL_RO write made no change");
     Expect(client.Command(
@@ -800,6 +887,99 @@ int main(int argc, char** argv) {
                                    "0", "lua:error"}),
                    "Script attempted to access an undeclared key",
                    "EVAL undeclared key");
+
+    // Scripts retain their declared-key transaction while redis.call runs.
+    // Blocking here could never be woken without breaking script atomicity,
+    // so Valkey gives list and sorted-set blocking pops one immediate attempt.
+    Expect(client.Command({"EVAL", "return redis.call('BLPOP',KEYS[1],0)", "1",
+                           "lua:blocking:list"}),
+           "$-1", "Lua BLPOP empty is immediate");
+    Expect(client.Command({"EVAL", "return redis.call('BRPOP',KEYS[1],0)", "1",
+                           "lua:blocking:list"}),
+           "$-1", "Lua BRPOP empty is immediate");
+    Expect(client.Command(
+               {"EVAL", "return redis.call('BRPOPLPUSH',KEYS[1],KEYS[2],0)",
+                "2", "{lua:blocking}:source", "{lua:blocking}:destination"}),
+           "$-1", "Lua BRPOPLPUSH empty is immediate");
+    Expect(client.Command({"EVAL",
+                           "return redis.call('BLMOVE',KEYS[1],KEYS[2],"
+                           "'LEFT','RIGHT',0)",
+                           "2", "{lua:blocking}:source",
+                           "{lua:blocking}:destination"}),
+           "$-1", "Lua BLMOVE empty is immediate");
+    Expect(client.Command({"EVAL", "return redis.call('BZPOPMIN',KEYS[1],0)",
+                           "1", "lua:blocking:zset"}),
+           "$-1", "Lua BZPOPMIN empty is immediate");
+    Expect(client.Command({"EVAL", "return redis.call('BZPOPMAX',KEYS[1],0)",
+                           "1", "lua:blocking:zset"}),
+           "$-1", "Lua BZPOPMAX empty is immediate");
+
+    Expect(client.Command({"RPUSH", "lua:blocking:list", "ready"}), ":1",
+           "Lua blocking list seed");
+    Expect(client.Command({"EVAL", "return redis.call('BLPOP',KEYS[1],0)", "1",
+                           "lua:blocking:list"}),
+           "*2\r\n" + Bulk("lua:blocking:list") + "\r\n" + Bulk("ready"),
+           "Lua BLPOP consumes available value");
+    Expect(client.Command({"ZADD", "lua:blocking:zset", "1", "ready"}), ":1",
+           "Lua blocking zset seed");
+    Expect(client.Command({"EVAL",
+                           "local r=redis.call('BZPOPMIN',KEYS[1],0); "
+                           "return {r[1],r[2],r[3]}",
+                           "1", "lua:blocking:zset"}),
+           "*3\r\n" + Bulk("lua:blocking:zset") + "\r\n" + Bulk("ready") +
+               "\r\n" + Bulk("1"),
+           "Lua BZPOPMIN consumes available member");
+
+    // XREAD and XREADGROUP are already non-blocking when BLOCK is absent.
+    // Unlike the pop commands, Valkey rejects an explicit BLOCK option rather
+    // than silently treating it as an immediate timeout.
+    Expect(client.Command({"EVAL",
+                           "return redis.call('XREAD','STREAMS',KEYS[1],'$')",
+                           "1", "lua:blocking:stream"}),
+           "$-1", "Lua XREAD empty is immediate");
+    ExpectContains(
+        client.Command({"XADD", "lua:blocking:stream", "*", "field", "ready"}),
+        "-", "Lua XREAD fixture");
+    Expect(
+        client.Command({"EVAL_RO",
+                        "local r=redis.call('XREAD','STREAMS',KEYS[1],'0-0'); "
+                        "return r[1][2][1][2][2]",
+                        "1", "lua:blocking:stream"}),
+        Bulk("ready"), "Lua XREAD returns available entry");
+    ExpectContains(
+        client.Command(
+            {"EVAL",
+             "return redis.call('XREAD','BLOCK',0,'STREAMS',KEYS[1],'$')", "1",
+             "lua:blocking:stream"}),
+        "xread command is not allowed with BLOCK option from scripts",
+        "Lua XREAD rejects BLOCK");
+    Expect(client.Command({"XGROUP", "CREATE", "lua:blocking:group-stream",
+                           "lua-blocking-group", "0", "MKSTREAM"}),
+           "+OK", "Lua XREADGROUP fixture");
+    Expect(client.Command(
+               {"EVAL",
+                "return redis.call('XREADGROUP','GROUP','lua-blocking-group',"
+                "'consumer','STREAMS',KEYS[1],'>')",
+                "1", "lua:blocking:group-stream"}),
+           "$-1", "Lua XREADGROUP empty is immediate");
+    ExpectContains(client.Command({"XADD", "lua:blocking:group-stream", "*",
+                                   "field", "ready"}),
+                   "-", "Lua XREADGROUP data fixture");
+    Expect(client.Command(
+               {"EVAL",
+                "local r=redis.call('XREADGROUP','GROUP',"
+                "'lua-blocking-group','consumer','STREAMS',KEYS[1],'>'); "
+                "return r[1][2][1][2][2]",
+                "1", "lua:blocking:group-stream"}),
+           Bulk("ready"), "Lua XREADGROUP returns available entry");
+    ExpectContains(
+        client.Command(
+            {"EVAL",
+             "return redis.call('XREADGROUP','GROUP','lua-blocking-group',"
+             "'consumer','BLOCK',0,'STREAMS',KEYS[1],'>')",
+             "1", "lua:blocking:group-stream"}),
+        "xreadgroup command is not allowed with BLOCK option from scripts",
+        "Lua XREADGROUP rejects BLOCK");
 
     // Lua is an ordering barrier inside EXEC and borrows the outer
     // transaction's locks, write receipts, txid, and commit record.

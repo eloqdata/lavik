@@ -131,11 +131,13 @@ state explicitly.
   participates in the same arbitration boundary rather than maintaining an
   independent client lock system.
 - Lua calls cannot escape their declared-key transaction or recursively enter
-  administrative, blocking, global, or scripting commands. Worker-local Lua
-  executions are serialized because cached closures share VM globals. Ordinary
-  commands do not take that worker-local execution gate, but once an invocation
-  exceeds `lua-time-limit`, a process-wide busy flag rejects ordinary client
-  commands until it finishes or an eligible kill succeeds.
+  administrative, global, or scripting commands. Blocking list and sorted-set
+  operations execute one immediate attempt without registering a waiter;
+  stream reads allow only the non-`BLOCK` form. Worker-local Lua executions are
+  serialized because cached closures share VM globals. Ordinary commands do
+  not take that worker-local execution gate, but once an invocation exceeds
+  `lua-time-limit`, a process-wide busy flag rejects ordinary client commands
+  until it finishes or an eligible kill succeeds.
 - A node configured as a replica does not create authoritative local expiry
   mutations, and replayed commands do not republish themselves.
 - Readiness follows recovery and optional import; shutdown drains admitted
