@@ -1,0 +1,17 @@
+KFT1
+mode	exact-model
+scenario	cluster-mutant-history-gap
+schema	1
+seed	7
+initial	CA65593EB675E5B7
+record	0	observation	world	phase%3D0%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	choice	action	capture-exact-cursor%3B0%3B
+record	1	ack	capture-exact-cursor	applied
+record	1	observation	world	phase%3D1%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	2	choice	action	evict-retained-event%3B0%3B
+record	2	ack	evict-retained-event	applied
+record	2	observation	world	phase%3D2%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D0%3Bpopulation-complete%3D1
+record	3	choice	action	choose-resume-mode%3B0%3B
+record	3	ack	choose-resume-mode	applied
+record	3	observation	world	phase%3D3%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D1%3Bcoverage%3D0%3Bpopulation-complete%3D1
+record	3	finding	replication.reparent-requires-complete-history	partial-resume-crossed-history-gap

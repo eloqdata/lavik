@@ -25,6 +25,7 @@ cmake -S . -B "${build_dir}" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address" \
   -DKEYLANE_ENABLE_OPT=OFF \
   -DKEYLANE_STATIC_OPENSSL=ON \
+  -DKEYLANE_BUILD_FAULT_SERVER=ON \
   -DBUILD_TESTING=ON
 cmake --build "${build_dir}" -j"$(nproc)"
 

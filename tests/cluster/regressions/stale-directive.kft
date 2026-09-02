@@ -1,0 +1,17 @@
+KFT1
+mode	exact-model
+scenario	cluster-mutant-stale-directive
+schema	1
+seed	7
+initial	CA65593EB675E5B7
+record	0	observation	world	phase%3D0%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	choice	action	capture-directive%3B0%3B
+record	1	ack	capture-directive	applied
+record	1	observation	world	phase%3D1%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	2	choice	action	restart-directive-target%3B0%3B
+record	2	ack	restart-directive-target	applied
+record	2	observation	world	phase%3D2%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	3	choice	action	replay-stale-directive%3B0%3B
+record	3	ack	replay-stale-directive	applied
+record	3	observation	world	phase%3D3%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	3	finding	meta.directive-evidence-scoped	stale-directive-evidence-applied

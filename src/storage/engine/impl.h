@@ -606,10 +606,10 @@ inline bool IsNewer(const RecordLocation& candidate,
 // point in the KEYLANE_CRASH_POINT environment variable; execution reaching
 // that point then kills the process on the spot — no flush, no destructors —
 // as if power had been cut, with exit code 86 so the test harness can tell a
-// fired crash point from an accidental death. Debug-only: NDEBUG builds
-// compile the whole mechanism away, so crash-safety scenarios must run
-// against a non-NDEBUG server binary.
-#ifndef NDEBUG
+// fired crash point from an accidental death. Ordinary optimized builds
+// compile the mechanism away; the explicitly non-packageable fault-server
+// build keeps it available under NDEBUG for sanitizer/integration coverage.
+#if !defined(NDEBUG) || KEYLANE_ENABLE_TEST_FAULTS
 inline void MaybeCrashAt(const char* point) noexcept {
   static const char* const armed = std::getenv("KEYLANE_CRASH_POINT");
   if (armed != nullptr && std::strcmp(armed, point) == 0) {
