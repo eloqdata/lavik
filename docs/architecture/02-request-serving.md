@@ -21,8 +21,9 @@ storage calls, role control, and trusted replay.
 `ConnectionContext` in its serving coroutine. That context retains the selected
 logical database, authentication and cluster-read state, negotiated
 `RespVersion` in its reusable reply builder, `MULTI` queue, WATCH registrations,
-socket and peer identity, client name, MONITOR subscription, and optional
-`PubSubSession`. A worker-local client record separately tracks data exposed by
+socket and peer identity, client name, MONITOR subscription, the native
+replication watermark used by `WAIT`, and optional `PubSubSession`. A
+worker-local client record separately tracks data exposed by
 `CLIENT`, including RESP version, client library name/version, subscription
 counts, blocking state, and replication-session identity. All disconnect paths
 return through one cleanup point which unregisters client, monitor, Pub/Sub, and
@@ -55,7 +56,8 @@ An `EXEC` retains its entry version for the outer aggregate header; a queued
 `HELLO` changes later child replies and the connection version that remains
 after `EXEC`.
 `RESET` returns the connection to RESP2 and clears its selected database,
-authentication, cluster-read, transaction, WATCH, and name state.
+authentication, cluster-read, transaction, WATCH, native replication
+watermark, and name state.
 
 The service recognizes authentication and replication handshakes before
 ordinary dispatch. An isolated Redis `PSYNC` connection is transferred to the
@@ -144,6 +146,15 @@ the source of truth checked after wakeup.
 
 - Requests from one connection are dispatched sequentially, so `SELECT` and
   pipelined commands observe wire order.
+- Successful source commands that may publish a native event invalidate the
+  connection's cached replication watermark. `WAIT` lazily fences every
+  worker publisher and then counts a native replica only when all of its flow
+  ACK cursors cross that history-local vector. Repeated waits without another
+  write reuse the cut. A blocking `WAIT` uses the keyless client-wait registry
+  so deadlines, disconnect cancellation, and `CLIENT UNBLOCK` share the same
+  lifecycle as collection waits. Inside `EXEC`, `WAIT` performs only an
+  immediate check; blocking on an envelope that cannot publish until the
+  transaction commits would deadlock the transaction with itself.
 - `MULTI` queues structurally validated `CommandRequest` objects with their
   database IDs; argument-dependent validation can remain deferred to `EXEC`.
   `EXEC` builds a union lock set and runs queued commands through the

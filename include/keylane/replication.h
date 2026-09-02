@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "celer/net/tcp_stream.h"
 #include "celer/runtime/task.h"
 
@@ -113,6 +114,14 @@ struct ReplicationStatus {
   bool redis_topology_fault_ = false;
 };
 
+// A source-history-local cut across Keylane's worker replication logs. Native
+// replicas acknowledge one independent LSN stream per source worker, so a
+// scalar Redis-style byte offset cannot represent the same delivery boundary.
+struct NativeReplicationWatermark {
+  std::string history_id_;
+  std::vector<std::uint64_t> next_lsns_;
+};
+
 // Owns replication role and connection lifetime. Replica connections are
 // initiated on worker 0 for control and on one target worker per source flow.
 // Source-side accepted flow sockets are adopted by the matching source worker.
@@ -166,7 +175,21 @@ class ReplicationManager {
       std::uint64_t client_id, std::string client_address, bool tls,
       bool eof_capable);
 
-  ReplicationStatus status() const;
+  // Collects a consistent control-plane snapshot without blocking the caller's
+  // runtime worker when another worker is updating the native session registry.
+  celer::Task<ReplicationStatus> status() const;
+  // Captures all source commands already queued on every worker. A missing
+  // value means no native replication history is currently active; callers
+  // may retry if they are waiting for a replica to connect.
+  celer::Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
+  CaptureNativeReplicationWatermark();
+  // Returns nullopt when the watermark belongs to an obsolete source history.
+  // A replica counts only after every native flow acknowledges the cut.
+  celer::Task<std::optional<std::uint64_t>> CountAcknowledgedNativeReplicas(
+      const NativeReplicationWatermark& watermark) const;
+  // The initial per-connection replication offset precedes every source
+  // event, so every online native replica satisfies it without a log fence.
+  celer::Task<std::uint64_t> CountOnlineNativeReplicas() const;
   bool is_replica() const noexcept;
   bool is_loading() const noexcept;
   bool reject_writes() const noexcept;

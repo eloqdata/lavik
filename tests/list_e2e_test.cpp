@@ -2788,6 +2788,164 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   source.Stop();
 }
 
+TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-wait-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string second_replica_data = prefix + "-second-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  const std::string second_replica_log = prefix + "-second-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup second_replica_cleanup(second_replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  FileCleanup second_replica_log_cleanup(second_replica_log);
+  for (const std::string* path :
+       {&source_data, &replica_data, &second_replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  std::uint16_t second_replica_port = FindFreePort();
+  while (second_replica_port == source_port ||
+         second_replica_port == replica_port) {
+    second_replica_port = FindFreePort();
+  }
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       2, {}, {"--recv-buffers-per-worker", "1024"});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 2, {},
+                        {"--recv-buffers-per-worker", "1024"});
+  ServerProcess second_replica(g_keylane_binary, second_replica_port,
+                               second_replica_data, second_replica_log, 2, {},
+                               {"--recv-buffers-per-worker", "1024"});
+  RespClient source_client(source_port);
+  RespClient replica_client(replica_port);
+  RespClient second_replica_client(second_replica_port);
+
+  ASSERT_EQ(source_client.Command({"SET", "wait-before-replica", "seed"}),
+            "+OK");
+  // A write with no native consumer cannot establish a log cut yet. WAIT
+  // keeps retrying until the finite deadline instead of reporting an error.
+  EXPECT_EQ(source_client.Command({"WAIT", "1", "20"}), ":0");
+  EXPECT_EQ(source_client.Command({"WAIT", "-1", "20"}),
+            "-ERR value is not an integer or out of range");
+  EXPECT_EQ(source_client.Command({"WAIT", "1", "invalid"}),
+            "-ERR value is not an integer or out of range");
+
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+  ASSERT_EQ(second_replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  ASSERT_EQ(second_replica_client.Command({"READONLY"}), "+OK");
+  auto wait_online = [](RespClient& client) {
+    const auto deadline = std::chrono::steady_clock::now() + 30s;
+    std::string info;
+    do {
+      info = client.Command({"INFO", "replication"});
+      if (info.find("keylane_replication_state:online") != std::string::npos) {
+        return true;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+  };
+  ASSERT_TRUE(wait_online(replica_client));
+  ASSERT_TRUE(wait_online(second_replica_client));
+  EXPECT_EQ(replica_client.Command({"WAIT", "1", "100"}), ":0");
+
+  // The connection's pre-replica write dirtied its cut. Both completed full
+  // syncs must cross the newly captured all-flow fence.
+  EXPECT_EQ(source_client.Command({"WAIT", "2", "1000"}), ":2");
+  EXPECT_EQ(replica_client.Command({"GET", "wait-before-replica"}),
+            Bulk("seed"));
+  EXPECT_EQ(second_replica_client.Command({"GET", "wait-before-replica"}),
+            Bulk("seed"));
+
+  std::string worker_keys[2];
+  for (unsigned candidate = 0; worker_keys[0].empty() || worker_keys[1].empty();
+       ++candidate) {
+    const std::string key = "wait-flow-" + std::to_string(candidate);
+    const unsigned worker = keylane::storage::RedisSlot(key) % 2;
+    if (worker_keys[worker].empty()) worker_keys[worker] = key;
+  }
+
+  replica.Pause();
+  ASSERT_EQ(source_client.Command(
+                {"MSET", worker_keys[0], "zero", worker_keys[1], "one"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command({"WAIT", "2", "50"}), ":1");
+
+  std::promise<std::string> blocked_id_promise;
+  std::future<std::string> blocked_id = blocked_id_promise.get_future();
+  auto blocked_wait = std::async(
+      std::launch::async, [source_port, &blocked_id_promise] {
+        RespClient waiting(source_port);
+        const std::string encoded_id = waiting.Command({"CLIENT", "ID"});
+        blocked_id_promise.set_value(encoded_id.substr(1));
+        if (waiting.Command({"SET", "wait-unblock", "value"}) != "+OK") {
+          return std::string("SET failed before WAIT");
+        }
+        return waiting.Command({"WAIT", "2", "0"});
+      });
+  const std::string blocked_client_id = blocked_id.get();
+  const auto blocked_deadline = std::chrono::steady_clock::now() + 2s;
+  bool client_blocked = false;
+  do {
+    const std::string listing =
+        source_client.Command({"CLIENT", "LIST", "ID", blocked_client_id});
+    client_blocked =
+        listing.find(" flags=b ") != std::string::npos;
+    if (!client_blocked) std::this_thread::sleep_for(10ms);
+  } while (!client_blocked &&
+           std::chrono::steady_clock::now() < blocked_deadline);
+  ASSERT_TRUE(client_blocked);
+  EXPECT_EQ(source_client.Command(
+                {"CLIENT", "UNBLOCK", blocked_client_id, "ERROR"}),
+            ":1");
+  ASSERT_EQ(blocked_wait.wait_for(1s), std::future_status::ready);
+  EXPECT_EQ(blocked_wait.get(),
+            "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
+
+  // WAIT is queued normally but cannot block inside EXEC: the transaction's
+  // replication envelope is not publishable until EXEC itself commits.
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"WAIT", "2", "5000"}), "+QUEUED");
+  const auto exec_started = std::chrono::steady_clock::now();
+  EXPECT_EQ(source_client.Command({"EXEC"}), "*1\r\n:1");
+  EXPECT_LT(std::chrono::steady_clock::now() - exec_started, 1s);
+
+  replica.Resume();
+  EXPECT_EQ(source_client.Command({"WAIT", "2", "5000"}), ":2");
+  // No intervening source write means this reuses the same connection cut.
+  EXPECT_EQ(source_client.Command({"WAIT", "2", "100"}), ":2");
+  EXPECT_EQ(replica_client.Command({"GET", worker_keys[0]}), Bulk("zero"));
+  EXPECT_EQ(replica_client.Command({"GET", worker_keys[1]}), Bulk("one"));
+  EXPECT_EQ(second_replica_client.Command({"GET", worker_keys[0]}),
+            Bulk("zero"));
+  EXPECT_EQ(second_replica_client.Command({"GET", worker_keys[1]}),
+            Bulk("one"));
+
+  EXPECT_EQ(source_client.Command({"RESET"}), "+RESET");
+  EXPECT_EQ(source_client.Command({"WAIT", "2", "100"}), ":2");
+  second_replica.Stop();
+  replica.Stop();
+  source.Stop();
+}
+
 TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =

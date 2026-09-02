@@ -252,6 +252,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   CheckKind("REPLICAOF", CommandKind::kReplicaOf);
   CheckKind("SLAVEOF", CommandKind::kReplicaOf);
   CheckKind("ROLE", CommandKind::kRole);
+  CheckKind("WAIT", CommandKind::kWait);
   CheckKind("MONITOR", CommandKind::kMonitor);
   CheckKind("SLOWLOG", CommandKind::kSlowLog);
   CheckKind("TOMBRAIDER", CommandKind::kTombRaider);
@@ -340,7 +341,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
   EXPECT_EQ(FindCommand("geohash")->min_args_, 2);
   for (const char* name :
        {"blpop", "brpop", "blmove", "brpoplpush", "blmpop", "bzmpop",
-        "bzpopmin", "bzpopmax", "xread", "xreadgroup"}) {
+        "bzpopmin", "bzpopmax", "xread", "xreadgroup", "wait"}) {
     const CommandSpec* spec = FindCommand(name);
     EXPECT_CHECK(spec != nullptr && (spec->flags_ & keylane::kCmdMayBlock) != 0,
                  std::string(name) + " should have kCmdMayBlock");

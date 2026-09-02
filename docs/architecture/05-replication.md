@@ -156,6 +156,25 @@ consume. Shrinking below pinned history establishes a target quota rather than
 deleting required events. A single oversized event can temporarily exceed the
 ordinary quota, but eviction and trim never retain only part of an event.
 
+Client `WAIT` uses the same ACK cursors without changing the native wire
+protocol. Because worker LSN domains are independent, the source captures a
+publisher fence on every worker after the connection's preceding writes and
+retains that vector with the source history ID. An online replica counts only
+after every flow reaches its corresponding fence. A history change invalidates
+the cached vector and causes the connection to establish a new cut; offsets
+from different histories are never compared. The initial connection offset
+precedes all events, so every online native replica satisfies it without a
+fence. Redis PSYNC export acknowledgements are deliberately excluded from this
+native-replica count.
+
+The source-side native session registry and history/continuation leases are
+shared by control and flow coroutines on different workers. They are protected
+by Celer's FIFO `CrossWorkerMutex`: contention suspends only the calling
+coroutine and resumes it on its original worker, so an unrelated connection on
+that worker is never parked behind a process-thread mutex. The mutex's atomic
+guard covers only waiter-list handoff; no replication registry work or
+`co_await` runs while that guard is held.
+
 Writes reserve the worker publisher queue and all relevant active full-sync
 queues before entering database or key gates. Multi-participant requests
 reserve every destination while the cross-flow ordering boundary keeps worker
@@ -456,8 +475,9 @@ replay, database barriers, and restart without backlog recovery.
 `tests/list_e2e_test.cpp` covers native full sync and tailing, unequal worker
 counts, large values, role changes, reconnects, TLS on control and all flows,
 flush during full sync, exact-once non-idempotent effects, tight queue
-waterlines, multiple replicas, Function-catalog full sync and incremental
-mutation, config rewrite, and transaction/control fault injection.
+waterlines, multiple replicas, connection-scoped `WAIT` across flow ACKs,
+Function-catalog full sync and incremental mutation, config rewrite, and
+transaction/control fault injection.
 
 `tests/multikey_e2e_test.cpp` covers concurrent wide replicated `MSET`, changing
 participant sets, duplex source sending, and cross-flow rendezvous progress.

@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "keylane/command.h"
+#include "keylane/replication.h"
 #include "keylane/resp.h"
 #include "keylane/storage/format.h"
 #include "keylane/tx/fingerprint.h"
@@ -39,6 +41,11 @@ struct ConnectionContext {
   // Set only while DispatchCommand is active. EXEC uses it when flushing the
   // readiness notifications captured from its queued child commands.
   BlockingWakeCascade* blocking_wake_cascade_ = nullptr;
+  // Redis WAIT is scoped to writes previously issued by this connection.
+  // Source writes mark the cached all-flow cut dirty; WAIT resolves it lazily
+  // so the ordinary write path does not fence asynchronous publisher queues.
+  std::optional<NativeReplicationWatermark> native_replication_watermark_;
+  bool native_replication_watermark_dirty_ = false;
 
   [[nodiscard]] RespVersion resp_version() const noexcept {
     return reply_builder_.version();

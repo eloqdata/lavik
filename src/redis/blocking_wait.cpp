@@ -683,6 +683,24 @@ Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>> RegisterBlockingWait(
       new BlockingWaitHandle(std::move(impl)));
 }
 
+Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
+RegisterClientBlockingWait(
+    std::uint64_t client_id,
+    std::optional<std::chrono::steady_clock::time_point> deadline) {
+  auto impl = std::make_unique<BlockingWaitHandle::Impl>();
+  impl->client_id_ = client_id;
+  impl->waiter_ = std::make_shared<BlockingWaiter>(
+      celer::ThisWorker().self_, storage::StorageEngine::AllocateWriteTxid());
+  RegisterBlockedClient(impl->client_id_, impl->waiter_);
+  RecordClientBlocked();
+  if (deadline.has_value()) {
+    celer::SpawnOnCurrentWorker(
+        TimeoutBlockingWaiter(impl->waiter_, *deadline));
+  }
+  co_return std::unique_ptr<BlockingWaitHandle>(
+      new BlockingWaitHandle(std::move(impl)));
+}
+
 Task<BlockingWakeReason> WaitForBlockingReady(BlockingWaitHandle& handle) {
   if (!handle.impl_ || !handle.impl_->active_) {
     co_return BlockingWakeReason::kCancelled;

@@ -586,29 +586,29 @@ CommandReply BuildClusterSlotsReply(const ReplicationStatus& replication,
   return BuiltReply(reply_builder.View());
 }
 
-std::optional<std::string> ReplicaMovedError(const ConnectionContext& ctx,
-                                             const CommandRequest& request) {
+Task<std::optional<std::string>> ReplicaMovedError(
+    const ConnectionContext& ctx, const CommandRequest& request) {
   if (g_replication == nullptr || !g_replication->is_replica() ||
       !g_replication->redirects_clients_to_upstream() ||
       request.spec_ == nullptr || (request.spec_->flags_ & kCmdNoKeys) != 0) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   const bool write = (request.spec_->flags_ & kCmdWrite) != 0;
   if (!write && ctx.cluster_readonly_) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   absl::StatusOr<KeyIndexView> keys =
       DetermineKeys(*request.spec_, request.args_);
   if (!keys.ok() || keys->empty()) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
-  const ReplicationStatus replication = g_replication->status();
+  const ReplicationStatus replication = co_await g_replication->status();
   if (!replication.upstream_.has_value()) {
-    return std::nullopt;
+    co_return std::nullopt;
   }
   const std::uint16_t slot = storage::RedisSlot(request.args_[keys->first_]);
-  return absl::StrCat("MOVED ", slot, " ", replication.upstream_->host_, ":",
-                      replication.upstream_->port_);
+  co_return absl::StrCat("MOVED ", slot, " ", replication.upstream_->host_, ":",
+                         replication.upstream_->port_);
 }
 
 Task<CommandReply> ExecuteCluster(const CommandRequest& request,
@@ -626,8 +626,8 @@ Task<CommandReply> ExecuteCluster(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendError(
         "ERR wrong number of arguments for 'cluster' command"));
   }
-  const ReplicationStatus replication =
-      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
+  ReplicationStatus replication;
+  if (g_replication != nullptr) replication = co_await g_replication->status();
   if (CmpCaseInsensitive(request.args_[1], "SLOTS")) {
     co_return BuildClusterSlotsReply(replication, reply_builder);
   }
@@ -1093,7 +1093,7 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       co_return BuiltReply(
           reply_builder.AppendError("ERR replication backend is unavailable"));
     }
-    const ReplicationStatus replication = g_replication->status();
+    const ReplicationStatus replication = co_await g_replication->status();
     if (replication.redis_sources_.size() > 1) {
       co_return BuiltReply(reply_builder.AppendError(
           "ERR CONFIG REWRITE cannot persist multiple Redis Cluster "
@@ -3671,8 +3671,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
 }
 
 Task<CommandReply> ExecuteRole(ReplyBuilder& reply_builder) {
-  const ReplicationStatus replication =
-      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
+  ReplicationStatus replication;
+  if (g_replication != nullptr) replication = co_await g_replication->status();
   if (replication.role_ == ReplicationRole::kMaster) {
     reply_builder.AppendArrayHeader(3);
     reply_builder.AppendBulkString("master");
@@ -3746,8 +3746,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
   const bool all =
       section == "default" || section == "all" || section == "everything";
   auto wants = [&](std::string_view name) { return all || section == name; };
-  const ReplicationStatus replication =
-      g_replication != nullptr ? g_replication->status() : ReplicationStatus{};
+  ReplicationStatus replication;
+  if (g_replication != nullptr) replication = co_await g_replication->status();
 
   std::optional<WorkerMetricsSnapshot> runtime_metrics;
   if (wants("clients") || wants("stats") || wants("persistence") ||
@@ -7766,6 +7766,132 @@ Task<CommandReply> ExecuteSentinelManagementExec(
   co_return BuiltReply(reply_builder.View());
 }
 
+Task<CommandReply> ExecuteWait(ConnectionContext& ctx,
+                               const CommandRequest& request,
+                               ReplyBuilder& reply_builder,
+                               bool allow_blocking) {
+  std::uint64_t required = 0;
+  std::uint64_t timeout_ms = 0;
+  if (!ParseUint64(request.args_[1], &required) ||
+      !ParseUint64(request.args_[2], &timeout_ms)) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR value is not an integer or out of range"));
+  }
+  if (g_replication == nullptr || g_replication->is_replica()) {
+    co_return BuiltReply(reply_builder.AppendInteger(0));
+  }
+
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  if (timeout_ms != 0) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto available =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::time_point::max() - now);
+    const std::uint64_t clamped =
+        std::min<std::uint64_t>(timeout_ms, available.count());
+    deadline = now + std::chrono::milliseconds(clamped);
+  }
+
+  std::unique_ptr<BlockingWaitHandle> blocking_wait;
+
+  for (;;) {
+    std::uint64_t acknowledged = 0;
+    if (ctx.native_replication_watermark_dirty_) {
+      if (allow_blocking) {
+        auto captured =
+            co_await g_replication->CaptureNativeReplicationWatermark();
+        if (!captured.ok()) {
+          co_return BuiltReply(reply_builder.AppendError(
+              absl::StrCat("ERR WAIT replication fence failed: ",
+                           captured.status().message())));
+        }
+        if (captured->has_value()) {
+          ctx.native_replication_watermark_ = std::move(**captured);
+          ctx.native_replication_watermark_dirty_ = false;
+          const auto count =
+              co_await g_replication->CountAcknowledgedNativeReplicas(
+                  *ctx.native_replication_watermark_);
+          if (count.has_value()) acknowledged = *count;
+        }
+      }
+      // A WAIT inside EXEC must never fence the publisher: the transaction's
+      // own replication envelope is unresolved until EXEC commits. Returning
+      // zero for an uncaptured newer write is conservative and nonblocking.
+    } else if (ctx.native_replication_watermark_.has_value()) {
+      const auto count =
+          co_await g_replication->CountAcknowledgedNativeReplicas(
+              *ctx.native_replication_watermark_);
+      if (count.has_value()) {
+        acknowledged = *count;
+      } else {
+        // LSNs are reusable after a history change. Rebase through a new
+        // all-flow fence instead of comparing offsets from different domains.
+        ctx.native_replication_watermark_dirty_ = true;
+        continue;
+      }
+    } else {
+      acknowledged = co_await g_replication->CountOnlineNativeReplicas();
+    }
+
+    if (blocking_wait != nullptr) {
+      switch (BlockingWaitState(*blocking_wait)) {
+        case BlockingWakeReason::kUnblockedError:
+          co_return BuiltReply(reply_builder.AppendError(
+              "UNBLOCKED client unblocked via CLIENT UNBLOCK"));
+        case BlockingWakeReason::kCancelled:
+          co_return BuiltReply(reply_builder.AppendError(
+              "ERR WAIT interrupted: client connection closed"));
+        case BlockingWakeReason::kTimeout:
+          co_return BuiltReply(reply_builder.AppendInteger(
+              static_cast<long long>(std::min<std::uint64_t>(
+                  acknowledged, static_cast<std::uint64_t>(
+                                    std::numeric_limits<long long>::max())))));
+        case BlockingWakeReason::kWaiting:
+        case BlockingWakeReason::kReady:
+          break;
+      }
+    }
+
+    if (acknowledged >= required || !allow_blocking ||
+        (deadline.has_value() &&
+         std::chrono::steady_clock::now() >= *deadline)) {
+      co_return BuiltReply(reply_builder.AppendInteger(
+          static_cast<long long>(std::min<std::uint64_t>(
+              acknowledged, static_cast<std::uint64_t>(
+                                std::numeric_limits<long long>::max())))));
+    }
+
+    if (blocking_wait == nullptr) {
+      auto registered =
+          co_await RegisterClientBlockingWait(ctx.conn_id_, deadline);
+      if (!registered.ok()) {
+        co_return BuiltReply(reply_builder.AppendError(absl::StrCat(
+            "ERR WAIT registration failed: ", registered.status().message())));
+      }
+      blocking_wait = std::move(*registered);
+      continue;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    auto sleep_for =
+        std::chrono::steady_clock::duration(std::chrono::milliseconds(1));
+    if (deadline.has_value()) {
+      if (now >= *deadline) continue;
+      sleep_for = std::min(sleep_for, *deadline - now);
+    }
+    // Native ACKs are updated on the source worker that owns each flow, while
+    // the client coroutine may live on any worker. This short cooperative poll
+    // avoids a cross-worker waiter registry and holds no DB or transaction
+    // gate; if WAIT concurrency becomes material, ACK fan-out can replace it
+    // without changing the watermark contract.
+    absl::Status slept =
+        co_await celer::SleepFor(*ThisWorker().self_, sleep_for);
+    if (!slept.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR WAIT interrupted: ", slept.message())));
+    }
+  }
+}
+
 Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
                                    ReplyBuilder& reply_builder) {
   const RespVersion exec_reply_version = ctx.resp_version();
@@ -8000,6 +8126,9 @@ Task<CommandReply> ExecuteExecBody(ConnectionContext& ctx,
       local = co_await ExecuteInfo(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kRole) {
       local = co_await ExecuteRole(local_builder);
+    } else if (cmd.kind_ == CommandKind::kWait) {
+      local = co_await ExecuteWait(ctx, cmd, local_builder,
+                                   /*allow_blocking=*/false);
     } else if (cmd.kind_ == CommandKind::kRandomKey) {
       local = co_await ExecuteRandomKey(cmd, local_builder);
     } else if (cmd.kind_ == CommandKind::kXGroup ||
@@ -9649,6 +9778,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         case CommandKind::kConfig:
         case CommandKind::kInfo:
         case CommandKind::kRole:
+        case CommandKind::kWait:
         case CommandKind::kCluster:
         case CommandKind::kCommand:
         case CommandKind::kReadOnly:
@@ -9674,7 +9804,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
           "LOADING Keylane is loading the dataset from the primary"));
     }
   }
-  if (std::optional<std::string> moved = ReplicaMovedError(ctx, request);
+  if (std::optional<std::string> moved =
+          co_await ReplicaMovedError(ctx, request);
       moved.has_value()) {
     if (ctx.in_multi_) ctx.multi_dirty_ = true;
     co_return BuiltReply(reply_builder.AppendError(*moved));
@@ -9706,6 +9837,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
         SetClientRespVersion(ctx.conn_id_, RespVersion::k2);
         ctx.client_name_.clear();
         SetClientName(ctx.conn_id_, {});
+        ctx.native_replication_watermark_.reset();
+        ctx.native_replication_watermark_dirty_ = false;
         co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
       case CommandKind::kExec:
         co_return co_await ExecuteExec(ctx, reply_builder);
@@ -9820,6 +9953,8 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       SetClientRespVersion(ctx.conn_id_, RespVersion::k2);
       ctx.client_name_.clear();
       SetClientName(ctx.conn_id_, {});
+      ctx.native_replication_watermark_.reset();
+      ctx.native_replication_watermark_dirty_ = false;
       co_return BuiltReply(reply_builder.AppendSimpleString("RESET"));
     case CommandKind::kReadOnly:
       ctx.cluster_readonly_ = true;
@@ -9829,6 +9964,9 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
       co_return BuiltReply(reply_builder.AppendSimpleString("OK"));
     case CommandKind::kClient:
       co_return co_await ExecuteClient(ctx, request, reply_builder);
+    case CommandKind::kWait:
+      co_return co_await ExecuteWait(ctx, request, reply_builder,
+                                     /*allow_blocking=*/true);
     case CommandKind::kPublish:
     case CommandKind::kPubSub:
     case CommandKind::kPSubscribe:
@@ -9846,6 +9984,20 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest request,
                                    ReplyBuilder& reply_builder) {
   const CommandKind kind = request.kind_;
+  const bool may_advance_replication_watermark = [&] {
+    if (request.replication_origin_ || g_replication == nullptr ||
+        g_replication->is_replica()) {
+      return false;
+    }
+    if (kind == CommandKind::kExec && ctx.in_multi_) {
+      return std::any_of(ctx.queued_.begin(), ctx.queued_.end(),
+                         ExecCommandMayReplicate);
+    }
+    // A write queued by MULTI has not executed and must not affect WAIT until
+    // EXEC succeeds. Other immediate commands can use the shared replication
+    // classification, including dynamic Lua writes and PUBLISH.
+    return !ctx.in_multi_ && ExecCommandMayReplicate(request);
+  }();
   // Plain SET cannot make list, sorted-set, or stream waiters ready. Avoid an
   // atomic cascade object and its completion check on this high-volume path;
   // commands with broader effects retain the conservative cascade lifetime.
@@ -9868,6 +10020,10 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
       co_await DispatchCommandImpl(ctx, request, reply_builder);
   if (cascade.has_value() && !cascade->empty()) {
     (void)co_await DrainBlockingWakeCascade(*cascade);
+  }
+  if (may_advance_replication_watermark && !reply.encoded_.empty() &&
+      reply.encoded_.front() != '-') {
+    ctx.native_replication_watermark_dirty_ = true;
   }
   const std::uint64_t elapsed_ticks = celer::ReadCycleCounter() - started;
   RecordCommandMetric(kind, elapsed_ticks);

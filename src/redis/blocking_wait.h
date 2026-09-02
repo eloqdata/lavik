@@ -99,6 +99,10 @@ class BlockingWaitHandle {
       RegisterBlockingWait(
           std::uint8_t, std::vector<BlockingWaitSpec>, std::uint64_t,
           std::optional<std::chrono::steady_clock::time_point>);
+  friend celer::Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
+      RegisterClientBlockingWait(
+          std::uint64_t,
+          std::optional<std::chrono::steady_clock::time_point>);
   friend celer::Task<BlockingWakeReason> WaitForBlockingReady(
       BlockingWaitHandle&);
   friend BlockingWakeReason BlockingWaitState(const BlockingWaitHandle&);
@@ -111,6 +115,13 @@ RegisterBlockingWait(std::uint8_t db_id, std::vector<BlockingWaitSpec> specs,
                      std::uint64_t client_id,
                      std::optional<std::chrono::steady_clock::time_point>
                          deadline = std::nullopt);
+// Registers a keyless blocking command for timeout, CLIENT UNBLOCK, and
+// connection-cancellation handling. Readiness remains the caller's concern.
+celer::Task<absl::StatusOr<std::unique_ptr<BlockingWaitHandle>>>
+RegisterClientBlockingWait(
+    std::uint64_t client_id,
+    std::optional<std::chrono::steady_clock::time_point> deadline =
+        std::nullopt);
 celer::Task<BlockingWakeReason> WaitForBlockingReady(
     BlockingWaitHandle& handle);
 BlockingWakeReason BlockingWaitState(const BlockingWaitHandle& handle);

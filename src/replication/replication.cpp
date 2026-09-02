@@ -2348,6 +2348,20 @@ struct MasterSession {
     return result == std::numeric_limits<std::uint64_t>::max() ? 0 : result;
   }
 
+  bool Acknowledged(const NativeReplicationWatermark& watermark) const {
+    if (!online() || source_history_id_ != watermark.history_id_ ||
+        watermark.next_lsns_.size() != flows_.size()) {
+      return false;
+    }
+    for (std::size_t flow = 0; flow < flows_.size(); ++flow) {
+      if (flows_[flow].lsn_.load(std::memory_order_acquire) <
+          watermark.next_lsns_[flow]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void MarkOnline() noexcept {
     ever_online_.store(true, std::memory_order_release);
     online_.store(true, std::memory_order_release);
@@ -2687,7 +2701,77 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
-  ReplicationStatus status() const {
+  Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
+  CaptureNativeReplicationWatermark() {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this]() { return CaptureNativeReplicationWatermark(); });
+    }
+
+    // History reset owns worker 0 and can replace every flow's LSN domain.
+    // Finish or observe that transition before constructing an all-flow cut.
+    absl::Status history_ready = co_await ResetInvalidReplicationHistory();
+    if (!history_ready.ok()) co_return history_ready;
+
+    std::string history_id;
+    {
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      history_id = history_id_;
+    }
+    std::vector<std::uint64_t> next_lsns(storage_->worker_count());
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      auto fence = [this]() { return storage_->FenceReplicationLog(); };
+      absl::StatusOr<std::uint64_t> next =
+          worker == celer::ThisWorker().id_
+              ? co_await fence()
+              : co_await celer::SubmitTaskTo(worker, fence);
+      if (!next.ok()) {
+        // With no native consumer the runtime backlog is intentionally
+        // disabled. WAIT keeps the connection dirty and retries if a replica
+        // arrives before its timeout instead of treating that idle state as a
+        // command error.
+        if (absl::IsFailedPrecondition(next.status())) {
+          co_return std::optional<NativeReplicationWatermark>{};
+        }
+        co_return next.status();
+      }
+      next_lsns[worker] = *next;
+    }
+    {
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      if (history_id_ != history_id) {
+        co_return std::optional<NativeReplicationWatermark>{};
+      }
+    }
+    co_return std::optional<NativeReplicationWatermark>(
+        NativeReplicationWatermark{.history_id_ = std::move(history_id),
+                                   .next_lsns_ = std::move(next_lsns)});
+  }
+
+  Task<std::optional<std::uint64_t>> CountAcknowledgedNativeReplicas(
+      const NativeReplicationWatermark& watermark) const {
+    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    if (watermark.history_id_ != history_id_) co_return std::nullopt;
+    std::uint64_t count = 0;
+    for (const auto& [session_id, session] : master_sessions_) {
+      (void)session_id;
+      count += session->Acknowledged(watermark) ? 1 : 0;
+    }
+    co_return count;
+  }
+
+  Task<std::uint64_t> CountOnlineNativeReplicas() const {
+    co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+    celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+    co_return static_cast<std::uint64_t>(std::count_if(
+        master_sessions_.begin(), master_sessions_.end(),
+        [](const auto& entry) { return entry.second->online(); }));
+  }
+
+  Task<ReplicationStatus> status() const {
     ReplicationStatus result;
     result.role_ = role_.load(std::memory_order_acquire);
     result.role_epoch_ = role_epoch_.load(std::memory_order_acquire);
@@ -2757,7 +2841,8 @@ class ReplicationManager::Impl {
       }
     }
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       result.local_history_id_ = history_id_;
       result.downstream_replicas_.reserve(master_sessions_.size());
       for (const auto& [session_id, session] : master_sessions_) {
@@ -2782,7 +2867,7 @@ class ReplicationManager::Impl {
               [](const auto& left, const auto& right) {
                 return left.node_id_ < right.node_id_;
               });
-    return result;
+    co_return result;
   }
 
   void StoreRole(ReplicationRole next, std::memory_order order) noexcept {
@@ -6782,7 +6867,8 @@ class ReplicationManager::Impl {
     SetClientReplicationSession(client_id, session_id);
     std::string source_history_id;
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       source_history_id = history_id_;
     }
     const bool allow_continue = args[3] == source_history_id;
@@ -6806,7 +6892,8 @@ class ReplicationManager::Impl {
       co_return absl::InternalError("failed to register control connection");
     }
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       master_sessions_[session_id] = session;
     }
     absl::Status sent = co_await WriteText(
@@ -6814,7 +6901,7 @@ class ReplicationManager::Impl {
         absl::StrCat("+KLFULLRESYNC ", session_id, " ", node_id_, " ",
                      source_history_id, " ", storage_->worker_count(), "\r\n"));
     if (!sent.ok()) {
-      RemoveMasterSession(session);
+      (void)co_await RemoveMasterSession(session);
       co_return sent;
     }
     // Anonymous KLPSYNC is reserved for protocol detection. It deliberately
@@ -6822,7 +6909,7 @@ class ReplicationManager::Impl {
     // a downstream replica. Real native replicas always advertise their
     // node id and listening port.
     if (protocol_probe) {
-      RemoveMasterSession(session);
+      (void)co_await RemoveMasterSession(session);
       co_return absl::OkStatus();
     }
 
@@ -6855,7 +6942,7 @@ class ReplicationManager::Impl {
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!slept.ok()) {
-        RemoveMasterSession(session);
+        (void)co_await RemoveMasterSession(session);
         co_return slept;
       }
       if (std::chrono::steady_clock::now() >= next_progress_log) {
@@ -6874,19 +6961,20 @@ class ReplicationManager::Impl {
       }
     }
     if (session->cancelled() || !session->all_flows_ready()) {
-      RemoveMasterSession(session);
+      (void)co_await RemoveMasterSession(session);
       co_return absl::DeadlineExceededError(
           stalled ? "replica flow made no full-sync progress for 10 minutes"
                   : "replica flows did not complete full synchronization");
     }
     sent = co_await WriteText(stream, "+KLONLINE\r\n");
     if (!sent.ok()) {
-      RemoveMasterSession(session);
+      (void)co_await RemoveMasterSession(session);
       co_return sent;
     }
     session->MarkOnline();
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto lease = disconnected_replica_leases_.find(session->node_id_);
       if (lease != disconnected_replica_leases_.end() &&
           lease->second.session_id_ < session->id_) {
@@ -6896,7 +6984,7 @@ class ReplicationManager::Impl {
     spdlog::info("accepted replication session {} with {} data flows",
                  session_id, session->worker_count());
     absl::Status waited = co_await WaitForClose(stream);
-    RemoveMasterSession(session);
+    (void)co_await RemoveMasterSession(session);
     co_return waited;
   }
 
@@ -6916,7 +7004,8 @@ class ReplicationManager::Impl {
     }
     std::shared_ptr<MasterSession> session;
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto found = master_sessions_.find(session_id);
       if (found != master_sessions_.end()) session = found->second;
     }
@@ -6996,9 +7085,11 @@ class ReplicationManager::Impl {
     co_return waited;
   }
 
-  void RemoveMasterSession(const std::shared_ptr<MasterSession>& session) {
+  Task<absl::Status> RemoveMasterSession(
+      const std::shared_ptr<MasterSession>& session) {
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       const auto found = master_sessions_.find(session->id_);
       if (found != master_sessions_.end() && found->second == session) {
         master_sessions_.erase(found);
@@ -7009,6 +7100,7 @@ class ReplicationManager::Impl {
       }
     }
     session->Cancel();
+    co_return absl::OkStatus();
   }
 
   void FinalizeRetiredMasterSessionsLocked() {
@@ -7072,7 +7164,8 @@ class ReplicationManager::Impl {
       std::string history_id;
       std::vector<storage::ReplicationLogInfo> logs;
       {
-        std::lock_guard lock(master_mutex_);
+        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         if (MasterHistoryHasConsumersLocked()) continue;
         history_id = history_id_;
@@ -7090,7 +7183,8 @@ class ReplicationManager::Impl {
 
       bool no_reconnectable_replica = false;
       {
-        std::lock_guard lock(master_mutex_);
+        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         if (MasterHistoryHasConsumersLocked()) continue;
         for (auto lease = disconnected_replica_leases_.begin();
@@ -7128,7 +7222,8 @@ class ReplicationManager::Impl {
       history_reset_running_ = true;
       bool disable = false;
       {
-        std::lock_guard lock(master_mutex_);
+        co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+        celer::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
         disable = !MasterHistoryHasConsumersLocked() &&
                   disconnected_replica_leases_.empty();
@@ -7190,7 +7285,8 @@ class ReplicationManager::Impl {
     if (!invalid) co_return absl::OkStatus();
     std::vector<std::shared_ptr<MasterSession>> cancelled;
     {
-      std::lock_guard lock(master_mutex_);
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       cancelled.reserve(master_sessions_.size());
       for (auto& [id, session] : master_sessions_) {
         (void)id;
@@ -7261,7 +7357,7 @@ class ReplicationManager::Impl {
   celer::AsyncMutex redis_fullsync_mutex_;       // worker 0 only
   std::atomic<std::uint64_t> next_master_session_id_{1};
   std::atomic<unsigned> active_master_controls_{0};
-  mutable std::mutex master_mutex_;
+  mutable celer::CrossWorkerMutex master_mutex_;
   absl::flat_hash_map<std::uint64_t, std::shared_ptr<MasterSession>>
       master_sessions_;
   std::vector<std::shared_ptr<MasterSession>> retired_master_sessions_;
@@ -7361,7 +7457,24 @@ Task<absl::Status> ReplicationManager::ServeRedisExportConnection(
                                            eof_capable);
 }
 
-ReplicationStatus ReplicationManager::status() const { return impl_->status(); }
+Task<ReplicationStatus> ReplicationManager::status() const {
+  return impl_->status();
+}
+
+Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
+ReplicationManager::CaptureNativeReplicationWatermark() {
+  return impl_->CaptureNativeReplicationWatermark();
+}
+
+Task<std::optional<std::uint64_t>>
+ReplicationManager::CountAcknowledgedNativeReplicas(
+    const NativeReplicationWatermark& watermark) const {
+  return impl_->CountAcknowledgedNativeReplicas(watermark);
+}
+
+Task<std::uint64_t> ReplicationManager::CountOnlineNativeReplicas() const {
+  return impl_->CountOnlineNativeReplicas();
+}
 
 bool ReplicationManager::is_replica() const noexcept {
   return impl_->is_replica();
