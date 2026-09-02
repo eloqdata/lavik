@@ -38,8 +38,25 @@ ctest --test-dir build_asan --output-on-failure
 
 The script defaults to `clang-18` and `clang++-18`. Override them with
 `KEYLANE_ASAN_CC`, `KEYLANE_ASAN_CXX`, and use `KEYLANE_ASAN_BUILD_DIR` to select
-a different build directory. It intentionally keeps `NDEBUG` disabled because
-the crash-safety fault-injection tests compile their crash points out otherwise.
+a different build directory. It enables the non-packageable fault-server
+variant so crash-safety hooks remain available even though RelWithDebInfo may
+define `NDEBUG`.
+
+Cluster fault tests use a dedicated build and bounded tier runner:
+
+```bash
+cmake -S . -B build_cluster_fault -DCMAKE_BUILD_TYPE=Debug \
+  -DKEYLANE_ENABLE_OPT=OFF -DKEYLANE_STATIC_OPENSSL=ON \
+  -DBUILD_TESTING=ON -DKEYLANE_BUILD_FAULT_SERVER=ON
+./scripts/run_cluster_fault_tests.sh --tier model
+./scripts/run_cluster_fault_tests.sh --tier integration
+./scripts/run_cluster_fault_tests.sh --tier soak --duration 600
+```
+
+See [`tests/cluster/README.md`](../../tests/cluster/README.md) for the
+determinism boundary, invariant matrix, trace/replay commands, and hardware
+allowlist rules. The CTest labels are `cluster-model`,
+`cluster-integration`, `cluster-soak`, and `cluster-hardware`.
 
 ## Downloadable release package
 
@@ -52,6 +69,8 @@ the GNU C++/compiler runtimes, strips a staged copy of the executable, verifies
 that no dynamic OpenSSL or C++ runtime dependency remains, and writes a
 versioned archive and SHA-256 checksum under `dist/`. The archive also carries
 the Apache-2.0 license text required by the statically linked OpenSSL code.
+It explicitly configures `KEYLANE_BUILD_FAULT_SERVER=OFF`; CMake also rejects
+that option whenever `BUILD_TESTING` is off.
 
 Unlike a local build, a package uses a portable CPU baseline:
 

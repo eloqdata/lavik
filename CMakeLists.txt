@@ -36,6 +36,14 @@ option(KEYLANE_ENABLE_READ_LATENCY_TRACE "Enable detailed GET latency tracing" O
 option(KEYLANE_ENABLE_SET_LATENCY_TRACE "Enable detailed SET latency tracing" OFF)
 option(KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT "Count cross-core SubmitTaskTo transfers (test builds only)" OFF)
 option(KEYLANE_WITH_SPDK "Use the SPDK userspace NVMe storage backend" OFF)
+option(KEYLANE_BUILD_FAULT_SERVER
+  "Build the non-packageable server variant used by deterministic fault tests"
+  OFF)
+
+if (KEYLANE_BUILD_FAULT_SERVER AND NOT BUILD_TESTING)
+  message(FATAL_ERROR
+    "KEYLANE_BUILD_FAULT_SERVER requires BUILD_TESTING=ON")
+endif()
 
 if (KEYLANE_ENABLE_OPT)
   include(CheckIPOSupported)
@@ -271,6 +279,7 @@ target_compile_definitions(keylane_module PUBLIC
   KEYLANE_ENABLE_READ_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_READ_LATENCY_TRACE}>
   KEYLANE_ENABLE_SET_LATENCY_TRACE=$<BOOL:${KEYLANE_ENABLE_SET_LATENCY_TRACE}>
   KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT=$<BOOL:${KEYLANE_ENABLE_CROSS_CORE_HOP_COUNT}>
+  KEYLANE_ENABLE_TEST_FAULTS=$<BOOL:${KEYLANE_BUILD_FAULT_SERVER}>
 )
 target_link_libraries(keylane_module PUBLIC
   celer::core
@@ -300,6 +309,18 @@ add_executable(keylane
 target_precompile_headers(keylane REUSE_FROM keylane_module)
 target_link_libraries(keylane PRIVATE keylane::module)
 
+if (KEYLANE_BUILD_FAULT_SERVER)
+  # This binary intentionally shares the test-instrumented module with the
+  # ordinary test server in this build tree. The option is rejected unless
+  # BUILD_TESTING is enabled, so packaging cannot accidentally ship it.
+  add_executable(keylane_fault_server
+    app/keylane.cpp
+    app/mimalloc_new_delete.cpp
+  )
+  target_precompile_headers(keylane_fault_server REUSE_FROM keylane_module)
+  target_link_libraries(keylane_fault_server PRIVATE keylane::module)
+endif()
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   if (KEYLANE_ENABLE_OPT)
     set(KEYLANE_OPT_COMPILE_OPTIONS -O3)
@@ -311,13 +332,17 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     # accelerated CRC engines are compile-gated by architecture feature
     # macros; apply the explicit target to those translation units as well or
     # a native Keylane build silently uses the generic table-based checksum.
-    foreach(target IN ITEMS
+    set(KEYLANE_OPT_TARGETS
         absl_crc_internal
         absl_crc32c
         celer
         celer_rpc
         keylane_module
         keylane)
+    if (TARGET keylane_fault_server)
+      list(APPEND KEYLANE_OPT_TARGETS keylane_fault_server)
+    endif()
+    foreach(target IN LISTS KEYLANE_OPT_TARGETS)
       target_compile_options(${target} PRIVATE ${KEYLANE_OPT_COMPILE_OPTIONS})
     endforeach()
     if (NOT KEYLANE_MARCH STREQUAL "")
@@ -326,6 +351,10 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   endif()
   if (KEYLANE_STATIC_CXX_RUNTIME)
     target_link_options(keylane PRIVATE -static-libstdc++ -static-libgcc)
+    if (TARGET keylane_fault_server)
+      target_link_options(keylane_fault_server PRIVATE
+        -static-libstdc++ -static-libgcc)
+    endif()
   endif()
 endif()
 
@@ -362,6 +391,98 @@ if (BUILD_TESTING)
   set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
   set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
   FetchContent_MakeAvailable(googletest)
+  include(GoogleTest)
+
+  add_library(keylane_test_support STATIC
+    tests/support/process.cpp
+  )
+  target_include_directories(keylane_test_support PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_features(keylane_test_support PUBLIC cxx_std_23)
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane_test_support PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  add_library(keylane_cluster_fault_harness STATIC
+    tests/cluster/cluster_invariants.cpp
+    tests/cluster/fault_controls.cpp
+    tests/cluster/fault_harness.cpp
+    tests/cluster/fault_trace.cpp
+    tests/cluster/reference_model.cpp
+  )
+  target_include_directories(keylane_cluster_fault_harness PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+  )
+  target_compile_features(keylane_cluster_fault_harness PUBLIC cxx_std_23)
+  target_link_libraries(keylane_cluster_fault_harness PUBLIC
+    absl::status
+    absl::statusor
+    absl::strings
+  )
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane_cluster_fault_harness PRIVATE
+      -Wall -Wextra -Wpedantic)
+  endif()
+
+  add_executable(keylane_cluster_model_tests
+    tests/cluster/fault_controls_test.cpp
+    tests/cluster/fault_harness_test.cpp
+  )
+  target_link_libraries(keylane_cluster_model_tests PRIVATE
+    keylane_cluster_fault_harness
+    GTest::gtest_main
+  )
+  target_compile_definitions(keylane_cluster_model_tests PRIVATE
+    KEYLANE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+  )
+  gtest_discover_tests(keylane_cluster_model_tests
+    TEST_PREFIX cluster_model.
+    PROPERTIES
+      LABELS cluster-model
+      TIMEOUT 15
+  )
+
+  add_executable(keylane_cluster_fault
+    tests/cluster/fault_harness_main.cpp
+  )
+  target_link_libraries(keylane_cluster_fault PRIVATE
+    keylane_cluster_fault_harness
+  )
+  add_test(
+    NAME cluster_soak_reference_model
+    COMMAND keylane_cluster_fault --soak-seconds 1 --seed 1
+  )
+  set_tests_properties(cluster_soak_reference_model PROPERTIES
+    LABELS cluster-soak
+    TIMEOUT 15)
+
+  if (UNIX)
+    add_test(
+      NAME cluster_hardware_safety_gate
+      COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cluster/hardware_gate.sh
+    )
+    set_tests_properties(cluster_hardware_safety_gate PROPERTIES
+      LABELS cluster-hardware
+      SKIP_RETURN_CODE 77
+      TIMEOUT 15)
+  endif()
+
+  if (UNIX)
+    add_executable(keylane_process_support_tests
+      tests/support/process_test.cpp
+    )
+    target_link_libraries(keylane_process_support_tests PRIVATE
+      keylane_test_support
+      GTest::gtest_main
+    )
+    gtest_discover_tests(keylane_process_support_tests
+      TEST_PREFIX cluster_integration.
+      PROPERTIES
+        LABELS cluster-integration
+        TIMEOUT 15
+    )
+  endif()
 
   add_executable(keylane_unit_tests
     tests/buffer_pool_test.cpp
@@ -388,7 +509,6 @@ if (BUILD_TESTING)
   target_link_libraries(keylane_unit_tests
     PRIVATE keylane::module GTest::gtest_main
   )
-  include(GoogleTest)
   gtest_discover_tests(keylane_unit_tests)
 
   if (UNIX)
@@ -461,15 +581,24 @@ if (BUILD_TESTING)
 
     find_program(KEYLANE_REDIS_SERVER_EXECUTABLE redis-server)
     if (KEYLANE_REDIS_SERVER_EXECUTABLE)
+      set(KEYLANE_SENTINEL_SERVER_TARGET keylane)
+      if (TARGET keylane_fault_server)
+        set(KEYLANE_SENTINEL_SERVER_TARGET keylane_fault_server)
+      endif()
       add_executable(keylane_sentinel_e2e_test
         tests/sentinel_e2e_test.cpp
       )
+      target_link_libraries(keylane_sentinel_e2e_test PRIVATE
+        keylane_test_support
+      )
       add_test(
         NAME keylane_sentinel_e2e
-        COMMAND keylane_sentinel_e2e_test $<TARGET_FILE:keylane>
+        COMMAND keylane_sentinel_e2e_test
+                $<TARGET_FILE:${KEYLANE_SENTINEL_SERVER_TARGET}>
                 ${KEYLANE_REDIS_SERVER_EXECUTABLE}
       )
       set_tests_properties(keylane_sentinel_e2e PROPERTIES
+        LABELS cluster-integration
         TIMEOUT 180
         RUN_SERIAL TRUE)
     endif()
