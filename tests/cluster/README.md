@@ -1,15 +1,14 @@
 # Deterministic cluster fault harness
 
-This directory owns the reusable test boundary for cluster HA work in issues
-#15–#24. It deliberately models protocol evidence with test-only strong types;
-it does not freeze production Meta, lease, replication, or migration schemas
-before those protocols exist.
+This directory owns the reusable test boundary for cluster HA behavior. It
+deliberately models protocol evidence with test-only strong types without
+prescribing production Meta, lease, replication, or migration schemas.
 
-The initial property engine is the in-tree `ScenarioRunner`, with GoogleTest
+The property engine is the in-tree `ScenarioRunner`, with GoogleTest
 used for assertions and CTest discovery. This avoids adding a second test
 dependency while preserving the required generated schedules, shrinking, and
-seed replay; a future scenario can add a dedicated property library without
-changing KFT1 or the scenario interface.
+seed replay. Scenarios can adopt a dedicated property library without changing
+KFT1 or the scenario interface.
 
 ## Components and determinism contract
 
@@ -40,7 +39,7 @@ KFT1 has two declared modes. `exact-model` is byte-for-byte replayable and is
 appropriate for checked-in regression inputs. `process-action-script` records
 the intended actions for a real-process run; OS scheduling and transport
 observations may drift, so replay must diagnose drift rather than promise an
-identical execution. The current runner executes exact-model traces. Later
+identical execution. The current runner executes exact-model traces. Real
 cluster fixtures can use the process mode as their adapter contract without
 changing the durable exact-model format.
 
@@ -51,18 +50,18 @@ packaging explicitly disables the option.
 
 ## Verification matrix
 
-| Safety claim | Stable invariant | Fast model coverage | Real adapter owner |
-|---|---|---|---|
-| One full authority incarnation (node, boot, term, grant) covers admission, in-flight work, background mutation, and success decisions | `authority.single-writer`, `client.operation-single-authority`, `client.valid-authority-at-admission`, `client.safe-success-decision` | same-node-incarnation assertions, dual-authority KFT1 regression, and client history assertions | lease/fencing issue |
-| Candidate selection is separate from durable activation | `promotion.safe-activation`, `promotion.durable-before-write-authority` | snapshot assertions and composed failover scenario | promotion issue |
-| Other replicas remain intact until activation and child history is ready before writes | `promotion.keep-replicas-until-activation`, `history.child-ready-before-write` | snapshot assertions | promotion/full-sync issues |
-| Restart invalidates old partial-sync evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression | replication issue |
-| Live reparent requires compatible domains, an exact cursor, contiguous retained events, and a complete transaction boundary | `replication.compatible-resume-domain`, `replication.reparent-requires-complete-history` | vector tests and history-gap KFT1 regression | replication issue |
-| A crashed rebuild cannot expose staging or a half-active population | `population.staging-hidden`, `population.atomic-activation` | storage controls and partial-activation KFT1 regression | full-sync issue |
-| Candidate ordering is componentwise within one compatibility domain | `candidate.componentwise-applied-order` | vector partial-order tests | promotion issue |
-| Meta publication/replay cannot regress committed state, and directive replay cannot reuse evidence after a target restart | `meta.committed-state-monotonic`, `meta.directive-evidence-scoped` | composed replay controls, snapshot assertions, and stale-directive KFT1 regression | Meta issue |
-| Migration has one serving owner and a complete target | `migration.single-owner`, `migration.complete-before-serving` | snapshot assertions | migration issue |
-| Redis errors expose only exact public error shapes, never internal term/grant/failed/retry state | `redis.control-error-shape`, `redis.compatible-control-error`, `redis.private-control-state-hidden` | structured public-shape allowlist assertions | request-routing issue |
+| Safety claim | Stable invariant | Fast model coverage |
+|---|---|---|
+| One full authority incarnation (node, boot, term, grant) covers admission, in-flight work, background mutation, and success decisions | `authority.single-writer`, `client.operation-single-authority`, `client.valid-authority-at-admission`, `client.safe-success-decision` | same-node-incarnation assertions, dual-authority KFT1 regression, and client history assertions |
+| Candidate selection is separate from durable activation | `promotion.safe-activation`, `promotion.durable-before-write-authority` | snapshot assertions and composed failover scenario |
+| Other replicas remain intact until activation and child history is ready before writes | `promotion.keep-replicas-until-activation`, `history.child-ready-before-write` | snapshot assertions |
+| Restart invalidates old partial-sync evidence | `replication.restart-invalidates-evidence` | stale-evidence KFT1 regression |
+| Live reparent requires compatible domains, an exact cursor, contiguous retained events, and a complete transaction boundary | `replication.compatible-resume-domain`, `replication.reparent-requires-complete-history` | vector tests and history-gap KFT1 regression |
+| A crashed rebuild cannot expose staging or a half-active population | `population.staging-hidden`, `population.atomic-activation` | storage controls and partial-activation KFT1 regression |
+| Candidate ordering is componentwise within one compatibility domain | `candidate.componentwise-applied-order` | vector partial-order tests |
+| Meta publication/replay cannot regress committed state, and directive replay cannot reuse evidence after a target restart | `meta.committed-state-monotonic`, `meta.directive-evidence-scoped` | composed replay controls, snapshot assertions, and stale-directive KFT1 regression |
+| Migration has one serving owner and a complete target | `migration.single-owner`, `migration.complete-before-serving` | snapshot assertions |
+| Redis errors expose only exact public error shapes, never internal term/grant/failed/retry state | `redis.control-error-shape`, `redis.compatible-control-error`, `redis.private-control-state-hidden` | structured public-shape allowlist assertions |
 
 An operation with `ClientOutcome::kNotReturned` may already be durable; this is
 the explicit uncertain-outcome state. It must never be silently promoted to a
@@ -85,8 +84,8 @@ writes the first unexpected trace under the build tree. Hardware jobs skip
 unless explicitly opted in; use `--tier hardware --require-hardware` in CI to
 turn a missing opt-in into a failure. Hardware opt-in additionally requires an
 unmounted `KEYLANE_CLUSTER_SCRATCH_DEVICE` block device. The gate is a safety
-precondition; raw/SPDK scenarios added by later issues must use the
-`cluster-hardware` label and keep destructive targets inside that allowlist.
+precondition; raw/SPDK scenarios must use the `cluster-hardware` label and keep
+destructive targets inside that allowlist.
 
 The trace CLI can generate, replay, and minimize artifacts:
 
