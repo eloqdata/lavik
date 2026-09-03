@@ -98,8 +98,13 @@ static_assert(kEpochMetadataPageCount ==
                       kMetadataPagePayloadBytes,
               "checkpoint root must fit existing fixed-metadata pages");
 inline constexpr std::uint64_t kEpochMetadataOffset = kDirectIoAlignment;
-inline constexpr std::uint64_t kScanBitmapMetadataOffset =
+// Keep the process-global recovery root at a capacity-independent address.
+// Capacity-sized bitmap ranges may grow in future formats without relocating
+// the bootstrap pointer needed before ordinary recovery begins.
+inline constexpr std::uint64_t kSystemStateMetadataOffset =
     kEpochMetadataOffset + kEpochMetadataPageCount * 2 * kDirectIoAlignment;
+inline constexpr std::uint64_t kScanBitmapMetadataOffset =
+    kSystemStateMetadataOffset + 2 * kDirectIoAlignment;
 
 constexpr std::size_t ScanBitmapBytes(std::uint64_t capacity_blocks) noexcept {
   return static_cast<std::size_t>((capacity_blocks + 7) / 8);
@@ -119,15 +124,10 @@ inline constexpr std::uint64_t CheckpointBitmapMetadataOffset(
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
 }
 
-constexpr std::uint64_t SystemStateMetadataOffset(
+constexpr std::uint64_t FixedMetadataBytes(
     std::uint64_t capacity_blocks) noexcept {
   return CheckpointBitmapMetadataOffset(capacity_blocks) +
          ScanBitmapPageCount(capacity_blocks) * 2 * kDirectIoAlignment;
-}
-
-constexpr std::uint64_t FixedMetadataBytes(
-    std::uint64_t capacity_blocks) noexcept {
-  return SystemStateMetadataOffset(capacity_blocks) + 2 * kDirectIoAlignment;
 }
 
 constexpr std::uint32_t DataBlockBegin(std::uint64_t capacity_blocks) noexcept {

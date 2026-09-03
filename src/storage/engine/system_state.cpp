@@ -328,8 +328,7 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
       std::array<std::byte, kDirectIoAlignment> page{};
       absl::Status read = ReadExactlyAt(
           device.path_, page,
-          MetadataPageSlotOffset(
-              SystemStateMetadataOffset(device.capacity_blocks_), 0, slot));
+          MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
       if (!read.ok()) return read;
       if (IsZero(page)) continue;
       saw_any_root = true;
@@ -507,8 +506,7 @@ Task<absl::Status> StorageEngine::Impl::WriteSystemStateRootOnDeviceLocal(
       *store.worker_, store.files_[device.file_index_],
       std::span<const std::byte>(buffer.data_, kDirectIoAlignment),
       lease.registered(), buffer,
-      MetadataPageSlotOffset(SystemStateMetadataOffset(device.capacity_blocks_),
-                             0, target_slot));
+      MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, target_slot));
   if (!written.ok() || *written != kDirectIoAlignment) {
     co_return written.ok()
         ? absl::InternalError("short system-state root write")

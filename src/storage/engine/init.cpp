@@ -20,16 +20,14 @@ struct MirroredSystemStateRoot {
 };
 
 absl::StatusOr<std::vector<MirroredSystemStateRoot>>
-ReadSystemStateRootCandidates(const std::string& path,
-                              std::uint64_t capacity_blocks) {
+ReadSystemStateRootCandidates(const std::string& path) {
   std::vector<MirroredSystemStateRoot> candidates;
   bool saw_nonzero = false;
   for (unsigned slot = 0; slot < 2; ++slot) {
     std::array<std::byte, kDirectIoAlignment> page{};
-    absl::Status read =
-        ReadExactlyAt(path, page,
-                      MetadataPageSlotOffset(
-                          SystemStateMetadataOffset(capacity_blocks), 0, slot));
+    absl::Status read = ReadExactlyAt(
+        path, page,
+        MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
     if (!read.ok()) return read;
     if (IsZero(page)) continue;
     saw_nonzero = true;
@@ -50,14 +48,13 @@ ReadSystemStateRootCandidates(const std::string& path,
 }
 
 absl::StatusOr<std::optional<MirroredSystemStateRoot>>
-SelectCommonSystemStateRoot(
-    const std::vector<std::pair<std::string, std::uint64_t>>& devices) {
-  if (devices.empty()) return std::optional<MirroredSystemStateRoot>{};
+SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
+  if (paths.empty()) return std::optional<MirroredSystemStateRoot>{};
   std::vector<std::vector<MirroredSystemStateRoot>> candidates;
-  candidates.reserve(devices.size());
+  candidates.reserve(paths.size());
   bool saw_any = false;
-  for (const auto& [path, capacity] : devices) {
-    auto loaded = ReadSystemStateRootCandidates(path, capacity);
+  for (const std::string& path : paths) {
+    auto loaded = ReadSystemStateRootCandidates(path);
     if (!loaded.ok()) return loaded.status();
     saw_any |= !loaded->empty();
     candidates.push_back(std::move(*loaded));
@@ -88,31 +85,26 @@ SelectCommonSystemStateRoot(
 }
 
 absl::Status InstallSystemStateRoot(
-    const std::string& path, std::uint64_t capacity_blocks,
+    const std::string& path,
     const std::optional<MirroredSystemStateRoot>& root) {
   std::array<std::byte, kDirectIoAlignment> zero{};
   for (unsigned slot = 0; slot < 2; ++slot) {
-    absl::Status cleared =
-        WriteExactlyAt(path, zero,
-                       MetadataPageSlotOffset(
-                           SystemStateMetadataOffset(capacity_blocks), 0, slot),
-                       false);
+    absl::Status cleared = WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+        false);
     if (!cleared.ok()) return cleared;
   }
   if (!root.has_value()) {
-    return WriteExactlyAt(path, zero,
-                          MetadataPageSlotOffset(
-                              SystemStateMetadataOffset(capacity_blocks), 0, 1),
-                          true);
+    return WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, 1),
+        true);
   }
   std::array<std::byte, kDirectIoAlignment> page{};
   EncodeMetadataPage(MetadataPageKind::kSystemState, 0, root->generation_,
                      root->payload_, page);
   const unsigned slot = static_cast<unsigned>((root->generation_ - 1) & 1);
   return WriteExactlyAt(
-      path, page,
-      MetadataPageSlotOffset(SystemStateMetadataOffset(capacity_blocks), 0,
-                             slot),
+      path, page, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
       true);
 }
 
@@ -232,11 +224,9 @@ absl::Status InitializeAddedDeviceMetadata(
     }
   }
   for (unsigned slot = 0; slot < 2; ++slot) {
-    status =
-        WriteExactlyAt(path, zero,
-                       MetadataPageSlotOffset(
-                           SystemStateMetadataOffset(capacity_blocks), 0, slot),
-                       slot == 1);
+    status = WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+        slot == 1);
     if (!status.ok()) return status;
   }
   return absl::OkStatus();
@@ -561,13 +551,12 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
 
   if (has_existing_device && configured_device_count > previous_device_count) {
     std::vector<std::uint64_t> canonical_epochs = InitialEpochValues();
-    std::vector<std::pair<std::string, std::uint64_t>> existing_paths;
+    std::vector<std::string> existing_paths;
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (!labels[i].has_value()) {
         continue;
       }
-      existing_paths.emplace_back(options_.data_files_[i],
-                                  labels[i]->capacity_blocks_);
+      existing_paths.push_back(options_.data_files_[i]);
       for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
            ++page_index) {
         const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
@@ -609,9 +598,8 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       if (!initialized.ok()) {
         return initialized;
       }
-      absl::Status system_state_installed =
-          InstallSystemStateRoot(options_.data_files_[i], capacity_by_path[i],
-                                 *inherited_system_state);
+      absl::Status system_state_installed = InstallSystemStateRoot(
+          options_.data_files_[i], *inherited_system_state);
       if (!system_state_installed.ok()) return system_state_installed;
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,

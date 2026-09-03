@@ -89,9 +89,11 @@ offset 0
   4 KiB device label
   epoch page 0 slot A, epoch page 0 slot B
   ...
+  system-state root slot A, system-state root slot B
   allocation-bitmap page 0 slot A, page 0 slot B
   ...
-  system-state root slot A, system-state root slot B
+  checkpoint-bitmap page 0 slot A, page 0 slot B
+  ...
   round up to the next 8 MiB boundary
   data block at local ID DataBlockBegin(capacity)
   next data block
@@ -114,8 +116,9 @@ and CRC32C checksum. Readers select the valid higher generation. An all-zero
 pair is uninitialized logical zero; a nonzero pair with no valid slot is
 corruption.
 
-The system-state root is a separate, process-global A/B pointer mirrored on
-every configured device. It names one copy-on-write manifest extent containing
+The system-state root is a separate, process-global A/B pointer at a fixed,
+capacity-independent offset before the bitmap ranges and mirrored on every
+configured device. It names one copy-on-write manifest extent containing
 the complete Function-catalog extent list, local catalog generation and CRC64,
 full-sync readiness and population state, and the latest promotion base.
 Worker zero is the only manifest writer. A generation is recoverable only when

@@ -159,6 +159,11 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
 
   constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;
   static_assert(ScanBitmapBytes(one_pib_blocks) == 16 * 1024 * 1024);
+  static_assert(kSystemStateMetadataOffset ==
+                kEpochMetadataOffset +
+                    kEpochMetadataPageCount * 2 * kDirectIoAlignment);
+  static_assert(kScanBitmapMetadataOffset ==
+                kSystemStateMetadataOffset + 2 * kDirectIoAlignment);
   static_assert(CheckpointBitmapMetadataOffset(one_pib_blocks) >
                 kScanBitmapMetadataOffset);
   static_assert(DataBlockBegin(one_pib_blocks) >= 3);
