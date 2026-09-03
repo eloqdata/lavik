@@ -165,17 +165,18 @@ shard owner a qpair for the block's controller; otherwise the checkpoint falls
 back instead of silently restoring the old cross-worker path. Each owner
 double-buffers checkpoint reads: after a block completes I/O it submits the
 next block before decoding and installing the current one. I/O, decoding, and
-index construction therefore proceed concurrently across owners. An index
-chunk is scanned once for complete structural validation and again for
-installation. The installation pass references key bytes directly in the
-pinned I/O buffer and copies them only into their final index nodes; it does
-not materialize an owning decoded batch. An owner therefore holds at most two
-8 MiB buffers plus final index state, so temporary entry memory remains bounded
-by worker count rather than key count. Barriers reduce the per-scanner block,
-index-entry, accounting-entry, capacity, and shard results. Block and
-index-entry totals must exactly match the root, every worker must have all
-three chunk kinds represented, and each installed index size must equal its
-capacity declaration.
+index construction therefore proceed concurrently across owners. After the
+whole payload passes CRC32C, each index entry is bounds- and semantics-checked
+and then installed directly from the pinned I/O buffer. Key bytes are copied
+only into their final index nodes; there is neither an owning decoded batch nor
+a second chunk pass. If a later entry is invalid, the already installed valid
+prefix participates in the same authoritative cold-scan merge as prefixes from
+earlier blocks. An owner therefore holds at most two 8 MiB buffers plus final
+index state, so temporary entry memory remains bounded by worker count rather
+than key count. Barriers reduce the per-scanner block, index-entry,
+accounting-entry, capacity, and shard results. Block and index-entry totals
+must exactly match the root, every worker must have all three chunk kinds
+represented, and each installed index size must equal its capacity declaration.
 The published total block count makes a missing chunk detectable without
 adding another root field. If a block or the final completeness check fails,
 startup

@@ -1623,7 +1623,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     }
     result->saw_shards_[block.extent_index_] = true;
     const std::byte* const entries_begin = cursor;
-    auto scan_entries = [&](bool install) -> absl::Status {
+    auto install_entries = [&]() -> absl::Status {
       const std::byte* entry_cursor = entries_begin;
       for (std::uint32_t i = 0; i < chunk.entry_count_; ++i) {
         if (static_cast<std::size_t>(end - entry_cursor) <
@@ -1702,43 +1702,40 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
                                                     allocation_epoch)) {
           return absl::InternalError("invalid checkpoint record location");
         }
-        if (install) {
-          ExtentManifest extents;
-          if (entry.extent_count_ != 0) {
-            auto mutable_extents =
-                std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
-            std::memcpy(mutable_extents->data(),
-                        entry_cursor + fixed_bytes + entry.key_bytes_,
-                        entry.extent_count_ * sizeof(ExtentRef));
-            extents = std::move(mutable_extents);
-          }
-          const RecordLocation location(
-              entry_block_id, entry.mutation_sequence_, allocation_epoch,
-              expire_at_ms, entry.logical_size_,
-              RecordLocation::PackedMetadata::Encode(
-                  record_offset, total_disk_bytes, block_owner, false,
-                  external, key_external,
-                  (flags & kShielding) != 0, (flags & kUnclaimed) != 0,
-                  false, kind, value_type));
-          const RecoveryRecordView recovered{
-              .digest_ = ComputeDigest(key),
-              .key_ = key,
-              .db_id_ = db_id,
-              .txid_ = 0,
-              .lsn_ = std::numeric_limits<std::uint64_t>::max(),
-              // Replication epochs are persisted once per partition before
-              // any record from that epoch can become durable. The checkpoint
-              // is an already-filtered snapshot, so repeating the epoch per
-              // key would only add I/O.
-              .replication_epoch_ =
-                  epoch_values_[kLogicalDatabaseCount + partition_id],
-              .location_ = location,
-              .extents_ = &extents,
-              .checkpoint_snapshot_ = true,
-          };
-          ApplyRecoveredRecord(store, PartitionFor(store, partition_id),
-                               recovered);
+        ExtentManifest extents;
+        if (entry.extent_count_ != 0) {
+          auto mutable_extents =
+              std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
+          std::memcpy(mutable_extents->data(),
+                      entry_cursor + fixed_bytes + entry.key_bytes_,
+                      entry.extent_count_ * sizeof(ExtentRef));
+          extents = std::move(mutable_extents);
         }
+        const RecordLocation location(
+            entry_block_id, entry.mutation_sequence_, allocation_epoch,
+            expire_at_ms, entry.logical_size_,
+            RecordLocation::PackedMetadata::Encode(
+                record_offset, total_disk_bytes, block_owner, false, external,
+                key_external, (flags & kShielding) != 0,
+                (flags & kUnclaimed) != 0, false, kind, value_type));
+        const RecoveryRecordView recovered{
+            .digest_ = ComputeDigest(key),
+            .key_ = key,
+            .db_id_ = db_id,
+            .txid_ = 0,
+            .lsn_ = std::numeric_limits<std::uint64_t>::max(),
+            // Replication epochs are persisted once per partition before any
+            // record from that epoch can become durable. The checkpoint is an
+            // already-filtered snapshot, so repeating the epoch per key would
+            // only add I/O.
+            .replication_epoch_ =
+                epoch_values_[kLogicalDatabaseCount + partition_id],
+            .location_ = location,
+            .extents_ = &extents,
+            .checkpoint_snapshot_ = true,
+        };
+        ApplyRecoveredRecord(store, PartitionFor(store, partition_id),
+                             recovered);
         entry_cursor += entry_bytes;
       }
       if (entry_cursor != end) {
@@ -1747,13 +1744,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       return absl::OkStatus();
     };
 
-    // Validate the complete chunk before publishing any entry. The second
-    // pass reuses string_views into this pinned buffer and copies keys only
-    // into their final index nodes, avoiding one owning RecoveryRecord and
-    // temporary string per key without weakening corrupt-chunk fallback.
-    absl::Status validated = scan_entries(false);
-    if (!validated.ok()) co_return validated;
-    absl::Status installed = scan_entries(true);
+    // Payload CRC is already validated before this loop, so each entry can be
+    // installed as soon as its own bounds and semantics validate. If a later
+    // entry is invalid, normal checkpoint fallback retains this valid prefix
+    // and merges the authoritative record scan into it. Avoiding a second
+    // pass also avoids recomputing RedisSlot for every key.
+    absl::Status installed = install_entries();
     if (!installed.ok()) co_return installed;
     result->entry_count_ += chunk.entry_count_;
     co_return absl::OkStatus();
