@@ -1427,41 +1427,40 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
                      db_id];
       }
     }
-    auto prepare =
-        [this, owner, capacities = std::move(capacities),
-         body_blocks = std::move(body_blocks_by_owner[owner])]() mutable {
-      WorkerStore& owner_store = *stores_[owner];
-      owner_store.checkpoint_index_capacities_ = std::move(capacities);
-      checkpoint_load_results_[owner].body_blocks_ = std::move(body_blocks);
-      try {
-        for (std::size_t partition_index = 0;
-             partition_index < owner_store.partitions_.size();
-             ++partition_index) {
-          auto& partition = owner_store.partitions_[partition_index];
-          for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount;
-               ++db_id) {
-            const std::uint64_t count =
-                owner_store.checkpoint_index_capacities_[partition_index]
-                                                         [db_id];
-            if (count > std::numeric_limits<std::size_t>::max()) {
-              return absl::ResourceExhaustedError(
-                  "checkpoint index capacity exceeds address space");
-            }
-            partition.indexes_[db_id].PreallocateForExpectedSize(
-                static_cast<std::size_t>(count));
-          }
-        }
-      } catch (const std::bad_alloc&) {
-        return absl::ResourceExhaustedError(
-            "failed to preallocate checkpoint index tables");
-      }
-      return absl::OkStatus();
-    };
-    absl::Status prepared =
-        owner == 0 ? prepare() : co_await celer::SubmitTo(owner, prepare);
-    if (!prepared.ok()) co_return prepared;
+    // Worker 0 is the sole writer until checkpoint_capacity_ready_barrier_.
+    // It distributes only small descriptors here; each owner allocates its
+    // large bucket arrays after the barrier so NUMA placement remains local
+    // and all worker allocations can proceed concurrently.
+    stores_[owner]->checkpoint_index_capacities_ = std::move(capacities);
+    checkpoint_load_results_[owner].body_blocks_ =
+        std::move(body_blocks_by_owner[owner]);
   }
   co_return absl::OkStatus();
+}
+
+absl::Status StorageEngine::Impl::PreallocateCheckpointIndexes(
+    WorkerStore& store) {
+  assert(celer::ThisWorker().id_ == store.worker_->id());
+  try {
+    for (std::size_t partition_index = 0;
+         partition_index < store.partitions_.size(); ++partition_index) {
+      auto& partition = store.partitions_[partition_index];
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        const std::uint64_t count =
+            store.checkpoint_index_capacities_[partition_index][db_id];
+        if (count > std::numeric_limits<std::size_t>::max()) {
+          return absl::ResourceExhaustedError(
+              "checkpoint index capacity exceeds address space");
+        }
+        partition.indexes_[db_id].PreallocateForExpectedSize(
+            static_cast<std::size_t>(count));
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    return absl::ResourceExhaustedError(
+        "failed to preallocate checkpoint index tables");
+  }
+  return absl::OkStatus();
 }
 
 absl::Status StorageEngine::Impl::ValidateCheckpointIndexSizes(

@@ -813,6 +813,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_capacity_ready_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_indexes_preallocated_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_indexes_ready_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_loaded_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_index_validated_barrier_ =
@@ -1013,6 +1017,37 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   }
 
   status = co_await checkpoint_capacity_ready_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
+    checkpoint_load.status_ = PreallocateCheckpointIndexes(store);
+  }
+
+  status = co_await checkpoint_indexes_preallocated_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (worker.id() == 0 &&
+      checkpoint_active_.load(std::memory_order_acquire)) {
+    absl::Status preallocation_status = absl::OkStatus();
+    for (const CheckpointLoadResult& loaded : checkpoint_load_results_) {
+      if (!loaded.status_.ok()) {
+        preallocation_status = loaded.status_;
+        break;
+      }
+    }
+    if (!preallocation_status.ok()) {
+      // No body has been installed yet. All workers must observe the shared
+      // fallback decision before any of them starts decoding checkpoint data.
+      spdlog::warn(
+          "shutdown checkpoint generation={} cannot preallocate indexes; "
+          "falling back to record scan: {}",
+          checkpoint_root_.generation_, preallocation_status.message());
+      checkpoint_load_fell_back_.store(true, std::memory_order_release);
+      checkpoint_active_.store(false, std::memory_order_release);
+    }
+  }
+
+  status = co_await checkpoint_indexes_ready_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
@@ -1636,6 +1671,8 @@ void StorageEngine::Impl::Fail(const absl::Status& status) {
   checkpoint_consumed_barrier_->Abort(status);
   checkpoint_capacity_loaded_barrier_->Abort(status);
   checkpoint_capacity_ready_barrier_->Abort(status);
+  checkpoint_indexes_preallocated_barrier_->Abort(status);
+  checkpoint_indexes_ready_barrier_->Abort(status);
   checkpoint_loaded_barrier_->Abort(status);
   checkpoint_index_validated_barrier_->Abort(status);
   metadata_barrier_->Abort(status);

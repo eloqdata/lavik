@@ -140,10 +140,12 @@ generation. For matching blocks a 12 KiB prefix read validates and classifies
 the block header and chunk header. Scanners then read the capacity chunks in
 full and rendezvous before any key is installed. Startup requires exactly one
 capacity chunk per worker, exactly one declaration per partition and database,
-and a declared sum equal to the root entry count. Worker 0 dispatches one
-owner-local allocation pass per worker; every nonempty `ScanHashMap` receives
-the same final power-of-two bucket count and 75-percent target it would have
-after normal growth.
+and a declared sum equal to the root entry count. Worker 0 distributes the
+validated capacities, then all workers allocate their own index tables in
+parallel. A second rendezvous publishes a uniform fallback decision before any
+body can be installed if one allocation fails. Every nonempty `ScanHashMap`
+receives the same final power-of-two bucket count and 75-percent target it
+would have after normal growth.
 
 After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload

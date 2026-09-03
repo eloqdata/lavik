@@ -3214,6 +3214,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> PrepareCheckpointIndexes();
 
+  absl::Status PreallocateCheckpointIndexes(WorkerStore& store);
+
   Task<absl::Status> LoadCheckpoint(WorkerStore& store,
                                     CheckpointLoadResult* result);
 
@@ -3447,6 +3449,8 @@ class StorageEngine::Impl {
   std::unique_ptr<CoroutineBarrier> checkpoint_consumed_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_capacity_loaded_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_capacity_ready_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_indexes_preallocated_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_indexes_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_loaded_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_index_validated_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;
