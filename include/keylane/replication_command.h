@@ -12,6 +12,10 @@
 namespace keylane {
 
 inline constexpr std::string_view kReplicatedExecCommand = "__KEYLANE_EXEC_V1";
+// Fragmentation changes only transport granularity. Every producer and
+// receiver applies this limit to the complete canonical event.
+inline constexpr std::uint64_t kMaxNativeReplicationEventBytes =
+    1024ULL * 1024 * 1024;
 
 // A committed, deterministic Redis command. The database is carried on every
 // record so replay does not depend on connection-local SELECT state.

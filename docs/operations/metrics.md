@@ -205,6 +205,48 @@ a conservative retained-size estimate, so it performs no allocator aggregation
 or `/proc` I/O. RSS is diagnostic only and is sampled by the explicit
 metrics/INFO request.
 
+## Replication and Function catalog
+
+`INFO replication` exposes `keylane_replication_group_id`, the current boot
+and replica-incarnation IDs, the local/upstream history, and
+`keylane_function_catalog_generation` plus its CRC64. Group ID is the stable
+peer/reparent lineage; boot, incarnation, and history are process-scoped.
+After a restart, expect a new history and whole-group full sync rather than a
+continuation from the old in-memory cursor.
+
+The catalog generation is node-local and must only be compared with that
+node's promotion base. Generation zero denotes a fresh set's implicit empty
+catalog; the first successful catalog commit makes it nonzero. It is useful for
+detecting a successful local Function commit or an unexpected catalog change,
+but equal or different generations on two nodes say nothing about replicated
+equivalence. The CRC64 identifies the local dump content for diagnosis.
+
+Backlog and full-sync metrics are worker-labelled:
+
+- `keylane_replication_backlog_bytes` and
+  `keylane_replication_backlog_capacity_bytes` show the current hard reconnect
+  window allocation and quota.
+- `keylane_replication_backlog_floor_lsn` and
+  `keylane_replication_backlog_tail_lsn` show retained event coverage. A
+  consumer below the floor must full-sync.
+- `keylane_replication_backlog_pinned_cursors` counts current ACK coverage
+  claims. At the hard cap, Keylane revokes lagging claims and evicts complete
+  old events instead of allowing the backlog to grow.
+- `keylane_replication_backlog_coverage_revocations_total` counts those
+  revocations.
+- `keylane_replication_publish_queue_bytes` and its capacity expose source
+  publication staging. The corresponding `keylane_fullsync_*` gauges expose
+  active full-sync sessions, their command queues, admission, and waits.
+- `keylane_replication_control_connections` and
+  `keylane_replication_flow_connections` distinguish native control sockets
+  from per-flow data sockets.
+
+Alert on sustained coverage revocations together with replicas repeatedly
+leaving `online`, on a publisher/full-sync queue remaining near capacity, or
+on a node remaining `LOADING` after a full-sync failure. A valid catalog root
+does not clear that last condition: full-sync population activation and
+catalog readiness must complete together.
+
 ## Update model
 
 Each worker owns a cache-line-aligned metrics shard and updates plain integers

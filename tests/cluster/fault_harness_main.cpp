@@ -38,7 +38,8 @@ bool ParseInteger(std::string_view text, Integer* output) {
 void Usage(std::ostream& output) {
   output << "usage: keylane_cluster_fault [options]\n"
             "  --scenario good|dual-authority|stale-evidence|history-gap|"
-            "partial-activation|stale-directive\n"
+            "partial-activation|stale-directive|catalog-ack-before-durable|"
+            "fullsync-retains-old-state|stale-catalog-promotion\n"
             "  --seed N --steps N [--trace-out PATH] [--expect-finding ID]\n"
             "  --replay PATH [--scenario NAME] [--expect-finding ID]\n"
             "  --minimize PATH [--scenario NAME] --trace-out PATH\n"

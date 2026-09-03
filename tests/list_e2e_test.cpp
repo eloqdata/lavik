@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <iterator>
 #include <optional>
@@ -26,6 +27,7 @@
 
 #include "gtest/gtest.h"
 #include "keylane/command_table.h"
+#include "keylane/rdb.h"
 #include "keylane/storage/format.h"
 
 namespace {
@@ -108,6 +110,120 @@ std::string ReadRespBulk(int fd) {
   payload.resize(size);
   return payload;
 }
+
+std::vector<std::string> ReadRespCommand(int fd) {
+  const std::string header = ReadRespLine(fd);
+  if (header.empty() || header.front() != '*') {
+    throw std::runtime_error("expected RESP array, got: " + header);
+  }
+  std::size_t count = 0;
+  const auto parsed =
+      std::from_chars(header.data() + 1, header.data() + header.size(), count);
+  if (parsed.ec != std::errc{} || parsed.ptr != header.data() + header.size()) {
+    throw std::runtime_error("invalid RESP array length: " + header);
+  }
+  std::vector<std::string> command;
+  command.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    command.push_back(ReadRespBulk(fd));
+  }
+  return command;
+}
+
+class RedisPsyncSource {
+ public:
+  RedisPsyncSource(std::string rdb, std::string command_stream) {
+    const int listen_fd =
+        ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+    if (listen_fd < 0) throw std::runtime_error("socket failed");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (::bind(listen_fd, reinterpret_cast<const sockaddr*>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(listen_fd, 1) != 0) {
+      ::close(listen_fd);
+      throw std::runtime_error("failed to listen for Redis PSYNC test source");
+    }
+    socklen_t address_size = sizeof(address);
+    if (::getsockname(listen_fd, reinterpret_cast<sockaddr*>(&address),
+                      &address_size) != 0) {
+      ::close(listen_fd);
+      throw std::runtime_error("failed to resolve Redis PSYNC test port");
+    }
+    port_ = ntohs(address.sin_port);
+
+    pid_ = ::fork();
+    if (pid_ < 0) {
+      ::close(listen_fd);
+      throw std::runtime_error("fork failed");
+    }
+    if (pid_ == 0) {
+      try {
+        const int discovery_fd =
+            ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (discovery_fd < 0) _exit(125);
+        const std::vector<std::string> discovery =
+            ReadRespCommand(discovery_fd);
+        if (discovery.empty() || discovery.front() != "CLUSTER") _exit(125);
+        SendAll(discovery_fd,
+                "-ERR This instance has cluster support disabled\r\n");
+        ::close(discovery_fd);
+
+        const int client_fd =
+            ::accept4(listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+        ::close(listen_fd);
+        if (client_fd < 0) _exit(125);
+        const auto expect = [client_fd](std::string_view name) {
+          const std::vector<std::string> command = ReadRespCommand(client_fd);
+          if (command.empty() || command.front() != name) {
+            throw std::runtime_error("unexpected Redis replication handshake");
+          }
+        };
+        expect("PING");
+        SendAll(client_fd, "+PONG\r\n");
+        expect("REPLCONF");
+        SendAll(client_fd, "+OK\r\n");
+        expect("REPLCONF");
+        SendAll(client_fd, "+OK\r\n");
+        expect("PSYNC");
+        SendAll(client_fd,
+                "+FULLRESYNC 0123456789012345678901234567890123456789 0\r\n$" +
+                    std::to_string(rdb.size()) + "\r\n");
+        SendAll(client_fd, rdb);
+        SendAll(client_fd, command_stream);
+        char buffer[256];
+        while (::recv(client_fd, buffer, sizeof(buffer), 0) > 0) {
+        }
+        ::close(client_fd);
+        _exit(0);
+      } catch (const std::exception&) {
+        _exit(125);
+      }
+    }
+    ::close(listen_fd);
+  }
+
+  RedisPsyncSource(const RedisPsyncSource&) = delete;
+  RedisPsyncSource& operator=(const RedisPsyncSource&) = delete;
+  ~RedisPsyncSource() { Stop(); }
+
+  std::uint16_t port() const noexcept { return port_; }
+
+  void Stop() noexcept {
+    if (pid_ <= 0) return;
+    (void)::kill(pid_, SIGTERM);
+    int status = 0;
+    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+    pid_ = -1;
+  }
+
+ private:
+  pid_t pid_ = -1;
+  std::uint16_t port_ = 0;
+};
 
 int ConnectSocket(std::uint16_t port);
 
@@ -257,6 +373,8 @@ class RespClient {
     }
   }
 
+  std::string ReadPush() { return ReadReply(); }
+
  private:
   std::string ReadReply() {
     const std::string line = ReadLine();
@@ -351,6 +469,36 @@ bool WaitForEventualReply(RespClient& client,
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   do {
     if (client.Command(command) == expected) return true;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+std::optional<std::uint64_t> InfoUnsigned(std::string_view info,
+                                          std::string_view field) {
+  const std::string needle = std::string(field) + ":";
+  const std::size_t value_begin = info.find(needle);
+  if (value_begin == std::string_view::npos) return std::nullopt;
+  const std::size_t begin = value_begin + needle.size();
+  const std::size_t end = info.find("\r\n", begin);
+  if (end == std::string_view::npos) return std::nullopt;
+  std::uint64_t value = 0;
+  const auto parsed =
+      std::from_chars(info.data() + begin, info.data() + end, value);
+  if (parsed.ec != std::errc{} || parsed.ptr != info.data() + end) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+bool WaitForLog(std::string_view path, std::string_view needle,
+                std::chrono::seconds timeout = 10s) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  do {
+    std::ifstream input{std::string(path)};
+    const std::string contents((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    if (contents.find(needle) != std::string::npos) return true;
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < deadline);
   return false;
@@ -662,6 +810,196 @@ std::string BulkArray(const std::vector<std::string_view>& values) {
   return reply;
 }
 
+TEST(ListE2eTest, FreshMinimumStorageUsesImplicitEmptyCatalog) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-minimum-storage-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 80ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t port = FindFreePort();
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"PING"}), "+PONG");
+    EXPECT_EQ(InfoUnsigned(client.Command({"INFO", "replication"}),
+                           "keylane_function_catalog_generation"),
+              0);
+
+    constexpr std::string_view library =
+        "#!lua name=minimum_capacity\n"
+        "redis.register_function('minimum_capacity_value', function(keys, "
+        "args) return 'visible' end)";
+    const std::string load =
+        client.Command({"FUNCTION", "LOAD", std::string(library)});
+    EXPECT_TRUE(load.starts_with("-ERR")) << load;
+    EXPECT_NE(client.Command({"FCALL", "minimum_capacity_value", "0"})
+                  .find("Function not found"),
+              std::string::npos);
+    EXPECT_EQ(InfoUnsigned(client.Command({"INFO", "replication"}),
+                           "keylane_function_catalog_generation"),
+              0);
+    server.Stop();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port, data_path, log_path, 2);
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"PING"}), "+PONG");
+    EXPECT_EQ(InfoUnsigned(client.Command({"INFO", "replication"}),
+                           "keylane_function_catalog_generation"),
+              0);
+    EXPECT_NE(client.Command({"FCALL", "minimum_capacity_value", "0"})
+                  .find("Function not found"),
+              std::string::npos);
+    server.Stop();
+  }
+}
+
+TEST(ListE2eTest, FunctionCatalogCrashRecoverySelectsCommittedRoot) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  constexpr std::string_view old_library =
+      "#!lua name=crash_catalog\n"
+      "redis.register_function('crash_catalog_value', function(keys, args) "
+      "return 'old' end)";
+  constexpr std::string_view new_library =
+      "#!lua name=crash_catalog\n"
+      "redis.register_function('crash_catalog_value', function(keys, args) "
+      "return 'new' end)";
+  struct CrashCase {
+    std::string_view point_;
+    std::string_view recovered_;
+    unsigned devices_ = 1;
+  };
+  constexpr CrashCase cases[] = {
+      {"function-catalog-body-durable", "old", 1},
+      {"system-state-device-root-durable", "new", 1},
+      {"system-state-device-root-durable", "old", 2},
+      {"function-catalog-before-runtime-swap", "new", 1},
+      {"function-catalog-after-runtime-swap", "new", 1},
+  };
+
+  for (std::size_t case_index = 0; case_index < std::size(cases);
+       ++case_index) {
+    const std::string prefix = "/tmp/keylane-function-catalog-crash-" +
+                               std::to_string(::getpid()) + "-" +
+                               std::to_string(case_index);
+    const std::string first_path = prefix + "-0.data";
+    const std::string second_path = prefix + "-1.data";
+    const std::string log_path = prefix + ".log";
+    FileCleanup first_cleanup(first_path);
+    FileCleanup second_cleanup(second_path);
+    FileCleanup log_cleanup(log_path);
+    for (unsigned device = 0; device < cases[case_index].devices_; ++device) {
+      const std::string& path = device == 0 ? first_path : second_path;
+      const int fd =
+          ::open(path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+      ASSERT_GE(fd, 0);
+      ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+      ASSERT_EQ(::close(fd), 0);
+    }
+    std::vector<std::string> extra_arguments;
+    if (cases[case_index].devices_ == 2) {
+      extra_arguments = {"--data-file", second_path};
+    }
+    const std::uint16_t port = FindFreePort();
+    {
+      ServerProcess server(g_keylane_binary, port, first_path, log_path, 2, {},
+                           extra_arguments);
+      RespClient client(port);
+      ASSERT_EQ(client.Command({"FUNCTION", "LOAD", old_library}),
+                Bulk("crash_catalog"));
+      server.Stop();
+    }
+    {
+      ServerProcess server(g_keylane_binary, port, first_path, log_path, 2,
+                           cases[case_index].point_, extra_arguments);
+      RespClient ready(port);
+      const int crash_fd = ConnectSocket(port);
+      ASSERT_GE(crash_fd, 0);
+      SendAll(crash_fd,
+              EncodeCommand({"FUNCTION", "LOAD", "REPLACE", new_library}));
+      server.WaitForCrash();
+      ASSERT_EQ(::close(crash_fd), 0);
+    }
+    {
+      ServerProcess server(g_keylane_binary, port, first_path, log_path, 2, {},
+                           extra_arguments);
+      RespClient client(port);
+      EXPECT_EQ(client.Command({"FCALL", "crash_catalog_value", "0"}),
+                Bulk(cases[case_index].recovered_))
+          << "crash point " << cases[case_index].point_ << " with "
+          << cases[case_index].devices_ << " device(s)";
+      server.Stop();
+    }
+  }
+}
+
+TEST(ListE2eTest, AmbiguousCatalogRootCommitFencesAllClientsUntilRestart) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  constexpr std::string_view old_library =
+      "#!lua name=ambiguous_catalog\n"
+      "redis.register_function('ambiguous_catalog_value', function(keys, "
+      "args) return 'old' end)";
+  constexpr std::string_view new_library =
+      "#!lua name=ambiguous_catalog\n"
+      "redis.register_function('ambiguous_catalog_value', function(keys, "
+      "args) return 'new' end)";
+  const std::string prefix =
+      "/tmp/keylane-function-catalog-ambiguous-" + std::to_string(::getpid());
+  const std::string first_path = prefix + "-0.data";
+  const std::string second_path = prefix + "-1.data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup first_cleanup(first_path);
+  FileCleanup second_cleanup(second_path);
+  FileCleanup log_cleanup(log_path);
+  for (const std::string* path : {&first_path, &second_path}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t port = FindFreePort();
+  {
+    // A fresh set has implicit generation zero. The initial LOAD commits
+    // generation one, so inject ambiguity into the REPLACE at generation two.
+    ServerProcess server(g_keylane_binary, port, first_path, log_path, 2, {},
+                         {"--data-file", second_path},
+                         {{"KEYLANE_FAIL_SYSTEM_STATE_ROOT_ONCE", "1:2"}});
+    RespClient mutation_client(port);
+    RespClient observer_client(port);
+    ASSERT_EQ(mutation_client.Command({"FUNCTION", "LOAD", old_library}),
+              Bulk("ambiguous_catalog"));
+    const std::string failed =
+        mutation_client.Command({"FUNCTION", "LOAD", "REPLACE", new_library});
+    EXPECT_TRUE(failed.starts_with("-ERR Error registering functions:"))
+        << failed;
+    EXPECT_TRUE(observer_client.Command({"SET", "fenced-write", "value"})
+                    .starts_with("-LOADING"));
+    EXPECT_TRUE(
+        observer_client.Command({"FCALL", "ambiguous_catalog_value", "0"})
+            .starts_with("-LOADING"));
+    server.Kill();
+  }
+  {
+    ServerProcess server(g_keylane_binary, port, first_path, log_path, 2, {},
+                         {"--data-file", second_path});
+    RespClient client(port);
+    EXPECT_EQ(client.Command({"FCALL", "ambiguous_catalog_value", "0"}),
+              Bulk("old"));
+    EXPECT_EQ(client.Command({"GET", "fenced-write"}), "$-1");
+    server.Stop();
+  }
+}
+
 TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -682,7 +1020,7 @@ TEST(ListE2eTest, PersistsStreamApproximateTrimNodeBoundaries) {
     RespClient client(port);
     EXPECT_EQ(
         client.Command({"CONFIG", "SET", "stream-node-max-entries", "10"}),
-              "+OK");
+        "+OK");
     for (unsigned index = 1; index <= 100; ++index) {
       const std::string id = std::to_string(index) + "-0";
       EXPECT_EQ(client.Command({"XADD", "trim-stream", id, "f", "v"}),
@@ -1039,8 +1377,8 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   const std::string help = client.Command({"CLIENT", "HELP"});
   EXPECT_NE(
       help.find(
-                "+CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
-            std::string::npos);
+          "+CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+      std::string::npos);
   EXPECT_NE(help.find("+SETINFO <option> <value>"), std::string::npos);
   EXPECT_NE(help.find("+    Print this help."), std::string::npos);
   EXPECT_EQ(client.Command({"CLIENT", "HELP", "extra"}),
@@ -1063,10 +1401,10 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
             std::string::npos);
   EXPECT_EQ(
       client.Command({"CLIENT", "SETINFO", "lib-name", "redis py"}),
-            "-ERR lib-name cannot contain spaces, newlines or special characters.");
+      "-ERR lib-name cannot contain spaces, newlines or special characters.");
   EXPECT_EQ(
       client.Command({"CLIENT", "SETINFO", "lib-ver", "1.2\n3"}),
-            "-ERR lib-ver cannot contain spaces, newlines or special characters.");
+      "-ERR lib-ver cannot contain spaces, newlines or special characters.");
   EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "badger", "hamster"}),
             "-ERR Unrecognized option 'badger'");
   EXPECT_EQ(client.Command({"CLIENT", "SETINFO", "lib-name"}),
@@ -1105,14 +1443,14 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   std::future<std::string> error_id = error_id_promise.get_future();
   auto error_waiter = std::async(std::launch::async, [port, &error_id_promise,
                                                       &client_id] {
-                                   RespClient waiting(port);
+    RespClient waiting(port);
     error_id_promise.set_value(client_id(waiting.Command({"CLIENT", "ID"})));
     return waiting.Command({"BLPOP", "client-unblock-error", "5"});
-                                 });
+  });
   const std::string error_client_id = error_id.get();
   ASSERT_TRUE(wait_until_blocked(error_client_id));
   EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", error_client_id, "ERROR"}),
-      ":1");
+            ":1");
   ASSERT_EQ(error_waiter.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(error_waiter.get(),
             "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
@@ -1121,15 +1459,15 @@ TEST(ListE2eTest, ClientUnblockFindsBlockedClientsAcrossWorkers) {
   std::future<std::string> stream_id = stream_id_promise.get_future();
   auto stream_waiter = std::async(std::launch::async, [port, &stream_id_promise,
                                                        &client_id] {
-                                    RespClient waiting(port);
+    RespClient waiting(port);
     stream_id_promise.set_value(client_id(waiting.Command({"CLIENT", "ID"})));
-                                    return waiting.Command(
+    return waiting.Command(
         {"XREAD", "BLOCK", "5000", "STREAMS", "client-unblock-stream", "0-0"});
-                                  });
+  });
   const std::string stream_client_id = stream_id.get();
   ASSERT_TRUE(wait_until_blocked(stream_client_id));
   EXPECT_EQ(client.Command({"CLIENT", "UNBLOCK", stream_client_id, "ERROR"}),
-      ":1");
+            ":1");
   ASSERT_EQ(stream_waiter.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(stream_waiter.get(),
             "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
@@ -1225,7 +1563,7 @@ TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
   ASSERT_GE(pipelined, 0);
   timeval short_timeout{.tv_sec = 2, .tv_usec = 0};
   ASSERT_EQ(::setsockopt(pipelined, SOL_SOCKET, SO_RCVTIMEO, &short_timeout,
-                        sizeof(short_timeout)),
+                         sizeof(short_timeout)),
             0);
   std::string commands = EncodeCommand({"LPUSH", key, "first"});
   commands += EncodeCommand({"BLPOP", key, "2"});
@@ -1234,7 +1572,7 @@ TEST(ListE2eTest, PipelineFlushesRepliesBeforeBlockingCommand) {
   ASSERT_EQ(first_waiter.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(first_waiter.get(),
             "*2\r\n$26\r\npipeline-blocking-fairness\r\n"
-                                "$5\r\nfirst");
+            "$5\r\nfirst");
   // This reply must be on the wire even though the next pipelined command is
   // now blocked on the same connection.
   EXPECT_EQ(ReadRespLine(pipelined), ":1");
@@ -1260,7 +1598,7 @@ TEST(ListE2eTest, ExecWakesBlockersOnlyForFinalValueTypes) {
   const int data_fd =
       ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(data_fd, 0);
-  ASSERT_EQ(::posix_fallocate(data_fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::posix_fallocate(data_fd, 0, 160ULL * 1024 * 1024), 0);
   ASSERT_EQ(::close(data_fd), 0);
 
   constexpr unsigned kWorkerCount = 3;
@@ -2175,12 +2513,12 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
             BulkArray({"replication-snapshot-batch-size", "32"}));
   ASSERT_EQ(
       source_client.Command({"CONFIG", "SET", "foreground-budget-us", "250"}),
-            "+OK");
+      "+OK");
   EXPECT_EQ(source_client.Command({"CONFIG", "GET", "foreground-budget-us"}),
             BulkArray({"foreground-budget-us", "250"}));
   ASSERT_EQ(
       source_client.Command({"CONFIG", "SET", "background-budget-us", "20"}),
-            "+OK");
+      "+OK");
   EXPECT_EQ(source_client.Command({"CONFIG", "GET", "background-budget-us"}),
             BulkArray({"background-budget-us", "20"}));
   ASSERT_EQ(source_client.Command(
@@ -2194,7 +2532,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
             "+OK");
   EXPECT_EQ(
       source_client.Command({"CONFIG", "GET", "spdk-max-completions-per-poll"}),
-            BulkArray({"spdk-max-completions-per-poll", "4"}));
+      BulkArray({"spdk-max-completions-per-poll", "4"}));
   EXPECT_EQ(
       source_client.Command({"CONFIG", "GET", "defrag-*"}),
       BulkArray({"defrag-paused", "no", "defrag-max-active-per-device", "8",
@@ -2270,6 +2608,18 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_NE(replication_info.find("role:slave"), std::string::npos);
   EXPECT_NE(replication_info.find("slave_read_only:1"), std::string::npos);
   EXPECT_NE(replication_info.find("master_replid:"), std::string::npos);
+  {
+    RespClient downstream_probe(replica_port);
+    EXPECT_EQ(downstream_probe.Command(
+                  {"KLPSYNC", "1", "?", "?", "?", "?", "?", "?"}),
+              "-ERR native cascading replication is not supported");
+  }
+  {
+    RespClient redis_export_probe(replica_port);
+    EXPECT_EQ(redis_export_probe.Command({"REPLCONF", "capa", "eof"}), "+OK");
+    EXPECT_EQ(redis_export_probe.Command({"PSYNC", "?", "-1"}),
+              "-ERR detach this Keylane replica before Redis export");
+  }
   const std::string source_replication =
       source_client.Command({"INFO", "replication"});
   EXPECT_NE(source_replication.find("role:master"), std::string::npos);
@@ -2286,9 +2636,8 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
       "redis.register_function{function_name='native_incremental_value', "
       "callback=function(keys, args) return args[1] end, "
       "flags={'no-writes'}}";
-  ASSERT_EQ(
-      source_client.Command({"FUNCTION", "LOAD", incremental_function}),
-      Bulk("native_incremental"));
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", incremental_function}),
+            Bulk("native_incremental"));
   const auto function_deadline = std::chrono::steady_clock::now() + 10s;
   std::string replicated_function;
   do {
@@ -2762,7 +3111,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
               BulkArray({"replica-priority", "90"}));
     EXPECT_EQ(
         startup_client.Command({"CONFIG", "SET", "replica-priority", "25"}),
-              "+OK");
+        "+OK");
     EXPECT_EQ(startup_client.Command({"MULTI"}), "+OK");
     EXPECT_EQ(startup_client.Command({"SLAVEOF", "NO", "ONE"}), "+QUEUED");
     EXPECT_EQ(startup_client.Command({"CONFIG", "REWRITE"}), "+QUEUED");
@@ -2780,7 +3129,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
     replication_info = rewritten_client.Command({"INFO", "replication"});
     EXPECT_NE(replication_info.find("role:master"), std::string::npos);
     EXPECT_EQ(rewritten_client.Command({"CONFIG", "GET", "replica-priority"}),
-        BulkArray({"replica-priority", "25"}));
+              BulkArray({"replica-priority", "25"}));
     EXPECT_EQ(rewritten_client.Command({"SET", "rewritten-master", "yes"}),
               "+OK");
     rewritten_master.Stop();
@@ -2891,8 +3240,8 @@ TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
 
   std::promise<std::string> blocked_id_promise;
   std::future<std::string> blocked_id = blocked_id_promise.get_future();
-  auto blocked_wait = std::async(
-      std::launch::async, [source_port, &blocked_id_promise] {
+  auto blocked_wait =
+      std::async(std::launch::async, [source_port, &blocked_id_promise] {
         RespClient waiting(source_port);
         const std::string encoded_id = waiting.Command({"CLIENT", "ID"});
         blocked_id_promise.set_value(encoded_id.substr(1));
@@ -2907,15 +3256,14 @@ TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
   do {
     const std::string listing =
         source_client.Command({"CLIENT", "LIST", "ID", blocked_client_id});
-    client_blocked =
-        listing.find(" flags=b ") != std::string::npos;
+    client_blocked = listing.find(" flags=b ") != std::string::npos;
     if (!client_blocked) std::this_thread::sleep_for(10ms);
   } while (!client_blocked &&
            std::chrono::steady_clock::now() < blocked_deadline);
   ASSERT_TRUE(client_blocked);
-  EXPECT_EQ(source_client.Command(
-                {"CLIENT", "UNBLOCK", blocked_client_id, "ERROR"}),
-            ":1");
+  EXPECT_EQ(
+      source_client.Command({"CLIENT", "UNBLOCK", blocked_client_id, "ERROR"}),
+      ":1");
   ASSERT_EQ(blocked_wait.wait_for(1s), std::future_status::ready);
   EXPECT_EQ(blocked_wait.get(),
             "-UNBLOCKED client unblocked via CLIENT UNBLOCK");
@@ -2942,6 +3290,148 @@ TEST(ListE2eTest, WaitsForNativeReplicaAcknowledgementsAcrossFlows) {
   EXPECT_EQ(source_client.Command({"RESET"}), "+RESET");
   EXPECT_EQ(source_client.Command({"WAIT", "2", "100"}), ":2");
   second_replica.Stop();
+  replica.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, ControlDisconnectBeforeFirstFlowCannotResumeEmptyDataset) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-control-drop-fullsync-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data), replica_cleanup(replica_data),
+      source_log_cleanup(source_log), replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  const std::uint16_t replica_port = FindFreePort();
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       2);
+  RespClient source_client(source_port);
+  ASSERT_EQ(source_client.Command({"SET", "fullsync-seed", "present"}), "+OK");
+  ServerProcess replica(
+      g_keylane_binary, replica_port, replica_data, replica_log, 2, {}, {},
+      {{"KEYLANE_REPLICATION_DROP_AFTER_CONTROL_RESPONSE_ONCE", "1"}});
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+
+  const auto deadline = std::chrono::steady_clock::now() + 60s;
+  std::string info;
+  do {
+    info = replica_client.Command({"INFO", "replication"});
+    if (info.find("keylane_replication_state:online") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos)
+      << info;
+  EXPECT_EQ(replica_client.Command({"GET", "fullsync-seed"}), Bulk("present"));
+
+  replica.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, ExecReusesAdmissionAndAccountsForReplicatedChildren) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-exec-admission-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data), replica_cleanup(replica_data),
+      source_log_cleanup(source_log), replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 512ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  const std::uint16_t replica_port = FindFreePort();
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       1, {}, {"--repl-backlog-size", "8388608"});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 1);
+  RespClient source_client(source_port);
+  RespClient replica_client(replica_port);
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 60s;
+  std::string replica_info;
+  do {
+    replica_info = replica_client.Command({"INFO", "replication"});
+    if (replica_info.find("keylane_replication_state:online") !=
+        std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(replica_info.find("keylane_replication_state:online"),
+            std::string::npos);
+  ASSERT_EQ(
+      source_client.Command(
+          {"CONFIG", "SET", "replication-publish-queue-mb-per-worker", "4"}),
+      "+OK");
+
+  std::string library =
+      "#!lua name=exec_admission\n--" + std::string(3 * 1024 * 1024, 'x') +
+      "\nredis.register_function{function_name='exec_admission_value', "
+      "callback=function(keys, args) return 'ready' end, flags={'no-writes'}}";
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", library}), "+QUEUED");
+  auto function_exec = std::async(std::launch::async, [&source_client] {
+    return source_client.Command({"EXEC"});
+  });
+  if (function_exec.wait_for(15s) != std::future_status::ready) {
+    source.Kill();
+    try {
+      (void)function_exec.get();
+    } catch (const std::exception&) {
+    }
+    replica.Stop();
+    FAIL() << "Function-only EXEC reacquired its own publisher admission";
+    return;
+  }
+  EXPECT_EQ(function_exec.get(), "*1\r\n" + Bulk("exec_admission"));
+  EXPECT_TRUE(WaitForEventualReply(replica_client,
+                                   {"FCALL_RO", "exec_admission_value", "0"},
+                                   Bulk("ready")));
+
+  const std::string published(9 * 1024 * 1024, 'p');
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"SET", "oversized-exec-key", "written"}),
+            "+QUEUED");
+  ASSERT_EQ(
+      source_client.Command({"PUBLISH", "oversized-exec-channel", published}),
+      "+QUEUED");
+  const std::string oversized_exec = source_client.Command({"EXEC"});
+  EXPECT_TRUE(oversized_exec.starts_with(
+      "-ERR replication publisher admission failed:"))
+      << oversized_exec.substr(0, 256);
+  EXPECT_EQ(source_client.Command({"GET", "oversized-exec-key"}), "$-1");
+  ASSERT_EQ(source_client.Command({"SET", "after-oversized-exec", "ok"}),
+            "+OK");
+  EXPECT_TRUE(WaitForEventualReply(
+      replica_client, {"GET", "after-oversized-exec"}, Bulk("ok")));
+
   replica.Stop();
   source.Stop();
 }
@@ -3087,8 +3577,7 @@ TEST(ListE2eTest, ClientKillDisconnectsReplicaSocketsAndReplicaReconnects) {
 TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
-      "/tmp/keylane-expired-replica-lease-e2e-" +
-      std::to_string(::getpid());
+      "/tmp/keylane-expired-replica-lease-e2e-" + std::to_string(::getpid());
   const std::string source_data = prefix + "-source.data";
   const std::string replica_data = prefix + "-replica.data";
   const std::string source_log = prefix + "-source.log";
@@ -3148,8 +3637,7 @@ TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
   // Freeze the target before severing its sockets so it cannot reconnect and
   // advance its process-local cursor while the source overwrites the window.
   replica.Pause();
-  ASSERT_EQ(source_client.Command({"CLIENT", "KILL", "TYPE", "REPLICA"}),
-            ":3");
+  ASSERT_EQ(source_client.Command({"CLIENT", "KILL", "TYPE", "REPLICA"}), ":3");
   const auto disconnected_deadline = std::chrono::steady_clock::now() + 10s;
   std::string source_info;
   do {
@@ -3170,8 +3658,7 @@ TEST(ListE2eTest, ExpiredDisconnectedReplicaDisablesHistoryAndFullSyncs) {
   std::string new_history;
   const auto expired_deadline = std::chrono::steady_clock::now() + 30s;
   do {
-    new_history =
-        history_id(source_client.Command({"INFO", "replication"}));
+    new_history = history_id(source_client.Command({"INFO", "replication"}));
     if (!new_history.empty() && new_history != old_history) break;
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < expired_deadline);
@@ -3350,21 +3837,18 @@ TEST(ListE2eTest, MaxClientsRejectsBeforeTlsAndUpdatesAtRuntime) {
   EXPECT_EQ(first->Command({"CONFIG", "GET", "maxclients"}),
             BulkArray({"maxclients", "1"}));
 
-  EXPECT_EQ(first->Command(
-                {"CONFIG", "GET", "client-query-buffer-limit"}),
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),
             BulkArray({"client-query-buffer-limit", "1073741824"}));
-  EXPECT_EQ(first->Command(
-                {"CONFIG", "SET", "client-query-buffer-limit", "2mb"}),
-            "+OK");
-  EXPECT_EQ(first->Command(
-                {"CONFIG", "GET", "client-query-buffer-limit"}),
+  EXPECT_EQ(
+      first->Command({"CONFIG", "SET", "client-query-buffer-limit", "2mb"}),
+      "+OK");
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),
             BulkArray({"client-query-buffer-limit", "2097152"}));
-  EXPECT_EQ(first->Command(
-                {"CONFIG", "SET", "client-query-buffer-limit", "512kb"}),
-            "-ERR client-query-buffer-limit must be between 1mb and LONG_MAX "
-            "bytes");
-  EXPECT_EQ(first->Command(
-                {"CONFIG", "GET", "client-query-buffer-limit"}),
+  EXPECT_EQ(
+      first->Command({"CONFIG", "SET", "client-query-buffer-limit", "512kb"}),
+      "-ERR client-query-buffer-limit must be between 1mb and LONG_MAX "
+      "bytes");
+  EXPECT_EQ(first->Command({"CONFIG", "GET", "client-query-buffer-limit"}),
             BulkArray({"client-query-buffer-limit", "2097152"}));
   EXPECT_NE(first->Command({"INFO", "clients"}).find("maxclients:1\r\n"),
             std::string::npos);
@@ -3507,6 +3991,121 @@ TEST(ListE2eTest, FlushDbDuringFullSyncCancelsAndRestartsWithoutOldKeys) {
   EXPECT_EQ(replica_client.Command({"GET", "shared{fullsync}"}),
             Bulk("new-root"));
   EXPECT_EQ(replica_client.Command({"GET", "replica-only{fullsync}"}), "$-1");
+  replica.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, FullSyncInstallsOnlyTheFinalFunctionCatalog) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-function-fullsync-cut-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  ServerProcess source(
+      g_keylane_binary, source_port, source_data, source_log, 1, {}, {},
+      {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_RESET_MS", "1500"}});
+  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                        replica_log, 1);
+  RespClient source_client(source_port);
+  RespClient replica_client(replica_port);
+
+  constexpr std::string_view old_library =
+      "#!lua name=target_old\n"
+      "redis.register_function{function_name='target_old_value', "
+      "callback=function(keys, args) return 'old' end, flags={'no-writes'}}";
+  constexpr std::string_view base_library =
+      "#!lua name=source_base\n"
+      "redis.register_function{function_name='source_base_value', "
+      "callback=function(keys, args) return 'base' end, flags={'no-writes'}}";
+  constexpr std::string_view standalone_library =
+      "#!lua name=source_standalone\n"
+      "redis.register_function{function_name='source_standalone_value', "
+      "callback=function(keys, args) return 'standalone' end, "
+      "flags={'no-writes'}}";
+  constexpr std::string_view mixed_library =
+      "#!lua name=source_mixed\n"
+      "redis.register_function{function_name='source_mixed_value', "
+      "callback=function(keys, args) return 'mixed' end, flags={'no-writes'}}";
+  ASSERT_EQ(replica_client.Command({"FUNCTION", "LOAD", old_library}),
+            Bulk("target_old"));
+  const auto baseline_generation =
+      InfoUnsigned(replica_client.Command({"INFO", "replication"}),
+                   "keylane_function_catalog_generation");
+  ASSERT_TRUE(baseline_generation.has_value());
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", base_library}),
+            Bulk("source_base"));
+
+  constexpr std::string_view channel = "catalog-fullsync";
+  RespClient subscriber(replica_port);
+  ASSERT_EQ(subscriber.Command({"SUBSCRIBE", channel}),
+            "*3\r\n" + Bulk("subscribe") + "\r\n" + Bulk(channel) + "\r\n:1");
+  ASSERT_EQ(replica_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+
+  const auto flows_deadline = std::chrono::steady_clock::now() + 10s;
+  std::string info;
+  do {
+    info = replica_client.Command({"INFO", "replication"});
+    if (info.find("keylane_connected_flows:1") != std::string::npos) break;
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < flows_deadline);
+  ASSERT_NE(info.find("keylane_connected_flows:1"), std::string::npos);
+
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", standalone_library}),
+            Bulk("source_standalone"));
+  ASSERT_EQ(source_client.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(source_client.Command({"FUNCTION", "LOAD", mixed_library}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command({"PUBLISH", channel, "projected"}),
+            "+QUEUED");
+  ASSERT_EQ(source_client.Command({"EXEC"}),
+            "*2\r\n" + Bulk("source_mixed") + "\r\n:0");
+
+  const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+  do {
+    info = replica_client.Command({"INFO", "replication"});
+    if (info.find("keylane_replication_state:online") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+  const auto final_generation =
+      InfoUnsigned(info, "keylane_function_catalog_generation");
+  ASSERT_TRUE(final_generation.has_value());
+  EXPECT_EQ(*final_generation, *baseline_generation + 1);
+  EXPECT_EQ(subscriber.ReadPush(), "*3\r\n" + Bulk("message") + "\r\n" +
+                                       Bulk(channel) + "\r\n" +
+                                       Bulk("projected"));
+
+  ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+  EXPECT_EQ(replica_client.Command({"FCALL_RO", "source_base_value", "0"}),
+            Bulk("base"));
+  EXPECT_EQ(
+      replica_client.Command({"FCALL_RO", "source_standalone_value", "0"}),
+      Bulk("standalone"));
+  EXPECT_EQ(replica_client.Command({"FCALL_RO", "source_mixed_value", "0"}),
+            Bulk("mixed"));
+  EXPECT_TRUE(replica_client.Command({"FCALL_RO", "target_old_value", "0"})
+                  .starts_with("-ERR Function not found"));
   replica.Stop();
   source.Stop();
 }
@@ -3703,7 +4302,563 @@ TEST(ListE2eTest, FullSyncHandoffProjectsNonIdempotentTailExactlyOnce) {
   source.Stop();
 }
 
-TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOnePublishesEmpty) {
+TEST(ListE2eTest, PromotionDrainsAdmittedReplicaApplyBeforeClosingDbGate) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-promotion-apply-drain-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       1);
+  RespClient source_client(source_port);
+  {
+    ServerProcess replica(
+        g_keylane_binary, replica_port, replica_data, replica_log, 1, {}, {},
+        {{"KEYLANE_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS", "1500"}});
+    RespClient replica_client(replica_port);
+    ASSERT_EQ(replica_client.Command(
+                  {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+              "+OK");
+    const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+    std::string info;
+    do {
+      info = replica_client.Command({"INFO", "replication"});
+      if (info.find("keylane_replication_state:online") != std::string::npos) {
+        break;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < online_deadline);
+    ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+
+    ASSERT_EQ(source_client.Command({"SET", "promotion-drain", "committed"}),
+              "+OK");
+    ASSERT_TRUE(WaitForLog(
+        replica_log,
+        "replication command admitted; pausing before database admission"));
+    auto promotion = std::async(std::launch::async, [replica_port] {
+      RespClient client(replica_port);
+      return client.Command({"REPLICAOF", "NO", "ONE"});
+    });
+    if (promotion.wait_for(10s) != std::future_status::ready) {
+      replica.Kill();
+      try {
+        (void)promotion.get();
+      } catch (const std::exception&) {
+      }
+      FAIL() << "promotion deadlocked behind an admitted replica apply";
+    }
+    EXPECT_EQ(promotion.get(), "+OK");
+    EXPECT_EQ(replica_client.Command({"GET", "promotion-drain"}),
+              Bulk("committed"));
+    replica.Stop();
+  }
+  {
+    ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                          replica_log, 1);
+    RespClient replica_client(replica_port);
+    EXPECT_EQ(replica_client.Command({"GET", "promotion-drain"}),
+              Bulk("committed"));
+    replica.Stop();
+  }
+  source.Stop();
+}
+
+TEST(ListE2eTest, PromotionDrainsCompleteReplicaTransaction) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix = "/tmp/keylane-promotion-transaction-drain-e2e-" +
+                             std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::string first_key = KeyForWorker("promotion-transaction", 0, 2);
+  const std::string second_key = KeyForWorker("promotion-transaction", 1, 2);
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       2);
+  RespClient source_client(source_port);
+  {
+    ServerProcess replica(
+        g_keylane_binary, replica_port, replica_data, replica_log, 2, {}, {},
+        {{"KEYLANE_REPLICATION_PAUSE_BEFORE_TRANSACTION_APPLY_MS", "1500"}});
+    RespClient replica_client(replica_port);
+    ASSERT_EQ(replica_client.Command(
+                  {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+              "+OK");
+    const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+    std::string info;
+    do {
+      info = replica_client.Command({"INFO", "replication"});
+      if (info.find("keylane_replication_state:online") != std::string::npos) {
+        break;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < online_deadline);
+    ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+
+    ASSERT_EQ(source_client.Command(
+                  {"MSET", first_key, "first", second_key, "second"}),
+              "+OK");
+    ASSERT_TRUE(WaitForLog(
+        replica_log,
+        "replication transaction complete; pausing before database apply"));
+    auto promotion = std::async(std::launch::async, [replica_port] {
+      RespClient client(replica_port);
+      return client.Command({"REPLICAOF", "NO", "ONE"});
+    });
+    ASSERT_EQ(promotion.wait_for(10s), std::future_status::ready);
+    EXPECT_EQ(promotion.get(), "+OK");
+    EXPECT_EQ(replica_client.Command({"GET", first_key}), Bulk("first"));
+    EXPECT_EQ(replica_client.Command({"GET", second_key}), Bulk("second"));
+    replica.Stop();
+  }
+  {
+    ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                          replica_log, 2);
+    RespClient replica_client(replica_port);
+    EXPECT_EQ(replica_client.Command({"GET", first_key}), Bulk("first"));
+    EXPECT_EQ(replica_client.Command({"GET", second_key}), Bulk("second"));
+    replica.Stop();
+  }
+  source.Stop();
+}
+
+TEST(ListE2eTest, PromotionDrainsCompleteReplicaControlBarrier) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-promotion-control-drain-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup replica_log_cleanup(replica_log);
+  for (const std::string* path : {&source_data, &replica_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source_port) replica_port = FindFreePort();
+  ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
+                       2);
+  RespClient source_client(source_port);
+  {
+    ServerProcess replica(
+        g_keylane_binary, replica_port, replica_data, replica_log, 2, {}, {},
+        {{"KEYLANE_REPLICATION_PAUSE_BEFORE_CONTROL_APPLY_MS", "1500"}});
+    RespClient replica_client(replica_port);
+    ASSERT_EQ(replica_client.Command({"READONLY"}), "+OK");
+    ASSERT_EQ(source_client.Command({"SET", "promotion-control", "present"}),
+              "+OK");
+    ASSERT_EQ(replica_client.Command(
+                  {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+              "+OK");
+    const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+    std::string info;
+    do {
+      info = replica_client.Command({"INFO", "replication"});
+      if (info.find("keylane_replication_state:online") != std::string::npos) {
+        break;
+      }
+      std::this_thread::sleep_for(10ms);
+    } while (std::chrono::steady_clock::now() < online_deadline);
+    ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+    ASSERT_EQ(replica_client.Command({"GET", "promotion-control"}),
+              Bulk("present"));
+
+    ASSERT_EQ(source_client.Command({"FLUSHDB"}), "+OK");
+    ASSERT_TRUE(WaitForLog(
+        replica_log,
+        "replication control barrier complete; pausing before database apply"));
+    auto promotion = std::async(std::launch::async, [replica_port] {
+      RespClient client(replica_port);
+      return client.Command({"REPLICAOF", "NO", "ONE"});
+    });
+    ASSERT_EQ(promotion.wait_for(10s), std::future_status::ready);
+    EXPECT_EQ(promotion.get(), "+OK");
+    EXPECT_EQ(replica_client.Command({"GET", "promotion-control"}), "$-1");
+    replica.Stop();
+  }
+  {
+    ServerProcess replica(g_keylane_binary, replica_port, replica_data,
+                          replica_log, 2);
+    RespClient replica_client(replica_port);
+    EXPECT_EQ(replica_client.Command({"GET", "promotion-control"}), "$-1");
+    replica.Stop();
+  }
+  source.Stop();
+}
+
+TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix = "/tmp/keylane-redis-fullsync-activation-e2e-" +
+                             std::to_string(::getpid());
+  const std::string replica_data = prefix + "-replica.data";
+  const std::string replica_log = prefix + "-replica.log";
+  FileCleanup replica_cleanup(replica_data);
+  FileCleanup replica_log_cleanup(replica_log);
+  const int fd =
+      ::open(replica_data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  constexpr std::string_view baseline_library =
+      "#!lua name=redis_baseline\n"
+      "redis.register_function{function_name='redis_baseline_value', "
+      "callback=function(keys, args) return args[1] end, "
+      "flags={'no-writes'}}";
+  keylane::rdb::StreamEncoder encoder(10);
+  std::string rdb(encoder.Header());
+  keylane::storage::RawValue baseline_value{
+      .encoded_ = "snapshot-value",
+      .logical_size_ = 14,
+      .value_type_ = keylane::storage::ValueType::kString,
+  };
+  auto baseline_key_fragment =
+      keylane::rdb::EncodeFileEntry(0, "redis-snapshot", baseline_value);
+  ASSERT_TRUE(baseline_key_fragment.ok()) << baseline_key_fragment.status();
+  encoder.Account(*baseline_key_fragment);
+  rdb += *baseline_key_fragment;
+  const std::string baseline_fragment =
+      keylane::rdb::EncodeFunctionLibraryEntry(baseline_library);
+  encoder.Account(baseline_fragment);
+  rdb += baseline_fragment;
+  rdb += encoder.Finish();
+
+  constexpr std::string_view transaction_library =
+      "#!lua name=redis_transaction\n"
+      "redis.register_function{function_name='redis_transaction_value', "
+      "callback=function(keys, args) return args[1] end, "
+      "flags={'no-writes'}}";
+  std::string command_stream;
+  command_stream += EncodeCommand({"SET", "redis-online", "delta"});
+  command_stream += EncodeCommand({"MULTI"});
+  command_stream += EncodeCommand({"FUNCTION", "LOAD", transaction_library});
+  command_stream +=
+      EncodeCommand({"SET", "redis-transaction-key", "transaction-value"});
+  command_stream += EncodeCommand({"EXEC"});
+  RedisPsyncSource source(std::move(rdb), std::move(command_stream));
+
+  std::uint16_t replica_port = FindFreePort();
+  while (replica_port == source.port()) replica_port = FindFreePort();
+  ServerProcess replica(
+      g_keylane_binary, replica_port, replica_data, replica_log, 1, {},
+      {"--redis-replicaof", "127.0.0.1", std::to_string(source.port())});
+  RespClient replica_client(replica_port);
+
+  const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+  std::string info;
+  do {
+    info = replica_client.Command({"INFO", "replication"});
+    if (info.find("keylane_replication_state:online") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+  EXPECT_EQ(replica_client.Command({"GET", "redis-snapshot"}),
+            Bulk("snapshot-value"));
+  EXPECT_EQ(replica_client.Command(
+                {"FCALL_RO", "redis_baseline_value", "0", "snapshot"}),
+            Bulk("snapshot"));
+  EXPECT_TRUE(WaitForEventualReply(replica_client, {"GET", "redis-online"},
+                                   Bulk("delta")));
+  EXPECT_TRUE(WaitForEventualReply(
+      replica_client,
+      {"FCALL_RO", "redis_transaction_value", "0", "replicated"},
+      Bulk("replicated")));
+  EXPECT_EQ(replica_client.Command({"GET", "redis-transaction-key"}),
+            Bulk("transaction-value"));
+
+  replica.Stop();
+}
+
+#ifndef NDEBUG
+TEST(ListE2eTest, DemotionCancelsRedisExportWaitingForDatabaseGates) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-redis-export-demotion-e2e-" + std::to_string(::getpid());
+  const std::string data_path = prefix + ".data";
+  const std::string log_path = prefix + ".log";
+  FileCleanup data_cleanup(data_path);
+  FileCleanup log_cleanup(log_path);
+  const int fd =
+      ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t unavailable_source_port = FindFreePort();
+  std::uint16_t port = FindFreePort();
+  while (port == unavailable_source_port) port = FindFreePort();
+  ServerProcess server(
+      g_keylane_binary, port, data_path, log_path, 2, {}, {},
+      {{"KEYLANE_REPLICATION_PAUSE_REDIS_EXPORT_BEFORE_GATES_MS", "1500"}});
+  auto export_request = std::async(std::launch::async, [port] {
+    try {
+      RespClient client(port);
+      if (client.Command({"REPLCONF", "capa", "eof"}) != "+OK") {
+        return std::string("REPLCONF failed");
+      }
+      return client.Command({"PSYNC", "?", "-1"});
+    } catch (const std::exception&) {
+      return std::string("closed");
+    }
+  });
+  ASSERT_TRUE(WaitForLog(
+      log_path, "Redis export active; pausing before database admission"));
+
+  auto demotion =
+      std::async(std::launch::async, [port, unavailable_source_port] {
+        RespClient client(port);
+        return client.Command({"REPLICAOF", "127.0.0.1",
+                               std::to_string(unavailable_source_port)});
+      });
+  if (demotion.wait_for(10s) != std::future_status::ready) {
+    server.Kill();
+    try {
+      (void)demotion.get();
+    } catch (const std::exception&) {
+    }
+    FAIL() << "demotion deadlocked with Redis export gate acquisition";
+    return;
+  }
+  EXPECT_EQ(demotion.get(), "+OK");
+  ASSERT_EQ(export_request.wait_for(5s), std::future_status::ready);
+  (void)export_request.get();
+  server.Stop();
+}
+
+TEST(ListE2eTest, DemotionCancelsNativeFullSyncHoldingDatabaseGates) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-native-fullsync-demotion-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string target_data = prefix + "-target.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string target_log = prefix + "-target.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup target_cleanup(target_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup target_log_cleanup(target_log);
+  for (const std::string* path : {&source_data, &target_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t target_port = FindFreePort();
+  while (target_port == source_port) target_port = FindFreePort();
+  std::uint16_t unavailable_source_port = FindFreePort();
+  while (unavailable_source_port == source_port ||
+         unavailable_source_port == target_port) {
+    unavailable_source_port = FindFreePort();
+  }
+  ServerProcess source(
+      g_keylane_binary, source_port, source_data, source_log, 2, {}, {},
+      {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS", "30000"}});
+  ServerProcess target(g_keylane_binary, target_port, target_data, target_log,
+                       2);
+  RespClient target_client(target_port);
+  ASSERT_EQ(target_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  ASSERT_TRUE(WaitForLog(
+      source_log,
+      "native full sync holds command gates before catalog acknowledgement"));
+
+  auto demotion =
+      std::async(std::launch::async, [source_port, unavailable_source_port] {
+        RespClient client(source_port);
+        return client.Command({"REPLICAOF", "127.0.0.1",
+                               std::to_string(unavailable_source_port)});
+      });
+  if (demotion.wait_for(10s) != std::future_status::ready) {
+    source.Kill();
+    target.Kill();
+    try {
+      (void)demotion.get();
+    } catch (const std::exception&) {
+    }
+    FAIL() << "demotion deadlocked with native full sync catalog cut";
+    return;
+  }
+  EXPECT_EQ(demotion.get(), "+OK");
+
+  target.Stop();
+  source.Stop();
+}
+
+TEST(ListE2eTest, DemotionDrainsCatalogExecBeforeDisablingSourceHistory) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-catalog-exec-demotion-e2e-" + std::to_string(::getpid());
+  const std::string source_data = prefix + "-source.data";
+  const std::string target_data = prefix + "-target.data";
+  const std::string source_log = prefix + "-source.log";
+  const std::string target_log = prefix + "-target.log";
+  FileCleanup source_cleanup(source_data);
+  FileCleanup target_cleanup(target_data);
+  FileCleanup source_log_cleanup(source_log);
+  FileCleanup target_log_cleanup(target_log);
+  for (const std::string* path : {&source_data, &target_data}) {
+    const int fd =
+        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+    ASSERT_EQ(::close(fd), 0);
+  }
+
+  const std::uint16_t source_port = FindFreePort();
+  std::uint16_t target_port = FindFreePort();
+  while (target_port == source_port) target_port = FindFreePort();
+  std::uint16_t unavailable_source_port = FindFreePort();
+  while (unavailable_source_port == source_port ||
+         unavailable_source_port == target_port) {
+    unavailable_source_port = FindFreePort();
+  }
+  ServerProcess source(
+      g_keylane_binary, source_port, source_data, source_log, 2, {}, {},
+      {{"KEYLANE_EXEC_PAUSE_BEFORE_CATALOG_REPLICATION_FENCE_MS", "1500"}});
+  ServerProcess target(g_keylane_binary, target_port, target_data, target_log,
+                       2);
+  RespClient target_client(target_port);
+  ASSERT_EQ(target_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  const auto online_deadline = std::chrono::steady_clock::now() + 30s;
+  std::string info;
+  do {
+    info = target_client.Command({"INFO", "replication"});
+    if (info.find("keylane_replication_state:online") != std::string::npos) {
+      break;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < online_deadline);
+  ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+
+  const std::string key = KeyForWorker("catalog-demotion", 1, 2);
+  constexpr std::string_view library =
+      "#!lua name=catalog_demotion\n"
+      "redis.register_function{function_name='catalog_demotion_value', "
+      "callback=function(keys, args) return args[1] end, "
+      "flags={'no-writes'}}";
+  auto exec = std::async(std::launch::async, [source_port, key, library] {
+    RespClient client(source_port);
+    if (client.Command({"MULTI"}) != "+OK" ||
+        client.Command({"FUNCTION", "LOAD", library}) != "+QUEUED" ||
+        client.Command({"SET", key, "committed"}) != "+QUEUED") {
+      return std::string("failed to queue catalog transaction");
+    }
+    return client.Command({"EXEC"});
+  });
+  ASSERT_TRUE(WaitForLog(
+      source_log, "catalog EXEC committed; pausing before replication fence"));
+  auto demotion =
+      std::async(std::launch::async, [source_port, unavailable_source_port] {
+        RespClient client(source_port);
+        return client.Command({"REPLICAOF", "127.0.0.1",
+                               std::to_string(unavailable_source_port)});
+      });
+  ASSERT_EQ(exec.wait_for(10s), std::future_status::ready);
+  EXPECT_EQ(exec.get(), "*2\r\n" + Bulk("catalog_demotion") + "\r\n+OK");
+  ASSERT_EQ(demotion.wait_for(10s), std::future_status::ready);
+  EXPECT_EQ(demotion.get(), "+OK");
+
+  RespClient topology_client(source_port);
+  ASSERT_EQ(topology_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+  EXPECT_EQ(topology_client.Command({"SET", "after-demotion", "writable"}),
+            "+OK");
+
+  target.Stop();
+  source.Stop();
+}
+#endif
+
+TEST(ListE2eTest, WriteDelayedAcrossRoleEpochIsRejected) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  const std::string prefix =
+      "/tmp/keylane-role-write-admission-e2e-" + std::to_string(::getpid());
+  const std::string target_data = prefix + "-target.data";
+  const std::string target_log = prefix + "-target.log";
+  FileCleanup target_cleanup(target_data);
+  FileCleanup target_log_cleanup(target_log);
+  const int fd =
+      ::open(target_data.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  ASSERT_GE(fd, 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::close(fd), 0);
+
+  const std::uint16_t unavailable_source_port = FindFreePort();
+  std::uint16_t target_port = FindFreePort();
+  while (target_port == unavailable_source_port) target_port = FindFreePort();
+  ServerProcess target(
+      g_keylane_binary, target_port, target_data, target_log, 1, {}, {},
+      {{"KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "3000"}});
+
+  auto write = std::async(std::launch::async, [target_port] {
+    RespClient client(target_port);
+    return client.Command({"SET", "stale-role-write", "must-not-commit"});
+  });
+  ASSERT_TRUE(WaitForLog(
+      target_log, "client write admitted; pausing before database admission"));
+  RespClient topology_client(target_port);
+  ASSERT_EQ(topology_client.Command({"REPLICAOF", "127.0.0.1",
+                                     std::to_string(unavailable_source_port)}),
+            "+OK");
+  ASSERT_EQ(topology_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+  EXPECT_NE(topology_client.Command({"INFO", "replication"})
+                .find("keylane_replication_state:master"),
+            std::string::npos);
+  ASSERT_EQ(write.wait_for(10s), std::future_status::ready);
+  EXPECT_EQ(write.get(), "-TRYAGAIN replication role changed; retry command");
+
+  target.Stop();
+}
+
+TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOneRemainsFenced) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
       "/tmp/keylane-replication-root-switch-e2e-" + std::to_string(::getpid());
@@ -3795,9 +4950,27 @@ TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOnePublishesEmpty) {
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < promoted_deadline);
   ASSERT_NE(info.find("role:master"), std::string::npos);
-  EXPECT_EQ(replica_client.Command({"GET", "shared{root}"}), "$-1");
-  EXPECT_EQ(replica_client.Command({"GET", "first-only{root}"}), "$-1");
-  EXPECT_EQ(replica_client.Command({"GET", "second-only{root}"}), "$-1");
+  // Starting the replacement permanently invalidated the old population.
+  // Cancelling it with NO ONE cannot make either the old or partial new root
+  // readable; only another whole-group full sync may clear the durable fence.
+  EXPECT_TRUE(
+      replica_client.Command({"GET", "shared{root}"}).starts_with("-LOADING"));
+  EXPECT_TRUE(replica_client.Command({"GET", "first-only{root}"})
+                  .starts_with("-LOADING"));
+  EXPECT_TRUE(replica_client.Command({"GET", "second-only{root}"})
+                  .starts_with("-LOADING"));
+  {
+    RespClient native_probe(replica_port);
+    EXPECT_TRUE(
+        native_probe.Command({"KLPSYNC", "1", "?", "?", "?", "?", "?", "?"})
+            .starts_with("-LOADING"));
+  }
+  {
+    RespClient redis_probe(replica_port);
+    EXPECT_EQ(redis_probe.Command({"REPLCONF", "capa", "eof"}), "+OK");
+    EXPECT_TRUE(
+        redis_probe.Command({"PSYNC", "?", "-1"}).starts_with("-LOADING"));
+  }
 
   ASSERT_EQ(replica_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(second_port)}),
@@ -4703,309 +5876,6 @@ TEST(ListE2eTest, MultiReplicaWriteFlushAndReconnectFlow) {
   second.Stop();
   source.Stop();
 }
-
-// The legacy source-push RPC tests remain as executable documentation until
-// snapshot/apply is moved onto KLPSYNC/KLFLOW in the next replication slice.
-TEST(ListE2eTest, DISABLED_ReplicatesMonolithicCollectionsInChunks) {
-  ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-list-replication-e2e-" + std::to_string(::getpid());
-  const std::string source_data = prefix + "-source.data";
-  const std::string replica_data = prefix + "-replica.data";
-  const std::string source_log = prefix + "-source.log";
-  const std::string replica_log = prefix + "-replica.log";
-  FileCleanup source_cleanup(source_data);
-  FileCleanup replica_cleanup(replica_data);
-  FileCleanup source_log_cleanup(source_log);
-  FileCleanup replica_log_cleanup(replica_log);
-  for (const std::string* path : {&source_data, &replica_data}) {
-    const int fd =
-        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    ASSERT_GE(fd, 0);
-    ASSERT_EQ(::posix_fallocate(fd, 0, 256ULL * 1024 * 1024), 0);
-    ASSERT_EQ(::close(fd), 0);
-  }
-
-  const std::uint16_t source_port = FindFreePort();
-  std::uint16_t replica_port = FindFreePort();
-  while (replica_port == source_port) replica_port = FindFreePort();
-  std::uint16_t replication_port = FindFreePort();
-  while (replication_port == source_port || replication_port == replica_port) {
-    replication_port = FindFreePort();
-  }
-  // 104 elements put each encoded value above the 12 MiB replication RPC
-  // limit, exercising begin/chunk/commit framing for every unbounded type.
-  const std::string element(128 * 1024, 'p');
-
-  // Persist source values before attaching the replica so this exercises both
-  // the baseline snapshot and later deltas.
-  {
-    ServerProcess source(g_keylane_binary, source_port, source_data, source_log,
-                         3);
-    RespClient client(source_port);
-    std::vector<std::string> hash_fields;
-    std::vector<std::string> set_members;
-    std::vector<std::string> zset_scores;
-    std::vector<std::string> zset_members;
-    std::vector<std::string> list_values;
-    hash_fields.reserve(104);
-    set_members.reserve(104);
-    zset_scores.reserve(104);
-    zset_members.reserve(104);
-    list_values.reserve(104);
-    std::vector<std::string_view> rpush{"RPUSH", "replicated-list"};
-    std::vector<std::string_view> hset{"HSET", "replicated-hash"};
-    std::vector<std::string_view> sadd{"SADD", "replicated-set"};
-    std::vector<std::string_view> zadd{"ZADD", "replicated-zset"};
-    for (int i = 0; i < 104; ++i) {
-      list_values.push_back(element + "-" + std::to_string(i));
-      rpush.push_back(list_values.back());
-      hash_fields.push_back("field-" + std::to_string(i));
-      set_members.push_back(element + "-member-" + std::to_string(i));
-      hset.push_back(hash_fields.back());
-      hset.push_back(set_members.back());
-      sadd.push_back(set_members.back());
-      zset_scores.push_back(std::to_string(i));
-      zset_members.push_back(element + "-zmember-" + std::to_string(i));
-      zadd.push_back(zset_scores.back());
-      zadd.push_back(zset_members.back());
-    }
-    ASSERT_EQ(client.Command(rpush), ":104");
-    ASSERT_EQ(client.Command(hset), ":104");
-    ASSERT_EQ(client.Command(sadd), ":104");
-    ASSERT_EQ(client.Command(zadd), ":104");
-    const std::string stream_payload(13 * 1024 * 1024, 's');
-    ASSERT_EQ(client.Command({"XADD", "replicated-stream", "1-0", "field",
-                              stream_payload}),
-              Bulk("1-0"));
-    source.Stop();
-  }
-
-  {
-    ServerProcess replica(
-        g_keylane_binary, replica_port, replica_data, replica_log, 2, {},
-        {"--replication-port", std::to_string(replication_port),
-         "--replica-read-only"});
-    RespClient replica_client(replica_port);
-    ServerProcess source(
-        g_keylane_binary, source_port, source_data, source_log, 4, {},
-        {"--replicate-to", "127.0.0.1:" + std::to_string(replication_port)});
-    RespClient source_client(source_port);
-
-    auto wait_for = [&](auto&& predicate) {
-      const auto deadline = std::chrono::steady_clock::now() + 30s;
-      while (std::chrono::steady_clock::now() < deadline) {
-        if (predicate()) return true;
-        std::this_thread::sleep_for(20ms);
-      }
-      return false;
-    };
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"LLEN", "replicated-list"}) == ":104";
-    }));
-    EXPECT_EQ(replica_client.Command({"LINDEX", "replicated-list", "10"}),
-              Bulk(element + "-10"));
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"HLEN", "replicated-hash"}) == ":104" &&
-             replica_client.Command({"SCARD", "replicated-set"}) == ":104" &&
-             replica_client.Command({"ZCARD", "replicated-zset"}) == ":104" &&
-             replica_client.Command({"XLEN", "replicated-stream"}) == ":1";
-    }));
-    EXPECT_EQ(replica_client.Command({"HGET", "replicated-hash", "field-10"}),
-              Bulk(element + "-member-10"));
-    EXPECT_EQ(replica_client.Command(
-                  {"SISMEMBER", "replicated-set", element + "-member-10"}),
-              ":1");
-    EXPECT_EQ(replica_client.Command(
-                  {"ZSCORE", "replicated-zset", element + "-zmember-10"}),
-              Bulk("10"));
-
-    // Delta capture is already active; the complete updated value is sent.
-    EXPECT_EQ(source_client.Command(
-                  {"RPUSH", "replica-created-list", element, "tail"}),
-              ":2");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"LLEN", "replica-created-list"}) == ":2" &&
-             replica_client.Command({"LINDEX", "replica-created-list", "-1"}) ==
-                 Bulk("tail");
-    }));
-    EXPECT_EQ(
-        source_client.Command({"LSET", "replicated-list", "10", "delta-value"}),
-        "+OK");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"LINDEX", "replicated-list", "10"}) ==
-             Bulk("delta-value");
-    }));
-    EXPECT_EQ(source_client.Command({"LPUSH", "replicated-list", "delta-head"}),
-              ":105");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"LINDEX", "replicated-list", "0"}) ==
-             Bulk("delta-head");
-    }));
-    EXPECT_EQ(source_client.Command(
-                  {"HSET", "replicated-hash", "field-10", "hash-delta"}),
-              ":0");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"HGET", "replicated-hash", "field-10"}) ==
-             Bulk("hash-delta");
-    }));
-    ASSERT_EQ(source_client.Command(
-                  {"SREM", "replicated-set", element + "-member-10"}),
-              ":1");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"SISMEMBER", "replicated-set",
-                                     element + "-member-10"}) == ":0";
-    }));
-    EXPECT_EQ(source_client.Command({"PEXPIRE", "replicated-list", "600000"}),
-              ":1");
-    ASSERT_TRUE(wait_for([&] {
-      const std::string ttl =
-          replica_client.Command({"PTTL", "replicated-list"});
-      return ttl.starts_with(':') && std::stoll(ttl.substr(1)) > 0;
-    }));
-    EXPECT_EQ(source_client.Command({"LTRIM", "replicated-list", "0", "39"}),
-              "+OK");
-    ASSERT_TRUE(wait_for([&] {
-      return replica_client.Command({"LLEN", "replicated-list"}) == ":40";
-    }));
-    source.Stop();
-    replica.Stop();
-  }
-
-  // The receiver persisted a local logical List, not the source's block
-  // references; standalone recovery must therefore rebuild it normally.
-  {
-    ServerProcess replica(g_keylane_binary, replica_port, replica_data,
-                          replica_log, 3);
-    RespClient client(replica_port);
-    EXPECT_EQ(client.Command({"LLEN", "replicated-list"}), ":40");
-    EXPECT_EQ(client.Command({"LINDEX", "replicated-list", "0"}),
-              Bulk("delta-head"));
-    EXPECT_EQ(client.Command({"HGET", "replicated-hash", "field-10"}),
-              Bulk("hash-delta"));
-    EXPECT_EQ(
-        client.Command({"SISMEMBER", "replicated-set", element + "-member-10"}),
-        ":0");
-    EXPECT_EQ(client.Command({"ZCARD", "replicated-zset"}), ":104");
-    EXPECT_EQ(client.Command({"XLEN", "replicated-stream"}), ":1");
-    replica.Stop();
-  }
-}
-
-TEST(ListE2eTest, DISABLED_ReplicaFlushDbDoesNotInvalidateInFlightListRead) {
-  ASSERT_FALSE(g_keylane_binary.empty());
-  const std::string prefix =
-      "/tmp/keylane-list-replica-flush-race-" + std::to_string(::getpid());
-  const std::string source_data = prefix + "-source.data";
-  const std::string replica_data = prefix + "-replica.data";
-  const std::string source_log = prefix + "-source.log";
-  const std::string replica_log = prefix + "-replica.log";
-  FileCleanup source_cleanup(source_data);
-  FileCleanup replica_cleanup(replica_data);
-  FileCleanup source_log_cleanup(source_log);
-  FileCleanup replica_log_cleanup(replica_log);
-  for (const std::string* path : {&source_data, &replica_data}) {
-    const int fd =
-        ::open(path->c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-    ASSERT_GE(fd, 0);
-    ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
-    ASSERT_EQ(::close(fd), 0);
-  }
-
-  const std::uint16_t source_port = FindFreePort();
-  std::uint16_t replica_port = FindFreePort();
-  while (replica_port == source_port) replica_port = FindFreePort();
-  std::uint16_t replication_port = FindFreePort();
-  while (replication_port == source_port || replication_port == replica_port) {
-    replication_port = FindFreePort();
-  }
-  std::vector<std::pair<std::string, std::string>> replica_environment;
-#ifndef NDEBUG
-  replica_environment.emplace_back("KEYLANE_LIST_READ_PAUSE_MS", "500");
-  replica_environment.emplace_back("KEYLANE_HASH_READ_PAUSE_MS", "500");
-#endif
-  ServerProcess replica(g_keylane_binary, replica_port, replica_data,
-                        replica_log, 2, {},
-                        {"--replication-port", std::to_string(replication_port),
-                         "--replica-read-only"},
-                        std::move(replica_environment));
-  ServerProcess source(
-      g_keylane_binary, source_port, source_data, source_log, 2, {},
-      {"--replicate-to", "127.0.0.1:" + std::to_string(replication_port)});
-  RespClient source_client(source_port);
-  RespClient replica_client(replica_port);
-  ASSERT_EQ(source_client.Command({"SELECT", "1"}), "+OK");
-  ASSERT_EQ(replica_client.Command({"SELECT", "1"}), "+OK");
-
-  const std::string element(128 * 1024, 'r');
-  ASSERT_EQ(source_client.Command({"RPUSH", "race-list", element, "tail"}),
-            ":2");
-  ASSERT_EQ(source_client.Command({"HSET", "race-hash", "field", "value"}),
-            ":1");
-  ASSERT_EQ(source_client.Command({"SADD", "race-set", "member"}), ":1");
-  const auto replication_deadline = std::chrono::steady_clock::now() + 120s;
-  while (std::chrono::steady_clock::now() < replication_deadline &&
-         replica_client.Command({"LLEN", "race-list"}) != ":2") {
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_EQ(replica_client.Command({"LLEN", "race-list"}), ":2");
-  while (std::chrono::steady_clock::now() < replication_deadline &&
-         replica_client.Command({"HGET", "race-hash", "field"}) !=
-             Bulk("value")) {
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_EQ(replica_client.Command({"HGET", "race-hash", "field"}),
-            Bulk("value"));
-  while (std::chrono::steady_clock::now() < replication_deadline &&
-         replica_client.Command({"SISMEMBER", "race-set", "member"}) != ":1") {
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_EQ(replica_client.Command({"SISMEMBER", "race-set", "member"}), ":1");
-
-  // A replica epoch delta bypasses the client DB gate. Pause after the read
-  // snapshots RecordLocation/extents and drops store_state_mutex_, then
-  // detach that complete index. The read can linearize on either side of
-  // FLUSHDB, but it must neither touch the freed Entry nor surface an internal
-  // storage error.
-  auto in_flight_read = std::async(std::launch::async, [replica_port] {
-    RespClient reader(replica_port);
-    if (reader.Command({"SELECT", "1"}) != "+OK") return std::string{};
-    return reader.Command({"LINDEX", "race-list", "0"});
-  });
-  auto in_flight_hash_read = std::async(std::launch::async, [replica_port] {
-    RespClient reader(replica_port);
-    if (reader.Command({"SELECT", "1"}) != "+OK") return std::string{};
-    return reader.Command({"HGET", "race-hash", "field"});
-  });
-  auto in_flight_set_read = std::async(std::launch::async, [replica_port] {
-    RespClient reader(replica_port);
-    if (reader.Command({"SELECT", "1"}) != "+OK") return std::string{};
-    return reader.Command({"SISMEMBER", "race-set", "member"});
-  });
-#ifndef NDEBUG
-  std::this_thread::sleep_for(100ms);
-#endif
-  ASSERT_EQ(source_client.Command({"FLUSHDB"}), "+OK");
-  const auto flush_deadline = std::chrono::steady_clock::now() + 120s;
-  while (std::chrono::steady_clock::now() < flush_deadline &&
-         replica_client.Command({"DBSIZE"}) != ":0") {
-    std::this_thread::sleep_for(20ms);
-  }
-  ASSERT_EQ(replica_client.Command({"DBSIZE"}), ":0");
-  const std::string raced_reply = in_flight_read.get();
-  EXPECT_TRUE(raced_reply == Bulk(element) || raced_reply == "$-1")
-      << raced_reply.substr(0, 256);
-  const std::string raced_hash_reply = in_flight_hash_read.get();
-  EXPECT_TRUE(raced_hash_reply == Bulk("value") || raced_hash_reply == "$-1")
-      << raced_hash_reply.substr(0, 256);
-  const std::string raced_set_reply = in_flight_set_read.get();
-  EXPECT_TRUE(raced_set_reply == ":1" || raced_set_reply == ":0")
-      << raced_set_reply.substr(0, 256);
-  EXPECT_EQ(replica_client.Command({"PING"}), "+PONG");
-  source.Stop();
-  replica.Stop();
-}
-
 TEST(HashE2eTest, UpdatesTransactionsAndRecoversMonolithicValues) {
   ASSERT_FALSE(g_keylane_binary.empty());
   const std::string prefix =
@@ -5526,7 +6396,7 @@ TEST(CollectionE2eTest, ExecPartialWritesRollbackDurably) {
   const int fd =
       ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);
-  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 160ULL * 1024 * 1024), 0);
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();
@@ -5596,7 +6466,7 @@ TEST(CollectionE2eTest, ExecStoreReplacementRollbackDurably) {
   const int fd =
       ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);
-  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 160ULL * 1024 * 1024), 0);
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();
@@ -6203,9 +7073,8 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
     } while (scan_cursor != "0");
     EXPECT_TRUE(saw_empty_key);
 
-    EXPECT_EQ(
-        client.Command({"CONFIG", "SET", "stream-node-max-entries", "1"}),
-        "+OK");
+    EXPECT_EQ(client.Command({"CONFIG", "SET", "stream-node-max-entries", "1"}),
+              "+OK");
     EXPECT_EQ(client.Command({"XADD", "bare-ms", "1", "f", "v"}), Bulk("1-0"));
     EXPECT_TRUE(client.Command({"XADD", "bare-ms", "1", "f", "v2"})
                     .starts_with("-ERR The ID specified in XADD"));
@@ -6241,9 +7110,9 @@ TEST(CollectionE2eTest, SortedSetGeoAndStreamCommandsRecover) {
                       "6-0", "f", "6"})
             .starts_with("-ERR syntax error, MAXLEN and MINID options at the "
                          "same time are not compatible"));
-    EXPECT_EQ(client.Command(
-                  {"CONFIG", "SET", "stream-node-max-entries", "100"}),
-              "+OK");
+    EXPECT_EQ(
+        client.Command({"CONFIG", "SET", "stream-node-max-entries", "100"}),
+        "+OK");
     EXPECT_EQ(client.Command({"XGROUP", "CREATE", "xgroup-options", "g", "0",
                               "MKSTREAM", "ENTRIESREAD", "0"}),
               "+OK");
@@ -6725,7 +7594,7 @@ TEST(CollectionE2eTest, StringCommandsRecover) {
   const int fd =
       ::open(data_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   ASSERT_GE(fd, 0);
-  ASSERT_EQ(::posix_fallocate(fd, 0, 128ULL * 1024 * 1024), 0);
+  ASSERT_EQ(::posix_fallocate(fd, 0, 160ULL * 1024 * 1024), 0);
   ASSERT_EQ(::close(fd), 0);
 
   const std::uint16_t port = FindFreePort();

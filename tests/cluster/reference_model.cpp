@@ -11,7 +11,7 @@
 namespace keylane::test::cluster {
 namespace {
 
-constexpr std::array<ScenarioDescriptor, 6> kScenarioDescriptors{
+constexpr std::array<ScenarioDescriptor, 9> kScenarioDescriptors{
     ScenarioDescriptor{Counterexample::kNone, "good", "cluster-reference-good",
                        ""},
     ScenarioDescriptor{Counterexample::kDualAuthority, "dual-authority",
@@ -29,6 +29,18 @@ constexpr std::array<ScenarioDescriptor, 6> kScenarioDescriptors{
     ScenarioDescriptor{Counterexample::kStaleDirective, "stale-directive",
                        "cluster-mutant-stale-directive",
                        "meta.directive-evidence-scoped"},
+    ScenarioDescriptor{Counterexample::kCatalogAckBeforeDurable,
+                       "catalog-ack-before-durable",
+                       "cluster-mutant-catalog-ack-before-durable",
+                       "function.catalog-durable-before-ack"},
+    ScenarioDescriptor{Counterexample::kFullSyncRetainsOldState,
+                       "fullsync-retains-old-state",
+                       "cluster-mutant-fullsync-retains-old-state",
+                       "fullsync.destructive-invalidation-before-transfer"},
+    ScenarioDescriptor{Counterexample::kStaleCatalogPromotion,
+                       "stale-catalog-promotion",
+                       "cluster-mutant-stale-catalog-promotion",
+                       "promotion.catalog-token-current"},
 };
 
 const ScenarioDescriptor& DescriptorFor(Counterexample counterexample) {
@@ -218,6 +230,10 @@ class ExplorationWorld final : public ScenarioWorld {
         },
     };
     snapshot_.promotion_.candidate_selected_ = true;
+    snapshot_.promotion_.promotion_base_committed_ = false;
+    snapshot_.promotion_.population_token_valid_ = true;
+    snapshot_.promotion_.captured_catalog_generation_ = CatalogGeneration{1};
+    snapshot_.promotion_.current_catalog_generation_ = CatalogGeneration{1};
     snapshot_.resume_ = ResumeObservation{
         .source_boot_ = BootId{1},
         .target_boot_ = BootId{1},
@@ -409,6 +425,7 @@ class ExplorationWorld final : public ScenarioWorld {
       if (!flushed.ok()) return flushed;
       candidate_durable_ = true;
       snapshot_.promotion_.durability_barrier_complete_ = true;
+      snapshot_.promotion_.promotion_base_committed_ = true;
     } else if (*kind == ExplorationAction::kPersistPrefix) {
       if (decision.effect_ != FaultEffect::kPersistPrefix) {
         return absl::InternalError("prefix fault rule did not fire");
@@ -600,6 +617,11 @@ enum class ScriptStep : std::uint8_t {
   kCaptureDirective,
   kRestartDirectiveTarget,
   kReplayStaleDirective,
+  kAcknowledgeCatalog,
+  kBeginFullSync,
+  kCaptureCatalogToken,
+  kAdvanceCatalogGeneration,
+  kActivateWithCatalogToken,
 };
 
 struct ScriptStepDescriptor {
@@ -607,7 +629,7 @@ struct ScriptStepDescriptor {
   std::string_view name_;
 };
 
-constexpr std::array<ScriptStepDescriptor, 15> kScriptStepDescriptors{
+constexpr std::array<ScriptStepDescriptor, 20> kScriptStepDescriptors{
     ScriptStepDescriptor{ScriptStep::kAdmitOldWrite, "admit-old-write"},
     ScriptStepDescriptor{ScriptStep::kExpireOldGrant, "expire-old-grant"},
     ScriptStepDescriptor{ScriptStep::kActivateCandidate, "activate-candidate"},
@@ -629,6 +651,15 @@ constexpr std::array<ScriptStepDescriptor, 15> kScriptStepDescriptors{
                          "restart-directive-target"},
     ScriptStepDescriptor{ScriptStep::kReplayStaleDirective,
                          "replay-stale-directive"},
+    ScriptStepDescriptor{ScriptStep::kAcknowledgeCatalog,
+                         "acknowledge-catalog"},
+    ScriptStepDescriptor{ScriptStep::kBeginFullSync, "begin-full-sync"},
+    ScriptStepDescriptor{ScriptStep::kCaptureCatalogToken,
+                         "capture-catalog-token"},
+    ScriptStepDescriptor{ScriptStep::kAdvanceCatalogGeneration,
+                         "advance-catalog-generation"},
+    ScriptStepDescriptor{ScriptStep::kActivateWithCatalogToken,
+                         "activate-with-catalog-token"},
 };
 
 std::string_view ScriptStepName(ScriptStep step) {
@@ -683,6 +714,8 @@ class ClusterScenarioWorld final : public ScenarioWorld {
     snapshot_.meta_.directive_operation_ = OperationId{1};
     snapshot_.meta_.current_boot_ = BootId{1};
     snapshot_.meta_.evidence_boot_ = BootId{1};
+    snapshot_.promotion_.captured_catalog_generation_ = CatalogGeneration{1};
+    snapshot_.promotion_.current_catalog_generation_ = CatalogGeneration{1};
   }
 
   std::vector<Action> EnabledActions() const override {
@@ -739,6 +772,11 @@ class ClusterScenarioWorld final : public ScenarioWorld {
     static constexpr std::array directive{ScriptStep::kCaptureDirective,
                                           ScriptStep::kRestartDirectiveTarget,
                                           ScriptStep::kReplayStaleDirective};
+    static constexpr std::array catalog{ScriptStep::kAcknowledgeCatalog};
+    static constexpr std::array full_sync{ScriptStep::kBeginFullSync};
+    static constexpr std::array stale_catalog{
+        ScriptStep::kCaptureCatalogToken, ScriptStep::kAdvanceCatalogGeneration,
+        ScriptStep::kActivateWithCatalogToken};
     switch (counterexample_) {
       case Counterexample::kNone:
       case Counterexample::kDualAuthority:
@@ -751,6 +789,12 @@ class ClusterScenarioWorld final : public ScenarioWorld {
         return activation;
       case Counterexample::kStaleDirective:
         return directive;
+      case Counterexample::kCatalogAckBeforeDurable:
+        return catalog;
+      case Counterexample::kFullSyncRetainsOldState:
+        return full_sync;
+      case Counterexample::kStaleCatalogPromotion:
+        return stale_catalog;
     }
     return authority;
   }
@@ -802,6 +846,24 @@ class ClusterScenarioWorld final : public ScenarioWorld {
     } else if (step == ScriptStep::kReplayStaleDirective) {
       snapshot_.meta_.directive_applied_ =
           counterexample_ == Counterexample::kStaleDirective;
+    } else if (step == ScriptStep::kAcknowledgeCatalog) {
+      snapshot_.function_catalog_.applied_cursor_advanced_ = true;
+      snapshot_.function_catalog_.replica_ack_sent_ = true;
+    } else if (step == ScriptStep::kBeginFullSync) {
+      snapshot_.full_sync_.in_progress_ = true;
+      // The mutant begins transfer without first committing the destructive
+      // invalidation of the old population, catalog readiness, and base.
+    } else if (step == ScriptStep::kCaptureCatalogToken) {
+      snapshot_.promotion_.candidate_selected_ = true;
+      snapshot_.promotion_.durability_barrier_complete_ = true;
+      snapshot_.promotion_.promotion_base_committed_ = true;
+      snapshot_.promotion_.population_token_valid_ = true;
+      snapshot_.promotion_.child_history_ready_ = true;
+    } else if (step == ScriptStep::kAdvanceCatalogGeneration) {
+      snapshot_.promotion_.current_catalog_generation_ = CatalogGeneration{2};
+    } else if (step == ScriptStep::kActivateWithCatalogToken) {
+      snapshot_.promotion_.candidate_activated_ = true;
+      snapshot_.promotion_.write_gate_open_ = true;
     }
   }
 

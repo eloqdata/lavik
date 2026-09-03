@@ -438,6 +438,7 @@ int main(int argc, char** argv) {
                    "FCALL does not inherit EVAL globals");
     Expect(client.Command({"FCALL_RO", "keylane_json", "0", "{\"number\":41}"}),
            Bulk("{\"answer\":42}"), "FCALL cjson encode and decode");
+
     ExpectContains(
         client.Command(
             {"FCALL_RO", "keylane_set", "1", "function:key", "blocked"}),
@@ -1561,6 +1562,45 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(300ms);
 
     server.Stop();
+
+    // Function mutations acknowledge only after their complete catalog dump
+    // is durable. Exercise startup recovery for an ordinary LOAD/RESTORE and
+    // for the two emptying mutations, including ASYNC (which changes only
+    // runtime reclamation, never the durability boundary).
+    {
+      ServerProcess restarted(argv[1], port, data_path, log_path);
+      RespClient recovered = Connect(port);
+      ExpectContains(
+          recovered.Command({"FCALL_RO", "keylane_globals", "0"}),
+          "Script attempted to access nonexistent global variable 'KEYS'",
+          "Function catalog preserves protected globals after restart");
+      Expect(recovered.Command({"FCALL", "transaction_set", "1",
+                                "function:restart", "durable"}),
+             "+OK", "transaction-loaded Function survives restart");
+      Expect(recovered.Command({"FUNCTION", "DELETE", "keylane_test"}), "+OK",
+             "durable FUNCTION DELETE");
+      restarted.Stop();
+    }
+    {
+      ServerProcess restarted(argv[1], port, data_path, log_path);
+      RespClient recovered = Connect(port);
+      ExpectContains(
+          recovered.Command({"FCALL", "keylane_get", "1", "function:key"}),
+          "Function not found", "FUNCTION DELETE survives restart");
+      Expect(recovered.Command({"GET", "function:restart"}), Bulk("durable"),
+             "Function write survives restart");
+      Expect(recovered.Command({"FUNCTION", "FLUSH", "ASYNC"}), "+OK",
+             "durable FUNCTION FLUSH ASYNC");
+      restarted.Stop();
+    }
+    {
+      ServerProcess restarted(argv[1], port, data_path, log_path);
+      RespClient recovered = Connect(port);
+      ExpectContains(recovered.Command({"FCALL", "transaction_set", "1",
+                                        "function:restart", "x"}),
+                     "Function not found", "FUNCTION FLUSH survives restart");
+      restarted.Stop();
+    }
   } catch (const std::exception& error) {
     std::cerr << error.what() << "\n--- Keylane log ---\n"
               << ReadFile(log_path) << std::flush;

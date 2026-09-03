@@ -1,0 +1,11 @@
+KFT1
+mode	exact-model
+scenario	cluster-mutant-fullsync-retains-old-state
+schema	1
+seed	7
+initial	CA65593EB675E5B7
+record	0	observation	world	phase%3D0%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	choice	action	begin-full-sync%3B0%3B
+record	1	ack	begin-full-sync	applied
+record	1	observation	world	phase%3D1%3Bold%3D1%3Bnew%3D0%3Bsource-boot%3D1%3Btarget-boot%3D1%3Bpartial%3D0%3Bcoverage%3D1%3Bpopulation-complete%3D1
+record	1	finding	fullsync.destructive-invalidation-before-transfer	full-sync-started-with-old-recovery-evidence

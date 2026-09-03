@@ -1404,6 +1404,114 @@ class ReplicationLogService final : public celer::Service {
     co_return absl::OkStatus();
   }
 
+  celer::Task<absl::Status> ExerciseHardBacklogCap() {
+    // A connected consumer advertises its first unacknowledged LSN, but the
+    // backlog is a hard reconnect window. Filling it revokes lagging coverage
+    // and evicts only complete events; the sender then observes a floor gap
+    // and forces a whole-group full sync.
+    absl::Status status = co_await storage_->EnableReplicationLog(17, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(77, 1);
+    if (!status.ok()) co_return status;
+    RepeatedByteSource pinned_payload(7 * kMiB, 'P');
+    auto pinned_first =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 1,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!pinned_first.ok()) co_return pinned_first.status();
+    auto pinned_second =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 2,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!pinned_second.ok()) co_return pinned_second.status();
+    const auto pinned_info = storage_->LocalReplicationLogInfo();
+    Check(pinned_info.retained_cursor_count_ == 0 &&
+              pinned_info.coverage_revocations_ == 1,
+          "hard-cap eviction did not revoke the lagging coverage claim");
+    Check(pinned_info.floor_lsn_ == 2,
+          "hard-cap eviction did not retain a complete newest event");
+    auto disconnected_append =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 3,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!disconnected_append.ok()) co_return disconnected_append.status();
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    // A larger reconnect window follows the same rule: the first publication
+    // that needs the ninth block revokes the stale claim and retains the
+    // newest eight complete events.
+    status = co_await storage_->EnableReplicationLog(20, 8 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(79, 1);
+    if (!status.ok()) co_return status;
+    for (std::uint64_t lsn = 1; lsn <= 8; ++lsn) {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = lsn,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      if (!appended.ok()) co_return appended.status();
+    }
+    auto reconnect_append =
+        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+            .kind_ = ReplicationEventKind::kMutation,
+            .partition_id_ = 9,
+            .partition_sequence_ = 9,
+            .payload_ = {},
+            .payload_source_ = &pinned_payload,
+        });
+    if (!reconnect_append.ok()) co_return reconnect_append.status();
+    const auto reconnect_info = storage_->LocalReplicationLogInfo();
+    Check(reconnect_info.floor_lsn_ == 2 &&
+              reconnect_info.retained_cursor_count_ == 0,
+          "hard-cap eviction did not revoke the large-window claim");
+    auto reconnect_cursor = co_await storage_->ReadReplicationLog(
+        ReplicationLogCursor{.lsn_ = 2}, kMiB, 1);
+    if (!reconnect_cursor.ok()) co_return reconnect_cursor.status();
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+
+    // Runtime growth preserves the retained reconnect suffix after hard-cap
+    // eviction; it never resurrects the revoked coverage claim.
+    status = co_await storage_->EnableReplicationLog(18, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(78, 1);
+    if (!status.ok()) co_return status;
+    for (std::uint64_t sequence = 1; sequence <= 2; ++sequence) {
+      auto appended =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = sequence,
+              .payload_ = {},
+              .payload_source_ = &pinned_payload,
+          });
+      if (!appended.ok()) co_return appended.status();
+    }
+    status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
+    if (!status.ok()) co_return status;
+    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 2 &&
+              storage_->LocalReplicationLogInfo().retained_cursor_count_ == 0,
+          "backlog growth resurrected evicted coverage");
+    co_return co_await storage_->DisableReplicationLog();
+  }
+
   celer::Task<absl::Status> Exercise() {
     absl::Status status = co_await ExerciseFullSyncOverrides();
     if (!status.ok()) co_return status;
@@ -1522,6 +1630,7 @@ class ReplicationLogService final : public celer::Service {
 
     status = co_await ExercisePartitionHandoff();
     if (!status.ok()) co_return status;
+    const auto before_oversized = storage_->LocalReplicationLogInfo();
     RepeatedByteSource too_large(9 * kMiB, 'x');
     auto oversized =
         co_await storage_->AppendReplicationLog(ReplicationLogAppend{
@@ -1530,11 +1639,14 @@ class ReplicationLogService final : public celer::Service {
             .payload_ = {},
             .payload_source_ = &too_large,
         });
-    if (!oversized.ok()) co_return oversized.status();
-    Check(storage_->LocalReplicationLogInfo().state_ ==
-                  ReplicationLogState::kActive &&
-              storage_->LocalReplicationLogInfo().block_count_ == 2,
-          "one oversized event could not temporarily exceed the backlog");
+    Check(
+        !oversized.ok() &&
+            oversized.status().code() == absl::StatusCode::kResourceExhausted &&
+            storage_->LocalReplicationLogInfo().state_ ==
+                ReplicationLogState::kActive &&
+            storage_->LocalReplicationLogInfo().tail_lsn_ ==
+                before_oversized.tail_lsn_,
+        "one oversized event exceeded the hard backlog cap");
     auto after_oversized =
         co_await storage_->AppendReplicationLog(ReplicationLogAppend{
             .partition_id_ = 3,
@@ -1543,8 +1655,8 @@ class ReplicationLogService final : public celer::Service {
             .payload_source_ = nullptr,
         });
     if (!after_oversized.ok()) co_return after_oversized.status();
-    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == *after_oversized,
-          "the complete oversized event was not evicted atomically");
+    Check(*after_oversized == before_oversized.tail_lsn_ + 1,
+          "an oversized admission failure consumed an event LSN");
     status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
     if (!status.ok()) co_return status;
     Check(
@@ -1786,181 +1898,7 @@ class ReplicationLogService final : public celer::Service {
               storage_->LocalReplicationLogInfo().block_count_ == 0,
           "disable did not reclaim the replication log");
 
-    // A connected consumer pins its first unacknowledged LSN. Filling the
-    // memory backlog must suspend the publisher instead of silently evicting
-    // that LSN; advancing the ACK cursor releases it without invalidating the
-    // history.
-    status = co_await storage_->EnableReplicationLog(17, 8 * kMiB);
-    if (!status.ok()) co_return status;
-    status = storage_->RetainReplicationLog(77, 1);
-    if (!status.ok()) co_return status;
-    RepeatedByteSource pinned_payload(7 * kMiB, 'P');
-    auto pinned_first =
-        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-            .kind_ = ReplicationEventKind::kMutation,
-            .partition_id_ = 9,
-            .partition_sequence_ = 1,
-            .payload_ = {},
-            .payload_source_ = &pinned_payload,
-        });
-    if (!pinned_first.ok()) co_return pinned_first.status();
-    bool pinned_append_finished = false;
-    absl::Status pinned_append_status =
-        absl::UnknownError("pinned backlog append did not run");
-    auto append_while_pinned = [&]() -> celer::Task<absl::Status> {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .kind_ = ReplicationEventKind::kMutation,
-              .partition_id_ = 9,
-              .partition_sequence_ = 2,
-              .payload_ = {},
-              .payload_source_ = &pinned_payload,
-          });
-      pinned_append_status = appended.status();
-      pinned_append_finished = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(append_while_pinned());
-    co_await celer::Yield(*worker_);
-    Check(!pinned_append_finished,
-          "backlog capacity evicted history below a connected consumer");
-    const auto pinned_info = storage_->LocalReplicationLogInfo();
-    Check(pinned_info.capacity_backpressured_ &&
-              pinned_info.retained_cursor_count_ == 1 &&
-              pinned_info.backpressure_waits_ == 1,
-          "backlog pressure or ACK pin metrics did not reflect the waiter");
-    status = storage_->RetainReplicationLog(77, 2);
-    if (!status.ok()) co_return status;
-    while (!pinned_append_finished) co_await celer::Yield(*worker_);
-    if (!pinned_append_status.ok()) co_return pinned_append_status;
-    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 2 &&
-              !storage_->LocalReplicationLogInfo().capacity_backpressured_,
-          "consumer ACK did not release the acknowledged backlog block");
-    bool disconnected_append_finished = false;
-    absl::Status disconnected_append_status =
-        absl::UnknownError("disconnected backlog append did not run");
-    auto append_until_disconnect = [&]() -> celer::Task<absl::Status> {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .kind_ = ReplicationEventKind::kMutation,
-              .partition_id_ = 9,
-              .partition_sequence_ = 3,
-              .payload_ = {},
-              .payload_source_ = &pinned_payload,
-          });
-      disconnected_append_status = appended.status();
-      disconnected_append_finished = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(append_until_disconnect());
-    co_await celer::Yield(*worker_);
-    Check(!disconnected_append_finished,
-          "backlog did not wait for the second unacknowledged LSN");
-    storage_->ReleaseReplicationLogRetention(77);
-    while (!disconnected_append_finished) co_await celer::Yield(*worker_);
-    if (!disconnected_append_status.ok()) {
-      co_return disconnected_append_status;
-    }
-    status = co_await storage_->DisableReplicationLog();
-    if (!status.ok()) co_return status;
-
-    // Advancing a connected replica by one complete block must hand that space
-    // directly to the waiting publisher. Waiting for a percentage-based low
-    // watermark makes a large reconnect window produce arbitrarily long
-    // zero-throughput stalls even while replica ACKs keep advancing.
-    status = co_await storage_->EnableReplicationLog(20, 8 * 8 * kMiB);
-    if (!status.ok()) co_return status;
-    status = storage_->RetainReplicationLog(79, 1);
-    if (!status.ok()) co_return status;
-    for (std::uint64_t lsn = 1; lsn <= 8; ++lsn) {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .kind_ = ReplicationEventKind::kMutation,
-              .partition_id_ = 9,
-              .partition_sequence_ = lsn,
-              .payload_ = {},
-              .payload_source_ = &pinned_payload,
-          });
-      if (!appended.ok()) co_return appended.status();
-    }
-    bool reconnect_append_finished = false;
-    absl::Status reconnect_append_status =
-        absl::UnknownError("reconnect-window append did not run");
-    auto append_for_reconnect = [&]() -> celer::Task<absl::Status> {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .kind_ = ReplicationEventKind::kMutation,
-              .partition_id_ = 9,
-              .partition_sequence_ = 9,
-              .payload_ = {},
-              .payload_source_ = &pinned_payload,
-          });
-      reconnect_append_status = appended.status();
-      reconnect_append_finished = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(append_for_reconnect());
-    co_await celer::Yield(*worker_);
-    Check(!reconnect_append_finished,
-          "full backlog did not wait for its retained cursor");
-    status = storage_->RetainReplicationLog(79, 2);
-    if (!status.ok()) co_return status;
-    while (!reconnect_append_finished) co_await celer::Yield(*worker_);
-    Check(reconnect_append_status.ok(),
-          "ACKed backlog block did not release the waiting publisher");
-    storage_->ReleaseReplicationLogRetention(79);
-    const auto reconnect_info = storage_->LocalReplicationLogInfo();
-    Check(reconnect_info.floor_lsn_ == 2,
-          "disconnect eagerly discarded part of the reconnect window");
-    auto reconnect_cursor = co_await storage_->ReadReplicationLog(
-        ReplicationLogCursor{.lsn_ = 2}, kMiB, 1);
-    if (!reconnect_cursor.ok()) co_return reconnect_cursor.status();
-    status = co_await storage_->DisableReplicationLog();
-    if (!status.ok()) co_return status;
-
-    // Runtime growth must be able to release an ACK-capacity wait. It cannot
-    // queue behind the append mutex held by the suspended publisher.
-    status = co_await storage_->EnableReplicationLog(18, 8 * kMiB);
-    if (!status.ok()) co_return status;
-    status = storage_->RetainReplicationLog(78, 1);
-    if (!status.ok()) co_return status;
-    auto resize_first =
-        co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-            .kind_ = ReplicationEventKind::kMutation,
-            .partition_id_ = 9,
-            .partition_sequence_ = 1,
-            .payload_ = {},
-            .payload_source_ = &pinned_payload,
-        });
-    if (!resize_first.ok()) co_return resize_first.status();
-    bool resize_append_finished = false;
-    absl::Status resize_append_status =
-        absl::UnknownError("resized backlog append did not run");
-    auto append_until_resize = [&]() -> celer::Task<absl::Status> {
-      auto appended =
-          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
-              .kind_ = ReplicationEventKind::kMutation,
-              .partition_id_ = 9,
-              .partition_sequence_ = 2,
-              .payload_ = {},
-              .payload_source_ = &pinned_payload,
-          });
-      resize_append_status = appended.status();
-      resize_append_finished = true;
-      co_return absl::OkStatus();
-    };
-    worker_->Spawn(append_until_resize());
-    co_await celer::Yield(*worker_);
-    Check(!resize_append_finished,
-          "resize test did not reach backlog capacity pressure");
-    status = co_await storage_->SetReplicationLogCapacity(2 * 8 * kMiB);
-    if (!status.ok()) co_return status;
-    while (!resize_append_finished) co_await celer::Yield(*worker_);
-    if (!resize_append_status.ok()) co_return resize_append_status;
-    Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 1,
-          "backlog growth discarded live retained history");
-    storage_->ReleaseReplicationLogRetention(78);
-    status = co_await storage_->DisableReplicationLog();
+    status = co_await ExerciseHardBacklogCap();
     if (!status.ok()) co_return status;
 
     status = co_await ExerciseCanonicalTransactionGrowth();

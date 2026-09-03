@@ -13,6 +13,101 @@ std::vector<std::uint64_t> InitialEpochValues() {
   return values;
 }
 
+struct MirroredSystemStateRoot {
+  std::uint64_t generation_ = 0;
+  SystemStateRoot root_{};
+  std::array<std::byte, sizeof(SystemStateRoot)> payload_{};
+};
+
+absl::StatusOr<std::vector<MirroredSystemStateRoot>>
+ReadSystemStateRootCandidates(const std::string& path) {
+  std::vector<MirroredSystemStateRoot> candidates;
+  bool saw_nonzero = false;
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    std::array<std::byte, kDirectIoAlignment> page{};
+    absl::Status read = ReadExactlyAt(
+        path, page,
+        MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot));
+    if (!read.ok()) return read;
+    if (IsZero(page)) continue;
+    saw_nonzero = true;
+    MirroredSystemStateRoot candidate;
+    if (!DecodeMetadataPage(page, MetadataPageKind::kSystemState, 0,
+                            &candidate.generation_, candidate.payload_) ||
+        !DecodeSystemStateRoot(candidate.payload_, &candidate.root_) ||
+        candidate.root_.generation_ != candidate.generation_) {
+      continue;
+    }
+    candidates.push_back(candidate);
+  }
+  if (saw_nonzero && candidates.empty()) {
+    return absl::InternalError(
+        "both fixed system-state root slots are corrupt: " + path);
+  }
+  return candidates;
+}
+
+absl::StatusOr<std::optional<MirroredSystemStateRoot>>
+SelectCommonSystemStateRoot(const std::vector<std::string>& paths) {
+  if (paths.empty()) return std::optional<MirroredSystemStateRoot>{};
+  std::vector<std::vector<MirroredSystemStateRoot>> candidates;
+  candidates.reserve(paths.size());
+  bool saw_any = false;
+  for (const std::string& path : paths) {
+    auto loaded = ReadSystemStateRootCandidates(path);
+    if (!loaded.ok()) return loaded.status();
+    saw_any |= !loaded->empty();
+    candidates.push_back(std::move(*loaded));
+  }
+  if (!saw_any) return std::optional<MirroredSystemStateRoot>{};
+  std::optional<MirroredSystemStateRoot> selected;
+  for (const MirroredSystemStateRoot& candidate : candidates.front()) {
+    bool common = true;
+    for (std::size_t device = 1; device < candidates.size() && common;
+         ++device) {
+      common =
+          std::any_of(candidates[device].begin(), candidates[device].end(),
+                      [&](const MirroredSystemStateRoot& other) {
+                        return other.generation_ == candidate.generation_ &&
+                               other.root_ == candidate.root_;
+                      });
+    }
+    if (common && (!selected.has_value() ||
+                   candidate.generation_ > selected->generation_)) {
+      selected = candidate;
+    }
+  }
+  if (!selected.has_value()) {
+    return absl::FailedPreconditionError(
+        "existing devices have no common valid system-state generation");
+  }
+  return selected;
+}
+
+absl::Status InstallSystemStateRoot(
+    const std::string& path,
+    const std::optional<MirroredSystemStateRoot>& root) {
+  std::array<std::byte, kDirectIoAlignment> zero{};
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    absl::Status cleared = WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+        false);
+    if (!cleared.ok()) return cleared;
+  }
+  if (!root.has_value()) {
+    return WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, 1),
+        true);
+  }
+  std::array<std::byte, kDirectIoAlignment> page{};
+  EncodeMetadataPage(MetadataPageKind::kSystemState, 0, root->generation_,
+                     root->payload_, page);
+  const unsigned slot = static_cast<unsigned>((root->generation_ - 1) & 1);
+  return WriteExactlyAt(
+      path, page, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+      true);
+}
+
 absl::Status ResetStorageMetadata(const std::string& path,
                                   std::uint64_t capacity_blocks) {
   constexpr std::size_t kResetChunkBytes = 128 * 1024;
@@ -127,6 +222,12 @@ absl::Status InitializeAddedDeviceMetadata(
     if (!status.ok()) {
       return status;
     }
+  }
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    status = WriteExactlyAt(
+        path, zero, MetadataPageSlotOffset(kSystemStateMetadataOffset, 0, slot),
+        slot == 1);
+    if (!status.ok()) return status;
   }
   return absl::OkStatus();
 }
@@ -450,10 +551,12 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
 
   if (has_existing_device && configured_device_count > previous_device_count) {
     std::vector<std::uint64_t> canonical_epochs = InitialEpochValues();
+    std::vector<std::string> existing_paths;
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (!labels[i].has_value()) {
         continue;
       }
+      existing_paths.push_back(options_.data_files_[i]);
       for (std::size_t page_index = 0; page_index < kEpochMetadataPageCount;
            ++page_index) {
         const std::size_t byte_offset = page_index * kMetadataPagePayloadBytes;
@@ -482,6 +585,10 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
         }
       }
     }
+    auto inherited_system_state = SelectCommonSystemStateRoot(existing_paths);
+    if (!inherited_system_state.ok()) {
+      return inherited_system_state.status();
+    }
     for (std::size_t i = 0; i < labels.size(); ++i) {
       if (labels[i].has_value()) {
         continue;
@@ -491,6 +598,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       if (!initialized.ok()) {
         return initialized;
       }
+      absl::Status system_state_installed = InstallSystemStateRoot(
+          options_.data_files_[i], *inherited_system_state);
+      if (!system_state_installed.ok()) return system_state_installed;
       DeviceLabel label{
           .magic_ = kDeviceLabelMagic,
           .version_ = kStorageFormatVersion,
@@ -570,6 +680,9 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   spdlog::info("storage direct-I/O alignment={} bytes", direct_io_alignment_);
   spdlog::info("storage flush submission size={} bytes",
                options_.flush_size_bytes_);
+
+  absl::Status system_state = LoadSystemState();
+  if (!system_state.ok()) return system_state;
 
   worker_count_ = worker_count;
   epoch_values_ = InitialEpochValues();
@@ -1334,6 +1447,43 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
       RecoveryWorkerBatchTargetBytes(worker_count_);
   std::vector<std::vector<RecoveryLiveReference>> live_by_owner(worker_count_);
   std::size_t buffered_bytes = 0;
+  // System-state blobs are not represented by key-index checkpoint entries,
+  // so charge them on both checkpoint and cold-scan recovery paths.
+  if (worker.id() == 0) {
+    auto account_system_extents = [&](ExtentManifest extents) -> absl::Status {
+      if (extents == nullptr) return absl::OkStatus();
+      for (std::size_t extent_index = 0; extent_index < extents->size();
+           ++extent_index) {
+        const ExtentRef& extent = extents->at(extent_index);
+        const std::uint16_t owner = BlockOwner(extent.block_id_);
+        if (owner >= worker_count_) {
+          return absl::InternalError(
+              "system-state manifest references an unscanned extent");
+        }
+        live_by_owner[owner].push_back(RecoveryLiveReference{
+            .block_id_ = extent.block_id_,
+            .allocation_epoch_ = extent.allocation_epoch_,
+            .bytes_ = extent.payload_bytes_,
+            .expected_owner_ = owner,
+            .extent_ = true,
+            .extent_payload_bytes_ = extent.payload_bytes_,
+            .extent_index_ = static_cast<std::uint32_t>(extent_index),
+            .extent_payload_checksum_ = extent.payload_checksum_,
+        });
+        buffered_bytes += sizeof(RecoveryLiveReference);
+      }
+      return absl::OkStatus();
+    };
+    status = account_system_extents(system_state_.manifest_extents_);
+    if (status.ok()) {
+      status = account_system_extents(system_state_.catalog_extents_);
+    }
+    if (!status.ok()) {
+      Fail(status);
+      co_return status;
+    }
+  }
+
   if (checkpoint_active_.load(std::memory_order_acquire)) {
     // The checkpoint persisted one absolute live-byte value per physical
     // block. Route that bounded table now that the header scan has established

@@ -552,17 +552,14 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "# HELP keylane_replication_backlog_tail_lsn Newest published flow LSN.\n"
       "# TYPE keylane_replication_backlog_tail_lsn gauge\n"
       "# HELP keylane_replication_backlog_pinned_cursors Live replica ACK "
-      "cursors pinning history.\n"
+      "coverage claims.\n"
       "# TYPE keylane_replication_backlog_pinned_cursors gauge\n"
-      "# HELP keylane_replication_backlog_backpressured Whether the worker is "
-      "waiting for ACK progress below the low watermark.\n"
-      "# TYPE keylane_replication_backlog_backpressured gauge\n"
       "# HELP keylane_replication_backlog_active Whether this worker's shared "
       "replication history is active.\n"
       "# TYPE keylane_replication_backlog_active gauge\n"
-      "# HELP keylane_replication_backlog_backpressure_waits_total Backlog "
-      "high-watermark backpressure episodes.\n"
-      "# TYPE keylane_replication_backlog_backpressure_waits_total counter\n"
+      "# HELP keylane_replication_backlog_coverage_revocations_total Lagging "
+      "coverage claims revoked at the hard backlog cap.\n"
+      "# TYPE keylane_replication_backlog_coverage_revocations_total counter\n"
       "# HELP keylane_replication_publish_queue_bytes Commands staged before "
       "the shared backlog.\n"
       "# TYPE keylane_replication_publish_queue_bytes gauge\n"
@@ -598,12 +595,10 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
         "\n", "keylane_replication_backlog_tail_lsn{", labels, "} ",
         log.tail_lsn_, "\n", "keylane_replication_backlog_pinned_cursors{",
         labels, "} ", log.pinned_cursors_, "\n",
-        "keylane_replication_backlog_backpressured{", labels, "} ",
-        log.capacity_backpressured_ ? 1 : 0, "\n",
         "keylane_replication_backlog_active{", labels, "} ",
         log.active_ ? 1 : 0, "\n",
-        "keylane_replication_backlog_backpressure_waits_total{", labels, "} ",
-        log.backpressure_waits_, "\n",
+        "keylane_replication_backlog_coverage_revocations_total{", labels, "} ",
+        log.coverage_revocations_, "\n",
         "keylane_replication_publish_queue_bytes{", labels, "} ",
         log.publish_queue_bytes_, "\n",
         "keylane_replication_publish_queue_capacity_bytes{", labels, "} ",

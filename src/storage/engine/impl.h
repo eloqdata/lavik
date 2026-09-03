@@ -1773,8 +1773,7 @@ class StorageEngine::Impl {
       // memory boundary while keeping both allocations off the append path.
       std::optional<ReplicationLogBlock> standby_block_;
       bool standby_refill_pending_ = false;
-      bool capacity_backpressured_ = false;
-      std::uint64_t capacity_waits_ = 0;
+      std::uint64_t coverage_revocations_ = 0;
       // The fixed staging charge covers both payloads and retained ring
       // capacity. The allocator must therefore neither admit nor account the
       // same backing allocation a second time.
@@ -1793,7 +1792,6 @@ class StorageEngine::Impl {
       AsyncNotification publisher_capacity_ready_;
       absl::flat_hash_map<std::uint64_t, std::uint64_t>
           retained_lsn_by_session_;
-      AsyncNotification retention_advanced_;
 
       // Backlog chunks are process-local and intentionally disappear on
       // restart together with the replication history id.
@@ -2567,6 +2565,18 @@ class StorageEngine::Impl {
   bool TryEnqueueReplicationCommand(ReplicationCommandAppend command);
   Task<absl::Status> PublishEphemeralReplicationCommand(
       std::uint16_t partition_id, std::vector<std::string> args);
+  absl::StatusOr<PreparedReplicationCommandPublication>
+  PrepareAdmittedReplicationCommand(
+      const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+      std::uint16_t partition_id, std::vector<std::string> args,
+      std::optional<std::vector<std::string>> fullsync_projection);
+  absl::Status PublishPreparedReplicationCommand(
+      const ReplicationPublisherAdmission& admission,
+      PreparedReplicationCommandPublication publication);
+  absl::Status PublishLateAdmittedReplicationCommand(
+      const ReplicationPublisherAdmission& admission, ReplicationEventKind kind,
+      std::uint16_t partition_id, std::vector<std::string> args,
+      std::optional<std::vector<std::string>> fullsync_projection);
   bool TryEnqueueReplicationTransaction(
       std::shared_ptr<ReplicationTransaction> transaction);
 
@@ -2628,7 +2638,59 @@ class StorageEngine::Impl {
 
   absl::Status FlushForShutdown();
 
+  Task<absl::StatusOr<CatalogDurabilityToken>> CommitFunctionCatalog(
+      std::string_view dump);
+  absl::StatusOr<std::optional<RecoveredFunctionCatalog>>
+  RecoverFunctionCatalog() const;
+  Task<absl::Status> MakeDurable(const DurabilityFrontier& frontier,
+                                 std::string_view opaque_accumulator);
+  Task<absl::Status> CommitPromotionBase(PromotionBase base);
+  absl::StatusOr<std::optional<PromotionBase>> RecoverPromotionBase() const;
+  absl::StatusOr<PopulationToken> RecoverPopulationToken() const;
+  Task<absl::Status> BeginReplicaFullSync(std::uint64_t session_id);
+  Task<absl::Status> CompleteReplicaFullSync(std::uint64_t session_id,
+                                             PopulationToken population);
+  bool ReplicaRecoveryFenced() const noexcept {
+    return replica_recovery_fenced_.load(std::memory_order_acquire) ||
+           request_serving_fenced_until_restart_.load(
+               std::memory_order_acquire);
+  }
+  void FenceRequestServingUntilRestart() noexcept {
+    request_serving_fenced_until_restart_.store(true,
+                                                std::memory_order_release);
+    replica_recovery_fenced_.store(true, std::memory_order_release);
+    replica_loading_.store(true, std::memory_order_release);
+  }
+
  private:
+  struct DurableSystemState {
+    std::uint64_t generation_ = 0;
+    CatalogDurabilityToken catalog_token_{};
+    std::uint64_t catalog_bytes_ = 0;
+    ExtentManifest catalog_extents_;
+    ExtentManifest manifest_extents_;
+    std::optional<PromotionBase> promotion_base_;
+    PopulationToken population_token_{};
+    std::uint64_t full_sync_session_id_ = 0;
+    bool catalog_ready_ = false;
+  };
+
+  absl::Status LoadSystemState();
+  Task<absl::Status> CommitSystemState(DurableSystemState next,
+                                       std::string_view catalog_dump,
+                                       bool replace_catalog);
+  Task<absl::Status> WriteSystemStateRootOnDeviceLocal(
+      std::size_t device_index, const SystemStateRoot& root,
+      std::uint8_t target_slot);
+  static absl::StatusOr<std::string> EncodePromotionBase(
+      const PromotionBase& base);
+  static absl::StatusOr<PromotionBase> DecodePromotionBase(
+      std::string_view encoded);
+  static absl::StatusOr<std::string> EncodeSystemStateManifest(
+      const DurableSystemState& state);
+  static absl::StatusOr<DurableSystemState> DecodeSystemStateManifest(
+      std::string_view encoded);
+
   struct SnapshotReadJoin;
   Task<absl::Status> ReadSnapshotRecord(
       WorkerStore& store, WorkerStore::PartitionStore& partition,
@@ -3075,8 +3137,7 @@ class StorageEngine::Impl {
   }
 
   static StagedRetiredRecord StagedRetiredRecordOf(
-      const RecordLocation& location,
-      ExtentManifest dependent_extents = {}) {
+      const RecordLocation& location, ExtentManifest dependent_extents = {}) {
     return StagedRetiredRecord{
         .dependent_extents_ = std::move(dependent_extents),
         .block_id_ = location.block_id(),
@@ -3237,8 +3298,7 @@ class StorageEngine::Impl {
   Task<absl::Status> PersistCheckpointBitmap(
       std::span<const std::uint64_t> block_ids);
 
-  Task<absl::Status> PublishShutdownCheckpoint(
-      std::uint64_t generation);
+  Task<absl::Status> PublishShutdownCheckpoint(std::uint64_t generation);
 
   Task<absl::Status> DiscoverCheckpoint(WorkerStore& store,
                                         CheckpointLoadResult* result);
@@ -3443,6 +3503,19 @@ class StorageEngine::Impl {
   // destructively rebuilding its single data root; foreground commands are
   // rejected above the engine, while tail commands stamp the pending epochs.
   std::atomic<bool> replica_loading_{false};
+  std::atomic<bool> replica_recovery_fenced_{false};
+  // Unlike the durable full-sync fence, no in-process transition may clear
+  // this flag; a new process must recover the authoritative system state and
+  // create a fresh replication history first.
+  std::atomic<bool> request_serving_fenced_until_restart_{false};
+  // All catalog and promotion updates serialize through worker zero and this
+  // mutex. The manifest is always rewritten from the current state so one
+  // field update cannot erase the other.
+  AsyncMutex system_state_mutex_;
+  DurableSystemState system_state_;
+  std::optional<std::string> recovered_catalog_dump_;
+  std::optional<absl::Status> system_state_failure_;
+  std::atomic<bool> system_state_root_failure_injected_{false};
   std::atomic<bool> expiration_authority_{true};
   std::atomic<std::uint32_t> expiration_pause_count_{0};
   // Background tasks that settle accounting through cross-worker hops

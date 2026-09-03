@@ -174,16 +174,21 @@ the source of truth checked after wakeup.
 
 Each Celer worker lazily owns one persistent `LuaWorkerRuntime`. It retains the
 Lua VM, compiled script closures, and locally installed Function libraries;
-source bodies and the canonical Function catalog have process-wide ownership.
-`SCRIPT LOAD`/`FLUSH` update every worker's script index. Function loads and
-restores stage and validate the same library on every worker before committing
-the process-wide catalog; delete and flush operations likewise visit every
-worker before releasing canonical catalog ownership. Script-cache mutations are
-serialized with each other and finish their worker fan-out before replying, but
-concurrent `SCRIPT EXISTS` or `EVALSHA` lookups do not join that mutation guard
-and can temporarily observe the per-worker transition. Function invocations,
-catalog reads, and catalog mutations do share the guard, so staged Function
-updates are not externally visible.
+source bodies and canonical metadata have process-wide ownership. `SCRIPT
+LOAD`/`FLUSH` update every worker's script index. Script-cache mutations are
+serialized with each other and finish their worker fan-out before replying,
+but concurrent `SCRIPT EXISTS` or `EVALSHA` lookups do not join that mutation
+guard and can temporarily observe the per-worker transition.
+
+`FunctionCatalog` owns the deeper Function lifecycle. A mutation constructs a
+complete hidden runtime on every worker, verifies identical metadata, commits
+the canonical `FUNCTION DUMP` to storage, and only then swaps the runtime and
+process-global maps. Function invocations, reads, mutations, RDB installation,
+and promotion capture share its guard. Startup restores and validates the
+durable catalog before Redis readiness when one exists; a fresh set starts
+with the canonical empty catalog without allocating a durable root. Full
+ownership, persistence, replay, and failure behavior are described in the
+[Function catalog](07-function-catalog.md) document.
 
 `EVAL`, `EVALSHA`, their `_RO` variants, `FCALL`, and `FCALL_RO` derive their
 key set from `numkeys`. The command layer acquires those declared keys through
@@ -284,6 +289,12 @@ has torn down a worker's I/O and coroutine frames, its native-thread service
 finalizer releases that worker's remaining `StorageEngine` state; worker-owned
 indexes are never destroyed from the shutdown thread.
 
+A locally admitted write also captures the replication role epoch before
+routing. After it acquires ordinary, blocking, multi-database, EXEC, or FLUSH
+database admission, it revalidates that epoch before mutation. A write delayed
+across demotion and promotion returns `TRYAGAIN`; it cannot enter the new child
+history using the publication decision from the old role.
+
 ## Verification
 
 Parser and version-aware reply encoding are unit-tested independently. The
@@ -307,7 +318,8 @@ real server executable.
 | Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |
 | Blocking waiter ownership and wakeups | `src/redis/blocking_wait.h`, `src/redis/blocking_wait.cpp` |
-| Worker-local Lua VM, script cache, Function catalog, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |
+| Worker-local Lua VM, script cache, Function runtime staging, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |
+| Durable process-global Function catalog lifecycle | `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/storage/engine/system_state.cpp` |
 | Pub/Sub session queues, worker-local registries, fan-out, and subscribed connection serving | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | SLOWLOG shards, command-stat reset, and client/Sentinel administration | `include/keylane/slowlog.h`, `src/redis/slowlog.cpp`, `include/keylane/metrics.h`, `src/metrics.cpp`, `src/redis/command.cpp` |
 | Redis RDB import/export and backup commands | `include/keylane/rdb.h`, `src/redis/rdb.cpp`, `src/redis/backup.h`, `src/redis/backup.cpp` |

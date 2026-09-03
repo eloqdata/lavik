@@ -1636,12 +1636,9 @@ Task<absl::Status> StorageEngine::Impl::ResetPartitionsDetachLocal(
 // (db_epoch, replication_epoch, index_generation) afterwards, the same
 // expected-version handoff defrag relocation uses.
 //
-// TODO(replication): native cascading is unsupported. This path applies
-// records without invoking source-side full-sync subscribers, so a node that
-// follows one Keylane source while accepting another Keylane replica
-// (A -> B -> C) can stop forwarding after the snapshot baseline. Reject
-// downstream native sessions while following an upstream until cascading has
-// an explicit publication design.
+// Replica apply deliberately bypasses source publication. ReplicationManager
+// rejects downstream native sessions while an upstream is configured, so this
+// path never has to act as a cascading relay.
 //
 // TODO(replication): this path also bypasses the command layer's database
 // gates (file-static in command.cpp), which KEYS and FLUSHDB close to get an
@@ -2090,7 +2087,21 @@ Task<absl::Status> StorageEngine::Impl::PromoteReplicaRoot(
                     : co_await celer::SubmitTaskTo(target, publish);
     if (!published.ok()) co_return published;
   }
-  replica_loading_.store(false, std::memory_order_release);
+  std::array<std::byte, 2 * kLogicalDatabaseCount * sizeof(std::uint64_t)>
+      population_bytes{};
+  std::memcpy(population_bytes.data(), local_db_epochs.data(),
+              kLogicalDatabaseCount * sizeof(std::uint64_t));
+  std::memcpy(
+      population_bytes.data() + kLogicalDatabaseCount * sizeof(std::uint64_t),
+      source_db_epochs.data(), kLogicalDatabaseCount * sizeof(std::uint64_t));
+  if (ReplicaRecoveryFenced()) {
+    absl::Status completed = co_await CompleteReplicaFullSync(
+        session_id, PopulationToken{
+                        .generation_ = session_id,
+                        .digest_ = Crc64(population_bytes),
+                    });
+    if (!completed.ok()) co_return completed;
+  }
   co_return absl::OkStatus();
 }
 

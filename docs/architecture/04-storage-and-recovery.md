@@ -89,7 +89,10 @@ offset 0
   4 KiB device label
   epoch page 0 slot A, epoch page 0 slot B
   ...
+  system-state root slot A, system-state root slot B
   allocation-bitmap page 0 slot A, page 0 slot B
+  ...
+  checkpoint-bitmap page 0 slot A, page 0 slot B
   ...
   round up to the next 8 MiB boundary
   data block at local ID DataBlockBegin(capacity)
@@ -112,6 +115,16 @@ Each logical metadata page has independent 4 KiB A/B slots with a generation
 and CRC32C checksum. Readers select the valid higher generation. An all-zero
 pair is uninitialized logical zero; a nonzero pair with no valid slot is
 corruption.
+
+The system-state root is a separate, process-global A/B pointer at a fixed,
+capacity-independent offset before the bitmap ranges and mirrored on every
+configured device. It names one copy-on-write manifest extent containing
+the complete Function-catalog extent list, local catalog generation and CRC64,
+full-sync readiness and population state, and the latest promotion base.
+Worker zero is the only manifest writer. A generation is recoverable only when
+the same valid root exists on every device; recovery chooses the highest such
+generation, so a torn multi-device update falls back to the previous common
+state rather than combining fields from different commits.
 
 Every data block is 8 MiB:
 
@@ -151,12 +164,11 @@ those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
 is a runtime view rather than a persisted C++ object representation.
 
-This compact version-1 record layout directly replaces the earlier 104-byte
-version-1 layout without changing the format number; there is no compatibility
-decoder. Media written by the earlier layout must be reset before this build
-starts. The checkpoint root, bitmap, and block kind make the same
-development-stage direct replacement under format version 1. Compact Hash/Set
-values likewise retain version 1.
+The current version-1 format also includes checkpoint metadata and the
+system-state root and manifest. During pre-deployment development this layout
+directly replaces earlier layouts that also used version 1; there is no
+compatibility decoder. Older media, including the earlier 104-byte record
+layout, must be reset before this build starts.
 
 Keys that do not fit the configured inline header limit move into the payload.
 Large key/value payloads use a root record containing an extent manifest. Each
@@ -174,7 +186,11 @@ inline-key limit, flush alignment, per-device defrag concurrency, configured
 paths, capacities, and membership. A fresh regular file must be an 8 MiB
 multiple. A raw device uses its complete 8 MiB blocks and ignores a shorter
 tail. With the current fixed metadata and eight-block per-device defrag reserve,
-each device needs at least 80 MiB to leave one foreground block.
+each device needs at least 80 MiB. A fresh set with no system-state root denotes
+the canonical empty Function catalog and consumes no foreground block merely
+to record that absence. Catalog bodies and manifests use the ordinary
+foreground allocator; insufficient capacity rejects the state-changing
+operation without replacing the current durable or runtime catalog.
 
 Fresh paths receive a storage-set label. Startup can add zero-label devices to
 a complete initialized set: it derives canonical epochs from existing members,
@@ -191,7 +207,10 @@ zero-label added device, so this architecture does not make one.
 After labels are resolved, preparation loads the newest valid epoch and bitmap
 page on every device. Epochs only increase, so the runtime vector is the
 component-wise maximum of all device copies; a later mirrored update also
-repairs stale fields on a lagging member.
+repairs stale fields on a lagging member. It separately selects the highest
+system-state root common to all members, reads and validates its manifest and
+Function dump, and records whether an interrupted full sync requires startup
+to remain fenced.
 
 If fixed metadata names an unconsumed checkpoint, worker 0 first advances its
 consumed generation on every device. All recovery workers then walk disjoint
@@ -240,6 +259,13 @@ barriers then coordinate one parallel recovery rather than independent
 worker-local boots. Request readiness follows successful completion of the
 complete recovery and allocator-cleanup sequence; the exact moment a listening
 socket exists is not the readiness boundary.
+
+After worker recovery, the Function catalog decodes the selected dump and
+stages it independently on every worker before Redis readiness. A missing root
+on a fresh set is the canonical empty catalog and needs no durable allocation.
+An existing root with a bad manifest, extent identity, checksum, dump, or
+inconsistent compile result fails startup; recovery never substitutes an empty
+catalog for corrupt durable state.
 
 Recovery proceeds as follows:
 
@@ -456,6 +482,16 @@ fdatasync
 publish the snapshot as disk-backed and settle retired versions
 ```
 
+System-state commits reuse the extent child-before-root rule. A replacement
+catalog body and the complete manifest are written and synchronized first.
+The writer then publishes the inactive A/B root and synchronizes it on each
+configured device. Catalog and promotion updates always copy forward the
+other fields from the last committed manifest, preventing independent writers
+from losing each other's state. An ambiguous per-device root result fail-stops
+the system-state writer and globally fences request serving. Restart resolves
+the result through the highest common generation before service becomes
+available again.
+
 The first flush durably clears the header slot not selected for the new
 allocation before committing the selected slot. Later header writes alternate
 slots. A dirty tail appended while a snapshot is in flight is requeued at the
@@ -604,6 +640,12 @@ checkpoint rather than weakening cold recovery.
   discovery bitmap are durable and the generation root is published. Startup
   consumes a generation before using it, so a later crash cannot reuse a
   snapshot from before that process ran.
+- A durable Function catalog is exposed only through a common system-state
+  root; a promotion base refers to the exact local catalog and population
+  tokens committed in that same manifest lineage.
+- Full-sync invalidation is durable before population replacement begins. A
+  valid catalog root cannot make an interrupted target readable until the
+  matching population and catalog readiness commit completes.
 
 ## Observability and verification
 
@@ -622,7 +664,8 @@ Current test evidence includes:
 
 | Test | Evidence |
 |---|---|
-| `tests/storage_format_test.cpp` | Label, metadata, block, record, extent, and transaction encoding; CRC rejection; A/B winner and torn-slot fallback |
+| `tests/storage_format_test.cpp` | Label, metadata, system-state root, block, record, extent, and transaction encoding; version/CRC rejection; A/B winner and torn-slot fallback |
+| `tests/multi_exec_e2e_test.cpp` | Function LOAD/RESTORE/DELETE/FLUSH durability and startup recovery |
 | `tests/storage_capacity_test.cpp` | Existing-file requirement, alignment and minimum capacity, persisted capacity, expansion membership, foreign-device rejection, and explicit reset |
 | `tests/extent_recovery_e2e_test.cpp` | External keys and values, manifest/extent recovery, reclamation, and repeated worker-count changes |
 | `tests/flushdb_reclaim_e2e_test.cpp` | Full-device FLUSHDB reclaim, paused-defrag exhaustion and resume, expiry escape valve, stale activated-header handling, and a crash after durable defrag source retirement |
@@ -630,7 +673,7 @@ Current test evidence includes:
 | `tests/tomb_raider_e2e_test.cpp` | Runtime scheduling plus retain/reap behavior for buried persistent or expired values |
 | `tests/multikey_e2e_test.cpp`, `tests/tx_cleaner_test.cpp` | Bounded disk MGET waves, commit batching and fence merging, transaction-generation rotation, recovery, FLUSHDB invalidation, rollback, retry, and exact retirement readiness |
 | `tests/atomicity_stress_e2e_test.cpp` | Overlapping multi-key serializability and recovery after a graceful durability drain |
-| `tests/list_e2e_test.cpp` | Shielded expired-winner behavior under an injected recovery clock rollback |
+| `tests/list_e2e_test.cpp` | Function-catalog body/root/runtime crash windows, multi-device torn-root fallback, and shielded expired-winner behavior under an injected recovery clock rollback |
 | `tests/buffer_pool_test.cpp` | Reuse of a waiting storage write-buffer acquisition |
 | `tests/device_affinity_test.cpp` | SPDK controller quota and qpair-owner planning across balanced, weighted, and controller-heavy layouts |
 
@@ -684,6 +727,7 @@ current source code are authoritative for present storage behavior.
 | Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
+| System-state manifest, catalog COW extents, full-sync fence, population token, and promotion base | `src/storage/engine/system_state.cpp`, `include/keylane/storage/engine.h` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/keylane/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |
 | Storage-path probing, device-set validation and expansion, controller/qpair affinity, metadata load, worker initialization and native-thread finalization, recovery barriers, and shutdown flush | `src/storage/engine/init.cpp`, `src/storage/engine/device_affinity.h`, `src/storage/engine/impl.h` |
 | Device-owner allocation, bitmap activation and cold-free retirement, epoch mirroring, reserves, and allocator fail-stop behavior | `src/storage/engine/alloc.cpp` |
@@ -698,4 +742,4 @@ current source code are authoritative for present storage behavior.
 | Durable database epoch advance, bounded index detach, and online detached-index reclaim | `src/storage/engine/flush_db.cpp` |
 | Transaction-generation rotation, promotion, readiness, and cold retirement | `src/storage/engine/tx_cleaner.cpp`, `include/keylane/storage/tx_cleaner.h` |
 | Device, durability, recovery, storage-I/O, Defrag, Tomb Raider, and transaction-cleaner observability | `include/keylane/storage/engine.h`, `src/storage/engine/metrics.cpp`, `src/storage/engine/recovery.cpp`, `src/metrics.cpp` |
-| Format, capacity, recovery, crash-window, expiration, reclamation, transaction-cleaner, and buffer-pool verification | `tests/storage_format_test.cpp`, `tests/storage_capacity_test.cpp`, `tests/extent_recovery_e2e_test.cpp`, `tests/flushdb_reclaim_e2e_test.cpp`, `tests/ttl_e2e_test.cpp`, `tests/tomb_raider_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/tx_cleaner_test.cpp`, `tests/buffer_pool_test.cpp` |
+| Format, capacity, catalog recovery, crash-window, expiration, reclamation, transaction-cleaner, and buffer-pool verification | `tests/storage_format_test.cpp`, `tests/storage_capacity_test.cpp`, `tests/multi_exec_e2e_test.cpp`, `tests/extent_recovery_e2e_test.cpp`, `tests/flushdb_reclaim_e2e_test.cpp`, `tests/ttl_e2e_test.cpp`, `tests/tomb_raider_e2e_test.cpp`, `tests/multikey_e2e_test.cpp`, `tests/atomicity_stress_e2e_test.cpp`, `tests/list_e2e_test.cpp`, `tests/tx_cleaner_test.cpp`, `tests/buffer_pool_test.cpp` |

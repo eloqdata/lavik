@@ -36,6 +36,7 @@ using HistoryId = StrongId<struct HistoryIdTag>;
 using OperationId = StrongId<struct OperationIdTag>;
 using EvidenceId = StrongId<struct EvidenceIdTag>;
 using FlowId = StrongId<struct FlowIdTag>;
+using CatalogGeneration = StrongId<struct CatalogGenerationTag>;
 
 // Partial-sync and ordering evidence is comparable only inside one complete
 // compatibility domain; missing flow cursors compare as zero.
@@ -84,10 +85,42 @@ struct AuthorityObservation {
 struct PromotionObservation {
   bool candidate_selected_ = false;
   bool durability_barrier_complete_ = false;
+  bool promotion_base_committed_ = false;
+  bool population_token_valid_ = false;
+  CatalogGeneration captured_catalog_generation_;
+  CatalogGeneration current_catalog_generation_;
   bool child_history_ready_ = false;
   bool candidate_activated_ = false;
   bool write_gate_open_ = false;
   bool another_replica_reset_ = false;
+};
+
+// Function mutation keeps staging hidden, makes the complete target catalog
+// durable before the runtime swap, and only then publishes or acknowledges
+// the original Redis command. Cursor advancement has the same durability
+// boundary as the replica ACK.
+struct FunctionCatalogObservation {
+  bool staging_visible_ = false;
+  bool durable_commit_complete_ = false;
+  bool runtime_swapped_ = false;
+  bool replication_published_ = false;
+  bool applied_cursor_advanced_ = false;
+  bool replica_ack_sent_ = false;
+};
+
+// Beginning a full sync is destructive: all old recovery evidence is durably
+// invalidated before transfer. Neither a valid catalog root nor a failed
+// transfer may make the target serve until both catalog and population are
+// ready for the new generation.
+struct FullSyncObservation {
+  bool in_progress_ = false;
+  bool old_population_invalidated_ = false;
+  bool old_promotion_base_invalidated_ = false;
+  bool old_catalog_readiness_invalidated_ = false;
+  bool catalog_ready_ = false;
+  bool population_ready_ = false;
+  bool activation_complete_ = false;
+  bool serving_ = false;
 };
 
 // Resume evidence is scoped to both process boots and requires exact,
@@ -177,6 +210,8 @@ struct ClientOperationObservation {
 struct ClusterSnapshot {
   std::vector<AuthorityObservation> authorities_;
   PromotionObservation promotion_;
+  FunctionCatalogObservation function_catalog_;
+  FullSyncObservation full_sync_;
   ResumeObservation resume_;
   PopulationObservation population_;
   std::optional<CandidateObservation> candidate_;
@@ -197,6 +232,9 @@ enum class Counterexample : std::uint8_t {
   kHistoryGap,
   kPartialActivation,
   kStaleDirective,
+  kCatalogAckBeforeDurable,
+  kFullSyncRetainsOldState,
+  kStaleCatalogPromotion,
 };
 
 struct ScenarioDescriptor {

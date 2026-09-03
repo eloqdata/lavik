@@ -2102,8 +2102,33 @@ std::string EncodeFunctionLibraryEntry(std::string_view code) {
   return out;
 }
 
+std::optional<std::size_t> FunctionDumpEncodedSize(
+    std::span<const std::string> libraries) noexcept {
+  // The footer is two version bytes followed by the eight-byte CRC64. Each
+  // library adds one FUNCTION2 opcode and Redis' length prefix before its
+  // source. Compute this before staging so an impossible catalog cannot be
+  // multiplied across every worker's hidden Lua runtime.
+  std::size_t bytes = 10;
+  constexpr std::size_t maximum = std::numeric_limits<std::size_t>::max();
+  for (const std::string& code : libraries) {
+    const std::size_t length_bytes = code.size() < 64            ? 1
+                                     : code.size() < 16384       ? 2
+                                     : code.size() <= UINT32_MAX ? 5
+                                                                 : 9;
+    if (bytes > maximum - 1 - length_bytes) return std::nullopt;
+    bytes += 1 + length_bytes;
+    if (code.size() > maximum - bytes) return std::nullopt;
+    bytes += code.size();
+  }
+  return bytes;
+}
+
 std::string EncodeFunctionDump(std::span<const std::string> libraries) {
   std::string payload;
+  if (const auto bytes = FunctionDumpEncodedSize(libraries);
+      bytes.has_value()) {
+    payload.reserve(*bytes);
+  }
   for (const std::string& code : libraries) {
     payload += EncodeFunctionLibraryEntry(code);
   }

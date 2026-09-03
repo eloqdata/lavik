@@ -25,6 +25,40 @@ std::uint64_t LoadLittleEndian(const std::uint8_t* input) noexcept {
   return value;
 }
 
+std::uint32_t LoadLittleEndian32(const std::byte* input) noexcept {
+  return std::to_integer<std::uint8_t>(input[0]) |
+         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[1]))
+          << 8) |
+         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[2]))
+          << 16) |
+         (static_cast<std::uint32_t>(std::to_integer<std::uint8_t>(input[3]))
+          << 24);
+}
+
+std::uint64_t LoadLittleEndian64(const std::byte* input) noexcept {
+  std::uint64_t value = 0;
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    value |=
+        static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(input[byte]))
+        << (byte * 8);
+  }
+  return value;
+}
+
+void StoreLittleEndian32(std::span<std::byte> output, std::size_t offset,
+                         std::uint32_t value) noexcept {
+  for (unsigned byte = 0; byte < 4; ++byte) {
+    output[offset + byte] = static_cast<std::byte>(value >> (byte * 8));
+  }
+}
+
+void StoreLittleEndian64(std::span<std::byte> output, std::size_t offset,
+                         std::uint64_t value) noexcept {
+  for (unsigned byte = 0; byte < 8; ++byte) {
+    output[offset + byte] = static_cast<std::byte>(value >> (byte * 8));
+  }
+}
+
 void SipRound(std::uint64_t* v0, std::uint64_t* v1, std::uint64_t* v2,
               std::uint64_t* v3) noexcept {
   *v0 += *v1;
@@ -236,6 +270,69 @@ std::uint32_t Crc32c(std::span<const std::byte> bytes) noexcept {
   const absl::string_view input(reinterpret_cast<const char*>(bytes.data()),
                                 bytes.size());
   return static_cast<std::uint32_t>(absl::ComputeCrc32c(input));
+}
+
+std::uint64_t Crc64(std::span<const std::byte> bytes) noexcept {
+  constexpr std::uint64_t kPolynomial = 0xad93d23594c935a9ULL;
+  std::uint64_t crc = 0;
+  for (const std::byte raw : bytes) {
+    const std::uint8_t byte = std::to_integer<std::uint8_t>(raw);
+    for (unsigned mask = 1; mask <= 0x80; mask <<= 1) {
+      bool high = (crc & (std::uint64_t{1} << 63)) != 0;
+      if ((byte & mask) != 0) high = !high;
+      crc <<= 1;
+      if (high) crc ^= kPolynomial;
+    }
+  }
+  std::uint64_t reflected = crc & 1;
+  for (unsigned bit = 1; bit < 64; ++bit) {
+    crc >>= 1;
+    reflected = (reflected << 1) | (crc & 1);
+  }
+  return reflected;
+}
+
+void EncodeSystemStateRoot(const SystemStateRoot& root,
+                           std::span<std::byte> output) noexcept {
+  assert(output.size() >= sizeof(SystemStateRoot));
+  std::fill(output.begin(), output.end(), std::byte{0});
+  StoreLittleEndian64(output, 0, kSystemStateRootMagic);
+  StoreLittleEndian32(output, 8, kStorageFormatVersion);
+  StoreLittleEndian32(output, 12, sizeof(SystemStateRoot));
+  StoreLittleEndian64(output, 16, root.generation_);
+  StoreLittleEndian64(output, 24, root.manifest_.block_id_);
+  StoreLittleEndian64(output, 32, root.manifest_.allocation_epoch_);
+  StoreLittleEndian32(output, 40, root.manifest_.payload_bytes_);
+  StoreLittleEndian32(output, 44, root.manifest_.payload_checksum_);
+  StoreLittleEndian64(output, 48, root.manifest_bytes_);
+}
+
+bool DecodeSystemStateRoot(std::span<const std::byte> input,
+                           SystemStateRoot* root) noexcept {
+  if (root == nullptr || input.size() < sizeof(SystemStateRoot) ||
+      LoadLittleEndian64(input.data()) != kSystemStateRootMagic ||
+      LoadLittleEndian32(input.data() + 8) != kStorageFormatVersion ||
+      LoadLittleEndian32(input.data() + 12) != sizeof(SystemStateRoot)) {
+    return false;
+  }
+  SystemStateRoot decoded;
+  decoded.root_bytes_ = sizeof(SystemStateRoot);
+  decoded.generation_ = LoadLittleEndian64(input.data() + 16);
+  decoded.manifest_.block_id_ = LoadLittleEndian64(input.data() + 24);
+  decoded.manifest_.allocation_epoch_ = LoadLittleEndian64(input.data() + 32);
+  decoded.manifest_.payload_bytes_ = LoadLittleEndian32(input.data() + 40);
+  decoded.manifest_.payload_checksum_ = LoadLittleEndian32(input.data() + 44);
+  decoded.manifest_bytes_ = LoadLittleEndian64(input.data() + 48);
+  if (decoded.generation_ == 0 ||
+      decoded.manifest_.block_id_ == kInvalidBlockId ||
+      decoded.manifest_.allocation_epoch_ == 0 ||
+      decoded.manifest_.payload_bytes_ == 0 ||
+      decoded.manifest_.payload_bytes_ > kExtentPayloadBytes ||
+      decoded.manifest_bytes_ != decoded.manifest_.payload_bytes_) {
+    return false;
+  }
+  *root = decoded;
+  return true;
 }
 
 void EncodeDeviceLabel(
@@ -684,7 +781,8 @@ bool EncodeReplicationFrameHeader(
   if (header.kind_ != ReplicationEventKind::kMutation &&
       header.kind_ != ReplicationEventKind::kTransaction &&
       header.kind_ != ReplicationEventKind::kControl &&
-      header.kind_ != ReplicationEventKind::kEphemeral) {
+      header.kind_ != ReplicationEventKind::kEphemeral &&
+      header.kind_ != ReplicationEventKind::kCatalogMutation) {
     return false;
   }
   ReplicationFrameHeader encoded = header;

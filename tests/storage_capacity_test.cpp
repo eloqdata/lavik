@@ -73,20 +73,20 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
   cleanup.paths_.push_back(unequal_a);
   cleanup.paths_.push_back(unequal_b);
   ASSERT_CHECK(
-      CreateFile(unequal_a, 80 * kMiB) && CreateFile(unequal_b, 88 * kMiB),
+      CreateFile(unequal_a, 88 * kMiB) && CreateFile(unequal_b, 96 * kMiB),
       "failed to create unequal-capacity files");
   ASSERT_CHECK(Prepare({unequal_a, unequal_b}).ok(),
                "unequal fresh device capacities were rejected");
   ASSERT_CHECK(
-      FileSize(unequal_a) == 80 * kMiB && FileSize(unequal_b) == 88 * kMiB,
+      FileSize(unequal_a) == 88 * kMiB && FileSize(unequal_b) == 96 * kMiB,
       "storage prepare changed regular-file sizes");
 
-  ASSERT_CHECK(GrowFile(unequal_b, 96 * kMiB),
+  ASSERT_CHECK(GrowFile(unequal_b, 104 * kMiB),
                "failed to grow initialized test file");
   ASSERT_CHECK(Prepare({unequal_a, unequal_b}).ok(),
                "larger backing file did not preserve labeled capacity");
   ASSERT_CHECK(
-      ::truncate(unequal_a.c_str(), static_cast<off_t>(72 * kMiB)) == 0 &&
+      ::truncate(unequal_a.c_str(), static_cast<off_t>(80 * kMiB)) == 0 &&
           !Prepare({unequal_a, unequal_b}).ok(),
       "backing file smaller than its label was accepted");
 
@@ -97,7 +97,8 @@ TEST(StorageCapacityTest, ValidatesAndPreservesDeviceCapacities) {
 
   const std::string minimum = prefix + "-minimum.data";
   cleanup.paths_.push_back(minimum);
-  ASSERT_CHECK(CreateFile(minimum, 80 * kMiB) && Prepare({minimum}).ok(),
+  ASSERT_CHECK(CreateFile(minimum, 80 * kMiB) && Prepare({minimum}).ok() &&
+                   Prepare({minimum}, true).ok(),
                "80 MiB single-device minimum was rejected");
 
   const std::string unaligned = prefix + "-unaligned.data";
@@ -118,7 +119,7 @@ TEST(StorageCapacityTest, ExpandsAnInitializedStorageSet) {
   const std::string added = prefix + "-added.data";
   cleanup.paths_ = {original, added};
 
-  ASSERT_CHECK(CreateFile(original, 80 * kMiB),
+  ASSERT_CHECK(CreateFile(original, 88 * kMiB),
                "failed to create original storage file");
   ASSERT_CHECK(Prepare({original}).ok(),
                "failed to initialize original storage set");
@@ -140,7 +141,7 @@ TEST(StorageCapacityTest, RejectsForeignDeviceDuringExpansion) {
   const std::string foreign = prefix + "-foreign.data";
   cleanup.paths_ = {first, foreign};
 
-  ASSERT_CHECK(CreateFile(first, 80 * kMiB) && CreateFile(foreign, 80 * kMiB),
+  ASSERT_CHECK(CreateFile(first, 88 * kMiB) && CreateFile(foreign, 88 * kMiB),
                "failed to create foreign-device test files");
   ASSERT_CHECK(Prepare({first}).ok() && Prepare({foreign}).ok(),
                "failed to initialize independent storage sets");

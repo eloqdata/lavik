@@ -24,8 +24,9 @@ Redis/Valkey clients, Sentinels, and replicas
  command handlers and Lua       worker-local Pub/Sub
           |                       registries/fan-out
  transaction coordination -------- replication manager
-          |                              |
-    storage engine <------------- replication log/replay
+          |                  Function catalog
+          |                    /         \
+    storage engine <--- system state   replication log/replay
           |
  file, block-device, or SPDK I/O
 
@@ -42,7 +43,8 @@ snapshots.
 | Request and Redis serving | Parse commands, negotiate RESP reply semantics, retain connection state, run Lua and Pub/Sub, classify and dispatch commands, and encode or stream replies | `RedisService`, `DispatchCommand`, `ExecuteCommand` |
 | Transaction coordination | Serialize conflicting key access across workers and execute single- or multi-shard command hops | `tx::TxRuntime`, `tx::Transaction`, `tx::TxShard` |
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
-| Replication | Manage node role and sessions, publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
+| Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
+| Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
@@ -56,8 +58,10 @@ snapshots.
    and awaits `StorageEngine::InitializeWorker`. Recovery barriers ensure all
    workers finish recovery and allocator cleanup before the process becomes
    ready.
-4. Worker 0 performs an optional validated RDB import before the readiness flag
-   is published. Replication is notified only after worker storage is ready.
+4. Worker 0 recovers and validates the durable Function catalog on every
+   worker, then performs an optional validated RDB import before the readiness
+   flag is published. Replication is notified only after worker storage and
+   catalog recovery are ready.
 5. On a shutdown signal, new requests and accepts are closed, active requests
    and RDB backup work drain, and storage is durably flushed. When configured,
    shutdown transaction cleaning first relocates committed tagged winners into
@@ -89,7 +93,10 @@ worker-local VM. Their declared keys establish the transaction boundary;
 holds, and successful write effects are committed and replicated with the
 outer invocation. Script-cache mutations fan out to every worker before the
 mutation command returns, while Function invocations and catalog operations
-share a catalog barrier that hides staged Function updates.
+share a catalog barrier that hides staged Function updates. Function mutations
+acknowledge only after the complete target dump is crash-durable and the
+worker runtimes have swapped; replicas apply that same boundary before
+advancing their event cursor.
 
 Pub/Sub keeps subscription registries on each connection's worker. Commands and
 cross-worker publications feed bounded per-session output encoded for the
@@ -144,6 +151,12 @@ state explicitly.
   until it finishes or an eligible kill succeeds.
 - A node configured as a replica does not create authoritative local expiry
   mutations, and replayed commands do not republish themselves.
+- Each process owns exactly one replication group. Boot, history, and replica
+  incarnation identities are distinct; a process restart creates a new
+  history and therefore requires whole-group full synchronization.
+- Full-sync start durably fences the prior population, promotion base, and
+  Function-catalog readiness. Neither a valid old catalog root nor an
+  interrupted replacement is sufficient to reopen service.
 - Readiness follows recovery and optional import; shutdown drains admitted
   requests before the final storage flush.
 - Replication and full-sync queues use admission/backpressure. They must not
@@ -180,7 +193,7 @@ those deployment boundaries remain unknown here.
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
 | Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |
 | Request/session/command flow and negotiated RESP semantics | `include/keylane/resp.h`, `include/keylane/resp_version.h`, `include/keylane/session.h`, `include/keylane/command.h`, `src/redis/server.cpp`, `src/redis/resp.cpp` |
-| Lua scripts, Functions, and their transaction boundary | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |
+| Lua scripts, Function catalog lifecycle, and their transaction boundary | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/function_catalog.h`, `src/redis/function_catalog.cpp`, `src/redis/command.cpp` |
 | Pub/Sub sessions, worker-local registries, fan-out, and bounded output | `include/keylane/pubsub.h`, `src/redis/pubsub.cpp`, `src/redis/server.cpp` |
 | Transaction boundary | `include/keylane/tx/`, `src/tx/` |
 | Storage boundary and focused lifecycle units | `include/keylane/storage/engine.h`, `include/keylane/storage/format.h`, `src/storage/engine/`, `src/storage/format.cpp` |

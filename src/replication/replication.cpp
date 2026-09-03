@@ -29,7 +29,10 @@
 #include <utility>
 #include <vector>
 
+#include "../redis/function_catalog.h"
+#include "../redis/lua_eval.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/crc/crc32c.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
@@ -47,7 +50,6 @@
 #include "keylane/replication_command.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
-#include "../redis/lua_eval.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -99,6 +101,9 @@ constexpr std::size_t kFullSyncInterleaveCommands = kFullSyncSchedulingItems;
 // issuing one metadata durability round-trip for every empty partition.
 constexpr std::size_t kFullSyncResetBatch = 64;
 constexpr std::size_t kMaxDataFrame = 12U * 1024U * 1024U;
+constexpr std::uint32_t kDataFrameMagic = 0x31464c4b;  // "KLF1" in LE.
+constexpr std::uint8_t kDataFrameVersion = 1;
+constexpr std::size_t kDataFrameHeaderBytes = 16;
 constexpr std::size_t kBacklogBatchBytes = storage::kReplicationTransferBytes;
 constexpr std::size_t kBacklogBatchFrames = 128;
 // A flow that finishes its partitions before its peers must keep publishing
@@ -154,8 +159,7 @@ absl::Status ReserveReplicationString(std::string* output,
   if (desired <= output->capacity()) return absl::OkStatus();
   std::size_t allocation_capacity = desired;
   if (output->capacity() <= std::numeric_limits<std::size_t>::max() / 2) {
-    allocation_capacity =
-        std::max(allocation_capacity, output->capacity() * 2);
+    allocation_capacity = std::max(allocation_capacity, output->capacity() * 2);
   } else {
     return ReplicationMemoryExhausted("replication buffer");
   }
@@ -172,8 +176,10 @@ absl::Status ReserveReplicationString(std::string* output,
 
 absl::Status AppendReplicationString(std::string* output,
                                      std::string_view value) {
-  if (value.size() > std::numeric_limits<std::size_t>::max() - output->size()) {
-    return ReplicationMemoryExhausted("replication buffer");
+  if (output->size() > kMaxNativeReplicationEventBytes ||
+      value.size() > kMaxNativeReplicationEventBytes - output->size()) {
+    return absl::ResourceExhaustedError(
+        "replication command exceeds the native event limit");
   }
   absl::Status reserved =
       ReserveReplicationString(output, output->size() + value.size());
@@ -219,8 +225,7 @@ class DataReader {
   }
   absl::Status String(std::uint32_t size, std::string* value) {
     if (remaining() < size) {
-      return absl::InvalidArgumentError(
-          "malformed replication record payload");
+      return absl::InvalidArgumentError("malformed replication record payload");
     }
     absl::Status reserved = ReserveReplicationString(value, size);
     if (!reserved.ok()) return reserved;
@@ -378,14 +383,35 @@ Task<absl::Status> WriteText(TcpStream& stream, std::string_view text) {
       reinterpret_cast<const std::byte*>(text.data()), text.size()));
 }
 
-absl::Status AppendDataFrame(std::string* output, DataFrameKind kind,
-                             std::string_view payload) {
-  if (payload.size() > kMaxDataFrame) {
+std::uint32_t DataFrameCrc32c(std::string_view first,
+                              std::string_view second = {}) noexcept {
+  absl::crc32c_t crc = absl::ComputeCrc32c(first);
+  crc = absl::ExtendCrc32c(crc, second);
+  return static_cast<std::uint32_t>(crc);
+}
+
+absl::Status AppendDataFrameHeader(std::string* output, DataFrameKind kind,
+                                   std::size_t payload_bytes,
+                                   std::uint32_t payload_crc32c) {
+  if (payload_bytes > kMaxDataFrame ||
+      payload_bytes > std::numeric_limits<std::uint32_t>::max()) {
     return absl::ResourceExhaustedError(
         "replication data frame exceeds configured limit");
   }
-  PutU32(*output, static_cast<std::uint32_t>(payload.size() + 1));
+  PutU32(*output, kDataFrameMagic);
+  PutU8(*output, kDataFrameVersion);
   PutU8(*output, static_cast<std::uint8_t>(kind));
+  PutU16(*output, kDataFrameHeaderBytes);
+  PutU32(*output, static_cast<std::uint32_t>(payload_bytes));
+  PutU32(*output, payload_crc32c);
+  return absl::OkStatus();
+}
+
+absl::Status AppendDataFrame(std::string* output, DataFrameKind kind,
+                             std::string_view payload) {
+  absl::Status header = AppendDataFrameHeader(output, kind, payload.size(),
+                                              DataFrameCrc32c(payload));
+  if (!header.ok()) return header;
   output->append(payload);
   return absl::OkStatus();
 }
@@ -393,11 +419,12 @@ absl::Status AppendDataFrame(std::string* output, DataFrameKind kind,
 Task<absl::Status> WriteDataFrame(TcpStream& stream, DataFrameKind kind,
                                   std::string_view payload) {
   std::string frame;
-  if (payload.size() > std::numeric_limits<std::size_t>::max() - 5) {
+  if (payload.size() >
+      std::numeric_limits<std::size_t>::max() - kDataFrameHeaderBytes) {
     co_return ReplicationMemoryExhausted("replication frame");
   }
   absl::Status reserved =
-      ReserveReplicationString(&frame, 5 + payload.size());
+      ReserveReplicationString(&frame, kDataFrameHeaderBytes + payload.size());
   if (!reserved.ok()) co_return reserved;
   absl::Status appended = AppendDataFrame(&frame, kind, payload);
   if (!appended.ok()) co_return appended;
@@ -423,18 +450,26 @@ Task<absl::StatusOr<std::string>> ReadExact(TcpStream& stream,
 
 Task<absl::StatusOr<std::pair<DataFrameKind, std::string>>> ReadDataFrame(
     TcpStream& stream) {
-  auto header = co_await ReadExact(stream, 5);
+  auto header = co_await ReadExact(stream, kDataFrameHeaderBytes);
   if (!header.ok()) co_return header.status();
   DataReader reader(*header);
-  std::uint32_t length = 0;
-  std::uint8_t kind = 0;
-  if (!reader.U32(&length) || !reader.U8(&kind) || length == 0 ||
-      length - 1 > kMaxDataFrame || kind < 1 ||
+  std::uint32_t magic = 0;
+  std::uint8_t version = 0, kind = 0;
+  std::uint16_t header_bytes = 0;
+  std::uint32_t payload_bytes = 0, payload_crc32c = 0;
+  if (!reader.U32(&magic) || !reader.U8(&version) || !reader.U8(&kind) ||
+      !reader.U16(&header_bytes) || !reader.U32(&payload_bytes) ||
+      !reader.U32(&payload_crc32c) || magic != kDataFrameMagic ||
+      version != kDataFrameVersion || header_bytes != kDataFrameHeaderBytes ||
+      payload_bytes > kMaxDataFrame || kind < 1 ||
       kind > static_cast<std::uint8_t>(DataFrameKind::kFullSyncCommand)) {
     co_return absl::InvalidArgumentError("malformed replication frame header");
   }
-  auto payload = co_await ReadExact(stream, length - 1);
+  auto payload = co_await ReadExact(stream, payload_bytes);
   if (!payload.ok()) co_return payload.status();
+  if (DataFrameCrc32c(*payload) != payload_crc32c) {
+    co_return absl::DataLossError("replication frame CRC32C mismatch");
+  }
   co_return std::make_pair(static_cast<DataFrameKind>(kind),
                            std::move(*payload));
 }
@@ -1310,7 +1345,9 @@ Task<absl::Status> SendRedisExportMutation(TcpStream& stream,
         (state->heads_[worker]->kind_ !=
              storage::ReplicationEventKind::kMutation &&
          state->heads_[worker]->kind_ !=
-             storage::ReplicationEventKind::kEphemeral)) {
+             storage::ReplicationEventKind::kEphemeral &&
+         state->heads_[worker]->kind_ !=
+             storage::ReplicationEventKind::kCatalogMutation)) {
       continue;
     }
     if (!state->heads_[worker]->command_.args_.empty() &&
@@ -1787,6 +1824,33 @@ struct ReplicaCursorState {
   std::atomic<std::uint64_t> total_lsn_{0};
 };
 
+std::string EncodeAppliedVector(const ReplicaCursorState& state) {
+  std::string result;
+  for (unsigned flow = 0; flow < state.size(); ++flow) {
+    if (!result.empty()) result.push_back(',');
+    absl::StrAppend(&result, state.Load(flow).lsn_);
+  }
+  return result.empty() ? "?" : result;
+}
+
+absl::StatusOr<std::vector<std::uint64_t>> DecodeAppliedVector(
+    std::string_view encoded) {
+  std::vector<std::uint64_t> result;
+  if (encoded == "?") return result;
+  while (!encoded.empty()) {
+    const std::size_t separator = encoded.find(',');
+    const std::string_view item = encoded.substr(0, separator);
+    std::uint64_t cursor = 0;
+    if (!ParseUnsigned(item, &cursor) || cursor == 0) {
+      return absl::InvalidArgumentError("invalid replication Applied vector");
+    }
+    result.push_back(cursor);
+    if (separator == std::string_view::npos) break;
+    encoded.remove_prefix(separator + 1);
+  }
+  return result;
+}
+
 // Transaction apply is detached from flow staging, so both participant ACK
 // tasks and later dependency tasks may begin waiting after completion. This
 // one-shot latch closes that race and resumes each coroutine on its owner
@@ -1860,8 +1924,8 @@ class ReplicaCompletionLatch {
             current.cross_core_, waiter->worker_->id(),
             celer::RemoteNotification{
                 .context_ = waiter->worker_,
-                .value_ = static_cast<std::uint64_t>(
-                    reinterpret_cast<std::uintptr_t>(
+                .value_ =
+                    static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(
                         waiter->handle_.address())),
                 .run_fn_ = &ReplicaCompletionLatch::ResumeRemote,
             });
@@ -1891,8 +1955,7 @@ class ReplicaCompletionLatch {
 
   void Unlock() noexcept { lock_.clear(std::memory_order_release); }
 
-  bool Register(Waiter* waiter,
-                std::coroutine_handle<> awaiting) noexcept {
+  bool Register(Waiter* waiter, std::coroutine_handle<> awaiting) noexcept {
     Lock();
     if (resolution_.load(std::memory_order_acquire) !=
         storage::ReplicationTransactionResolution::kPending) {
@@ -2003,10 +2066,15 @@ struct ReplicaSession {
     {
       std::lock_guard lock(control_mutex_);
       controls.reserve(controls_.size());
-      for (auto& [_, arrival] : controls_) {
-        controls.push_back(std::move(arrival));
+      for (auto it = controls_.begin(); it != controls_.end();) {
+        if (it->second->applying_) {
+          ++it;
+          continue;
+        }
+        controls.push_back(std::move(it->second));
+        const auto discarded = it++;
+        controls_.erase(discarded);
       }
-      controls_.clear();
     }
     const absl::Status cancelled =
         absl::CancelledError("replication session cancelled");
@@ -2111,13 +2179,15 @@ class ReplicationConnectionMetricGuard {
 struct MasterSession {
   MasterSession(std::uint64_t id, unsigned worker_count, std::string node_id,
                 std::string host, std::uint16_t port,
-                std::string source_history_id, bool allow_continue)
+                std::string source_history_id, bool allow_continue,
+                std::vector<std::uint64_t> applied)
       : id_(id),
         node_id_(std::move(node_id)),
         host_(std::move(host)),
         port_(port),
         source_history_id_(std::move(source_history_id)),
         allow_continue_(allow_continue),
+        applied_(std::move(applied)),
         flow_fds_(worker_count, -1),
         flows_(worker_count),
         flow_resume_possible_(worker_count, -1),
@@ -2393,6 +2463,7 @@ struct MasterSession {
   const std::uint16_t port_ = 0;
   const std::string source_history_id_;
   const bool allow_continue_ = false;
+  const std::vector<std::uint64_t> applied_;
 
  private:
   mutable std::mutex mutex_;
@@ -2427,6 +2498,9 @@ struct RedisSource {
   std::optional<std::string> replid_;
   std::atomic<std::uint64_t> offset_{0};
   std::uint64_t role_epoch_ = 0;
+  // Guarded by ReplicationGroup::state_mutex_. A nonzero value means this
+  // source installed its RDB for the active whole-group replacement.
+  std::uint64_t full_sync_session_id_ = 0;
   std::atomic<bool> dataset_valid_{false};
   std::atomic<bool> link_up_{false};
   std::atomic<std::uint64_t> link_state_changed_nanos_{SteadyNanos()};
@@ -2445,17 +2519,20 @@ struct UpstreamDiscovery {
 
 }  // namespace
 
-class ReplicationManager::Impl {
+class ReplicationManager::ReplicationGroup {
  public:
-  Impl(storage::StorageEngine* storage,
-       std::optional<ReplicaOfConfig> initial_upstream,
-       const ReplicationOptions& options)
+  ReplicationGroup(storage::StorageEngine* storage,
+                   std::optional<ReplicaOfConfig> initial_upstream,
+                   const ReplicationOptions& options)
       : storage_(storage),
         upstream_(std::move(initial_upstream)),
         cursor_state_(
             std::make_shared<ReplicaCursorState>(storage->worker_count())),
         replica_priority_(options.replica_priority_),
         node_id_(NewReplicationId()),
+        group_id_(NewReplicationId()),
+        boot_id_(NewReplicationId()),
+        replica_incarnation_(NewReplicationId()),
         history_id_(NewReplicationId()),
         listen_port_(options.listen_port_),
         tls_context_(options.use_tls_ ? options.tls_context_ : nullptr),
@@ -2463,6 +2540,10 @@ class ReplicationManager::Impl {
         masterauth_(options.masterauth_),
         redis_psync_(options.redis_psync_),
         redis_export_backpressure_(options.redis_export_backpressure_) {
+    const auto boot_bytes = std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>(boot_id_.data()), boot_id_.size());
+    next_redis_full_sync_session_id_.store(storage::Crc64(boot_bytes),
+                                           std::memory_order_relaxed);
     const std::size_t minimum_blocks = storage_->worker_count();
     const std::size_t configured_blocks =
         options.backlog_size_bytes_ / storage::kStorageBlockBytes;
@@ -2473,6 +2554,20 @@ class ReplicationManager::Impl {
         options.publish_queue_bytes_per_worker_, std::memory_order_relaxed);
     snapshot_batch_size_.store(options.snapshot_batch_size_,
                                std::memory_order_relaxed);
+    if (!upstream_.has_value()) {
+      auto recovered_base = storage_->RecoverPromotionBase();
+      auto recovered_catalog = storage_->RecoverFunctionCatalog();
+      if (recovered_base.ok() && recovered_base->has_value() &&
+          recovered_catalog.ok() && recovered_catalog->has_value() &&
+          (**recovered_catalog).token_.catalog_generation_ >=
+              (**recovered_base).catalog_token_.catalog_generation_) {
+        // Promotion preserves the one group lineage across process boots. A
+        // later catalog generation is valid because every catalog commit is
+        // serialized through the same system-state writer and preserves the
+        // base; an earlier generation can never authorize the recovered data.
+        group_id_ = (**recovered_base).group_id_;
+      }
+    }
     if (upstream_.has_value()) {
       StoreRole(ReplicationRole::kConnecting, std::memory_order_relaxed);
       role_epoch_.store(1, std::memory_order_relaxed);
@@ -2523,6 +2618,51 @@ class ReplicationManager::Impl {
       }
     }
 
+    // Stop old upstream ingress while database admission is still open. A
+    // command that already crossed the apply-FIFO boundary may be waiting for
+    // that admission; closing it first would deadlock role transition against
+    // the flow that must publish the final applied cursor. Complete read-ahead
+    // events that have not started apply remain unacknowledged and are outside
+    // the frozen promotion frontier.
+    std::optional<std::uint64_t> detached_role_epoch;
+    std::vector<std::shared_ptr<ReplicaSession>> draining_sessions;
+    bool retire_source_before_gates = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      const bool had_upstream = upstream_.has_value();
+      if (had_upstream || upstream.has_value()) {
+        detached_role_epoch =
+            role_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        StoreRole(upstream.has_value() ? ReplicationRole::kConnecting
+                                       : ReplicationRole::kSyncing,
+                  std::memory_order_release);
+        // A master full-sync flow can hold the command gates while waiting
+        // for its target to acknowledge the catalog. Retire source egress
+        // before this transition tries to acquire those same gates.
+        retire_source_before_gates = !had_upstream && upstream.has_value();
+        if (active_replica_session_ != nullptr) {
+          draining_sessions.push_back(std::move(active_replica_session_));
+        }
+        for (const auto& source : redis_sources_) {
+          if (source->session_ == nullptr) continue;
+          draining_sessions.push_back(std::move(source->session_));
+        }
+      }
+    }
+    for (const auto& session : draining_sessions) {
+      absl::Status stopped = co_await CancelAndWaitForReplicaFlows(session);
+      if (!stopped.ok()) co_return stopped;
+      if (session->session_id_ != 0) {
+        absl::Status discarded =
+            co_await storage_->AbortReplicaRoot(session->session_id_);
+        if (!discarded.ok()) co_return discarded;
+      }
+    }
+    if (retire_source_before_gates) {
+      absl::Status drained = co_await DrainSourceEgress();
+      if (!drained.ok()) co_return drained;
+    }
+
     while (!CloseAllCommandDbGates()) {
       absl::Status waited = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
@@ -2537,32 +2677,88 @@ class ReplicationManager::Impl {
       if (!waited.ok()) co_return waited;
     }
 
+    // FUNCTION and FCALL take database admission before the Function guard.
+    // Close and drain that admission first so promotion cannot hold the guard
+    // while waiting for a command that is itself waiting for the guard. Once
+    // the gates are closed, no new catalog user can enter before token capture.
+    std::unique_ptr<FunctionCatalogOperationGuard> promotion_catalog_guard;
+    if (!upstream.has_value()) {
+      promotion_catalog_guard = co_await AcquireFunctionCatalogOperation();
+    }
+
+    absl::Status quiesced = co_await storage_->QuiesceExpiration();
+    if (!quiesced.ok()) co_return quiesced;
+    bool expiration_quiesced = true;
+    struct ExpirationResumeGuard {
+      storage::StorageEngine* storage_ = nullptr;
+      bool* quiesced_ = nullptr;
+      ~ExpirationResumeGuard() {
+        if (storage_ != nullptr && quiesced_ != nullptr && *quiesced_) {
+          storage_->ResumeExpiration();
+        }
+      }
+    } expiration_resume{storage_, &expiration_quiesced};
     if (upstream.has_value()) {
-      absl::Status quiesced = co_await storage_->QuiesceExpiration();
-      if (!quiesced.ok()) co_return quiesced;
       storage_->SetExpirationAuthority(false);
       storage_->ResumeExpiration();
+      expiration_quiesced = false;
     }
 
     std::vector<std::shared_ptr<ReplicaSession>> cancelled;
     bool start_upstream = false;
     bool discard_incomplete_root = false;
+    bool promotion_required = false;
+    storage::PromotionBase promotion_base;
     {
       std::lock_guard lock(state_mutex_);
       const bool had_upstream = upstream_.has_value();
+      const bool retry_promotion =
+          !upstream.has_value() && pending_promotion_.has_value();
       bool dataset_valid =
           native_dataset_valid_.load(std::memory_order_acquire);
       for (const auto& source : redis_sources_) {
-        dataset_valid =
-            dataset_valid ||
-            source->dataset_valid_.load(std::memory_order_acquire);
+        dataset_valid = dataset_valid ||
+                        source->dataset_valid_.load(std::memory_order_acquire);
       }
       // A lost transport changes ONLINE to CONNECTING, but the last committed
       // replica root remains a valid promotion candidate. Only an explicit
       // source switch whose replacement full sync has not reached its cut
       // publishes an empty dataset on REPLICAOF NO ONE.
-      discard_incomplete_root =
-          !upstream.has_value() && had_upstream && !dataset_valid;
+      discard_incomplete_root = !retry_promotion && !upstream.has_value() &&
+                                had_upstream && !dataset_valid;
+      promotion_required = retry_promotion || (!upstream.has_value() &&
+                                               had_upstream && dataset_valid);
+      if (retry_promotion) {
+        promotion_base = *pending_promotion_;
+      } else if (promotion_required) {
+        promotion_base.group_id_ = group_id_;
+        promotion_base.parent_history_id_ =
+            upstream_history_id_.value_or("redis-parent");
+        promotion_base.parent_frontier_.history_context_ =
+            promotion_base.parent_history_id_;
+        if (!redis_sources_.empty()) {
+          promotion_base.parent_frontier_.flow_cursors_.reserve(
+              redis_sources_.size());
+          for (const auto& source : redis_sources_) {
+            promotion_base.parent_frontier_.flow_cursors_.push_back(
+                source->offset_.load(std::memory_order_acquire) + 1);
+          }
+        } else if (cursor_state_ != nullptr) {
+          promotion_base.parent_frontier_.flow_cursors_.reserve(
+              cursor_state_->size());
+          for (unsigned flow = 0; flow < cursor_state_->size(); ++flow) {
+            promotion_base.parent_frontier_.flow_cursors_.push_back(
+                cursor_state_->Load(flow).lsn_);
+          }
+        }
+        promotion_base.storage_accumulator_ = absl::StrCat(
+            "role-epoch:", role_epoch_.load(std::memory_order_relaxed));
+        // Retain only the frozen parent-side proof. Population and catalog
+        // tokens are refreshed on every retry under their own durability
+        // barriers.
+        pending_promotion_ = promotion_base;
+      }
+      if (upstream.has_value()) pending_promotion_.reset();
       upstream_ = upstream;
       if (upstream.has_value()) {
         native_dataset_valid_.store(false, std::memory_order_release);
@@ -2574,6 +2770,7 @@ class ReplicationManager::Impl {
         if (source->session_ != nullptr) cancelled.push_back(source->session_);
       }
       redis_sources_.clear();
+      redis_full_sync_session_id_ = 0;
       expected_redis_topology_.reset();
       redis_cluster_ = false;
       redis_topology_fault_ = false;
@@ -2588,8 +2785,12 @@ class ReplicationManager::Impl {
       // writes may have occurred while promoted or while following another
       // source, so none of the old per-flow cursors are safe for CONTINUE.
       cursor_state_.reset();
-      const std::uint64_t next_epoch =
-          role_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      std::uint64_t next_epoch = 0;
+      if (detached_role_epoch.has_value()) {
+        next_epoch = *detached_role_epoch;
+      } else {
+        next_epoch = role_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+      }
       const bool redis = discovery.has_value() &&
                          discovery->protocol_ == UpstreamProtocol::kRedis;
       redis_psync_.store(redis, std::memory_order_release);
@@ -2609,9 +2810,16 @@ class ReplicationManager::Impl {
         redis_sources_.push_back(std::move(source));
       }
       StoreRole(upstream_.has_value() ? ReplicationRole::kConnecting
+                : promotion_required  ? ReplicationRole::kSyncing
                                       : ReplicationRole::kMaster,
                 std::memory_order_release);
       start_upstream = upstream_.has_value();
+    }
+    if (promotion_required) {
+      // From this point onward any failed durability or child-history step is
+      // fail-closed. The role remains syncing and request handling observes
+      // LOADING until a later promotion attempt or full sync succeeds.
+      storage_->SetReplicaLoading(true);
     }
     for (const auto& session : cancelled) session->Cancel();
     for (const auto& session : cancelled) {
@@ -2623,6 +2831,15 @@ class ReplicationManager::Impl {
         if (!discarded.ok()) co_return discarded;
       }
     }
+    if (start_upstream) {
+      absl::Status retired;
+      if (retire_source_before_gates) {
+        retired = co_await DisableSourceHistory();
+      } else {
+        retired = co_await RetireSourceHistory();
+      }
+      if (!retired.ok()) co_return retired;
+    }
     if (discard_incomplete_root) {
       absl::Status cleared = co_await storage_->FlushAllDetach();
       if (!cleared.ok()) {
@@ -2631,9 +2848,53 @@ class ReplicationManager::Impl {
         co_return cleared;
       }
     }
+    if (promotion_required) {
+      auto population = storage_->RecoverPopulationToken();
+      if (!population.ok()) co_return population.status();
+      promotion_base.population_token_ = *population;
+      promotion_base.catalog_token_ =
+          GlobalFunctionCatalog().durability_token();
+      absl::Status durable = co_await storage_->MakeDurable(
+          promotion_base.parent_frontier_, promotion_base.storage_accumulator_);
+      if (!durable.ok()) co_return durable;
+      if (promotion_base.catalog_token_ !=
+          GlobalFunctionCatalog().durability_token()) {
+        co_return absl::AbortedError(
+            "Function catalog changed while preparing promotion");
+      }
+      absl::Status committed =
+          co_await storage_->CommitPromotionBase(promotion_base);
+      if (!committed.ok()) co_return committed;
+      absl::Status retired = co_await RetireSourceHistory();
+      if (!retired.ok()) co_return retired;
+      // The child publisher must exist before the role transition lets a
+      // client commit the first post-promotion mutation.
+      const std::uint64_t child_log_epoch =
+          role_epoch_.load(std::memory_order_acquire);
+      for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+        const std::size_t flow_capacity = BacklogCapacityForFlow(
+            worker, backlog_size_bytes_.load(std::memory_order_acquire));
+        absl::Status enabled = co_await celer::SubmitTaskTo(
+            worker,
+            [this, child_log_epoch, flow_capacity]() -> Task<absl::Status> {
+              co_return co_await storage_->EnableReplicationLog(child_log_epoch,
+                                                                flow_capacity);
+            });
+        if (!enabled.ok()) co_return enabled;
+      }
+      {
+        std::lock_guard lock(state_mutex_);
+        pending_promotion_.reset();
+        StoreRole(ReplicationRole::kMaster, std::memory_order_release);
+      }
+    }
     if (!start_upstream) {
-      storage_->SetReplicaLoading(false);
-      storage_->SetExpirationAuthority(true);
+      if (!storage_->ReplicaRecoveryFenced()) {
+        storage_->SetReplicaLoading(false);
+        storage_->SetExpirationAuthority(true);
+      }
+      storage_->ResumeExpiration();
+      expiration_quiesced = false;
     }
     if (start_upstream && StorageIsReady()) StartCoordinator();
     co_return absl::OkStatus();
@@ -2772,8 +3033,11 @@ class ReplicationManager::Impl {
     result.role_ = role_.load(std::memory_order_acquire);
     result.role_epoch_ = role_epoch_.load(std::memory_order_acquire);
     result.local_node_id_ = node_id_;
+    result.boot_id_ = boot_id_;
+    result.replica_incarnation_ = replica_incarnation_;
     {
       std::lock_guard lock(state_mutex_);
+      result.group_id_ = group_id_;
       result.upstream_ = upstream_;
       result.upstream_node_id_ = upstream_node_id_;
       result.upstream_history_id_ = upstream_history_id_;
@@ -2822,10 +3086,10 @@ class ReplicationManager::Impl {
         if (!redis_sources_.empty()) {
           for (const auto& source : redis_sources_) {
             if (!source->link_up_.load(std::memory_order_acquire)) {
-              down_seconds = std::max(
-                  down_seconds,
-                  SecondsSince(source->link_state_changed_nanos_.load(
-                      std::memory_order_acquire)));
+              down_seconds =
+                  std::max(down_seconds,
+                           SecondsSince(source->link_state_changed_nanos_.load(
+                               std::memory_order_acquire)));
             }
           }
         } else if (result.role_ != ReplicationRole::kOnline) {
@@ -2871,8 +3135,7 @@ class ReplicationManager::Impl {
     if (next == ReplicationRole::kOnline ||
         previous == ReplicationRole::kOnline ||
         previous == ReplicationRole::kMaster) {
-      link_state_changed_nanos_.store(SteadyNanos(),
-                                      std::memory_order_release);
+      link_state_changed_nanos_.store(SteadyNanos(), std::memory_order_release);
     }
   }
 
@@ -2888,13 +3151,18 @@ class ReplicationManager::Impl {
     return role_.load(std::memory_order_acquire) != ReplicationRole::kMaster;
   }
 
+  std::uint64_t role_epoch() const noexcept {
+    return role_epoch_.load(std::memory_order_acquire);
+  }
+
   bool is_redis_follower() const noexcept {
     return redis_psync_.load(std::memory_order_acquire);
   }
 
   bool is_loading() const noexcept {
     const ReplicationRole role = role_.load(std::memory_order_acquire);
-    return role == ReplicationRole::kConnecting ||
+    return storage_->ReplicaRecoveryFenced() ||
+           role == ReplicationRole::kConnecting ||
            role == ReplicationRole::kSyncing;
   }
 
@@ -3019,9 +3287,21 @@ class ReplicationManager::Impl {
                                            std::uint64_t client_id,
                                            std::string client_address,
                                            bool tls) {
-    if (redis_psync_.load(std::memory_order_acquire)) {
-      co_return absl::FailedPreconditionError(
-          "a redis-replicaof follower cannot serve downstream replicas");
+    if (is_loading()) {
+      absl::Status sent = co_await WriteText(
+          stream,
+          "-LOADING node has no valid native replication source state\r\n");
+      co_return sent.ok() ? absl::FailedPreconditionError(
+                                "a fenced node cannot serve native replication")
+                          : sent;
+    }
+    if (is_replica()) {
+      absl::Status sent = co_await WriteText(
+          stream, "-ERR native cascading replication is not supported\r\n");
+      co_return sent.ok()
+          ? absl::FailedPreconditionError(
+                "a Keylane replica cannot serve downstream native replication")
+          : sent;
     }
     // Accepted Redis sockets are normally optimized for batched replies, but
     // replication is an ACK-driven stream whose frame header and payload are
@@ -3034,7 +3314,7 @@ class ReplicationManager::Impl {
     std::uint64_t replication_session_id = 0;
     if (EqualCaseInsensitive(args.front(), "KLFLOW")) {
       unsigned flow_id = 0;
-      if (args.size() != 6 ||
+      if (args.size() != 5 ||
           !ParseUnsigned(args[2], &replication_session_id) ||
           replication_session_id == 0 || !ParseUnsigned(args[3], &flow_id)) {
         co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
@@ -3114,6 +3394,14 @@ class ReplicationManager::Impl {
                 "Redis replica did not advertise EOF capability")
           : sent;
     }
+    if (is_loading()) {
+      absl::Status sent = co_await WriteText(
+          stream,
+          "-LOADING node has no valid Redis replication source state\r\n");
+      co_return sent.ok() ? absl::FailedPreconditionError(
+                                "a fenced node cannot export Redis PSYNC")
+                          : sent;
+    }
     if (is_replica()) {
       absl::Status sent = co_await WriteText(
           stream, "-ERR detach this Keylane replica before Redis export\r\n");
@@ -3121,6 +3409,8 @@ class ReplicationManager::Impl {
                                 "a Keylane replica cannot export Redis PSYNC")
                           : sent;
     }
+    const std::uint64_t source_role_epoch =
+        role_epoch_.load(std::memory_order_acquire);
     bool expected = false;
     if (!redis_export_active_.compare_exchange_strong(
             expected, true, std::memory_order_acq_rel,
@@ -3131,10 +3421,24 @@ class ReplicationManager::Impl {
           ? absl::AlreadyExistsError("a Redis PSYNC export is already active")
           : sent;
     }
+    redis_export_fd_.store(stream.NativeFd(), std::memory_order_release);
     struct ActiveGuard {
       std::atomic<bool>* active_;
-      ~ActiveGuard() { active_->store(false, std::memory_order_release); }
-    } active_guard{&redis_export_active_};
+      std::atomic<int>* fd_;
+      ~ActiveGuard() {
+        fd_->store(-1, std::memory_order_release);
+        active_->store(false, std::memory_order_release);
+      }
+    } active_guard{&redis_export_active_, &redis_export_fd_};
+    if (is_replica() || is_loading()) {
+      absl::Status sent = co_await WriteText(
+          stream,
+          "-LOADING node has no valid Redis replication source state\r\n");
+      co_return sent.ok()
+          ? absl::FailedPreconditionError(
+                "node lost valid source state during PSYNC setup")
+          : sent;
+    }
     if (celer::ThisWorker().id_ == 0) {
       StartIdleReplicationHistoryMonitor();
     } else {
@@ -3169,7 +3473,14 @@ class ReplicationManager::Impl {
       if (!status.ok()) co_return status;
     }
 
+    status = co_await MaybePauseBeforeRedisExportDbAdmission();
+    if (!status.ok()) co_return status;
     while (!CloseAllCommandDbGates()) {
+      if (role_epoch_.load(std::memory_order_acquire) != source_role_epoch ||
+          is_replica() || is_loading()) {
+        co_return absl::CancelledError(
+            "source role changed before Redis export snapshot admission");
+      }
       status = co_await celer::SleepFor(*celer::ThisWorker().self_,
                                         std::chrono::milliseconds(1));
       if (!status.ok()) co_return status;
@@ -3421,7 +3732,7 @@ class ReplicationManager::Impl {
       co_return status;
     }
     const std::vector<std::string> sync_args{
-        "KLPSYNC", std::string(kProtocolVersion), "?", "?"};
+        "KLPSYNC", std::string(kProtocolVersion), "?", "?", "?", "?", "?", "?"};
     status = co_await WriteText(stream, EncodeRespCommand(sync_args));
     if (!status.ok()) {
       stream.Close().IgnoreError();
@@ -3545,6 +3856,84 @@ class ReplicationManager::Impl {
   bool RedisSourceRegistered(const std::shared_ptr<RedisSource>& source) const {
     return std::find(redis_sources_.begin(), redis_sources_.end(), source) !=
            redis_sources_.end();
+  }
+
+  std::uint64_t NextRedisFullSyncSessionId() noexcept {
+    for (;;) {
+      const std::uint64_t candidate =
+          next_redis_full_sync_session_id_.fetch_add(1,
+                                                     std::memory_order_relaxed);
+      if (candidate != 0) return candidate;
+    }
+  }
+
+  Task<absl::StatusOr<std::uint64_t>> BeginRedisFullSyncAttempt(
+      const std::shared_ptr<RedisSource>& source) {
+    // Serialize the short durable invalidation/activation decisions. RDB
+    // imports use the same mutex, but network receipt does not, so sources can
+    // still download concurrently without allowing an old all-source snapshot
+    // to activate across a newer FULLRESYNC.
+    std::uint64_t session_id = 0;
+    std::vector<std::shared_ptr<ReplicaSession>> replaced_sessions;
+    absl::Status invalidated;
+    {
+      co_await redis_fullsync_mutex_.Lock();
+      celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                         celer::ThisWorker().self_);
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!redis_psync_.load(std::memory_order_relaxed) ||
+            !RedisSourceRegistered(source) || redis_topology_fault_ ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
+          co_return absl::CancelledError("Redis full sync source was replaced");
+        }
+        if (redis_full_sync_session_id_ == 0) {
+          redis_full_sync_session_id_ = NextRedisFullSyncSessionId();
+          for (const auto& current : redis_sources_) {
+            current->dataset_valid_.store(false, std::memory_order_release);
+            current->full_sync_session_id_ = 0;
+            current->replid_.reset();
+            if (current != source && current->session_ != nullptr) {
+              replaced_sessions.push_back(current->session_);
+            }
+          }
+        }
+        session_id = redis_full_sync_session_id_;
+        source->dataset_valid_.store(false, std::memory_order_release);
+        source->full_sync_session_id_ = 0;
+        source->replid_.reset();
+      }
+      RefreshRedisRole();
+      invalidated = co_await storage_->BeginReplicaFullSync(session_id);
+    }
+    absl::Status stopped = absl::OkStatus();
+    for (const auto& session : replaced_sessions) {
+      absl::Status current = co_await CancelAndWaitForReplicaFlows(session);
+      if (stopped.ok() && !current.ok()) stopped = current;
+    }
+    if (!invalidated.ok()) co_return invalidated;
+    if (!stopped.ok()) co_return stopped;
+    co_return session_id;
+  }
+
+  Task<absl::Status> WaitForRedisFullSyncActivation(
+      const std::shared_ptr<RedisSource>& source) {
+    while (storage_->ReplicaRecoveryFenced()) {
+      {
+        std::lock_guard lock(state_mutex_);
+        if (!RedisSourceRegistered(source) || redis_topology_fault_ ||
+            source->role_epoch_ !=
+                role_epoch_.load(std::memory_order_relaxed)) {
+          co_return absl::CancelledError(
+              "Redis full sync was cancelled before population activation");
+        }
+      }
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    co_return absl::OkStatus();
   }
 
   void RefreshRedisRole() {
@@ -4063,6 +4452,10 @@ class ReplicationManager::Impl {
     while (true) {
       auto wire = co_await commands.Next();
       if (!wire.ok()) co_return wire.status();
+      if (source->role_epoch_ != role_epoch_.load(std::memory_order_acquire)) {
+        co_return absl::CancelledError(
+            "Redis replication source was detached before command apply");
+      }
       if (wire->command_.args_.empty()) {
         co_return absl::InvalidArgumentError(
             "empty command in Redis replication stream");
@@ -4190,7 +4583,8 @@ class ReplicationManager::Impl {
     std::optional<std::string> replid;
     {
       std::lock_guard lock(state_mutex_);
-      if (source->dataset_valid_.load(std::memory_order_acquire)) {
+      if (redis_full_sync_session_id_ == 0 &&
+          source->dataset_valid_.load(std::memory_order_acquire)) {
         replid = source->replid_;
       }
     }
@@ -4221,6 +4615,8 @@ class ReplicationManager::Impl {
     if (role_epoch_.load(std::memory_order_acquire) != source->role_epoch_) {
       co_return absl::CancelledError("replication role epoch was replaced");
     }
+    absl::Status activated = co_await WaitForRedisFullSyncActivation(source);
+    if (!activated.ok()) co_return activated;
     StoreRedisLink(source, true);
     source->syncing_ = false;
     RefreshRedisRole();
@@ -4238,21 +4634,85 @@ class ReplicationManager::Impl {
     source->syncing_ = true;
     source->dataset_valid_ = false;
     RefreshRedisRole();
+    auto full_sync_session = co_await BeginRedisFullSyncAttempt(source);
+    if (!full_sync_session.ok()) co_return full_sync_session.status();
     auto rdb_path = co_await ReceiveRedisRdb(stream);
     if (!rdb_path.ok()) co_return rdb_path.status();
     absl::Status status = co_await ImportRedisRdb(*rdb_path, source);
     (void)::unlink(rdb_path->c_str());
     if (!status.ok()) co_return status;
-    source->offset_.store(offset, std::memory_order_release);
-    source->dataset_valid_ = true;
+
     {
-      std::lock_guard lock(state_mutex_);
-      source->replid_ = std::move(replid);
-      if (redis_sources_.front() == source) {
-        upstream_node_id_ = source->replid_;
-        upstream_history_id_ = source->replid_;
+      co_await redis_fullsync_mutex_.Lock();
+      celer::UnlockGuard fullsync_unlock(&redis_fullsync_mutex_,
+                                         celer::ThisWorker().self_);
+      source->offset_.store(offset, std::memory_order_release);
+      source->dataset_valid_ = true;
+      bool population_complete = true;
+      std::string population_accumulator;
+      {
+        std::lock_guard lock(state_mutex_);
+        if (redis_full_sync_session_id_ != *full_sync_session) {
+          co_return absl::CancelledError(
+              "Redis full sync attempt was superseded during import");
+        }
+        source->replid_ = std::move(replid);
+        source->full_sync_session_id_ = *full_sync_session;
+        if (redis_sources_.front() == source) {
+          upstream_node_id_ = source->replid_;
+          upstream_history_id_ = source->replid_;
+        }
+        source_worker_count_ = static_cast<unsigned>(redis_sources_.size());
+        RedisSlotSet registered_slots;
+        for (const auto& current : redis_sources_) {
+          registered_slots |= current->slots_;
+          const bool valid =
+              current->dataset_valid_.load(std::memory_order_acquire) &&
+              current->replid_.has_value() &&
+              current->full_sync_session_id_ == *full_sync_session;
+          population_complete &= valid;
+          if (valid) {
+            absl::StrAppend(&population_accumulator, *current->replid_, ":",
+                            current->offset_.load(std::memory_order_acquire),
+                            ";");
+          }
+        }
+        if (redis_cluster_) {
+          population_complete =
+              population_complete && !redis_topology_fault_ &&
+              expected_redis_topology_.has_value() &&
+              registered_slots.count() == storage::kLogicalStorageShards &&
+              redis_sources_.size() ==
+                  expected_redis_topology_->masters_.size();
+        }
       }
-      source_worker_count_ = static_cast<unsigned>(redis_sources_.size());
+      if (population_complete) {
+        const auto bytes = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(population_accumulator.data()),
+            population_accumulator.size());
+        status = co_await storage_->CompleteReplicaFullSync(
+            *full_sync_session, storage::PopulationToken{
+                                    .generation_ = *full_sync_session,
+                                    .digest_ = storage::Crc64(bytes),
+                                });
+        if (!status.ok()) {
+          std::lock_guard lock(state_mutex_);
+          if (redis_full_sync_session_id_ == *full_sync_session) {
+            source->dataset_valid_.store(false, std::memory_order_release);
+            source->full_sync_session_id_ = 0;
+            source->replid_.reset();
+          }
+          co_return status;
+        }
+        {
+          std::lock_guard lock(state_mutex_);
+          if (redis_full_sync_session_id_ != *full_sync_session) {
+            co_return absl::CancelledError(
+                "Redis full sync activation was superseded");
+          }
+          redis_full_sync_session_id_ = 0;
+        }
+      }
     }
     spdlog::info("Redis FULLRESYNC completed from {}:{} at offset {}",
                  source->upstream_.host_, source->upstream_.port_,
@@ -4263,6 +4723,8 @@ class ReplicationManager::Impl {
   Task<absl::Status> RunRedisReplicaSession(
       const std::shared_ptr<RedisSource>& source,
       const std::shared_ptr<ReplicaSession>& session) {
+    session->active_flows_.fetch_add(1, std::memory_order_acq_rel);
+    ReplicaFlowActivityGuard activity(&session->active_flows_);
     auto connected = co_await ConnectTcp(source->upstream_.host_,
                                          source->upstream_.port_, tls_context_);
     if (!connected.ok()) co_return connected.status();
@@ -4334,12 +4796,42 @@ class ReplicationManager::Impl {
     }
 
     StoreRole(ReplicationRole::kSyncing, std::memory_order_release);
-    // The native protocol carries the replica node identity separately
-    // from the history id it wants to continue.
+    // The control hello carries the complete resume context. Flow handshakes
+    // merely bind one socket to one component of this whole-group vector.
+    std::string requested_group;
+    std::string requested_history;
+    std::string applied_vector;
+    unsigned requested_flow_count = 0;
+    bool resume_proof_advertised = false;
+    {
+      std::lock_guard lock(state_mutex_);
+      requested_group = group_id_;
+      // A durable full-sync fence means the old population and resume proof
+      // have already been invalidated. Even if this boot still remembers a
+      // matching history and backlog cursor, advertising them could create a
+      // transient ONLINE state over an incomplete replacement.
+      const bool replacement_required =
+          storage_->ReplicaRecoveryFenced() ||
+          !native_dataset_valid_.load(std::memory_order_acquire);
+      requested_history =
+          replacement_required ? "?" : upstream_history_id_.value_or("?");
+      applied_vector = replacement_required || cursor_state_ == nullptr
+                           ? "?"
+                           : EncodeAppliedVector(*cursor_state_);
+      if (applied_vector != "?") {
+        requested_flow_count = cursor_state_->size();
+        resume_proof_advertised = true;
+      }
+    }
     const std::vector<std::string> sync_args{
-        "KLPSYNC", std::string(kProtocolVersion),
+        "KLPSYNC",
+        std::string(kProtocolVersion),
         absl::StrCat("?", node_id_, ":", listen_port_),
-        upstream_history_id_.value_or("?")};
+        requested_group,
+        requested_history,
+        replica_incarnation_,
+        boot_id_,
+        applied_vector};
     absl::Status sent =
         co_await WriteText(control, EncodeRespCommand(sync_args));
     if (!sent.ok()) {
@@ -4356,10 +4848,11 @@ class ReplicationManager::Impl {
     const std::vector<std::string_view> words = SplitWords(*response);
     std::uint64_t session_id = 0;
     unsigned source_workers = 0;
-    if (words.size() != 5 || words[0] != "+KLFULLRESYNC" ||
+    if (words.size() != 7 || words[0] != "+KLFULLRESYNC" ||
         !ParseUnsigned(words[1], &session_id) || session_id == 0 ||
-        words[2].size() != 40 || words[3].size() != 40 ||
-        !ParseUnsigned(words[4], &source_workers) || source_workers == 0) {
+        !IsReplicationId(words[2]) || !IsReplicationId(words[3]) ||
+        !IsReplicationId(words[4]) || !IsReplicationId(words[5]) ||
+        !ParseUnsigned(words[6], &source_workers) || source_workers == 0) {
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
       co_return absl::InvalidArgumentError(
@@ -4369,6 +4862,28 @@ class ReplicationManager::Impl {
       session->sockets_.Remove(control_fd);
       control.Close().IgnoreError();
       co_return absl::CancelledError("replication role epoch was replaced");
+    }
+    const bool local_population_matches_response =
+        resume_proof_advertised && requested_group == words[3] &&
+        requested_history == words[5] && requested_flow_count == source_workers;
+    if (!local_population_matches_response) {
+      // Publishing a new source context makes it eligible for the next
+      // reconnect. Persist the destructive fence first, so a disconnect
+      // before the first flow cannot turn an empty/old population into a
+      // same-context CONTINUE proof.
+      absl::Status invalidated =
+          co_await storage_->BeginReplicaFullSync(session_id);
+      if (!invalidated.ok()) {
+        session->sockets_.Remove(control_fd);
+        control.Close().IgnoreError();
+        co_return invalidated;
+      }
+      native_dataset_valid_.store(false, std::memory_order_release);
+      if (role_epoch_.load(std::memory_order_acquire) != role_epoch) {
+        session->sockets_.Remove(control_fd);
+        control.Close().IgnoreError();
+        co_return absl::CancelledError("replication role epoch was replaced");
+      }
     }
     session->session_id_ = session_id;
     session->source_worker_count_ = source_workers;
@@ -4399,10 +4914,18 @@ class ReplicationManager::Impl {
       session->cursors_ = std::move(next_cursors);
       if (active_replica_session_ == session) {
         upstream_node_id_ = std::string(words[2]);
-        upstream_history_id_ = std::string(words[3]);
+        group_id_ = std::string(words[3]);
+        upstream_history_id_ = std::string(words[5]);
         replica_session_id_ = session_id;
         source_worker_count_ = source_workers;
       }
+    }
+
+    if (ShouldInjectControlDropAfterResponse()) {
+      session->sockets_.Remove(control_fd);
+      control.Close().IgnoreError();
+      co_return absl::UnavailableError(
+          "injected replication control disconnect after response");
     }
 
     for (unsigned flow_id = 0; flow_id < source_workers; ++flow_id) {
@@ -4459,16 +4982,24 @@ class ReplicationManager::Impl {
     for (unsigned owner = 0; owner < session->transaction_owners_.size();
          ++owner) {
       auto cancel_owner = [session, owner]() {
-        auto& transactions =
-            session->transaction_owners_[owner]->transactions_;
+        auto& transactions = session->transaction_owners_[owner]->transactions_;
         std::vector<std::shared_ptr<ReplicaTransactionArrival>> arrivals;
         arrivals.reserve(transactions.size());
-        for (auto& [_, arrival] : transactions) {
+        for (auto it = transactions.begin(); it != transactions.end();) {
+          auto& arrival = it->second;
+          // A complete transaction that already entered apply owns an active
+          // counter and must publish either its committed participant cursors
+          // or its failure before role transition captures the frontier.
+          if (arrival->applying_) {
+            ++it;
+            continue;
+          }
           arrival->status_ =
               absl::CancelledError("replication session cancelled");
           arrivals.push_back(std::move(arrival));
+          const auto discarded = it++;
+          transactions.erase(discarded);
         }
-        transactions.clear();
         for (const auto& arrival : arrivals) {
           (void)arrival->completion_.ResolveOnce(
               storage::ReplicationTransactionResolution::kDiscard);
@@ -4542,12 +5073,9 @@ class ReplicationManager::Impl {
         "replication target session {} flow {} requesting cursor={}:{}",
         session->session_id_, flow_id, cursor.lsn_, cursor.fragment_index_);
     const std::vector<std::string> flow_args{
-        "KLFLOW",
-        std::string(kProtocolVersion),
-        std::to_string(session->session_id_),
-        std::to_string(flow_id),
-        std::to_string(cursor.lsn_),
-        std::to_string(cursor.fragment_index_)};
+        "KLFLOW", std::string(kProtocolVersion),
+        std::to_string(session->session_id_), std::to_string(flow_id),
+        std::to_string(cursor.lsn_)};
     absl::Status sent =
         co_await WriteText(stream, EncodeRespCommand(flow_args));
     if (!sent.ok()) {
@@ -4557,15 +5085,38 @@ class ReplicationManager::Impl {
       co_return sent;
     }
     auto response = co_await ReadLine(stream);
-    const std::string expected =
-        absl::StrCat("+KLFLOW ", session->session_id_, " ", flow_id);
-    if (!response.ok() || response->substr(0, expected.size()) != expected) {
+    const std::vector<std::string_view> flow_words =
+        response.ok() ? SplitWords(*response) : std::vector<std::string_view>{};
+    std::uint64_t response_session = 0;
+    unsigned response_flow = 0;
+    const bool response_valid =
+        response.ok() && flow_words.size() == 4 && flow_words[0] == "+KLFLOW" &&
+        ParseUnsigned(flow_words[1], &response_session) &&
+        response_session == session->session_id_ &&
+        ParseUnsigned(flow_words[2], &response_flow) &&
+        response_flow == flow_id &&
+        (flow_words[3] == "CONTINUE" || flow_words[3] == "FULL");
+    if (!response_valid) {
       session->sockets_.Remove(fd);
       stream.Close().IgnoreError();
       session->Cancel();
       co_return response.ok()
           ? absl::InvalidArgumentError("invalid KLFLOW response")
           : response.status();
+    }
+    if (flow_words[3] == "FULL") {
+      // Every flow performs this idempotent call before reading its first data
+      // frame. The single system-state writer makes all of them wait for the
+      // same durable invalidation, so no partition reset can outrun it.
+      absl::Status invalidated =
+          co_await storage_->BeginReplicaFullSync(session->session_id_);
+      if (!invalidated.ok()) {
+        session->sockets_.Remove(fd);
+        stream.Close().IgnoreError();
+        session->Cancel();
+        co_return invalidated;
+      }
+      native_dataset_valid_.store(false, std::memory_order_release);
     }
     session->connected_flows_.fetch_add(1, std::memory_order_acq_rel);
     absl::Status data_status =
@@ -4594,8 +5145,7 @@ class ReplicationManager::Impl {
   }
 
   Task<absl::Status> ApplyReadyReplicaTransaction(
-      std::shared_ptr<ReplicaSession> session,
-      unsigned owner,
+      std::shared_ptr<ReplicaSession> session, unsigned owner,
       std::shared_ptr<ReplicaTransactionArrival> arrival) {
     // The registration leaf spawns this coroutine on the transaction owner.
     // Keep all mutable arrival state on that worker until completion; waiters
@@ -4613,29 +5163,25 @@ class ReplicationManager::Impl {
       status = co_await WaitForReplicaTransaction(predecessor);
       if (!status.ok()) break;
     }
-    if (status.ok() && session->cancelled()) {
-      status = absl::CancelledError(
-          "replication session ended before transaction apply");
-    }
+    // Once every participant is registered, promotion owns this apply through
+    // active_transaction_applies_. Transport cancellation discards only
+    // incomplete arrivals; this task must publish its cursor into the frozen
+    // frontier before the role transition can continue.
+    if (status.ok())
+      status = co_await MaybePauseBeforeReplicaTransactionApply();
     if (status.ok()) status = co_await ApplyReplicatedCommand(command);
 
-    const bool cancelled = session->cancelled();
-    if (cancelled) {
-      arrival->status_ = absl::CancelledError(
-          "replication session ended during transaction apply");
-    } else {
-      arrival->status_ = std::move(status);
-      if (arrival->status_.ok()) {
-        // Cursor publication precedes completion resolution, so every flow
-        // ACK observes one atomic resumable cut for the participant set.
-        for (unsigned participant : arrival->participants_) {
-          session->cursors_->Store(participant,
-                                   arrival->lsns_[participant] + 1, 0);
-        }
+    arrival->status_ = std::move(status);
+    if (arrival->status_.ok()) {
+      // Cursor publication is part of the apply completion, not network ACK.
+      // A role change may close the socket while this transaction is inside
+      // storage; a successful commit must still enter the frozen frontier.
+      for (unsigned participant : arrival->participants_) {
+        session->cursors_->Store(participant, arrival->lsns_[participant] + 1,
+                                 0);
       }
     }
-    auto& transactions =
-        session->transaction_owners_[owner]->transactions_;
+    auto& transactions = session->transaction_owners_[owner]->transactions_;
     auto found = transactions.find(arrival->id_);
     if (found != transactions.end() && found->second == arrival) {
       // All declared participants arrived before apply started. Their flow
@@ -4644,8 +5190,9 @@ class ReplicationManager::Impl {
       transactions.erase(found);
     }
     (void)arrival->completion_.ResolveOnce(
-        cancelled ? storage::ReplicationTransactionResolution::kDiscard
-                  : storage::ReplicationTransactionResolution::kPublish);
+        arrival->status_.ok()
+            ? storage::ReplicationTransactionResolution::kPublish
+            : storage::ReplicationTransactionResolution::kDiscard);
     co_return absl::OkStatus();
   }
 
@@ -4720,8 +5267,7 @@ class ReplicationManager::Impl {
       return absl::CancelledError(
           "replication session ended before transaction arrival");
     }
-    auto& transactions =
-        session->transaction_owners_[owner]->transactions_;
+    auto& transactions = session->transaction_owners_[owner]->transactions_;
     std::shared_ptr<ReplicaTransactionArrival> arrival;
     bool start_apply = false;
     auto [it, inserted] = transactions.try_emplace(prepared.id_);
@@ -4754,11 +5300,9 @@ class ReplicationManager::Impl {
       arrival->command_args_ = std::move(prepared.command_args_);
       arrival->payload_arrived_ = true;
     }
-    if (prepared.predecessor_ != nullptr &&
-        prepared.predecessor_ != arrival &&
-        std::find(arrival->predecessors_.begin(),
-                  arrival->predecessors_.end(), prepared.predecessor_) ==
-            arrival->predecessors_.end()) {
+    if (prepared.predecessor_ != nullptr && prepared.predecessor_ != arrival &&
+        std::find(arrival->predecessors_.begin(), arrival->predecessors_.end(),
+                  prepared.predecessor_) == arrival->predecessors_.end()) {
       arrival->predecessors_.push_back(std::move(prepared.predecessor_));
     }
     arrival->arrived_[prepared.flow_id_] = true;
@@ -4793,11 +5337,11 @@ class ReplicationManager::Impl {
     }
     const unsigned owner = static_cast<unsigned>(
         prepared->id_ % session->transaction_owners_.size());
-    auto register_on_owner =
-        [this, session, owner, prepared = std::move(*prepared)]() mutable {
-          return RegisterReplicaTransactionOnOwner(
-              session, owner, std::move(prepared));
-        };
+    auto register_on_owner = [this, session, owner,
+                              prepared = std::move(*prepared)]() mutable {
+      return RegisterReplicaTransactionOnOwner(session, owner,
+                                               std::move(prepared));
+    };
     co_return co_await celer::SubmitTo(owner, std::move(register_on_owner));
   }
 
@@ -4855,7 +5399,10 @@ class ReplicationManager::Impl {
     }
 
     if (apply_here) {
-      absl::Status status = co_await ApplyReplicatedCommand(apply_command);
+      absl::Status status = co_await MaybePauseBeforeReplicaControlApply();
+      if (status.ok()) {
+        status = co_await ApplyReplicatedCommand(apply_command);
+      }
       std::lock_guard lock(session->control_mutex_);
       arrival->status_ = std::move(status);
       if (arrival->status_.ok()) {
@@ -4916,8 +5463,8 @@ class ReplicationManager::Impl {
   };
 
   Task<absl::Status> StageReplicaOnlineCommands(
-      const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id, const std::shared_ptr<ReplicaOnlineApplyState>& state) {
+      const std::shared_ptr<ReplicaSession>& session, unsigned flow_id,
+      const std::shared_ptr<ReplicaOnlineApplyState>& state) {
     constexpr std::size_t kOnlineCompletionCommands = 256;
     std::shared_ptr<ReplicaTransactionArrival> last_transaction;
     for (;;) {
@@ -4966,15 +5513,24 @@ class ReplicationManager::Impl {
           last_transaction.reset();
         }
         if (applied.ok() && control) {
-          applied = co_await ApplyReplicaControl(
-              session, flow_id, pending.lsn_, std::move(pending.command_));
+          applied = co_await ApplyReplicaControl(session, flow_id, pending.lsn_,
+                                                 std::move(pending.command_));
         } else if (applied.ok()) {
-          applied = co_await ApplyReplicatedCommand(pending.command_);
+          applied = co_await MaybePauseBeforeReplicaCommandApply();
+          if (applied.ok()) {
+            applied = co_await ApplyReplicatedCommand(pending.command_);
+          }
         }
       }
       if (!applied.ok()) {
         InvalidateReplicaContinuation(session);
         co_return applied;
+      }
+      if (!transaction && !control) {
+        // Applied is a storage boundary. Publish the cursor here so promotion
+        // can close the transport and still capture every command whose local
+        // mutation completed; ACK delivery is not part of that proof.
+        session->cursors_->Store(flow_id, pending.lsn_ + 1, 0);
       }
       while (state->completions_.size() >= kOnlineCompletionCommands &&
              !state->ack_done_) {
@@ -5016,8 +5572,7 @@ class ReplicationManager::Impl {
             "replication flow staging queue closed");
       }
 
-      ReplicaOnlineCompletion pending =
-          std::move(state->completions_.front());
+      ReplicaOnlineCompletion pending = std::move(state->completions_.front());
       state->completions_.pop_front();
       state->completion_capacity_ready_.NotifyAll(*celer::ThisWorker().self_);
       const bool transaction = pending.transaction_ != nullptr;
@@ -5030,10 +5585,9 @@ class ReplicationManager::Impl {
         co_return applied;
       }
 
-      // Transaction apply published every participant cursor before resolving
-      // its completion latch. Re-storing this flow is harmless and keeps the
-      // single-flow and transaction ACK paths structurally identical.
-      session->cursors_->Store(flow_id, pending.lsn_ + 1, 0);
+      // Every event publishes its cursor at apply completion. ACK is transport
+      // feedback only and must not overwrite a newer cursor after staging has
+      // advanced farther on this flow.
       if (transaction && ShouldInjectFlowDropAfterTransaction(flow_id)) {
         co_return absl::UnavailableError(
             "injected replication flow disconnect after transaction");
@@ -5077,8 +5631,7 @@ class ReplicationManager::Impl {
 
   Task<absl::Status> RunReplicaOnlineFlowData(
       TcpStream& stream, const std::shared_ptr<ReplicaSession>& session,
-      unsigned flow_id,
-      std::pair<DataFrameKind, std::string> first_frame) {
+      unsigned flow_id, std::pair<DataFrameKind, std::string> first_frame) {
     auto state = std::make_shared<ReplicaOnlineApplyState>();
     celer::ThisWorker().self_->Spawn(
         TrackReplicaOnlineStage(stream, session, flow_id, state));
@@ -5095,8 +5648,8 @@ class ReplicationManager::Impl {
     constexpr std::size_t kOnlineQueueCommands = 256;
     while (stream.IsOpen()) {
       if (state->stage_done_ || state->ack_done_) {
-        receiver_status = state->stage_done_ ? state->stage_status_
-                                             : state->ack_status_;
+        receiver_status =
+            state->stage_done_ ? state->stage_status_ : state->ack_status_;
         break;
       }
       absl::StatusOr<std::pair<DataFrameKind, std::string>> frame =
@@ -5124,10 +5677,10 @@ class ReplicationManager::Impl {
       std::uint64_t lsn = 0;
       std::uint32_t fragment = 0;
       std::uint8_t flags = 0;
-      if (!reader.U64(&lsn) || !reader.U32(&fragment) ||
-          !reader.U8(&flags) || reader.remaining() == 0) {
-        receiver_status = absl::InvalidArgumentError(
-            "malformed replication command frame");
+      if (!reader.U64(&lsn) || !reader.U32(&fragment) || !reader.U8(&flags) ||
+          reader.remaining() == 0) {
+        receiver_status =
+            absl::InvalidArgumentError("malformed replication command frame");
         break;
       }
       const auto first_flag =
@@ -5175,8 +5728,8 @@ class ReplicationManager::Impl {
         co_await state->capacity_ready_.Wait();
       }
       if (state->stage_done_ || state->ack_done_) {
-        receiver_status = state->stage_done_ ? state->stage_status_
-                                             : state->ack_status_;
+        receiver_status =
+            state->stage_done_ ? state->stage_status_ : state->ack_status_;
         break;
       }
       state->commands_.push_back(ReplicaOnlineCommand{
@@ -5473,17 +6026,15 @@ class ReplicationManager::Impl {
         if (!acknowledged.ok()) co_return acknowledged;
         ++expected_fullsync_sequence;
       } else if (frame->first == DataFrameKind::kCommand) {
-        co_return co_await RunReplicaOnlineFlowData(
-            stream, session, flow_id, std::move(*frame));
+        co_return co_await RunReplicaOnlineFlowData(stream, session, flow_id,
+                                                    std::move(*frame));
       } else if (frame->first == DataFrameKind::kCursor) {
         DataReader reader(frame->second);
         std::uint64_t lsn = 0;
-        std::uint32_t fragment = 0;
-        if (!reader.U64(&lsn) || !reader.U32(&fragment) ||
-            reader.remaining() != 0) {
+        if (!reader.U64(&lsn) || reader.remaining() != 0) {
           co_return absl::InvalidArgumentError("malformed replication cursor");
         }
-        session->cursors_->Store(flow_id, lsn, fragment);
+        session->cursors_->Store(flow_id, lsn, 0);
         absl::Status acknowledged = co_await send_ack(0, lsn);
         if (!acknowledged.ok()) co_return acknowledged;
       } else if (frame->first == DataFrameKind::kRecords) {
@@ -5539,6 +6090,17 @@ class ReplicationManager::Impl {
                                                   std::memory_order_acq_rel);
   }
 
+  bool ShouldInjectControlDropAfterResponse() {
+    const char* configured =
+        std::getenv("KEYLANE_REPLICATION_DROP_AFTER_CONTROL_RESPONSE_ONCE");
+    if (configured == nullptr || std::string_view(configured) != "1") {
+      return false;
+    }
+    bool expected = false;
+    return replication_control_response_fault_drop_used_
+        .compare_exchange_strong(expected, true, std::memory_order_acq_rel);
+  }
+
   void InvalidateReplicaContinuation(
       const std::shared_ptr<ReplicaSession>& session) {
     std::lock_guard lock(state_mutex_);
@@ -5584,6 +6146,89 @@ class ReplicationManager::Impl {
     }
     return !replication_command_apply_fault_drop_used_.exchange(
         true, std::memory_order_acq_rel);
+  }
+
+  Task<absl::Status> MaybePauseBeforeReplicaCommandApply() {
+    const char* configured =
+        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS");
+    if (configured == nullptr) co_return absl::OkStatus();
+    std::uint64_t milliseconds = 0;
+    const std::size_t length = std::strlen(configured);
+    const auto parsed =
+        std::from_chars(configured, configured + length, milliseconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != configured + length ||
+        milliseconds == 0 || milliseconds > 60000 ||
+        replication_command_apply_pause_used_.exchange(
+            true, std::memory_order_acq_rel)) {
+      co_return absl::OkStatus();
+    }
+    spdlog::info(
+        "replication command admitted; pausing before database admission");
+    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                       std::chrono::milliseconds(milliseconds));
+  }
+
+  Task<absl::Status> MaybePauseBeforeReplicaTransactionApply() {
+    const char* configured =
+        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_TRANSACTION_APPLY_MS");
+    if (configured == nullptr) co_return absl::OkStatus();
+    std::uint64_t milliseconds = 0;
+    const std::size_t length = std::strlen(configured);
+    const auto parsed =
+        std::from_chars(configured, configured + length, milliseconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != configured + length ||
+        milliseconds == 0 || milliseconds > 60000 ||
+        replication_transaction_apply_pause_used_.exchange(
+            true, std::memory_order_acq_rel)) {
+      co_return absl::OkStatus();
+    }
+    spdlog::info(
+        "replication transaction complete; pausing before database apply");
+    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                       std::chrono::milliseconds(milliseconds));
+  }
+
+  Task<absl::Status> MaybePauseBeforeReplicaControlApply() {
+    const char* configured =
+        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_CONTROL_APPLY_MS");
+    if (configured == nullptr) co_return absl::OkStatus();
+    std::uint64_t milliseconds = 0;
+    const std::size_t length = std::strlen(configured);
+    const auto parsed =
+        std::from_chars(configured, configured + length, milliseconds);
+    if (parsed.ec != std::errc{} || parsed.ptr != configured + length ||
+        milliseconds == 0 || milliseconds > 60000 ||
+        replication_control_apply_pause_used_.exchange(
+            true, std::memory_order_acq_rel)) {
+      co_return absl::OkStatus();
+    }
+    spdlog::info(
+        "replication control barrier complete; pausing before database apply");
+    co_return co_await celer::SleepFor(*celer::ThisWorker().self_,
+                                       std::chrono::milliseconds(milliseconds));
+  }
+
+  Task<absl::Status> MaybePauseBeforeRedisExportDbAdmission() {
+#ifndef NDEBUG
+    const char* configured =
+        std::getenv("KEYLANE_REPLICATION_PAUSE_REDIS_EXPORT_BEFORE_GATES_MS");
+    if (configured != nullptr) {
+      std::uint64_t milliseconds = 0;
+      const std::size_t length = std::strlen(configured);
+      const auto parsed =
+          std::from_chars(configured, configured + length, milliseconds);
+      if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+          milliseconds != 0 && milliseconds <= 60000 &&
+          !redis_export_gate_pause_used_.exchange(true,
+                                                  std::memory_order_acq_rel)) {
+        spdlog::info("Redis export active; pausing before database admission");
+        co_return co_await celer::SleepFor(
+            *celer::ThisWorker().self_,
+            std::chrono::milliseconds(milliseconds));
+      }
+    }
+#endif
+    co_return absl::OkStatus();
   }
 
   Task<absl::Status> RunMasterFlowData(
@@ -5827,7 +6472,6 @@ class ReplicationManager::Impl {
           std::uint64_t sequence_ = 0;
           std::uint64_t item_id_ = 0;
         };
-        constexpr std::size_t kDataFrameHeaderBytes = 5;
         constexpr std::size_t kFullSyncSequenceBytes = 8;
         constexpr std::size_t kCommandHeaderBytes = 2 + 8 + 8 + 4 + 1;
         constexpr std::size_t kWireOverhead = kDataFrameHeaderBytes +
@@ -5886,10 +6530,10 @@ class ReplicationManager::Impl {
                                               payload.data() + payload_offset),
                                           count));
             if (!read.ok()) co_return read;
-            PutU32(frame_headers,
-                   static_cast<std::uint32_t>(1 + payload.size()));
-            PutU8(frame_headers,
-                  static_cast<std::uint8_t>(DataFrameKind::kFullSyncCommand));
+            absl::Status frame_header = AppendDataFrameHeader(
+                &frame_headers, DataFrameKind::kFullSyncCommand, payload.size(),
+                DataFrameCrc32c(payload));
+            if (!frame_header.ok()) co_return frame_header;
             if (last) {
               pending_acks.push_back(PendingFullSyncAck{
                   .partition_id_ = encoded.item_.command_->partition_id_,
@@ -5944,13 +6588,40 @@ class ReplicationManager::Impl {
     // exact even when earlier FUNCTION mutations were also captured while the
     // key snapshot was being scanned.
     auto send_function_catalog = [&]() -> Task<absl::Status> {
-      std::vector<std::string> codes;
-      for (const LuaFunctionLibrary& library :
-           SnapshotLuaFunctionLibraries()) {
-        codes.push_back(library.code_);
+#ifndef NDEBUG
+      if (const char* configured = std::getenv(
+              "KEYLANE_REPLICATION_PAUSE_FULLSYNC_BEFORE_CATALOG_ACK_MS");
+          configured != nullptr &&
+          !replication_fullsync_catalog_pause_used_.exchange(
+              true, std::memory_order_acq_rel)) {
+        std::uint64_t pause_ms = 0;
+        const std::size_t length = std::strlen(configured);
+        const auto parsed =
+            std::from_chars(configured, configured + length, pause_ms);
+        if (parsed.ec == std::errc{} && parsed.ptr == configured + length &&
+            pause_ms != 0 && pause_ms <= 60000) {
+          spdlog::info(
+              "native full sync holds command gates before catalog "
+              "acknowledgement");
+          const auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(pause_ms);
+          while (!session->cancelled() &&
+                 std::chrono::steady_clock::now() < deadline) {
+            absl::Status paused = co_await celer::SleepFor(
+                *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+            if (!paused.ok()) co_return paused;
+          }
+          if (session->cancelled()) {
+            co_return absl::CancelledError(
+                "replication session ended before catalog acknowledgement");
+          }
+        }
       }
-      std::vector<std::string> args{
-          "FUNCTION", "RESTORE", rdb::EncodeFunctionDump(codes), "FLUSH"};
+#endif
+      auto catalog_operation = co_await AcquireFunctionCatalogOperation();
+      std::vector<std::string> args{"FUNCTION", "RESTORE",
+                                    GlobalFunctionCatalog().SnapshotDump(),
+                                    "FLUSH"};
       std::vector<std::string_view> views;
       views.reserve(args.size());
       for (const std::string& arg : args) views.push_back(arg);
@@ -5963,7 +6634,7 @@ class ReplicationManager::Impl {
 
       constexpr std::size_t kCommandHeaderBytes = 2 + 8 + 8 + 4 + 1;
       constexpr std::size_t kFragmentBytes =
-          kBacklogBatchBytes - 5 - 8 - kCommandHeaderBytes;
+          kBacklogBatchBytes - kDataFrameHeaderBytes - 8 - kCommandHeaderBytes;
       const std::size_t total = static_cast<std::size_t>(source->size());
       std::size_t offset = 0;
       std::uint32_t fragment = 0;
@@ -5973,12 +6644,12 @@ class ReplicationManager::Impl {
         const bool last = offset + count == total;
         std::uint8_t flags = 0;
         if (first) {
-          flags |= static_cast<std::uint8_t>(
-              storage::ReplicationFrameFlag::kFirst);
+          flags |=
+              static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kFirst);
         }
         if (last) {
-          flags |= static_cast<std::uint8_t>(
-              storage::ReplicationFrameFlag::kLast);
+          flags |=
+              static_cast<std::uint8_t>(storage::ReplicationFrameFlag::kLast);
         }
         const std::uint64_t sequence = fullsync_sequence++;
         std::string payload;
@@ -5992,8 +6663,8 @@ class ReplicationManager::Impl {
         const std::size_t payload_offset = payload.size();
         payload.resize(payload_offset + count);
         absl::Status read = co_await source->Read(
-            offset, std::span(reinterpret_cast<std::byte*>(
-                                  payload.data() + payload_offset),
+            offset, std::span(reinterpret_cast<std::byte*>(payload.data() +
+                                                           payload_offset),
                               count));
         if (!read.ok()) co_return read;
         absl::Status sent = co_await WriteDataFrame(
@@ -6543,21 +7214,20 @@ class ReplicationManager::Impl {
     }
     ++fullsync_sequence;
     co_return co_await EnterMasterFlowBacklog(stream, session, flow_id,
-                                              *backlog_cursor, 0);
+                                              *backlog_cursor);
   }
 
   Task<absl::Status> EnterMasterFlowBacklog(
       TcpStream& stream, const std::shared_ptr<MasterSession>& session,
-      unsigned flow_id, std::uint64_t next_lsn, std::uint32_t fragment_index) {
+      unsigned flow_id, std::uint64_t next_lsn) {
     storage::ReplicationLogCursor cursor{.lsn_ = next_lsn,
-                                         .fragment_index_ = fragment_index};
+                                         .fragment_index_ = 0};
     absl::Status retained =
         storage_->RetainReplicationLog(session->id_, cursor.lsn_);
     if (!retained.ok()) co_return retained;
     session->SetBacklogCursor(flow_id, ReplicationPhase::kBacklog, cursor);
     std::string cursor_payload;
     PutU64(cursor_payload, next_lsn);
-    PutU32(cursor_payload, fragment_index);
     absl::Status cursor_sent =
         co_await WriteDataFrame(stream, DataFrameKind::kCursor, cursor_payload);
     if (!cursor_sent.ok()) co_return cursor_sent;
@@ -6601,9 +7271,8 @@ class ReplicationManager::Impl {
       }
       if (duplex->expected_acks_.empty()) {
         co_return duplex->sender_done_
-                      ? absl::OkStatus()
-                      : absl::UnavailableError(
-                            "replication backlog flow closed");
+            ? absl::OkStatus()
+            : absl::UnavailableError("replication backlog flow closed");
       }
 
       const std::uint64_t expected_lsn = duplex->expected_acks_.front();
@@ -6622,8 +7291,8 @@ class ReplicationManager::Impl {
         co_return absl::InvalidArgumentError(
             "malformed replication command ACK");
       }
-      const storage::ReplicationLogCursor acknowledged{
-          .lsn_ = expected_lsn + 1, .fragment_index_ = 0};
+      const storage::ReplicationLogCursor acknowledged{.lsn_ = expected_lsn + 1,
+                                                       .fragment_index_ = 0};
       absl::Status retained =
           storage_->RetainReplicationLog(session->id_, acknowledged.lsn_);
       if (!retained.ok()) co_return retained;
@@ -6701,7 +7370,10 @@ class ReplicationManager::Impl {
         break;
       }
       std::string frame_headers;
-      frame_headers.reserve(batch->frames_.size() * 18);
+      constexpr std::size_t kCommandPreludeBytes = 13;
+      constexpr std::size_t kCommandWireHeaderBytes =
+          kDataFrameHeaderBytes + kCommandPreludeBytes;
+      frame_headers.reserve(batch->frames_.size() * kCommandWireHeaderBytes);
       std::vector<iovec> wire_batch;
       wire_batch.reserve(batch->frames_.size() * 2);
       std::vector<std::uint64_t> pending_acks;
@@ -6711,18 +7383,23 @@ class ReplicationManager::Impl {
           co_return absl::ResourceExhaustedError(
               "replication data frame exceeds configured limit");
         }
-        PutU32(frame_headers,
-               static_cast<std::uint32_t>(14 + frame.payload_.size()));
-        PutU8(frame_headers,
-              static_cast<std::uint8_t>(DataFrameKind::kCommand));
-        PutU64(frame_headers, frame.header_.lsn_);
-        PutU32(frame_headers, frame.header_.fragment_index_);
-        PutU8(frame_headers, frame.header_.flags_);
+        std::string prelude;
+        prelude.reserve(kCommandPreludeBytes);
+        PutU64(prelude, frame.header_.lsn_);
+        PutU32(prelude, frame.header_.fragment_index_);
+        PutU8(prelude, frame.header_.flags_);
+        absl::Status frame_header =
+            AppendDataFrameHeader(&frame_headers, DataFrameKind::kCommand,
+                                  kCommandPreludeBytes + frame.payload_.size(),
+                                  DataFrameCrc32c(prelude, frame.payload_));
+        if (!frame_header.ok()) co_return frame_header;
+        frame_headers.append(prelude);
       }
       for (std::size_t index = 0; index < batch->frames_.size(); ++index) {
         const auto& frame = batch->frames_[index];
         wire_batch.push_back(iovec{
-            .iov_base = frame_headers.data() + index * 18, .iov_len = 18});
+            .iov_base = frame_headers.data() + index * kCommandWireHeaderBytes,
+            .iov_len = kCommandWireHeaderBytes});
         wire_batch.push_back(
             iovec{.iov_base = const_cast<char*>(frame.payload_.data()),
                   .iov_len = frame.payload_.size()});
@@ -6737,8 +7414,7 @@ class ReplicationManager::Impl {
         // receiver runs concurrently on this worker and may observe an ACK as
         // soon as the first complete frame reaches the peer.
         duplex->expected_acks_.insert(duplex->expected_acks_.end(),
-                                      pending_acks.begin(),
-                                      pending_acks.end());
+                                      pending_acks.begin(), pending_acks.end());
         duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
         absl::Status sent = co_await stream.WriteAllV(wire_batch);
         if (!sent.ok()) {
@@ -6767,8 +7443,7 @@ class ReplicationManager::Impl {
       cursor = batch->next_;
     }
     if (sender_status.ok()) {
-      sender_status = absl::UnavailableError(
-          "replication backlog flow closed");
+      sender_status = absl::UnavailableError("replication backlog flow closed");
     }
     duplex->sender_done_ = true;
     duplex->expected_ack_ready_.NotifyAll(*celer::ThisWorker().self_);
@@ -6824,8 +7499,11 @@ class ReplicationManager::Impl {
   Task<absl::Status> ServeMasterControl(TcpStream& stream,
                                         std::vector<std::string> args,
                                         std::uint64_t client_id) {
-    if (args.size() != 4 || args[1] != kProtocolVersion ||
-        (args[3] != "?" && !IsReplicationId(args[3]))) {
+    if (args.size() != 8 || args[1] != kProtocolVersion ||
+        (args[3] != "?" && !IsReplicationId(args[3])) ||
+        (args[4] != "?" && !IsReplicationId(args[4])) ||
+        (args[5] != "?" && !IsReplicationId(args[5])) ||
+        (args[6] != "?" && !IsReplicationId(args[6]))) {
       co_return absl::InvalidArgumentError("invalid KLPSYNC handshake");
     }
     active_master_controls_.fetch_add(1, std::memory_order_acq_rel);
@@ -6833,6 +7511,10 @@ class ReplicationManager::Impl {
       std::atomic<unsigned>* active_;
       ~ControlGuard() { active_->fetch_sub(1, std::memory_order_acq_rel); }
     } control_guard{&active_master_controls_};
+    if (is_replica() || is_loading()) {
+      co_return absl::FailedPreconditionError(
+          "node lost valid source state during the native handshake");
+    }
     StartIdleReplicationHistoryMonitor();
     const bool protocol_probe = args[2] == "?";
     absl::Status history_ready = co_await EnsureReplicationHistoryReady();
@@ -6862,16 +7544,26 @@ class ReplicationManager::Impl {
         next_master_session_id_.fetch_add(1, std::memory_order_relaxed);
     SetClientReplicationSession(client_id, session_id);
     std::string source_history_id;
+    std::string source_group_id;
     {
       co_await master_mutex_.Lock(*celer::ThisWorker().self_);
       celer::CrossWorkerMutex::Guard lock(&master_mutex_);
       source_history_id = history_id_;
     }
-    const bool allow_continue = args[3] == source_history_id;
+    {
+      std::lock_guard lock(state_mutex_);
+      source_group_id = group_id_;
+    }
+    auto applied = DecodeAppliedVector(args[7]);
+    if (!applied.ok()) co_return applied.status();
+    const bool allow_continue =
+        args[3] == source_group_id && args[4] == source_history_id &&
+        IsReplicationId(args[5]) && IsReplicationId(args[6]) &&
+        applied->size() == storage_->worker_count();
     auto session = std::make_shared<MasterSession>(
         session_id, storage_->worker_count(), std::move(replica_node_id),
         std::move(replica_host), replica_port, source_history_id,
-        allow_continue);
+        allow_continue, std::move(*applied));
     for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
       const std::size_t flow_capacity = BacklogCapacityForFlow(
           worker, backlog_size_bytes_.load(std::memory_order_acquire));
@@ -6890,19 +7582,28 @@ class ReplicationManager::Impl {
     {
       co_await master_mutex_.Lock(*celer::ThisWorker().self_);
       celer::CrossWorkerMutex::Guard lock(&master_mutex_);
-      master_sessions_[session_id] = session;
+      if (is_replica() || is_loading()) {
+        session->Cancel();
+      } else {
+        master_sessions_[session_id] = session;
+      }
+    }
+    if (session->cancelled()) {
+      co_return absl::FailedPreconditionError(
+          "node lost valid source state during the native handshake");
     }
     absl::Status sent = co_await WriteText(
         stream,
         absl::StrCat("+KLFULLRESYNC ", session_id, " ", node_id_, " ",
-                     source_history_id, " ", storage_->worker_count(), "\r\n"));
+                     source_group_id, " ", boot_id_, " ", source_history_id,
+                     " ", storage_->worker_count(), "\r\n"));
     if (!sent.ok()) {
       (void)co_await RemoveMasterSession(session);
       co_return sent;
     }
     // Anonymous KLPSYNC is reserved for protocol detection. It deliberately
     // avoids leaving a ten-minute flow-stall session or appearing in INFO as
-    // a downstream replica. Real native replicas always advertise their
+    // a downstream replica. Real protocol-v2 replicas always advertise their
     // node id and listening port.
     if (protocol_probe) {
       (void)co_await RemoveMasterSession(session);
@@ -6989,13 +7690,11 @@ class ReplicationManager::Impl {
     std::uint64_t session_id = 0;
     unsigned flow_id = 0;
     std::uint64_t next_lsn = 0;
-    std::uint32_t fragment_index = 0;
-    if (args.size() != 6 || args[1] != kProtocolVersion ||
+    if (args.size() != 5 || args[1] != kProtocolVersion ||
         !ParseUnsigned(args[2], &session_id) || session_id == 0 ||
         !ParseUnsigned(args[3], &flow_id) ||
         flow_id != celer::ThisWorker().id_ ||
-        !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0 ||
-        !ParseUnsigned(args[5], &fragment_index)) {
+        !ParseUnsigned(args[4], &next_lsn) || next_lsn == 0) {
       co_return absl::InvalidArgumentError("invalid KLFLOW handshake");
     }
     std::shared_ptr<MasterSession> session;
@@ -7011,14 +7710,14 @@ class ReplicationManager::Impl {
     }
     const auto log_info = storage_->LocalReplicationLogInfo();
     const bool continue_mode =
-        session->allow_continue_ && (next_lsn > 1 || fragment_index != 0) &&
+        session->allow_continue_ && next_lsn == session->applied_[flow_id] &&
         log_info.state_ == storage::ReplicationLogState::kActive &&
         next_lsn >= log_info.floor_lsn_ && next_lsn <= log_info.tail_lsn_ + 1;
     spdlog::info(
         "replication session {} flow {} requested cursor={}:{} "
         "history-match={} "
         "backlog-state={} floor={} tail={} selected={}",
-        session_id, flow_id, next_lsn, fragment_index, session->allow_continue_,
+        session_id, flow_id, next_lsn, 0, session->allow_continue_,
         static_cast<unsigned>(log_info.state_), log_info.floor_lsn_,
         log_info.tail_lsn_, continue_mode ? "CONTINUE" : "FULL");
     if (!session->SetFlowResumePossible(flow_id, continue_mode)) {
@@ -7056,7 +7755,7 @@ class ReplicationManager::Impl {
     absl::Status waited =
         selected_continue_mode
             ? co_await EnterMasterFlowBacklog(stream, session, flow_id,
-                                              next_lsn, fragment_index)
+                                              next_lsn)
             : co_await RunMasterFlowData(stream, session, flow_id);
     if (!waited.ok()) {
       spdlog::warn("replication source flow {} ended: {}", flow_id,
@@ -7099,6 +7798,67 @@ class ReplicationManager::Impl {
     co_return absl::OkStatus();
   }
 
+  Task<absl::Status> DrainSourceEgress() {
+    assert(celer::ThisWorker().id_ == 0);
+    // The role is already non-master. Cancel registered downstreams and wait
+    // for handshake/export guards without touching publisher reservations:
+    // commands admitted under the old role still have to drain and publish.
+    std::vector<std::shared_ptr<MasterSession>> sessions;
+    {
+      co_await master_mutex_.Lock(*celer::ThisWorker().self_);
+      celer::CrossWorkerMutex::Guard lock(&master_mutex_);
+      sessions.reserve(master_sessions_.size() +
+                       retired_master_sessions_.size());
+      for (auto& [session_id, session] : master_sessions_) {
+        (void)session_id;
+        sessions.push_back(std::move(session));
+      }
+      for (auto& session : retired_master_sessions_) {
+        sessions.push_back(std::move(session));
+      }
+      master_sessions_.clear();
+      retired_master_sessions_.clear();
+      disconnected_replica_leases_.clear();
+      history_id_ = NewReplicationId();
+    }
+    for (const auto& session : sessions) session->Cancel();
+    auto source_flows_active = [&] {
+      return std::any_of(
+          sessions.begin(), sessions.end(),
+          [](const auto& item) { return item->connected_flows() != 0; });
+    };
+    while (active_master_controls_.load(std::memory_order_acquire) != 0 ||
+           redis_export_active_.load(std::memory_order_acquire) ||
+           idle_history_monitor_running_ || history_reset_running_ ||
+           source_flows_active()) {
+      const int redis_export_fd =
+          redis_export_fd_.load(std::memory_order_acquire);
+      if (redis_export_fd >= 0) (void)::shutdown(redis_export_fd, SHUT_RDWR);
+      absl::Status waited = co_await celer::SleepFor(
+          *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+    // Flow teardown performs any history reset before ClearFlow drops the
+    // final connected-flow count. Together with the monitor/reset flags, this
+    // joins every old source task before its history can be disabled.
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> DisableSourceHistory() {
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      absl::Status disabled = co_await celer::SubmitTaskTo(
+          worker, [this]() { return storage_->DisableReplicationLog(); });
+      if (!disabled.ok()) co_return disabled;
+    }
+    co_return absl::OkStatus();
+  }
+
+  Task<absl::Status> RetireSourceHistory() {
+    absl::Status drained = co_await DrainSourceEgress();
+    if (!drained.ok()) co_return drained;
+    co_return co_await DisableSourceHistory();
+  }
+
   void FinalizeRetiredMasterSessionsLocked() {
     auto retired = retired_master_sessions_.begin();
     while (retired != retired_master_sessions_.end()) {
@@ -7122,7 +7882,7 @@ class ReplicationManager::Impl {
           auto existing = disconnected_replica_leases_.find(session->node_id_);
           if (existing == disconnected_replica_leases_.end()) {
             disconnected_replica_leases_.emplace(session->node_id_,
-                                                  std::move(lease));
+                                                 std::move(lease));
           } else if (existing->second.session_id_ < session->id_) {
             existing->second = std::move(lease);
           }
@@ -7156,6 +7916,7 @@ class ReplicationManager::Impl {
       absl::Status slept = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(10));
       if (!slept.ok()) co_return slept;
+      if (is_replica()) co_return absl::OkStatus();
 
       std::string history_id;
       std::vector<storage::ReplicationLogInfo> logs;
@@ -7186,17 +7947,18 @@ class ReplicationManager::Impl {
         for (auto lease = disconnected_replica_leases_.begin();
              lease != disconnected_replica_leases_.end();) {
           const DisconnectedReplicaLease& candidate = lease->second;
-          bool expired = candidate.history_id_ != history_id_ ||
-                         candidate.highest_sent_next_lsns_.size() != logs.size();
+          bool expired =
+              candidate.history_id_ != history_id_ ||
+              candidate.highest_sent_next_lsns_.size() != logs.size();
           for (std::size_t worker = 0; !expired && worker < logs.size();
                ++worker) {
             // Native continuation is all-flow: one flow whose oldest retained
             // LSN is beyond the furthest frame possibly sent makes the entire
             // disconnected replica require full synchronization.
-            expired = logs[worker].state_ !=
-                          storage::ReplicationLogState::kActive ||
-                      logs[worker].floor_lsn_ >
-                          candidate.highest_sent_next_lsns_[worker];
+            expired =
+                logs[worker].state_ != storage::ReplicationLogState::kActive ||
+                logs[worker].floor_lsn_ >
+                    candidate.highest_sent_next_lsns_[worker];
           }
           if (expired) {
             spdlog::info(
@@ -7212,21 +7974,45 @@ class ReplicationManager::Impl {
       }
       if (!no_reconnectable_replica || history_reset_running_) continue;
 
-      // Serialize with history reset and handshake setup. A handshake that
-      // arrives after this point waits, observes the new history id, and must
-      // full-sync; one already in progress is caught by the final recheck.
+      // Serialize with history reset and handshake setup, then let every
+      // command admitted against this history finish publishing before the
+      // log is cleared. In particular, a durable Function inside EXEC must
+      // cross its participant log fences rather than being failed by idle
+      // history cleanup.
       history_reset_running_ = true;
+      bool command_gates_closed = false;
+      struct IdleResetGuard {
+        bool* reset_running_;
+        bool* command_gates_closed_;
+        ~IdleResetGuard() {
+          if (*command_gates_closed_) OpenAllCommandDbGates();
+          *reset_running_ = false;
+        }
+      } idle_reset_guard{&history_reset_running_, &command_gates_closed};
+      while (!CloseAllCommandDbGates()) {
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      }
+      command_gates_closed = true;
+      while (CommandDbOperationsActive()) {
+        absl::Status waited = co_await celer::SleepFor(
+            *celer::ThisWorker().self_, std::chrono::milliseconds(1));
+        if (!waited.ok()) co_return waited;
+      }
+
+      // A handshake that arrives after the reset flag was set waits and sees
+      // the new history. One that became active before it is caught here.
       bool disable = false;
       {
         co_await master_mutex_.Lock(*celer::ThisWorker().self_);
         celer::CrossWorkerMutex::Guard lock(&master_mutex_);
         FinalizeRetiredMasterSessionsLocked();
-        disable = !MasterHistoryHasConsumersLocked() &&
+        disable = !is_replica() && !MasterHistoryHasConsumersLocked() &&
                   disconnected_replica_leases_.empty();
         if (disable) history_id_ = NewReplicationId();
       }
       if (!disable) {
-        history_reset_running_ = false;
         continue;
       }
 
@@ -7236,7 +8022,6 @@ class ReplicationManager::Impl {
             worker, [this]() { return storage_->DisableReplicationLog(); });
         if (!disabled.ok()) break;
       }
-      history_reset_running_ = false;
       if (!disabled.ok()) co_return disabled;
       spdlog::info(
           "disabled replication history after all disconnected replicas "
@@ -7306,10 +8091,18 @@ class ReplicationManager::Impl {
   storage::StorageEngine* storage_;
   mutable std::mutex state_mutex_;
   std::optional<ReplicaOfConfig> upstream_;
+  // Guarded by state_mutex_. A failed promotion remains fenced, but REPLICAOF
+  // NO ONE may retry the frozen proof without reconstructing retired flows.
+  std::optional<storage::PromotionBase> pending_promotion_;
   std::shared_ptr<ReplicaSession> active_replica_session_;
   std::atomic<ReplicationRole> role_{ReplicationRole::kMaster};
   std::atomic<std::uint64_t> link_state_changed_nanos_{SteadyNanos()};
   std::atomic<std::uint64_t> role_epoch_{0};
+  // Redis sources replace one node-wide population together. The active
+  // session is guarded by state_mutex_; the allocator is boot-scoped so a
+  // restarted process cannot mistake an old durable fence for its attempt.
+  std::uint64_t redis_full_sync_session_id_ = 0;
+  std::atomic<std::uint64_t> next_redis_full_sync_session_id_{1};
   std::atomic<bool> native_dataset_valid_{false};
   std::atomic<unsigned> ready_workers_{0};
   std::uint64_t replica_session_id_ = 0;
@@ -7321,10 +8114,16 @@ class ReplicationManager::Impl {
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
   std::atomic<bool> replication_fault_drop_used_{false};
+  std::atomic<bool> replication_control_response_fault_drop_used_{false};
   std::atomic<bool> replication_transaction_fault_drop_used_{false};
   std::atomic<bool> replication_command_apply_fault_drop_used_{false};
+  std::atomic<bool> replication_command_apply_pause_used_{false};
+  std::atomic<bool> replication_transaction_apply_pause_used_{false};
+  std::atomic<bool> replication_control_apply_pause_used_{false};
+  std::atomic<bool> redis_export_gate_pause_used_{false};
   std::atomic<bool> replication_fullsync_pause_used_{false};
   std::atomic<bool> replication_fullsync_handoff_pause_used_{false};
+  std::atomic<bool> replication_fullsync_catalog_pause_used_{false};
   std::atomic<unsigned> snapshot_read_concurrency_{
       kDefaultReplicationSnapshotReadConcurrency};
   std::atomic<std::size_t> snapshot_batch_size_{kSnapshotKeysPerBatch};
@@ -7334,6 +8133,9 @@ class ReplicationManager::Impl {
   bool history_reset_running_ = false;  // worker 0 only
 
   const std::string node_id_;
+  std::string group_id_;  // guarded by state_mutex_
+  const std::string boot_id_;
+  const std::string replica_incarnation_;
   std::string history_id_;  // guarded by master_mutex_
   const std::uint16_t listen_port_;
   const std::shared_ptr<celer::TlsContext> tls_context_;
@@ -7342,6 +8144,9 @@ class ReplicationManager::Impl {
   std::atomic<bool> redis_psync_{false};
   std::atomic<bool> redis_export_backpressure_{false};
   std::atomic<bool> redis_export_active_{false};
+  // Valid only while redis_export_active_ is true; demotion shuts this socket
+  // down before disabling the source history it consumes.
+  std::atomic<int> redis_export_fd_{-1};
   // Each Redis source owns an independent PSYNC cursor. Cursors intentionally
   // remain process-local until storage and offsets can share a crash-atomic
   // commit record; process restart therefore requests a fresh RDB per source.
@@ -7365,67 +8170,67 @@ class ReplicationManager::Impl {
 ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
-    : impl_(std::make_unique<Impl>(storage, std::move(initial_upstream),
-                                   options)),
+    : group_(std::make_unique<ReplicationGroup>(
+          storage, std::move(initial_upstream), options)),
       options_(std::move(options)) {}
 
 ReplicationManager::~ReplicationManager() = default;
 
 void ReplicationManager::StorageReady(celer::Worker& worker) {
-  impl_->StorageReady(worker);
+  group_->StorageReady(worker);
 }
 
-Task<absl::Status> ReplicationManager::SetUpstream(
-    std::optional<ReplicaOfConfig> upstream) {
-  return impl_->SetUpstream(std::move(upstream));
+Task<absl::Status> ReplicationManager::ApplyDirective(
+    ReplicationDirective directive) {
+  switch (directive.kind_) {
+    case ReplicationDirective::Kind::kSetUpstream:
+      co_return co_await group_->SetUpstream(std::move(directive.upstream_));
+    case ReplicationDirective::Kind::kAddUpstream:
+      if (!directive.upstream_.has_value()) {
+        co_return absl::InvalidArgumentError(
+            "add-upstream directive has no endpoint");
+      }
+      co_return co_await group_->AddUpstream(std::move(*directive.upstream_));
+    case ReplicationDirective::Kind::kBacklogBytes:
+      co_return co_await group_->SetBacklogSizeBytes(directive.value_);
+    case ReplicationDirective::Kind::kPublishQueueBytes:
+      co_return co_await group_->SetPublishQueueBytesPerWorker(
+          directive.value_);
+    case ReplicationDirective::Kind::kSnapshotReadConcurrency:
+      co_return group_->SetSnapshotReadConcurrency(
+          static_cast<unsigned>(directive.value_));
+    case ReplicationDirective::Kind::kSnapshotBatchSize:
+      co_return group_->SetSnapshotBatchSize(directive.value_);
+    case ReplicationDirective::Kind::kReplicaPriority:
+      co_return group_->SetReplicaPriority(
+          static_cast<unsigned>(directive.value_));
+  }
+  co_return absl::InvalidArgumentError("unknown replication directive");
 }
 
-Task<absl::Status> ReplicationManager::AddUpstream(ReplicaOfConfig upstream) {
-  return impl_->AddUpstream(std::move(upstream));
-}
-
-absl::Status ReplicationManager::SetSnapshotReadConcurrency(
-    unsigned concurrency) noexcept {
-  return impl_->SetSnapshotReadConcurrency(concurrency);
+Task<ReplicationStatus> ReplicationManager::Observe() const {
+  return group_->status();
 }
 
 unsigned ReplicationManager::snapshot_read_concurrency() const noexcept {
-  return impl_->snapshot_read_concurrency();
-}
-
-absl::Status ReplicationManager::SetSnapshotBatchSize(
-    std::size_t count) noexcept {
-  return impl_->SetSnapshotBatchSize(count);
+  return group_->snapshot_read_concurrency();
 }
 
 std::size_t ReplicationManager::snapshot_batch_size() const noexcept {
-  return impl_->snapshot_batch_size();
-}
-
-Task<absl::Status> ReplicationManager::SetBacklogSizeBytes(std::size_t bytes) {
-  return impl_->SetBacklogSizeBytes(bytes);
+  return group_->snapshot_batch_size();
 }
 
 std::size_t ReplicationManager::backlog_size_bytes() const noexcept {
-  return impl_->backlog_size_bytes();
-}
-
-Task<absl::Status> ReplicationManager::SetPublishQueueBytesPerWorker(
-    std::size_t bytes) {
-  return impl_->SetPublishQueueBytesPerWorker(bytes);
+  return group_->backlog_size_bytes();
 }
 
 std::size_t ReplicationManager::publish_queue_bytes_per_worker()
     const noexcept {
-  return impl_->publish_queue_bytes_per_worker();
-}
-
-absl::Status ReplicationManager::SetReplicaPriority(unsigned priority) noexcept {
-  return impl_->SetReplicaPriority(priority);
+  return group_->publish_queue_bytes_per_worker();
 }
 
 unsigned ReplicationManager::replica_priority() const noexcept {
-  return impl_->replica_priority();
+  return group_->replica_priority();
 }
 
 bool ReplicationManager::IsNativeHandshake(
@@ -7441,52 +8246,52 @@ Task<absl::Status> ReplicationManager::ServeNativeConnection(
     co_return absl::InvalidArgumentError(
         "connection did not start with a replication handshake");
   }
-  co_return co_await impl_->ServeNativeConnection(
+  co_return co_await group_->ServeNativeConnection(
       stream, std::move(args), client_id, std::move(client_address), tls);
 }
 
 Task<absl::Status> ReplicationManager::ServeRedisExportConnection(
     TcpStream& stream, std::vector<std::string> args, std::uint64_t client_id,
     std::string client_address, bool tls, bool eof_capable) {
-  return impl_->ServeRedisExportConnection(stream, std::move(args), client_id,
-                                           std::move(client_address), tls,
-                                           eof_capable);
-}
-
-Task<ReplicationStatus> ReplicationManager::status() const {
-  return impl_->status();
+  return group_->ServeRedisExportConnection(stream, std::move(args), client_id,
+                                            std::move(client_address), tls,
+                                            eof_capable);
 }
 
 Task<absl::StatusOr<std::optional<NativeReplicationWatermark>>>
 ReplicationManager::CaptureNativeReplicationWatermark() {
-  return impl_->CaptureNativeReplicationWatermark();
+  return group_->CaptureNativeReplicationWatermark();
 }
 
 Task<std::optional<std::uint64_t>>
 ReplicationManager::CountAcknowledgedNativeReplicas(
     const NativeReplicationWatermark& watermark) const {
-  return impl_->CountAcknowledgedNativeReplicas(watermark);
+  return group_->CountAcknowledgedNativeReplicas(watermark);
 }
 
 Task<std::uint64_t> ReplicationManager::CountOnlineNativeReplicas() const {
-  return impl_->CountOnlineNativeReplicas();
+  return group_->CountOnlineNativeReplicas();
 }
 
 bool ReplicationManager::is_replica() const noexcept {
-  return impl_->is_replica();
+  return group_->is_replica();
 }
 
 bool ReplicationManager::is_loading() const noexcept {
-  return impl_->is_loading();
+  return group_->is_loading();
 }
 
 bool ReplicationManager::reject_writes() const noexcept {
-  return impl_->is_redis_follower() ||
+  return is_loading() || group_->is_redis_follower() ||
          (options_.replica_read_only_ && is_replica());
 }
 
+std::uint64_t ReplicationManager::role_epoch() const noexcept {
+  return group_->role_epoch();
+}
+
 bool ReplicationManager::redirects_clients_to_upstream() const noexcept {
-  return !impl_->is_redis_follower();
+  return !group_->is_redis_follower();
 }
 
 std::string_view ReplicationRoleName(ReplicationRole role) noexcept {

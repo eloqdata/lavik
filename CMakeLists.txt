@@ -232,6 +232,7 @@ add_library(keylane_module
   src/storage/engine/recovery.cpp
   src/storage/engine/replication.cpp
   src/storage/engine/replication_log.cpp
+  src/storage/engine/system_state.cpp
   src/storage/engine/tomb_raider.cpp
   src/storage/engine/tx_cleaner.cpp
   src/storage/engine/write.cpp
@@ -245,6 +246,7 @@ add_library(keylane_module
   src/redis/backup.cpp
   src/redis/blocking_wait.cpp
   src/redis/command.cpp
+  src/redis/function_catalog.cpp
   src/redis/hash_command.cpp
   src/redis/list_command.cpp
   src/redis/lua_eval.cpp
@@ -492,6 +494,7 @@ if (BUILD_TESTING)
     tests/cross_worker_mutex_test.cpp
     tests/device_affinity_test.cpp
     tests/logging_test.cpp
+    tests/lua_eval_test.cpp
     tests/memory_test.cpp
     tests/resp_test.cpp
     tests/scan_hash_map_test.cpp
@@ -509,6 +512,9 @@ if (BUILD_TESTING)
   )
   target_link_libraries(keylane_unit_tests
     PRIVATE keylane::module GTest::gtest_main
+  )
+  target_include_directories(keylane_unit_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/redis
   )
   gtest_discover_tests(keylane_unit_tests)
 
@@ -656,7 +662,7 @@ if (BUILD_TESTING)
       NAME keylane_multi_exec_e2e
       COMMAND keylane_multi_exec_e2e_test $<TARGET_FILE:keylane>
     )
-    set_tests_properties(keylane_multi_exec_e2e PROPERTIES TIMEOUT 120)
+    set_tests_properties(keylane_multi_exec_e2e PROPERTIES TIMEOUT 180)
 
     add_executable(keylane_atomicity_stress_e2e_test
       tests/atomicity_stress_e2e_test.cpp

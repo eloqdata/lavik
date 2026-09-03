@@ -135,8 +135,35 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(!DecodeMetadataPage(metadata_page, MetadataPageKind::kEpochs, 11,
                                   &metadata_generation, decoded_payload));
 
+  SystemStateRoot system_root{
+      .magic_ = kSystemStateRootMagic,
+      .version_ = kStorageFormatVersion,
+      .root_bytes_ = sizeof(SystemStateRoot),
+      .generation_ = 41,
+      .manifest_ =
+          ExtentRef{
+              .block_id_ = block_id,
+              .allocation_epoch_ = 19,
+              .payload_bytes_ = 123,
+              .payload_checksum_ = 0x12345678,
+          },
+      .manifest_bytes_ = 123,
+  };
+  std::array<std::byte, sizeof(SystemStateRoot)> system_root_bytes{};
+  EncodeSystemStateRoot(system_root, system_root_bytes);
+  SystemStateRoot decoded_system_root;
+  ASSERT_TRUE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
+  EXPECT_EQ(decoded_system_root, system_root);
+  system_root_bytes[8] = std::byte{2};  // Unknown versions are rejected.
+  EXPECT_FALSE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
+
   constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;
   static_assert(ScanBitmapBytes(one_pib_blocks) == 16 * 1024 * 1024);
+  static_assert(kSystemStateMetadataOffset ==
+                kEpochMetadataOffset +
+                    kEpochMetadataPageCount * 2 * kDirectIoAlignment);
+  static_assert(kScanBitmapMetadataOffset ==
+                kSystemStateMetadataOffset + 2 * kDirectIoAlignment);
   static_assert(CheckpointBitmapMetadataOffset(one_pib_blocks) >
                 kScanBitmapMetadataOffset);
   static_assert(DataBlockBegin(one_pib_blocks) >= 3);
