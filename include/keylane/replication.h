@@ -38,7 +38,7 @@ struct ReplicationOptions {
   // Redis Sentinel promotes only replicas with a nonzero priority and prefers
   // lower values. This is runtime mutable through CONFIG SET.
   unsigned replica_priority_ = 100;
-  // Advertised to the source during the version-2 control handshake so INFO
+  // Advertised to the source during the native control handshake so INFO
   // and CLUSTER NODES can identify the replica's Redis endpoint.
   std::uint16_t listen_port_ = 6379;
   bool use_tls_ = false;

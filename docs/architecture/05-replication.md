@@ -101,9 +101,9 @@ Redis listener. Worker 0 owns the `KLPSYNC` control connection. The source has
 one `KLFLOW` data connection per source worker and adopts each flow socket onto
 that worker. A target may have a different worker count; it assigns source flow
 `n` to target worker `n % target_worker_count` without changing the source flow
-identity. Native protocol v2 identifies the sparse binary
-transaction-envelope format described below and rejects v1 explicitly. The
-control hello carries the group,
+identity. Native protocol v1 is the only supported native wire format; there is
+no compatibility layout from an earlier deployment. The control hello carries
+the group,
 replica incarnation, replica boot, requested history context, and complete
 Applied vector; the response supplies the source group, boot, history, session,
 and flow count. `Applied[flow]` is the next incomplete logical event and starts
@@ -132,7 +132,7 @@ client write
 
 Canonical commands use the KRC1 command-body encoding: explicit logical database,
 argument count and lengths, then argument bytes. Large arguments stream into
-the backlog without another complete flattened allocation. The native v2
+the backlog without another complete flattened allocation. The native v1
 transport wraps each fragment in a versioned little-endian header containing
 magic, header and payload lengths, kind, and payload CRC32C. One logical event
 has one flow-local LSN and may span transport fragments and 8 MiB memory blocks,

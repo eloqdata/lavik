@@ -2611,7 +2611,7 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   {
     RespClient downstream_probe(replica_port);
     EXPECT_EQ(downstream_probe.Command(
-                  {"KLPSYNC", "2", "?", "?", "?", "?", "?", "?"}),
+                  {"KLPSYNC", "1", "?", "?", "?", "?", "?", "?"}),
               "-ERR native cascading replication is not supported");
   }
   {
@@ -4950,7 +4950,7 @@ TEST(ListE2eTest, SwitchingUpstreamLoadsDestructivelyAndNoOneRemainsFenced) {
   {
     RespClient native_probe(replica_port);
     EXPECT_TRUE(
-        native_probe.Command({"KLPSYNC", "2", "?", "?", "?", "?", "?", "?"})
+        native_probe.Command({"KLPSYNC", "1", "?", "?", "?", "?", "?", "?"})
             .starts_with("-LOADING"));
   }
   {

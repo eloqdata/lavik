@@ -63,7 +63,7 @@ using storage::PartitionReplicationStart;
 using storage::PartitionSnapshotBatch;
 using storage::SnapshotRecord;
 
-constexpr std::string_view kProtocolVersion = "2";
+constexpr std::string_view kProtocolVersion = "1";
 constexpr auto kHandshakeTimeout = std::chrono::seconds(10);
 
 std::uint64_t SteadyNanos() noexcept {
@@ -101,8 +101,8 @@ constexpr std::size_t kFullSyncInterleaveCommands = kFullSyncSchedulingItems;
 // issuing one metadata durability round-trip for every empty partition.
 constexpr std::size_t kFullSyncResetBatch = 64;
 constexpr std::size_t kMaxDataFrame = 12U * 1024U * 1024U;
-constexpr std::uint32_t kDataFrameMagic = 0x32464c4b;  // "KLF2" in LE.
-constexpr std::uint8_t kDataFrameVersion = 2;
+constexpr std::uint32_t kDataFrameMagic = 0x31464c4b;  // "KLF1" in LE.
+constexpr std::uint8_t kDataFrameVersion = 1;
 constexpr std::size_t kDataFrameHeaderBytes = 16;
 constexpr std::size_t kBacklogBatchBytes = storage::kReplicationTransferBytes;
 constexpr std::size_t kBacklogBatchFrames = 128;
