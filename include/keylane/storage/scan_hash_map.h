@@ -1171,6 +1171,38 @@ class ScanHashMap {
     return !tables_[0].buckets_.empty() || !tables_[1].buckets_.empty();
   }
 
+  // Allocates the final direct-bucket table for an empty map whose population
+  // is known exactly, such as an offline recovery checkpoint. Normal inserts
+  // deliberately grow incrementally because their eventual population is not
+  // known; recovery can avoid repeatedly allocating, walking, and retaining
+  // both sides of those intermediate rehashes. The normal 75-percent target
+  // remains unchanged, so the settled representation and lookup behavior are
+  // identical to a map that reached the same size through ordinary growth.
+  // Throws std::bad_alloc without modifying the map if capacity cannot be
+  // represented or allocated.
+  void PreallocateForExpectedSize(std::size_t expected_entries) {
+    assert(empty() && !has_allocated_storage());
+    if (expected_entries == 0) return;
+
+    const std::size_t required_buckets =
+        expected_entries / kTargetEntriesPerBucket +
+        (expected_entries % kTargetEntriesPerBucket != 0);
+    const std::size_t exponent =
+        required_buckets <= 1
+            ? 0
+            : std::bit_width(required_buckets - 1);
+    if (exponent > MaxBucketExponent ||
+        exponent >= std::numeric_limits<std::size_t>::digits) {
+      throw std::bad_alloc();
+    }
+
+    ScanHashMapEntryArena& arena = EnsureArena();
+    Table prepared(arena.allocation_domain());
+    prepared.exponent_ = static_cast<std::uint8_t>(exponent);
+    prepared.buckets_.resize(std::size_t{1} << exponent);
+    tables_[0] = std::move(prepared);
+  }
+
   // Includes both tables during incremental expansion. Primarily useful for
   // capacity diagnostics and saturation tests.
   std::size_t allocated_bucket_count() const noexcept {

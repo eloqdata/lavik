@@ -1424,6 +1424,13 @@ struct CheckpointShardResult {
   std::uint64_t accounting_entry_count_ = 0;
 };
 
+struct CheckpointIndexCapacity {
+  std::uint64_t entry_count_ = 0;
+  std::uint16_t partition_id_ = 0;
+  std::uint16_t shard_id_ = 0;
+  std::uint8_t db_id_ = 0;
+};
+
 struct CheckpointLoadResult {
   absl::Status status_ = absl::OkStatus();
   std::vector<std::uint64_t> blocks_;
@@ -1431,6 +1438,11 @@ struct CheckpointLoadResult {
   std::uint64_t accounting_entry_count_ = 0;
   std::vector<bool> saw_shards_;
   std::vector<bool> saw_accounting_shards_;
+  std::vector<std::uint32_t> capacity_chunks_by_shard_;
+  std::vector<CheckpointIndexCapacity> index_capacities_;
+  // The prefix pass classifies these blocks without reading their 8 MiB
+  // payloads. Capacity chunks are consumed before this list is decoded.
+  std::vector<std::uint64_t> body_blocks_;
   // The durable accounting chunks contain one entry per live physical block.
   // Keep the decoded table bounded by block count while the header scan
   // establishes runtime ownership. A failed checkpoint discards these
@@ -1914,6 +1926,11 @@ class StorageEngine::Impl {
     // outlive every map during reverse-order WorkerStore destruction.
     std::shared_ptr<ScanHashMapEntryArena> record_index_entry_arena_;
     std::vector<PartitionStore> partitions_;
+    // Present only while a shutdown checkpoint is being restored. Keeping the
+    // exact counts owner-local permits a post-load equality check without
+    // cross-thread reads of ScanHashMap state.
+    std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>>
+        checkpoint_index_capacities_;
     struct RdbSnapshotSession {
       std::uint64_t id_ = 0;
       std::uint64_t snapshot_time_ms_ = 0;
@@ -3186,8 +3203,15 @@ class StorageEngine::Impl {
   Task<absl::Status> PublishShutdownCheckpoint(
       std::uint64_t generation);
 
+  Task<absl::Status> DiscoverCheckpoint(WorkerStore& store,
+                                        CheckpointLoadResult* result);
+
+  Task<absl::Status> PrepareCheckpointIndexes();
+
   Task<absl::Status> LoadCheckpoint(WorkerStore& store,
                                     CheckpointLoadResult* result);
+
+  absl::Status ValidateCheckpointIndexSizes(const WorkerStore& store) const;
 
   void CompleteShutdownFlush(const absl::Status& status);
 
@@ -3409,7 +3433,10 @@ class StorageEngine::Impl {
   std::vector<std::unique_ptr<WorkerStore>> stores_;
   std::unique_ptr<CoroutineBarrier> open_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_consumed_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_capacity_loaded_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_capacity_ready_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_loaded_barrier_;
+  std::unique_ptr<CoroutineBarrier> checkpoint_index_validated_barrier_;
   std::unique_ptr<CoroutineBarrier> metadata_barrier_;
   std::unique_ptr<CoroutineBarrier> checkpoint_retired_barrier_;
   std::unique_ptr<CoroutineBarrier> recovery_barrier_;

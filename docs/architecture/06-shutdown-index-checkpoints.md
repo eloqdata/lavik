@@ -48,7 +48,13 @@ contiguous block range. Its raw payload is `ceil(capacity_blocks / 8)` bytes;
 the A/B copies consume twice that amount plus page headers (32 MiB at the
 per-device 1 PiB limit).
 
-Each worker serializes two chunk kinds into ordinary 8 MiB checkpoint blocks.
+Each worker serializes three chunk kinds into ordinary 8 MiB checkpoint blocks.
+Its single capacity chunk contains the exact entry count for every owned
+partition and logical-database index, including empty indexes. The complete
+directory fits in one block even with one worker. Startup uses these counts to
+allocate final index bucket tables before it installs keys; the directory is
+also a completeness check independent of how index entries happen to be split
+across blocks.
 Index chunks contain the complete key, database and partition epoch, physical
 record location, logical type and size, expiry and shielding state, and any
 extent manifest. Their fixed entry header packs owner, database, type and flags
@@ -66,14 +72,14 @@ because extent identity deliberately does not occupy every runtime
 `BlockState`, and an extent's recovery owner can differ from its key-index
 shard. The restored extent entry therefore resolves its physical owner only
 after the block-header scan.
-Index and accounting chunks share the checkpoint block kind, generation,
-bitmap, publication lifecycle, and payload CRC; an explicit chunk-kind field
-selects their entry layout.
+Capacity, index, and accounting chunks share the checkpoint block kind,
+generation, bitmap, publication lifecycle, and payload CRC; an explicit
+chunk-kind field selects their entry layout.
 
 Publication order is:
 
 ```text
-write and synchronize every checkpoint index and accounting block
+write and synchronize every checkpoint capacity, index, and accounting block
 write and synchronize the checkpoint bitmap on every device
 publish the generation and expected counts through the root on every device
 ```
@@ -104,20 +110,30 @@ all recovery workers walk disjoint, topology-aware stripes of its set bits.
 SPDK workers touch only devices for which they own a qpair; io_uring workers
 stripe the complete storage set. A false positive is ignored unless the
 allocated block has a self-validating checkpoint header for the selected
-generation. For matching blocks each scanner validates block identity and
+generation. For matching blocks a 12 KiB prefix read validates and classifies
+the block header and chunk header. Scanners then read the capacity chunks in
+full and rendezvous before any key is installed. Startup requires exactly one
+capacity chunk per worker, exactly one declaration per partition and database,
+and a declared sum equal to the root entry count. Worker 0 dispatches one
+owner-local allocation pass per worker; every nonempty `ScanHashMap` receives
+the same final power-of-two bucket count and 75-percent target it would have
+after normal growth.
+
+After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
-checksums, then submits the complete decoded block to its index-owning worker.
-Each scanner double-buffers checkpoint reads: after a block completes I/O it
-submits the next block before decoding and installing the current one. I/O,
-decoding, and index construction therefore proceed concurrently both within
-and across scanners. A scanner holds at most two 8 MiB buffers and one decoded
-batch, so temporary entry memory remains bounded by worker count rather than
-dataset size. A barrier reduces the per-scanner block, index-entry,
-accounting-entry, and shard results. Block and index-entry totals must exactly
-match the root, and every worker must have both chunk kinds represented. The
-published total block count makes a missing accounting chunk detectable
-without adding another root field. If a block or the final completeness check
-fails, startup
+checksums, then submits the complete decoded index or accounting block to its
+owner. Each scanner double-buffers checkpoint reads: after a block completes
+I/O it submits the next block before decoding and installing the current one.
+I/O, decoding, and index construction therefore proceed concurrently both
+within and across scanners. A scanner holds at most two 8 MiB buffers and one
+decoded batch, so temporary entry memory remains bounded by worker count rather
+than dataset size. Barriers reduce the per-scanner block, index-entry,
+accounting-entry, capacity, and shard results. Block and index-entry totals
+must exactly match the root, every worker must have all three chunk kinds
+represented, and each installed index size must equal its capacity declaration.
+The published total block count makes a missing chunk detectable without
+adding another root field. If a block or the final completeness check fails,
+startup
 disables ordinary-body skipping and performs the full record scan. Entries
 from already validated checkpoint blocks remain installed and participate in
 the normal winner merge; the full scan supplies every missing key.
@@ -152,6 +168,11 @@ per-key hash aggregation formerly performed while decoding the checkpoint.
 The speedup still does not make startup independent of index-entry or allocated
 block count: every checkpoint key must be decoded and every allocated block
 header must be scanned.
+
+Capacity chunks directly replace the earlier two-kind version-1 checkpoint
+layout. An earlier checkpoint is rejected before any key body is installed and
+falls back to the authoritative record scan; ordinary record media is
+unchanged.
 
 ## Source map
 

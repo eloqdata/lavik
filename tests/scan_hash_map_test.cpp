@@ -84,6 +84,34 @@ TEST(ScanHashMapTest, DirectoryCapacityDoesNotInflateEmptyArena) {
   EXPECT_LT(sizeof(ScanHashMapEntryArena), 1024);
 }
 
+TEST(ScanHashMapTest, PreallocatesSettledTableForKnownPopulation) {
+  ScanHashMap<std::uint64_t> map;
+  map.PreallocateForExpectedSize(91);
+  EXPECT_EQ(map.allocated_bucket_count(), 16);
+  EXPECT_FALSE(map.rehashing());
+
+  for (std::size_t i = 0; i < 91; ++i) {
+    const std::string key = "preallocated-" + std::to_string(i);
+    map.InsertNew(ComputeDigest(key), key, i);
+    EXPECT_FALSE(map.rehashing());
+    EXPECT_EQ(map.allocated_bucket_count(), 16);
+  }
+  EXPECT_EQ(map.size(), 91);
+}
+
+TEST(ScanHashMapTest, KnownEmptyPopulationAllocatesNothing) {
+  ScanHashMap<std::uint64_t> map;
+  map.PreallocateForExpectedSize(0);
+  EXPECT_FALSE(map.has_allocated_storage());
+}
+
+TEST(ScanHashMapTest, UnrepresentablePreallocationLeavesMapEmpty) {
+  ScanHashMap<std::uint64_t, 0> map;
+  EXPECT_THROW(map.PreallocateForExpectedSize(10), std::bad_alloc);
+  EXPECT_TRUE(map.empty());
+  EXPECT_FALSE(map.has_allocated_storage());
+}
+
 TEST(ScanHashMapTest, RetainedArenaAccountingFollowsStorageLifetime) {
   ASSERT_TRUE(keylane::InitMemoryLimit(64 * 1024 * 1024, 1).ok());
   keylane::BindMemoryAccountingShard(0);

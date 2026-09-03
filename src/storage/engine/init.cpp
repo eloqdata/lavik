@@ -809,7 +809,13 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   open_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_consumed_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_capacity_loaded_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_capacity_ready_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_loaded_barrier_ =
+      std::make_unique<CoroutineBarrier>(worker_count);
+  checkpoint_index_validated_barrier_ =
       std::make_unique<CoroutineBarrier>(worker_count);
   metadata_barrier_ = std::make_unique<CoroutineBarrier>(worker_count);
   checkpoint_retired_barrier_ =
@@ -832,6 +838,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   for (CheckpointLoadResult& result : checkpoint_load_results_) {
     result.saw_shards_.resize(worker_count, false);
     result.saw_accounting_shards_.resize(worker_count, false);
+    result.capacity_chunks_by_shard_.resize(worker_count, 0);
   }
   return absl::OkStatus();
 }
@@ -985,10 +992,42 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   if (!status.ok()) co_return status;
 
   if (checkpoint_active_.load(std::memory_order_acquire)) {
+    checkpoint_load.status_ =
+        co_await DiscoverCheckpoint(store, &checkpoint_load);
+  }
+
+  status = co_await checkpoint_capacity_loaded_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (worker.id() == 0 &&
+      checkpoint_active_.load(std::memory_order_acquire)) {
+    const absl::Status prepared = co_await PrepareCheckpointIndexes();
+    if (!prepared.ok()) {
+      spdlog::warn(
+          "shutdown checkpoint generation={} cannot prepare indexes; "
+          "falling back to record scan: {}",
+          checkpoint_root_.generation_, prepared.message());
+      checkpoint_load_fell_back_.store(true, std::memory_order_release);
+      checkpoint_active_.store(false, std::memory_order_release);
+    }
+  }
+
+  status = co_await checkpoint_capacity_ready_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (checkpoint_active_.load(std::memory_order_acquire)) {
     checkpoint_load.status_ = co_await LoadCheckpoint(store, &checkpoint_load);
   }
 
   status = co_await checkpoint_loaded_barrier_->Wait(worker);
+  if (!status.ok()) co_return status;
+
+  if (checkpoint_active_.load(std::memory_order_acquire) &&
+      checkpoint_load.status_.ok()) {
+    checkpoint_load.status_ = ValidateCheckpointIndexSizes(store);
+  }
+
+  status = co_await checkpoint_index_validated_barrier_->Wait(worker);
   if (!status.ok()) co_return status;
 
   if (worker.id() == 0) {
@@ -1571,7 +1610,10 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
 void StorageEngine::Impl::Fail(const absl::Status& status) {
   open_barrier_->Abort(status);
   checkpoint_consumed_barrier_->Abort(status);
+  checkpoint_capacity_loaded_barrier_->Abort(status);
+  checkpoint_capacity_ready_barrier_->Abort(status);
   checkpoint_loaded_barrier_->Abort(status);
+  checkpoint_index_validated_barrier_->Abort(status);
   metadata_barrier_->Abort(status);
   checkpoint_retired_barrier_->Abort(status);
   recovery_barrier_->Abort(status);

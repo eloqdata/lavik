@@ -192,20 +192,25 @@ repairs stale fields on a lagging member.
 
 If fixed metadata names an unconsumed checkpoint, worker 0 first advances its
 consumed generation on every device. All recovery workers then walk disjoint
-topology-aware stripes of the checkpoint bitmap. Each holds at most one block,
-validates it, and submits its decoded batch to the index-owning worker, so block
-I/O and index construction run concurrently with worker-bounded temporary
-memory. A barrier reduces per-worker block, entry, and shard totals. The root's
-expected counts make missing bitmap bits disable the fast path; stale bits are
-ignored unless their block header names the selected generation. Once the
-complete checkpoint is resident, its discovery bitmap is zeroed, each scanner
-returns its validated blocks through the cold-free lifecycle, and another
-barrier precedes ordinary recovery. A missing block, generation or topology
-mismatch, invalid bound, or checksum failure disables ordinary-body skipping
-and retains the full record scan. Entries from an already installed valid
-checkpoint prefix merge with that scan rather than requiring an unbounded
-rollback buffer. Startup also zeroes stale checkpoint bitmap state when no
-checkpoint is usable.
+topology-aware stripes of the checkpoint bitmap. A small prefix read first
+classifies matching chunks without reading every 8 MiB body. The exact
+per-partition, per-database capacities are then validated against the root and
+used to allocate each owner-local index's final power-of-two bucket table.
+Only after every owner has finished that allocation do scanners double-buffer
+the index and accounting bodies and submit decoded batches to index owners.
+This removes incremental index rehashing from checkpoint recovery while
+retaining worker-bounded temporary I/O memory. Barriers reduce per-worker
+block, entry, capacity, and shard totals and verify each loaded index against
+its declared size. The root's expected counts make missing bitmap bits disable
+the fast path; stale bits are ignored unless their block header names the
+selected generation. Once the complete checkpoint is resident, its discovery
+bitmap is zeroed, each scanner returns its validated blocks through the
+cold-free lifecycle, and another barrier precedes ordinary recovery. A missing
+block, generation or topology mismatch, invalid bound, checksum failure, or
+capacity mismatch disables ordinary-body skipping and retains the full record
+scan. Entries from an already installed valid checkpoint prefix merge with
+that scan rather than requiring an unbounded rollback buffer. Startup also
+zeroes stale checkpoint bitmap state when no checkpoint is usable.
 
 ### Per-worker initialization and teardown
 
@@ -310,6 +315,10 @@ All partition and logical-database indexes on a worker allocate entries from a
 shared worker-local arena, so sparse indexes share capacity instead of
 stranding it at partition boundaries. A population detached by `FLUSHDB`
 retains ownership of that arena until asynchronous reclamation finishes.
+Ordinary online growth remains incremental. Shutdown-checkpoint recovery knows
+each final population exactly and allocates its settled bucket table before
+installing entries, avoiding intermediate rehash tables without changing the
+steady-state load factor or representation.
 Optional per-key state such as expiration may change an entry's concrete
 representation. Those replacements are owner-serialized, and staged flush,
 coroutine, and transaction-undo state revalidates or retargets its saved entry

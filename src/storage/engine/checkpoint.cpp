@@ -12,6 +12,7 @@ constexpr std::uint32_t kCheckpointWireVersion = 1;
 enum class CheckpointChunkKind : std::uint32_t {
   kIndexEntries = 1,
   kBlockAccounting = 2,
+  kIndexCapacity = 3,
 };
 
 enum CheckpointEntryFlag : std::uint8_t {
@@ -81,12 +82,21 @@ struct CheckpointAccountingEntry {
   std::uint32_t reserved_tail_ = 0;
 };
 
+struct CheckpointCapacityEntry {
+  std::uint64_t entry_count_ = 0;
+  std::uint16_t partition_id_ = 0;
+  std::uint8_t db_id_ = 0;
+  std::array<std::uint8_t, 5> reserved_{};
+};
+
 static_assert(std::is_trivially_copyable_v<CheckpointChunkHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointAccountingEntry>);
+static_assert(std::is_trivially_copyable_v<CheckpointCapacityEntry>);
 static_assert(sizeof(CheckpointChunkHeader) == 40);
 static_assert(sizeof(CheckpointEntryHeader) == 56);
 static_assert(sizeof(CheckpointAccountingEntry) == 40);
+static_assert(sizeof(CheckpointCapacityEntry) == 16);
 static_assert(kMaxMemoryWorkers <= kCheckpointOwnerMask + 1);
 static_assert(kLogicalDatabaseCount <= kCheckpointDbMask + 1);
 static_assert(static_cast<std::uint8_t>(RecordKind::kTxCommit) <=
@@ -151,6 +161,51 @@ bool CheckpointBlockAllocated(
           (1U << (local % 8))) != 0;
 }
 
+absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
+    std::uint64_t block_id, const std::byte* data, const BlockHeader& block,
+    std::uint64_t generation, unsigned worker_count, bool validate_payload) {
+  BlockHeader reread{};
+  if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                  data, kBlockHeaderBytes),
+                              &reread) ||
+      reread.block_id_ != block_id ||
+      reread.allocation_epoch_ != block.allocation_epoch_ ||
+      reread.kind_ != BlockKind::kCheckpointIndex ||
+      reread.tx_generation_ != generation ||
+      reread.layout_worker_count_ != worker_count ||
+      reread.extent_index_ != block.extent_index_ ||
+      reread.extent_payload_bytes_ != block.extent_payload_bytes_ ||
+      reread.extent_payload_checksum_ != block.extent_payload_checksum_ ||
+      reread.record_count_ != block.record_count_) {
+    return absl::InternalError("checkpoint header changed while reading");
+  }
+  if (block.extent_index_ >= worker_count ||
+      block.extent_payload_bytes_ < sizeof(CheckpointChunkHeader) ||
+      block.extent_payload_bytes_ > kExtentPayloadBytes ||
+      block.committed_bytes_ !=
+          kBlockHeaderBytes + block.extent_payload_bytes_) {
+    return absl::InternalError("invalid checkpoint block bounds");
+  }
+  const auto payload = std::span<const std::byte>(
+      data + kBlockHeaderBytes, block.extent_payload_bytes_);
+  if (validate_payload && Crc32c(payload) != block.extent_payload_checksum_) {
+    return absl::InternalError("checkpoint payload checksum mismatch");
+  }
+  CheckpointChunkHeader chunk{};
+  std::memcpy(&chunk, payload.data(), sizeof(chunk));
+  if (chunk.magic_ != kCheckpointChunkMagic ||
+      chunk.version_ != kCheckpointWireVersion ||
+      chunk.header_bytes_ != sizeof(chunk) || chunk.generation_ != generation ||
+      chunk.shard_id_ != block.extent_index_ ||
+      chunk.entry_count_ != block.record_count_ || chunk.reserved_ != 0 ||
+      (chunk.kind_ != CheckpointChunkKind::kIndexEntries &&
+       chunk.kind_ != CheckpointChunkKind::kBlockAccounting &&
+       chunk.kind_ != CheckpointChunkKind::kIndexCapacity)) {
+    return absl::InternalError("invalid checkpoint chunk header");
+  }
+  return chunk;
+}
+
 // A checkpoint reader alternates two of these slots. Each slot submits the
 // header immediately and chains the payload read from that completion, so the
 // next block remains in flight while the worker decodes the current block.
@@ -181,10 +236,11 @@ class CheckpointPrefetchSlot {
 
   void Start(Worker& worker, FixedFile file, std::uint64_t offset,
              std::uint64_t block_id, std::uint64_t generation,
-             unsigned worker_count) {
+             unsigned worker_count, bool prefix_only = false) {
     assert(state_ != nullptr);
     assert(!state_->active_);
-    state_->Start(worker, file, offset, block_id, generation, worker_count);
+    state_->Start(worker, file, offset, block_id, generation, worker_count,
+                  prefix_only);
   }
 
   struct Awaiter {
@@ -234,13 +290,14 @@ class CheckpointPrefetchSlot {
 
     void Start(Worker& worker, FixedFile file, std::uint64_t offset,
                std::uint64_t block_id, std::uint64_t generation,
-               unsigned worker_count) {
+               unsigned worker_count, bool prefix_only) {
       worker_ = &worker;
       file_ = file;
       offset_ = offset;
       block_id_ = block_id;
       generation_ = generation;
       worker_count_ = worker_count;
+      prefix_only_ = prefix_only;
       phase_ = Phase::kHeader;
       active_ = true;
       complete_ = false;
@@ -288,7 +345,10 @@ class CheckpointPrefetchSlot {
         return;
       }
       header_ = header;
-      payload_read_bytes_ = AlignDirect(header.committed_bytes_);
+      payload_read_bytes_ =
+          prefix_only_
+              ? AlignDirect(kBlockHeaderBytes + sizeof(CheckpointChunkHeader))
+              : AlignDirect(header.committed_bytes_);
       phase_ = Phase::kPayload;
       absl::Status submitted = Submit(payload_read_bytes_);
       if (!submitted.ok()) {
@@ -330,6 +390,7 @@ class CheckpointPrefetchSlot {
     bool active_ = false;
     bool complete_ = false;
     bool orphaned_ = false;
+    bool prefix_only_ = false;
     std::coroutine_handle<> waiter_{};
     std::optional<Result> result_;
   };
@@ -518,6 +579,37 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   result = {};
   std::vector<std::byte> payload;
   payload.reserve(kExtentPayloadBytes);
+
+  // Every logical index is represented, including empty ones. Besides making
+  // a missing or duplicate directory entry detectable before installation,
+  // this keeps the startup allocation decision independent of whatever entry
+  // chunks happen to share a physical checkpoint block.
+  CheckpointChunkHeader capacity_chunk{
+      .generation_ = generation,
+      .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+      .kind_ = CheckpointChunkKind::kIndexCapacity,
+  };
+  AppendPod(&payload, capacity_chunk);
+  std::uint32_t capacity_entries = 0;
+  for (const WorkerStore::PartitionStore& partition : store.partitions_) {
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      AppendPod(&payload,
+                CheckpointCapacityEntry{
+                    .entry_count_ = partition.indexes_[db_id].size(),
+                    .partition_id_ = partition.id_,
+                    .db_id_ = db_id,
+                });
+      ++capacity_entries;
+    }
+  }
+  reinterpret_cast<CheckpointChunkHeader*>(payload.data())->entry_count_ =
+      capacity_entries;
+  auto capacity_written = co_await WriteCheckpointBlock(
+      store, generation, store.worker_->id(), capacity_entries, payload);
+  if (!capacity_written.ok()) co_return capacity_written.status();
+  result.blocks_.push_back(*capacity_written);
+
+  payload.clear();
   CheckpointChunkHeader chunk{
       .generation_ = generation,
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
@@ -886,9 +978,9 @@ Task<absl::Status> StorageEngine::Impl::PublishShutdownCheckpoint(
     entry_count += shard.entry_count_;
     blocks.insert(blocks.end(), shard.blocks_.begin(), shard.blocks_.end());
   }
-  if (blocks.size() < 2 * worker_count_) {
+  if (blocks.size() < 3 * worker_count_) {
     co_return absl::InternalError(
-        "checkpoint bitmap does not contain both chunks for every worker");
+        "checkpoint bitmap does not contain all chunk kinds for every worker");
   }
   std::sort(blocks.begin(), blocks.end());
   if (std::adjacent_find(blocks.begin(), blocks.end()) != blocks.end()) {
@@ -906,26 +998,17 @@ Task<absl::Status> StorageEngine::Impl::PublishShutdownCheckpoint(
   co_return co_await PersistCheckpointRoot(root);
 }
 
-Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
+Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     WorkerStore& store, CheckpointLoadResult* result) {
   assert(result != nullptr);
   *result = {};
   result->saw_shards_.resize(worker_count_, false);
   result->saw_accounting_shards_.resize(worker_count_, false);
+  result->capacity_chunks_by_shard_.resize(worker_count_, 0);
   if (!checkpoint_active_.load(std::memory_order_acquire)) {
     co_return absl::OkStatus();
   }
-  std::array<CheckpointPrefetchSlot, 2> prefetch;
-  for (CheckpointPrefetchSlot& slot : prefetch) {
-    absl::Status initialized =
-        slot.Initialize(options_.buffers_.alignment_);
-    if (!initialized.ok()) co_return initialized;
-  }
 
-  // Use the same topology-aware striped ownership as ordinary recovery. On
-  // io_uring every worker scans a disjoint global stripe; with SPDK only a
-  // device's configured qpair owners touch it. Interleaving devices keeps all
-  // controllers busy without giving any worker more than one decoded block.
   std::vector<std::uint64_t> next_device_offsets(devices_.size());
   std::uint64_t device_linear_begin = 0;
   for (std::size_t device_index = 0; device_index < devices_.size();
@@ -948,7 +1031,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     device_linear_begin += device.data_block_count_;
   }
 
-  std::vector<std::uint64_t> checkpoint_blocks;
+  std::vector<std::uint64_t> candidates;
   while (true) {
     bool scanned_block = false;
     for (std::size_t device_index = 0; device_index < devices_.size();
@@ -972,57 +1055,264 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       }
       const std::uint64_t block_id = MakeBlockId(device.id_, local);
       if (CheckpointBlockAllocated(device_allocators_, block_id)) {
-        checkpoint_blocks.push_back(block_id);
+        candidates.push_back(block_id);
       }
     }
     if (!scanned_block) break;
   }
 
+  std::array<CheckpointPrefetchSlot, 2> prefetch;
+  for (CheckpointPrefetchSlot& slot : prefetch) {
+    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
+    if (!initialized.ok()) co_return initialized;
+  }
+  auto start_prefetch = [this, &store](CheckpointPrefetchSlot& slot,
+                                       std::uint64_t block_id,
+                                       bool prefix_only) {
+    const auto [file_id, offset] = FileOffset(block_id);
+    slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
+               checkpoint_root_.generation_, worker_count_, prefix_only);
+  };
+
+  std::vector<std::uint64_t> capacity_blocks;
+  if (!candidates.empty()) start_prefetch(prefetch[0], candidates[0], true);
+  for (std::size_t index = 0; index < candidates.size(); ++index) {
+    CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
+    auto candidate = co_await current.Wait();
+    if (!candidate.ok()) co_return candidate.status();
+    if (index + 1 < candidates.size()) {
+      start_prefetch(prefetch[(index + 1) % prefetch.size()],
+                     candidates[index + 1], true);
+    }
+    if (!candidate->has_value()) continue;
+    auto chunk = ValidateCheckpointChunk(
+        candidates[index], current.data(), **candidate,
+        checkpoint_root_.generation_, worker_count_, false);
+    if (!chunk.ok()) co_return chunk.status();
+    result->blocks_.push_back(candidates[index]);
+    if (chunk->kind_ == CheckpointChunkKind::kIndexCapacity) {
+      capacity_blocks.push_back(candidates[index]);
+    } else {
+      result->body_blocks_.push_back(candidates[index]);
+    }
+  }
+
+  if (!capacity_blocks.empty()) {
+    start_prefetch(prefetch[0], capacity_blocks[0], false);
+  }
+  for (std::size_t index = 0; index < capacity_blocks.size(); ++index) {
+    CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
+    auto candidate = co_await current.Wait();
+    if (!candidate.ok()) co_return candidate.status();
+    if (index + 1 < capacity_blocks.size()) {
+      start_prefetch(prefetch[(index + 1) % prefetch.size()],
+                     capacity_blocks[index + 1], false);
+    }
+    if (!candidate->has_value()) {
+      co_return absl::InternalError(
+          "checkpoint capacity header changed after discovery");
+    }
+    const BlockHeader& block = **candidate;
+    auto chunk = ValidateCheckpointChunk(
+        capacity_blocks[index], current.data(), block,
+        checkpoint_root_.generation_, worker_count_, true);
+    if (!chunk.ok()) co_return chunk.status();
+    if (chunk->kind_ != CheckpointChunkKind::kIndexCapacity) {
+      co_return absl::InternalError(
+          "checkpoint capacity chunk changed kind after discovery");
+    }
+    const std::size_t entries_bytes =
+        block.extent_payload_bytes_ - sizeof(CheckpointChunkHeader);
+    if (entries_bytes != static_cast<std::size_t>(chunk->entry_count_) *
+                             sizeof(CheckpointCapacityEntry)) {
+      co_return absl::InternalError("invalid checkpoint capacity chunk size");
+    }
+    const std::byte* cursor =
+        current.data() + kBlockHeaderBytes + sizeof(CheckpointChunkHeader);
+    for (std::uint32_t entry_index = 0;
+         entry_index < chunk->entry_count_; ++entry_index) {
+      CheckpointCapacityEntry entry{};
+      std::memcpy(&entry, cursor, sizeof(entry));
+      cursor += sizeof(entry);
+      if (entry.partition_id_ >= kLogicalStorageShards ||
+          entry.db_id_ >= kLogicalDatabaseCount ||
+          entry.partition_id_ % worker_count_ != block.extent_index_ ||
+          std::any_of(entry.reserved_.begin(), entry.reserved_.end(),
+                      [](std::uint8_t byte) { return byte != 0; })) {
+        co_return absl::InternalError("invalid checkpoint capacity entry");
+      }
+      result->index_capacities_.push_back(
+          {.entry_count_ = entry.entry_count_,
+           .partition_id_ = entry.partition_id_,
+           .shard_id_ = static_cast<std::uint16_t>(block.extent_index_),
+           .db_id_ = entry.db_id_});
+    }
+    ++result->capacity_chunks_by_shard_[block.extent_index_];
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
+  assert(celer::ThisWorker().id_ == 0);
+  constexpr std::uint64_t kMissing =
+      std::numeric_limits<std::uint64_t>::max();
+  std::vector<std::uint64_t> expected(
+      static_cast<std::size_t>(kLogicalStorageShards) *
+          kLogicalDatabaseCount,
+      kMissing);
+  std::vector<std::uint32_t> capacity_chunks(worker_count_, 0);
+  std::uint64_t discovered_blocks = 0;
+  std::uint64_t declared_entries = 0;
+
+  for (const CheckpointLoadResult& loaded : checkpoint_load_results_) {
+    if (!loaded.status_.ok()) co_return loaded.status_;
+    if (std::numeric_limits<std::uint64_t>::max() - discovered_blocks <
+        loaded.blocks_.size()) {
+      co_return absl::InternalError("checkpoint block total overflows");
+    }
+    discovered_blocks += loaded.blocks_.size();
+    for (unsigned shard = 0; shard < worker_count_; ++shard) {
+      if (std::numeric_limits<std::uint32_t>::max() - capacity_chunks[shard] <
+          loaded.capacity_chunks_by_shard_[shard]) {
+        co_return absl::InternalError("checkpoint capacity total overflows");
+      }
+      capacity_chunks[shard] += loaded.capacity_chunks_by_shard_[shard];
+    }
+    for (const CheckpointIndexCapacity& capacity :
+         loaded.index_capacities_) {
+      if (capacity.partition_id_ >= kLogicalStorageShards ||
+          capacity.db_id_ >= kLogicalDatabaseCount ||
+          capacity.partition_id_ % worker_count_ != capacity.shard_id_) {
+        co_return absl::InternalError("invalid checkpoint capacity owner");
+      }
+      const std::size_t slot =
+          static_cast<std::size_t>(capacity.partition_id_) *
+              kLogicalDatabaseCount +
+          capacity.db_id_;
+      if (expected[slot] != kMissing) {
+        co_return absl::InternalError(
+            "checkpoint repeats an index capacity entry");
+      }
+      expected[slot] = capacity.entry_count_;
+      if (std::numeric_limits<std::uint64_t>::max() - declared_entries <
+          capacity.entry_count_) {
+        co_return absl::InternalError("checkpoint capacity sum overflows");
+      }
+      declared_entries += capacity.entry_count_;
+    }
+  }
+  if (discovered_blocks != checkpoint_root_.block_count_) {
+    co_return absl::InternalError("checkpoint block count mismatch");
+  }
+  if (std::any_of(capacity_chunks.begin(), capacity_chunks.end(),
+                  [](std::uint32_t count) { return count != 1; })) {
+    co_return absl::InternalError(
+        "checkpoint must contain one capacity chunk per worker");
+  }
+  if (std::find(expected.begin(), expected.end(), kMissing) != expected.end()) {
+    co_return absl::InternalError(
+        "checkpoint omits an index capacity entry");
+  }
+  if (declared_entries != checkpoint_root_.entry_count_) {
+    co_return absl::InternalError("checkpoint capacity entry count mismatch");
+  }
+
+  for (unsigned owner = 0; owner < worker_count_; ++owner) {
+    std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>> capacities(
+        stores_[owner]->partitions_.size());
+    for (std::size_t partition_index = 0;
+         partition_index < capacities.size(); ++partition_index) {
+      const std::uint16_t partition_id = static_cast<std::uint16_t>(
+          owner + partition_index * worker_count_);
+      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+        capacities[partition_index][db_id] =
+            expected[static_cast<std::size_t>(partition_id) *
+                         kLogicalDatabaseCount +
+                     db_id];
+      }
+    }
+    auto prepare = [this, owner,
+                    capacities = std::move(capacities)]() mutable {
+      WorkerStore& owner_store = *stores_[owner];
+      owner_store.checkpoint_index_capacities_ = std::move(capacities);
+      try {
+        for (std::size_t partition_index = 0;
+             partition_index < owner_store.partitions_.size();
+             ++partition_index) {
+          auto& partition = owner_store.partitions_[partition_index];
+          for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount;
+               ++db_id) {
+            const std::uint64_t count =
+                owner_store.checkpoint_index_capacities_[partition_index]
+                                                         [db_id];
+            if (count > std::numeric_limits<std::size_t>::max()) {
+              return absl::ResourceExhaustedError(
+                  "checkpoint index capacity exceeds address space");
+            }
+            partition.indexes_[db_id].PreallocateForExpectedSize(
+                static_cast<std::size_t>(count));
+          }
+        }
+      } catch (const std::bad_alloc&) {
+        return absl::ResourceExhaustedError(
+            "failed to preallocate checkpoint index tables");
+      }
+      return absl::OkStatus();
+    };
+    absl::Status prepared =
+        owner == 0 ? prepare() : co_await celer::SubmitTo(owner, prepare);
+    if (!prepared.ok()) co_return prepared;
+  }
+  co_return absl::OkStatus();
+}
+
+absl::Status StorageEngine::Impl::ValidateCheckpointIndexSizes(
+    const WorkerStore& store) const {
+  if (store.checkpoint_index_capacities_.size() != store.partitions_.size()) {
+    return absl::InternalError("checkpoint index capacities were not prepared");
+  }
+  for (std::size_t partition_index = 0;
+       partition_index < store.partitions_.size(); ++partition_index) {
+    const auto& partition = store.partitions_[partition_index];
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      if (partition.indexes_[db_id].size() !=
+          store.checkpoint_index_capacities_[partition_index][db_id]) {
+        return absl::InternalError(
+            "checkpoint index size differs from declared capacity");
+      }
+    }
+  }
+  return absl::OkStatus();
+}
+
+Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
+    WorkerStore& store, CheckpointLoadResult* result) {
+  assert(result != nullptr);
+  if (!checkpoint_active_.load(std::memory_order_acquire)) {
+    co_return absl::OkStatus();
+  }
+  std::array<CheckpointPrefetchSlot, 2> prefetch;
+  for (CheckpointPrefetchSlot& slot : prefetch) {
+    absl::Status initialized =
+        slot.Initialize(options_.buffers_.alignment_);
+    if (!initialized.ok()) co_return initialized;
+  }
+
   auto decode_block = [this, &store, result](
                           std::uint64_t block_id, const std::byte* data,
                           BlockHeader block) -> Task<absl::Status> {
-    BlockHeader reread{};
-    if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
-                                    data, kBlockHeaderBytes),
-                                &reread) ||
-        reread.block_id_ != block_id ||
-        reread.allocation_epoch_ != block.allocation_epoch_ ||
-        reread.kind_ != BlockKind::kCheckpointIndex ||
-        reread.tx_generation_ != checkpoint_root_.generation_ ||
-        reread.extent_index_ != block.extent_index_ ||
-        reread.extent_payload_bytes_ != block.extent_payload_bytes_ ||
-        reread.extent_payload_checksum_ != block.extent_payload_checksum_ ||
-        reread.record_count_ != block.record_count_) {
-      co_return absl::InternalError("checkpoint header changed while reading");
-    }
-    const auto payload = std::span<const std::byte>(
-        data + kBlockHeaderBytes, block.extent_payload_bytes_);
-    if (Crc32c(payload) != block.extent_payload_checksum_) {
-      co_return absl::InternalError("checkpoint payload checksum mismatch");
-    }
-    if (block.extent_index_ >= worker_count_) {
-      co_return absl::InternalError("checkpoint block has an invalid shard");
+    auto decoded_chunk = ValidateCheckpointChunk(
+        block_id, data, block, checkpoint_root_.generation_, worker_count_,
+        true);
+    if (!decoded_chunk.ok()) co_return decoded_chunk.status();
+    if (decoded_chunk->kind_ == CheckpointChunkKind::kIndexCapacity) {
+      co_return absl::InternalError(
+          "checkpoint capacity chunk reached the body decoder");
     }
     const std::byte* cursor = data + kBlockHeaderBytes;
     const std::byte* end = cursor + block.extent_payload_bytes_;
-    if (static_cast<std::size_t>(end - cursor) <
-        sizeof(CheckpointChunkHeader)) {
-      co_return absl::InternalError("checkpoint chunk is truncated");
-    }
-    CheckpointChunkHeader chunk{};
-    std::memcpy(&chunk, cursor, sizeof(chunk));
+    CheckpointChunkHeader chunk = *decoded_chunk;
     cursor += sizeof(chunk);
-    if (chunk.magic_ != kCheckpointChunkMagic ||
-        chunk.version_ != kCheckpointWireVersion ||
-        chunk.header_bytes_ != sizeof(chunk) ||
-        chunk.generation_ != checkpoint_root_.generation_ ||
-        chunk.shard_id_ != block.extent_index_ ||
-        chunk.entry_count_ != block.record_count_ ||
-        chunk.reserved_ != 0 ||
-        (chunk.kind_ != CheckpointChunkKind::kIndexEntries &&
-         chunk.kind_ != CheckpointChunkKind::kBlockAccounting)) {
-      co_return absl::InternalError("invalid checkpoint chunk header");
-    }
     if (chunk.kind_ == CheckpointChunkKind::kBlockAccounting) {
       if (chunk.entry_count_ > static_cast<std::size_t>(end - cursor) /
                                    sizeof(CheckpointAccountingEntry) ||
@@ -1075,7 +1365,6 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         ++result->accounting_entry_count_;
       }
       result->saw_accounting_shards_[block.extent_index_] = true;
-      result->blocks_.push_back(block_id);
       co_return absl::OkStatus();
     }
     if (chunk.entry_count_ > static_cast<std::size_t>(end - cursor) /
@@ -1202,7 +1491,6 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           });
       if (!applied.ok()) co_return applied;
     }
-    result->blocks_.push_back(block_id);
     co_return absl::OkStatus();
   };
 
@@ -1212,20 +1500,23 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     slot.Start(*store.worker_, store.files_[file_id], offset, block_id,
                checkpoint_root_.generation_, worker_count_);
   };
-  if (!checkpoint_blocks.empty()) {
-    start_prefetch(prefetch[0], checkpoint_blocks[0]);
+  if (!result->body_blocks_.empty()) {
+    start_prefetch(prefetch[0], result->body_blocks_[0]);
   }
-  for (std::size_t index = 0; index < checkpoint_blocks.size(); ++index) {
+  for (std::size_t index = 0; index < result->body_blocks_.size(); ++index) {
     CheckpointPrefetchSlot& current = prefetch[index % prefetch.size()];
     auto candidate = co_await current.Wait();
     if (!candidate.ok()) co_return candidate.status();
-    if (index + 1 < checkpoint_blocks.size()) {
+    if (index + 1 < result->body_blocks_.size()) {
       start_prefetch(prefetch[(index + 1) % prefetch.size()],
-                     checkpoint_blocks[index + 1]);
+                     result->body_blocks_[index + 1]);
     }
-    if (!candidate->has_value()) continue;
+    if (!candidate->has_value()) {
+      co_return absl::InternalError(
+          "checkpoint body header changed after discovery");
+    }
     absl::Status decoded =
-        co_await decode_block(checkpoint_blocks[index], current.data(),
+        co_await decode_block(result->body_blocks_[index], current.data(),
                               **candidate);
     if (!decoded.ok()) co_return decoded;
   }
