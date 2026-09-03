@@ -510,26 +510,30 @@ TEST(ClusterRouterTest, EndpointFormatsHostAndPort) {
 TEST(TopologyCacheTest, CachedReaderTracksVersionAndSnapshot) {
   TopologyCache cache;
   {
-    const auto [state, version] = CurrentCachedWithVersion(cache);
+    std::uint64_t version = 1;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
     EXPECT_EQ(state, nullptr);
     EXPECT_EQ(version, 0);
   }
   const std::shared_ptr<const ServingState> first = MakeState(1);
   cache.Publish(first);
   {
-    const auto [state, version] = CurrentCachedWithVersion(cache);
+    std::uint64_t version = 0;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
     EXPECT_EQ(state, first);
     EXPECT_EQ(version, 1);
     // A second read on the same thread hits the cached entry with the same
     // consistent pair.
-    const auto again = CurrentCachedWithVersion(cache);
-    EXPECT_EQ(again.first, first);
-    EXPECT_EQ(again.second, 1);
+    std::uint64_t version2 = 0;
+    const auto& again = CurrentCachedWithVersion(cache, &version2);
+    EXPECT_EQ(again, first);
+    EXPECT_EQ(version2, 1);
   }
   const std::shared_ptr<const ServingState> second = MakeState(2);
   cache.Publish(second);
   {
-    const auto [state, version] = CurrentCachedWithVersion(cache);
+    std::uint64_t version = 0;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
     EXPECT_EQ(state, second);
     EXPECT_EQ(version, 2);
   }
@@ -551,7 +555,8 @@ TEST(TopologyCacheTest, CachedReaderConsistentUnderConcurrentPublish) {
   // inconsistent (state, version) pairing is directly visible.
   std::thread reader([&] {
     while (!stop.load(std::memory_order_acquire)) {
-      const auto [state, version] = CurrentCachedWithVersion(cache);
+      std::uint64_t version = 0;
+      const auto& state = CurrentCachedWithVersion(cache, &version);
       if (state != nullptr && state->topology_epoch() != version) {
         mismatch.store(true);
         break;

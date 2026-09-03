@@ -274,8 +274,13 @@ class TopologyCache {
 // Publish stores the state before bumping the version, so an unchanged final
 // read proves no publication — and therefore no drain — raced the
 // registration.
-std::pair<std::shared_ptr<const ServingState>, std::uint64_t>
-CurrentCachedWithVersion(TopologyCache& cache);
+// Returns a reference to the calling thread's cached snapshot — no refcount
+// traffic on the shared control block. The reference stays valid until the
+// calling thread's next CurrentCachedWithVersion call; callers that need the
+// snapshot across suspension points (the admission record on the request)
+// copy it deliberately.
+const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
+    TopologyCache& cache, std::uint64_t* version_out);
 
 // Pure routing decisions over a committed ServingState. All functions are
 // stateless.

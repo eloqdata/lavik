@@ -406,12 +406,15 @@ std::uint64_t TopologyCache::Publish(
 
 std::uint64_t TopologyCache::version() const { return version_.load(); }
 
-std::pair<std::shared_ptr<const ServingState>, std::uint64_t>
-CurrentCachedWithVersion(TopologyCache& cache) {
+const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
+    TopologyCache& cache, std::uint64_t* version_out) {
   thread_local std::shared_ptr<const ServingState> entry;
   thread_local std::uint64_t entry_version = 0;
   const std::uint64_t v = cache.version();
-  if (entry != nullptr && entry_version == v) return {entry, v};
+  if (entry != nullptr && entry_version == v) {
+    *version_out = v;
+    return entry;
+  }
   // Miss: pair the snapshot with the version that actually covers it. A
   // publish landing between the two version reads is retried rather than
   // cached, so a hit always means "this state was current at this version".
@@ -422,7 +425,8 @@ CurrentCachedWithVersion(TopologyCache& cache) {
     if (before == after) {
       entry = std::move(state);
       entry_version = before;
-      return {entry, before};
+      *version_out = before;
+      return entry;
     }
   }
 }

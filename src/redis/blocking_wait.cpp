@@ -512,8 +512,10 @@ std::optional<CommandReply> ClusterBlockingAdmissionError(
   // A slightly stale cached snapshot is fine: an attempt admitted under it is
   // re-gated on the next wakeup, and the final mutation still passes the
   // owner-side re-check before executing.
-  const std::shared_ptr<const cluster::ServingState> state =
-      cluster::CurrentCachedWithVersion(runtime->topology_cache_).first;
+  std::uint64_t unused_version = 0;
+  const std::shared_ptr<const cluster::ServingState>& state =
+      cluster::CurrentCachedWithVersion(runtime->topology_cache_,
+                                        &unused_version);
   const cluster::RequestView view{
       .slots_ = slots,
       .is_write_ = true,

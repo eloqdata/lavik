@@ -822,8 +822,10 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
   // A slightly stale cached snapshot is fine here: admission under it can at
   // worst produce a standard redirect, and the owner-side re-check
   // backstops writes.
-  const std::shared_ptr<const cluster::ServingState> state =
-      cluster::CurrentCachedWithVersion(runtime->topology_cache_).first;
+  std::uint64_t gate_snapshot_version = 0;  // the gate needs no handshake
+  const std::shared_ptr<const cluster::ServingState>& state =
+      cluster::CurrentCachedWithVersion(runtime->topology_cache_,
+                                        &gate_snapshot_version);
   const cluster::RequestView view{
       .slots_ = request.cluster_slots_,
       .is_write_ = ClusterRequestIsWrite(request),
@@ -833,7 +835,7 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
   const cluster::Decision decision = cluster::Admit(state.get(), view);
   if (!EmitClusterDecision(decision, request.connection_tls_, reply_builder,
                            reply)) {
-    request.cluster_admitted_state_ = std::move(state);
+    request.cluster_admitted_state_ = state;  // deliberate copy: own ref
     return false;
   }
   return true;
@@ -884,8 +886,9 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
   for (;;) {
     // The snapshot arrives paired with the cache version at which it was
     // current; that pairing is what makes the handshake below airtight.
-    const auto [current, version_before] =
-        cluster::CurrentCachedWithVersion(cache);
+    std::uint64_t version_before = 0;
+    const std::shared_ptr<const cluster::ServingState>& current =
+        cluster::CurrentCachedWithVersion(cache, &version_before);
     if (!cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
                                      current.get(),
                                      request.cluster_slots_)) {
@@ -8724,8 +8727,9 @@ Task<CommandReply> ExecuteExecBody(
       // version change across registration means the guards may be invisible
       // to a concurrent drain — roll back and re-admit.
       for (;;) {
-        const auto [current, version_before] =
-            cluster::CurrentCachedWithVersion(cache);
+        std::uint64_t version_before = 0;
+        const std::shared_ptr<const cluster::ServingState>& current =
+            cluster::CurrentCachedWithVersion(cache, &version_before);
         const cluster::Decision decision = cluster::Admit(current.get(), view);
         CommandReply redirect;
         if (EmitClusterDecision(decision, queued.front().connection_tls_,
