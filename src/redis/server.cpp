@@ -2367,6 +2367,7 @@ int RunServer(ServerOptions options) {
 
   const WaitResult wait_result = WaitForSignalOrServerStop(server);
   int shutdown_exit_code = 0;
+  bool fast_process_exit = false;
   if (wait_result == WaitResult::kSignal) {
     const int signal = static_cast<int>(g_last_shutdown_signal);
     spdlog::info("shutdown requested by signal {}",
@@ -2384,6 +2385,11 @@ int RunServer(ServerOptions options) {
       shutdown_exit_code = 1;
     } else {
       spdlog::info("all storage buffers durably flushed");
+      fast_process_exit = storage.AbandonWorkerStateForProcessExit();
+      if (fast_process_exit) {
+        spdlog::info(
+            "durable shutdown checkpoint permits OS-reclaimed worker state");
+      }
     }
     server.RequestStop();
   }
@@ -2393,6 +2399,16 @@ int RunServer(ServerOptions options) {
                             ? 1
                             : server.exit_code();
   CleanupShutdownSignalHandler();
+  if (fast_process_exit) {
+    // All worker IO backends and coroutine frames are already quiescent. A
+    // normal return would only run process-lifetime destructors after the
+    // deliberately abandoned stores, so flush the synchronous logger and make
+    // the process-only contract explicit. ASan builds never arm this branch.
+    if (auto logger = spdlog::default_logger(); logger != nullptr) {
+      logger->flush();
+    }
+    std::_Exit(exit_code);
+  }
   return exit_code;
 }
 

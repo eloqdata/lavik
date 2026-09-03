@@ -791,9 +791,19 @@ class StorageEngine {
   celer::Task<absl::Status> InitializeWorker(celer::Worker& worker);
   // Runs on the worker's native thread after its IO and coroutine frames have
   // been torn down. Releases all state owned by that worker, including every
-  // worker-local ScanHashMap.
+  // worker-local ScanHashMap, unless AbandonWorkerStateForProcessExit armed
+  // the clean-process-exit path.
   void FinalizeWorker(celer::Worker& worker) noexcept;
   absl::Status FlushForShutdown();
+
+  // Arms O(1) worker finalization only after a shutdown checkpoint has been
+  // published successfully. The caller must terminate the process after its
+  // workers stop: worker-owned indexes and buffers are intentionally released
+  // to the OS instead of being destructed and cannot be reused in-process.
+  // Returns false in AddressSanitizer builds or when no durable checkpoint is
+  // available, in which case FinalizeWorker retains its normal full-cleanup
+  // behavior and sanitizer exit-time leak checking remains effective.
+  bool AbandonWorkerStateForProcessExit() noexcept;
 
   unsigned OwnerForKey(std::string_view key) const noexcept;
   unsigned worker_count() const noexcept;

@@ -2097,6 +2097,7 @@ class StorageEngine::Impl {
 
   Task<absl::Status> InitializeWorker(Worker& worker);
   void FinalizeWorker(unsigned worker_id) noexcept;
+  bool AbandonWorkerStateForProcessExit() noexcept;
 
   unsigned OwnerForKey(std::string_view key) const noexcept {
     return StorageShardForKey(key) % worker_count_;
@@ -3398,6 +3399,12 @@ class StorageEngine::Impl {
   std::uint64_t checkpoint_loaded_block_count_ = 0;
   absl::Status checkpoint_tx_cleanup_status_ = absl::OkStatus();
   absl::Status checkpoint_publish_status_ = absl::OkStatus();
+  // A successful root publication makes the clean-shutdown snapshot the next
+  // process's recovery authority. Only then may the server deliberately leave
+  // worker memory to kernel process teardown instead of walking a billion-key
+  // index during an otherwise complete shutdown.
+  std::atomic<bool> shutdown_checkpoint_published_{false};
+  std::atomic<bool> abandon_worker_state_on_finalize_{false};
   std::atomic<bool> epoch_metadata_failed_{false};
   // Cold branch on every logical write. It is set only while this node is
   // destructively rebuilding its single data root; foreground commands are

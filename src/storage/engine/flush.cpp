@@ -61,6 +61,8 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
             spdlog::warn("shutdown checkpoint was not published: {}",
                          checkpoint_publish_status_.message());
           } else if (barrier.ok() && store->worker_->id() == 0) {
+            shutdown_checkpoint_published_.store(true,
+                                                 std::memory_order_release);
             std::uint64_t entries = 0;
             std::uint64_t accounting_entries = 0;
             std::size_t blocks = 0;

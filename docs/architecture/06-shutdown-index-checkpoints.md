@@ -110,6 +110,18 @@ cleanup, not a representation supported by the checkpoint. Checkpoint
 allocation does not consume the defrag reserve and does not wait for online
 reclamation.
 
+After successful root publication, the production server arms a process-exit
+only finalization path. Each runtime worker first drains I/O, closes its
+io_uring or SPDK backend, and destroys detached coroutine frames as usual. Its
+storage finalizer can then release ownership of the worker store without
+walking every index entry; the process exits after the workers join and the OS
+reclaims that address space in bulk through an explicit `_Exit` boundary.
+AddressSanitizer builds never arm this shortcut: they retain ordinary
+destruction and normal process return so LeakSanitizer still performs its
+exit-time scan. The shortcut is also never armed when checkpoint publication
+or the shutdown flush fails, and it cannot be used by an embedding that intends
+to reuse the storage engine in the same process.
+
 ## Startup consumption and fallback
 
 Preparation compares root copies from every device. A usable root must be

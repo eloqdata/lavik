@@ -25,6 +25,10 @@ absl::Status StorageEngine::FlushForShutdown() {
   return impl_->FlushForShutdown();
 }
 
+bool StorageEngine::AbandonWorkerStateForProcessExit() noexcept {
+  return impl_->AbandonWorkerStateForProcessExit();
+}
+
 unsigned StorageEngine::OwnerForKey(std::string_view key) const noexcept {
   return impl_->OwnerForKey(key);
 }

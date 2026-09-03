@@ -1578,7 +1578,31 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 
 void StorageEngine::Impl::FinalizeWorker(unsigned worker_id) noexcept {
   assert(worker_id < stores_.size());
+  if (abandon_worker_state_on_finalize_.load(std::memory_order_acquire)) {
+    // Worker::Shutdown has already drained IO and closed io_uring/SPDK state,
+    // and detached coroutine frames were destroyed before this callback. The
+    // production caller exits the process after joining these workers, so
+    // traversing every index node has no correctness benefit; releasing the
+    // pointer leaves the address space for the kernel to reclaim in bulk.
+    (void)stores_[worker_id].release();
+    return;
+  }
   stores_[worker_id].reset();
+}
+
+bool StorageEngine::Impl::AbandonWorkerStateForProcessExit() noexcept {
+#if KEYLANE_ASAN_BUILD
+  // ASan enables LeakSanitizer on supported platforms. Keep the ordinary
+  // return path intact so intentional production process-exit abandonment
+  // cannot hide unrelated leaks from its exit-time reachability scan.
+  return false;
+#else
+  if (!shutdown_checkpoint_published_.load(std::memory_order_acquire)) {
+    return false;
+  }
+  abandon_worker_state_on_finalize_.store(true, std::memory_order_release);
+  return true;
+#endif
 }
 
 absl::Status StorageEngine::Impl::FlushForShutdown() {
