@@ -965,6 +965,7 @@ constexpr std::string_view kTombRaiderSleepConfig = "tomb-raider-sleep-ms";
 constexpr std::string_view kTombRaiderDailyTimeConfig =
     "tomb-raider-daily-time";
 constexpr std::string_view kTxCleanerCooldownConfig = "tx-cleaner-cooldown-ms";
+constexpr std::string_view kShutdownCheckpointConfig = "shutdown-checkpoint";
 constexpr std::string_view kForegroundBudgetConfig = "foreground-budget-us";
 constexpr std::string_view kBackgroundBudgetConfig = "background-budget-us";
 constexpr std::string_view kBackgroundWarrantConfig =
@@ -996,6 +997,7 @@ enum class RuntimeConfigKey : std::uint8_t {
   kTombRaiderSleep,
   kTombRaiderDailyTime,
   kTxCleanerCooldown,
+  kShutdownCheckpoint,
   kForegroundBudget,
   kBackgroundBudget,
   kBackgroundWarrant,
@@ -1014,7 +1016,7 @@ struct RuntimeConfigDescriptor {
 };
 
 // CONFIG command metadata only. Execution paths never consult this table;
-// replication, defrag, and tomb-raider load their owning atomics directly.
+// each subsystem reads its owning runtime state directly.
 constexpr std::array kRuntimeConfigs{
     RuntimeConfigDescriptor{kSnapshotReadConcurrencyConfig,
                             RuntimeConfigKey::kSnapshotReadConcurrency},
@@ -1043,6 +1045,8 @@ constexpr std::array kRuntimeConfigs{
                             RuntimeConfigKey::kTombRaiderDailyTime},
     RuntimeConfigDescriptor{kTxCleanerCooldownConfig,
                             RuntimeConfigKey::kTxCleanerCooldown},
+    RuntimeConfigDescriptor{kShutdownCheckpointConfig,
+                            RuntimeConfigKey::kShutdownCheckpoint},
     RuntimeConfigDescriptor{kForegroundBudgetConfig,
                             RuntimeConfigKey::kForegroundBudget},
     RuntimeConfigDescriptor{kBackgroundBudgetConfig,
@@ -1200,6 +1204,8 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
           return FormatDailySecond(tomb_raider->daily_second_);
         case RuntimeConfigKey::kTxCleanerCooldown:
           return std::to_string(g_storage->TxCleanerCooldownMs());
+        case RuntimeConfigKey::kShutdownCheckpoint:
+          return g_storage->ShutdownCheckpointEnabled() ? "yes" : "no";
         case RuntimeConfigKey::kForegroundBudget:
           return std::to_string(
               celer::ThisWorker().self_->foreground_budget_us());
@@ -1436,6 +1442,13 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
             "value is not an integer or out of range");
       } else {
         configured = g_storage->ConfigureTxCleanerCooldown(value);
+      }
+    } else if (config->key_ == RuntimeConfigKey::kShutdownCheckpoint) {
+      const std::optional<bool> enabled = ParseConfigYesNo(args[3]);
+      if (!enabled.has_value()) {
+        configured = absl::InvalidArgumentError("value must be 'yes' or 'no'");
+      } else {
+        g_storage->ConfigureShutdownCheckpoint(*enabled);
       }
     } else if (config->key_ == RuntimeConfigKey::kForegroundBudget ||
                config->key_ == RuntimeConfigKey::kBackgroundBudget ||
@@ -2591,8 +2604,6 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
   constexpr unsigned kLocalBits = 64 - kPartitionBits;
   constexpr std::uint64_t kPackedLocalMask =
       (std::uint64_t{1} << kLocalBits) - 1;
-  constexpr std::uint64_t kDroppedLocalMask =
-      (std::uint64_t{1} << kPartitionBits) - 1;
   // COUNT is a work hint, not a latency promise. Partitions are interleaved
   // across workers, so allowing one command to walk an arbitrarily large
   // COUNT can turn into hundreds of serial cross-worker hops. Bound that
@@ -2605,11 +2616,10 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
 
   const ScanOptions& options = *parsed;
   unsigned partition_id = static_cast<unsigned>(options.cursor_ >> kLocalBits);
-  // ScanHashMap's reverse-bit cursor for a table with at most 2^50 buckets
-  // always has 14 zero low bits. Pack its significant high 50 bits below the
-  // 14-bit partition id and restore the zeros before scanning the local map.
-  std::uint64_t local_cursor = (options.cursor_ & kPackedLocalMask)
-                               << kPartitionBits;
+  // ScanHashMap's cursor carries the bucket index in its low bits. Production
+  // indexes use at most 32 bucket bits, so preserving it verbatim below the
+  // 14-bit partition id leaves 18 spare bits without discarding scan state.
+  std::uint64_t local_cursor = options.cursor_ & kPackedLocalMask;
   if (options.cursor_ != 0 && partition_id >= storage::kLogicalStorageShards) {
     co_return BuiltReply(reply_builder.AppendError("ERR invalid cursor"));
   }
@@ -2660,13 +2670,13 @@ Task<CommandReply> ExecuteScan(const CommandRequest& request,
     }
 
     if (batch.cursor_ != 0) {
-      if ((batch.cursor_ & kDroppedLocalMask) != 0) {
+      if ((batch.cursor_ & ~kPackedLocalMask) != 0) {
         co_return BuiltReply(
             reply_builder.AppendError("ERR local scan cursor overflow"));
       }
       const std::uint64_t cursor =
           (static_cast<std::uint64_t>(partition_id) << kLocalBits) |
-          (batch.cursor_ >> kPartitionBits);
+          batch.cursor_;
       co_return BuiltReply(EncodeScanReply(reply_builder, cursor, keys));
     }
 

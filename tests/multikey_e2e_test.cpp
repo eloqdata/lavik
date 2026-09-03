@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -221,7 +222,8 @@ class ServerProcess {
                 bool fail_tx_cleaner_once = false, unsigned threads = 4,
                 std::string_view order_hold_ms = {},
                 std::string_view standby_pause_ms = {},
-                std::string_view fail_replication_transaction_containing = {}) {
+                std::string_view fail_replication_transaction_containing = {},
+                bool shutdown_checkpoint = false) {
     pid_ = ::fork();
     if (pid_ < 0) Fail("fork failed");
     if (pid_ == 0) {
@@ -270,6 +272,9 @@ class ServerProcess {
           "--data-file",
           data_path,
       };
+      if (shutdown_checkpoint) {
+        arguments.push_back("--shutdown-checkpoint");
+      }
       std::vector<char*> child_argv;
       for (std::string& argument : arguments) {
         child_argv.push_back(argument.data());
@@ -422,6 +427,19 @@ int main(int argc, char** argv) {
     ServerProcess server(argv[1], port, data_path, log_path);
     RespClient client = Connect(port);
     Expect(client.Command({"PING"}), "+PONG", "PING");
+    Expect(client.Command({"CONFIG", "GET", "shutdown-checkpoint"}),
+           "*2\r\n" + Bulk("shutdown-checkpoint") + "\r\n" + Bulk("no"),
+           "shutdown checkpoint defaults off");
+    Expect(client.Command({"CONFIG", "SET", "shutdown-checkpoint", "yes"}),
+           "+OK", "enable shutdown checkpoint at runtime");
+    Expect(client.Command({"CONFIG", "GET", "shutdown-checkpoint"}),
+           "*2\r\n" + Bulk("shutdown-checkpoint") + "\r\n" + Bulk("yes"),
+           "read enabled shutdown checkpoint");
+    Expect(client.Command({"CONFIG", "SET", "shutdown-checkpoint", "maybe"}),
+           "-ERR value must be 'yes' or 'no'",
+           "reject invalid shutdown checkpoint setting");
+    Expect(client.Command({"CONFIG", "SET", "shutdown-checkpoint", "no"}),
+           "+OK", "disable shutdown checkpoint at runtime");
 
     Expect(client.Command({"RANDOMKEY"}), "$-1", "RANDOMKEY empty database");
     Expect(client.Command({"SELECT", "15"}), "+OK", "RANDOMKEY select db15");
@@ -760,6 +778,86 @@ int main(int argc, char** argv) {
       Fail("SCAN TYPE hash returned string keys");
     }
 
+    // Force one logical partition owned by each of the four server workers to
+    // grow beyond one bucket. Its stateless hash-table cursor uses low
+    // bucket-index bits, which the global SCAN cursor must preserve while
+    // crossing worker ownership boundaries between client calls.
+    {
+      constexpr std::size_t kPackedCursorKeysPerWorker = 128;
+      constexpr std::uint64_t kPackedLocalMask =
+          (std::uint64_t{1} << (64 - 14)) - 1;
+      // Standard Redis slots for b, c, d, and a are 3300, 7365, 11298, and
+      // 15495 respectively, selecting owners 0 through 3 modulo four.
+      constexpr std::array<std::string_view, 4> kWorkerTags{
+          "{b}", "{c}", "{d}", "{a}"};
+      std::vector<std::string> packed_cursor_keys;
+      packed_cursor_keys.reserve(kPackedCursorKeysPerWorker *
+                                 kWorkerTags.size());
+      for (std::string_view tag : kWorkerTags) {
+        for (std::size_t i = 0; i < kPackedCursorKeysPerWorker; ++i) {
+          packed_cursor_keys.push_back("scan-packed:" + std::string(tag) +
+                                       ":" + std::to_string(i));
+        }
+      }
+      for (const std::string& key : packed_cursor_keys) {
+        Expect(client.Command({"SET", key, "v"}), "+OK",
+               "packed-cursor seed");
+      }
+
+      std::string collected;
+      std::string cursor = "0";
+      std::array<bool, 4> saw_local_cursor{};
+      std::size_t calls = 0;
+      do {
+        const std::string reply = client.Command(
+            {"SCAN", cursor, "MATCH", "scan-packed:*", "COUNT", "1"});
+        if (reply.starts_with("-")) {
+          Fail("packed-cursor SCAN failed: " + reply);
+        }
+        const std::size_t cursor_bulk = reply.find("\r\n") + 2;
+        const std::size_t cursor_start = reply.find("\r\n", cursor_bulk) + 2;
+        const std::size_t cursor_end = reply.find("\r\n", cursor_start);
+        cursor = reply.substr(cursor_start, cursor_end - cursor_start);
+        std::uint64_t numeric_cursor = 0;
+        const auto [parsed_cursor, error] = std::from_chars(
+            cursor.data(), cursor.data() + cursor.size(), numeric_cursor);
+        if (error != std::errc{} ||
+            parsed_cursor != cursor.data() + cursor.size()) {
+          Fail("packed-cursor SCAN returned malformed cursor: " + cursor);
+        }
+        if ((numeric_cursor & kPackedLocalMask) != 0) {
+          const std::uint64_t partition_id = numeric_cursor >> (64 - 14);
+          saw_local_cursor[partition_id % saw_local_cursor.size()] = true;
+        }
+        collected += reply.substr(cursor_end);
+        if (++calls >= 1000) {
+          Fail("packed-cursor SCAN did not terminate");
+        }
+      } while (cursor != "0");
+
+      for (std::size_t worker = 0; worker < saw_local_cursor.size(); ++worker) {
+        if (!saw_local_cursor[worker]) {
+          Fail("packed-cursor SCAN never returned local bucket state for "
+               "worker " +
+               std::to_string(worker));
+        }
+      }
+      for (const std::string& key : packed_cursor_keys) {
+        if (collected.find(Bulk(key)) == std::string::npos) {
+          Fail("packed-cursor SCAN missed key: " + key);
+        }
+      }
+
+      std::vector<std::string_view> delete_args{"DEL"};
+      delete_args.reserve(packed_cursor_keys.size() + 1);
+      for (const std::string& key : packed_cursor_keys) {
+        delete_args.push_back(key);
+      }
+      Expect(client.Command(delete_args),
+             ":" + std::to_string(packed_cursor_keys.size()),
+             "packed-cursor cleanup");
+    }
+
     // SCAN MATCH speaks the same glob dialect.
     {
       std::string collected;
@@ -807,9 +905,27 @@ int main(int argc, char** argv) {
                            "{disk-batch}d", "batch-d"}),
            "+OK", "same-shard disk batch seed");
 
+    // Enabling immediately before the drain must be enough to publish a
+    // checkpoint even though the process started with the default disabled.
+    Expect(client.Command({"CONFIG", "SET", "shutdown-checkpoint", "yes"}),
+           "+OK", "enable checkpoint for the next shutdown");
     server.Stop();
-    ServerProcess recovered_server(argv[1], port, data_path, log_path);
+    if (ReadFile(log_path).find("published shutdown checkpoint generation=") ==
+        std::string::npos) {
+      Fail("runtime-enabled shutdown did not publish a checkpoint");
+    }
+    ServerProcess recovered_server(argv[1], port, data_path, log_path, {}, {},
+                                   false, 4, {}, {}, {}, true);
     RespClient recovered = Connect(port);
+    if (ReadFile(log_path).find("loaded shutdown checkpoint generation=") ==
+        std::string::npos) {
+      Fail("startup-enabled recovery did not load the runtime checkpoint");
+    }
+    Expect(recovered.Command({"CONFIG", "GET", "shutdown-checkpoint"}),
+           "*2\r\n" + Bulk("shutdown-checkpoint") + "\r\n" + Bulk("yes"),
+           "startup checkpoint setting initializes runtime state");
+    Expect(recovered.Command({"CONFIG", "SET", "shutdown-checkpoint", "no"}),
+           "+OK", "disable the recovered server's next checkpoint");
     Expect(recovered.Command({"MGET", "cleaner-a", "cleaner-b", "cleaner-c",
                               "cleaner-d"}),
            "*4\r\n" + Bulk("after-a") + "\r\n" + Bulk("after-b") +

@@ -11,7 +11,11 @@ restore a location whose later value read reports media corruption even when a
 cold body scan would have reported that corruption during startup.
 `shutdown-checkpoint yes` enables creation at clean shutdown and use at the
 next startup. The CLI spelling is `--shutdown-checkpoint`; the default is
-disabled.
+disabled. The startup value decides whether recovery consumes an existing
+checkpoint because CONFIG is not available until recovery completes. Once the
+server is online, `CONFIG SET shutdown-checkpoint yes|no` atomically changes
+whether the next clean shutdown creates a checkpoint; `CONFIG GET` reports the
+current process-local value.
 
 Checkpoint construction starts only after request admission has stopped and
 every worker has sealed and flushed its record streams, drained storage
@@ -22,6 +26,12 @@ old transaction generations are retired before any index shard is frozen.
 There is no online checkpoint flow. The build is therefore O(current index
 entries), including reading complete keys that are not retained inline; it
 does not scan obsolete record versions.
+
+After request admission is closed and all accepted requests have drained, the
+shutdown thread snapshots the runtime atomic once before publishing the flush
+request. Every worker therefore observes the same latched decision and either
+all enter or all skip the checkpoint barriers. A CONFIG update completed before
+that drain affects the shutdown; no update can enter after the drain.
 
 ## Durable representation and publication
 

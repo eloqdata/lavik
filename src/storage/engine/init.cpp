@@ -851,7 +851,7 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
       [](const std::unique_ptr<DeviceAllocator>& allocator) {
         return allocator->checkpoint_bitmap_valid_;
       });
-  checkpoint_active_.store(options_.shutdown_checkpoint_ &&
+  checkpoint_active_.store(ShutdownCheckpointEnabled() &&
                                checkpoint_root_coherent_ &&
                                checkpoint_root_valid &&
                                checkpoint_bitmaps_valid,
@@ -1812,6 +1812,11 @@ absl::Status StorageEngine::Impl::FlushForShutdown() {
          std::chrono::steady_clock::now() < commit_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
+  // Request admission is already closed and drained, so CONFIG can no longer
+  // change this process's policy. Publish one latched decision to every worker;
+  // letting workers sample the live atomic independently could split barrier
+  // participation and deadlock shutdown.
+  shutdown_checkpoint_for_flush_ = ShutdownCheckpointEnabled();
   shutdown_flush_requested_.store(true, std::memory_order_release);
   unsigned completed =
       shutdown_flush_completed_.load(std::memory_order_acquire);

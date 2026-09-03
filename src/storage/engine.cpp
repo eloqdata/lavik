@@ -25,6 +25,14 @@ absl::Status StorageEngine::FlushForShutdown() {
   return impl_->FlushForShutdown();
 }
 
+bool StorageEngine::ShutdownCheckpointEnabled() const noexcept {
+  return impl_->ShutdownCheckpointEnabled();
+}
+
+void StorageEngine::ConfigureShutdownCheckpoint(bool enabled) noexcept {
+  impl_->ConfigureShutdownCheckpoint(enabled);
+}
+
 bool StorageEngine::AbandonWorkerStateForProcessExit() noexcept {
   return impl_->AbandonWorkerStateForProcessExit();
 }

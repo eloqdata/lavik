@@ -16,7 +16,7 @@ Task<absl::Status> StorageEngine::Impl::PeriodicFlush(WorkerStore* store) {
 
     if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
       status = co_await FlushWorkerForShutdown(store);
-      if (options_.shutdown_checkpoint_) {
+      if (shutdown_checkpoint_for_flush_) {
         // Stop ordinary append activity before worker 0 promotes every
         // committed transaction-tagged winner. All workers must observe that
         // result before freezing their index shard; the remaining barriers

@@ -34,8 +34,9 @@ struct StorageEngineOptions {
   // before assigning a fresh storage-set identity. Data blocks are left
   // physically intact but become unreachable.
   bool reset_data_files_ = false;
-  // Publish a best-effort index checkpoint during a clean shutdown so the next
-  // startup can avoid decoding ordinary record-block bodies.
+  // Initial value for the runtime checkpoint setting. It controls checkpoint
+  // consumption during startup and can be changed before the next clean
+  // shutdown through CONFIG once request serving begins.
   bool shutdown_checkpoint_ = false;
   std::uint32_t flush_max_ms_ = 1000;
   // Minimum delay between transaction-generation rotations/cleaning rounds.
@@ -860,6 +861,13 @@ class StorageEngine {
   // the clean-process-exit path.
   void FinalizeWorker(celer::Worker& worker) noexcept;
   absl::Status FlushForShutdown();
+
+  // Whether the next clean shutdown should build an index checkpoint. The
+  // value is process-local and may change concurrently through CONFIG.
+  bool ShutdownCheckpointEnabled() const noexcept;
+  // Changes whether the next clean shutdown builds an index checkpoint. A
+  // shutdown already past request draining has latched its decision.
+  void ConfigureShutdownCheckpoint(bool enabled) noexcept;
 
   // Arms O(1) worker finalization only after a shutdown checkpoint has been
   // published successfully. The caller must terminate the process after its

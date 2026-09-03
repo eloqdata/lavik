@@ -1654,6 +1654,8 @@ inline Task<absl::StatusOr<std::size_t>> WriteStorageBuffer(
 class StorageEngine::Impl {
  public:
   explicit Impl(StorageEngineOptions options) : options_(std::move(options)) {
+    shutdown_checkpoint_enabled_.store(options_.shutdown_checkpoint_,
+                                       std::memory_order_relaxed);
     replication_publish_queue_bytes_.store(
         options_.replication_publish_queue_bytes_, std::memory_order_relaxed);
     expiration_authority_.store(options_.expiration_authority_,
@@ -2318,6 +2320,13 @@ class StorageEngine::Impl {
   }
 
   Task<absl::Status> ConfigureDefrag(DefragConfigUpdate update);
+
+  bool ShutdownCheckpointEnabled() const noexcept {
+    return shutdown_checkpoint_enabled_.load(std::memory_order_acquire);
+  }
+  void ConfigureShutdownCheckpoint(bool enabled) noexcept {
+    shutdown_checkpoint_enabled_.store(enabled, std::memory_order_release);
+  }
 
   TxCleanerTotals TxCleanerStats() const noexcept {
     return TxCleanerTotals{
@@ -3457,6 +3466,11 @@ class StorageEngine::Impl {
                                        BlockState& source);
 
   StorageEngineOptions options_;
+  // CONFIG SET updates the next-shutdown policy without visiting workers.
+  // FlushForShutdown snapshots it before publishing shutdown_flush_requested_,
+  // so every worker enters the same barrier path for that shutdown.
+  std::atomic<bool> shutdown_checkpoint_enabled_{false};
+  bool shutdown_checkpoint_for_flush_ = false;
   // One runtime setting shared by all workers. Queue occupancy and waiters
   // remain worker-local; CONFIG SET stores this atomically and then visits each
   // worker only to wake publishers that may now fit under a larger limit.
