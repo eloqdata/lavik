@@ -3199,11 +3199,6 @@ class StorageEngine::Impl {
   Task<absl::Status> BuildShutdownCheckpointShard(WorkerStore& store,
                                                   std::uint64_t generation);
 
-  Task<absl::StatusOr<std::uint64_t>> WriteCheckpointBlock(
-      WorkerStore& store, std::uint64_t generation, std::uint32_t shard_id,
-      std::uint32_t record_count, std::span<std::byte> block,
-      std::size_t payload_bytes);
-
   Task<absl::Status> PersistCheckpointBitmapOnDeviceLocal(
       std::size_t device_index, std::vector<std::uint64_t> block_ids);
 

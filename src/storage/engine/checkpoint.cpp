@@ -139,37 +139,50 @@ constexpr std::uint8_t CheckpointFlags(std::uint32_t metadata) noexcept {
                                    kCheckpointFlagsMask);
 }
 
-// Shutdown owns one buffer per worker, so encoding directly into DMA-capable
-// memory avoids allocating, zeroing, and copying a second 8 MiB block for every
-// chunk. WriteCheckpointBlock awaits completion before Clear permits reuse.
-class CheckpointWriteBuffer {
+// Two slots let shutdown encode the next chunk while the prior direct write is
+// in flight. Heap-owned completion state keeps the DMA buffer alive if an
+// unrelated serialization error abandons the owning coroutine.
+class CheckpointWriteSlot {
+  struct State;
+
  public:
-  explicit CheckpointWriteBuffer(std::size_t alignment)
-      : data_(static_cast<std::byte*>(
-            celer::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
-        alignment_(alignment) {}
+  CheckpointWriteSlot() = default;
+  CheckpointWriteSlot(const CheckpointWriteSlot&) = delete;
+  CheckpointWriteSlot& operator=(const CheckpointWriteSlot&) = delete;
+  ~CheckpointWriteSlot() { Release(); }
 
-  CheckpointWriteBuffer(const CheckpointWriteBuffer&) = delete;
-  CheckpointWriteBuffer& operator=(const CheckpointWriteBuffer&) = delete;
-
-  ~CheckpointWriteBuffer() {
-    celer::FreeStorageBuffer(data_, alignment_);
+  absl::Status Initialize(std::size_t alignment) {
+    assert(state_ == nullptr);
+    State* state = new (std::nothrow) State(alignment);
+    if (state == nullptr || state->data_ == nullptr) {
+      delete state;
+      return absl::ResourceExhaustedError(
+          "failed to allocate checkpoint write buffer");
+    }
+    state_ = state;
+    return absl::OkStatus();
   }
 
-  bool valid() const noexcept { return data_ != nullptr; }
-  std::size_t size() const noexcept { return payload_bytes_; }
+  bool active() const noexcept {
+    assert(state_ != nullptr);
+    return state_->active_;
+  }
 
-  std::span<std::byte> block() noexcept {
-    assert(valid());
-    return {data_, kStorageBlockBytes};
+  std::size_t size() const noexcept {
+    assert(state_ != nullptr);
+    return state_->payload_bytes_;
   }
 
   std::span<std::byte> payload() noexcept {
-    assert(valid());
-    return {data_ + kBlockHeaderBytes, payload_bytes_};
+    assert(state_ != nullptr);
+    return {state_->data_ + kBlockHeaderBytes, state_->payload_bytes_};
   }
 
-  void Clear() noexcept { payload_bytes_ = 0; }
+  void Clear() noexcept {
+    assert(state_ != nullptr);
+    assert(!state_->active_);
+    state_->payload_bytes_ = 0;
+  }
 
   template <typename T>
   void AppendPod(const T& value) noexcept {
@@ -178,16 +191,166 @@ class CheckpointWriteBuffer {
   }
 
   void AppendBytes(const void* source, std::size_t bytes) noexcept {
-    assert(bytes <= kExtentPayloadBytes - payload_bytes_);
+    assert(state_ != nullptr);
+    assert(!state_->active_);
+    assert(bytes <= kExtentPayloadBytes - state_->payload_bytes_);
     if (bytes == 0) return;
-    std::memcpy(data_ + kBlockHeaderBytes + payload_bytes_, source, bytes);
-    payload_bytes_ += bytes;
+    std::memcpy(state_->data_ + kBlockHeaderBytes + state_->payload_bytes_,
+                source, bytes);
+    state_->payload_bytes_ += bytes;
+  }
+
+  std::size_t Finalize(std::uint64_t block_id, std::uint64_t allocation_epoch,
+                       std::uint64_t generation, std::uint32_t shard_id,
+                       std::uint32_t record_count,
+                       unsigned worker_count) noexcept {
+    assert(state_ != nullptr);
+    assert(!state_->active_);
+    std::byte* const data = state_->data_;
+    const auto payload = std::span<const std::byte>(
+        data + kBlockHeaderBytes, state_->payload_bytes_);
+    BlockHeader header{
+        .magic_ = kBlockMagic,
+        .block_id_ = block_id,
+        .version_ = kStorageFormatVersion,
+        .header_bytes_ = kBlockHeaderBytes,
+        .block_bytes_ = kStorageBlockBytes,
+        .writer_id_ = shard_id,
+        .allocation_epoch_ = allocation_epoch,
+        .committed_bytes_ = static_cast<std::uint32_t>(
+            kBlockHeaderBytes + state_->payload_bytes_),
+        .record_count_ = record_count,
+        .max_lsn_ = 0,
+        .header_sequence_ = 1,
+        .checksum_ = 0,
+        .layout_worker_count_ = worker_count,
+        .kind_ = BlockKind::kCheckpointIndex,
+        .reserved_ = {},
+        .extent_index_ = shard_id,
+        .extent_payload_bytes_ =
+            static_cast<std::uint32_t>(state_->payload_bytes_),
+        .extent_payload_checksum_ = Crc32c(payload),
+        .reserved_runtime_ = {},
+        .tx_generation_ = generation,
+    };
+    std::fill_n(data, kBlockHeaderBytes, std::byte{0});
+    EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
+                                  data, kBlockHeaderSlotBytes));
+    const std::size_t write_bytes =
+        AlignDirect(kBlockHeaderBytes + state_->payload_bytes_);
+    std::fill(data + kBlockHeaderBytes + state_->payload_bytes_,
+              data + write_bytes, std::byte{0});
+    return write_bytes;
+  }
+
+  absl::Status Start(Worker& worker, FixedFile file, std::uint64_t offset,
+                     std::size_t write_bytes) {
+    assert(state_ != nullptr);
+    return state_->Start(worker, file, offset, write_bytes);
+  }
+
+  struct Awaiter {
+    State* state_;
+
+    bool await_ready() const noexcept { return state_->complete_; }
+
+    bool await_suspend(std::coroutine_handle<> awaiting) noexcept {
+      assert(!state_->complete_);
+      assert(!state_->waiter_);
+      state_->waiter_ = awaiting;
+      return true;
+    }
+
+    absl::Status await_resume() {
+      assert(state_->complete_);
+      assert(state_->result_.has_value());
+      state_->active_ = false;
+      state_->complete_ = false;
+      absl::Status result = std::move(*state_->result_);
+      state_->result_.reset();
+      return result;
+    }
+  };
+
+  Awaiter Wait() noexcept {
+    assert(state_ != nullptr);
+    assert(state_->active_);
+    return Awaiter{state_};
   }
 
  private:
-  std::byte* data_ = nullptr;
-  std::size_t alignment_ = 0;
-  std::size_t payload_bytes_ = 0;
+  struct State final : celer::IoCompletion {
+    explicit State(std::size_t alignment)
+        : data_(static_cast<std::byte*>(
+              celer::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
+          alignment_(alignment) {}
+
+    ~State() override { celer::FreeStorageBuffer(data_, alignment_); }
+
+    absl::Status Start(Worker& worker, FixedFile file, std::uint64_t offset,
+                       std::size_t write_bytes) {
+      assert(!active_);
+      worker_ = &worker;
+      expected_bytes_ = write_bytes;
+      active_ = true;
+      complete_ = false;
+      orphaned_ = false;
+      waiter_ = {};
+      result_.reset();
+      absl::Status submitted = worker.SubmitWrite(
+          file, std::span<const std::byte>(data_, write_bytes), offset, this);
+      if (!submitted.ok()) active_ = false;
+      return submitted;
+    }
+
+    void Complete(Worker& worker, int result, unsigned flags) override {
+      (void)flags;
+      assert(&worker == worker_);
+      if (result < 0) {
+        Finish(absl::ErrnoToStatus(-result, "checkpoint write failed"));
+        return;
+      }
+      const std::size_t bytes = static_cast<std::size_t>(result);
+      worker.RecordStorageWriteCompletion(bytes);
+      Finish(bytes == expected_bytes_
+                 ? absl::OkStatus()
+                 : absl::InternalError("short checkpoint block write"));
+    }
+
+    void Finish(absl::Status result) {
+      result_.emplace(std::move(result));
+      complete_ = true;
+      if (orphaned_) {
+        delete this;
+        return;
+      }
+      if (waiter_) worker_->Enqueue(std::exchange(waiter_, {}));
+    }
+
+    std::byte* data_ = nullptr;
+    std::size_t alignment_ = 0;
+    std::size_t payload_bytes_ = 0;
+    std::size_t expected_bytes_ = 0;
+    Worker* worker_ = nullptr;
+    bool active_ = false;
+    bool complete_ = false;
+    bool orphaned_ = false;
+    std::coroutine_handle<> waiter_{};
+    std::optional<absl::Status> result_;
+  };
+
+  void Release() noexcept {
+    if (state_ == nullptr) return;
+    if (state_->active_ && !state_->complete_) {
+      state_->orphaned_ = true;
+      state_->waiter_ = {};
+    } else {
+      delete state_;
+    }
+    state_ = nullptr;
+  }
+
+  State* state_ = nullptr;
 };
 
 bool CheckpointBlockAllocated(
@@ -556,77 +719,43 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointRoot(
   co_return absl::OkStatus();
 }
 
-Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::WriteCheckpointBlock(
-    WorkerStore& store, std::uint64_t generation, std::uint32_t shard_id,
-    std::uint32_t record_count, std::span<std::byte> block,
-    std::size_t payload_bytes) {
-  if (block.size() != kStorageBlockBytes || payload_bytes == 0 ||
-      payload_bytes > kExtentPayloadBytes) {
-    co_return absl::InvalidArgumentError("invalid checkpoint block payload");
-  }
-  auto reserved = co_await AllocateBlock(store, AllocationPurpose::kCheckpoint);
-  if (!reserved.ok()) co_return reserved.status();
-  std::byte* const data = block.data();
-  const auto payload = std::span<const std::byte>(
-      data + kBlockHeaderBytes, payload_bytes);
-  const std::uint32_t checksum = Crc32c(payload);
-  BlockHeader header{
-      .magic_ = kBlockMagic,
-      .block_id_ = reserved->block_id_,
-      .version_ = kStorageFormatVersion,
-      .header_bytes_ = kBlockHeaderBytes,
-      .block_bytes_ = kStorageBlockBytes,
-      .writer_id_ = store.worker_->id(),
-      .allocation_epoch_ = reserved->allocation_epoch_,
-      .committed_bytes_ =
-          static_cast<std::uint32_t>(kBlockHeaderBytes + payload_bytes),
-      .record_count_ = record_count,
-      .max_lsn_ = 0,
-      .header_sequence_ = 1,
-      .checksum_ = 0,
-      .layout_worker_count_ = worker_count_,
-      .kind_ = BlockKind::kCheckpointIndex,
-      .reserved_ = {},
-      .extent_index_ = shard_id,
-      .extent_payload_bytes_ = static_cast<std::uint32_t>(payload_bytes),
-      .extent_payload_checksum_ = checksum,
-      .reserved_runtime_ = {},
-      .tx_generation_ = generation,
-  };
-  // The second header slot and direct-I/O tail must not retain bytes from the
-  // prior chunk when this worker reuses its buffer.
-  std::fill_n(data, kBlockHeaderBytes, std::byte{0});
-  EncodeBlockHeader(header, std::span<std::byte, kBlockHeaderSlotBytes>(
-                                data, kBlockHeaderSlotBytes));
-  const auto [file_id, block_offset] = FileOffset(reserved->block_id_);
-  const std::size_t write_bytes =
-      AlignDirect(kBlockHeaderBytes + payload_bytes);
-  std::fill(data + kBlockHeaderBytes + payload_bytes, data + write_bytes,
-            std::byte{0});
-  auto written = co_await WriteStorageBuffer(
-      *store.worker_, store.files_[file_id],
-      std::span<const std::byte>(data, write_bytes), false, {}, block_offset);
-  absl::Status status =
-      written.ok() && *written == write_bytes
-          ? absl::OkStatus()
-          : (written.ok() ? absl::InternalError("short checkpoint block write")
-                          : written.status());
-  if (status.ok()) {
-    status = co_await celer::Fdatasync(*store.worker_, store.files_[file_id]);
-  }
-  if (!status.ok()) co_return status;
-  co_return reserved->block_id_;
-}
-
 Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     WorkerStore& store, std::uint64_t generation) {
   CheckpointShardResult& result = checkpoint_shards_[store.worker_->id()];
   result = {};
-  CheckpointWriteBuffer payload(options_.buffers_.alignment_);
-  if (!payload.valid()) {
-    co_return absl::ResourceExhaustedError(
-        "failed to allocate checkpoint write buffer");
+  std::array<CheckpointWriteSlot, 2> write_slots;
+  for (CheckpointWriteSlot& slot : write_slots) {
+    absl::Status initialized =
+        slot.Initialize(options_.buffers_.alignment_);
+    if (!initialized.ok()) co_return initialized;
   }
+  std::size_t payload_slot = 0;
+  CheckpointWriteSlot* payload = &write_slots[payload_slot];
+
+  auto submit_payload =
+      [this, &store, generation, &result, &write_slots, &payload_slot,
+       &payload](std::uint32_t record_count) -> Task<absl::Status> {
+    auto reserved =
+        co_await AllocateBlock(store, AllocationPurpose::kCheckpoint);
+    if (!reserved.ok()) co_return reserved.status();
+    const std::size_t write_bytes = payload->Finalize(
+        reserved->block_id_, reserved->allocation_epoch_, generation,
+        store.worker_->id(), record_count, worker_count_);
+    const auto [file_id, block_offset] = FileOffset(reserved->block_id_);
+    absl::Status submitted = payload->Start(
+        *store.worker_, store.files_[file_id], block_offset, write_bytes);
+    if (!submitted.ok()) co_return submitted;
+    result.blocks_.push_back(reserved->block_id_);
+
+    payload_slot = (payload_slot + 1) % write_slots.size();
+    payload = &write_slots[payload_slot];
+    if (payload->active()) {
+      absl::Status completed = co_await payload->Wait();
+      if (!completed.ok()) co_return completed;
+    }
+    payload->Clear();
+    co_return absl::OkStatus();
+  };
 
   // Every logical index is represented, including empty ones. Besides making
   // a missing or duplicate directory entry detectable before installation,
@@ -637,11 +766,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .kind_ = CheckpointChunkKind::kIndexCapacity,
   };
-  payload.AppendPod(capacity_chunk);
+  payload->AppendPod(capacity_chunk);
   std::uint32_t capacity_entries = 0;
   for (const WorkerStore::PartitionStore& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-      payload.AppendPod(CheckpointCapacityEntry{
+      payload->AppendPod(CheckpointCapacityEntry{
           .entry_count_ = partition.indexes_[db_id].size(),
           .partition_id_ = partition.id_,
           .db_id_ = db_id,
@@ -650,38 +779,30 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     }
   }
   auto* capacity_header =
-      reinterpret_cast<CheckpointChunkHeader*>(payload.payload().data());
+      reinterpret_cast<CheckpointChunkHeader*>(payload->payload().data());
   capacity_header->entry_count_ = capacity_entries;
-  auto capacity_written = co_await WriteCheckpointBlock(
-      store, generation, store.worker_->id(), capacity_entries,
-      payload.block(), payload.size());
-  if (!capacity_written.ok()) co_return capacity_written.status();
-  result.blocks_.push_back(*capacity_written);
+  absl::Status submitted = co_await submit_payload(capacity_entries);
+  if (!submitted.ok()) co_return submitted;
 
-  payload.Clear();
   CheckpointChunkHeader chunk{
       .generation_ = generation,
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
-  payload.AppendPod(chunk);
+  payload->AppendPod(chunk);
   std::uint32_t chunk_entries = 0;
   absl::flat_hash_map<std::uint64_t, RecoveryLiveReference>
       extent_identities;
 
-  auto flush_chunk = [this, &store, generation, &result, &payload,
-                      &chunk_entries]() -> Task<absl::Status> {
+  auto flush_chunk = [&store, generation, &payload, &chunk_entries,
+                      &submit_payload]() -> Task<absl::Status> {
     auto* header =
-        reinterpret_cast<CheckpointChunkHeader*>(payload.payload().data());
+        reinterpret_cast<CheckpointChunkHeader*>(payload->payload().data());
     header->entry_count_ = chunk_entries;
-    auto written = co_await WriteCheckpointBlock(
-        store, generation, store.worker_->id(), chunk_entries,
-        payload.block(), payload.size());
-    if (!written.ok()) co_return written.status();
-    result.blocks_.push_back(*written);
-    payload.Clear();
+    absl::Status submitted = co_await submit_payload(chunk_entries);
+    if (!submitted.ok()) co_return submitted;
     CheckpointChunkHeader next{
         .generation_ = generation,
         .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
-    payload.AppendPod(next);
+    payload->AppendPod(next);
     chunk_entries = 0;
     co_return absl::OkStatus();
   };
@@ -733,7 +854,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
           co_return absl::ResourceExhaustedError(
               "one checkpoint index entry exceeds a storage block");
         }
-        if (payload.size() + entry_bytes > kExtentPayloadBytes) {
+        if (payload->size() + entry_bytes > kExtentPayloadBytes) {
           absl::Status flushed = co_await flush_chunk();
           if (!flushed.ok()) co_return flushed;
         }
@@ -757,14 +878,14 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
                 location.block_owner(), db_id, location.kind(),
                 location.value_type(), flags),
         };
-        payload.AppendPod(encoded);
+        payload->AppendPod(encoded);
         if (has_expiry) {
-          payload.AppendPod(location.expire_at_ms_);
+          payload->AppendPod(location.expire_at_ms_);
         }
-        payload.AppendBytes(key.data(), key.size());
+        payload->AppendBytes(key.data(), key.size());
         if (extents != nullptr) {
-          payload.AppendBytes(extents->data(),
-                              extents->size() * sizeof(ExtentRef));
+          payload->AppendBytes(extents->data(),
+                               extents->size() * sizeof(ExtentRef));
           for (std::size_t extent_index = 0;
                extent_index < extents->size(); ++extent_index) {
             const ExtentRef& extent = extents->at(extent_index);
@@ -805,32 +926,28 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   absl::Status flushed = co_await flush_chunk();
   if (!flushed.ok()) co_return flushed;
 
-  payload.Clear();
+  payload->Clear();
   CheckpointChunkHeader accounting_chunk{
       .generation_ = generation,
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .kind_ = CheckpointChunkKind::kBlockAccounting,
   };
-  payload.AppendPod(accounting_chunk);
+  payload->AppendPod(accounting_chunk);
   chunk_entries = 0;
   auto flush_accounting_chunk =
-      [this, &store, generation, &result, &payload,
-       &chunk_entries]() -> Task<absl::Status> {
+      [&store, generation, &payload, &chunk_entries,
+       &submit_payload]() -> Task<absl::Status> {
     auto* header =
-        reinterpret_cast<CheckpointChunkHeader*>(payload.payload().data());
+        reinterpret_cast<CheckpointChunkHeader*>(payload->payload().data());
     header->entry_count_ = chunk_entries;
-    auto written = co_await WriteCheckpointBlock(
-        store, generation, store.worker_->id(), chunk_entries,
-        payload.block(), payload.size());
-    if (!written.ok()) co_return written.status();
-    result.blocks_.push_back(*written);
-    payload.Clear();
+    absl::Status submitted = co_await submit_payload(chunk_entries);
+    if (!submitted.ok()) co_return submitted;
     CheckpointChunkHeader next{
         .generation_ = generation,
         .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
         .kind_ = CheckpointChunkKind::kBlockAccounting,
     };
-    payload.AppendPod(next);
+    payload->AppendPod(next);
     chunk_entries = 0;
     co_return absl::OkStatus();
   };
@@ -864,11 +981,11 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         co_return absl::FailedPreconditionError(
             "checkpoint accounting found a live non-record block");
       }
-      if (payload.size() + sizeof(entry) > kExtentPayloadBytes) {
+      if (payload->size() + sizeof(entry) > kExtentPayloadBytes) {
         flushed = co_await flush_accounting_chunk();
         if (!flushed.ok()) co_return flushed;
       }
-      payload.AppendPod(entry);
+      payload->AppendPod(entry);
       ++chunk_entries;
       ++result.accounting_entry_count_;
     }
@@ -885,15 +1002,22 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         .owner_ = kUnownedBlock,
         .extent_ = 1,
     };
-    if (payload.size() + sizeof(entry) > kExtentPayloadBytes) {
+    if (payload->size() + sizeof(entry) > kExtentPayloadBytes) {
       flushed = co_await flush_accounting_chunk();
       if (!flushed.ok()) co_return flushed;
     }
-    payload.AppendPod(entry);
+    payload->AppendPod(entry);
     ++chunk_entries;
     ++result.accounting_entry_count_;
   }
-  co_return co_await flush_accounting_chunk();
+  flushed = co_await flush_accounting_chunk();
+  if (!flushed.ok()) co_return flushed;
+  for (CheckpointWriteSlot& slot : write_slots) {
+    if (!slot.active()) continue;
+    absl::Status completed = co_await slot.Wait();
+    if (!completed.ok()) co_return completed;
+  }
+  co_return absl::OkStatus();
 }
 
 Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
@@ -932,11 +1056,6 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
       dirty_pages.push_back(page_index);
     }
   }
-  if (dirty_pages.empty()) {
-    allocator.checkpoint_bitmap_valid_ = true;
-    co_return absl::OkStatus();
-  }
-
   WorkerStore& store = *stores_[allocator.owner_];
   auto acquired = co_await store.buffers_.AcquireReadBuffer();
   if (!acquired.ok()) co_return acquired.status();
@@ -976,6 +1095,11 @@ Task<absl::Status> StorageEngine::Impl::PersistCheckpointBitmapOnDeviceLocal(
     committed.push_back(
         {.generation_ = next_generation, .active_slot_ = next_slot});
   }
+  // All shard builders rendezvous before publication reaches this function.
+  // This namespace/file barrier therefore covers their completed checkpoint
+  // block writes together with the bitmap pages above. It is still required
+  // when the bitmap is unchanged: reused block ids may contain a new
+  // generation whose data has not otherwise crossed a durability barrier.
   absl::Status synced = co_await celer::Fdatasync(
       *store.worker_, store.files_[device.file_index_]);
   if (!synced.ok()) {

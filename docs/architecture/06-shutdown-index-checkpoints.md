@@ -76,13 +76,27 @@ Capacity, index, and accounting chunks share the checkpoint block kind,
 generation, bitmap, publication lifecycle, and payload CRC; an explicit
 chunk-kind field selects their entry layout.
 
+Each shard builder alternates two aligned 8 MiB buffers. Once one buffer has
+been encoded and submitted, the worker builds the next chunk in the other
+while the first write remains in flight; it waits only before reusing a slot.
+Both writes must complete before that shard enters the publication barrier.
+Abandoning a shard after a serialization or I/O error leaves any submitted
+buffer owned by its completion, so asynchronous device access cannot outlive
+the DMA memory.
+
 Publication order is:
 
 ```text
-write and synchronize every checkpoint capacity, index, and accounting block
-write and synchronize the checkpoint bitmap on every device
+write every checkpoint capacity, index, and accounting block
+write the checkpoint bitmap and synchronize data plus bitmap once per device
 publish the generation and expected counts through the root on every device
 ```
+
+The shard-build barrier waits for every block write completion before bitmap
+publication starts. Each device's bitmap synchronization is also the durability
+barrier for all checkpoint blocks written through any worker's file handle or
+SPDK qpair on that device. The barrier runs even when the bitmap bytes are
+unchanged because a reused block id can hold a newer checkpoint generation.
 
 Until the final step completes, new blocks are unpublished acceleration state.
 A partial or failed build never changes the published generation. Its bitmap
