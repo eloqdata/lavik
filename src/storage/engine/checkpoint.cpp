@@ -1093,7 +1093,9 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     if (chunk->kind_ == CheckpointChunkKind::kIndexCapacity) {
       capacity_blocks.push_back(candidates[index]);
     } else {
-      result->body_blocks_.push_back(candidates[index]);
+      result->discovered_body_blocks_.push_back(
+          {.block_id_ = candidates[index],
+           .shard_id_ = static_cast<std::uint16_t>(chunk->shard_id_)});
     }
   }
 
@@ -1161,6 +1163,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
           kLogicalDatabaseCount,
       kMissing);
   std::vector<std::uint32_t> capacity_chunks(worker_count_, 0);
+  std::vector<std::vector<std::uint64_t>> body_blocks_by_owner(worker_count_);
   std::uint64_t discovered_blocks = 0;
   std::uint64_t declared_entries = 0;
 
@@ -1171,6 +1174,26 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
       co_return absl::InternalError("checkpoint block total overflows");
     }
     discovered_blocks += loaded.blocks_.size();
+    for (const CheckpointBodyBlock& body :
+         loaded.discovered_body_blocks_) {
+      if (body.shard_id_ >= worker_count_) {
+        co_return absl::InternalError(
+            "checkpoint body block has an invalid owner");
+      }
+#ifdef CELER_WITH_SPDK_STORAGE
+      const auto& device_owners =
+          device_owners_[DeviceIndexForBlock(body.block_id_)];
+      if (!std::binary_search(device_owners.begin(), device_owners.end(),
+                              body.shard_id_)) {
+        // The checkpoint requires the original worker topology. A shard that
+        // cannot open the controller it used at shutdown cannot safely take
+        // over this read merely to avoid a cross-core installation hop.
+        co_return absl::InternalError(
+            "checkpoint owner has no qpair for its body block");
+      }
+#endif
+      body_blocks_by_owner[body.shard_id_].push_back(body.block_id_);
+    }
     for (unsigned shard = 0; shard < worker_count_; ++shard) {
       if (std::numeric_limits<std::uint32_t>::max() - capacity_chunks[shard] <
           loaded.capacity_chunks_by_shard_[shard]) {
@@ -1231,10 +1254,12 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
                      db_id];
       }
     }
-    auto prepare = [this, owner,
-                    capacities = std::move(capacities)]() mutable {
+    auto prepare =
+        [this, owner, capacities = std::move(capacities),
+         body_blocks = std::move(body_blocks_by_owner[owner])]() mutable {
       WorkerStore& owner_store = *stores_[owner];
       owner_store.checkpoint_index_capacities_ = std::move(capacities);
+      checkpoint_load_results_[owner].body_blocks_ = std::move(body_blocks);
       try {
         for (std::size_t partition_index = 0;
              partition_index < owner_store.partitions_.size();
@@ -1305,6 +1330,10 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         block_id, data, block, checkpoint_root_.generation_, worker_count_,
         true);
     if (!decoded_chunk.ok()) co_return decoded_chunk.status();
+    if (block.extent_index_ != store.worker_->id()) {
+      co_return absl::InternalError(
+          "checkpoint body block changed owner after discovery");
+    }
     if (decoded_chunk->kind_ == CheckpointChunkKind::kIndexCapacity) {
       co_return absl::InternalError(
           "checkpoint capacity chunk reached the body decoder");
@@ -1480,17 +1509,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
     if (cursor != end) {
       co_return absl::InternalError("checkpoint chunk has trailing bytes");
     }
-    const unsigned owner = block.extent_index_;
-    if (owner == store.worker_->id()) {
-      ApplyRecovery(owner, std::move(recovered));
-    } else {
-      absl::Status applied = co_await celer::SubmitTo(
-          owner, [this, owner, recovered = std::move(recovered)]() mutable {
-            ApplyRecovery(owner, std::move(recovered));
-            return absl::OkStatus();
-          });
-      if (!applied.ok()) co_return applied;
-    }
+    ApplyRecovery(store.worker_->id(), std::move(recovered));
     co_return absl::OkStatus();
   };
 

@@ -121,16 +121,22 @@ after normal growth.
 
 After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
-checksums, then submits the complete decoded index or accounting block to its
-owner. Each scanner double-buffers checkpoint reads: after a block completes
-I/O it submits the next block before decoding and installing the current one.
-I/O, decoding, and index construction therefore proceed concurrently both
-within and across scanners. A scanner holds at most two 8 MiB buffers and one
-decoded batch, so temporary entry memory remains bounded by worker count rather
-than dataset size. Barriers reduce the per-scanner block, index-entry,
-accounting-entry, capacity, and shard results. Block and index-entry totals
-must exactly match the root, every worker must have all three chunk kinds
-represented, and each installed index size must equal its capacity declaration.
+checksums. Before those body reads, the prefix results redistribute every index
+and accounting block to its durable shard. That owner reads, decodes, and
+installs the block locally, avoiding a cross-worker decoded batch. This is
+always accessible on io_uring because every worker opens every path. On SPDK,
+checkpoint preparation verifies that the unchanged topology still gives the
+shard owner a qpair for the block's controller; otherwise the checkpoint falls
+back instead of silently restoring the old cross-worker path. Each owner
+double-buffers checkpoint reads: after a block completes I/O it submits the
+next block before decoding and installing the current one. I/O, decoding, and
+index construction therefore proceed concurrently across owners. An owner
+holds at most two 8 MiB buffers and one decoded batch, so temporary entry
+memory remains bounded by worker count rather than dataset size. Barriers
+reduce the per-scanner block, index-entry, accounting-entry, capacity, and
+shard results. Block and index-entry totals must exactly match the root, every
+worker must have all three chunk kinds represented, and each installed index
+size must equal its capacity declaration.
 The published total block count makes a missing chunk detectable without
 adding another root field. If a block or the final completeness check fails,
 startup

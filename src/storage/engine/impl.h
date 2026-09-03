@@ -1431,6 +1431,11 @@ struct CheckpointIndexCapacity {
   std::uint8_t db_id_ = 0;
 };
 
+struct CheckpointBodyBlock {
+  std::uint64_t block_id_ = 0;
+  std::uint16_t shard_id_ = 0;
+};
+
 struct CheckpointLoadResult {
   absl::Status status_ = absl::OkStatus();
   std::vector<std::uint64_t> blocks_;
@@ -1440,8 +1445,12 @@ struct CheckpointLoadResult {
   std::vector<bool> saw_accounting_shards_;
   std::vector<std::uint32_t> capacity_chunks_by_shard_;
   std::vector<CheckpointIndexCapacity> index_capacities_;
-  // The prefix pass classifies these blocks without reading their 8 MiB
-  // payloads. Capacity chunks are consumed before this list is decoded.
+  // Discovery records the durable shard because the physical bitmap stripe
+  // reader need not be the index owner. The preparation barrier redistributes
+  // these descriptors before any 8 MiB body is read.
+  std::vector<CheckpointBodyBlock> discovered_body_blocks_;
+  // After redistribution this contains only blocks owned by this worker, so
+  // their decode and index installation remain owner-local.
   std::vector<std::uint64_t> body_blocks_;
   // The durable accounting chunks contain one entry per live physical block.
   // Keep the decoded table bounded by block count while the header scan
