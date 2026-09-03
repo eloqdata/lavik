@@ -69,7 +69,7 @@ TEST(StorageFormatTest, ComputesRedisClusterSlotsAndHashTags) {
 
 TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   using namespace keylane::storage;
-  static_assert(kStorageFormatVersion == 2);
+  static_assert(kStorageFormatVersion == 1);
 
   constexpr std::uint64_t device_id = kDeviceIdLimit - 2;
   constexpr std::uint32_t local_block =
@@ -154,7 +154,7 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   SystemStateRoot decoded_system_root;
   ASSERT_TRUE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
   EXPECT_EQ(decoded_system_root, system_root);
-  system_root_bytes[8] = std::byte{1};  // Version 1 is intentionally rejected.
+  system_root_bytes[8] = std::byte{2};  // Unknown versions are rejected.
   EXPECT_FALSE(DecodeSystemStateRoot(system_root_bytes, &decoded_system_root));
 
   constexpr std::uint64_t one_pib_blocks = std::uint64_t{1} << 27;

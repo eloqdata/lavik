@@ -152,7 +152,7 @@ recovery decoder enforce the durable 512 MiB maximum key length; a wider
 internal or replication protocol argument limit cannot create a record that a
 restart would reject.
 
-The version-2 record wire layout has a 72-byte base header at explicit byte
+The version-1 record wire layout has a 72-byte base header at explicit byte
 offsets. A nonzero transaction ID and expiration timestamp each add one aligned
 8-byte extension, so fixed metadata is 72, 80, or 88 bytes. The base packs
 record kind, database, value type, external-payload state, external-key state,
@@ -161,10 +161,11 @@ those flags and key length; total record length is derived from header and
 payload length. Neither derived length is stored. The decoded `RecordHeader`
 is a runtime view rather than a persisted C++ object representation.
 
-The current version-2 format also includes the checkpoint metadata and the
-system-state root and manifest. There is no version-1 compatibility decoder;
-older media, including the earlier 104-byte record layout, must be reset before
-this build starts.
+The current version-1 format also includes checkpoint metadata and the
+system-state root and manifest. During pre-deployment development this layout
+directly replaces earlier layouts that also used version 1; there is no
+compatibility decoder. Older media, including the earlier 104-byte record
+layout, must be reset before this build starts.
 
 Keys that do not fit the configured inline header limit move into the payload.
 Large key/value payloads use a root record containing an extent manifest. Each

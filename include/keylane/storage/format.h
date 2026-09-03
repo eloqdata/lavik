@@ -19,10 +19,10 @@ inline constexpr std::size_t kBlockHeaderBytes =
 inline constexpr std::size_t kRecordAlignment = 8;
 inline constexpr std::size_t kMaxRecordHeaderBytes = kDirectIoAlignment;
 inline constexpr std::size_t kStorageBlockBytes = 8 * 1024 * 1024;
-// Version 2 adds the mirrored system-state root used by the durable Function
-// catalog and promotion base. Version 1 media is intentionally rejected: the
-// system-state lineage cannot be inferred safely from the old layout.
-inline constexpr std::uint32_t kStorageFormatVersion = 2;
+// Pre-deployment format changes directly replace version 1. Compatibility
+// with earlier development media is intentionally unsupported because its
+// missing system-state lineage cannot be inferred safely.
+inline constexpr std::uint32_t kStorageFormatVersion = 1;
 inline constexpr unsigned kLocalBlockIdBits = 27;
 inline constexpr std::uint64_t kLocalBlockIdLimit = std::uint64_t{1}
                                                     << kLocalBlockIdBits;
@@ -50,7 +50,7 @@ inline constexpr std::uint64_t kMaxRecordPayloadBytes = 2 * kMaxStringBytes;
 inline constexpr std::uint64_t kMetadataPageMagic =
     0x31475041544d4c4bULL;  // KLMETAP1
 inline constexpr std::uint64_t kSystemStateRootMagic =
-    0x32525453534c4bULL;  // KLSSTR2
+    0x31525453534c4bULL;  // KLSSTR1
 inline constexpr std::uint32_t kLogicalStorageShards = 16384;
 inline constexpr std::uint8_t kLogicalDatabaseCount = 16;
 inline constexpr std::uint64_t kDeviceLabelOffset = 0;

@@ -127,8 +127,8 @@ Named debug crash points cover durable catalog body, per-device system root,
 root completion, and runtime-swap boundaries. `INFO replication` exposes the
 local catalog generation and CRC64 alongside group, boot, incarnation, and
 history identities. End-to-end Function coverage exercises ordinary mutation,
-RDB/native transfer, and startup recovery; storage format tests cover the v2
-root codec and version rejection.
+RDB/native transfer, and startup recovery; storage format tests cover the v1
+root codec and unknown-version rejection.
 
 ## Source map
 

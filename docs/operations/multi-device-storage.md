@@ -114,9 +114,10 @@ Data begins at the next 8 MiB boundary; it is not hard-coded to local block
 one. See the current
 [storage and recovery architecture](../architecture/04-storage-and-recovery.md).
 
-This build writes storage format version 2 and deliberately has no version-1
-decoder. Starting it on version-1 media fails closed. Upgrade or rollback
-across that boundary requires a backup plus reset/restore, or a full sync from
+This build writes the current storage format version 1 and does not detect or
+preserve compatibility with pre-deployment layouts that previously reused
+that version. Such media is unsupported. Moving between incompatible
+development layouts requires a backup plus reset/restore, or a full sync from
 a compatible source; replacing only the binary is not sufficient.
 
 ## Per-device allocator ownership
