@@ -4548,6 +4548,16 @@ TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
       "flags={'no-writes'}}";
   keylane::rdb::StreamEncoder encoder(10);
   std::string rdb(encoder.Header());
+  keylane::storage::RawValue baseline_value{
+      .encoded_ = "snapshot-value",
+      .logical_size_ = 14,
+      .value_type_ = keylane::storage::ValueType::kString,
+  };
+  auto baseline_key_fragment =
+      keylane::rdb::EncodeFileEntry(0, "redis-snapshot", baseline_value);
+  ASSERT_TRUE(baseline_key_fragment.ok()) << baseline_key_fragment.status();
+  encoder.Account(*baseline_key_fragment);
+  rdb += *baseline_key_fragment;
   const std::string baseline_fragment =
       keylane::rdb::EncodeFunctionLibraryEntry(baseline_library);
   encoder.Account(baseline_fragment);
@@ -4585,6 +4595,8 @@ TEST(ListE2eTest, RedisPsyncFullSyncActivatesBeforeOnlineWrites) {
     std::this_thread::sleep_for(10ms);
   } while (std::chrono::steady_clock::now() < online_deadline);
   ASSERT_NE(info.find("keylane_replication_state:online"), std::string::npos);
+  EXPECT_EQ(replica_client.Command({"GET", "redis-snapshot"}),
+            Bulk("snapshot-value"));
   EXPECT_EQ(replica_client.Command(
                 {"FCALL_RO", "redis_baseline_value", "0", "snapshot"}),
             Bulk("snapshot"));

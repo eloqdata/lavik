@@ -83,15 +83,19 @@ done
 printf 'yes\n' | "$redis_cli" --cluster create \
   "127.0.0.1:${master_ports[0]}" "127.0.0.1:${master_ports[1]}" \
   "127.0.0.1:${master_ports[2]}" --cluster-replicas 0 >/dev/null
-for _ in {1..200}; do
-  "$redis_cli" -p "${master_ports[0]}" cluster info | tr -d '\r' | \
-    grep -q '^cluster_state:ok$' && break
-  sleep 0.05
+for port in "${master_ports[@]}"; do
+  for _ in {1..200}; do
+    "$redis_cli" -p "$port" cluster info | tr -d '\r' | \
+      grep -q '^cluster_state:ok$' && break
+    sleep 0.05
+  done
+  "$redis_cli" -p "$port" cluster info | tr -d '\r' | \
+    grep -q '^cluster_state:ok$'
 done
 
-"$redis_cli" -c -p "${master_ports[0]}" set '{a}baseline' one >/dev/null
-"$redis_cli" -c -p "${master_ports[0]}" set '{b}baseline' two >/dev/null
-"$redis_cli" -c -p "${master_ports[0]}" set '{c}baseline' three >/dev/null
+[[ $("$redis_cli" -c -p "${master_ports[0]}" set '{a}baseline' one) == OK ]]
+[[ $("$redis_cli" -c -p "${master_ports[0]}" set '{b}baseline' two) == OK ]]
+[[ $("$redis_cli" -c -p "${master_ports[0]}" set '{c}baseline' three) == OK ]]
 fullsync_function=$'#!lua name=redis_import_fullsync\nredis.register_function{function_name="redis_import_fullsync_value", callback=function(keys, args) return args[1] end, flags={"no-writes"}}'
 for port in "${master_ports[@]}"; do
   [[ $("$redis_cli" -p "$port" function load replace "$fullsync_function") == redis_import_fullsync ]]

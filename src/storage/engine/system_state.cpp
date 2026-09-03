@@ -443,7 +443,10 @@ absl::Status StorageEngine::Impl::LoadSystemState() {
   recovered_catalog_dump_ = std::move(catalog);
   const bool fenced = system_state_.full_sync_session_id_ != 0;
   replica_recovery_fenced_.store(fenced, std::memory_order_release);
-  replica_loading_.store(fenced, std::memory_order_release);
+  // The durable fence survives a restart, but native ReplicaSyncState does
+  // not. Keep ordinary writes out through ReplicaRecoveryFenced() until a
+  // replacement sync starts; ResetReplicaPartitions alone enables routing
+  // into the native rebuild root once its per-partition state exists.
   return absl::OkStatus();
 }
 
@@ -741,7 +744,6 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
   UnlockGuard unlock(&system_state_mutex_, celer::ThisWorker().self_);
   if (system_state_.full_sync_session_id_ == session_id) {
     replica_recovery_fenced_.store(true, std::memory_order_release);
-    replica_loading_.store(true, std::memory_order_release);
     co_return absl::OkStatus();
   }
   DurableSystemState next = system_state_;
@@ -753,7 +755,10 @@ Task<absl::Status> StorageEngine::Impl::BeginReplicaFullSync(
       co_await CommitSystemState(std::move(next), {}, false);
   if (!committed.ok()) co_return committed;
   replica_recovery_fenced_.store(true, std::memory_order_release);
-  replica_loading_.store(true, std::memory_order_release);
+  // This fence is shared by native and Redis full sync, while
+  // replica_loading_ is not: Redis imports its RDB through ordinary writes,
+  // and native sync enables hidden-root routing only after it installs the
+  // corresponding per-partition ReplicaSyncState.
   spdlog::info(
       "full-sync session {} durably invalidated system state at "
       "generation {}",
