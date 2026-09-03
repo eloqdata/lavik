@@ -33,8 +33,10 @@ Four values at the end of mirrored epoch metadata form the checkpoint root:
 - the expected checkpoint index-entry count.
 
 These fields and the checkpoint block kinds directly extend development
-storage format version 1. There is no compatibility decoder; existing media
-must be cleared when moving between incompatible development layouts. Each
+storage format version 1. There is no compatibility decoder. Incompatible
+ordinary-record layouts require clearing existing media; a checkpoint-only
+layout change uses a new chunk magic so the next startup rejects the transient
+snapshot and falls back to the still-authoritative ordinary-record scan. Each
 root copy participates in the existing per-page A/B generation and CRC32C
 protocol on every device.
 
@@ -55,12 +57,17 @@ directory fits in one block even with one worker. Startup uses these counts to
 allocate final index bucket tables before it installs keys; the directory is
 also a completeness check independent of how index entries happen to be split
 across blocks.
-Index chunks contain the complete key, database and partition epoch, physical
-record location, logical type and size, expiry and shielding state, and any
-extent manifest. Their fixed entry header packs owner, database, type and flags
-into one metadata word, derives entry bounds from the chunk and field lengths,
-and stores expiry only when present. It never stores the process-random key
-digest; startup recomputes that digest from the complete key.
+Index chunks contain the complete key, physical record location, database,
+logical type and size, expiry and shielding state, and any extent manifest.
+Their 40-byte fixed entry header packs the 43-bit block id with the low 21 bits
+of its allocation epoch, and packs aligned offset, aligned length, owner,
+database, type, and flags into another word. The remaining epoch bits retain
+the complete runtime reuse horizon. Entries inherit the partition replication
+epoch that is already durable in mirrored epoch metadata; repeating it per key
+would add 8 GB of checkpoint I/O per billion keys. Entry bounds come from the
+chunk and field lengths, and expiry is stored only when present. The format
+never stores the process-random key digest; startup recomputes that digest from
+the complete key.
 
 Block-accounting chunks contain one entry for every live ordinary or extent
 block owned by the shard, not one entry per key. Each entry stores the block

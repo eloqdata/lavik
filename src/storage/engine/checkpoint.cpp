@@ -6,7 +6,7 @@ namespace keylane::storage {
 namespace {
 
 constexpr std::uint64_t kCheckpointChunkMagic =
-    0x314b4e5548434c4bULL;  // KLCHUNK1
+    0x3150434b48434c4bULL;  // KLCHKCP1
 constexpr std::uint32_t kCheckpointWireVersion = 1;
 
 enum class CheckpointChunkKind : std::uint32_t {
@@ -23,22 +23,28 @@ enum CheckpointEntryFlag : std::uint8_t {
   kHasExpiry = 1U << 4,
 };
 
-constexpr std::uint32_t kCheckpointOwnerShift = 0;
-constexpr std::uint32_t kCheckpointDbShift = 10;
-constexpr std::uint32_t kCheckpointKindShift = 14;
-constexpr std::uint32_t kCheckpointTypeShift = 16;
-constexpr std::uint32_t kCheckpointFlagsShift = 19;
-constexpr std::uint32_t kCheckpointOwnerMask = 0x3ffU;
-constexpr std::uint32_t kCheckpointDbMask = 0xfU;
-constexpr std::uint32_t kCheckpointKindMask = 0x3U;
-constexpr std::uint32_t kCheckpointTypeMask = 0x7U;
-constexpr std::uint32_t kCheckpointFlagsMask = 0x1fU;
-constexpr std::uint32_t kCheckpointMetadataMask =
+constexpr unsigned kCheckpointOffsetShift = 0;
+constexpr unsigned kCheckpointLengthShift = 20;
+constexpr unsigned kCheckpointOwnerShift = 40;
+constexpr unsigned kCheckpointDbShift = 50;
+constexpr unsigned kCheckpointTypeShift = 54;
+constexpr unsigned kCheckpointFlagsShift = 57;
+constexpr std::uint64_t kCheckpointOffsetMask = (std::uint64_t{1} << 20) - 1;
+constexpr std::uint64_t kCheckpointLengthMask = (std::uint64_t{1} << 20) - 1;
+constexpr std::uint64_t kCheckpointOwnerMask = (std::uint64_t{1} << 10) - 1;
+constexpr std::uint64_t kCheckpointDbMask = (std::uint64_t{1} << 4) - 1;
+constexpr std::uint64_t kCheckpointTypeMask = (std::uint64_t{1} << 3) - 1;
+constexpr std::uint64_t kCheckpointFlagsMask = (std::uint64_t{1} << 5) - 1;
+constexpr std::uint64_t kCheckpointLocationMetadataMask =
+    (kCheckpointOffsetMask << kCheckpointOffsetShift) |
+    (kCheckpointLengthMask << kCheckpointLengthShift) |
     (kCheckpointOwnerMask << kCheckpointOwnerShift) |
     (kCheckpointDbMask << kCheckpointDbShift) |
-    (kCheckpointKindMask << kCheckpointKindShift) |
     (kCheckpointTypeMask << kCheckpointTypeShift) |
     (kCheckpointFlagsMask << kCheckpointFlagsShift);
+constexpr std::uint8_t kCheckpointTombstoneType = 7;
+constexpr std::uint64_t kCheckpointAllocationEpochLowMask =
+    (std::uint64_t{1} << RecordLocation::kAllocationEpochLowBits) - 1;
 
 struct CheckpointChunkHeader {
   std::uint64_t magic_ = kCheckpointChunkMagic;
@@ -52,18 +58,17 @@ struct CheckpointChunkHeader {
 };
 
 struct CheckpointEntryHeader {
-  std::uint64_t block_id_ = 0;
-  std::uint64_t allocation_epoch_ = 0;
   std::uint64_t mutation_sequence_ = 0;
-  std::uint64_t replication_epoch_ = 0;
-  std::uint32_t key_bytes_ = 0;
+  // Block id and the low 21 allocation-epoch bits share one word. The
+  // remaining epoch bits retain the full runtime reuse horizon below.
+  std::uint64_t block_and_epoch_low_ = 0;
+  // Aligned offset, aligned length, owner, database, type, and flags occupy
+  // 62 explicitly assigned bits. The top two bits must remain zero.
+  std::uint64_t location_metadata_ = 0;
+  std::uint32_t allocation_epoch_high_ = 0;
   std::uint32_t logical_size_ = 0;
-  std::uint32_t record_offset_ = 0;
-  std::uint32_t total_disk_bytes_ = 0;
+  std::uint32_t key_bytes_ = 0;
   std::uint32_t extent_count_ = 0;
-  // Owner, database, kind, value type, and flags occupy 24 bits. The upper
-  // bits must remain zero so format extensions cannot be misread silently.
-  std::uint32_t metadata_ = 0;
 };
 
 struct CheckpointAccountingEntry {
@@ -94,47 +99,87 @@ static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointAccountingEntry>);
 static_assert(std::is_trivially_copyable_v<CheckpointCapacityEntry>);
 static_assert(sizeof(CheckpointChunkHeader) == 40);
-static_assert(sizeof(CheckpointEntryHeader) == 56);
+static_assert(sizeof(CheckpointEntryHeader) == 40);
 static_assert(sizeof(CheckpointAccountingEntry) == 40);
 static_assert(sizeof(CheckpointCapacityEntry) == 16);
 static_assert(kMaxMemoryWorkers <= kCheckpointOwnerMask + 1);
 static_assert(kLogicalDatabaseCount <= kCheckpointDbMask + 1);
-static_assert(static_cast<std::uint8_t>(RecordKind::kTxCommit) <=
-              kCheckpointKindMask);
-static_assert(static_cast<std::uint8_t>(ValueType::kStream) <=
-              kCheckpointTypeMask);
+static_assert(static_cast<std::uint8_t>(ValueType::kStream) <
+              kCheckpointTombstoneType);
+static_assert(kCheckpointTombstoneType <= kCheckpointTypeMask);
+static_assert(kStorageBlockBytes / kRecordAlignment - 1 <=
+              kCheckpointOffsetMask);
+static_assert((kStorageBlockBytes - kBlockHeaderBytes) / kRecordAlignment <=
+              kCheckpointLengthMask);
+static_assert(RecordLocation::kBlockIdBits +
+                  RecordLocation::kAllocationEpochLowBits ==
+              64);
+static_assert(RecordLocation::kAllocationEpochBits -
+                  RecordLocation::kAllocationEpochLowBits <=
+              32);
+static_assert(kCheckpointFlagsShift + 5 <= 64);
+static_assert((kExternal | kKeyExternal | kShielding | kUnclaimed |
+               kHasExpiry) == kCheckpointFlagsMask);
 
-constexpr std::uint32_t EncodeCheckpointMetadata(
+constexpr std::uint64_t EncodeCheckpointLocationMetadata(
+    std::uint32_t record_offset, std::uint32_t total_disk_bytes,
     std::uint16_t block_owner, std::uint8_t db_id, RecordKind kind,
     ValueType value_type, std::uint8_t flags) noexcept {
-  return (static_cast<std::uint32_t>(block_owner) << kCheckpointOwnerShift) |
-         (static_cast<std::uint32_t>(db_id) << kCheckpointDbShift) |
-         (static_cast<std::uint32_t>(kind) << kCheckpointKindShift) |
-         (static_cast<std::uint32_t>(value_type) << kCheckpointTypeShift) |
-         (static_cast<std::uint32_t>(flags) << kCheckpointFlagsShift);
+  const std::uint8_t type = kind == RecordKind::kTombstone
+                                ? kCheckpointTombstoneType
+                                : static_cast<std::uint8_t>(value_type);
+  return (static_cast<std::uint64_t>(record_offset / kRecordAlignment)
+          << kCheckpointOffsetShift) |
+         (static_cast<std::uint64_t>(total_disk_bytes / kRecordAlignment)
+          << kCheckpointLengthShift) |
+         (static_cast<std::uint64_t>(block_owner) << kCheckpointOwnerShift) |
+         (static_cast<std::uint64_t>(db_id) << kCheckpointDbShift) |
+         (static_cast<std::uint64_t>(type) << kCheckpointTypeShift) |
+         (static_cast<std::uint64_t>(flags) << kCheckpointFlagsShift);
 }
 
-constexpr std::uint16_t CheckpointBlockOwner(std::uint32_t metadata) noexcept {
+constexpr std::uint32_t CheckpointRecordOffset(
+    std::uint64_t metadata) noexcept {
+  return static_cast<std::uint32_t>(
+             (metadata >> kCheckpointOffsetShift) & kCheckpointOffsetMask) *
+         kRecordAlignment;
+}
+
+constexpr std::uint32_t CheckpointTotalDiskBytes(
+    std::uint64_t metadata) noexcept {
+  return static_cast<std::uint32_t>(
+             (metadata >> kCheckpointLengthShift) & kCheckpointLengthMask) *
+         kRecordAlignment;
+}
+
+constexpr std::uint16_t CheckpointBlockOwner(std::uint64_t metadata) noexcept {
   return static_cast<std::uint16_t>((metadata >> kCheckpointOwnerShift) &
                                     kCheckpointOwnerMask);
 }
 
-constexpr std::uint8_t CheckpointDb(std::uint32_t metadata) noexcept {
+constexpr std::uint8_t CheckpointDb(std::uint64_t metadata) noexcept {
   return static_cast<std::uint8_t>((metadata >> kCheckpointDbShift) &
                                    kCheckpointDbMask);
 }
 
-constexpr RecordKind CheckpointKind(std::uint32_t metadata) noexcept {
-  return static_cast<RecordKind>((metadata >> kCheckpointKindShift) &
-                                 kCheckpointKindMask);
+constexpr std::uint8_t CheckpointTypeCode(std::uint64_t metadata) noexcept {
+  return static_cast<std::uint8_t>((metadata >> kCheckpointTypeShift) &
+                                   kCheckpointTypeMask);
 }
 
-constexpr ValueType CheckpointValueType(std::uint32_t metadata) noexcept {
-  return static_cast<ValueType>((metadata >> kCheckpointTypeShift) &
-                                kCheckpointTypeMask);
+constexpr RecordKind CheckpointKind(std::uint64_t metadata) noexcept {
+  return CheckpointTypeCode(metadata) == kCheckpointTombstoneType
+             ? RecordKind::kTombstone
+             : RecordKind::kValue;
 }
 
-constexpr std::uint8_t CheckpointFlags(std::uint32_t metadata) noexcept {
+constexpr ValueType CheckpointValueType(std::uint64_t metadata) noexcept {
+  return CheckpointTypeCode(metadata) == kCheckpointTombstoneType
+             ? ValueType::kNone
+             : static_cast<ValueType>(CheckpointTypeCode(metadata));
+}
+
+constexpr std::uint8_t CheckpointFlags(std::uint64_t metadata) noexcept {
   return static_cast<std::uint8_t>((metadata >> kCheckpointFlagsShift) &
                                    kCheckpointFlagsMask);
 }
@@ -865,18 +910,22 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         if (location.unclaimed()) flags |= kUnclaimed;
         if (has_expiry) flags |= kHasExpiry;
         CheckpointEntryHeader encoded{
-            .block_id_ = location.block_id(),
-            .allocation_epoch_ = location.allocation_epoch(),
             .mutation_sequence_ = location.mutation_sequence_,
-            .replication_epoch_ = partition.replication_epoch_,
-            .key_bytes_ = static_cast<std::uint32_t>(key.size()),
-            .logical_size_ = location.logical_size_,
-            .record_offset_ = location.record_offset(),
-            .total_disk_bytes_ = location.total_disk_bytes(),
-            .extent_count_ = static_cast<std::uint32_t>(extent_count),
-            .metadata_ = EncodeCheckpointMetadata(
+            .block_and_epoch_low_ =
+                location.block_id() |
+                ((location.allocation_epoch() &
+                  kCheckpointAllocationEpochLowMask)
+                 << RecordLocation::kBlockIdBits),
+            .location_metadata_ = EncodeCheckpointLocationMetadata(
+                location.record_offset(), location.total_disk_bytes(),
                 location.block_owner(), db_id, location.kind(),
                 location.value_type(), flags),
+            .allocation_epoch_high_ = static_cast<std::uint32_t>(
+                location.allocation_epoch() >>
+                RecordLocation::kAllocationEpochLowBits),
+            .logical_size_ = location.logical_size_,
+            .key_bytes_ = static_cast<std::uint32_t>(key.size()),
+            .extent_count_ = static_cast<std::uint32_t>(extent_count),
         };
         payload->AppendPod(encoded);
         if (has_expiry) {
@@ -1585,18 +1634,28 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       }
       CheckpointEntryHeader entry{};
       std::memcpy(&entry, cursor, sizeof(entry));
+      const std::uint64_t block_id =
+          entry.block_and_epoch_low_ & RecordLocation::kBlockIdMask;
+      const std::uint64_t allocation_epoch =
+          (entry.block_and_epoch_low_ >> RecordLocation::kBlockIdBits) |
+          (static_cast<std::uint64_t>(entry.allocation_epoch_high_)
+           << RecordLocation::kAllocationEpochLowBits);
       const std::uint16_t block_owner =
-          CheckpointBlockOwner(entry.metadata_);
-      const std::uint8_t db_id = CheckpointDb(entry.metadata_);
-      const RecordKind kind = CheckpointKind(entry.metadata_);
-      const ValueType value_type = CheckpointValueType(entry.metadata_);
-      const std::uint8_t flags = CheckpointFlags(entry.metadata_);
+          CheckpointBlockOwner(entry.location_metadata_);
+      const std::uint8_t db_id = CheckpointDb(entry.location_metadata_);
+      const RecordKind kind = CheckpointKind(entry.location_metadata_);
+      const ValueType value_type =
+          CheckpointValueType(entry.location_metadata_);
+      const std::uint8_t flags = CheckpointFlags(entry.location_metadata_);
+      const std::uint32_t record_offset =
+          CheckpointRecordOffset(entry.location_metadata_);
+      const std::uint32_t total_disk_bytes =
+          CheckpointTotalDiskBytes(entry.location_metadata_);
       const bool has_expiry = (flags & kHasExpiry) != 0;
       const std::size_t fixed_bytes =
           sizeof(entry) + (has_expiry ? sizeof(std::uint64_t) : 0);
-      if ((entry.metadata_ & ~kCheckpointMetadataMask) != 0 ||
+      if ((entry.location_metadata_ & ~kCheckpointLocationMetadataMask) != 0 ||
           db_id >= kLogicalDatabaseCount || block_owner >= worker_count_ ||
-          entry.replication_epoch_ == 0 ||
           (flags & ~(kExternal | kKeyExternal | kShielding | kUnclaimed |
                      kHasExpiry)) != 0 ||
           (kind != RecordKind::kValue && kind != RecordKind::kTombstone) ||
@@ -1606,12 +1665,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
            (value_type < ValueType::kString ||
             value_type > ValueType::kStream)) ||
           entry.logical_size_ > RecordIndexValue::kLogicalSizeMask ||
-          entry.record_offset_ < kBlockHeaderBytes ||
-          entry.record_offset_ % kRecordAlignment != 0 ||
-          entry.total_disk_bytes_ == 0 ||
-          entry.total_disk_bytes_ % kRecordAlignment != 0 ||
-          static_cast<std::uint64_t>(entry.record_offset_) +
-                  entry.total_disk_bytes_ >
+          record_offset < kBlockHeaderBytes || total_disk_bytes == 0 ||
+          static_cast<std::uint64_t>(record_offset) + total_disk_bytes >
               kStorageBlockBytes ||
           fixed_bytes > static_cast<std::size_t>(end - cursor) ||
           entry.key_bytes_ >
@@ -1636,7 +1691,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       const char* key_data =
           reinterpret_cast<const char*>(cursor + fixed_bytes);
       std::string key(key_data, entry.key_bytes_);
-      if (RedisSlot(key) % worker_count_ != block.extent_index_) {
+      const std::uint16_t partition_id = RedisSlot(key);
+      if (partition_id % worker_count_ != block.extent_index_) {
         co_return absl::InternalError("checkpoint key is in the wrong shard");
       }
       ExtentManifest extents;
@@ -1651,8 +1707,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       const bool external = (flags & kExternal) != 0;
       const bool key_external = (flags & kKeyExternal) != 0;
       if (external != (extents != nullptr) ||
-          !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
-                                                  entry.allocation_epoch_)) {
+          !RecordLocation::CanEncodeBlockIdentity(block_id,
+                                                  allocation_epoch)) {
         co_return absl::InternalError("invalid checkpoint record location");
       }
       const Digest digest = ComputeDigest(key);
@@ -1662,13 +1718,18 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           .db_id_ = db_id,
           .txid_ = 0,
           .lsn_ = std::numeric_limits<std::uint64_t>::max(),
-          .replication_epoch_ = entry.replication_epoch_,
+          // Replication epochs are persisted once per partition before any
+          // record from that epoch can become durable. The checkpoint is a
+          // snapshot of the already-filtered live index, so repeating that
+          // partition invariant in every entry only adds I/O.
+          .replication_epoch_ =
+              epoch_values_[kLogicalDatabaseCount + partition_id],
           .location_ = RecordLocation(
-              entry.block_id_, entry.mutation_sequence_,
-              entry.allocation_epoch_, expire_at_ms, entry.logical_size_,
+              block_id, entry.mutation_sequence_, allocation_epoch,
+              expire_at_ms, entry.logical_size_,
               RecordLocation::PackedMetadata::Encode(
-                  entry.record_offset_, entry.total_disk_bytes_, block_owner,
-                  false, external, key_external,
+                  record_offset, total_disk_bytes, block_owner, false,
+                  external, key_external,
                   (flags & kShielding) != 0, (flags & kUnclaimed) != 0, false,
                   kind, value_type)),
           .extents_ = std::move(extents),
