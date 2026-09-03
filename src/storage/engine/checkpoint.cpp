@@ -8,6 +8,10 @@ namespace {
 constexpr std::uint64_t kCheckpointChunkMagic =
     0x3150434b48434c4bULL;  // KLCHKCP1
 constexpr std::uint32_t kCheckpointWireVersion = 1;
+// Version 1 is intentionally replaced in place during development. Requiring
+// this layout tag prevents an older same-sized entry header from being
+// interpreted under the packed partition layout below.
+constexpr std::uint32_t kCheckpointLayoutTag = 0x50545231;  // PTR1
 
 enum class CheckpointChunkKind : std::uint32_t {
   kIndexEntries = 1,
@@ -45,6 +49,18 @@ constexpr std::uint64_t kCheckpointLocationMetadataMask =
 constexpr std::uint8_t kCheckpointTombstoneType = 7;
 constexpr std::uint64_t kCheckpointAllocationEpochLowMask =
     (std::uint64_t{1} << RecordLocation::kAllocationEpochLowBits) - 1;
+constexpr unsigned kCheckpointKeyBytesBits = 32;
+constexpr unsigned kCheckpointExtentCountBits = 18;
+constexpr unsigned kCheckpointPartitionBits = 14;
+constexpr unsigned kCheckpointExtentCountShift = kCheckpointKeyBytesBits;
+constexpr unsigned kCheckpointPartitionShift =
+    kCheckpointExtentCountShift + kCheckpointExtentCountBits;
+constexpr std::uint64_t kCheckpointKeyBytesMask =
+    (std::uint64_t{1} << kCheckpointKeyBytesBits) - 1;
+constexpr std::uint64_t kCheckpointExtentCountMask =
+    (std::uint64_t{1} << kCheckpointExtentCountBits) - 1;
+constexpr std::uint64_t kCheckpointPartitionMask =
+    (std::uint64_t{1} << kCheckpointPartitionBits) - 1;
 
 struct CheckpointChunkHeader {
   std::uint64_t magic_ = kCheckpointChunkMagic;
@@ -54,10 +70,15 @@ struct CheckpointChunkHeader {
   std::uint32_t shard_id_ = 0;
   CheckpointChunkKind kind_ = CheckpointChunkKind::kIndexEntries;
   std::uint32_t entry_count_ = 0;
-  std::uint32_t reserved_ = 0;
+  std::uint32_t layout_tag_ = kCheckpointLayoutTag;
+  // A checkpoint digest is meaningful only under this seed. Clean restarts
+  // retain it so index construction can consume the serialized digest; cold
+  // recovery remains free to start with a newly randomized process seed.
+  DigestSeed digest_seed_{};
 };
 
 struct CheckpointEntryHeader {
+  Digest digest_{};
   std::uint64_t mutation_sequence_ = 0;
   // Block id and the low 21 allocation-epoch bits share one word. The
   // remaining epoch bits retain the full runtime reuse horizon below.
@@ -67,8 +88,11 @@ struct CheckpointEntryHeader {
   std::uint64_t location_metadata_ = 0;
   std::uint32_t allocation_epoch_high_ = 0;
   std::uint32_t logical_size_ = 0;
-  std::uint32_t key_bytes_ = 0;
-  std::uint32_t extent_count_ = 0;
+  // These fields consume 32 + 18 + 14 bits respectively. Keeping them in one
+  // word records the logical partition without increasing the 48-byte entry;
+  // startup can trust the CRC-protected routing decision instead of hashing
+  // every complete key through the Redis slot algorithm again.
+  std::uint64_t key_extent_partition_ = 0;
 };
 
 struct CheckpointAccountingEntry {
@@ -98,8 +122,8 @@ static_assert(std::is_trivially_copyable_v<CheckpointChunkHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointEntryHeader>);
 static_assert(std::is_trivially_copyable_v<CheckpointAccountingEntry>);
 static_assert(std::is_trivially_copyable_v<CheckpointCapacityEntry>);
-static_assert(sizeof(CheckpointChunkHeader) == 40);
-static_assert(sizeof(CheckpointEntryHeader) == 40);
+static_assert(sizeof(CheckpointChunkHeader) == 56);
+static_assert(sizeof(CheckpointEntryHeader) == 48);
 static_assert(sizeof(CheckpointAccountingEntry) == 40);
 static_assert(sizeof(CheckpointCapacityEntry) == 16);
 static_assert(kMaxMemoryWorkers <= kCheckpointOwnerMask + 1);
@@ -117,6 +141,10 @@ static_assert(RecordLocation::kBlockIdBits +
 static_assert(RecordLocation::kAllocationEpochBits -
                   RecordLocation::kAllocationEpochLowBits <=
               32);
+static_assert(kCheckpointPartitionShift + kCheckpointPartitionBits == 64);
+static_assert(MaxKeyBytes() <= kCheckpointKeyBytesMask);
+static_assert(kMaxStringExtents <= kCheckpointExtentCountMask);
+static_assert(kLogicalStorageShards <= kCheckpointPartitionMask + 1);
 static_assert(kCheckpointFlagsShift + 5 <= 64);
 static_assert((kExternal | kKeyExternal | kShielding | kUnclaimed |
                kHasExpiry) == kCheckpointFlagsMask);
@@ -183,6 +211,37 @@ constexpr std::uint8_t CheckpointFlags(std::uint64_t metadata) noexcept {
   return static_cast<std::uint8_t>((metadata >> kCheckpointFlagsShift) &
                                    kCheckpointFlagsMask);
 }
+
+constexpr std::uint64_t EncodeCheckpointKeyExtentPartition(
+    std::uint32_t key_bytes, std::uint32_t extent_count,
+    std::uint16_t partition_id) noexcept {
+  return static_cast<std::uint64_t>(key_bytes) |
+         (static_cast<std::uint64_t>(extent_count)
+          << kCheckpointExtentCountShift) |
+         (static_cast<std::uint64_t>(partition_id)
+          << kCheckpointPartitionShift);
+}
+
+constexpr std::uint32_t CheckpointKeyBytes(std::uint64_t packed) noexcept {
+  return static_cast<std::uint32_t>(packed & kCheckpointKeyBytesMask);
+}
+
+constexpr std::uint32_t CheckpointExtentCount(
+    std::uint64_t packed) noexcept {
+  return static_cast<std::uint32_t>(
+      (packed >> kCheckpointExtentCountShift) & kCheckpointExtentCountMask);
+}
+
+constexpr std::uint16_t CheckpointPartition(std::uint64_t packed) noexcept {
+  return static_cast<std::uint16_t>(
+      (packed >> kCheckpointPartitionShift) & kCheckpointPartitionMask);
+}
+
+constexpr std::uint64_t kCheckpointPackedFieldTest =
+    EncodeCheckpointKeyExtentPartition(0xfedcba98U, 0x2aaaaU, 0x2aaaU);
+static_assert(CheckpointKeyBytes(kCheckpointPackedFieldTest) == 0xfedcba98U);
+static_assert(CheckpointExtentCount(kCheckpointPackedFieldTest) == 0x2aaaaU);
+static_assert(CheckpointPartition(kCheckpointPackedFieldTest) == 0x2aaaU);
 
 // Two slots let shutdown encode the next chunk while the prior direct write is
 // in flight. Heap-owned completion state keeps the DMA buffer alive if an
@@ -449,7 +508,8 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
       chunk.version_ != kCheckpointWireVersion ||
       chunk.header_bytes_ != sizeof(chunk) || chunk.generation_ != generation ||
       chunk.shard_id_ != block.extent_index_ ||
-      chunk.entry_count_ != block.record_count_ || chunk.reserved_ != 0 ||
+      chunk.entry_count_ != block.record_count_ ||
+      chunk.layout_tag_ != kCheckpointLayoutTag ||
       (chunk.kind_ != CheckpointChunkKind::kIndexEntries &&
        chunk.kind_ != CheckpointChunkKind::kBlockAccounting &&
        chunk.kind_ != CheckpointChunkKind::kIndexCapacity)) {
@@ -810,6 +870,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       .generation_ = generation,
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .kind_ = CheckpointChunkKind::kIndexCapacity,
+      .digest_seed_ = CurrentDigestSeed(),
   };
   payload->AppendPod(capacity_chunk);
   std::uint32_t capacity_entries = 0;
@@ -831,7 +892,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
 
   CheckpointChunkHeader chunk{
       .generation_ = generation,
-      .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
+      .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+      .digest_seed_ = CurrentDigestSeed()};
   payload->AppendPod(chunk);
   std::uint32_t chunk_entries = 0;
   absl::flat_hash_map<std::uint64_t, RecoveryLiveReference>
@@ -846,7 +908,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     if (!submitted.ok()) co_return submitted;
     CheckpointChunkHeader next{
         .generation_ = generation,
-        .shard_id_ = static_cast<std::uint32_t>(store.worker_->id())};
+        .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
+        .digest_seed_ = CurrentDigestSeed()};
     payload->AppendPod(next);
     chunk_entries = 0;
     co_return absl::OkStatus();
@@ -910,6 +973,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         if (location.unclaimed()) flags |= kUnclaimed;
         if (has_expiry) flags |= kHasExpiry;
         CheckpointEntryHeader encoded{
+            .digest_ = ComputeDigest(key),
             .mutation_sequence_ = location.mutation_sequence_,
             .block_and_epoch_low_ =
                 location.block_id() |
@@ -924,8 +988,9 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
                 location.allocation_epoch() >>
                 RecordLocation::kAllocationEpochLowBits),
             .logical_size_ = location.logical_size_,
-            .key_bytes_ = static_cast<std::uint32_t>(key.size()),
-            .extent_count_ = static_cast<std::uint32_t>(extent_count),
+            .key_extent_partition_ = EncodeCheckpointKeyExtentPartition(
+                static_cast<std::uint32_t>(key.size()),
+                static_cast<std::uint32_t>(extent_count), partition.id_),
         };
         payload->AppendPod(encoded);
         if (has_expiry) {
@@ -980,6 +1045,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       .generation_ = generation,
       .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
       .kind_ = CheckpointChunkKind::kBlockAccounting,
+      .digest_seed_ = CurrentDigestSeed(),
   };
   payload->AppendPod(accounting_chunk);
   chunk_entries = 0;
@@ -995,6 +1061,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         .generation_ = generation,
         .shard_id_ = static_cast<std::uint32_t>(store.worker_->id()),
         .kind_ = CheckpointChunkKind::kBlockAccounting,
+        .digest_seed_ = CurrentDigestSeed(),
     };
     payload->AppendPod(next);
     chunk_entries = 0;
@@ -1311,6 +1378,12 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
         candidates[index], current.data(), **candidate,
         checkpoint_root_.generation_, worker_count_, false);
     if (!chunk.ok()) co_return chunk.status();
+    if (!result->digest_seed_.has_value()) {
+      result->digest_seed_ = chunk->digest_seed_;
+    } else if (*result->digest_seed_ != chunk->digest_seed_) {
+      co_return absl::InternalError(
+          "checkpoint blocks disagree on the digest seed");
+    }
     result->blocks_.push_back(candidates[index]);
     if (chunk->kind_ == CheckpointChunkKind::kIndexCapacity) {
       capacity_blocks.push_back(candidates[index]);
@@ -1344,6 +1417,11 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     if (chunk->kind_ != CheckpointChunkKind::kIndexCapacity) {
       co_return absl::InternalError(
           "checkpoint capacity chunk changed kind after discovery");
+    }
+    if (!result->digest_seed_.has_value() ||
+        chunk->digest_seed_ != *result->digest_seed_) {
+      co_return absl::InternalError(
+          "checkpoint capacity digest seed changed after discovery");
     }
     const std::size_t entries_bytes =
         block.extent_payload_bytes_ - sizeof(CheckpointChunkHeader);
@@ -1386,11 +1464,20 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
       kMissing);
   std::vector<std::uint32_t> capacity_chunks(worker_count_, 0);
   std::vector<std::vector<std::uint64_t>> body_blocks_by_owner(worker_count_);
+  std::optional<DigestSeed> checkpoint_digest_seed;
   std::uint64_t discovered_blocks = 0;
   std::uint64_t declared_entries = 0;
 
   for (const CheckpointLoadResult& loaded : checkpoint_load_results_) {
     if (!loaded.status_.ok()) co_return loaded.status_;
+    if (loaded.digest_seed_.has_value()) {
+      if (!checkpoint_digest_seed.has_value()) {
+        checkpoint_digest_seed = loaded.digest_seed_;
+      } else if (*checkpoint_digest_seed != *loaded.digest_seed_) {
+        co_return absl::InternalError(
+            "checkpoint scanners disagree on the digest seed");
+      }
+    }
     if (std::numeric_limits<std::uint64_t>::max() - discovered_blocks <
         loaded.blocks_.size()) {
       co_return absl::InternalError("checkpoint block total overflows");
@@ -1449,6 +1536,9 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
   if (discovered_blocks != checkpoint_root_.block_count_) {
     co_return absl::InternalError("checkpoint block count mismatch");
   }
+  if (!checkpoint_digest_seed.has_value()) {
+    co_return absl::InternalError("checkpoint omits the digest seed");
+  }
   if (std::any_of(capacity_chunks.begin(), capacity_chunks.end(),
                   [](std::uint32_t count) { return count != 1; })) {
     co_return absl::InternalError(
@@ -1461,6 +1551,10 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
   if (declared_entries != checkpoint_root_.entry_count_) {
     co_return absl::InternalError("checkpoint capacity entry count mismatch");
   }
+
+  // No recovered key has been hashed yet. Publish the seed before owners pass
+  // the capacity-ready barrier and begin constructing their local indexes.
+  RestoreDigestSeed(*checkpoint_digest_seed);
 
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>> capacities(
@@ -1490,24 +1584,19 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
 absl::Status StorageEngine::Impl::PreallocateCheckpointIndexes(
     WorkerStore& store) {
   assert(celer::ThisWorker().id_ == store.worker_->id());
-  try {
-    for (std::size_t partition_index = 0;
-         partition_index < store.partitions_.size(); ++partition_index) {
-      auto& partition = store.partitions_[partition_index];
-      for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
-        const std::uint64_t count =
-            store.checkpoint_index_capacities_[partition_index][db_id];
-        if (count > std::numeric_limits<std::size_t>::max()) {
-          return absl::ResourceExhaustedError(
-              "checkpoint index capacity exceeds address space");
-        }
-        partition.indexes_[db_id].PreallocateForExpectedSize(
-            static_cast<std::size_t>(count));
+  for (std::size_t partition_index = 0;
+       partition_index < store.partitions_.size(); ++partition_index) {
+    auto& partition = store.partitions_[partition_index];
+    for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      const std::uint64_t count =
+          store.checkpoint_index_capacities_[partition_index][db_id];
+      if (count > std::numeric_limits<std::size_t>::max() ||
+          !partition.indexes_[db_id].PreallocateForExpectedSize(
+              static_cast<std::size_t>(count))) {
+        return absl::ResourceExhaustedError(
+            "checkpoint index capacity exceeds address space");
       }
     }
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError(
-        "failed to preallocate checkpoint index tables");
   }
   return absl::OkStatus();
 }
@@ -1551,6 +1640,10 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         block_id, data, block, checkpoint_root_.generation_, worker_count_,
         true);
     if (!decoded_chunk.ok()) co_return decoded_chunk.status();
+    if (decoded_chunk->digest_seed_ != CurrentDigestSeed()) {
+      co_return absl::InternalError(
+          "checkpoint digest seed changed after discovery");
+    }
     if (block.extent_index_ != store.worker_->id()) {
       co_return absl::InternalError(
           "checkpoint body block changed owner after discovery");
@@ -1649,6 +1742,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             CheckpointRecordOffset(entry.location_metadata_);
         const std::uint32_t total_disk_bytes =
             CheckpointTotalDiskBytes(entry.location_metadata_);
+        const std::uint32_t key_bytes =
+            CheckpointKeyBytes(entry.key_extent_partition_);
+        const std::uint32_t extent_count =
+            CheckpointExtentCount(entry.key_extent_partition_);
+        const std::uint16_t partition_id =
+            CheckpointPartition(entry.key_extent_partition_);
         const bool has_expiry = (flags & kHasExpiry) != 0;
         const std::size_t fixed_bytes =
             sizeof(entry) + (has_expiry ? sizeof(std::uint64_t) : 0);
@@ -1667,18 +1766,20 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             record_offset < kBlockHeaderBytes || total_disk_bytes == 0 ||
             static_cast<std::uint64_t>(record_offset) + total_disk_bytes >
                 kStorageBlockBytes ||
+            partition_id >= kLogicalStorageShards ||
+            partition_id % worker_count_ != block.extent_index_ ||
             fixed_bytes > static_cast<std::size_t>(end - entry_cursor) ||
-            entry.key_bytes_ >
+            key_bytes >
                 static_cast<std::size_t>(end - entry_cursor) - fixed_bytes ||
-            entry.extent_count_ >
+            extent_count >
                 (static_cast<std::size_t>(end - entry_cursor) - fixed_bytes -
-                 entry.key_bytes_) /
+                 key_bytes) /
                     sizeof(ExtentRef)) {
           return absl::InternalError("invalid checkpoint entry");
         }
         const std::size_t entry_bytes =
-            fixed_bytes + entry.key_bytes_ +
-            static_cast<std::size_t>(entry.extent_count_) * sizeof(ExtentRef);
+            fixed_bytes + key_bytes +
+            static_cast<std::size_t>(extent_count) * sizeof(ExtentRef);
         std::uint64_t expire_at_ms = 0;
         if (has_expiry) {
           std::memcpy(&expire_at_ms, entry_cursor + sizeof(entry),
@@ -1690,25 +1791,21 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         }
         const char* key_data =
             reinterpret_cast<const char*>(entry_cursor + fixed_bytes);
-        const std::string_view key(key_data, entry.key_bytes_);
-        const std::uint16_t partition_id = RedisSlot(key);
-        if (partition_id % worker_count_ != block.extent_index_) {
-          return absl::InternalError("checkpoint key is in the wrong shard");
-        }
+        const std::string_view key(key_data, key_bytes);
         const bool external = (flags & kExternal) != 0;
         const bool key_external = (flags & kKeyExternal) != 0;
-        if (external != (entry.extent_count_ != 0) ||
+        if (external != (extent_count != 0) ||
             !RecordLocation::CanEncodeBlockIdentity(entry_block_id,
                                                     allocation_epoch)) {
           return absl::InternalError("invalid checkpoint record location");
         }
         ExtentManifest extents;
-        if (entry.extent_count_ != 0) {
+        if (extent_count != 0) {
           auto mutable_extents =
-              std::make_shared<std::vector<ExtentRef>>(entry.extent_count_);
+              std::make_shared<std::vector<ExtentRef>>(extent_count);
           std::memcpy(mutable_extents->data(),
-                      entry_cursor + fixed_bytes + entry.key_bytes_,
-                      entry.extent_count_ * sizeof(ExtentRef));
+                      entry_cursor + fixed_bytes + key_bytes,
+                      extent_count * sizeof(ExtentRef));
           extents = std::move(mutable_extents);
         }
         const RecordLocation location(
@@ -1718,24 +1815,36 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
                 record_offset, total_disk_bytes, block_owner, false, external,
                 key_external, (flags & kShielding) != 0,
                 (flags & kUnclaimed) != 0, false, kind, value_type));
-        const RecoveryRecordView recovered{
-            .digest_ = ComputeDigest(key),
-            .key_ = key,
-            .db_id_ = db_id,
-            .txid_ = 0,
-            .lsn_ = std::numeric_limits<std::uint64_t>::max(),
-            // Replication epochs are persisted once per partition before any
-            // record from that epoch can become durable. The checkpoint is an
-            // already-filtered snapshot, so repeating the epoch per key would
-            // only add I/O.
-            .replication_epoch_ =
-                epoch_values_[kLogicalDatabaseCount + partition_id],
-            .location_ = location,
-            .extents_ = &extents,
-            .checkpoint_snapshot_ = true,
-        };
-        ApplyRecoveredRecord(store, PartitionFor(store, partition_id),
-                             recovered);
+        auto& partition = PartitionFor(store, partition_id);
+        RecordIndex::Entry* installed = partition.indexes_[db_id].InsertNew(
+            entry.digest_, key, location, !key_external);
+        if (installed == nullptr) {
+          return absl::ResourceExhaustedError(
+              "checkpoint index entry capacity exhausted");
+        }
+
+        // A frozen checkpoint has exactly one final winner per key. Direct
+        // insertion skips cold-scan version arbitration while publishing the
+        // same owner-local accounting as ordinary recovery insertion.
+        partition.mutation_sequence_ = std::max(
+            partition.mutation_sequence_, location.mutation_sequence_);
+        AddFullSyncCoverageEntry(partition, db_id, key.size());
+        if (location.external()) {
+          store.external_manifests_.insert_or_assign(installed,
+                                                      std::move(extents));
+        }
+        if (location.key_external()) [[unlikely]] {
+          // The complete key is needed through expiry and any fallback merge;
+          // steady-state external-key reads use the durable record.
+          store.recovery_external_keys_.insert_or_assign(installed, key);
+        }
+        if (location.kind() == RecordKind::kValue) {
+          ++partition.live_key_count_[db_id];
+          ++store.live_key_count_[db_id];
+          if (location.expire_at_ms_ != 0) {
+            ++partition.expiring_key_count_[db_id];
+          }
+        }
         entry_cursor += entry_bytes;
       }
       if (entry_cursor != end) {
@@ -1744,11 +1853,11 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       return absl::OkStatus();
     };
 
-    // Payload CRC is already validated before this loop, so each entry can be
-    // installed as soon as its own bounds and semantics validate. If a later
-    // entry is invalid, normal checkpoint fallback retains this valid prefix
-    // and merges the authoritative record scan into it. Avoiding a second
-    // pass also avoids recomputing RedisSlot for every key.
+    // Payload CRC is already validated before this loop. Validated entries are
+    // installed directly into its final index; if a later entry is invalid,
+    // normal checkpoint fallback retains the valid prefix and merges the
+    // authoritative record scan into it. The pinned block remains alive until
+    // its final string_view has been copied.
     absl::Status installed = install_entries();
     if (!installed.ok()) co_return installed;
     result->entry_count_ += chunk.entry_count_;

@@ -22,6 +22,24 @@ TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
   EXPECT_EQ(DigestHash{}(first), first.value_);
 }
 
+TEST(StorageFormatTest, RestoresCheckpointDigestSeedBeforeHashing) {
+  using namespace keylane::storage;
+  const DigestSeed original = CurrentDigestSeed();
+  DigestSeed checkpoint_seed{};
+  checkpoint_seed.fill(0xa5);
+
+  RestoreDigestSeed(checkpoint_seed);
+  const Digest restored = ComputeDigest("checkpoint-key");
+  EXPECT_EQ(CurrentDigestSeed(), checkpoint_seed);
+  EXPECT_EQ(restored, ComputeDigest("checkpoint-key"));
+
+  DigestSeed different_seed{};
+  different_seed.fill(0x5a);
+  RestoreDigestSeed(different_seed);
+  EXPECT_NE(restored, ComputeDigest("checkpoint-key"));
+  RestoreDigestSeed(original);
+}
+
 TEST(StorageFormatTest, KeepsRuntimeAndRecoveryKeyLimitsIdentical) {
   using namespace keylane::storage;
   EXPECT_TRUE(ValidRecordKeySize(MaxKeyBytes()));

@@ -164,8 +164,6 @@ absl::Status ReserveReplicationString(std::string* output,
   }
   try {
     output->reserve(allocation_capacity);
-  } catch (const std::bad_alloc&) {
-    return ReplicationMemoryExhausted("replication buffer allocation");
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError("replication buffer is too large");
   }
@@ -322,8 +320,6 @@ DecodeRecords(std::string_view payload) try {
     return absl::InvalidArgumentError("trailing replication record payload");
   }
   return std::make_pair(partition_id, std::move(records));
-} catch (const std::bad_alloc&) {
-  return ReplicationMemoryExhausted("replication record payload");
 } catch (const std::length_error&) {
   return absl::ResourceExhaustedError(
       "replication record payload is too large");

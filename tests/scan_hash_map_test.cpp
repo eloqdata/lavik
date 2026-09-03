@@ -36,8 +36,8 @@ TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
   }
   EXPECT_EQ(arena->allocated_pages(), 1);
   EXPECT_FALSE(first.CanAllocateEntry("overflow", true, false));
-  EXPECT_THROW(first.InsertNew(ComputeDigest("overflow"), "overflow", 1),
-               std::bad_alloc);
+  EXPECT_EQ(first.InsertNew(ComputeDigest("overflow"), "overflow", 1),
+            nullptr);
 
   EXPECT_TRUE(first.Erase(ComputeDigest("k0"), "k0"));
   EXPECT_TRUE(first.CanAllocateEntry("replacement", true, false));
@@ -86,7 +86,7 @@ TEST(ScanHashMapTest, DirectoryCapacityDoesNotInflateEmptyArena) {
 
 TEST(ScanHashMapTest, PreallocatesSettledTableForKnownPopulation) {
   ScanHashMap<std::uint64_t> map;
-  map.PreallocateForExpectedSize(91);
+  ASSERT_TRUE(map.PreallocateForExpectedSize(91));
   EXPECT_EQ(map.allocated_bucket_count(), 16);
   EXPECT_FALSE(map.rehashing());
 
@@ -101,13 +101,13 @@ TEST(ScanHashMapTest, PreallocatesSettledTableForKnownPopulation) {
 
 TEST(ScanHashMapTest, KnownEmptyPopulationAllocatesNothing) {
   ScanHashMap<std::uint64_t> map;
-  map.PreallocateForExpectedSize(0);
+  EXPECT_TRUE(map.PreallocateForExpectedSize(0));
   EXPECT_FALSE(map.has_allocated_storage());
 }
 
 TEST(ScanHashMapTest, UnrepresentablePreallocationLeavesMapEmpty) {
   ScanHashMap<std::uint64_t, 0> map;
-  EXPECT_THROW(map.PreallocateForExpectedSize(10), std::bad_alloc);
+  EXPECT_FALSE(map.PreallocateForExpectedSize(10));
   EXPECT_TRUE(map.empty());
   EXPECT_FALSE(map.has_allocated_storage());
 }

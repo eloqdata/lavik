@@ -127,24 +127,16 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::PinFullSyncValue(
         "full-sync capture ended while pinning value");
   }
   const std::uint64_t id = capture->second.next_pinned_value_id_;
-  try {
-    auto [_, inserted] = capture->second.pinned_values_.emplace(
-        id, WorkerStore::FullSyncCapture::PinnedValue{
-                .extents_ = extents,
-                .key_bytes_ = key_prefix,
-                .value_bytes_ = extent_bytes - key_prefix,
-            });
-    if (!inserted) {
-      InvalidateFullSyncSession(store, session_id);
-      store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
-      co_return absl::InternalError("duplicate full-sync pinned value id");
-    }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
+  auto [_, inserted] = capture->second.pinned_values_.emplace(
+      id, WorkerStore::FullSyncCapture::PinnedValue{
+              .extents_ = extents,
+              .key_bytes_ = key_prefix,
+              .value_bytes_ = extent_bytes - key_prefix,
+          });
+  if (!inserted) {
     InvalidateFullSyncSession(store, session_id);
     store.worker_->Spawn(ReleaseFullSyncExtents(std::move(extents)));
-    co_return absl::ResourceExhaustedError(
-        "full-sync pinned value allocation failed");
+    co_return absl::InternalError("duplicate full-sync pinned value id");
   }
   ++capture->second.next_pinned_value_id_;
   co_return id;
@@ -208,17 +200,16 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
           status = absl::ResourceExhaustedError(
               "full-sync coverage memory credit exhausted");
         } else {
-          try {
-            capture->second.key_phases_.InsertOrAssign(
-                digest, coverage_key,
-                WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight,
-                coverage_key.size() <= options_.inline_key_max_bytes_);
-            phase_inserted = true;
-          } catch (const std::bad_alloc&) {
-            RecordMemoryRejection();
+          const auto phase = capture->second.key_phases_.InsertOrAssign(
+              digest, coverage_key,
+              WorkerStore::FullSyncCapture::KeyPhase::kBaselineInflight,
+              coverage_key.size() <= options_.inline_key_max_bytes_);
+          if (phase.rejected_) {
             InvalidateFullSyncSession(store, session_id);
             status = absl::ResourceExhaustedError(
-                "full-sync coverage allocation failed");
+                "full-sync coverage entry capacity exhausted");
+          } else {
+            phase_inserted = true;
           }
           if (status.ok()) {
             const ExtentManifest extents = ExtentsFor(store, current);
@@ -1117,15 +1108,13 @@ void StorageEngine::Impl::AcknowledgePartitionFullSyncOverrides(
     session->second.publish_queue_bytes_ -=
         std::min(session->second.publish_queue_bytes_, credit);
     if (returns_to_coverage) {
-      try {
-        // This identity already owns coverage credit transferred from the
-        // acknowledged override; no new session headroom is consumed here.
-        capture->second.key_phases_.InsertOrAssign(
-            ComputeDigest(acknowledged.key_), acknowledged.key_,
-            WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit,
-            acknowledged.key_.size() <= options_.inline_key_max_bytes_);
-      } catch (const std::bad_alloc&) {
-        RecordMemoryRejection();
+      // This identity already owns coverage credit transferred from the
+      // acknowledged override; no new session headroom is consumed here.
+      const auto restored = capture->second.key_phases_.InsertOrAssign(
+          ComputeDigest(acknowledged.key_), acknowledged.key_,
+          WorkerStore::FullSyncCapture::KeyPhase::kTailingWithOverrideCredit,
+          acknowledged.key_.size() <= options_.inline_key_max_bytes_);
+      if (restored.rejected_) {
         InvalidateFullSyncSession(store, session_id);
         return;
       }
@@ -1807,8 +1796,7 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
             "replica large-value staging exceeds this worker's retained-memory "
             "budget");
       }
-      try {
-        partition.replica_value_stage_ = ReplicaValueStage{
+      partition.replica_value_stage_ = ReplicaValueStage{
             .db_id_ = record.db_id_,
             .db_epoch_ = record.db_epoch_,
             .mutation_sequence_ = record.mutation_sequence_,
@@ -1827,14 +1815,8 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
         // an arbitrary point later in the stream.
         partition.replica_value_stage_->value_.reserve(
             static_cast<std::size_t>(record.logical_size_));
-        partition.replica_value_stage_->memory_charge_.Adopt(
-            &*stage_reservation, stage_bytes);
-      } catch (const std::bad_alloc&) {
-        partition.replica_value_stage_.reset();
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "replica large-value staging allocation failed");
-      }
+      partition.replica_value_stage_->memory_charge_.Adopt(
+          &*stage_reservation, stage_bytes);
       continue;
     }
     if (record.kind_ == SnapshotRecord::Kind::kValueChunk) {

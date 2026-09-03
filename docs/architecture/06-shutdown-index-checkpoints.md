@@ -35,10 +35,10 @@ Four values at the end of mirrored epoch metadata form the checkpoint root:
 These fields and the checkpoint block kinds directly extend development
 storage format version 1. There is no compatibility decoder. Incompatible
 ordinary-record layouts require clearing existing media; a checkpoint-only
-layout change uses a new chunk magic so the next startup rejects the transient
-snapshot and falls back to the still-authoritative ordinary-record scan. Each
-root copy participates in the existing per-page A/B generation and CRC32C
-protocol on every device.
+layout change uses a new chunk-layout discriminator so the next startup rejects
+the transient snapshot and falls back to the still-authoritative
+ordinary-record scan. Each root copy participates in the existing per-page A/B
+generation and CRC32C protocol on every device.
 
 Each device also has a checkpoint bitmap parallel to its allocation bitmap,
 with one bit per physical block and the same independently checksummed A/B page
@@ -59,15 +59,26 @@ also a completeness check independent of how index entries happen to be split
 across blocks.
 Index chunks contain the complete key, physical record location, database,
 logical type and size, expiry and shielding state, and any extent manifest.
-Their 40-byte fixed entry header packs the 43-bit block id with the low 21 bits
+Their 48-byte fixed entry header packs the 43-bit block id with the low 21 bits
 of its allocation epoch, and packs aligned offset, aligned length, owner,
 database, type, and flags into another word. The remaining epoch bits retain
-the complete runtime reuse horizon. Entries inherit the partition replication
-epoch that is already durable in mirrored epoch metadata; repeating it per key
-would add 8 GB of checkpoint I/O per billion keys. Entry bounds come from the
-chunk and field lengths, and expiry is stored only when present. The format
-never stores the process-random key digest; startup recomputes that digest from
-the complete key.
+the complete runtime reuse horizon. The final word packs key length, extent
+count, and logical partition into 32, 18, and 14 bits. Persisting the already
+validated partition lets recovery route an entry without recalculating its
+Redis slot, while the chunk CRC and partition-to-shard check protect the cached
+routing metadata. Entries inherit the partition replication epoch that is
+already durable in mirrored epoch metadata; repeating it per key would add 8
+GB of checkpoint I/O per billion keys. Entry bounds come from the chunk and
+field lengths, and expiry is stored only when present. The format stores each
+key's SipHash digest and the checkpoint-wide random seed that gives it meaning.
+A successful clean restart adopts that seed before constructing any index and
+consumes the stored digests without hashing every key again.
+Successive clean checkpoints retain the seed; a cold scan without a usable
+checkpoint can choose a fresh process seed because ordinary records do not
+depend on it. Retaining the seed avoids restart CPU at the cost of adding eight
+checkpoint bytes per key and not rotating collision-flooding entropy at every
+clean restart; the seed remains local storage metadata and is never exposed in
+the Redis or replication protocols.
 
 Block-accounting chunks contain one entry for every live ordinary or extent
 block owned by the shard, not one entry per key. Each entry stores the block
@@ -150,9 +161,10 @@ capacity chunk per worker, exactly one declaration per partition and database,
 and a declared sum equal to the root entry count. Worker 0 distributes the
 validated capacities, then all workers allocate their own index tables in
 parallel. A second rendezvous publishes a uniform fallback decision before any
-body can be installed if one allocation fails. Every nonempty `ScanHashMap`
-receives the same final power-of-two bucket count and 75-percent target it
-would have after normal growth.
+body can be installed if a declared capacity cannot be represented. Physical
+allocator exhaustion is process-fatal rather than a fallback condition. Every
+nonempty `ScanHashMap` receives the same final power-of-two bucket count and
+75-percent target it would have after normal growth.
 
 After that allocation barrier, each scanner validates block identity and
 allocation epoch, generation, shard, bounds, entry counts, and CRC32C payload
@@ -166,21 +178,26 @@ back instead of silently restoring the old cross-worker path. Each owner
 double-buffers checkpoint reads: after a block completes I/O it submits the
 next block before decoding and installing the current one. I/O, decoding, and
 index construction therefore proceed concurrently across owners. After the
-whole payload passes CRC32C, each index entry is bounds- and semantics-checked
-and then installed directly from the pinned I/O buffer. Key bytes are copied
-only into their final index nodes; there is neither an owning decoded batch nor
-a second chunk pass. If a later entry is invalid, the already installed valid
-prefix participates in the same authoritative cold-scan merge as prefixes from
-earlier blocks. An owner therefore holds at most two 8 MiB buffers plus final
-index state, so temporary entry memory remains bounded by worker count rather
-than key count. Barriers reduce the per-scanner block, index-entry,
-accounting-entry, capacity, and shard results. Block and index-entry totals
-must exactly match the root, every worker must have all three chunk kinds
-represented, and each installed index size must equal its capacity declaration.
-The published total block count makes a missing chunk detectable without
-adding another root field. If a block or the final completeness check fails,
-startup
-disables ordinary-body skipping and performs the full record scan. Entries
+whole payload passes CRC32C, each index entry is bounds- and semantics-checked,
+its stored partition is checked against the chunk shard, and it is installed
+directly from the pinned I/O buffer. Key bytes are copied only into their final
+index nodes; there is neither an owning decoded batch, a Redis-slot
+recalculation, nor a second chunk pass. Because the frozen checkpoint contains
+exactly one
+final winner per logical key, successful loading inserts those entries without
+the multi-version arbitration used by the ordinary record scan. If a later
+entry is invalid, the already installed valid prefix is marked as a checkpoint
+winner and participates in the same authoritative cold-scan merge as prefixes
+from earlier blocks. An owner therefore holds at most two 8 MiB buffers plus
+final index state, so temporary entry memory remains bounded by worker count
+rather than key count. Barriers reduce the per-scanner block,
+index-entry, accounting-entry, capacity, and shard results. Block and
+index-entry totals must exactly match the root, every worker must have all
+three chunk kinds represented, and each installed index size must equal its
+capacity declaration. The published total block count makes a missing chunk
+detectable without adding another root field. If a block or the final
+completeness check fails, startup disables ordinary-body skipping and performs
+the full record scan. Entries
 from already validated checkpoint blocks remain installed and participate in
 the normal winner merge; the full scan supplies every missing key.
 
@@ -215,10 +232,10 @@ The speedup still does not make startup independent of index-entry or allocated
 block count: every checkpoint key must be decoded and every allocated block
 header must be scanned.
 
-Capacity chunks directly replace the earlier two-kind version-1 checkpoint
-layout. An earlier checkpoint is rejected before any key body is installed and
-falls back to the authoritative record scan; ordinary record media is
-unchanged.
+The version-1 chunk layout is replaced in place rather than decoded through a
+compatibility path. A checkpoint with an earlier header size or layout
+discriminator is rejected before any key body is installed and falls back to
+the authoritative record scan; ordinary record media is unchanged.
 
 ## Source map
 

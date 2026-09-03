@@ -965,13 +965,7 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
                            "external key has no valid extent manifest");
   }
   std::string key;
-  try {
-    key.resize(key_bytes);
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "external key read allocation failed");
-  }
+  key.resize(key_bytes);
   std::size_t offset = 0;
   for (std::size_t index = 0; index < extents->size() && offset < key.size();
        ++index) {
@@ -989,10 +983,6 @@ Task<absl::StatusOr<std::string>> StorageEngine::Impl::LoadExternalKey(
     } else {
       try {
         partial.resize(ref.payload_bytes_);
-      } catch (const std::bad_alloc&) {
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "external key extent buffer allocation failed");
       } catch (const std::length_error&) {
         co_return absl::ResourceExhaustedError(
             "external key extent buffer is too large");

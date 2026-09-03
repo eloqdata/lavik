@@ -8,12 +8,16 @@
 
 namespace keylane::storage {
 
-RecordIndex::Entry* StorageEngine::Impl::ReplaceIndexLocation(
+absl::StatusOr<RecordIndex::Entry*> StorageEngine::Impl::ReplaceIndexLocation(
     WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
     const Digest& digest, const RecordLocation& location, TxUndoLog* tx_undo) {
   RecordIndex::Entry* replaced = nullptr;
   RecordIndex::Entry* current =
       index.ReplaceValue(entry, location, digest, &replaced);
+  if (current == nullptr) {
+    return absl::ResourceExhaustedError(
+        "record index entry capacity exhausted");
+  }
   if (replaced == nullptr) {
     return current;
   }
@@ -67,8 +71,6 @@ bool TryPreparePostMutationQueueSlot(Queue* queue,
   try {
     queue->PrepareCapacity(minimum_capacity);
     return true;
-  } catch (const std::bad_alloc&) {
-    return false;
   } catch (const std::length_error&) {
     return false;
   }
@@ -842,9 +844,14 @@ Task<absl::Status> StorageEngine::Impl::RollbackTxLocal(
         --partition.expiring_key_count_[entry.db_id_];
       }
     }
-    current =
+    auto restored =
         ReplaceIndexLocation(store, partition.indexes_[entry.db_id_], current,
                              undo_digest, *entry.previous_, &undo);
+    if (!restored.ok()) {
+      store.write_failed_ = true;
+      co_return restored.status();
+    }
+    current = *restored;
     if (entry.previous_->external()) {
       store.external_manifests_.insert_or_assign(current,
                                                  entry.previous_extents_);
@@ -1328,30 +1335,18 @@ Task<absl::Status> StorageEngine::Impl::AppendLocked(
                                               : ++partition.mutation_sequence_;
   std::shared_ptr<const ReplicationCommandAppend> fullsync_command;
   if (replication != nullptr) {
-    try {
-      AppendReplicationExpirationEffect(
-          &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
-          kind == RecordKind::kValue ? expire_at_ms : 0);
-    } catch (const std::bad_alloc&) {
-      RecordMemoryRejection();
-      co_return absl::ResourceExhaustedError(
-          "OOM replication command allocation failed");
-    }
+    AppendReplicationExpirationEffect(
+        &replication->args_, db_id, db_id, key, kind == RecordKind::kValue,
+        kind == RecordKind::kValue ? expire_at_ms : 0);
     replication->db_id_ = db_id;
     replication->partition_id_ = partition.id_;
     replication->partition_sequence_ = mutation_sequence;
     if (!partition.fullsync_subscribers_.empty()) [[unlikely]] {
-      try {
-        // Build the subscriber-owned copy before writing. Once the durable
-        // mutation succeeds, publishing cannot discover a new OOM failure.
-        // Active sessions already hold fixed staging budgets for this copy.
-        fullsync_command =
-            std::make_shared<ReplicationCommandAppend>(*replication);
-      } catch (const std::bad_alloc&) {
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "OOM full-sync replication copy allocation failed");
-      }
+      // Build the subscriber-owned copy before writing. Active sessions hold
+      // fixed staging budgets; a physical allocation failure is fatal rather
+      // than converted into a recoverable command error.
+      fullsync_command =
+          std::make_shared<ReplicationCommandAppend>(*replication);
     }
   }
   // Every real keyspace modification funnels through here (client writes,
@@ -1513,16 +1508,10 @@ bool StorageEngine::Impl::TryConsumeFullSyncCoverageCredit(
     return false;
   }
   if (consume_arena_credit) {
-    try {
-      capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
-          ScanHashMapEntryArena::kMaximumPageId,
-          /*externally_admitted=*/true,
-          /*externally_accounted=*/true));
-    } catch (const std::bad_alloc&) {
-      RecordMemoryRejection();
-      InvalidateFullSyncSession(store, session_id);
-      return false;
-    }
+    capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
+        ScanHashMapEntryArena::kMaximumPageId,
+        /*externally_admitted=*/true,
+        /*externally_accounted=*/true));
     capture.arena_credit_consumed_ = true;
   }
   return true;
@@ -1556,16 +1545,10 @@ bool StorageEngine::Impl::TryConsumeFullSyncArenaCredit(
   if (!TryConsumeFullSyncCredit(store, session_id, capture, kArenaFixedBytes)) {
     return false;
   }
-  try {
-    capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
-        ScanHashMapEntryArena::kMaximumPageId,
-        /*externally_admitted=*/true,
-        /*externally_accounted=*/true));
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    InvalidateFullSyncSession(store, session_id);
-    return false;
-  }
+  capture.key_phases_.SetEntryArena(std::make_shared<ScanHashMapEntryArena>(
+      ScanHashMapEntryArena::kMaximumPageId,
+      /*externally_admitted=*/true,
+      /*externally_accounted=*/true));
   capture.arena_credit_consumed_ = true;
   return true;
 }
@@ -1715,27 +1698,17 @@ void StorageEngine::Impl::FullSyncCaptureOnCommit(
     session->second.publish_queue_bytes_ += credit;
     capture.replacement_credit_bytes_ += credit;
   }
-  try {
-    auto [override, inserted] =
-        capture.overrides_.emplace(record.mutation_sequence_, record);
-    if (!inserted) {
-      InvalidateFullSyncSession(store, session_id);
-      return;
-    }
-    try {
-      auto [latest, latest_inserted] = latest_by_key.emplace(
-          std::string(record.key_), record.mutation_sequence_);
-      (void)latest;
-      if (!latest_inserted) {
-        capture.overrides_.erase(override);
-        InvalidateFullSyncSession(store, session_id);
-      }
-    } catch (const std::bad_alloc&) {
-      capture.overrides_.erase(override);
-      throw;
-    }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
+  auto [override, inserted] =
+      capture.overrides_.emplace(record.mutation_sequence_, record);
+  if (!inserted) {
+    InvalidateFullSyncSession(store, session_id);
+    return;
+  }
+  auto [latest, latest_inserted] = latest_by_key.emplace(
+      std::string(record.key_), record.mutation_sequence_);
+  (void)latest;
+  if (!latest_inserted) {
+    capture.overrides_.erase(override);
     InvalidateFullSyncSession(store, session_id);
   }
 }
@@ -1824,24 +1797,13 @@ bool StorageEngine::Impl::TryEnqueueFullSyncRecord(
     store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
     return false;
   }
-  try {
-    WorkerStore::FullSyncSessionState::PendingCommand pending{
-        .id_ = id,
-        .staging_bytes_ = logical_bytes,
-        .command_ = nullptr,
-        .record_ = record,
-    };
-    state.publish_queue_.push_back_prepared(std::move(pending));
-  } catch (const std::bad_alloc&) {
-    // This is a post-commit subscriber copy. The primary history remains
-    // complete; abandoning this lower-priority full-sync attempt is the only
-    // safe recovery if the already-admitted physical allocation still fails.
-    state.publish_queue_bytes_ -= logical_bytes;
-    state.db_epoch_invalidated_ = true;
-    RecordMemoryRejection();
-    store.fullsync_publisher_capacity_ready_.NotifyAll(*store.worker_);
-    return false;
-  }
+  WorkerStore::FullSyncSessionState::PendingCommand pending{
+      .id_ = id,
+      .staging_bytes_ = logical_bytes,
+      .command_ = nullptr,
+      .record_ = record,
+  };
+  state.publish_queue_.push_back_prepared(std::move(pending));
   return true;
 }
 
@@ -2248,6 +2210,17 @@ acquire_active_stream:
     co_return absl::ResourceExhaustedError(
         "record index entry page capacity exhausted");
   }
+  if (tx != nullptr && tx->collect_undo_) {
+    const auto undo = store.tx_undo_.find(txid);
+    if (undo != store.tx_undo_.end() &&
+        !undo->second.CanTrack(previous_entry)) {
+      // The journal must reject its deterministic handle limit before the
+      // durable staging buffer changes; allocator failure while growing the
+      // admitted journal is a process-fatal physical OOM instead.
+      co_return absl::ResourceExhaustedError(
+          "transaction undo handle capacity exhausted");
+    }
+  }
   std::optional<MemoryReservation> index_memory_reservation;
   if (needs_index_allocation) {
     const std::size_t allocation_bytes = index_ptr->RequiredAllocationBytes(
@@ -2416,11 +2389,21 @@ acquire_active_stream:
           current_tx_undo = &found->second;
         }
       }
-      inserted_entry = ReplaceIndexLocation(store, *index_ptr, previous_entry,
-                                            digest, location, current_tx_undo);
+      auto replaced = ReplaceIndexLocation(store, *index_ptr, previous_entry,
+                                           digest, location, current_tx_undo);
+      if (!replaced.ok()) {
+        store.write_failed_ = true;
+        co_return replaced.status();
+      }
+      inserted_entry = *replaced;
     } else {
       inserted_entry =
           index_ptr->InsertNew(digest, key, location, !key_external);
+      if (inserted_entry == nullptr) {
+        store.write_failed_ = true;
+        co_return absl::ResourceExhaustedError(
+            "record index entry capacity exhausted");
+      }
       assert(partition_ptr != nullptr);
       AddFullSyncCoverageEntry(*partition_ptr, db_id, key.size());
     }
@@ -2458,9 +2441,14 @@ acquire_active_stream:
   });
   if (tx != nullptr && tx->collect_undo_ && inserted_entry != nullptr) {
     TxUndoLog& undo = store.tx_undo_[txid];
-    const std::uint32_t entry_handle = undo.Track(inserted_entry);
+    const std::optional<std::uint32_t> entry_handle =
+        undo.Track(inserted_entry);
+    if (!entry_handle.has_value()) {
+      co_return absl::ResourceExhaustedError(
+          "transaction undo handle capacity exhausted");
+    }
     undo.entries_.push_back(TxUndoEntry{
-        .entry_handle_ = entry_handle,
+        .entry_handle_ = *entry_handle,
         .previous_ = previous,
         .previous_extents_ = previous_extents,
         .db_id_ = db_id,

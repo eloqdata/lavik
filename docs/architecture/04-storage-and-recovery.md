@@ -133,11 +133,14 @@ Records are 8-byte aligned and carry their database and value type, key
 representation, logical and physical sizes, transaction ID, database and
 replication epochs, logical mutation sequence, absolute expiration time,
 physical LSN, allocation epoch, and payload and header checksums. A key digest
-is deliberately absent: it is process-random runtime state reconstructed from
-the complete key. Record kinds are value, tombstone, and keyless transaction
-commit decision. Both the storage write boundary and recovery decoder enforce
-the durable 512 MiB maximum key length; a wider internal or replication
-protocol argument limit cannot create a record that a restart would reject.
+is deliberately absent from authoritative ordinary records: cold recovery
+reconstructs it from the complete key under a fresh random seed. An optional
+shutdown checkpoint can persist both its snapshot digests and their seed as
+non-authoritative acceleration state. Record kinds are value, tombstone, and
+keyless transaction commit decision. Both the storage write boundary and
+recovery decoder enforce the durable 512 MiB maximum key length; a wider
+internal or replication protocol argument limit cannot create a record that a
+restart would reject.
 
 The version-1 record wire layout has a 72-byte base header at explicit byte
 offsets. A nonzero transaction ID and expiration timestamp each add one aligned
@@ -201,13 +204,16 @@ the index and accounting bodies. The prefix directory redistributes those
 blocks to their durable shard first, so the index owner performs both body I/O
 and installation without a cross-worker decoded batch. After validating the
 body checksum, each individually validated entry is installed directly from
-its pinned I/O buffer, so key bytes have no intermediate owning copy and the
-chunk needs no second pass. A later invalid entry sends the installed valid
-prefix through the ordinary cold-scan merge. io_uring owners can open every
-configured path; under SPDK the unchanged worker topology must also give the
-shard owner a qpair for the block's controller. This removes incremental index
-rehashing, cross-worker installation, and decoded entry batches from
-checkpoint recovery while retaining worker-bounded temporary I/O memory.
+its pinned I/O buffer. The entry carries its validated logical partition and
+runtime digest, so key bytes have no intermediate owning copy and recovery
+does not recalculate Redis slots or key digests. A later invalid entry sends
+the installed valid prefix
+through the ordinary cold-scan merge. io_uring
+owners can open every configured path; under SPDK the unchanged worker
+topology must also give the shard owner a qpair for the block's controller.
+This removes incremental index rehashing, cross-worker installation, decoded
+entry batches, and per-key routing hashes from checkpoint recovery while
+retaining worker-bounded temporary I/O memory.
 Barriers reduce
 per-worker block, entry, capacity, and shard totals and verify each loaded
 index against its declared size. The root's expected counts make missing
@@ -315,11 +321,14 @@ use, preserving block-reuse and ABA protection. These index representations
 are runtime-only; durable block and record headers retain the fields needed for
 restart validation.
 
-Runtime key digests use one operating-system-seeded SipHash key per process.
-They are consistent across workers for that process, change on restart, and do
-not affect Redis-slot routing. External keys and decoded Hash or Set fields
-retain or reconstruct a digest only as a lookup aid; collisions are verified
-against complete keys, and process-local fingerprints are never persisted.
+Runtime key digests use one operating-system-seeded SipHash key shared by all
+workers and do not affect Redis-slot routing. A cold recovery chooses a fresh
+seed; a successful shutdown-checkpoint recovery restores the checkpoint seed
+before hashing any key so its serialized top-level digests remain valid.
+External keys and decoded Hash or Set fields retain or reconstruct a digest
+only as a lookup aid, and collisions are verified against complete keys. The
+seed and top-level digests appear only in the one-use checkpoint, never in
+authoritative records or replication protocols.
 
 All partition and logical-database indexes on a worker allocate entries from a
 shared worker-local arena, so sparse indexes share capacity instead of
@@ -339,8 +348,12 @@ needs a new or replacement entry, storage admits the required entry and table
 capacity from the current worker's memory share. Incremental expansion likewise
 prepares its destination capacity before removing source entries. Admission or
 index-capacity failure returns `ResourceExhausted` without publishing a record
-that cannot enter the index; allocation failure during expansion leaves both
-tables searchable and the maintenance step retryable.
+that cannot enter the index; an admission rejection during expansion leaves
+both tables searchable and the maintenance step retryable. Keylane does not
+turn a physical allocator failure into a command or recovery status: an actual
+`std::bad_alloc` remains unhandled and terminates the process. This keeps
+recoverable capacity policy separate from a process that can no longer uphold
+its in-memory invariants.
 
 `--max-memory` is divided into fixed worker shares; a worker does not borrow
 another worker's unused balance. Retained state is admitted up to 90 percent of
@@ -668,7 +681,7 @@ current source code are authoritative for present storage behavior.
 |---|---|
 | Public lifecycle, routing, typed operations, locked transaction contract, snapshots, epochs, maintenance, and durability interfaces | `include/keylane/storage/engine.h` |
 | Worker, partition, block, append-stream, allocator, recovery, and background-maintenance state | `src/storage/engine/impl.h` |
-| Runtime index representation, shared entry arena, process-local key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
+| Runtime index representation, shared entry arena, runtime key digests, and asynchronous entry-identity validation | `include/keylane/storage/scan_hash_map.h`, `include/keylane/storage/format.h`, `src/storage/format.cpp`, `src/storage/engine/impl.h`, `src/storage/engine/write.cpp`, `src/storage/engine/flush.cpp` |
 | Persistent constants, device and block IDs, A/B metadata pages, record and extent layouts, and checksums | `include/keylane/storage/format.h`, `src/storage/format.cpp` |
 | Checkpoint serialization, bitmap validation, generation publication and consumption, fallback, and block retirement | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/init.cpp`, `src/storage/engine/recovery.cpp` |
 | Aligned buffer ownership, registered-I/O fallback, oversized reads, and cross-worker lease return | `include/keylane/storage/buffer_pool.h`, `src/storage/buffer_pool.cpp` |

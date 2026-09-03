@@ -1101,7 +1101,18 @@ struct TxUndoLog {
   // stable slot before the old Entry is destroyed, so current_entries_ never
   // exposes a stale pointer to rollback even when the allocator later reuses
   // that address.
-  std::uint32_t Track(RecordIndex::Entry* entry) {
+  bool CanTrack(const RecordIndex::Entry* entry) const noexcept {
+    if (entry != nullptr &&
+        handle_by_address_.contains(reinterpret_cast<std::uintptr_t>(entry))) {
+      return true;
+    }
+    return current_entries_.size() <
+           std::numeric_limits<std::uint32_t>::max();
+  }
+
+  // Null means the 32-bit handle namespace is full. Physical allocation
+  // failure is deliberately not represented here and remains process-fatal.
+  std::optional<std::uint32_t> Track(RecordIndex::Entry* entry) {
     assert(entry != nullptr);
     const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(entry);
     if (auto found = handle_by_address_.find(address);
@@ -1109,12 +1120,13 @@ struct TxUndoLog {
       return found->second;
     }
     if (current_entries_.size() >= std::numeric_limits<std::uint32_t>::max()) {
-      throw std::bad_alloc();
+      return std::nullopt;
     }
     const std::uint32_t handle =
         static_cast<std::uint32_t>(current_entries_.size());
     current_entries_.push_back(entry);
-    const bool inserted = handle_by_address_.emplace(address, handle).second;
+    [[maybe_unused]] const bool inserted =
+        handle_by_address_.emplace(address, handle).second;
     assert(inserted);
     return handle;
   }
@@ -1137,7 +1149,7 @@ struct TxUndoLog {
     assert(handle < current_entries_.size());
     current_entries_[handle] = current;
     handle_by_address_.erase(found);
-    const bool inserted =
+    [[maybe_unused]] const bool inserted =
         handle_by_address_
             .emplace(reinterpret_cast<std::uintptr_t>(current), handle)
             .second;
@@ -1461,6 +1473,7 @@ struct CheckpointLoadResult {
   std::vector<bool> saw_accounting_shards_;
   std::vector<std::uint32_t> capacity_chunks_by_shard_;
   std::vector<CheckpointIndexCapacity> index_capacities_;
+  std::optional<DigestSeed> digest_seed_;
   // Discovery records the durable shard because the physical bitmap stripe
   // reader need not be the index owner. The preparation barrier redistributes
   // these descriptors before any 8 MiB body is read.
@@ -2933,12 +2946,13 @@ class StorageEngine::Impl {
       WorkerStore& store,
       std::vector<std::vector<RecoveryLiveReference>>* batches);
 
-  void ApplyRecovery(unsigned target, RecoveryBatch batch);
+  absl::Status ApplyRecovery(unsigned target, RecoveryBatch batch);
 
-  void ApplyRecoveredRecord(WorkerStore& store, const RecoveryRecord& record);
-  void ApplyRecoveredRecord(WorkerStore& store,
-                            WorkerStore::PartitionStore& partition,
-                            const RecoveryRecordView& record);
+  absl::Status ApplyRecoveredRecord(WorkerStore& store,
+                                    const RecoveryRecord& record);
+  absl::Status ApplyRecoveredRecord(
+      WorkerStore& store, WorkerStore::PartitionStore& partition,
+      const RecoveryRecordView& record);
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {
@@ -3198,12 +3212,10 @@ class StorageEngine::Impl {
       TxUndoLog* replacement_undo = nullptr,
       WorkerStore::PartitionStore* known_partition = nullptr);
 
-  RecordIndex::Entry* ReplaceIndexLocation(WorkerStore& store,
-                                           RecordIndex& index,
-                                           RecordIndex::Entry* entry,
-                                           const Digest& digest,
-                                           const RecordLocation& location,
-                                           TxUndoLog* tx_undo = nullptr);
+  absl::StatusOr<RecordIndex::Entry*> ReplaceIndexLocation(
+      WorkerStore& store, RecordIndex& index, RecordIndex::Entry* entry,
+      const Digest& digest, const RecordLocation& location,
+      TxUndoLog* tx_undo = nullptr);
 
   void SealActiveBlocks(WorkerStore& store);
 

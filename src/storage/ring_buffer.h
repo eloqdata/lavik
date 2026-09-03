@@ -106,8 +106,6 @@ class RingBuffer {
     try {
       push_back(std::move(value));
       return true;
-    } catch (const std::bad_alloc&) {
-      return false;
     } catch (const std::length_error&) {
       return false;
     }

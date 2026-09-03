@@ -3396,18 +3396,13 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       if (!request.replication_origin_ && g_storage->ReplicationLogActive()) {
         const std::array<std::string_view, 3> copied_args{"SET", args[1],
                                                           args[2]};
-        try {
-          // The active publisher's fixed staging budget covers this journal
-          // owner; construct it before mutation so physical OOM is still a
-          // normal command failure rather than a missing replication event.
-          replication.emplace();
-          replication->args_.reserve(copied_args.size());
-          for (std::string_view arg : copied_args) {
-            replication->args_.emplace_back(arg);
-          }
-        } catch (const std::bad_alloc&) {
-          RecordMemoryRejection();
-          co_return BuiltReply(AppendOomError(reply_builder));
+        // The active publisher's fixed staging budget covers this journal
+        // owner. Construct it before mutation; a physical allocation failure
+        // is fatal rather than risking a missing replication event.
+        replication.emplace();
+        replication->args_.reserve(copied_args.size());
+        for (std::string_view arg : copied_args) {
+          replication->args_.emplace_back(arg);
         }
       }
       if (set_trace != nullptr) {
@@ -9038,10 +9033,6 @@ void ReplicationTransactionGuard::Initialize(
     }
     transaction->retained_charge_.Adopt(&*reservation, *allocation_bytes);
     transaction_ = std::move(transaction);
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    status_ = absl::ResourceExhaustedError(
-        "OOM command not allowed when used memory > 'maxmemory'.");
   } catch (const std::length_error&) {
     status_ =
         absl::ResourceExhaustedError("replication transaction is too large");
@@ -9119,10 +9110,6 @@ absl::Status ReplicationTransactionGuard::TrySetCommandArgs(
     transaction_->retained_charge_.Resize(
         std::max(current_bytes, *target_bytes));
     return absl::OkStatus();
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM command not allowed when used memory > 'maxmemory'.");
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError(
         "replication transaction payload is too large");
@@ -9167,9 +9154,6 @@ void ReplicationTransactionGuard::SetFinalExpirations(
                                         effect.exists_, effect.expire_at_ms_);
     }
     SetCommandArgs(std::move(command_args));
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    InvalidatePayload();
   } catch (const std::length_error&) {
     InvalidatePayload();
   }

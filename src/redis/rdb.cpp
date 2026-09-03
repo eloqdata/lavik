@@ -71,12 +71,6 @@ constexpr std::uint8_t kEof = 255;
 constexpr std::uint64_t kCrcPolynomial = 0xad93d23594c935a9ULL;
 constexpr std::string_view kListMagic = "KLL1";
 
-absl::Status MemoryExhausted(std::string_view operation) {
-  RecordMemoryRejection();
-  return absl::ResourceExhaustedError(
-      absl::StrCat("insufficient memory for ", operation));
-}
-
 constexpr std::string_view kZSetMagic = "KZS1";
 constexpr std::string_view kStreamMagicV1 = "KXS1";
 constexpr std::string_view kStreamMagicV2 = "KXS2";
@@ -334,8 +328,6 @@ absl::StatusOr<std::string> ReadString(Reader* reader) try {
   std::string output(static_cast<std::size_t>(output_size->value), '\0');
   if (!LzfDecompress(compressed, &output)) return Bad("invalid LZF data");
   return output;
-} catch (const std::bad_alloc&) {
-  return MemoryExhausted("RDB string");
 } catch (const std::length_error&) {
   return absl::ResourceExhaustedError("RDB string is too large");
 }

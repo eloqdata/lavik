@@ -11,13 +11,7 @@ StorageEngine::Impl::LoadExternalKeyForRecovery(WorkerStore& store,
                            "recovered external key manifest is invalid");
   }
   std::string key;
-  try {
-    key.resize(key_bytes);
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "recovered external key allocation failed");
-  }
+  key.resize(key_bytes);
   std::size_t offset = 0;
   for (std::size_t index = 0; index < extents->size() && offset < key.size();
        ++index) {
@@ -189,13 +183,13 @@ Task<absl::Status> StorageEngine::Impl::ApplyRecoveryBatches(
     RecoveryBatch batch;
     std::swap(batch, pending);
     if (target == store.worker_->id()) {
-      ApplyRecovery(target, std::move(batch));
+      absl::Status applied = ApplyRecovery(target, std::move(batch));
+      if (!applied.ok()) co_return applied;
       continue;
     }
     absl::Status applied = co_await celer::SubmitTo(
         target, [this, target, batch = std::move(batch)]() mutable {
-          ApplyRecovery(target, std::move(batch));
-          return absl::OkStatus();
+          return ApplyRecovery(target, std::move(batch));
         });
     if (!applied.ok()) {
       co_return applied;
@@ -597,7 +591,8 @@ Task<absl::Status> StorageEngine::Impl::ScanAssignedBlocks(
   co_return absl::OkStatus();
 }
 
-void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
+absl::Status StorageEngine::Impl::ApplyRecovery(unsigned target,
+                                                RecoveryBatch batch) {
   WorkerStore& store = *stores_[target];
   for (const RecoveryBlock& recovered : batch.blocks_) {
     const ActiveBlock& block = recovered.block_;
@@ -635,7 +630,8 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
       store.recovery_tx_records_.push_back(recovered);
       continue;
     }
-    ApplyRecoveredRecord(store, recovered);
+    absl::Status applied = ApplyRecoveredRecord(store, recovered);
+    if (!applied.ok()) return applied;
   }
   for (const RecoveryBatch::CommitRecord& commit : batch.commit_records_) {
     BlockState* state = FindBlockState(store, commit.block_id_);
@@ -656,9 +652,10 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
                         commit.bytes_, true);
     }
   }
+  return absl::OkStatus();
 }
 
-void StorageEngine::Impl::ApplyRecoveredRecord(
+absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, const RecoveryRecord& recovered) {
   auto& partition = PartitionForKey(store, recovered.key_);
   const RecoveryRecordView view{
@@ -672,16 +669,16 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       .extents_ = &recovered.extents_,
       .checkpoint_snapshot_ = recovered.checkpoint_snapshot_,
   };
-  ApplyRecoveredRecord(store, partition, view);
+  return ApplyRecoveredRecord(store, partition, view);
 }
 
-void StorageEngine::Impl::ApplyRecoveredRecord(
+absl::Status StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, WorkerStore::PartitionStore& partition,
     const RecoveryRecordView& recovered) {
   assert(recovered.extents_ != nullptr);
   {
     if (recovered.replication_epoch_ != partition.replication_epoch_) {
-      return;
+      return absl::OkStatus();
     }
     partition.mutation_sequence_ = std::max(
         partition.mutation_sequence_, recovered.location_.mutation_sequence_);
@@ -744,11 +741,17 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       winner.set_tx_tagged(recovered.txid_ != 0);
       RecordIndex::Entry* winner_entry = found;
       if (winner_entry != nullptr) {
-        winner_entry = ReplaceIndexLocation(store, index, winner_entry,
-                                            recovered.digest_, winner);
+        auto replaced = ReplaceIndexLocation(store, index, winner_entry,
+                                             recovered.digest_, winner);
+        if (!replaced.ok()) return replaced.status();
+        winner_entry = *replaced;
       } else {
         winner_entry = index.InsertNew(recovered.digest_, recovered.key_,
                                        winner, !winner.key_external());
+        if (winner_entry == nullptr) {
+          return absl::ResourceExhaustedError(
+              "recovery index entry capacity exhausted");
+        }
         AddFullSyncCoverageEntry(partition, recovered.db_id_,
                                  recovered.key_.size());
       }
@@ -797,6 +800,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       found->value_.set_shielding(true);
     }
   }
+  return absl::OkStatus();
 }
 
 }  // namespace keylane::storage

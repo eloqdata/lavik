@@ -164,9 +164,17 @@ struct DigestHash {
   std::size_t operator()(const Digest& digest) const noexcept;
 };
 
-// Returns a process-local SipHash-1-2 fingerprint. The process-wide random
-// seed deliberately changes at restart, so a Digest is runtime identity and
-// must never be persisted or exchanged as durable protocol state.
+using DigestSeed = std::array<std::uint8_t, 16>;
+
+// Returns the process-wide SipHash seed. Storage recovery may replace it with
+// the seed from a clean-shutdown checkpoint before any recovered key is
+// hashed; callers must not mutate hashing state after request serving starts.
+const DigestSeed& CurrentDigestSeed() noexcept;
+void RestoreDigestSeed(const DigestSeed& seed) noexcept;
+
+// Returns a SipHash-1-2 fingerprint under CurrentDigestSeed(). A digest may be
+// persisted only together with that seed; ordinary records remain independent
+// of runtime hashing and cold recovery can therefore choose a fresh seed.
 Digest ComputeDigest(std::string_view key) noexcept;
 std::uint16_t RedisSlot(std::string_view key) noexcept;
 std::uint32_t StorageShardForKey(std::string_view key) noexcept;

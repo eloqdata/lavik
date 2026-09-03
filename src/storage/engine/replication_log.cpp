@@ -452,30 +452,21 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
       if (log.state_ == ReplicationLogState::kActive) {
         admission.log_epoch_ = log.log_epoch_;
       }
-      try {
-        admission.fullsync_session_ids_.reserve(
-            store.fullsync_sessions_.size());
-        admission.fullsync_unstarted_guards_.reserve(
-            target.has_value() ? store.fullsync_sessions_.size() : 0);
-        for (auto& [session_id, session] : store.fullsync_sessions_) {
-          if (session.db_epoch_invalidated_) continue;
-          if (session_needs_credit(session_id)) {
-            admission.fullsync_session_ids_.push_back(session_id);
-          } else if (target.has_value()) {
-            admission.fullsync_unstarted_guards_.push_back(
-                ReplicationPublisherAdmission::UnstartedGuard{
-                    .session_id_ = session_id,
-                    .partition_id_ = target->partition_id_,
-                    .db_id_ = target->db_id_,
-                });
-          }
+      admission.fullsync_session_ids_.reserve(store.fullsync_sessions_.size());
+      admission.fullsync_unstarted_guards_.reserve(
+          target.has_value() ? store.fullsync_sessions_.size() : 0);
+      for (auto& [session_id, session] : store.fullsync_sessions_) {
+        if (session.db_epoch_invalidated_) continue;
+        if (session_needs_credit(session_id)) {
+          admission.fullsync_session_ids_.push_back(session_id);
+        } else if (target.has_value()) {
+          admission.fullsync_unstarted_guards_.push_back(
+              ReplicationPublisherAdmission::UnstartedGuard{
+                  .session_id_ = session_id,
+                  .partition_id_ = target->partition_id_,
+                  .db_id_ = target->db_id_,
+              });
         }
-      } catch (const std::bad_alloc&) {
-        ++store.replication_publisher_serving_ticket_;
-        store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "replication publisher admission allocation failed");
       }
 
       try {
@@ -491,12 +482,6 @@ StorageEngine::Impl::AcquireReplicationPublisherAdmission(
           PrepareAdmittedQueueSlot(&session.publish_queue_,
                                    session.publisher_admitted_items_);
         }
-      } catch (const std::bad_alloc&) {
-        ++store.replication_publisher_serving_ticket_;
-        store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
-        RecordMemoryRejection();
-        co_return absl::ResourceExhaustedError(
-            "replication publisher queue allocation failed");
       } catch (const std::length_error&) {
         ++store.replication_publisher_serving_ticket_;
         store.replication_publisher_admission_ready_.NotifyAll(*store.worker_);
@@ -601,9 +586,6 @@ StorageEngine::Impl::TryAcquireFullSyncReplacementAdmission(
       PrepareAdmittedQueueSlot(&session.publish_queue_,
                                session.publisher_admitted_items_);
     }
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return std::nullopt;
   } catch (const std::length_error&) {
     RecordMemoryRejection();
     return std::nullopt;
@@ -740,22 +722,14 @@ Task<absl::Status> StorageEngine::Impl::PublishEphemeralReplicationCommand(
         "ephemeral replication sequence space exhausted");
   }
 
-  std::shared_ptr<ReplicationCommandAppend> command;
-  try {
-    command =
-        std::make_shared<ReplicationCommandAppend>(ReplicationCommandAppend{
-            .kind_ = ReplicationEventKind::kEphemeral,
-            .db_id_ = 0,
-            .partition_id_ = partition_id,
-            .partition_sequence_ = sequence,
-            .args_ = std::move(args),
-        });
-  } catch (const std::bad_alloc&) {
-    ReleaseReplicationPublisherAdmission(*admission, *staging_bytes);
-    RecordMemoryRejection();
-    co_return absl::ResourceExhaustedError(
-        "ephemeral replication command allocation failed");
-  }
+  auto command =
+      std::make_shared<ReplicationCommandAppend>(ReplicationCommandAppend{
+          .kind_ = ReplicationEventKind::kEphemeral,
+          .db_id_ = 0,
+          .partition_id_ = partition_id,
+          .partition_sequence_ = sequence,
+          .args_ = std::move(args),
+      });
   WorkerStore& store = CurrentStore();
   for (std::uint64_t session_id : admission->fullsync_session_ids_) {
     (void)TryEnqueueFullSyncCommand(store, session_id, command);
@@ -1004,13 +978,6 @@ Task<absl::Status> StorageEngine::Impl::DrainReplicationPublishQueue(
             .args_ = BuildReplicationTransactionEnvelope(
                 *pending.transaction_, celer::ThisWorker().id_),
         };
-      } catch (const std::bad_alloc&) {
-        log.state_ = ReplicationLogState::kInvalid;
-        RecordMemoryRejection();
-        spdlog::warn(
-            "replication transaction marker allocation failed; "
-            "invalidating history");
-        break;
       } catch (const std::length_error&) {
         log.state_ = ReplicationLogState::kInvalid;
         spdlog::warn(
@@ -1201,7 +1168,7 @@ auto StorageEngine::Impl::AllocateReplicationLogBlock()
   const RetainedAllocationDomain domain{.externally_admitted_ = true};
   WorkerStore::ReplicationLogBlock block(domain);
   block.sparse_offsets_.reserve(kMaximumSparseOffsetsPerBlock);
-  block.bytes_.reset(static_cast<std::byte*>(AllocateRetainedBytes(
+  block.bytes_.reset(static_cast<std::byte*>(TryAllocateRetainedBytes(
       domain, kStorageBlockBytes, alignof(std::max_align_t))));
   reservation->Release();
   return block;

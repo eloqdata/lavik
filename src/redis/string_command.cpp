@@ -1041,9 +1041,6 @@ absl::StatusOr<std::string> BuildLcsReply(std::string_view a,
     try {
       previous.assign(row_cells, 0);
       current.assign(row_cells, 0);
-    } catch (const std::bad_alloc&) {
-      return absl::ResourceExhaustedError(
-          "Insufficient memory, failed allocating transient memory for LCS");
     } catch (const std::length_error&) {
       return absl::ResourceExhaustedError(
           "Insufficient memory, failed allocating transient memory for LCS");
@@ -1074,9 +1071,6 @@ absl::StatusOr<std::string> BuildLcsReply(std::string_view a,
   std::vector<std::uint32_t> table;
   try {
     table.assign(cells, 0);
-  } catch (const std::bad_alloc&) {
-    return absl::ResourceExhaustedError(
-        "Insufficient memory, failed allocating transient memory for LCS");
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError(
         "Insufficient memory, failed allocating transient memory for LCS");
@@ -1261,10 +1255,6 @@ absl::Status PrepareBitOpReplication(BitOpContext* context) noexcept {
     // the value copy here is the last potentially failing allocation and must
     // happen before WriteBitOpDestination mutates the primary index.
     return context->replication_->TrySetCommandArgs(std::move(canonical_args));
-  } catch (const std::bad_alloc&) {
-    RecordMemoryRejection();
-    return absl::ResourceExhaustedError(
-        "OOM command not allowed when used memory > 'maxmemory'.");
   } catch (const std::length_error&) {
     return absl::ResourceExhaustedError(
         "BITOP replication command is too large");

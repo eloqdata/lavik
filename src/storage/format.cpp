@@ -43,9 +43,9 @@ void SipRound(std::uint64_t* v0, std::uint64_t* v1, std::uint64_t* v2,
   *v2 = std::rotl(*v2, 32);
 }
 
-const std::array<std::uint8_t, 16>& DigestSeed() noexcept {
-  static const std::array<std::uint8_t, 16> seed = [] {
-    std::array<std::uint8_t, 16> generated{};
+DigestSeed& MutableDigestSeed() noexcept {
+  static DigestSeed seed = [] {
+    DigestSeed generated{};
     std::size_t offset = 0;
     while (offset != generated.size()) {
       const ssize_t bytes =
@@ -210,8 +210,18 @@ std::size_t DigestHash::operator()(const Digest& digest) const noexcept {
   return static_cast<std::size_t>(digest.value_);
 }
 
+const DigestSeed& CurrentDigestSeed() noexcept { return MutableDigestSeed(); }
+
+void RestoreDigestSeed(const DigestSeed& seed) noexcept {
+  // Storage initialization calls this before recovery hashes a key and before
+  // clients are admitted. Keeping the hot ComputeDigest path lock-free is
+  // worth making that lifecycle constraint explicit instead of synchronizing
+  // every command around a seed that is immutable during serving.
+  MutableDigestSeed() = seed;
+}
+
 Digest ComputeDigest(std::string_view key) noexcept {
-  return Digest{.value_ = SipHash12(key, DigestSeed())};
+  return Digest{.value_ = SipHash12(key, CurrentDigestSeed())};
 }
 
 std::uint16_t RedisSlot(std::string_view key) noexcept {

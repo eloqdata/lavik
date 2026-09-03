@@ -1238,7 +1238,11 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
   // commit protocol promises.
   for (const RecoveryRecord& parked : store.recovery_tx_records_) {
     if (recovery_committed_txids_.contains(parked.txid_)) {
-      ApplyRecoveredRecord(store, parked);
+      status = ApplyRecoveredRecord(store, parked);
+      if (!status.ok()) {
+        Fail(status);
+        co_return status;
+      }
     }
   }
 
@@ -1273,6 +1277,12 @@ Task<absl::Status> StorageEngine::Impl::InitializeWorker(Worker& worker) {
 #endif
   for (auto& partition : store.partitions_) {
     for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
+      // Recovery rebuilds this count alongside every winning index entry.
+      // A zero count proves that no value in this index carries an expiry, so
+      // scanning all buckets cannot discover work. This matters especially
+      // for large persistent datasets without TTLs, while preserving the
+      // durable-tombstone treatment below for every index that can expire.
+      if (partition.expiring_key_count_[db_id] == 0) continue;
       auto& index = partition.indexes_[db_id];
       index.ForEach([&](RecordIndex::Entry& entry) {
         if (entry.value_.kind() == RecordKind::kValue &&
