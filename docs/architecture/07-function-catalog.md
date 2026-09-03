@@ -33,10 +33,10 @@ A successful primary mutation follows one commit order:
 
 ```text
 complete target
-  -> hidden stage and cross-worker validation
   -> encode existing FUNCTION DUMP format
   -> require the complete synthetic FUNCTION RESTORE event to fit the 1 GiB
      native-event limit
+  -> hidden stage and cross-worker validation
   -> use the pre-mutation replication publication admission
   -> commit the complete dump to system-state v2
   -> non-failing worker-runtime and process-global metadata swaps

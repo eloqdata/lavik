@@ -46,8 +46,9 @@ class FunctionCatalog {
   explicit FunctionCatalog(storage::StorageEngine* storage)
       : storage_(storage) {}
 
-  // Requires the Function operation guard. The returned complete catalog is
-  // invisible until commit; any worker compile or metadata mismatch aborts
+  // Requires the Function operation guard. Dump and replication-event limits
+  // are checked before cross-worker compilation. The returned complete catalog
+  // is invisible until commit; any worker compile or metadata mismatch aborts
   // every hidden runtime before returning an error.
   celer::Task<absl::StatusOr<StagedCatalog>> StageCompleteCatalog(
       std::vector<LuaFunctionLibrary> target);

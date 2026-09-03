@@ -100,6 +100,20 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
     codes.push_back(library.code_);
   }
 
+  const std::optional<std::size_t> dump_bytes =
+      rdb::FunctionDumpEncodedSize(codes);
+  if (!dump_bytes.has_value() ||
+      *dump_bytes > storage::kMaxFunctionCatalogBytes) {
+    co_return absl::OutOfRangeError(
+        "Function catalog dump exceeds the 1 GiB limit");
+  }
+  std::string dump = rdb::EncodeFunctionDump(codes);
+  const std::array<std::string_view, 4> restore_args{"FUNCTION", "RESTORE",
+                                                     dump, "FLUSH"};
+  auto encoded_restore =
+      ReplicationCommandPayloadSource::Create(0, restore_args);
+  if (!encoded_restore.ok()) co_return encoded_restore.status();
+
   std::optional<std::vector<LuaFunctionLibrary>> canonical;
   unsigned staged_workers = 0;
   for (; staged_workers < storage_->worker_count(); ++staged_workers) {
@@ -141,24 +155,6 @@ FunctionCatalog::StageCompleteCatalog(std::vector<LuaFunctionLibrary> target) {
   }
   if (!canonical.has_value()) {
     co_return absl::FailedPreconditionError("Lua runtime has no workers");
-  }
-  std::string dump = rdb::EncodeFunctionDump(codes);
-  if (dump.size() > storage::kMaxFunctionCatalogBytes) {
-    StagedCatalog staged{
-        .libraries_ = std::move(*canonical), .dump_ = {}, .active_ = true};
-    co_await AbortStagedCatalog(&staged);
-    co_return absl::OutOfRangeError(
-        "Function catalog dump exceeds the 1 GiB limit");
-  }
-  const std::array<std::string_view, 4> restore_args{"FUNCTION", "RESTORE",
-                                                     dump, "FLUSH"};
-  auto encoded_restore =
-      ReplicationCommandPayloadSource::Create(0, restore_args);
-  if (!encoded_restore.ok()) {
-    StagedCatalog staged{
-        .libraries_ = std::move(*canonical), .dump_ = {}, .active_ = true};
-    co_await AbortStagedCatalog(&staged);
-    co_return encoded_restore.status();
   }
   co_return StagedCatalog{
       .libraries_ = std::move(*canonical),

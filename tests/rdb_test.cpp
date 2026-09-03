@@ -392,6 +392,8 @@ TEST(RdbTest, EncodesAndDecodesRedisFunctionDump) {
       "#!lua name=two\nredis.register_function('two', function() return 2 end)",
   };
   const std::string payload = EncodeFunctionDump(libraries);
+  ASSERT_TRUE(FunctionDumpEncodedSize(libraries).has_value());
+  EXPECT_EQ(*FunctionDumpEncodedSize(libraries), payload.size());
   auto decoded = DecodeFunctionDump(payload);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(*decoded, libraries);
@@ -399,6 +401,19 @@ TEST(RdbTest, EncodesAndDecodesRedisFunctionDump) {
   std::string corrupt = payload;
   corrupt[1] ^= 1;
   EXPECT_FALSE(DecodeFunctionDump(corrupt).ok());
+}
+
+TEST(RdbTest, ComputesFunctionDumpSizeAcrossLengthEncodings) {
+  const std::vector<std::string> empty;
+  ASSERT_TRUE(FunctionDumpEncodedSize(empty).has_value());
+  EXPECT_EQ(*FunctionDumpEncodedSize(empty), 10);
+
+  const std::vector<std::string> libraries = {
+      std::string(63, 'a'), std::string(64, 'b'), std::string(16384, 'c')};
+  ASSERT_TRUE(FunctionDumpEncodedSize(libraries).has_value());
+  EXPECT_EQ(*FunctionDumpEncodedSize(libraries), 16532);
+  EXPECT_EQ(*FunctionDumpEncodedSize(libraries),
+            EncodeFunctionDump(libraries).size());
 }
 
 TEST(RdbTest, RejectsCorruptAndUnsupportedCompleteFiles) {

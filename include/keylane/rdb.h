@@ -71,6 +71,10 @@ absl::StatusOr<std::string> EncodeFileEntry(std::uint8_t db_id,
 // FUNCTION DUMP concatenates these entries and appends the RDB version and
 // CRC64 footer used by RESTORE payloads.
 std::string EncodeFunctionLibraryEntry(std::string_view code);
+// Returns the exact encoded size without materializing the dump. Absence means
+// the entry overhead and source lengths cannot be represented by size_t.
+std::optional<std::size_t> FunctionDumpEncodedSize(
+    std::span<const std::string> libraries) noexcept;
 std::string EncodeFunctionDump(std::span<const std::string> libraries);
 absl::StatusOr<std::vector<std::string>> DecodeFunctionDump(
     std::string_view payload);
