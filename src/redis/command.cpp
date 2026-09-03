@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_set.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/str_cat.h"
 #include "backup.h"
 #include "blocking_wait.h"
@@ -37,7 +38,11 @@
 #include "celer/runtime/worker.h"
 #include "client_limit.h"
 #include "function_catalog.h"
+#include "cluster_command.h"
+#include "cluster_gate.h"
 #include "hash_command.h"
+#include "keylane/cluster/authority.h"
+#include "keylane/cluster/runtime.h"
 #include "keylane/command_table.h"
 #include "keylane/config.h"
 #include "keylane/expiration.h"
@@ -357,8 +362,19 @@ CommandReply ExecuteSimpleLocalCommand(const CommandRequest& request,
       const char* begin = args[1].data();
       const char* end = begin + args[1].size();
       const auto [parsed_end, error] = std::from_chars(begin, end, db_id);
-      if (error != std::errc{} || parsed_end != end ||
-          db_id >= storage::kLogicalDatabaseCount) {
+      if (error != std::errc{} || parsed_end != end) {
+        reply.encoded_ =
+            reply_builder.AppendError("ERR DB index is out of range");
+        return reply;
+      }
+      if (cluster::ClusterEnabled() && db_id != 0) {
+        // Redis rejects every non-zero database in cluster mode
+        // (db.c selectCommand); SELECT 0 stays a successful no-op.
+        reply.encoded_ = reply_builder.AppendError(
+            "ERR SELECT is not allowed in cluster mode");
+        return reply;
+      }
+      if (db_id >= storage::kLogicalDatabaseCount) {
         reply.encoded_ =
             reply_builder.AppendError("ERR DB index is out of range");
         return reply;
@@ -498,6 +514,12 @@ Task<CommandReply> ExecutePubSubCommand(ConnectionContext& context,
 
 Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
                                     ReplyBuilder& reply_builder) {
+  // Redis rejects REPLICAOF in cluster mode before even validating arguments
+  // (replication.c replicaofCommand); the trailing period is verbatim.
+  if (cluster::ClusterEnabled()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR REPLICAOF not allowed in cluster mode."));
+  }
   auto parsed = ParseReplicaOfRequest(request.args_);
   if (!parsed.ok()) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -525,6 +547,12 @@ Task<CommandReply> ExecuteReplicaOf(const CommandRequest& request,
 
 Task<CommandReply> ExecuteAddReplicaOf(const CommandRequest& request,
                                        ReplyBuilder& reply_builder) {
+  // Same cluster-mode rejection as REPLICAOF: two topology sources must never
+  // coexist on one node.
+  if (cluster::ClusterEnabled()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        "ERR REPLICAOF not allowed in cluster mode."));
+  }
   auto parsed = ParseReplicaOfRequest(request.args_);
   if (!parsed.ok() || !parsed->host_.has_value()) {
     const std::string message = parsed.ok()
@@ -643,8 +671,272 @@ Task<std::optional<std::string>> ReplicaMovedError(
                          replication.upstream_->port_);
 }
 
+// ---- Redis Cluster data-plane gate ----
+//
+// When cluster mode is enabled, admission is decided by cluster::Admit
+// against the latest committed ServingState, and the legacy replica-MOVED
+// shim above never runs: cluster mode forbids a replication upstream (startup
+// validation plus the REPLICAOF command rejection), so the two redirect
+// sources are mutually exclusive.
+//
+// The standalone LOADING gate (DispatchCommandImpl) and the cluster gate share
+// the whitelist below but draw on different sources: the standalone gate asks
+// the replication manager whether an upstream sync is in progress, which is
+// inert in cluster mode; the cluster gate takes readiness from the committed
+// ServingState (the static control adapter publishes storage readiness only
+// after recovery completes). There is deliberately one readiness fact per
+// mode, never two live at once.
+
+// Commands served while the dataset is not ready. Verbatim mirror of the
+// whitelist the standalone is_loading gate used before extraction; REPLICAOF/
+// ADDREPLICAOF stay whitelisted so their cluster-mode rejection is produced by
+// the command itself (Redis aligns the error text) instead of being masked by
+// LOADING.
+bool LoadingAllowedCommandKind(CommandKind kind) {
+  switch (kind) {
+    case CommandKind::kPing:
+    case CommandKind::kEcho:
+    case CommandKind::kAuth:
+    case CommandKind::kSelect:
+    case CommandKind::kClient:
+    case CommandKind::kReplicaOf:
+    case CommandKind::kAddReplicaOf:
+    case CommandKind::kConfig:
+    case CommandKind::kInfo:
+    case CommandKind::kRole:
+    case CommandKind::kWait:
+    case CommandKind::kCluster:
+    case CommandKind::kCommand:
+    case CommandKind::kReadOnly:
+    case CommandKind::kReadWrite:
+    case CommandKind::kMonitor:
+    case CommandKind::kSlowLog:
+    case CommandKind::kPublish:
+    case CommandKind::kPubSub:
+    case CommandKind::kPSubscribe:
+    case CommandKind::kPUnsubscribe:
+    case CommandKind::kSubscribe:
+    case CommandKind::kUnsubscribe:
+    case CommandKind::kQuit:
+    case CommandKind::kReset:
+    case CommandKind::kScript:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// EVAL/EVALSHA/FCALL carry kCmdDynamicWrite: they may write and are treated as
+// writes for admission (a read-only script still redirects to the primary,
+// matching Redis); the *_ro forms carry kCmdReadOnly instead.
+bool ClusterRequestIsWrite(const CommandRequest& request) {
+  return request.spec_ != nullptr &&
+         (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0;
+}
+
+// Extracts the command's distinct Redis hash slots in first-occurrence order
+// (Admit inspects the first key's slot before reporting cross-slot). A key
+// extraction failure (e.g. malformed EVAL numkeys) means "no keys": the
+// command is admitted locally and produces its own argument error, mirroring
+// Redis getNodeByQuery returning myself for zero keys and matching the
+// ReplicaMovedError precedent.
+void PopulateClusterSlots(CommandRequest& request) {
+  request.cluster_slots_.clear();
+  if (request.spec_ == nullptr || (request.spec_->flags_ & kCmdNoKeys) != 0) {
+    return;
+  }
+  const absl::StatusOr<KeyIndexView> keys =
+      DetermineKeys(*request.spec_, request.args_);
+  if (!keys.ok() || keys->empty()) return;
+  // Single-key write routing already hashed this key into
+  // routed_partition_id_; reuse it instead of computing CRC16 twice.
+  if (keys->count() == 1 && request.routed_partition_id_.has_value() &&
+      request.routed_key_argument_ == keys->first_) {
+    request.cluster_slots_.push_back(*request.routed_partition_id_);
+    return;
+  }
+  for (std::uint32_t index = keys->first_; index <= keys->last_;
+       index += keys->step_) {
+    const std::uint16_t slot = storage::RedisSlot(request.args_[index]);
+    if (std::find(request.cluster_slots_.begin(), request.cluster_slots_.end(),
+                  slot) == request.cluster_slots_.end()) {
+      request.cluster_slots_.push_back(slot);
+    }
+  }
+}
+
+// The MOVED target port follows the requesting connection's TLS state
+// (Redis getNodeClientPort/shouldReturnTlsInfo): TLS connections get the
+// target's TLS port, falling back to the plain port when it offers no TLS.
+std::uint16_t ClusterDecisionClientPort(const cluster::Decision& decision,
+                                        bool connection_tls) {
+  if (connection_tls && decision.moved_tls_port_ != 0) {
+    return decision.moved_tls_port_;
+  }
+  return decision.moved_port_;
+}
+
+// Maps a non-serving admission decision to its wire reply (plan §2.1).
+// Returns true when the decision produced a terminal reply; false when it
+// admits local execution. kCloseConnection yields an empty reply with the
+// close flag: the outcome is undeterminable, so nothing is written.
+bool EmitClusterDecision(const cluster::Decision& decision, bool connection_tls,
+                         ReplyBuilder& reply_builder, CommandReply* reply) {
+  switch (decision.kind_) {
+    case cluster::Decision::Kind::kServe:
+    case cluster::Decision::Kind::kServeStaleRead:
+      return false;
+    case cluster::Decision::Kind::kMoved:
+      reply->encoded_ = AppendMovedError(
+          reply_builder, decision.moved_slot_, decision.moved_host_,
+          ClusterDecisionClientPort(decision, connection_tls));
+      return true;
+    case cluster::Decision::Kind::kCrossSlot:
+      reply->encoded_ = AppendCrossSlotError(reply_builder);
+      return true;
+    case cluster::Decision::Kind::kClusterDownUnbound:
+      reply->encoded_ = AppendClusterDownUnboundError(reply_builder);
+      return true;
+    case cluster::Decision::Kind::kLoading:
+      // Cluster readiness comes from the published ServingState, not from an
+      // upstream sync, so use Redis's plain loading text rather than the
+      // replication-shaped message of the standalone gate.
+      reply->encoded_ = reply_builder.AppendError(
+          "LOADING Redis is loading the dataset in memory");
+      return true;
+    case cluster::Decision::Kind::kCloseConnection:
+      reply->close_connection_ = true;
+      return true;
+  }
+  return false;  // unreachable: every Kind is handled above
+}
+
+// Runs the cluster admission gate for one dispatched command. Returns true
+// when the request was answered terminally; otherwise the request carries the
+// ServingState snapshot it was admitted against (used by the owner-side
+// re-check) and execution may proceed.
+bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
+                       ReplyBuilder& reply_builder, CommandReply* reply) {
+  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+  PopulateClusterSlots(request);
+  // A slightly stale cached snapshot is fine here: admission under it can at
+  // worst produce a standard redirect, and the owner-side re-check
+  // backstops writes.
+  const std::shared_ptr<const cluster::ServingState> state =
+      cluster::CurrentCachedWithVersion(runtime->topology_cache_).first;
+  const cluster::RequestView view{
+      .slots_ = request.cluster_slots_,
+      .is_write_ = ClusterRequestIsWrite(request),
+      .connection_readonly_ = ctx.cluster_readonly_,
+      .loading_allowed_ = LoadingAllowedCommandKind(request.kind_),
+  };
+  const cluster::Decision decision = cluster::Admit(state.get(), view);
+  if (!EmitClusterDecision(decision, request.connection_tls_, reply_builder,
+                           reply)) {
+    request.cluster_admitted_state_ = std::move(state);
+    return false;
+  }
+  return true;
+}
+
+// Registers every distinct admitted group of the request's slots in the
+// in-flight cells carried by the ServingState (the fencing seam the control
+// plane drains on). The guards live in the caller's coroutine frame and
+// release when the execution completes. Registration is one atomic increment
+// per group on the calling thread's stripe — no lock, no allocation.
+void RegisterClusterInFlight(
+    const cluster::ServingState& state, std::span<const std::uint16_t> slots,
+    absl::InlinedVector<cluster::InFlightGuard, 4>* guards) {
+  const std::size_t stripe = cluster::InFlightStripe();
+  for (const std::uint16_t slot : slots) {
+    cluster::GroupInFlight* cell = state.InFlightCellForSlot(slot);
+    if (cell == nullptr) continue;
+    // An admitted request has at most a handful of slots (the gate rejects
+    // cross-slot requests), so a linear dedupe over the guards beats a hash
+    // set here.
+    bool seen = false;
+    for (const cluster::InFlightGuard& guard : *guards) {
+      if (guard.cell() == cell) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) guards->emplace_back(*cell, stripe);
+  }
+}
+
+// Choke point 1 of 2 (plan §3.2): the owner-side authority re-check for
+// non-transactional writes, called from ExecuteCommandBody after every
+// suspending admission (publisher admission, DB gate, snapshot/order gates)
+// and before the handler runs. Reads are intentionally not re-checked
+// (stale-read policy, plan §2.3). Returns the standard redirect/error reply
+// when authority changed; std::nullopt when the write may proceed.
+std::optional<CommandReply> RecheckClusterWriteAuthority(
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    absl::InlinedVector<cluster::InFlightGuard, 4>* in_flights) {
+  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+      request.cluster_admitted_state_ == nullptr ||
+      request.cluster_slots_.empty() || !ClusterRequestIsWrite(request)) {
+    return std::nullopt;
+  }
+  cluster::TopologyCache& cache =
+      cluster::GetClusterRuntime()->topology_cache_;
+  for (;;) {
+    // The snapshot arrives paired with the cache version at which it was
+    // current; that pairing is what makes the handshake below airtight.
+    const auto [current, version_before] =
+        cluster::CurrentCachedWithVersion(cache);
+    if (!cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
+                                     current.get(),
+                                     request.cluster_slots_)) {
+      // Nothing has executed yet, so the request can safely be re-admitted
+      // against the current snapshot. Writes are never on the loading
+      // whitelist, so a current snapshot that lost readiness answers LOADING
+      // honestly rather than serving through the authority change that
+      // carried it.
+      const cluster::RequestView view{
+          .slots_ = request.cluster_slots_,
+          .is_write_ = true,
+          .connection_readonly_ = false,
+          .loading_allowed_ = false,
+      };
+      const cluster::Decision decision = cluster::Admit(current.get(), view);
+      CommandReply reply;
+      if (EmitClusterDecision(decision, request.connection_tls_, reply_builder,
+                              &reply)) {
+        return reply;
+      }
+      // A benign republish (same serving verdict, refreshed token): re-arm
+      // the request with the current snapshot so the transaction hook
+      // (choke point 2) compares against it and the registration below lands
+      // on the cells the next publisher drains.
+      request.cluster_admitted_state_ = current;
+    }
+    // Publication-race handshake: Publish stores the new state before bumping
+    // the version, so a publication either happened entirely before
+    // version_before (then `current` above IS the new state and the authority
+    // check answered it) or lands inside the window and flips the final read
+    // (then the registration is rolled back and the loop retries). A
+    // registration therefore can never slip past a drain unseen.
+    // Registration targets the admitted snapshot the request holds for its
+    // whole lifetime, which keeps the cells alive behind the guards' raw
+    // pointers; token-equal snapshots share the same cells, so the
+    // publisher's drain sees these guards regardless.
+    RegisterClusterInFlight(*request.cluster_admitted_state_,
+                            request.cluster_slots_, in_flights);
+    if (cache.version() == version_before) return std::nullopt;
+    in_flights->clear();
+  }
+}
+
 Task<CommandReply> ExecuteCluster(const CommandRequest& request,
                                   ReplyBuilder& reply_builder) {
+  if (cluster::ClusterEnabled()) {
+    // Cluster mode serves the real discovery surface (SLOTS/NODES/MYID/INFO/
+    // KEYSLOT) from the committed ServingState; the legacy shim below fakes
+    // full coverage from replication state for standalone mode only.
+    co_return co_await ExecuteClusterModeCommand(request, reply_builder);
+  }
   if (request.args_.size() >= 2 &&
       CmpCaseInsensitive(request.args_[1], "KEYSLOT")) {
     if (request.args_.size() != 3) {
@@ -3048,7 +3340,7 @@ Task<CommandReply> ExecuteNegativeRandomStream(
       db, std::move(options), request.args_[1], owner);
   if (!TryBeginDbOperation(db)) {
     co_return BuiltReply(
-        reply_builder.AppendError("TRYAGAIN database flush is in progress"));
+        AppendTryAgainError(reply_builder, "database flush is in progress"));
   }
   DbOperationGuard initial_db_guard(db);
   state->now_ms_ = RedisUnixTimeMillis();
@@ -3885,6 +4177,10 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
                             .count();
     info += "# Server\r\n";
     info += "keylane_version:" + std::string(kVersion) + "\r\n";
+    // Redis reports redis_mode in the Server section (server.c); cluster
+    // clients and operators read it together with the # Cluster section.
+    info += std::string("redis_mode:") +
+            (cluster::ClusterEnabled() ? "cluster" : "standalone") + "\r\n";
     info += "process_id:" + std::to_string(::getpid()) + "\r\n";
     info += "run_id:" + replication.local_node_id_ + "\r\n";
     info += "tcp_port:" + std::to_string(g_server_port) + "\r\n";
@@ -4194,6 +4490,13 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
             std::to_string(runtime->next_txid_.load(std::memory_order_relaxed) -
                            1) +
             "\r\n\r\n";
+  }
+  if (wants("cluster")) {
+    // Redis always emits the Cluster section (server.c:6219), standalone
+    // included; clients key off cluster_enabled.
+    info += "# Cluster\r\n";
+    info += std::string("cluster_enabled:") +
+            (cluster::ClusterEnabled() ? "1" : "0") + "\r\n\r\n";
   }
   if (wants("keyspace")) {
     info += "# Keyspace\r\n";
@@ -4648,6 +4951,9 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
 
   status = co_await transaction.Execute(read_callback, context, false);
   if (!status.ok() || should_skip(*context)) {
+    // The release hop does not mutate; a fence landing after the write
+    // decision must not turn lock cleanup into a spurious failure.
+    transaction.SetShardValidator(nullptr, nullptr);
     absl::Status released =
         co_await transaction.Execute(&ReleaseHeldKeys, nullptr, true);
     disarm_undo();
@@ -4658,6 +4964,10 @@ Task<TwoPhaseResult> ExecuteTwoPhaseWrite(
 
   status = co_await transaction.Execute(write_callback, context, false);
   context->rollback_ = !status.ok();
+  // The finish hop settles (publishes or rolls back) what the write hop did.
+  // Validating it against a fresher fence would either block the settlement
+  // or misreport an already-decided outcome, so the hook is cleared.
+  transaction.SetShardValidator(nullptr, nullptr);
   absl::Status finished = co_await transaction.Execute(
       &TwoPhaseFinishCallback<Context>, context, true);
   if (status.ok() && !finished.ok()) status = std::move(finished);
@@ -4817,6 +5127,8 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return BuiltReply(
@@ -4831,6 +5143,11 @@ Task<CommandReply> ExecuteRename(const CommandRequest& request,
       });
   absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_,
+                                             reply_builder);
+    }
     if (status.code() == absl::StatusCode::kNotFound) {
       co_return BuiltReply(reply_builder.AppendError("ERR no such key"));
     }
@@ -4881,6 +5198,13 @@ absl::StatusOr<CopyOptions> ParseCopyOptions(const CommandRequest& request) {
       continue;
     }
     return absl::InvalidArgumentError("syntax error");
+  }
+  if (cluster::ClusterEnabled() && options.destination_db_ != 0) {
+    // Cluster mode has no cross-database COPY (Redis db.c copyCommand). This
+    // single choke point covers ExecuteCopy, the EXEC precompute, and the EXEC
+    // sequential fallback.
+    return absl::InvalidArgumentError(
+        "Copying to another database is not allowed in cluster mode");
   }
   return options;
 }
@@ -4967,7 +5291,7 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
       (options->destination_db_ != request.db_id_ &&
        !db_guard.Add(options->destination_db_))) {
     co_return BuiltReply(
-        reply_builder.AppendError("TRYAGAIN database flush is in progress"));
+        AppendTryAgainError(reply_builder, "database flush is in progress"));
   }
   if (!CommandWriteAdmissionIsCurrent(request)) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -4981,6 +5305,8 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
                      storage::ComputeDigest(args[2]), 2,
                      tx::LockMode::kExclusive);
   transaction.Seal();
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return BuiltReply(
@@ -4997,6 +5323,11 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
       });
   absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_,
+                                             reply_builder);
+    }
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
   if (execution.skipped_ || !context.copied_) {
@@ -5086,6 +5417,8 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
                        tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return BuiltReply(
@@ -5100,6 +5433,11 @@ Task<CommandReply> ExecuteMSetNx(const CommandRequest& request,
       });
   absl::Status status = std::move(execution.status_);
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_,
+                                             reply_builder);
+    }
     co_return BuiltReply(AppendStorageError(reply_builder, status));
   }
   if (execution.skipped_) {
@@ -5232,6 +5570,10 @@ Task<CommandReply> ExecuteMultiKey(
                write ? tx::LockMode::kExclusive : tx::LockMode::kShared);
   }
   txn.Seal();
+  ClusterShardValidatorContext cluster_validator;
+  if (write) {
+    InstallClusterShardValidator(txn, request, cluster_validator);
+  }
   std::unique_ptr<ReplicationTransactionGuard> replication;
   if (keys->count() > 1) {
     replication = std::make_unique<ReplicationTransactionGuard>(request, &txn);
@@ -5285,6 +5627,9 @@ Task<CommandReply> ExecuteMultiKey(
   absl::Status status =
       co_await txn.Execute(&MultiKeyShardCallback, &ctx, !two_hop);
   if (two_hop) {
+    // The finish hop settles the write hop's mutations; it must not be
+    // fenced off by an authority change that the write hop already beat.
+    txn.SetShardValidator(nullptr, nullptr);
     ctx.rollback_ = !status.ok();
     absl::Status finish =
         co_await txn.Execute(&MultiKeyFinishCallback, &ctx, true);
@@ -5293,6 +5638,10 @@ Task<CommandReply> ExecuteMultiKey(
     }
   }
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      co_return ClusterValidatorFailureReply(
+          txn, cluster_validator, request.connection_tls_, reply_builder);
+    }
     // Runtime state is already rolled back, and no commit record is ever
     // appended: recovery treats every record this write tagged as an aborted
     // prepare and drops it, so neither a reader nor a crash can observe half
@@ -6599,6 +6948,23 @@ Task<std::string> ExecuteLuaRedisCall(
     });
   }
 
+  if (cluster::ClusterEnabled() && !command.replication_origin_) {
+    // Cluster backstop on top of declared-key confinement: every accessed key
+    // must stay within the slot set the script was admitted with. Redis raises
+    // this same error from its script path (getNodeByQuery for scripts).
+    for (const ExecKey& key : command_keys) {
+      const std::uint16_t key_slot =
+          storage::RedisSlot(command.args_[key.arg_]);
+      if (std::find(eval_request.cluster_slots_.begin(),
+                    eval_request.cluster_slots_.end(),
+                    key_slot) == eval_request.cluster_slots_.end()) {
+        co_return EncodeError(
+            "ERR Script attempted to access a non local key in a cluster "
+            "node");
+      }
+    }
+  }
+
   const bool routed_multi = (flags & (kCmdMultiShard | kCmdMovableKeys)) != 0 ||
                             command_keys.size() != 1;
   const ExecSequentialFamily sequential = ClassifyExecSequential(command.kind_);
@@ -6622,6 +6988,24 @@ Task<std::string> ExecuteLuaRedisCall(
     co_return EncodeError("ERR Script killed by user with SCRIPT KILL...");
   }
 
+  // Choke point 2 for redis.call: re-check the script's captured authority
+  // before dispatching a write. The single-key hop below re-checks again on
+  // the owner worker (it bypasses tx::Transaction); the routed_multi path is
+  // covered by the transaction's shard validator; the sequential families
+  // mutate through SubmitTaskTo inside the already-armed transaction and rely
+  // on this pre-dispatch check.
+  if (write && !command.replication_origin_ &&
+      eval_request.cluster_admitted_state_ != nullptr) {
+    const std::shared_ptr<const cluster::ServingState> current =
+        cluster::GetClusterRuntime()->topology_cache_.Current();
+    if (!cluster::AuthorityUnchanged(*eval_request.cluster_admitted_state_,
+                                     current.get(),
+                                     eval_request.cluster_slots_)) {
+      co_return EncodeError(
+          "ERR Script attempted to access a non local key in a cluster node");
+    }
+  }
+
   std::string reply;
   if (routed_multi && sequential != ExecSequentialFamily::kNone) {
     reply = co_await ExecuteExecSequentialCommand(sequential, command,
@@ -6640,7 +7024,14 @@ Task<std::string> ExecuteLuaRedisCall(
     run.tx_writes_ = tx_writes->data();
     absl::Status dispatched = co_await transaction->Execute(
         &ExecRunShardCallback, &run, /*release=*/false);
-    if (!dispatched.ok()) co_return EncodeStorageError(dispatched);
+    if (!dispatched.ok()) {
+      if (IsClusterAuthorityChanged(dispatched)) {
+        co_return EncodeError(
+            "ERR Script attempted to access a non local key in a cluster "
+            "node");
+      }
+      co_return EncodeStorageError(dispatched);
+    }
     AssembleRunReplies(run);
     if (reply_chunks.front()) {
       co_return EncodeError(
@@ -6657,6 +7048,17 @@ Task<std::string> ExecuteLuaRedisCall(
   ReplyChunkSource chunks;
   absl::Status dispatched =
       co_await SubmitTaskTo(owner, [&]() -> Task<absl::Status> {
+        // The per-call hop bypasses tx::Transaction, so re-check the
+        // admission on the owner right before mutating.
+        if (write && eval_request.cluster_admitted_state_ != nullptr) {
+          const std::shared_ptr<const cluster::ServingState> current =
+              cluster::GetClusterRuntime()->topology_cache_.Current();
+          if (!cluster::AuthorityUnchanged(
+                  *eval_request.cluster_admitted_state_, current.get(),
+                  eval_request.cluster_slots_)) {
+            co_return ClusterAuthorityChangedStatus();
+          }
+        }
         storage::TxShardWrites* writes =
             tx_writes == nullptr ? nullptr : &(*tx_writes)[owner];
         if (command.kind_ == CommandKind::kDel ||
@@ -6682,6 +7084,10 @@ Task<std::string> ExecuteLuaRedisCall(
         co_return absl::OkStatus();
       });
   if (!dispatched.ok()) {
+    if (IsClusterAuthorityChanged(dispatched)) {
+      co_return EncodeError(
+          "ERR Script attempted to access a non local key in a cluster node");
+    }
     co_return EncodeStorageError(dispatched);
   }
   if (chunks) {
@@ -6917,6 +7323,16 @@ Task<std::string> ExecuteEvalWithTransaction(
     co_return EncodeError(absl::StrCat("ERR Error compiling script: ",
                                        execution.status().message()));
   }
+  if (function_kind && cluster::ClusterEnabled() &&
+      ((*execution)->function_flags() & kLuaFunctionNoCluster) != 0) {
+    // Redis refuses no-cluster functions on cluster nodes (script.c; the text
+    // is verbatim and addReplyError prefixes "-ERR "). The check sits after
+    // function resolution (the flags are only known then) and before any
+    // execution. It precedes the *_ro write-flag check so FCALL_RO on a
+    // no-cluster function reports the cluster reason first.
+    co_return EncodeError(
+        "ERR Can not run script on cluster, 'no-cluster' flag is set.");
+  }
   if (request.kind_ == CommandKind::kFCallRo &&
       (((*execution)->function_flags() & kLuaFunctionNoWrites) == 0)) {
     co_return EncodeError(
@@ -7004,6 +7420,10 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
   std::vector<storage::TxShardWrites> tx_writes;
   std::optional<tx::Transaction> transaction;
   std::unique_ptr<ReplicationTransactionGuard> replication;
+  // Owner-side authority re-check for the declared-key transaction (choke
+  // point 2). The context is consulted from shard threads and must
+  // outlive every hop of the transaction, so it lives at function scope.
+  ClusterShardValidatorContext cluster_validator;
 
   if (key_count != 0) {
     transaction.emplace();
@@ -7016,6 +7436,7 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
     }
     transaction->Seal();
     if (!read_only) {
+      InstallClusterShardValidator(*transaction, request, cluster_validator);
       replication =
           std::make_unique<ReplicationTransactionGuard>(request, &*transaction);
       if (!replication->status().ok()) {
@@ -7031,7 +7452,13 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
     absl::Status armed = co_await transaction->Execute(
         &ArmOnlyShardCallback, nullptr, /*release=*/false);
     if (!armed.ok()) {
+      transaction->SetShardValidator(nullptr, nullptr);
       (void)co_await transaction->Release();
+      if (IsClusterAuthorityChanged(armed)) {
+        co_return BuiltReply(reply_builder.AppendError(
+            "ERR Script attempted to access a non local key in a cluster "
+            "node"));
+      }
       co_return BuiltReply(
           reply_builder.AppendError(absl::StrCat("ERR ", armed.message())));
     }
@@ -7049,6 +7476,9 @@ Task<CommandReply> ExecuteEval(const CommandRequest& request,
 
   if (transaction.has_value()) {
     if (!read_only) {
+      // The script's mutations are complete once it returns; the publish and
+      // release hops settle them and must not be fenced off retroactively.
+      transaction->SetShardValidator(nullptr, nullptr);
       absl::Status published = co_await transaction->Execute(
           &PublishFullSyncEffectsCallback, &tx_writes, /*release=*/false);
       if (!published.ok()) {
@@ -8244,6 +8674,80 @@ Task<CommandReply> ExecuteExecBody(
     }
   }
 
+  // Cluster mode: the whole transaction must touch one slot that this node
+  // still owns. Queue time gated each command against the snapshot it was
+  // admitted under; EXEC re-evaluates the union against the current cache
+  // because a reload may have moved the slot between queue and EXEC. The wire
+  // behavior is the documented Redis semantics (no local redis-server was
+  // available to verify against): a transaction whose queued keys span slots
+  // fails as a whole with CROSSSLOT, and a slot now owned elsewhere redirects
+  // the whole EXEC with MOVED.
+  std::vector<std::uint16_t> exec_cluster_slots;
+  std::shared_ptr<const cluster::ServingState> exec_admitted_state;
+  absl::InlinedVector<cluster::InFlightGuard, 4> exec_in_flights;
+  if (cluster::ClusterEnabled() && !ctx.strict_replication_apply_) {
+    for (std::size_t i = 0; i < queued.size(); ++i) {
+      const CommandRequest& cmd = queued[i];
+      if (cmd.spec_ == nullptr || (cmd.spec_->flags_ & kCmdNoKeys) != 0 ||
+          !key_errors[i].empty()) {
+        continue;
+      }
+      const absl::StatusOr<KeyIndexView> keys =
+          DetermineKeys(*cmd.spec_, cmd.args_);
+      if (!keys.ok() || keys->empty()) continue;
+      for (std::uint32_t index = keys->first_; index <= keys->last_;
+           index += keys->step_) {
+        const std::uint16_t slot = storage::RedisSlot(cmd.args_[index]);
+        if (std::find(exec_cluster_slots.begin(), exec_cluster_slots.end(),
+                      slot) == exec_cluster_slots.end()) {
+          exec_cluster_slots.push_back(slot);
+        }
+      }
+    }
+    if (exec_cluster_slots.size() > 1) {
+      co_await DropWatches(ctx);
+      co_return BuiltReply(AppendCrossSlotError(reply_builder));
+    }
+    if (!exec_cluster_slots.empty() && has_write) {
+      cluster::TopologyCache& cache =
+          cluster::GetClusterRuntime()->topology_cache_;
+      const cluster::RequestView view{
+          .slots_ = exec_cluster_slots,
+          .is_write_ = true,
+          .connection_readonly_ = ctx.cluster_readonly_,
+          // Writes are never loading-whitelisted; a not-ready snapshot must
+          // answer LOADING rather than serve the write.
+          .loading_allowed_ = false,
+      };
+      // Same publication-race handshake as RecheckClusterWriteAuthority: the
+      // snapshot arrives paired with the version it was current at, and a
+      // version change across registration means the guards may be invisible
+      // to a concurrent drain — roll back and re-admit.
+      for (;;) {
+        const auto [current, version_before] =
+            cluster::CurrentCachedWithVersion(cache);
+        const cluster::Decision decision = cluster::Admit(current.get(), view);
+        CommandReply redirect;
+        if (EmitClusterDecision(decision, queued.front().connection_tls_,
+                                reply_builder, &redirect)) {
+          co_await DropWatches(ctx);
+          co_return redirect;
+        }
+        exec_admitted_state = current;
+        // Align every queued command's captured state with the EXEC-time
+        // admission so per-command re-checks (e.g. Lua redis.call) compare
+        // against the same snapshot.
+        for (CommandRequest& cmd : queued) {
+          cmd.cluster_admitted_state_ = exec_admitted_state;
+        }
+        RegisterClusterInFlight(*exec_admitted_state, exec_cluster_slots,
+                                &exec_in_flights);
+        if (cache.version() == version_before) break;
+        exec_in_flights.clear();
+      }
+    }
+  }
+
   std::vector<std::string> replies(queued.size());
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
@@ -8337,8 +8841,8 @@ Task<CommandReply> ExecuteExecBody(
     for (const std::uint8_t db : dbs) {
       if (!db_guard.Add(db)) {
         co_await DropWatches(ctx);
-        co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
-            "TRYAGAIN database flush is in progress")));
+        co_return finalize_exec_reply(BuiltReply(AppendTryAgainError(
+            reply_builder, "database flush is in progress")));
       }
     }
     if (write_admission_role_epoch.has_value() && g_replication != nullptr &&
@@ -8577,6 +9081,18 @@ Task<CommandReply> ExecuteExecBody(
             auto guard = co_await tx::CurrentTxShard().AcquireKeys(
                 std::span<const tx::KeyRef>(refs));
             if (replication != nullptr) replication->EnterCurrentShard();
+            if (exec_admitted_state != nullptr) {
+              // Choke point 2 for the single-shard fast path (which never
+              // builds a tx::Transaction): re-check the EXEC's authority after
+              // the key guard and before the first mutation.
+              const std::shared_ptr<const cluster::ServingState> current =
+                  cluster::GetClusterRuntime()->topology_cache_.Current();
+              if (!cluster::AuthorityUnchanged(*exec_admitted_state,
+                                               current.get(),
+                                               exec_cluster_slots)) {
+                co_return ClusterAuthorityChangedStatus();
+              }
+            }
             if (!ctx.watched_.empty() &&
                 !co_await CheckConnectionWatches(ctx)) {
               watch_aborted = true;
@@ -8624,6 +9140,13 @@ Task<CommandReply> ExecuteExecBody(
           });
       if (!status.ok()) {
         co_await DropWatches(ctx);
+        if (IsClusterAuthorityChanged(status)) {
+          // The fast-path re-check fires before any queued command runs, so
+          // the redirect it maps to is always honest.
+          co_return finalize_exec_reply(ClusterAuthorityChangedReply(
+              exec_cluster_slots, queued.front().connection_tls_,
+              reply_builder));
+        }
         co_return finalize_exec_reply(BuiltReply(
             reply_builder.AppendError(absl::StrCat("ERR ", status.message()))));
       }
@@ -8681,6 +9204,13 @@ Task<CommandReply> ExecuteExecBody(
         }
       }
       txn.Seal();
+      ClusterShardValidatorContext cluster_validator;
+      if (exec_admitted_state != nullptr) {
+        cluster_validator.admitted_ = exec_admitted_state;
+        cluster_validator.slots_ = exec_cluster_slots;
+        txn.SetShardValidator(&ValidateClusterShardAuthority,
+                              &cluster_validator);
+      }
       std::unique_ptr<ReplicationTransactionGuard> replication;
       if (replication_request != nullptr) {
         replication = std::make_unique<ReplicationTransactionGuard>(
@@ -8715,6 +9245,12 @@ Task<CommandReply> ExecuteExecBody(
       if (!armed.ok()) {
         (void)co_await txn.Release();
         co_await DropWatches(ctx);
+        if (IsClusterAuthorityChanged(armed)) {
+          // Nothing executed yet.
+          co_return finalize_exec_reply(ClusterAuthorityChangedReply(
+              exec_cluster_slots, queued.front().connection_tls_,
+              reply_builder));
+        }
         co_return finalize_exec_reply(BuiltReply(
             reply_builder.AppendError(absl::StrCat("ERR ", armed.message()))));
       }
@@ -8776,6 +9312,16 @@ Task<CommandReply> ExecuteExecBody(
         absl::Status hop = co_await txn.Execute(&ExecRunShardCallback, &run,
                                                 /*release=*/false);
         if (!hop.ok()) {
+          if (IsClusterAuthorityChanged(hop)) {
+            // A fence raced EXEC mid-flight: earlier runs may already have
+            // committed, so the outcome is undeterminable. The Redis contract
+            // for that is to close the connection without an error reply.
+            (void)co_await txn.Release();
+            co_await DropWatches(ctx);
+            CommandReply reply;
+            reply.close_connection_ = true;
+            co_return reply;
+          }
           for (std::size_t j = i; j < end; ++j) {
             replies[j] = EncodeStorageError(hop);
           }
@@ -8784,6 +9330,9 @@ Task<CommandReply> ExecuteExecBody(
         }
         i = end;
       }
+      // Every queued command ran; the publish/release hops settle their
+      // effects and must not be fenced off retroactively.
+      txn.SetShardValidator(nullptr, nullptr);
       absl::Status published =
           co_await txn.Execute(&PublishFullSyncEffectsCallback, &tx_writes,
                                /*release=*/false);
@@ -10142,6 +10691,97 @@ Task<CommandReply> ExecuteClient(ConnectionContext& ctx,
 
 }  // namespace
 
+// ---- Cluster owner-side re-check definitions (declared in cluster_gate.h) --
+//
+// These are keylane-scope (not file-local) because the per-type multi-key
+// executors (set/zset/list/sort/string) inject the same validator into their
+// own transactions. EmitClusterDecision stays file-local above; the functions
+// below call it across the namespace boundary within this translation unit.
+
+absl::Status ClusterAuthorityChangedStatus() {
+  return absl::FailedPreconditionError("cluster authority changed");
+}
+
+bool IsClusterAuthorityChanged(const absl::Status& status) {
+  return status.code() == absl::StatusCode::kFailedPrecondition &&
+         status.message() == "cluster authority changed";
+}
+
+CommandReply ClusterAuthorityChangedReply(std::span<const std::uint16_t> slots,
+                                          bool connection_tls,
+                                          ReplyBuilder& reply_builder) {
+  CommandReply reply;
+  const std::shared_ptr<const cluster::ServingState> current =
+      cluster::GetClusterRuntime()->topology_cache_.Current();
+  const cluster::RequestView view{
+      .slots_ = slots,
+      .is_write_ = true,
+      .connection_readonly_ = false,
+      // Same rule as the dispatch gate: writes are never whitelisted, so a
+      // snapshot that lost readiness maps to LOADING instead of serving.
+      .loading_allowed_ = false,
+  };
+  const cluster::Decision decision = cluster::Admit(current.get(), view);
+  if (!EmitClusterDecision(decision, connection_tls, reply_builder, &reply)) {
+    reply.close_connection_ = true;
+  }
+  return reply;
+}
+
+absl::Status ValidateClusterShardAuthority(void* opaque, unsigned /*shard*/) {
+  auto* context = static_cast<ClusterShardValidatorContext*>(opaque);
+  const std::shared_ptr<const cluster::ServingState> current =
+      cluster::GetClusterRuntime()->topology_cache_.Current();
+  if (context->admitted_ != nullptr &&
+      cluster::AuthorityUnchanged(*context->admitted_, current.get(),
+                                  context->slots_)) {
+    return absl::OkStatus();
+  }
+  context->tripped_.store(true, std::memory_order_relaxed);
+  return ClusterAuthorityChangedStatus();
+}
+
+void InstallClusterShardValidator(tx::Transaction& transaction,
+                                  const CommandRequest& request,
+                                  ClusterShardValidatorContext& context) {
+  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+      request.cluster_admitted_state_ == nullptr ||
+      request.cluster_slots_.empty()) {
+    return;
+  }
+  context.admitted_ = request.cluster_admitted_state_;
+  context.slots_ = request.cluster_slots_;
+  transaction.SetShardValidator(&ValidateClusterShardAuthority, &context);
+}
+
+absl::Status RecheckClusterRequestAuthority(const CommandRequest& request) {
+  if (!cluster::ClusterEnabled() || request.replication_origin_ ||
+      request.cluster_admitted_state_ == nullptr ||
+      request.cluster_slots_.empty()) {
+    return absl::OkStatus();
+  }
+  const std::shared_ptr<const cluster::ServingState> current =
+      cluster::GetClusterRuntime()->topology_cache_.Current();
+  if (cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
+                                  current.get(), request.cluster_slots_)) {
+    return absl::OkStatus();
+  }
+  return ClusterAuthorityChangedStatus();
+}
+
+CommandReply ClusterValidatorFailureReply(
+    const tx::Transaction& transaction,
+    const ClusterShardValidatorContext& context, bool connection_tls,
+    ReplyBuilder& reply_builder) {
+  if (!transaction.single_shard()) {
+    CommandReply reply;
+    reply.close_connection_ = true;
+    return reply;
+  }
+  return ClusterAuthorityChangedReply(context.slots_, connection_tls,
+                                      reply_builder);
+}
+
 Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
                                        CommandRequest& request,
                                        ReplyBuilder& reply_builder) {
@@ -10178,47 +10818,27 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
               "KILL or SHUTDOWN NOSAVE."));
   }
   if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
-    const bool allowed_while_loading = [&] {
-      switch (kind) {
-        case CommandKind::kPing:
-        case CommandKind::kEcho:
-        case CommandKind::kAuth:
-        case CommandKind::kSelect:
-        case CommandKind::kClient:
-        case CommandKind::kReplicaOf:
-        case CommandKind::kAddReplicaOf:
-        case CommandKind::kConfig:
-        case CommandKind::kInfo:
-        case CommandKind::kRole:
-        case CommandKind::kWait:
-        case CommandKind::kCluster:
-        case CommandKind::kCommand:
-        case CommandKind::kReadOnly:
-        case CommandKind::kReadWrite:
-        case CommandKind::kMonitor:
-        case CommandKind::kSlowLog:
-        case CommandKind::kPublish:
-        case CommandKind::kPubSub:
-        case CommandKind::kPSubscribe:
-        case CommandKind::kPUnsubscribe:
-        case CommandKind::kSubscribe:
-        case CommandKind::kUnsubscribe:
-        case CommandKind::kQuit:
-        case CommandKind::kReset:
-        case CommandKind::kScript:
-          return true;
-        default:
-          return false;
-      }
-    }();
-    if (!allowed_while_loading) {
+    // The whitelist is shared verbatim with the cluster gate
+    // (LoadingAllowedCommandKind); this gate is inert in cluster mode because
+    // cluster nodes have no replication upstream to sync from.
+    if (!LoadingAllowedCommandKind(kind)) {
       co_return BuiltReply(reply_builder.AppendError(
           "LOADING Keylane is loading the dataset from the primary"));
     }
   }
-  if (std::optional<std::string> moved =
-          co_await ReplicaMovedError(ctx, request);
-      moved.has_value()) {
+  if (cluster::ClusterEnabled()) {
+    // Cluster admission gate: redirect or refuse before any
+    // execution, including at MULTI queue time so EXEC aborts dirty. The
+    // admitted ServingState snapshot rides on the request for the owner-side
+    // authority re-check.
+    CommandReply cluster_reply;
+    if (ClusterGateReject(ctx, request, reply_builder, &cluster_reply)) {
+      if (ctx.in_multi_) ctx.multi_dirty_ = true;
+      co_return cluster_reply;
+    }
+  } else if (std::optional<std::string> moved =
+                 co_await ReplicaMovedError(ctx, request);
+             moved.has_value()) {
     if (ctx.in_multi_) ctx.multi_dirty_ = true;
     co_return BuiltReply(reply_builder.AppendError(*moved));
   }
@@ -10557,6 +11177,19 @@ Task<CommandReply> ExecuteCommandBody(
       co_return BuiltReply(
           reply_builder.AppendError(absl::StrCat("ERR ", entered.message())));
     }
+  }
+
+  // Cluster owner-side authority re-check (choke point 1 of 2): the
+  // admission decision was made at dispatch time against a snapshot that a
+  // reload may have fenced while this request suspended on the admissions
+  // above. Nothing has executed yet, so a changed authority is safely answered
+  // with a fresh redirect. Transaction-based writes re-check per shard via the
+  // tx validator hook (choke point 2).
+  absl::InlinedVector<cluster::InFlightGuard, 4> cluster_in_flights;
+  if (std::optional<CommandReply> fenced = RecheckClusterWriteAuthority(
+          request, reply_builder, &cluster_in_flights);
+      fenced.has_value()) {
+    co_return std::move(*fenced);
   }
 
   if (random_stream.has_value()) {
@@ -10967,7 +11600,7 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
 // Admission suspends on the publish-queue capacity of the worker it runs on,
 // and holding that same worker's DB gate across the wait would stall every
 // FLUSHDB and FULLSYNC_CUT drain waiting for the gate counts to reach zero.
-Task<CommandReply> ExecuteAdmittedCommand(const CommandRequest& request,
+Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
                                           ReplyBuilder& reply_builder,
                                           std::uint64_t client_id,
                                           ConnectionContext* connection) {

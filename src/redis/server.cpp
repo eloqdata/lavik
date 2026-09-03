@@ -44,6 +44,8 @@
 #include "celer/runtime/sync.h"
 #include "client_limit.h"
 #include "function_catalog.h"
+#include "keylane/cluster/control_port.h"
+#include "keylane/cluster/runtime.h"
 #include "keylane/command.h"
 #include "keylane/command_table.h"
 #include "keylane/config.h"
@@ -212,8 +214,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
     // bursts from every worker otherwise become an artificial tail-latency
     // event in the trace build itself.
     stats.next_report_ns_ =
-        now + kReadLatencyReportIntervalNs +
-        100'000'000ULL * ThisWorker().id_;
+        now + kReadLatencyReportIntervalNs + 100'000'000ULL * ThisWorker().id_;
     return;
   }
   if (now < stats.next_report_ns_) {
@@ -300,8 +301,7 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
       p9999(stats.lookup_), p9999(stats.buffer_), p9999(stats.decode_),
       p9999(stats.route_back_), p9999(stats.send_));
 #if CELER_ENABLE_CROSS_CORE_LATENCY_TRACE
-  const auto cross_core_stats =
-      ThisWorker().self_->TakeCrossCoreLatencyStats();
+  const auto cross_core_stats = ThisWorker().self_->TakeCrossCoreLatencyStats();
   const auto log_cross_core = [&](std::string_view name,
                                   const Worker::LatencySampleStats& value) {
     spdlog::info(
@@ -312,15 +312,13 @@ void RecordReadLatency(const ReadLatencyTrace& trace) {
         static_cast<double>(value.max_ns_) / 1000.0);
   };
   log_cross_core("wake-batch", cross_core_stats.wake_batch_wait_);
-  log_cross_core("parked-wake-batch",
-                 cross_core_stats.parked_wake_batch_wait_);
+  log_cross_core("parked-wake-batch", cross_core_stats.parked_wake_batch_wait_);
   log_cross_core("request-queue", cross_core_stats.request_queue_);
   log_cross_core("reply-queue", cross_core_stats.reply_queue_);
 #endif
   stats = ReadLatencyStats{};
   stats.next_report_ns_ =
-      now + kReadLatencyReportIntervalNs +
-      100'000'000ULL * ThisWorker().id_;
+      now + kReadLatencyReportIntervalNs + 100'000'000ULL * ThisWorker().id_;
 }
 
 struct SetLatencyStats {
@@ -482,6 +480,70 @@ void CleanupShutdownSignalHandler() noexcept {
   }
 }
 
+// SIGHUP-driven reload of the static cluster topology. The reload
+// path must use its own eventfd: WaitForSignalOrServerStop treats any write to
+// the shutdown eventfd as a stop request. The handler is installed only while
+// the static control adapter is active.
+int g_reload_signal_event_fd = -1;
+// Owned by RunServer for the process lifetime; read only on the main thread.
+cluster::StaticClusterControl* g_static_cluster_control = nullptr;
+
+void ClusterReloadSignalHandler(int /*signal*/) {
+  if (g_reload_signal_event_fd < 0) {
+    return;
+  }
+  const std::uint64_t wake = 1;
+  const ssize_t result = write(g_reload_signal_event_fd, &wake, sizeof(wake));
+  (void)result;
+}
+
+absl::Status InstallClusterReloadSignalHandler() {
+  g_reload_signal_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (g_reload_signal_event_fd < 0) {
+    return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
+  }
+
+  struct sigaction action {};
+  sigemptyset(&action.sa_mask);
+  action.sa_handler = ClusterReloadSignalHandler;
+  if (sigaction(SIGHUP, &action, nullptr) != 0) {
+    close(g_reload_signal_event_fd);
+    g_reload_signal_event_fd = -1;
+    return absl::Status(absl::StatusCode::kInternal, "sigaction setup failed");
+  }
+  return absl::OkStatus();
+}
+
+void CleanupClusterReloadSignalHandler() noexcept {
+  struct sigaction action {};
+  sigemptyset(&action.sa_mask);
+  action.sa_handler = SIG_DFL;
+  (void)sigaction(SIGHUP, &action, nullptr);
+  if (g_reload_signal_event_fd >= 0) {
+    close(g_reload_signal_event_fd);
+    g_reload_signal_event_fd = -1;
+  }
+}
+
+// Reloads the static topology file. A failed reload keeps the previously
+// published ServingState (the RefreshTarget contract), so a bad edit never
+// half-applies a fence.
+void ReloadStaticClusterTarget() {
+  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+  if (g_static_cluster_control == nullptr || runtime == nullptr) return;
+  const absl::Status refreshed =
+      g_static_cluster_control->RefreshTarget(runtime->topology_cache_);
+  if (refreshed.ok()) {
+    spdlog::info("cluster topology reloaded, serving version {}",
+                 runtime->topology_cache_.version());
+  } else {
+    spdlog::warn(
+        "cluster topology reload failed; keeping the previous serving state: "
+        "{}",
+        refreshed.message());
+  }
+}
+
 enum class WaitResult {
   kSignal,
   kStopped,
@@ -597,19 +659,20 @@ std::string_view ExecuteHello(const PasswordAuthenticator& authenticator,
   reply.AppendInteger(static_cast<long long>(std::min<std::uint64_t>(
       ctx.conn_id_, std::numeric_limits<long long>::max())));
   reply.AppendBulkString("mode");
-  reply.AppendBulkString("standalone");
+  reply.AppendBulkString(cluster::ClusterEnabled() ? "cluster" : "standalone");
   reply.AppendBulkString("role");
-  reply.AppendBulkString(replication != nullptr && replication->is_replica()
-                             ? "slave"
-                             : "master");
+  reply.AppendBulkString(
+      replication != nullptr && replication->is_replica() ? "slave" : "master");
   reply.AppendBulkString("modules");
   reply.AppendArrayHeader(0);
   return reply.View();
 }
 
-std::string_view ExecuteHelloFromContext(
-    const void* authenticator, void* replication, ConnectionContext& ctx,
-    std::span<const std::string> args, ReplyBuilder& reply) {
+std::string_view ExecuteHelloFromContext(const void* authenticator,
+                                         void* replication,
+                                         ConnectionContext& ctx,
+                                         std::span<const std::string> args,
+                                         ReplyBuilder& reply) {
   return ExecuteHello(*static_cast<const PasswordAuthenticator*>(authenticator),
                       static_cast<ReplicationManager*>(replication), ctx, args,
                       reply);
@@ -617,13 +680,16 @@ std::string_view ExecuteHelloFromContext(
 
 template <typename Server>
 WaitResult WaitForSignalOrServerStop(const Server& server) {
-  pollfd fds[2] = {
+  // A negative reload fd is simply never readable, so the poll list is fixed
+  // whether or not the static cluster adapter armed its SIGHUP handler.
+  pollfd fds[3] = {
       {.fd = g_signal_event_fd, .events = POLLIN, .revents = 0},
       {.fd = server.completion_fd(), .events = POLLIN, .revents = 0},
+      {.fd = g_reload_signal_event_fd, .events = POLLIN, .revents = 0},
   };
 
   while (true) {
-    const int rc = poll(fds, 2, -1);
+    const int rc = poll(fds, 3, -1);
     if (rc < 0) [[unlikely]] {
       if (errno == EINTR) {
         continue;
@@ -648,6 +714,16 @@ WaitResult WaitForSignalOrServerStop(const Server& server) {
         spdlog::warn("server completion eventfd read failed errno={}", errno);
       }
       return WaitResult::kStopped;
+    }
+    if ((fds[2].revents & POLLIN) != 0) {
+      std::uint64_t wake = 0;
+      const ssize_t result =
+          read(g_reload_signal_event_fd, &wake, sizeof(wake));
+      if (result < 0 && errno != EAGAIN) {
+        spdlog::warn("reload eventfd read failed errno={}", errno);
+      }
+      // Reload is not a stop: drain the event and keep waiting.
+      ReloadStaticClusterTarget();
     }
   }
 }
@@ -703,16 +779,14 @@ class RedisService final : public TcpService, public ClientLimit {
       TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
       RespCommandParser* parser, CommandBatch* ready,
       ClientBufferReservation* client_buffers,
-      std::size_t* unassigned_input_bytes,
-      std::size_t* multi_input_bytes,
+      std::size_t* unassigned_input_bytes, std::size_t* multi_input_bytes,
       std::optional<absl::Status>* deferred_read_error,
       std::shared_ptr<PubSubSession> session);
   Task<absl::Status> ServeSubscribed(
       TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
       RespCommandParser* parser, CommandBatch* ready,
       ClientBufferReservation* client_buffers,
-      std::size_t* unassigned_input_bytes,
-      std::size_t* multi_input_bytes,
+      std::size_t* unassigned_input_bytes, std::size_t* multi_input_bytes,
       std::optional<absl::Status>* deferred_read_error);
   Task<absl::Status> ImportRdb();
 
@@ -1049,6 +1123,20 @@ Task<absl::Status> RedisService::Run(Worker& worker, ServiceContext ctx) {
     // this boundary. Publish readiness only after an optional startup RDB
     // import has also completed successfully on every worker.
     ready_.store(true, std::memory_order_release);
+    if (g_static_cluster_control != nullptr &&
+        cluster::GetClusterRuntime() != nullptr) {
+      // Flip the published ServingState to storage-ready; until this lands,
+      // the dispatch gate answers LOADING to every non-whitelisted command.
+      g_static_cluster_control->SetStorageReady(true);
+      const absl::Status published = g_static_cluster_control->RefreshTarget(
+          cluster::GetClusterRuntime()->topology_cache_);
+      if (!published.ok()) {
+        // The gate keeps answering LOADING rather than serving against a
+        // state this node cannot prove ready.
+        spdlog::error("cluster storage-ready publication failed: {}",
+                      published.message());
+      }
+    }
   }
 
   spdlog::info("worker[{}] direct-IO storage initialized", worker.id());
@@ -1186,8 +1274,7 @@ Task<absl::Status> ReadCommandBatch(
       RespParseResult parsed = parser->Parse(input->View());
       input->Consume(parsed.consumed_);
       assert(parsed.consumed_ <=
-             std::numeric_limits<std::size_t>::max() -
-                 *unassigned_input_bytes);
+             std::numeric_limits<std::size_t>::max() - *unassigned_input_bytes);
       *unassigned_input_bytes += parsed.consumed_;
       if (parsed.state_ == RespParseState::kError) {
         if (!ready->empty()) {
@@ -1484,14 +1571,12 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
   } reader_done{session};
 
   ReplyBuilder builder(ctx.resp_version());
-  auto enqueue_command_reply =
-      [&](CommandReply reply) -> Task<absl::Status> {
+  auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
     if (reply.disk_value_.has_value()) {
       const auto bytes = reply.disk_value_->network_bytes();
       EnqueuePubSubReply(
-          session,
-          std::string(reinterpret_cast<const char*>(bytes.data()),
-                      bytes.size()));
+          session, std::string(reinterpret_cast<const char*>(bytes.data()),
+                               bytes.size()));
       co_return absl::OkStatus();
     }
     if (!reply.encoded_.empty()) {
@@ -1518,16 +1603,16 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       } else {
         read_status = co_await ReadCommandBatch(
             stream, input, parser, ready, client_buffers,
-            &client_query_buffer_limit_bytes_,
-            unassigned_input_bytes, deferred_read_error);
+            &client_query_buffer_limit_bytes_, unassigned_input_bytes,
+            deferred_read_error);
       }
     }
     if (!read_status.ok()) {
       if (read_status.code() != absl::StatusCode::kUnavailable) {
         builder.Reset();
-        EnqueuePubSubReply(
-            session, std::string(builder.AppendError(
-                         absl::StrCat("ERR ", read_status.message()))));
+        EnqueuePubSubReply(session,
+                           std::string(builder.AppendError(
+                               absl::StrCat("ERR ", read_status.message()))));
         ExitPubSubMode(session);
         co_return read_status;
       }
@@ -1548,6 +1633,9 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     RequestGuard request_guard(this);
     auto request = BuildCommandRequest(std::move(command), ctx.selected_db_);
+    if (request.ok()) {
+      request->connection_tls_ = stream.IsTls();
+    }
     builder.SetVersion(ctx.resp_version());
     builder.Reset();
     if (!request.ok()) {
@@ -1630,8 +1718,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     const bool succeeded =
         reply.encoded_.empty() || reply.encoded_.front() != '-';
     if (reply.selected_db_.has_value()) ctx.selected_db_ = *reply.selected_db_;
-    absl::Status enqueued =
-        co_await enqueue_command_reply(std::move(reply));
+    absl::Status enqueued = co_await enqueue_command_reply(std::move(reply));
     if (!enqueued.ok()) {
       ClosePubSubSession(session);
       co_return enqueued;
@@ -1649,23 +1736,17 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status> RedisService::ServeSubscribed(TcpStream& stream,
-                                                 ConnectionContext& ctx,
-                                                 RequestInputBuffer* input,
-                                                 RespCommandParser* parser,
-                                                 CommandBatch* ready,
-                                                 ClientBufferReservation*
-                                                     client_buffers,
-                                                 std::size_t*
-                                                     unassigned_input_bytes,
-                                                 std::size_t* multi_input_bytes,
-                                                 std::optional<absl::Status>*
-                                                     deferred_read_error) {
+Task<absl::Status> RedisService::ServeSubscribed(
+    TcpStream& stream, ConnectionContext& ctx, RequestInputBuffer* input,
+    RespCommandParser* parser, CommandBatch* ready,
+    ClientBufferReservation* client_buffers,
+    std::size_t* unassigned_input_bytes, std::size_t* multi_input_bytes,
+    std::optional<absl::Status>* deferred_read_error) {
   std::shared_ptr<PubSubSession> session = ctx.pubsub_session_;
   MarkPubSubReaderStarted(session);
   ThisWorker().self_->Spawn(ReadSubscribedCommands(
-      stream, ctx, input, parser, ready, client_buffers,
-      unassigned_input_bytes, multi_input_bytes, deferred_read_error, session));
+      stream, ctx, input, parser, ready, client_buffers, unassigned_input_bytes,
+      multi_input_bytes, deferred_read_error, session));
 
   absl::Status streamed = co_await StreamPubSubMessages(stream, session);
   const bool normal_exit = PubSubSubscriptionCount(session) == 0;
@@ -1706,11 +1787,10 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         read_status = std::move(*deferred_read_error);
         deferred_read_error.reset();
       } else {
-        read_status = co_await ReadCommandBatch(stream, &input, &parser, &ready,
-                                                &client_buffers,
-                                                &client_query_buffer_limit_bytes_,
-                                                &unassigned_input_bytes,
-                                                &deferred_read_error);
+        read_status = co_await ReadCommandBatch(
+            stream, &input, &parser, &ready, &client_buffers,
+            &client_query_buffer_limit_bytes_, &unassigned_input_bytes,
+            &deferred_read_error);
       }
       if (!read_status.ok()) [[unlikely]] {
         if (read_status.code() == absl::StatusCode::kUnavailable) [[unlikely]] {
@@ -1735,9 +1815,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     const auto& args = command.args_;
     if (!args.empty() && absl::EqualsIgnoreCase(args.front(), "HELLO") &&
         !ctx.in_multi_) {
-      const std::string_view encoded =
-          ExecuteHello(authenticator_, replication_, ctx, args,
-                       ctx.reply_builder_);
+      const std::string_view encoded = ExecuteHello(
+          authenticator_, replication_, ctx, args, ctx.reply_builder_);
       absl::Status written = co_await WriteOrBatchReply(
           stream, encoded, !ready.empty(), &pending_replies);
       if (!written.ok()) co_return written;
@@ -1868,6 +1947,11 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
 
     auto request_result =
         BuildCommandRequest(std::move(command), ctx.selected_db_);
+    if (request_result.ok()) {
+      // Cluster MOVED/discovery replies select the TLS port for connections
+      // that arrived over TLS (Redis getNodeClientPort semantics).
+      request_result->connection_tls_ = stream.IsTls();
+    }
     const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply;
     std::shared_ptr<const std::string> monitor_message;
@@ -2331,6 +2415,56 @@ int RunServer(ServerOptions options) {
                 options.thread_count_, options.config_file_);
   tx::TxRuntime::Create(options.thread_count_);
 
+  // Redis Cluster data plane: install the process-wide runtime and
+  // load the static topology before any listener accepts a client. The first
+  // publish carries storage_ready=false, so the dispatch gate answers LOADING
+  // to non-whitelisted commands until RedisService::Run flips readiness after
+  // recovery (and any startup RDB import) completes.
+  std::unique_ptr<cluster::StaticClusterControl> cluster_control;
+  if (options.cluster_enabled_) {
+    auto runtime = std::make_unique<cluster::ClusterRuntime>();
+    // Announce-address defaults: an explicit announce ip wins; otherwise the
+    // first non-wildcard bind address; a wildcard bind stays empty so
+    // discovery self entries keep the "use the startup node" convention.
+    runtime->announce_ip_ = options.cluster_announce_ip_;
+    if (runtime->announce_ip_.empty()) {
+      const std::string& first_bind = options.bind_addresses_.front();
+      const bool wildcard =
+          first_bind == "*" || first_bind == "0.0.0.0" || first_bind == "::";
+      if (!wildcard) runtime->announce_ip_ = first_bind;
+    }
+    runtime->announce_port_ = options.cluster_announce_port_ != 0
+                                  ? options.cluster_announce_port_
+                                  : options.port_;
+    runtime->announce_tls_port_ = options.cluster_announce_tls_port_ != 0
+                                      ? options.cluster_announce_tls_port_
+                                      : options.tls_port_;
+    cluster::InstallClusterRuntime(std::move(runtime));
+    std::string self_host = options.bind_addresses_.front();
+    if (self_host == "*") self_host = "0.0.0.0";
+    cluster_control = std::make_unique<cluster::StaticClusterControl>(
+        options.cluster_static_nodes_file_,
+        cluster::StaticClusterControl::SelfMatch{self_host, options.port_},
+        cluster::GetClusterRuntime()->announce_tls_port_);
+    // A first-load failure is fatal: there is no previous ServingState to
+    // keep, and serving without one would answer every command CLUSTERDOWN.
+    const absl::Status loaded = cluster_control->RefreshTarget(
+        cluster::GetClusterRuntime()->topology_cache_);
+    if (!loaded.ok()) {
+      spdlog::error("cluster topology load failed: {}", loaded.message());
+      CleanupShutdownSignalHandler();
+      return 1;
+    }
+    g_static_cluster_control = cluster_control.get();
+    const absl::Status reload_installed = InstallClusterReloadSignalHandler();
+    if (!reload_installed.ok()) {
+      spdlog::error("cluster reload signal setup failed: {}",
+                    reload_installed.message());
+      CleanupShutdownSignalHandler();
+      return 1;
+    }
+  }
+
   celer::ServerOptions runtime_options;
   runtime_options.bind_addresses_ = options.bind_addresses_;
   runtime_options.thread_count_ = options.thread_count_;
@@ -2366,6 +2500,8 @@ int RunServer(ServerOptions options) {
   auto start_status = server.Start(runtime_options);
   if (!start_status.ok()) [[unlikely]] {
     spdlog::error("server start failed: {}", start_status.message());
+    g_static_cluster_control = nullptr;
+    CleanupClusterReloadSignalHandler();
     CleanupShutdownSignalHandler();
     return 1;
   }
@@ -2403,6 +2539,8 @@ int RunServer(ServerOptions options) {
   const int exit_code = redis.startup_failed() || shutdown_exit_code != 0
                             ? 1
                             : server.exit_code();
+  g_static_cluster_control = nullptr;
+  CleanupClusterReloadSignalHandler();
   CleanupShutdownSignalHandler();
   if (fast_process_exit) {
     // All worker IO backends and coroutine frames are already quiescent. A

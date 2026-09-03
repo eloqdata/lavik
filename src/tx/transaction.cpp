@@ -190,6 +190,10 @@ Task<absl::Status> Transaction::InvokeCallback(std::uint16_t shard_slot) {
     shard.entry_hook_invoked_ = true;
     entry_hook_(entry_hook_ctx_, shard.shard_id_);
   }
+  if (validator_ != nullptr) {
+    absl::Status valid = validator_(validator_ctx_, shard.shard_id_);
+    if (!valid.ok()) co_return valid;
+  }
   co_return co_await cb_(cb_ctx_, Slice(shard));
 }
 
@@ -264,6 +268,13 @@ Task<absl::Status> Transaction::ExecuteSingleShard(bool release) {
         if (!sd.entry_hook_invoked_ && entry_hook_ != nullptr) {
           sd.entry_hook_invoked_ = true;
           entry_hook_(entry_hook_ctx_, sd.shard_id_);
+        }
+        if (validator_ != nullptr) {
+          absl::Status valid = validator_(validator_ctx_, sd.shard_id_);
+          if (!valid.ok()) {
+            if (release) single_shard_guard_.reset();
+            co_return valid;
+          }
         }
         absl::Status status = co_await cb_(cb_ctx_, Slice(sd));
         if (release) single_shard_guard_.reset();

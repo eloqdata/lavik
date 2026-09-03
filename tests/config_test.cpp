@@ -509,4 +509,117 @@ TEST(ReplicaOfCommandTest, ParsesFollowAndNoOneForms) {
                    .ok());
 }
 
+TEST(RedisConfigTest, AppliesClusterDirectives) {
+  ServerOptions options;
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective(
+          {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-announce-ip", "10.0.0.8"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-announce-port", "7390"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-announce-tls-port", "7391"}, &options)
+          .ok());
+
+  EXPECT_TRUE(options.cluster_enabled_);
+  EXPECT_EQ(options.cluster_static_nodes_file_, "/etc/keylane/nodes.conf");
+  EXPECT_EQ(options.cluster_announce_ip_, "10.0.0.8");
+  EXPECT_EQ(options.cluster_announce_port_, 7390);
+  EXPECT_EQ(options.cluster_announce_tls_port_, 7391);
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+
+  // A zero announce port follows the corresponding listen port.
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-announce-port", "0"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-announce-tls-port", "0"}, &options)
+          .ok());
+  EXPECT_EQ(options.cluster_announce_port_, 0);
+  EXPECT_EQ(options.cluster_announce_tls_port_, 0);
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"cluster-enabled", "no"}, &options).ok());
+  EXPECT_FALSE(options.cluster_enabled_);
+}
+
+TEST(RedisConfigTest, RejectsInvalidClusterDirectives) {
+  ServerOptions options;
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-enabled", "maybe"}, &options).ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective({"cluster-enabled"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-enabled", "yes", "extra"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-static-nodes-file"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-announce-ip"}, &options).ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-announce-port", "65536"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-announce-port", "-1"}, &options)
+          .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"cluster-announce-port", "http"}, &options)
+          .ok());
+  EXPECT_FALSE(ApplyRedisConfigDirective({"cluster-announce-tls-port", "65536"},
+                                         &options)
+                   .ok());
+}
+
+TEST(RedisConfigTest, RequiresNodesFileWhenClusterEnabled) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, RejectsClusterWithReplicationUpstream) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+  options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+
+  options.replicaof_.reset();
+  options.redis_replicaof_ = keylane::ReplicaOfConfig{"redis.local", 6380};
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+
+  options.redis_replicaof_.reset();
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+}
+
+TEST(RedisConfigTest, ValidatesClusterAnnouncePortResolution) {
+  ServerOptions options;
+  options.cluster_enabled_ = true;
+  options.cluster_static_nodes_file_ = "/etc/keylane/nodes.conf";
+
+  // TLS-only deployment: the zero announce ports follow the listen ports, so
+  // the resolved TLS announce port is nonzero and the node is valid.
+  options.port_ = 0;
+  options.tls_port_ = 6380;
+  options.tls_cert_file_ = "server.crt";
+  options.tls_key_file_ = "server.key";
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+
+  // An explicit announce port wins over the listen port it follows.
+  options.cluster_announce_tls_port_ = 7391;
+  EXPECT_TRUE(ValidateServerOptions(options).ok());
+  options.cluster_announce_tls_port_ = 0;
+
+  // With neither a plaintext nor a TLS listener there is no client endpoint
+  // left to announce, and cluster mode must refuse to start.
+  options.tls_port_ = 0;
+  EXPECT_FALSE(ValidateServerOptions(options).ok());
+}
+
 }  // namespace

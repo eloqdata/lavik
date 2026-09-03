@@ -46,6 +46,16 @@ using ShardCallback = celer::Task<absl::Status> (*)(void* ctx,
 // its holds and before its first shard callback. The hook must not suspend.
 using ShardEntryHook = void (*)(void* ctx, unsigned shard_id);
 
+// Optional pre-callback validation hook (cluster authority
+// re-check). Runs on the owner shard immediately before every shard callback —
+// after every scheduling/arming suspension — so an admission captured before
+// a fence cannot mutate afterwards. A non-ok result aborts this shard's
+// callback and becomes that shard's status; other shards decide independently.
+// The hook must not suspend and must tolerate running once per hop. An unset
+// hook costs one branch per callback and changes nothing for read-only or
+// hookless transactions.
+using ShardValidator = absl::Status (*)(void* ctx, unsigned shard_id);
+
 // A multi-key transaction, embedded in the coordinator coroutine's frame.
 //
 // Lifecycle: Begin -> AddKey... -> Seal -> [Schedule ->] Execute(release).
@@ -83,6 +93,15 @@ class Transaction {
   void SetShardEntryHook(ShardEntryHook hook, void* ctx) noexcept {
     entry_hook_ = hook;
     entry_hook_ctx_ = ctx;
+  }
+
+  // Installs (or clears, with nullptr) the per-shard pre-callback validator.
+  // Callers that run several Execute hops should clear the validator before
+  // non-mutating finish/publish hops so a fence landing after the last
+  // mutation cannot turn an already-committed transaction into an error.
+  void SetShardValidator(ShardValidator validator, void* ctx) noexcept {
+    validator_ = validator;
+    validator_ctx_ = ctx;
   }
 
   // Multi-shard only; no-op for single-shard transactions.
@@ -157,6 +176,8 @@ class Transaction {
   void* cb_ctx_ = nullptr;
   ShardEntryHook entry_hook_ = nullptr;
   void* entry_hook_ctx_ = nullptr;
+  ShardValidator validator_ = nullptr;
+  void* validator_ctx_ = nullptr;
   absl::InlinedVector<TxKey, 4> keys_;
   absl::InlinedVector<std::uint16_t, 4> owners_;
   absl::InlinedVector<KeyRef, 4> lock_refs_;

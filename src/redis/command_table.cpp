@@ -350,7 +350,10 @@ constexpr CommandSpec kCommandTable[] = {
     {"role", CommandKind::kRole, 1, 1, 0, 0, 1, kCmdNoKeys | kCmdReadOnly},
     {"wait", CommandKind::kWait, 3, 3, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdMayBlock},
-    {"cluster", CommandKind::kCluster, 2, 3, 0, 0, 1,
+    // Max arity stays open: per-subcommand argument counts are validated by
+    // the handler (src/redis/cluster_command.cpp) so errors carry Redis's
+    // subcommand syntax text instead of the generic arity error.
+    {"cluster", CommandKind::kCluster, 2, 0, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},
     {"command", CommandKind::kCommand, 1, 0, 0, 0, 1,
      kCmdNoKeys | kCmdReadOnly | kCmdGlobal},

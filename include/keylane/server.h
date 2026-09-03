@@ -80,6 +80,15 @@ struct ServerOptions {
   std::uint32_t defrag_record_sleep_us_ = 0;
   bool defrag_paused_ = false;
   std::optional<ReplicaOfConfig> replicaof_;
+  // Redis Cluster data plane. All startup-only.
+  bool cluster_enabled_ = false;
+  // nodes.conf-format static topology shared by every node in the cluster.
+  std::string cluster_static_nodes_file_;
+  // Advertised client endpoints. 0 port = follow port_ / tls_port_; an empty
+  // announce ip keeps the wildcard-bind startup-node convention for self.
+  std::string cluster_announce_ip_;
+  std::uint16_t cluster_announce_port_ = 0;
+  std::uint16_t cluster_announce_tls_port_ = 0;
   // Explicit Redis PSYNC compatibility alias. It may name a standalone Redis
   // server or the first master of a Redis Cluster.
   std::optional<ReplicaOfConfig> redis_replicaof_;

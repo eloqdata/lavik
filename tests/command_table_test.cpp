@@ -1079,3 +1079,18 @@ TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
   EXPECT_FALSE(spans({"fcall", "fn", "2", same_a, same_b}));
   EXPECT_TRUE(spans({"fcall", "fn", "2", same_a, cross}));
 }
+
+TEST(CommandTableTest, ClusterArityLeavesSubcommandChecksToTheHandler) {
+  // CLUSTER's table arity is {2, 0}: the upper bound stays open so
+  // per-subcommand argument validation in cluster_command.cpp can produce
+  // Redis's unknown-subcommand error text instead of the generic arity error.
+  const CommandSpec* spec = FindCommand("cluster");
+  ASSERT_NE(spec, nullptr);
+  EXPECT_EQ(spec->kind_, CommandKind::kCluster);
+  EXPECT_EQ(spec->min_args_, 2);
+  EXPECT_EQ(spec->max_args_, 0);
+  CheckArity("cluster", 1, false);
+  CheckArity("cluster", 2, true);
+  CheckArity("cluster", 3, true);
+  CheckArity("cluster", 6, true);
+}

@@ -146,6 +146,29 @@ std::string EncodeBulkString(std::string_view value);
 std::string EncodeNullBulkString();
 std::string EncodeInteger(long long value);
 std::string EncodeError(std::string_view message);
+
+// Redis Cluster wire errors. The texts are verbatim Redis 7.2:
+// cluster clients dispatch on the first token (MOVED/CROSSSLOT/CLUSTERDOWN/
+// TRYAGAIN), and MOVED carries the slot plus the owning node's concrete
+// "host:port". The TLS-vs-plain port choice belongs to the caller, which knows
+// the requesting connection's TLS state (mirroring Redis getNodeClientPort).
+std::string ClusterMovedMessage(std::uint16_t slot, std::string_view host,
+                                std::uint16_t port);
+inline constexpr std::string_view kClusterCrossSlotMessage =
+    "CROSSSLOT Keys in request don't hash to the same slot";
+// Redis's CLUSTERDOWN has several message variants; v1 has no global
+// cluster-down state, so only the per-slot coverage-gap form is emitted
+// (Redis's CLUSTER_DOWN_UNBOUND).
+inline constexpr std::string_view kClusterDownUnboundMessage =
+    "CLUSTERDOWN Hash slot not served";
+std::string ClusterTryAgainMessage(std::string_view message);
+
+std::string_view AppendMovedError(ReplyBuilder& builder, std::uint16_t slot,
+                                  std::string_view host, std::uint16_t port);
+std::string_view AppendCrossSlotError(ReplyBuilder& builder);
+std::string_view AppendClusterDownUnboundError(ReplyBuilder& builder);
+std::string_view AppendTryAgainError(ReplyBuilder& builder,
+                                     std::string_view message);
 std::string_view EncodeScanReply(ReplyBuilder& builder, std::uint64_t cursor,
                                  const std::vector<std::string>& keys);
 std::string EncodeScanReply(std::uint64_t cursor,

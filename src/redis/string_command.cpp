@@ -12,6 +12,7 @@
 
 #include "absl/strings/str_cat.h"
 #include "celer/runtime/cross_core.h"
+#include "cluster_gate.h"
 #include "keylane/expiration.h"
 #include "keylane/memory.h"
 #include "keylane/redis_parse.h"
@@ -1401,6 +1402,11 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kShared);
   }
   transaction.Seal();
+  // Cluster owner-side re-check: BITOP always writes its
+  // destination; the validator fires before the mutating shard callback on
+  // every hop (single-shard combined callback, or the multi-shard write hop).
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return Built(
@@ -1437,6 +1443,18 @@ celer::Task<CommandReply> ExecuteBitOpCommand(const CommandRequest& request,
     }
   }
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      // Read hops mutate nothing; the single-shard callback and the
+      // multi-shard write hop are both gated before any write. Multi-shard
+      // releases after a read-hop trip still free their holds via the
+      // transaction epilogue.
+      if (!transaction.single_shard() && !transaction.releasing()) {
+        (void)co_await transaction.Release();
+      }
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_,
+                                             reply_builder);
+    }
     co_return Built(reply_builder.AppendRaw(StorageError(status)));
   }
   replication.Commit();

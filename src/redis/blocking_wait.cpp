@@ -23,7 +23,10 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "keylane/cluster/authority.h"
+#include "keylane/cluster/runtime.h"
 #include "keylane/metrics.h"
+#include "keylane/resp.h"
 #include "keylane/storage/engine.h"
 
 namespace keylane {
@@ -43,8 +46,7 @@ Task<absl::Status> DrainBlockingWakeCascade(BlockingWakeCascade& cascade) {
   co_return absl::OkStatus();
 }
 
-BlockingNotificationCapture::BlockingNotificationCapture(
-    unsigned worker_count)
+BlockingNotificationCapture::BlockingNotificationCapture(unsigned worker_count)
     : per_worker_(worker_count) {}
 
 void BlockingNotificationCapture::Record(std::uint8_t db_id, std::string key,
@@ -55,8 +57,7 @@ void BlockingNotificationCapture::Record(std::uint8_t db_id, std::string key,
       CapturedBlockingNotification{db_id, std::move(key), value_type});
 }
 
-std::vector<CapturedBlockingNotification>
-BlockingNotificationCapture::Take() {
+std::vector<CapturedBlockingNotification> BlockingNotificationCapture::Take() {
   std::size_t count = 0;
   for (const auto& slot : per_worker_) count += slot.size();
 
@@ -441,15 +442,14 @@ BlockingWaitRegistry& LocalBlockingWaiters() {
 
 absl::flat_hash_map<std::uint64_t, std::weak_ptr<BlockingWaiter>>&
 LocalBlockedClients() {
-  static thread_local absl::flat_hash_map<
-      std::uint64_t, std::weak_ptr<BlockingWaiter>>
+  static thread_local absl::flat_hash_map<std::uint64_t,
+                                          std::weak_ptr<BlockingWaiter>>
       clients;
   return clients;
 }
 
-void RegisterBlockedClient(
-    std::uint64_t client_id,
-    const std::shared_ptr<BlockingWaiter>& waiter) {
+void RegisterBlockedClient(std::uint64_t client_id,
+                           const std::shared_ptr<BlockingWaiter>& waiter) {
   if (client_id == 0) return;
   LocalBlockedClients()[client_id] = waiter;
   SetClientBlocked(client_id, true);
@@ -496,6 +496,70 @@ Task<absl::Status> TimeoutBlockingWaiter(
 
 unsigned ShardForKey(std::string_view key) {
   return g_storage->OwnerForKey(key);
+}
+
+// Re-admission for blocking commands. A blocking command was
+// admitted at dispatch time, but a topology reload may have fenced its slot
+// while it waited; every attempt re-runs the admission gate against the
+// current ServingState before touching storage. Every user of
+// ExecuteBlockingWaitLoop is a write (blocking pops and moves), so the view
+// is evaluated as a write. Returns the standard wire error to terminate the
+// wait with, or std::nullopt when the attempt may proceed.
+std::optional<CommandReply> ClusterBlockingAdmissionError(
+    std::span<const std::uint16_t> slots) {
+  if (slots.empty()) return std::nullopt;
+  cluster::ClusterRuntime* runtime = cluster::GetClusterRuntime();
+  // A slightly stale cached snapshot is fine: an attempt admitted under it is
+  // re-gated on the next wakeup, and the final mutation still passes the
+  // owner-side re-check before executing.
+  const std::shared_ptr<const cluster::ServingState> state =
+      cluster::CurrentCachedWithVersion(runtime->topology_cache_).first;
+  const cluster::RequestView view{
+      .slots_ = slots,
+      .is_write_ = true,
+      .connection_readonly_ = false,
+      .loading_allowed_ = false,
+  };
+  const cluster::Decision decision = cluster::Admit(state.get(), view);
+  std::string message;
+  switch (decision.kind_) {
+    case cluster::Decision::Kind::kServe:
+    case cluster::Decision::Kind::kServeStaleRead:
+      return std::nullopt;
+    case cluster::Decision::Kind::kMoved:
+      // The wait loop has no access to the connection's TLS state; prefer the
+      // plain port, falling back to the TLS port when the target offers no
+      // plain endpoint.
+      message = ClusterMovedMessage(decision.moved_slot_, decision.moved_host_,
+                                    decision.moved_port_ != 0
+                                        ? decision.moved_port_
+                                        : decision.moved_tls_port_);
+      break;
+    case cluster::Decision::Kind::kCrossSlot:
+      message = std::string(kClusterCrossSlotMessage);
+      break;
+    case cluster::Decision::Kind::kClusterDownUnbound:
+      message = std::string(kClusterDownUnboundMessage);
+      break;
+    case cluster::Decision::Kind::kLoading:
+      message = "LOADING Redis is loading the dataset in memory";
+      break;
+    case cluster::Decision::Kind::kCloseConnection: {
+      CommandReply reply;
+      reply.close_connection_ = true;
+      return reply;
+    }
+  }
+  // CommandReply borrows its encoding; park the bytes in a shared string kept
+  // alive by the immediately-draining chunk source so the reply stays valid
+  // until the connection's write loop has consumed it.
+  CommandReply reply;
+  auto encoded = std::make_shared<std::string>(EncodeError(message));
+  reply.encoded_ = *encoded;
+  reply.chunks_ = [encoded]() -> Task<absl::StatusOr<std::string>> {
+    co_return std::string();
+  };
+  return reply;
 }
 
 struct WaiterCleanup {
@@ -755,6 +819,19 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
   };
 
   std::unique_ptr<BlockingWaitHandle> waiter;
+  // Blocking waits outlive the admission that accepted them. The
+  // slot set is a pure function of the wait keys, so it is computed once and
+  // re-admitted against the current ServingState on every attempt.
+  std::vector<std::uint16_t> cluster_slots;
+  if (cluster::ClusterEnabled()) {
+    for (const BlockingWaitSpec& spec : specs) {
+      const std::uint16_t slot = storage::RedisSlot(spec.key_);
+      if (std::find(cluster_slots.begin(), cluster_slots.end(), slot) ==
+          cluster_slots.end()) {
+        cluster_slots.push_back(slot);
+      }
+    }
+  }
   for (;;) {
     BlockingWakeCascade* attempt_cascade = nullptr;
     if (waiter) {
@@ -793,6 +870,12 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     if (!CommandWriteAdmissionIsCurrent(request)) {
       co_return status_reply(
           absl::AbortedError("replication role changed; retry command"));
+    }
+
+    if (std::optional<CommandReply> fenced =
+            ClusterBlockingAdmissionError(cluster_slots);
+        fenced.has_value()) {
+      co_return std::move(*fenced);
     }
 
     BlockingAttemptResult result = co_await attempt(attempt_cascade);
@@ -846,10 +929,8 @@ BlockingDeadlineFromSeconds(double timeout_seconds) {
       nanoseconds > static_cast<long double>(maximum.count())) {
     return absl::InvalidArgumentError("timeout is out of range");
   }
-  return now +
-         std::chrono::nanoseconds(static_cast<std::int64_t>(nanoseconds));
+  return now + std::chrono::nanoseconds(static_cast<std::int64_t>(nanoseconds));
 }
-
 
 void InitBlockingWaitStorage(storage::StorageEngine* engine) {
   g_storage = engine;
@@ -868,8 +949,7 @@ void NotifyListBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kList);
     return;
   }
-  NotifyListBlockingKey(request.db_id_, key,
-                        request.blocking_wake_cascade_);
+  NotifyListBlockingKey(request.db_id_, key, request.blocking_wake_cascade_);
 }
 
 void NotifyZSetBlockingKey(std::uint8_t db_id, std::string_view key,
@@ -885,8 +965,7 @@ void NotifyZSetBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kSortedSet);
     return;
   }
-  NotifyZSetBlockingKey(request.db_id_, key,
-                        request.blocking_wake_cascade_);
+  NotifyZSetBlockingKey(request.db_id_, key, request.blocking_wake_cascade_);
 }
 
 void NotifyStreamBlockingKey(std::uint8_t db_id, std::string_view key,
@@ -921,8 +1000,7 @@ void NotifyStreamBlockingKey(const CommandRequest& request,
         request.db_id_, std::string(key), storage::ValueType::kStream);
     return;
   }
-  NotifyStreamBlockingKey(request.db_id_, key,
-                          request.blocking_wake_cascade_);
+  NotifyStreamBlockingKey(request.db_id_, key, request.blocking_wake_cascade_);
 }
 
 Task<absl::Status> FlushBlockingNotifications(
@@ -954,9 +1032,8 @@ Task<absl::Status> FlushBlockingNotifications(
     const std::uint8_t db_id = notifications[begin].db_id_;
     const std::string& key = notifications[begin].key_;
     const storage::ExpirationInfo info = co_await celer::SubmitTaskTo(
-        ShardForKey(key), [db_id, key] {
-          return g_storage->GetExpiration(db_id, key);
-        });
+        ShardForKey(key),
+        [db_id, key] { return g_storage->GetExpiration(db_id, key); });
     if (info.exists_) {
       const auto matching = std::find_if(
           notifications.begin() + static_cast<std::ptrdiff_t>(begin),
@@ -989,6 +1066,5 @@ Task<absl::Status> NotifyBlockingDb(std::uint8_t db_id) {
   }
   co_return absl::OkStatus();
 }
-
 
 }  // namespace keylane

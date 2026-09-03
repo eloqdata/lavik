@@ -101,14 +101,29 @@ used by graceful shutdown.
 3. `DispatchCommand` handles connection-level transaction and client state,
    attaches the connection's reply version, then records command metrics and
    eligible slow-log entries around the dispatch result.
-4. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
+4. `DispatchCommandImpl` runs the readiness and ownership admission gates.
+   The standalone LOADING gate rejects non-whitelisted commands while a
+   replica syncs from its upstream; it is inert in cluster mode, which has no
+   upstream. When cluster mode is enabled, the cluster admission gate runs
+   next, deciding from the committed `cluster::ServingState` whether to serve
+   locally, serve a stale replica read, redirect with MOVED, or refuse with
+   CROSSSLOT, CLUSTERDOWN, or LOADING. It replaces the standalone
+   replica-MOVED shim — the two topology sources are mutually exclusive — and
+   it also runs at `MULTI` queue time so a rejected command aborts the queued
+   transaction. An admitted request carries its key slots and the snapshot it
+   was admitted against into execution for the owner-side authority re-check.
+5. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
    capacity for source writes before database/key work. Eligible single-key
    writes are moved directly to their owner so admission and mutation share the
    owner-local fast path.
-5. `ExecuteCommandBody` enforces replica write policy and memory admission,
+6. `ExecuteCommandBody` enforces replica write policy and memory admission,
    manages database and replication gates, then calls the relevant local,
-   storage, transaction, blocking, RDB, or administrative handler.
-6. The service writes a normal encoded reply, a direct storage-backed value, or
+   storage, transaction, blocking, RDB, or administrative handler. In cluster
+   mode, admitted writes re-check their authority against the current
+   `ServingState` after these suspending admissions and before the handler
+   runs; transactional writes re-check per shard through a validator hook on
+   `tx::Transaction` instead.
+7. The service writes a normal encoded reply, a direct storage-backed value, or
    bounded chunks. Small pipeline replies are coalesced up to 64 KiB.
 
 ## Command metadata and routing
@@ -126,6 +141,14 @@ owner can execute locally or through one Celer cross-worker submission.
 Commands needing atomic access to several keys build a `tx::Transaction` and
 execute one or more shard callbacks. Global commands explicitly collect from or
 coordinate all workers.
+
+When cluster mode is enabled, the same hash slot is also a node-level routing
+decision made before any worker routing: every key of a request must hash to
+one slot (hashtags keep multi-key commands usable), that slot must belong to a
+granted local group, and anything else is redirected to the owning node or
+refused. Multi-key commands, `MULTI`/`EXEC` unions, and Lua declared keys all
+obey the single-slot constraint. The worker mapping inside the owning node is
+unchanged. See [Cluster data plane](06-cluster-data-plane.md).
 
 MGET acquires all requested keys in one shared-lock transaction and preserves
 their argument positions in the assembled reply. Each participating shard
@@ -316,6 +339,7 @@ real server executable.
 | Command request/reply contracts, dispatch, replay, and gate interfaces | `include/keylane/command.h` |
 | Static command classification and key extraction | `include/keylane/command_table.h`, `src/redis/command_table.cpp` |
 | Admission, role checks, database/replication gates, transaction integration, routing, and replay | `src/redis/command.cpp` |
+| Cluster admission gate, CLUSTER subcommands, and discovery replies | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp` |
 | Type-family command handlers | `src/redis/string_command.cpp`, `src/redis/list_command.cpp`, `src/redis/hash_command.cpp`, `src/redis/set_command.cpp`, `src/redis/zset_command.cpp`, `src/redis/stream_command.cpp`, `src/redis/sort_command.cpp` |
 | Blocking waiter ownership and wakeups | `src/redis/blocking_wait.h`, `src/redis/blocking_wait.cpp` |
 | Worker-local Lua VM, script cache, Function runtime staging, invocation state, and command re-entry | `src/redis/lua_eval.h`, `src/redis/lua_eval.cpp`, `src/redis/command.cpp` |

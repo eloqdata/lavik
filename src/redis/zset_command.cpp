@@ -19,6 +19,7 @@
 #include "blocking_wait.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "cluster_gate.h"
 #include "keylane/command_table.h"
 #include "keylane/glob.h"
 #include "keylane/memory.h"
@@ -660,6 +661,10 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
         static_cast<std::uint32_t>(argument), tx::LockMode::kExclusive);
   }
   transaction.Seal();
+  // Cluster owner-side re-check: pops mutate, so the validator
+  // gates the single-shard pop callback and the multi-shard hold hop.
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(transaction, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return Built(StorageError(builder, replication.status()));
@@ -675,7 +680,13 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     };
     status =
         co_await transaction.Execute(&SingleShardPopCallback, &context, true);
-    if (!status.ok()) co_return Built(StorageError(builder, status));
+    if (!status.ok()) {
+      if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+        co_return ClusterValidatorFailureReply(
+            transaction, cluster_validator, request.connection_tls_, builder);
+      }
+      co_return Built(StorageError(builder, status));
+    }
     if (context.popped_.empty()) {
       if (empty != nullptr) *empty = true;
       co_return Built(builder.AppendNullArray());
@@ -689,7 +700,21 @@ Task<CommandReply> ExecuteZSetMultiPopAttempt(const CommandRequest& request,
     co_return Built(builder.View());
   }
   status = co_await transaction.Execute(&ZSetHoldCallback, nullptr, false);
-  if (!status.ok()) co_return Built(StorageError(builder, status));
+  if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      // The hold hop retains its locks on failure; drop them before
+      // answering. Nothing mutated: the callback never ran.
+      (void)co_await transaction.Release();
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_, builder);
+    }
+    co_return Built(StorageError(builder, status));
+  }
+  // The mutations below run in bare SubmitTaskTo hops the transaction hook
+  // cannot see; the hook's job here was to gate entry into the mutation
+  // phase. Clear it so the settle hops cannot be fenced off retroactively.
+  // (Unreachable in cluster mode: admission allows one slot, hence one shard.)
+  transaction.SetShardValidator(nullptr, nullptr);
 
   for (std::size_t argument : shape.key_args_) {
     const std::string& key = request.args_[argument];
@@ -2657,6 +2682,13 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
                        tx::LockMode::kShared);
   }
   transaction.Seal();
+  // Cluster owner-side re-check: only STORE forms mutate.
+  // Single-shard stores write inside the read callback hop; multi-shard
+  // stores validate again before the write hop and clear before the settle.
+  ClusterShardValidatorContext cluster_validator;
+  if (context.store_) {
+    InstallClusterShardValidator(transaction, request, cluster_validator);
+  }
   ReplicationTransactionGuard replication(request, &transaction);
   if (!replication.status().ok()) {
     co_return Built(StorageError(builder, replication.status()));
@@ -2681,11 +2713,22 @@ Task<CommandReply> ExecuteZSetMultiKey(const CommandRequest& request,
     if (status.ok())
       status = co_await transaction.Execute(&MultiWriteShard, &context, false);
     context.rollback_ = !status.ok();
+    // The finish hop settles (or rolls back) what the write hop did; it must
+    // not be fenced off by an authority change the write hop already beat.
+    transaction.SetShardValidator(nullptr, nullptr);
     absl::Status finished =
         co_await transaction.Execute(&MultiFinishShard, &context, true);
     if (status.ok() && !finished.ok()) status = finished;
   }
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      if (context.store_ && !context.single_shard_ &&
+          !transaction.releasing()) {
+        (void)co_await transaction.Release();
+      }
+      co_return ClusterValidatorFailureReply(transaction, cluster_validator,
+                                             request.connection_tls_, builder);
+    }
     if (context.store_ && !context.single_shard_ && !transaction.releasing())
       (void)co_await transaction.Release();
     co_return Built(StorageError(builder, status));
