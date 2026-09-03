@@ -660,8 +660,26 @@ void StorageEngine::Impl::ApplyRecovery(unsigned target, RecoveryBatch batch) {
 
 void StorageEngine::Impl::ApplyRecoveredRecord(
     WorkerStore& store, const RecoveryRecord& recovered) {
+  auto& partition = PartitionForKey(store, recovered.key_);
+  const RecoveryRecordView view{
+      .digest_ = recovered.digest_,
+      .key_ = recovered.key_,
+      .db_id_ = recovered.db_id_,
+      .txid_ = recovered.txid_,
+      .lsn_ = recovered.lsn_,
+      .replication_epoch_ = recovered.replication_epoch_,
+      .location_ = recovered.location_,
+      .extents_ = &recovered.extents_,
+      .checkpoint_snapshot_ = recovered.checkpoint_snapshot_,
+  };
+  ApplyRecoveredRecord(store, partition, view);
+}
+
+void StorageEngine::Impl::ApplyRecoveredRecord(
+    WorkerStore& store, WorkerStore::PartitionStore& partition,
+    const RecoveryRecordView& recovered) {
+  assert(recovered.extents_ != nullptr);
   {
-    auto& partition = PartitionForKey(store, recovered.key_);
     if (recovered.replication_epoch_ != partition.replication_epoch_) {
       return;
     }
@@ -744,7 +762,7 @@ void StorageEngine::Impl::ApplyRecoveredRecord(
       }
       if (winner.external()) {
         store.external_manifests_.insert_or_assign(winner_entry,
-                                                   recovered.extents_);
+                                                   *recovered.extents_);
       } else if (found != nullptr || !recovered.checkpoint_snapshot_) {
         store.external_manifests_.erase(winner_entry);
       }

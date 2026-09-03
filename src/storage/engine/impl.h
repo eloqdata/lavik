@@ -878,6 +878,22 @@ struct RecoveryRecord {
   bool checkpoint_snapshot_ = false;
 };
 
+// Non-owning counterpart used while a validated checkpoint buffer remains
+// pinned. The caller owns both key bytes and the manifest for the duration of
+// ApplyRecoveredRecord; the final index and manifest map take the copies they
+// need before the I/O buffer can be reused.
+struct RecoveryRecordView {
+  Digest digest_{};
+  std::string_view key_;
+  std::uint8_t db_id_ = 0;
+  std::uint64_t txid_ = 0;
+  std::uint64_t lsn_ = 0;
+  std::uint64_t replication_epoch_ = 1;
+  RecordLocation location_{};
+  const ExtentManifest* extents_ = nullptr;
+  bool checkpoint_snapshot_ = false;
+};
+
 struct RecoveryBlock {
   ActiveBlock block_{};
 };
@@ -2920,6 +2936,9 @@ class StorageEngine::Impl {
   void ApplyRecovery(unsigned target, RecoveryBatch batch);
 
   void ApplyRecoveredRecord(WorkerStore& store, const RecoveryRecord& record);
+  void ApplyRecoveredRecord(WorkerStore& store,
+                            WorkerStore::PartitionStore& partition,
+                            const RecoveryRecordView& record);
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {

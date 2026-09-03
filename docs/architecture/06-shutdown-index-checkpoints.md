@@ -165,13 +165,17 @@ shard owner a qpair for the block's controller; otherwise the checkpoint falls
 back instead of silently restoring the old cross-worker path. Each owner
 double-buffers checkpoint reads: after a block completes I/O it submits the
 next block before decoding and installing the current one. I/O, decoding, and
-index construction therefore proceed concurrently across owners. An owner
-holds at most two 8 MiB buffers and one decoded batch, so temporary entry
-memory remains bounded by worker count rather than dataset size. Barriers
-reduce the per-scanner block, index-entry, accounting-entry, capacity, and
-shard results. Block and index-entry totals must exactly match the root, every
-worker must have all three chunk kinds represented, and each installed index
-size must equal its capacity declaration.
+index construction therefore proceed concurrently across owners. An index
+chunk is scanned once for complete structural validation and again for
+installation. The installation pass references key bytes directly in the
+pinned I/O buffer and copies them only into their final index nodes; it does
+not materialize an owning decoded batch. An owner therefore holds at most two
+8 MiB buffers plus final index state, so temporary entry memory remains bounded
+by worker count rather than key count. Barriers reduce the per-scanner block,
+index-entry, accounting-entry, capacity, and shard results. Block and
+index-entry totals must exactly match the root, every worker must have all
+three chunk kinds represented, and each installed index size must equal its
+capacity declaration.
 The published total block count makes a missing chunk detectable without
 adding another root field. If a block or the final completeness check fails,
 startup

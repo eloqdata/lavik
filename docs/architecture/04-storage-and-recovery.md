@@ -199,11 +199,14 @@ used to allocate each owner-local index's final power-of-two bucket table.
 Only after every owner has finished that allocation do scanners double-buffer
 the index and accounting bodies. The prefix directory redistributes those
 blocks to their durable shard first, so the index owner performs both body I/O
-and installation without a cross-worker decoded batch. io_uring owners can
-open every configured path; under SPDK the unchanged worker topology must also
-give the shard owner a qpair for the block's controller. This removes both
-incremental index rehashing and cross-worker installation from checkpoint
-recovery while retaining worker-bounded temporary I/O memory. Barriers reduce
+and installation without a cross-worker decoded batch. A validated body is
+installed directly from its pinned I/O buffer, so key bytes have no
+intermediate owning copy before the final index node. io_uring owners can open
+every configured path; under SPDK the unchanged worker topology must also give
+the shard owner a qpair for the block's controller. This removes incremental
+index rehashing, cross-worker installation, and decoded entry batches from
+checkpoint recovery while retaining worker-bounded temporary I/O memory.
+Barriers reduce
 per-worker block, entry, capacity, and shard totals and verify each loaded
 index against its declared size. The root's expected counts make missing
 bitmap bits disable the fast path; stale bits are ignored unless their block
