@@ -188,7 +188,7 @@ and promotion capture share its guard. Startup restores and validates the
 durable catalog before Redis readiness when one exists; a fresh set starts
 with the canonical empty catalog without allocating a durable root. Full
 ownership, persistence, replay, and failure behavior are described in the
-[Function catalog](06-function-catalog.md) document.
+[Function catalog](07-function-catalog.md) document.
 
 `EVAL`, `EVALSHA`, their `_RO` variants, `FCALL`, and `FCALL_RO` derive their
 key set from `numkeys`. The command layer acquires those declared keys through

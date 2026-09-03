@@ -12,7 +12,7 @@ references rather than current architecture.
 |---|---|---|
 | System composition | Process lifecycle, runtime dependency, cross-cutting flows, and integrations | [System overview](01-overview.md) |
 | Request and Redis serving | TCP/TLS sessions, RESP2/RESP3 negotiation, command dispatch, connection state, Lua/Functions, Pub/Sub, replies, and command handlers | [Request and Redis serving](02-request-serving.md) |
-| Function catalog | Process-global Function ownership, hidden staging, crash-durable catalog commits, startup recovery, and replication integration | [Function catalog](06-function-catalog.md) |
+| Function catalog | Process-global Function ownership, hidden staging, crash-durable catalog commits, startup recovery, and replication integration | [Function catalog](07-function-catalog.md) |
 | Transaction coordination | Per-worker intent arbitration, cross-worker scheduling, multi-hop execution, WATCH, and transaction completion | [Transaction coordination](03-transaction-coordination.md) |
 | Storage and recovery | Logical indexes, append/read paths, durable format, devices, recovery, shutdown checkpoints, flushing, expiry, and reclamation | [Storage and recovery](04-storage-and-recovery.md), [Shutdown index checkpoints](06-shutdown-index-checkpoints.md) |
 | Replication | Native Keylane replication, Redis PSYNC interoperability, full sync, online logs, Sentinel-managed role changes, and replay | [Replication](05-replication.md) |
