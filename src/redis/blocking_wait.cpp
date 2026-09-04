@@ -558,9 +558,10 @@ std::optional<CommandReply> ClusterBlockingAdmissionError(
   CommandReply reply;
   auto encoded = std::make_shared<std::string>(EncodeError(message));
   reply.encoded_ = *encoded;
-  reply.chunks_ = [encoded]() -> Task<absl::StatusOr<std::string>> {
-    co_return std::string();
-  };
+  reply.chunks_ = std::make_unique<ReplyChunkSource>(
+      [encoded]() -> Task<absl::StatusOr<std::string>> {
+        co_return std::string();
+      });
   return reply;
 }
 

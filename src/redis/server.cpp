@@ -1572,8 +1572,8 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
   ReplyBuilder builder(ctx.resp_version());
   auto enqueue_command_reply = [&](CommandReply reply) -> Task<absl::Status> {
-    if (reply.disk_value_.has_value()) {
-      const auto bytes = reply.disk_value_->network_bytes();
+    if (reply.disk_value_.valid()) {
+      const auto bytes = reply.disk_value_.network_bytes();
       EnqueuePubSubReply(
           session, std::string(reinterpret_cast<const char*>(bytes.data()),
                                bytes.size()));
@@ -1583,7 +1583,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       EnqueuePubSubReply(session, std::string(reply.encoded_));
     }
     while (reply.chunks_) {
-      auto chunk = co_await reply.chunks_();
+      auto chunk = co_await (*reply.chunks_)();
       if (!chunk.ok()) co_return chunk.status();
       if (chunk->empty()) break;
       EnqueuePubSubReply(session, std::move(*chunk));
@@ -2034,7 +2034,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     absl::Status write_status;
-    if (reply.disk_value_.has_value()) {
+    if (reply.disk_value_.valid()) {
       write_status = co_await FlushReplyBatch(stream, &pending_replies);
       if (write_status.ok()) {
         if (reply.read_trace_.request_start_ns_ != 0) {
@@ -2044,7 +2044,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           reply.set_trace_.send_start_ns_ = SetTraceNowNanos();
         }
         write_status =
-            co_await stream.WriteAll(reply.disk_value_->network_bytes());
+            co_await stream.WriteAll(reply.disk_value_.network_bytes());
       }
     } else if (reply.chunks_) {
       write_status = co_await FlushReplyBatch(stream, &pending_replies);
@@ -2072,7 +2072,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       if (stall) {
         stall->last_progress_ = std::chrono::steady_clock::now();
       }
-      auto chunk = co_await reply.chunks_();
+      auto chunk = co_await (*reply.chunks_)();
       if (!chunk.ok()) {
         co_return chunk.status();
       }

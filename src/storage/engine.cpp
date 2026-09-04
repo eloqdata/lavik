@@ -490,8 +490,10 @@ void StorageEngine::SetReplicaLoading(bool loading) noexcept {
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Get(std::uint8_t db_id,
                                                    std::string_view key,
-                                                   ReadLatencyTrace* trace) {
-  return impl_->Get(db_id, key, trace);
+                                                   ReadLatencyTrace* trace,
+                                                   std::optional<std::uint16_t>
+                                                       routed_partition_id) {
+  return impl_->Get(db_id, key, trace, routed_partition_id);
 }
 
 Task<absl::StatusOr<std::uint64_t>> StorageEngine::StringLength(

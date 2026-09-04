@@ -34,21 +34,16 @@ ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
                                  std::size_t headroom_bytes,
                                  std::size_t tailroom_bytes) noexcept
     : pool_(pool),
+      data_(buffer.data_),
+      size_(static_cast<std::uint32_t>(buffer.size_)),
+      headroom_bytes_(static_cast<std::uint32_t>(headroom_bytes)),
+      tailroom_bytes_(static_cast<std::uint32_t>(tailroom_bytes)),
       owner_worker_(owner_worker),
-      buffer_(buffer),
-      headroom_bytes_(headroom_bytes),
-      tailroom_bytes_(tailroom_bytes) {}
-
-ReadBufferLease::ReadBufferLease(unsigned owner_worker,
-                                 celer::FixedBuffer buffer,
-                                 std::size_t headroom_bytes,
-                                 std::size_t tailroom_bytes,
-                                 std::size_t heap_alignment) noexcept
-    : owner_worker_(owner_worker),
-      buffer_(buffer),
-      headroom_bytes_(headroom_bytes),
-      tailroom_bytes_(tailroom_bytes),
-      heap_alignment_(heap_alignment) {}
+      buffer_id_(buffer.index_) {
+  assert(buffer.size_ <= std::numeric_limits<std::uint32_t>::max());
+  assert(headroom_bytes <= std::numeric_limits<std::uint32_t>::max());
+  assert(tailroom_bytes <= std::numeric_limits<std::uint32_t>::max());
+}
 
 ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
                                  unsigned owner_worker,
@@ -57,38 +52,40 @@ ReadBufferLease::ReadBufferLease(RegisteredBufferPool* pool,
                                  std::size_t tailroom_bytes,
                                  std::size_t overflow_id) noexcept
     : pool_(pool),
+      data_(buffer.data_),
+      size_(static_cast<std::uint32_t>(buffer.size_)),
+      headroom_bytes_(static_cast<std::uint32_t>(headroom_bytes)),
+      tailroom_bytes_(static_cast<std::uint32_t>(tailroom_bytes)),
+      release_id_(static_cast<std::uint32_t>(overflow_id)),
       owner_worker_(owner_worker),
-      buffer_(buffer),
-      headroom_bytes_(headroom_bytes),
-      tailroom_bytes_(tailroom_bytes),
-      overflow_id_(overflow_id) {}
+      buffer_id_(buffer.index_) {
+  assert(buffer.size_ <= std::numeric_limits<std::uint32_t>::max());
+  assert(headroom_bytes <= std::numeric_limits<std::uint32_t>::max());
+  assert(tailroom_bytes <= std::numeric_limits<std::uint32_t>::max());
+  assert(overflow_id <= std::numeric_limits<std::uint32_t>::max());
+}
 
 ReadBufferLease::ReadBufferLease(ReadBufferLease&& other) noexcept
     : pool_(std::exchange(other.pool_, nullptr)),
-      owner_worker_(other.owner_worker_),
-      buffer_(other.buffer_),
+      data_(std::exchange(other.data_, nullptr)),
+      size_(other.size_),
       headroom_bytes_(other.headroom_bytes_),
       tailroom_bytes_(other.tailroom_bytes_),
-      heap_alignment_(other.heap_alignment_),
-      overflow_id_(other.overflow_id_) {
-  other.buffer_ = {};
-  other.heap_alignment_ = 0;
-  other.overflow_id_ = 0;
-}
+      release_id_(std::exchange(other.release_id_, 0)),
+      owner_worker_(other.owner_worker_),
+      buffer_id_(other.buffer_id_) {}
 
 ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
   if (this != &other) {
     Reset();
     pool_ = std::exchange(other.pool_, nullptr);
+    data_ = std::exchange(other.data_, nullptr);
+    size_ = other.size_;
     owner_worker_ = other.owner_worker_;
-    buffer_ = other.buffer_;
     headroom_bytes_ = other.headroom_bytes_;
     tailroom_bytes_ = other.tailroom_bytes_;
-    heap_alignment_ = other.heap_alignment_;
-    overflow_id_ = other.overflow_id_;
-    other.buffer_ = {};
-    other.heap_alignment_ = 0;
-    other.overflow_id_ = 0;
+    release_id_ = std::exchange(other.release_id_, 0);
+    buffer_id_ = other.buffer_id_;
   }
   return *this;
 }
@@ -96,30 +93,29 @@ ReadBufferLease& ReadBufferLease::operator=(ReadBufferLease&& other) noexcept {
 ReadBufferLease::~ReadBufferLease() { Reset(); }
 
 celer::FixedBuffer ReadBufferLease::io_buffer() const noexcept {
-  if (!valid() || buffer_.size_ < headroom_bytes_ + tailroom_bytes_) {
+  if (!valid() || size_ < headroom_bytes_ + tailroom_bytes_) {
     return {};
   }
   return celer::FixedBuffer{
-      .data_ = buffer_.data_ + headroom_bytes_,
-      .size_ = buffer_.size_ - headroom_bytes_ - tailroom_bytes_,
-      .index_ = buffer_.index_,
+      .data_ = data_ + headroom_bytes_,
+      .size_ = size_ - headroom_bytes_ - tailroom_bytes_,
+      .index_ = buffer_id_,
   };
 }
 
 void ReadBufferLease::Reset() noexcept {
   if (pool_ != nullptr) {
     RegisteredBufferPool* pool = std::exchange(pool_, nullptr);
-    if (overflow_id_ != 0) {
-      pool->ReleaseOverflow(overflow_id_);
+    if (release_id_ != 0) {
+      pool->ReleaseOverflow(release_id_);
     } else {
-      pool->Release(buffer_.index_);
+      pool->Release(buffer_id_);
     }
-  } else if (buffer_.data_ != nullptr && heap_alignment_ != 0) {
-    celer::FreeStorageBuffer(buffer_.data_, heap_alignment_);
   }
-  buffer_ = {};
-  heap_alignment_ = 0;
-  overflow_id_ = 0;
+  data_ = nullptr;
+  size_ = 0;
+  release_id_ = 0;
+  buffer_id_ = 0;
 }
 
 RegisteredBufferPool::~RegisteredBufferPool() {
@@ -193,6 +189,16 @@ absl::Status RegisteredBufferPool::Init(
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "registered buffer sizes must be positive");
   }
+  if (options.read_payload_bytes_ >
+          std::numeric_limits<std::uint32_t>::max() ||
+      options.read_headroom_bytes_ >
+          std::numeric_limits<std::uint32_t>::max() ||
+      options.read_tailroom_bytes_ >
+          std::numeric_limits<std::uint32_t>::max()) {
+    return absl::Status(absl::StatusCode::kOutOfRange,
+                        "read buffer dimensions exceed the 32-bit lease "
+                        "representation");
+  }
   if (options.write_buffer_bytes_ > 0 &&
       (std::numeric_limits<std::size_t>::max() / configured_write_count) <
           options.write_buffer_bytes_) {
@@ -211,6 +217,11 @@ absl::Status RegisteredBufferPool::Init(
   const std::size_t read_slot_bytes = options.read_headroom_bytes_ +
                                       options.read_payload_bytes_ +
                                       options.read_tailroom_bytes_;
+  if (read_slot_bytes > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::Status(absl::StatusCode::kOutOfRange,
+                        "read buffer slot exceeds the 32-bit lease "
+                        "representation");
+  }
   const std::size_t registered_write_count = configured_write_count;
   const std::size_t registered_write_bytes =
       registered_write_count * options.write_buffer_bytes_;
@@ -452,6 +463,11 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
   }
   const std::size_t bytes = options_.read_headroom_bytes_ + payload_bytes +
                             options_.read_tailroom_bytes_;
+  if (bytes > std::numeric_limits<std::uint32_t>::max()) {
+    return absl::Status(absl::StatusCode::kOutOfRange,
+                        "overflow read buffer exceeds the 32-bit lease "
+                        "representation");
+  }
   std::size_t best_free = free_overflow_read_buffers_.size();
   std::size_t best_bytes = std::numeric_limits<std::size_t>::max();
   for (std::size_t i = 0; i < free_overflow_read_buffers_.size(); ++i) {
@@ -478,6 +494,12 @@ absl::StatusOr<ReadBufferLease> RegisteredBufferPool::AllocateHeapReadBuffer(
   if (data == nullptr) {
     return absl::Status(absl::StatusCode::kResourceExhausted,
                         "aligned heap read buffer allocation failed");
+  }
+  if (overflow_read_buffers_.size() >=
+      std::numeric_limits<std::uint32_t>::max()) {
+    celer::FreeStorageBuffer(data, options_.alignment_);
+    return absl::Status(absl::StatusCode::kResourceExhausted,
+                        "overflow read buffer id space exhausted");
   }
   overflow_read_buffers_.push_back(
       celer::FixedBuffer{.data_ = data, .size_ = bytes, .index_ = 0});

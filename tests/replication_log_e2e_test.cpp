@@ -206,8 +206,8 @@ class ReplicationLogService final : public celer::Service {
     keylane::CommandReply reply =
         co_await keylane::ExecuteCommand(*request, reply_builder);
     std::string actual(reply.encoded_);
-    if (reply.disk_value_.has_value()) {
-      const auto bytes = reply.disk_value_->network_bytes();
+    if (reply.disk_value_.valid()) {
+      const auto bytes = reply.disk_value_.network_bytes();
       actual.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     }
     if (reply.chunks_ || actual != expected_reply) {

@@ -433,15 +433,28 @@ class DiskValue {
             std::size_t network_size, std::size_t value_offset,
             std::size_t value_size) noexcept
       : lease_(std::move(lease)),
-        network_offset_(network_offset),
-        network_size_(network_size),
-        value_offset_(value_offset),
-        value_size_(value_size) {}
+        network_offset_(static_cast<std::uint32_t>(network_offset)),
+        network_size_(static_cast<std::uint32_t>(network_size)),
+        value_offset_(static_cast<std::uint32_t>(value_offset)),
+        value_size_(static_cast<std::uint32_t>(value_size)) {
+    // A direct string GET is bounded by kMaxRecordPayloadBytes (1 GiB);
+    // narrowing these offsets keeps the move-only result small as it crosses
+    // command coroutine frames without reducing the supported string limit.
+    // Collections span multiple records and never use DiskValue for their
+    // aggregate encoded size.
+    assert(network_offset <= std::numeric_limits<std::uint32_t>::max());
+    assert(network_size <= std::numeric_limits<std::uint32_t>::max());
+    assert(value_offset <= std::numeric_limits<std::uint32_t>::max());
+    assert(value_size <= std::numeric_limits<std::uint32_t>::max());
+  }
 
   DiskValue(const DiskValue&) = delete;
   DiskValue& operator=(const DiskValue&) = delete;
   DiskValue(DiskValue&&) noexcept = default;
   DiskValue& operator=(DiskValue&&) noexcept = default;
+
+  // Whether this object owns a read buffer and can be sent as a direct reply.
+  bool valid() const noexcept { return lease_.valid(); }
 
   std::span<const std::byte> network_bytes() const noexcept {
     auto bytes = lease_.bytes();
@@ -455,11 +468,13 @@ class DiskValue {
 
  private:
   ReadBufferLease lease_;
-  std::size_t network_offset_ = 0;
-  std::size_t network_size_ = 0;
-  std::size_t value_offset_ = 0;
-  std::size_t value_size_ = 0;
+  std::uint32_t network_offset_ = 0;
+  std::uint32_t network_size_ = 0;
+  std::uint32_t value_offset_ = 0;
+  std::uint32_t value_size_ = 0;
 };
+
+static_assert(sizeof(DiskValue) == 56);
 
 // One string lookup in a pre-locked, worker-local batch. BatchGetLocked keeps
 // the storage pipeline inside one coroutine and fans ordinary disk reads into
@@ -1164,9 +1179,12 @@ class StorageEngine {
 
   // These operations must execute on OwnerForKey(key), normally through
   // SubmitTaskTo. Only digest/location metadata is retained after completion.
-  celer::Task<absl::StatusOr<DiskValue>> Get(std::uint8_t db_id,
-                                             std::string_view key,
-                                             ReadLatencyTrace* trace = nullptr);
+  // routed_partition_id reuses a route computed for this exact key before its
+  // owner hop; when present it must equal RedisSlot(key).
+  celer::Task<absl::StatusOr<DiskValue>> Get(
+      std::uint8_t db_id, std::string_view key,
+      ReadLatencyTrace* trace = nullptr,
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
   celer::Task<absl::StatusOr<std::uint64_t>> StringLength(std::uint8_t db_id,
                                                           std::string_view key);
   celer::Task<absl::StatusOr<SetResult>> Set(

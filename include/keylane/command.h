@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -306,39 +307,58 @@ enum class CommandKind {
 
 struct CommandSpec;
 
-struct CommandRequest {
+struct alignas(64) CommandRequest {
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
   // Reply protocol for every nested/cross-core execution path. Replication
   // and internal callers naturally default to RESP2 because their replies are
   // discarded; client dispatch overwrites this from the connection.
   RespVersion resp_version_ = RespVersion::k2;
-  // Set only for commands applied from the replication stream. Such commands
-  // bypass replica read-only checks and must not be published again.
-  bool replication_origin_ = false;
+  // These values share one byte: they are request-local control state, not a
+  // durable or wire representation. Replication-origin commands bypass
+  // replica read-only checks and must not be published again. TLS controls
+  // which advertised port cluster replies select. The slot count needs only
+  // 0, 1, or 2; two distinct slots are already a terminal CROSSSLOT witness.
+  std::uint8_t replication_origin_ : 1 = false;
+  std::uint8_t connection_tls_ : 1 = false;
+  std::uint8_t cluster_slot_sample_count_ : 2 = 0;
+  std::uint8_t write_admission_role_epoch_valid_ : 1 = false;
   // Captured when a client write chooses its source-publication path. A DB
   // gate that reopens under a different role must reject the stale request
-  // before mutation, including when writable replicas are enabled.
-  std::optional<std::uint64_t> write_admission_role_epoch_;
+  // before mutation, including when writable replicas are enabled. Its valid
+  // bit shares the control byte above, retaining every uint64_t epoch value
+  // while avoiding optional<uint64_t>'s extra word.
+  std::uint64_t write_admission_role_epoch_ = 0;
   const CommandSpec* spec_ = nullptr;
-  // Populated after key extraction proves there is exactly one key. Source
-  // writes compute it before their cross-core handoff; cluster admission also
-  // fills it for reads so owner routing can reuse the Redis slot. Consumers
-  // must also match the argument index; zero means there is no reusable key
-  // route.
-  std::optional<std::uint16_t> routed_partition_id_;
-  std::size_t routed_key_argument_ = 0;
-  // True when the connection arrived over TLS. Cluster discovery and MOVED
-  // replies select the TLS port for TLS connections (mirroring Redis
-  // getNodeClientPort/shouldReturnTlsInfo).
-  bool connection_tls_ = false;
   // Cluster admission needs the first slot plus at most one different-slot
   // witness: two distinct slots already make the request terminally
   // CROSSSLOT, while every admitted request carries exactly one slot. Keeping
-  // only those samples avoids embedding a general vector in every request,
-  // including requests created while cluster mode is disabled.
+  // only those samples avoids embedding a general vector in every request.
+  // For a single-key request, the first sample also stores the owner route;
+  // routed_key_argument_ identifies when that value is reusable even while
+  // cluster mode is disabled. KeyIndexView already represents key positions
+  // as uint16_t, and argument zero is the command name, so zero is an exact
+  // no-route sentinel rather than a narrower limit.
   std::array<std::uint16_t, 2> cluster_slot_samples_{};
-  std::uint8_t cluster_slot_sample_count_ = 0;
+  std::uint16_t routed_key_argument_ = 0;
+
+  // A route is reusable only for the exact argument from which its slot was
+  // computed; this prevents nested and rewritten requests from applying a
+  // stale route to another key.
+  bool HasRoutedPartitionFor(std::uint16_t argument) const noexcept {
+    return argument != 0 && routed_key_argument_ == argument;
+  }
+  // Requires HasRoutedPartitionFor() for the argument being routed.
+  std::uint16_t RoutedPartitionId() const noexcept {
+    return cluster_slot_samples_[0];
+  }
+  void SetRoutedPartition(std::uint16_t slot,
+                          std::uint16_t argument) noexcept {
+    assert(argument != 0);
+    cluster_slot_samples_[0] = slot;
+    routed_key_argument_ = argument;
+  }
+  void ClearRoutedPartition() noexcept { routed_key_argument_ = 0; }
   void ClearClusterSlots() noexcept { cluster_slot_sample_count_ = 0; }
   void AddClusterSlot(std::uint16_t slot) noexcept {
     if (cluster_slot_sample_count_ == 0) {
@@ -367,6 +387,12 @@ struct CommandRequest {
   BlockingWakeCascade* blocking_wake_cascade_ = nullptr;
 };
 
+// Command dispatch moves this object through coroutine frames and MULTI
+// vectors. Keeping both its alignment and extent at two x86 cache lines avoids
+// an accidental third-line touch while preserving a fixed vector stride.
+static_assert(alignof(CommandRequest) == 64);
+static_assert(sizeof(CommandRequest) == 128);
+
 struct ReplicaOfRequest {
   // Empty for REPLICAOF NO ONE; otherwise identifies the requested upstream.
   std::optional<std::string> host_;
@@ -389,14 +415,25 @@ struct CommandReply {
   // TODO: Add TcpStream::WriteVAll so composite replies can send independently
   // produced fragments without flattening them into ReplyBuilder.
   std::string_view encoded_;
-  std::optional<storage::DiskValue> disk_value_;
-  ReplyChunkSource chunks_;  // drained after `encoded` when set
+  // DiskValue's lease already has an exact empty state; wrapping it in
+  // optional duplicates that state and enlarges every command result.
+  storage::DiskValue disk_value_;
+  // Streaming replies are rare and already own heap-backed continuation
+  // state. Keep only a pointer in every ordinary command result so GET/SET do
+  // not move std::function's three-word empty representation through each
+  // coroutine frame; the pointed-to source is drained after `encoded`.
+  std::unique_ptr<ReplyChunkSource> chunks_;
   bool close_connection_ = false;
   bool start_monitoring_ = false;
   ReadLatencyTrace read_trace_;
   SetLatencyTrace set_trace_;
   std::optional<std::uint8_t> selected_db_;
 };
+
+// The direct GET result is moved through several coroutine promises. Keep its
+// common representation within 96 bytes so adding rare reply state cannot
+// silently restore the former two-cache-line-plus footprint.
+static_assert(sizeof(CommandReply) <= 96);
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);

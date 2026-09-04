@@ -95,6 +95,8 @@ struct HashValue {
 absl::StatusOr<HashValue> DecodeHashValue(std::string_view payload);
 absl::StatusOr<std::string> EncodeHashValue(const HashValue& bucket);
 
+class RecordIndexValue;
+
 struct RecordLocationCore {
   // Runtime block identities need only the 27-bit local block id plus the
   // 16-bit configured device id. Pairing those 43 bits with a 53-bit
@@ -235,6 +237,8 @@ struct RecordLocationCore {
     }
 
    private:
+    friend class RecordIndexValue;
+
     explicit constexpr PackedMetadata(std::uint64_t bits) noexcept
         : bits_(bits) {}
 
@@ -483,6 +487,39 @@ class RecordIndexValue {
                : static_cast<ValueType>(type_code());
   }
 
+  // Rebuilds runtime metadata without expanding and repacking each state bit.
+  // The compact and runtime layouts deliberately keep the physical fields and
+  // ten state bits contiguous; only the logical-size prefix and owner slot
+  // differ. Static assertions below make a future layout change fail here
+  // instead of silently corrupting a materialized location.
+  RecordLocation::PackedMetadata MaterializeMetadata(
+      std::uint16_t block_owner) const noexcept {
+    using Runtime = RecordLocation::PackedMetadata;
+    static_assert(kLengthShift - kOffsetShift == Runtime::kLengthShift);
+    static_assert(kInMemoryShift + 1 == Runtime::kInMemoryShift);
+    static_assert(kExternalShift + 1 == Runtime::kExternalShift);
+    static_assert(kKeyExternalShift + 1 == Runtime::kKeyExternalShift);
+    static_assert(kShieldingShift + 1 == Runtime::kShieldingShift);
+    static_assert(kUnclaimedShift + 1 == Runtime::kUnclaimedShift);
+    static_assert(kTxTaggedShift + 1 == Runtime::kTxTaggedShift);
+    static_assert(kTypeCodeShift + 1 == Runtime::kTypeCodeShift);
+    static_assert(kHasExpiryShift + 1 == Runtime::kHasExpiryShift);
+    static_assert(kTypeCodeMask == Runtime::kTypeCodeMask);
+    static_assert(kTombstoneTypeCode == Runtime::kTombstoneTypeCode);
+    assert(block_owner < kMaxMemoryWorkers);
+
+    constexpr std::uint64_t kPhysicalMask =
+        ((std::uint64_t{1} << (kOffsetBits + kLengthBits)) - 1)
+        << kOffsetShift;
+    constexpr std::uint64_t kStateMask =
+        ((std::uint64_t{1} << kStateBits) - 1) << kInMemoryShift;
+    const std::uint64_t runtime_bits =
+        ((metadata_ & kPhysicalMask) >> kOffsetShift) |
+        (static_cast<std::uint64_t>(block_owner) << Runtime::kOwnerShift) |
+        ((metadata_ & kStateMask) << 1);
+    return Runtime(runtime_bits);
+  }
+
   void set_in_memory(bool value) noexcept {
     SetBit(&metadata_, kInMemoryShift, value);
   }
@@ -564,14 +601,13 @@ struct RecordIndexEntryPolicy {
                              std::uint64_t allocation_epoch,
                              std::uint16_t block_owner) noexcept {
     assert(value.has_expiry() == (extra != nullptr));
-    return RecordLocation(
-        value.block_id(), value.mutation_sequence_, allocation_epoch,
-        extra == nullptr ? 0 : *extra, value.logical_size(),
-        RecordLocation::PackedMetadata::Encode(
-            value.record_offset(), value.total_disk_bytes(), block_owner,
-            value.in_memory(), value.external(), value.key_external(),
-            value.shielding(), value.unclaimed(), value.tx_tagged(),
-            value.kind(), value.value_type(), value.has_expiry()));
+    RecordLocationCore core(value.block_id(), value.mutation_sequence_,
+                            allocation_epoch, value.logical_size(),
+                            value.MaterializeMetadata(block_owner));
+    // MaterializeMetadata already carries the trusted subtype discriminator;
+    // this constructor validates it instead of clearing and setting the same
+    // bit again on every lookup.
+    return RecordLocation(core, extra == nullptr ? 0 : *extra);
   }
   static void Assign(StoredValue* stored, Extra* extra,
                      const RecordLocation& value) noexcept {
@@ -2141,14 +2177,19 @@ class StorageEngine::Impl {
   }
 
   Task<absl::StatusOr<DiskValue>> Get(std::uint8_t db_id, std::string_view key,
-                                      ReadLatencyTrace* trace);
+                                      ReadLatencyTrace* trace,
+                                      std::optional<std::uint16_t>
+                                          routed_partition_id);
 
   // Caller holds this worker's key lock for `digest` (shared) and runs on
   // OwnerForKey(key). `digest` must equal ComputeDigest(key).
   Task<absl::StatusOr<DiskValue>> GetLocked(std::uint8_t db_id,
                                             std::string_view key,
                                             const Digest& digest,
-                                            ReadLatencyTrace* trace);
+                                            ReadLatencyTrace* trace,
+                                            std::optional<std::uint16_t>
+                                                routed_partition_id =
+                                                    std::nullopt);
 
   Task<std::vector<BatchGetValue>> BatchGetLocked(
       std::uint8_t db_id, std::span<const BatchGetRequest> requests);

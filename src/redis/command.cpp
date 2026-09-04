@@ -764,13 +764,11 @@ void PopulateClusterSlots(CommandRequest& request) {
     // Source writes arrive with a route chosen before their owner hop. Reads
     // first discover their route here; retaining it avoids hashing the key a
     // second time when storage dispatch chooses the owner below.
-    if (!request.routed_partition_id_.has_value() ||
-        request.routed_key_argument_ != keys->first_) {
-      request.routed_partition_id_ =
-          storage::RedisSlot(request.args_[keys->first_]);
-      request.routed_key_argument_ = keys->first_;
+    if (!request.HasRoutedPartitionFor(keys->first_)) {
+      request.SetRoutedPartition(
+          storage::RedisSlot(request.args_[keys->first_]), keys->first_);
     }
-    request.AddClusterSlot(*request.routed_partition_id_);
+    request.AddClusterSlot(request.RoutedPartitionId());
     return;
   }
   for (std::uint32_t index = keys->first_; index <= keys->last_;
@@ -2506,10 +2504,9 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
     if (keys.ok() && !keys->empty()) {
       if (keys->count() == 1) {
         const std::string& key = request->args_[keys->first_];
-        const bool routed = request->routed_partition_id_.has_value() &&
-                            request->routed_key_argument_ == keys->first_;
+        const bool routed = request->HasRoutedPartitionFor(keys->first_);
         const std::uint16_t partition_id =
-            routed ? *request->routed_partition_id_ : storage::RedisSlot(key);
+            routed ? request->RoutedPartitionId() : storage::RedisSlot(key);
         scopes.push_back(WorkerScope{
             .worker_ = partition_id % g_storage->worker_count(),
             .target_ =
@@ -3211,7 +3208,8 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
   }
 
   CommandReply reply = BuiltReply(reply_builder.AppendArrayHeader(matches));
-  reply.chunks_ = [state]() { return NextKeysChunk(state); };
+  reply.chunks_ = std::make_unique<ReplyChunkSource>(
+      [state]() { return NextKeysChunk(state); });
   co_return reply;
 }
 
@@ -3417,7 +3415,8 @@ Task<CommandReply> ExecuteNegativeRandomStream(
   if (state->options_.with_values_) reply_elements *= 2;
   CommandReply reply =
       BuiltReply(reply_builder.AppendArrayHeader(reply_elements));
-  reply.chunks_ = [state]() { return NextNegativeRandomChunk(state); };
+  reply.chunks_ = std::make_unique<ReplyChunkSource>(
+      [state]() { return NextNegativeRandomChunk(state); });
   co_return reply;
 }
 
@@ -3768,7 +3767,11 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
             "ERR wrong number of arguments for 'get' command");
         co_return reply;
       }
-      auto value = co_await g_storage->Get(request.db_id_, args[1], read_trace);
+      auto value = co_await g_storage->Get(
+          request.db_id_, args[1], read_trace,
+          request.HasRoutedPartitionFor(1)
+              ? std::optional<std::uint16_t>(request.RoutedPartitionId())
+              : std::nullopt);
       if (!value.ok()) {
         if (value.status().code() == absl::StatusCode::kNotFound) {
           reply.encoded_ = reply_builder.AppendNull();
@@ -3776,7 +3779,7 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
           reply.encoded_ = AppendStorageError(reply_builder, value.status());
         }
       } else {
-        reply.disk_value_.emplace(std::move(*value));
+        reply.disk_value_ = std::move(*value);
       }
       co_return reply;
     }
@@ -3806,7 +3809,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       }
       PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
       reply.encoded_ = reply_builder.AppendRaw(prepared.header_);
-      reply.chunks_ = std::move(prepared.chunks_);
+      reply.chunks_ = std::make_unique<ReplyChunkSource>(
+          std::move(prepared.chunks_));
       co_return reply;
     }
 
@@ -3887,15 +3891,16 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       auto result = co_await g_storage->Set(
           request.db_id_, args[1], args[2], *options,
           replication ? &*replication : nullptr, set_trace,
-          request.routed_key_argument_ == 1 ? request.routed_partition_id_
-                                            : std::nullopt);
+          request.HasRoutedPartitionFor(1)
+              ? std::optional<std::uint16_t>(request.RoutedPartitionId())
+              : std::nullopt);
       if (!result.ok()) {
         reply.encoded_ = AppendStorageError(reply_builder, result.status());
         co_return reply;
       }
       if (options->return_old_value_) {
         if (result->old_value_.has_value()) {
-          reply.disk_value_.emplace(std::move(*result->old_value_));
+          reply.disk_value_ = std::move(*result->old_value_);
         } else {
           reply.encoded_ = reply_builder.AppendNull();
         }
@@ -8376,7 +8381,7 @@ Task<CommandReply> ExecuteSentinelManagementExec(
     } else {
       local = co_await ExecuteClient(ctx, command, local_builder);
     }
-    if (local.disk_value_.has_value() || local.chunks_) {
+    if (local.disk_value_.valid() || local.chunks_) {
       replies.push_back(
           EncodeError("ERR management command produced a streamed reply"));
     } else {
@@ -9601,7 +9606,8 @@ Task<CommandReply> ExecuteExecBody(
     auto state = std::make_shared<ExecReplyStreamState>();
     state->replies_ = std::move(replies);
     state->chunks_ = std::move(reply_chunks);
-    reply.chunks_ = [state]() { return NextExecReplyChunk(state); };
+    reply.chunks_ = std::make_unique<ReplyChunkSource>(
+        [state]() { return NextExecReplyChunk(state); });
   }
   reply.selected_db_ = select_db;
   co_return reply;
@@ -11534,10 +11540,9 @@ Task<CommandReply> ExecuteCommandBody(
         // Single-key source writes are already on this computed owner, while
         // cluster reads learned the same route during admission. Deriving the
         // worker from the retained slot is cheaper than hashing args[1] again.
-        const bool routed = request.routed_partition_id_.has_value() &&
-                            request.routed_key_argument_ == 1;
+        const bool routed = request.HasRoutedPartitionFor(1);
         const unsigned target = routed
-                                    ? *request.routed_partition_id_ %
+                                    ? request.RoutedPartitionId() %
                                           g_storage->worker_count()
                                     : ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE
@@ -11626,8 +11631,7 @@ namespace {
 // admission, body, and release on their existing "already on the target"
 // inline paths, so the write pays one cross-core round trip instead of three.
 std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
-  request.routed_partition_id_.reset();
-  request.routed_key_argument_ = 0;
+  request.ClearRoutedPartition();
   if (request.spec_ == nullptr || g_storage == nullptr) {
     return std::nullopt;
   }
@@ -11653,8 +11657,7 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
   if (!keys.ok() || keys->count() != 1) return std::nullopt;
   const std::uint16_t partition_id =
       storage::RedisSlot(request.args_[keys->first_]);
-  request.routed_partition_id_ = partition_id;
-  request.routed_key_argument_ = keys->first_;
+  request.SetRoutedPartition(partition_id, keys->first_);
   return partition_id % g_storage->worker_count();
 }
 
@@ -11724,9 +11727,9 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
 }  // namespace
 
 bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
-  return !request.write_admission_role_epoch_.has_value() ||
+  return !request.write_admission_role_epoch_valid_ ||
          g_replication == nullptr ||
-         g_replication->role_epoch() == *request.write_admission_role_epoch_;
+         g_replication->role_epoch() == request.write_admission_role_epoch_;
 }
 
 Task<CommandReply> ExecuteCommand(CommandRequest& request,
@@ -11737,6 +11740,7 @@ Task<CommandReply> ExecuteCommand(CommandRequest& request,
       (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
       g_replication != nullptr) {
     request.write_admission_role_epoch_ = g_replication->role_epoch();
+    request.write_admission_role_epoch_valid_ = true;
   }
   const std::optional<unsigned> owner = SingleKeyWriteOwner(request);
   // Lua invocations carry a non-owning pointer to their connection's WAIT
@@ -11905,7 +11909,7 @@ Task<absl::Status> ApplyReplicatedCommand(const ReplicatedCommand& command) {
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
-  if (reply.disk_value_.has_value() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.chunks_) {
     co_return absl::Status(absl::StatusCode::kInternal,
                            "replication write produced a streamed reply");
   }
@@ -11951,7 +11955,7 @@ Task<absl::Status> ApplyRedisReplicatedCommand(
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteCommand(*request, reply_builder);
-  if (reply.disk_value_.has_value() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.chunks_) {
     co_return absl::InternalError(
         "Redis replication write produced a streamed reply");
   }
@@ -12004,7 +12008,7 @@ Task<absl::Status> ApplyRedisReplicatedTransaction(
 
   ReplyBuilder reply_builder;
   CommandReply reply = co_await ExecuteExec(context, reply_builder);
-  if (reply.disk_value_.has_value() || reply.chunks_) {
+  if (reply.disk_value_.valid() || reply.chunks_) {
     co_return absl::InternalError(
         "Redis replicated transaction produced a streamed reply");
   }

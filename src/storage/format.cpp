@@ -217,6 +217,33 @@ T LoadRecordField(std::span<const std::byte> input,
   return value;
 }
 
+template <std::size_t BufferBytes>
+std::uint32_t RecordHeaderChecksumWithBuffer(
+    std::span<const std::byte> input) noexcept {
+  assert(input.size() <= BufferBytes);
+  std::array<std::byte, BufferBytes> copy;
+  std::memcpy(copy.data(), input.data(), input.size());
+  StoreRecordField(std::span<std::byte>(copy.data(), input.size()),
+                   kRecordHeaderChecksumOffset, std::uint32_t{0});
+  return Crc32c(std::span<const std::byte>(copy.data(), input.size()));
+}
+
+// Keep the maximum-size scratch page out of the overwhelmingly common short-
+// key decoder frame. Besides reserving 4 KiB, an inlined array makes hardened
+// builds touch the extra page on every read for stack-clash protection.
+[[gnu::noinline]] std::uint32_t LargeRecordHeaderChecksum(
+    std::span<const std::byte> input) noexcept {
+  return RecordHeaderChecksumWithBuffer<kMaxRecordHeaderBytes>(input);
+}
+
+std::uint32_t RecordHeaderChecksum(std::span<const std::byte> input) noexcept {
+  constexpr std::size_t kCommonHeaderBytes = 256;
+  if (input.size() <= kCommonHeaderBytes) [[likely]] {
+    return RecordHeaderChecksumWithBuffer<kCommonHeaderBytes>(input);
+  }
+  return LargeRecordHeaderChecksum(input);
+}
+
 constexpr std::uint16_t RecordMetadata(const RecordHeader& header) noexcept {
   return static_cast<std::uint16_t>(
       (static_cast<std::uint16_t>(header.kind_) << kRecordKindShift) |
@@ -737,11 +764,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
        decoded.key_external_)) {
     return false;
   }
-  std::array<std::byte, kMaxRecordHeaderBytes> copy{};
-  std::memcpy(copy.data(), input.data(), header_bytes);
-  StoreRecordField(std::span<std::byte>(copy.data(), header_bytes),
-                   kRecordHeaderChecksumOffset, std::uint32_t{0});
-  if (Crc32c(std::span<const std::byte>(copy.data(), header_bytes)) !=
+  if (RecordHeaderChecksum(input.first(header_bytes)) !=
       decoded.header_checksum_) {
     return false;
   }

@@ -213,20 +213,33 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
-    std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace) {
+    std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  assert(!routed_partition_id.has_value() ||
+         *routed_partition_id == RedisSlot(key));
+  // Keep the fallback lazy: value_or(RedisSlot(key)) would compute the slot
+  // even when routing already supplied the partition on this hot GET path.
+  const std::uint16_t partition_id = routed_partition_id.has_value()
+                                         ? *routed_partition_id
+                                         : RedisSlot(key);
   auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
       db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
-  co_return co_await GetLocked(db_id, key, digest, trace);
+  co_return co_await GetLocked(db_id, key, digest, trace, partition_id);
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    ReadLatencyTrace* trace) {
+    ReadLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   WorkerStore& store = CurrentStore();
-  auto& partition = PartitionForKey(store, key);
+  assert(!routed_partition_id.has_value() ||
+         *routed_partition_id == RedisSlot(key));
+  auto& partition = routed_partition_id.has_value()
+                        ? PartitionFor(store, *routed_partition_id)
+                        : PartitionForKey(store, key);
   auto& index = partition.indexes_[db_id];
   auto* found = index.Find(digest, key);
   if (found != nullptr && !found->key_complete()) [[unlikely]] {
