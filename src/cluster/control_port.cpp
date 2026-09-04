@@ -183,7 +183,7 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
   parsed.node_.node_id_ = *node_id;
   auto address = ParseNodeAddress(fields[1]);
   if (!address.ok()) return LineError(line_number, address.status());
-  parsed.node_.host_ = std::move(address->first);
+  parsed.node_.SetHost(address->first);
   parsed.node_.port_ = address->second;
 
   // Only the role flags carry routing meaning; myself/fail?/fail/handshake/
@@ -291,7 +291,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
   std::size_t matches = 0;
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const ParsedNode& node = nodes[i];
-    if ((wildcard || node.node_.host_ == self.host_) &&
+    if ((wildcard || node.node_.host() == self.host_) &&
         node.node_.port_ == self.port_) {
       ++matches;
       matched_index = static_cast<NodeIndex>(i);

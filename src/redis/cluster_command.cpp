@@ -64,7 +64,7 @@ std::string_view DiscoveryHost(const cluster::ServingState& state,
   if (self == &node) {
     return runtime.announce_ip_;
   }
-  return node.host_;
+  return node.host();
 }
 
 // Client port a discovery reply advertises for `node`. The self entry honors

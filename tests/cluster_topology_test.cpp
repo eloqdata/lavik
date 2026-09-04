@@ -49,9 +49,19 @@ TEST(NodeIdTest, DistinguishesAbsentFromAnAllZeroIdentity) {
 NodeDescriptor MakeNode(unsigned n, std::uint16_t port = 7000) {
   NodeDescriptor node;
   node.node_id_ = TestNodeId(n);
-  node.host_ = "127.0.0.1";
+  node.SetHost("127.0.0.1");
   node.port_ = port;
   return node;
+}
+
+TEST(NodeDescriptorTest, PreservesInlineAndOverflowHosts) {
+  NodeDescriptor node;
+  node.SetHost("255.255.255.255");
+  EXPECT_EQ(node.host(), "255.255.255.255");
+
+  constexpr std::string_view kLongHost = "redis-primary.example.internal";
+  node.SetHost(kLongHost);
+  EXPECT_EQ(node.host(), kLongHost);
 }
 
 GroupView MakeGroup(std::string group_id, NodeIndex primary_node_index,
@@ -581,7 +591,7 @@ TEST(ClusterRouterTest, EndpointFormatsHostAndPort) {
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "127.0.0.1:7000");
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/true), "127.0.0.1:7443");
 
-  node.host_ = "::1";
+  node.SetHost("::1");
   node.tls_port_ = 0;
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "[::1]:7000");
 }

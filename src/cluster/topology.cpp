@@ -157,7 +157,7 @@ std::uint64_t ComputeContentHash(
   HashU64(hash, sorted_nodes.size());
   for (const NodeDescriptor* node : sorted_nodes) {
     HashNodeId(hash, node->node_id_);
-    HashString(hash, node->host_);
+    HashString(hash, node->host());
     HashU64(hash, node->port_);
     HashU64(hash, node->tls_port_);
     HashBool(hash, node->is_primary());
@@ -530,11 +530,12 @@ std::uint16_t ClientPort(const NodeDescriptor& node, bool connection_tls) {
 
 std::string Endpoint(const NodeDescriptor& node, bool connection_tls) {
   const std::uint16_t port = ClientPort(node, connection_tls);
+  const std::string_view host = node.host();
   // Bracket IPv6 literals so the "host:port" shape stays unambiguous.
-  if (node.host_.find(':') != std::string::npos) {
-    return absl::StrCat("[", node.host_, "]:", port);
+  if (host.find(':') != std::string_view::npos) {
+    return absl::StrCat("[", host, "]:", port);
   }
-  return absl::StrCat(node.host_, ":", port);
+  return absl::StrCat(host, ":", port);
 }
 
 }  // namespace router

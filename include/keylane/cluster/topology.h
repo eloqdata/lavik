@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 
 namespace keylane::cluster {
@@ -94,7 +95,7 @@ static_assert(kSlotCount < kNoGroupIndex);
 // One cluster node as the data plane sees it. In v1 the static topology file
 // is the only source; `tls_port_` is the configured cluster-wide TLS port
 // (uniform-port assumption, see control_port.h).
-struct NodeDescriptor {
+struct alignas(64) NodeDescriptor {
   NodeId node_id_;              // stable across restarts
   bool link_connected_ = true;  // parsed from the file; not consulted in v1
   std::uint16_t port_ = 0;
@@ -103,12 +104,33 @@ struct NodeDescriptor {
   // the same ServingState::Nodes() table.
   NodeIndex primary_node_index_ = kNoNodeIndex;
   std::uint64_t config_epoch_ = 0;
-  std::string host_;
+
+  // Most advertised addresses (including every IPv4 literal) stay inside the
+  // descriptor. Longer hostnames and IPv6 literals retain their full value by
+  // using InlinedVector's overflow allocation.
+  absl::InlinedVector<char, 16> host_;
+
+  // Replaces the advertised host without requiring callers to depend on its
+  // compact storage representation.
+  void SetHost(std::string_view host) {
+    host_.assign(host.begin(), host.end());
+  }
+  // Returns the advertised host for hashing, comparison, and wire formatting.
+  std::string_view host() const noexcept {
+    if (host_.empty()) return {};
+    return std::string_view(host_.data(), host_.size());
+  }
 
   bool is_primary() const noexcept {
     return primary_node_index_ == kNoNodeIndex;
   }
 };
+
+// Node tables are traversed on routing and discovery paths. Keeping each
+// descriptor in one aligned cache line prevents adjacent entries from sharing
+// a line while preserving support for arbitrarily long advertised hosts.
+static_assert(sizeof(NodeDescriptor) == 64);
+static_assert(alignof(NodeDescriptor) == 64);
 
 // Slot range, both ends inclusive, as written in a nodes.conf node line.
 struct SlotRange {

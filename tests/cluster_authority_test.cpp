@@ -55,7 +55,7 @@ NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                         std::uint16_t port, std::uint16_t tls_port) {
   NodeDescriptor node;
   node.node_id_ = ParseNodeId(id);
-  node.host_ = std::string(host);
+  node.SetHost(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
   return node;

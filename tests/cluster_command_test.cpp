@@ -42,7 +42,7 @@ cluster::NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                                  bool link_connected = true) {
   cluster::NodeDescriptor node;
   node.node_id_ = ParseNodeId(id);
-  node.host_ = std::string(host);
+  node.SetHost(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
   node.primary_node_index_ = primary_node_index;

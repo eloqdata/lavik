@@ -110,7 +110,7 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // the Redis layer picks between them by the connection's TLS state.
   decision.kind_ = Decision::Kind::kMoved;
   decision.moved_slot_ = slot;
-  decision.moved_host_ = primary->host_;
+  decision.moved_host_ = primary->host();
   decision.moved_port_ = primary->port_;
   decision.moved_tls_port_ = primary->tls_port_;
   return decision;

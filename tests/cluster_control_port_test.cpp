@@ -135,7 +135,7 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
 
   const NodeDescriptor* node_b = serving.FindNode(ParseNodeId(kIdB));
   ASSERT_NE(node_b, nullptr);
-  EXPECT_EQ(node_b->host_, "127.0.0.1");  // ",hostname" suffix stripped
+  EXPECT_EQ(node_b->host(), "127.0.0.1");  // ",hostname" suffix stripped
   EXPECT_EQ(node_b->port_, 7002);
   EXPECT_EQ(node_b->tls_port_, 17011);  // uniform cluster TLS port
   EXPECT_TRUE(node_b->is_primary());
@@ -143,7 +143,7 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
 
   const NodeDescriptor* node_c = serving.FindNode(ParseNodeId(kIdC));
   ASSERT_NE(node_c, nullptr);
-  EXPECT_EQ(node_c->host_, "::1");  // IPv6 brackets stripped
+  EXPECT_EQ(node_c->host(), "::1");  // IPv6 brackets stripped
   EXPECT_EQ(node_c->port_, 7003);
 
   const NodeDescriptor* node_d = serving.FindNode(ParseNodeId(kIdD));
