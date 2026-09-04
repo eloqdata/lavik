@@ -255,7 +255,8 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
 
 absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     std::string_view content, const SelfMatch& self,
-    std::uint16_t cluster_tls_port, bool storage_ready) {
+    std::uint16_t cluster_tls_port, bool storage_ready,
+    std::size_t worker_count) {
   std::vector<ParsedNode> nodes;
   std::uint64_t topology_epoch = 0;
   std::size_t line_number = 0;
@@ -330,6 +331,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(topology_epoch);
   builder.SetSelfNodeIndex(matched_index);
+  builder.SetInFlightStripeCount(worker_count);
   for (const ParsedNode& node : nodes) builder.AddNode(node.node_);
   for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
     const ParsedNode& node = nodes[node_index];
@@ -366,10 +368,12 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
 }
 
 StaticClusterControl::StaticClusterControl(std::string path, SelfMatch self,
-                                           std::uint16_t cluster_tls_port)
+                                           std::uint16_t cluster_tls_port,
+                                           std::size_t worker_count)
     : path_(std::move(path)),
       self_(std::move(self)),
-      cluster_tls_port_(cluster_tls_port) {}
+      cluster_tls_port_(cluster_tls_port),
+      worker_count_(worker_count) {}
 
 void StaticClusterControl::SetStorageReady(bool ready) {
   storage_ready_.store(ready, std::memory_order_release);
@@ -379,7 +383,8 @@ absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
   // Any failure returns before Publish, so the cache keeps the previously
   // published state (fencing transitions are only ever published complete).
   // The class needs no lock around the file IO: path_/self_/cluster_tls_port_
-  // are immutable after construction and storage_ready_ is atomic.
+  // and worker_count_ are immutable after construction and storage_ready_ is
+  // atomic.
   std::ifstream input(path_, std::ios::binary);
   if (!input.is_open()) {
     return absl::NotFoundError(
@@ -391,8 +396,9 @@ absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
     return absl::UnknownError(
         absl::StrCat("cannot read cluster nodes file '", path_, "'"));
   }
-  auto state = Parse(content, self_, cluster_tls_port_,
-                     storage_ready_.load(std::memory_order_acquire));
+  auto state =
+      Parse(content, self_, cluster_tls_port_,
+            storage_ready_.load(std::memory_order_acquire), worker_count_);
   if (!state.ok()) return state.status();
   cache.Publish(std::move(*state));
   return absl::OkStatus();

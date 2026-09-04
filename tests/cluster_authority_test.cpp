@@ -87,7 +87,7 @@ std::shared_ptr<const ServingState> BuildState(std::string_view self,
                                                GroupView group_a,
                                                GroupView group_b) {
   ServingStateBuilder builder;
-  builder.SetTopologyEpoch(1);
+  builder.SetTopologyEpoch(1).SetInFlightStripeCount(4);
   if (self == kNodeA) {
     builder.SetSelfNodeIndex(kNodeAIndex);
   } else if (self == kNodeB) {
@@ -414,6 +414,13 @@ TEST(GroupInFlightTest, CountsAndDrains) {
   EXPECT_EQ(state->GroupInFlightCount(kGroupA), 0);
   EXPECT_EQ(state->GroupInFlightCount(kGroupB), 0);
   EXPECT_EQ(state->TotalInFlightCount(), 0);
+}
+
+TEST(GroupInFlightTest, AllocatesOneStripePerConfiguredWorker) {
+  const auto state = BuildState(kNodeA);
+  const GroupInFlight* cell = state->InFlightCellForSlot(kSlotInA);
+  ASSERT_NE(cell, nullptr);
+  EXPECT_EQ(cell->StripeCount(), 4);
 }
 
 TEST(GroupInFlightTest, MoveTransfersOwnership) {

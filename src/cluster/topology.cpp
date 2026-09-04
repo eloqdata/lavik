@@ -255,7 +255,7 @@ std::uint64_t ServingState::AuthorityTokenForSlot(std::uint16_t slot) const {
 GroupInFlight* ServingState::InFlightCellForSlot(std::uint16_t slot) const {
   const GroupIndex index = slot_to_group_[slot];
   if (index == kNoGroupIndex) return nullptr;
-  return in_flight_cells_[static_cast<std::size_t>(index)].get();
+  return &in_flight_cells_[static_cast<std::size_t>(index)];
 }
 
 std::uint64_t ServingState::GroupInFlightCount(
@@ -263,13 +263,13 @@ std::uint64_t ServingState::GroupInFlightCount(
   const GroupView* group = FindGroup(group_id);
   if (group == nullptr) return 0;
   const std::size_t index = static_cast<std::size_t>(group - groups_.data());
-  return in_flight_cells_[index]->Total();
+  return in_flight_cells_[index].Total();
 }
 
 std::uint64_t ServingState::TotalInFlightCount() const {
   std::uint64_t total = 0;
-  for (const std::shared_ptr<GroupInFlight>& cell : in_flight_cells_) {
-    total += cell->Total();
+  for (const GroupInFlight& cell : in_flight_cells_) {
+    total += cell.Total();
   }
   return total;
 }
@@ -300,6 +300,12 @@ ServingStateBuilder& ServingStateBuilder::SetSelfNodeIndex(
   return *this;
 }
 
+ServingStateBuilder& ServingStateBuilder::SetInFlightStripeCount(
+    std::size_t stripe_count) {
+  in_flight_stripe_count_ = stripe_count;
+  return *this;
+}
+
 ServingStateBuilder& ServingStateBuilder::AddNode(NodeDescriptor node) {
   nodes_.push_back(std::move(node));
   return *this;
@@ -326,6 +332,10 @@ ServingStateBuilder& ServingStateBuilder::AddSlotRange(
 
 absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
     const {
+  if (in_flight_stripe_count_ == 0) {
+    return absl::InvalidArgumentError(
+        "in-flight stripe count must be greater than zero");
+  }
   std::vector<NodeId> node_ids;
   node_ids.reserve(nodes_.size());
   for (const NodeDescriptor& node : nodes_) {
@@ -450,9 +460,9 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   }
   // Every group starts with a fresh cell; Publish may swap in the replaced
   // snapshot's cell for token-unchanged groups.
-  state->in_flight_cells_.resize(state->groups_.size());
-  for (std::shared_ptr<GroupInFlight>& cell : state->in_flight_cells_) {
-    cell = std::make_shared<GroupInFlight>();
+  state->in_flight_cells_.reserve(state->groups_.size());
+  for (std::size_t i = 0; i < state->groups_.size(); ++i) {
+    state->in_flight_cells_.emplace_back(in_flight_stripe_count_);
   }
   state->content_hash_ = ComputeContentHash(topology_epoch_, self_node_index_,
                                             nodes_, groups_, slot_to_group);

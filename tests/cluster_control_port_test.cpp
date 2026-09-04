@@ -99,7 +99,8 @@ class TempNodesFile {
 TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   auto state = StaticClusterControl::Parse(ValidTopology(), {"127.0.0.1", 7001},
                                            /*cluster_tls_port=*/17011,
-                                           /*storage_ready=*/true);
+                                           /*storage_ready=*/true,
+                                           /*worker_count=*/7);
   ASSERT_TRUE(state.ok()) << state.status();
   const ServingState& serving = **state;
 
@@ -109,6 +110,8 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   EXPECT_EQ(serving.Groups().size(), 3U);
   EXPECT_EQ(serving.Nodes().size(), 4U);
   EXPECT_TRUE(serving.FullyReady());
+  ASSERT_NE(serving.InFlightCellForSlot(0), nullptr);
+  EXPECT_EQ(serving.InFlightCellForSlot(0)->StripeCount(), 7);
 
   ASSERT_NE(serving.Self(), nullptr);
   EXPECT_EQ(serving.Self()->node_id_, ParseNodeId(kIdA));

@@ -926,9 +926,9 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     // (then the registration is rolled back and the loop retries). A
     // registration therefore can never slip past a drain unseen.
     // Registration targets the admitted snapshot the request holds for its
-    // whole lifetime, which keeps the cells alive behind the guards' raw
-    // pointers; token-equal snapshots share the same cells, so the
-    // publisher's drain sees these guards regardless.
+    // whole lifetime, which keeps the cell handles alive behind the guards'
+    // raw pointers; token-equal snapshots share the same stripe allocations,
+    // so the publisher's drain sees these guards regardless.
     RegisterClusterInFlight(*request.cluster_admitted_state_,
                             request.cluster_slots_, in_flights);
     if (cache.version() == version_before) return std::nullopt;

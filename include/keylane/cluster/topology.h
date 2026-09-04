@@ -14,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -139,35 +140,44 @@ struct SlotRange {
 };
 
 // Striped in-flight mutation counter for one group, owned by the published
-// ServingState. Registration on the request path is one atomic increment on
-// the calling thread's stripe: no lock, no allocation, and no cross-thread
-// cacheline contention as long as threads stay on distinct stripes. The drain
-// side (control plane, tests) sums the stripes off the request path.
+// ServingState. One stripe is allocated for every request worker, so
+// registration is one directly indexed atomic increment: no lock, request-
+// path allocation, modulo, or cross-thread cacheline contention. Copies share
+// the same stripe allocation so token-equivalent snapshots drain together.
 class GroupInFlight {
  public:
-  static constexpr std::size_t kStripeCount = 64;
+  explicit GroupInFlight(std::size_t stripe_count)
+      : stripes_(std::make_shared_for_overwrite<Stripe[]>(stripe_count)),
+        stripe_count_(stripe_count) {
+    assert(stripe_count_ != 0);
+  }
+
+  // Number of configured request-worker stripes in this cell.
+  std::size_t StripeCount() const noexcept { return stripe_count_; }
 
   // Enter is seq_cst on purpose: paired with the registrant's subsequent
   // TopologyCache::version() load and the publisher's store-then-bump order it
   // forms a Dekker handshake — a drain that starts after a revoking publish
   // either observes this registration, or the registrant observes the
-  // publication and rolls back (see TopologyCache::Publish).
+  // publication and rolls back (see TopologyCache::Publish). `stripe` is the
+  // configured Celer worker id and must be less than StripeCount().
   void Enter(std::size_t stripe) noexcept {
-    stripes_[stripe % kStripeCount].value_.fetch_add(1);
+    assert(stripe < stripe_count_);
+    stripes_[stripe].value_.fetch_add(1);
   }
   // Release is sufficient for Exit: an Exit not yet visible to the drain only
   // makes the drain wait longer, never miss an execution.
   void Exit(std::size_t stripe) noexcept {
-    stripes_[stripe % kStripeCount].value_.fetch_sub(1,
-                                                     std::memory_order_release);
+    assert(stripe < stripe_count_);
+    stripes_[stripe].value_.fetch_sub(1, std::memory_order_release);
   }
   // Drain-side aggregate; sums every stripe. Never on the request path.
   std::uint64_t Total() const noexcept {
     std::uint64_t total = 0;
-    for (const Stripe& stripe : stripes_) {
+    for (std::size_t i = 0; i < stripe_count_; ++i) {
       // seq_cst so the drain participates in the Dekker handshake described
       // at Enter().
-      total += stripe.value_.load();
+      total += stripes_[i].value_.load();
     }
     return total;
   }
@@ -176,7 +186,15 @@ class GroupInFlight {
   struct alignas(64) Stripe {
     std::atomic<std::int64_t> value_{0};
   };
-  std::array<Stripe, kStripeCount> stripes_;
+  static_assert(sizeof(Stripe) == 64);
+
+  // make_shared_for_overwrite<T[]> keeps the control block and variable-length
+  // stripe array in one allocation; Stripe's member initializer still zeros
+  // every counter. GroupInFlight itself stays a small, copyable handle in
+  // ServingState's cell vector, so dynamic sizing adds no request-path pointer
+  // indirection compared with shared_ptr<GroupInFlight> plus an inline array.
+  std::shared_ptr<Stripe[]> stripes_;
+  std::size_t stripe_count_;
 };
 
 // RAII marker for one admitted in-flight mutation: Enter on construction,
@@ -255,9 +273,9 @@ class ServingState {
 
   // Striped in-flight cell of the group owning `slot`, or nullptr when the
   // slot is unbound. Request-path registration is one atomic Enter on the
-  // calling thread's stripe; the cell outlives this snapshot whenever a later
-  // snapshot shares it (token-unchanged groups, see TopologyCache::Publish),
-  // so a guard is safe to hold for the whole execution.
+  // calling thread's stripe. The admitted snapshot keeps this handle alive
+  // for every guard, while token-unchanged later snapshots share its
+  // underlying stripe allocation (see TopologyCache::Publish).
   GroupInFlight* InFlightCellForSlot(std::uint16_t slot) const;
   // Drain-side aggregates over the cells, for the control plane and tests —
   // never the request path. To fence a group, publish the revoking state and
@@ -280,13 +298,13 @@ class ServingState {
   // Precomputed per-group authority tokens, parallel to groups_. Computed
   // once at Build so the request path never hashes or scans for them.
   std::vector<std::uint64_t> group_tokens_;
-  // One cell per entry in groups_. Build installs a fresh cell per group;
-  // TopologyCache::Publish then swaps in the replaced snapshot's cell for
-  // every group whose authority token is unchanged, so executions admitted
-  // under either snapshot drain together. Mutable because Publication
-  // installs the sharing after the state is built but before it becomes
-  // visible to readers.
-  mutable std::vector<std::shared_ptr<GroupInFlight>> in_flight_cells_;
+  // One cell handle per entry in groups_. Build gives each handle a fresh
+  // stripe allocation; TopologyCache::Publish then copies the replaced
+  // snapshot's handle for every group whose authority token is unchanged, so
+  // executions admitted under either snapshot drain together. Mutable because
+  // publication installs the sharing after the state is built but before it
+  // becomes visible to readers.
+  mutable std::vector<GroupInFlight> in_flight_cells_;
 
   // Implements the cell sharing described on in_flight_cells_; called by
   // TopologyCache::Publish before the state is stored.
@@ -298,6 +316,10 @@ class ServingStateBuilder {
  public:
   ServingStateBuilder& SetTopologyEpoch(std::uint64_t epoch);
   ServingStateBuilder& SetSelfNodeIndex(NodeIndex node_index);
+  // Configures one in-flight stripe per request worker. The default keeps
+  // standalone model construction convenient; production adapters must pass
+  // the server's configured worker count.
+  ServingStateBuilder& SetInFlightStripeCount(std::size_t stripe_count);
   ServingStateBuilder& AddNode(NodeDescriptor node);
   // Takes ownership of the group's slot ranges. Slots may also be attached
   // later via AddSlotRange to an existing group id.
@@ -315,6 +337,7 @@ class ServingStateBuilder {
  private:
   std::uint64_t topology_epoch_ = 0;
   NodeIndex self_node_index_ = kNoNodeIndex;
+  std::size_t in_flight_stripe_count_ = 1;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
 };

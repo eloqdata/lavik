@@ -117,6 +117,12 @@ TEST(ServingStateBuilderTest, RejectsMalformedNodeIds) {
   EXPECT_FALSE(builder.Build().ok());
 }
 
+TEST(ServingStateBuilderTest, RejectsZeroInFlightStripes) {
+  ServingStateBuilder builder;
+  builder.SetInFlightStripeCount(0);
+  EXPECT_FALSE(builder.Build().ok());
+}
+
 TEST(ServingStateBuilderTest, RejectsDuplicateNodeId) {
   ServingStateBuilder builder;
   builder.AddNode(MakeNode(1)).AddNode(MakeNode(1));
