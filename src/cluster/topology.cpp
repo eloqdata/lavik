@@ -475,6 +475,7 @@ std::shared_ptr<const ServingState> TopologyCache::Current() const {
 
 std::uint64_t TopologyCache::Publish(
     std::shared_ptr<const ServingState> state) {
+  const std::lock_guard publish_lock(publish_mutex_);
   const std::shared_ptr<const ServingState> current = current_.load();
   if (current != nullptr && state != nullptr &&
       current->content_hash() == state->content_hash()) {
@@ -493,32 +494,57 @@ std::uint64_t TopologyCache::Publish(
   if (state != nullptr && current != nullptr) {
     state->ShareInFlightCellsFrom(*current);
   }
+  // Mark the pair unstable before making the new state visible. A reader that
+  // lands between the state store and version bump observes the odd sequence
+  // and retries instead of accepting the new state with the old version.
+  publication_sequence_.fetch_add(1, std::memory_order_acq_rel);
   current_.store(std::move(state));
-  return version_.fetch_add(1) + 1;
+  const std::uint64_t published = version_.fetch_add(1) + 1;
+  publication_sequence_.fetch_add(1, std::memory_order_release);
+  return published;
 }
 
 std::uint64_t TopologyCache::version() const { return version_.load(); }
 
+std::uint64_t TopologyCache::publication_sequence() const {
+  return publication_sequence_.load(std::memory_order_acquire);
+}
+
 const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
-    TopologyCache& cache, std::uint64_t* version_out) {
+    TopologyCache& cache, std::uint64_t* version_out,
+    std::uint64_t* publication_sequence_out) {
+  thread_local const TopologyCache* entry_cache = nullptr;
   thread_local std::shared_ptr<const ServingState> entry;
   thread_local std::uint64_t entry_version = 0;
-  const std::uint64_t v = cache.version();
-  if (entry != nullptr && entry_version == v) {
-    *version_out = v;
+  thread_local std::uint64_t entry_sequence = 0;
+  const std::uint64_t sequence = cache.publication_sequence();
+  if ((sequence & 1U) == 0 && entry_cache == &cache && entry != nullptr &&
+      entry_sequence == sequence) {
+    *version_out = entry_version;
+    if (publication_sequence_out != nullptr) {
+      *publication_sequence_out = sequence;
+    }
     return entry;
   }
-  // Miss: pair the snapshot with the version that actually covers it. A
-  // publish landing between the two version reads is retried rather than
-  // cached, so a hit always means "this state was current at this version".
+  // Miss: an odd sequence means a writer is between the state store and
+  // version bump. Matching even sequence reads prove both values came from
+  // one completed publication. Include the cache identity in the TLS entry:
+  // tests and embedders may consult multiple caches whose versions coincide.
   for (;;) {
-    const std::uint64_t before = cache.version();
+    const std::uint64_t before = cache.publication_sequence();
+    if ((before & 1U) != 0) continue;
     std::shared_ptr<const ServingState> state = cache.Current();
-    const std::uint64_t after = cache.version();
+    const std::uint64_t version = cache.version();
+    const std::uint64_t after = cache.publication_sequence();
     if (before == after) {
+      entry_cache = &cache;
       entry = std::move(state);
-      entry_version = before;
-      *version_out = before;
+      entry_version = version;
+      entry_sequence = before;
+      *version_out = version;
+      if (publication_sequence_out != nullptr) {
+        *publication_sequence_out = before;
+      }
       return entry;
     }
   }

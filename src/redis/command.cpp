@@ -900,11 +900,13 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
   cluster::TopologyCache& cache =
       cluster::GetClusterRuntime()->topology_cache_;
   for (;;) {
-    // The snapshot arrives paired with the cache version at which it was
-    // current; that pairing is what makes the handshake below airtight.
+    // The snapshot arrives with a completed publication sequence; that
+    // pairing is what makes the handshake below airtight.
     std::uint64_t version_before = 0;
+    std::uint64_t publication_before = 0;
     const std::shared_ptr<const cluster::ServingState>& current =
-        cluster::CurrentCachedWithVersion(cache, &version_before);
+        cluster::CurrentCachedWithVersion(cache, &version_before,
+                                          &publication_before);
     if (!cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
                                      current.get(),
                                      request.cluster_slots_)) {
@@ -931,11 +933,11 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
       // on the cells the next publisher drains.
       request.cluster_admitted_state_ = current;
     }
-    // Publication-race handshake: Publish stores the new state before bumping
-    // the version, so a publication either happened entirely before
-    // version_before (then `current` above IS the new state and the authority
-    // check answered it) or lands inside the window and flips the final read
-    // (then the registration is rolled back and the loop retries). A
+    // Publication-race handshake: the sequence is odd across the state and
+    // logical-version update. A publication either happened entirely before
+    // publication_before (then `current` above is the new state and the
+    // authority check answered it) or changes the final sequence read (then
+    // the registration is rolled back and the loop retries). A
     // registration therefore can never slip past a drain unseen.
     // Registration targets the admitted snapshot the request holds for its
     // whole lifetime, which keeps the cell handles alive behind the guards'
@@ -943,7 +945,9 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     // so the publisher's drain sees these guards regardless.
     RegisterClusterInFlight(*request.cluster_admitted_state_,
                             request.cluster_slots_, in_flights);
-    if (cache.version() == version_before) return std::nullopt;
+    if (cache.publication_sequence() == publication_before) {
+      return std::nullopt;
+    }
     in_flights->clear();
   }
 }
@@ -8764,13 +8768,15 @@ Task<CommandReply> ExecuteExecBody(
           .loading_allowed_ = false,
       };
       // Same publication-race handshake as RecheckClusterWriteAuthority: the
-      // snapshot arrives paired with the version it was current at, and a
-      // version change across registration means the guards may be invisible
+      // snapshot arrives paired with a completed publication sequence, and a
+      // sequence change across registration means the guards may be invisible
       // to a concurrent drain — roll back and re-admit.
       for (;;) {
         std::uint64_t version_before = 0;
+        std::uint64_t publication_before = 0;
         const std::shared_ptr<const cluster::ServingState>& current =
-            cluster::CurrentCachedWithVersion(cache, &version_before);
+            cluster::CurrentCachedWithVersion(cache, &version_before,
+                                              &publication_before);
         const cluster::Decision decision = cluster::Admit(current.get(), view);
         CommandReply redirect;
         if (EmitClusterDecision(decision, queued.front().connection_tls_,
@@ -8787,7 +8793,7 @@ Task<CommandReply> ExecuteExecBody(
         }
         RegisterClusterInFlight(*exec_admitted_state, exec_cluster_slots,
                                 &exec_in_flights);
-        if (cache.version() == version_before) break;
+        if (cache.publication_sequence() == publication_before) break;
         exec_in_flights.clear();
       }
     }

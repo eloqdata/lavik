@@ -634,6 +634,30 @@ TEST(TopologyCacheTest, CachedReaderTracksVersionAndSnapshot) {
   }
 }
 
+TEST(TopologyCacheTest, CachedReaderIsScopedToCacheInstance) {
+  TopologyCache first_cache;
+  TopologyCache second_cache;
+  const std::shared_ptr<const ServingState> first = MakeState(11);
+  const std::shared_ptr<const ServingState> second = MakeState(22);
+  first_cache.Publish(first);
+  second_cache.Publish(second);
+
+  std::uint64_t version = 0;
+  EXPECT_EQ(CurrentCachedWithVersion(first_cache, &version), first);
+  EXPECT_EQ(version, 1);
+  EXPECT_EQ(CurrentCachedWithVersion(second_cache, &version), second);
+  EXPECT_EQ(version, 1);
+}
+
+TEST(TopologyCacheTest, PublicationSequenceBracketsCompletedPairs) {
+  TopologyCache cache;
+  EXPECT_EQ(cache.publication_sequence(), 0);
+  EXPECT_EQ(cache.Publish(MakeState(1)), 1);
+  EXPECT_EQ(cache.publication_sequence(), 2);
+  EXPECT_EQ(cache.Publish(MakeState(2)), 2);
+  EXPECT_EQ(cache.publication_sequence(), 4);
+}
+
 TEST(TopologyCacheTest, CachedReaderConsistentUnderConcurrentPublish) {
   TopologyCache cache;
   std::atomic<bool> stop{false};

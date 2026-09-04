@@ -50,20 +50,23 @@ inverted, out-of-range, or overlapping slot ranges. Coverage may be partial:
 an unbound slot is a first-class state, not an error.
 
 Publication is a single atomic `shared_ptr` swap, so topology, grants, and
-readiness always appear together and readers always observe one consistent
-snapshot. The cache carries a monotonic version: it orders publications for
-tests and anchors the registration handshake below, and a content-identical
-republication (decided by a content hash over the semantic state) is a no-op
-that keeps the existing snapshot and version, so reload churn is invisible.
+readiness always appear together. A writer mutex serializes the rare
+control-plane publications, and an odd/even publication sequence brackets the
+snapshot store and version update. Readers accept a snapshot/version pair only
+when equal even sequence reads surround it, so they cannot pair a newly stored
+snapshot with the preceding version. The cache also carries a monotonic logical
+version for publication ordering and tests. A content-identical republication
+(decided by a content hash over the semantic state) is a no-op that keeps the
+existing snapshot, version, and sequence, so reload churn is invisible.
 Authority decisions never consult the global version: admission captures the
 snapshot it decided against, and the owner-side re-check compares a per-group
 authority token — owner identity, term, grant, and readiness, precomputed at
 build time — so an unrelated group's republication does not disturb
 in-flight work.
 
-Request-path reads go through a thread-local snapshot cache that re-reads
-only the version per call; a hit returns the last observed snapshot with no
-shared-memory writes at all. This keeps the admission gate free of
+Request-path reads go through a thread-local snapshot cache that re-reads only
+the publication sequence per call; a hit returns the last observed snapshot
+with no shared-memory writes at all. This keeps the admission gate free of
 cross-worker serialization — a direct `atomic<shared_ptr>` load per request
 would serialize on the toolchain's internal spin bit.
 
@@ -148,9 +151,10 @@ request path. Publication shares the replaced snapshot's counter into every
 group whose authority token is unchanged, so executions admitted under
 token-equal snapshots drain together, while a changed group starts a fresh
 counter and fencing drains the replaced snapshot's. Registration is bracketed
-by cache-version loads — the publisher stores the new state and bumps the
-version before draining — so a drain either observes a concurrent
-registration or the registrant observes the bump and rolls back. Draining
+by publication-sequence loads — an odd sequence covers the state/version
+update and a completed publication changes the even token — so a drain either
+observes a concurrent registration or the registrant observes the sequence
+change and rolls back. Draining
 those executions before issuing a new grant is the control plane's contract
 (planned follow-up work); the data plane provides the mechanism and does not
 itself wait.

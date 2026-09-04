@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -344,14 +345,13 @@ class ServingStateBuilder {
 
 // Committed local routing snapshot. Publication
 // is a single atomic swap, so topology, grants, and readiness always appear
-// together. The version serves two purposes: publication ordering/tests, and
-// the publication-race handshake that keeps in-flight registration honest —
-// registrants bracket their Enter() with version loads, so a publisher that
-// stores the new state and then bumps the version either has its drain
-// observe the registration or has the registrant observe the bump and roll
-// back. Authority decisions use ServingState::AuthorityToken, never this
-// global version, so unrelated groups republishing does not disturb
-// in-flight writes.
+// together. A logical version orders completed publications for observers and
+// tests. A separate odd/even publication sequence keeps snapshot/version reads
+// and in-flight registration honest: registrants accept only equal even
+// sequence reads around their Enter, so a publisher either observes the
+// registration while draining or makes the registrant roll it back. Authority
+// decisions use ServingState::AuthorityToken, never the global version, so
+// unrelated groups republishing does not disturb in-flight writes.
 class TopologyCache {
  public:
   // nullptr until the first publish; callers treat that as "not ready".
@@ -359,36 +359,45 @@ class TopologyCache {
   // Publishes `state`; a content-identical state is a no-op (same version).
   // Installs the in-flight cell sharing (ServingState::in_flight_cells_)
   // before the store, so the state must not be visible to readers yet. The
-  // state store precedes the version bump; the registration handshake relies
-  // on that order. Returns the current version after the call.
+  // publication sequence is odd across the state/version update. Returns the
+  // current logical version after the call.
   std::uint64_t Publish(std::shared_ptr<const ServingState> state);
   std::uint64_t version() const;
+  // Odd while a publication is changing the snapshot/version pair and even
+  // otherwise. Request-side registration brackets its in-flight Enter with
+  // this token so it cannot accept a snapshot from a half-published pair.
+  std::uint64_t publication_sequence() const;
 
  private:
+  // Publications are control-plane events, so serializing writers has no
+  // request-path cost and lets publication_sequence_ provide seqlock
+  // semantics even if multiple control sources publish concurrently.
+  std::mutex publish_mutex_;
   std::atomic<std::shared_ptr<const ServingState>> current_;
   std::atomic<std::uint64_t> version_{0};
+  std::atomic<std::uint64_t> publication_sequence_{0};
 };
 
 // Request-path reader for the cache: keeps the last observed snapshot in a
-// thread_local and re-reads only the version per call, so the steady-state
+// thread_local and re-reads only the publication sequence per call, so the
 // cost is one atomic load on a read-shared cacheline. This avoids
 // atomic<shared_ptr>::load on the hot path, which this toolchain's libstdc++
 // implements with an internal packed spin bit — a process-wide serialization
 // point when every request on every worker takes it.
 //
 // The returned pair is consistent: the snapshot was the current state at the
-// returned version. Callers registering in-flight work bracket the
-// registration between this version and a fresh version() read afterwards;
-// Publish stores the state before bumping the version, so an unchanged final
-// read proves no publication — and therefore no drain — raced the
-// registration.
+// returned version. Callers registering in-flight work request the optional
+// publication sequence and compare it with a fresh publication_sequence()
+// afterwards; an unchanged even token proves no publication — and therefore
+// no drain — raced the registration.
 // Returns a reference to the calling thread's cached snapshot — no refcount
 // traffic on the shared control block. The reference stays valid until the
 // calling thread's next CurrentCachedWithVersion call; callers that need the
 // snapshot across suspension points (the admission record on the request)
 // copy it deliberately.
 const std::shared_ptr<const ServingState>& CurrentCachedWithVersion(
-    TopologyCache& cache, std::uint64_t* version_out);
+    TopologyCache& cache, std::uint64_t* version_out,
+    std::uint64_t* publication_sequence_out = nullptr);
 
 // Pure routing decisions over a committed ServingState. All functions are
 // stateless.
