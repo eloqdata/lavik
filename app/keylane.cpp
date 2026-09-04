@@ -95,10 +95,6 @@ int main(int argc, char** argv) {
                options.tls_replication_,
                "Use TLS for outgoing replication connections")
       ->capture_default_str();
-  app.add_flag("--cluster-enabled,!--no-cluster-enabled",
-               options.replication_options_.cluster_enabled_,
-               "Enable fail-closed one-node-one-replication-group mode")
-      ->capture_default_str();
   app.add_option("--requirepass", options.requirepass_,
                  "Password required by AUTH");
   app.add_option("--masteruser", options.masteruser_,
@@ -110,7 +106,9 @@ int main(int argc, char** argv) {
                  "Explicitly follow Redis using PSYNC: HOST PORT")
       ->expected(2);
   app.add_flag("--cluster-enabled,!--no-cluster-enabled",
-               options.cluster_enabled_, "Enable the Redis Cluster data plane")
+               options.cluster_enabled_,
+               "Enable the Redis Cluster data plane and fail-closed "
+               "population management")
       ->capture_default_str();
   app.add_option("--cluster-static-nodes-file",
                  options.cluster_static_nodes_file_,

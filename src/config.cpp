@@ -366,13 +366,6 @@ absl::Status ApplyRedisConfigDirective(
     options->tls_replication_ = *enabled;
     return absl::OkStatus();
   }
-  if (name == "cluster-enabled") {
-    if (directive.size() != 2) return WrongArgumentCount(name);
-    auto enabled = ParseYesNo(directive[1], name);
-    if (!enabled.ok()) return enabled.status();
-    options->replication_options_.cluster_enabled_ = *enabled;
-    return absl::OkStatus();
-  }
   if (name == "load-rdb-replace") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto enabled = ParseYesNo(directive[1], name);
@@ -637,6 +630,10 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
           "cluster-enabled cannot be combined with replicaof or "
           "redis-replicaof");
     }
+    if (!options.load_rdb_file_.empty()) {
+      return absl::InvalidArgumentError(
+          "cluster-enabled cannot be combined with load-rdb");
+    }
     // MOVED and discovery replies must name at least one reachable client
     // endpoint. A zero announce port follows the corresponding listen port,
     // so a TLS-only deployment (port 0, tls-port > 0) resolves a nonzero
@@ -690,19 +687,6 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
   if (options.masteruser_ != "default") {
     return absl::InvalidArgumentError(
         "only the default replication user is currently supported");
-  }
-  const bool cluster_enabled = options.replication_options_.cluster_enabled_;
-  if (cluster_enabled && options.replicaof_.has_value()) {
-    return absl::InvalidArgumentError(
-        "cluster-enabled cannot be configured with replicaof");
-  }
-  if (cluster_enabled && options.redis_replicaof_.has_value()) {
-    return absl::InvalidArgumentError(
-        "cluster-enabled cannot be configured with redis-replicaof");
-  }
-  if (cluster_enabled && !options.load_rdb_file_.empty()) {
-    return absl::InvalidArgumentError(
-        "cluster-enabled cannot be configured with load-rdb");
   }
   if (!options.load_rdb_file_.empty() && options.replicaof_.has_value()) {
     return absl::InvalidArgumentError(

@@ -21,6 +21,7 @@ using keylane::test::ReadFile;
 using keylane::test::RespClient;
 using keylane::test::TempDirectory;
 using keylane::test::WaitUntil;
+using keylane::test::WriteFile;
 
 std::string g_keylane_binary;
 
@@ -264,6 +265,12 @@ TEST(RebuildProtocolIntegrationTest,
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
+  const std::filesystem::path nodes = directory.path() / "nodes.conf";
+  WriteFile(nodes,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
+                std::to_string(target_port) +
+                "@0 master - 0 0 1 connected 0-16383\n"
+                "vars currentEpoch 1 lastVoteEpoch 0\n");
   ChildProcess source(
       ServerArguments(source_port, source_data), source_log,
       {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "5000"}});
@@ -296,6 +303,8 @@ TEST(RebuildProtocolIntegrationTest,
 
   auto cluster_arguments = ServerArguments(target_port, target_data);
   cluster_arguments.push_back("--cluster-enabled");
+  cluster_arguments.push_back("--cluster-static-nodes-file");
+  cluster_arguments.push_back(nodes.string());
   target = ChildProcess(cluster_arguments, target_log);
   WaitForStartup(target_port, "partial cluster target recovery");
   {

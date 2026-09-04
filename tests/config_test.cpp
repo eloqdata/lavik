@@ -337,15 +337,15 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
 
 TEST(RedisConfigTest, ParsesClusterEnabled) {
   ServerOptions options;
-  EXPECT_FALSE(options.replication_options_.cluster_enabled_);
+  EXPECT_FALSE(options.cluster_enabled_);
 
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
-  EXPECT_TRUE(options.replication_options_.cluster_enabled_);
+  EXPECT_TRUE(options.cluster_enabled_);
 
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"CLUSTER-ENABLED", "no"}, &options).ok());
-  EXPECT_FALSE(options.replication_options_.cluster_enabled_);
+  EXPECT_FALSE(options.cluster_enabled_);
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"cluster-enabled", "maybe"}, &options).ok());
   EXPECT_FALSE(ApplyRedisConfigDirective({"cluster-enabled"}, &options).ok());
@@ -358,6 +358,10 @@ TEST(RedisConfigTest, ClusterModeRejectsStandalonePopulationSources) {
   ServerOptions options;
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective(
+                  {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"},
+                  &options)
+                  .ok());
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 
   options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
@@ -527,6 +531,7 @@ TEST(RedisConfigTest, AtomicallyRewritesFailoverManagedDirectives) {
 TEST(RedisConfigTest, ConfigRewritePreservesClusterEnabled) {
   TempConfigFile config(
       "cluster-enabled yes\n"
+      "cluster-static-nodes-file /etc/keylane/nodes.conf\n"
       "replica-priority 80\n");
 
   absl::Status rewritten =
@@ -535,7 +540,7 @@ TEST(RedisConfigTest, ConfigRewritePreservesClusterEnabled) {
 
   ServerOptions options;
   ASSERT_TRUE(LoadRedisConfigFile(config.path().string(), &options).ok());
-  EXPECT_TRUE(options.replication_options_.cluster_enabled_);
+  EXPECT_TRUE(options.cluster_enabled_);
   EXPECT_EQ(options.replication_options_.replica_priority_, 0u);
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 

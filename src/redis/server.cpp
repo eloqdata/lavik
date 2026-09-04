@@ -2140,6 +2140,10 @@ int RunServer(ServerOptions options) {
     spdlog::error("configuration error: {}", validated.message());
     return 1;
   }
+  // Cluster mode is a process-wide startup decision. Replication consumes a
+  // derived copy so its fail-closed population state cannot disagree with the
+  // cluster data plane because of separate CLI or config parsing.
+  options.replication_options_.cluster_enabled_ = options.cluster_enabled_;
   auto allowed_max_clients = MaxClientsAllowedByFileLimit(options.max_clients_);
   if (!allowed_max_clients.ok()) {
     spdlog::error("maxclients file-descriptor setup failed: {}",
