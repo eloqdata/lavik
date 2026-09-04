@@ -11,8 +11,10 @@
 #include <string_view>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
+#include "keylane/cluster/topology.h"
 #include "keylane/read_trace.h"
 #include "keylane/resp_version.h"
 #include "keylane/set_trace.h"
@@ -326,6 +328,23 @@ struct CommandRequest {
   // there is no reusable key route.
   std::optional<std::uint16_t> routed_partition_id_;
   std::size_t routed_key_argument_ = 0;
+  // True when the connection arrived over TLS. Cluster discovery and MOVED
+  // replies select the TLS port for TLS connections (mirroring Redis
+  // getNodeClientPort/shouldReturnTlsInfo).
+  bool connection_tls_ = false;
+  // Cluster admission record: the distinct hash slots of the command's keys
+  // and the ServingState snapshot the gate admitted against. The owner-side
+  // authority re-check compares per-group tokens against the current cache.
+  // Inlined: cluster mode populates this per keyed request, and cross-slot
+  // requests are rejected, so the distinct slot count is almost always one —
+  // inline storage keeps the admission path allocation-free.
+  absl::InlinedVector<std::uint16_t, 4> cluster_slots_;
+  // Mutable: the owner-side re-check re-arms this snapshot after a benign
+  // republish (same serving verdict, refreshed token) so the transaction
+  // hook compares against the fresher state. This is a cache-consistency
+  // update, not a mutation of the request's logical contents, and
+  // ExecuteCommandBody takes the request as const.
+  mutable std::shared_ptr<const cluster::ServingState> cluster_admitted_state_;
   std::vector<std::string> args_;
   std::shared_ptr<ReplicationCommandCapture> replication_capture_;
   std::shared_ptr<BlockingNotificationCapture> blocking_notification_capture_;

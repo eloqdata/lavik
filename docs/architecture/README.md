@@ -16,6 +16,7 @@ references rather than current architecture.
 | Transaction coordination | Per-worker intent arbitration, cross-worker scheduling, multi-hop execution, WATCH, and transaction completion | [Transaction coordination](03-transaction-coordination.md) |
 | Storage and recovery | Logical indexes, append/read paths, durable format, devices, recovery, shutdown checkpoints, flushing, expiry, and reclamation | [Storage and recovery](04-storage-and-recovery.md), [Shutdown index checkpoints](06-shutdown-index-checkpoints.md) |
 | Replication | Native Keylane replication, Redis PSYNC interoperability, full sync, online logs, Sentinel-managed role changes, and replay | [Replication](05-replication.md) |
+| Cluster data plane | Slot-ownership routing, authority admission and fencing, and Redis Cluster discovery and redirect compatibility | [Cluster data plane](06-cluster-data-plane.md) |
 
 Metrics, memory accounting, logging, configuration, and the Celer runtime cross
 several subsystems and are summarized in the system overview rather than
@@ -75,4 +76,5 @@ architecture update.
 | Storage exposes a durable engine boundary with focused implementation units | `include/keylane/storage/`, `src/storage/` |
 | Shutdown checkpoints are optional one-shot recovery accelerators published through fixed metadata | `src/storage/engine/checkpoint.cpp`, `src/storage/engine/flush.cpp`, `src/storage/engine/recovery.cpp` |
 | Replication has manager, Sentinel-compatible configuration, and storage-log integration boundaries | `include/keylane/replication.h`, `src/config.cpp`, `src/replication/`, `src/storage/engine/replication_log.cpp` |
+| Cluster data plane has topology, authority, control-port, and Redis gate boundaries | `include/keylane/cluster/`, `src/cluster/`, `src/redis/cluster_command.cpp`, `src/redis/command.cpp` |
 | Celer is a pinned runtime submodule | `.gitmodules`, `CMakeLists.txt`, `celer/include/celer/`, `celer/src/` |

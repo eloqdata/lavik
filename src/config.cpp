@@ -418,6 +418,38 @@ absl::Status ApplyRedisConfigDirective(
     }
     return absl::OkStatus();
   }
+  // Redis Cluster data plane. All five directives are
+  // startup-only: runtime CONFIG SET goes through the separate
+  // kRuntimeConfigs table and never reaches this function.
+  if (name == "cluster-enabled") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->cluster_enabled_ = *enabled;
+    return absl::OkStatus();
+  }
+  if (name == "cluster-static-nodes-file" || name == "cluster-announce-ip") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    if (name == "cluster-static-nodes-file") {
+      options->cluster_static_nodes_file_ = directive[1];
+    } else {
+      options->cluster_announce_ip_ = directive[1];
+    }
+    return absl::OkStatus();
+  }
+  if (name == "cluster-announce-port" || name == "cluster-announce-tls-port") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    // 0 follows the corresponding listen port (port / tls-port).
+    std::uint16_t port = 0;
+    absl::Status parsed = ParseUnsigned(directive[1], name, &port, true);
+    if (!parsed.ok()) return parsed;
+    if (name == "cluster-announce-port") {
+      options->cluster_announce_port_ = port;
+    } else {
+      options->cluster_announce_tls_port_ = port;
+    }
+    return absl::OkStatus();
+  }
   if (name == "replica-read-only") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     auto read_only = ParseYesNo(directive[1], name);
@@ -580,6 +612,41 @@ absl::Status ValidateServerOptions(const ServerOptions& options) {
           static_cast<std::size_t>(std::numeric_limits<long>::max())) {
     return absl::InvalidArgumentError(
         "client-query-buffer-limit must be between 1mb and LONG_MAX bytes");
+  }
+  // Redis Cluster data plane. Cluster mode owns the topology
+  // source of truth, so it is mutually exclusive with both replication
+  // upstream directives; runtime REPLICAOF is rejected separately at the
+  // command layer. The nodes file itself is parsed and matched against this
+  // node's address by the cluster control port at startup; validation here
+  // only requires it to be configured.
+  if (options.cluster_enabled_) {
+    if (options.cluster_static_nodes_file_.empty()) {
+      return absl::InvalidArgumentError(
+          "cluster-enabled requires cluster-static-nodes-file");
+    }
+    if (options.replicaof_.has_value() ||
+        options.redis_replicaof_.has_value()) {
+      return absl::InvalidArgumentError(
+          "cluster-enabled cannot be combined with replicaof or "
+          "redis-replicaof");
+    }
+    // MOVED and discovery replies must name at least one reachable client
+    // endpoint. A zero announce port follows the corresponding listen port,
+    // so a TLS-only deployment (port 0, tls-port > 0) resolves a nonzero
+    // announced TLS port and is valid. This runs before the generic
+    // port/tls-port check below so cluster deployments get this message.
+    const std::uint16_t announced_port = options.cluster_announce_port_ != 0
+                                             ? options.cluster_announce_port_
+                                             : options.port_;
+    const std::uint16_t announced_tls_port =
+        options.cluster_announce_tls_port_ != 0
+            ? options.cluster_announce_tls_port_
+            : options.tls_port_;
+    if (announced_port == 0 && announced_tls_port == 0) {
+      return absl::InvalidArgumentError(
+          "cluster-enabled requires an announced client port: set port, "
+          "tls-port, cluster-announce-port, or cluster-announce-tls-port");
+    }
   }
   if (options.port_ == 0 && options.tls_port_ == 0) {
     return absl::InvalidArgumentError(

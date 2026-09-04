@@ -1,0 +1,572 @@
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "keylane/cluster/topology.h"
+
+namespace keylane::cluster {
+namespace {
+
+// 40 lowercase hex chars, as a nodes.conf node line writes them. NodeId(0)
+// stays all-zero; tests number real nodes from 1.
+std::string NodeId(unsigned n) {
+  std::string id(40, '0');
+  for (int i = 39; n != 0; n >>= 4, --i) {
+    id[static_cast<std::size_t>(i)] = "0123456789abcdef"[n & 0xF];
+  }
+  return id;
+}
+
+NodeDescriptor MakeNode(unsigned n, std::uint16_t port = 7000) {
+  NodeDescriptor node;
+  node.node_id_ = NodeId(n);
+  node.host_ = "127.0.0.1";
+  node.port_ = port;
+  return node;
+}
+
+GroupView MakeGroup(std::string group_id, unsigned primary_node,
+                    std::vector<SlotRange> slots) {
+  GroupView group;
+  group.group_id_ = std::move(group_id);
+  group.primary_node_id_ = NodeId(primary_node);
+  group.slot_ranges_ = std::move(slots);
+  return group;
+}
+
+// Single group owning every slot; `mutate` customizes the group before
+// building (readiness/grant/term variants).
+template <typename Mutate>
+std::shared_ptr<const ServingState> MakeState(std::uint64_t epoch,
+                                              Mutate&& mutate) {
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(epoch).SetSelfNodeId(NodeId(1)).AddNode(MakeNode(1));
+  GroupView group = MakeGroup("g1", 1, {{0, kSlotCount - 1}});
+  mutate(group);
+  builder.AddGroup(std::move(group));
+  auto result = builder.Build();
+  EXPECT_TRUE(result.ok()) << result.status().message();
+  return *std::move(result);
+}
+
+std::shared_ptr<const ServingState> MakeState(std::uint64_t epoch = 1) {
+  return MakeState(epoch, [](GroupView&) {});
+}
+
+// Two primaries splitting the slot space at 5460/5461, the classic static
+// test topology.
+ServingStateBuilder MakeTwoGroupBuilder() {
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(7)
+      .SetSelfNodeId(NodeId(1))
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 1, {{0, 5460}}))
+      .AddGroup(MakeGroup("g2", 2, {{5461, 16383}}));
+  return builder;
+}
+
+TEST(ServingStateBuilderTest, RejectsMalformedNodeIds) {
+  for (std::string bad :
+       {std::string(39, 'a'), std::string(41, 'a'), std::string(40, 'A'),
+        std::string(40, 'g'), std::string()}) {
+    ServingStateBuilder builder;
+    NodeDescriptor node = MakeNode(1);
+    node.node_id_ = bad;
+    builder.AddNode(std::move(node));
+    auto result = builder.Build();
+    EXPECT_FALSE(result.ok()) << "accepted malformed node id '" << bad << "'";
+  }
+}
+
+TEST(ServingStateBuilderTest, RejectsDuplicateNodeId) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddNode(MakeNode(1));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsEmptyAndDuplicateGroupId) {
+  {
+    ServingStateBuilder builder;
+    builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("", 1, {}));
+    EXPECT_FALSE(builder.Build().ok());
+  }
+  {
+    ServingStateBuilder builder;
+    builder.AddNode(MakeNode(1))
+        .AddGroup(MakeGroup("g1", 1, {}))
+        .AddGroup(MakeGroup("g1", 1, {}));
+    EXPECT_FALSE(builder.Build().ok());
+  }
+}
+
+TEST(ServingStateBuilderTest, RejectsUnknownPrimaryNode) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1));
+  GroupView group = MakeGroup("g1", 1, {});
+  group.primary_node_id_ = NodeId(9);  // never added as a node
+  builder.AddGroup(std::move(group));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsUnknownReplicaNode) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1));
+  GroupView group = MakeGroup("g1", 1, {});
+  group.replica_node_ids_.push_back(NodeId(9));
+  builder.AddGroup(std::move(group));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsInvertedSlotRange) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{100, 99}}));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsSlotRangeBeyondSlotCount) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{16000, 20000}}));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsOverlappingSlotsAcrossGroups) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 1, {{0, 100}}))
+      .AddGroup(MakeGroup("g2", 2, {{100, 200}}));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsOverlappingRangesWithinGroup) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1))
+      .AddGroup(MakeGroup("g1", 1, {{0, 100}, {50, 150}}));
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, AddSlotRangeAttachesToExistingGroup) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  builder.AddSlotRange("g1", {10, 20});
+  auto result = builder.Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  const std::shared_ptr<const ServingState>& state = *result;
+  ASSERT_NE(state->GroupForSlot(10), nullptr);
+  EXPECT_EQ(state->GroupForSlot(10)->group_id_, "g1");
+  EXPECT_EQ(state->GroupForSlot(20)->group_id_, "g1");
+  EXPECT_EQ(state->GroupForSlot(21), nullptr);
+  EXPECT_EQ(state->CoveredSlotCount(), 11);
+}
+
+TEST(ServingStateBuilderTest, AddSlotRangeToUnknownGroupIsDropped) {
+  // The frozen AddSlotRange signature cannot report failure, so the range is
+  // dropped and Build stays valid with the slot left uncovered.
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  builder.AddSlotRange("no-such-group", {0, 100});
+  auto result = builder.Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  EXPECT_EQ((*result)->CoveredSlotCount(), 0);
+  EXPECT_EQ((*result)->GroupForSlot(0), nullptr);
+}
+
+TEST(ServingStateBuilderTest, SelfMayBeAbsent) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  auto result = builder.Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  EXPECT_EQ((*result)->Self(), nullptr);
+}
+
+TEST(ServingStateTest, AccessorsRoundTrip) {
+  ServingStateBuilder builder = MakeTwoGroupBuilder();
+  NodeDescriptor replica = MakeNode(3, 7003);
+  replica.is_primary_ = false;
+  replica.primary_id_ = NodeId(1);
+  builder.AddNode(std::move(replica));
+  auto result = builder.Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  const std::shared_ptr<const ServingState>& state = *result;
+
+  EXPECT_EQ(state->topology_epoch(), 7);
+  ASSERT_NE(state->Self(), nullptr);
+  EXPECT_EQ(state->Self()->node_id_, NodeId(1));
+
+  ASSERT_NE(state->FindNode(NodeId(3)), nullptr);
+  EXPECT_EQ(state->FindNode(NodeId(3))->port_, 7003);
+  EXPECT_FALSE(state->FindNode(NodeId(3))->is_primary_);
+  EXPECT_EQ(state->FindNode(NodeId(9)), nullptr);
+
+  ASSERT_NE(state->FindGroup("g2"), nullptr);
+  EXPECT_EQ(state->FindGroup("g2")->primary_node_id_, NodeId(2));
+  EXPECT_EQ(state->FindGroup("nope"), nullptr);
+
+  EXPECT_EQ(state->Nodes().size(), 3);
+  EXPECT_EQ(state->Groups().size(), 2);
+
+  ASSERT_NE(state->GroupForSlot(0), nullptr);
+  EXPECT_EQ(state->GroupForSlot(0)->group_id_, "g1");
+  EXPECT_EQ(state->GroupForSlot(5460)->group_id_, "g1");
+  EXPECT_EQ(state->GroupForSlot(5461)->group_id_, "g2");
+  EXPECT_EQ(state->GroupForSlot(16383)->group_id_, "g2");
+}
+
+TEST(ServingStateTest, CoverageCompleteWhenAllSlotsBound) {
+  auto result = MakeTwoGroupBuilder().Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  EXPECT_TRUE((*result)->CoverageComplete());
+  EXPECT_EQ((*result)->CoveredSlotCount(), kSlotCount);
+}
+
+TEST(ServingStateTest, CoverageGapIsReported) {
+  ServingStateBuilder builder;
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{0, 5460}}));
+  auto result = builder.Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  const std::shared_ptr<const ServingState>& state = *result;
+  EXPECT_FALSE(state->CoverageComplete());
+  EXPECT_EQ(state->CoveredSlotCount(), 5461);
+  EXPECT_EQ(state->GroupForSlot(5461), nullptr);
+  EXPECT_EQ(state->GroupForSlot(16383), nullptr);
+}
+
+TEST(ServingStateTest, FullyReadyTracksStorageAndPopulation) {
+  EXPECT_TRUE(MakeState()->FullyReady());
+  EXPECT_FALSE(MakeState(1, [](GroupView& g) {
+                 g.storage_ready_ = false;
+               })->FullyReady());
+  EXPECT_FALSE(MakeState(1, [](GroupView& g) {
+                 g.population_ready_ = false;
+               })->FullyReady());
+  // Fencing is an authority concern, not a readiness one.
+  EXPECT_TRUE(
+      MakeState(1, [](GroupView& g) { g.granted_ = false; })->FullyReady());
+}
+
+TEST(ServingStateTest, ContentHashIsOrderIndependent) {
+  // Same semantic content, built with nodes, groups, and slot ranges in
+  // different orders — including differently partitioned but equivalent
+  // ranges.
+  ServingStateBuilder a = MakeTwoGroupBuilder();
+  ServingStateBuilder b;
+  b.SetTopologyEpoch(7)
+      .SetSelfNodeId(NodeId(1))
+      .AddNode(MakeNode(2))
+      .AddNode(MakeNode(1))
+      .AddGroup(MakeGroup("g2", 2, {{10000, 16383}, {5461, 9999}}))
+      .AddGroup(MakeGroup("g1", 1, {{0, 2000}, {2001, 5460}}));
+  auto result_a = a.Build();
+  auto result_b = b.Build();
+  ASSERT_TRUE(result_a.ok()) << result_a.status().message();
+  ASSERT_TRUE(result_b.ok()) << result_b.status().message();
+  EXPECT_EQ((*result_a)->content_hash(), (*result_b)->content_hash());
+}
+
+TEST(ServingStateTest, ContentHashCoversEverySemanticField) {
+  const std::uint64_t base = MakeState()->content_hash();
+  EXPECT_NE(MakeState(2)->content_hash(), base);  // topology epoch
+
+  ServingStateBuilder other_self;
+  other_self.SetTopologyEpoch(1)
+      .SetSelfNodeId(NodeId(2))
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 1, {{0, kSlotCount - 1}}));
+  auto other = other_self.Build();
+  ASSERT_TRUE(other.ok()) << other.status().message();
+  EXPECT_NE((*other)->content_hash(), base);  // self id
+
+  EXPECT_NE(
+      MakeState(1, [](GroupView& g) { g.group_term_ = 9; })->content_hash(),
+      base);
+  EXPECT_NE(
+      MakeState(1, [](GroupView& g) { g.granted_ = false; })->content_hash(),
+      base);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.population_ready_ = false; })
+                ->content_hash(),
+            base);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.storage_ready_ = false; })
+                ->content_hash(),
+            base);
+
+  // Slot ownership: move slot 100 from g1 to g2.
+  ServingStateBuilder moved;
+  moved.SetTopologyEpoch(1)
+      .SetSelfNodeId(NodeId(1))
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 1, {{0, 99}, {101, 16383}}))
+      .AddGroup(MakeGroup("g2", 2, {{100, 100}}));
+  auto moved_result = moved.Build();
+  ASSERT_TRUE(moved_result.ok()) << moved_result.status().message();
+  EXPECT_NE((*moved_result)->content_hash(), base);
+}
+
+TEST(ServingStateTest, AuthorityToken) {
+  const std::shared_ptr<const ServingState> base = MakeState();
+  const std::uint64_t token = base->AuthorityToken("g1");
+  EXPECT_NE(token, 0);
+  EXPECT_EQ(base->AuthorityToken("unknown-group"), 0);
+
+  // Stable for identical content.
+  EXPECT_EQ(MakeState()->AuthorityToken("g1"), token);
+
+  // Changes in every covered dimension: owner identity, term, grant, both
+  // readiness flags, config epoch.
+  ServingStateBuilder other_primary;
+  other_primary.SetTopologyEpoch(1)
+      .SetSelfNodeId(NodeId(1))
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 2, {{0, kSlotCount - 1}}));
+  auto other_result = other_primary.Build();
+  ASSERT_TRUE(other_result.ok()) << other_result.status().message();
+  EXPECT_NE((*other_result)->AuthorityToken("g1"), token);
+
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.group_term_ = 2; })
+                ->AuthorityToken("g1"),
+            token);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.granted_ = false; })
+                ->AuthorityToken("g1"),
+            token);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.population_ready_ = false; })
+                ->AuthorityToken("g1"),
+            token);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.storage_ready_ = false; })
+                ->AuthorityToken("g1"),
+            token);
+  EXPECT_NE(MakeState(1, [](GroupView& g) { g.config_epoch_ = 42; })
+                ->AuthorityToken("g1"),
+            token);
+}
+
+TEST(TopologyCacheTest, PublishSharesCellsOnlyForTokenUnchangedGroups) {
+  TopologyCache cache;
+  auto first = MakeTwoGroupBuilder().Build();
+  ASSERT_TRUE(first.ok()) << first.status().message();
+  cache.Publish(*first);
+  const std::shared_ptr<const ServingState> replaced = cache.Current();
+
+  // Hold one in-flight guard per group against the published snapshot.
+  GroupInFlight* cell_g1 = replaced->InFlightCellForSlot(5);
+  GroupInFlight* cell_g2 = replaced->InFlightCellForSlot(5461);
+  ASSERT_NE(cell_g1, nullptr);
+  ASSERT_NE(cell_g2, nullptr);
+  const std::size_t stripe = InFlightStripe();
+  const InFlightGuard guard_g1(*cell_g1, stripe);
+  const InFlightGuard guard_g2(*cell_g2, stripe);
+
+  // Fence g2 (higher epoch, grant dropped); g1's authority is untouched.
+  ServingStateBuilder builder;
+  builder.SetTopologyEpoch(8)
+      .SetSelfNodeId(NodeId(1))
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddGroup(MakeGroup("g1", 1, {{0, 5460}}));
+  GroupView fenced_g2 = MakeGroup("g2", 2, {{5461, 16383}});
+  fenced_g2.granted_ = false;
+  builder.AddGroup(std::move(fenced_g2));
+  auto second = builder.Build();
+  ASSERT_TRUE(second.ok()) << second.status().message();
+  cache.Publish(*second);
+  const std::shared_ptr<const ServingState> current = cache.Current();
+  ASSERT_NE(current, replaced);
+
+  // g1 keeps the shared cell: the in-flight guard is visible from both
+  // snapshots, so draining either covers it.
+  EXPECT_EQ(current->GroupInFlightCount("g1"), 1);
+  EXPECT_EQ(replaced->GroupInFlightCount("g1"), 1);
+  // g2's authority changed: the new snapshot starts a fresh cell, while the
+  // still-running guard remains visible on the replaced snapshot a fence
+  // publisher drains.
+  EXPECT_EQ(current->GroupInFlightCount("g2"), 0);
+  EXPECT_EQ(replaced->GroupInFlightCount("g2"), 1);
+}
+
+TEST(TopologyCacheTest, ContentIdenticalRepublishKeepsInFlightCells) {
+  TopologyCache cache;
+  cache.Publish(MakeState(1));
+  const std::shared_ptr<const ServingState> state = cache.Current();
+  GroupInFlight* cell = state->InFlightCellForSlot(5);
+  ASSERT_NE(cell, nullptr);
+  const InFlightGuard guard(*cell, InFlightStripe());
+
+  // A no-op republish must not disturb in-flight accounting.
+  cache.Publish(MakeState(1));
+  EXPECT_EQ(cache.Current()->GroupInFlightCount("g1"), 1);
+  EXPECT_EQ(cache.version(), 1);
+}
+
+TEST(TopologyCacheTest, PublishSwapsAndBumpsVersion) {
+  TopologyCache cache;
+  EXPECT_EQ(cache.Current(), nullptr);
+  EXPECT_EQ(cache.version(), 0);
+
+  const std::shared_ptr<const ServingState> first = MakeState(1);
+  EXPECT_EQ(cache.Publish(first), 1);
+  EXPECT_EQ(cache.Current(), first);
+  EXPECT_EQ(cache.version(), 1);
+
+  const std::shared_ptr<const ServingState> second = MakeState(2);
+  EXPECT_EQ(cache.Publish(second), 2);
+  EXPECT_EQ(cache.Current(), second);
+  EXPECT_EQ(cache.version(), 2);
+}
+
+TEST(TopologyCacheTest, ContentIdenticalRepublishKeepsVersionAndSnapshot) {
+  TopologyCache cache;
+  const std::shared_ptr<const ServingState> first = MakeState(1);
+  const std::shared_ptr<const ServingState> same_content = MakeState(1);
+  ASSERT_EQ(first->content_hash(), same_content->content_hash());
+
+  EXPECT_EQ(cache.Publish(first), 1);
+  EXPECT_EQ(cache.Publish(same_content), 1);
+  // The older snapshot is kept, not swapped.
+  EXPECT_EQ(cache.Current(), first);
+  EXPECT_EQ(cache.version(), 1);
+}
+
+TEST(TopologyCacheTest, VersionsIncreaseMonotonicallyUnderOnePublisher) {
+  TopologyCache cache;
+  for (std::uint64_t i = 1; i <= 10; ++i) {
+    EXPECT_EQ(cache.Publish(MakeState(i)), i);
+  }
+  EXPECT_EQ(cache.version(), 10);
+}
+
+TEST(TopologyCacheTest, ConcurrentPublishAndCurrentSmoke) {
+  TopologyCache cache;
+  constexpr int kThreads = 4;
+  constexpr int kPublishesPerThread = 50;
+  std::atomic<bool> start{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) {
+    threads.emplace_back([t, &start, &cache] {
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      for (int i = 0; i < kPublishesPerThread; ++i) {
+        // Distinct epochs make every published snapshot unique, so every
+        // Publish must bump the version exactly once.
+        cache.Publish(MakeState(
+            static_cast<std::uint64_t>(t * kPublishesPerThread + i + 1)));
+        EXPECT_NE(cache.Current(), nullptr);
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (std::thread& thread : threads) thread.join();
+
+  EXPECT_NE(cache.Current(), nullptr);
+  EXPECT_EQ(cache.version(), kThreads * kPublishesPerThread);
+}
+
+TEST(ClusterRouterTest, PrimaryForSlot) {
+  auto result = MakeTwoGroupBuilder().Build();
+  ASSERT_TRUE(result.ok()) << result.status().message();
+  const std::shared_ptr<const ServingState>& state = *result;
+
+  const NodeDescriptor* owner = router::PrimaryForSlot(*state, 0);
+  ASSERT_NE(owner, nullptr);
+  EXPECT_EQ(owner->node_id_, NodeId(1));
+  EXPECT_EQ(router::PrimaryForSlot(*state, 16383)->node_id_, NodeId(2));
+
+  // Unbound slot: no group, hence no primary.
+  ServingStateBuilder partial;
+  partial.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{0, 100}}));
+  auto partial_result = partial.Build();
+  ASSERT_TRUE(partial_result.ok()) << partial_result.status().message();
+  EXPECT_EQ(router::PrimaryForSlot(**partial_result, 101), nullptr);
+}
+
+TEST(ClusterRouterTest, ClientPortFollowsConnectionTlsState) {
+  NodeDescriptor node = MakeNode(1, 7000);
+  node.tls_port_ = 7443;
+  EXPECT_EQ(router::ClientPort(node, /*connection_tls=*/true), 7443);
+  EXPECT_EQ(router::ClientPort(node, /*connection_tls=*/false), 7000);
+
+  // TLS connection to a node that offers no TLS port falls back to port.
+  node.tls_port_ = 0;
+  EXPECT_EQ(router::ClientPort(node, /*connection_tls=*/true), 7000);
+}
+
+TEST(ClusterRouterTest, EndpointFormatsHostAndPort) {
+  NodeDescriptor node = MakeNode(1, 7000);
+  node.tls_port_ = 7443;
+  EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "127.0.0.1:7000");
+  EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/true), "127.0.0.1:7443");
+
+  node.host_ = "::1";
+  node.tls_port_ = 0;
+  EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "[::1]:7000");
+}
+
+TEST(TopologyCacheTest, CachedReaderTracksVersionAndSnapshot) {
+  TopologyCache cache;
+  {
+    std::uint64_t version = 1;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
+    EXPECT_EQ(state, nullptr);
+    EXPECT_EQ(version, 0);
+  }
+  const std::shared_ptr<const ServingState> first = MakeState(1);
+  cache.Publish(first);
+  {
+    std::uint64_t version = 0;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
+    EXPECT_EQ(state, first);
+    EXPECT_EQ(version, 1);
+    // A second read on the same thread hits the cached entry with the same
+    // consistent pair.
+    std::uint64_t version2 = 0;
+    const auto& again = CurrentCachedWithVersion(cache, &version2);
+    EXPECT_EQ(again, first);
+    EXPECT_EQ(version2, 1);
+  }
+  const std::shared_ptr<const ServingState> second = MakeState(2);
+  cache.Publish(second);
+  {
+    std::uint64_t version = 0;
+    const auto& state = CurrentCachedWithVersion(cache, &version);
+    EXPECT_EQ(state, second);
+    EXPECT_EQ(version, 2);
+  }
+}
+
+TEST(TopologyCacheTest, CachedReaderConsistentUnderConcurrentPublish) {
+  TopologyCache cache;
+  std::atomic<bool> stop{false};
+  std::atomic<bool> mismatch{false};
+  std::thread publisher([&] {
+    for (std::uint64_t i = 1; i <= 2000 && !mismatch.load(); ++i) {
+      cache.Publish(MakeState(i));
+    }
+    stop.store(true, std::memory_order_release);
+  });
+  // The reader runs on a fresh thread so its thread_local entry starts empty
+  // (the cache is per-thread and not scoped to a TopologyCache instance).
+  // This publish sequence yields version == topology epoch, so any
+  // inconsistent (state, version) pairing is directly visible.
+  std::thread reader([&] {
+    while (!stop.load(std::memory_order_acquire)) {
+      std::uint64_t version = 0;
+      const auto& state = CurrentCachedWithVersion(cache, &version);
+      if (state != nullptr && state->topology_epoch() != version) {
+        mismatch.store(true);
+        break;
+      }
+    }
+  });
+  publisher.join();
+  reader.join();
+  EXPECT_FALSE(mismatch.load());
+}
+
+}  // namespace
+}  // namespace keylane::cluster

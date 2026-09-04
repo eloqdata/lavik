@@ -17,6 +17,7 @@
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
 #include "blocking_wait.h"
+#include "cluster_gate.h"
 #include "keylane/redis_parse.h"
 #include "keylane/resp.h"
 #include "keylane/storage/engine.h"
@@ -426,6 +427,12 @@ Task<absl::StatusOr<bool>> ReplaceDestinationLocked(
     const CommandRequest& request, const LockedKey& destination,
     std::span<const std::string> values, storage::TxShardWrites* writes) {
   auto replace = [&]() -> Task<absl::StatusOr<bool>> {
+    // Choke point 2 for SORT STORE: re-check the captured cluster
+    // admission on the destination owner, immediately before mutating — the
+    // hop itself is the airtight point. Nothing has run yet when it fires, so
+    // the caller can safely answer with a fresh redirect.
+    const absl::Status authority = RecheckClusterRequestAuthority(request);
+    if (!authority.ok()) co_return authority;
     auto deleted = co_await g_storage->DeleteLocked(
         request.db_id_, destination.name_, destination.digest_, writes);
     if (!deleted.ok()) co_return deleted.status();
@@ -555,6 +562,9 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       co_return Built(reply_builder.View());
     }
 
+    // SORT STORE's mutation runs inside ReplaceDestinationLocked's owner hop;
+    // the cluster authority re-check lives there, right before the first
+    // write — the airtight point.
     const std::string& destination_name = request.args_[*options->store_arg_];
     const LockedKey* destination = FindLockedKey(keys, destination_name);
     const std::uint64_t txid = storage::StorageEngine::AllocateWriteTxid();
@@ -569,6 +579,11 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
         return g_storage->RollbackTxLocal(txid);
       });
       (void)co_await ReleaseSortTransaction(&transaction);
+      if (IsClusterAuthorityChanged(replaced.status())) {
+        // The re-check fired before any write of the destination.
+        co_return ClusterAuthorityChangedReply(
+            request.cluster_slots_, request.connection_tls_, reply_builder);
+      }
       co_return Built(AppendSortError(reply_builder, replaced.status()));
     }
 

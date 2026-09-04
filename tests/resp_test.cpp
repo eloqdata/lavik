@@ -292,5 +292,53 @@ TEST(ReplyBuilderTest, DegradesSemanticTypesToResp2) {
             "$20\r\n12345678901234567890\r\n$5\r\nhello\r\n");
 }
 
+// The cluster error helpers emit Redis 7.2's texts verbatim: clients dispatch
+// on the first token (MOVED/CROSSSLOT/CLUSTERDOWN/TRYAGAIN), so a drifted
+// message is a protocol bug, not a cosmetic one.
+TEST(ClusterErrorTest, MovedErrorCarriesSlotAndConcreteEndpoint) {
+  ReplyBuilder builder;
+  EXPECT_EQ(AppendMovedError(builder, 3998, "10.0.0.2", 6380),
+            "-MOVED 3998 10.0.0.2:6380\r\n");
+  builder.Reset();
+  EXPECT_EQ(AppendMovedError(builder, 0, "192.168.1.1", 0),
+            "-MOVED 0 192.168.1.1:0\r\n");
+}
+
+TEST(ClusterErrorTest, CrossSlotErrorIsVerbatim) {
+  ReplyBuilder builder;
+  EXPECT_EQ(AppendCrossSlotError(builder),
+            "-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+}
+
+TEST(ClusterErrorTest, ClusterDownUnboundErrorIsVerbatim) {
+  ReplyBuilder builder;
+  EXPECT_EQ(AppendClusterDownUnboundError(builder),
+            "-CLUSTERDOWN Hash slot not served\r\n");
+}
+
+TEST(ClusterErrorTest, TryAgainErrorWrapsMessage) {
+  ReplyBuilder builder;
+  EXPECT_EQ(AppendTryAgainError(builder, "database flush is in progress"),
+            "-TRYAGAIN database flush is in progress\r\n");
+}
+
+// The free-standing message builders feed paths without a ReplyBuilder (the
+// blocking wait loop); both spellings must agree with the builder forms above.
+TEST(ClusterErrorTest, MessageBuildersMatchBuilderForms) {
+  EXPECT_EQ(ClusterMovedMessage(42, "10.0.0.9", 7379),
+            "MOVED 42 10.0.0.9:7379");
+  EXPECT_EQ(kClusterCrossSlotMessage,
+            "CROSSSLOT Keys in request don't hash to the same slot");
+  EXPECT_EQ(kClusterDownUnboundMessage, "CLUSTERDOWN Hash slot not served");
+  EXPECT_EQ(ClusterTryAgainMessage("x"), "TRYAGAIN x");
+  ReplyBuilder builder(RespVersion::k3);
+  // Cluster errors are simple error lines with no RESP2/RESP3 divergence.
+  EXPECT_EQ(AppendMovedError(builder, 42, "10.0.0.9", 7379),
+            "-MOVED 42 10.0.0.9:7379\r\n");
+  builder.Reset();
+  EXPECT_EQ(AppendCrossSlotError(builder),
+            "-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+}
+
 }  // namespace
 }  // namespace keylane

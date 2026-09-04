@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "absl/strings/str_cat.h"
 #include "keylane/memory.h"
 
 namespace keylane {
@@ -662,6 +663,33 @@ std::string EncodeError(std::string_view message) {
   builder.Reserve(message.size() + 3);
   builder.AppendError(message);
   return std::move(builder).Release();
+}
+
+std::string ClusterMovedMessage(std::uint16_t slot, std::string_view host,
+                                std::uint16_t port) {
+  return absl::StrCat("MOVED ", slot, " ", host, ":", port);
+}
+
+std::string ClusterTryAgainMessage(std::string_view message) {
+  return absl::StrCat("TRYAGAIN ", message);
+}
+
+std::string_view AppendMovedError(ReplyBuilder& builder, std::uint16_t slot,
+                                  std::string_view host, std::uint16_t port) {
+  return builder.AppendError(ClusterMovedMessage(slot, host, port));
+}
+
+std::string_view AppendCrossSlotError(ReplyBuilder& builder) {
+  return builder.AppendError(kClusterCrossSlotMessage);
+}
+
+std::string_view AppendClusterDownUnboundError(ReplyBuilder& builder) {
+  return builder.AppendError(kClusterDownUnboundMessage);
+}
+
+std::string_view AppendTryAgainError(ReplyBuilder& builder,
+                                     std::string_view message) {
+  return builder.AppendError(ClusterTryAgainMessage(message));
 }
 
 std::string_view EncodeScanReply(ReplyBuilder& builder, std::uint64_t cursor,

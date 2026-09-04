@@ -11,8 +11,8 @@ HTTP service, and storage I/O backends.
 
 The executable is one process with worker-affine state rather than a collection
 of networked services. Redis serving, metrics, replication, transaction
-coordination, and storage are composed in `RunServer`; Celer owns the worker and
-socket lifecycle underneath those Keylane modules.
+coordination, the cluster data plane, and storage are composed in `RunServer`;
+Celer owns the worker and socket lifecycle underneath those Keylane modules.
 
 ```text
 Redis/Valkey clients, Sentinels, and replicas
@@ -45,6 +45,7 @@ snapshots.
 | Storage and recovery | Own logical indexes and physical blocks, execute reads and appends, recover durable state, and reclaim obsolete data | `storage::StorageEngine` |
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
+| Cluster data plane | Admit, redirect, or refuse requests by slot ownership and authority, and serve Redis Cluster discovery | `cluster::Admit`, `cluster::TopologyCache`, `cluster::ClusterControlPort` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle

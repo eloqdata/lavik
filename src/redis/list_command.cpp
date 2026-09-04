@@ -18,6 +18,7 @@
 #include "absl/status/statusor.h"
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/worker.h"
+#include "cluster_gate.h"
 #include "keylane/command_table.h"
 #include "keylane/redis_parse.h"
 #include "keylane/resp.h"
@@ -622,14 +623,28 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
           AppendStorageError(reply_builder, replication.status()));
     }
     SingleShardListOutcome outcome = co_await celer::SubmitTaskTo(
-        first_owner, [db_id = request.db_id_, keys = std::move(keys), move,
-                      source_left, destination_left, pop_left, pop_count,
-                      replication = &replication]() mutable {
-          return ExecuteSingleShardListMulti(db_id, std::move(keys), move,
-                                             source_left, destination_left,
-                                             pop_left, pop_count, replication);
+        first_owner,
+        [&request, db_id = request.db_id_, keys = std::move(keys), move,
+         source_left, destination_left, pop_left, pop_count,
+         replication = &replication]() mutable -> Task<SingleShardListOutcome> {
+          // Choke point 2 for the transaction-free single-shard path: re-check
+          // the cluster admission on the owner right before mutating. Cluster
+          // admission guarantees one slot, hence this path.
+          const absl::Status authority =
+              RecheckClusterRequestAuthority(request);
+          if (!authority.ok()) {
+            co_return SingleShardListOutcome(authority);
+          }
+          co_return co_await ExecuteSingleShardListMulti(
+              db_id, std::move(keys), move, source_left, destination_left,
+              pop_left, pop_count, replication);
         });
     if (!outcome.status_.ok()) {
+      if (IsClusterAuthorityChanged(outcome.status_)) {
+        // The re-check fired before the hop mutated anything.
+        co_return ClusterAuthorityChangedReply(
+            request.cluster_slots_, request.connection_tls_, reply_builder);
+      }
       co_return BuiltReply(AppendStorageError(reply_builder, outcome.status_));
     }
     if (outcome.values_.empty()) {
@@ -662,6 +677,8 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
                static_cast<std::uint32_t>(arg), tx::LockMode::kExclusive);
   }
   txn.Seal();
+  ClusterShardValidatorContext cluster_validator;
+  InstallClusterShardValidator(txn, request, cluster_validator);
   ReplicationTransactionGuard replication(request, &txn);
   if (!replication.status().ok()) {
     co_return BuiltReply(
@@ -673,10 +690,20 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
   }
   status = co_await txn.Execute(&ListLockHoldCallback, nullptr, false);
   if (!status.ok()) {
+    if (cluster_validator.tripped_.load(std::memory_order_relaxed)) {
+      // The hold hop retains its locks on failure; drop them before
+      // answering. Nothing mutated: ListLockHoldCallback never ran.
+      (void)co_await txn.Release();
+      co_return ClusterValidatorFailureReply(
+          txn, cluster_validator, request.connection_tls_, reply_builder);
+    }
     co_return BuiltReply(reply_builder.AppendError("ERR ", status.message()));
   }
 
   auto release = [&]() -> Task<absl::Status> {
+    // The settle hop must not be fenced off retroactively: it releases the
+    // holds under which earlier hops already mutated (or not).
+    txn.SetShardValidator(nullptr, nullptr);
     co_return co_await txn.Execute(&ListLockHoldCallback, nullptr, true);
   };
 

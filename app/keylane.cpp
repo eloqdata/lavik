@@ -105,6 +105,23 @@ int main(int argc, char** argv) {
   app.add_option("--redis-replicaof", redis_replicaof_cli,
                  "Explicitly follow Redis using PSYNC: HOST PORT")
       ->expected(2);
+  app.add_flag("--cluster-enabled,!--no-cluster-enabled",
+               options.cluster_enabled_, "Enable the Redis Cluster data plane")
+      ->capture_default_str();
+  app.add_option("--cluster-static-nodes-file",
+                 options.cluster_static_nodes_file_,
+                 "Shared nodes.conf-format static cluster topology file");
+  app.add_option("--cluster-announce-ip", options.cluster_announce_ip_,
+                 "Client-facing address advertised by cluster discovery");
+  app.add_option("--cluster-announce-port", options.cluster_announce_port_,
+                 "Client-facing plaintext port (0 follows --port)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--cluster-announce-tls-port",
+                 options.cluster_announce_tls_port_,
+                 "Client-facing TLS port (0 follows --tls-port)")
+      ->capture_default_str()
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--metrics-port", options.metrics_port_,
                  "Prometheus HTTP listen port (0 disables)")
       ->capture_default_str()
