@@ -321,11 +321,11 @@ struct CommandRequest {
   // before mutation, including when writable replicas are enabled.
   std::optional<std::uint64_t> write_admission_role_epoch_;
   const CommandSpec* spec_ = nullptr;
-  // Populated by source-write dispatch after DetermineKeys proves there is
-  // exactly one key. The request remains alive across its cross-core handoff,
-  // so publisher admission, command dispatch, and storage lookup can all reuse
-  // the Redis slot. Consumers must also match the argument index; zero means
-  // there is no reusable key route.
+  // Populated after key extraction proves there is exactly one key. Source
+  // writes compute it before their cross-core handoff; cluster admission also
+  // fills it for reads so owner routing can reuse the Redis slot. Consumers
+  // must also match the argument index; zero means there is no reusable key
+  // route.
   std::optional<std::uint16_t> routed_partition_id_;
   std::size_t routed_key_argument_ = 0;
   // True when the connection arrived over TLS. Cluster discovery and MOVED

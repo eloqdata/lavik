@@ -760,10 +760,16 @@ void PopulateClusterSlots(CommandRequest& request) {
   const absl::StatusOr<KeyIndexView> keys =
       DetermineKeys(*request.spec_, request.args_);
   if (!keys.ok() || keys->empty()) return;
-  // Single-key write routing already hashed this key into
-  // routed_partition_id_; reuse it instead of computing CRC16 twice.
-  if (keys->count() == 1 && request.routed_partition_id_.has_value() &&
-      request.routed_key_argument_ == keys->first_) {
+  if (keys->count() == 1) {
+    // Source writes arrive with a route chosen before their owner hop. Reads
+    // first discover their route here; retaining it avoids hashing the key a
+    // second time when storage dispatch chooses the owner below.
+    if (!request.routed_partition_id_.has_value() ||
+        request.routed_key_argument_ != keys->first_) {
+      request.routed_partition_id_ =
+          storage::RedisSlot(request.args_[keys->first_]);
+      request.routed_key_argument_ = keys->first_;
+    }
     request.AddClusterSlot(*request.routed_partition_id_);
     return;
   }
@@ -11525,13 +11531,15 @@ Task<CommandReply> ExecuteCommandBody(
     case CommandKind::kRestore:
     case CommandKind::kType:
       if (args.size() >= 2) {
-        // ExecuteCommand already moved a proven single-key source write to
-        // its owner. Reuse that decision instead of hashing args[1] again;
-        // other paths retain the normal defensive route calculation.
+        // Single-key source writes are already on this computed owner, while
+        // cluster reads learned the same route during admission. Deriving the
+        // worker from the retained slot is cheaper than hashing args[1] again.
         const bool routed = request.routed_partition_id_.has_value() &&
                             request.routed_key_argument_ == 1;
-        const unsigned target =
-            routed ? ThisWorker().id_ : ShardForKey(args[1]);
+        const unsigned target = routed
+                                    ? *request.routed_partition_id_ %
+                                          g_storage->worker_count()
+                                    : ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE
         if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;
