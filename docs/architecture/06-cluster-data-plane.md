@@ -141,6 +141,11 @@ combination of admission, the two choke points, and per-group tokens
 guarantees a stale topology causes redirection or temporary unavailability,
 never a second writer.
 
+Only writes retain ownership of the admitted snapshot across suspension
+points. Reads finish their decision while the thread-local cache keeps the
+snapshot alive and carry no per-request shared reference afterwards, matching
+their intentionally absent owner-side re-check.
+
 Executions register their admitted groups when they pass the re-check and
 unregister at completion, so a fence publisher can observe whether any
 admitted write is still running for an affected group. The accounting lives

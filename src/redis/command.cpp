@@ -838,16 +838,21 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
   const std::shared_ptr<const cluster::ServingState>& state =
       cluster::CurrentCachedWithVersion(runtime->topology_cache_,
                                         &gate_snapshot_version);
+  const bool is_write = ClusterRequestIsWrite(request);
   const cluster::RequestView view{
       .slots_ = request.cluster_slots_,
-      .is_write_ = ClusterRequestIsWrite(request),
+      .is_write_ = is_write,
       .connection_readonly_ = ctx.cluster_readonly_,
       .loading_allowed_ = LoadingAllowedCommandKind(request.kind_),
   };
   const cluster::Decision decision = cluster::Admit(state.get(), view);
   if (!EmitClusterDecision(decision, request.connection_tls_, reply_builder,
                            reply)) {
-    request.cluster_admitted_state_ = state;  // deliberate copy: own ref
+    // Reads intentionally have no owner-side fence re-check, so retaining the
+    // snapshot would only bounce its shared reference-count cacheline between
+    // workers. Writes keep ownership because they may suspend before their
+    // authority re-check and in-flight registration.
+    if (is_write) request.cluster_admitted_state_ = state;
     return false;
   }
   return true;
