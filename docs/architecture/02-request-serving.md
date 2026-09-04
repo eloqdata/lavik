@@ -105,16 +105,17 @@ racing closure is either rejected or remains visible to the drain.
    attaches the connection's reply version, then records command metrics and
    eligible slow-log entries around the dispatch result.
 4. `DispatchCommandImpl` runs the readiness and ownership admission gates.
-   The standalone LOADING gate rejects non-whitelisted commands while a
-   replica syncs from its upstream; it is inert in cluster mode, which has no
-   upstream. When cluster mode is enabled, the cluster admission gate runs
-   next, deciding from the committed `cluster::ServingState` whether to serve
-   locally, serve a stale replica read, redirect with MOVED, or refuse with
-   CROSSSLOT, CLUSTERDOWN, or LOADING. It replaces the standalone
-   replica-MOVED shim — the two topology sources are mutually exclusive — and
-   it also runs at `MULTI` queue time so a rejected command aborts the queued
-   transaction. An admitted request carries its key slots and the snapshot it
-   was admitted against into execution for the owner-side authority re-check.
+   The replication LOADING gate rejects non-whitelisted commands while a
+   standalone replica syncs or a cluster node rebuilds its Meta-authorized
+   population. When cluster mode is enabled, the cluster admission gate runs
+   next and independently decides from the committed `cluster::ServingState`
+   whether to serve locally, serve a stale replica read, redirect with MOVED,
+   or refuse with CROSSSLOT, CLUSTERDOWN, or LOADING. Cluster mode disables the
+   standalone replica-MOVED shim: a population source transfers data but never
+   supplies client-routing authority. The cluster gate also runs at `MULTI`
+   queue time so a rejected command aborts the queued transaction. An admitted
+   request carries its key slots and the snapshot it was admitted against into
+   execution for the owner-side authority re-check.
 5. `ExecuteCommand` and `ExecuteAdmittedCommand` reserve replication publisher
    capacity for source writes before database/key work. Eligible single-key
    writes are moved directly to their owner so admission and mutation share the
@@ -168,10 +169,10 @@ waiting and reacquire it for each concrete attempt. Their waiter registry and
 readiness events are implemented in the Redis subsystem, while storage remains
 the source of truth checked after wakeup.
 
-External data commands also capture the replication manager's packed
-serving-generation/open token at dispatch. Every path revalidates that token
-after obtaining its database gate; blocking List and Sorted Set loops and the
-Stream loop repeat the check on every wake. A role transition away from a
+External data commands dispatched through the shared database-gate path also
+capture the replication manager's packed serving-generation/open token and
+revalidate it after obtaining that gate; blocking List and Sorted Set loops and
+the Stream loop repeat the check on every wake. A role transition away from a
 serving population first closes and advances the generation, then broadcasts a
 wake to every worker-local blocking registry. A waiter admitted against the old
 population therefore exits with LOADING or TRYAGAIN instead of timing out or

@@ -8,7 +8,26 @@
 #include <string_view>
 #include <vector>
 
+#include "keylane/storage/engine.h"
 #include "keylane/storage/format.h"
+
+TEST(StorageStateTest, PromotionBaseEqualityIncludesDurabilityFrontier) {
+  using namespace keylane::storage;
+  const PromotionBase base{
+      .group_id_ = "group-a",
+      .parent_history_id_ = "history-a",
+      .parent_frontier_ = {.history_context_ = "context-a",
+                           .flow_cursors_ = {4, 8}},
+      .population_token_ = {.generation_ = 7, .digest_ = 11},
+      .catalog_token_ = {.catalog_generation_ = 3, .dump_crc64_ = 5},
+      .storage_accumulator_ = "accumulator-a",
+  };
+  PromotionBase equal = base;
+  EXPECT_EQ(equal, base);
+
+  equal.parent_frontier_.flow_cursors_[1] = 9;
+  EXPECT_NE(equal, base);
+}
 
 TEST(StorageFormatTest, ComputesStableProcessLocalDigests) {
   using namespace keylane::storage;

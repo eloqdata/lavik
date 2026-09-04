@@ -687,17 +687,15 @@ Task<std::optional<std::string>> ReplicaMovedError(
 //
 // When cluster mode is enabled, admission is decided by cluster::Admit
 // against the latest committed ServingState, and the legacy replica-MOVED
-// shim above never runs: cluster mode forbids a replication upstream (startup
-// validation plus the REPLICAOF command rejection), so the two redirect
-// sources are mutually exclusive.
+// shim above never runs. Cluster mode forbids standalone REPLICAOF control but
+// the replication manager may still have a Meta-authorized population source;
+// that source never supplies client redirection authority.
 //
-// The standalone LOADING gate (DispatchCommandImpl) and the cluster gate share
-// the whitelist below but draw on different sources: the standalone gate asks
-// the replication manager whether an upstream sync is in progress, which is
-// inert in cluster mode; the cluster gate takes readiness from the committed
-// ServingState (the static control adapter publishes storage readiness only
-// after recovery completes). There is deliberately one readiness fact per
-// mode, never two live at once.
+// The replication LOADING gate (DispatchCommandImpl) and the cluster gate
+// share the whitelist below but prove different facts. In cluster mode the
+// former stays closed until the authorized population rebuild is complete;
+// the latter independently checks topology authority plus the committed
+// ServingState's storage/population readiness. Both must admit a data command.
 
 // Commands served while the dataset is not ready. Verbatim mirror of the
 // whitelist the standalone is_loading gate used before extraction; REPLICAOF/
@@ -10926,9 +10924,9 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
               "KILL or SHUTDOWN NOSAVE."));
   }
   if (g_replication != nullptr && g_replication->is_loading()) [[unlikely]] {
-    // The whitelist is shared verbatim with the cluster gate
-    // (LoadingAllowedCommandKind); this gate is inert in cluster mode because
-    // cluster nodes have no replication upstream to sync from.
+    // The whitelist is shared verbatim with the cluster gate. In cluster mode
+    // this is the target-side population fence; ClusterGateReject below still
+    // performs the independent topology/authority admission.
     if (!LoadingAllowedCommandKind(kind)) {
       co_return BuiltReply(reply_builder.AppendError(
           "LOADING Keylane is loading the dataset from the primary"));

@@ -224,7 +224,9 @@ class ReplicationManager {
   // Revokes every downstream destructive-reset capability and reconnect lease
   // (for example, when this node loses primary authority). An accepted
   // directive remains the version watermark, preventing its replay after
-  // revocation; revoking an empty ledger is an idempotent no-op.
+  // revocation; revoking an empty ledger is an idempotent no-op. Standalone
+  // managers reject this cluster-only transition without disturbing ordinary
+  // downstream replication sessions.
   celer::Task<absl::Status> RevokeClusterRebuildSourceAuthorizations();
 
   // Current runtime settings; all mutations enter through ApplyDirective.

@@ -3251,6 +3251,10 @@ class ReplicationManager::ReplicationGroup {
       co_return co_await celer::SubmitTaskTo(
           0, [this] { return RevokeClusterRebuildSourceAuthorizations(); });
     }
+    if (!cluster_enabled_ || cluster_group_ == nullptr) {
+      co_return absl::FailedPreconditionError(
+          "cluster source revocation requires cluster-enabled mode");
+    }
     struct RevocationGuard {
       std::mutex* state_mutex_ = nullptr;
       unsigned* in_flight_ = nullptr;
@@ -5898,6 +5902,7 @@ class ReplicationManager::ReplicationGroup {
     if (session->cluster_rebuild_ != nullptr) {
       const RebuildDirective& directive = session->cluster_rebuild_->directive_;
       if (words[2] != directive.identity_.source_node_id_ ||
+          words[3] != directive.identity_.group_id_ ||
           words[4] != directive.identity_.source_boot_id_ ||
           words[5] != directive.identity_.source_history_id_ ||
           source_workers != directive.flow_count_) {
@@ -5905,8 +5910,8 @@ class ReplicationManager::ReplicationGroup {
         session->sockets_.Remove(control_fd);
         control.Close().IgnoreError();
         co_return absl::FailedPreconditionError(
-            "native source identity/history/flow layout does not match the "
-            "cluster rebuild directive");
+            "native source node/group/boot/history/flow layout does not "
+            "match the cluster rebuild directive");
       }
     }
     const bool local_population_matches_response =
