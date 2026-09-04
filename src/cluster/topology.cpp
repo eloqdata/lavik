@@ -97,14 +97,32 @@ void HashNodeId(std::uint64_t& hash, const NodeId& node_id) {
   for (std::uint8_t byte : node_id.bytes()) HashByte(hash, byte);
 }
 
+const NodeDescriptor* NodeAt(const std::vector<NodeDescriptor>& nodes,
+                             NodeIndex node_index) {
+  if (node_index == kNoNodeIndex || node_index >= nodes.size()) return nullptr;
+  return &nodes[node_index];
+}
+
+void HashNodeReference(std::uint64_t& hash,
+                       const std::vector<NodeDescriptor>& nodes,
+                       NodeIndex node_index) {
+  const NodeDescriptor* node = NodeAt(nodes, node_index);
+  if (node == nullptr) {
+    HashBool(hash, false);
+    return;
+  }
+  HashNodeId(hash, node->node_id_);
+}
+
 // Composite authority token for one group: owner identity, term, grant, and
 // readiness. Computed once per group at Build; the request path only compares
 // the precomputed values. 0 is reserved for "unknown group" so a dangling
 // group id can never compare equal to a real authority during the owner-side
 // re-check.
-std::uint64_t ComputeGroupToken(const GroupView& group) {
+std::uint64_t ComputeGroupToken(const GroupView& group,
+                                const std::vector<NodeDescriptor>& nodes) {
   std::uint64_t hash = kFnv1aOffsetBasis;
-  HashNodeId(hash, group.primary_node_id_);
+  HashNodeReference(hash, nodes, group.primary_node_index_);
   HashU64(hash, group.group_term_);
   HashBool(hash, group.granted_);
   HashBool(hash, group.population_ready_);
@@ -121,13 +139,13 @@ std::uint64_t ComputeGroupToken(const GroupView& group) {
 // GroupView::slot_ranges_ (differently partitioned but equivalent ranges —
 // e.g. [0,9] versus [0,4]+[5,9] — describe the same state).
 std::uint64_t ComputeContentHash(
-    std::uint64_t topology_epoch, const NodeId& self_node_id,
+    std::uint64_t topology_epoch, NodeIndex self_node_index,
     const std::vector<NodeDescriptor>& nodes,
     const std::vector<GroupView>& groups,
     const std::array<std::int32_t, kSlotCount>& slot_to_group) {
   std::uint64_t hash = kFnv1aOffsetBasis;
   HashU64(hash, topology_epoch);
-  HashNodeId(hash, self_node_id);
+  HashNodeReference(hash, nodes, self_node_index);
 
   std::vector<const NodeDescriptor*> sorted_nodes;
   sorted_nodes.reserve(nodes.size());
@@ -142,8 +160,8 @@ std::uint64_t ComputeContentHash(
     HashString(hash, node->host_);
     HashU64(hash, node->port_);
     HashU64(hash, node->tls_port_);
-    HashBool(hash, node->is_primary_);
-    HashNodeId(hash, node->primary_id_);
+    HashBool(hash, node->is_primary());
+    HashNodeReference(hash, nodes, node->primary_node_index_);
     HashU64(hash, node->config_epoch_);
     HashBool(hash, node->link_connected_);
   }
@@ -158,9 +176,12 @@ std::uint64_t ComputeContentHash(
   HashU64(hash, sorted_groups.size());
   for (const GroupView* group : sorted_groups) {
     HashString(hash, group->group_id_);
-    HashNodeId(hash, group->primary_node_id_);
-    std::vector<NodeId> replicas(group->replica_node_ids_.begin(),
-                                 group->replica_node_ids_.end());
+    HashNodeReference(hash, nodes, group->primary_node_index_);
+    std::vector<NodeId> replicas;
+    replicas.reserve(group->replica_node_indices_.size());
+    for (NodeIndex replica_index : group->replica_node_indices_) {
+      replicas.push_back(nodes[replica_index].node_id_);
+    }
     std::sort(replicas.begin(), replicas.end());
     HashU64(hash, replicas.size());
     for (const NodeId& replica : replicas) HashNodeId(hash, replica);
@@ -183,8 +204,12 @@ std::uint64_t ComputeContentHash(
 }  // namespace
 
 const NodeDescriptor* ServingState::Self() const {
-  if (self_node_id_.empty()) return nullptr;
-  return FindNode(self_node_id_);
+  return NodeAt(self_node_index_);
+}
+
+const NodeDescriptor* ServingState::NodeAt(NodeIndex node_index) const {
+  if (node_index == kNoNodeIndex || node_index >= nodes_.size()) return nullptr;
+  return &nodes_[node_index];
 }
 
 const NodeDescriptor* ServingState::FindNode(const NodeId& node_id) const {
@@ -276,8 +301,9 @@ ServingStateBuilder& ServingStateBuilder::SetTopologyEpoch(
   return *this;
 }
 
-ServingStateBuilder& ServingStateBuilder::SetSelfNodeId(const NodeId& node_id) {
-  self_node_id_ = node_id;
+ServingStateBuilder& ServingStateBuilder::SetSelfNodeIndex(
+    NodeIndex node_index) {
+  self_node_index_ = node_index;
   return *this;
 }
 
@@ -322,9 +348,22 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
           absl::StrCat("duplicate node id '", node_ids[i].ToHexString(), "'"));
     }
   }
-  auto node_exists = [&node_ids](const NodeId& id) {
-    return std::binary_search(node_ids.begin(), node_ids.end(), id);
-  };
+  if (self_node_index_ != kNoNodeIndex && self_node_index_ >= nodes_.size()) {
+    return absl::InvalidArgumentError("self node index is out of range");
+  }
+  for (const NodeDescriptor& node : nodes_) {
+    if (node.primary_node_index_ == kNoNodeIndex) continue;
+    if (node.primary_node_index_ >= nodes_.size()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("node '", node.node_id_.ToHexString(),
+                       "' primary node index is out of range"));
+    }
+    if (!nodes_[node.primary_node_index_].is_primary()) {
+      return absl::InvalidArgumentError(
+          absl::StrCat("node '", node.node_id_.ToHexString(),
+                       "' points at a non-primary node"));
+    }
+  }
 
   std::vector<std::string_view> group_ids;
   group_ids.reserve(groups_.size());
@@ -343,16 +382,26 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   }
 
   for (const GroupView& group : groups_) {
-    if (!node_exists(group.primary_node_id_)) {
+    if (group.primary_node_index_ >= nodes_.size()) {
       return absl::InvalidArgumentError(absl::StrCat(
-          "group '", group.group_id_, "' primary '",
-          group.primary_node_id_.ToHexString(), "' is not a known node"));
+          "group '", group.group_id_, "' primary node index is out of range"));
     }
-    for (const NodeId& replica : group.replica_node_ids_) {
-      if (!node_exists(replica)) {
+    if (!nodes_[group.primary_node_index_].is_primary()) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "group '", group.group_id_, "' primary index names a replica"));
+    }
+    for (NodeIndex replica_index : group.replica_node_indices_) {
+      if (replica_index >= nodes_.size()) {
         return absl::InvalidArgumentError(
-            absl::StrCat("group '", group.group_id_, "' replica '",
-                         replica.ToHexString(), "' is not a known node"));
+            absl::StrCat("group '", group.group_id_,
+                         "' replica node index is out of range"));
+      }
+      const NodeDescriptor& replica = nodes_[replica_index];
+      if (replica.is_primary() ||
+          replica.primary_node_index_ != group.primary_node_index_) {
+        return absl::InvalidArgumentError(
+            absl::StrCat("group '", group.group_id_,
+                         "' replica index does not name its replica"));
       }
     }
   }
@@ -393,14 +442,14 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
 
   auto state = std::make_shared<ServingState>();
   state->topology_epoch_ = topology_epoch_;
-  state->self_node_id_ = self_node_id_;
+  state->self_node_index_ = self_node_index_;
   state->nodes_ = nodes_;
   state->groups_ = groups_;
   state->slot_to_group_ = slot_to_group;
   state->covered_slots_ = covered_slots;
   state->group_tokens_.reserve(state->groups_.size());
   for (const GroupView& group : state->groups_) {
-    state->group_tokens_.push_back(ComputeGroupToken(group));
+    state->group_tokens_.push_back(ComputeGroupToken(group, state->nodes_));
   }
   // Every group starts with a fresh cell; Publish may swap in the replaced
   // snapshot's cell for token-unchanged groups.
@@ -408,7 +457,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   for (std::shared_ptr<GroupInFlight>& cell : state->in_flight_cells_) {
     cell = std::make_shared<GroupInFlight>();
   }
-  state->content_hash_ = ComputeContentHash(topology_epoch_, self_node_id_,
+  state->content_hash_ = ComputeContentHash(topology_epoch_, self_node_index_,
                                             nodes_, groups_, slot_to_group);
   return state;
 }
@@ -474,7 +523,7 @@ const NodeDescriptor* PrimaryForSlot(const ServingState& state,
                                      std::uint16_t slot) {
   const GroupView* group = state.GroupForSlot(slot);
   if (group == nullptr) return nullptr;
-  return state.FindNode(group->primary_node_id_);
+  return state.NodeAt(group->primary_node_index_);
 }
 
 std::uint16_t ClientPort(const NodeDescriptor& node, bool connection_tls) {

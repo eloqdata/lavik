@@ -151,6 +151,8 @@ absl::StatusOr<SlotRange> ParseSlotToken(std::string_view token) {
 
 struct ParsedNode {
   NodeDescriptor node_;
+  std::optional<NodeId> primary_id_;
+  bool is_primary_ = true;
   std::vector<SlotRange> slots_;
 };
 
@@ -203,7 +205,7 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
                      master ? "node is flagged both master and slave"
                             : "node is flagged neither master nor slave");
   }
-  parsed.node_.is_primary_ = master;
+  parsed.is_primary_ = master;
 
   if (slave) {
     const std::optional<NodeId> primary_id = NodeId::Parse(fields[3]);
@@ -212,7 +214,7 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
           line_number,
           absl::StrCat("replica has a malformed primary id '", fields[3], "'"));
     }
-    parsed.node_.primary_id_ = *primary_id;
+    parsed.primary_id_ = *primary_id;
   } else if (fields[3] != "-") {
     return LineError(line_number, "primary line carries a primary id");
   }
@@ -276,18 +278,23 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     topology_epoch = std::max(topology_epoch, node->node_.config_epoch_);
     nodes.push_back(std::move(*node));
   }
+  if (nodes.size() > kNoNodeIndex) {
+    return absl::ResourceExhaustedError(
+        "nodes.conf has too many nodes for 32-bit node indices");
+  }
 
   // Identify the local entry. The shared file carries no myself mark, so the
   // bind address selects it; a wildcard bind matches on the port alone. The
   // match must be unique or startup would serve under an ambiguous identity.
   const bool wildcard = IsWildcardHost(self.host_);
-  const ParsedNode* matched = nullptr;
+  NodeIndex matched_index = kNoNodeIndex;
   std::size_t matches = 0;
-  for (const ParsedNode& node : nodes) {
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const ParsedNode& node = nodes[i];
     if ((wildcard || node.node_.host_ == self.host_) &&
         node.node_.port_ == self.port_) {
       ++matches;
-      matched = &node;
+      matched_index = static_cast<NodeIndex>(i);
     }
   }
   if (matches != 1) {
@@ -298,45 +305,48 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
 
   // Replica wiring is validated up front: a replica pointing at an absent or
   // non-primary node would corrupt group assembly below.
-  for (const ParsedNode& node : nodes) {
-    if (node.node_.is_primary_) continue;
-    const ParsedNode* primary = nullptr;
-    for (const ParsedNode& candidate : nodes) {
-      if (candidate.node_.node_id_ == node.node_.primary_id_) {
-        primary = &candidate;
+  for (ParsedNode& node : nodes) {
+    if (node.is_primary_) continue;
+    NodeIndex primary_index = kNoNodeIndex;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].node_.node_id_ == *node.primary_id_) {
+        primary_index = static_cast<NodeIndex>(i);
         break;
       }
     }
-    if (primary == nullptr) {
+    if (primary_index == kNoNodeIndex) {
       return absl::InvalidArgumentError(absl::StrCat(
           "replica ", node.node_.node_id_.ToHexString(),
-          " points at unknown primary ", node.node_.primary_id_.ToHexString()));
+          " points at unknown primary ", node.primary_id_->ToHexString()));
     }
-    if (!primary->node_.is_primary_) {
+    if (!nodes[primary_index].is_primary_) {
       return absl::InvalidArgumentError(absl::StrCat(
           "replica ", node.node_.node_id_.ToHexString(),
-          " points at non-primary ", node.node_.primary_id_.ToHexString()));
+          " points at non-primary ", node.primary_id_->ToHexString()));
     }
+    node.node_.primary_node_index_ = primary_index;
   }
 
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(topology_epoch);
-  builder.SetSelfNodeId(matched->node_.node_id_);
+  builder.SetSelfNodeIndex(matched_index);
   for (const ParsedNode& node : nodes) builder.AddNode(node.node_);
-  for (const ParsedNode& node : nodes) {
+  for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+    const ParsedNode& node = nodes[node_index];
     // Only slot-owning primaries form a group. An empty primary (mid
     // scale-out) owns nothing, and its replicas serve nothing either.
-    if (!node.node_.is_primary_ || node.slots_.empty()) continue;
+    if (!node.is_primary_ || node.slots_.empty()) continue;
     GroupView group;
     // The static adapter defines its opaque group id as the primary's Redis
     // node id. Keep GroupId textual because a future Meta adapter may assign
     // ids from a different namespace.
     group.group_id_ = node.node_.node_id_.ToHexString();
-    group.primary_node_id_ = node.node_.node_id_;
-    for (const ParsedNode& replica : nodes) {
-      if (!replica.node_.is_primary_ &&
-          replica.node_.primary_id_ == node.node_.node_id_) {
-        group.replica_node_ids_.push_back(replica.node_.node_id_);
+    group.primary_node_index_ = static_cast<NodeIndex>(node_index);
+    for (std::size_t replica_index = 0; replica_index < nodes.size();
+         ++replica_index) {
+      if (nodes[replica_index].node_.primary_node_index_ == node_index) {
+        group.replica_node_indices_.push_back(
+            static_cast<NodeIndex>(replica_index));
       }
     }
     // Statically configured primaries hold a permanent grant; the file has

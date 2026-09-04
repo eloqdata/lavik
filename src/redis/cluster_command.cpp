@@ -61,7 +61,7 @@ std::string_view DiscoveryHost(const cluster::ServingState& state,
                                const cluster::ClusterRuntime& runtime,
                                const cluster::NodeDescriptor& node) {
   const cluster::NodeDescriptor* self = state.Self();
-  if (self != nullptr && self->node_id_ == node.node_id_) {
+  if (self == &node) {
     return runtime.announce_ip_;
   }
   return node.host_;
@@ -76,7 +76,7 @@ std::uint16_t DiscoveryPort(const cluster::ServingState& state,
                             const cluster::NodeDescriptor& node,
                             bool connection_tls) {
   const cluster::NodeDescriptor* self = state.Self();
-  if (self != nullptr && self->node_id_ == node.node_id_) {
+  if (self == &node) {
     const std::uint16_t announced =
         connection_tls && runtime.announce_tls_port_ != 0
             ? runtime.announce_tls_port_
@@ -137,12 +137,13 @@ void BuildClusterSlotsReply(const cluster::ServingState& state,
   std::uint64_t entry_count = 0;
   for (const cluster::GroupView& group : state.Groups()) {
     const cluster::NodeDescriptor* primary =
-        state.FindNode(group.primary_node_id_);
+        state.NodeAt(group.primary_node_index_);
     if (primary == nullptr) continue;  // Build() validates; defensive
     GroupSlots view;
     view.primary_ = primary;
-    for (const cluster::NodeId& replica_id : group.replica_node_ids_) {
-      if (const cluster::NodeDescriptor* replica = state.FindNode(replica_id)) {
+    for (cluster::NodeIndex replica_index : group.replica_node_indices_) {
+      if (const cluster::NodeDescriptor* replica =
+              state.NodeAt(replica_index)) {
         view.replicas_.push_back(replica);
       }
     }
@@ -181,28 +182,31 @@ std::string BuildClusterNodes(const cluster::ServingState& state,
                               bool connection_tls) {
   std::string nodes;
   const cluster::NodeDescriptor* self = state.Self();
-  for (const cluster::NodeDescriptor& node : state.Nodes()) {
+  for (std::size_t node_index = 0; node_index < state.Nodes().size();
+       ++node_index) {
+    const cluster::NodeDescriptor& node = state.Nodes()[node_index];
     node.node_id_.AppendHexTo(&nodes);
     absl::StrAppend(
         &nodes, " ",
         ClusterNodeAddress(DiscoveryHost(state, runtime, node),
                            DiscoveryPort(state, runtime, node, connection_tls)),
         " ");
-    if (self != nullptr && self->node_id_ == node.node_id_) {
+    if (self == &node) {
       absl::StrAppend(&nodes, "myself,");
     }
-    absl::StrAppend(&nodes, node.is_primary_ ? "master" : "slave", " ");
-    const bool names_primary = !node.is_primary_ && !node.primary_id_.empty();
-    if (names_primary) {
-      node.primary_id_.AppendHexTo(&nodes);
+    absl::StrAppend(&nodes, node.is_primary() ? "master" : "slave", " ");
+    const cluster::NodeDescriptor* primary =
+        state.NodeAt(node.primary_node_index_);
+    if (primary != nullptr) {
+      primary->node_id_.AppendHexTo(&nodes);
     } else {
       nodes.push_back('-');
     }
     absl::StrAppend(&nodes, " 0 0 ", node.config_epoch_, " ",
                     node.link_connected_ ? "connected" : "disconnected");
-    if (node.is_primary_) {
+    if (node.is_primary()) {
       for (const cluster::GroupView& group : state.Groups()) {
-        if (group.primary_node_id_ != node.node_id_) continue;
+        if (group.primary_node_index_ != node_index) continue;
         for (const cluster::SlotRange& range :
              CompactSlotRanges(group.slot_ranges_)) {
           if (range.first_ == range.last_) {
@@ -239,7 +243,7 @@ std::string BuildClusterInfo(const cluster::ServingState* state) {
     }
     for (const cluster::GroupView& group : state->Groups()) {
       if (!group.slot_ranges_.empty() &&
-          state->FindNode(group.primary_node_id_) != nullptr) {
+          state->NodeAt(group.primary_node_index_) != nullptr) {
         ++cluster_size;
       }
     }

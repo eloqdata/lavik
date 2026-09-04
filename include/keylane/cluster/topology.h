@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -76,18 +77,29 @@ class NodeId {
   bool present_ = false;
 };
 
+// Stable index into one ServingState's contiguous node table. Indices never
+// cross snapshot boundaries; authority hashes resolve them back to NodeId so
+// reordering an equivalent table does not change semantic identity.
+using NodeIndex = std::uint32_t;
+inline constexpr NodeIndex kNoNodeIndex = std::numeric_limits<NodeIndex>::max();
+
 // One cluster node as the data plane sees it. In v1 the static topology file
 // is the only source; `tls_port_` is the configured cluster-wide TLS port
 // (uniform-port assumption, see control_port.h).
 struct NodeDescriptor {
-  NodeId node_id_;     // stable across restarts
-  NodeId primary_id_;  // replicas only; empty for primaries
+  NodeId node_id_;              // stable across restarts
+  bool link_connected_ = true;  // parsed from the file; not consulted in v1
   std::uint16_t port_ = 0;
   std::uint16_t tls_port_ = 0;  // 0 = TLS not offered
-  bool is_primary_ = true;
-  bool link_connected_ = true;  // parsed from the file; not consulted in v1
+  // kNoNodeIndex identifies a primary; replicas point at their primary in
+  // the same ServingState::Nodes() table.
+  NodeIndex primary_node_index_ = kNoNodeIndex;
   std::uint64_t config_epoch_ = 0;
   std::string host_;
+
+  bool is_primary() const noexcept {
+    return primary_node_index_ == kNoNodeIndex;
+  }
 };
 
 // Slot range, both ends inclusive, as written in a nodes.conf node line.
@@ -173,13 +185,13 @@ class [[nodiscard]] InFlightGuard {
 // adapter will assign Meta-scoped ids over the same seam).
 struct GroupView {
   std::string group_id_;
-  NodeId primary_node_id_;
-  std::vector<NodeId> replica_node_ids_;
-  std::uint64_t group_term_ = 0;
+  NodeIndex primary_node_index_ = kNoNodeIndex;
   bool granted_ = true;  // false = fenced: this group must not serve
   bool population_ready_ = true;
   bool storage_ready_ = true;
+  std::uint64_t group_term_ = 0;
   std::uint64_t config_epoch_ = 0;
+  std::vector<NodeIndex> replica_node_indices_;
   std::vector<SlotRange> slot_ranges_;  // owned slots, validated at Build
 };
 
@@ -192,6 +204,9 @@ class ServingState {
   std::uint64_t content_hash() const { return content_hash_; }
 
   const NodeDescriptor* Self() const;  // nullptr when self is not in the file
+  NodeIndex SelfNodeIndex() const { return self_node_index_; }
+  // Direct node-table lookup; returns nullptr for kNoNodeIndex/out of range.
+  const NodeDescriptor* NodeAt(NodeIndex node_index) const;
   const NodeDescriptor* FindNode(const NodeId& node_id) const;
   const GroupView* FindGroup(std::string_view group_id) const;
   const std::vector<NodeDescriptor>& Nodes() const { return nodes_; }
@@ -233,7 +248,7 @@ class ServingState {
   std::uint64_t content_hash_ = 0;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
-  NodeId self_node_id_;
+  NodeIndex self_node_index_ = kNoNodeIndex;
   // slot -> index into groups_, -1 when unbound.
   std::array<std::int32_t, kSlotCount> slot_to_group_;
   std::uint32_t covered_slots_ = 0;
@@ -257,23 +272,24 @@ class ServingState {
 class ServingStateBuilder {
  public:
   ServingStateBuilder& SetTopologyEpoch(std::uint64_t epoch);
-  ServingStateBuilder& SetSelfNodeId(const NodeId& node_id);
+  ServingStateBuilder& SetSelfNodeIndex(NodeIndex node_index);
   ServingStateBuilder& AddNode(NodeDescriptor node);
   // Takes ownership of the group's slot ranges. Slots may also be attached
   // later via AddSlotRange to an existing group id.
   ServingStateBuilder& AddGroup(GroupView group);
   ServingStateBuilder& AddSlotRange(std::string_view group_id, SlotRange range);
 
-  // Validates: node ids are unique 40-hex; group ids unique; every group has
-  // an existing primary node; replica ids exist; slot ranges are in
-  // [0, kSlotCount) and non-overlapping. Computes the slot map and content
-  // hash. Self may legitimately be absent (validation of self-match is the
-  // control adapter's job, since only it knows the match rule).
+  // Validates: node ids are present and unique; group ids are unique; every
+  // node index is in range and describes a consistent primary/replica
+  // relationship; slot ranges are in [0, kSlotCount) and non-overlapping.
+  // Computes the slot map and content hash. Self may legitimately be absent
+  // (validation of self-match is the control adapter's job, since only it
+  // knows the match rule).
   absl::StatusOr<std::shared_ptr<const ServingState>> Build() const;
 
  private:
   std::uint64_t topology_epoch_ = 0;
-  NodeId self_node_id_;
+  NodeIndex self_node_index_ = kNoNodeIndex;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
 };

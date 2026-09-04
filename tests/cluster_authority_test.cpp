@@ -23,6 +23,7 @@ using keylane::cluster::InFlightGuard;
 using keylane::cluster::InFlightStripe;
 using keylane::cluster::NodeDescriptor;
 using keylane::cluster::NodeId;
+using keylane::cluster::NodeIndex;
 using keylane::cluster::RequestView;
 using keylane::cluster::ServingState;
 using keylane::cluster::ServingStateBuilder;
@@ -34,6 +35,9 @@ constexpr std::string_view kNodeB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kNodeR = "cccccccccccccccccccccccccccccccccccccccc";
 constexpr std::string_view kGroupA = "group-a";
 constexpr std::string_view kGroupB = "group-b";
+constexpr NodeIndex kNodeAIndex = 0;
+constexpr NodeIndex kNodeBIndex = 1;
+constexpr NodeIndex kNodeRIndex = 2;
 
 // Default topology: group-a (primary A, replica R) owns [0, 9999], group-b
 // (primary B) owns [10000, 16383].
@@ -58,37 +62,44 @@ NodeDescriptor MakeNode(std::string_view id, std::string_view host,
   return node;
 }
 
-GroupView MakeGroup(std::string_view id, std::string_view primary,
+GroupView MakeGroup(std::string_view id, NodeIndex primary_node_index,
                     std::uint16_t first_slot, std::uint16_t last_slot) {
   GroupView group;
   group.group_id_ = std::string(id);
-  group.primary_node_id_ = ParseNodeId(primary);
+  group.primary_node_index_ = primary_node_index;
   group.slot_ranges_.push_back(SlotRange{first_slot, last_slot});
   return group;
 }
 
 GroupView GroupA() {
-  GroupView group = MakeGroup(kGroupA, kNodeA, 0, 9999);
-  group.replica_node_ids_.push_back(ParseNodeId(kNodeR));
+  GroupView group = MakeGroup(kGroupA, kNodeAIndex, 0, 9999);
+  group.replica_node_indices_.push_back(kNodeRIndex);
   return group;
 }
 
-GroupView GroupB() { return MakeGroup(kGroupB, kNodeB, 10000, 16383); }
+GroupView GroupB() { return MakeGroup(kGroupB, kNodeBIndex, 10000, 16383); }
 
 // Group-b covers only [10000, 15000], leaving [15001, 16383] unbound.
-GroupView GroupBWithGap() { return MakeGroup(kGroupB, kNodeB, 10000, 15000); }
+GroupView GroupBWithGap() {
+  return MakeGroup(kGroupB, kNodeBIndex, 10000, 15000);
+}
 
 std::shared_ptr<const ServingState> BuildState(std::string_view self,
                                                GroupView group_a,
                                                GroupView group_b) {
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(ParseNodeId(self));
+  if (self == kNodeA) {
+    builder.SetSelfNodeIndex(kNodeAIndex);
+  } else if (self == kNodeB) {
+    builder.SetSelfNodeIndex(kNodeBIndex);
+  } else if (self == kNodeR) {
+    builder.SetSelfNodeIndex(kNodeRIndex);
+  }
   builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
   builder.AddNode(MakeNode(kNodeB, "10.0.0.2", 7001, 17001));
   NodeDescriptor replica = MakeNode(kNodeR, "10.0.0.3", 7002, 17002);
-  replica.is_primary_ = false;
-  replica.primary_id_ = ParseNodeId(kNodeA);
+  replica.primary_node_index_ = kNodeAIndex;
   builder.AddNode(std::move(replica));
   builder.AddGroup(std::move(group_a));
   builder.AddGroup(std::move(group_b));
@@ -349,8 +360,8 @@ TEST(ClusterAuthorityTest, AuthorityUnchangedDetectsInvolvedGroupChanges) {
       *admitted, BuildState(kNodeA, unready, GroupB()).get(), slots));
 
   GroupView new_owner = GroupA();
-  new_owner.primary_node_id_ = ParseNodeId(kNodeR);
-  new_owner.replica_node_ids_.clear();
+  new_owner.primary_node_index_ = kNodeBIndex;
+  new_owner.replica_node_indices_.clear();
   EXPECT_FALSE(AuthorityUnchanged(
       *admitted, BuildState(kNodeA, new_owner, GroupB()).get(), slots));
 }

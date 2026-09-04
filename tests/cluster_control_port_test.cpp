@@ -116,13 +116,17 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   const GroupView* group_a = serving.GroupForSlot(0);
   ASSERT_NE(group_a, nullptr);
   EXPECT_EQ(group_a->group_id_, kIdA);
-  EXPECT_EQ(group_a->primary_node_id_, ParseNodeId(kIdA));
+  ASSERT_NE(serving.NodeAt(group_a->primary_node_index_), nullptr);
+  EXPECT_EQ(serving.NodeAt(group_a->primary_node_index_)->node_id_,
+            ParseNodeId(kIdA));
   EXPECT_EQ(group_a->config_epoch_, 1);
   EXPECT_TRUE(group_a->granted_);
   EXPECT_TRUE(group_a->population_ready_);
   EXPECT_TRUE(group_a->storage_ready_);
-  ASSERT_EQ(group_a->replica_node_ids_.size(), 1U);
-  EXPECT_EQ(group_a->replica_node_ids_[0], ParseNodeId(kIdD));
+  ASSERT_EQ(group_a->replica_node_indices_.size(), 1U);
+  ASSERT_NE(serving.NodeAt(group_a->replica_node_indices_[0]), nullptr);
+  EXPECT_EQ(serving.NodeAt(group_a->replica_node_indices_[0])->node_id_,
+            ParseNodeId(kIdD));
   EXPECT_EQ(serving.GroupForSlot(5460)->group_id_, kIdA);
   EXPECT_EQ(serving.GroupForSlot(5461)->group_id_, kIdB);
   EXPECT_EQ(serving.GroupForSlot(16383)->group_id_, kIdC);
@@ -134,7 +138,7 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   EXPECT_EQ(node_b->host_, "127.0.0.1");  // ",hostname" suffix stripped
   EXPECT_EQ(node_b->port_, 7002);
   EXPECT_EQ(node_b->tls_port_, 17011);  // uniform cluster TLS port
-  EXPECT_TRUE(node_b->is_primary_);
+  EXPECT_TRUE(node_b->is_primary());
   EXPECT_TRUE(node_b->link_connected_);
 
   const NodeDescriptor* node_c = serving.FindNode(ParseNodeId(kIdC));
@@ -144,8 +148,10 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
 
   const NodeDescriptor* node_d = serving.FindNode(ParseNodeId(kIdD));
   ASSERT_NE(node_d, nullptr);
-  EXPECT_FALSE(node_d->is_primary_);
-  EXPECT_EQ(node_d->primary_id_, ParseNodeId(kIdA));
+  EXPECT_FALSE(node_d->is_primary());
+  ASSERT_NE(serving.NodeAt(node_d->primary_node_index_), nullptr);
+  EXPECT_EQ(serving.NodeAt(node_d->primary_node_index_)->node_id_,
+            ParseNodeId(kIdA));
   EXPECT_FALSE(node_d->link_connected_);
 }
 
