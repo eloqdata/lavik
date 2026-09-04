@@ -2550,6 +2550,8 @@ class ReplicationManager::ReplicationGroup {
     backlog_size_bytes_.store(std::max(minimum_blocks, configured_blocks) *
                                   storage::kStorageBlockBytes,
                               std::memory_order_relaxed);
+    backlog_backpressure_.store(options.backlog_backpressure_,
+                                std::memory_order_relaxed);
     publish_queue_bytes_per_worker_.store(
         options.publish_queue_bytes_per_worker_, std::memory_order_relaxed);
     snapshot_batch_size_.store(options.snapshot_batch_size_,
@@ -3251,6 +3253,33 @@ class ReplicationManager::ReplicationGroup {
 
   std::size_t backlog_size_bytes() const noexcept {
     return backlog_size_bytes_.load(std::memory_order_acquire);
+  }
+
+  Task<absl::Status> SetBacklogBackpressure(bool enabled) {
+    if (celer::ThisWorker().id_ != 0) {
+      co_return co_await celer::SubmitTaskTo(
+          0, [this, enabled]() { return SetBacklogBackpressure(enabled); });
+    }
+    // Every log has a worker-local waiter. Apply the policy and wake each
+    // owner before publishing the CONFIG value as successfully installed.
+    for (unsigned worker = 0; worker < storage_->worker_count(); ++worker) {
+      absl::Status configured;
+      if (worker == 0) {
+        configured =
+            co_await storage_->SetReplicationBacklogBackpressure(enabled);
+      } else {
+        configured = co_await celer::SubmitTaskTo(worker, [this, enabled]() {
+          return storage_->SetReplicationBacklogBackpressure(enabled);
+        });
+      }
+      if (!configured.ok()) co_return configured;
+    }
+    backlog_backpressure_.store(enabled, std::memory_order_release);
+    co_return absl::OkStatus();
+  }
+
+  bool backlog_backpressure() const noexcept {
+    return backlog_backpressure_.load(std::memory_order_acquire);
   }
 
   Task<absl::Status> SetPublishQueueBytesPerWorker(std::size_t bytes) {
@@ -7160,8 +7189,8 @@ class ReplicationManager::ReplicationGroup {
     }
     // Pin the stable post-full-sync cursor before any source admission gate is
     // reopened. The cut frame itself may take arbitrarily long to reach or be
-    // acknowledged by the target; writes after this point must backpressure
-    // rather than evicting history below the cut.
+    // acknowledged by the target; later retention pressure follows the
+    // configured wait-or-full-sync policy instead of silently losing history.
     absl::Status retained =
         storage_->RetainReplicationLog(session->id_, *backlog_cursor);
     if (!retained.ok()) {
@@ -7337,7 +7366,7 @@ class ReplicationManager::ReplicationGroup {
       if (std::chrono::steady_clock::now() < deadline) continue;
       spdlog::warn(
           "replication session {} flow {} made no backlog ACK progress for "
-          "10 minutes; disconnecting it to release write backpressure",
+          "10 minutes; disconnecting it to release retained backlog pressure",
           session->id_, flow_id);
       (void)::shutdown(fd, SHUT_RDWR);
       co_return absl::DeadlineExceededError(
@@ -7762,7 +7791,7 @@ class ReplicationManager::ReplicationGroup {
                    waited.message());
       // A disconnected session must stop pinning history before any cleanup
       // that may need the replication-log mutex. This also immediately wakes
-      // foreground writes backpressured on that replica.
+      // any publisher backpressured on that replica.
       storage_->ReleaseReplicationLogRetention(session->id_);
       // A backlog encoding/allocation failure marks worker history invalid.
       // Reset it immediately rather than waiting for a replica reconnect:
@@ -8128,6 +8157,9 @@ class ReplicationManager::ReplicationGroup {
       kDefaultReplicationSnapshotReadConcurrency};
   std::atomic<std::size_t> snapshot_batch_size_{kSnapshotKeysPerBatch};
   std::atomic<std::size_t> backlog_size_bytes_{0};
+  // Mirrors the fully installed storage policy for CONFIG GET; publisher
+  // rollover reads the storage-owned atomic directly.
+  std::atomic<bool> backlog_backpressure_{true};
   std::atomic<std::size_t> publish_queue_bytes_per_worker_{0};
   std::atomic<unsigned> replica_priority_{100};
   bool history_reset_running_ = false;  // worker 0 only
@@ -8193,6 +8225,8 @@ Task<absl::Status> ReplicationManager::ApplyDirective(
       co_return co_await group_->AddUpstream(std::move(*directive.upstream_));
     case ReplicationDirective::Kind::kBacklogBytes:
       co_return co_await group_->SetBacklogSizeBytes(directive.value_);
+    case ReplicationDirective::Kind::kBacklogBackpressure:
+      co_return co_await group_->SetBacklogBackpressure(directive.value_ != 0);
     case ReplicationDirective::Kind::kPublishQueueBytes:
       co_return co_await group_->SetPublishQueueBytesPerWorker(
           directive.value_);
@@ -8222,6 +8256,10 @@ std::size_t ReplicationManager::snapshot_batch_size() const noexcept {
 
 std::size_t ReplicationManager::backlog_size_bytes() const noexcept {
   return group_->backlog_size_bytes();
+}
+
+bool ReplicationManager::backlog_backpressure() const noexcept {
+  return group_->backlog_backpressure();
 }
 
 std::size_t ReplicationManager::publish_queue_bytes_per_worker()

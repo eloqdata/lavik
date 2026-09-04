@@ -292,6 +292,11 @@ Task<absl::Status> StorageEngine::SetReplicationLogCapacity(
   return impl_->SetReplicationLogCapacity(capacity_bytes);
 }
 
+Task<absl::Status> StorageEngine::SetReplicationBacklogBackpressure(
+    bool enabled) {
+  return impl_->SetReplicationBacklogBackpressure(enabled);
+}
+
 Task<absl::Status> StorageEngine::SetReplicationPublishQueueCapacity(
     std::size_t capacity_bytes) {
   return impl_->SetReplicationPublishQueueCapacity(capacity_bytes);

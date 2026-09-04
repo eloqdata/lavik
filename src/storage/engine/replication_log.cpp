@@ -258,6 +258,8 @@ Task<absl::Status> StorageEngine::Impl::EnableReplicationLog(
   log.publisher_admitted_bytes_ = 0;
   log.publisher_admitted_items_ = 0;
   log.retained_lsn_by_session_.clear();
+  log.capacity_backpressured_ = false;
+  log.capacity_waits_ = 0;
   log.coverage_revocations_ = 0;
   co_return absl::OkStatus();
 }
@@ -272,15 +274,19 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
   const std::size_t requested_blocks = capacity_bytes / kStorageBlockBytes;
-  // Cursor progress is worker-local and deliberately does not acquire the log
-  // append mutex. With live coverage claims, publish the new quota without
-  // eager trimming; a later append either reclaims complete events or revokes
-  // lagging claims at the hard cap.
+  // Cursor progress and this administrative path are worker-local and do not
+  // acquire the append mutex. A publisher may be suspended while owning that
+  // mutex, so quota changes must publish and wake it before any eager trim.
   if (log.state_ == ReplicationLogState::kActive &&
       !log.retained_lsn_by_session_.empty()) {
+    if (requested_blocks > log.max_blocks_) {
+      log.capacity_backpressured_ = false;
+    }
     log.max_blocks_ = requested_blocks;
+    log.retention_advanced_.NotifyAll(*store.worker_);
     // A shrink beneath live retained history is a target quota. Existing
-    // blocks remain until an append needs space.
+    // blocks remain until ACK progress or the configured revocation policy
+    // lets a later append reclaim complete events.
     co_return absl::OkStatus();
   }
   co_await log.mutex_.Lock();
@@ -307,7 +313,7 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
         log.blocks_.front().last_lsn_ >= *retained_lsn) {
       // Shrinking the reconnect window must not punch a hole beneath a live
       // ONLINE replica as part of CONFIG SET. Keep the excess blocks for now;
-      // a subsequent append revokes lagging coverage if it needs that space.
+      // a subsequent append applies the current wait-or-revoke policy.
       break;
     }
     // Never split a fragmented logical event while reducing the retained
@@ -319,6 +325,20 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
       log.blocks_.pop_front();
     } while (!log.blocks_.empty() && log.blocks_.front().sealed_ &&
              log.blocks_.front().first_lsn_ <= evicted_through);
+  }
+  co_return absl::OkStatus();
+}
+
+Task<absl::Status>
+StorageEngine::Impl::SetReplicationBacklogBackpressure(bool enabled) {
+  replication_backlog_backpressure_.store(enabled, std::memory_order_release);
+  WorkerStore& store = CurrentStore();
+  auto& log = store.replication_log_;
+  if (!enabled) {
+    // A publisher waiting at the hard cap owns log.mutex_. Waking through the
+    // worker-local notification avoids queueing CONFIG behind that mutex and
+    // lets the publisher observe the new revoke-on-pressure policy.
+    log.retention_advanced_.NotifyAll(*store.worker_);
   }
   co_return absl::OkStatus();
 }
@@ -1369,6 +1389,29 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
                            log.blocks_.front().sealed_ &&
                            log.blocks_.front().last_lsn_ < keep_from;
 
+    const bool backpressure =
+        replication_backlog_backpressure_.load(std::memory_order_acquire);
+    if (log.capacity_backpressured_ &&
+        (!backpressure || !retained.has_value())) {
+      log.capacity_backpressured_ = false;
+    }
+    if (log.capacity_backpressured_) {
+      if (evictable) {
+        // Reclaim one complete event as soon as ACK progress permits. Waiting
+        // for a larger fraction of a multi-gigabyte window would unnecessarily
+        // turn small replica lag into prolonged zero write throughput.
+        evict_event();
+        log.capacity_backpressured_ = false;
+      } else {
+        co_await log.retention_advanced_.Wait();
+        if (log.state_ != ReplicationLogState::kActive) {
+          co_return InvalidState(
+              "replication log stopped while waiting for replica ACK");
+        }
+        continue;
+      }
+    }
+
     if (log.blocks_.size() < log.max_blocks_) break;
     if (evictable) {
       evict_event();
@@ -1381,9 +1424,22 @@ Task<absl::Status> StorageEngine::Impl::EnsureReplicationLogActiveBlock(
           "replication event exhausted the hard backlog capacity");
     }
     if (retained.has_value()) {
-      // The group backlog is a hard reconnect window, not an unbounded pin.
-      // Revoke every lagging coverage claim at a complete-event boundary; its
-      // sender observes the resulting floor gap and reconnects with full sync.
+      if (backpressure) {
+        // The pin represents history an online consumer has not ACKed. Keep
+        // successful primary writes inside that history by propagating this
+        // wait through the publisher queue to foreground admission.
+        log.capacity_backpressured_ = true;
+        ++log.capacity_waits_;
+        co_await log.retention_advanced_.Wait();
+        if (log.state_ != ReplicationLogState::kActive) {
+          co_return InvalidState(
+              "replication log stopped while waiting for replica ACK");
+        }
+        continue;
+      }
+      // With backpressure disabled, the bounded backlog is a reconnect window
+      // rather than an unbounded pin. Consumers discover the resulting floor
+      // gap and reconnect with whole-group full sync.
       ++log.coverage_revocations_;
       log.retained_lsn_by_session_.clear();
       continue;
@@ -1724,8 +1780,10 @@ absl::Status StorageEngine::Impl::RetainReplicationLog(
       return absl::InvalidArgumentError(
           "replication retention cursor cannot move backwards");
     }
+    if (keep_from_lsn == found->second) return absl::OkStatus();
     found->second = keep_from_lsn;
   }
+  log.retention_advanced_.NotifyAll(*store.worker_);
   return absl::OkStatus();
 }
 
@@ -1733,7 +1791,9 @@ void StorageEngine::Impl::ReleaseReplicationLogRetention(
     std::uint64_t session_id) {
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;
-  log.retained_lsn_by_session_.erase(session_id);
+  if (log.retained_lsn_by_session_.erase(session_id) != 0) {
+    log.retention_advanced_.NotifyAll(*store.worker_);
+  }
 }
 
 Task<absl::Status> StorageEngine::Impl::TrimReplicationLog(
@@ -1771,6 +1831,7 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     log.log_epoch_ = 0;
     log.next_lsn_ = 1;
     log.max_blocks_ = 0;
+    log.capacity_backpressured_ = false;
     for (std::size_t index = 0; index < log.publish_queue_.size(); ++index) {
       auto& pending = log.publish_queue_[index];
       if (pending.fence_ == nullptr) continue;
@@ -1785,6 +1846,7 @@ Task<absl::Status> StorageEngine::Impl::DisableReplicationLog() {
     log.publisher_admitted_items_ = 0;
     log.publisher_staging_charge_.Reset();
     log.retained_lsn_by_session_.clear();
+    log.retention_advanced_.NotifyAll(*store.worker_);
     log.publisher_capacity_ready_.NotifyAll(*store.worker_);
   }
   log.standby_block_.reset();
@@ -1848,7 +1910,9 @@ ReplicationLogInfo StorageEngine::Impl::LocalReplicationLogInfo() const {
       .fullsync_session_count_ = store.fullsync_sessions_.size(),
       .retained_cursor_count_ = log.retained_lsn_by_session_.size(),
       .coverage_revocations_ = log.coverage_revocations_,
+      .backpressure_waits_ = log.capacity_waits_,
       .fullsync_backpressure_waits_ = store.fullsync_publisher_capacity_waits_,
+      .capacity_backpressured_ = log.capacity_backpressured_,
   };
 }
 

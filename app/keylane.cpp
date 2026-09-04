@@ -189,6 +189,12 @@ int main(int argc, char** argv) {
                options.replication_options_.redis_export_backpressure_,
                "Backpressure writes when a Redis PSYNC export falls behind")
       ->capture_default_str();
+  app.add_flag(
+         "--replication-backlog-backpressure,"
+         "!--no-replication-backlog-backpressure",
+         options.replication_options_.backlog_backpressure_,
+         "Backpressure writes when retained replication history is full")
+      ->capture_default_str();
   app.add_option("--replica-priority",
                  options.replication_options_.replica_priority_,
                  "Redis Sentinel replica promotion priority (0 disables)")

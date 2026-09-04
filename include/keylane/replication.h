@@ -48,6 +48,10 @@ struct ReplicationOptions {
   // Global in-memory history quota. Chunks are allocated lazily and distributed
   // across source-worker flows without multiplying this value by worker count.
   std::size_t backlog_size_bytes_ = 1ULL * 1024 * 1024 * 1024;
+  // Preserve an online consumer's unacknowledged history by backpressuring
+  // source writes at the backlog limit. Operators may disable this at runtime
+  // to prefer primary availability and force lagging consumers to full-sync.
+  bool backlog_backpressure_ = true;
   // Bounded source publisher staging memory on each worker. A single larger
   // command may exceed this waterline only while it is the exclusive item.
   std::size_t publish_queue_bytes_per_worker_ = 16ULL * 1024 * 1024;
@@ -134,6 +138,7 @@ struct ReplicationDirective {
     kSetUpstream,
     kAddUpstream,
     kBacklogBytes,
+    kBacklogBackpressure,
     kPublishQueueBytes,
     kSnapshotReadConcurrency,
     kSnapshotBatchSize,
@@ -171,6 +176,7 @@ class ReplicationManager {
   std::size_t snapshot_batch_size() const noexcept;
 
   std::size_t backlog_size_bytes() const noexcept;
+  bool backlog_backpressure() const noexcept;
   std::size_t publish_queue_bytes_per_worker() const noexcept;
   unsigned replica_priority() const noexcept;
 

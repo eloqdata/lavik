@@ -1405,11 +1405,14 @@ class ReplicationLogService final : public celer::Service {
   }
 
   celer::Task<absl::Status> ExerciseHardBacklogCap() {
-    // A connected consumer advertises its first unacknowledged LSN, but the
-    // backlog is a hard reconnect window. Filling it revokes lagging coverage
-    // and evicts only complete events; the sender then observes a floor gap
-    // and forces a whole-group full sync.
-    absl::Status status = co_await storage_->EnableReplicationLog(17, 8 * kMiB);
+    // With backpressure explicitly disabled, the backlog is a hard reconnect
+    // window. Filling it revokes lagging coverage and evicts only complete
+    // events; the sender then observes a floor gap and forces whole-group full
+    // sync.
+    absl::Status status =
+        co_await storage_->SetReplicationBacklogBackpressure(false);
+    if (!status.ok()) co_return status;
+    status = co_await storage_->EnableReplicationLog(17, 8 * kMiB);
     if (!status.ok()) co_return status;
     status = storage_->RetainReplicationLog(77, 1);
     if (!status.ok()) co_return status;
@@ -1509,7 +1512,74 @@ class ReplicationLogService final : public celer::Service {
     Check(storage_->LocalReplicationLogInfo().floor_lsn_ == 2 &&
               storage_->LocalReplicationLogInfo().retained_cursor_count_ == 0,
           "backlog growth resurrected evicted coverage");
-    co_return co_await storage_->DisableReplicationLog();
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    co_return co_await storage_->SetReplicationBacklogBackpressure(true);
+  }
+
+  celer::Task<absl::Status> ExerciseBacklogBackpressurePolicy() {
+    absl::Status status = co_await storage_->EnableReplicationLog(21, 8 * kMiB);
+    if (!status.ok()) co_return status;
+    status = storage_->RetainReplicationLog(80, 1);
+    if (!status.ok()) co_return status;
+
+    RepeatedByteSource payload(7 * kMiB, 'B');
+    auto first = co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+        .kind_ = ReplicationEventKind::kMutation,
+        .partition_id_ = 9,
+        .partition_sequence_ = 1,
+        .payload_ = {},
+        .payload_source_ = &payload,
+    });
+    if (!first.ok()) co_return first.status();
+
+    bool append_finished = false;
+    absl::Status append_status =
+        absl::UnknownError("backpressured append did not run");
+    auto append = [&](std::uint64_t sequence) -> celer::Task<absl::Status> {
+      auto result =
+          co_await storage_->AppendReplicationLog(ReplicationLogAppend{
+              .kind_ = ReplicationEventKind::kMutation,
+              .partition_id_ = 9,
+              .partition_sequence_ = sequence,
+              .payload_ = {},
+              .payload_source_ = &payload,
+          });
+      append_status = result.ok() ? absl::OkStatus() : result.status();
+      append_finished = true;
+      co_return absl::OkStatus();
+    };
+
+    worker_->Spawn(append(2));
+    co_await celer::Yield(*worker_);
+    Check(!append_finished &&
+              storage_->LocalReplicationLogInfo().capacity_backpressured_,
+          "default backlog policy did not wait for replica ACK");
+    status = storage_->RetainReplicationLog(80, 2);
+    if (!status.ok()) co_return status;
+    while (!append_finished) co_await celer::Yield(*worker_);
+    if (!append_status.ok()) co_return append_status;
+
+    append_finished = false;
+    append_status = absl::UnknownError("policy-change append did not run");
+    worker_->Spawn(append(3));
+    co_await celer::Yield(*worker_);
+    Check(!append_finished &&
+              storage_->LocalReplicationLogInfo().capacity_backpressured_,
+          "second append did not enter backlog backpressure");
+    status = co_await storage_->SetReplicationBacklogBackpressure(false);
+    if (!status.ok()) co_return status;
+    while (!append_finished) co_await celer::Yield(*worker_);
+    if (!append_status.ok()) co_return append_status;
+
+    const auto info = storage_->LocalReplicationLogInfo();
+    Check(info.backpressure_waits_ >= 2 &&
+              info.coverage_revocations_ == 1 &&
+              info.retained_cursor_count_ == 0,
+          "runtime policy change did not wake and revoke lagging coverage");
+    status = co_await storage_->DisableReplicationLog();
+    if (!status.ok()) co_return status;
+    co_return co_await storage_->SetReplicationBacklogBackpressure(true);
   }
 
   celer::Task<absl::Status> Exercise() {
@@ -1897,6 +1967,9 @@ class ReplicationLogService final : public celer::Service {
                   ReplicationLogState::kDisabled &&
               storage_->LocalReplicationLogInfo().block_count_ == 0,
           "disable did not reclaim the replication log");
+
+    status = co_await ExerciseBacklogBackpressurePolicy();
+    if (!status.ok()) co_return status;
 
     status = co_await ExerciseHardBacklogCap();
     if (!status.ok()) co_return status;

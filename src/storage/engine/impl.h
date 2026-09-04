@@ -1658,6 +1658,9 @@ class StorageEngine::Impl {
                                        std::memory_order_relaxed);
     replication_publish_queue_bytes_.store(
         options_.replication_publish_queue_bytes_, std::memory_order_relaxed);
+    replication_backlog_backpressure_.store(
+        options_.replication_backlog_backpressure_,
+        std::memory_order_relaxed);
     expiration_authority_.store(options_.expiration_authority_,
                                 std::memory_order_relaxed);
     const TombRaiderMode mode =
@@ -1776,6 +1779,11 @@ class StorageEngine::Impl {
       std::optional<ReplicationLogBlock> standby_block_;
       bool standby_refill_pending_ = false;
       std::uint64_t coverage_revocations_ = 0;
+      // Only one publisher owns the log mutex, so this state is worker-local.
+      // ACK cursor updates wake the notification without acquiring that mutex.
+      bool capacity_backpressured_ = false;
+      std::uint64_t capacity_waits_ = 0;
+      AsyncNotification retention_advanced_;
       // The fixed staging charge covers both payloads and retained ring
       // capacity. The allocator must therefore neither admit nor account the
       // same backing allocation a second time.
@@ -2547,6 +2555,7 @@ class StorageEngine::Impl {
   Task<absl::Status> EnableReplicationLog(std::uint64_t log_epoch,
                                           std::size_t capacity_bytes);
   Task<absl::Status> SetReplicationLogCapacity(std::size_t capacity_bytes);
+  Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   Task<absl::Status> SetReplicationPublishQueueCapacity(
       std::size_t capacity_bytes);
   Task<absl::StatusOr<std::uint64_t>> AppendReplicationLog(
@@ -3475,6 +3484,9 @@ class StorageEngine::Impl {
   // remain worker-local; CONFIG SET stores this atomically and then visits each
   // worker only to wake publishers that may now fit under a larger limit.
   std::atomic<std::size_t> replication_publish_queue_bytes_{0};
+  // The append path samples this only at an 8 MiB block rollover. CONFIG
+  // visits each worker after changing it so a disabled policy wakes sleepers.
+  std::atomic<bool> replication_backlog_backpressure_{true};
   unsigned worker_count_ = 0;
   std::uint64_t total_data_blocks_ = 0;
   std::vector<StorageDevice> devices_;

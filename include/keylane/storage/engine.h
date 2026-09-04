@@ -46,6 +46,9 @@ struct StorageEngineOptions {
   // Bounded, per-worker staging memory for commands waiting to enter the
   // shared in-memory replication backlog.
   std::size_t replication_publish_queue_bytes_ = 16ULL * 1024 * 1024;
+  // Initial retention policy for a backlog pinned by an online consumer.
+  // Runtime CONFIG changes wake any publisher waiting under the old policy.
+  bool replication_backlog_backpressure_ = true;
   bool expiration_authority_ = true;
   // Keys at or below this size stay complete in the in-memory index. Larger
   // keys are stored in disk extents and verified on demand.
@@ -223,6 +226,7 @@ struct StorageReplicationLogMetrics {
   std::uint64_t floor_lsn_ = 1;
   std::uint64_t tail_lsn_ = 0;
   std::uint64_t coverage_revocations_ = 0;
+  std::uint64_t backpressure_waits_ = 0;
   std::size_t chunk_count_ = 0;
   std::size_t capacity_bytes_ = 0;
   std::size_t publish_queue_bytes_ = 0;
@@ -234,6 +238,7 @@ struct StorageReplicationLogMetrics {
   std::size_t pinned_cursors_ = 0;
   std::uint64_t fullsync_backpressure_waits_ = 0;
   bool active_ = false;
+  bool backpressured_ = false;
 };
 
 struct StorageMetricsSnapshot {
@@ -413,7 +418,9 @@ struct ReplicationLogInfo {
   std::size_t fullsync_session_count_ = 0;
   std::size_t retained_cursor_count_ = 0;
   std::uint64_t coverage_revocations_ = 0;
+  std::uint64_t backpressure_waits_ = 0;
   std::uint64_t fullsync_backpressure_waits_ = 0;
+  bool capacity_backpressured_ = false;
 };
 
 // A value read directly into a registered storage buffer. network_bytes()
@@ -1049,6 +1056,10 @@ class StorageEngine {
   // growth allocates nothing until a later append needs another block.
   celer::Task<absl::Status> SetReplicationLogCapacity(
       std::size_t capacity_bytes);
+  // Selects whether a live retention cursor blocks publication at capacity.
+  // Disabling the policy wakes blocked publishers, which revoke lagging
+  // coverage and continue; enabling it affects the next capacity conflict.
+  celer::Task<absl::Status> SetReplicationBacklogBackpressure(bool enabled);
   // Changes the worker-local in-memory publisher admission waterline. A
   // shrink never drops queued commands; new admissions wait for occupancy to
   // fall below the new limit. A growth wakes waiters immediately.
@@ -1063,9 +1074,9 @@ class StorageEngine {
   celer::Task<absl::StatusOr<ReplicationLogBatch>> ReadReplicationLog(
       ReplicationLogCursor next, std::size_t max_bytes, std::size_t max_frames);
   // Pins history needed by one ONLINE/downstream session. The cursor is the
-  // first LSN not yet acknowledged by that session. Capacity pressure waits
-  // for the slowest retained cursor instead of evicting required history.
-  // Both calls are worker-local and never perform IO.
+  // first LSN not yet acknowledged by that session. At capacity, the runtime
+  // policy either waits for the slowest retained cursor or revokes lagging
+  // coverage. Both calls are worker-local and never perform IO.
   absl::Status RetainReplicationLog(std::uint64_t session_id,
                                     std::uint64_t keep_from_lsn);
   void ReleaseReplicationLogRetention(std::uint64_t session_id);

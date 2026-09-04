@@ -2229,7 +2229,8 @@ int RunServer(ServerOptions options) {
       "flush_size_bytes={} "
       "inline_key_max_bytes={} "
       "defrag_max_active_per_device={} defrag_sleep_ms={} "
-      "defrag_record_sleep_us={} defrag_paused={} shutdown_checkpoint={}",
+      "defrag_record_sleep_us={} defrag_paused={} shutdown_checkpoint={} "
+      "replication_backlog_backpressure={}",
       kVersion, bind_display, options.port_, options.tls_port_,
       options.metrics_port_, options.thread_count_, options.max_clients_,
       kMaxClientsFileDescriptorReserve, options.pin_workers_,
@@ -2246,7 +2247,8 @@ int RunServer(ServerOptions options) {
       options.inline_key_max_bytes_,
       options.defrag_max_active_per_device_,
       options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
-      options.defrag_paused_, options.shutdown_checkpoint_);
+      options.defrag_paused_, options.shutdown_checkpoint_,
+      options.replication_options_.backlog_backpressure_);
 
   const absl::Status memory_status =
       InitMemoryLimit(options.max_memory_bytes_, options.thread_count_,
@@ -2275,6 +2277,8 @@ int RunServer(ServerOptions options) {
   storage_options.flush_size_bytes_ = options.flush_size_bytes_;
   storage_options.replication_publish_queue_bytes_ =
       options.replication_publish_queue_bytes_;
+  storage_options.replication_backlog_backpressure_ =
+      options.replication_options_.backlog_backpressure_;
   storage_options.inline_key_max_bytes_ = options.inline_key_max_bytes_;
   // A node configured with an upstream must not create local
   // expiration mutation sequences. It still hides expired values by their

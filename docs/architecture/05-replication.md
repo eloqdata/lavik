@@ -190,14 +190,19 @@ events and fences already reserved by admitted commands. A later downstream
 must full-sync and re-enables a fresh history before its snapshot cut.
 
 A connected native downstream advertises its first unacknowledged LSN as a
-coverage claim. At the hard backlog limit, the source revokes lagging claims,
-evicts complete old events, and lets those consumers discover a floor gap and
-reconnect with whole-group full sync. A full-sync session pinned after its cut
-is aborted by the same rule. Disconnect leaves the remaining capacity as a
-circular reconnect window. Shrinking below claimed history establishes a
-target quota; later publication revokes claims until the target can be met.
-Eviction, trim, and reconnect coverage operate on complete events and never
-retain or advertise only a suffix of one fragmented event.
+coverage claim. By default, the publisher waits at the hard backlog limit until
+ACK progress makes a complete event reclaimable; publisher staging then fills
+and propagates bounded backpressure to foreground write admission. Runtime
+`CONFIG SET replication-backlog-backpressure no` wakes any blocked publisher
+and changes capacity conflicts to revoke lagging claims, evict complete old
+events, and let affected consumers discover a floor gap and reconnect with
+whole-group full sync. Re-enabling it affects the next capacity conflict. A
+full-sync session pinned after its cut follows the same selected policy.
+Disconnect leaves the remaining capacity as a circular reconnect window.
+Shrinking below claimed history establishes a target quota; later publication
+waits or revokes according to the current policy. Eviction, trim, and reconnect
+coverage operate on complete events and never retain or advertise only a
+suffix of one fragmented event.
 
 Client `WAIT` uses the same ACK cursors without changing the native wire
 protocol. Because worker LSN domains are independent, the source captures a
@@ -437,7 +442,8 @@ transaction is emitted once as Redis `MULTI`/`EXEC`, and a flush is emitted
 once after matching copies are present on every worker. Without
 `redis-export-backpressure`, a slow Redis replica that falls below a backlog
 floor is disconnected and must full-sync again. With it enabled, the exporter
-pins its cursors and foreground writes inherit the backlog pressure.
+pins its cursors; pressure from those pins follows the global
+`replication-backlog-backpressure` wait-or-full-sync policy.
 
 ### Sentinel-managed failover
 
@@ -476,6 +482,7 @@ reattachment.
 | `CONFIG REWRITE` | Atomically persists the current single upstream mode and `replica-priority`; unavailable without a config file or with multiple Redis Cluster sources |
 | `tls-replication`, `masteruser`, `masterauth` | Outgoing control and every data connection; only the `default` user is supported |
 | `repl-backlog-size` | Startup/CLI/runtime global backlog, default 1 GiB; at least one 8 MiB block per worker |
+| `replication-backlog-backpressure` | Startup/CLI/runtime retained-history policy, default `yes`; `no` prefers primary write availability by forcing lagging consumers to full-sync at capacity |
 | `replication-publish-queue-mb-per-worker` | Startup/CLI/runtime staging waterline, default 16 MiB per active worker log and per active full-sync session |
 | `replication-snapshot-batch-size` | Startup/CLI/runtime scan scheduling batch, default 64 |
 | `replication-snapshot-read-concurrency` | Runtime-only read concurrency, default 16 and maximum 128 |
@@ -507,9 +514,10 @@ retention/backpressure, full-sync queue/session, and connection metrics.
   event during the RDB cut but before its worker's backlog fence, can therefore
   be absent from the target.
 - Publication admission must reject before mutation when the complete event
-  cannot fit. Retention pressure may revoke a lagging consumer's coverage and
-  force its full sync, but cannot leave a successful primary write out of the
-  source history.
+  cannot fit. Retention pressure either waits for ACK progress or, when
+  configured not to backpressure, revokes a lagging consumer's coverage and
+  forces its full sync; neither policy can leave a successful primary write
+  out of the source history.
 - Native cascading replication is unsupported. A node with an upstream rejects
   native downstream handshakes and Redis export, and replica application never
   republishes upstream events.

@@ -230,8 +230,13 @@ Backlog and full-sync metrics are worker-labelled:
   `keylane_replication_backlog_tail_lsn` show retained event coverage. A
   consumer below the floor must full-sync.
 - `keylane_replication_backlog_pinned_cursors` counts current ACK coverage
-  claims. At the hard cap, Keylane revokes lagging claims and evicts complete
-  old events instead of allowing the backlog to grow.
+  claims. At the hard cap, the default policy waits for cursor progress;
+  `replication-backlog-backpressure no` instead revokes lagging claims and
+  evicts complete old events without allowing the backlog to grow.
+- `keylane_replication_backlog_backpressured` identifies workers currently
+  waiting for cursor progress, and
+  `keylane_replication_backlog_backpressure_waits_total` counts capacity
+  conflicts that entered that state.
 - `keylane_replication_backlog_coverage_revocations_total` counts those
   revocations.
 - `keylane_replication_publish_queue_bytes` and its capacity expose source
@@ -241,11 +246,12 @@ Backlog and full-sync metrics are worker-labelled:
   `keylane_replication_flow_connections` distinguish native control sockets
   from per-flow data sockets.
 
-Alert on sustained coverage revocations together with replicas repeatedly
-leaving `online`, on a publisher/full-sync queue remaining near capacity, or
-on a node remaining `LOADING` after a full-sync failure. A valid catalog root
-does not clear that last condition: full-sync population activation and
-catalog readiness must complete together.
+Alert on sustained backlog backpressure together with a publisher queue near
+capacity. When backpressure is disabled, alert instead on sustained coverage
+revocations together with replicas repeatedly leaving `online`. Also alert on
+a full-sync queue remaining near capacity or a node remaining `LOADING` after
+a full-sync failure. A valid catalog root does not clear that last condition:
+full-sync population activation and catalog readiness must complete together.
 
 ## Update model
 

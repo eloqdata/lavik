@@ -441,6 +441,13 @@ absl::Status ApplyRedisConfigDirective(
     options->replication_options_.redis_export_backpressure_ = *enabled;
     return absl::OkStatus();
   }
+  if (name == "replication-backlog-backpressure") {
+    if (directive.size() != 2) return WrongArgumentCount(name);
+    auto enabled = ParseYesNo(directive[1], name);
+    if (!enabled.ok()) return enabled.status();
+    options->replication_options_.backlog_backpressure_ = *enabled;
+    return absl::OkStatus();
+  }
   if (name == "recv-buffers-per-worker") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     return ParseUnsigned(directive[1], name, &options->recv_buffer_count_,

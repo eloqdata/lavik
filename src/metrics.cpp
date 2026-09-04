@@ -558,8 +558,14 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
       "replication history is active.\n"
       "# TYPE keylane_replication_backlog_active gauge\n"
       "# HELP keylane_replication_backlog_coverage_revocations_total Lagging "
-      "coverage claims revoked at the hard backlog cap.\n"
+      "coverage claims revoked at the hard cap when backpressure is disabled.\n"
       "# TYPE keylane_replication_backlog_coverage_revocations_total counter\n"
+      "# HELP keylane_replication_backlog_backpressure_waits_total Backlog "
+      "capacity conflicts that waited for retained cursor progress.\n"
+      "# TYPE keylane_replication_backlog_backpressure_waits_total counter\n"
+      "# HELP keylane_replication_backlog_backpressured Whether this worker "
+      "is currently waiting for retained cursor progress.\n"
+      "# TYPE keylane_replication_backlog_backpressured gauge\n"
       "# HELP keylane_replication_publish_queue_bytes Commands staged before "
       "the shared backlog.\n"
       "# TYPE keylane_replication_publish_queue_bytes gauge\n"
@@ -599,6 +605,10 @@ celer::Task<absl::Status> RenderPrometheusMetrics(
         log.active_ ? 1 : 0, "\n",
         "keylane_replication_backlog_coverage_revocations_total{", labels, "} ",
         log.coverage_revocations_, "\n",
+        "keylane_replication_backlog_backpressure_waits_total{", labels, "} ",
+        log.backpressure_waits_, "\n",
+        "keylane_replication_backlog_backpressured{", labels, "} ",
+        log.backpressured_ ? 1 : 0, "\n",
         "keylane_replication_publish_queue_bytes{", labels, "} ",
         log.publish_queue_bytes_, "\n",
         "keylane_replication_publish_queue_capacity_bytes{", labels, "} ",

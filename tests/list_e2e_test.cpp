@@ -2540,6 +2540,22 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
   EXPECT_EQ(source_client.Command({"CONFIG", "GET", "repl-backlog-size"}),
             BulkArray({"repl-backlog-size", "1073741824"}));
   EXPECT_EQ(source_client.Command(
+                {"CONFIG", "GET", "replication-backlog-backpressure"}),
+            BulkArray({"replication-backlog-backpressure", "yes"}));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "replication-backlog-backpressure", "no"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command(
+                {"CONFIG", "GET", "replication-backlog-backpressure"}),
+            BulkArray({"replication-backlog-backpressure", "no"}));
+  EXPECT_TRUE(source_client
+                  .Command({"CONFIG", "SET",
+                            "replication-backlog-backpressure", "maybe"})
+                  .starts_with("-ERR"));
+  ASSERT_EQ(source_client.Command(
+                {"CONFIG", "SET", "replication-backlog-backpressure", "yes"}),
+            "+OK");
+  EXPECT_EQ(source_client.Command(
                 {"CONFIG", "GET", "replication-publish-queue-mb-per-worker"}),
             BulkArray({"replication-publish-queue-mb-per-worker", "16"}));
   ASSERT_EQ(

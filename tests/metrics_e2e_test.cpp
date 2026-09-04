@@ -523,6 +523,12 @@ TEST(MetricsE2eTest, ExposesPrometheusCommandStorageAndDefragMetrics) {
   // The lazy shared backlog is enabled on the first downstream handshake.
   EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_capacity_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_replication_backlog_pinned_cursors"), 0);
+  EXPECT_EQ(
+      MetricValue(body,
+                  "keylane_replication_backlog_backpressure_waits_total"),
+      0);
+  EXPECT_EQ(
+      MetricValue(body, "keylane_replication_backlog_backpressured"), 0);
   EXPECT_GT(
       MetricValue(body, "keylane_replication_publish_queue_capacity_bytes"), 0);
   EXPECT_EQ(MetricValue(body, "keylane_fullsync_publish_queue_bytes"), 0);
