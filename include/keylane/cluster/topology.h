@@ -83,6 +83,14 @@ class NodeId {
 using NodeIndex = std::uint32_t;
 inline constexpr NodeIndex kNoNodeIndex = std::numeric_limits<NodeIndex>::max();
 
+// Compact index stored in the fixed 16,384-entry slot map. The sentinel
+// consumes the largest value, leaving 65,535 representable groups per
+// snapshot, well above the number that can own at least one Redis slot.
+using GroupIndex = std::uint16_t;
+inline constexpr GroupIndex kNoGroupIndex =
+    std::numeric_limits<GroupIndex>::max();
+static_assert(kSlotCount < kNoGroupIndex);
+
 // One cluster node as the data plane sees it. In v1 the static topology file
 // is the only source; `tls_port_` is the configured cluster-wide TLS port
 // (uniform-port assumption, see control_port.h).
@@ -249,8 +257,9 @@ class ServingState {
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
   NodeIndex self_node_index_ = kNoNodeIndex;
-  // slot -> index into groups_, -1 when unbound.
-  std::array<std::int32_t, kSlotCount> slot_to_group_;
+  // slot -> index into groups_, kNoGroupIndex when unbound. A 16-bit entry
+  // keeps the hot, fixed-size routing table at 32 KiB.
+  std::array<GroupIndex, kSlotCount> slot_to_group_;
   std::uint32_t covered_slots_ = 0;
   // Precomputed per-group authority tokens, parallel to groups_. Computed
   // once at Build so the request path never hashes or scans for them.
@@ -279,12 +288,12 @@ class ServingStateBuilder {
   ServingStateBuilder& AddGroup(GroupView group);
   ServingStateBuilder& AddSlotRange(std::string_view group_id, SlotRange range);
 
-  // Validates: node ids are present and unique; group ids are unique; every
-  // node index is in range and describes a consistent primary/replica
-  // relationship; slot ranges are in [0, kSlotCount) and non-overlapping.
-  // Computes the slot map and content hash. Self may legitimately be absent
-  // (validation of self-match is the control adapter's job, since only it
-  // knows the match rule).
+  // Validates: node ids are present and unique; group ids are unique; the
+  // snapshot fits the compact group-index space; every node index is in range
+  // and describes a consistent primary/replica relationship; slot ranges are
+  // in [0, kSlotCount) and non-overlapping. Computes the slot map and content
+  // hash. Self may legitimately be absent (validation of self-match is the
+  // control adapter's job, since only it knows the match rule).
   absl::StatusOr<std::shared_ptr<const ServingState>> Build() const;
 
  private:

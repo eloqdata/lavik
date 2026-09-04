@@ -142,7 +142,7 @@ std::uint64_t ComputeContentHash(
     std::uint64_t topology_epoch, NodeIndex self_node_index,
     const std::vector<NodeDescriptor>& nodes,
     const std::vector<GroupView>& groups,
-    const std::array<std::int32_t, kSlotCount>& slot_to_group) {
+    const std::array<GroupIndex, kSlotCount>& slot_to_group) {
   std::uint64_t hash = kFnv1aOffsetBasis;
   HashU64(hash, topology_epoch);
   HashNodeReference(hash, nodes, self_node_index);
@@ -193,8 +193,8 @@ std::uint64_t ComputeContentHash(
   }
 
   for (int slot = 0; slot < kSlotCount; ++slot) {
-    const std::int32_t group_index = slot_to_group[slot];
-    if (group_index < 0) continue;
+    const GroupIndex group_index = slot_to_group[slot];
+    if (group_index == kNoGroupIndex) continue;
     HashU64(hash, static_cast<std::uint64_t>(slot));
     HashString(hash, groups[static_cast<std::size_t>(group_index)].group_id_);
   }
@@ -228,8 +228,8 @@ const GroupView* ServingState::FindGroup(std::string_view group_id) const {
 
 const GroupView* ServingState::GroupForSlot(std::uint16_t slot) const {
   if (slot >= kSlotCount) return nullptr;
-  const std::int32_t group_index = slot_to_group_[slot];
-  if (group_index < 0) return nullptr;
+  const GroupIndex group_index = slot_to_group_[slot];
+  if (group_index == kNoGroupIndex) return nullptr;
   return &groups_[static_cast<std::size_t>(group_index)];
 }
 
@@ -247,8 +247,8 @@ std::uint64_t ServingState::AuthorityToken(std::string_view group_id) const {
 
 std::uint64_t ServingState::AuthorityTokenForSlot(std::uint16_t slot) const {
   if (slot >= kSlotCount) return 0;
-  const std::int32_t group_index = slot_to_group_[slot];
-  if (group_index < 0) return 0;
+  const GroupIndex group_index = slot_to_group_[slot];
+  if (group_index == kNoGroupIndex) return 0;
   return group_tokens_[static_cast<std::size_t>(group_index)];
 }
 
@@ -260,8 +260,8 @@ std::size_t InFlightStripe() noexcept {
 }
 
 GroupInFlight* ServingState::InFlightCellForSlot(std::uint16_t slot) const {
-  const std::int32_t index = slot_to_group_[slot];
-  if (index < 0) return nullptr;
+  const GroupIndex index = slot_to_group_[slot];
+  if (index == kNoGroupIndex) return nullptr;
   return in_flight_cells_[static_cast<std::size_t>(index)].get();
 }
 
@@ -365,6 +365,10 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
     }
   }
 
+  if (groups_.size() > kNoGroupIndex) {
+    return absl::ResourceExhaustedError(
+        "topology has too many groups for 16-bit group indices");
+  }
   std::vector<std::string_view> group_ids;
   group_ids.reserve(groups_.size());
   for (const GroupView& group : groups_) {
@@ -406,8 +410,8 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
     }
   }
 
-  std::array<std::int32_t, kSlotCount> slot_to_group;
-  slot_to_group.fill(-1);
+  std::array<GroupIndex, kSlotCount> slot_to_group;
+  slot_to_group.fill(kNoGroupIndex);
   std::uint32_t covered_slots = 0;
   for (std::size_t gi = 0; gi < groups_.size(); ++gi) {
     const GroupView& group = groups_[gi];
@@ -425,8 +429,8 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
             range.last_, " exceeds the slot count"));
       }
       for (int slot = range.first_; slot <= range.last_; ++slot) {
-        const std::int32_t existing = slot_to_group[slot];
-        if (existing >= 0) {
+        const GroupIndex existing = slot_to_group[slot];
+        if (existing != kNoGroupIndex) {
           // Any double assignment is rejected, including within one group:
           // neither the static file nor Meta can legitimately produce it.
           const GroupView& owner = groups_[static_cast<std::size_t>(existing)];
@@ -434,7 +438,7 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
               "slot ", slot, " is covered by both group '", owner.group_id_,
               "' and group '", group.group_id_, "'"));
         }
-        slot_to_group[slot] = static_cast<std::int32_t>(gi);
+        slot_to_group[slot] = static_cast<GroupIndex>(gi);
         ++covered_slots;
       }
     }
