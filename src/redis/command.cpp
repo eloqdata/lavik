@@ -277,6 +277,15 @@ bool CmpCaseInsensitive(std::string_view a, std::string_view b) {
 
 }  // namespace
 
+// GCC can diagnose Abseil's trivially-relocatable InlinedVector move as
+// reading its inactive union member when an empty request is moved into
+// StatusOr. The vector size remains zero and those bytes are never observed;
+// keep the suppression scoped to the one construction path that instantiates
+// that false positive so genuine uninitialized reads elsewhere stay visible.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id) {
   if (command.args_.empty()) {
@@ -291,6 +300,9 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
   request.args_ = std::move(command.args_);
   return request;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
     std::span<const std::string> args) {
