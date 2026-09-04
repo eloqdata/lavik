@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -21,6 +22,7 @@ using keylane::cluster::GroupView;
 using keylane::cluster::InFlightGuard;
 using keylane::cluster::InFlightStripe;
 using keylane::cluster::NodeDescriptor;
+using keylane::cluster::NodeId;
 using keylane::cluster::RequestView;
 using keylane::cluster::ServingState;
 using keylane::cluster::ServingStateBuilder;
@@ -40,10 +42,16 @@ constexpr std::uint16_t kOtherSlotInA = 7;
 constexpr std::uint16_t kSlotInB = 10005;
 constexpr std::uint16_t kUnboundSlot = 16000;  // only in gap topologies
 
+NodeId ParseNodeId(std::string_view id) {
+  const std::optional<NodeId> parsed = NodeId::Parse(id);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed.value_or(NodeId{});
+}
+
 NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                         std::uint16_t port, std::uint16_t tls_port) {
   NodeDescriptor node;
-  node.node_id_ = std::string(id);
+  node.node_id_ = ParseNodeId(id);
   node.host_ = std::string(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
@@ -54,14 +62,14 @@ GroupView MakeGroup(std::string_view id, std::string_view primary,
                     std::uint16_t first_slot, std::uint16_t last_slot) {
   GroupView group;
   group.group_id_ = std::string(id);
-  group.primary_node_id_ = std::string(primary);
+  group.primary_node_id_ = ParseNodeId(primary);
   group.slot_ranges_.push_back(SlotRange{first_slot, last_slot});
   return group;
 }
 
 GroupView GroupA() {
   GroupView group = MakeGroup(kGroupA, kNodeA, 0, 9999);
-  group.replica_node_ids_.push_back(std::string(kNodeR));
+  group.replica_node_ids_.push_back(ParseNodeId(kNodeR));
   return group;
 }
 
@@ -75,12 +83,12 @@ std::shared_ptr<const ServingState> BuildState(std::string_view self,
                                                GroupView group_b) {
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(self);
+  builder.SetSelfNodeId(ParseNodeId(self));
   builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
   builder.AddNode(MakeNode(kNodeB, "10.0.0.2", 7001, 17001));
   NodeDescriptor replica = MakeNode(kNodeR, "10.0.0.3", 7002, 17002);
   replica.is_primary_ = false;
-  replica.primary_id_ = std::string(kNodeA);
+  replica.primary_id_ = ParseNodeId(kNodeA);
   builder.AddNode(std::move(replica));
   builder.AddGroup(std::move(group_a));
   builder.AddGroup(std::move(group_b));
@@ -341,7 +349,7 @@ TEST(ClusterAuthorityTest, AuthorityUnchangedDetectsInvolvedGroupChanges) {
       *admitted, BuildState(kNodeA, unready, GroupB()).get(), slots));
 
   GroupView new_owner = GroupA();
-  new_owner.primary_node_id_ = std::string(kNodeR);
+  new_owner.primary_node_id_ = ParseNodeId(kNodeR);
   new_owner.replica_node_ids_.clear();
   EXPECT_FALSE(AuthorityUnchanged(
       *admitted, BuildState(kNodeA, new_owner, GroupB()).get(), slots));

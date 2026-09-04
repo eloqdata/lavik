@@ -32,18 +32,62 @@ namespace keylane::cluster {
 // static_assert in topology.cpp ties the two together.
 inline constexpr std::uint16_t kSlotCount = 16384;
 
+// Redis Cluster node identity in its compact binary form. The wire and
+// nodes.conf representation remains exactly 40 lowercase hexadecimal
+// characters; parsing at the topology boundary avoids keeping a separately
+// allocated string in every immutable descriptor and every node reference.
+// A default-constructed value is empty so optional relationships such as a
+// primary node's absent upstream do not need a sentinel from the valid
+// 160-bit identity space.
+class NodeId {
+ public:
+  static constexpr std::size_t kByteSize = 20;
+  static constexpr std::size_t kHexSize = 2 * kByteSize;
+  using Bytes = std::array<std::uint8_t, kByteSize>;
+  using Hex = std::array<char, kHexSize>;
+
+  NodeId() = default;
+
+  // Parses the canonical Redis spelling. Uppercase is rejected rather than
+  // normalized so configuration continues to have one spelling per id.
+  static std::optional<NodeId> Parse(std::string_view hex) noexcept;
+
+  // Empty represents an absent relationship, not the valid all-zero id.
+  bool empty() const noexcept { return !present_; }
+  // Returns the binary identity; callers must check empty() when absence is
+  // meaningful because an empty id also carries zero-initialized storage.
+  const Bytes& bytes() const noexcept { return bytes_; }
+  // Formats the canonical lowercase wire spelling. ToHex() requires a
+  // present id; an empty id produces no text from ToHexString()/AppendHexTo.
+  Hex ToHex() const noexcept;
+  std::string ToHexString() const;
+  void AppendHexTo(std::string* output) const;
+
+  friend bool operator==(const NodeId&, const NodeId&) = default;
+  friend bool operator<(const NodeId& left, const NodeId& right) noexcept {
+    if (left.present_ != right.present_) return !left.present_;
+    return left.bytes_ < right.bytes_;
+  }
+
+ private:
+  explicit NodeId(Bytes bytes) : bytes_(bytes), present_(true) {}
+
+  Bytes bytes_{};
+  bool present_ = false;
+};
+
 // One cluster node as the data plane sees it. In v1 the static topology file
 // is the only source; `tls_port_` is the configured cluster-wide TLS port
 // (uniform-port assumption, see control_port.h).
 struct NodeDescriptor {
-  std::string node_id_;  // 40 lowercase hex chars, stable across restarts
-  std::string host_;
+  NodeId node_id_;     // stable across restarts
+  NodeId primary_id_;  // replicas only; empty for primaries
   std::uint16_t port_ = 0;
   std::uint16_t tls_port_ = 0;  // 0 = TLS not offered
   bool is_primary_ = true;
-  std::string primary_id_;  // replicas only: node_id of their primary
-  std::uint64_t config_epoch_ = 0;
   bool link_connected_ = true;  // parsed from the file; not consulted in v1
+  std::uint64_t config_epoch_ = 0;
+  std::string host_;
 };
 
 // Slot range, both ends inclusive, as written in a nodes.conf node line.
@@ -129,10 +173,10 @@ class [[nodiscard]] InFlightGuard {
 // adapter will assign Meta-scoped ids over the same seam).
 struct GroupView {
   std::string group_id_;
-  std::string primary_node_id_;
-  std::vector<std::string> replica_node_ids_;
+  NodeId primary_node_id_;
+  std::vector<NodeId> replica_node_ids_;
   std::uint64_t group_term_ = 0;
-  bool granted_ = true;         // false = fenced: this group must not serve
+  bool granted_ = true;  // false = fenced: this group must not serve
   bool population_ready_ = true;
   bool storage_ready_ = true;
   std::uint64_t config_epoch_ = 0;
@@ -148,7 +192,7 @@ class ServingState {
   std::uint64_t content_hash() const { return content_hash_; }
 
   const NodeDescriptor* Self() const;  // nullptr when self is not in the file
-  const NodeDescriptor* FindNode(std::string_view node_id) const;
+  const NodeDescriptor* FindNode(const NodeId& node_id) const;
   const GroupView* FindGroup(std::string_view group_id) const;
   const std::vector<NodeDescriptor>& Nodes() const { return nodes_; }
   const std::vector<GroupView>& Groups() const { return groups_; }
@@ -189,7 +233,7 @@ class ServingState {
   std::uint64_t content_hash_ = 0;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
-  std::string self_node_id_;
+  NodeId self_node_id_;
   // slot -> index into groups_, -1 when unbound.
   std::array<std::int32_t, kSlotCount> slot_to_group_;
   std::uint32_t covered_slots_ = 0;
@@ -213,7 +257,7 @@ class ServingState {
 class ServingStateBuilder {
  public:
   ServingStateBuilder& SetTopologyEpoch(std::uint64_t epoch);
-  ServingStateBuilder& SetSelfNodeId(std::string_view node_id);
+  ServingStateBuilder& SetSelfNodeId(const NodeId& node_id);
   ServingStateBuilder& AddNode(NodeDescriptor node);
   // Takes ownership of the group's slot ranges. Slots may also be attached
   // later via AddSlotRange to an existing group id.
@@ -229,7 +273,7 @@ class ServingStateBuilder {
 
  private:
   std::uint64_t topology_epoch_ = 0;
-  std::string self_node_id_;
+  NodeId self_node_id_;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
 };

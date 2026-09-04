@@ -20,16 +20,6 @@
 namespace keylane::cluster {
 namespace {
 
-// A node id is exactly 40 lowercase hex characters (the format Redis writes).
-// Uppercase is rejected rather than normalized: node ids are compared by
-// exact string everywhere (self match, replica wiring, MYID), so accepting
-// two spellings of one id would invite silent mismatches.
-bool IsNodeId(std::string_view text) {
-  return text.size() == 40 && std::all_of(text.begin(), text.end(), [](char c) {
-           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-         });
-}
-
 template <typename Integer>
 bool ParseUnsigned(std::string_view text, Integer* result) {
   static_assert(std::is_unsigned_v<Integer>);
@@ -183,11 +173,12 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
                                                " fields, want at least 8"));
   }
   ParsedNode parsed;
-  if (!IsNodeId(fields[0])) {
+  const std::optional<NodeId> node_id = NodeId::Parse(fields[0]);
+  if (!node_id.has_value()) {
     return LineError(line_number,
                      absl::StrCat("malformed node id '", fields[0], "'"));
   }
-  parsed.node_.node_id_ = std::string(fields[0]);
+  parsed.node_.node_id_ = *node_id;
   auto address = ParseNodeAddress(fields[1]);
   if (!address.ok()) return LineError(line_number, address.status());
   parsed.node_.host_ = std::move(address->first);
@@ -215,12 +206,13 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
   parsed.node_.is_primary_ = master;
 
   if (slave) {
-    if (!IsNodeId(fields[3])) {
+    const std::optional<NodeId> primary_id = NodeId::Parse(fields[3]);
+    if (!primary_id.has_value()) {
       return LineError(
           line_number,
           absl::StrCat("replica has a malformed primary id '", fields[3], "'"));
     }
-    parsed.node_.primary_id_ = std::string(fields[3]);
+    parsed.node_.primary_id_ = *primary_id;
   } else if (fields[3] != "-") {
     return LineError(line_number, "primary line carries a primary id");
   }
@@ -316,14 +308,14 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
       }
     }
     if (primary == nullptr) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("replica ", node.node_.node_id_,
-                       " points at unknown primary ", node.node_.primary_id_));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "replica ", node.node_.node_id_.ToHexString(),
+          " points at unknown primary ", node.node_.primary_id_.ToHexString()));
     }
     if (!primary->node_.is_primary_) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("replica ", node.node_.node_id_,
-                       " points at non-primary ", node.node_.primary_id_));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "replica ", node.node_.node_id_.ToHexString(),
+          " points at non-primary ", node.node_.primary_id_.ToHexString()));
     }
   }
 
@@ -336,7 +328,10 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     // scale-out) owns nothing, and its replicas serve nothing either.
     if (!node.node_.is_primary_ || node.slots_.empty()) continue;
     GroupView group;
-    group.group_id_ = node.node_.node_id_;
+    // The static adapter defines its opaque group id as the primary's Redis
+    // node id. Keep GroupId textual because a future Meta adapter may assign
+    // ids from a different namespace.
+    group.group_id_ = node.node_.node_id_.ToHexString();
     group.primary_node_id_ = node.node_.node_id_;
     for (const ParsedNode& replica : nodes) {
       if (!replica.node_.is_primary_ &&

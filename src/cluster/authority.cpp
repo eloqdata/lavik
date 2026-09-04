@@ -89,7 +89,7 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // locally; staleness is the client's explicit choice. Writes and
   // non-READONLY reads redirect to the primary.
   if (self != nullptr && !request.is_write_ && request.connection_readonly_) {
-    for (const std::string& replica_id : group->replica_node_ids_) {
+    for (const NodeId& replica_id : group->replica_node_ids_) {
       if (replica_id == self->node_id_) {
         decision.kind_ = Decision::Kind::kServeStaleRead;
         return decision;

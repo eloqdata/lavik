@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -25,18 +26,24 @@ constexpr std::string_view kNodeA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr std::string_view kNodeB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kNodeR = "cccccccccccccccccccccccccccccccccccccccc";
 
+cluster::NodeId ParseNodeId(std::string_view id) {
+  const std::optional<cluster::NodeId> parsed = cluster::NodeId::Parse(id);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed.value_or(cluster::NodeId{});
+}
+
 cluster::NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                                  std::uint16_t port, std::uint16_t tls_port,
                                  bool is_primary, std::string_view primary_id,
                                  std::uint64_t config_epoch,
                                  bool link_connected = true) {
   cluster::NodeDescriptor node;
-  node.node_id_ = std::string(id);
+  node.node_id_ = ParseNodeId(id);
   node.host_ = std::string(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
   node.is_primary_ = is_primary;
-  node.primary_id_ = std::string(primary_id);
+  if (!primary_id.empty()) node.primary_id_ = ParseNodeId(primary_id);
   node.config_epoch_ = config_epoch;
   node.link_connected_ = link_connected;
   return node;
@@ -48,8 +55,11 @@ cluster::GroupView MakeGroup(std::string_view group_id,
                              std::vector<cluster::SlotRange> ranges) {
   cluster::GroupView group;
   group.group_id_ = std::string(group_id);
-  group.primary_node_id_ = std::string(primary_id);
-  group.replica_node_ids_ = std::move(replica_ids);
+  group.primary_node_id_ = ParseNodeId(primary_id);
+  group.replica_node_ids_.reserve(replica_ids.size());
+  for (const std::string& replica_id : replica_ids) {
+    group.replica_node_ids_.push_back(ParseNodeId(replica_id));
+  }
   group.slot_ranges_ = std::move(ranges);
   return group;
 }
@@ -61,7 +71,7 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
     bool full_coverage, std::string_view self_id = kNodeA) {
   cluster::ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(self_id);
+  if (!self_id.empty()) builder.SetSelfNodeId(ParseNodeId(self_id));
   builder.AddNode(MakeNode(kNodeA, "127.0.0.1", 7000, 17001, true, "", 1));
   builder.AddNode(MakeNode(kNodeB, "127.0.0.2", 7001, 17002, true, "", 2));
   builder.AddNode(MakeNode(kNodeR, "127.0.0.3", 7002, 17003, false, kNodeA, 1));
@@ -82,7 +92,7 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
 std::shared_ptr<const cluster::ServingState> BuildCompactionState() {
   cluster::ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(kNodeA);
+  builder.SetSelfNodeId(ParseNodeId(kNodeA));
   builder.AddNode(MakeNode(kNodeA, "127.0.0.1", 7000, 17001, true, "", 1));
   builder.AddNode(
       MakeNode(kNodeB, "127.0.0.2", 7001, 17002, true, "", 2, false));
@@ -410,7 +420,8 @@ TEST(ClusterCommandTest, NodesMarksReplicaSelfAndAnnouncesWildcard) {
       BuildThreeNodeState(false, kNodeR);
   ASSERT_NE(state, nullptr);
   ClusterRuntimeGuard guard(MakeRuntime(state));
-  const std::string reply = RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
+  const std::string reply =
+      RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
   const std::string_view payload = BulkPayload(reply);
   // The replica is self: myself,slave, its primary's id, and the empty
   // wildcard-bind host. A is no longer myself and advertises its concrete
@@ -432,7 +443,8 @@ TEST(ClusterCommandTest, NodesCompactsSlotRangesAndFlagsLinkState) {
       BuildCompactionState();
   ASSERT_NE(state, nullptr);
   ClusterRuntimeGuard guard(MakeRuntime(state));
-  const std::string reply = RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
+  const std::string reply =
+      RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
   const std::string_view payload = BulkPayload(reply);
   EXPECT_NE(payload.find(absl::StrCat(kNodeA,
                                       " :7000@0 myself,master - 0 0 1 "

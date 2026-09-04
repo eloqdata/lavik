@@ -1,6 +1,7 @@
 #include "keylane/cluster/topology.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <utility>
 
@@ -9,6 +10,49 @@
 #include "keylane/storage/format.h"
 
 namespace keylane::cluster {
+
+std::optional<NodeId> NodeId::Parse(std::string_view hex) noexcept {
+  if (hex.size() != kHexSize) return std::nullopt;
+
+  Bytes bytes;
+  for (std::size_t i = 0; i < kByteSize; ++i) {
+    const auto nibble = [](char c) -> std::optional<std::uint8_t> {
+      if (c >= '0' && c <= '9') return static_cast<std::uint8_t>(c - '0');
+      if (c >= 'a' && c <= 'f') {
+        return static_cast<std::uint8_t>(c - 'a' + 10);
+      }
+      return std::nullopt;
+    };
+    const std::optional<std::uint8_t> high = nibble(hex[2 * i]);
+    const std::optional<std::uint8_t> low = nibble(hex[2 * i + 1]);
+    if (!high.has_value() || !low.has_value()) return std::nullopt;
+    bytes[i] = static_cast<std::uint8_t>((*high << 4) | *low);
+  }
+  return NodeId(bytes);
+}
+
+NodeId::Hex NodeId::ToHex() const noexcept {
+  assert(!empty());
+  Hex hex{};
+  constexpr char kHexDigits[] = "0123456789abcdef";
+  for (std::size_t i = 0; i < bytes_.size(); ++i) {
+    hex[2 * i] = kHexDigits[bytes_[i] >> 4];
+    hex[2 * i + 1] = kHexDigits[bytes_[i] & 0x0f];
+  }
+  return hex;
+}
+
+std::string NodeId::ToHexString() const {
+  if (empty()) return {};
+  const Hex hex = ToHex();
+  return std::string(hex.data(), hex.size());
+}
+
+void NodeId::AppendHexTo(std::string* output) const {
+  if (empty()) return;
+  const Hex hex = ToHex();
+  output->append(hex.data(), hex.size());
+}
 
 // The data plane hashes keys with storage::RedisSlot and routes by hash slot;
 // the two slot spaces must stay identical or routing and storage would
@@ -47,6 +91,12 @@ void HashString(std::uint64_t& hash, std::string_view value) {
   }
 }
 
+void HashNodeId(std::uint64_t& hash, const NodeId& node_id) {
+  HashBool(hash, !node_id.empty());
+  if (node_id.empty()) return;
+  for (std::uint8_t byte : node_id.bytes()) HashByte(hash, byte);
+}
+
 // Composite authority token for one group: owner identity, term, grant, and
 // readiness. Computed once per group at Build; the request path only compares
 // the precomputed values. 0 is reserved for "unknown group" so a dangling
@@ -54,23 +104,13 @@ void HashString(std::uint64_t& hash, std::string_view value) {
 // re-check.
 std::uint64_t ComputeGroupToken(const GroupView& group) {
   std::uint64_t hash = kFnv1aOffsetBasis;
-  HashString(hash, group.primary_node_id_);
+  HashNodeId(hash, group.primary_node_id_);
   HashU64(hash, group.group_term_);
   HashBool(hash, group.granted_);
   HashBool(hash, group.population_ready_);
   HashBool(hash, group.storage_ready_);
   HashU64(hash, group.config_epoch_);
   return hash == 0 ? 1 : hash;
-}
-
-// Node ids come from the shared static topology file; Redis writes them as 40
-// lowercase hex characters and the data plane keeps them verbatim so MYID and
-// CLUSTER NODES stay stable across restarts.
-bool IsValidNodeId(std::string_view node_id) {
-  if (node_id.size() != 40) return false;
-  return std::all_of(node_id.begin(), node_id.end(), [](char c) {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-  });
 }
 
 // Serializes the semantic content of a snapshot: nodes, per-group authority
@@ -81,13 +121,13 @@ bool IsValidNodeId(std::string_view node_id) {
 // GroupView::slot_ranges_ (differently partitioned but equivalent ranges —
 // e.g. [0,9] versus [0,4]+[5,9] — describe the same state).
 std::uint64_t ComputeContentHash(
-    std::uint64_t topology_epoch, std::string_view self_node_id,
+    std::uint64_t topology_epoch, const NodeId& self_node_id,
     const std::vector<NodeDescriptor>& nodes,
     const std::vector<GroupView>& groups,
     const std::array<std::int32_t, kSlotCount>& slot_to_group) {
   std::uint64_t hash = kFnv1aOffsetBasis;
   HashU64(hash, topology_epoch);
-  HashString(hash, self_node_id);
+  HashNodeId(hash, self_node_id);
 
   std::vector<const NodeDescriptor*> sorted_nodes;
   sorted_nodes.reserve(nodes.size());
@@ -98,12 +138,12 @@ std::uint64_t ComputeContentHash(
             });
   HashU64(hash, sorted_nodes.size());
   for (const NodeDescriptor* node : sorted_nodes) {
-    HashString(hash, node->node_id_);
+    HashNodeId(hash, node->node_id_);
     HashString(hash, node->host_);
     HashU64(hash, node->port_);
     HashU64(hash, node->tls_port_);
     HashBool(hash, node->is_primary_);
-    HashString(hash, node->primary_id_);
+    HashNodeId(hash, node->primary_id_);
     HashU64(hash, node->config_epoch_);
     HashBool(hash, node->link_connected_);
   }
@@ -118,12 +158,12 @@ std::uint64_t ComputeContentHash(
   HashU64(hash, sorted_groups.size());
   for (const GroupView* group : sorted_groups) {
     HashString(hash, group->group_id_);
-    HashString(hash, group->primary_node_id_);
-    std::vector<std::string_view> replicas(group->replica_node_ids_.begin(),
-                                           group->replica_node_ids_.end());
+    HashNodeId(hash, group->primary_node_id_);
+    std::vector<NodeId> replicas(group->replica_node_ids_.begin(),
+                                 group->replica_node_ids_.end());
     std::sort(replicas.begin(), replicas.end());
     HashU64(hash, replicas.size());
-    for (std::string_view replica : replicas) HashString(hash, replica);
+    for (const NodeId& replica : replicas) HashNodeId(hash, replica);
     HashU64(hash, group->group_term_);
     HashBool(hash, group->granted_);
     HashBool(hash, group->population_ready_);
@@ -147,7 +187,7 @@ const NodeDescriptor* ServingState::Self() const {
   return FindNode(self_node_id_);
 }
 
-const NodeDescriptor* ServingState::FindNode(std::string_view node_id) const {
+const NodeDescriptor* ServingState::FindNode(const NodeId& node_id) const {
   for (const NodeDescriptor& node : nodes_) {
     if (node.node_id_ == node_id) return &node;
   }
@@ -200,11 +240,11 @@ GroupInFlight* ServingState::InFlightCellForSlot(std::uint16_t slot) const {
   return in_flight_cells_[static_cast<std::size_t>(index)].get();
 }
 
-std::uint64_t ServingState::GroupInFlightCount(std::string_view group_id) const {
+std::uint64_t ServingState::GroupInFlightCount(
+    std::string_view group_id) const {
   const GroupView* group = FindGroup(group_id);
   if (group == nullptr) return 0;
-  const std::size_t index =
-      static_cast<std::size_t>(group - groups_.data());
+  const std::size_t index = static_cast<std::size_t>(group - groups_.data());
   return in_flight_cells_[index]->Total();
 }
 
@@ -236,8 +276,7 @@ ServingStateBuilder& ServingStateBuilder::SetTopologyEpoch(
   return *this;
 }
 
-ServingStateBuilder& ServingStateBuilder::SetSelfNodeId(
-    std::string_view node_id) {
+ServingStateBuilder& ServingStateBuilder::SetSelfNodeId(const NodeId& node_id) {
   self_node_id_ = node_id;
   return *this;
 }
@@ -268,13 +307,11 @@ ServingStateBuilder& ServingStateBuilder::AddSlotRange(
 
 absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
     const {
-  std::vector<std::string_view> node_ids;
+  std::vector<NodeId> node_ids;
   node_ids.reserve(nodes_.size());
   for (const NodeDescriptor& node : nodes_) {
-    if (!IsValidNodeId(node.node_id_)) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("invalid node id '", node.node_id_,
-                       "': want 40 lowercase hex characters"));
+    if (node.node_id_.empty()) {
+      return absl::InvalidArgumentError("node id must not be empty");
     }
     node_ids.push_back(node.node_id_);
   }
@@ -282,10 +319,10 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
   for (std::size_t i = 1; i < node_ids.size(); ++i) {
     if (node_ids[i] == node_ids[i - 1]) {
       return absl::InvalidArgumentError(
-          absl::StrCat("duplicate node id '", node_ids[i], "'"));
+          absl::StrCat("duplicate node id '", node_ids[i].ToHexString(), "'"));
     }
   }
-  auto node_exists = [&node_ids](std::string_view id) {
+  auto node_exists = [&node_ids](const NodeId& id) {
     return std::binary_search(node_ids.begin(), node_ids.end(), id);
   };
 
@@ -307,15 +344,15 @@ absl::StatusOr<std::shared_ptr<const ServingState>> ServingStateBuilder::Build()
 
   for (const GroupView& group : groups_) {
     if (!node_exists(group.primary_node_id_)) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("group '", group.group_id_, "' primary '",
-                       group.primary_node_id_, "' is not a known node"));
+      return absl::InvalidArgumentError(absl::StrCat(
+          "group '", group.group_id_, "' primary '",
+          group.primary_node_id_.ToHexString(), "' is not a known node"));
     }
-    for (const std::string& replica : group.replica_node_ids_) {
+    for (const NodeId& replica : group.replica_node_ids_) {
       if (!node_exists(replica)) {
         return absl::InvalidArgumentError(
-            absl::StrCat("group '", group.group_id_, "' replica '", replica,
-                         "' is not a known node"));
+            absl::StrCat("group '", group.group_id_, "' replica '",
+                         replica.ToHexString(), "' is not a known node"));
       }
     }
   }

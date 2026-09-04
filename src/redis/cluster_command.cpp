@@ -77,9 +77,10 @@ std::uint16_t DiscoveryPort(const cluster::ServingState& state,
                             bool connection_tls) {
   const cluster::NodeDescriptor* self = state.Self();
   if (self != nullptr && self->node_id_ == node.node_id_) {
-    const std::uint16_t announced = connection_tls && runtime.announce_tls_port_ != 0
-                                        ? runtime.announce_tls_port_
-                                        : runtime.announce_port_;
+    const std::uint16_t announced =
+        connection_tls && runtime.announce_tls_port_ != 0
+            ? runtime.announce_tls_port_
+            : runtime.announce_port_;
     if (announced != 0) return announced;
   }
   return cluster::router::ClientPort(node, connection_tls);
@@ -109,11 +110,13 @@ std::vector<cluster::SlotRange> CompactSlotRanges(
 }
 
 void AppendClusterSlotsNode(ReplyBuilder& reply_builder, std::string_view host,
-                            std::uint16_t port, std::string_view node_id) {
+                            std::uint16_t port,
+                            const cluster::NodeId& node_id) {
   reply_builder.AppendArrayHeader(3);
   reply_builder.AppendBulkString(host);
   reply_builder.AppendInteger(port);
-  reply_builder.AppendBulkString(node_id);
+  const cluster::NodeId::Hex hex = node_id.ToHex();
+  reply_builder.AppendBulkString(std::string_view(hex.data(), hex.size()));
 }
 
 // CLUSTER SLOTS: one [start, end, primary, replica...] entry per contiguous
@@ -138,7 +141,7 @@ void BuildClusterSlotsReply(const cluster::ServingState& state,
     if (primary == nullptr) continue;  // Build() validates; defensive
     GroupSlots view;
     view.primary_ = primary;
-    for (const std::string& replica_id : group.replica_node_ids_) {
+    for (const cluster::NodeId& replica_id : group.replica_node_ids_) {
       if (const cluster::NodeDescriptor* replica = state.FindNode(replica_id)) {
         view.replicas_.push_back(replica);
       }
@@ -179,18 +182,22 @@ std::string BuildClusterNodes(const cluster::ServingState& state,
   std::string nodes;
   const cluster::NodeDescriptor* self = state.Self();
   for (const cluster::NodeDescriptor& node : state.Nodes()) {
+    node.node_id_.AppendHexTo(&nodes);
     absl::StrAppend(
-        &nodes, node.node_id_, " ",
+        &nodes, " ",
         ClusterNodeAddress(DiscoveryHost(state, runtime, node),
-                           DiscoveryPort(state, runtime, node,
-                                         connection_tls)),
+                           DiscoveryPort(state, runtime, node, connection_tls)),
         " ");
     if (self != nullptr && self->node_id_ == node.node_id_) {
       absl::StrAppend(&nodes, "myself,");
     }
     absl::StrAppend(&nodes, node.is_primary_ ? "master" : "slave", " ");
     const bool names_primary = !node.is_primary_ && !node.primary_id_.empty();
-    absl::StrAppend(&nodes, names_primary ? node.primary_id_.c_str() : "-");
+    if (names_primary) {
+      node.primary_id_.AppendHexTo(&nodes);
+    } else {
+      nodes.push_back('-');
+    }
     absl::StrAppend(&nodes, " 0 0 ", node.config_epoch_, " ",
                     node.link_connected_ ? "connected" : "disconnected");
     if (node.is_primary_) {
@@ -287,11 +294,14 @@ Task<CommandReply> ExecuteClusterModeCommand(const CommandRequest& request,
       reply.encoded_ = AppendClusterSubcommandError(reply_builder, subcommand);
       co_return reply;
     }
-    std::string_view self_id;
+    cluster::NodeId::Hex self_id{};
+    std::size_t self_id_size = 0;
     if (state != nullptr && state->Self() != nullptr) {
-      self_id = state->Self()->node_id_;
+      self_id = state->Self()->node_id_.ToHex();
+      self_id_size = self_id.size();
     }
-    reply.encoded_ = reply_builder.AppendBulkString(self_id);
+    reply.encoded_ = reply_builder.AppendBulkString(
+        std::string_view(self_id.data(), self_id_size));
     co_return reply;
   }
 
