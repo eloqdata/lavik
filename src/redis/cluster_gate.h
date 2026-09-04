@@ -4,7 +4,7 @@
 // per-type multi-key executors (invariant 1 choke point 2).
 //
 // The dispatch gate captures the ServingState a request was admitted against
-// on CommandRequest (cluster_admitted_state_ / cluster_slots_). A topology
+// on CommandRequest (cluster_admitted_state_ / ClusterSlots()). A topology
 // reload (SIGHUP) can fence that admission while a command suspends on
 // scheduling or I/O, so every mutation path re-checks the captured per-group
 // authority tokens against the current cache right before writing. The

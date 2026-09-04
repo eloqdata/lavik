@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -11,7 +12,6 @@
 #include <string_view>
 #include <vector>
 
-#include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 #include "celer/runtime/task.h"
 #include "keylane/cluster/topology.h"
@@ -332,13 +332,27 @@ struct CommandRequest {
   // replies select the TLS port for TLS connections (mirroring Redis
   // getNodeClientPort/shouldReturnTlsInfo).
   bool connection_tls_ = false;
-  // Cluster admission record: the distinct hash slots of the command's keys
-  // and the ServingState snapshot the gate admitted against. The owner-side
-  // authority re-check compares per-group tokens against the current cache.
-  // Inlined: cluster mode populates this per keyed request, and cross-slot
-  // requests are rejected, so the distinct slot count is almost always one —
-  // inline storage keeps the admission path allocation-free.
-  absl::InlinedVector<std::uint16_t, 4> cluster_slots_;
+  // Cluster admission needs the first slot plus at most one different-slot
+  // witness: two distinct slots already make the request terminally
+  // CROSSSLOT, while every admitted request carries exactly one slot. Keeping
+  // only those samples avoids embedding a general vector in every request,
+  // including requests created while cluster mode is disabled.
+  std::array<std::uint16_t, 2> cluster_slot_samples_{};
+  std::uint8_t cluster_slot_sample_count_ = 0;
+  void ClearClusterSlots() noexcept { cluster_slot_sample_count_ = 0; }
+  void AddClusterSlot(std::uint16_t slot) noexcept {
+    if (cluster_slot_sample_count_ == 0) {
+      cluster_slot_samples_[0] = slot;
+      cluster_slot_sample_count_ = 1;
+    } else if (cluster_slot_samples_[0] != slot &&
+               cluster_slot_sample_count_ == 1) {
+      cluster_slot_samples_[1] = slot;
+      cluster_slot_sample_count_ = 2;
+    }
+  }
+  std::span<const std::uint16_t> ClusterSlots() const noexcept {
+    return {cluster_slot_samples_.data(), cluster_slot_sample_count_};
+  }
   // Mutable: the owner-side re-check re-arms this snapshot after a benign
   // republish (same serving verdict, refreshed token) so the transaction
   // hook compares against the fresher state. This is a cache-consistency

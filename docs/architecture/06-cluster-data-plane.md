@@ -82,6 +82,11 @@ traffic owned by healthy groups; keyless commands consult the aggregate.
 whitelist membership), so the full decision matrix is testable offline. Its
 evaluation order mirrors Redis `getNodeByQuery`:
 
+The request record retains only the first slot and, when present, one distinct
+slot as a CROSSSLOT witness. More distinct slots cannot change the decision,
+and every request that proceeds beyond admission therefore carries exactly one
+slot without a general-purpose vector allocation or footprint.
+
 1. Loading: no committed snapshot, or an involved group is not ready. Only
    whitelisted commands (health, discovery, configuration, subscription
    management) are served; everything else is LOADING.

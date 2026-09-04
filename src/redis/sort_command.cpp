@@ -582,7 +582,7 @@ Task<CommandReply> ExecuteSortCommand(const CommandRequest& request,
       if (IsClusterAuthorityChanged(replaced.status())) {
         // The re-check fired before any write of the destination.
         co_return ClusterAuthorityChangedReply(
-            request.cluster_slots_, request.connection_tls_, reply_builder);
+            request.ClusterSlots(), request.connection_tls_, reply_builder);
       }
       co_return Built(AppendSortError(reply_builder, replaced.status()));
     }

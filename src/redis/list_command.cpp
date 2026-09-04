@@ -643,7 +643,7 @@ Task<CommandReply> ExecuteListMultiKey(const CommandRequest& request,
       if (IsClusterAuthorityChanged(outcome.status_)) {
         // The re-check fired before the hop mutated anything.
         co_return ClusterAuthorityChangedReply(
-            request.cluster_slots_, request.connection_tls_, reply_builder);
+            request.ClusterSlots(), request.connection_tls_, reply_builder);
       }
       co_return BuiltReply(AppendStorageError(reply_builder, outcome.status_));
     }
