@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -19,8 +20,9 @@ using keylane::cluster::Decision;
 using keylane::cluster::GroupInFlight;
 using keylane::cluster::GroupView;
 using keylane::cluster::InFlightGuard;
-using keylane::cluster::InFlightStripe;
 using keylane::cluster::NodeDescriptor;
+using keylane::cluster::NodeId;
+using keylane::cluster::NodeIndex;
 using keylane::cluster::RequestView;
 using keylane::cluster::ServingState;
 using keylane::cluster::ServingStateBuilder;
@@ -32,6 +34,9 @@ constexpr std::string_view kNodeB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kNodeR = "cccccccccccccccccccccccccccccccccccccccc";
 constexpr std::string_view kGroupA = "group-a";
 constexpr std::string_view kGroupB = "group-b";
+constexpr NodeIndex kNodeAIndex = 0;
+constexpr NodeIndex kNodeBIndex = 1;
+constexpr NodeIndex kNodeRIndex = 2;
 
 // Default topology: group-a (primary A, replica R) owns [0, 9999], group-b
 // (primary B) owns [10000, 16383].
@@ -40,47 +45,60 @@ constexpr std::uint16_t kOtherSlotInA = 7;
 constexpr std::uint16_t kSlotInB = 10005;
 constexpr std::uint16_t kUnboundSlot = 16000;  // only in gap topologies
 
+NodeId ParseNodeId(std::string_view id) {
+  const std::optional<NodeId> parsed = NodeId::Parse(id);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed.value_or(NodeId{});
+}
+
 NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                         std::uint16_t port, std::uint16_t tls_port) {
   NodeDescriptor node;
-  node.node_id_ = std::string(id);
-  node.host_ = std::string(host);
+  node.node_id_ = ParseNodeId(id);
+  node.SetHost(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
   return node;
 }
 
-GroupView MakeGroup(std::string_view id, std::string_view primary,
+GroupView MakeGroup(std::string_view id, NodeIndex primary_node_index,
                     std::uint16_t first_slot, std::uint16_t last_slot) {
   GroupView group;
   group.group_id_ = std::string(id);
-  group.primary_node_id_ = std::string(primary);
+  group.primary_node_index_ = primary_node_index;
   group.slot_ranges_.push_back(SlotRange{first_slot, last_slot});
   return group;
 }
 
 GroupView GroupA() {
-  GroupView group = MakeGroup(kGroupA, kNodeA, 0, 9999);
-  group.replica_node_ids_.push_back(std::string(kNodeR));
+  GroupView group = MakeGroup(kGroupA, kNodeAIndex, 0, 9999);
+  group.replica_node_indices_.push_back(kNodeRIndex);
   return group;
 }
 
-GroupView GroupB() { return MakeGroup(kGroupB, kNodeB, 10000, 16383); }
+GroupView GroupB() { return MakeGroup(kGroupB, kNodeBIndex, 10000, 16383); }
 
 // Group-b covers only [10000, 15000], leaving [15001, 16383] unbound.
-GroupView GroupBWithGap() { return MakeGroup(kGroupB, kNodeB, 10000, 15000); }
+GroupView GroupBWithGap() {
+  return MakeGroup(kGroupB, kNodeBIndex, 10000, 15000);
+}
 
 std::shared_ptr<const ServingState> BuildState(std::string_view self,
                                                GroupView group_a,
                                                GroupView group_b) {
   ServingStateBuilder builder;
-  builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(self);
+  builder.SetTopologyEpoch(1).SetInFlightStripeCount(4);
+  if (self == kNodeA) {
+    builder.SetSelfNodeIndex(kNodeAIndex);
+  } else if (self == kNodeB) {
+    builder.SetSelfNodeIndex(kNodeBIndex);
+  } else if (self == kNodeR) {
+    builder.SetSelfNodeIndex(kNodeRIndex);
+  }
   builder.AddNode(MakeNode(kNodeA, "10.0.0.1", 7000, 17000));
   builder.AddNode(MakeNode(kNodeB, "10.0.0.2", 7001, 17001));
   NodeDescriptor replica = MakeNode(kNodeR, "10.0.0.3", 7002, 17002);
-  replica.is_primary_ = false;
-  replica.primary_id_ = std::string(kNodeA);
+  replica.primary_node_index_ = kNodeAIndex;
   builder.AddNode(std::move(replica));
   builder.AddGroup(std::move(group_a));
   builder.AddGroup(std::move(group_b));
@@ -341,8 +359,8 @@ TEST(ClusterAuthorityTest, AuthorityUnchangedDetectsInvolvedGroupChanges) {
       *admitted, BuildState(kNodeA, unready, GroupB()).get(), slots));
 
   GroupView new_owner = GroupA();
-  new_owner.primary_node_id_ = std::string(kNodeR);
-  new_owner.replica_node_ids_.clear();
+  new_owner.primary_node_index_ = kNodeBIndex;
+  new_owner.replica_node_indices_.clear();
   EXPECT_FALSE(AuthorityUnchanged(
       *admitted, BuildState(kNodeA, new_owner, GroupB()).get(), slots));
 }
@@ -385,7 +403,7 @@ TEST(GroupInFlightTest, CountsAndDrains) {
     GroupInFlight* cell_b = state->InFlightCellForSlot(kSlotInB);
     ASSERT_NE(cell_a, nullptr);
     ASSERT_NE(cell_b, nullptr);
-    const std::size_t stripe = InFlightStripe();
+    constexpr std::size_t stripe = 0;
     const InFlightGuard first(*cell_a, stripe);
     const InFlightGuard second(*cell_a, stripe);
     const InFlightGuard other(*cell_b, stripe);
@@ -398,11 +416,18 @@ TEST(GroupInFlightTest, CountsAndDrains) {
   EXPECT_EQ(state->TotalInFlightCount(), 0);
 }
 
+TEST(GroupInFlightTest, AllocatesOneStripePerConfiguredWorker) {
+  const auto state = BuildState(kNodeA);
+  const GroupInFlight* cell = state->InFlightCellForSlot(kSlotInA);
+  ASSERT_NE(cell, nullptr);
+  EXPECT_EQ(cell->StripeCount(), 4);
+}
+
 TEST(GroupInFlightTest, MoveTransfersOwnership) {
   const auto state = BuildState(kNodeA);
   GroupInFlight* cell = state->InFlightCellForSlot(kSlotInA);
   ASSERT_NE(cell, nullptr);
-  const std::size_t stripe = InFlightStripe();
+  constexpr std::size_t stripe = 0;
   {
     InFlightGuard first(*cell, stripe);
     {
@@ -426,7 +451,7 @@ TEST(GroupInFlightTest, ConcurrentEnterExit) {
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&state, &slots, t] {
       // Each thread gets its own stripe, so the hot path never contends.
-      const std::size_t stripe = InFlightStripe();
+      const std::size_t stripe = static_cast<std::size_t>(t);
       for (int i = 0; i < kIterations; ++i) {
         GroupInFlight* cell = state->InFlightCellForSlot(slots[(t + i) % 3]);
         const InFlightGuard guard(*cell, stripe);

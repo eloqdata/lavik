@@ -14,8 +14,10 @@
 
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/status/statusor.h"
 
 namespace keylane::cluster {
@@ -32,19 +35,103 @@ namespace keylane::cluster {
 // static_assert in topology.cpp ties the two together.
 inline constexpr std::uint16_t kSlotCount = 16384;
 
+// Redis Cluster node identity in its compact binary form. The wire and
+// nodes.conf representation remains exactly 40 lowercase hexadecimal
+// characters; parsing at the topology boundary avoids keeping a separately
+// allocated string in every immutable descriptor and every node reference.
+// A default-constructed value is empty so optional relationships such as a
+// primary node's absent upstream do not need a sentinel from the valid
+// 160-bit identity space.
+class NodeId {
+ public:
+  static constexpr std::size_t kByteSize = 20;
+  static constexpr std::size_t kHexSize = 2 * kByteSize;
+  using Bytes = std::array<std::uint8_t, kByteSize>;
+  using Hex = std::array<char, kHexSize>;
+
+  NodeId() = default;
+
+  // Parses the canonical Redis spelling. Uppercase is rejected rather than
+  // normalized so configuration continues to have one spelling per id.
+  static std::optional<NodeId> Parse(std::string_view hex) noexcept;
+
+  // Empty represents an absent relationship, not the valid all-zero id.
+  bool empty() const noexcept { return !present_; }
+  // Returns the binary identity; callers must check empty() when absence is
+  // meaningful because an empty id also carries zero-initialized storage.
+  const Bytes& bytes() const noexcept { return bytes_; }
+  // Formats the canonical lowercase wire spelling. ToHex() requires a
+  // present id; an empty id produces no text from ToHexString()/AppendHexTo.
+  Hex ToHex() const noexcept;
+  std::string ToHexString() const;
+  void AppendHexTo(std::string* output) const;
+
+  friend bool operator==(const NodeId&, const NodeId&) = default;
+  friend bool operator<(const NodeId& left, const NodeId& right) noexcept {
+    if (left.present_ != right.present_) return !left.present_;
+    return left.bytes_ < right.bytes_;
+  }
+
+ private:
+  explicit NodeId(Bytes bytes) : bytes_(bytes), present_(true) {}
+
+  Bytes bytes_{};
+  bool present_ = false;
+};
+
+// Stable index into one ServingState's contiguous node table. Indices never
+// cross snapshot boundaries; authority hashes resolve them back to NodeId so
+// reordering an equivalent table does not change semantic identity.
+using NodeIndex = std::uint32_t;
+inline constexpr NodeIndex kNoNodeIndex = std::numeric_limits<NodeIndex>::max();
+
+// Compact index stored in the fixed 16,384-entry slot map. The sentinel
+// consumes the largest value, leaving 65,535 representable groups per
+// snapshot, well above the number that can own at least one Redis slot.
+using GroupIndex = std::uint16_t;
+inline constexpr GroupIndex kNoGroupIndex =
+    std::numeric_limits<GroupIndex>::max();
+static_assert(kSlotCount < kNoGroupIndex);
+
 // One cluster node as the data plane sees it. In v1 the static topology file
 // is the only source; `tls_port_` is the configured cluster-wide TLS port
 // (uniform-port assumption, see control_port.h).
-struct NodeDescriptor {
-  std::string node_id_;  // 40 lowercase hex chars, stable across restarts
-  std::string host_;
+struct alignas(64) NodeDescriptor {
+  NodeId node_id_;              // stable across restarts
+  bool link_connected_ = true;  // parsed from the file; not consulted in v1
   std::uint16_t port_ = 0;
   std::uint16_t tls_port_ = 0;  // 0 = TLS not offered
-  bool is_primary_ = true;
-  std::string primary_id_;  // replicas only: node_id of their primary
+  // kNoNodeIndex identifies a primary; replicas point at their primary in
+  // the same ServingState::Nodes() table.
+  NodeIndex primary_node_index_ = kNoNodeIndex;
   std::uint64_t config_epoch_ = 0;
-  bool link_connected_ = true;  // parsed from the file; not consulted in v1
+
+  // Most advertised addresses (including every IPv4 literal) stay inside the
+  // descriptor. Longer hostnames and IPv6 literals retain their full value by
+  // using InlinedVector's overflow allocation.
+  absl::InlinedVector<char, 16> host_;
+
+  // Replaces the advertised host without requiring callers to depend on its
+  // compact storage representation.
+  void SetHost(std::string_view host) {
+    host_.assign(host.begin(), host.end());
+  }
+  // Returns the advertised host for hashing, comparison, and wire formatting.
+  std::string_view host() const noexcept {
+    if (host_.empty()) return {};
+    return std::string_view(host_.data(), host_.size());
+  }
+
+  bool is_primary() const noexcept {
+    return primary_node_index_ == kNoNodeIndex;
+  }
 };
+
+// Node tables are traversed on routing and discovery paths. Keeping each
+// descriptor in one aligned cache line prevents adjacent entries from sharing
+// a line while preserving support for arbitrarily long advertised hosts.
+static_assert(sizeof(NodeDescriptor) == 64);
+static_assert(alignof(NodeDescriptor) == 64);
 
 // Slot range, both ends inclusive, as written in a nodes.conf node line.
 struct SlotRange {
@@ -53,35 +140,44 @@ struct SlotRange {
 };
 
 // Striped in-flight mutation counter for one group, owned by the published
-// ServingState. Registration on the request path is one atomic increment on
-// the calling thread's stripe: no lock, no allocation, and no cross-thread
-// cacheline contention as long as threads stay on distinct stripes. The drain
-// side (control plane, tests) sums the stripes off the request path.
+// ServingState. One stripe is allocated for every request worker, so
+// registration is one directly indexed atomic increment: no lock, request-
+// path allocation, modulo, or cross-thread cacheline contention. Copies share
+// the same stripe allocation so token-equivalent snapshots drain together.
 class GroupInFlight {
  public:
-  static constexpr std::size_t kStripeCount = 64;
+  explicit GroupInFlight(std::size_t stripe_count)
+      : stripes_(std::make_shared_for_overwrite<Stripe[]>(stripe_count)),
+        stripe_count_(stripe_count) {
+    assert(stripe_count_ != 0);
+  }
+
+  // Number of configured request-worker stripes in this cell.
+  std::size_t StripeCount() const noexcept { return stripe_count_; }
 
   // Enter is seq_cst on purpose: paired with the registrant's subsequent
   // TopologyCache::version() load and the publisher's store-then-bump order it
   // forms a Dekker handshake — a drain that starts after a revoking publish
   // either observes this registration, or the registrant observes the
-  // publication and rolls back (see TopologyCache::Publish).
+  // publication and rolls back (see TopologyCache::Publish). `stripe` is the
+  // configured Celer worker id and must be less than StripeCount().
   void Enter(std::size_t stripe) noexcept {
-    stripes_[stripe % kStripeCount].value_.fetch_add(1);
+    assert(stripe < stripe_count_);
+    stripes_[stripe].value_.fetch_add(1);
   }
   // Release is sufficient for Exit: an Exit not yet visible to the drain only
   // makes the drain wait longer, never miss an execution.
   void Exit(std::size_t stripe) noexcept {
-    stripes_[stripe % kStripeCount].value_.fetch_sub(1,
-                                                     std::memory_order_release);
+    assert(stripe < stripe_count_);
+    stripes_[stripe].value_.fetch_sub(1, std::memory_order_release);
   }
   // Drain-side aggregate; sums every stripe. Never on the request path.
   std::uint64_t Total() const noexcept {
     std::uint64_t total = 0;
-    for (const Stripe& stripe : stripes_) {
+    for (std::size_t i = 0; i < stripe_count_; ++i) {
       // seq_cst so the drain participates in the Dekker handshake described
       // at Enter().
-      total += stripe.value_.load();
+      total += stripes_[i].value_.load();
     }
     return total;
   }
@@ -90,14 +186,16 @@ class GroupInFlight {
   struct alignas(64) Stripe {
     std::atomic<std::int64_t> value_{0};
   };
-  std::array<Stripe, kStripeCount> stripes_;
-};
+  static_assert(sizeof(Stripe) == 64);
 
-// One stable stripe per thread, assigned lazily from a process-wide counter.
-// Keeps request-path registrations contention-free without tying this module
-// to a worker model; stripe sharing only costs cacheline contention, never
-// correctness.
-std::size_t InFlightStripe() noexcept;
+  // make_shared_for_overwrite<T[]> keeps the control block and variable-length
+  // stripe array in one allocation; Stripe's member initializer still zeros
+  // every counter. GroupInFlight itself stays a small, copyable handle in
+  // ServingState's cell vector, so dynamic sizing adds no request-path pointer
+  // indirection compared with shared_ptr<GroupInFlight> plus an inline array.
+  std::shared_ptr<Stripe[]> stripes_;
+  std::size_t stripe_count_;
+};
 
 // RAII marker for one admitted in-flight mutation: Enter on construction,
 // Exit on destruction. The request path keeps a small inlined vector of
@@ -129,13 +227,13 @@ class [[nodiscard]] InFlightGuard {
 // adapter will assign Meta-scoped ids over the same seam).
 struct GroupView {
   std::string group_id_;
-  std::string primary_node_id_;
-  std::vector<std::string> replica_node_ids_;
-  std::uint64_t group_term_ = 0;
-  bool granted_ = true;         // false = fenced: this group must not serve
+  NodeIndex primary_node_index_ = kNoNodeIndex;
+  bool granted_ = true;  // false = fenced: this group must not serve
   bool population_ready_ = true;
   bool storage_ready_ = true;
+  std::uint64_t group_term_ = 0;
   std::uint64_t config_epoch_ = 0;
+  std::vector<NodeIndex> replica_node_indices_;
   std::vector<SlotRange> slot_ranges_;  // owned slots, validated at Build
 };
 
@@ -148,7 +246,10 @@ class ServingState {
   std::uint64_t content_hash() const { return content_hash_; }
 
   const NodeDescriptor* Self() const;  // nullptr when self is not in the file
-  const NodeDescriptor* FindNode(std::string_view node_id) const;
+  NodeIndex SelfNodeIndex() const { return self_node_index_; }
+  // Direct node-table lookup; returns nullptr for kNoNodeIndex/out of range.
+  const NodeDescriptor* NodeAt(NodeIndex node_index) const;
+  const NodeDescriptor* FindNode(const NodeId& node_id) const;
   const GroupView* FindGroup(std::string_view group_id) const;
   const std::vector<NodeDescriptor>& Nodes() const { return nodes_; }
   const std::vector<GroupView>& Groups() const { return groups_; }
@@ -172,9 +273,9 @@ class ServingState {
 
   // Striped in-flight cell of the group owning `slot`, or nullptr when the
   // slot is unbound. Request-path registration is one atomic Enter on the
-  // calling thread's stripe; the cell outlives this snapshot whenever a later
-  // snapshot shares it (token-unchanged groups, see TopologyCache::Publish),
-  // so a guard is safe to hold for the whole execution.
+  // calling thread's stripe. The admitted snapshot keeps this handle alive
+  // for every guard, while token-unchanged later snapshots share its
+  // underlying stripe allocation (see TopologyCache::Publish).
   GroupInFlight* InFlightCellForSlot(std::uint16_t slot) const;
   // Drain-side aggregates over the cells, for the control plane and tests —
   // never the request path. To fence a group, publish the revoking state and
@@ -189,20 +290,21 @@ class ServingState {
   std::uint64_t content_hash_ = 0;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
-  std::string self_node_id_;
-  // slot -> index into groups_, -1 when unbound.
-  std::array<std::int32_t, kSlotCount> slot_to_group_;
+  NodeIndex self_node_index_ = kNoNodeIndex;
+  // slot -> index into groups_, kNoGroupIndex when unbound. A 16-bit entry
+  // keeps the hot, fixed-size routing table at 32 KiB.
+  std::array<GroupIndex, kSlotCount> slot_to_group_;
   std::uint32_t covered_slots_ = 0;
   // Precomputed per-group authority tokens, parallel to groups_. Computed
   // once at Build so the request path never hashes or scans for them.
   std::vector<std::uint64_t> group_tokens_;
-  // One cell per entry in groups_. Build installs a fresh cell per group;
-  // TopologyCache::Publish then swaps in the replaced snapshot's cell for
-  // every group whose authority token is unchanged, so executions admitted
-  // under either snapshot drain together. Mutable because Publication
-  // installs the sharing after the state is built but before it becomes
-  // visible to readers.
-  mutable std::vector<std::shared_ptr<GroupInFlight>> in_flight_cells_;
+  // One cell handle per entry in groups_. Build gives each handle a fresh
+  // stripe allocation; TopologyCache::Publish then copies the replaced
+  // snapshot's handle for every group whose authority token is unchanged, so
+  // executions admitted under either snapshot drain together. Mutable because
+  // publication installs the sharing after the state is built but before it
+  // becomes visible to readers.
+  mutable std::vector<GroupInFlight> in_flight_cells_;
 
   // Implements the cell sharing described on in_flight_cells_; called by
   // TopologyCache::Publish before the state is stored.
@@ -213,23 +315,29 @@ class ServingState {
 class ServingStateBuilder {
  public:
   ServingStateBuilder& SetTopologyEpoch(std::uint64_t epoch);
-  ServingStateBuilder& SetSelfNodeId(std::string_view node_id);
+  ServingStateBuilder& SetSelfNodeIndex(NodeIndex node_index);
+  // Configures one in-flight stripe per request worker. The default keeps
+  // standalone model construction convenient; production adapters must pass
+  // the server's configured worker count.
+  ServingStateBuilder& SetInFlightStripeCount(std::size_t stripe_count);
   ServingStateBuilder& AddNode(NodeDescriptor node);
   // Takes ownership of the group's slot ranges. Slots may also be attached
   // later via AddSlotRange to an existing group id.
   ServingStateBuilder& AddGroup(GroupView group);
   ServingStateBuilder& AddSlotRange(std::string_view group_id, SlotRange range);
 
-  // Validates: node ids are unique 40-hex; group ids unique; every group has
-  // an existing primary node; replica ids exist; slot ranges are in
-  // [0, kSlotCount) and non-overlapping. Computes the slot map and content
+  // Validates: node ids are present and unique; group ids are unique; the
+  // snapshot fits the compact group-index space; every node index is in range
+  // and describes a consistent primary/replica relationship; slot ranges are
+  // in [0, kSlotCount) and non-overlapping. Computes the slot map and content
   // hash. Self may legitimately be absent (validation of self-match is the
   // control adapter's job, since only it knows the match rule).
   absl::StatusOr<std::shared_ptr<const ServingState>> Build() const;
 
  private:
   std::uint64_t topology_epoch_ = 0;
-  std::string self_node_id_;
+  NodeIndex self_node_index_ = kNoNodeIndex;
+  std::size_t in_flight_stripe_count_ = 1;
   std::vector<NodeDescriptor> nodes_;
   std::vector<GroupView> groups_;
 };

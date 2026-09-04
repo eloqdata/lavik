@@ -277,6 +277,15 @@ bool CmpCaseInsensitive(std::string_view a, std::string_view b) {
 
 }  // namespace
 
+// GCC can diagnose Abseil's trivially-relocatable InlinedVector move as
+// reading its inactive union member when an empty request is moved into
+// StatusOr. The vector size remains zero and those bytes are never observed;
+// keep the suppression scoped to the one construction path that instantiates
+// that false positive so genuine uninitialized reads elsewhere stay visible.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id) {
   if (command.args_.empty()) {
@@ -291,6 +300,9 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
   request.args_ = std::move(command.args_);
   return request;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 absl::StatusOr<ReplicaOfRequest> ParseReplicaOfRequest(
     std::span<const std::string> args) {
@@ -849,7 +861,11 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 void RegisterClusterInFlight(
     const cluster::ServingState& state, std::span<const std::uint16_t> slots,
     absl::InlinedVector<cluster::InFlightGuard, 4>* guards) {
-  const std::size_t stripe = cluster::InFlightStripe();
+  // Requests execute on stable Celer workers, so the worker id is already the
+  // exact per-thread stripe identity needed here. Passing it into the cluster
+  // model keeps that lower layer independent of the runtime and avoids a
+  // second thread-local identity allocator.
+  const std::size_t stripe = celer::ThisWorker().id_;
   for (const std::uint16_t slot : slots) {
     cluster::GroupInFlight* cell = state.InFlightCellForSlot(slot);
     if (cell == nullptr) continue;
@@ -922,9 +938,9 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
     // (then the registration is rolled back and the loop retries). A
     // registration therefore can never slip past a drain unseen.
     // Registration targets the admitted snapshot the request holds for its
-    // whole lifetime, which keeps the cells alive behind the guards' raw
-    // pointers; token-equal snapshots share the same cells, so the
-    // publisher's drain sees these guards regardless.
+    // whole lifetime, which keeps the cell handles alive behind the guards'
+    // raw pointers; token-equal snapshots share the same stripe allocations,
+    // so the publisher's drain sees these guards regardless.
     RegisterClusterInFlight(*request.cluster_admitted_state_,
                             request.cluster_slots_, in_flights);
     if (cache.version() == version_before) return std::nullopt;

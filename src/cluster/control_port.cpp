@@ -20,16 +20,6 @@
 namespace keylane::cluster {
 namespace {
 
-// A node id is exactly 40 lowercase hex characters (the format Redis writes).
-// Uppercase is rejected rather than normalized: node ids are compared by
-// exact string everywhere (self match, replica wiring, MYID), so accepting
-// two spellings of one id would invite silent mismatches.
-bool IsNodeId(std::string_view text) {
-  return text.size() == 40 && std::all_of(text.begin(), text.end(), [](char c) {
-           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-         });
-}
-
 template <typename Integer>
 bool ParseUnsigned(std::string_view text, Integer* result) {
   static_assert(std::is_unsigned_v<Integer>);
@@ -161,6 +151,8 @@ absl::StatusOr<SlotRange> ParseSlotToken(std::string_view token) {
 
 struct ParsedNode {
   NodeDescriptor node_;
+  std::optional<NodeId> primary_id_;
+  bool is_primary_ = true;
   std::vector<SlotRange> slots_;
 };
 
@@ -183,14 +175,15 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
                                                " fields, want at least 8"));
   }
   ParsedNode parsed;
-  if (!IsNodeId(fields[0])) {
+  const std::optional<NodeId> node_id = NodeId::Parse(fields[0]);
+  if (!node_id.has_value()) {
     return LineError(line_number,
                      absl::StrCat("malformed node id '", fields[0], "'"));
   }
-  parsed.node_.node_id_ = std::string(fields[0]);
+  parsed.node_.node_id_ = *node_id;
   auto address = ParseNodeAddress(fields[1]);
   if (!address.ok()) return LineError(line_number, address.status());
-  parsed.node_.host_ = std::move(address->first);
+  parsed.node_.SetHost(address->first);
   parsed.node_.port_ = address->second;
 
   // Only the role flags carry routing meaning; myself/fail?/fail/handshake/
@@ -212,15 +205,16 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
                      master ? "node is flagged both master and slave"
                             : "node is flagged neither master nor slave");
   }
-  parsed.node_.is_primary_ = master;
+  parsed.is_primary_ = master;
 
   if (slave) {
-    if (!IsNodeId(fields[3])) {
+    const std::optional<NodeId> primary_id = NodeId::Parse(fields[3]);
+    if (!primary_id.has_value()) {
       return LineError(
           line_number,
           absl::StrCat("replica has a malformed primary id '", fields[3], "'"));
     }
-    parsed.node_.primary_id_ = std::string(fields[3]);
+    parsed.primary_id_ = *primary_id;
   } else if (fields[3] != "-") {
     return LineError(line_number, "primary line carries a primary id");
   }
@@ -261,7 +255,8 @@ absl::StatusOr<ParsedNode> ParseNodeLine(
 
 absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     std::string_view content, const SelfMatch& self,
-    std::uint16_t cluster_tls_port, bool storage_ready) {
+    std::uint16_t cluster_tls_port, bool storage_ready,
+    std::size_t worker_count) {
   std::vector<ParsedNode> nodes;
   std::uint64_t topology_epoch = 0;
   std::size_t line_number = 0;
@@ -284,18 +279,23 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
     topology_epoch = std::max(topology_epoch, node->node_.config_epoch_);
     nodes.push_back(std::move(*node));
   }
+  if (nodes.size() > kNoNodeIndex) {
+    return absl::ResourceExhaustedError(
+        "nodes.conf has too many nodes for 32-bit node indices");
+  }
 
   // Identify the local entry. The shared file carries no myself mark, so the
   // bind address selects it; a wildcard bind matches on the port alone. The
   // match must be unique or startup would serve under an ambiguous identity.
   const bool wildcard = IsWildcardHost(self.host_);
-  const ParsedNode* matched = nullptr;
+  NodeIndex matched_index = kNoNodeIndex;
   std::size_t matches = 0;
-  for (const ParsedNode& node : nodes) {
-    if ((wildcard || node.node_.host_ == self.host_) &&
+  for (std::size_t i = 0; i < nodes.size(); ++i) {
+    const ParsedNode& node = nodes[i];
+    if ((wildcard || node.node_.host() == self.host_) &&
         node.node_.port_ == self.port_) {
       ++matches;
-      matched = &node;
+      matched_index = static_cast<NodeIndex>(i);
     }
   }
   if (matches != 1) {
@@ -306,42 +306,49 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
 
   // Replica wiring is validated up front: a replica pointing at an absent or
   // non-primary node would corrupt group assembly below.
-  for (const ParsedNode& node : nodes) {
-    if (node.node_.is_primary_) continue;
-    const ParsedNode* primary = nullptr;
-    for (const ParsedNode& candidate : nodes) {
-      if (candidate.node_.node_id_ == node.node_.primary_id_) {
-        primary = &candidate;
+  for (ParsedNode& node : nodes) {
+    if (node.is_primary_) continue;
+    NodeIndex primary_index = kNoNodeIndex;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+      if (nodes[i].node_.node_id_ == *node.primary_id_) {
+        primary_index = static_cast<NodeIndex>(i);
         break;
       }
     }
-    if (primary == nullptr) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("replica ", node.node_.node_id_,
-                       " points at unknown primary ", node.node_.primary_id_));
+    if (primary_index == kNoNodeIndex) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "replica ", node.node_.node_id_.ToHexString(),
+          " points at unknown primary ", node.primary_id_->ToHexString()));
     }
-    if (!primary->node_.is_primary_) {
-      return absl::InvalidArgumentError(
-          absl::StrCat("replica ", node.node_.node_id_,
-                       " points at non-primary ", node.node_.primary_id_));
+    if (!nodes[primary_index].is_primary_) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "replica ", node.node_.node_id_.ToHexString(),
+          " points at non-primary ", node.primary_id_->ToHexString()));
     }
+    node.node_.primary_node_index_ = primary_index;
   }
 
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(topology_epoch);
-  builder.SetSelfNodeId(matched->node_.node_id_);
+  builder.SetSelfNodeIndex(matched_index);
+  builder.SetInFlightStripeCount(worker_count);
   for (const ParsedNode& node : nodes) builder.AddNode(node.node_);
-  for (const ParsedNode& node : nodes) {
+  for (std::size_t node_index = 0; node_index < nodes.size(); ++node_index) {
+    const ParsedNode& node = nodes[node_index];
     // Only slot-owning primaries form a group. An empty primary (mid
     // scale-out) owns nothing, and its replicas serve nothing either.
-    if (!node.node_.is_primary_ || node.slots_.empty()) continue;
+    if (!node.is_primary_ || node.slots_.empty()) continue;
     GroupView group;
-    group.group_id_ = node.node_.node_id_;
-    group.primary_node_id_ = node.node_.node_id_;
-    for (const ParsedNode& replica : nodes) {
-      if (!replica.node_.is_primary_ &&
-          replica.node_.primary_id_ == node.node_.node_id_) {
-        group.replica_node_ids_.push_back(replica.node_.node_id_);
+    // The static adapter defines its opaque group id as the primary's Redis
+    // node id. Keep GroupId textual because a future Meta adapter may assign
+    // ids from a different namespace.
+    group.group_id_ = node.node_.node_id_.ToHexString();
+    group.primary_node_index_ = static_cast<NodeIndex>(node_index);
+    for (std::size_t replica_index = 0; replica_index < nodes.size();
+         ++replica_index) {
+      if (nodes[replica_index].node_.primary_node_index_ == node_index) {
+        group.replica_node_indices_.push_back(
+            static_cast<NodeIndex>(replica_index));
       }
     }
     // Statically configured primaries hold a permanent grant; the file has
@@ -361,10 +368,12 @@ absl::StatusOr<std::shared_ptr<const ServingState>> StaticClusterControl::Parse(
 }
 
 StaticClusterControl::StaticClusterControl(std::string path, SelfMatch self,
-                                           std::uint16_t cluster_tls_port)
+                                           std::uint16_t cluster_tls_port,
+                                           std::size_t worker_count)
     : path_(std::move(path)),
       self_(std::move(self)),
-      cluster_tls_port_(cluster_tls_port) {}
+      cluster_tls_port_(cluster_tls_port),
+      worker_count_(worker_count) {}
 
 void StaticClusterControl::SetStorageReady(bool ready) {
   storage_ready_.store(ready, std::memory_order_release);
@@ -374,7 +383,8 @@ absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
   // Any failure returns before Publish, so the cache keeps the previously
   // published state (fencing transitions are only ever published complete).
   // The class needs no lock around the file IO: path_/self_/cluster_tls_port_
-  // are immutable after construction and storage_ready_ is atomic.
+  // and worker_count_ are immutable after construction and storage_ready_ is
+  // atomic.
   std::ifstream input(path_, std::ios::binary);
   if (!input.is_open()) {
     return absl::NotFoundError(
@@ -386,8 +396,9 @@ absl::Status StaticClusterControl::RefreshTarget(TopologyCache& cache) {
     return absl::UnknownError(
         absl::StrCat("cannot read cluster nodes file '", path_, "'"));
   }
-  auto state = Parse(content, self_, cluster_tls_port_,
-                     storage_ready_.load(std::memory_order_acquire));
+  auto state =
+      Parse(content, self_, cluster_tls_port_,
+            storage_ready_.load(std::memory_order_acquire), worker_count_);
   if (!state.ok()) return state.status();
   cache.Publish(std::move(*state));
   return absl::OkStatus();

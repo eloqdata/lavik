@@ -2449,7 +2449,8 @@ int RunServer(ServerOptions options) {
     cluster_control = std::make_unique<cluster::StaticClusterControl>(
         options.cluster_static_nodes_file_,
         cluster::StaticClusterControl::SelfMatch{self_host, options.port_},
-        cluster::GetClusterRuntime()->announce_tls_port_);
+        cluster::GetClusterRuntime()->announce_tls_port_,
+        options.thread_count_);
     // A first-load failure is fatal: there is no previous ServingState to
     // keep, and serving without one would answer every command CLUSTERDOWN.
     const absl::Status loaded = cluster_control->RefreshTarget(

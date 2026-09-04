@@ -7,6 +7,7 @@
 // ever learning about Raft phases, transport, or licensing.
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -53,9 +54,12 @@ class StaticClusterControl final : public ClusterControlPort {
   };
 
   // `cluster_tls_port` is the cluster-wide uniform TLS port announced for
-  // every node (0 = no TLS). Non-uniform TLS ports are out of v1 scope.
+  // every node (0 = no TLS). `worker_count` sizes each group's in-flight
+  // stripes so Celer worker ids index them directly. Non-uniform TLS ports are
+  // out of v1 scope.
   StaticClusterControl(std::string path, SelfMatch self,
-                       std::uint16_t cluster_tls_port);
+                       std::uint16_t cluster_tls_port,
+                       std::size_t worker_count = 1);
 
   absl::Status RefreshTarget(TopologyCache& cache) override;
 
@@ -67,12 +71,14 @@ class StaticClusterControl final : public ClusterControlPort {
   // that will never parse).
   static absl::StatusOr<std::shared_ptr<const ServingState>> Parse(
       std::string_view content, const SelfMatch& self,
-      std::uint16_t cluster_tls_port, bool storage_ready);
+      std::uint16_t cluster_tls_port, bool storage_ready,
+      std::size_t worker_count = 1);
 
  private:
   std::string path_;
   SelfMatch self_;
   std::uint16_t cluster_tls_port_;
+  std::size_t worker_count_;
   std::atomic<bool> storage_ready_{false};
 };
 

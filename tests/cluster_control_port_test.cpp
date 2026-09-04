@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +21,7 @@ using keylane::cluster::GroupView;
 using keylane::cluster::InMemoryClusterControl;
 using keylane::cluster::kSlotCount;
 using keylane::cluster::NodeDescriptor;
+using keylane::cluster::NodeId;
 using keylane::cluster::ServingState;
 using keylane::cluster::StaticClusterControl;
 using keylane::cluster::TopologyCache;
@@ -30,6 +32,12 @@ constexpr std::string_view kIdB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kIdC = "cccccccccccccccccccccccccccccccccccccccc";
 constexpr std::string_view kIdD = "dddddddddddddddddddddddddddddddddddddddd";
 static_assert(kIdA.size() == 40);
+
+NodeId ParseNodeId(std::string_view id) {
+  const std::optional<NodeId> parsed = NodeId::Parse(id);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed.value_or(NodeId{});
+}
 
 std::string NodeLine(std::string_view id, std::string_view address,
                      std::string_view flags, std::string_view primary,
@@ -91,7 +99,8 @@ class TempNodesFile {
 TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   auto state = StaticClusterControl::Parse(ValidTopology(), {"127.0.0.1", 7001},
                                            /*cluster_tls_port=*/17011,
-                                           /*storage_ready=*/true);
+                                           /*storage_ready=*/true,
+                                           /*worker_count=*/7);
   ASSERT_TRUE(state.ok()) << state.status();
   const ServingState& serving = **state;
 
@@ -101,43 +110,51 @@ TEST(ClusterControlPortTest, ParsesCompleteTopology) {
   EXPECT_EQ(serving.Groups().size(), 3U);
   EXPECT_EQ(serving.Nodes().size(), 4U);
   EXPECT_TRUE(serving.FullyReady());
+  ASSERT_NE(serving.InFlightCellForSlot(0), nullptr);
+  EXPECT_EQ(serving.InFlightCellForSlot(0)->StripeCount(), 7);
 
   ASSERT_NE(serving.Self(), nullptr);
-  EXPECT_EQ(serving.Self()->node_id_, kIdA);
+  EXPECT_EQ(serving.Self()->node_id_, ParseNodeId(kIdA));
 
   const GroupView* group_a = serving.GroupForSlot(0);
   ASSERT_NE(group_a, nullptr);
   EXPECT_EQ(group_a->group_id_, kIdA);
-  EXPECT_EQ(group_a->primary_node_id_, kIdA);
+  ASSERT_NE(serving.NodeAt(group_a->primary_node_index_), nullptr);
+  EXPECT_EQ(serving.NodeAt(group_a->primary_node_index_)->node_id_,
+            ParseNodeId(kIdA));
   EXPECT_EQ(group_a->config_epoch_, 1);
   EXPECT_TRUE(group_a->granted_);
   EXPECT_TRUE(group_a->population_ready_);
   EXPECT_TRUE(group_a->storage_ready_);
-  ASSERT_EQ(group_a->replica_node_ids_.size(), 1U);
-  EXPECT_EQ(group_a->replica_node_ids_[0], kIdD);
+  ASSERT_EQ(group_a->replica_node_indices_.size(), 1U);
+  ASSERT_NE(serving.NodeAt(group_a->replica_node_indices_[0]), nullptr);
+  EXPECT_EQ(serving.NodeAt(group_a->replica_node_indices_[0])->node_id_,
+            ParseNodeId(kIdD));
   EXPECT_EQ(serving.GroupForSlot(5460)->group_id_, kIdA);
   EXPECT_EQ(serving.GroupForSlot(5461)->group_id_, kIdB);
   EXPECT_EQ(serving.GroupForSlot(16383)->group_id_, kIdC);
   EXPECT_EQ(serving.FindGroup(kIdA), group_a);
-  EXPECT_EQ(serving.FindNode(std::string(40, 'f')), nullptr);
+  EXPECT_EQ(serving.FindNode(ParseNodeId(std::string(40, 'f'))), nullptr);
 
-  const NodeDescriptor* node_b = serving.FindNode(kIdB);
+  const NodeDescriptor* node_b = serving.FindNode(ParseNodeId(kIdB));
   ASSERT_NE(node_b, nullptr);
-  EXPECT_EQ(node_b->host_, "127.0.0.1");  // ",hostname" suffix stripped
+  EXPECT_EQ(node_b->host(), "127.0.0.1");  // ",hostname" suffix stripped
   EXPECT_EQ(node_b->port_, 7002);
   EXPECT_EQ(node_b->tls_port_, 17011);  // uniform cluster TLS port
-  EXPECT_TRUE(node_b->is_primary_);
+  EXPECT_TRUE(node_b->is_primary());
   EXPECT_TRUE(node_b->link_connected_);
 
-  const NodeDescriptor* node_c = serving.FindNode(kIdC);
+  const NodeDescriptor* node_c = serving.FindNode(ParseNodeId(kIdC));
   ASSERT_NE(node_c, nullptr);
-  EXPECT_EQ(node_c->host_, "::1");  // IPv6 brackets stripped
+  EXPECT_EQ(node_c->host(), "::1");  // IPv6 brackets stripped
   EXPECT_EQ(node_c->port_, 7003);
 
-  const NodeDescriptor* node_d = serving.FindNode(kIdD);
+  const NodeDescriptor* node_d = serving.FindNode(ParseNodeId(kIdD));
   ASSERT_NE(node_d, nullptr);
-  EXPECT_FALSE(node_d->is_primary_);
-  EXPECT_EQ(node_d->primary_id_, kIdA);
+  EXPECT_FALSE(node_d->is_primary());
+  ASSERT_NE(serving.NodeAt(node_d->primary_node_index_), nullptr);
+  EXPECT_EQ(serving.NodeAt(node_d->primary_node_index_)->node_id_,
+            ParseNodeId(kIdA));
   EXPECT_FALSE(node_d->link_connected_);
 }
 
@@ -172,7 +189,7 @@ TEST(ClusterControlPortTest, ParsesSingleSlotsAndCrlfLines) {
   EXPECT_EQ(serving.GroupForSlot(11), group);
   EXPECT_EQ(serving.GroupForSlot(12), group);
   EXPECT_EQ(serving.GroupForSlot(6), nullptr);
-  const NodeDescriptor* node = serving.FindNode(kIdA);
+  const NodeDescriptor* node = serving.FindNode(ParseNodeId(kIdA));
   ASSERT_NE(node, nullptr);
   EXPECT_EQ(node->tls_port_, 0);  // cluster_tls_port passthrough
 }
@@ -321,7 +338,7 @@ TEST(ClusterControlPortTest, MatchesSelfByExactHostAndPort) {
                                            0, true);
   ASSERT_TRUE(state.ok()) << state.status();
   ASSERT_NE((*state)->Self(), nullptr);
-  EXPECT_EQ((*state)->Self()->node_id_, kIdB);
+  EXPECT_EQ((*state)->Self()->node_id_, ParseNodeId(kIdB));
 }
 
 TEST(ClusterControlPortTest, WildcardSelfHostMatchesOnPortAlone) {
@@ -331,7 +348,7 @@ TEST(ClusterControlPortTest, WildcardSelfHostMatchesOnPortAlone) {
     ASSERT_TRUE(state.ok()) << wildcard << ": " << state.status();
     // Node C's file host is ::1, so only the port can have matched.
     ASSERT_NE((*state)->Self(), nullptr);
-    EXPECT_EQ((*state)->Self()->node_id_, kIdC) << wildcard;
+    EXPECT_EQ((*state)->Self()->node_id_, ParseNodeId(kIdC)) << wildcard;
   }
 }
 
@@ -364,7 +381,7 @@ TEST(ClusterControlPortTest, RequiresExactlyOneSelfMatch) {
       StaticClusterControl::Parse(duplicated_port, {"10.0.0.2", 7001}, 0, true);
   ASSERT_TRUE(exact.ok()) << exact.status();
   ASSERT_NE((*exact)->Self(), nullptr);
-  EXPECT_EQ((*exact)->Self()->node_id_, kIdB);
+  EXPECT_EQ((*exact)->Self()->node_id_, ParseNodeId(kIdB));
 }
 
 TEST(ClusterControlPortTest, RefreshPublishesFileContent) {

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -24,32 +25,40 @@ namespace cluster = keylane::cluster;
 constexpr std::string_view kNodeA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 constexpr std::string_view kNodeB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 constexpr std::string_view kNodeR = "cccccccccccccccccccccccccccccccccccccccc";
+constexpr cluster::NodeIndex kNodeAIndex = 0;
+constexpr cluster::NodeIndex kNodeBIndex = 1;
+constexpr cluster::NodeIndex kNodeRIndex = 2;
+
+cluster::NodeId ParseNodeId(std::string_view id) {
+  const std::optional<cluster::NodeId> parsed = cluster::NodeId::Parse(id);
+  EXPECT_TRUE(parsed.has_value());
+  return parsed.value_or(cluster::NodeId{});
+}
 
 cluster::NodeDescriptor MakeNode(std::string_view id, std::string_view host,
                                  std::uint16_t port, std::uint16_t tls_port,
-                                 bool is_primary, std::string_view primary_id,
+                                 cluster::NodeIndex primary_node_index,
                                  std::uint64_t config_epoch,
                                  bool link_connected = true) {
   cluster::NodeDescriptor node;
-  node.node_id_ = std::string(id);
-  node.host_ = std::string(host);
+  node.node_id_ = ParseNodeId(id);
+  node.SetHost(host);
   node.port_ = port;
   node.tls_port_ = tls_port;
-  node.is_primary_ = is_primary;
-  node.primary_id_ = std::string(primary_id);
+  node.primary_node_index_ = primary_node_index;
   node.config_epoch_ = config_epoch;
   node.link_connected_ = link_connected;
   return node;
 }
 
 cluster::GroupView MakeGroup(std::string_view group_id,
-                             std::string_view primary_id,
-                             std::vector<std::string> replica_ids,
+                             cluster::NodeIndex primary_node_index,
+                             std::vector<cluster::NodeIndex> replica_indices,
                              std::vector<cluster::SlotRange> ranges) {
   cluster::GroupView group;
   group.group_id_ = std::string(group_id);
-  group.primary_node_id_ = std::string(primary_id);
-  group.replica_node_ids_ = std::move(replica_ids);
+  group.primary_node_index_ = primary_node_index;
+  group.replica_node_indices_ = std::move(replica_indices);
   group.slot_ranges_ = std::move(ranges);
   return group;
 }
@@ -61,17 +70,25 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
     bool full_coverage, std::string_view self_id = kNodeA) {
   cluster::ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(self_id);
-  builder.AddNode(MakeNode(kNodeA, "127.0.0.1", 7000, 17001, true, "", 1));
-  builder.AddNode(MakeNode(kNodeB, "127.0.0.2", 7001, 17002, true, "", 2));
-  builder.AddNode(MakeNode(kNodeR, "127.0.0.3", 7002, 17003, false, kNodeA, 1));
-  builder.AddGroup(MakeGroup("group-a", kNodeA, {std::string(kNodeR)},
+  if (self_id == kNodeA) {
+    builder.SetSelfNodeIndex(kNodeAIndex);
+  } else if (self_id == kNodeB) {
+    builder.SetSelfNodeIndex(kNodeBIndex);
+  } else if (self_id == kNodeR) {
+    builder.SetSelfNodeIndex(kNodeRIndex);
+  }
+  builder.AddNode(
+      MakeNode(kNodeA, "127.0.0.1", 7000, 17001, cluster::kNoNodeIndex, 1));
+  builder.AddNode(
+      MakeNode(kNodeB, "127.0.0.2", 7001, 17002, cluster::kNoNodeIndex, 2));
+  builder.AddNode(MakeNode(kNodeR, "127.0.0.3", 7002, 17003, kNodeAIndex, 1));
+  builder.AddGroup(MakeGroup("group-a", kNodeAIndex, {kNodeRIndex},
                              {cluster::SlotRange{0, 100}}));
   const std::uint16_t last =
       full_coverage ? static_cast<std::uint16_t>(cluster::kSlotCount - 1)
                     : static_cast<std::uint16_t>(200);
   builder.AddGroup(
-      MakeGroup("group-b", kNodeB, {}, {cluster::SlotRange{101, last}}));
+      MakeGroup("group-b", kNodeBIndex, {}, {cluster::SlotRange{101, last}}));
   auto state = builder.Build();
   EXPECT_TRUE(state.ok()) << state.status();
   return state.ok() ? std::move(*state) : nullptr;
@@ -82,16 +99,17 @@ std::shared_ptr<const cluster::ServingState> BuildThreeNodeState(
 std::shared_ptr<const cluster::ServingState> BuildCompactionState() {
   cluster::ServingStateBuilder builder;
   builder.SetTopologyEpoch(1);
-  builder.SetSelfNodeId(kNodeA);
-  builder.AddNode(MakeNode(kNodeA, "127.0.0.1", 7000, 17001, true, "", 1));
+  builder.SetSelfNodeIndex(kNodeAIndex);
   builder.AddNode(
-      MakeNode(kNodeB, "127.0.0.2", 7001, 17002, true, "", 2, false));
+      MakeNode(kNodeA, "127.0.0.1", 7000, 17001, cluster::kNoNodeIndex, 1));
+  builder.AddNode(MakeNode(kNodeB, "127.0.0.2", 7001, 17002,
+                           cluster::kNoNodeIndex, 2, false));
   builder.AddGroup(
-      MakeGroup("group-a", kNodeA, {},
+      MakeGroup("group-a", kNodeAIndex, {},
                 {cluster::SlotRange{10, 10}, cluster::SlotRange{5, 5},
                  cluster::SlotRange{7, 9}}));
-  builder.AddGroup(
-      MakeGroup("group-b", kNodeB, {}, {cluster::SlotRange{16383, 16383}}));
+  builder.AddGroup(MakeGroup("group-b", kNodeBIndex, {},
+                             {cluster::SlotRange{16383, 16383}}));
   auto state = builder.Build();
   EXPECT_TRUE(state.ok()) << state.status();
   return state.ok() ? std::move(*state) : nullptr;
@@ -410,7 +428,8 @@ TEST(ClusterCommandTest, NodesMarksReplicaSelfAndAnnouncesWildcard) {
       BuildThreeNodeState(false, kNodeR);
   ASSERT_NE(state, nullptr);
   ClusterRuntimeGuard guard(MakeRuntime(state));
-  const std::string reply = RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
+  const std::string reply =
+      RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
   const std::string_view payload = BulkPayload(reply);
   // The replica is self: myself,slave, its primary's id, and the empty
   // wildcard-bind host. A is no longer myself and advertises its concrete
@@ -432,7 +451,8 @@ TEST(ClusterCommandTest, NodesCompactsSlotRangesAndFlagsLinkState) {
       BuildCompactionState();
   ASSERT_NE(state, nullptr);
   ClusterRuntimeGuard guard(MakeRuntime(state));
-  const std::string reply = RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
+  const std::string reply =
+      RunClusterCommand(MakeRequest({"CLUSTER", "NODES"}));
   const std::string_view payload = BulkPayload(reply);
   EXPECT_NE(payload.find(absl::StrCat(kNodeA,
                                       " :7000@0 myself,master - 0 0 1 "

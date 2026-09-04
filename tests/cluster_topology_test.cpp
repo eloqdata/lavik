@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -11,29 +12,63 @@
 namespace keylane::cluster {
 namespace {
 
-// 40 lowercase hex chars, as a nodes.conf node line writes them. NodeId(0)
+// 40 lowercase hex chars, as a nodes.conf node line writes them. TestNodeId(0)
 // stays all-zero; tests number real nodes from 1.
-std::string NodeId(unsigned n) {
+NodeId TestNodeId(unsigned n) {
   std::string id(40, '0');
   for (int i = 39; n != 0; n >>= 4, --i) {
     id[static_cast<std::size_t>(i)] = "0123456789abcdef"[n & 0xF];
   }
-  return id;
+  return *NodeId::Parse(id);
+}
+
+TEST(NodeIdTest, ParsesAndFormatsCanonicalRedisIdentity) {
+  constexpr std::string_view kHex = "0123456789abcdef0123456789abcdef01234567";
+  const std::optional<NodeId> id = NodeId::Parse(kHex);
+  ASSERT_TRUE(id.has_value());
+  EXPECT_EQ(id->ToHexString(), kHex);
+  EXPECT_EQ(id->bytes().front(), 0x01);
+  EXPECT_EQ(id->bytes().back(), 0x67);
+
+  std::string appended = "id=";
+  id->AppendHexTo(&appended);
+  EXPECT_EQ(appended, std::string("id=") + std::string(kHex));
+}
+
+TEST(NodeIdTest, DistinguishesAbsentFromAnAllZeroIdentity) {
+  const NodeId absent;
+  const std::optional<NodeId> zero = NodeId::Parse(std::string(40, '0'));
+  ASSERT_TRUE(zero.has_value());
+  EXPECT_TRUE(absent.empty());
+  EXPECT_FALSE(zero->empty());
+  EXPECT_NE(absent, *zero);
+  EXPECT_TRUE(absent.ToHexString().empty());
+  EXPECT_EQ(zero->ToHexString(), std::string(40, '0'));
 }
 
 NodeDescriptor MakeNode(unsigned n, std::uint16_t port = 7000) {
   NodeDescriptor node;
-  node.node_id_ = NodeId(n);
-  node.host_ = "127.0.0.1";
+  node.node_id_ = TestNodeId(n);
+  node.SetHost("127.0.0.1");
   node.port_ = port;
   return node;
 }
 
-GroupView MakeGroup(std::string group_id, unsigned primary_node,
+TEST(NodeDescriptorTest, PreservesInlineAndOverflowHosts) {
+  NodeDescriptor node;
+  node.SetHost("255.255.255.255");
+  EXPECT_EQ(node.host(), "255.255.255.255");
+
+  constexpr std::string_view kLongHost = "redis-primary.example.internal";
+  node.SetHost(kLongHost);
+  EXPECT_EQ(node.host(), kLongHost);
+}
+
+GroupView MakeGroup(std::string group_id, NodeIndex primary_node_index,
                     std::vector<SlotRange> slots) {
   GroupView group;
   group.group_id_ = std::move(group_id);
-  group.primary_node_id_ = NodeId(primary_node);
+  group.primary_node_index_ = primary_node_index;
   group.slot_ranges_ = std::move(slots);
   return group;
 }
@@ -44,8 +79,8 @@ template <typename Mutate>
 std::shared_ptr<const ServingState> MakeState(std::uint64_t epoch,
                                               Mutate&& mutate) {
   ServingStateBuilder builder;
-  builder.SetTopologyEpoch(epoch).SetSelfNodeId(NodeId(1)).AddNode(MakeNode(1));
-  GroupView group = MakeGroup("g1", 1, {{0, kSlotCount - 1}});
+  builder.SetTopologyEpoch(epoch).SetSelfNodeIndex(0).AddNode(MakeNode(1));
+  GroupView group = MakeGroup("g1", 0, {{0, kSlotCount - 1}});
   mutate(group);
   builder.AddGroup(std::move(group));
   auto result = builder.Build();
@@ -62,11 +97,11 @@ std::shared_ptr<const ServingState> MakeState(std::uint64_t epoch = 1) {
 ServingStateBuilder MakeTwoGroupBuilder() {
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(7)
-      .SetSelfNodeId(NodeId(1))
+      .SetSelfNodeIndex(0)
       .AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 1, {{0, 5460}}))
-      .AddGroup(MakeGroup("g2", 2, {{5461, 16383}}));
+      .AddGroup(MakeGroup("g1", 0, {{0, 5460}}))
+      .AddGroup(MakeGroup("g2", 1, {{5461, 16383}}));
   return builder;
 }
 
@@ -74,13 +109,18 @@ TEST(ServingStateBuilderTest, RejectsMalformedNodeIds) {
   for (std::string bad :
        {std::string(39, 'a'), std::string(41, 'a'), std::string(40, 'A'),
         std::string(40, 'g'), std::string()}) {
-    ServingStateBuilder builder;
-    NodeDescriptor node = MakeNode(1);
-    node.node_id_ = bad;
-    builder.AddNode(std::move(node));
-    auto result = builder.Build();
-    EXPECT_FALSE(result.ok()) << "accepted malformed node id '" << bad << "'";
+    EXPECT_FALSE(NodeId::Parse(bad).has_value())
+        << "accepted malformed node id '" << bad << "'";
   }
+  ServingStateBuilder builder;
+  builder.AddNode(NodeDescriptor{});
+  EXPECT_FALSE(builder.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsZeroInFlightStripes) {
+  ServingStateBuilder builder;
+  builder.SetInFlightStripeCount(0);
+  EXPECT_FALSE(builder.Build().ok());
 }
 
 TEST(ServingStateBuilderTest, RejectsDuplicateNodeId) {
@@ -92,14 +132,14 @@ TEST(ServingStateBuilderTest, RejectsDuplicateNodeId) {
 TEST(ServingStateBuilderTest, RejectsEmptyAndDuplicateGroupId) {
   {
     ServingStateBuilder builder;
-    builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("", 1, {}));
+    builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("", 0, {}));
     EXPECT_FALSE(builder.Build().ok());
   }
   {
     ServingStateBuilder builder;
     builder.AddNode(MakeNode(1))
-        .AddGroup(MakeGroup("g1", 1, {}))
-        .AddGroup(MakeGroup("g1", 1, {}));
+        .AddGroup(MakeGroup("g1", 0, {}))
+        .AddGroup(MakeGroup("g1", 0, {}));
     EXPECT_FALSE(builder.Build().ok());
   }
 }
@@ -107,8 +147,7 @@ TEST(ServingStateBuilderTest, RejectsEmptyAndDuplicateGroupId) {
 TEST(ServingStateBuilderTest, RejectsUnknownPrimaryNode) {
   ServingStateBuilder builder;
   builder.AddNode(MakeNode(1));
-  GroupView group = MakeGroup("g1", 1, {});
-  group.primary_node_id_ = NodeId(9);  // never added as a node
+  GroupView group = MakeGroup("g1", 9, {});  // never added as a node
   builder.AddGroup(std::move(group));
   EXPECT_FALSE(builder.Build().ok());
 }
@@ -116,21 +155,57 @@ TEST(ServingStateBuilderTest, RejectsUnknownPrimaryNode) {
 TEST(ServingStateBuilderTest, RejectsUnknownReplicaNode) {
   ServingStateBuilder builder;
   builder.AddNode(MakeNode(1));
-  GroupView group = MakeGroup("g1", 1, {});
-  group.replica_node_ids_.push_back(NodeId(9));
+  GroupView group = MakeGroup("g1", 0, {});
+  group.replica_node_indices_.push_back(9);
   builder.AddGroup(std::move(group));
   EXPECT_FALSE(builder.Build().ok());
 }
 
+TEST(ServingStateBuilderTest, RejectsOutOfRangeSelfAndReplicaPrimaryIndices) {
+  ServingStateBuilder bad_self;
+  bad_self.SetSelfNodeIndex(1)
+      .AddNode(MakeNode(1))
+      .AddGroup(MakeGroup("g1", 0, {}));
+  EXPECT_FALSE(bad_self.Build().ok());
+
+  NodeDescriptor replica = MakeNode(2);
+  replica.primary_node_index_ = 9;
+  ServingStateBuilder bad_replica;
+  bad_replica.AddNode(MakeNode(1))
+      .AddNode(std::move(replica))
+      .AddGroup(MakeGroup("g1", 0, {}));
+  EXPECT_FALSE(bad_replica.Build().ok());
+}
+
+TEST(ServingStateBuilderTest, RejectsInconsistentGroupNodeRoles) {
+  NodeDescriptor replica = MakeNode(2);
+  replica.primary_node_index_ = 0;
+
+  ServingStateBuilder replica_as_primary;
+  replica_as_primary.AddNode(MakeNode(1))
+      .AddNode(replica)
+      .AddGroup(MakeGroup("g1", 1, {}));
+  EXPECT_FALSE(replica_as_primary.Build().ok());
+
+  GroupView wrong_group = MakeGroup("g1", 1, {});
+  wrong_group.replica_node_indices_.push_back(2);
+  ServingStateBuilder mismatched_replica;
+  mismatched_replica.AddNode(MakeNode(1))
+      .AddNode(MakeNode(3))
+      .AddNode(std::move(replica))
+      .AddGroup(std::move(wrong_group));
+  EXPECT_FALSE(mismatched_replica.Build().ok());
+}
+
 TEST(ServingStateBuilderTest, RejectsInvertedSlotRange) {
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{100, 99}}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {{100, 99}}));
   EXPECT_FALSE(builder.Build().ok());
 }
 
 TEST(ServingStateBuilderTest, RejectsSlotRangeBeyondSlotCount) {
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{16000, 20000}}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {{16000, 20000}}));
   EXPECT_FALSE(builder.Build().ok());
 }
 
@@ -138,21 +213,21 @@ TEST(ServingStateBuilderTest, RejectsOverlappingSlotsAcrossGroups) {
   ServingStateBuilder builder;
   builder.AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 1, {{0, 100}}))
-      .AddGroup(MakeGroup("g2", 2, {{100, 200}}));
+      .AddGroup(MakeGroup("g1", 0, {{0, 100}}))
+      .AddGroup(MakeGroup("g2", 1, {{100, 200}}));
   EXPECT_FALSE(builder.Build().ok());
 }
 
 TEST(ServingStateBuilderTest, RejectsOverlappingRangesWithinGroup) {
   ServingStateBuilder builder;
   builder.AddNode(MakeNode(1))
-      .AddGroup(MakeGroup("g1", 1, {{0, 100}, {50, 150}}));
+      .AddGroup(MakeGroup("g1", 0, {{0, 100}, {50, 150}}));
   EXPECT_FALSE(builder.Build().ok());
 }
 
 TEST(ServingStateBuilderTest, AddSlotRangeAttachesToExistingGroup) {
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {}));
   builder.AddSlotRange("g1", {10, 20});
   auto result = builder.Build();
   ASSERT_TRUE(result.ok()) << result.status().message();
@@ -168,7 +243,7 @@ TEST(ServingStateBuilderTest, AddSlotRangeToUnknownGroupIsDropped) {
   // The frozen AddSlotRange signature cannot report failure, so the range is
   // dropped and Build stays valid with the slot left uncovered.
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {}));
   builder.AddSlotRange("no-such-group", {0, 100});
   auto result = builder.Build();
   ASSERT_TRUE(result.ok()) << result.status().message();
@@ -178,7 +253,7 @@ TEST(ServingStateBuilderTest, AddSlotRangeToUnknownGroupIsDropped) {
 
 TEST(ServingStateBuilderTest, SelfMayBeAbsent) {
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {}));
   auto result = builder.Build();
   ASSERT_TRUE(result.ok()) << result.status().message();
   EXPECT_EQ((*result)->Self(), nullptr);
@@ -187,24 +262,27 @@ TEST(ServingStateBuilderTest, SelfMayBeAbsent) {
 TEST(ServingStateTest, AccessorsRoundTrip) {
   ServingStateBuilder builder = MakeTwoGroupBuilder();
   NodeDescriptor replica = MakeNode(3, 7003);
-  replica.is_primary_ = false;
-  replica.primary_id_ = NodeId(1);
+  replica.primary_node_index_ = 0;
   builder.AddNode(std::move(replica));
   auto result = builder.Build();
   ASSERT_TRUE(result.ok()) << result.status().message();
   const std::shared_ptr<const ServingState>& state = *result;
 
   EXPECT_EQ(state->topology_epoch(), 7);
+  EXPECT_EQ(state->SelfNodeIndex(), 0);
   ASSERT_NE(state->Self(), nullptr);
-  EXPECT_EQ(state->Self()->node_id_, NodeId(1));
+  EXPECT_EQ(state->Self()->node_id_, TestNodeId(1));
+  EXPECT_EQ(state->NodeAt(0), state->Self());
+  EXPECT_EQ(state->NodeAt(kNoNodeIndex), nullptr);
+  EXPECT_EQ(state->NodeAt(99), nullptr);
 
-  ASSERT_NE(state->FindNode(NodeId(3)), nullptr);
-  EXPECT_EQ(state->FindNode(NodeId(3))->port_, 7003);
-  EXPECT_FALSE(state->FindNode(NodeId(3))->is_primary_);
-  EXPECT_EQ(state->FindNode(NodeId(9)), nullptr);
+  ASSERT_NE(state->FindNode(TestNodeId(3)), nullptr);
+  EXPECT_EQ(state->FindNode(TestNodeId(3))->port_, 7003);
+  EXPECT_FALSE(state->FindNode(TestNodeId(3))->is_primary());
+  EXPECT_EQ(state->FindNode(TestNodeId(9)), nullptr);
 
   ASSERT_NE(state->FindGroup("g2"), nullptr);
-  EXPECT_EQ(state->FindGroup("g2")->primary_node_id_, NodeId(2));
+  EXPECT_EQ(state->FindGroup("g2")->primary_node_index_, 1);
   EXPECT_EQ(state->FindGroup("nope"), nullptr);
 
   EXPECT_EQ(state->Nodes().size(), 3);
@@ -226,7 +304,7 @@ TEST(ServingStateTest, CoverageCompleteWhenAllSlotsBound) {
 
 TEST(ServingStateTest, CoverageGapIsReported) {
   ServingStateBuilder builder;
-  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{0, 5460}}));
+  builder.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {{0, 5460}}));
   auto result = builder.Build();
   ASSERT_TRUE(result.ok()) << result.status().message();
   const std::shared_ptr<const ServingState>& state = *result;
@@ -253,14 +331,31 @@ TEST(ServingStateTest, ContentHashIsOrderIndependent) {
   // Same semantic content, built with nodes, groups, and slot ranges in
   // different orders — including differently partitioned but equivalent
   // ranges.
-  ServingStateBuilder a = MakeTwoGroupBuilder();
+  NodeDescriptor replica_a = MakeNode(3);
+  replica_a.primary_node_index_ = 0;
+  GroupView group_a = MakeGroup("g1", 0, {{0, 5460}});
+  group_a.replica_node_indices_.push_back(2);
+  ServingStateBuilder a;
+  a.SetTopologyEpoch(7)
+      .SetSelfNodeIndex(0)
+      .AddNode(MakeNode(1))
+      .AddNode(MakeNode(2))
+      .AddNode(std::move(replica_a))
+      .AddGroup(std::move(group_a))
+      .AddGroup(MakeGroup("g2", 1, {{5461, 16383}}));
+
+  NodeDescriptor replica_b = MakeNode(3);
+  replica_b.primary_node_index_ = 2;
+  GroupView reordered_group_a = MakeGroup("g1", 2, {{0, 2000}, {2001, 5460}});
+  reordered_group_a.replica_node_indices_.push_back(0);
   ServingStateBuilder b;
   b.SetTopologyEpoch(7)
-      .SetSelfNodeId(NodeId(1))
+      .SetSelfNodeIndex(2)
+      .AddNode(std::move(replica_b))
       .AddNode(MakeNode(2))
       .AddNode(MakeNode(1))
-      .AddGroup(MakeGroup("g2", 2, {{10000, 16383}, {5461, 9999}}))
-      .AddGroup(MakeGroup("g1", 1, {{0, 2000}, {2001, 5460}}));
+      .AddGroup(MakeGroup("g2", 1, {{10000, 16383}, {5461, 9999}}))
+      .AddGroup(std::move(reordered_group_a));
   auto result_a = a.Build();
   auto result_b = b.Build();
   ASSERT_TRUE(result_a.ok()) << result_a.status().message();
@@ -274,10 +369,10 @@ TEST(ServingStateTest, ContentHashCoversEverySemanticField) {
 
   ServingStateBuilder other_self;
   other_self.SetTopologyEpoch(1)
-      .SetSelfNodeId(NodeId(2))
+      .SetSelfNodeIndex(1)
       .AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 1, {{0, kSlotCount - 1}}));
+      .AddGroup(MakeGroup("g1", 0, {{0, kSlotCount - 1}}));
   auto other = other_self.Build();
   ASSERT_TRUE(other.ok()) << other.status().message();
   EXPECT_NE((*other)->content_hash(), base);  // self id
@@ -298,11 +393,11 @@ TEST(ServingStateTest, ContentHashCoversEverySemanticField) {
   // Slot ownership: move slot 100 from g1 to g2.
   ServingStateBuilder moved;
   moved.SetTopologyEpoch(1)
-      .SetSelfNodeId(NodeId(1))
+      .SetSelfNodeIndex(0)
       .AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 1, {{0, 99}, {101, 16383}}))
-      .AddGroup(MakeGroup("g2", 2, {{100, 100}}));
+      .AddGroup(MakeGroup("g1", 0, {{0, 99}, {101, 16383}}))
+      .AddGroup(MakeGroup("g2", 1, {{100, 100}}));
   auto moved_result = moved.Build();
   ASSERT_TRUE(moved_result.ok()) << moved_result.status().message();
   EXPECT_NE((*moved_result)->content_hash(), base);
@@ -321,10 +416,10 @@ TEST(ServingStateTest, AuthorityToken) {
   // readiness flags, config epoch.
   ServingStateBuilder other_primary;
   other_primary.SetTopologyEpoch(1)
-      .SetSelfNodeId(NodeId(1))
+      .SetSelfNodeIndex(0)
       .AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 2, {{0, kSlotCount - 1}}));
+      .AddGroup(MakeGroup("g1", 1, {{0, kSlotCount - 1}}));
   auto other_result = other_primary.Build();
   ASSERT_TRUE(other_result.ok()) << other_result.status().message();
   EXPECT_NE((*other_result)->AuthorityToken("g1"), token);
@@ -358,18 +453,18 @@ TEST(TopologyCacheTest, PublishSharesCellsOnlyForTokenUnchangedGroups) {
   GroupInFlight* cell_g2 = replaced->InFlightCellForSlot(5461);
   ASSERT_NE(cell_g1, nullptr);
   ASSERT_NE(cell_g2, nullptr);
-  const std::size_t stripe = InFlightStripe();
+  constexpr std::size_t stripe = 0;
   const InFlightGuard guard_g1(*cell_g1, stripe);
   const InFlightGuard guard_g2(*cell_g2, stripe);
 
   // Fence g2 (higher epoch, grant dropped); g1's authority is untouched.
   ServingStateBuilder builder;
   builder.SetTopologyEpoch(8)
-      .SetSelfNodeId(NodeId(1))
+      .SetSelfNodeIndex(0)
       .AddNode(MakeNode(1))
       .AddNode(MakeNode(2))
-      .AddGroup(MakeGroup("g1", 1, {{0, 5460}}));
-  GroupView fenced_g2 = MakeGroup("g2", 2, {{5461, 16383}});
+      .AddGroup(MakeGroup("g1", 0, {{0, 5460}}));
+  GroupView fenced_g2 = MakeGroup("g2", 1, {{5461, 16383}});
   fenced_g2.granted_ = false;
   builder.AddGroup(std::move(fenced_g2));
   auto second = builder.Build();
@@ -395,7 +490,7 @@ TEST(TopologyCacheTest, ContentIdenticalRepublishKeepsInFlightCells) {
   const std::shared_ptr<const ServingState> state = cache.Current();
   GroupInFlight* cell = state->InFlightCellForSlot(5);
   ASSERT_NE(cell, nullptr);
-  const InFlightGuard guard(*cell, InFlightStripe());
+  const InFlightGuard guard(*cell, /*stripe=*/0);
 
   // A no-op republish must not disturb in-flight accounting.
   cache.Publish(MakeState(1));
@@ -474,12 +569,12 @@ TEST(ClusterRouterTest, PrimaryForSlot) {
 
   const NodeDescriptor* owner = router::PrimaryForSlot(*state, 0);
   ASSERT_NE(owner, nullptr);
-  EXPECT_EQ(owner->node_id_, NodeId(1));
-  EXPECT_EQ(router::PrimaryForSlot(*state, 16383)->node_id_, NodeId(2));
+  EXPECT_EQ(owner->node_id_, TestNodeId(1));
+  EXPECT_EQ(router::PrimaryForSlot(*state, 16383)->node_id_, TestNodeId(2));
 
   // Unbound slot: no group, hence no primary.
   ServingStateBuilder partial;
-  partial.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 1, {{0, 100}}));
+  partial.AddNode(MakeNode(1)).AddGroup(MakeGroup("g1", 0, {{0, 100}}));
   auto partial_result = partial.Build();
   ASSERT_TRUE(partial_result.ok()) << partial_result.status().message();
   EXPECT_EQ(router::PrimaryForSlot(**partial_result, 101), nullptr);
@@ -502,7 +597,7 @@ TEST(ClusterRouterTest, EndpointFormatsHostAndPort) {
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "127.0.0.1:7000");
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/true), "127.0.0.1:7443");
 
-  node.host_ = "::1";
+  node.SetHost("::1");
   node.tls_port_ = 0;
   EXPECT_EQ(router::Endpoint(node, /*connection_tls=*/false), "[::1]:7000");
 }

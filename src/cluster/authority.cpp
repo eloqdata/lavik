@@ -76,8 +76,8 @@ Decision Admit(const ServingState* state, const RequestView& request) {
 
   // Single-slot request from here on; the loading gate already established
   // the owning group's readiness.
-  const NodeDescriptor* self = state->Self();
-  if (self != nullptr && self->node_id_ == group->primary_node_id_) {
+  const NodeIndex self_index = state->SelfNodeIndex();
+  if (self_index == group->primary_node_index_) {
     // A fenced group has no safe owner: the primary must not serve and there
     // is no other authority to redirect to.
     decision.kind_ = group->granted_ ? Decision::Kind::kServe
@@ -88,16 +88,17 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // A READONLY connection on a replica of the owning group serves reads
   // locally; staleness is the client's explicit choice. Writes and
   // non-READONLY reads redirect to the primary.
-  if (self != nullptr && !request.is_write_ && request.connection_readonly_) {
-    for (const std::string& replica_id : group->replica_node_ids_) {
-      if (replica_id == self->node_id_) {
+  if (self_index != kNoNodeIndex && !request.is_write_ &&
+      request.connection_readonly_) {
+    for (NodeIndex replica_index : group->replica_node_indices_) {
+      if (replica_index == self_index) {
         decision.kind_ = Decision::Kind::kServeStaleRead;
         return decision;
       }
     }
   }
 
-  const NodeDescriptor* primary = state->FindNode(group->primary_node_id_);
+  const NodeDescriptor* primary = state->NodeAt(group->primary_node_index_);
   if (primary == nullptr) {
     // Build() rejects a group whose primary node is missing, so no committed
     // state reaches this; fail closed rather than redirect to nowhere.
@@ -109,7 +110,7 @@ Decision Admit(const ServingState* state, const RequestView& request) {
   // the Redis layer picks between them by the connection's TLS state.
   decision.kind_ = Decision::Kind::kMoved;
   decision.moved_slot_ = slot;
-  decision.moved_host_ = primary->host_;
+  decision.moved_host_ = primary->host();
   decision.moved_port_ = primary->port_;
   decision.moved_tls_port_ = primary->tls_port_;
   return decision;
