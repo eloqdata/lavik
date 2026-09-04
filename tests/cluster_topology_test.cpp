@@ -437,7 +437,7 @@ TEST(TopologyCacheTest, PublishSharesCellsOnlyForTokenUnchangedGroups) {
   GroupInFlight* cell_g2 = replaced->InFlightCellForSlot(5461);
   ASSERT_NE(cell_g1, nullptr);
   ASSERT_NE(cell_g2, nullptr);
-  const std::size_t stripe = InFlightStripe();
+  constexpr std::size_t stripe = 0;
   const InFlightGuard guard_g1(*cell_g1, stripe);
   const InFlightGuard guard_g2(*cell_g2, stripe);
 
@@ -474,7 +474,7 @@ TEST(TopologyCacheTest, ContentIdenticalRepublishKeepsInFlightCells) {
   const std::shared_ptr<const ServingState> state = cache.Current();
   GroupInFlight* cell = state->InFlightCellForSlot(5);
   ASSERT_NE(cell, nullptr);
-  const InFlightGuard guard(*cell, InFlightStripe());
+  const InFlightGuard guard(*cell, /*stripe=*/0);
 
   // A no-op republish must not disturb in-flight accounting.
   cache.Publish(MakeState(1));

@@ -849,7 +849,11 @@ bool ClusterGateReject(ConnectionContext& ctx, CommandRequest& request,
 void RegisterClusterInFlight(
     const cluster::ServingState& state, std::span<const std::uint16_t> slots,
     absl::InlinedVector<cluster::InFlightGuard, 4>* guards) {
-  const std::size_t stripe = cluster::InFlightStripe();
+  // Requests execute on stable Celer workers, so the worker id is already the
+  // exact per-thread stripe identity needed here. Passing it into the cluster
+  // model keeps that lower layer independent of the runtime and avoids a
+  // second thread-local identity allocator.
+  const std::size_t stripe = celer::ThisWorker().id_;
   for (const std::uint16_t slot : slots) {
     cluster::GroupInFlight* cell = state.InFlightCellForSlot(slot);
     if (cell == nullptr) continue;

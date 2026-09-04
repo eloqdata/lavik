@@ -20,7 +20,6 @@ using keylane::cluster::Decision;
 using keylane::cluster::GroupInFlight;
 using keylane::cluster::GroupView;
 using keylane::cluster::InFlightGuard;
-using keylane::cluster::InFlightStripe;
 using keylane::cluster::NodeDescriptor;
 using keylane::cluster::NodeId;
 using keylane::cluster::NodeIndex;
@@ -404,7 +403,7 @@ TEST(GroupInFlightTest, CountsAndDrains) {
     GroupInFlight* cell_b = state->InFlightCellForSlot(kSlotInB);
     ASSERT_NE(cell_a, nullptr);
     ASSERT_NE(cell_b, nullptr);
-    const std::size_t stripe = InFlightStripe();
+    constexpr std::size_t stripe = 0;
     const InFlightGuard first(*cell_a, stripe);
     const InFlightGuard second(*cell_a, stripe);
     const InFlightGuard other(*cell_b, stripe);
@@ -421,7 +420,7 @@ TEST(GroupInFlightTest, MoveTransfersOwnership) {
   const auto state = BuildState(kNodeA);
   GroupInFlight* cell = state->InFlightCellForSlot(kSlotInA);
   ASSERT_NE(cell, nullptr);
-  const std::size_t stripe = InFlightStripe();
+  constexpr std::size_t stripe = 0;
   {
     InFlightGuard first(*cell, stripe);
     {
@@ -445,7 +444,7 @@ TEST(GroupInFlightTest, ConcurrentEnterExit) {
   for (int t = 0; t < kThreads; ++t) {
     threads.emplace_back([&state, &slots, t] {
       // Each thread gets its own stripe, so the hot path never contends.
-      const std::size_t stripe = InFlightStripe();
+      const std::size_t stripe = static_cast<std::size_t>(t);
       for (int i = 0; i < kIterations; ++i) {
         GroupInFlight* cell = state->InFlightCellForSlot(slots[(t + i) % 3]);
         const InFlightGuard guard(*cell, stripe);

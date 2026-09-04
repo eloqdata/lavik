@@ -252,13 +252,6 @@ std::uint64_t ServingState::AuthorityTokenForSlot(std::uint16_t slot) const {
   return group_tokens_[static_cast<std::size_t>(group_index)];
 }
 
-std::size_t InFlightStripe() noexcept {
-  static std::atomic<std::size_t> next{0};
-  thread_local const std::size_t stripe =
-      next.fetch_add(1, std::memory_order_relaxed);
-  return stripe;
-}
-
 GroupInFlight* ServingState::InFlightCellForSlot(std::uint16_t slot) const {
   const GroupIndex index = slot_to_group_[slot];
   if (index == kNoGroupIndex) return nullptr;

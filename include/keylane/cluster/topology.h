@@ -157,12 +157,6 @@ class GroupInFlight {
   std::array<Stripe, kStripeCount> stripes_;
 };
 
-// One stable stripe per thread, assigned lazily from a process-wide counter.
-// Keeps request-path registrations contention-free without tying this module
-// to a worker model; stripe sharing only costs cacheline contention, never
-// correctness.
-std::size_t InFlightStripe() noexcept;
-
 // RAII marker for one admitted in-flight mutation: Enter on construction,
 // Exit on destruction. The request path keeps a small inlined vector of
 // these, one per distinct group touched by the command, so registration never
