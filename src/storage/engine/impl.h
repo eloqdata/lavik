@@ -2211,7 +2211,7 @@ class StorageEngine::Impl {
       std::uint8_t db_id, std::string_view key, Digest digest,
       ReadLatencyTrace* trace,
       std::optional<std::uint16_t> routed_partition_id,
-      bool acquire_key_lock);
+      bool acquire_key_lock, bool optimistic_read = false);
 
   Task<std::vector<BatchGetValue>> BatchGetLocked(
       std::uint8_t db_id, std::span<const BatchGetRequest> requests);
@@ -3034,26 +3034,32 @@ class StorageEngine::Impl {
   // Block states live in one dense array per device, indexed by local block
   // id. Each array is sized once at startup and never resized, so entries
   // never move and a BlockState* stays valid across suspension points.
+  struct BlockStateLookup {
+    BlockState* states_ = nullptr;
+    std::uint32_t local_begin_ = 0;
+    std::uint32_t local_end_ = 0;
+  };
+
   BlockState& BlockStateAt(std::uint64_t block_id) noexcept {
-    const std::size_t device_index = DeviceIndexForBlock(block_id);
-    const StorageDevice& device = devices_[device_index];
+    const std::size_t device_index = DeviceIdForBlock(block_id);
+    assert(device_index < block_state_lookup_.size());
+    const BlockStateLookup& lookup = block_state_lookup_[device_index];
     const std::uint32_t local = LocalBlockId(block_id);
-    assert(local >= device.data_block_begin_);
-    assert(local < device.capacity_blocks_);
-    return device_block_states_[device_index][local - device.data_block_begin_];
+    assert(local >= lookup.local_begin_ && local < lookup.local_end_);
+    return lookup.states_[local - lookup.local_begin_];
   }
 
   // Which worker owns a block, or kUnownedBlock if it is free. Along with the
   // immutable allocation epoch, this is safe for a key owner to read directly.
   std::uint16_t BlockOwner(std::uint64_t block_id) const noexcept {
-    const std::size_t device_index = DeviceIndexForBlock(block_id);
-    const StorageDevice& device = devices_[device_index];
+    const std::size_t device_index = DeviceIdForBlock(block_id);
     const std::uint32_t local = LocalBlockId(block_id);
-    if (device_block_states_.empty() || local < device.data_block_begin_ ||
-        local >= device.capacity_blocks_) {
+    if (device_index >= block_state_lookup_.size()) return kUnownedBlock;
+    const BlockStateLookup& lookup = block_state_lookup_[device_index];
+    if (local < lookup.local_begin_ || local >= lookup.local_end_) {
       return kUnownedBlock;
     }
-    return device_block_states_[device_index][local - device.data_block_begin_]
+    return lookup.states_[local - lookup.local_begin_]
         .owner_.load(std::memory_order_acquire);
   }
 
@@ -3566,6 +3572,10 @@ class StorageEngine::Impl {
   // data_block_begin. Shared across workers; each entry names its owner and
   // only that worker touches anything but the owner field.
   std::vector<std::vector<BlockState>> device_block_states_;
+  // Combines the immutable begin and data pointer used by every point lookup.
+  // The owning vectors above are never resized after initialization, so these
+  // pointers stay valid for the engine lifetime.
+  std::vector<BlockStateLookup> block_state_lookup_;
   std::vector<std::unique_ptr<DeviceAllocator>> device_allocators_;
   std::vector<std::size_t> defrag_reserve_blocks_;
   std::unique_ptr<std::atomic<unsigned>[]> active_defrags_by_device_;

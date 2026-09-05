@@ -432,6 +432,26 @@ TEST(ScanHashMapTest, ExternalKeyStoresOnlyDigestAndLogicalLength) {
   EXPECT_TRUE(map.empty());
 }
 
+TEST(ScanHashMapTest, InlineShortKeyComparisonCoversEveryByte) {
+  ScanHashMap<std::uint64_t> map;
+  for (const std::size_t length : {7u, 8u, 9u, 15u, 16u, 17u}) {
+    std::string key(length, 'a');
+    const Digest digest = ComputeDigest(key);
+    auto inserted = map.InsertNew(digest, key, length);
+    ASSERT_NE(inserted, nullptr);
+    EXPECT_EQ(map.Find(digest, key), inserted);
+
+    for (const std::size_t offset : {std::size_t{0}, length / 2, length - 1}) {
+      std::string different = key;
+      different[offset] = 'b';
+      // Supply the stored digest deliberately: a digest mismatch would hide a
+      // byte-comparison hole rather than exercise it.
+      EXPECT_EQ(map.Find(digest, different), nullptr)
+          << "length=" << length << " offset=" << offset;
+    }
+  }
+}
+
 TEST(ScanHashMapTest, KeyMetadataVarintUsesExpectedWidths) {
   using Entry = ScanHashMap<std::uint64_t>::Entry;
   EXPECT_EQ(Entry::KeyMetadataBytesFor(0, true), 1);

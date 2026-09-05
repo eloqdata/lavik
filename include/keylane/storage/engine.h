@@ -474,7 +474,7 @@ class DiskValue {
   std::uint32_t value_size_ = 0;
 };
 
-static_assert(sizeof(DiskValue) == 56);
+static_assert(sizeof(DiskValue) == 48);
 
 // One string lookup in a pre-locked, worker-local batch. BatchGetLocked keeps
 // the storage pipeline inside one coroutine and fans ordinary disk reads into

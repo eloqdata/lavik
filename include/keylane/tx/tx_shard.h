@@ -130,6 +130,14 @@ class TxShard {
     return Awaiter(this, KeyRef{fp, mode, db_id});
   }
 
+  bool CanReadOptimistically(std::uint8_t db_id) const noexcept {
+    assert(db_id < storage::kLogicalDatabaseCount);
+    // Optimistic GETs do not register themselves, so a read-only workload
+    // keeps this table empty. Any writer or already locked operation makes it
+    // nonempty and conservatively restores the original shared-lock path.
+    return locks_[db_id].size() == 0;
+  }
+
   // Arms one hop of a scheduled multi-shard transaction and drives it. An
   // entry whose intents were granted at schedule time can bypass unrelated
   // ordered queue entries; contended entries still wait at the queue head.

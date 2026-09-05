@@ -1036,7 +1036,9 @@ Task<CommandReply> ExecuteRead(
       const unsigned owner = locked_key == nullptr ? g_storage->OwnerForKey(key)
                                                    : locked_key->owner_;
       const bool initialize = dollar[k] && !initialized_dollars;
-      absl::StatusOr<ReadOneResult> one = absl::UnknownError("not dispatched");
+      // The local/remote owner branches are exhaustive. Avoid allocating an
+      // error message that is overwritten once for every stream key.
+      absl::StatusOr<ReadOneResult> one;
       const std::optional<storage::Digest> locked_digest =
           locked_key == nullptr
               ? std::optional<storage::Digest>{}

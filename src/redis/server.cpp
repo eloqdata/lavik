@@ -62,6 +62,7 @@
 #include "keylane/tx/tx_shard.h"
 #include "keylane/version.h"
 #include "lua_eval.h"
+#include "request_gate.h"
 #include "spdlog/spdlog.h"
 
 namespace keylane {
@@ -812,8 +813,6 @@ class RedisService final : public TcpService, public ClientLimit {
   bool TryBeginRequest() noexcept;
   void EndRequest() noexcept;
 
-  static constexpr std::uint64_t kRequestsClosed = 1ULL << 63;
-  static constexpr std::uint64_t kRequestCountMask = ~kRequestsClosed;
   storage::StorageEngine* storage_;
   ReplicationManager* replication_;
   long online_mimalloc_purge_delay_ms_;
@@ -833,7 +832,7 @@ class RedisService final : public TcpService, public ClientLimit {
   absl::Status rdb_import_status_;
   std::atomic<bool> startup_failed_{false};
   std::atomic<bool> ready_{false};
-  std::atomic<std::uint64_t> request_gate_{0};
+  RequestGate request_gate_;
 };
 
 bool RedisService::AdmitConnection(int fd, bool tls_endpoint) noexcept {
@@ -897,6 +896,7 @@ void RedisService::OnConnectionClosed() noexcept {
 
 void RedisService::Prepare(unsigned thread_count) {
   active_clients_.store(0, std::memory_order_relaxed);
+  request_gate_.Prepare(thread_count);
   TcpService::Prepare(thread_count);
   PrepareMonitor(thread_count);
   PreparePubSub(thread_count);
@@ -907,33 +907,19 @@ void RedisService::Prepare(unsigned thread_count) {
 }
 
 void RedisService::StopAcceptingRequests() noexcept {
-  request_gate_.fetch_or(kRequestsClosed, std::memory_order_acq_rel);
-  request_gate_.notify_all();
+  request_gate_.Close();
 }
 
 void RedisService::WaitForRequestsDrained() const noexcept {
-  std::uint64_t state = request_gate_.load(std::memory_order_acquire);
-  while ((state & kRequestCountMask) != 0) {
-    request_gate_.wait(state, std::memory_order_acquire);
-    state = request_gate_.load(std::memory_order_acquire);
-  }
+  request_gate_.WaitUntilEmpty();
 }
 
 bool RedisService::TryBeginRequest() noexcept {
-  std::uint64_t state = request_gate_.load(std::memory_order_acquire);
-  while ((state & kRequestsClosed) == 0) {
-    if (request_gate_.compare_exchange_weak(state, state + 1,
-                                            std::memory_order_acq_rel,
-                                            std::memory_order_acquire)) {
-      return true;
-    }
-  }
-  return false;
+  return request_gate_.TryEnter(ThisWorker().id_);
 }
 
 void RedisService::EndRequest() noexcept {
-  request_gate_.fetch_sub(1, std::memory_order_acq_rel);
-  request_gate_.notify_all();
+  request_gate_.Leave(ThisWorker().id_);
 }
 
 Task<absl::Status> RedisService::ImportRdb() {
@@ -1643,7 +1629,6 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
                                       "ERR ", request.status().message()))));
       continue;
     }
-
     const CommandKind kind = request->kind_;
     if (HasMonitorSessions()) [[unlikely]] {
       PublishMonitorMessage(PrepareMonitorMessage(
@@ -1652,7 +1637,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
       const std::size_t queued_before = ctx.queued_.size();
       CommandReply reply =
-          co_await DispatchCommand(ctx, std::move(*request), builder);
+          co_await DispatchCommand(ctx, *request, builder);
       if (ctx.queued_.size() > queued_before) {
         *multi_input_bytes += command_memory.Detach();
       } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1708,7 +1693,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
     const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply =
-        co_await DispatchCommand(ctx, std::move(*request), builder);
+        co_await DispatchCommand(ctx, *request, builder);
     if (ctx.queued_.size() > queued_before) {
       *multi_input_bytes += command_memory.Detach();
     } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1995,8 +1980,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
           [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
-      reply = co_await DispatchCommand(ctx, std::move(*request_result),
-                                       ctx.reply_builder_);
+      reply =
+          co_await DispatchCommand(ctx, *request_result, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {
       multi_input_bytes += command_memory.Detach();
@@ -2034,8 +2019,13 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
 
     absl::Status write_status;
+    // An empty batch needs no ordering flush. Check before creating the
+    // coroutine so direct/streamed replies avoid a frame and symmetric transfer
+    // when no encoded replies precede them; nonempty batches still flush first.
     if (reply.disk_value_.valid()) {
-      write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!pending_replies.empty()) {
+        write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      }
       if (write_status.ok()) {
         if (reply.read_trace_.request_start_ns_ != 0) {
           reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();
@@ -2047,7 +2037,9 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             co_await stream.WriteAll(reply.disk_value_.network_bytes());
       }
     } else if (reply.chunks_) {
-      write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      if (!pending_replies.empty()) {
+        write_status = co_await FlushReplyBatch(stream, &pending_replies);
+      }
       if (write_status.ok()) {
         if (reply.read_trace_.request_start_ns_ != 0) {
           reply.read_trace_.send_start_ns_ = ReadTraceNowNanos();

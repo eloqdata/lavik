@@ -1026,6 +1026,42 @@ class ScanHashMap {
       return digest;
     }
 
+    bool MatchesKey(const Digest& digest, std::string_view key) const noexcept {
+      // A lookup used to decode this varint once for key_complete() and again
+      // for key(). At billion-key scale the random entry load is already a
+      // cache miss; decode its metadata only once after that load arrives.
+      const KeyMetadata metadata = DecodeKeyMetadata(tail());
+      if (metadata.logical_size_ != key.size()) return false;
+      const std::byte* payload = tail() + metadata.encoded_bytes_;
+      if (metadata.key_complete_) {
+        // Decimal benchmark and application identifiers commonly occupy
+        // 8--16 bytes. Two overlapping 8-byte comparisons cover that whole
+        // range without reading beyond either object and avoid an out-of-line
+        // memcmp in the random-lookup hot path. Other lengths retain libc's
+        // tuned implementation.
+        if (metadata.logical_size_ >= sizeof(std::uint64_t) &&
+            metadata.logical_size_ <= 2 * sizeof(std::uint64_t)) {
+          std::uint64_t stored_head;
+          std::uint64_t sought_head;
+          std::uint64_t stored_tail;
+          std::uint64_t sought_tail;
+          std::memcpy(&stored_head, payload, sizeof(stored_head));
+          std::memcpy(&sought_head, key.data(), sizeof(sought_head));
+          const std::size_t tail_offset =
+              metadata.logical_size_ - sizeof(std::uint64_t);
+          std::memcpy(&stored_tail, payload + tail_offset,
+                      sizeof(stored_tail));
+          std::memcpy(&sought_tail, key.data() + tail_offset,
+                      sizeof(sought_tail));
+          return stored_head == sought_head && stored_tail == sought_tail;
+        }
+        return std::memcmp(payload, key.data(), metadata.logical_size_) == 0;
+      }
+      Digest stored;
+      std::memcpy(&stored, payload, sizeof(stored));
+      return stored == digest;
+    }
+
     struct Allocation {
       Entry* entry_ = nullptr;
       EntryHandle handle_ = 0;
@@ -1915,11 +1951,7 @@ class ScanHashMap {
 
   static bool KeyEquals(const Entry& entry, const Digest& digest,
                         std::string_view key) noexcept {
-    if (entry.key_complete()) [[likely]] {
-      return entry.key() == key;
-    }
-    return entry.logical_key_size() == key.size() &&
-           entry.external_key_digest() == digest;
+    return entry.MatchesKey(digest, key);
   }
 
   static std::uint64_t ReverseBits(std::uint64_t value) noexcept {
@@ -2207,7 +2239,10 @@ class ScanHashMap {
         found != nullptr) {
       return found;
     }
-    return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
+    if (Rehashing()) [[unlikely]] {
+      return FindInRehashTable(digest, key, hash);
+    }
+    return nullptr;
   }
 
   const Entry* FindWithoutStep(const Digest& digest,
@@ -2217,7 +2252,25 @@ class ScanHashMap {
         found != nullptr) {
       return found;
     }
-    return Rehashing() ? FindInTable(tables_[1], digest, key, hash) : nullptr;
+    if (Rehashing()) [[unlikely]] {
+      return FindInRehashTable(digest, key, hash);
+    }
+    return nullptr;
+  }
+
+  // Expansion is transient, while Find is the steady-state read hot path.
+  // Keeping the second table's full lookup loop out of line avoids duplicating
+  // key decoding and comparison code in the common function. The extra call is
+  // paid only after the old table misses while an expansion is in progress.
+  [[gnu::noinline]] Entry* FindInRehashTable(const Digest& digest,
+                                             std::string_view key,
+                                             std::uint64_t hash) {
+    return FindInTable(tables_[1], digest, key, hash);
+  }
+
+  [[gnu::noinline]] const Entry* FindInRehashTable(
+      const Digest& digest, std::string_view key, std::uint64_t hash) const {
+    return FindInTable(tables_[1], digest, key, hash);
   }
 
   bool AddToTable(Table& table, EntryHandle entry, std::uint64_t hash) {

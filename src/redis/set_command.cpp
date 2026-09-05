@@ -161,8 +161,9 @@ Task<CommandReply> ExecuteSetCommandImpl(const CommandRequest& request,
           reply_builder.AppendError("ERR unsupported Set command path"));
   }
 
-  absl::StatusOr<storage::HashResult> result =
-      absl::UnknownError("Set command was not dispatched");
+  // Both locked and ordinary dispatch assign this placeholder. A non-empty
+  // diagnostic here only allocates a StatusRep that is discarded immediately.
+  absl::StatusOr<storage::HashResult> result;
   auto replication =
       tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {

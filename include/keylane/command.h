@@ -431,9 +431,9 @@ struct CommandReply {
 };
 
 // The direct GET result is moved through several coroutine promises. Keep its
-// common representation within 96 bytes so adding rare reply state cannot
-// silently restore the former two-cache-line-plus footprint.
-static_assert(sizeof(CommandReply) <= 96);
+// common representation at 80 bytes so adding rare reply state cannot silently
+// restore the former larger coroutine frames.
+static_assert(sizeof(CommandReply) == 80);
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);
@@ -441,9 +441,12 @@ absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
 struct ConnectionContext;
 
 // Connection-level dispatch: intercepts MULTI/EXEC/DISCARD and queueing;
-// everything else falls through to ExecuteCommand.
+// everything else falls through to ExecuteCommand. The caller must retain
+// `request` until the returned task completes. Redis sessions directly
+// co_await dispatch from the frame that owns the request, avoiding a second
+// 128-byte CommandRequest in this child coroutine frame.
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest request,
+                                   CommandRequest& request,
                                    ReplyBuilder& reply_builder);
 
 // Unregisters every WATCH this connection holds (connection close, UNWATCH,

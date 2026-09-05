@@ -511,6 +511,7 @@ if (BUILD_TESTING)
     tests/random_sample_test.cpp
     tests/rdb_test.cpp
     tests/record_location_test.cpp
+    tests/request_gate_test.cpp
     tests/replication_command_test.cpp
     tests/ring_buffer_test.cpp
     tests/tx_lock_test.cpp

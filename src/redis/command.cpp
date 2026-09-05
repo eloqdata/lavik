@@ -11080,7 +11080,7 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
 }
 
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
-                                   CommandRequest request,
+                                   CommandRequest& request,
                                    ReplyBuilder& reply_builder) {
   const CommandKind kind = request.kind_;
   const bool may_advance_replication_watermark = [&] {
@@ -11631,7 +11631,6 @@ namespace {
 // admission, body, and release on their existing "already on the target"
 // inline paths, so the write pays one cross-core round trip instead of three.
 std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
-  request.ClearRoutedPartition();
   if (request.spec_ == nullptr || g_storage == nullptr) {
     return std::nullopt;
   }
@@ -11654,9 +11653,19 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
       DetermineKeys(*request.spec_, request.args_);
   // count() == 1 rather than !empty(): XGROUP HELP resolves to no key at all
   // and must keep the all-worker admission fan-out.
-  if (!keys.ok() || keys->count() != 1) return std::nullopt;
+  if (!keys.ok() || keys->count() != 1) {
+    request.ClearRoutedPartition();
+    return std::nullopt;
+  }
+  // Cluster admission already computes the exact single-key route for both
+  // reads and writes. Preserve that route when this helper rejects a read,
+  // and reuse it for a write, so owner dispatch and storage lookup do not hash
+  // the same key again. Rewritten requests are protected by the argument-index
+  // identity check and recompute below.
   const std::uint16_t partition_id =
-      storage::RedisSlot(request.args_[keys->first_]);
+      request.HasRoutedPartitionFor(keys->first_)
+          ? request.RoutedPartitionId()
+          : storage::RedisSlot(request.args_[keys->first_]);
   request.SetRoutedPartition(partition_id, keys->first_);
   return partition_id % g_storage->worker_count();
 }
@@ -11665,18 +11674,9 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
 // Admission suspends on the publish-queue capacity of the worker it runs on,
 // and holding that same worker's DB gate across the wait would stall every
 // FLUSHDB and FULLSYNC_CUT drain waiting for the gate counts to reach zero.
-Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
-                                          ReplyBuilder& reply_builder,
-                                          std::uint64_t client_id,
-                                          ConnectionContext* connection) {
-  const bool source_write =
-      !request.replication_origin_ && request.spec_ != nullptr &&
-      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
-      g_storage != nullptr && g_storage->ReplicationLogActive();
-  if (!source_write) [[likely]] {
-    co_return co_await ExecuteCommandBody(request, reply_builder, client_id,
-                                          connection);
-  }
+Task<CommandReply> ExecuteAdmittedWriteCommand(
+    CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, ConnectionContext* connection) {
   if (ReplicationEventExceedsBacklog(ReplicationEventAdmissionBytes(request))) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR replication publisher admission failed: canonical event exceeds "
@@ -11724,6 +11724,25 @@ Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
   co_return reply;
 }
 
+Task<CommandReply> ExecuteAdmittedCommand(CommandRequest& request,
+                                          ReplyBuilder& reply_builder,
+                                          std::uint64_t client_id,
+                                          ConnectionContext* connection) {
+  const bool source_write =
+      !request.replication_origin_ && request.spec_ != nullptr &&
+      (request.spec_->flags_ & (kCmdWrite | kCmdDynamicWrite)) != 0 &&
+      g_storage != nullptr && g_storage->ReplicationLogActive();
+  // Keep this wrapper non-coroutine. Reads and replica-applied writes need no
+  // publisher admission, so returning the body task directly avoids a second
+  // coroutine frame and resume on every such command. The write-only child
+  // owns all state that must survive its admission suspension.
+  if (!source_write) [[likely]] {
+    return ExecuteCommandBody(request, reply_builder, client_id, connection);
+  }
+  return ExecuteAdmittedWriteCommand(request, reply_builder, client_id,
+                                     connection);
+}
+
 }  // namespace
 
 bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
@@ -11731,6 +11750,22 @@ bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
          g_replication == nullptr ||
          g_replication->role_epoch() == request.write_admission_role_epoch_;
 }
+
+namespace {
+
+Task<CommandReply> ExecuteCommandOnOwner(
+    unsigned owner, CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, ConnectionContext* connection) {
+  co_return co_await SubmitTaskTo(
+      owner,
+      [&request, &reply_builder, client_id,
+       connection]() -> Task<CommandReply> {
+        co_return co_await ExecuteAdmittedCommand(request, reply_builder,
+                                                  client_id, connection);
+      });
+}
+
+}  // namespace
 
 Task<CommandReply> ExecuteCommand(CommandRequest& request,
                                   ReplyBuilder& reply_builder,
@@ -11749,16 +11784,13 @@ Task<CommandReply> ExecuteCommand(CommandRequest& request,
   assert(connection == nullptr || !IsLuaInvocationCommand(request) ||
          !owner.has_value());
   if (owner.has_value() && *owner != ThisWorker().id_) {
-    co_return co_await SubmitTaskTo(*owner,
-                                    [&request, &reply_builder, client_id,
-                                     connection]() -> Task<CommandReply> {
-                                      co_return co_await ExecuteAdmittedCommand(
-                                          request, reply_builder, client_id,
-                                          connection);
-                                    });
+    return ExecuteCommandOnOwner(*owner, request, reply_builder, client_id,
+                                 connection);
   }
-  co_return co_await ExecuteAdmittedCommand(request, reply_builder, client_id,
-                                            connection);
+  // This wrapper deliberately remains non-coroutine. The common local path
+  // has no state that must survive suspension, while ExecuteCommandOnOwner
+  // owns the cross-worker state for the uncommon routed-write path.
+  return ExecuteAdmittedCommand(request, reply_builder, client_id, connection);
 }
 
 Task<absl::Status> ApplyReplicatedExec(const std::vector<std::string>& args) {

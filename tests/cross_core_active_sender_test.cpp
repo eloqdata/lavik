@@ -11,6 +11,45 @@
 namespace celer {
 namespace {
 
+TEST(RemoteNotificationTest, AggregateInitializationZeroesOmittedFields) {
+  const RemoteNotification empty{};
+  EXPECT_EQ(empty.context_, nullptr);
+  EXPECT_EQ(empty.value_, 0U);
+  EXPECT_EQ(empty.run_fn_, nullptr);
+  const RemoteNotification partial{.value_ = 42};
+  EXPECT_EQ(partial.context_, nullptr);
+  EXPECT_EQ(partial.value_, 42U);
+  EXPECT_EQ(partial.run_fn_, nullptr);
+}
+
+TEST(RemoteNotificationTest, BothDequeuePathsOverwriteAllScratchFields) {
+  std::uint64_t result = 0;
+  const RemoteNotification message{
+      .context_ = &result,
+      .value_ = 42,
+      .run_fn_ = +[](void* context, std::uint64_t value) noexcept {
+        *static_cast<std::uint64_t*>(context) += value;
+      }};
+  SpscRing<RemoteNotification, 4> ring;
+  moodycamel::ConcurrentQueue<RemoteNotification> overflow;
+  RemoteNotification scratch[2];
+  ASSERT_TRUE(ring.try_enqueue(message));
+  ASSERT_EQ(ring.try_dequeue_bulk(scratch, 2), 1U);
+  ASSERT_EQ(scratch[0].context_, message.context_);
+  ASSERT_EQ(scratch[0].run_fn_, message.run_fn_);
+  scratch[0].run_fn_(scratch[0].context_, scratch[0].value_);
+  EXPECT_EQ(result, 42U);
+  ASSERT_TRUE(overflow.enqueue(message));
+  // A different, uninitialized slot also exercises the overflow assignment.
+  ASSERT_EQ(overflow.try_dequeue_bulk(scratch + 1, 1), 1U);
+  ASSERT_EQ(scratch[1].context_, message.context_);
+  ASSERT_EQ(scratch[1].run_fn_, message.run_fn_);
+  scratch[1].run_fn_(scratch[1].context_, scratch[1].value_);
+  EXPECT_EQ(result, 84U);
+  EXPECT_EQ(ring.try_dequeue_bulk(scratch, 2), 0U);
+  EXPECT_EQ(overflow.try_dequeue_bulk(scratch, 2), 0U);
+}
+
 TEST(SpscRingTest, RefreshesCachedHeadAfterConsumerProgress) {
   SpscRing<int, 4> ring;
 

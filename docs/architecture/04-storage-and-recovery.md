@@ -437,11 +437,22 @@ commit-record flush; it is not a synchronous crash-durability fence.
 
 ### Reads and pins
 
-Reads hold the key's shared transaction lock while resolving the current index
-entry. Tombstones and expired values are invisible; an expired observation can
-enqueue a bounded active-expiration candidate. A staged location is copied or
-framed from its write buffer. A disk location is read on its physical block
-owner into an aligned lease.
+An ordinary single-key GET may resolve its complete inline-key index entry
+without registering a shared transaction lock when that logical database's
+lock table is empty. The empty-table observation and index lookup do not
+suspend, so the lookup is the read's linearization point. A multi-shard writer
+registers intents on every participant before any shard executes; an existing
+writer therefore makes the table nonempty, while a writer registered after the
+lookup overlaps the GET and can be ordered after it. Optimistic GETs do not
+populate the table, so a read-only workload keeps this fast path available.
+Any existing lock, an external index key that needs asynchronous verification,
+or a physical-location race falls back to the original shared-lock path and
+rereads. Transaction-owned reads always use that locked path directly.
+
+Tombstones and expired values are invisible; an expired observation can enqueue
+a bounded active-expiration candidate. A staged location is copied or framed
+from its write buffer. A disk location is read on its physical block owner into
+an aligned lease.
 
 Worker-local MGET uses `BatchGetLocked` after the command has acquired its key
 locks. It classifies index entries in one coroutine and issues ordinary-size

@@ -298,5 +298,42 @@ TEST(RecordLocationTest, TxUndoLogRetargetsSharedHandleInConstantTime) {
   EXPECT_EQ(undo.Track(ordinary), key_handle);
 }
 
+TEST(RecordLocationTest, IndexKeyMatchingPreservesTailAndCollisionSemantics) {
+  const auto packed = RecordLocation::PackedMetadata::Encode(
+      kBlockHeaderBytes, kRecordAlignment, 0, true, false, false, false, false,
+      false, RecordKind::kValue, ValueType::kString);
+  for (const bool expiring : {false, true}) {
+    for (const bool complete : {false, true}) {
+      for (const std::size_t length : {0, 1, 63, 64, 8191, 8192}) {
+        RecordIndex index;
+        const std::string key(length, '\0');
+        const Digest digest = ComputeDigest(key);
+        auto* entry = index.InsertNew(
+            digest, key,
+            RecordLocation(1, 2, 3, expiring ? 1234 : 0, 4, packed), complete);
+        ASSERT_NE(entry, nullptr);
+        EXPECT_EQ(entry->key_complete(), complete);
+        EXPECT_EQ(index.Find(digest, key), entry);
+        EXPECT_EQ(std::as_const(index).Find(digest, key), entry);
+        // Force lookup into the same bucket/tag. Length must still match,
+        // and complete keys must distinguish bytes even on a digest collision.
+        EXPECT_EQ(index.Find(digest, key + "x"), nullptr);
+        if (!key.empty()) {
+          std::string collision = key;
+          collision.back() = 'x';
+          EXPECT_EQ(index.Find(digest, collision), complete ? nullptr : entry);
+        }
+        // Incomplete entries are candidates verified against disk by storage;
+        // their stored digest remains necessary even with matching length/tag.
+        if (!complete) {
+          Digest other_digest = digest;
+          other_digest.value_ ^= 1;
+          EXPECT_EQ(index.Find(other_digest, key), nullptr);
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
 }  // namespace keylane::storage

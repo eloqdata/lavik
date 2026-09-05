@@ -212,13 +212,18 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
   co_return std::optional<std::string>{};
 }
 
-Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
+// Keep optimistic-read admission out of the already large command dispatcher.
+// LTO otherwise duplicates this wrapper and expands unrelated command cases,
+// increasing their instruction-cache footprint even though only GET uses it.
+[[gnu::noinline]] Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
     std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
+  const bool optimistic =
+      tx::CurrentTxShard().CanReadOptimistically(db_id);
   return GetWithLockState(db_id, key, digest, trace, routed_partition_id,
-                          true);
+                          !optimistic, optimistic);
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
@@ -233,7 +238,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     std::uint8_t db_id, std::string_view key, Digest digest,
     ReadLatencyTrace* trace,
-    std::optional<std::uint16_t> routed_partition_id, bool acquire_key_lock) {
+    std::optional<std::uint16_t> routed_partition_id, bool acquire_key_lock,
+    bool optimistic_read) {
   assert(db_id < kLogicalDatabaseCount);
   assert(!routed_partition_id.has_value() ||
          *routed_partition_id == RedisSlot(key));
@@ -246,46 +252,67 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
   auto& partition = routed_partition_id.has_value()
                         ? PartitionFor(store, *routed_partition_id)
                         : PartitionForKey(store, key);
-  auto& index = partition.indexes_[db_id];
-  auto* found = index.Find(digest, key);
-  if (found != nullptr && !found->key_complete()) [[unlikely]] {
-    auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
-    if (!resolved.ok()) {
-      co_return resolved.status();
+  while (true) {
+    auto& index = partition.indexes_[db_id];
+    auto* found = index.Find(digest, key);
+    if (found != nullptr && !found->key_complete()) [[unlikely]] {
+      if (optimistic_read) {
+        // Verifying an out-of-index key suspends before we know this is the
+        // requested key, so there is no lock-free linearization point yet.
+        key_lock = co_await tx::CurrentTxShard().AcquireKey(
+            db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+        optimistic_read = false;
+        continue;
+      }
+      auto resolved = co_await FindVerifiedEntry(store, index, digest, key);
+      if (!resolved.ok()) {
+        co_return resolved.status();
+      }
+      found = *resolved;
     }
-    found = *resolved;
-  }
-  if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
+    if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
+      if (trace != nullptr) {
+        trace->lookup_done_ns_ = ReadTraceNowNanos();
+      }
+      co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
+    }
+    if (IsExpiredNow(*found)) {
+      QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
+      if (trace != nullptr) {
+        trace->lookup_done_ns_ = ReadTraceNowNanos();
+      }
+      co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
+    }
+    if (found->value_.value_type() != ValueType::kString) {
+      co_return absl::Status(
+          absl::StatusCode::kInvalidArgument,
+          "WRONGTYPE Operation against a key holding the wrong kind of value");
+    }
     if (trace != nullptr) {
+      trace->hit_ = true;
       trace->lookup_done_ns_ = ReadTraceNowNanos();
     }
-    co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
-  }
-  if (IsExpiredNow(*found)) {
-    QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
-    if (trace != nullptr) {
-      trace->lookup_done_ns_ = ReadTraceNowNanos();
+
+    auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
+                                     MaterializeIndexLocation(*found),
+                                     ExtentsFor(store, found), trace);
+    if (optimistic_read && !loaded.ok() &&
+        (loaded.status().code() == absl::StatusCode::kNotFound ||
+         loaded.status().code() == absl::StatusCode::kAborted)) {
+      // The key existed at the optimistic lookup, but a concurrent writer may
+      // retire its physical record before the I/O path pins it. Do not turn
+      // that race into a spurious nil; take the original lock path and reread.
+      key_lock = co_await tx::CurrentTxShard().AcquireKey(
+          db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+      optimistic_read = false;
+      continue;
     }
-    co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
-  }
-  if (found->value_.value_type() != ValueType::kString) {
-    co_return absl::Status(
-        absl::StatusCode::kInvalidArgument,
-        "WRONGTYPE Operation against a key holding the wrong kind of value");
-  }
-  if (trace != nullptr) {
-    trace->hit_ = true;
-    trace->lookup_done_ns_ = ReadTraceNowNanos();
-  }
+    if (!loaded.ok()) {
+      co_return loaded.status();
+    }
 
-  auto loaded = co_await LoadValue(store, partition, db_id, key, digest,
-                                   MaterializeIndexLocation(*found),
-                                   ExtentsFor(store, found), trace);
-  if (!loaded.ok()) {
-    co_return loaded.status();
+    co_return EncodeDiskValue(std::move(*loaded));
   }
-
-  co_return EncodeDiskValue(std::move(*loaded));
 }
 
 Task<std::vector<BatchGetValue>> StorageEngine::Impl::BatchGetLocked(
@@ -798,8 +825,10 @@ StorageEngine::Impl::LoadValue(WorkerStore& key_store,
   const std::uint64_t replication_epoch = partition.replication_epoch_;
   while (true) {
     assert(location.block_owner() < worker_count_);
-    absl::StatusOr<LoadedValue> loaded(absl::Status(
-        absl::StatusCode::kInternal, "value read was not dispatched"));
+    // Every branch below assigns `loaded` before it is observed. Keep the
+    // required placeholder message-free so the common local GET path does not
+    // construct and then immediately discard an error payload.
+    absl::StatusOr<LoadedValue> loaded;
 
     // An external value's manifest is already decoded in this index entry,
     // so the record's own block holds nothing worth reading. Assemble here

@@ -52,12 +52,18 @@ class ReadBufferLease {
   // fixed-buffer IO. A pool that fell back to unregistered mode at Init keeps
   // its slot ids but reports false here. Defined after RegisteredBufferPool.
   bool registered() const noexcept;
-  unsigned owner_worker() const noexcept { return owner_worker_; }
-  std::uint16_t buffer_id() const noexcept { return buffer_id_; }
+  // Pool ownership is immutable after Init; do not duplicate it in every
+  // lease moved through the direct-GET coroutine chain.
+  unsigned owner_worker() const noexcept;
+  std::uint16_t buffer_id() const noexcept {
+    return (release_token_ & kOverflowTokenBit) == 0
+               ? static_cast<std::uint16_t>(release_token_)
+               : 0;
+  }
 
   // Entire registered iovec, including framing/alignment headroom and tailroom.
   celer::FixedBuffer registered_buffer() const noexcept {
-    return {.data_ = data_, .size_ = size_, .index_ = buffer_id_};
+    return {.data_ = data_, .size_ = size_, .index_ = buffer_id()};
   }
 
   // Aligned region intended as the destination of READ_FIXED.
@@ -73,31 +79,34 @@ class ReadBufferLease {
 
  private:
   friend class RegisteredBufferPool;
-  ReadBufferLease(RegisteredBufferPool* pool, unsigned owner_worker,
-                  celer::FixedBuffer buffer, std::size_t headroom_bytes,
+  ReadBufferLease(RegisteredBufferPool* pool, celer::FixedBuffer buffer,
+                  std::size_t headroom_bytes,
                   std::size_t tailroom_bytes) noexcept;
-  ReadBufferLease(RegisteredBufferPool* pool, unsigned owner_worker,
-                  celer::FixedBuffer buffer, std::size_t headroom_bytes,
+  ReadBufferLease(RegisteredBufferPool* pool, celer::FixedBuffer buffer,
+                  std::size_t headroom_bytes,
                   std::size_t tailroom_bytes, std::size_t overflow_id) noexcept;
 
-  // Every lease is pool-owned. release_id_ is zero for a fixed slot and the
-  // one-based overflow-buffer id otherwise; those states are mutually
-  // exclusive, so retaining the former standalone-heap fields only enlarged
-  // every direct GET result moved through the command coroutines. Buffer
-  // dimensions are bounded to uint32_t by Init and the 1 GiB limit on the
-  // single string record carried by a direct GET. Collections are stored as
-  // multiple records and do not use this reply lease for their total size.
+  // A lease releases either a fixed slot or an overflow slot, never both. The
+  // high bit distinguishes the latter so their mutually exclusive ids occupy
+  // one word. The remaining 31-bit id space is far beyond the practical
+  // number of separately allocated, page-aligned buffers in one worker while
+  // keeping release O(1) for large-value GETs.
+  static constexpr std::uint32_t kOverflowTokenBit = std::uint32_t{1} << 31;
+  static constexpr std::uint32_t kReleaseTokenMask = kOverflowTokenBit - 1;
+
+  // Every lease is pool-owned. Buffer dimensions are bounded to uint32_t by
+  // Init and the 1 GiB limit on the single string record carried by a direct
+  // GET. Collections are stored as multiple records and do not use this reply
+  // lease for their total size.
   RegisteredBufferPool* pool_ = nullptr;
   std::byte* data_ = nullptr;
   std::uint32_t size_ = 0;
   std::uint32_t headroom_bytes_ = 0;
   std::uint32_t tailroom_bytes_ = 0;
-  std::uint32_t release_id_ = 0;
-  std::uint32_t owner_worker_ = 0;
-  std::uint16_t buffer_id_ = 0;
+  std::uint32_t release_token_ = 0;
 };
 
-static_assert(sizeof(ReadBufferLease) == 40);
+static_assert(sizeof(ReadBufferLease) == 32);
 
 class RegisteredBufferPool {
  public:
@@ -219,7 +228,11 @@ class RegisteredBufferPool {
 };
 
 inline bool ReadBufferLease::registered() const noexcept {
-  return buffer_id_ != 0 && pool_ != nullptr && pool_->buffers_registered_;
+  return buffer_id() != 0 && pool_ != nullptr && pool_->buffers_registered_;
+}
+
+inline unsigned ReadBufferLease::owner_worker() const noexcept {
+  return pool_ != nullptr ? pool_->owner_worker_ : 0;
 }
 
 }  // namespace keylane::storage

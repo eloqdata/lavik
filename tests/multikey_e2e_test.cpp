@@ -72,6 +72,26 @@ class RespClient {
     return false;
   }
 
+  // Send one wire batch before reading, then retain replies in wire order.
+  std::vector<std::string> Pipeline(
+      const std::vector<std::vector<std::string_view>>& commands) {
+    std::string wire;
+    for (const auto& args : commands) {
+      wire += "*" + std::to_string(args.size()) + "\r\n";
+      for (const auto arg : args) {
+        wire += "$" + std::to_string(arg.size()) + "\r\n";
+        wire.append(arg);
+        wire += "\r\n";
+      }
+    }
+    SendAll(wire);
+    std::vector<std::string> replies;
+    for (std::size_t i = 0; i < commands.size(); ++i) {
+      replies.push_back(ReadReply());
+    }
+    return replies;
+  }
+
  private:
   std::string ReadReply() {
     const std::string line = ReadLine();
@@ -668,6 +688,12 @@ int main(int argc, char** argv) {
            "MSET with large value");
     Expect(client.Command({"MGET", "large", "small"}),
            "*2\r\n" + Bulk(large) + "\r\n" + Bulk("s"), "MGET large");
+    const auto streamed_pipeline = client.Pipeline(
+        {{"GET", "large"}, {"PING"}, {"GET", "large"}, {"PING"}});
+    if (streamed_pipeline != std::vector<std::string>{
+                                 Bulk(large), "+PONG", Bulk(large), "+PONG"}) {
+      Fail("mixed streamed/encoded pipeline reordered replies");
+    }
     Expect(client.Command({"DEL", "large", "small"}), ":2", "DEL large");
 
     // ---- KEYS / SCAN TYPE ----
@@ -936,6 +962,21 @@ int main(int argc, char** argv) {
            "*4\r\n" + Bulk("batch-d") + "\r\n" + Bulk("batch-b") + "\r\n" +
                Bulk("batch-a") + "\r\n" + Bulk("batch-c"),
            "same-shard batched disk MGET after restart");
+    // Recovered values exercise disk-backed replies. Encoded replies preceding
+    // them must flush first, and an empty batch must not suppress a disk reply.
+    for (int repeat = 0; repeat < 3; ++repeat) {
+      const auto replies = recovered.Pipeline(
+          {{"GET", "{disk-batch}a"}, {"PING"},
+           {"GET", "{disk-batch}b"}, {"GET", "{disk-batch}c"},
+           {"GET", "pipeline-missing-key"}, {"GET", "{disk-batch}d"},
+           {"PING"}});
+      const std::vector<std::string> expected{
+          Bulk("batch-a"), "+PONG", Bulk("batch-b"), Bulk("batch-c"),
+          "$-1", Bulk("batch-d"), "+PONG"};
+      if (replies != expected) {
+        Fail("mixed disk/encoded pipeline reordered replies");
+      }
+    }
     Expect(recovered.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "disable tx cleaner before recovery fixture");

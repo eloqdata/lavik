@@ -136,6 +136,7 @@ TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
   std::vector<std::string> order;
   const LockFp k1 = 100;
   const LockFp k2 = 200;
+  EXPECT_TRUE(shard.CanReadOptimistically(0));
 
   // t0: fast-path reader takes k1 and falls asleep on "disk".
   ManualEvent io_a;
@@ -144,11 +145,13 @@ TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
                "A started, sleeping");
   EXPECT_CHECK(counter.load() == 1,
                "fast path must not touch the txid counter");
+  EXPECT_FALSE(shard.CanReadOptimistically(0));
 
   // t1: writer on k1 conflicts with the sleeping holder -> queues.
   RunImmediate(shard, k1, LockMode::kExclusive, order, "B");
   EXPECT_CHECK(order.size() == 1, "B must wait for the sleeping holder");
   EXPECT_CHECK(counter.load() == 2, "contended acquisition draws a txid");
+  EXPECT_FALSE(shard.CanReadOptimistically(0));
 
   // t2: second reader on k1 blocked by B's exclusive intent (no barging).
   RunImmediate(shard, k1, LockMode::kShared, order, "C");
@@ -172,6 +175,7 @@ TEST(TxLockTest, QueuesConflictsWithoutBlockingOtherKeys) {
   EXPECT_CHECK(shard.committed_txid() == 2,
                "committed_txid advanced to C's txid");
   EXPECT_CHECK(shard.locks(0).size() == 0, "lock table empty at quiescence");
+  EXPECT_TRUE(shard.CanReadOptimistically(0));
 }
 
 }  // namespace

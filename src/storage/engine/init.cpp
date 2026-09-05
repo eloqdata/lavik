@@ -530,12 +530,18 @@ absl::Status StorageEngine::Impl::Prepare(unsigned worker_count) {
   // Sized once and never resized: BlockState pointers are held across
   // suspension points, so entries must not move.
   device_block_states_.resize(devices_.size());
+  block_state_lookup_.resize(devices_.size());
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
     device_block_states_[device_index] =
         std::vector<BlockState>(static_cast<std::size_t>(
             device.capacity_blocks_ - device.data_block_begin_));
+    block_state_lookup_[device_index] = BlockStateLookup{
+        .states_ = device_block_states_[device_index].data(),
+        .local_begin_ = device.data_block_begin_,
+        .local_end_ = static_cast<std::uint32_t>(device.capacity_blocks_),
+    };
     total_data_blocks_ += device.data_block_count_;
     const std::size_t reserve = DefragReserveForDevice(device_index);
     if (device.data_block_count_ > reserve) {

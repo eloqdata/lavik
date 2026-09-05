@@ -99,6 +99,28 @@ class BufferPoolWaitService final : public celer::Service {
     if (!read_waiter_acquired_ || pool_.overflow_read_buffer_count() != 0) {
       result_ = absl::DeadlineExceededError(
           "fixed-read-buffer release did not wake its waiter");
+      worker.RequestStop();
+      co_return result_;
+    }
+
+    // Overflow leases encode their one-based release id in the same token as
+    // fixed-buffer ids. Exercise destruction and reuse so a representation
+    // change cannot silently return an overflow buffer through the fixed path.
+    auto overflow = co_await pool_.AcquireReadBuffer(2 * kMiB);
+    if (!overflow.ok() || overflow->buffer_id() != 0 ||
+        overflow->registered() || pool_.overflow_read_buffer_count() != 1) {
+      result_ = absl::FailedPreconditionError(
+          "oversized read did not acquire an overflow lease");
+      worker.RequestStop();
+      co_return result_;
+    }
+    std::byte* overflow_data = overflow->bytes().data();
+    overflow->Reset();
+    auto reused = co_await pool_.AcquireReadBuffer(2 * kMiB);
+    if (!reused.ok() || reused->bytes().data() != overflow_data ||
+        pool_.overflow_read_buffer_count() != 1) {
+      result_ = absl::FailedPreconditionError(
+          "released overflow read buffer was not reusable");
     }
     worker.RequestStop();
     co_return result_;

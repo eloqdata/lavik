@@ -63,7 +63,10 @@ The service recognizes authentication and replication handshakes before
 ordinary dispatch. An isolated Redis `PSYNC` connection is transferred to the
 Redis exporter; an isolated native Keylane handshake is transferred to the
 replication manager. Other authenticated traffic enters the request-drain gate
-used by graceful shutdown.
+used by graceful shutdown. That gate stores a closed bit and active count in
+one cache-line-isolated shard per worker. Normal traffic therefore mutates only
+worker-local state; shutdown closes every shard before it waits, so an entry
+racing closure is either rejected or remains visible to the drain.
 
 ## Request pipeline
 
