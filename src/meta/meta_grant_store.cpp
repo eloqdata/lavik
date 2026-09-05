@@ -227,7 +227,7 @@ absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
     w.WriteString(group_id);
     w.WriteU64(entry.group_term_);
     w.WriteU64(entry.last_authority_version_);
-    w.WriteU8(entry.fenced_ ? 1 : 0);
+    w.WriteBool(entry.fenced_);
     w.WriteOptional(entry.grant_, [](MetaWriter& ww, const MetaGroupGrant& g) {
       ww.WriteString(g.owner_);
       ww.WriteU64(g.term_);
@@ -263,12 +263,9 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
     auto last_av = r.ReadU64();
     if (!last_av.ok()) return last_av.status();
     entry.last_authority_version_ = *last_av;
-    auto fenced = r.ReadU8();
+    auto fenced = r.ReadBool("fenced tag must be 0 or 1");
     if (!fenced.ok()) return fenced.status();
-    if (*fenced > 1) {
-      return MetaFailStopError("fenced tag must be 0 or 1");
-    }
-    entry.fenced_ = *fenced == 1;
+    entry.fenced_ = *fenced;
     auto grant = r.ReadOptional<MetaGroupGrant>([](MetaReader& rr) {
       MetaGroupGrant g;
       auto owner = rr.ReadString(kMetaNodeIdBytes);

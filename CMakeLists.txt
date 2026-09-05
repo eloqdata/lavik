@@ -438,6 +438,7 @@ if (KEYLANE_BUILD_META)
     src/meta/meta_state_apply.cpp
     src/meta/meta_state_machine.cpp
     src/meta/meta_topology_store.cpp
+    src/meta/meta_value_codec.cpp
     src/meta/nuraft_log_store.cpp
     src/meta/nuraft_rpc_client.cpp
     src/meta/nuraft_rpc_listener.cpp

@@ -136,7 +136,7 @@ std::string MetaPolicyStore::Serialize() const {
     w.WriteCount(static_cast<std::uint32_t>(versions.size()));
     for (const auto& [version, state] : versions) {
       w.WriteU64(version);
-      w.WriteU8(state.retired_ ? 1 : 0);
+      w.WriteBool(state.retired_);
       w.WriteString(state.content_);
       WriteFixedArray(w, state.content_hash_);
     }
@@ -177,11 +177,8 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
     for (std::uint32_t v = 0; v < *version_count; ++v) {
       auto version_no = r.ReadU64();
       if (!version_no.ok()) return version_no.status();
-      auto retired = r.ReadU8();
+      auto retired = r.ReadBool("retired tag must be 0 or 1");
       if (!retired.ok()) return retired.status();
-      if (*retired > 1) {
-        return MetaFailStopError("retired tag must be 0 or 1");
-      }
       auto content = r.ReadString(kMaxMetaPayloadBytes);
       if (!content.ok()) return content.status();
       auto hash = ReadFixedArray<32>(r);
@@ -197,7 +194,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
       VersionState state;
       state.content_ = std::string(*content);
       state.content_hash_ = *hash;
-      state.retired_ = *retired == 1;
+      state.retired_ = *retired;
       if (!versions.emplace(*version_no, std::move(state)).second) {
         return MetaFailStopError("duplicate policy version in snapshot");
       }

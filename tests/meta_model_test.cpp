@@ -191,6 +191,26 @@ TEST(MetaModelEncoding, TruncatedListElementFails) {
   EXPECT_FALSE(items.ok());
 }
 
+TEST(MetaModelEncoding, BoolRoundTripAndInvalidTagFails) {
+  MetaWriter w;
+  w.WriteBool(false);
+  w.WriteBool(true);
+
+  MetaReader r(w.buffer());
+  auto false_value = r.ReadBool("invalid bool");
+  ASSERT_TRUE(false_value.ok()) << false_value.status();
+  EXPECT_FALSE(*false_value);
+  auto true_value = r.ReadBool("invalid bool");
+  ASSERT_TRUE(true_value.ok()) << true_value.status();
+  EXPECT_TRUE(*true_value);
+  EXPECT_TRUE(r.Finish().ok());
+
+  MetaReader invalid(std::string_view("\x02", 1));
+  auto invalid_value = invalid.ReadBool("invalid bool");
+  ASSERT_FALSE(invalid_value.ok());
+  EXPECT_EQ(invalid_value.status().message(), "invalid bool");
+}
+
 TEST(MetaModelEncoding, BadOptionalPresenceTagFails) {
   MetaWriter w;
   w.WriteU8(2);  // presence tag must be 0 or 1

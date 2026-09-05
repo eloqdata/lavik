@@ -77,8 +77,6 @@ namespace keylane::meta {
 
 // Per-record accumulated evidence cap (v1 policy value; bounded state).
 inline constexpr std::uint32_t kMaxMetaOperationEvidencePerRecord = 1024;
-// ActorContext.readable_time_ cap when persisting it (command-carried text).
-inline constexpr std::uint32_t kMaxMetaOperationActorTimeBytes = 128;
 
 enum class MetaOperationLifecycle : std::uint8_t {
   kSubmitted = 1,

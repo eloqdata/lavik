@@ -41,6 +41,8 @@ void MetaWriter::WriteU64(std::uint64_t v) {
   }
 }
 
+void MetaWriter::WriteBool(bool value) { WriteU8(value ? 1 : 0); }
+
 void MetaWriter::WriteRaw(std::string_view bytes) { buffer_.append(bytes); }
 
 void MetaWriter::WriteString(std::string_view bytes) {
@@ -83,6 +85,14 @@ absl::StatusOr<std::uint64_t> MetaReader::ReadU64() {
     v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
   }
   return v;
+}
+
+absl::StatusOr<bool> MetaReader::ReadBool(
+    std::string_view invalid_tag_message) {
+  auto tag = ReadU8();
+  if (!tag.ok()) return tag.status();
+  if (*tag > 1) return MetaFailStopError(invalid_tag_message);
+  return *tag == 1;
 }
 
 absl::StatusOr<std::string_view> MetaReader::ReadRaw(std::size_t bytes) {

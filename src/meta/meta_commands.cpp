@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "absl/strings/str_cat.h"
+#include "meta/meta_value_codec.h"
 
 namespace keylane::meta {
 namespace {
@@ -40,8 +41,7 @@ absl::Status WriteCommandHeader(MetaWriter& w, MetaCommandTag tag,
   }
   w.WriteU16(static_cast<std::uint16_t>(tag));
   WriteFixedArray(w, request_id);
-  w.WriteString(actor.principal_);
-  w.WriteString(actor.readable_time_);
+  WriteActorContext(w, actor);
   return absl::OkStatus();
 }
 
@@ -60,14 +60,11 @@ struct MetaCommandHeader {
 absl::StatusOr<MetaCommandHeader> ReadCommandHeader(MetaReader& r) {
   auto request_id = ReadFixedArray<16>(r);
   if (!request_id.ok()) return request_id.status();
-  auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
-  if (!principal.ok()) return principal.status();
-  auto readable_time = ReadBoundedString(r, kMaxMetaActorReadableTimeBytes);
-  if (!readable_time.ok()) return readable_time.status();
+  auto actor = ReadActorContext(r);
+  if (!actor.ok()) return actor.status();
   MetaCommandHeader header;
   header.request_id_ = *request_id;
-  header.actor_.principal_ = std::move(*principal);
-  header.actor_.readable_time_ = std::move(*readable_time);
+  header.actor_ = std::move(*actor);
   return header;
 }
 
@@ -791,40 +788,12 @@ absl::StatusOr<RetirePolicy> ReadRetirePolicyBody(MetaReader& r) {
 
 absl::Status WriteEvidenceSummary(MetaWriter& w,
                                   const MetaEvidenceSummary& ev) {
-  if (auto st = WriteNodeId(w, ev.node_id_); !st.ok()) return st;
-  WriteFixedArray(w, ev.boot_incarnation_);
-  w.WriteU64(ev.group_term_);
-  w.WriteU64(ev.population_manifest_id_);
-  w.WriteU64(ev.replication_history_id_);
-  WriteFixedArray(w, ev.operation_id_);
-  WriteFixedArray(w, ev.kind_hash_);
+  if (auto st = CheckCap("node_id", ev.node_id_.size(), kMetaNodeIdBytes);
+      !st.ok()) {
+    return st;
+  }
+  WriteMetaEvidenceSummary(w, ev);
   return absl::OkStatus();
-}
-
-absl::StatusOr<MetaEvidenceSummary> ReadEvidenceSummary(MetaReader& r) {
-  MetaEvidenceSummary ev;
-  auto node_id = ReadNodeId(r);
-  if (!node_id.ok()) return node_id.status();
-  ev.node_id_ = std::move(*node_id);
-  auto boot = ReadFixedArray<kMetaBootIncarnationBytes>(r);
-  if (!boot.ok()) return boot.status();
-  ev.boot_incarnation_ = *boot;
-  auto group_term = r.ReadU64();
-  if (!group_term.ok()) return group_term.status();
-  ev.group_term_ = *group_term;
-  auto manifest = r.ReadU64();
-  if (!manifest.ok()) return manifest.status();
-  ev.population_manifest_id_ = *manifest;
-  auto history = r.ReadU64();
-  if (!history.ok()) return history.status();
-  ev.replication_history_id_ = *history;
-  auto operation_id = ReadFixedArray<16>(r);
-  if (!operation_id.ok()) return operation_id.status();
-  ev.operation_id_ = *operation_id;
-  auto kind_hash = ReadFixedArray<32>(r);
-  if (!kind_hash.ok()) return kind_hash.status();
-  ev.kind_hash_ = *kind_hash;
-  return ev;
 }
 
 absl::Status WritePolicyReference(MetaWriter& w,
@@ -834,17 +803,8 @@ absl::Status WritePolicyReference(MetaWriter& w,
       !st.ok()) {
     return st;
   }
-  w.WriteString(reference.policy_id_);
-  w.WriteU64(reference.version_);
+  WriteMetaPolicyReference(w, reference);
   return absl::OkStatus();
-}
-
-absl::StatusOr<MetaPolicyReference> ReadPolicyReference(MetaReader& r) {
-  auto policy_id = ReadBoundedString(r, kMaxMetaPolicyIdBytes);
-  if (!policy_id.ok()) return policy_id.status();
-  auto version = r.ReadU64();
-  if (!version.ok()) return version.status();
-  return MetaPolicyReference{std::move(*policy_id), *version};
 }
 
 absl::Status WriteCommandBody(MetaWriter& w, const SubmitOperation& cmd) {
@@ -900,7 +860,7 @@ absl::StatusOr<SubmitOperation> ReadSubmitOperationBody(MetaReader& r) {
   if (!replication_history.ok()) return replication_history.status();
   auto policy_references = r.ReadList<MetaPolicyReference>(
       kMaxMetaPolicyReferencesPerOperation,
-      [](MetaReader& rr) { return ReadPolicyReference(rr); });
+      [](MetaReader& rr) { return ReadMetaPolicyReference(rr); });
   if (!policy_references.ok()) return policy_references.status();
   SubmitOperation cmd;
   cmd.request_id_ = header->request_id_;
@@ -960,7 +920,7 @@ absl::StatusOr<TransitionOperationPhase> ReadTransitionOperationPhaseBody(
   if (!blob.ok()) return blob.status();
   auto evidence = r.ReadList<MetaEvidenceSummary>(
       kMaxMetaEvidenceSummariesPerCommand,
-      [](MetaReader& rr) { return ReadEvidenceSummary(rr); });
+      [](MetaReader& rr) { return ReadMetaEvidenceSummary(rr); });
   if (!evidence.ok()) return evidence.status();
   TransitionOperationPhase cmd;
   cmd.request_id_ = header->request_id_;
@@ -985,7 +945,7 @@ absl::Status WriteCommandBody(MetaWriter& w, const CompleteOperation& cmd) {
   WriteFixedArray(w, cmd.operation_id_);
   w.WriteU64(cmd.expected_revision_);
   w.WriteString(cmd.result_);
-  w.WriteU8(cmd.data_loss_possible_ ? 1 : 0);
+  w.WriteBool(cmd.data_loss_possible_);
   return absl::OkStatus();
 }
 
@@ -998,18 +958,15 @@ absl::StatusOr<CompleteOperation> ReadCompleteOperationBody(MetaReader& r) {
   if (!expected_revision.ok()) return expected_revision.status();
   auto result = ReadBoundedString(r, kMaxMetaPayloadBytes);
   if (!result.ok()) return result.status();
-  auto data_loss = r.ReadU8();
+  auto data_loss = r.ReadBool("data_loss_possible must be 0 or 1");
   if (!data_loss.ok()) return data_loss.status();
-  if (*data_loss > 1) {
-    return MetaFailStopError("data_loss_possible must be 0 or 1");
-  }
   CompleteOperation cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.operation_id_ = *operation_id;
   cmd.expected_revision_ = *expected_revision;
   cmd.result_ = std::move(*result);
-  cmd.data_loss_possible_ = *data_loss == 1;
+  cmd.data_loss_possible_ = *data_loss;
   return cmd;
 }
 

@@ -130,6 +130,7 @@ class MetaWriter {
   void WriteU16(std::uint16_t v);
   void WriteU32(std::uint32_t v);
   void WriteU64(std::uint64_t v);
+  void WriteBool(bool value);
 
   // Fixed-length bytes, no length prefix; the reader must know the length.
   void WriteRaw(std::string_view bytes);
@@ -178,6 +179,9 @@ class MetaReader {
   absl::StatusOr<std::uint16_t> ReadU16();
   absl::StatusOr<std::uint32_t> ReadU32();
   absl::StatusOr<std::uint64_t> ReadU64();
+  // Boolean values use a single 0/1 tag. The caller supplies the diagnostic
+  // because field ownership remains with the enclosing codec.
+  absl::StatusOr<bool> ReadBool(std::string_view invalid_tag_message);
 
   absl::StatusOr<std::string_view> ReadRaw(std::size_t bytes);
   // Cap check precedes the bounds check (over-cap prefixes fail even on

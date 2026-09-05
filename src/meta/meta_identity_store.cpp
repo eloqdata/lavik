@@ -235,7 +235,7 @@ std::string MetaIdentityStore::Serialize() const {
     w.WriteU64(record.capability_mask_);
     w.WriteU8(static_cast<std::uint8_t>(record.role_));
     w.WriteU64(record.revision_);
-    w.WriteU8(record.retired_ ? 1 : 0);
+    w.WriteBool(record.retired_);
   }
   w.WriteCount(static_cast<std::uint32_t>(meta_members_.size()));
   for (const auto& [server_id, record] : meta_members_) {
@@ -243,7 +243,7 @@ std::string MetaIdentityStore::Serialize() const {
     w.WriteString(record.principal_);
     w.WriteU16(record.min_schema_);
     w.WriteU16(record.max_schema_);
-    w.WriteU8(record.retired_ ? 1 : 0);
+    w.WriteBool(record.retired_);
   }
   return w.TakeBuffer();
 }
@@ -284,11 +284,8 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     }
     auto revision = r.ReadU64();
     if (!revision.ok()) return revision.status();
-    auto retired = r.ReadU8();
+    auto retired = r.ReadBool("retired tag must be 0 or 1");
     if (!retired.ok()) return retired.status();
-    if (*retired > 1) {
-      return MetaFailStopError("retired tag must be 0 or 1");
-    }
 
     // Invariant enforcement (fail-stop): a corrupt snapshot must fail
     // identically on every node.
@@ -318,7 +315,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     record.capability_mask_ = *capability_mask;
     record.role_ = static_cast<MetaNodeRole>(*role);
     record.revision_ = *revision;
-    record.retired_ = *retired == 1;
+    record.retired_ = *retired;
     record.endpoints_ = std::move(*endpoints);
     store.node_id_by_principal_.emplace(record.principal_, record.node_id_);
     store.nodes_.emplace(record.node_id_, std::move(record));
@@ -334,11 +331,10 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     if (!min_schema.ok()) return min_schema.status();
     auto max_schema = r.ReadU16();
     if (!max_schema.ok()) return max_schema.status();
-    auto retired = r.ReadU8();
+    auto retired = r.ReadBool("invalid meta member in snapshot");
     if (!retired.ok()) return retired.status();
-    if (*retired > 1 || *server_id == 0 ||
-        *server_id >
-            static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+    if (*server_id == 0 || *server_id > static_cast<std::uint32_t>(
+                                            std::numeric_limits<int>::max())) {
       return MetaFailStopError("invalid meta member in snapshot");
     }
     const MetaMemberIdentity descriptor{static_cast<int>(*server_id),
@@ -353,7 +349,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       return MetaFailStopError("duplicate meta member binding in snapshot");
     }
     MetaMemberRecord record{*server_id, std::string(*principal), *min_schema,
-                            *max_schema, *retired == 1};
+                            *max_schema, *retired};
     store.meta_server_id_by_principal_.emplace(record.principal_,
                                                record.server_id_);
     store.meta_members_.emplace(record.server_id_, std::move(record));
