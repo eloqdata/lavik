@@ -131,7 +131,7 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
         current == nullptr ||
         !MaterializeIndexLocation(*current).SamePhysicalRecord(location) ||
         current->value_.kind() != RecordKind::kValue ||
-        IsExpired(*current, UnixTimeMillis())) {
+        IsExpiredNow(*current)) {
       co_return std::optional<std::string>{};
     }
     co_return std::optional<std::string>(std::move(*loaded));
@@ -217,16 +217,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::Get(
     std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
-  assert(!routed_partition_id.has_value() ||
-         *routed_partition_id == RedisSlot(key));
-  // Keep the fallback lazy: value_or(RedisSlot(key)) would compute the slot
-  // even when routing already supplied the partition on this hot GET path.
-  const std::uint16_t partition_id = routed_partition_id.has_value()
-                                         ? *routed_partition_id
-                                         : RedisSlot(key);
-  auto key_lock = co_await tx::CurrentTxShard().AcquireKey(
-      db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
-  co_return co_await GetLocked(db_id, key, digest, trace, partition_id);
+  return GetWithLockState(db_id, key, digest, trace, routed_partition_id,
+                          true);
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
@@ -234,9 +226,23 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     ReadLatencyTrace* trace,
     std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
-  WorkerStore& store = CurrentStore();
+  return GetWithLockState(db_id, key, digest, trace, routed_partition_id,
+                          false);
+}
+
+Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
+    std::uint8_t db_id, std::string_view key, Digest digest,
+    ReadLatencyTrace* trace,
+    std::optional<std::uint16_t> routed_partition_id, bool acquire_key_lock) {
+  assert(db_id < kLogicalDatabaseCount);
   assert(!routed_partition_id.has_value() ||
          *routed_partition_id == RedisSlot(key));
+  tx::TxShard::Guard key_lock;
+  if (acquire_key_lock) {
+    key_lock = co_await tx::CurrentTxShard().AcquireKey(
+        db_id, tx::FingerprintOf(digest), tx::LockMode::kShared);
+  }
+  WorkerStore& store = CurrentStore();
   auto& partition = routed_partition_id.has_value()
                         ? PartitionFor(store, *routed_partition_id)
                         : PartitionForKey(store, key);
@@ -255,8 +261,7 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     }
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
   }
-  const std::uint64_t now_ms = UnixTimeMillis();
-  if (IsExpired(*found, now_ms)) {
+  if (IsExpiredNow(*found)) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     if (trace != nullptr) {
       trace->lookup_done_ns_ = ReadTraceNowNanos();
@@ -573,9 +578,10 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::StringLengthLocked(
     }
     found = *resolved;
   }
+  const bool expired = found != nullptr && IsExpiredNow(*found);
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
-      IsExpired(*found, UnixTimeMillis())) {
-    if (found != nullptr && IsExpired(*found, UnixTimeMillis())) {
+      expired) {
+    if (expired) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     }
     co_return absl::Status(absl::StatusCode::kNotFound, "key not found");
@@ -614,7 +620,7 @@ Task<ExpirationInfo> StorageEngine::Impl::GetExpirationLocked(
   if (found == nullptr || found->value_.kind() != RecordKind::kValue) {
     co_return ExpirationInfo{};
   }
-  if (IsExpired(*found, UnixTimeMillis())) {
+  if (IsExpiredNow(*found)) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return ExpirationInfo{};
   }
@@ -641,7 +647,7 @@ Task<absl::StatusOr<RawValue>> StorageEngine::Impl::ReadRawValueLocked(
     found = *resolved;
   }
   if (found == nullptr || found->value_.kind() != RecordKind::kValue ||
-      IsExpired(*found, UnixTimeMillis())) {
+      IsExpiredNow(*found)) {
     if (found != nullptr && found->value_.kind() == RecordKind::kValue) {
       QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     }
@@ -698,7 +704,7 @@ Task<bool> StorageEngine::Impl::KeyLive(std::uint8_t db_id,
     found = *resolved;
   }
   co_return found != nullptr && found->value_.kind() == RecordKind::kValue &&
-      !IsExpired(*found, UnixTimeMillis());
+      !IsExpiredNow(*found);
 }
 
 Task<bool> StorageEngine::Impl::Exists(std::uint8_t db_id,
@@ -728,7 +734,7 @@ Task<bool> StorageEngine::Impl::ExistsLocked(std::uint8_t db_id,
   if (found == nullptr || found->value_.kind() != RecordKind::kValue) {
     co_return false;
   }
-  if (IsExpired(*found, UnixTimeMillis())) {
+  if (IsExpiredNow(*found)) {
     QueueExpiredCandidate(store, partition.id_, db_id, *found, key);
     co_return false;
   }

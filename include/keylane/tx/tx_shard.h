@@ -262,6 +262,15 @@ class TxShard {
   friend class Awaiter;
 
   bool TryFastPath(std::span<const KeyRef> keys) {
+    if (keys.size() == 1) {
+      const KeyRef& key = keys.front();
+      const bool granted = locks_[key.db_].AcquireIntentAndHoldIfGranted(
+          key.fp_, key.mode_);
+      if (granted) {
+        ++fastpath_runs_;
+      }
+      return granted;
+    }
     // Intents are recorded even when not granted: they block later barging
     // while this acquisition waits in the queue.
     if (!AcquireIntents(keys)) {
@@ -285,6 +294,12 @@ class TxShard {
   TxWaiter* PopBypassReady() noexcept;
 
   void Release(std::span<const KeyRef> keys) {
+    if (keys.size() == 1) {
+      const KeyRef& key = keys.front();
+      locks_[key.db_].ReleaseHoldAndIntent(key.fp_, key.mode_);
+      Poll();
+      return;
+    }
     ReleaseHolds(keys);
     ReleaseIntents(keys);
     Poll();

@@ -706,6 +706,19 @@ inline bool IsExpired(const RecordIndex::Entry& entry,
          expire_at_ms <= now_ms;
 }
 
+// The compact index already says whether an expiry word exists. Keep the
+// clock read behind that bit: non-expiring keys dominate foreground traffic,
+// while expiring keys retain the exact same millisecond comparison.
+[[gnu::always_inline]] inline bool IsExpiredNow(
+    const RecordIndex::Entry& entry) noexcept {
+  return entry.value_.has_expiry() && IsExpired(entry, UnixTimeMillis());
+}
+
+[[gnu::always_inline]] inline bool IsExpiredNow(
+    const RecordLocation& location) noexcept {
+  return location.has_expiry() && IsExpired(location, UnixTimeMillis());
+}
+
 inline absl::StatusOr<std::shared_ptr<const std::vector<ExtentRef>>>
 DecodeManifest(std::span<const std::byte> payload, std::uint64_t logical_size,
                bool validate_logical_bytes = true) {
@@ -2190,6 +2203,15 @@ class StorageEngine::Impl {
                                             std::optional<std::uint16_t>
                                                 routed_partition_id =
                                                     std::nullopt);
+
+  // Shared implementation for ordinary and transaction-owned reads. Keeping
+  // conditional lock acquisition in this coroutine avoids a nested Task frame
+  // on every standalone GET while preserving the pre-locked public contract.
+  Task<absl::StatusOr<DiskValue>> GetWithLockState(
+      std::uint8_t db_id, std::string_view key, Digest digest,
+      ReadLatencyTrace* trace,
+      std::optional<std::uint16_t> routed_partition_id,
+      bool acquire_key_lock);
 
   Task<std::vector<BatchGetValue>> BatchGetLocked(
       std::uint8_t db_id, std::span<const BatchGetRequest> requests);

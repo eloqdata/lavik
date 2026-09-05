@@ -189,7 +189,7 @@ Task<absl::Status> StorageEngine::Impl::ReadSnapshotRecord(
       if (status.ok() && current != nullptr &&
           current->value_.kind() == RecordKind::kValue) {
         const RecordLocation location = MaterializeIndexLocation(*current);
-        if (IsExpired(location, UnixTimeMillis())) {
+        if (IsExpiredNow(location)) {
           QueueExpiredCandidate(store, partition.id_, db_id, *current, *key);
         } else if (!TryConsumeFullSyncCoverageCredit(
                        store, session_id, capture->second,
@@ -324,7 +324,7 @@ StorageEngine::Impl::ReadFullSyncOverrideRecord(
 
   const RecordIndex::Entry* current = *resolved;
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
-      IsExpired(*current, UnixTimeMillis())) {
+      IsExpiredNow(*current)) {
     const std::uint64_t sequence =
         current == nullptr ? requested.mutation_sequence_
                            : std::max(requested.mutation_sequence_,

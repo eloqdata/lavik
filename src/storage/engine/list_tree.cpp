@@ -195,7 +195,7 @@ Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteListLocked(
   }
   const bool stored_value =
       found != nullptr && found->value_.kind() == RecordKind::kValue;
-  const bool exists = stored_value && !IsExpired(*found, UnixTimeMillis());
+  const bool exists = stored_value && !IsExpiredNow(*found);
   if (exists && found->value_.value_type() != ValueType::kList) {
     co_return absl::InvalidArgumentError(
         "WRONGTYPE Operation against a key holding the wrong kind of value");

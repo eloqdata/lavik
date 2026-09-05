@@ -144,7 +144,7 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
   // not read wall time for the ordinary overwrite path; it is irrelevant when
   // the index entry cannot expire.
   if (exists && found->value_.has_expiry() &&
-      IsExpired(*found, UnixTimeMillis())) {
+      IsExpiredNow(*found)) {
     exists = false;
   }
   if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
@@ -310,7 +310,7 @@ Task<absl::StatusOr<bool>> StorageEngine::Impl::DeleteLocked(
   if (found == nullptr || found->value_.kind() == RecordKind::kTombstone) {
     co_return false;
   }
-  const bool expired = IsExpired(*found, UnixTimeMillis());
+  const bool expired = IsExpiredNow(*found);
   absl::Status status = co_await AppendLocked(
       store, partition, db_id, key, digest, {}, RecordKind::kTombstone,
       ValueType::kNone, 0, tx, 0, nullptr, nullptr, replication);

@@ -25,6 +25,52 @@ namespace keylane::tx {
 //    must be visible to the scheduler. Invariant: holds ⊆ intents.
 class LockTable {
  public:
+  // Single-key acquisitions dominate ordinary command traffic. Combining the
+  // intent and hold transition keeps the uncontended path to one hash-table
+  // probe while preserving the same published state: a failed acquisition
+  // retains only its intent for queue ordering, and a successful one owns
+  // both the intent and compatible hold before it can suspend.
+  bool AcquireIntentAndHoldIfGranted(LockFp fp, LockMode mode) {
+    IntentLock& lock = map_[fp];
+    if (mode == LockMode::kShared) {
+      ++lock.shared_intent_;
+      if (lock.exclusive_intent_ != 0) {
+        return false;
+      }
+      assert(lock.exclusive_held_ == 0);
+      ++lock.shared_held_;
+      return true;
+    }
+    ++lock.exclusive_intent_;
+    if (lock.shared_intent_ != 0 || lock.exclusive_intent_ != 1) {
+      return false;
+    }
+    assert(lock.shared_held_ == 0 && lock.exclusive_held_ == 0);
+    lock.exclusive_held_ = 1;
+    return true;
+  }
+
+  // Releases the two layers acquired for one running key with one lookup.
+  // Queued single-key work reaches this method only after Poll has installed
+  // its hold, so both counters are present regardless of how it was granted.
+  void ReleaseHoldAndIntent(LockFp fp, LockMode mode) {
+    auto it = map_.find(fp);
+    assert(it != map_.end());
+    IntentLock& lock = it->second;
+    if (mode == LockMode::kShared) {
+      assert(lock.shared_intent_ > 0 && lock.shared_held_ > 0);
+      --lock.shared_intent_;
+      --lock.shared_held_;
+    } else {
+      assert(lock.exclusive_intent_ > 0 && lock.exclusive_held_ == 1);
+      --lock.exclusive_intent_;
+      lock.exclusive_held_ = 0;
+    }
+    if (lock.IsFree()) {
+      map_.erase(it);
+    }
+  }
+
   // Records the intent unconditionally. Returns true iff granted immediately:
   // shared — no exclusive intent; exclusive — no other intent at all.
   bool AcquireIntent(LockFp fp, LockMode mode) {

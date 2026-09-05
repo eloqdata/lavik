@@ -244,8 +244,9 @@ class ScanHashMapEntryArena {
   Allocation Allocate(std::size_t bytes);
   void Deallocate(Handle handle) noexcept;
 
-  // Resolve translates a live bucket handle; it does not independently track
-  // whether the selected slot is allocated.
+  // Resolve translates a handle read from an occupied live bucket. Debug
+  // builds validate that ownership invariant; release builds rely on it and
+  // do not turn every lookup into defensive arena bookkeeping.
   void* Resolve(Handle handle) const noexcept;
   // HandleOf accepts an address owned by this arena and returns zero when the
   // aligned page belongs to a different arena.
@@ -342,13 +343,13 @@ class ScanHashMapEntryArena {
   std::size_t allocated_pages_ = 0;
   std::size_t allocated_spans_ = 0;
   // Directory slot zero stays empty so handle zero is the null reference.
-  // A normal descriptor packs the 64 KiB-aligned page address with
-  // class_index+1 in its low bits; the large marker reads block size from the
-  // page header. The directory is a raw, deliberately uninitialized array with
-  // an explicit growth policy. Fresh IDs advance monotonically, so only the
-  // copied prefix and newly published slot are ever read. Released slots encode
-  // the next free ID in-band, eliminating a second capacity-growing array while
-  // keeping ReleasePage noexcept.
+  // A normal descriptor packs the 64 KiB-aligned page address with its small
+  // block size in the low 16 bits; the large marker reads its variable size
+  // from the page header. The directory is a raw, deliberately uninitialized
+  // array with an explicit growth policy. Fresh IDs advance monotonically, so
+  // only the copied prefix and newly published slot are ever read. Released
+  // slots encode the next free ID in-band, eliminating a second
+  // capacity-growing array while keeping ReleasePage noexcept.
   std::uint64_t* directory_ = nullptr;
   std::size_t directory_capacity_ = 0;
   std::uint32_t next_page_id_ = 1;
@@ -723,7 +724,7 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
   assert(page->capacity_ != 0 && page->capacity_ <= (1U << kSlotBits));
   const std::uint64_t descriptor =
       reinterpret_cast<std::uintptr_t>(page) |
-      static_cast<std::uint64_t>(large ? kLargeClassMarker : class_index + 1);
+      static_cast<std::uint64_t>(large ? kLargeClassMarker : block_size);
   SetDirectoryDescriptor(page_id, descriptor);
   ++allocated_pages_;
   if (!large) AddAvailable(page);
@@ -863,11 +864,30 @@ inline void ScanHashMapEntryArena::Deallocate(Handle handle) noexcept {
 }
 
 inline void* ScanHashMapEntryArena::Resolve(Handle handle) const noexcept {
-  const PageHeader* page = PageFor(handle);
-  if (page == nullptr) return nullptr;
+  const std::uint32_t page_id = handle >> kSlotBits;
+  assert(page_id != 0 && page_id < next_page_id_);
+  const std::uint64_t descriptor = DirectoryDescriptor(page_id);
+  const std::uint64_t marker = descriptor & std::uint64_t{0xffff};
+  assert(descriptor != 0 && marker != kFreePageMarker);
+
+  const auto* page = reinterpret_cast<const PageHeader*>(
+      descriptor & ~std::uint64_t{0xffff});
   const std::uint16_t slot = static_cast<std::uint16_t>(handle & kSlotMask);
-  if (slot >= page->capacity_) return nullptr;
-  return const_cast<std::byte*>(SlotAddress(page, slot));
+  if (marker == kLargeClassMarker) {
+    assert(slot < page->capacity_);
+    return const_cast<std::byte*>(SlotAddress(page, slot));
+  }
+
+  // The descriptor publishes immutable layout together with the page
+  // address. A live bucket handle is already known to select an allocated
+  // slot, so release lookup needs neither a size-class table load nor a
+  // capacity division before it can address the entry.
+  const std::size_t block_size = marker;
+  assert(block_size >= kClassSizes.front() &&
+         block_size <= kClassSizes.back() && block_size % 8 == 0);
+  assert(slot < (kPageBytes - kPageHeaderBytes) / block_size);
+  return const_cast<std::byte*>(reinterpret_cast<const std::byte*>(page) +
+                               kPageHeaderBytes + slot * block_size);
 }
 
 inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
@@ -1243,7 +1263,7 @@ class ScanHashMap {
   }
 
   Entry* Find(const Digest& digest, std::string_view key) {
-    RehashStep();
+    AdvanceRehashIfNeeded();
     return FindWithoutStep(digest, key);
   }
 
@@ -1253,7 +1273,7 @@ class ScanHashMap {
 
   std::vector<Entry*> FindCandidates(const Digest& digest,
                                      std::string_view key) {
-    RehashStep();
+    AdvanceRehashIfNeeded();
     std::vector<Entry*> result;
     const std::uint64_t hash = Hash(digest);
     AppendCandidates(tables_[0], digest, key, hash, &result);
@@ -1408,7 +1428,7 @@ class ScanHashMap {
   // slots are reused by later inserts, so footprint is bounded by the peak
   // live count.
   bool Erase(const Digest& digest, std::string_view key) {
-    RehashStep();
+    AdvanceRehashIfNeeded();
     const std::uint64_t hash = Hash(digest);
     const std::uint8_t tag = HashTag(hash);
     const int tables = Rehashing() ? 2 : 1;
@@ -1441,7 +1461,7 @@ class ScanHashMap {
     if (entry == nullptr) {
       return false;
     }
-    RehashStep();
+    AdvanceRehashIfNeeded();
     const std::uint64_t hash = EntryHash(*entry);
     const int tables = Rehashing() ? 2 : 1;
     for (int t = 0; t < tables; ++t) {
@@ -1922,6 +1942,17 @@ class ScanHashMap {
   }
 
   bool Rehashing() const noexcept { return rehash_index_ != kNotRehashing; }
+
+  // RehashStep is intentionally large and stays out of line. Keep its common
+  // steady-state guard at the call site so every lookup does not pay a
+  // call/return merely to discover that the recovered or settled table is not
+  // expanding. While expansion is active, reads and mutations still advance
+  // exactly one bucket before accessing either table.
+  [[gnu::always_inline]] void AdvanceRehashIfNeeded() {
+    if (Rehashing()) [[unlikely]] {
+      RehashStep();
+    }
+  }
 
   void EnsureTable() {
     if (tables_[0].buckets_.empty()) {

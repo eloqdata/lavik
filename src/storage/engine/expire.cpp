@@ -91,7 +91,7 @@ Task<absl::Status> StorageEngine::Impl::ExpireCandidate(
   if (current == nullptr || current->value_.kind() != RecordKind::kValue ||
       current->value_.mutation_sequence_ != candidate.mutation_sequence_ ||
       ExpireAt(*current) != candidate.expire_at_ms_ ||
-      !IsExpired(*current, UnixTimeMillis())) {
+      !IsExpiredNow(*current)) {
     co_return absl::OkStatus();
   }
   // Prefer a durable delete so a later wall-clock rollback cannot expose the
