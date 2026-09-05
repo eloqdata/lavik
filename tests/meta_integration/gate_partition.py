@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Meta-plane partition safety gate for issue #19.
+"""Meta-plane partition safety gate.
 
 A leader isolated from both followers cannot commit a privileged operation,
 steps down after leadership validity expires, and exposes no grant-renewal or
 other committed-state progress. Once the majority heals, a leader is elected,
 the rejected operation remains absent, and all acknowledged history converges
-without a fork. Data-node lease self-expiry remains issue #21's boundary.
+without a fork. Data-node lease self-expiry is outside the Meta control-plane
+boundary.
 """
 
 import os

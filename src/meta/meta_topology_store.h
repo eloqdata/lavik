@@ -1,13 +1,12 @@
 #pragma once
 
-// MetaTopologyStore: the committed topology store of the issue #19 metadata
-// control plane (plan docs/plans/issue-19-metadata-raft-implementation.md §2
-// "topology"). It holds three things: the group table (group_id ->
+// MetaTopologyStore is the metadata control plane's committed topology store.
+// It holds three things: the group table (group_id ->
 // GroupState), the 16384-entry slot map, and the cluster-wide
 // topology_epoch.
 //
 // Invariants:
-//   - One-node-one-group (§2): a node_id is a member of at most one group.
+//   - One-node-one-group: a node_id is a member of at most one group.
 //     AssignNodeToGroup to the same group with the same role replays as an
 //     idempotent accept; a different role or a different group is a domain
 //     rejection (membership change requires an explicit RemoveNodeFromGroup
@@ -38,17 +37,17 @@
 //   - Membership does not cascade: removing the node named by record.owner_
 //     from the member table leaves owner_ untouched. The apply dispatcher
 //     reads the fact and decides.
-//   - State is size-bounded (§2 硬上限): kMaxMetaGroups groups, at most
+//   - State is size-bounded: kMaxMetaGroups groups, at most
 //     kMaxMetaNodes members per group; over-cap applies are rejected, never
 //     silently truncated.
 //
-// Replay idempotency (§2 "apply 的 replay 幂等定义"): re-applying a command
+// Replay idempotency: re-applying a command
 // whose exact post-effect is already present is an idempotent accept
 // (no-op); conflicting content is a domain rejection. The granular
 // primitives follow the same rule: setting a field to the value it already
 // holds is a no-op accept.
 //
-// Failure classes (§2): domain rejections return MetaDomainRejectError
+// Failure classes: domain rejections return MetaDomainRejectError
 // (kDomainReject); deserialization failures are fail-stop (kFailStop).
 //
 // Scope: pure in-memory function of command + committed state — no IO, no
@@ -81,7 +80,7 @@ struct MetaGroupMember {
   bool operator==(const MetaGroupMember&) const = default;
 };
 
-// Read view of one group: the committed GroupRecord (§2) plus the topology
+// Read view of one group: the committed GroupRecord plus the topology
 // store's own bookkeeping (config_epoch, membership CAS revision, members).
 struct MetaTopologyGroupView {
   std::string group_id_;
@@ -94,7 +93,7 @@ struct MetaTopologyGroupView {
 
 class MetaTopologyStore {
  public:
-  // Domain-validated apply of the topology commands (§2). Each returns
+  // Domain-validated apply of the topology commands. Each returns
   // absl::OkStatus() on apply or idempotent accept, and a kDomainReject
   // status otherwise; state is unchanged on rejection.
   absl::Status Apply(const CreateGroup& cmd);

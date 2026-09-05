@@ -67,7 +67,7 @@ absl::Status MetaGrantStore::BeginGroupTerm(
     return MetaDomainRejectError("unknown group");
   }
   Entry& entry = it->second;
-  // Terms advance exactly one step per command (plan §2: T-1 -> T).
+  // Terms advance exactly one step per command: T-1 -> T.
   if (command.expected_term_ == std::numeric_limits<std::uint64_t>::max() ||
       command.new_term_ != command.expected_term_ + 1) {
     return MetaDomainRejectError("new term must be exactly expected term + 1");
@@ -120,7 +120,8 @@ absl::Status MetaGrantStore::ValidateActivate(
     return MetaDomainRejectError("unknown group");
   }
   const Entry& entry = it->second;
-  // Cross-term activation is rejected (plan §2: expected_term == 当前 term).
+  // Cross-term activation is rejected: expected_term must equal the current
+  // term.
   if (command.expected_term_ != entry.group_term_) {
     return MetaDomainRejectError("expected term does not match current term");
   }

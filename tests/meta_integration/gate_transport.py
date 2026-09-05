@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Transport connect/cancel/timeout behavior at cluster level (issue #19).
+"""Transport connect/cancel/timeout behavior at cluster level.
 
 Single 3-node cluster on the proxy mesh, continuous propose load
 throughout:

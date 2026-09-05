@@ -11,8 +11,8 @@ namespace {
 // Field-cap re-validation at the store boundary: commands normally arrive via
 // the strict decoder (which enforces caps), but the store keeps its own
 // invariants self-contained so an in-memory constructed command cannot push
-// the state out of spec (§2: over-limit input fails, never silently
-// truncates).
+// state beyond its bounds. Over-limit input fails and is never silently
+// truncated.
 absl::Status CheckNodeFields(const std::string& node_id,
                              const std::vector<std::string>& endpoints) {
   if (node_id.empty() || node_id.size() > kMetaNodeIdBytes) {
@@ -42,7 +42,7 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
   if (const auto existing = nodes_.find(cmd.node_id_);
       existing != nodes_.end()) {
     // Replay of the same log index: the exact post-effect (identical content,
-    // active, never mutated) is already present -> idempotent accept (§2).
+    // active, never mutated) is already present -> idempotent accept.
     // Any other record under this node_id is a content conflict.
     const MetaNodeRecord& record = existing->second;
     const bool identical = !record.retired_ && record.revision_ == 1 &&
@@ -54,7 +54,7 @@ absl::Status MetaIdentityStore::Apply(const RegisterNode& cmd) {
     return MetaDomainRejectError(
         absl::StrCat("node_id ", cmd.node_id_, " already registered"));
   }
-  // Global one-to-one principal binding (§6); retired tombstones hold their
+  // Global one-to-one principal binding; retired tombstones hold their
   // binding, so a principal is never rebound (rotation unimplemented).
   if (node_id_by_principal_.contains(cmd.principal_)) {
     return MetaDomainRejectError(
@@ -86,8 +86,8 @@ absl::Status MetaIdentityStore::Apply(const UpdateNode& cmd) {
   }
   MetaNodeRecord& record = it->second;
   // Replay: the record already carries this command's post-effect (revision
-  // expected+1, identical mutable content) -> idempotent accept (§2).
-  // UpdateNode cannot touch the principal binding (§6: the schema has no
+  // expected+1, identical mutable content) -> idempotent accept.
+  // UpdateNode cannot touch the principal binding: the schema has no
   // principal field; rotation unimplemented), so it is not compared.
   const bool is_replay = !record.retired_ &&
                          record.revision_ == cmd.expected_revision_ + 1 &&
@@ -131,7 +131,7 @@ absl::Status MetaIdentityStore::Apply(const RetireNode& cmd) {
         absl::StrCat("expected_revision CAS conflict on ", cmd.node_id_));
   }
   // Retire is terminal. The principal binding is kept (tombstone): it is
-  // never rebound because rotation is unimplemented (§6).
+  // never rebound because rotation is unimplemented.
   record.retired_ = true;
   record.revision_ = cmd.expected_revision_ + 1;
   return absl::OkStatus();
@@ -291,7 +291,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     }
 
     // Invariant enforcement (fail-stop): a corrupt snapshot must fail
-    // identically on every node (§2 失败分类).
+    // identically on every node.
     const std::string node_id_str(*node_id);
     const std::string principal_str(*principal);
     if (node_id_str.empty() || principal_str.empty()) {

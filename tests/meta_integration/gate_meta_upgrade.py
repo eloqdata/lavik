@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Production metadata upgrade and uncommitted-tail gate (issue #19).
+"""Production metadata upgrade and uncommitted-tail gate.
 
 The first scenario attests an N-1 member as schema [1,1], proves the committed
 v2 write-format switch is rejected while it is present, removes it, commits

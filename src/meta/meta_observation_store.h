@@ -1,7 +1,7 @@
 #pragma once
 
-// MetaObservationStore: volatile, leader-local store for soft observations
-// (issue #19 plan v5 §4).
+// MetaObservationStore is the volatile, leader-local store for soft
+// observations.
 //
 // Observations are NEVER committed to the Raft log and never survive a Meta
 // restart or leader change: nodes re-report through freshly authenticated
@@ -14,7 +14,7 @@
 //     session_generation} triple. boot_incarnation is opaque and is NEVER
 //     ordered by value; ordering comes from session_generation, a
 //     controller-local monotonic sequence issued by the authenticated
-//     session layer (#20; tests inject it directly via ctl).
+//     session layer; tests inject it directly through the ctl adapter.
 //   - AdoptSession() establishes the current generation for a node and
 //     atomically purges every older observation of that node. Only the
 //     current generation may ingest.
@@ -72,7 +72,7 @@ struct MetaCandidateProgressObs {
   uint64_t group_term_ = 0;
   uint64_t population_manifest_id_ = 0;
   uint64_t replication_history_id_ = 0;
-  std::string applied_flow_vector_;  // opaque, bounded; compared by #21 rules
+  std::string applied_flow_vector_;  // opaque and bounded
   std::string backlog_coverage_;     // opaque, bounded
   std::string readiness_;            // opaque, bounded
   bool operator==(const MetaCandidateProgressObs&) const = default;

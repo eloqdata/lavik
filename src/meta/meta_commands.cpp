@@ -1233,9 +1233,9 @@ absl::StatusOr<RetireMetaMember> ReadRetireMetaMemberBody(MetaReader& r) {
 absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command,
                                               std::uint16_t write_schema) {
   MetaWriter w;
-  // SetSchemaVersion is always written in the frozen v1 layout (§2 升级契约:
-  // 自身以最旧可读格式编码); every other command uses the current write
-  // schema.
+  // SetSchemaVersion uses the frozen v1 layout so every binary in the readable
+  // compatibility window can decode it. Every other command uses the current
+  // write schema.
   const std::uint16_t write_version =
       std::holds_alternative<SetSchemaVersion>(command) ? kMetaSchemaVersionV1
                                                         : write_schema;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: mTLS transport for keylane_meta (issue #19).
+"""Integration gate: mTLS transport for keylane_meta.
 
 The gate creates one CA and a distinct leaf per member. Every leaf covers the
 numeric endpoint and carries exactly one canonical URI SAN

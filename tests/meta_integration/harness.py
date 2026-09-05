@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared harness for the keylane_meta process gates (issue #19).
+"""Shared harness for the keylane_meta process gates.
 
 Stdlib-only building blocks for driving multi-node keylane_meta clusters:
 
@@ -8,11 +8,11 @@ Stdlib-only building blocks for driving multi-node keylane_meta clusters:
   restart reusing the same data dir), the SO_PEERCRED-authenticated Unix ctl
   client, and
   polling helpers (`wait_status` / `wait_leader` / `wait_committed`).
-  Committed writes ride the real issue-#19 command schema: `submitop` /
+  Committed writes use the metadata command schema: `submitop` /
   `completeop` / `getop` wrap the ctl verbs, and `propose(value)` is the
   compound write — a SubmitOperation immediately followed by its
   CompleteOperation, so the non-terminal operation set stays tiny against
-  the max_active_operations cap (plan §2 硬上限). Operation ids derive from
+  the max_active_operations cap. Operation ids derive from
   a per-node counter (32 lowercase hex chars, unique cluster-wide via the
   node-id prefix).
 - `Proxy`: a localhost TCP forwarding pair (advertised listen port ->
@@ -244,7 +244,7 @@ class Node:
     def getnode(self, node_id):
         return self.ctl(f"getnode {node_id}")
 
-    # -- observation-surface drivers (issue #19 §4) ------------------------
+    # -- observation-surface drivers ---------------------------------------
     # creategroup/begingroupterm/transitionop build the committed anchors
     # (group term, manifest, operation history binding) that observation
     # freshness is checked against; adoptsession/obs_*/observations/obsaudit
@@ -302,8 +302,8 @@ class Node:
         non-terminal set stays tiny against max_active_operations).
         Returns (op_id, reply); the reply is the completeop line and is
         "OK <idx>" only when BOTH halves committed — a submit that landed
-        while its complete failed (leader change mid-pair) is the plan's
-        uncertain outcome and is simply never recorded by the caller."""
+        while its complete failed (leader change mid-pair) has an uncertain
+        outcome and is simply never recorded by the caller."""
         op_id = self.new_op_id()
         reply = self.submitop(op_id, "gate", value, timeout=timeout)
         if not reply.startswith("OK "):
@@ -917,8 +917,8 @@ def propose_ops(leader, first, count, prefix="key", history=None):
 def manual_snapshot(node, timeout=15.0):
     """Drive the ctl `snapshot` verb to OK and return the snapshot index.
 
-    With the formal state machine the snapshot's durable write runs on the
-    SM writer thread, so a previous round (e.g. an automatic snapshot that
+    The snapshot's durable write runs on the SM writer thread, so a previous
+    round (e.g. an automatic snapshot that
     just fired) can still be in flight — NuRaft's create_snapshot then
     fails fast and the ctl answers "ERR snapshot-failed". Retry instead of
     treating that race as a gate failure."""

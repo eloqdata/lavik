@@ -1,10 +1,8 @@
-// MetaObservationStore tests for the issue #19 formal implementation
-// (src/meta/meta_observation_store, plan
-// docs/plans/issue-19-metadata-raft-implementation.md §4).
+// MetaObservationStore tests.
 //
 // The store is volatile and leader-local: observations never enter the Raft
 // log. These tests drive only the public surface against a fake
-// MetaCommittedFacts and cover the plan §7.2 freshness matrix: unregistered
+// MetaCommittedFacts and cover the freshness matrix: unregistered
 // nodes, stale/future session generations, boot mismatch, old/future/exact
 // group terms, manifest mismatch, unbound history, unknown/terminal
 // operations, generation-adoption purge, commit-driven revalidation with
@@ -409,7 +407,7 @@ TEST(MetaObservationStore, CandidateSetIsBoundedPerGroup) {
                           facts, 1000)
                   .ok());
   // A third distinct node overflows the bounded set: rejected, not squeezed
-  // in (plan §2 fail-safe), and audited.
+  // in, rejected without truncation, and audited.
   ExpectDomainReject(store.Ingest(
       CandidateObs(Ident("n3", 0x0a, 1), "g1", 3, 7, 42), facts, 1000));
   EXPECT_TRUE(

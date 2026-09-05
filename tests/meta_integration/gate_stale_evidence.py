@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Stale / incarnation-forged observations never reach committed state
-(issue #19; plan §4 and §7.2).
+"""Stale or incarnation-forged observations never reach committed state.
 
 One 3-node cluster; serial phases:
 
 1. Register a data node and build the committed anchors observation
    freshness checks match against: group g1 promoted to term 1
    (creategroup + begingroupterm).
-2. Trusted session gen=1 adopted via ctl (the #20 session layer's stand-in);
+2. Trusted session gen=1 adopted through the ctl session adapter;
    a candidate observation carrying the correct committed term is ACCEPTED
    and visible through the facts-filtered query path.
 3. Forgery matrix, every entry rejected AND written to the obs audit ring:

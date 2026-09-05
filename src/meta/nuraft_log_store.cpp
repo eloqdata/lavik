@@ -200,15 +200,15 @@ absl::StatusOr<std::unique_ptr<NuraftLogStore>> NuraftLogStore::Open(
     return ErrnoStatus("mkdir", data_dir);
   }
 
-  // v2 is deliberately incompatible with the v1 spike layout (see the class
-  // header): refuse to open a directory that still holds a v1 log.
+  // v2 is deliberately incompatible with the legacy single-file layout (see
+  // the class header): refuse to open a directory that still holds a v1 log.
   const std::string v1_path = data_dir + "/raft_log.dat";
   std::error_code ec;
   if (std::filesystem::exists(v1_path, ec)) {
     return absl::Status(
         absl::StatusCode::kFailedPrecondition,
-        "WAL v2 refuses the v1 spike layout: " + v1_path +
-            " exists; wipe the spike data directory (it holds no production "
+        "WAL v2 refuses the legacy single-file layout: " + v1_path +
+            " exists; wipe the legacy data directory (it holds no production "
             "data) instead of migrating it");
   }
 

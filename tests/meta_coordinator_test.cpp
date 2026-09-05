@@ -1,6 +1,5 @@
-// Tests for the issue-#19 coordinator seam
-// (src/meta/meta_coordinator.{h,cpp}), the in-process C++ API that hides NuRaft
-// from #20-#23 (plan docs/plans/issue-19-metadata-raft-implementation.md §5).
+// Tests for the in-process coordinator API, which hides NuRaft from control
+// sessions and operation reconcilers.
 //
 // Two slices:
 //   1. Component tests (MetaCoordinatorComponentTest): a MetaCoordinator over a
@@ -53,8 +52,8 @@
 #include "meta/nuraft_log_store.h"
 #include "meta/nuraft_state_mgr.h"
 
-// The seam's trust-boundary stand-in (friended by MetaPrincipalPasskey): tests
-// are a trusted entry, like the ctl surface and the #20 session layer.
+// Trusted test peer for the passkey-protected principal boundary. Tests use
+// the same privileged construction path as ctl and authenticated sessions.
 namespace keylane::meta {
 class MetaCoordinatorTestPeer {
  public:
@@ -438,7 +437,7 @@ TEST_F(MetaCoordinatorComponentTest, CommittedViewFactsAnswerFromStores) {
   term.request_id_ = MakeRequestId(0x63);
   term.group_id_ = "g1";
   term.expected_term_ = 0;
-  term.new_term_ = 1;  // terms advance exactly one step (T-1 -> T, plan §2)
+  term.new_term_ = 1;  // terms advance exactly one step (T-1 -> T)
   Commit(3, term);
   SubmitOperation submit;
   submit.request_id_ = MakeRequestId(0x64);
@@ -667,7 +666,7 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
             keylane::meta::MetaCommandTag::kRegisterNode);
 
   // The coordinator injected the actor and propose-time readable clock; the
-  // committed command's audit record carries both (plan §2 审计模型).
+  // committed command's audit record carries both.
   const auto stores = machine_->StoresSnapshot();
   ASSERT_TRUE(stores.identity_.FindNode(MakeNodeId(0x11)).has_value());
   const auto audit = stores.audit_.Find(accepted->log_index_);
@@ -748,7 +747,7 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
 
   // Fill the audit window to capacity with one batched append: every command
   // (accepted or domain-rejected) writes exactly one audit record keyed by
-  // its log index (plan §2), so identical re-registers fill the window.
+  // its log index, so identical re-registers fill the window.
   const std::uint64_t before = server_->get_committed_log_idx();
   std::vector<nuraft::ptr<nuraft::buffer>> logs;
   logs.reserve(keylane::meta::kMaxMetaAuditWindowRecords);
@@ -959,7 +958,7 @@ TEST_F(MetaCoordinatorServerTest,
       << cancelled.status();
 }
 
-// Mock reconciler (stands in for #21-#23): reconciles one fixed operation to
+// Mock operation reconciler: reconciles one fixed operation to
 // Running through LeaderContext::Propose only. Idempotent by construction —
 // every run first reconciles from the committed view, so a restart that finds
 // the operation already Running proposes nothing.
@@ -1145,7 +1144,7 @@ TEST_F(MetaCoordinatorServerTest,
 
   // Full restart on the same directory: the recovered SM replays the durable
   // WAL through commit() once the re-elected leader's current-term entry
-  // reaches quorum (plan §3). The same reconciler instance is re-registered.
+  // reaches quorum. The same reconciler instance is re-registered.
   OpenStorage();
   LaunchServer();
   MakeCoordinator();

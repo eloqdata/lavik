@@ -52,7 +52,7 @@ struct MetaCtlServer::Core {
   nuraft::ptr<nuraft::raft_server> server_;
   nuraft::ptr<MetaStateMachine> state_machine_;
   std::shared_ptr<MetaCoordinator> coordinator_;
-  // Leader-local observation store (plan §4). Internally serialized because
+  // Leader-local observation store. Internally serialized because
   // ctl ingestion and commit-driven revalidation run on different threads.
   std::shared_ptr<MetaObservationStore> obs_store_;
   MetaCtlServerOptions options_;
@@ -146,7 +146,7 @@ void CompleteAsyncReply(const std::shared_ptr<MetaCelerBridge>& bridge,
       [state](celer::Worker& worker) { worker.Enqueue(state->waiter_); });
 }
 
-// Opaque request_id for audit correlation (§2): 8B LE per-process counter ||
+// Opaque request_id for audit correlation: 8B LE per-process counter ||
 // 8B random boot salt. Its representation carries no ordering contract.
 MetaRequestId MakeRequestId() {
   static const std::uint64_t boot_salt = [] {
@@ -244,7 +244,7 @@ const char* RoleName(MetaNodeRole role) {
 }
 
 // ---------------------------------------------------------------------------
-// Observation-surface helpers (plan §4; see the header's verb reference).
+// Observation-surface helpers; see the header's verb reference.
 // ---------------------------------------------------------------------------
 
 // Wall clock for the VOLATILE observation store (receive time / TTL). The
@@ -418,7 +418,7 @@ celer::Task<std::string> HandleCompleteOp(
   // The CAS token comes from the local committed state: on the leader that
   // accepted the submit, the record is visible at its post-submit revision.
   // A freshly elected leader may legitimately lag behind the submit's OK —
-  // "ERR not-found" is the uncertain-outcome signal (plan §3), never a
+  // "ERR not-found" is the uncertain-outcome signal, never a
   // false success.
   const std::optional<MetaOperationRecord> record =
       state_machine->FindOperation(id);
@@ -616,10 +616,9 @@ celer::Task<std::string> HandlePruneOperationArchive(
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
-// adoptsession: the trusted session layer's stand-in until #20 (plan §4 —
-// "本期由 ctl 注入路径模拟可信 generation"). No facts needed: adopting a
-// session for an unregistered node is harmless because Ingest re-checks
-// registration on every observation.
+// adoptsession injects trusted authenticated data-node session identity. No
+// facts are needed here: adopting a session for an unregistered
+// node is harmless because Ingest re-checks registration on every observation.
 std::string HandleAdoptSession(
     const std::shared_ptr<MetaObservationStore>& obs_store,
     const MetaObservationIdentity& identity) {
@@ -693,7 +692,7 @@ celer::Task<std::string> HandleConfigChange(
   if (!server->is_leader()) {
     co_return "ERR not-leader";
   }
-  // Migrate the bootstrap member (and any pre-formal config) into the
+  // Bind the bootstrap member (and any legacy configuration) into the
   // committed identity store before the next membership mutation. Permission
   // always requires BOTH this binding and NuRaft's committed config aux.
   const nuraft::ptr<nuraft::cluster_config> current_config =
@@ -1130,7 +1129,7 @@ celer::Task<std::string> DispatchCommand(
         static_cast<std::uint16_t>(max_schema));
   }
   if (command == "snapshot") {
-    // Plan §3 快照切点: a manual snapshot must serialize against the commit
+    // A manual snapshot must serialize against the commit
     // thread — serialize_commit_ blocks the background commit until the
     // state machine's exact-cut capture returns (NuRaft semantics per
     // raft_server.hxx create_snapshot_options). The capture is synchronous

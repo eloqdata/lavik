@@ -1,17 +1,15 @@
 #pragma once
 
-// MetaCommands: the committed command schema of the issue #19 metadata
-// control plane (plan docs/plans/issue-19-metadata-raft-implementation.md
-// §2 "Committed 命令集 v1").
+// MetaCommands defines the metadata control plane's committed command schema.
 //
 // Wire envelope (see meta_encoding.h for primitives):
 //   schema_version u16 | command_tag u16 | request_id 16B |
 //   actor_principal str | readable_time str | command body
 // Bodies are sequences of fixed-width LE integers, length-prefixed capped
-// strings/bytes, and capped lists. Every field has a hard cap (§2: state is
-// size-bounded; over-cap input fails, never silently truncates).
+// strings/bytes, and capped lists. Every field has a hard cap so state remains
+// bounded; over-cap input fails and is never silently truncated.
 //
-// Cross-cutting schema rules (§2):
+// Cross-cutting schema rules:
 //   - Every command carries an opaque 16-byte request_id for audit
 //     correlation. Trusted entries generate one when their external protocol
 //     does not provide it; byte ordering and ULID semantics are deliberately
@@ -22,9 +20,9 @@
 //     actor fields are ordinary bounded strings — they MUST be encoded,
 //     otherwise a follower's apply would lose the audit identity. The
 //     unforgeability guarantee is a property of the ENTRY layer (only the
-//     trusted ctl/coordinator entries can construct commands): the plan's
-//     "外部 codec 不接受 actor 字段" defense is implemented at the ctl
-//     text-protocol entry, not in this internal encoding.
+//     trusted ctl/coordinator entries can construct commands). External
+//     callers cannot supply actor fields; the ctl text-protocol entry injects
+//     them before using this internal encoding.
 //   - Mutations of mutable records carry expected_revision (CAS; conflict is
 //     a domain rejection, not a decode failure).
 //   - All changes are absolute values written by the proposer; there are no
@@ -34,7 +32,7 @@
 //
 // SetSchemaVersion is part of the permanently frozen v1 layout subset: it is
 // always encoded with schema_version = kMetaSchemaVersionV1 so that any
-// binary within the readable window can decode it (§2 升级契约). Its frozen
+// binary within the readable window can decode it. Its frozen
 // layout is tag + request_id + actor_principal + readable_time +
 // new_active_write_schema + attestation — the actor fields are part of the
 // frozen subset because it is a privileged command whose audit record must
@@ -42,9 +40,9 @@
 // "decodable by any v2+ binary" promise. This layout NEVER changes.
 //
 // The checked-in v1 fixture freezes the oldest-readable SetSchemaVersion
-// layout used during upgrades. The remaining issue-19 layouts become durable
-// contracts at release; later evolution uses a newer schema version or an
-// append-only command tag whose minimum write schema is explicit.
+// layout used during upgrades. All command layouts are durable contracts;
+// later evolution uses a newer schema version or an append-only command tag
+// whose minimum write schema is explicit.
 
 #include <array>
 #include <cstdint>
@@ -65,19 +63,19 @@ namespace keylane::meta {
 using MetaRequestId = std::array<std::uint8_t, 16>;
 
 // operation_id: client-provided stable UUID; the operation's permanent
-// idempotency key (§2 Operation 标识).
+// idempotency key.
 using MetaOperationId = std::array<std::uint8_t, 16>;
 
 // Content-addressing hashes (policy content, intent, evidence): SHA-256.
 using MetaHash256 = std::array<std::uint8_t, 32>;
 
-// boot_incarnation: opaque fixed-length value; never ordered by magnitude
-// (§4), compared only for equality.
+// boot_incarnation: opaque fixed-length value, compared only for equality and
+// never ordered by magnitude.
 inline constexpr std::size_t kMetaBootIncarnationBytes = 16;
 using MetaBootIncarnation = std::array<std::uint8_t, kMetaBootIncarnationBytes>;
 
-// Injected by the trusted entry at Propose time (§2). principal_ is the
-// canonical SAN principal (§6); readable_time_ is the human-readable propose
+// Injected by the trusted entry at Propose time. principal_ is the
+// canonical SAN principal; readable_time_ is the human-readable propose
 // timestamp the trusted entry writes and apply only copies into the audit
 // record. Both ride the raft-log encoding as ordinary bounded strings (see
 // the file header for why unforgeability is an entry-layer property).
@@ -147,25 +145,24 @@ enum class MetaCommandTag : std::uint16_t {
 };
 
 // ---------------------------------------------------------------------------
-// identity/enrollment (§2). RegisterNode binds the certificate principal;
-// UpdateNode must NOT modify it (no principal field — rotation unimplemented,
-// §6).
+// identity/enrollment. RegisterNode binds the certificate principal;
+// UpdateNode must NOT modify it (no principal field; rotation is unimplemented).
 // ---------------------------------------------------------------------------
 
 struct RegisterNode {
   MetaRequestId request_id_{};
   ActorContext actor_;  // trusted-entry injected; encoded on the raft wire
   std::string node_id_;
-  std::string principal_;  // canonical SAN principal, globally 1:1 (§6)
+  std::string principal_;  // canonical SAN principal, globally 1:1
   std::vector<std::string> endpoints_;
   std::uint64_t capability_mask_ = 0;
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
   bool operator==(const RegisterNode&) const = default;
 };
 
-// Mutable-record mutation: expected_revision is the CAS token (§2). There is
+// Mutable-record mutation: expected_revision is the CAS token. There is
 // deliberately no principal_ field: UpdateNode must not modify the principal
-// binding (§6).
+// binding.
 struct UpdateNode {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -186,7 +183,7 @@ struct RetireNode {
 };
 
 // ---------------------------------------------------------------------------
-// topology (§2). Every topology-visible change carries the new topology_epoch
+// topology. Every topology-visible change carries the new topology_epoch
 // as an absolute value; owner-visible changes additionally carry the affected
 // groups' new config_epoch values.
 // ---------------------------------------------------------------------------
@@ -195,11 +192,11 @@ struct CreateGroup {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::string group_id_;
-  std::uint64_t new_topology_epoch_ = 0;  // absolute (§2)
+  std::uint64_t new_topology_epoch_ = 0;  // absolute
   bool operator==(const CreateGroup&) const = default;
 };
 
-// One-node-one-group is enforced by apply (§2); the command asserts the
+// One-node-one-group is enforced by apply; the command asserts the
 // absolute target membership and the group record CAS token.
 struct AssignNodeToGroup {
   MetaRequestId request_id_{};
@@ -208,7 +205,7 @@ struct AssignNodeToGroup {
   std::string node_id_;
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
   std::uint64_t expected_revision_ = 0;
-  std::uint64_t new_topology_epoch_ = 0;  // absolute (§2)
+  std::uint64_t new_topology_epoch_ = 0;  // absolute
   bool operator==(const AssignNodeToGroup&) const = default;
 };
 
@@ -218,7 +215,7 @@ struct RemoveNodeFromGroup {
   std::string group_id_;
   std::string node_id_;
   std::uint64_t expected_revision_ = 0;
-  std::uint64_t new_topology_epoch_ = 0;  // absolute (§2)
+  std::uint64_t new_topology_epoch_ = 0;  // absolute
   bool operator==(const RemoveNodeFromGroup&) const = default;
 };
 
@@ -241,7 +238,7 @@ struct SetSlotMap {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::vector<MetaSlotAssignment> ranges_;
-  std::uint64_t new_topology_epoch_ = 0;  // absolute (§2)
+  std::uint64_t new_topology_epoch_ = 0;  // absolute
   std::vector<MetaGroupConfigEpoch> config_epochs_;
   bool operator==(const SetSlotMap&) const = default;
 };
@@ -263,9 +260,9 @@ struct SetGroupReplicationState {
 };
 
 // ---------------------------------------------------------------------------
-// GroupRecord (§2): per-group committed record. replication_history_id is
-// deliberately absent: it is a data-plane boot-scoped identity (#14) and does
-// not enter the committed record. The versioned record codec is defined here
+// GroupRecord: per-group committed record. replication_history_id is
+// deliberately absent because it is scoped to a data-plane boot and does not
+// enter the committed group record. The versioned record codec is defined here
 // (u16 schema_version envelope, same convention as commands).
 // ---------------------------------------------------------------------------
 
@@ -283,8 +280,8 @@ absl::StatusOr<std::string> EncodeMetaGroupRecord(
 absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 
 // ---------------------------------------------------------------------------
-// term/grant (§2: term 只升一次,激活不再动 term). BeginGroupTerm(T) raises
-// group_term and enters the no-grant/fenced state; GrantAuthority renews the
+// term/grant: BeginGroupTerm(T) raises group_term exactly once and enters the
+// no-grant/fenced state; GrantAuthority renews the
 // same owner's lease without moving owner/term; ActivateAuthority is the
 // failover/migration atomic commit point — it validates expected_term and
 // atomically sets owner + grant + authority_version + epochs, and
@@ -292,7 +289,8 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes);
 // ---------------------------------------------------------------------------
 
 // Lease parameters plus the committed policy-version reference every grant
-// must carry (§2: grant 引用的 policy 版本必须已 committed).
+// must carry. Apply rejects references to policy versions that are not
+// committed.
 struct MetaGrantSpec {
   std::uint64_t lease_duration_ms_ = 0;
   std::string policy_id_;
@@ -350,7 +348,7 @@ struct FenceGroup {
 };
 
 // ---------------------------------------------------------------------------
-// policy (§2 PolicyStore): versioned documents, content-hash addressed.
+// policy: versioned documents addressed by content hash.
 // RetirePolicy must be rejected by apply while a version is still referenced
 // by an active grant or a non-terminal operation — the schema carries just
 // the (policy_id, version) pair.
@@ -375,16 +373,16 @@ struct RetirePolicy {
 };
 
 // ---------------------------------------------------------------------------
-// operation journal (§2 通用生命周期): Submitted -> Running -> Completed |
+// operation journal: Submitted -> Running -> Completed |
 // Aborted. kind-specific phase-graph legality is checked by coordinator-
 // registered ValidateProposal plugins (leader-local), never by apply; the
 // schema therefore treats kind and phase blobs as opaque bounded values.
 // ---------------------------------------------------------------------------
 
 // Immutable evidence summary baked into a command by the leader after
-// ValidateProposal (§2 Leader-local 校验与 apply 校验的拆分). The journal and
+// ValidateProposal. The journal and
 // audit trail persist these summaries, never observation references.
-// boot_incarnation_ is opaque and never ordered by magnitude (§4).
+// boot_incarnation_ is opaque and never ordered by magnitude.
 struct MetaEvidenceSummary {
   std::string node_id_;
   MetaBootIncarnation boot_incarnation_{};
@@ -448,9 +446,9 @@ struct AbortOperation {
   bool operator==(const AbortOperation&) const = default;
 };
 
-// Non-contiguous archival of terminal operations (§2 归档去卡死).
+// Non-contiguous archival of terminal operations.
 // operation_seq values are raft log indexes of the corresponding
-// SubmitOperation commands (§2 seq 颁发), used here purely as references.
+// SubmitOperation commands, used here purely as references.
 struct ArchiveOperations {
   MetaRequestId request_id_{};
   ActorContext actor_;
@@ -459,11 +457,11 @@ struct ArchiveOperations {
 };
 
 // ---------------------------------------------------------------------------
-// upgrade (§2/§3 升级契约). SetSchemaVersion switches the committed
+// upgrade. SetSchemaVersion switches the committed
 // active_write_schema. Its encoding is part of the PERMANENTLY FROZEN v1
 // layout subset: it is always written with schema_version =
 // kMetaSchemaVersionV1 so every binary within the readable window can decode
-// it (§2 "自身以最旧可读格式编码"). Fields may never be reordered, removed,
+// it. Fields may never be reordered, removed,
 // or re-typed; extensions go through new command tags. The frozen layout —
 // tag + request_id + actor_principal + readable_time +
 // new_active_write_schema + attestation — carries the actor like every other

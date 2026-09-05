@@ -24,7 +24,7 @@ absl::Status CheckNodeId(const std::string& node_id) {
   return absl::OkStatus();
 }
 
-// The epoch rule (§2): absolute values, strictly monotonic and gap-free —
+// The epoch rule: absolute values, strictly monotonic and gap-free —
 // the command must carry exactly current+1. Saturating at u64 max is a
 // rejection, never a wrap.
 absl::Status CheckNextTopologyEpoch(std::uint64_t current,
@@ -43,7 +43,7 @@ absl::Status MetaTopologyStore::Apply(const CreateGroup& cmd) {
   if (const auto it = groups_.find(cmd.group_id_); it != groups_.end()) {
     // Replay: the group exists exactly as created (never mutated) and the
     // topology epoch already carries this command's value -> idempotent
-    // accept (§2). Anything else under this group_id is a conflict.
+    // accept. Anything else under this group_id is a conflict.
     const GroupState& group = it->second;
     const bool pristine = group.revision_ == 1 && group.members_.empty() &&
                           group.config_epoch_ == 0 &&
@@ -79,7 +79,7 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
   GroupState& group = it->second;
   const auto member = group.members_.find(cmd.node_id_);
   // Replay: the member already sits in this group with the same role and the
-  // record at the revision this command produces -> idempotent accept (§2).
+  // record at the revision this command produces -> idempotent accept.
   if (member != group.members_.end() && member->second == cmd.role_ &&
       group.revision_ == cmd.expected_revision_ + 1 &&
       topology_epoch_ == cmd.new_topology_epoch_) {
@@ -89,7 +89,7 @@ absl::Status MetaTopologyStore::Apply(const AssignNodeToGroup& cmd) {
     return MetaDomainRejectError(
         absl::StrCat("expected_revision CAS conflict on ", cmd.group_id_));
   }
-  // One-node-one-group (§2). Cross-store facts (registration, old
+  // One-node-one-group. Cross-store facts (registration, old
   // authority/obligations) are exposed to the apply dispatcher, not checked
   // here.
   if (const auto prior = group_of_node_.find(cmd.node_id_);
@@ -126,7 +126,7 @@ absl::Status MetaTopologyStore::Apply(const RemoveNodeFromGroup& cmd) {
   GroupState& group = it->second;
   const auto member = group.members_.find(cmd.node_id_);
   // Replay: the member is already gone and the record sits at the revision
-  // this command produces -> idempotent accept (§2).
+  // this command produces -> idempotent accept.
   if (member == group.members_.end() &&
       group.revision_ == cmd.expected_revision_ + 1 &&
       topology_epoch_ == cmd.new_topology_epoch_) {
@@ -185,7 +185,7 @@ absl::Status MetaTopologyStore::Apply(const SetSlotMap& cmd) {
     if (auto st = CheckGroupId(entry.group_id_); !st.ok()) return st;
   }
 
-  // Replay (§2 幂等接受): slot map, topology epoch, and every listed config
+  // Replay: slot map, topology epoch, and every listed config
   // epoch already carry this command's effect -> no-op accept.
   if (topology_epoch_ == cmd.new_topology_epoch_) {
     std::array<std::string, kMetaSlotCount> target;
@@ -359,7 +359,7 @@ absl::Status MetaTopologyStore::SetGroupConfigEpoch(
 
 absl::Status MetaTopologyStore::SetTopologyEpoch(
     std::uint64_t new_topology_epoch) {
-  // Same value already held: idempotent no-op accept (§2).
+  // Same value already held: idempotent no-op accept.
   if (new_topology_epoch == topology_epoch_) return absl::OkStatus();
   if (auto st = CheckNextTopologyEpoch(topology_epoch_, new_topology_epoch);
       !st.ok()) {
@@ -506,7 +506,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
     if (!members.ok()) return members.status();
 
     // Invariant enforcement (fail-stop): a corrupt snapshot fails
-    // identically on every node (§2 失败分类).
+    // identically on every node.
     if (group_id->empty()) {
       return MetaFailStopError("empty group_id in snapshot");
     }

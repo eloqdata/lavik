@@ -1,4 +1,4 @@
-// Entry point of the Raft-backed meta control plane (issue #19).
+// Entry point of the Raft-backed meta control plane.
 // keylane_meta is the only keylane artifact that links NuRaft: cluster
 // membership and other control-plane metadata live on the meta plane, while
 // the data-plane binary (keylane) and its tests stay Raft-free by
@@ -635,11 +635,10 @@ int main(int argc, char** argv) {
   nuraft::ptr<NuraftStateMgr> state_mgr(std::move(*mgr_or));
   auto machine_or = MetaStateMachine::Open(options.data_dir_);
   if (!machine_or.ok()) {
-    // The formal state machine's durable layout is intentionally incompatible
-    // with the prototype (WAL v1 raft_log.dat is rejected by NuraftLogStore,
-    // "LSN1" snapshots fail the "MSN1" framing check): it held
-    // no production data, so the remedy is to wipe the directory, and boot
-    // refuses it loudly instead of migrating.
+    // The current durable layout is intentionally incompatible with the
+    // legacy single-file WAL and "LSN1" snapshots. Those formats held no
+    // production data, so boot refuses them loudly and the remedy is to wipe
+    // the directory rather than attempt migration.
     spdlog::critical("state machine open failed: {}",
                      machine_or.status().message());
     return 1;

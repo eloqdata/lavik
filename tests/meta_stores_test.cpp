@@ -1,7 +1,6 @@
-// Store-level tests for the issue #19 committed stores:
+// Store-level tests for the committed stores:
 // meta_identity_store (identity/enrollment), meta_topology_store (topology),
-// meta_policy_store (policy). See
-// docs/plans/issue-19-metadata-raft-implementation.md §2.
+// meta_policy_store (policy).
 //
 // The tests exercise only the public surface: state queryable after applying
 // commands, domain rejection behavior, replay idempotency (same content
@@ -107,7 +106,7 @@ TEST(MetaIdentityStore, RegisterNodeReplayIsIdempotentAccept) {
   const RegisterNode cmd = MakeRegister(0x11);
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Same content re-applied (replay of the same log index): accepted as a
-  // no-op, state and revision unchanged (plan §2 replay 幂等定义).
+  // no-op, with state and revision unchanged.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.NodeCount(), 1u);
   EXPECT_EQ(store.FindNode(cmd.node_id_)->revision_, 1u);
@@ -140,7 +139,7 @@ TEST(MetaIdentityStore, RegisterNodePrincipalGloballyOneToOne) {
   const RegisterNode first = MakeRegister(0x13);
   ASSERT_TRUE(store.Apply(first).ok());
 
-  // Binding the same principal to a second node_id is rejected (§6).
+  // Binding the same principal to a second node_id is rejected.
   RegisterNode second = MakeRegister(0x14);
   second.principal_ = first.principal_;
   ExpectDomainReject(store.Apply(second));
@@ -207,7 +206,7 @@ TEST(MetaIdentityStore, RegisterNodeEnforcesNodeCap) {
 
 // ---------------------------------------------------------------------------
 // UpdateNode: expected_revision CAS; cannot modify the principal binding
-// (the schema carries no principal field — rotation unimplemented, §6);
+// (the schema carries no principal field because rotation is unimplemented);
 // replay is an idempotent accept; retired nodes reject updates.
 // ---------------------------------------------------------------------------
 
@@ -235,7 +234,7 @@ TEST(MetaIdentityStore, UpdateNodeAppliesWithCas) {
   EXPECT_EQ(record->revision_, 2u);
   EXPECT_EQ(record->endpoints_, cmd.endpoints_);
   EXPECT_EQ(record->capability_mask_, cmd.capability_mask_);
-  // Principal binding untouched (UpdateNode has no principal field, §6).
+  // Principal binding untouched because UpdateNode has no principal field.
   EXPECT_EQ(record->principal_, MakePrincipal(0x30));
   EXPECT_FALSE(record->retired_);
 }
@@ -260,7 +259,7 @@ TEST(MetaIdentityStore, UpdateNodeReplayIsIdempotentAccept) {
   const UpdateNode cmd = MakeUpdate(0x33, /*expected_revision=*/1);
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay of the same log index: the record already sits at the revision
-  // this command produces with identical content -> idempotent accept (§2).
+  // this command produces with identical content -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.FindNode(cmd.node_id_)->revision_, 2u);
 
@@ -307,7 +306,7 @@ TEST(MetaIdentityStore, RetireNodeRetiresAndKeepsPrincipalBinding) {
   EXPECT_FALSE(store.IsActiveNode(MakeNodeId(0x40)));
   EXPECT_EQ(store.NodeCount(), 1u);  // tombstone retained
 
-  // The tombstone still holds the principal: rebinding is rejected (§6).
+  // The tombstone still holds the principal: rebinding is rejected.
   EXPECT_EQ(store.FindNodeByPrincipal(MakePrincipal(0x40))->node_id_,
             MakeNodeId(0x40));
   RegisterNode rebind = MakeRegister(0x41);
@@ -342,7 +341,7 @@ TEST(MetaIdentityStore, RetiredNodeCannotReregister) {
 
 // ---------------------------------------------------------------------------
 // Serialization: u16 schema_version envelope + sorted records; deterministic
-// bytes; strict fail-stop decode (§2 失败分类).
+// bytes; strict fail-stop decode.
 // ---------------------------------------------------------------------------
 
 void ExpectStoreFailStop(const absl::Status& status) {
@@ -496,7 +495,7 @@ TEST(MetaIdentityStore, DeserializeRejectsInvariantViolations) {
 }
 
 // ===========================================================================
-// Topology store (plan §2 "topology").
+// Topology store.
 // ===========================================================================
 
 using keylane::meta::CreateGroup;
@@ -535,7 +534,7 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
   EXPECT_EQ(view->revision_, 1u);
   EXPECT_EQ(view->config_epoch_, 0u);
   EXPECT_TRUE(view->members_.empty());
-  // Freshly created GroupRecord: no owner, all counters zero (§2).
+  // Freshly created GroupRecord: no owner, all counters zero.
   EXPECT_EQ(view->record_.owner_, "");
   EXPECT_EQ(view->record_.group_term_, 0u);
   EXPECT_EQ(view->record_.authority_version_, 0u);
@@ -548,7 +547,7 @@ TEST(MetaTopologyStore, CreateGroupCreatesQueryableGroup) {
 
 TEST(MetaTopologyStore, CreateGroupRequiresExactNextEpoch) {
   MetaTopologyStore store;
-  // Initial epoch is 0: only exactly 1 is accepted (严格单调、恰好 +1, §2).
+  // Initial epoch is 0: only exactly current+1 is accepted.
   ExpectDomainReject(store.Apply(MakeCreateGroup("group-a", 0)));
   ExpectDomainReject(store.Apply(MakeCreateGroup("group-a", 2)));
   EXPECT_EQ(store.TopologyEpoch(), 0u);
@@ -560,7 +559,7 @@ TEST(MetaTopologyStore, CreateGroupReplayIsIdempotentAccept) {
   const CreateGroup cmd = MakeCreateGroup("group-a", 1);
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay of the same log index: the pristine group exists and the epoch
-  // already carries this command's value -> idempotent accept (§2).
+  // already carries this command's value -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.GroupCount(), 1u);
   EXPECT_EQ(store.TopologyEpoch(), 1u);
@@ -598,7 +597,7 @@ TEST(MetaTopologyStore, CreateGroupEnforcesGroupCap) {
 
 // ---------------------------------------------------------------------------
 // AssignNodeToGroup / RemoveNodeFromGroup: one-node-one-group enforcement,
-// group-record revision CAS, replay idempotency (§2).
+// group-record revision CAS, replay idempotency.
 // ---------------------------------------------------------------------------
 
 using keylane::meta::AssignNodeToGroup;
@@ -673,7 +672,7 @@ TEST(MetaTopologyStore, AssignNodeToGroupReplayIsIdempotentAccept) {
       MakeAssign("group-a", 0x10, MetaNodeRole::kReplica, /*expected=*/1);
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay: member already present with the same role and the group record
-  // at the revision this command produces -> idempotent accept (§2).
+  // at the revision this command produces -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.FindGroup("group-a")->revision_, 2u);
   EXPECT_EQ(store.FindGroup("group-a")->members_.size(), 1u);
@@ -693,7 +692,7 @@ TEST(MetaTopologyStore, AssignNodeToOtherGroupRejectedOneNodeOneGroup) {
                   .Apply(MakeAssign("group-a", 0x10, MetaNodeRole::kPrimary,
                                     /*expected=*/1, /*topology_epoch=*/3))
                   .ok());
-  // One-node-one-group (§2): assigning the same node elsewhere is rejected;
+  // One-node-one-group: assigning the same node elsewhere is rejected;
   // the old membership fact stays queryable for the apply dispatcher.
   ExpectDomainReject(store.Apply(
       MakeAssign("group-b", 0x10, MetaNodeRole::kReplica, /*expected=*/1)));
@@ -760,7 +759,7 @@ TEST(MetaTopologyStore, RemoveNodeFromGroupReplayIsIdempotentAccept) {
   const RemoveNodeFromGroup cmd = MakeRemove("group-a", 0x10, /*expected=*/2);
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay: the member is already gone and the record sits at the revision
-  // this command produces -> idempotent accept (§2).
+  // this command produces -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.FindGroup("group-a")->revision_, 3u);
 }
@@ -785,7 +784,7 @@ TEST(MetaTopologyStore, RemoveNodeFromGroupRejects) {
 
 // ---------------------------------------------------------------------------
 // SetSlotMap: absolute slot map replacement, exact-next topology_epoch,
-// overlap/bounds/unknown-group rejection, replay idempotency (§2).
+// overlap/bounds/unknown-group rejection, replay idempotency.
 // ---------------------------------------------------------------------------
 
 using keylane::meta::SetSlotMap;
@@ -883,7 +882,8 @@ TEST(MetaTopologyStore, SetSlotMapIsAbsolute) {
   MetaTopologyStore store;
   MakeTwoGroups(store);
   ASSERT_TRUE(store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3)).ok());
-  // A new map replaces the whole old one (absolute values, §2).
+  // A new map replaces the whole old one because commands carry absolute
+  // values.
   ASSERT_TRUE(store.Apply(MakeSlotMap({{500, 600, "group-b"}}, 4)).ok());
   EXPECT_FALSE(store.SlotOwner(0).has_value());
   EXPECT_EQ(store.SlotOwner(550), std::optional<std::string>("group-b"));
@@ -905,11 +905,11 @@ TEST(MetaTopologyStore, SetSlotMapReplayIdempotentAndConflictRejected) {
       MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 11}});
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay: slot map, epoch, and config epochs already carry this command's
-  // effect -> idempotent accept (§2 幂等接受).
+  // effect -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.TopologyEpoch(), 3u);
 
-  // Same epoch, different content -> conflict rejection (§2 冲突拒绝).
+  // Same epoch, different content -> conflict rejection.
   ExpectDomainReject(store.Apply(MakeSlotMap({{0, 99, "group-a"}}, 3)));
   ExpectDomainReject(
       store.Apply(MakeSlotMap({{0, 100, "group-a"}}, 3, {{"group-a", 12}})));
@@ -962,7 +962,7 @@ TEST(MetaTopologyStore, GranularPrimitivesSetRecordFields) {
 
 TEST(MetaTopologyStore, SetTopologyEpochRules) {
   MetaTopologyStore store;
-  // Exactly current+1 (absolute, §2); the current value is an idempotent
+  // Exactly current+1 is accepted; the current value is an idempotent
   // no-op; anything else is rejected.
   ExpectDomainReject(store.SetTopologyEpoch(2));  // gap from 0
   ASSERT_TRUE(store.SetTopologyEpoch(0).ok());    // 0 already held: no-op
@@ -1219,7 +1219,7 @@ TEST(MetaTopologyStore, DeserializeRejectsInvariantViolations) {
 }
 
 // ===========================================================================
-// Policy store (plan §2 "policy (PolicyStore)").
+// Policy store.
 // ===========================================================================
 
 using keylane::meta::MetaHash256;
@@ -1327,7 +1327,7 @@ TEST(MetaPolicyStore, PutPolicyReplayIsIdempotentAccept) {
   const PutPolicy cmd = MakePut("migration-policy", 1, "content-v1");
   ASSERT_TRUE(store.Apply(cmd).ok());
   // Replay of the same log index: same version slot, same content, still
-  // active -> idempotent accept (§2).
+  // active -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_EQ(store.PolicyCount(), 1u);
   EXPECT_EQ(store.TotalContentBytes(), cmd.content_.size());
@@ -1357,7 +1357,7 @@ TEST(MetaPolicyStore, PutPolicyRequiresMonotonicVersion) {
 }
 
 // ---------------------------------------------------------------------------
-// Caps (§2 硬上限): kMaxMetaPolicyVersionsPerPolicy per policy,
+// Caps: kMaxMetaPolicyVersionsPerPolicy per policy,
 // kMaxMetaPolicyTotalBytes across all policies. Over-cap = rejection, never
 // silent truncation.
 // ---------------------------------------------------------------------------
@@ -1399,7 +1399,7 @@ TEST(MetaPolicyStore, PutPolicyEnforcesTotalBytesCap) {
 
 // ---------------------------------------------------------------------------
 // RetirePolicy: terminal tombstone, content retained, replay idempotent.
-// The §2 guard against retiring a version still referenced by an active
+// The guard against retiring a version still referenced by an active
 // grant or non-terminal operation is cross-store (grant/operation stores)
 // and enforced by the apply dispatcher; the store exposes the facts.
 // ---------------------------------------------------------------------------
@@ -1436,7 +1436,7 @@ TEST(MetaPolicyStore, RetirePolicyReplayIsIdempotentAccept) {
   ASSERT_TRUE(store.Apply(MakePut("p", 1, "content-v1")).ok());
   const RetirePolicy cmd = MakeRetirePolicy("p", 1);
   ASSERT_TRUE(store.Apply(cmd).ok());
-  // Replay: the version is already retired -> idempotent accept (§2).
+  // Replay: the version is already retired -> idempotent accept.
   ASSERT_TRUE(store.Apply(cmd).ok());
   EXPECT_FALSE(store.IsVersionActive("p", 1));
 }

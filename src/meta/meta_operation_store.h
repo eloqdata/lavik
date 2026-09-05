@@ -1,9 +1,7 @@
 #pragma once
 
-// MetaOperationStore: the committed operation journal of the issue #19
-// metadata control plane (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §2 "Operation 标识与归档"
-// and the generic lifecycle machine).
+// MetaOperationStore is the metadata control plane's committed operation
+// journal and generic lifecycle state machine.
 //
 // Identity and idempotency:
 //   - operation_id is the CLIENT-PROVIDED stable UUID and the operation's
@@ -12,28 +10,29 @@
 //     returns the existing record (or archived summary) unchanged; same id +
 //     different intent_hash is payload reuse and rejects.
 //   - operation_seq is the raft log index of the SubmitOperation command,
-//     handed in by the apply caller (plan §2 seq 颁发: no counters, naturally
-//     unique/monotonic/consistent across nodes). It is a pure reference for
-//     ordering and archival. A seq collision between two different ids means
-//     the caller lost the index correspondence — an apply-layer bug, so the
+//     handed in by the apply caller. This requires no separate counter and is
+//     naturally unique, monotonic, and consistent across nodes. It is a pure
+//     reference for ordering and archival. A seq collision between two
+//     different ids means the caller lost the index correspondence — an
+//     apply-layer bug, so the
 //     store FAILS STOP (spdlog::critical + abort, the system_exit policy).
 //
 // Generic lifecycle machine (kind-specific phase-graph legality belongs to
-// coordinator ValidateProposal plugins, never to apply — plan §2):
+// coordinator ValidateProposal plugins, never to apply):
 //   Submitted -> Running -> Completed | Aborted (terminal states are
 //   irreversible; Completed/Aborted are also reachable directly from
 //   Submitted). kind and intent_hash are immutable after submit (the
 //   transition commands do not even carry them). Mutation commands carry
 //   expected_revision as the CAS token; on accept the revision becomes
 //   expected_revision + 1 — the command schema has no new_revision field, so
-//   the CAS pins the post-value deterministically (plan §2 绝对值规则).
+//   the CAS pins the post-value deterministically.
 //
-// Replay idempotency (plan §2): re-applying a command at the same log index
+// Replay idempotency: re-applying a command at the same log index
 // reproduces the same verdict and state. Each mutation first checks whether
 // its post-effect is already present with identical content and accepts as a
 // no-op; only genuinely conflicting content rejects (kDomainReject).
 //
-// Non-contiguous archival (plan §2 归档去卡死): ArchiveOperations moves a SET
+// Non-contiguous archival: ArchiveOperations moves a SET
 // of terminal operations to archive summaries, so a long-Running operation
 // never blocks archival. The command is atomic: every seq must resolve to a
 // live terminal record or an already-archived summary (idempotent no-op), or
@@ -43,12 +42,12 @@
 // as "already done" during the retention window. Non-terminal operations are
 // never archivable. References to unknown ids/seqs reject.
 //
-// Bounded state (plan §2 硬上限): live non-terminal operations are capped by
+// Bounded state: live non-terminal operations are capped by
 // max_active (SubmitOperation creating beyond it rejects; terminal records
 // stay live-but-inactive until archived), the whole live set — including
 // terminal records awaiting archival — is capped by max_active + max_archived
 // (SubmitOperation rejects at the joint bound; ArchiveOperations is the
-// escape valve, keeping every collection bounded per §2), archive summaries
+// escape valve, keeping every collection bounded), archive summaries
 // by max_archived (ArchiveOperations rejects at the cap; the operator exports
 // via ctl — ExportArchive drains the summaries as versioned bytes), and a
 // record's accumulated evidence summaries by
@@ -99,7 +98,8 @@ struct MetaOperationRecord {
   std::uint64_t replication_history_id_ = 0;
   std::vector<MetaPolicyReference> policy_references_;
   MetaOperationLifecycle lifecycle_ = MetaOperationLifecycle::kSubmitted;
-  std::string kind_phase_blob_;  // opaque; kind-specific schema lives in #21+
+  // Opaque to committed apply; operation-specific coordinators own the schema.
+  std::string kind_phase_blob_;
   std::uint64_t revision_ = 0;   // CAS token; bumps on every accepted mutation
   std::vector<MetaEvidenceSummary> evidence_;  // persisted summaries, in order
   std::string terminal_result_;  // Completed: result; Aborted: reason
@@ -108,7 +108,7 @@ struct MetaOperationRecord {
   bool operator==(const MetaOperationRecord&) const = default;
 };
 
-// Tombstone of an archived terminal operation (plan §2 摘要保留字段). Kept
+// Tombstone of an archived terminal operation. Kept
 // for the retention window so late duplicate submissions resolve
 // deterministically.
 struct MetaOperationArchiveSummary {
@@ -151,7 +151,7 @@ class MetaOperationStore {
   absl::Status PruneArchive(const PruneOperationArchive& command);
 
   // Fact queries. Archived ids/seqs resolve to their terminal summary —
-  // "already done" — while unknown ones return nullopt (plan §2 引用规则).
+  // "already done" — while unknown ones return nullopt.
   std::optional<MetaOperationRecord> FindOperation(
       const MetaOperationId& id) const;
   std::optional<MetaOperationRecord> FindOperationBySeq(
@@ -175,8 +175,8 @@ class MetaOperationStore {
   std::size_t LiveCount() const { return live_.size(); }
   std::size_t ArchivedCount() const { return archived_.size(); }
 
-  // Versioned byte drain of all archive summaries for ctl export (plan §2:
-  // at the cap the operator must export before ArchiveOperations accepts).
+  // Versioned byte drain of all archive summaries for ctl export. At the cap,
+  // the operator must export before ArchiveOperations accepts.
   absl::StatusOr<std::string> ExportArchive() const;
 
   // Snapshot serialization: versioned strict encoding; decode enforces caps

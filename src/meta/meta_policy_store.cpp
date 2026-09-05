@@ -29,7 +29,7 @@ absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
   if (cmd.content_.empty() || cmd.content_.size() > kMaxMetaPayloadBytes) {
     return MetaDomainRejectError("content empty or over cap");
   }
-  // Content-hash addressing (§2): the declared hash must match the content.
+  // Content-hash addressing: the declared hash must match the content.
   if (ContentHash(cmd.content_) != cmd.content_hash_) {
     return MetaDomainRejectError(
         absl::StrCat("content_hash mismatch for ", cmd.policy_id_));
@@ -38,8 +38,8 @@ absl::Status MetaPolicyStore::Apply(const PutPolicy& cmd) {
   if (policy_it != policies_.end()) {
     const auto& versions = policy_it->second;
     if (const auto it = versions.find(cmd.version_); it != versions.end()) {
-      // Replay: same slot, same content, still active -> idempotent accept
-      // (§2). Retired or different content is a conflict.
+      // Replay: same slot, same content, still active -> idempotent accept.
+      // Retired or different content is a conflict.
       if (!it->second.retired_ && it->second.content_ == cmd.content_) {
         return absl::OkStatus();
       }
@@ -78,11 +78,11 @@ absl::Status MetaPolicyStore::Apply(const RetirePolicy& cmd) {
     return MetaDomainRejectError(
         absl::StrCat("unknown version ", cmd.version_, " of ", cmd.policy_id_));
   }
-  // Replay: already retired -> idempotent accept (§2). Retirement keeps the
+  // Replay: already retired -> idempotent accept. Retirement keeps the
   // content (tombstone) and never reverses.
   //
-  // The §2 guard against retiring a version still referenced by an active
-  // grant or non-terminal operation is cross-store: MetaStateApply performs
+  // The guard against retiring a version still referenced by an active grant
+  // or non-terminal operation is cross-store: MetaStateApply performs
   // it using IsVersionPresent/IsVersionActive plus the grant/operation stores.
   it->second.retired_ = true;
   return absl::OkStatus();
@@ -190,7 +190,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
         return MetaFailStopError("empty content in snapshot");
       }
       // Content-hash addressing holds in the snapshot too: a corrupt
-      // snapshot fails identically on every node (§2 失败分类).
+      // snapshot fails identically on every node.
       if (ContentHash(*content) != *hash) {
         return MetaFailStopError("content_hash mismatch in snapshot");
       }

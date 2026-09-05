@@ -1,6 +1,6 @@
 #pragma once
 
-// Certificate-principal and authorization policy for the issue-#19 Meta
+// Certificate-principal and authorization policy for the metadata
 // control plane. TLS verifies the certificate chain and validity period;
 // this module supplies the second half of authentication: selecting one
 // canonical Keylane URI SAN, binding Raft peers to their configured member
@@ -78,7 +78,7 @@ absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,
 
 // Two-role control-plane authorization. Operators may perform privileged
 // mutations and diagnostics. Data nodes may only establish/report their own
-// observation session. The typed directive response half belongs to #20.
+// observation session. Typed directive responses are outside this boundary.
 enum class MetaAccess : std::uint8_t {
   kStatus,
   kPrivileged,

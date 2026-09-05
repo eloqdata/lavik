@@ -1,9 +1,8 @@
 #pragma once
 
-// MetaCoordinator: the in-process coordinator seam of the issue #19 metadata
-// control plane (plan docs/plans/issue-19-metadata-raft-implementation.md §5),
-// the ONLY interface #20-#23 (control sessions, failover/migration/placement
-// coordinators) program against. It hides NuRaft entirely: consumers see
+// MetaCoordinator is the in-process API for control sessions and
+// failover/migration/placement reconcilers. It hides NuRaft entirely:
+// consumers see
 // commands, committed views, commit subscriptions, and reconciler lifecycle —
 // never a raft type.
 //
@@ -35,7 +34,7 @@
 //     schema gate, actor injection, encoding — runs SYNCHRONOUSLY on the
 //     caller's thread. Hooks that read the observation store therefore
 //     require the caller to run on the coordinator's owner thread (the celer
-//     worker in production. The observation store is internally serialized
+//     worker in production). The observation store is internally serialized
 //     because commit-driven revalidation runs on the dispatch thread.
 //   - The commit round trip suspends. Resumption goes through the injected
 //     options.resume_hook_ — production wires the MetaCelerBridge hop so the
@@ -67,20 +66,20 @@
 //     subscription core mutex (the atomic triple uses a two-phase retry read,
 //     see SubscribeCommitted), so the order is never inverted.
 //
-// TRUST BOUNDARY (plan §2 审计模型)
+// TRUST BOUNDARY
 //
 // Every privileged command carries an ActorContext that only a TRUSTED ENTRY
 // may inject. Propose takes an AuthenticatedPrincipal, which can only be
 // CONSTRUCTED with a MetaPrincipalPasskey — a passkey whose own constructor
 // is private and friended to exactly the trusted entries: the ctl surface
 // (MetaCtlServer, authenticated by UDS peer credentials or mutual TLS), the
-// coordinator
-// itself (it mints the internal actor LeaderContext proposes with), and the
+// coordinator itself (it mints the internal actor LeaderContext proposes
+// with), and the
 // test peer. Copying an existing principal inside trusted code is allowed;
 // untrusted code can never mint one. The coordinator stamps readable_time
 // from the system clock at propose time — reading the clock HERE is legal
-// because this is the proposal entry point, not apply (plan §2: apply never
-// reads a clock; it copies the injected text into the audit record).
+// because this is the proposal entry point. Apply never reads a clock; it
+// copies the injected text into the audit record.
 
 #include <atomic>
 #include <chrono>
@@ -152,7 +151,7 @@ class AuthenticatedPrincipal {
 };
 
 // ---------------------------------------------------------------------------
-// MetaCommittedView: one atomic read of the committed aggregate (plan §5).
+// MetaCommittedView: one atomic read of the committed aggregate.
 // A single snapshot object pairing a deep copy of MetaStores with the applied
 // index they reflect — consumers never observe a cross-store tear. Produced
 // only by the coordinator (the constructor is just a value bundle; the
@@ -204,7 +203,7 @@ class MetaStoresFacts : public MetaCommittedFacts {
 };
 
 // ---------------------------------------------------------------------------
-// Committed-stream subscription (plan §5 SubscribeCommitted).
+// Committed-stream subscription.
 // ---------------------------------------------------------------------------
 
 // One delivered commit: the applied log index and its apply verdict (replay
@@ -234,7 +233,7 @@ class MetaCommitSubscription {
   // Overflow cancellation: once the bounded per-subscriber queue overflows,
   // the subscription is cancelled, no callback fires again, and
   // needs_resync() reports that the consumer must re-SubscribeCommitted from
-  // a fresh view (plan §5: 溢出即取消并强制从最新视图重同步). cancelled() is
+  // a fresh view. cancelled() is
   // also true after the owning coordinator is destroyed.
   bool cancelled() const;
   bool needs_resync() const;
@@ -247,13 +246,13 @@ class MetaCommitSubscription {
   std::uint64_t id_;
 };
 
-// The atomic triple (plan §5): the complete committed view, the cursor it was
+// The atomic triple: the complete committed view, the cursor it was
 // captured against, and the live subscription — captured as one consistent
 // unit, so "everything committed" = view + events with log_index > cursor.
 //
 // Delivery contract:
 //   - Events arrive in strict commit order, one per committed command.
-//   - REPLAY may deliver the same index twice (plan §3: apply is repeatable);
+//   - REPLAY may deliver the same index twice because apply is repeatable;
 //     the subscriber dedups by index. The documented subscriber discipline:
 //     start with watermark = view.applied_index(), skip events with
 //     log_index <= watermark, otherwise process and advance the watermark.
@@ -276,8 +275,9 @@ struct MetaSubscriptionStart {
 };
 
 // ---------------------------------------------------------------------------
-// ValidateProposal plugins (plan §2 Leader-local 校验与 apply 校验的拆分).
-// Hooks are the landing point for kind-specific phase rules (#21-#23) and any
+// ValidateProposal plugins separate leader-local validation from committed
+// apply validation.
+// Hooks are the landing point for operation-specific phase rules and any
 // check that needs volatile context (observation freshness): they run ONLY on
 // the leader, synchronously inside Propose BEFORE encoding/append, in
 // registration order, and the first non-OK status aborts the proposal with
@@ -292,7 +292,7 @@ using MetaValidateHook = std::function<absl::Status(
     const MetaCommand&, const MetaCommittedView&, const MetaObservationStore&)>;
 
 // ---------------------------------------------------------------------------
-// RunAsLeader: reconciler lifecycle (plan §5).
+// RunAsLeader: reconciler lifecycle.
 // ---------------------------------------------------------------------------
 
 class MetaReconciler;
@@ -318,7 +318,7 @@ class MetaLeaderContext {
   AuthenticatedPrincipal actor_;
 };
 
-// A #21-#23-style control loop. Start() is called on the coordinator's
+// A leader-scoped control loop. Start() is called on the coordinator's
 // leadership thread after BecomeLeader (which NuRaft's
 // wait_for_sm_catchup_on_becoming_leader_ gates until the SM has caught up:
 // the reconciler's first CommittedView already reflects the re-confirmed
@@ -328,7 +328,7 @@ class MetaLeaderContext {
 // has fully stopped touching the context. Calls are strictly serialized per
 // reconciler: Start, then CancelAndWait, then possibly Start again.
 //
-// Idempotency contract (plan §5): reconcilers advance ONLY through Propose;
+// Idempotency contract: reconcilers advance ONLY through Propose;
 // operation idempotency keys, expected_revision CAS, and the apply layer's
 // replay idempotency make retries and restarts safe. After any leadership
 // change the reconciler rebuilds from CommittedView() and must tolerate
@@ -349,7 +349,7 @@ class MetaReconciler {
 using MetaProposeResumeHook = std::function<void(std::coroutine_handle<>)>;
 
 struct MetaCoordinatorOptions {
-  // Fail-safe gates (plan §2/§3; constructor-injected so tests exercise them
+  // Fail-safe gates are constructor-injected so tests exercise them
   // with tiny thresholds):
   //   Propose returns kResourceExhausted while the WAL holds more than this
   //   many uncompacted bytes (i.e. a snapshot/compaction is outstanding).
@@ -387,7 +387,7 @@ class MetaCoordinator {
   MetaCoordinator(const MetaCoordinator&) = delete;
   MetaCoordinator& operator=(const MetaCoordinator&) = delete;
 
-  // The one write path (plan §5). Returns the committed apply outcome —
+  // The one write path. Returns the committed apply outcome —
   // verdict read back from the audit record at the command's log index — or a
   // status:
   //   - kFailedPrecondition: not the leader (the message carries the known
@@ -397,7 +397,7 @@ class MetaCoordinator {
   //     WAL over the cap, consecutive snapshot failures at the limit).
   //   - kDeadlineExceeded / kCancelled / kInternal: the raft round timed out,
   //     was cancelled (shutdown/leadership loss), or failed. These are
-  //     UNCERTAIN OUTCOMES (plan §3): the command may still have committed.
+  //     UNCERTAIN OUTCOMES: the command may still have committed.
   //     The message says so; the caller reconciles against CommittedView()
   //     using the command's idempotency key instead of assuming failure —
   //     safe because every command is replay/idempotency-safe by design.

@@ -483,7 +483,7 @@ TEST(ClusterE2eTest, DiscoveryResp2AndResp3) {
   EXPECT_EQ(client.Command({"CLUSTER", "MYID"}),
             "$40\r\n" + std::string(kNodeA));
 
-  // INFO: exact field set pinned by the plan; full coverage => ok.
+  // INFO returns this exact field set when every slot has coverage.
   const std::string expected_info = absl::StrCat(
       "cluster_state:ok\r\ncluster_slots_assigned:16384\r\n"
       "cluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\n"

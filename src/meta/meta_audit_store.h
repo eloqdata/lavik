@@ -1,8 +1,7 @@
 #pragma once
 
-// MetaAuditStore: the bounded, hash-chained audit window of the issue #19
-// metadata control plane (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §0/§2 "审计模型").
+// MetaAuditStore is the metadata control plane's bounded, hash-chained audit
+// window.
 //
 // One record per privileged command application, keyed by the command's raft
 // log index; window order is log-index order. Each record carries the actor
@@ -17,11 +16,10 @@
 // Pruning a prefix does not break verification of what remains: the store
 // keeps the hash of the last pruned record as the new anchor, and exported
 // bytes carry the anchor they chain from, so an external archive can verify
-// continuity across exports (external dedup key per plan §2:
-// (cluster_id, raft_log_index, record_hash)).
+// continuity across exports. External archives deduplicate by
+// (cluster_id, raft_log_index, record_hash).
 //
-// Replay idempotency (plan §2 "同一 log index 的重放产生相同状态、相同判定、
-// 相同 audit record"): Append of an index already in the window with identical
+// Replay idempotency: appending an index already in the window with identical
 // content is a no-op. Append of an existing index with DIFFERENT content, an
 // out-of-order new index, or an index at/below the pruned floor means the
 // apply layer lost the log index <-> record correspondence; that is an
@@ -30,8 +28,8 @@
 // trail. The same deterministic input byte stream aborts every node at the
 // same index, so this cannot fork the group.
 //
-// Capacity fail-safe (plan §2/appendix D: never silently drop unexported
-// records): the window holds at most capacity() records (default
+// Capacity is fail-safe: never silently drop unexported records. The window
+// holds at most capacity() records (default
 // kMaxMetaAuditWindowRecords). NeedsExport() reports a full window; the
 // coordinator gates privileged proposals on it (RESOURCE_EXHAUSTED until the
 // operator exports). Append beyond capacity FAILS STOP: a committed command's
@@ -70,7 +68,7 @@ inline constexpr std::uint32_t kMaxMetaAuditSummaryBytes = 2048;
 inline constexpr std::uint32_t kMaxMetaAuditDetailBytes = 2048;
 inline constexpr std::uint32_t kMaxMetaAuditReadableTimeBytes = 128;
 
-// The apply verdict persisted with each record (plan §2 判定结果).
+// The apply verdict persisted with each record.
 enum class MetaAuditVerdict : std::uint8_t {
   kAccepted = 1,  // command applied, including an idempotent no-op accept
   kRejected = 2,  // domain rejection: index consumed, state unchanged
@@ -112,8 +110,8 @@ class MetaAuditStore {
   std::size_t size() const { return window_.size(); }
   std::uint32_t capacity() const { return window_capacity_; }
 
-  // Full-window state the coordinator's Propose layer gates on (plan §2:
-  // privileged Propose returns RESOURCE_EXHAUSTED until the operator exports).
+  // Full-window state gated by the coordinator's Propose layer: privileged
+  // proposals return RESOURCE_EXHAUSTED until the operator exports records.
   bool NeedsExport() const { return window_.size() >= window_capacity_; }
 
   // Hash of the newest record, or the prune anchor when the window is empty
@@ -130,7 +128,7 @@ class MetaAuditStore {
   std::uint64_t pruned_floor() const { return pruned_floor_; }
 
   // Versioned byte drain of every window record with log_index <= through,
-  // for ctl-side external archival (plan §2: 导出外部归档). A pure read; the
+  // for ctl-side external archival. A pure read; the
   // blob carries the anchor it chains from plus per-record chain hashes.
   absl::StatusOr<std::string> ExportThrough(std::uint64_t through) const;
 

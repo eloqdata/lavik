@@ -202,7 +202,8 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 
 // ---------------------------------------------------------------------------
 // topology membership. AssignNodeToGroup carries the one-node-one-group
-// cross-store half (plan §2, file header item 4); RemoveNodeFromGroup keeps
+// cross-store half described in file-header invariant 4;
+// RemoveNodeFromGroup keeps
 // "grant owner => member" by refusing to strand an active grant.
 // ---------------------------------------------------------------------------
 
@@ -289,7 +290,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// term/grant (plan §2: term 只升一次,激活不再动 term). BeginGroupTerm writes
+// term/grant. BeginGroupTerm writes
 // both halves (grant store term state machine + the committed GroupRecord in
 // the topology store); ActivateAuthority is the atomic failover/migration
 // commit point (file header item 3).
@@ -346,7 +347,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       " config_epoch=", cmd.new_config_epoch_,
       " policy=", cmd.grant_.policy_id_, "@", cmd.grant_.policy_version_);
   // Phase 1: pure validation across all four stores; nothing is written until
-  // every check has passed (§2: the atomic commit point).
+  // every check has passed; this is the atomic commit point.
   const absl::Status valid = stores.grant_.ValidateActivate(cmd);
   if (!valid.ok()) return Rejected(valid, std::move(summary));
   const auto view = stores.topology_.FindGroup(cmd.group_id_);
@@ -591,7 +592,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }
 
 // ---------------------------------------------------------------------------
-// upgrade (§3 升级契约). SetSchemaVersion rewrites the committed
+// upgrade. SetSchemaVersion rewrites the committed
 // active_write_schema as an absolute value. The coordinator and transport
 // enforce member attestation and reject too-old binaries; apply's rule is only
 // that this binary must be able to write the new schema.
@@ -684,7 +685,7 @@ absl::StatusOr<std::string> MetaStores::Serialize() const {
   w.WriteU16(active_write_schema_);
   std::string out = w.TakeBuffer();
   if (out.size() > kMaxMetaSnapshotBytes) {
-    // §2/§3 fail-safe: the snapshot byte cap fails the snapshot; it is never
+    // Fail-safe: the snapshot byte cap fails the snapshot; it is never
     // silently truncated.
     return MetaDomainRejectError("meta snapshot exceeds the total byte cap");
   }
@@ -742,7 +743,7 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   if (!audit_store.ok()) return audit_store.status();
   stores.audit_ = std::move(*audit_store);
   if (*schema == 0 || *schema > kMetaCurrentSchemaVersion) {
-    // §3 升级契约: a binary must loudly fail on a committed write schema it
+    // A binary must loudly fail on a committed write schema it
     // cannot produce (old binary reading new encoding).
     return MetaFailStopError("snapshot carries an unwritable active schema");
   }
@@ -793,8 +794,8 @@ MetaApplyResult ApplyCommitted(MetaStores& stores, std::uint64_t log_index,
   result.verdict_ = outcome.verdict_;
   result.detail_ = outcome.detail_;
 
-  // Every privileged command appends its audit record, accepted or rejected
-  // (§2 审计模型). Replay reproduces the identical record, so Append is an
+  // Every privileged command appends its audit record, accepted or rejected.
+  // Replay reproduces the identical record, so Append is an
   // idempotent no-op and the window does not grow.
   MetaAuditRecord record;
   record.log_index_ = log_index;

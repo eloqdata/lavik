@@ -1,13 +1,11 @@
 #pragma once
 
-// MetaStateMachine: the formal NuRaft `state_machine` of the issue #19
-// metadata control plane (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §3; replaces the spike
-// state machine). It owns the committed aggregate `MetaStores` (six stores +
+// MetaStateMachine is the metadata control plane's NuRaft `state_machine`.
+// It owns the committed aggregate `MetaStores` (six stores +
 // committed active_write_schema) and applies every committed entry through
 // the deterministic pure function ApplyCommitted (see meta_state_apply.h).
 //
-// commit() and the failure classification (plan §2 "失败分两类"):
+// commit() and failure classification:
 //   - commit() decodes the entry with the committed command codec. A DECODE FAILURE
 //     IS FAIL-STOP (spdlog::critical + abort, the system_exit policy): the
 //     same byte sequence fails identically on every node, so aborting cannot
@@ -21,11 +19,11 @@
 //     `actor_` field — the wire encoding carries both as ordinary bounded
 //     strings (meta_commands.h), so every node applies with the same actor.
 //     Unforgeability is an entry-layer property (only the trusted
-//     ctl/coordinator entries construct commands; plan §2), not this
+//     ctl/coordinator entries construct commands), not this
 //     codec's.
 //
-// Recovery and the durability of last_commit_index (plan §3 恢复与
-// commit-watermark 契约, verified against pinned NuRaft 0b01b18):
+// Recovery and durability of last_commit_index, verified against the pinned
+// NuRaft revision:
 //   The stores are volatile and rebuilt by replay; durability comes from
 //   snapshots. The commit index is persisted ONLY as part of a snapshot (it
 //   equals the snapshot's last_log_idx). After a restart the core initializes
@@ -37,14 +35,14 @@
 //   state before quorum re-confirmation.
 //   Consequently commit() MAY BE INVOKED REPEATEDLY for the same index: a
 //   committed entry already applied before a crash is re-applied after it.
-//   Correctness rests on the plan §2 replay idempotency (absolute-value
+//   Correctness rests on replay idempotency (absolute-value
 //   commands + "effect already present with identical content -> idempotent
 //   accept" + audit records keyed by log index), never on at-most-once
 //   delivery. Persisting last_commit_index per commit would be wrong: NuRaft
 //   never re-applies entries at or below last_commit_index(), so a watermark
 //   newer than the durable stores would silently drop acknowledged writes.
 //
-// Snapshot contract (plan §3 快照切点):
+// Snapshot contract:
 //   - EXACT CUT POINT: create_snapshot() serializes MetaStores under the
 //     state mutex synchronously (KB-scale), so the captured bytes hold the
 //     state of exactly the snapshot's last_log_idx. Automatic snapshots run
@@ -62,17 +60,17 @@
 //     when_done(true) (on_snapshot_completed), so a durable snapshot always
 //     precedes log truncation. A write failure rejects the snapshot via
 //     when_done(false), which only skips this compaction round; consecutive
-//     failures are counted (consecutive_snapshot_failures()) for the §3
-//     replay-observability alerting.
+//     failures are counted by consecutive_snapshot_failures() for replay
+//     observability and alerting.
 //   - SIZE FAIL-SAFE: MetaStores::Serialize fails beyond
-//     kMaxMetaSnapshotBytes (§2/§3); create_snapshot rejects the round and
+//     kMaxMetaSnapshotBytes; create_snapshot rejects the round and
 //     alerts instead of silently truncating.
 //   - TRANSMISSION: NuRaft's logical-object API; object N is the Nth
 //     kSnapshotObjectBytes chunk of the snapshot's serialized MetaStores
 //     envelope (bounded objects, O(1) per read). An open read stream pins its
 //     snapshot against pruning until free_user_snp_ctx — pruning mid-stream
 //     would make the core restart the follower's sync from object zero with
-//     the newest snapshot on every round (spike gate_transport livelock).
+//     the newest snapshot on every catch-up round.
 //   - RECEIVE SIDE: save_logical_snp_obj accumulates the envelope and writes
 //     the snapshot file before apply_snapshot() loads it — a received
 //     snapshot is durable before it is applied; apply_snapshot() returning
@@ -82,8 +80,8 @@
 //     offset on every append tick until a response advances it, client
 //     timeouts recreate the request on a fresh connection, and stale
 //     responses can regress the ctx offset), so the same object may arrive
-//     any number of times — the spike's map accumulation absorbed duplicates
-//     by construction, a byte stream cannot. The receiver appends only the
+//     any number of times. Offset-addressed assembly absorbs duplicates, but
+//     a plain byte stream cannot. The receiver appends only the
 //     object whose id equals the assembly cursor receiving_next_obj_
 //     (is_first_obj restarts assembly, covering the leader's sync-ctx
 //     timeout/restart), acknowledges every object with the cursor value
@@ -103,11 +101,11 @@
 // Threading and IO model: NuRaft calls commit/create_snapshot/read...obj on
 // its commit and snapshot threads; all state is mutex-guarded. Only the
 // writer thread performs create-side durability IO; receive-side writes stay
-// inline on the core's snapshot-sync thread (the spike's model). Lock order
+// inline on the core's snapshot-sync thread. Lock order
 // is mutex_ -> io_mutex_; the writer thread never holds both in the reverse
 // order.
 //
-// active_write_schema (§3 升级契约): ApplyCommitted rewrites
+// active_write_schema: ApplyCommitted rewrites
 // stores_.active_write_schema_ via the SetSchemaVersion command path;
 // active_write_schema() exposes it for the coordinator's Propose encoder.
 
@@ -130,7 +128,7 @@
 
 namespace keylane::meta {
 
-// Commit-event sink for MetaCoordinator (plan §5 SubscribeCommitted).
+// Commit-event sink for MetaCoordinator.
 // Invoked from commit() with the applied log index and its apply result. The
 // contract is strict because of WHERE it is invoked: synchronously on the
 // commit thread, AFTER ApplyCommitted, while the state mutex is still held.
@@ -145,8 +143,8 @@ using MetaCommitEventSink =
 
 class MetaStateMachine : public nuraft::state_machine {
  public:
-  // Byte granularity of the logical snapshot objects streamed to followers;
-  // bounded per plan §3 ("对象有界").
+  // Byte granularity of the bounded logical snapshot objects streamed to
+  // followers.
   static constexpr uint64_t kSnapshotObjectBytes = 64u << 10;  // 64 KiB
 
   // Opens `data_dir` (creating it if needed) and loads the latest snapshot,
@@ -166,7 +164,7 @@ class MetaStateMachine : public nuraft::state_machine {
   // building block; KB-scale). All six stores plus active_write_schema_ move
   // together — readers never observe a cross-store tear.
   MetaStores StoresSnapshot() const;
-  // The committed write format gate (§3): defaults to v1, rewritten by
+  // The committed write format gate: defaults to v1, rewritten by
   // SetSchemaVersion through the normal command path.
   std::uint16_t active_write_schema() const;
 

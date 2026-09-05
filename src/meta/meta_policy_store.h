@@ -1,13 +1,12 @@
 #pragma once
 
-// MetaPolicyStore: the committed policy store of the issue #19 metadata
-// control plane (plan docs/plans/issue-19-metadata-raft-implementation.md §2
-// "policy (PolicyStore)"). It holds versioned policy documents addressed by
+// MetaPolicyStore is the metadata control plane's committed policy store. It
+// holds versioned policy documents addressed by
 // content hash: policy_id -> version -> {content, content_hash, retired}.
 //
 // Invariants:
-//   - content_hash_ is verified at apply: it must equal SHA-256(content)
-//     (content-hash addressing, §2); a mismatch is a domain rejection. The
+//   - content_hash_ is verified at apply: it must equal SHA-256(content), or
+//     the command is rejected. The
 //     same check runs at snapshot load, fail-stop on mismatch.
 //   - Versions are strictly monotonic per policy_id: a PutPolicy must carry a
 //     version greater than every existing version of that policy (gaps are
@@ -17,7 +16,7 @@
 //   - Retired is terminal and content-retaining: RetirePolicy flips the
 //     flag; the version keeps its content (tombstone), still counts against
 //     every cap, and can never be re-put or reactivated.
-//   - State is size-bounded (§2 硬上限): at most
+//   - State is size-bounded: at most
 //     kMaxMetaPolicyVersionsPerPolicy versions per policy_id and
 //     kMaxMetaPolicyTotalBytes content bytes across all policies (active +
 //     retired). Content must be non-empty so the byte cap also bounds the
@@ -27,15 +26,15 @@
 // Cross-store scope: whether a version is still referenced by an active
 // grant or a non-terminal operation is NOT known here — those references
 // live in the grant and operation stores. This store exposes the facts the
-// apply dispatcher needs for the §2 RetirePolicy guard (IsVersionPresent /
+// apply dispatcher needs for the RetirePolicy guard (IsVersionPresent /
 // IsVersionActive / FindVersion); it performs the cross-store check.
 //
-// Replay idempotency (§2 "apply 的 replay 幂等定义"): re-applying a command
+// Replay idempotency: re-applying a command
 // whose exact post-effect is already present (PutPolicy: same version slot,
 // same content, active; RetirePolicy: version already retired) is an
 // idempotent accept (no-op); conflicting content is a domain rejection.
 //
-// Failure classes (§2): domain rejections return MetaDomainRejectError
+// Failure classes: domain rejections return MetaDomainRejectError
 // (kDomainReject); deserialization failures are fail-stop (kFailStop).
 //
 // Scope: pure in-memory function of command + committed state — no IO, no
@@ -71,17 +70,17 @@ class MetaPolicyStore {
  public:
   // SHA-256 of a policy document. Proposers use it to build PutPolicy
   // commands; the store uses the same function to verify content_hash_ at
-  // apply and snapshot load (§2 content-hash 寻址/hash 校验).
+  // apply and snapshot load.
   static MetaHash256 ContentHash(std::string_view content);
 
-  // Domain-validated apply of the policy commands (§2). Each returns
+  // Domain-validated apply of the policy commands. Each returns
   // absl::OkStatus() on apply or idempotent accept, and a kDomainReject
   // status otherwise; state is unchanged on rejection.
   absl::Status Apply(const PutPolicy& cmd);
   absl::Status Apply(const RetirePolicy& cmd);
 
-  // Fact queries for the apply dispatcher (the §2 RetirePolicy reference
-  // guard) and for reads. "Present" means the version slot exists, active or
+  // Fact queries for the apply dispatcher's RetirePolicy reference guard and
+  // for reads. "Present" means the version slot exists, active or
   // retired; "active" means present and not retired.
   bool IsVersionPresent(const std::string& policy_id,
                         std::uint64_t version) const;

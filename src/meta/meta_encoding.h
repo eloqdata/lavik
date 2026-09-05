@@ -1,8 +1,7 @@
 #pragma once
 
-// MetaEncoding: wire primitives for the issue #19 metadata control plane's
-// hand-rolled, versioned, little-endian binary encoding (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §2).
+// MetaEncoding provides primitives for the metadata control plane's
+// hand-written, versioned, little-endian binary encoding.
 //
 // Wire conventions:
 //   - Fixed-width integers (u8/u16/u32/u64) are little-endian.
@@ -16,10 +15,9 @@
 //   - Optionals carry a u8 presence tag (0 = absent, 1 = present); any other
 //     tag value is a decode failure.
 //   - Readers are strict: truncation, cap violations, unknown versions/tags,
-//     and trailing bytes all fail. There is no silent truncation anywhere
-//     (plan §2 "超限一律 fail-safe").
+//     and trailing bytes all fail safely. There is no silent truncation.
 //
-// Failure classification (plan §2 "失败分两类"):
+// Failure classification:
 //   - Decode failures (unknown schema version, corrupt or over-cap encoding)
 //     are FAIL-STOP: the same byte sequence must fail identically on every
 //     node, and the state machine treats one as system_exit territory. These
@@ -50,41 +48,42 @@
 namespace keylane::meta {
 
 // ---------------------------------------------------------------------------
-// Hard caps (plan §2 "硬上限": all state is size-bounded; exceeding a cap
-// fails safe, never silently truncates). Values are v1 policy choices; the
+// Hard caps keep all state bounded. Exceeding a cap fails safely and never
+// silently truncates. Values are v1 policy choices; the
 // encoded schema does not depend on them.
 // ---------------------------------------------------------------------------
 
 // Single committed command, total encoded bytes.
 inline constexpr std::uint32_t kMaxMetaCommandBytes = 1u << 20;  // 1 MiB
 // One bounded payload blob: policy content, intent, kind_phase_blob, terminal
-// result (§2 "单 payload(policy、evidence、intent)字节上限").
+// result.
 inline constexpr std::uint32_t kMaxMetaPayloadBytes = 256u * 1024u;  // 256 KiB
-// Registered data nodes (§2 节点数上限).
+// Registered data nodes.
 inline constexpr std::uint32_t kMaxMetaNodes = 4096;
-// Shard groups (§2 group 数上限).
+// Shard groups.
 inline constexpr std::uint32_t kMaxMetaGroups = 512;
-// Non-terminal operations (§2 max_active_operations).
+// Non-terminal operations.
 inline constexpr std::uint32_t kMaxMetaActiveOperations = 4096;
 // Terminal-operation archive summaries kept as the tombstone index; at the
-// cap ArchiveOperations is rejected until the operator exports (§2).
+// cap ArchiveOperations is rejected until the operator exports.
 inline constexpr std::uint32_t kMaxMetaArchivedOperationSummaries = 65536;
-// Retained versions per policy_id (§2 policy 版本数上限).
+// Retained versions per policy_id.
 inline constexpr std::uint32_t kMaxMetaPolicyVersionsPerPolicy = 32;
-// Total policy content bytes across all policies (§2 policy 总字节上限).
+// Total policy content bytes across all policies.
 inline constexpr std::uint32_t kMaxMetaPolicyTotalBytes = 16u << 20;  // 16 MiB
 // Audit window records; when full, privileged Propose fails with
-// RESOURCE_EXHAUSTED until the operator exports (§2, never silently dropped).
+// RESOURCE_EXHAUSTED until the operator exports; records are never silently
+// dropped.
 inline constexpr std::uint32_t kMaxMetaAuditWindowRecords = 65536;
-// Total snapshot bytes; create_snapshot fails and alerts beyond this (§2/§3).
+// Total snapshot bytes; create_snapshot fails and alerts beyond this.
 inline constexpr std::uint64_t kMaxMetaSnapshotBytes = 512ull << 20;  // 512 MiB
 // Uncompacted WAL bytes; Propose fails with RESOURCE_EXHAUSTED beyond this
-// while a snapshot is outstanding (§3 max_uncompacted_wal_bytes fail-safe).
+// while a snapshot is outstanding.
 inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
                                                              << 30;  // 1 GiB
 
 // ---------------------------------------------------------------------------
-// Schema versioning (§2/§3 升级契约).
+// Schema versioning.
 // ---------------------------------------------------------------------------
 
 inline constexpr std::uint16_t kMetaSchemaVersionV1 = 1;
@@ -95,10 +94,9 @@ inline constexpr std::uint16_t kMetaSchemaVersionV2 = 2;
 static_assert(KEYLANE_META_BINARY_SCHEMA_MAX == 1 ||
                   KEYLANE_META_BINARY_SCHEMA_MAX == 2,
               "test fixture binary schema must be v1 or v2");
-// Oldest format this binary can read. The state machine reads N and N-1
-// (§3). V2 deliberately keeps the v1 field layout: this first real upgrade
-// exercises negotiation and rolling-compatibility mechanics before a later
-// schema revision needs a structural migration.
+// Oldest format this binary can read. The state machine reads N and N-1.
+// V2 deliberately keeps the v1 field layout so negotiation and rolling
+// compatibility can be exercised independently of structural migration.
 inline constexpr std::uint16_t kMetaMinReadableSchemaVersion =
     kMetaSchemaVersionV1;
 // Format this binary writes, except where a command's layout belongs to the
@@ -107,7 +105,7 @@ inline constexpr std::uint16_t kMetaCurrentSchemaVersion =
     KEYLANE_META_BINARY_SCHEMA_MAX;
 
 // ---------------------------------------------------------------------------
-// Failure classification (plan §2). See the file header for the two classes.
+// Failure classification. See the file header for the two classes.
 // ---------------------------------------------------------------------------
 
 enum class MetaFailureClass {

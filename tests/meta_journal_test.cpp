@@ -1,8 +1,7 @@
-// Journal-side store tests for the issue #19 formal implementation: the audit
+// Journal-side tests for the audit
 // store (src/meta/meta_audit_store), the term/grant store
 // (src/meta/meta_grant_store), and the operation journal store
-// (src/meta/meta_operation_store). See
-// docs/plans/issue-19-metadata-raft-implementation.md §2.
+// (src/meta/meta_operation_store).
 //
 // The tests exercise only the public surface: state queryable after applying
 // commands, rejection behavior, idempotent replay acceptance vs conflict
@@ -159,8 +158,8 @@ TEST(MetaAuditStore, ExportDrainsRecordsWithTheirChainContext) {
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   ASSERT_EQ(decoded->records_.size(), 2);
   // The export chains from the genesis anchor and carries per-record hashes,
-  // so an external archive can verify continuity (plan §2 dedup key:
-  // (cluster_id, raft_log_index, record_hash)).
+  // so an external archive can verify continuity and deduplicate by
+  // (cluster_id, raft_log_index, record_hash).
   EXPECT_EQ(decoded->anchor_before_, MetaHash256{});
   EXPECT_EQ(decoded->records_[0], *store.Find(1));
   EXPECT_EQ(decoded->records_[1], *store.Find(2));
@@ -282,7 +281,7 @@ TEST(MetaAuditStore, DeserializeRejectsCorruptionAndChainBreaks) {
 }
 
 // ---------------------------------------------------------------------------
-// MetaGrantStore: per-group term, grant, fencing (plan §2 term/grant).
+// MetaGrantStore: per-group term, grant, and fencing.
 // ---------------------------------------------------------------------------
 
 using keylane::meta::ActivateAuthority;
@@ -311,7 +310,7 @@ BeginGroupTerm MakeBeginTerm(std::string group_id, std::uint64_t expected,
   return cmd;
 }
 
-// An activate carries no new term (plan §2: term 只升一次,激活不再动 term).
+// An activation carries no new term; only BeginGroupTerm advances it.
 ActivateAuthority MakeActivate(std::string group_id,
                                std::uint64_t expected_term,
                                std::string new_owner,
@@ -373,7 +372,7 @@ TEST(MetaGrantStore, BeginGroupTermPromotesOnceAndFences) {
   EXPECT_TRUE(state->fenced_);  // promotion enters the no-grant/fenced state
   EXPECT_FALSE(state->grant_.has_value());
   // Replay of the same command: the effect exists and the content is
-  // consistent — idempotent no-op accept (plan §2 replay rule).
+  // consistent — idempotent no-op accept.
   ASSERT_TRUE(store.BeginGroupTerm(MakeBeginTerm("g1", 0, 1)).ok());
   EXPECT_EQ(store.GroupState("g1")->group_term_, 1);
   // CAS conflict: expected term does not match the current term.
@@ -536,7 +535,7 @@ TEST(MetaGrantStore, FactQueriesTrackGrantState) {
   const ActivateAuthority activate = MakeActivate("g1", 1, "node-a", 1);
   ASSERT_TRUE(store.ValidateActivate(activate).ok());
   ASSERT_TRUE(store.ApplyGrantPart(activate).ok());
-  // PolicyInUse feeds the RetirePolicy guard (plan §2 引用检查).
+  // PolicyInUse feeds the RetirePolicy guard.
   EXPECT_TRUE(store.PolicyInUse("policy/leader-lease", 7));
   EXPECT_FALSE(store.PolicyInUse("policy/leader-lease", 8));
   EXPECT_FALSE(store.PolicyInUse("policy/other", 7));
@@ -630,7 +629,7 @@ TEST(MetaGrantStore, DeserializeRejectsCorruption) {
 
 // ---------------------------------------------------------------------------
 // MetaOperationStore: the client-id-keyed operation journal with terminal
-// tombstone archival (plan §2 Operation 标识与归档).
+// tombstone archival.
 // ---------------------------------------------------------------------------
 
 using keylane::meta::AbortOperation;
@@ -711,7 +710,7 @@ TEST(MetaOperationStore, DuplicateSubmitIsIdempotentOnlyForSameIntent) {
   ASSERT_TRUE(store.SubmitOperation(MakeSubmit(id, 42), 100).ok());
   // Same id + same intent_hash: idempotent accept returning the existing
   // record, even with a different log index (a retried client request that
-  // got logged twice converges — plan §2 永久幂等键).
+  // got logged twice converges.
   const auto dup = store.SubmitOperation(MakeSubmit(id, 42), 150);
   ASSERT_TRUE(dup.ok()) << dup.status();
   EXPECT_FALSE(dup->created_);
@@ -888,7 +887,7 @@ TEST(MetaOperationStore, ArchiveMovesTerminalOpsToTombstonesNonContiguously) {
                   .ok());
 
   // Non-contiguous archival: the Running operation at seq 101 is skipped, so
-  // a long-Running operation never blocks archival (plan §2 归档去卡死).
+  // a long-Running operation never blocks archival.
   ASSERT_TRUE(store.ArchiveOperations(MakeArchive({100, 102})).ok());
   EXPECT_EQ(store.LiveCount(), 1);
   EXPECT_EQ(store.ArchivedCount(), 2);
@@ -944,7 +943,7 @@ TEST(MetaOperationStore, LateDuplicateSubmitResolvesViaTombstone) {
   ASSERT_TRUE(store.ArchiveOperations(MakeArchive({100})).ok());
 
   // A retried client submission deterministically resolves as already done,
-  // even at a fresh log index (plan §2 永久幂等键 + 墓碑索引).
+  // even at a fresh log index because the idempotency tombstone is retained.
   const auto dup = store.SubmitOperation(MakeSubmit(id, 42), 200);
   ASSERT_TRUE(dup.ok()) << dup.status();
   EXPECT_FALSE(dup->created_);
@@ -1001,8 +1000,8 @@ TEST(MetaOperationStore, ArchiveSummaryCapEnforced) {
 
 TEST(MetaOperationStore, LiveRecordBoundFailsSafe) {
   // The live set (including terminal records awaiting archival) is bounded by
-  // max_active + max_archived, keeping all store state bounded (plan §2
-  // 硬上限); the escape valve is ArchiveOperations.
+  // max_active + max_archived, keeping all store state bounded; the escape
+  // valve is ArchiveOperations.
   MetaOperationStore store(/*max_active=*/2, /*max_archived=*/1);
   for (std::uint8_t i = 1; i <= 3; ++i) {
     ASSERT_TRUE(

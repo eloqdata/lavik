@@ -1,9 +1,7 @@
 #pragma once
 
-// MetaGrantStore: per-group committed term/grant/fence state of the issue #19
-// metadata control plane (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §2 "term/grant: term
-// 只升一次,激活不再动 term").
+// MetaGrantStore owns the metadata control plane's committed per-group
+// term, grant, and fence state.
 //
 // Per group the store keeps: the current group_term, the current grant
 // (owner, term, authority_version, lease parameters, policy reference), and
@@ -17,7 +15,7 @@
 // survives revocation (last_authority_version_ is kept when the grant is
 // dropped), so a stale activation can never re-install an older authority.
 //
-// Command semantics (all absolute values, CAS via expected_* fields; plan §2):
+// Command semantics (all absolute values, with CAS via expected_* fields):
 //   - BeginGroupTerm(expected=T-1, new=T): T must be exactly expected+1 and
 //     expected must equal the current term; promotes and fences.
 //   - GrantAuthority: same-owner lease renewal. CAS on term and
@@ -33,7 +31,7 @@
 //     FAILS STOP on a term mismatch (contract violation = apply-layer bug).
 //   - RevokeGrant/FenceGroup: CAS on the current term; drop the grant, fence.
 //
-// Replay idempotency (plan §2): re-applying a command at the same log index
+// Replay idempotency: re-applying a command at the same log index
 // must reproduce the same verdict and state. Each command first checks
 // whether its post-effect is already present with identical content and then
 // accepts as a no-op; only genuinely conflicting content is rejected (a

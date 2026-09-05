@@ -220,12 +220,12 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
       data.size());
   absl::StatusOr<MetaCommand> decoded = DecodeMetaCommand(bytes);
   if (!decoded.ok()) {
-    // Plan §2 failure classification: a decode failure is fail-stop, strictly
+    // A decode failure is fail-stop, strictly
     // separated from a domain rejection (cleanly decoded, refused by
     // ApplyCommitted, index consumed). The same byte sequence fails
     // identically on every node, so aborting here cannot fork the group —
     // this is also how an old binary loudly refuses a newer encoding after an
-    // upgrade (§3 升级契约).
+    // upgrade.
     spdlog::critical(
         "meta state machine: undecodable committed command at {}: {}", log_idx,
         decoded.status().message());
@@ -260,8 +260,8 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
 
 void MetaStateMachine::commit_config(
     nuraft::ulong log_idx, nuraft::ptr<nuraft::cluster_config>& /*new_conf*/) {
-  // Membership bindings ride ordinary committed commands (plan §6 two-phase
-  // membership); the conf entry itself touches no store.
+  // Membership bindings use ordinary committed commands in a two-phase
+  // transition; the configuration entry itself touches no store.
   last_committed_idx_ = log_idx;
 }
 
@@ -282,7 +282,7 @@ void MetaStateMachine::create_snapshot(
   job.idx_ = idx;
   job.when_done_ = when_done;
   {
-    // EXACT CUT POINT (plan §3): serialize the stores under the state mutex,
+    // EXACT CUT POINT: serialize the stores under the state mutex,
     // synchronously. Automatic snapshots arrive on the commit thread at a
     // commit boundary; the manual path (ctl `snapshot` in meta_main) must use
     // create_snapshot({serialize_commit_=true}) or
@@ -290,7 +290,7 @@ void MetaStateMachine::create_snapshot(
     std::lock_guard<std::mutex> lock(mutex_);
     absl::StatusOr<std::string> envelope = stores_.Serialize();
     if (!envelope.ok()) {
-      // §2/§3 size fail-safe: reject this snapshot round (log compaction is
+      // Size fail-safe: reject this snapshot round (log compaction is
       // skipped with it) and alert; never silently truncate.
       ++consecutive_snapshot_failures_;
       spdlog::error(
@@ -447,7 +447,7 @@ void MetaStateMachine::save_logical_snp_obj(nuraft::snapshot& s,
 
     if (is_last_obj && consumed) {
       // The stream completed in sequence — the assembly is the whole
-      // envelope. Receive-side durability precedes apply (plan §3): the file
+      // envelope. Receive-side durability precedes apply: the file
       // must exist before apply_snapshot() loads it. An out-of-sequence
       // is_last (a duplicate, or a superseded stream's tail) writes nothing;
       // apply_snapshot() then still finds the completed stream's file.

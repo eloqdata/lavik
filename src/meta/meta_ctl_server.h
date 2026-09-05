@@ -11,8 +11,8 @@
 //
 // Protocol: one command per line (LF-terminated, CR tolerated), exactly one
 // reply line per command, processed strictly in order per connection.
-// Committed writes ride the real issue-#19 command schema
-// (meta_commands.h); the prototype KV verbs are not part of this surface:
+// Committed writes use the metadata command schema
+// (meta_commands.h); generic KV verbs are not part of this surface:
 //   submitop <id32hex> <kind> <payload>
 //                          -> propose SubmitOperation (intent = payload,
 //                             intent_hash = SHA-256(payload)): "OK <log_idx>"
@@ -30,7 +30,7 @@
 //                             Completed/Aborted) short-circuit without
 //                             proposing. Submitting and immediately
 //                             completing keeps the non-terminal operation set
-//                             tiny (max_active_operations, plan §2 硬上限).
+//                             tiny and below max_active_operations.
 //   getop <id32hex>        -> "OK submitted" / "OK running" /
 //                             "OK completed <result>" / "OK aborted <reason>"
 //                             / "ERR not-found". Reads the state machine's
@@ -68,21 +68,19 @@
 //                                durably store the export first.
 //   snapshot               -> "OK <idx>" / "ERR snapshot-failed"; wraps
 //                             raft_server::create_snapshot with
-//                             serialize_commit_=true (plan
-//                             docs/plans/issue-19-metadata-raft-implementation.md
-//                             §3 快照切点: the manual capture is serialized
-//                             against the commit thread — NuRaft semantics
-//                             per raft_server.hxx create_snapshot_options).
+//                             serialize_commit_=true: the manual capture is
+//                             serialized against the commit thread, as defined
+//                             by raft_server.hxx create_snapshot_options.
 //                             The durable write then runs asynchronously on
 //                             the state machine's writer thread, so OK means
 //                             the exact-cut capture at <idx> was taken; an
 //                             in-flight earlier round fails fast with 0 and
 //                             a later asynchronous write failure only skips
-//                             this compaction round (§3 replay 可观测性).
+//                             this compaction round.
 //
-// Observation surface (plan §4; the MetaObservationStore is volatile and
+// Observation surface: MetaObservationStore is volatile and
 // leader-local, so this whole verb family manipulates process-local state —
-// nothing here is replicated):
+// nothing here is replicated:
 //   creategroup <group_id> / begingroupterm <group_id> <expected> <new> /
 //   transitionop <id32hex> <phase> <history>
 //                          -> committed-state drivers so the gates can build
@@ -93,8 +91,8 @@
 //                             replication_history_id is what later anchors
 //                             `obs evidence` (HistoryBoundToOperation).
 //   adoptsession <node_id> <boot_hex32> <gen>
-//                          -> MetaObservationStore::AdoptSession (the trusted
-//                             session layer's stand-in until #20); "OK" /
+//                          -> MetaObservationStore::AdoptSession with trusted
+//                             authenticated-session identity; "OK" /
 //                             "ERR <detail>".
 //   obs boot <node_id> <boot_hex32> <gen>
 //   obs health <node_id> <boot_hex32> <gen> <health>
@@ -122,7 +120,7 @@
 // Payloads and principals are whitespace-free single tokens; anything else
 // is a protocol error and closes the connection after an "ERR bad-request".
 //
-// ACTOR INJECTION (plan §2 审计模型): the ctl surface is a trusted entry, so
+// ACTOR INJECTION: the ctl surface is a trusted entry, so
 // IT injects the authenticated principal of every command it proposes. UDS
 // sessions derive `keylane://operator/uid-N` from SO_PEERCRED and an explicit
 // uid allowlist; remote sessions derive one canonical URI SAN from mutual TLS.

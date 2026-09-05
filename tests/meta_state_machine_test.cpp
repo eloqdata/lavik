@@ -1,9 +1,7 @@
-// Tests for the issue-#19 formal MetaStateMachine (src/meta/
-// meta_state_machine.{h,cpp}) and its integration with the WAL v2
+// Tests for MetaStateMachine and its integration with the WAL v2
 // NuraftLogStore through a real raft_server.
 //
-// Vertical slices (plan docs/plans/issue-19-metadata-raft-implementation.md
-// §3, §7.5):
+// Vertical slices:
 //   1. Component contract: real commands committed directly into the state
 //      machine; kill/reopen recovery (close + reopen stands in for process
 //      restart; fdatasync-before-return is what makes it crash-safe);
@@ -14,8 +12,7 @@
 //      real adapters (NuraftStateMgr + WAL v2 NuraftLogStore +
 //      MetaStateMachine) proves the persistence ordering the Raft core
 //      relies on and replay-based recovery after restart. These two tests
-//      are the spike's raft_server integration tests migrated to the formal
-//      state machine with real commands.
+//      use the production state machine with real commands.
 //
 // ACTOR ON THE WIRE: the command codec encodes the trusted-entry-injected
 // ActorContext (actor_principal, readable_time) as ordinary bounded fields of
@@ -173,8 +170,7 @@ class MetaStateMachineTest : public ::testing::Test {
   }
 
   // Drives create_snapshot and waits for the async writer thread to invoke
-  // when_done (the formal state machine's file IO is deliberately off the
-  // calling thread; plan §3 快照切点).
+  // when_done; snapshot file IO deliberately runs off the calling thread.
   void CreateSnapshot(MetaStateMachine& machine, uint64_t log_idx,
                       uint64_t log_term) {
     nuraft::ptr<nuraft::cluster_config> config =
@@ -250,7 +246,7 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
     EXPECT_TRUE(stores.identity_.IsActiveNode(MakeNodeId(0x11)));
 
     // Every privileged command writes exactly one audit record keyed by its
-    // raft log index (plan §2 审计模型), carrying the trusted entry's actor
+    // raft log index, carrying the trusted entry's actor
     // fields verbatim off the wire (see the file header).
     const auto audit = stores.audit_.Find(1);
     ASSERT_TRUE(audit.has_value());
@@ -270,7 +266,7 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
     EXPECT_EQ(stores.audit_.size(), 2u);
   }
   EXPECT_EQ(machine->last_commit_index(), 2u);
-  // §3 升级契约: the committed write schema defaults to v1.
+  // The committed write schema defaults to v1.
   EXPECT_EQ(machine->active_write_schema(), kMetaSchemaVersionV1);
 }
 
@@ -280,8 +276,8 @@ TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
   std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
 
   Commit(*machine, 1, MakeRegister(0x11));
-  // A cleanly decoded command violating a domain rule (principal already
-  // bound to another node, §6 全局一对一) is REJECTED: index consumed, audit
+  // A cleanly decoded command violating a domain rule (the principal is
+  // already bound to another node) is REJECTED: index consumed, audit
   // written, state unchanged — the commit thread keeps going (no fail-stop).
   RegisterNode conflict = MakeRegister(0x22);
   conflict.principal_ = MakePrincipal(0x11);
@@ -298,7 +294,7 @@ TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
 }
 
 TEST_F(MetaStateMachineTest, UndecodableCommitFailsStop) {
-  // The other half of the §2 failure classification: bytes that fail the
+  // The other half of failure classification: bytes that fail the
   // command codec are fail-stop (system_exit policy: spdlog::critical + abort).
   // The same bytes fail identically on every node, so this cannot fork the
   // group.
@@ -329,7 +325,7 @@ TEST_F(MetaStateMachineTest, RestartWithoutSnapshotReplaysFromScratch) {
 
   // No snapshot was taken: the durable commit point is still zero and the
   // stores start empty. The Raft core replays the WAL forward from
-  // last_commit_index() (plan §3: 重启 watermark=快照 idx), which is what
+  // last_commit_index(), whose durable watermark is the snapshot index. This
   // rebuilds the state — simulated here by re-committing the same entries.
   auto reopened = Open();
   ASSERT_TRUE(reopened.ok()) << reopened.status();
@@ -379,7 +375,7 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
 }
 
 TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {
-  // Plan §3 快照切点: the captured state is exactly the snapshot's
+  // The captured state is exactly the snapshot's
   // last_log_idx state — commit N+1.. after create_snapshot() must not leak
   // into the snapshot file. Asserted on MetaStores CONTENT, not the index.
   auto opened = Open();
@@ -411,10 +407,10 @@ TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {
 }
 
 TEST_F(MetaStateMachineTest, ReplayAfterSnapshotDoesNotGrowAudit) {
-  // Plan §3: the commit watermark only advances with snapshots, so entries
+  // The commit watermark only advances with snapshots, so entries
   // applied after the last snapshot are REPLAYED after a crash. Replay of
   // the same log index must produce the identical audit record — the window
-  // keyed by log index does not grow (§2 replay 幂等定义).
+  // keyed by log index does not grow during replay.
   nuraft::ptr<nuraft::buffer> c4 = EncodeOrDie(MakeRegister(0x44));
   nuraft::ptr<nuraft::buffer> c5 = EncodeOrDie(MakeRegister(0x55));
   ASSERT_NE(c4, nullptr);
@@ -529,8 +525,8 @@ TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
 }
 
 TEST_F(MetaStateMachineTest, MidStreamPruneKeepsPinnedSnapshotStreamable) {
-  // Port of the spike's snapshot-sync livelock regression (issue #19 spike
-  // gate_transport): pruning a snapshot whose read stream is still open
+  // Snapshot-sync livelock regression: pruning a snapshot whose read stream
+  // is still open
   // fails the stream's next read, NuRaft resets the sync context on a failed
   // read and restarts from object zero with the newest snapshot, so a
   // follower whose stream time exceeded the snapshot interval could never
@@ -597,7 +593,7 @@ TEST_F(MetaStateMachineTest, ActiveWriteSchemaFollowsSetSchemaVersion) {
   std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
   EXPECT_EQ(machine->active_write_schema(), kMetaSchemaVersionV1);
 
-  // SetSchemaVersion goes through the normal command path (§3 升级契约) and
+  // SetSchemaVersion goes through the normal command path and
   // rewrites the committed active_write_schema as an absolute value. It is a
   // privileged command: the frozen wire layout carries the actor, so the
   // audit record identifies the entry that proposed it.
@@ -637,7 +633,7 @@ TEST_F(MetaStateMachineTest, ActiveWriteSchemaFollowsSetSchemaVersion) {
 }
 
 TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
-  // Plan §2 seq 颁发: operation_seq is the SubmitOperation command's raft
+  // operation_seq is the SubmitOperation command's raft
   // log index — the state machine hands ApplyCommitted its commit index and
   // the journal keys on it directly (no counter).
   auto opened = Open();
@@ -659,13 +655,13 @@ TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
     EXPECT_EQ(operation->operation_seq_, 7u);
     EXPECT_EQ(operation->kind_, "migration");
     // The journal persists the submitter's injected ActorContext, decoded off
-    // the wire like any other field (§2).
+    // the wire like any other field.
     EXPECT_EQ(operation->actor_.principal_, kEntryPrincipal);
     EXPECT_EQ(operation->actor_.readable_time_, kEntryReadableTime);
   }
 
   // Replay of the same index: idempotent accept, no state growth, no audit
-  // growth (§2 replay 幂等定义).
+  // growth during replay.
   Commit(*machine, 7, submit);
   const MetaStores stores = machine->StoresSnapshot();
   EXPECT_EQ(stores.audit_.size(), 1u);
@@ -834,8 +830,8 @@ TEST_F(MetaServerIntegrationTest, CommitThenRestartReplaysLog) {
   EXPECT_EQ(NodeCount(), 0u);
 
   // The new leader's first current-term entry lets it commit everything
-  // before it; replay then re-applies the pre-restart entries (plan §3
-  // quorum 重确认).
+  // before it; replay then re-applies the pre-restart entries after quorum
+  // confirmation.
   LaunchServer(/*snapshot_distance=*/0);
   AppendAndWait(MakeRegister(0x33));
   ASSERT_TRUE(
@@ -855,10 +851,10 @@ TEST_F(MetaServerIntegrationTest, SnapshotCompactionAndRestart) {
   ASSERT_EQ(NodeCount(), 9u);
 
   // Manual snapshot on the latest committed index. serialize_commit_=true is
-  // MANDATORY for the manual path (plan §3: 手动快照必须 serialize_commit_
-  // =true 或 schedule_snapshot_creation()) — it excludes the commit thread
+  // MANDATORY for the manual path: serialize_commit_=true, or equivalently
+  // schedule_snapshot_creation(), excludes the commit thread
   // while the state machine captures, which is what makes the cut point
-  // exact. The formal state machine writes the file asynchronously off the
+  // exact. The state machine writes the file asynchronously off the
   // commit thread, so compaction completes when the writer's when_done
   // reaches the core; wait for it.
   nuraft::raft_server::create_snapshot_options options;

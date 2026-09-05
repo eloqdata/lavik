@@ -95,9 +95,9 @@ absl::Status ReadSchemaVersion(MetaReader& r) {
 }
 
 // Apply-layer correspondence bug: the log index <-> record mapping broke.
-// Failing stop (rather than dropping or overwriting) is the plan §2 audit
-// rule — never silently lose or rewrite an unexported record; the same input
-// stream aborts every node at the same index, so this cannot fork the group.
+// Fail stop rather than dropping or overwriting: never silently lose or
+// rewrite an unexported record. The same input stream aborts every node at the
+// same index, so this cannot fork the group.
 [[noreturn]] void FatalAuditCorruption(std::string_view what,
                                        std::uint64_t log_index) {
   spdlog::critical(

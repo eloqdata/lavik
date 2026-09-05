@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: leader-change safety for keylane_meta (issue #19).
+"""Integration gate: leader-change safety for keylane_meta.
 
 Single 3-node cluster with ALL raft traffic flowing through the proxy
 mesh (bootstrap_meshed_cluster), continuous propose load throughout:
@@ -229,13 +229,11 @@ def link_fault_round(nodes, mesh, history, leader, follower, mode, hold_s):
 
 def main():
     workdir, keep = H.make_workdir(sys.argv, "meta_integration_leader_")
-    # reserved_log_items=500: with the formal MetaStateMachine a snapshot
-    # carries the accumulated audit window, so an install_snapshot stream
-    # costs real time; a zero reserve would let the leader compact past a
-    # healing follower before the stream ends and force it to chase one
-    # stale snapshot after another (the gate_transport rationale). A
-    # 500-entry window keeps the post-heal/post-sync append path open while
-    # compaction still fires every 30 entries.
+    # A snapshot carries the accumulated audit window, so install_snapshot
+    # takes measurable time. Keeping 500 log entries prevents the leader from
+    # compacting past a healing follower before its stream ends and forcing it
+    # to chase successive snapshots, while compaction still fires every 30
+    # entries.
     args = H.raft_args(reserved_log_items=500)
     nodes = H.make_nodes(BINARY, workdir, 3, args=args)
     mesh = H.Mesh()

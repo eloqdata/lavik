@@ -14,8 +14,8 @@ namespace keylane::meta {
 
 namespace {
 
-// Observation payload strings are soft state but still bounded (plan §2:
-// 超限一律 fail-safe). The cap matches the committed-side payload cap; an
+// Observation payload strings are soft state but remain bounded. The cap
+// matches the committed-side payload cap; an
 // over-cap field rejects the ingest rather than being truncated.
 constexpr std::uint32_t kMaxObsFieldBytes = kMaxMetaPayloadBytes;
 // Audit details are single-token (no whitespace) so the ctl `obsaudit` line
@@ -79,8 +79,7 @@ struct MetaObservationStore::Impl {
   };
 
   // Latest-wins key for operation evidence: each (node, kind_phase) pair
-  // keeps only its newest report (plan §4 "per-(node,kind,generation) 最新
-  // 覆盖", where evidence "kind" is operation+phase).
+  // keeps only its newest report within the current session generation.
   struct EvidenceKey {
     std::string node_id_;
     std::string kind_phase_;
@@ -148,11 +147,10 @@ struct MetaObservationStore::Impl {
       if (!anchor.ok()) {
         return anchor;
       }
-      // replication_history_id_ is NOT checked here by design: the committed
-      // GroupRecord deliberately carries no history id (plan §2 — it is a
-      // data-plane boot-scoped identity), so a bare candidate has no
-      // committed anchor to match against; #21's comparison rules consume it
-      // as opaque payload.
+      // GroupRecord deliberately carries no history id because replication
+      // history is scoped to a data-plane boot. A bare candidate therefore
+      // has no committed history anchor; operation-specific comparison rules
+      // consume the value as opaque payload.
       if (const absl::Status size =
               CheckFieldSize(candidate->applied_flow_vector_, "flow");
           !size.ok()) {
@@ -345,7 +343,7 @@ absl::Status MetaObservationStore::Ingest(MetaObservation observation,
     }
     std::map<std::string, MetaObservation>& by_node = group_it->second;
     if (!by_node.contains(node_id)) {
-      // Hard caps fail safe (plan §2): a NEW node beyond the bounded
+      // Hard caps fail safe: a NEW node beyond the bounded
       // per-group candidate set or the total cap is rejected, never silently
       // squeezed in; refreshing an existing key never grows the state.
       if (by_node.size() >= limits_.max_candidates_per_group_) {
@@ -403,8 +401,8 @@ void MetaObservationStore::RevalidateAll(const MetaCommittedFacts& facts,
   Impl& impl = *impl_;
   // Committed state moved under stored observations (term promoted, manifest
   // swapped, operation terminated, node retired): anything that no longer
-  // passes the full admission check is actively purged, per plan §4's
-  // 失效三管. Read paths re-filter independently, so a purge miss here could
+  // passes the full admission check is actively purged. Read paths re-filter
+  // independently, so a purge miss here could
   // never leak stale data — this pass is what bounds memory instead.
   auto revalidate_map = [&](std::map<std::string, MetaObservation>& by_node) {
     for (auto it = by_node.begin(); it != by_node.end();) {

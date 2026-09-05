@@ -42,9 +42,8 @@
 // NuRaft's raft-to-peer path always passes send_timeout_ms = 0
 // (peer::send_req), so this adapter enforces its own timeouts: the connect
 // deadline is connect_timeout_, passed straight to celer::ConnectTcp, which
-// enforces it natively (the Wave-1 ConnectOperation timeout-SQE
-// use-after-free that once forced an adapter-side deadline coroutine is fixed
-// in celer and regression-covered by celer_connect_timer_check), and a
+// enforces it natively. The timeout-SQE lifetime is regression-covered by
+// celer_connect_timer_check. A
 // per-request overall timeout (send-to-response) driven by a single watchdog
 // coroutine that sleeps until the earliest deadline of the egress/outstanding
 // front entries. A non-zero send_timeout_ms from NuRaft (auto-forwarding

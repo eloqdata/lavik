@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: membership-change semantics for keylane_meta (issue #19).
+"""Integration gate: membership-change semantics for keylane_meta.
 
 One cluster under a continuous propose load; serial phases:
 
@@ -52,11 +52,10 @@ def assert_frozen(node, settle_s=1.0, observe_s=0.7):
 
 def main():
     workdir, keep = H.make_workdir(sys.argv, "meta_integration_membership_")
-    # reserved_log_items=500: joiners catch up from empty under continuous
-    # load via install_snapshot; with the formal state machine's heavier
-    # snapshots a zero reserve would let the leader compact past the joiner
-    # before its sync completes (the gate_transport snapshot-chase
-    # rationale). The reserve keeps the post-sync append path open.
+    # Joiners catch up from empty under continuous load via install_snapshot.
+    # Keeping 500 log entries prevents the leader from compacting past a
+    # joiner before its snapshot sync completes, leaving the post-sync append
+    # path available.
     args = H.raft_args(reserved_log_items=500)
     nodes = H.make_nodes(BINARY, workdir, 3, args=args)
     extras = []  # joiners, for log dumps and cleanup

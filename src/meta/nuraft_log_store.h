@@ -1,9 +1,7 @@
 #pragma once
 
-// NuraftLogStore: NuRaft `log_store` backed by the WAL v2 segmented log, one
-// log per server (issue #19; plan
-// docs/plans/issue-19-metadata-raft-implementation.md §0/§3 "WAL v2: 按快照
-// 边界+大小上限分段,compact 删段").
+// NuraftLogStore is a NuRaft `log_store` backed by one WAL v2 segmented log
+// per server.
 //
 // WAL v2 layout (`data_dir`):
 //   log-<first_idx>.seg   one segment per index range; <first_idx> is the
@@ -22,8 +20,8 @@
 // with snapshot compact boundaries. A full compaction leaves one header-only
 // floor segment pinning start_index.
 //
-// INCOMPATIBLE WITH THE v1 SPIKE LAYOUT: Open fails with a clear error when
-// `data_dir` holds a v1 `raft_log.dat`. Spike directories carry no production
+// INCOMPATIBLE WITH THE LEGACY SINGLE-FILE LAYOUT: Open fails clearly when
+// `data_dir` holds `raft_log.dat`. Legacy directories carry no production
 // data; the remedy is to wipe the directory, not to migrate.
 //
 // Durability contract with the Raft core (verified against the pinned NuRaft
@@ -126,12 +124,12 @@ class NuraftLogFaultInjector {
 
 class NuraftLogStore : public nuraft::log_store {
  public:
-  // Default roll trigger for the active segment (plan §3 "单段大小上限").
+  // Default roll trigger for the active segment.
   static constexpr uint64_t kDefaultMaxSegmentBytes = 64ull << 20;  // 64 MiB
 
   // Opens (creating if absent) the v2 segment set inside `data_dir`; the
   // directory itself is created when missing. Fails when the directory holds
-  // a v1 spike log (`raft_log.dat`) — the layouts are incompatible.
+  // a legacy single-file log (`raft_log.dat`) — the layouts are incompatible.
   // `max_segment_bytes` is the segment roll trigger; tests pass a tiny value
   // to exercise rolling.
   static absl::StatusOr<std::unique_ptr<NuraftLogStore>> Open(
@@ -159,7 +157,7 @@ class NuraftLogStore : public nuraft::log_store {
   bool flush() override;
 
   // On-disk bytes covering [start_index(), next_slot()) — segment headers
-  // plus live records. The §3 max_uncompacted_wal_bytes fail-safe gates
+  // plus live records. The max_uncompacted_wal_bytes fail-safe gates
   // Propose on this while a snapshot is outstanding.
   uint64_t UncompactedBytes() const;
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: slow-peer backpressure for keylane_meta (issue #19).
+"""Integration gate: slow-peer backpressure for keylane_meta.
 
 Two scenarios on 3-node proxy-meshed clusters:
 

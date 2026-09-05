@@ -99,7 +99,7 @@ absl::StatusOr<std::string_view> MetaReader::ReadString(
   auto len = ReadU32();
   if (!len.ok()) return len.status();
   // Cap first: an over-cap prefix is a hard failure even when the body is
-  // also truncated (plan §2: over-limit input fails safe, never truncates).
+  // also truncated: over-limit input fails safely and is never truncated.
   if (*len > max_bytes) {
     return MetaFailStopError("length prefix exceeds the field cap");
   }

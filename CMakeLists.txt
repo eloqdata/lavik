@@ -162,8 +162,8 @@ if (KEYLANE_BUILD_META)
       "asio submodule not found; run git submodule update --init --recursive")
   endif()
   # NuRaft's non-Conan configure path requires ASIO_INCLUDE_DIR to be set even
-  # when DISABLE_ASIO is on (upstream issue #579 remnant), so point it at the
-  # vendored header-only asio. Keylane uses only NuRaft's Raft core; the
+  # when DISABLE_ASIO is on (upstream configure-time behavior), so point it at
+  # the vendored header-only asio. Keylane uses only NuRaft's Raft core; the
   # asio-based network service stays disabled because keylane_meta will serve
   # transport through celer.
   set(DISABLE_ASIO ON)
@@ -630,7 +630,7 @@ if (BUILD_TESTING)
         RUN_SERIAL TRUE
       )
 
-      # Issue-19 process gates: leader-change safety, WAL/snapshot
+      # Metadata process gates: leader-change safety, WAL/snapshot
       # recovery matrix, membership-change semantics, transport
       # connect/cancel/timeout, slow-peer backpressure, mTLS, the observation
       # stale-evidence/observation-lifecycle gate, rolling schema/tail

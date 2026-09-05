@@ -1,7 +1,7 @@
 #pragma once
 
 // NuraftStateMgr: NuRaft `state_mgr` with on-disk server state, cluster
-// config, and log store for the issue-#19 metadata control plane.
+// config, and log store for the metadata control plane.
 //
 // Owns the three pieces of Raft metadata durability in one data directory:
 //   - `raft_log.dat`        log store, owned via NuraftLogStore

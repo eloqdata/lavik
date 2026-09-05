@@ -1,34 +1,32 @@
 #pragma once
 
-// MetaIdentityStore: the committed identity/enrollment store of the issue #19
-// metadata control plane (plan
-// docs/plans/issue-19-metadata-raft-implementation.md §2 "identity/enrollment",
-// §6 身份模型). It is the node registry: node_id -> MetaNodeRecord.
+// MetaIdentityStore is the metadata control plane's committed node registry:
+// node_id -> MetaNodeRecord.
 //
 // Invariants:
-//   - Principal binding is globally one-to-one (§6 canonical principal):
+//   - Principal binding is globally one-to-one:
 //     a principal can be bound to at most one node_id, ever. Retired nodes
 //     keep their binding as tombstones, so a principal is never rebound
-//     (rotation is unimplemented, §6); re-registering a retired node_id is
+//     because rotation is unimplemented; re-registering a retired node_id is
 //     likewise rejected.
 //   - revision_ is the CAS token: 1 at registration, expected_revision+1 after
-//     each applied mutation. Mutations carry expected_revision (§2 绝对值
-//     命令 + CAS); a mismatch is a domain rejection.
+//     each applied mutation. Mutations carry expected_revision as an absolute
+//     CAS token; a mismatch is a domain rejection.
 //   - Retired is terminal: no command reactivates a node, and UpdateNode on a
 //     retired node is rejected.
-//   - State is size-bounded (§2 硬上限): total records (active + retired
+//   - State is size-bounded: total records (active + retired
 //     tombstones) never exceed kMaxMetaNodes; over-cap applies are rejected,
 //     never silently truncated.
 //
-// Replay idempotency (§2 "apply 的 replay 幂等定义"): re-applying a command
+// Replay idempotency: re-applying a command
 // whose exact post-effect is already present — same content, and for CAS
 // commands the record sitting at the revision this command would produce —
 // is an idempotent accept (no-op); the same record slot with conflicting
 // content is a domain rejection. This is what makes duplicate commit()
-// during recovery (§3 "apply 可能重复") produce the same state and the same
+// during recovery produce the same state and the same
 // verdict.
 //
-// Failure classes (§2): domain rejections return MetaDomainRejectError
+// Failure classes: domain rejections return MetaDomainRejectError
 // (kDomainReject); deserialization failures are fail-stop (kFailStop), the
 // same bytes failing identically on every node.
 //
@@ -60,7 +58,7 @@ namespace keylane::meta {
 // invariants above.
 struct MetaNodeRecord {
   std::string node_id_;
-  std::string principal_;  // canonical SAN principal, globally 1:1 (§6)
+  std::string principal_;  // canonical SAN principal, globally 1:1
   std::vector<std::string> endpoints_;
   std::uint64_t capability_mask_ = 0;
   MetaNodeRole role_ = MetaNodeRole::kPrimary;
@@ -83,7 +81,7 @@ struct MetaMemberRecord {
 
 class MetaIdentityStore {
  public:
-  // Domain-validated apply of the identity commands (§2). Each returns
+  // Domain-validated apply of the identity commands. Each returns
   // absl::OkStatus() on apply or idempotent accept, and a kDomainReject
   // status otherwise; state is unchanged on rejection.
   absl::Status Apply(const RegisterNode& cmd);

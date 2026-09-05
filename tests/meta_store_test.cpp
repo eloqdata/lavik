@@ -1,4 +1,4 @@
-// Tests for the issue-#19 persistence glue under src/meta/: the WAL v2
+// Tests for the persistence glue under src/meta/: the WAL v2
 // segmented NuraftLogStore and NuraftStateMgr.
 //
 // Component contracts are exercised by closing and reopening the same data
@@ -6,10 +6,8 @@
 // injector covers pwrite/ftruncate/fdatasync/unlink policy without depending
 // on a particular filesystem. The state machine tests — component and
 // core-driven raft_server integration — live in meta_state_machine_test.cpp
-// on the formal MetaStateMachine with real commands (the spike state machine
-// and its component tests were removed when the formal state machine landed;
-// the MidStreamPrune livelock
-// regression is covered by MetaStateMachineTest.MidStreamPrune* there).
+// on MetaStateMachine with real commands. The snapshot-stream pruning
+// regression is covered by MetaStateMachineTest.MidStreamPrune* there.
 
 #include <unistd.h>
 
@@ -378,8 +376,8 @@ TEST_F(LogStoreTest, TornTailIsTruncatedOnOpen) {
 }
 
 TEST_F(LogStoreTest, RejectsV1LayoutDirectory) {
-  // WAL v2 is incompatible with the v1 spike layout: a directory holding the
-  // v1 single-file log must fail loudly instead of silently starting a fresh
+  // WAL v2 is incompatible with the legacy single-file layout: a directory
+  // holding the v1 log must fail loudly instead of silently starting a fresh
   // v2 log next to it.
   std::filesystem::create_directories(dir_);
   {
@@ -477,7 +475,7 @@ TEST_F(LogStoreTest, CompactDropsWholeSegmentsAndRewritesBoundary) {
 
     // Compact at 6: whole segments below the boundary are unlinked, the
     // segment straddling it is rewritten so a segment starts exactly at the
-    // snapshot compact boundary (plan §3).
+    // snapshot compact boundary.
     ASSERT_TRUE(store->compact(6));
     EXPECT_EQ(store->start_index(), 7u);
     EXPECT_EQ(store->next_slot(), 13u);

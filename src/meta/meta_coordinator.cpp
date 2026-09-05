@@ -833,7 +833,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
       co_return absl::Status(
           absl::StatusCode::kResourceExhausted,
           "meta: audit headroom unavailable; wait for pending proposals or "
-          "export and prune the full window (fail-safe, plan §2)");
+          "export and prune the full window (fail-safe)");
     }
     if (prune != nullptr) {
       audit_gate_->prune_reserved_ = true;
@@ -855,7 +855,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
           "meta: uncompacted WAL bytes " + std::to_string(uncompacted) +
               " exceed limit " +
               std::to_string(options_.max_uncompacted_wal_bytes_) +
-              "; snapshot/compaction outstanding (fail-safe, plan §3)");
+              "; snapshot/compaction outstanding (fail-safe)");
     }
     const std::uint64_t snapshot_failures =
         state_machine_.consecutive_snapshot_failures();
@@ -865,18 +865,18 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
           "meta: " + std::to_string(snapshot_failures) +
               " consecutive snapshot failures reached the limit " +
               std::to_string(options_.max_consecutive_snapshot_failures_) +
-              " (fail-safe, plan §3)");
+              " (fail-safe)");
     }
   }
 
-  // ValidateProposal plugins (leader-local; plan §2). First rejection aborts
+  // ValidateProposal plugins run leader-locally. The first rejection aborts
   // the proposal before anything is encoded or appended.
   for (const MetaValidateHook& hook : hooks_) {
     const absl::Status status = hook(command, view, observations_);
     if (!status.ok()) co_return status;
   }
 
-  // §3 升级契约: proposals use the committed active write schema. The
+  // Proposals use the committed active write schema. The
   // codec emits the current or immediately preceding version; anything else
   // means the binary/format window moved, so fail before writing a format
   // peers cannot read.
@@ -888,7 +888,7 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
                                " is outside this binary's write window");
   }
 
-  // Actor injection (plan §2 审计模型): the trusted entry's principal plus a
+  // Actor injection: the trusted entry's principal plus a
   // propose-time readable timestamp. The clock read is legal HERE — the
   // proposal entry point; apply only copies the text into the audit record.
   const std::string readable_time = FormatReadableTime();
