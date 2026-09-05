@@ -24,7 +24,7 @@ using keylane::test::WaitUntil;
 std::string g_keylane_binary;
 
 TEST(ServingGenerationIntegrationTest,
-     BlockedCommandCannotConsumeAReplacementDataset) {
+     AdmittedCommandsCannotConsumeAReplacementDataset) {
   ASSERT_FALSE(g_keylane_binary.empty());
   TempDirectory directory("serving-generation");
   const std::filesystem::path source_data = directory.path() / "source.data";
@@ -55,7 +55,9 @@ TEST(ServingGenerationIntegrationTest,
     };
   };
   ChildProcess source(server_arguments(source_port, source_data), source_log);
-  ChildProcess target(server_arguments(target_port, target_data), target_log);
+  ChildProcess target(
+      server_arguments(target_port, target_data), target_log,
+      {{"KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
   WaitUntil("source startup", 20s, [&] {
     RespClient client = Connect(source_port, 200ms);
@@ -105,6 +107,21 @@ TEST(ServingGenerationIntegrationTest,
   ASSERT_EQ(transaction_client.Command({"MULTI"}), "+OK");
   ASSERT_EQ(transaction_client.Command({"FUNCTION", "LIST"}), "+QUEUED");
 
+  // KEYS owns its database gate instead of using the ordinary dispatch path.
+  // Suspend it after old-population admission but before gate acquisition so
+  // the full sync can replace the dataset first; it must reject that stale
+  // admission before committing an array header for the new population.
+  std::future<std::string> stale_keys = std::async(std::launch::async, [&] {
+    RespClient client = Connect(target_port);
+    return client.Command({"KEYS", "*"});
+  });
+  WaitUntil("KEYS pre-gate pause", 10s, [&] {
+    return keylane::test::ReadFile(target_log)
+               .find(
+                   "client command admitted; pausing before database "
+                   "admission") != std::string::npos;
+  });
+
   ASSERT_EQ(target_client.Command(
                 {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
             "+OK");
@@ -118,6 +135,11 @@ TEST(ServingGenerationIntegrationTest,
     const std::string reply = target_client.Command({"INFO", "REPLICATION"});
     return reply.find("keylane_replication_state:online") != std::string::npos;
   });
+  ASSERT_EQ(stale_keys.wait_for(15s), std::future_status::ready);
+  const std::string keys_reply = stale_keys.get();
+  EXPECT_TRUE(keys_reply.starts_with("-TRYAGAIN ") ||
+              keys_reply.starts_with("-LOADING "))
+      << keys_reply;
   const std::string transaction_reply = transaction_client.Command({"EXEC"});
   EXPECT_TRUE(transaction_reply.starts_with("-TRYAGAIN ") ||
               transaction_reply.starts_with("-LOADING "))

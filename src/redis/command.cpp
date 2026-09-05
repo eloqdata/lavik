@@ -2215,7 +2215,7 @@ Task<absl::Status> MaybePauseBeforeCommandDbAdmission() {
       pause_used.exchange(true, std::memory_order_acq_rel)) {
     co_return absl::OkStatus();
   }
-  spdlog::info("client write admitted; pausing before database admission");
+  spdlog::info("client command admitted; pausing before database admission");
   co_return co_await celer::SleepFor(*ThisWorker().self_,
                                      std::chrono::milliseconds(milliseconds));
 }
@@ -3165,6 +3165,14 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
     co_return BuiltReply(reply_builder.AppendError(
         "ERR wrong number of arguments for 'keys' command"));
   }
+  // The shared fault-injection pause makes the admission-to-exclusive-gate
+  // generation race deterministic in integration coverage. It is inert
+  // unless the test-only environment setting is present.
+  absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+  if (!paused.ok()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR database admission failed: ", paused.message())));
+  }
   const std::uint8_t db = request.db_id_;
   if (!CloseDbGate(db)) {
     co_return BuiltReply(reply_builder.AppendError(
@@ -3182,6 +3190,14 @@ Task<CommandReply> ExecuteKeys(const CommandRequest& request,
       co_return BuiltReply(
           reply_builder.AppendError(absl::StrCat("ERR ", waited.message())));
     }
+  }
+  // Closing the gate proves that a later population replacement cannot pass
+  // us, but this request may have slept before winning that exclusivity. Bind
+  // the scan to the generation admitted at dispatch before committing a RESP
+  // array header that cannot subsequently be replaced with an error.
+  if (const auto error = CommandServingGenerationError(request);
+      error.has_value()) {
+    co_return BuiltReply(reply_builder.AppendError(*error));
   }
   absl::Status quiesced = co_await g_storage->QuiesceExpiration();
   if (!quiesced.ok()) {
@@ -11122,10 +11138,17 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest& request,
                                    ReplyBuilder& reply_builder) {
+  // FLUSH, KEYS, and RDB backup commands acquire or close database gates in
+  // their handlers instead of using the ordinary shared-admission path. They
+  // still need a dispatch-time token to reject an old-population request after
+  // it eventually wins and drains its exclusive cut.
   if (!request.replication_origin_ && request.spec_ != nullptr &&
       ((request.spec_->flags_ & kCmdUsesDbGate) != 0 ||
        request.kind_ == CommandKind::kFlushDb ||
-       request.kind_ == CommandKind::kFlushAll)) {
+       request.kind_ == CommandKind::kFlushAll ||
+       request.kind_ == CommandKind::kKeys ||
+       request.kind_ == CommandKind::kSave ||
+       request.kind_ == CommandKind::kBgSave)) {
     request.serving_generation_ =
         g_replication != nullptr ? g_replication->CaptureServingGeneration()
                                  : 0;

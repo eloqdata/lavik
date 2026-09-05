@@ -331,9 +331,11 @@ struct alignas(64) CommandRequest {
   // while avoiding optional<uint64_t>'s extra word.
   std::uint64_t write_admission_role_epoch_ = 0;
   // External data commands capture the currently open dataset generation at
-  // dispatch. A zero token records admission while serving was closed;
-  // internal/nested execution is unscoped because its outer command already
-  // owns the fence. Its valid bit shares the compact control byte above.
+  // dispatch. They revalidate after acquiring either ordinary database
+  // admission or a self-managed exclusive database cut. A zero token records
+  // admission while serving was closed; internal/nested execution is unscoped
+  // because its outer command already owns the fence. Its valid bit shares the
+  // compact control byte above.
   std::uint64_t serving_generation_ = 0;
   const CommandSpec* spec_ = nullptr;
   // Cluster admission needs the first slot plus at most one different-slot
@@ -455,7 +457,8 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest& request,
                                    ReplyBuilder& reply_builder);
 
-// Revalidates an external data command after it obtains a database gate.
+// Revalidates an external data command after it obtains ordinary database
+// admission or drains a self-managed exclusive database cut.
 // Replication-origin and internally nested requests are intentionally
 // unscoped. A mismatch returns a Redis wire error body (without RESP framing)
 // so every execution path reports the same LOADING/TRYAGAIN outcome.

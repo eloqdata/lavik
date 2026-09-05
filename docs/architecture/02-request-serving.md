@@ -169,16 +169,21 @@ waiting and reacquire it for each concrete attempt. Their waiter registry and
 readiness events are implemented in the Redis subsystem, while storage remains
 the source of truth checked after wakeup.
 
-External data commands dispatched through the shared database-gate path also
-capture the replication manager's packed serving-generation/open token and
-revalidate it after obtaining that gate; blocking List and Sorted Set loops and
-the Stream loop repeat the check on every wake. A role transition away from a
+External data commands capture the replication manager's packed
+serving-generation/open token at dispatch and revalidate it after obtaining
+database admission. This includes ordinary shared-gate commands and commands
+that establish their own exclusive cut: FLUSH, KEYS, and SAVE/BGSAVE validate
+after closing and draining their target database gates, before mutation, reply
+commitment, or snapshot capture. Blocking List and Sorted Set loops and the
+Stream loop repeat the check on every wake. A role transition away from a
 serving population first closes and advances the generation, then broadcasts a
-wake to every worker-local blocking registry. A waiter admitted against the old
-population therefore exits with LOADING or TRYAGAIN instead of timing out or
-examining the replacement population. Opening a completed population publishes
-the role before the open bit. Trusted replication-origin commands bypass this
-client fence because they are the work that constructs the closed population.
+wake to every worker-local blocking registry. A request admitted against the
+old population therefore exits with LOADING or TRYAGAIN instead of examining
+the replacement population. Once KEYS has validated and committed its streamed
+reply, a later replacement waits for its exclusive database gate rather than
+disconnecting it mid-reply. Opening a completed population publishes the role
+before the open bit. Trusted replication-origin commands bypass this client
+fence because they are the work that constructs the closed population.
 
 ## Session and transaction behavior
 

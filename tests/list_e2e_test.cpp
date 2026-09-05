@@ -4858,8 +4858,9 @@ TEST(ListE2eTest, WriteDelayedAcrossRoleEpochIsRejected) {
     RespClient client(target_port);
     return client.Command({"SET", "stale-role-write", "must-not-commit"});
   });
-  ASSERT_TRUE(WaitForLog(
-      target_log, "client write admitted; pausing before database admission"));
+  ASSERT_TRUE(
+      WaitForLog(target_log,
+                 "client command admitted; pausing before database admission"));
   RespClient topology_client(target_port);
   ASSERT_EQ(topology_client.Command({"REPLICAOF", "127.0.0.1",
                                      std::to_string(unavailable_source_port)}),

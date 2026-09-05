@@ -505,9 +505,13 @@ start another attempt in the same physical indexes.
 
 Role transitions also fence client work with a packed serving generation.
 Closing a population advances the generation and wakes all blocking registries;
-commands revalidate after reacquiring database admission, so a waiter from the
-previous population cannot observe the rebuilt indexes. Replication-origin
-apply bypasses this client fence while the population is closed.
+commands revalidate after acquiring ordinary database admission or draining a
+self-managed exclusive database cut, so queued, blocked, scanning, and backup
+requests from the previous population cannot observe or capture the rebuilt
+indexes. A self-gated command that validates first retains its gate through the
+point that makes its result stable, so a later replacement waits instead of
+invalidating an already committed result. Replication-origin apply bypasses
+this client fence while the population is closed.
 
 ## Online apply and rendezvous
 

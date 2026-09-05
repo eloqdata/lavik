@@ -153,10 +153,13 @@ class RdbOutputQueue {
 class BackupJob : public std::enable_shared_from_this<BackupJob> {
  public:
   BackupJob(storage::StorageEngine* storage, std::string target_path,
-            std::uint64_t session_id)
+            std::uint64_t session_id, const CommandRequest& request)
       : storage_(storage),
         output_(std::move(target_path)),
-        session_id_(session_id) {}
+        session_id_(session_id),
+        serving_generation_(request.serving_generation_),
+        serving_generation_valid_(request.serving_generation_valid_),
+        replication_origin_(request.replication_origin_) {}
 
   Task<absl::Status> Run() {
     struct CutGuard {
@@ -190,6 +193,22 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       absl::Status yielded = co_await celer::SleepFor(
           *celer::ThisWorker().self_, std::chrono::milliseconds(1));
       if (!yielded.ok()) co_return yielded;
+    }
+
+    // SAVE and BGSAVE manage their own all-database gate, so normal command
+    // dispatch cannot perform the post-admission generation check for them.
+    // Validate after winning and draining exclusivity: if a replacement won
+    // first, its partial candidate must never become an externally requested
+    // backup. If this cut wins first, the replacement waits on these gates and
+    // the storage snapshot preserves the old population after they reopen.
+    CommandRequest fence_request;
+    fence_request.serving_generation_ = serving_generation_;
+    fence_request.serving_generation_valid_ = serving_generation_valid_;
+    fence_request.replication_origin_ = replication_origin_;
+    if (const auto error = CommandServingGenerationError(fence_request);
+        error.has_value()) {
+      cut_error_ = std::string(*error);
+      co_return absl::FailedPreconditionError(cut_error_);
     }
 
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -290,6 +309,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   bool cut_failed() const noexcept {
     return cut_failed_.load(std::memory_order_acquire);
   }
+  std::string_view cut_error() const noexcept { return cut_error_; }
   const std::vector<std::uint64_t>& saved_change_cuts() const noexcept {
     return saved_change_cuts_;
   }
@@ -376,9 +396,15 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
   storage::StorageEngine* storage_;
   RdbOutputQueue output_;
   std::uint64_t session_id_ = 0;
+  std::uint64_t serving_generation_ = 0;
+  bool serving_generation_valid_ = false;
+  bool replication_origin_ = false;
   std::atomic<unsigned> remaining_{0};
   std::atomic<bool> cut_ready_{false};
   std::atomic<bool> cut_failed_{false};
+  // Written before cut_failed_'s release store and read only after its acquire
+  // load, so the command coroutine can preserve the exact Redis fence error.
+  std::string cut_error_;
   std::vector<std::uint64_t> saved_change_cuts_;
   mutable std::mutex status_mutex_;
   absl::Status status_;
@@ -414,7 +440,7 @@ Task<absl::Status> FinishBackup(std::shared_ptr<BackupJob> job) {
   co_return status;
 }
 
-std::shared_ptr<BackupJob> TryStartBackup() {
+std::shared_ptr<BackupJob> TryStartBackup(const CommandRequest& request) {
   bool expected = false;
   if (!g_backup_active.compare_exchange_strong(expected, true,
                                                std::memory_order_acq_rel,
@@ -427,7 +453,7 @@ std::shared_ptr<BackupJob> TryStartBackup() {
     session = g_next_backup_session.fetch_add(1, std::memory_order_relaxed);
   }
   return std::make_shared<BackupJob>(g_backup_storage, g_backup_target_path,
-                                     session);
+                                     session, request);
 }
 
 CommandReply Reply(std::string_view encoded) {
@@ -453,7 +479,7 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
     co_return Reply(
         reply_builder.AppendError("ERR RDB backup is not configured"));
   }
-  std::shared_ptr<BackupJob> job = TryStartBackup();
+  std::shared_ptr<BackupJob> job = TryStartBackup(request);
   if (job == nullptr) {
     co_return Reply(
         reply_builder.AppendError("ERR Background save already in progress"));
@@ -470,13 +496,19 @@ Task<CommandReply> ExecuteRdbBackupCommand(const CommandRequest& request,
       }
     }
     if (cut->cut_failed()) {
+      if (!cut->cut_error().empty()) {
+        co_return Reply(reply_builder.AppendError(cut->cut_error()));
+      }
       co_return Reply(reply_builder.AppendError("ERR RDB cut failed"));
     }
     co_return Reply(
         reply_builder.AppendSimpleString("Background saving started"));
   }
-  absl::Status status = co_await FinishBackup(std::move(job));
+  absl::Status status = co_await FinishBackup(job);
   if (!status.ok()) {
+    if (!job->cut_error().empty()) {
+      co_return Reply(reply_builder.AppendError(job->cut_error()));
+    }
     co_return Reply(reply_builder.AppendError(
         absl::StrCat("ERR RDB save failed: ", status.message())));
   }

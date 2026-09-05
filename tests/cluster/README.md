@@ -122,9 +122,10 @@ rejection, and idempotent empty revocation without adding a test-only control
 protocol. `source_authorization_test.cpp` separately proves same-revision
 multi-target grants, exact replay, revision supersession, revoked-watermark
 rejection, and idempotent empty revocation.
-`serving_generation_integration_test.cpp` proves a blocked request cannot cross
-into a replacement dataset, and `rebuild_failure_integration_test.cpp` proves
-an uncertain native promotion stops the current boot without retrying.
+`serving_generation_integration_test.cpp` proves that neither a blocked request
+nor a self-gated KEYS scan admitted before replacement can cross into the new
+dataset, and `rebuild_failure_integration_test.cpp` proves an uncertain native
+promotion stops the current boot without retrying.
 `rebuild_protocol_integration_test.cpp` exercises adversarial source behavior:
 the target must reject `KLONLINE` before its local flow proof and must reject a
 reset after the full-sync cut without losing the promoted population. It also
