@@ -179,11 +179,17 @@ Stream loop repeat the check on every wake. A role transition away from a
 serving population first closes and advances the generation, then broadcasts a
 wake to every worker-local blocking registry. A request admitted against the
 old population therefore exits with LOADING or TRYAGAIN instead of examining
-the replacement population. Once KEYS has validated and committed its streamed
-reply, a later replacement waits for its exclusive database gate rather than
-disconnecting it mid-reply. Opening a completed population publishes the role
-before the open bit. Trusted replication-origin commands bypass this client
-fence because they are the work that constructs the closed population.
+the replacement population. WATCH holds shared database admission across its
+cross-worker registrations and liveness reads, so reset either waits and then
+dirties those registrations or wins first and makes WATCH reject its stale
+generation before registering. Each registration also retains that generation;
+EXEC treats a later generation mismatch as a watched-key modification even if
+the replacement has identical key liveness. Once KEYS has validated and
+committed its streamed reply, a later replacement waits for its exclusive
+database gate rather than disconnecting it mid-reply. Opening a completed
+population publishes the role before the open bit. Trusted replication-origin
+commands bypass this client fence because they are the work that constructs the
+closed population.
 
 ## Session and transaction behavior
 

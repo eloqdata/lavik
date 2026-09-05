@@ -23,6 +23,30 @@ using keylane::test::WaitUntil;
 
 std::string g_keylane_binary;
 
+std::vector<std::string> ServerArguments(std::uint16_t port,
+                                         const std::filesystem::path& data) {
+  return {
+      g_keylane_binary,
+      "--port",
+      std::to_string(port),
+      "--threads",
+      "1",
+      "--no-pin-workers",
+      "--logtostderr",
+      "--recv-buffers-per-worker",
+      "1024",
+      "--data-file",
+      data.string(),
+  };
+}
+
+void WaitForStartup(std::string_view label, std::uint16_t port) {
+  WaitUntil(label, 20s, [port] {
+    RespClient client = Connect(port, 200ms);
+    return client.Command({"PING"}) == "+PONG";
+  });
+}
+
 TEST(ServingGenerationIntegrationTest,
      AdmittedCommandsCannotConsumeAReplacementDataset) {
   ASSERT_FALSE(g_keylane_binary.empty());
@@ -38,35 +62,13 @@ TEST(ServingGenerationIntegrationTest,
   PortReservation target_reservation;
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
-  const auto server_arguments = [](std::uint16_t port,
-                                   const std::filesystem::path& data) {
-    return std::vector<std::string>{
-        g_keylane_binary,
-        "--port",
-        std::to_string(port),
-        "--threads",
-        "1",
-        "--no-pin-workers",
-        "--logtostderr",
-        "--recv-buffers-per-worker",
-        "1024",
-        "--data-file",
-        data.string(),
-    };
-  };
-  ChildProcess source(server_arguments(source_port, source_data), source_log);
+  ChildProcess source(ServerArguments(source_port, source_data), source_log);
   ChildProcess target(
-      server_arguments(target_port, target_data), target_log,
+      ServerArguments(target_port, target_data), target_log,
       {{"KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
 
-  WaitUntil("source startup", 20s, [&] {
-    RespClient client = Connect(source_port, 200ms);
-    return client.Command({"PING"}) == "+PONG";
-  });
-  WaitUntil("target startup", 20s, [&] {
-    RespClient client = Connect(target_port, 200ms);
-    return client.Command({"PING"}) == "+PONG";
-  });
+  WaitForStartup("source startup", source_port);
+  WaitForStartup("target startup", target_port);
 
   RespClient source_client = Connect(source_port);
   ASSERT_EQ(source_client.Command({"RPUSH", "generation-fence", "value"}),
@@ -147,6 +149,83 @@ TEST(ServingGenerationIntegrationTest,
   ASSERT_EQ(target_client.Command({"READONLY"}), "+OK");
   EXPECT_EQ(target_client.Command({"LRANGE", "generation-fence", "0", "-1"}),
             "*1\r\n$5\r\nvalue");
+
+  target.Stop(SIGINT);
+  source.Stop(SIGINT);
+}
+
+TEST(ServingGenerationIntegrationTest, WatchIsBoundToItsServingGeneration) {
+  ASSERT_FALSE(g_keylane_binary.empty());
+  TempDirectory directory("watch-serving-generation");
+  const std::filesystem::path source_data = directory.path() / "source.data";
+  const std::filesystem::path target_data = directory.path() / "target.data";
+  const std::filesystem::path source_log = directory.path() / "source.log";
+  const std::filesystem::path target_log = directory.path() / "target.log";
+  CreateDataFile(source_data, 128ULL * 1024 * 1024);
+  CreateDataFile(target_data, 128ULL * 1024 * 1024);
+
+  PortReservation source_reservation;
+  PortReservation target_reservation;
+  const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
+  const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
+  ChildProcess source(ServerArguments(source_port, source_data), source_log);
+  ChildProcess target(
+      ServerArguments(target_port, target_data), target_log,
+      {{"KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS", "5000"}});
+
+  WaitForStartup("WATCH source startup", source_port);
+  WaitForStartup("WATCH target startup", target_port);
+
+  RespClient source_client = Connect(source_port);
+  ASSERT_EQ(source_client.Command({"SET", "generation-watch", "replacement"}),
+            "+OK");
+
+  // Pause after dispatch captured the old generation but before WATCH takes
+  // database admission. The reset must win first; when WATCH resumes it must
+  // reject that stale admission rather than registering after reset's
+  // MarkAllWatched pass and remaining clean against the replacement.
+  RespClient watcher = Connect(target_port);
+  std::future<std::string> stale_watch = std::async(std::launch::async, [&] {
+    return watcher.Command({"WATCH", "generation-watch"});
+  });
+  WaitUntil("WATCH pre-gate pause", 10s, [&] {
+    return keylane::test::ReadFile(target_log)
+               .find(
+                   "client command admitted; pausing before database "
+                   "admission") != std::string::npos;
+  });
+
+  RespClient target_client = Connect(target_port);
+  ASSERT_EQ(target_client.Command(
+                {"REPLICAOF", "127.0.0.1", std::to_string(source_port)}),
+            "+OK");
+  ASSERT_EQ(stale_watch.wait_for(10s), std::future_status::ready);
+  const std::string watch_reply = stale_watch.get();
+  EXPECT_TRUE(watch_reply.starts_with("-TRYAGAIN ") ||
+              watch_reply.starts_with("-LOADING "))
+      << watch_reply;
+
+  WaitUntil("WATCH target full sync", 20s, [&] {
+    const std::string reply = target_client.Command({"INFO", "REPLICATION"});
+    return reply.find("keylane_replication_state:online") != std::string::npos;
+  });
+  ASSERT_EQ(watcher.Command({"READONLY"}), "+OK");
+  EXPECT_EQ(watcher.Command({"GET", "generation-watch"}), "$11\r\nreplacement");
+
+  // A completed WATCH also belongs to the generation in which it observed
+  // the key. Promotion changes the serving generation without another
+  // population reset, so this proves EXEC uses the retained token rather than
+  // depending only on reset's MarkAllWatched side effect.
+  ASSERT_EQ(source_client.Command({"SET", "promotion-proof", "ready"}), "+OK");
+  WaitUntil("WATCH promotion proof apply", 10s, [&] {
+    return watcher.Command({"GET", "promotion-proof"}) == "$5\r\nready";
+  });
+  ASSERT_EQ(watcher.Command({"WATCH", "generation-watch"}), "+OK");
+  ASSERT_EQ(target_client.Command({"REPLICAOF", "NO", "ONE"}), "+OK");
+  ASSERT_EQ(watcher.Command({"READWRITE"}), "+OK");
+  ASSERT_EQ(watcher.Command({"MULTI"}), "+OK");
+  ASSERT_EQ(watcher.Command({"GET", "generation-watch"}), "+QUEUED");
+  EXPECT_EQ(watcher.Command({"EXEC"}), "*-1");
 
   target.Stop(SIGINT);
   source.Stop(SIGINT);

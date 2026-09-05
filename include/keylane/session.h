@@ -75,6 +75,11 @@ struct ConnectionContext {
     tx::LockFp fp_ = 0;
     std::uint16_t owner_ = 0;
     std::uint8_t db_ = 0;
+    // WATCH is an observation of one logical population, not just one key's
+    // liveness. EXEC treats a serving-generation change as a modification even
+    // when the replacement happens to contain the same key state.
+    std::uint64_t serving_generation_ = 0;
+    bool serving_generation_valid_ = false;
     // Liveness observed on the owning shard at WATCH time; EXEC compares it
     // against the key's own current liveness, so fingerprint collisions can
     // only ever cause false aborts, not missed ones.

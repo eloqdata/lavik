@@ -8272,8 +8272,32 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
     co_return BuiltReply(reply_builder.AppendError(
         absl::StrCat("ERR ", keys.status().message())));
   }
+  // WATCH is intercepted by connection-level dispatch, so it cannot rely on
+  // ExecuteCommandBody's ordinary database admission despite carrying the
+  // kCmdUsesDbGate classification. Hold the selected database across every
+  // cross-worker registration and liveness read: a replacement that starts
+  // later must dirty the completed registrations, while a replacement that
+  // won first is detected before this request installs any new ones.
+  absl::Status paused = co_await MaybePauseBeforeCommandDbAdmission();
+  if (!paused.ok()) {
+    co_return BuiltReply(reply_builder.AppendError(
+        absl::StrCat("ERR database admission failed: ", paused.message())));
+  }
+  while (!TryBeginDbOperation(request.db_id_)) {
+    absl::Status waited = co_await celer::SleepFor(
+        *ThisWorker().self_, std::chrono::milliseconds(1));
+    if (!waited.ok()) {
+      co_return BuiltReply(reply_builder.AppendError(
+          absl::StrCat("ERR database admission failed: ", waited.message())));
+    }
+  }
+  DbOperationGuard db_guard(request.db_id_);
+  if (const auto error = CommandServingGenerationError(request);
+      error.has_value()) {
+    co_return BuiltReply(reply_builder.AppendError(*error));
+  }
   for (std::size_t i = keys->first_; i <= keys->last_; i += keys->step_) {
-    const std::uint8_t db = ctx.selected_db_;
+    const std::uint8_t db = request.db_id_;
     const storage::Digest digest = storage::ComputeDigest(request.args_[i]);
     const tx::LockFp fp = tx::FingerprintOf(digest);
     bool already = false;
@@ -8301,6 +8325,9 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
         .fp_ = fp,
         .owner_ = owner,
         .db_ = db,
+        .serving_generation_ = request.serving_generation_,
+        .serving_generation_valid_ =
+            static_cast<bool>(request.serving_generation_valid_),
         .live_ = live,
     });
   }
@@ -8314,6 +8341,10 @@ Task<CommandReply> ExecuteWatch(ConnectionContext& ctx,
 // against their own snapshot.
 Task<bool> CheckConnectionWatches(const ConnectionContext& ctx) {
   for (const auto& watched : ctx.watched_) {
+    if (watched.serving_generation_valid_ && g_replication != nullptr &&
+        !g_replication->ServingGenerationMatches(watched.serving_generation_)) {
+      co_return false;
+    }
     const bool clean = co_await celer::SubmitTaskTo(
         watched.owner_,
         [key = watched.key_, db = watched.db_, digest = watched.digest_,

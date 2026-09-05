@@ -387,7 +387,7 @@ TEST(CommandTableTest, LookupFlagsArityAndKeyPositions) {
         "expire",    "pexpire",  "expireat",    "pexpireat",   "persist",
         "ttl",       "pttl",     "expiretime",  "pexpiretime", "touch",
         "randomkey", "copy",     "getbit",      "setbit",      "bitcount",
-        "bitpos",    "bitfield", "bitfield_ro", "bitop"};
+        "bitpos",    "bitfield", "bitfield_ro", "bitop",       "watch"};
     const char* ungated[] = {"ping", "select", "flushdb", "flushall",
                              "tombraider"};
     for (const char* name : gated) {
