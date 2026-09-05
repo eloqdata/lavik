@@ -570,11 +570,11 @@ class NuraftRpcClient : public nuraft::rpc_client {
         send_timeout_ms != 0 ? send_timeout_ms
                              : static_cast<std::uint64_t>(
                                    core->config_.request_timeout_.count());
-    bridge_->Post(
-        [core, req, when_done, timeout_ms](celer::Worker& worker) mutable {
-          EnqueueSend(std::move(core), worker, std::move(req),
-                      std::move(when_done), timeout_ms);
-        });
+    bridge_->Post([core = std::move(core), req, when_done,
+                   timeout_ms](celer::Worker& worker) mutable {
+      EnqueueSend(std::move(core), worker, std::move(req), std::move(when_done),
+                  timeout_ms);
+    });
   }
 
   std::uint64_t get_id() const override { return core_->id_; }

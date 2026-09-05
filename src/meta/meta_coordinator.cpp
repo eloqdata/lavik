@@ -112,19 +112,17 @@ MetaCommitSubscription::~MetaCommitSubscription() {
 }
 
 bool MetaCommitSubscription::cancelled() const {
-  const std::shared_ptr<MetaSubscriptionCore> core = core_;
-  if (core == nullptr) return true;
-  std::lock_guard<std::mutex> lock(core->mu_);
-  const auto it = core->subs_.find(id_);
-  return it == core->subs_.end() || it->second->cancelled_;
+  if (core_ == nullptr) return true;
+  std::lock_guard<std::mutex> lock(core_->mu_);
+  const auto it = core_->subs_.find(id_);
+  return it == core_->subs_.end() || it->second->cancelled_;
 }
 
 bool MetaCommitSubscription::needs_resync() const {
-  const std::shared_ptr<MetaSubscriptionCore> core = core_;
-  if (core == nullptr) return true;
-  std::lock_guard<std::mutex> lock(core->mu_);
-  const auto it = core->subs_.find(id_);
-  return it == core->subs_.end() || it->second->needs_resync_;
+  if (core_ == nullptr) return true;
+  std::lock_guard<std::mutex> lock(core_->mu_);
+  const auto it = core_->subs_.find(id_);
+  return it == core_->subs_.end() || it->second->needs_resync_;
 }
 
 // ---------------------------------------------------------------------------
