@@ -14,6 +14,14 @@ of networked services. Redis serving, metrics, replication, transaction
 coordination, the cluster data plane, and storage are composed in `RunServer`;
 Celer owns the worker and socket lifecycle underneath those Keylane modules.
 
+A separate `keylane_meta` executable runs the [Raft-backed meta control
+plane](08-meta-control-plane.md). It owns committed cluster metadata,
+leader-local observations, authenticated administration, and coordination
+seams for future data-node control sessions. It links the pinned NuRaft
+submodule for consensus on top of Celer. NuRaft is linked only into
+`keylane_meta`: the data-plane executable, library, and tests never see
+consensus code, and the build enforces that boundary at configure time.
+
 ```text
 Redis/Valkey clients, Sentinels, and replicas
                 |
@@ -46,6 +54,7 @@ snapshots.
 | Function catalog | Stage one complete process-global Function definition set on every worker, commit its existing `FUNCTION DUMP` encoding, swap runtimes, and recover it before service readiness | `FunctionCatalog` |
 | Replication | Own one replication group, node role and sessions; publish native logs, run full/partial synchronization, interoperate with Redis PSYNC and Sentinel, and apply trusted replay | `ReplicationManager` |
 | Cluster data plane | Admit, redirect, or refuse requests by slot ownership and authority, and serve Redis Cluster discovery | `cluster::Admit`, `cluster::TopologyCache`, `cluster::ClusterControlPort` |
+| Meta control plane | Replicate metadata commands, maintain the durable control-plane model, admit fresh leader-local observations, and expose authenticated proposal and subscription seams | `meta::MetaCoordinator`, `meta::MetaStateMachine`, `meta::MetaObservationStore` |
 | Observability and limits | Maintain worker-local command, connection, and slow-log state, expose Prometheus snapshots, account retained memory, and enforce admission estimates | `RenderPrometheusMetrics`, `MaybeRecordSlowCommand`, `InitMemoryLimit`, `WouldExceedMemoryLimit` |
 
 ## Process lifecycle
@@ -162,6 +171,14 @@ state explicitly.
   requests before the final storage flush.
 - Replication and full-sync queues use admission/backpressure. They must not
   silently drop an already accepted logical write.
+- Meta decisions derive from one committed view plus observations accepted by
+  the current leader session generation. Observations are never Raft state and
+  are purged on role changes or when their committed term, manifest, history,
+  operation, or node identity anchor becomes stale.
+- Metadata apply is deterministic and replay-safe by log index. A rejected
+  domain command still consumes its index and creates an audit record;
+  malformed durable bytes or inconsistent replay fail stop rather than
+  allowing replicas to diverge.
 - `maxmemory` admission uses explicit worker-owned retained allocations rather
   than global allocation hooks. RSS and mimalloc committed/reserved statistics
   remain diagnostic, so the retained waterline is not an instantaneous RSS
@@ -173,6 +190,7 @@ state explicitly.
 |---|---|
 | Celer | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
 | mimalloc | Pinned allocator submodule; the official global new/delete override serves ordinary C++ allocations, while retained storage calls mimalloc through explicitly accounted domains |
+| NuRaft | Pinned Raft consensus submodule with its asio transport disabled; linked only by `keylane_meta`. A vendored header-only asio submodule exists solely to satisfy NuRaft's configure-time header check |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
 | Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |
@@ -190,6 +208,7 @@ those deployment boundaries remain unknown here.
 | Claim | Repository source |
 |---|---|
 | Language level, targets, dependencies, source units, and test entry points | `CMakeLists.txt` |
+| Meta control-plane composition and the NuRaft layering boundary | `CMakeLists.txt`, `src/meta/meta_main.cpp`, `src/meta/`, `.gitmodules` |
 | CLI/config parsing and top-level process entry | `app/keylane.cpp`, `include/keylane/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
 | Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |
