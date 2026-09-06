@@ -1,0 +1,27 @@
+# Chart contract
+
+## Redis and Valkey I/O-thread scaling
+
+- Question: how do GET and SET throughput change with connection count and
+  configured I/O-thread count?
+- Takeaway: 1–2 threads plateau near 150k QPS; 8–16 threads are required to
+  approach the single-client ceiling. Valkey SET regresses at 16 threads.
+- Form: four small-multiple line charts, split by product and workload.
+- Data: 100 reviewed rows; five connection counts and five I/O-thread counts.
+- Scale: zero-based, shared 0–1M QPS scale; connections are ordered categories.
+- Identity: fixed colors, dash styles, and point markers distinguish thread
+  counts without relying only on color.
+- Delivery: `iothread-scaling-qps.svg` and its inspected PNG rendering.
+
+## Best in-memory configurations versus Keylane
+
+- Question: at each connection count, how close is raw-device Keylane to the
+  best measured pure-memory Redis and Valkey configuration?
+- Takeaway: Keylane GET peaks 13–14% below the memory systems, while Keylane
+  SET is faster than both.
+- Form: two vertically stacked grouped-bar charts for GET and SET.
+- Data: 30 reviewed rows. Redis uses 16 I/O threads; Valkey uses 16 for GET and
+  8 for SET; Keylane uses 16 workers.
+- Scale: zero-based, shared 0–1.05M QPS scale.
+- Identity: stable blue/orange/pink product colors plus distinct fill textures.
+- Delivery: `best-memory-vs-keylane-qps.svg` and its inspected PNG rendering.

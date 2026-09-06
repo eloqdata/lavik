@@ -1,0 +1,153 @@
+# Keylane、Redis 与 Valkey：10 GB / 1 KiB 高并发性能对比
+
+测试日期：2026-09-06
+
+## 技术结论
+
+在同一台 16 逻辑 CPU 服务端、同一个 10,000,000-key × 1,024-byte
+工作集和同一个单客户端下，六盘 raw io_uring Keylane 的最佳 GET 为
+**828,502 QPS**，比调到本轮最优的纯内存 Redis 8.8.0 低 **14.1%**，
+比纯内存 Valkey 9.1.0 低 **12.6%**。Keylane 的最佳 SET 为
+**984,452 QPS**，反而比 Redis 高 **12.5%**、比 Valkey 高 **23.7%**。
+
+因此，这组结果支持一个有边界的结论：在本机、1 KiB value、pipeline=1
+和单客户端上，Keylane 的随机读吞吐与调优后的纯内存系统相差约
+13%–14%，写吞吐没有落后。它不证明任意硬件、数据大小或耐久性配置下
+都只有这个差距。
+
+Redis/Valkey 必须开启足够多的 I/O threads 才能形成公平比较。1–2
+threads 的峰值只有约 144k–159k QPS；Redis 在 16 threads 达到本轮最佳，
+Valkey GET 在 16 threads 最佳，但 Valkey SET 在 8 threads 最佳，增加到
+16 threads 后下降 4.7%。
+
+## Keylane 与调优后纯内存系统的差距
+
+![Keylane、Redis、Valkey 不同连接数 QPS](best-memory-vs-keylane-qps.png)
+
+图中的纯内存配置按命令选择本轮实测最优线程数：Redis GET/SET 都是
+16 I/O threads；Valkey GET 是 16、SET 是 8。Keylane 固定为 16 workers。
+这样比较的是每个系统在已测配置中的最好结果，而不是用单线程
+Redis/Valkey 放大 Keylane 优势。
+
+| 负载 | 系统与配置 | 峰值 QPS | 峰值连接数 | Avg | p50 | p99 | p99.9 | p99.99 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| GET | Keylane，16 workers | 828,502 | 1,280 | 1.544 ms | 1.319 ms | 4.543 ms | 11.199 ms | 21.887 ms |
+| GET | Redis，16 I/O threads | 964,267 | 1,280 | 1.327 ms | 1.111 ms | 4.671 ms | 8.191 ms | 17.407 ms |
+| GET | Valkey，16 I/O threads | 948,300 | 1,280 | 1.349 ms | 1.111 ms | 4.479 ms | 8.383 ms | 17.151 ms |
+| SET | Keylane，16 workers | 984,452 | 1,280 | 1.300 ms | 1.159 ms | 4.575 ms | 7.455 ms | 16.063 ms |
+| SET | Redis，16 I/O threads | 874,879 | 1,280 | 1.463 ms | 1.191 ms | 4.767 ms | 7.839 ms | 17.663 ms |
+| SET | Valkey，8 I/O threads | 796,145 | 1,280 | 1.607 ms | 1.447 ms | 4.319 ms | 9.471 ms | 17.919 ms |
+
+峰值点的 p99 很接近：GET 为 4.48–4.67 ms，SET 为 4.32–4.77 ms。
+Keylane GET 的 p99.99 较差，但 Keylane SET 的 p99.9/p99.99 都优于两套
+纯内存对照。吞吐接近并不是以明显恶化 p99 换来的。
+
+### 各连接数的精确 QPS
+
+| 负载 | 连接数 | Keylane 16 workers | Redis 16 I/O threads | Valkey 最佳线程配置 |
+|---|---:|---:|---:|---:|
+| GET | 80 | 251,872 | 300,320 | 374,308（16） |
+| GET | 160 | 447,569 | 496,011 | 576,207（16） |
+| GET | 320 | 658,224 | 686,043 | 708,992（16） |
+| GET | 640 | 796,395 | 869,620 | 882,881（16） |
+| GET | 1,280 | 828,502 | 964,267 | 948,300（16） |
+| SET | 80 | 338,732 | 298,222 | 362,610（8） |
+| SET | 160 | 566,366 | 476,830 | 579,863（8） |
+| SET | 320 | 764,712 | 657,652 | 682,094（8） |
+| SET | 640 | 964,503 | 798,889 | 775,229（8） |
+| SET | 1,280 | 984,452 | 874,879 | 796,145（8） |
+
+## I/O threads 决定 Redis/Valkey 能否接近 Keylane
+
+![Redis 与 Valkey I/O threads 扩展曲线](iothread-scaling-qps.png)
+
+1→2 I/O threads 对两套系统几乎没有帮助；4 threads 开始明显扩展，
+8 threads 后才进入 800k QPS 区间。Redis 的 GET/SET 在已测范围内仍随
+16 threads 上升。Valkey 的 GET 也继续上升，但 SET 在 8 threads 后回退，
+说明“线程越多越快”不成立，生产配置需要按负载选择。
+
+| 系统 | I/O threads | GET 峰值 QPS @ 连接数 | SET 峰值 QPS @ 连接数 |
+|---|---:|---:|---:|
+| Redis 8.8.0 | 1 | 156,477 @ 320 | 146,263 @ 320 |
+| Redis 8.8.0 | 2 | 157,452 @ 320 | 147,218 @ 320 |
+| Redis 8.8.0 | 4 | 432,526 @ 1,280 | 398,222 @ 640 |
+| Redis 8.8.0 | 8 | 841,942 @ 1,280 | 817,501 @ 1,280 |
+| Redis 8.8.0 | 16 | 964,267 @ 1,280 | 874,879 @ 1,280 |
+| Valkey 9.1.0 | 1 | 154,406 @ 320 | 143,854 @ 320 |
+| Valkey 9.1.0 | 2 | 159,368 @ 640 | 148,006 @ 320 |
+| Valkey 9.1.0 | 4 | 440,085 @ 640 | 409,011 @ 1,280 |
+| Valkey 9.1.0 | 8 | 848,840 @ 1,280 | 796,145 @ 1,280 |
+| Valkey 9.1.0 | 16 | 948,300 @ 1,280 | 758,618 @ 1,280 |
+
+## 测试口径与指标定义
+
+- 服务端：`172.16.0.4`，AMD EPYC 9V74，8 cores / 16 threads，125 GiB
+  RAM；所有服务端线程限制在 CPU 0–15。
+- 客户端：`172.16.0.5`，16 cores，31 GiB RAM；memtier 2.5.1 固定
+  16 threads 并限制在 CPU 0–15。`.6` 在本轮不可达，因此只使用一个客户端。
+- 数据集：10,000,000 个十进制数字 key，每个 value 固定 1,024 bytes；
+  逻辑 value payload 为 10.24 GB（十进制），即 9.54 GiB。Redis 灌数后
+  `used_memory=12.46G`，Valkey 为 `12.36G`。
+- 负载：GET 为全 key 范围均匀随机且 100% 命中；SET 为均匀随机覆盖
+  已有 key，不新增 key。
+- 并发：80、160、320、640、1,280 个连接；pipeline=1；每点 30 秒。
+  QPS 是正式 30 秒窗口内完成请求数除以窗口墙钟。
+- 延迟：均为 memtier 客户端端到端观测值；表中单位为毫秒。
+
+## 实施方法
+
+- Keylane 使用代码提交
+  [`29dc8e6`](https://github.com/thweetkomputer/keylane/commit/29dc8e6b87c40196dc397759690252944f1196f0)，
+  Clang 18 Release、`-march=native`、16 workers、六块独立 raw NVMe 的
+  io_uring 后端、暂停 defrag。二进制 SHA-256 为
+  `ef8cc3f1b815fe123f408626f8d4dadfc3a509ed7f63ab5de17e3e237b2d82fd`。
+- Redis 使用官方 [8.8.0 release](https://github.com/redis/redis/releases/tag/8.8.0)，
+  Valkey 使用官方 [9.1.0 release](https://github.com/valkey-io/valkey/releases/tag/9.1.0)；
+  两者均按源码默认 jemalloc、`-O3` 构建，不加载额外模块。
+- Redis/Valkey 关闭 AOF 和自动 RDB 保存。首次精确灌入 10M key 并验证
+  `DBSIZE` 后保存一个基线 RDB；每个 I/O-thread 档都从这个未被正式 SET
+  改写的 RDB 重启，验证 key 数和 `CONFIG GET io-threads`，预热 GET 10 秒，
+  再按连接数由低到高跑 GET 和 SET。
+- Keylane 六盘从 RAID0 解组后逐盘 `blkdiscard`，只灌入一次 10M key，
+  验证 `DBSIZE`，预热 GET 10 秒，再按相同顺序测试。
+- 复现入口为 [`run_memory_sweep.sh`](run_memory_sweep.sh) 和
+  [`run_keylane_sweep.sh`](run_keylane_sweep.sh)；规范化与图表生成入口为
+  [`build_assets.py`](build_assets.py)。全部 110 个正式点见
+  [`results.csv`](results.csv)，原始输入哈希见
+  [`raw-SHA256SUMS`](raw-SHA256SUMS)。
+
+## 限制、异常与稳健性
+
+- 每个点目前只有一轮 30 秒运行，适合判断十几个百分点和倍数级差异，
+  不能把 1%–3% 当成稳定优势。应在关键的 640/1,280 连接点交错重复三次。
+- 单客户端仍可能限制最高值。峰值点客户端平均使用的核心数为：Keylane
+  GET 11.38、SET 14.27；Redis GET 13.29、SET 12.41；Valkey GET 12.85、
+  SET 11.16。Keylane SET 尤其接近客户端 CPU 上限，因此 984k 是当前
+  单客户端口径下的观测值，不一定是服务端上限。
+- Redis/Valkey 的正式窗口完全关闭持久化；Keylane 把 value 写到 raw
+  NVMe，但本报告不声称三者具备等价的崩溃耐久语义。这里回答的是请求
+  路径性能差距，不是同耐久级别成本。
+- 一个不计入正式结果的 Keylane 准备运行，在“恢复已有 10M key、再次
+  覆盖灌数、请求 metrics”这一时刻发生 general-protection fault。因果
+  尚未定位。重新清盘、取消主动 metrics 抓取后的 10 个正式点全部完成且
+  无断连；异常日志保留在原始结果目录，不能据此认定 metrics 是根因。
+- 全部正式 GET 均为零 miss；110 个结果文件都有且只有一个完整 `Totals`
+  行；Redis/Valkey 五档线程数均通过服务端配置回读；三个结果目录的
+  SHA-256 校验全部通过。
+
+## 建议的下一步
+
+1. 在 640 和 1,280 连接对三套最优配置交错跑三次，报告均值、标准差和
+   最差 p99.99。
+2. 恢复第二台客户端或增加客户端 CPU，验证 Keylane SET 和 Redis/Valkey
+   GET 是否被当前单客户端封顶。
+3. 单独复现并定位 Keylane 准备阶段 general-protection fault，分别隔离
+   恢复后覆盖写、后台 flush 和 metrics scrape。
+4. 若要比较生产代价，再增加 Redis/Valkey AOF `everysec` 和明确 fsync
+   策略的耐久性对等测试，不要把本轮无持久化纯内存数据直接当生产结论。
+
+## 仍待回答的问题
+
+- Redis/Valkey 的 12 I/O threads 是否比 8/16 更适合这台 8C/16T 主机？
+- value 变为 64 B、4 KiB 或出现热点分布后，Keylane 的相对差距如何变化？
+- 双客户端下超过 1M QPS 后，限制首先来自服务器、客户端还是网络？
