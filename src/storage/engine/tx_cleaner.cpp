@@ -365,9 +365,25 @@ Task<absl::Status> StorageEngine::Impl::RetireTxGenerationLocal(
     store.active_tx_block_allocation_mutexes_.erase(generation);
   }
   if (released.empty()) co_return absl::OkStatus();
+  const std::vector<std::uint64_t> retired_blocks = released;
   const std::size_t released_count = released.size();
   absl::Status returned = co_await ReturnColdBlocks(std::move(released));
   if (returned.ok()) {
+    // External-key extents remain recovery dependencies until the transaction
+    // block's allocation bit is durably clear. Ordinary record blocks release
+    // the same debt in ReleaseEmptyBlock; transaction generations retire by a
+    // separate path and must perform the matching handoff here.
+    for (const std::uint64_t block_id : retired_blocks) {
+      auto deferred = store.deferred_dependent_extent_reclaims_.find(block_id);
+      if (deferred == store.deferred_dependent_extent_reclaims_.end()) {
+        continue;
+      }
+      std::vector<ExtentManifest> manifests = std::move(deferred->second);
+      store.deferred_dependent_extent_reclaims_.erase(deferred);
+      for (const ExtentManifest& manifest : manifests) {
+        SpawnExtentReclaim(store, manifest);
+      }
+    }
     tx_cleaner_retired_blocks_.fetch_add(released_count,
                                          std::memory_order_relaxed);
     space_reclaim_generation_.fetch_add(1, std::memory_order_release);

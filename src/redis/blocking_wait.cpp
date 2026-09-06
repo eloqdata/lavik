@@ -413,6 +413,20 @@ class BlockingWaitRegistry {
     }
   }
 
+  void NotifyAll() {
+    // A generation fence invalidates every waiter rather than transferring
+    // FIFO ownership for one key. Signal all registrations; a waiter present
+    // in several lanes accepts only its first idempotent ready transition.
+    for (auto& [key, state] : queues_) {
+      (void)key;
+      for (const Entry& entry : state.entries_) {
+        if (const auto waiter = entry.waiter_.lock()) {
+          SignalBlockingReady(waiter, nullptr);
+        }
+      }
+    }
+  }
+
  private:
   void Erase(const BlockingKey& key, std::uint64_t ticket) {
     auto found = queues_.find(key);
@@ -659,7 +673,28 @@ void NotifyBlockingKey(std::uint8_t db_id, std::string_view key,
                           });
 }
 
+void RunServingGenerationNotification(void*, std::uint64_t) noexcept {
+  LocalBlockingWaiters().NotifyAll();
+}
+
 }  // namespace
+
+void NotifyServingGenerationChanged() noexcept {
+  const celer::CurrentWorker& current = celer::ThisWorker();
+  if (current.self_ == nullptr || current.cross_core_ == nullptr) return;
+  for (unsigned worker = 0; worker < current.cross_core_->size(); ++worker) {
+    if (worker == current.id_) {
+      LocalBlockingWaiters().NotifyAll();
+      continue;
+    }
+    celer::PostNotification(current.cross_core_, worker,
+                            celer::RemoteNotification{
+                                .context_ = nullptr,
+                                .value_ = 0,
+                                .run_fn_ = &RunServingGenerationNotification,
+                            });
+  }
+}
 
 bool UnblockClientOnCurrentWorker(std::uint64_t client_id,
                                   ClientUnblockMode mode) noexcept {
@@ -798,8 +833,8 @@ void FinishBlockingWait(BlockingWaitHandle& handle) {
 }
 
 Task<CommandReply> ExecuteBlockingWaitLoop(
-    std::uint64_t client_id, const CommandRequest& request,
-    std::vector<BlockingWaitSpec> specs,
+    const CommandRequest& request, ReplyBuilder& reply_builder,
+    std::uint64_t client_id, std::vector<BlockingWaitSpec> specs,
     std::optional<std::chrono::steady_clock::time_point> deadline,
     std::string cancellation_message, BlockingAttempt attempt,
     BlockingReplyFactory timeout_reply,
@@ -873,6 +908,12 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
     if (!CommandWriteAdmissionIsCurrent(request)) {
       co_return status_reply(
           absl::AbortedError("replication role changed; retry command"));
+    }
+    if (const auto error = CommandServingGenerationError(request);
+        error.has_value()) {
+      CommandReply reply;
+      reply.encoded_ = reply_builder.AppendError(*error);
+      co_return reply;
     }
 
     if (std::optional<CommandReply> fenced =

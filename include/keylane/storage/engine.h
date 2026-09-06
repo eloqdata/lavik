@@ -1171,8 +1171,9 @@ class StorageEngine {
   celer::Task<absl::Status> ApplyReplicaRecords(
       std::uint64_t session_id, std::uint16_t partition_id,
       std::uint64_t replication_epoch, std::span<const SnapshotRecord> records);
-  // Publishes a completed in-place rebuild at the final cut. Abort drains
-  // staged writes before detaching and reclaiming the partial population.
+  // Publishes a completed in-place rebuild at the final cut after draining
+  // worker-local detached-index reclamation. Abort drains staged writes before
+  // detaching the partial population through the same reclaim path.
   celer::Task<absl::Status> PromoteReplicaRoot(std::uint64_t session_id);
   celer::Task<absl::Status> AbortReplicaRoot(std::uint64_t session_id);
   void SetReplicaLoading(bool loading) noexcept;
@@ -1362,6 +1363,10 @@ class StorageEngine {
   // Reconfigures the worker-0 scheduler. An in-flight round always finishes;
   // the new schedule starts counting from that completion.
   celer::Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
+  // Replica reset coordination: disables future rounds, asks an in-flight
+  // round to forfeit at its next safe checkpoint, and waits until it exits.
+  // This is deliberately stronger than the user-facing OFF configuration.
+  celer::Task<absl::Status> QuiesceTombRaiderForReplica();
   // Runtime relocation pacing. Reducing concurrency does not cancel active
   // passes; it prevents replacements until the active count reaches the new
   // limit. Sleep changes take effect at the next checkpoint.

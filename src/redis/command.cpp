@@ -2691,10 +2691,13 @@ class MultiDbOperationGuard {
   MultiDbOperationGuard() = default;
   MultiDbOperationGuard(const MultiDbOperationGuard&) = delete;
   MultiDbOperationGuard& operator=(const MultiDbOperationGuard&) = delete;
-  ~MultiDbOperationGuard() {
+  ~MultiDbOperationGuard() { Release(); }
+
+  void Release() noexcept {
     for (const std::uint8_t db : dbs_) {
       EndDbOperation(db);
     }
+    dbs_.clear();
   }
 
   bool Add(std::uint8_t db_id) {
@@ -2812,6 +2815,10 @@ Task<CommandReply> ExecuteFlush(const CommandRequest& request,
     if (!CommandWriteAdmissionIsCurrent(request)) {
       co_return BuiltReply(reply_builder.AppendError(
           "TRYAGAIN replication role changed; retry command"));
+    }
+    if (const auto error = CommandServingGenerationError(request);
+        error.has_value()) {
+      co_return BuiltReply(reply_builder.AppendError(*error));
     }
 
     if (request.kind_ == CommandKind::kFlushAll) {
@@ -3397,6 +3404,10 @@ Task<CommandReply> ExecuteNegativeRandomStream(
         AppendTryAgainError(reply_builder, "database flush is in progress"));
   }
   DbOperationGuard initial_db_guard(db);
+  if (const auto error = CommandServingGenerationError(request);
+      error.has_value()) {
+    co_return BuiltReply(reply_builder.AppendError(*error));
+  }
   state->now_ms_ = RedisUnixTimeMillis();
   absl::StatusOr<storage::HashResult> length =
       co_await BeginNegativeRandomStream(state);
@@ -4426,6 +4437,8 @@ Task<CommandReply> ExecuteInfo(const CommandRequest& request,
         "\r\n";
     info += "keylane_replication_state:" +
             std::string(ReplicationRoleName(replication.role_)) + "\r\n";
+    info += std::string("keylane_replication_failed_stopped:") +
+            (replication.failed_stopped_ ? "1\r\n" : "0\r\n");
     info += "keylane_replication_role_epoch:" +
             std::to_string(replication.role_epoch_) + "\r\n";
     info += "keylane_replication_group_id:" + replication.group_id_ + "\r\n";
@@ -5357,6 +5370,10 @@ Task<CommandReply> ExecuteCopy(const CommandRequest& request,
   if (!CommandWriteAdmissionIsCurrent(request)) {
     co_return BuiltReply(reply_builder.AppendError(
         "TRYAGAIN replication role changed; retry command"));
+  }
+  if (const auto error = CommandServingGenerationError(request);
+      error.has_value()) {
+    co_return BuiltReply(reply_builder.AppendError(*error));
   }
 
   tx::Transaction transaction;
@@ -8813,6 +8830,20 @@ Task<CommandReply> ExecuteExecBody(
     }
   }
 
+  // Keep gate ownership separate from keyed transaction participation.
+  // FUNCTION commands still belong to the selected database's serving
+  // generation, but adding them to `dbs` would incorrectly change their
+  // existing ephemeral replication path into a storage-backed transaction
+  // with no shard owners.
+  std::vector<std::uint8_t> gate_dbs = dbs;
+  for (const CommandRequest& command : queued) {
+    if (command.serving_generation_valid_ &&
+        std::find(gate_dbs.begin(), gate_dbs.end(), command.db_id_) ==
+            gate_dbs.end()) {
+      gate_dbs.push_back(command.db_id_);
+    }
+  }
+
   std::vector<std::string> replies(queued.size());
   std::vector<ReplyChunkSource> reply_chunks(queued.size());
   std::optional<std::uint8_t> select_db;
@@ -8885,38 +8916,31 @@ Task<CommandReply> ExecuteExecBody(
     co_return std::string(local.encoded_);
   };
 
-  std::optional<DbOperationGuard> keyless_write_gate;
-  if (dbs.empty() && source_write) {
-    if (!TryBeginDbOperation(queued.front().db_id_)) {
+  MultiDbOperationGuard db_guard;
+  for (const std::uint8_t db : gate_dbs) {
+    if (!db_guard.Add(db)) {
       co_await DropWatches(ctx);
-      co_return finalize_exec_reply(BuiltReply(
-          reply_builder.AppendError("TRYAGAIN database flush is in progress")));
+      co_return finalize_exec_reply(BuiltReply(AppendTryAgainError(
+          reply_builder, "database flush is in progress")));
     }
-    keyless_write_gate.emplace(queued.front().db_id_);
-    if (write_admission_role_epoch.has_value() && g_replication != nullptr &&
-        g_replication->role_epoch() != *write_admission_role_epoch) {
+  }
+  if (source_write && write_admission_role_epoch.has_value() &&
+      g_replication != nullptr &&
+      g_replication->role_epoch() != *write_admission_role_epoch) {
+    co_await DropWatches(ctx);
+    co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
+        "TRYAGAIN replication role changed; retry command")));
+  }
+  for (const CommandRequest& command : queued) {
+    if (const auto error = CommandServingGenerationError(command);
+        error.has_value()) {
       co_await DropWatches(ctx);
-      co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
-          "TRYAGAIN replication role changed; retry command")));
+      co_return finalize_exec_reply(
+          BuiltReply(reply_builder.AppendError(*error)));
     }
   }
 
   if (!dbs.empty()) {
-    MultiDbOperationGuard db_guard;
-    for (const std::uint8_t db : dbs) {
-      if (!db_guard.Add(db)) {
-        co_await DropWatches(ctx);
-        co_return finalize_exec_reply(BuiltReply(AppendTryAgainError(
-            reply_builder, "database flush is in progress")));
-      }
-    }
-    if (write_admission_role_epoch.has_value() && g_replication != nullptr &&
-        g_replication->role_epoch() != *write_admission_role_epoch) {
-      co_await DropWatches(ctx);
-      co_return finalize_exec_reply(BuiltReply(reply_builder.AppendError(
-          "TRYAGAIN replication role changed; retry command")));
-    }
-
     // One write id for the whole EXEC: every record any of its commands
     // writes carries it, and one commit record at the end covers them all.
     // Read-only transactions collect no fences and append no commit.
@@ -9457,6 +9481,7 @@ Task<CommandReply> ExecuteExecBody(
       }
     }
   }
+  db_guard.Release();
 
   // A transaction with PUBLISH but no durable write has no storage shard on
   // which to place the ordinary transaction envelope. Publish its captured
@@ -10848,6 +10873,23 @@ CommandReply ClusterValidatorFailureReply(
                                       reply_builder);
 }
 
+std::optional<std::string_view> CommandServingGenerationError(
+    const CommandRequest& request) noexcept {
+  if (request.replication_origin_ || !request.serving_generation_valid_ ||
+      g_replication == nullptr) {
+    return std::nullopt;
+  }
+  if (g_replication->ServingGenerationMatches(request.serving_generation_)) {
+    return std::nullopt;
+  }
+  return g_replication->is_loading()
+             ? std::string_view(
+                   "LOADING Keylane is loading the dataset from the primary")
+             : std::string_view(
+                   "TRYAGAIN Keylane dataset changed while the command was "
+                   "queued or blocked");
+}
+
 Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
                                        CommandRequest& request,
                                        ReplyBuilder& reply_builder) {
@@ -11082,6 +11124,15 @@ Task<CommandReply> DispatchCommandImpl(ConnectionContext& ctx,
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest& request,
                                    ReplyBuilder& reply_builder) {
+  if (!request.replication_origin_ && request.spec_ != nullptr &&
+      ((request.spec_->flags_ & kCmdUsesDbGate) != 0 ||
+       request.kind_ == CommandKind::kFlushDb ||
+       request.kind_ == CommandKind::kFlushAll)) {
+    request.serving_generation_ =
+        g_replication != nullptr ? g_replication->CaptureServingGeneration()
+                                 : 0;
+    request.serving_generation_valid_ = true;
+  }
   const CommandKind kind = request.kind_;
   const bool may_advance_replication_watermark = [&] {
     if (request.replication_origin_ || g_replication == nullptr ||
@@ -11187,6 +11238,10 @@ Task<CommandReply> ExecuteCommandBody(
     if (!CommandWriteAdmissionIsCurrent(request)) {
       co_return BuiltReply(reply_builder.AppendError(
           "TRYAGAIN replication role changed; retry command"));
+    }
+    if (const auto error = CommandServingGenerationError(request);
+        error.has_value()) {
+      co_return BuiltReply(reply_builder.AppendError(*error));
     }
   }
 

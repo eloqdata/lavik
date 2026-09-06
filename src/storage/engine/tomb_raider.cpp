@@ -8,6 +8,9 @@ namespace keylane::storage {
 namespace {
 
 constexpr auto kMaxScheduleSleep = std::chrono::minutes(1);
+// Long operator-configured pacing sleeps stay cheap while replica transition
+// latency remains independent of that setting.
+constexpr auto kMaxForfeitCheckpointSleep = std::chrono::milliseconds(100);
 
 template <typename Duration>
 std::chrono::milliseconds ScheduleSleep(Duration remaining) {
@@ -61,10 +64,45 @@ std::optional<std::chrono::system_clock::time_point> NextDailyTime(
 // forfeits the round, and recovery rebuilds both tombstone entries and
 // shielding bits exactly from the surviving records.
 
+Task<absl::Status> StorageEngine::QuiesceTombRaiderForReplica() {
+  return impl_->QuiesceTombRaiderForReplica();
+}
+
 Task<absl::Status> StorageEngine::Impl::ConfigureTombRaider(
     TombRaiderConfigUpdate update) {
   co_return co_await celer::SubmitTo(
       0, [this, update] { return ApplyTombRaiderConfig(*stores_[0], update); });
+}
+
+Task<absl::Status> StorageEngine::Impl::QuiesceTombRaiderForReplica() {
+  co_return co_await celer::SubmitTaskTo(0, [this]() -> Task<absl::Status> {
+    WorkerStore& coordinator = *stores_[0];
+    while (tomb_raider_quiescing_) {
+      absl::Status waited = co_await celer::SleepFor(
+          *coordinator.worker_, std::chrono::milliseconds(1));
+      if (!waited.ok()) co_return waited;
+    }
+
+    tomb_raider_quiescing_ = true;
+    tomb_raider_forfeit_requested_.store(true, std::memory_order_release);
+    struct QuiesceGuard {
+      bool* quiescing_;
+      std::atomic<bool>* forfeit_requested_;
+      ~QuiesceGuard() {
+        forfeit_requested_->store(false, std::memory_order_release);
+        *quiescing_ = false;
+      }
+    } quiesce_guard{&tomb_raider_quiescing_, &tomb_raider_forfeit_requested_};
+
+    absl::Status disabled = ApplyTombRaiderConfig(
+        coordinator,
+        TombRaiderConfigUpdate{.action_ = TombRaiderConfigAction::kOff});
+    if (!disabled.ok()) co_return disabled;
+    while (tomb_raider_running_.load(std::memory_order_acquire)) {
+      co_await tomb_raider_round_finished_.Wait();
+    }
+    co_return absl::OkStatus();
+  });
 }
 
 absl::Status StorageEngine::Impl::ApplyTombRaiderConfig(
@@ -73,6 +111,10 @@ absl::Status StorageEngine::Impl::ApplyTombRaiderConfig(
       update.action_ == TombRaiderConfigAction::kOn ||
       update.action_ == TombRaiderConfigAction::kInterval ||
       update.action_ == TombRaiderConfigAction::kDaily;
+  if (needs_authority && tomb_raider_quiescing_) {
+    return absl::Status(absl::StatusCode::kFailedPrecondition,
+                        "tomb raider is quiescing for replica reset");
+  }
   if (needs_authority &&
       !expiration_authority_.load(std::memory_order_acquire)) {
     return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -238,6 +280,9 @@ Task<absl::Status> StorageEngine::Impl::TombRaiderLoop(
 }
 
 Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
+  if (TombRaiderShouldForfeit()) {
+    co_return absl::OkStatus();
+  }
   bool expected = false;
   if (!tomb_raider_running_.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) {
@@ -245,8 +290,9 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   }
   // The round counts as a settlement: its frames park on cross-worker hops,
   // so the shutdown drain must not finish under it. In exchange, every
-  // phase aborts at its next block/batch boundary once a shutdown flush is
-  // requested — a forfeited round costs nothing, the next run redoes it.
+  // phase aborts at its next block/batch boundary once shutdown or replica
+  // quiesce requests forfeiture. A forfeited round costs nothing; a later
+  // primary may explicitly configure a fresh schedule and redo it.
   active_settlements_.fetch_add(1, std::memory_order_acq_rel);
   struct RoundGuard {
     std::atomic<bool>* running_;
@@ -261,6 +307,10 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
   } round_guard{&tomb_raider_running_, &active_settlements_,
                 &tomb_raider_round_finished_, celer::ThisWorker().self_};
 
+  if (TombRaiderShouldForfeit()) {
+    co_return absl::OkStatus();
+  }
+
   // The reap must not start until every worker's sweep has finished: the
   // record that still needs a candidate may sit in the last unswept block.
   for (unsigned target = 0; target < worker_count_; ++target) {
@@ -271,6 +321,9 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
     if (!marked.ok()) {
       co_return marked;
     }
+    if (TombRaiderShouldForfeit()) {
+      co_return absl::OkStatus();
+    }
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     absl::Status swept = co_await celer::SubmitTaskTo(
@@ -280,6 +333,9 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
     if (!swept.ok()) {
       co_return swept;
     }
+    if (TombRaiderShouldForfeit()) {
+      co_return absl::OkStatus();
+    }
   }
   for (unsigned target = 0; target < worker_count_; ++target) {
     absl::Status reaped = co_await celer::SubmitTaskTo(
@@ -288,6 +344,9 @@ Task<absl::Status> StorageEngine::Impl::RunTombRaider() {
         });
     if (!reaped.ok()) {
       co_return reaped;
+    }
+    if (TombRaiderShouldForfeit()) {
+      co_return absl::OkStatus();
     }
   }
   tomb_raider_rounds_.fetch_add(1, std::memory_order_relaxed);
@@ -304,7 +363,7 @@ Task<absl::Status> StorageEngine::Impl::TombMarkLocal(WorkerStore& store) {
       }
       std::uint64_t cursor = 0;
       do {
-        if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+        if (TombRaiderShouldForfeit()) {
           co_return absl::OkStatus();  // forfeit the round
         }
         cursor = index.Scan(cursor, [](RecordIndex::Entry& entry) {
@@ -327,6 +386,9 @@ Task<absl::Status> StorageEngine::Impl::TombClaimLocal(
     WorkerStore& store, std::vector<TombClaim> claims) {
   std::size_t handled = 0;
   for (const TombClaim& claim : claims) {
+    if (TombRaiderShouldForfeit()) {
+      co_return absl::OkStatus();
+    }
     auto& partition = PartitionForKey(store, claim.key_);
     if (partition.replication_epoch_ == claim.replication_epoch_) {
       auto resolved = co_await FindVerifiedEntry(
@@ -405,6 +467,10 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
 
   std::vector<std::vector<TombClaim>> pending(worker_count_);
   auto flush_claims = [&](unsigned owner) -> Task<absl::Status> {
+    if (TombRaiderShouldForfeit()) {
+      pending[owner].clear();
+      co_return absl::OkStatus();
+    }
     std::vector<TombClaim> batch = std::move(pending[owner]);
     pending[owner].clear();
     if (batch.empty()) {
@@ -422,7 +488,7 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
   };
 
   for (const BlockSnapshot& snapshot : blocks) {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    if (TombRaiderShouldForfeit()) {
       co_return absl::OkStatus();  // forfeit the round
     }
     BlockState* state = FindBlockState(store, snapshot.block_id_);
@@ -551,6 +617,9 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
         }
       }
       if (++decoded % 256 == 0) {
+        if (TombRaiderShouldForfeit()) {
+          co_return absl::OkStatus();
+        }
         co_await celer::Yield(*store.worker_);
       }
     }
@@ -558,15 +627,25 @@ Task<absl::Status> StorageEngine::Impl::TombSweepLocal(WorkerStore& store) {
     // CPU share, so a full-disk round never crowds out online traffic.
     const std::uint32_t block_sleep_ms =
         tomb_raider_config_.block_sleep_ms_.load(std::memory_order_relaxed);
-    if (block_sleep_ms != 0) {
-      absl::Status slept = co_await celer::SleepFor(
-          *store.worker_, std::chrono::milliseconds(block_sleep_ms));
+    auto sleep_remaining = std::chrono::milliseconds(block_sleep_ms);
+    while (sleep_remaining > std::chrono::milliseconds::zero()) {
+      if (TombRaiderShouldForfeit()) {
+        co_return absl::OkStatus();
+      }
+      const auto sleep_chunk =
+          std::min(sleep_remaining, kMaxForfeitCheckpointSleep);
+      absl::Status slept =
+          co_await celer::SleepFor(*store.worker_, sleep_chunk);
       if (!slept.ok()) {
         co_return slept;
       }
+      sleep_remaining -= sleep_chunk;
     }
   }
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
+    if (TombRaiderShouldForfeit()) {
+      co_return absl::OkStatus();
+    }
     absl::Status flushed = co_await flush_claims(owner);
     if (!flushed.ok()) {
       co_return flushed;
@@ -595,6 +674,9 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
       }
       std::uint64_t cursor = 0;
       do {
+        if (TombRaiderShouldForfeit()) {
+          co_return absl::OkStatus();
+        }
         cursor = index.Scan(cursor, [&](RecordIndex::Entry& entry) {
           if (!entry.value_.unclaimed()) {
             return;
@@ -630,7 +712,7 @@ Task<absl::Status> StorageEngine::Impl::TombReapLocal(WorkerStore& store) {
 
   std::uint64_t reaped = 0;
   for (Candidate& candidate : tombs) {
-    if (shutdown_flush_requested_.load(std::memory_order_acquire)) {
+    if (TombRaiderShouldForfeit()) {
       break;  // forfeit the rest; totals below still publish
     }
     if (candidate.key_.empty() && candidate.key_bytes_ != 0) [[unlikely]] {

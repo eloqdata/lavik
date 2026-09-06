@@ -168,6 +168,17 @@ waiting and reacquire it for each concrete attempt. Their waiter registry and
 readiness events are implemented in the Redis subsystem, while storage remains
 the source of truth checked after wakeup.
 
+External data commands also capture the replication manager's packed
+serving-generation/open token at dispatch. Every path revalidates that token
+after obtaining its database gate; blocking List and Sorted Set loops and the
+Stream loop repeat the check on every wake. A role transition away from a
+serving population first closes and advances the generation, then broadcasts a
+wake to every worker-local blocking registry. A waiter admitted against the old
+population therefore exits with LOADING or TRYAGAIN instead of timing out or
+examining the replacement population. Opening a completed population publishes
+the role before the open bit. Trusted replication-origin commands bypass this
+client fence because they are the work that constructs the closed population.
+
 ## Session and transaction behavior
 
 - Requests from one connection are dispatched sequentially, so `SELECT` and

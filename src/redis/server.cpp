@@ -2360,6 +2360,7 @@ int RunServer(ServerOptions options) {
   // expiration mutation sequences. It still hides expired values by their
   // absolute deadline and applies the primary's replicated tombstone.
   storage_options.expiration_authority_ =
+      !options.replication_options_.cluster_enabled_ &&
       !options.replicaof_.has_value() && !options.redis_replicaof_.has_value();
   storage_options.tomb_raider_interval_ms_ = options.tomb_raider_interval_ms_;
   storage_options.tomb_raider_sleep_ms_ = options.tomb_raider_sleep_ms_;

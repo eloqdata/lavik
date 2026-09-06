@@ -1232,9 +1232,10 @@ struct ReplicaValueStage {
   RetainedMemoryCharge memory_charge_;
 };
 
-// One partition's worth of entries taken out of service by FLUSHDB. The entries
-// are unreachable to readers the moment the index is detached, but the blocks
-// they occupy still count them as live until the reclaimer subtracts them.
+// One partition's worth of entries taken out of service by FLUSHDB or replica
+// reset. The entries are unreachable to readers the moment the index is
+// detached, but the blocks they occupy still count them as live until the
+// reclaimer subtracts them.
 struct DetachedIndex {
   RecordIndex index_;
   std::uint8_t db_id_ = 0;
@@ -2376,6 +2377,8 @@ class StorageEngine::Impl {
 
   Task<absl::Status> ConfigureTombRaider(TombRaiderConfigUpdate update);
 
+  Task<absl::Status> QuiesceTombRaiderForReplica();
+
   DefragTotals DefragStats() const noexcept {
     return DefragTotals{
         .paused_ = defrag_config_.paused_.load(std::memory_order_acquire),
@@ -3005,9 +3008,10 @@ class StorageEngine::Impl {
   // Retiring the detached entries is left to ReclaimDetachedIndexes.
   void DetachDbLocal(WorkerStore& store, std::uint8_t db_id);
 
-  // Retires the entries FLUSHDB detached: subtracts what they contributed to
-  // their blocks, then frees them. Readers can no longer reach any of it, so
-  // this may run long after the command replied.
+  // Retires entries detached by database flush or a replica population
+  // transition: subtracts what they contributed to their blocks, then frees
+  // them. Readers can no longer reach any of it, so asynchronous callers do
+  // not need to wait for this work before observing the new keyspace.
   //
   // Each block is credited once for the whole population rather than once per
   // record, which is the same total by construction and turns a per-record
@@ -3016,17 +3020,20 @@ class StorageEngine::Impl {
   // above zero, so it cannot reach the empty-block path until this settles.
   Task<absl::Status> ReclaimDetachedIndexes(WorkerStore& store);
 
-  // At most one reclaimer per store, so the two ways in — a background one that
-  // FLUSHDB ASYNC leaves behind, and a caller waiting for SYNC — never split a
-  // population between them. Whichever runs picks up work queued after it
-  // started, so an arriving FLUSHDB only has to make sure one is alive.
+  void QueueDetachedIndex(WorkerStore& store, RecordIndex& index,
+                          std::uint8_t db_id);
+
+  // At most one reclaimer runs per store, so background and synchronous callers
+  // cannot split the detached-index FIFO between them. Whichever runs picks up
+  // work queued after it started, so an arriving caller only has to make sure
+  // one is alive.
   void EnsureDetachedReclaim(WorkerStore& store);
 
   Task<absl::Status> RunDetachedReclaim(WorkerStore* store);
 
   // Waits for everything detached so far to be retired. The keyspace is already
-  // empty either way; this is what makes FLUSHDB SYNC mean the memory came back
-  // before the reply.
+  // unreachable; synchronous flush and replica lifecycle callers use this to
+  // ensure index memory and live-block accounting have settled before success.
   Task<absl::Status> AwaitDetachedReclaim(WorkerStore& store);
 
   void Fail(const absl::Status& status);
@@ -3428,6 +3435,11 @@ class StorageEngine::Impl {
 
   Task<absl::Status> RunTombRaider();
 
+  bool TombRaiderShouldForfeit() const noexcept {
+    return shutdown_flush_requested_.load(std::memory_order_acquire) ||
+           tomb_raider_forfeit_requested_.load(std::memory_order_acquire);
+  }
+
   Task<absl::Status> TombMarkLocal(WorkerStore& store);
 
   Task<absl::Status> TombSweepLocal(WorkerStore& store);
@@ -3644,6 +3656,14 @@ class StorageEngine::Impl {
   static_assert(sizeof(TombRaiderRuntimeConfig) == 64);
   AsyncNotification tomb_raider_round_finished_;
   std::atomic<bool> tomb_raider_running_{false};
+  // Cross-worker phase checkpoints observe this flag. The worker-0 quiesce
+  // coordinator keeps it set until the current round has published running
+  // false; ordinary TOMBRAIDER OFF never touches it.
+  std::atomic<bool> tomb_raider_forfeit_requested_{false};
+  // Worker-0-only serialization prevents an enabling CONFIG update from
+  // reopening admission while replica quiesce is suspended waiting on a
+  // remote phase.
+  bool tomb_raider_quiescing_ = false;
   std::atomic<std::uint64_t> tomb_raider_rounds_{0};
   std::atomic<std::uint64_t> tomb_raider_reaped_{0};
   std::atomic<std::uint64_t> tomb_raider_refreshed_{0};
