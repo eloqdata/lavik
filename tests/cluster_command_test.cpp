@@ -219,7 +219,7 @@ TEST(ClusterCommandTest, SubcommandErrorsMatchRedis) {
                   "arguments for '",
                   subcommand, "'")));
   };
-  // Unknown subcommands, including the v1 exclusions from the plan.
+  // Unsupported and unknown subcommands use the same error path.
   for (const char* sub :
        {"SHARDS", "SETSLOT", "MEET", "FORGET", "REPLICATE", "ADDSLOTS",
         "DELSLOTS", "FAILOVER", "RESET", "BUMPEPOCH", "SAVECONFIG",

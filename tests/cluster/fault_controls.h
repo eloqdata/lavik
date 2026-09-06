@@ -105,8 +105,8 @@ struct MetaEntry {
 };
 
 // This is a committed-state reference machine, not a Raft implementation. It
-// controls replay and snapshot installation while #19 remains the owner of
-// consensus, WAL, and versioned production state.
+// controls replay and snapshot installation while the production metadata
+// control plane owns consensus, WAL, and versioned state.
 class ControlPlaneReferenceMachine {
  public:
   // Entries must be contiguous with nondecreasing terms. Replay is idempotent

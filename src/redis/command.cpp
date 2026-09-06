@@ -787,7 +787,7 @@ std::uint16_t ClusterDecisionClientPort(const cluster::Decision& decision,
   return decision.moved_port_;
 }
 
-// Maps a non-serving admission decision to its wire reply (plan §2.1).
+// Maps a non-serving admission decision to its wire reply.
 // Returns true when the decision produced a terminal reply; false when it
 // admits local execution. kCloseConnection yields an empty reply with the
 // close flag: the outcome is undeterminable, so nothing is written.
@@ -887,12 +887,12 @@ void RegisterClusterInFlight(
   }
 }
 
-// Choke point 1 of 2 (plan §3.2): the owner-side authority re-check for
-// non-transactional writes, called from ExecuteCommandBody after every
+// Owner-side authority re-check for non-transactional writes, called from
+// ExecuteCommandBody after every
 // suspending admission (publisher admission, DB gate, snapshot/order gates)
 // and before the handler runs. Reads are intentionally not re-checked
-// (stale-read policy, plan §2.3). Returns the standard redirect/error reply
-// when authority changed; std::nullopt when the write may proceed.
+// according to the stale-read policy. Returns the standard redirect/error
+// reply when authority changed; std::nullopt when the write may proceed.
 std::optional<CommandReply> RecheckClusterWriteAuthority(
     const CommandRequest& request, ReplyBuilder& reply_builder,
     absl::InlinedVector<cluster::InFlightGuard, 4>* in_flights) {

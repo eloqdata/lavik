@@ -1,0 +1,259 @@
+diff --git a/include/libnuraft/asio_service_options.hxx b/include/libnuraft/asio_service_options.hxx
+index ca22c35..d46aa27 100644
+--- a/include/libnuraft/asio_service_options.hxx
++++ b/include/libnuraft/asio_service_options.hxx
+@@ -22,6 +22,7 @@ limitations under the License.
+ #include <memory>
+ #include <string>
+ #include <system_error>
++#include <vector>
+ 
+ 
+ typedef struct ssl_ctx_st SSL_CTX;
+@@ -121,6 +122,8 @@ struct asio_service_options {
+         : thread_pool_size_(0)
+         , worker_start_(nullptr)
+         , worker_stop_(nullptr)
++        , listen_address_()
++        , max_rpc_payload_bytes_(0x40000000)
+         , enable_ssl_(false)
+         , skip_verification_(false)
+         , write_req_meta_(nullptr)
+@@ -155,6 +158,19 @@ struct asio_service_options {
+      */
+     std::function< void(uint32_t) > worker_stop_;
+ 
++    /** Numeric address the RPC listener binds. Empty preserves the upstream
++     * IPv4-any behavior. */
++    std::string listen_address_;
++
++    /** Maximum request or response payload accepted before allocation. */
++    uint32_t max_rpc_payload_bytes_;
++
++    /** Verify a decoded RPC header against the TLS peer URI SANs. Invoked on
++     * requests and responses before payload allocation or Raft processing. */
++    std::function< bool( const asio_service_meta_cb_params&,
++                         const std::vector<std::string>& ) >
++        verify_rpc_peer_;
++
+     /**
+      * If `true`, enable SSL/TLS secure connection.
+      */
+diff --git a/src/asio_service.cxx b/src/asio_service.cxx
+index 5dbc01e..cca5d24 100644
+--- a/src/asio_service.cxx
++++ b/src/asio_service.cxx
+@@ -72,6 +72,7 @@ limitations under the License.
+ #else
+     #include <asio/ssl.hpp>
+ #endif
++    #include <openssl/x509v3.h>
+     using ssl_socket = asio::ssl::stream<asio::ip::tcp::socket&>;
+     using ssl_context = asio::ssl::context;
+ #endif
+@@ -160,6 +161,37 @@ asio_service::meta_cb_params req_to_params(req_msg* req, resp_msg* resp) {
+              resp );
+ }
+ 
++#ifndef SSL_LIBRARY_NOT_FOUND
++std::vector<std::string> peer_uri_sans(ssl_socket& socket) {
++    std::vector<std::string> result;
++    X509* cert = SSL_get1_peer_certificate(socket.native_handle());
++    if (!cert) return result;
++    GENERAL_NAMES* names = static_cast<GENERAL_NAMES*>(
++        X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
++    if (names) {
++        const int count = sk_GENERAL_NAME_num(names);
++        for (int ii = 0; ii < count; ++ii) {
++            const GENERAL_NAME* name = sk_GENERAL_NAME_value(names, ii);
++            if (!name || name->type != GEN_URI) continue;
++            const ASN1_IA5STRING* uri = name->d.uniformResourceIdentifier;
++            const unsigned char* data = ASN1_STRING_get0_data(uri);
++            const int len = ASN1_STRING_length(uri);
++            if (data && len >= 0) {
++                result.emplace_back(reinterpret_cast<const char*>(data),
++                                    static_cast<size_t>(len));
++            }
++        }
++        GENERAL_NAMES_free(names);
++    }
++    X509_free(cert);
++    return result;
++}
++#else
++std::vector<std::string> peer_uri_sans(ssl_socket&) {
++    return std::vector<std::string>();
++}
++#endif
++
+ // === ASIO Abstraction ===
+ //     (to switch SSL <-> unsecure on-the-fly)
+ struct pending_req_pkg {
+@@ -308,6 +340,7 @@ public:
+         , cached_port_(0)
+         , crc_header_(0)
+         , crc_from_msg_(0)
++        , peer_uri_sans_()
+     {
+         p_tr( "asio rpc session created: %p. %s",
+               this,
+@@ -357,6 +390,7 @@ public:
+                   session_id_,
+                   cached_address_.c_str(),
+                   cached_port_ );
++            peer_uri_sans_ = peer_uri_sans(ssl_socket_);
+             this->start(self);
+ 
+         } else {
+@@ -474,8 +508,34 @@ public:
+             // int32 data_size = header_->get_int();
+             h_bs.pos(RPC_REQ_HEADER_SIZE - CRC_FLAGS_LEN - DATA_SIZE_LEN);
+             int32 data_size = h_bs.get_i32();
+-            // Up to 1GB.
+-            if (data_size < 0 || data_size > 0x40000000) {
++
++            // Authenticate the certificate principal against the decoded
++            // Raft identity before allocating attacker-controlled payload or
++            // allowing process_req() to observe a higher term.
++            buffer_serializer auth_bs(header_);
++            auth_bs.pos(1);
++            const msg_type auth_type = (msg_type)auth_bs.get_u8();
++            const int32 auth_src = auth_bs.get_i32();
++            const int32 auth_dst = auth_bs.get_i32();
++            const ulong auth_term = auth_bs.get_u64();
++            const ulong auth_last_term = auth_bs.get_u64();
++            const ulong auth_last_idx = auth_bs.get_u64();
++            const ulong auth_commit_idx = auth_bs.get_u64();
++            if (impl_->get_options().verify_rpc_peer_ &&
++                !impl_->get_options().verify_rpc_peer_(
++                    asio_service::meta_cb_params(
++                        (int)auth_type, auth_src, auth_dst, auth_term,
++                        auth_last_term, auth_last_idx, auth_commit_idx),
++                    peer_uri_sans_)) {
++                p_er("RPC peer verification failed for request source %d",
++                     auth_src);
++                this->stop();
++                return;
++            }
++
++            if (data_size < 0 ||
++                static_cast<uint32_t>(data_size) >
++                    impl_->get_options().max_rpc_payload_bytes_) {
+                 p_er("bad log data size in the header %d, stop "
+                      "this session to protect further corruption",
+                      data_size);
+@@ -960,6 +1020,7 @@ private:
+      * CRC number from the request header.
+      */
+     uint32_t crc_from_msg_;
++    std::vector<std::string> peer_uri_sans_;
+ };
+ 
+ // rpc listener implementation
+@@ -971,6 +1032,7 @@ public:
+     asio_rpc_listener( asio_service_impl* _impl,
+                        asio::io_service& io,
+                        ssl_context& ssl_ctx,
++                       const std::string& listen_address,
+                        ushort port,
+                        bool _enable_ssl,
+                        ptr<logger>& l )
+@@ -979,11 +1041,19 @@ public:
+         , ssl_ctx_(ssl_ctx)
+         , handler_()
+         , stopped_(false)
+-        , acceptor_(io, asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port))
++        , acceptor_(io)
+         , session_id_cnt_(1)
+         , ssl_enabled_(_enable_ssl)
+         , l_(l)
+     {
++        asio::ip::address address = listen_address.empty()
++            ? asio::ip::address(asio::ip::address_v4::any())
++            : asio::ip::make_address(listen_address);
++        asio::ip::tcp::endpoint endpoint(address, port);
++        acceptor_.open(endpoint.protocol());
++        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
++        acceptor_.bind(endpoint);
++        acceptor_.listen();
+         p_in( "Raft ASIO listener initiated, %s",
+               ssl_enabled_ ? "SSL ENABLED" : "UNSECURED" );
+     }
+@@ -1126,6 +1196,7 @@ public:
+         , socket_busy_(false)
+         , operation_timer_(io_svc)
+         , l_(l)
++        , peer_uri_sans_()
+     {
+         client_id_ = impl_->assign_client_id();
+         if (ssl_enabled_) {
+@@ -1168,6 +1239,20 @@ public:
+     bool verify_certificate(bool preverified,
+                             asio::ssl::verify_context& ctx)
+     {
++        // The upstream callback verifies only the issuing chain. Bind the
++        // leaf certificate to the NuRaft endpoint as well, using OpenSSL's
++        // SAN-aware IP/DNS checks (CN fallback is intentionally disabled).
++        if (preverified &&
++            X509_STORE_CTX_get_error_depth(ctx.native_handle()) == 0) {
++            X509* cert = X509_STORE_CTX_get_current_cert(ctx.native_handle());
++            ERROR_CODE address_error;
++            (void)asio::ip::make_address(host_, address_error);
++            const int peer_name_matches = address_error
++                ? X509_check_host(cert, host_.data(), host_.size(),
++                                  X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, nullptr)
++                : X509_check_ip_asc(cert, host_.c_str(), 0);
++            if (peer_name_matches != 1) return false;
++        }
+         if (impl_->get_options().verify_sn_) {
+             char subject_name[256];
+             X509* cert = X509_STORE_CTX_get_current_cert( ctx.native_handle() );
+@@ -1705,6 +1790,7 @@ private:
+             p_in( "handshake with %s:%s succeeded (as a client)",
+                   host_.c_str(), port_.c_str() );
+             ssl_ready_ = true;
++            peer_uri_sans_ = peer_uri_sans(ssl_socket_);
+             this->register_req_send(req, when_done, send_timeout_ms);
+ 
+         } else {
+@@ -1794,6 +1880,24 @@ private:
+         ulong nxt_idx = bs.get_u64();
+         byte accepted_val = bs.get_u8();
+         int32 carried_data_size = bs.get_i32();
++        if (carried_data_size < 0 ||
++            static_cast<uint32_t>(carried_data_size) >
++                impl_->get_options().max_rpc_payload_bytes_) {
++            std::string err_msg =
++                "response payload exceeds configured limit";
++            handle_error(req, err_msg, when_done);
++            return;
++        }
++        if (impl_->get_options().verify_rpc_peer_ &&
++            !impl_->get_options().verify_rpc_peer_(
++                asio_service::meta_cb_params(
++                    (int)msg_type_val, src, dst, term, 0, nxt_idx, 0),
++                peer_uri_sans_)) {
++            std::string err_msg =
++                "RPC peer verification failed for response";
++            handle_error(req, err_msg, when_done);
++            return;
++        }
+         ptr<resp_msg> rsp
+             ( cs_new<resp_msg>
+               ( term, (msg_type)msg_type_val, src, dst,
+@@ -2052,6 +2156,7 @@ private:
+     uint64_t client_id_;
+     asio::steady_timer operation_timer_;
+     ptr<logger> l_;
++    std::vector<std::string> peer_uri_sans_;
+ 
+     /**
+      * Queue of request which is pending for reading.
+@@ -2452,6 +2557,7 @@ ptr<rpc_listener> asio_service::create_rpc_listener( ushort listening_port,
+                      ( impl_,
+                        impl_->get_io_svc(),
+                        impl_->ssl_server_ctx_,
++                       impl_->my_opt_.listen_address_,
+                        listening_port,
+                        impl_->my_opt_.enable_ssl_,
+                        l );

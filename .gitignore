@@ -49,6 +49,9 @@ vgcore.*
 /.vscode/
 .clangd
 
+# Python
+__pycache__/
+
 # OS cruft
 .DS_Store
 Thumbs.db

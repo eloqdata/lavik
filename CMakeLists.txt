@@ -149,6 +149,80 @@ set(MI_TRACK_ASAN ${KEYLANE_ASAN_BUILD} CACHE BOOL "" FORCE)
 set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
 
+option(KEYLANE_BUILD_META
+  "Build the keylane_meta Raft control plane (requires the recursive nuraft submodule)"
+  ON)
+if (KEYLANE_BUILD_META)
+  if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/CMakeLists.txt)
+    message(FATAL_ERROR
+      "nuraft submodule not found; run git submodule update --init --recursive")
+  endif()
+  if (NOT EXISTS
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/asio/asio/include/asio.hpp)
+    message(FATAL_ERROR
+      "nuraft/asio submodule not found; run git submodule update --init --recursive")
+  endif()
+  # Apply the pinned Keylane patch set to an isolated build-tree copy. The
+  # third-party checkout stays pristine, configure is repeatable, and a patch
+  # that no longer applies fails before compilation instead of drifting.
+  set(KEYLANE_NURAFT_SOURCE_DIR
+      ${CMAKE_CURRENT_BINARY_DIR}/_keylane_nuraft_source)
+  file(REMOVE_RECURSE ${KEYLANE_NURAFT_SOURCE_DIR})
+  file(MAKE_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR})
+  file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/
+       DESTINATION ${KEYLANE_NURAFT_SOURCE_DIR}
+       PATTERN ".git" EXCLUDE)
+  find_program(KEYLANE_GIT_EXECUTABLE git REQUIRED)
+  file(GLOB KEYLANE_NURAFT_PATCHES CONFIGURE_DEPENDS
+       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/nuraft/*.patch)
+  list(SORT KEYLANE_NURAFT_PATCHES)
+  foreach(KEYLANE_NURAFT_PATCH IN LISTS KEYLANE_NURAFT_PATCHES)
+    execute_process(
+      # The isolated copy may live underneath Keylane's own worktree. Stop
+      # repository discovery at the build root so git applies paths relative
+      # to WORKING_DIRECTORY instead of silently skipping every path outside
+      # the generated directory's prefix in the parent repository.
+      COMMAND ${CMAKE_COMMAND} -E env
+              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+              ${KEYLANE_GIT_EXECUTABLE} apply --check ${KEYLANE_NURAFT_PATCH}
+      WORKING_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR}
+      RESULT_VARIABLE KEYLANE_NURAFT_PATCH_CHECK)
+    if (NOT KEYLANE_NURAFT_PATCH_CHECK EQUAL 0)
+      message(FATAL_ERROR "NuRaft patch no longer applies: ${KEYLANE_NURAFT_PATCH}")
+    endif()
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env
+              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+              ${KEYLANE_GIT_EXECUTABLE} apply ${KEYLANE_NURAFT_PATCH}
+      WORKING_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR}
+      COMMAND_ERROR_IS_FATAL ANY)
+  endforeach()
+  unset(KEYLANE_NURAFT_PATCH)
+  unset(KEYLANE_NURAFT_PATCHES)
+  set(DISABLE_ASIO OFF)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(ASIO_INCLUDE_DIR
+      ${KEYLANE_NURAFT_SOURCE_DIR}/asio/asio/include CACHE PATH "" FORCE)
+  # NuRaft's tests subdirectory builds its asio-based harness whenever
+  # BUILD_TESTING is on. Shadow keylane's global test enablement for this
+  # subdirectory only, then restore it for keylane's own test targets.
+  set(KEYLANE_SAVED_BUILD_TESTING ${BUILD_TESTING})
+  set(BUILD_TESTING OFF)
+  add_subdirectory(${KEYLANE_NURAFT_SOURCE_DIR}
+                   ${CMAKE_CURRENT_BINARY_DIR}/_keylane_nuraft_build)
+  set(BUILD_TESTING ${KEYLANE_SAVED_BUILD_TESTING})
+  unset(KEYLANE_SAVED_BUILD_TESTING)
+  # NuRaft's headers are not warning-clean under -Wpedantic/-Wunused-parameter;
+  # consumers compile with -Wall -Wextra -Wpedantic, so treat them as SYSTEM.
+  get_target_property(KEYLANE_NURAFT_IFACE_INCLUDES static_lib
+    INTERFACE_INCLUDE_DIRECTORIES)
+  if (KEYLANE_NURAFT_IFACE_INCLUDES)
+    set_target_properties(static_lib PROPERTIES
+      INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${KEYLANE_NURAFT_IFACE_INCLUDES}")
+  endif()
+  unset(KEYLANE_NURAFT_IFACE_INCLUDES)
+endif()
+
 set(KEYLANE_LUA_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua/src")
 add_library(keylane_lua STATIC
   ${KEYLANE_LUA_SOURCE_DIR}/lapi.c
@@ -378,6 +452,73 @@ if (UNIX)
   )
 endif()
 
+if (KEYLANE_BUILD_META)
+  # Architecture layering: Raft is a meta-plane concern. NuRaft is linked
+  # only into keylane_meta; keylane, keylane_module, and the test binaries
+  # must stay Raft-free so the data plane never sees consensus code.
+  #
+  # keylane_meta_core carries durability, the completion bridge, and control
+  # logic; NuRaft's native Asio service owns peer transport and timers.
+  set(KEYLANE_META_CORE_SOURCES
+    src/meta/meta_audit_store.cpp
+    src/meta/meta_commands.cpp
+    src/meta/meta_coordinator.cpp
+    src/meta/meta_ctl_server.cpp
+    src/meta/meta_encoding.cpp
+    src/meta/meta_grant_store.cpp
+    src/meta/meta_identity_verifier.cpp
+    src/meta/meta_identity_store.cpp
+    src/meta/meta_observation_store.cpp
+    src/meta/meta_operation_store.cpp
+    src/meta/meta_policy_store.cpp
+    src/meta/meta_proposal_executor.cpp
+    src/meta/meta_state_apply.cpp
+    src/meta/meta_state_machine.cpp
+    src/meta/meta_topology_store.cpp
+    src/meta/meta_value_codec.cpp
+    src/meta/nuraft_asio_transport.cpp
+    src/meta/nuraft_log_store.cpp
+    src/meta/nuraft_scheduler.cpp
+    src/meta/nuraft_state_mgr.cpp
+  )
+  add_library(keylane_meta_core STATIC ${KEYLANE_META_CORE_SOURCES})
+  target_include_directories(keylane_meta_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+  )
+  target_link_libraries(keylane_meta_core PUBLIC
+    NuRaft::static_lib
+    celer::core
+  )
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane_meta_core PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  add_executable(keylane_meta
+    app/keylane_meta.cpp
+  )
+  target_include_directories(keylane_meta PRIVATE
+    ${KEYLANE_GENERATED_INCLUDE_DIR}
+  )
+  target_compile_definitions(keylane_meta PRIVATE
+    KEYLANE_NURAFT_PINNED_COMMIT=\"0b01b185b46b8e482f6c384b636c35605121a41e\"
+  )
+  target_link_libraries(keylane_meta PRIVATE
+    keylane_meta_core
+  )
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane_meta PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  # Negative guard for the layering rule above: fail at configure time if
+  # nuraft ever leaks into the data-plane module's link interface.
+  get_target_property(KEYLANE_MODULE_IFACE_LIBS keylane_module
+    INTERFACE_LINK_LIBRARIES)
+  if (KEYLANE_MODULE_IFACE_LIBS MATCHES "nuraft|NuRaft")
+    message(FATAL_ERROR
+      "keylane_module must not link NuRaft; Raft is meta-plane only")
+  endif()
+endif()
+
 if (BUILD_TESTING)
   # Test-only executables do not ship, and their intentionally oversized
   # coroutine stress cases have triggered GCC IPO compiler ICEs. Preserve LTO
@@ -450,6 +591,97 @@ if (BUILD_TESTING)
     PROPERTIES
       LABELS cluster-model
       TIMEOUT 15
+  )
+
+  if (KEYLANE_BUILD_META)
+    # Meta-plane tests. Links keylane_meta_core (NuRaft); the data-plane
+    # unit test binary stays Raft-free, so meta tests get their own binary.
+    add_executable(keylane_meta_tests
+      tests/meta_coordinator_test.cpp
+      tests/meta_journal_test.cpp
+      tests/meta_model_test.cpp
+      tests/meta_observation_test.cpp
+      tests/meta_security_test.cpp
+      tests/meta_state_machine_test.cpp
+      tests/meta_store_test.cpp
+      tests/meta_stores_test.cpp
+    )
+    target_link_libraries(keylane_meta_tests PRIVATE
+      keylane_meta_core
+      GTest::gtest_main
+    )
+    target_compile_definitions(keylane_meta_tests PRIVATE
+      KEYLANE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    gtest_discover_tests(keylane_meta_tests
+      TEST_PREFIX meta.
+      PROPERTIES
+        LABELS meta
+        TIMEOUT 30
+    )
+
+    # 3-node end-to-end smoke for the meta control plane: membership changes,
+    # replication, crash/restart catch-up, automatic and manual snapshots.
+    find_program(KEYLANE_PYTHON3_EXECUTABLE NAMES python3)
+    if (KEYLANE_PYTHON3_EXECUTABLE)
+      add_test(
+        NAME meta_integration.smoke_3node
+        COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
+                $<TARGET_FILE:keylane_meta>
+      )
+      set_tests_properties(meta_integration.smoke_3node PROPERTIES
+        LABELS meta-integration
+        TIMEOUT 120
+        RUN_SERIAL TRUE
+      )
+
+      # Metadata process gates: leader-change safety, WAL/snapshot
+      # recovery matrix, membership-change semantics, transport
+      # connect/cancel/timeout, slow-peer backpressure, mTLS, the observation
+      # stale-evidence/observation-lifecycle gate, and Meta partition safety.
+      # Each spins up its own
+      # multi-node keylane_meta clusters; RUN_SERIAL keeps port allocation
+      # and timing margins deterministic.
+      foreach(gate leader_change recovery membership transport backpressure
+              mtls stale_evidence partition)
+        add_test(
+          NAME meta_integration.gate_${gate}
+          COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_${gate}.py
+                  $<TARGET_FILE:keylane_meta>
+        )
+        set_tests_properties(meta_integration.gate_${gate} PROPERTIES
+          LABELS meta-integration
+          TIMEOUT 180
+          RUN_SERIAL TRUE
+        )
+      endforeach()
+    else()
+      message(STATUS "python3 not found; meta integration tests are disabled")
+    endif()
+  endif()
+
+  # celer's connect/timer verification harness, run under ctest. Keylane
+  # forces CELER_BUILD_EXAMPLES=OFF, so the celer-side example target never
+  # materializes in this build; compile the source directly here instead (it
+  # only uses celer public headers). The suite deliberately sleeps past armed
+  # deadlines to catch stale-timeout dispatches, hence the 90s budget.
+  add_executable(celer_connect_timer_check
+    celer/example/connect_timer_check.cpp
+  )
+  target_link_libraries(celer_connect_timer_check PRIVATE celer::core)
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(celer_connect_timer_check PRIVATE
+      -Wall -Wextra -Wpedantic)
+  endif()
+  add_test(
+    NAME celer_connect_timer_check
+    COMMAND celer_connect_timer_check
+  )
+  set_tests_properties(celer_connect_timer_check PROPERTIES
+    LABELS celer
+    TIMEOUT 90
   )
 
   add_executable(keylane_cluster_fault

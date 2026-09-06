@@ -13,6 +13,7 @@ or safety boundaries.
 | [Multi-device storage](multi-device-storage.md) | Provisioning storage paths, expanding a storage set, or diagnosing membership and capacity constraints |
 | [Tomb Raider scheduling](tomb-raider.md) | Configuring or operating tombstone cleanup schedules |
 | [Prometheus metrics](metrics.md) | Integrating metrics, interpreting exported values, or changing monitoring behavior |
+| [Meta control plane](meta-control-plane.md) | Provisioning Meta identities, bootstrapping or changing membership, rolling schema upgrades, snapshot/WAL incidents, and exporting audit or operation archives |
 | [Network IRQ affinity tuning](irq-affinity-tuning.md) | Measuring or changing host IRQ placement for latency tuning |
 | [Monitoring stack](../../deploy/monitoring/README.md) | Running the repository's Prometheus and Grafana deployment |
 
