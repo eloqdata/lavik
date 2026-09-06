@@ -1,5 +1,7 @@
 # Keylane SPDK/io_uring、Dragonfly、Garnet、Apache Kvrocks、Pika、Tendis 与 KeyDB On Flash 性能对比（2026-08-11）
 
+**中文** | [English](keylane-vs-dragonfly-tiering-2026-08-11.en.md)
+
 > 2026-08-12 更新：Keylane 三种后端、Dragonfly Tiered Storage、Microsoft Garnet Storage Tier、Apache Kvrocks、Pika、Tendis 和 KeyDB On Flash 已按统一的 5 分钟口径完成复测，表内均已替换为本轮结果。每种后端只灌数一次，随后依次执行纯读、1:1 读写混合和纯写。本次 Keylane 复测保持 defrag 开启，其他系统保持各自的后台回收或 auto compaction 开启。
 
 > 2026-08-12 补充：增加 Azure Managed Redis 480 GB/16 vCPU 实例的独立容量与性能测试。该组使用约 400 GB 数据和 60 秒窗口，已用 `*` 标入主榜单，并在表下说明与本地双 NVMe 300 秒结果的口径差异。

@@ -29,6 +29,9 @@ threads 的峰值只有约 144k–159k QPS；Redis 在 16 threads 达到本轮�
 Valkey GET 在 16 threads 最佳，但 Valkey SET 在 8 threads 最佳，增加到
 16 threads 后下降 4.7%。
 
+若需要比较更多磁盘型 Redis 兼容系统及不同持久化、WAL、compaction
+配置，请参阅[更完整的持久化与分层存储对比报告](../keylane-vs-dragonfly-tiering-2026-08-11.md)。
+
 ## Keylane 与调优后纯内存系统的差距
 
 ![Keylane、Redis、Valkey 不同连接数 QPS](best-memory-vs-keylane-qps.png)

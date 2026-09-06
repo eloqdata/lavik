@@ -252,7 +252,7 @@ and mixed workloads.
 These numbers are measurements, not universal product rankings. The systems
 used different storage engines, cache budgets, and durability settings; some
 competitor configurations disabled WAL or binlog. Consult the
-[full comparison report](perf_reports/keylane-vs-dragonfly-tiering-2026-08-11.md)
+[full comparison report](perf_reports/keylane-vs-dragonfly-tiering-2026-08-11.en.md)
 for exact versions, configuration, workload order, fairness constraints, and
 reproduction commands.
 

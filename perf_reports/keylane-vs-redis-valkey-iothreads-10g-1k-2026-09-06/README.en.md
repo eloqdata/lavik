@@ -34,6 +34,10 @@ meaningful. Their one- and two-thread peaks were only about 144k–159k QPS.
 Redis performed best with 16 threads. Valkey GET was also best with 16 threads,
 but Valkey SET was best with 8 and regressed by 4.7% at 16.
 
+For a broader comparison of disk-backed Redis-compatible systems and their
+different persistence, WAL, and compaction settings, see the
+[detailed persistence and storage-tier report](../keylane-vs-dragonfly-tiering-2026-08-11.en.md).
+
 ## The gap between Keylane and tuned in-memory systems
 
 ![Keylane, Redis, and Valkey QPS by connection count](best-memory-vs-keylane-qps.png)
