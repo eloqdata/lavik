@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ Keylane
+# Keylane
 
 ### Redis-class performance. NVMe-scale capacity.
 
@@ -36,26 +36,26 @@ operational tooling.
 > [current architecture](docs/architecture/README.md) and test your workload
 > before adopting it.
 
-## ✨ Highlights
+## Highlights
 
-- 💾 **NVMe-scale capacity.** Store data in preallocated regular files, raw Linux
+- **NVMe-scale capacity.** Store data in preallocated regular files, raw Linux
   block devices, or NVMe namespaces accessed directly through SPDK.
-- 🔌 **Redis-compatible interface.** RESP2/RESP3, common Redis data structures,
+- **Redis-compatible interface.** RESP2/RESP3, common Redis data structures,
   pipelining, authentication, TLS, Pub/Sub, Lua scripts, and Functions.
-- 🧰 **Rich data model.** Strings, Lists, Hashes, Sets, Sorted Sets, and Streams,
+- **Rich data model.** Strings, Lists, Hashes, Sets, Sorted Sets, and Streams,
   with semantics exercised by vendored Valkey compatibility tests.
-- 🔒 **Atomic multi-key operations.** Cross-worker coordination for multi-key
+- **Atomic multi-key operations.** Cross-worker coordination for multi-key
   commands, `MULTI`/`EXEC`, `WATCH`, and declared-key Lua/Function calls.
-- 🛡️ **Crash-consistent storage.** Checksummed append-only records, A/B metadata,
+- **Crash-consistent storage.** Checksummed append-only records, A/B metadata,
   transaction commit records, parallel recovery, TTL, and online defragmentation.
-- 🔁 **Replication and migration.** Native Keylane replication, Redis PSYNC
+- **Replication and migration.** Native Keylane replication, Redis PSYNC
   following/export, Redis Sentinel integration, and Redis-compatible RDB
   import/export.
-- 📈 **Operational visibility.** Prometheus metrics, Redis `INFO`, `SLOWLOG`,
+- **Operational visibility.** Prometheus metrics, Redis `INFO`, `SLOWLOG`,
   bounded memory admission, graceful shutdown, and configurable background
   maintenance.
 
-## 🏗️ Architecture
+## Architecture
 
 Keylane is a single-process, layered system. Mutable state is partitioned by
 worker, the complete top-level key index stays in memory, and record data is
@@ -84,11 +84,11 @@ placed on high-performance storage.
 
 | Layer | Responsibility | Key design choices |
 |---|---|---|
-| 🔌 **Redis service** | Owns protocol compatibility and connection state | RESP2/RESP3, command dispatch, Lua/Functions, Pub/Sub, TLS, and Redis administration surfaces |
-| ⚡ **Worker runtime** | Executes network, command, and storage work | One native thread and coroutine scheduler per worker; workers can be pinned one-to-one to CPUs, busy-poll before parking, and exchange work through cross-core mailboxes |
-| 🔒 **Coordination** | Routes keys and serializes conflicting operations | Redis hash-slot ownership, worker-local shared/exclusive intents, and cross-worker transactions for atomic multi-key commands |
-| 🧠 **In-memory hash index** | Locates the newest logical version of every key | Worker-owned partition indexes retain compact key and record-location metadata in DRAM; values remain staged or storage-backed, and recovery rebuilds the indexes from durable records |
-| 💾 **Storage engine** | Owns durable data and device capacity | Immutable record versions, checksummed metadata, batched direct I/O, parallel recovery, TTL, online defragmentation, and file/raw/SPDK backends |
+| **Redis service** | Owns protocol compatibility and connection state | RESP2/RESP3, command dispatch, Lua/Functions, Pub/Sub, TLS, and Redis administration surfaces |
+| **Worker runtime** | Executes network, command, and storage work | One native thread and coroutine scheduler per worker; workers can be pinned one-to-one to CPUs, busy-poll before parking, and exchange work through cross-core mailboxes |
+| **Coordination** | Routes keys and serializes conflicting operations | Redis hash-slot ownership, worker-local shared/exclusive intents, and cross-worker transactions for atomic multi-key commands |
+| **In-memory hash index** | Locates the newest logical version of every key | Worker-owned partition indexes retain compact key and record-location metadata in DRAM; values remain staged or storage-backed, and recovery rebuilds the indexes from durable records |
+| **Storage engine** | Owns durable data and device capacity | Immutable record versions, checksummed metadata, batched direct I/O, parallel recovery, TTL, online defragmentation, and file/raw/SPDK backends |
 
 Replication, memory admission, metrics, and graceful lifecycle management span
 these layers rather than belonging to only one of them.
@@ -97,7 +97,7 @@ See the [architecture index](docs/architecture/README.md) for the authoritative
 module map and deeper descriptions of request serving, transactions, storage,
 recovery, and replication.
 
-## 📦 Installation
+## Installation
 
 ### Prerequisites
 
@@ -115,7 +115,7 @@ sudo apt-get update
 sudo apt-get install -y build-essential cmake git libssl-dev
 ```
 
-### 🔨 Build from source
+### Build from source
 
 ```bash
 git clone --recursive https://github.com/thweetkomputer/keylane.git
@@ -143,7 +143,7 @@ The archive is written under `dist/` using an `x86-64-v2` or `armv8-a` CPU
 baseline. See [Building and packaging](docs/operations/building-and-packaging.md)
 for compiler, sanitizer, CPU-target, and packaging details.
 
-### ⚙️ Optional SPDK build
+### Optional SPDK build
 
 The default build uses io_uring for both regular files and raw block devices.
 For userspace NVMe access, install the SPDK dependencies for the target host and
@@ -161,7 +161,7 @@ SPDK device paths use the form `spdk://<PCI-domain>:<bus>:<device>.<function>/<n
 SPDK requires exclusive device ownership, host driver binding, DMA-capable
 memory, and deployment-specific CPU/IRQ planning.
 
-## 🚀 Quick Start
+## Quick Start
 
 Keylane never creates, extends, or truncates a storage path. For a throwaway
 local instance, first provision a file and then start the server:
@@ -219,7 +219,7 @@ using raw devices or expanding an existing storage set.
 Run `keylane --help` for all command-line options. Keylane also accepts a
 Redis-style configuration file as its first argument.
 
-## 📊 Benchmark
+## Benchmark
 
 The table below is a same-hardware comparison using two NVMe devices, 200 million
 keys, uniformly random 1,000–4,000-byte values, 80 client connections, pipeline
@@ -256,18 +256,17 @@ competitor configurations disabled WAL or binlog. Consult the
 for exact versions, configuration, workload order, fairness constraints, and
 reproduction commands.
 
-### 🧪 Large-dataset and stability results
+### One million QPS on a 16-vCPU server
 
-- With **500 million 2 KiB keys** and 12 workers, Keylane SPDK sustained
-  322,640 GET/s and 370,683 commands/s on a random 1:1 workload. See the
-  [SPDK vs. raw io_uring report](perf_reports/keylane-spdk-vs-iouring-500m2k-memtier-valkey-12c-2026-08-26.md).
-- In a **48-hour** run with 400 million keys at a client-limited 100,000 QPS
-  and a 95:5 GET/SET mix, Keylane completed 17.28 billion operations without a
-  restart, storage error, or memory rejection. Every five-minute server-side
-  p99.99 point remained below 3 ms. See the
-  [48-hour stability report](perf_reports/keylane-spdk-48h-stability-2026-08-15.md).
+On a server with 16 logical CPUs and 16 pinned workers, Keylane served random
+GETs from a one-billion-key SPDK dataset at **1,007,197 QPS** with 1,024-byte
+values, 640 connections, and pipeline depth 1. All 64 million measured GETs
+found an existing key, and no errors were reported. The 128-, 256-, and
+512-byte workloads also exceeded one million QPS. See the
+[one-billion-key, 16-worker benchmark report](perf_reports/keylane-spdk-dfly-bench-1b-value-size-limit-16worker-2026-08-31.md)
+for the complete setup, latency measurements, and reproduction commands.
 
-## ⚠️ Durability and compatibility notes
+## Durability and compatibility notes
 
 - An ordinary successful write is not a synchronous `fsync` durability fence.
   Keylane batches data and header flushes; graceful shutdown drains them. Read
@@ -281,7 +280,7 @@ reproduction commands.
   orchestration manifest. The deployment layer owns service supervision,
   persistent path provisioning, and resource isolation.
 
-## 🛠️ Development and documentation
+## Development and documentation
 
 ```bash
 ./scripts/build_debug.sh
@@ -304,7 +303,7 @@ Useful references:
 
 <div align="center">
 
-### ⭐ Help Keylane grow
+### Help Keylane grow
 
 If Keylane looks useful, please
 **[star the project on GitHub](https://github.com/thweetkomputer/keylane)**.
