@@ -432,13 +432,10 @@ class DiskValue {
  public:
   DiskValue() = default;
   DiskValue(ReadBufferLease lease, std::size_t network_offset,
-            std::size_t network_size, std::size_t value_offset,
-            std::size_t value_size) noexcept
+            std::size_t network_size) noexcept
       : lease_(std::move(lease)),
         network_offset_(static_cast<std::uint32_t>(network_offset)),
-        network_size_(static_cast<std::uint32_t>(network_size)),
-        value_offset_(static_cast<std::uint32_t>(value_offset)),
-        value_size_(static_cast<std::uint32_t>(value_size)) {
+        network_size_(static_cast<std::uint32_t>(network_size)) {
     // A direct string GET is bounded by kMaxRecordPayloadBytes (1 GiB);
     // narrowing these offsets keeps the move-only result small as it crosses
     // command coroutine frames without reducing the supported string limit.
@@ -446,8 +443,6 @@ class DiskValue {
     // aggregate encoded size.
     assert(network_offset <= std::numeric_limits<std::uint32_t>::max());
     assert(network_size <= std::numeric_limits<std::uint32_t>::max());
-    assert(value_offset <= std::numeric_limits<std::uint32_t>::max());
-    assert(value_size <= std::numeric_limits<std::uint32_t>::max());
   }
 
   DiskValue(const DiskValue&) = delete;
@@ -464,19 +459,31 @@ class DiskValue {
   }
 
   std::span<const std::byte> value_bytes() const noexcept {
-    auto bytes = lease_.bytes();
-    return {bytes.data() + value_offset_, value_size_};
+    const std::span<const std::byte> frame = network_bytes();
+    assert(frame.size() >= 6 && frame.front() == std::byte{'$'});
+    std::size_t value_offset = 1;
+    while (value_offset < frame.size() &&
+           frame[value_offset] != std::byte{'\r'}) {
+      ++value_offset;
+    }
+    assert(value_offset + 3 < frame.size());
+    assert(frame[value_offset + 1] == std::byte{'\n'});
+    value_offset += 2;
+    assert(frame[frame.size() - 2] == std::byte{'\r'});
+    assert(frame.back() == std::byte{'\n'});
+    return frame.subspan(value_offset, frame.size() - value_offset - 2);
   }
 
  private:
   ReadBufferLease lease_;
   std::uint32_t network_offset_ = 0;
   std::uint32_t network_size_ = 0;
-  std::uint32_t value_offset_ = 0;
-  std::uint32_t value_size_ = 0;
 };
 
-static_assert(sizeof(DiskValue) == 48);
+// The value span is recoverable from the RESP frame and has no hot-path
+// caller. Do not duplicate its offset and size in every direct GET result:
+// this object crosses several coroutine frames before the socket write.
+static_assert(sizeof(DiskValue) == 40);
 
 // One string lookup in a pre-locked, worker-local batch. BatchGetLocked keeps
 // the storage pipeline inside one coroutine and fans ordinary disk reads into

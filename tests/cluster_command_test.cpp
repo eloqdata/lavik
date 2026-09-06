@@ -158,8 +158,10 @@ std::string RunClusterCommand(
   handle.resume();
   EXPECT_TRUE(handle.done());
   std::string encoded;
-  if (handle.done() && handle.promise().value_.has_value()) {
-    encoded = std::string(handle.promise().value_->encoded_);
+  // A completed Task<T> always constructed its result: unhandled exceptions
+  // terminate, so there is no completed-without-value state to probe here.
+  if (handle.done()) {
+    encoded = std::string(handle.promise().value_.encoded_);
   }
   handle.destroy();
   return encoded;

@@ -291,7 +291,9 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
               if (!reserved.ok()) return Error(reserved, pos);
               state_ = State::kArgumentStart;
             } else {
-              if (parsed > static_cast<long long>(kMaxBulkLen)) {
+              if (parsed > static_cast<long long>(kMaxBulkLen) ||
+                  static_cast<unsigned long long>(parsed) >
+                      current_argument_.max_size()) {
                 return Error(
                     absl::OutOfRangeError("RESP bulk string too large"), pos);
               }
@@ -387,9 +389,13 @@ RespParseResult RespCommandParser::Parse(std::string_view input) {
         const std::size_t available = input.size() - pos;
         const std::size_t take = std::min(available, bulk_remaining_);
         if (take != 0) {
-          absl::Status appended =
-              AppendArgument(&current_argument_, input.substr(pos, take));
-          if (!appended.ok()) return Error(appended, pos);
+          // Bulk length was checked against both the protocol limit and the
+          // string's max_size before this state was entered. bulk_remaining_
+          // bounds the cumulative append, so repeating overflow checks and a
+          // length_error handler on every ordinary RESP argument is redundant.
+          // Allocation failure remains process-fatal through the coroutine's
+          // unhandled-exception policy.
+          current_argument_.append(input.substr(pos, take));
           bulk_remaining_ -= take;
           if (!consume(take)) {
             return Error(absl::ResourceExhaustedError(

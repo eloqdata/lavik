@@ -2201,9 +2201,16 @@ bool TryBeginDbOperation(std::uint8_t db_id) noexcept {
   return false;
 }
 
+// InitStorage resolves this before worker threads start. Every ordinary write
+// then does only the unarmed pointer check, without libc getenv or a
+// function-local static guard.
+const char* g_command_pause_before_db_admission = nullptr;
+
+// Deterministic E2E hook for widening the role-change window after write
+// admission. Changing the test-only environment variable at runtime is not
+// supported.
 Task<absl::Status> MaybePauseBeforeCommandDbAdmission() {
-  const char* configured =
-      std::getenv("KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS");
+  const char* configured = g_command_pause_before_db_admission;
   if (configured == nullptr) co_return absl::OkStatus();
   std::uint64_t milliseconds = 0;
   const std::size_t length = std::strlen(configured);
@@ -9892,6 +9899,11 @@ bool RequestSpansMultipleShards(const CommandRequest& request) {
 
 void InitStorage(storage::StorageEngine* engine,
                  ReplicationManager* replication) {
+  // Test processes set their environment before constructing the server.
+  // Capture it while startup is still single-threaded; the command hot path
+  // treats the pointer as immutable after workers launch.
+  g_command_pause_before_db_admission =
+      std::getenv("KEYLANE_COMMAND_PAUSE_BEFORE_DB_ADMISSION_MS");
   g_storage = engine;
   InitFunctionCatalog(engine);
   InitBlockingWaitStorage(engine);
@@ -11753,6 +11765,13 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
   if (g_replication != nullptr ? g_replication->reject_writes()
                                : g_replica_read_only) {
     return std::nullopt;
+  }
+  // PopulateClusterSlots caches a route only after DetermineKeys proves the
+  // request has exactly one key. For a static key spec, matching the cached
+  // argument is therefore sufficient proof here and avoids repeating arity
+  // and key-range resolution on every cluster write.
+  if (request.HasRoutedPartitionFor(request.spec_->first_key_)) {
+    return request.RoutedPartitionId() % g_storage->worker_count();
   }
   const absl::StatusOr<KeyIndexView> keys =
       DetermineKeys(*request.spec_, request.args_);

@@ -87,6 +87,22 @@ constexpr std::array<std::uint64_t, 28> kLatencyBucketUpperUs{
 // several multi-worker subsystems that keep descriptors open.
 constexpr std::uint64_t kMaxClientsFileDescriptorReserve = 256;
 
+CommandRequest BuildParsedCommandRequest(RespCommand command,
+                                         std::uint8_t db_id) {
+  // RespCommandParser reports kOk only after producing at least the command
+  // name. Keep the checked builder for synthesized and wire-replay commands,
+  // but do not wrap every client request in StatusOr merely to recheck this
+  // parser invariant in the hottest coroutine frame.
+  assert(!command.args_.empty());
+  CommandRequest request;
+  request.spec_ = FindCommand(command.args_.front());
+  request.kind_ = request.spec_ != nullptr ? request.spec_->kind_
+                                           : CommandKind::kUnknown;
+  request.db_id_ = db_id;
+  request.args_ = std::move(command.args_);
+  return request;
+}
+
 absl::StatusOr<std::uint64_t> MaxClientsAllowedByFileLimit(
     std::uint64_t requested) {
   rlimit limit{};
@@ -1618,26 +1634,20 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       co_return absl::OkStatus();
     }
     RequestGuard request_guard(this);
-    auto request = BuildCommandRequest(std::move(command), ctx.selected_db_);
-    if (request.ok()) {
-      request->connection_tls_ = stream.IsTls();
-    }
+    CommandRequest request =
+        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
+    request.connection_tls_ = stream.IsTls();
     builder.SetVersion(ctx.resp_version());
     builder.Reset();
-    if (!request.ok()) {
-      EnqueuePubSubReply(session, std::string(builder.AppendError(absl::StrCat(
-                                      "ERR ", request.status().message()))));
-      continue;
-    }
-    const CommandKind kind = request->kind_;
+    const CommandKind kind = request.kind_;
     if (HasMonitorSessions()) [[unlikely]] {
       PublishMonitorMessage(PrepareMonitorMessage(
-          request->db_id_, ctx.peer_address_, request->args_, &*request));
+          request.db_id_, ctx.peer_address_, request.args_, &request));
     }
     if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
       const std::size_t queued_before = ctx.queued_.size();
       CommandReply reply =
-          co_await DispatchCommand(ctx, *request, builder);
+          co_await DispatchCommand(ctx, request, builder);
       if (ctx.queued_.size() > queued_before) {
         *multi_input_bytes += command_memory.Detach();
       } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1655,15 +1665,15 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
       co_return absl::OkStatus();
     }
     if (kind == CommandKind::kPing && ctx.resp_version() == RespVersion::k2) {
-      if (request->args_.size() > 2) {
+      if (request.args_.size() > 2) {
         EnqueuePubSubReply(
             session, std::string(builder.AppendError(
                          "ERR wrong number of arguments for 'ping' command")));
       } else {
         builder.AppendPushHeader(2);
         builder.AppendBulkString("pong");
-        builder.AppendBulkString(request->args_.size() == 2
-                                     ? std::string_view(request->args_[1])
+        builder.AppendBulkString(request.args_.size() == 2
+                                     ? std::string_view(request.args_[1])
                                      : std::string_view{});
         EnqueuePubSubReply(session, std::string(builder.View()));
       }
@@ -1678,7 +1688,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
         EnqueuePubSubReply(
             session,
             std::string(builder.AppendError("ERR unknown command '" +
-                                            request->args_.front() + "'")));
+                                            request.args_.front() + "'")));
       } else {
         std::string name(CommandCanonicalName(kind));
         EnqueuePubSubReply(
@@ -1693,7 +1703,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
 
     const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply =
-        co_await DispatchCommand(ctx, *request, builder);
+        co_await DispatchCommand(ctx, request, builder);
     if (ctx.queued_.size() > queued_before) {
       *multi_input_bytes += command_memory.Detach();
     } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1930,21 +1940,16 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
     }
     RequestGuard request_guard(this);
 
-    auto request_result =
-        BuildCommandRequest(std::move(command), ctx.selected_db_);
-    if (request_result.ok()) {
-      // Cluster MOVED/discovery replies select the TLS port for connections
-      // that arrived over TLS (Redis getNodeClientPort semantics).
-      request_result->connection_tls_ = stream.IsTls();
-    }
+    CommandRequest request =
+        BuildParsedCommandRequest(std::move(command), ctx.selected_db_);
+    // Cluster MOVED/discovery replies select the TLS port for connections
+    // that arrived over TLS (Redis getNodeClientPort semantics).
+    request.connection_tls_ = stream.IsTls();
     const std::size_t queued_before = ctx.queued_.size();
     CommandReply reply;
     std::shared_ptr<const std::string> monitor_message;
     bool publish_monitor_after_dispatch = false;
-    if (!request_result.ok()) [[unlikely]] {
-      reply.encoded_ = ctx.reply_builder_.AppendError(
-          absl::StrCat("ERR ", request_result.status().message()));
-    } else {
+    {
       // A reply batch must never cross an unbounded command boundary. A
       // pipelined blocking command can park this connection before the loop
       // reaches its ordinary write path, otherwise replies for commands that
@@ -1952,8 +1957,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       // Blocking commands queued by MULTI execute non-blocking at EXEC time,
       // so preserve batching while they are only being queued.
       const bool may_block =
-          !ctx.in_multi_ && request_result->spec_ != nullptr &&
-          (request_result->spec_->flags_ & kCmdMayBlock) != 0;
+          !ctx.in_multi_ && request.spec_ != nullptr &&
+          (request.spec_->flags_ & kCmdMayBlock) != 0;
       if (may_block && !pending_replies.empty()) {
         absl::Status flushed =
             co_await FlushReplyBatch(stream, &pending_replies);
@@ -1964,7 +1969,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       // transaction implementation publishes those children after WATCH and
       // other pre-execution checks pass.
       if (HasMonitorSessions()) [[unlikely]] {
-        const CommandKind kind = request_result->kind_;
+        const CommandKind kind = request.kind_;
         publish_monitor_after_dispatch = kind == CommandKind::kExec;
         const bool defer_to_exec =
             ctx.in_multi_ && kind != CommandKind::kExec &&
@@ -1972,8 +1977,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             kind != CommandKind::kWatch;
         if (!defer_to_exec) {
           monitor_message =
-              PrepareMonitorMessage(request_result->db_id_, ctx.peer_address_,
-                                    request_result->args_, &*request_result);
+              PrepareMonitorMessage(request.db_id_, ctx.peer_address_,
+                                    request.args_, &request);
         }
       }
       if (monitor_message != nullptr && !publish_monitor_after_dispatch)
@@ -1981,7 +1986,7 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
         PublishMonitorMessage(std::move(monitor_message));
       }
       reply =
-          co_await DispatchCommand(ctx, *request_result, ctx.reply_builder_);
+          co_await DispatchCommand(ctx, request, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {
       multi_input_bytes += command_memory.Detach();

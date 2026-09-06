@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -307,7 +308,12 @@ enum class CommandKind {
 
 struct CommandSpec;
 
-struct alignas(64) CommandRequest {
+// CommandRequest is stored directly in Celer coroutine frames. Their allocator
+// guarantees max_align_t, so stronger type alignment would let GCC emit aligned
+// SIMD stores that the frame cannot honor. The compact extent still keeps
+// vectors densely strided; do not over-align the type without extending the
+// coroutine allocation contract and measuring its cost on ordinary commands.
+struct alignas(std::max_align_t) CommandRequest {
   CommandKind kind_ = CommandKind::kUnknown;
   std::uint8_t db_id_ = 0;
   // Reply protocol for every nested/cross-core execution path. Replication
@@ -396,9 +402,10 @@ struct alignas(64) CommandRequest {
 };
 
 // Command dispatch moves this object through coroutine frames and MULTI
-// vectors. Keeping both its alignment and extent at two x86 cache lines avoids
-// an accidental third-line touch while preserving a fixed vector stride.
-static_assert(alignof(CommandRequest) == 64);
+// vectors. The two independent 64-bit role and dataset fences added by the
+// rebuild protocol require the second cache line; keep the extent fixed so
+// unrelated fields cannot silently add a third line.
+static_assert(alignof(CommandRequest) == alignof(std::max_align_t));
 static_assert(sizeof(CommandRequest) == 128);
 
 struct ReplicaOfRequest {
@@ -439,9 +446,9 @@ struct CommandReply {
 };
 
 // The direct GET result is moved through several coroutine promises. Keep its
-// common representation at 80 bytes so adding rare reply state cannot silently
+// common representation at 72 bytes so adding rare reply state cannot silently
 // restore the former larger coroutine frames.
-static_assert(sizeof(CommandReply) == 80);
+static_assert(sizeof(CommandReply) == 72);
 
 absl::StatusOr<CommandRequest> BuildCommandRequest(RespCommand command,
                                                    std::uint8_t db_id);
@@ -452,7 +459,7 @@ struct ConnectionContext;
 // everything else falls through to ExecuteCommand. The caller must retain
 // `request` until the returned task completes. Redis sessions directly
 // co_await dispatch from the frame that owns the request, avoiding a second
-// 128-byte CommandRequest in this child coroutine frame.
+// 112-byte CommandRequest in this child coroutine frame.
 Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
                                    CommandRequest& request,
                                    ReplyBuilder& reply_builder);

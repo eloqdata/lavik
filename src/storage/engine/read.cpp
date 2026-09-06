@@ -810,7 +810,7 @@ absl::StatusOr<DiskValue> StorageEngine::Impl::EncodeDiskValue(
   buffer[value_offset + value_bytes + 1] = std::byte{'\n'};
   const std::size_t network_offset = value_offset - prefix_bytes;
   return DiskValue(std::move(lease), network_offset,
-                   prefix_bytes + value_bytes + 2, value_offset, value_bytes);
+                   prefix_bytes + value_bytes + 2);
 }
 
 Task<absl::StatusOr<StorageEngine::Impl::LoadedValue>>

@@ -119,6 +119,10 @@ Decision Admit(const ServingState* state, const RequestView& request) {
 bool AuthorityUnchanged(const ServingState& admitted,
                         const ServingState* current,
                         std::span<const std::uint16_t> slots) {
+  // The gate and owner normally observe the same immutable snapshot. Return
+  // before walking slot tables or comparing group ids/tokens; pointer identity
+  // is a complete authority proof because ServingState cannot change in place.
+  if (&admitted == current) return true;
   if (current == nullptr) {
     // Losing the committed state entirely revokes every slotted admission;
     // a no-key request captured no authority and stays valid.

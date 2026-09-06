@@ -7529,8 +7529,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   bool ShouldInjectFlowDrop(unsigned flow_id) {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND");
+    const char* configured = replication_drop_flow_after_command_;
     if (configured == nullptr) return false;
     unsigned target = 0;
     const std::size_t length = std::strlen(configured);
@@ -7545,8 +7544,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   bool ShouldInjectControlDropAfterResponse() {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_DROP_AFTER_CONTROL_RESPONSE_ONCE");
+    const char* configured = replication_drop_after_control_response_once_;
     if (configured == nullptr || std::string_view(configured) != "1") {
       return false;
     }
@@ -7680,8 +7678,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   bool ShouldInjectFlowDropAfterTransaction(unsigned flow_id) {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_TRANSACTION_APPLY");
+    const char* configured = replication_drop_flow_after_transaction_apply_;
     if (configured == nullptr) return false;
     unsigned target = 0;
     const std::size_t length = std::strlen(configured);
@@ -7696,8 +7693,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   bool ShouldInjectFlowDropAfterCommandApply(unsigned flow_id) {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND_APPLY");
+    const char* configured = replication_drop_flow_after_command_apply_;
     if (configured == nullptr) return false;
     unsigned target = 0;
     const std::size_t length = std::strlen(configured);
@@ -7712,8 +7708,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> MaybePauseBeforeReplicaCommandApply() {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS");
+    const char* configured = replication_pause_before_command_apply_ms_;
     if (configured == nullptr) co_return absl::OkStatus();
     std::uint64_t milliseconds = 0;
     const std::size_t length = std::strlen(configured);
@@ -7732,8 +7727,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> MaybePauseBeforeReplicaTransactionApply() {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_TRANSACTION_APPLY_MS");
+    const char* configured = replication_pause_before_transaction_apply_ms_;
     if (configured == nullptr) co_return absl::OkStatus();
     std::uint64_t milliseconds = 0;
     const std::size_t length = std::strlen(configured);
@@ -7752,8 +7746,7 @@ class ReplicationManager::ReplicationGroup {
   }
 
   Task<absl::Status> MaybePauseBeforeReplicaControlApply() {
-    const char* configured =
-        std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_CONTROL_APPLY_MS");
+    const char* configured = replication_pause_before_control_apply_ms_;
     if (configured == nullptr) co_return absl::OkStatus();
     std::uint64_t milliseconds = 0;
     const std::size_t length = std::strlen(configured);
@@ -9821,6 +9814,24 @@ class ReplicationManager::ReplicationGroup {
   std::optional<std::string> upstream_node_id_;
   std::optional<std::string> upstream_history_id_;
   std::string failure_reason_;  // guarded by state_mutex_
+  // Fault-injection settings are process-startup inputs. Cache their pointers
+  // before workers launch so the ONLINE command and ACK paths do not enter
+  // libc getenv for every replicated mutation. Runtime setenv is unsupported;
+  // the environment owns these strings for the process lifetime.
+  const char* const replication_drop_flow_after_command_ =
+      std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND");
+  const char* const replication_drop_after_control_response_once_ =
+      std::getenv("KEYLANE_REPLICATION_DROP_AFTER_CONTROL_RESPONSE_ONCE");
+  const char* const replication_drop_flow_after_transaction_apply_ =
+      std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_TRANSACTION_APPLY");
+  const char* const replication_drop_flow_after_command_apply_ =
+      std::getenv("KEYLANE_REPLICATION_DROP_FLOW_AFTER_COMMAND_APPLY");
+  const char* const replication_pause_before_command_apply_ms_ =
+      std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_COMMAND_APPLY_MS");
+  const char* const replication_pause_before_transaction_apply_ms_ =
+      std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_TRANSACTION_APPLY_MS");
+  const char* const replication_pause_before_control_apply_ms_ =
+      std::getenv("KEYLANE_REPLICATION_PAUSE_BEFORE_CONTROL_APPLY_MS");
   std::atomic<bool> replication_fault_drop_used_{false};
   std::atomic<bool> replication_control_response_fault_drop_used_{false};
   std::atomic<bool> replication_transaction_fault_drop_used_{false};
