@@ -171,17 +171,14 @@ mkdir -p /tmp/keylane-quickstart
 fallocate -l 1G /tmp/keylane-quickstart/keylane.data
 
 ./build/keylane \
-  --data-file /tmp/keylane-quickstart/keylane.data \
-  --bind 127.0.0.1 \
-  --port 6379 \
-  --threads 2 \
-  --no-pin-workers \
-  --registered-buffer-mb-per-worker 64 \
-  --logtostderr
+  --data-file /tmp/keylane-quickstart/keylane.data
 ```
 
-Those worker and buffer settings keep the local smoke test modest. Production
-settings should be sized and benchmarked for the host and workload.
+By default, Keylane listens on `127.0.0.1:6379`, uses every CPU in its inherited
+affinity mask, and pins one worker to each CPU. It configures 256 MiB of storage
+buffers per worker and writes logs to `./logs/keylane.log`. Use `taskset` or the
+corresponding command-line options when the process should use fewer resources.
+Production settings should be sized and benchmarked for the host and workload.
 
 In another terminal, use any Redis-compatible client:
 
