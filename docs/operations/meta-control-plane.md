@@ -1,61 +1,237 @@
 # Meta control plane operations
 
-## Start a Meta cluster
+## Process and storage prerequisites
 
-Run a typical deployment as three separate `keylane_meta` processes with
-independent durable data directories. Raft transport is plaintext by default,
-matching the data plane; use it only on a network whose access and routing are
-already trusted.
+Build the separate Meta executable with:
 
-Start the first member with its own advertised numeric address and `--bootstrap`:
+```sh
+cmake --build <build-dir> --target keylane_meta
+```
+
+A cluster normally has three `keylane_meta` processes. Every process needs:
+
+- A positive, cluster-unique `--id` that never changes for that member.
+- A numeric IPv4 or IPv6 `--addr` used both as its Raft listener and advertised
+  endpoint. For IPv6, use the form accepted by `keylane_meta --help`.
+- A private `--data-dir`. Never share a directory between members or reuse it
+  with another id.
+- A local administrative Unix socket, defaulting to
+  `<data-dir>/meta-admin.sock`.
+
+Create the data directory as the service account with mode 0700. The control
+socket itself is mode 0600 and authenticates the caller with Linux
+`SO_PEERCRED`. By default only the process uid is allowed; repeat
+`--ctl-allow-uid N` to replace that default with an explicit uid allowlist.
+The socket parent must not be group- or world-writable. Remote administration
+is a separate option: `--ctl-addr` requires all three `--ctl-tls-*` arguments,
+and plaintext TCP administration is rejected even on loopback.
+
+Only the first process of a new cluster is started with `--bootstrap`. A fresh
+process without `--bootstrap` opens its listener and waits to be invited; merely
+starting it does not make it a member. On restart, use the same id, address,
+data directory, TLS mode, and bootstrap setting originally used for that
+member.
+
+## Send administrative commands
+
+This shell helper uses Python's standard library to send one LF-terminated
+command over the Unix socket. Run it as an allowed uid:
+
+```sh
+meta_ctl() {
+  python3 - "$1" "$2" <<'PY'
+import socket
+import sys
+
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.connect(sys.argv[1])
+    sock.sendall((sys.argv[2] + "\n").encode())
+    reply = bytearray()
+    while not reply.endswith(b"\n"):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        reply.extend(chunk)
+print(reply.decode().rstrip("\n"))
+PY
+}
+
+meta_ctl /var/lib/keylane/meta-1/meta-admin.sock status
+```
+
+The connection may also remain open for multiple commands, with exactly one
+reply line per command. Query every live member when locating the leader; the
+leader's reply contains `leader=1`, while mutation requests sent to a follower
+return `ERR not-leader`.
+
+## Run a local plaintext cluster
+
+Raft transport is plaintext when no `--tls-*` arguments are present. The
+following three-process cluster is suitable for local development; production
+addresses and durable directories should be managed by the service manager
+instead of background shell jobs:
+
+```sh
+META_BIN=./build-clang/keylane_meta
+META_ROOT=/tmp/keylane-meta-demo
+install -d -m 0700 "$META_ROOT" \
+  "$META_ROOT/node1" "$META_ROOT/node2" "$META_ROOT/node3"
+
+"$META_BIN" --id 1 --addr 127.0.0.1:7101 \
+  --data-dir "$META_ROOT/node1" --bootstrap \
+  >"$META_ROOT/node1.log" 2>&1 &
+
+"$META_BIN" --id 2 --addr 127.0.0.1:7102 \
+  --data-dir "$META_ROOT/node2" \
+  >"$META_ROOT/node2.log" 2>&1 &
+
+"$META_BIN" --id 3 --addr 127.0.0.1:7103 \
+  --data-dir "$META_ROOT/node3" \
+  >"$META_ROOT/node3.log" 2>&1 &
+```
+
+Wait until node 1 reports `leader=1`, then add one waiting member at a time:
+
+```sh
+meta_ctl "$META_ROOT/node1/meta-admin.sock" status
+meta_ctl "$META_ROOT/node1/meta-admin.sock" \
+  "addsrv 2 127.0.0.1:7102"
+
+meta_ctl "$META_ROOT/node2/meta-admin.sock" status
+
+meta_ctl "$META_ROOT/node1/meta-admin.sock" \
+  "addsrv 3 127.0.0.1:7103"
+
+meta_ctl "$META_ROOT/node3/meta-admin.sock" status
+```
+
+Do not treat `addsrv` returning `OK` as proof that catch-up finished: NuRaft
+returns it when the invite is accepted. Before adding the next member, poll the
+new member's `status` until it remains alive and its `committed` index reaches
+the leader value observed after the add. The current `status` command does not
+list the membership set; a replicated write observed on the joiner is the
+stronger end-to-end check when an automation needs proof of convergence.
+
+Plaintext peers still check the claimed Raft source and destination ids against
+the configuration and committed identity bindings, but those ids are not
+cryptographically authenticated. Use plaintext only where network access and
+routing are already trusted.
+
+## Configure Raft mTLS
+
+mTLS uses one CA trusted by the whole Meta cluster and a distinct certificate
+and private key for every member. Member `N` must have exactly one recognized
+Keylane URI SAN, `keylane://meta/N`, plus an IP or DNS SAN matching the endpoint
+given to its peers. The certificate must be usable for both TLS server and TLS
+client authentication. Never copy one member's certificate or key to another
+member.
+
+Use an organization-managed CA in production. The following OpenSSL commands
+show the required certificate shape for a disposable development cluster:
+
+```sh
+TLS_ROOT=/tmp/keylane-meta-tls
+install -d -m 0700 "$TLS_ROOT"
+umask 077
+
+openssl req -x509 -newkey rsa:3072 -nodes -sha256 -days 30 \
+  -subj '/CN=Keylane Meta Development CA' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -keyout "$TLS_ROOT/ca.key" -out "$TLS_ROOT/ca.crt"
+
+issue_meta_cert() {
+  member_id=$1
+  member_ip=$2
+  openssl req -newkey rsa:2048 -nodes -sha256 \
+    -subj "/CN=keylane-meta-$member_id" \
+    -addext "subjectAltName=IP:$member_ip,URI:keylane://meta/$member_id" \
+    -addext 'extendedKeyUsage=serverAuth,clientAuth' \
+    -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+    -keyout "$TLS_ROOT/meta-$member_id.key" \
+    -out "$TLS_ROOT/meta-$member_id.csr"
+  openssl x509 -req -sha256 -days 30 \
+    -in "$TLS_ROOT/meta-$member_id.csr" \
+    -CA "$TLS_ROOT/ca.crt" -CAkey "$TLS_ROOT/ca.key" \
+    -CAcreateserial -copy_extensions copy \
+    -out "$TLS_ROOT/meta-$member_id.crt"
+}
+
+issue_meta_cert 1 10.0.0.11
+issue_meta_cert 2 10.0.0.12
+issue_meta_cert 3 10.0.0.13
+```
+
+Protect the CA key offline in a real deployment. Distribute only `ca.crt` and
+the matching member leaf/key to each host. Start each process with its own leaf
+and the shared CA, for example member 1:
 
 ```sh
 keylane_meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
   --bootstrap \
-  --ctl-allow-uid 991
+  --tls-ca /etc/keylane/meta/ca.crt \
+  --tls-cert /etc/keylane/meta/meta-1.crt \
+  --tls-key /etc/keylane/meta/meta-1.key
 ```
 
-The local control endpoint defaults to `<data-dir>/meta-admin.sock`, is created
-with mode 0600, authenticates through `SO_PEERCRED`, and permits the process
-UID unless `--ctl-allow-uid` is repeated explicitly. Use `--ctl-socket` to
-choose another path, but keep its parent directory owned by the service account
-and not group- or world-writable; startup rejects an unsafe parent. To expose
-administration over TCP, replace the Unix endpoint with `--ctl-addr` and
-provide all three `--ctl-tls-*` files; plaintext TCP administration is
-rejected, including on loopback.
+Use the equivalent member-specific certificate and omit `--bootstrap` for
+members 2 and 3, then join them with the same `addsrv` procedure as the
+plaintext example. `--tls-ca`, `--tls-cert`, and `--tls-key` are all-or-nothing;
+partial TLS configuration fails startup. Start the joiner with mTLS before
+issuing `addsrv`, and ensure its URI SAN matches the id in that command.
 
-To authenticate and encrypt Raft traffic, provision a shared operator-owned CA
-and a distinct key and certificate for every Meta member, then pass `--tls-ca`,
-`--tls-cert`, and `--tls-key` to every member. The three options are
-all-or-nothing. Member `N` must present exactly one URI SAN
-`keylane://meta/N`, plus an IP or DNS SAN covering the advertised address; do
-not copy one member certificate to another node. Protect the CA key offline
-and restrict each node key and data directory to the service account. For
-example, add these arguments to member 1:
+Do not mix plaintext and mTLS members. Enabling or disabling Raft TLS on an
+existing cluster requires a coordinated restart of all members; it does not
+change the WAL or snapshot format. `--raft-io-threads` sizes NuRaft's native
+Asio pool (default 2); it does not change the single Celer control-session
+worker or make WAL synchronization asynchronous.
+
+## Add and remove peers
+
+Membership commands are accepted only by the current leader and only one
+change may be active at a time. To add a peer:
+
+1. Allocate a never-before-used positive id, private data directory, and Raft
+   endpoint. With mTLS, issue its matching certificate first.
+2. Start the new `keylane_meta` process without `--bootstrap`.
+3. On the current leader, run `addsrv <id> <endpoint>`. A third principal
+   argument is accepted but may only be the matching canonical
+   `keylane://meta/<id>`; omitting it selects that value automatically.
+4. Poll the joiner's `status` and verify replicated progress before adding
+   another peer or relying on it for quorum.
+
+For example:
 
 ```sh
-  --tls-ca /etc/keylane/meta-ca.pem \
-  --tls-cert /etc/keylane/meta-1.pem \
-  --tls-key /etc/keylane/meta-1-key.pem
+meta_ctl /var/lib/keylane/meta-1/meta-admin.sock \
+  "addsrv 4 10.0.0.14:7100"
 ```
 
-Do not mix plaintext and mTLS members in one cluster. `--raft-io-threads`
-sizes NuRaft's native Asio pool (default 2); it does not change the single
-Celer control-session worker or make WAL synchronization asynchronous.
+The leader first commits and audits the member identity binding, then invokes
+NuRaft `add_srv`. `ERR joining` and `ERR config-changing` mean the caller should
+wait, re-check the leader and both members, and retry the same operation.
+`ERR already-exists` may mean an earlier invite committed; verify the joiner
+rather than creating a different identity.
 
-Start additional members without `--bootstrap`, then ask the current leader to
-add each identity and endpoint:
+To remove a peer, select a follower and run this on the leader:
 
-```text
-addsrv 2 10.0.0.12:7100 keylane://meta/2
-addsrv 3 10.0.0.13:7100 keylane://meta/3
+```sh
+meta_ctl /var/lib/keylane/meta-1/meta-admin.sock "removesrv 4"
 ```
 
-The add operation commits the identity binding before changing Raft membership.
-`removesrv N` performs the inverse order: Raft removal first, then retirement
-of the binding. Treat `ERR joining` and `ERR config-changing` as retryable only
-after checking cluster status; never bypass the identity step manually.
+On success, Keylane first completes NuRaft `remove_srv`, then commits and
+audits retirement of that member's identity before replying `OK`. Stop the
+removed process after the command succeeds. The retired id and principal are
+terminal and cannot be reactivated; replacing that machine requires a new id,
+fresh data directory, and, with mTLS, a new certificate.
+
+Remove one member at a time and preserve a quorum throughout. Prefer removing
+a follower; removing the current leader may return `ERR cannot-remove-leader`
+or trigger a step-down depending on NuRaft state. `ERR leaving` and
+`ERR config-changing` indicate another membership change is still active.
+Never wipe or repurpose a member's data directory before its removal has
+committed and the remaining cluster has elected a healthy leader.
 
 ## Status and snapshots
 
