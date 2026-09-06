@@ -1,5 +1,7 @@
 # Keylane、Redis、Valkey、Dragonfly 与 Garnet：1 KiB 高并发性能对比
 
+**中文** | [English](README.en.md)
+
 测试日期：2026-09-06
 
 ## 技术结论
