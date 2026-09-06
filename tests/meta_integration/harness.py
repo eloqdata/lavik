@@ -87,7 +87,6 @@ def raft_args(snapshot_distance=30, heartbeat_ms=100, election_ms_low=300,
     """Fast process-test timing; small snapshot distance + zero reserve
     make automatic snapshotting and compaction really fire at test scale."""
     return [
-        "--unsafe-allow-plaintext-raft",
         "--heartbeat-ms", str(heartbeat_ms),
         "--election-ms-low", str(election_ms_low),
         "--election-ms-high", str(election_ms_high),

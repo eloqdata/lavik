@@ -112,7 +112,6 @@ struct CliOptions {
   std::string tls_ca_;
   std::string tls_cert_;
   std::string tls_key_;
-  bool unsafe_allow_plaintext_raft_ = false;
   int heartbeat_ms_ = 100;
   int election_ms_low_ = 300;
   int election_ms_high_ = 600;
@@ -139,7 +138,6 @@ void PrintUsage(const char* program) {
       "[--ctl-socket PATH | --ctl-addr ip:port] "
       "[--bootstrap]\n"
       "          [--tls-ca F --tls-cert F --tls-key F]\n"
-      "          [--unsafe-allow-plaintext-raft]\n"
       "          [--ctl-allow-uid N] [--ctl-tls-ca F --ctl-tls-cert F "
       "--ctl-tls-key F]\n"
       "          [--heartbeat-ms N] [--election-ms-low N] [--election-ms-high "
@@ -223,10 +221,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
     }
     if (name == "--bootstrap") {
       options.bootstrap_ = true;
-      continue;
-    }
-    if (name == "--unsafe-allow-plaintext-raft") {
-      options.unsafe_allow_plaintext_raft_ = true;
       continue;
     }
 
@@ -343,7 +337,9 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
   if (!options.ctl_socket_.empty() && options.ctl_allowed_uids_.empty()) {
     options.ctl_allowed_uids_.push_back(::getuid());
   }
-  // mTLS is all-or-nothing: any one of the three files enables the check.
+  // Raft follows the data-plane convention: plaintext is the default, while
+  // supplying any TLS input opts into mTLS and therefore requires a complete
+  // identity. Partial configuration must not silently downgrade to plaintext.
   const bool tls_any = !options.tls_ca_.empty() || !options.tls_cert_.empty() ||
                        !options.tls_key_.empty();
   const bool tls_all = !options.tls_ca_.empty() && !options.tls_cert_.empty() &&
@@ -352,11 +348,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "--tls-ca, --tls-cert and --tls-key must be given "
                         "together (or not at all)");
-  }
-  if (!tls_all && !options.unsafe_allow_plaintext_raft_) {
-    return absl::InvalidArgumentError(
-        "Raft mTLS is required; test-only plaintext transport requires the "
-        "explicit --unsafe-allow-plaintext-raft flag");
   }
   const bool ctl_tls_any = !options.ctl_tls_ca_.empty() ||
                            !options.ctl_tls_cert_.empty() ||

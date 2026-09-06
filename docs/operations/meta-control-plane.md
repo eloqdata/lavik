@@ -1,14 +1,11 @@
 # Meta control plane operations
 
-## Provision identities before startup
+## Start a Meta cluster
 
 Run a typical deployment as three separate `keylane_meta` processes with
-independent durable data directories. Provision a shared operator-owned CA and
-a distinct key and certificate for every Meta member. Member `N` must present
-exactly one URI SAN `keylane://meta/N`, plus an IP or DNS SAN covering the
-advertised address; do not copy one member certificate to another node.
-Protect the CA key offline and restrict each node key and data directory to the
-service account.
+independent durable data directories. Raft transport is plaintext by default,
+matching the data plane; use it only on a network whose access and routing are
+already trusted.
 
 Start the first member with its own advertised numeric address and `--bootstrap`:
 
@@ -16,9 +13,6 @@ Start the first member with its own advertised numeric address and `--bootstrap`
 keylane_meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
   --bootstrap \
-  --tls-ca /etc/keylane/meta-ca.pem \
-  --tls-cert /etc/keylane/meta-1.pem \
-  --tls-key /etc/keylane/meta-1-key.pem \
   --ctl-allow-uid 991
 ```
 
@@ -31,11 +25,24 @@ administration over TCP, replace the Unix endpoint with `--ctl-addr` and
 provide all three `--ctl-tls-*` files; plaintext TCP administration is
 rejected, including on loopback.
 
-Raft mutual TLS is mandatory in normal startup. The
-`--unsafe-allow-plaintext-raft` escape hatch exists only for isolated tests and
-must not be used in a deployment. `--raft-io-threads` sizes NuRaft's native
-Asio pool (default 2); it does not change the single Celer control-session
-worker or make WAL synchronization asynchronous.
+To authenticate and encrypt Raft traffic, provision a shared operator-owned CA
+and a distinct key and certificate for every Meta member, then pass `--tls-ca`,
+`--tls-cert`, and `--tls-key` to every member. The three options are
+all-or-nothing. Member `N` must present exactly one URI SAN
+`keylane://meta/N`, plus an IP or DNS SAN covering the advertised address; do
+not copy one member certificate to another node. Protect the CA key offline
+and restrict each node key and data directory to the service account. For
+example, add these arguments to member 1:
+
+```sh
+  --tls-ca /etc/keylane/meta-ca.pem \
+  --tls-cert /etc/keylane/meta-1.pem \
+  --tls-key /etc/keylane/meta-1-key.pem
+```
+
+Do not mix plaintext and mTLS members in one cluster. `--raft-io-threads`
+sizes NuRaft's native Asio pool (default 2); it does not change the single
+Celer control-session worker or make WAL synchronization asynchronous.
 
 Start additional members without `--bootstrap`, then ask the current leader to
 add each identity and endpoint:

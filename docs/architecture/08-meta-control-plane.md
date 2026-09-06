@@ -124,18 +124,24 @@ independent segmented-WAL marker follows the same fail-loudly rule.
 
 ## Authentication, membership, and audit
 
-Raft transport requires mutual TLS by default. Every member certificate has
-exactly one canonical `keylane://meta/<server-id>` URI SAN and an IP or DNS SAN
-covering its advertised endpoint. The NuRaft configuration identity
-descriptor, the CA-authenticated certificate, and the committed identity-store
-binding must all match the claimed source id; neither the configuration nor
-the store binding grants membership alone. A pristine joiner temporarily
-relies on the authenticated certificate and invited configuration until it
-installs the leader's configuration and its first state-machine entry or
-snapshot.
+Raft transport is plaintext by default, matching the data-plane deployment
+model. It still checks claimed source and destination ids against NuRaft
+configuration descriptors and committed identity-store bindings, but those
+claims are not cryptographically authenticated; deployments whose network is
+not fully trusted enable optional mutual TLS. With mTLS, every member
+certificate has exactly one canonical `keylane://meta/<server-id>` URI SAN and
+an IP or DNS SAN covering its advertised endpoint. The NuRaft configuration
+identity descriptor, the CA-authenticated certificate, and the committed
+identity-store binding must all match the claimed source id; neither the
+configuration nor the store binding grants membership alone. With mTLS, a
+pristine joiner temporarily relies on the authenticated certificate and
+invited configuration until it installs the leader's configuration and its
+first state-machine entry or snapshot. Plaintext deployments instead rely on
+network isolation during that bootstrap interval.
 
-Dynamic membership preserves that conjunction. Add commits the member binding
-before `add_srv`; removal commits `remove_srv` before retiring the binding.
+Dynamic membership preserves the applicable configuration and identity-store
+bindings. Add commits the member binding before `add_srv`; removal commits
+`remove_srv` before retiring the binding.
 The retired binding also disambiguates the short interval after removal commits
 but before NuRaft publishes its new in-memory configuration. Reactivation of
 retired principals is rejected. Data-node identities use canonical

@@ -1,9 +1,10 @@
 #pragma once
 
 // Assembly helpers for NuRaft's native Asio transport. NuRaft owns peer
-// sockets, timers, and its Asio worker pool; Keylane supplies mTLS contexts,
-// replicated member verification, listener binding, and allocation
-// bounds through its pinned patch hooks.
+// sockets, timers, and its Asio worker pool; Keylane optionally supplies mTLS
+// contexts and always supplies replicated member verification, listener
+// binding, and allocation bounds through its pinned patch hooks. In plaintext
+// mode member ids are checked but are not cryptographically authenticated.
 
 #include <cstddef>
 #include <cstdint>
@@ -29,9 +30,10 @@ struct MetaAsioTransportConfig {
   bool TlsEnabled() const { return !tls_ca_cert_file_.empty(); }
 };
 
-// Validates TLS files and builds callbacks before any NuRaft thread starts.
-// The returned SSL_CTX providers transfer one server and one client context
-// to NuRaft; the options object must therefore be consumed by one launcher.
+// Builds transport callbacks before any NuRaft thread starts. When mTLS is
+// enabled it also validates the TLS files; the returned SSL_CTX providers
+// transfer one server and one client context to NuRaft, so the options object
+// must be consumed by one launcher.
 absl::StatusOr<nuraft::asio_service::options> BuildMetaAsioOptions(
     const MetaAsioTransportConfig& config,
     nuraft::ptr<NuraftStateMgr> state_mgr,
