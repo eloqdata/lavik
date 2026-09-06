@@ -40,6 +40,7 @@
 #include "meta/meta_hash.h"
 #include "meta/meta_identity_verifier.h"
 #include "meta/meta_observation_store.h"
+#include "meta/meta_proposal_executor.h"
 #include "meta/meta_state_machine.h"
 #include "meta/nuraft_scheduler.h"
 
@@ -55,6 +56,10 @@ struct MetaCtlServer::Core {
   // Leader-local observation store. Internally serialized because
   // ctl ingestion and commit-driven revalidation run on different threads.
   std::shared_ptr<MetaObservationStore> obs_store_;
+  // Non-owning. Process assembly keeps the executor alive until after the
+  // Celer worker and all session coroutines have stopped.
+  MetaProposalExecutor* proposal_executor_ = nullptr;
+  std::shared_ptr<MetaMembershipGate> membership_gate_;
   MetaCtlServerOptions options_;
   std::shared_ptr<celer::TlsContext> tls_context_;
 
@@ -106,6 +111,18 @@ std::string CmdResultToken(nuraft::cmd_result_code code) {
     default:
       return "code-" + std::to_string(static_cast<int>(code));
   }
+}
+
+const char* AuditPolicyName(MetaAuditPolicy policy) {
+  switch (policy) {
+    case MetaAuditPolicy::kDisabled:
+      return "disabled";
+    case MetaAuditPolicy::kBoundedRotate:
+      return "bounded-rotate";
+    case MetaAuditPolicy::kStrictExport:
+      return "strict-export";
+  }
+  return "unknown";
 }
 
 // Parking state for one asynchronous NuRaft round trip (append_entries,
@@ -587,23 +604,23 @@ celer::Task<std::string> HandleTransitionOp(
   co_return reply;
 }
 
-celer::Task<std::string> HandleSetSchema(
-    const std::shared_ptr<MetaCoordinator>& coordinator,
-    AuthenticatedPrincipal principal, std::uint16_t schema,
-    const std::string& attestation) {
-  SetSchemaVersion command;
-  command.request_id_ = MakeRequestId();
-  command.new_active_write_schema_ = schema;
-  command.attestation_ = attestation;
-  co_return co_await ProposeCommand(coordinator, std::move(principal), command);
-}
-
 celer::Task<std::string> HandlePruneAudit(
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::uint64_t through) {
   PruneAudit command;
   command.request_id_ = MakeRequestId();
   command.through_log_index_ = through;
+  co_return co_await ProposeCommand(coordinator, std::move(principal), command);
+}
+
+celer::Task<std::string> HandleSetAuditPolicy(
+    const std::shared_ptr<MetaCoordinator>& coordinator,
+    AuthenticatedPrincipal principal, MetaAuditPolicy policy,
+    const std::string& attestation) {
+  SetAuditPolicy command;
+  command.request_id_ = MakeRequestId();
+  command.policy_ = policy;
+  command.attestation_ = attestation;
   co_return co_await ProposeCommand(coordinator, std::move(principal), command);
 }
 
@@ -686,9 +703,13 @@ celer::Task<std::string> HandleConfigChange(
     nuraft::ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     AuthenticatedPrincipal principal, std::shared_ptr<MetaCelerBridge> bridge,
-    bool add, int server_id, const std::string& endpoint,
-    const std::string& member_principal, std::uint16_t min_schema,
-    std::uint16_t max_schema) {
+    MetaProposalExecutor& proposal_executor,
+    const std::shared_ptr<MetaMembershipGate>& membership_gate, bool add,
+    int server_id, const std::string& endpoint,
+    const std::string& member_principal) {
+  std::unique_ptr<MetaMembershipGate::Lease> config_lease =
+      membership_gate->TryAcquire();
+  if (config_lease == nullptr) co_return "ERR config-changing";
   if (!server->is_leader()) {
     co_return "ERR not-leader";
   }
@@ -719,57 +740,61 @@ celer::Task<std::string> HandleConfigChange(
     bind.request_id_ = MakeRequestId();
     bind.server_id_ = static_cast<std::uint32_t>(descriptor->server_id_);
     bind.principal_ = descriptor->principal_;
-    bind.min_schema_ = descriptor->min_schema_;
-    bind.max_schema_ = descriptor->max_schema_;
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
   }
-  nuraft::ptr<CmdResult> result;
+  nuraft::ptr<nuraft::srv_config> add_config;
   if (add) {
-    const MetaMemberIdentity identity{server_id, member_principal, min_schema,
-                                      max_schema};
+    const MetaMemberIdentity identity{server_id, member_principal};
     auto canonical = MetaMemberIdentity::DecodeAux(identity.EncodeAux());
     if (!canonical.ok()) {
       co_return "ERR bad-member-identity";
-    }
-    const std::uint16_t active_schema =
-        state_machine->StoresSnapshot().active_write_schema_;
-    if (min_schema > active_schema || max_schema < active_schema) {
-      co_return "ERR schema-incompatible";
     }
     BindMetaMember bind;
     bind.request_id_ = MakeRequestId();
     bind.server_id_ = static_cast<std::uint32_t>(server_id);
     bind.principal_ = member_principal;
-    bind.min_schema_ = min_schema;
-    bind.max_schema_ = max_schema;
     std::string bound = co_await ProposeCommand(coordinator, principal, bind);
     if (bound.rfind("OK ", 0) != 0) co_return bound;
-    nuraft::srv_config config(server_id, /*dc_id=*/0, endpoint,
-                              identity.EncodeAux(), /*learner=*/false);
-    result = server->add_srv(config);
-  } else {
-    result = server->remove_srv(server_id);
-  }
-  if (result == nullptr) {
-    co_return "ERR no-result";
+    add_config = nuraft::cs_new<nuraft::srv_config>(
+        server_id, /*dc_id=*/0, endpoint, identity.EncodeAux(),
+        /*learner=*/false);
   }
   std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
-  CmdResult::handler_type2 handler =
-      [bridge, state](CmdResult& completed,
-                      nuraft::ptr<std::exception>& err) mutable {
-        std::string reply;
-        if (err != nullptr) {
-          reply = "ERR exception";
-        } else if (completed.get_result_code() == nuraft::cmd_result_code::OK &&
-                   completed.get_accepted()) {
-          reply = "OK";
-        } else {
-          reply = "ERR " + CmdResultToken(completed.get_result_code());
+  const absl::Status submitted =
+      proposal_executor.Submit([server, bridge, state, add, server_id,
+                                add_config = std::move(add_config)]() mutable {
+        try {
+          nuraft::ptr<CmdResult> result = add ? server->add_srv(*add_config)
+                                              : server->remove_srv(server_id);
+          if (result == nullptr) {
+            CompleteAsyncReply(bridge, std::move(state), "ERR no-result");
+            return;
+          }
+          CmdResult::handler_type2 handler =
+              [bridge, state](CmdResult& completed,
+                              nuraft::ptr<std::exception>& err) mutable {
+                std::string reply;
+                if (err != nullptr) {
+                  reply = "ERR exception";
+                } else if (completed.get_result_code() ==
+                               nuraft::cmd_result_code::OK &&
+                           completed.get_accepted()) {
+                  reply = "OK";
+                } else {
+                  reply = "ERR " + CmdResultToken(completed.get_result_code());
+                }
+                CompleteAsyncReply(bridge, std::move(state), std::move(reply));
+              };
+          // when_ready may invoke inline or register for a later NuRaft
+          // callback. Either path must be established before this work item
+          // is allowed to finish successfully.
+          result->when_ready(handler);
+        } catch (...) {
+          CompleteAsyncReply(bridge, std::move(state), "ERR exception");
         }
-        CompleteAsyncReply(bridge, std::move(state), std::move(reply));
-      };
-  result->when_ready(handler);
+      });
+  if (!submitted.ok()) co_return "ERR executor-unavailable";
   std::string reply = co_await AsyncReplyAwaiter(std::move(state));
   if (add || (reply != "OK" && reply != "ERR not-found")) {
     co_return reply;
@@ -898,16 +923,6 @@ celer::Task<std::string> DispatchMutationVerb(
                                           std::move(principal), id, tokens[2],
                                           history);
   }
-  if (command == "setschema") {
-    std::uint64_t schema = 0;
-    if (tokens.size() != 3 || !ParseU64(tokens[1], schema) ||
-        schema > UINT16_MAX) {
-      co_return "ERR bad-request";
-    }
-    co_return co_await HandleSetSchema(coordinator, std::move(principal),
-                                       static_cast<std::uint16_t>(schema),
-                                       tokens[2]);
-  }
   if (command == "pruneaudit") {
     std::uint64_t through = 0;
     if (tokens.size() != 2 || !ParseU64(tokens[1], through) || through == 0) {
@@ -915,6 +930,21 @@ celer::Task<std::string> DispatchMutationVerb(
     }
     co_return co_await HandlePruneAudit(coordinator, std::move(principal),
                                         through);
+  }
+  if (command == "setauditpolicy") {
+    if (tokens.size() != 3) co_return "ERR bad-request";
+    MetaAuditPolicy policy;
+    if (tokens[1] == "disabled") {
+      policy = MetaAuditPolicy::kDisabled;
+    } else if (tokens[1] == "bounded-rotate") {
+      policy = MetaAuditPolicy::kBoundedRotate;
+    } else if (tokens[1] == "strict-export") {
+      policy = MetaAuditPolicy::kStrictExport;
+    } else {
+      co_return "ERR bad-request";
+    }
+    co_return co_await HandleSetAuditPolicy(coordinator, std::move(principal),
+                                            policy, tokens[2]);
   }
   if (command == "pruneoperations") {
     if (tokens.size() < 2 ||
@@ -937,17 +967,21 @@ celer::Task<std::string> DispatchMutationVerb(
 }
 
 // Runs on the celer worker thread and suspends only on bridge round trips. The
-// shared references keep command dependencies alive if teardown releases the
-// core's references mid-command. Authentication has already resolved the
-// trusted principal; actor fields never come from command text. Observation
-// access is internally serialized because commit-driven revalidation can run
-// concurrently with this worker.
+// Shared references keep refcounted command dependencies alive if teardown
+// releases the core's references mid-command. The proposal executor is a
+// process-owned non-owning reference whose documented lifetime covers every
+// worker coroutine. Authentication has already resolved the trusted principal;
+// actor fields never come from command text. Observation access is internally
+// serialized because commit-driven revalidation can run concurrently with
+// this worker.
 celer::Task<std::string> DispatchCommand(
     nuraft::ptr<nuraft::raft_server> server,
     nuraft::ptr<MetaStateMachine> state_machine,
     const std::shared_ptr<MetaCoordinator>& coordinator,
     std::shared_ptr<MetaObservationStore> obs_store,
     std::shared_ptr<MetaCelerBridge> bridge,
+    MetaProposalExecutor& proposal_executor,
+    std::shared_ptr<MetaMembershipGate> membership_gate,
     const MetaPrincipalIdentity& identity, AuthenticatedPrincipal principal,
     std::string_view line) {
   const std::vector<std::string> tokens = SplitTokens(line);
@@ -972,7 +1006,7 @@ celer::Task<std::string> DispatchCommand(
   if (command == "submitop" || command == "completeop" ||
       command == "registernode" || command == "creategroup" ||
       command == "begingroupterm" || command == "transitionop" ||
-      command == "setschema" || command == "pruneaudit" ||
+      command == "pruneaudit" || command == "setauditpolicy" ||
       command == "pruneoperations") {
     std::string reply = co_await DispatchMutationVerb(
         coordinator, state_machine, std::move(principal), command, tokens);
@@ -1092,17 +1126,22 @@ celer::Task<std::string> DispatchCommand(
     co_return "OK " + HexEncode(*exported);
   }
   if (command == "status") {
+    const MetaAuditStore audit = state_machine->StoresSnapshot().audit_;
     co_return "OK leader=" + std::to_string(server->is_leader() ? 1 : 0) +
         " id=" + std::to_string(server->get_id()) +
         " committed=" + std::to_string(server->get_committed_log_idx()) +
         " snapshot_idx=" + std::to_string(server->get_last_snapshot_idx()) +
         " term=" + std::to_string(server->get_term()) +
-        " schema=" + std::to_string(state_machine->active_write_schema());
+        " audit_policy=" + AuditPolicyName(audit.policy()) +
+        " audit_size=" + std::to_string(audit.size()) +
+        " audit_capacity=" + std::to_string(audit.capacity()) +
+        " audit_dropped_total=" + std::to_string(audit.dropped_total()) +
+        " audit_dropped_through=" + std::to_string(audit.dropped_through());
   }
   if (command == "addsrv" || command == "removesrv") {
     const bool add = command == "addsrv";
     if ((!add && tokens.size() != 2u) ||
-        (add && tokens.size() != 3u && tokens.size() != 6u)) {
+        (add && tokens.size() != 3u && tokens.size() != 4u)) {
       co_return "ERR bad-request";
     }
     int server_id = 0;
@@ -1111,39 +1150,40 @@ celer::Task<std::string> DispatchCommand(
     }
     std::string member_principal =
         "keylane://meta/" + std::to_string(server_id);
-    std::uint64_t min_schema = kMetaMinReadableSchemaVersion;
-    std::uint64_t max_schema = kMetaCurrentSchemaVersion;
-    if (add && tokens.size() == 6u) {
+    if (add && tokens.size() == 4u) {
       member_principal = tokens[3];
-      if (!ParseU64(tokens[4], min_schema) ||
-          !ParseU64(tokens[5], max_schema) || min_schema > UINT16_MAX ||
-          max_schema > UINT16_MAX) {
-        co_return "ERR bad-request";
-      }
     }
     co_return co_await HandleConfigChange(
         std::move(server), std::move(state_machine), coordinator,
-        std::move(principal), std::move(bridge), add, server_id,
-        add ? tokens[2] : std::string(), member_principal,
-        static_cast<std::uint16_t>(min_schema),
-        static_cast<std::uint16_t>(max_schema));
+        std::move(principal), std::move(bridge), proposal_executor,
+        membership_gate, add, server_id, add ? tokens[2] : std::string(),
+        member_principal);
   }
   if (command == "snapshot") {
     // A manual snapshot must serialize against the commit
     // thread — serialize_commit_ blocks the background commit until the
     // state machine's exact-cut capture returns (NuRaft semantics per
     // raft_server.hxx create_snapshot_options). The capture is synchronous
-    // and KB-scale on this worker thread; the durability write is handed to
-    // the state machine's writer thread, so the reply only guarantees the
+    // and KB-scale on the proposal executor; the durability write is handed
+    // to the state machine's writer thread, so the reply only guarantees the
     // cut point, and compaction completes asynchronously. A round already
     // in flight fails fast (returns 0).
-    nuraft::raft_server::create_snapshot_options options;
-    options.serialize_commit_ = true;
-    const std::uint64_t idx = server->create_snapshot(options);
-    if (idx == 0) {
-      co_return "ERR snapshot-failed";
-    }
-    co_return "OK " + std::to_string(idx);
+    std::shared_ptr<AsyncReply> state = std::make_shared<AsyncReply>();
+    const absl::Status submitted =
+        proposal_executor.Submit([server, bridge, state]() mutable {
+          try {
+            nuraft::raft_server::create_snapshot_options options;
+            options.serialize_commit_ = true;
+            const std::uint64_t idx = server->create_snapshot(options);
+            CompleteAsyncReply(
+                bridge, std::move(state),
+                idx == 0 ? "ERR snapshot-failed" : "OK " + std::to_string(idx));
+          } catch (...) {
+            CompleteAsyncReply(bridge, std::move(state), "ERR exception");
+          }
+        });
+    if (!submitted.ok()) co_return "ERR executor-unavailable";
+    co_return co_await AsyncReplyAwaiter(std::move(state));
   }
   co_return "ERR unknown-command";
 }
@@ -1194,6 +1234,8 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
     nuraft::ptr<MetaStateMachine> state_machine,
     std::shared_ptr<MetaCoordinator> coordinator,
     std::shared_ptr<MetaObservationStore> obs_store,
+    MetaProposalExecutor& proposal_executor,
+    std::shared_ptr<MetaMembershipGate> membership_gate,
     MetaCtlServerOptions options) {
   if (bridge == nullptr) {
     return absl::Status(absl::StatusCode::kInvalidArgument,
@@ -1208,6 +1250,9 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "observation store must not be null");
   }
+  if (membership_gate == nullptr) {
+    return absl::InvalidArgumentError("membership gate must not be null");
+  }
   const absl::Status valid = ValidateOptions(options);
   if (!valid.ok()) return valid;
   auto core = std::make_shared<Core>();
@@ -1216,6 +1261,8 @@ absl::StatusOr<std::shared_ptr<MetaCtlServer>> MetaCtlServer::Create(
   core->state_machine_ = std::move(state_machine);
   core->coordinator_ = std::move(coordinator);
   core->obs_store_ = std::move(obs_store);
+  core->proposal_executor_ = &proposal_executor;
+  core->membership_gate_ = std::move(membership_gate);
   core->options_ = std::move(options);
   if (core->options_.transport_ == MetaCtlServerOptions::Transport::kTcpMtls) {
     celer::TlsServerOptions tls;
@@ -1302,7 +1349,12 @@ celer::Task<absl::Status> MetaCtlServer::AcceptLoop(CorePtr core) {
       if (!core->listening_) {
         break;
       }
-      co_await celer::SleepFor(worker, std::chrono::milliseconds(10));
+      const absl::Status slept =
+          co_await celer::SleepFor(worker, std::chrono::milliseconds(10));
+      if (!slept.ok()) {
+        if (!core->listening_) break;
+        co_return slept;
+      }
       continue;
     }
     celer::Connection* connection = *accepted;
@@ -1392,7 +1444,8 @@ celer::Task<absl::Status> MetaCtlServer::SessionLoop(
       // gate driver is synchronous per connection anyway.
       std::string reply = co_await DispatchCommand(
           core->server_, core->state_machine_, core->coordinator_,
-          core->obs_store_, core->bridge_, *identity, authenticated, line);
+          core->obs_store_, core->bridge_, *core->proposal_executor_,
+          core->membership_gate_, *identity, authenticated, line);
       reply.push_back('\n');
       const absl::Status written =
           co_await stream.WriteAll(std::span<const std::byte>(

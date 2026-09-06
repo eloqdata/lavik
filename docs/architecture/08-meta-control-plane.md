@@ -3,17 +3,19 @@
 ## Boundary and state model
 
 `keylane_meta` is a separate C++ process for durable cluster metadata. It
-embeds NuRaft but replaces NuRaft's asio networking and timers with Celer
-adapters. The main Keylane data-plane executable remains Raft-free. The future
+embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
+and TLS. One Celer worker owns the administrative and future data-node control
+sessions; a bounded proposal executor keeps synchronous NuRaft API entry and
+WAL I/O off that worker, and a mailbox returns completions to it. The main
+Keylane data-plane executable remains Raft-free. The future
 authenticated data-node control session belongs to issue #20; this module
 exposes the in-process coordinator and observation seams that session will use.
 
-The state machine owns one `MetaStores` value containing six committed stores
-and the active write schema:
+The state machine owns one `MetaStores` value containing six committed stores:
 
 | Store | Durable responsibility |
 |---|---|
-| Identity | Data-node certificate principal bindings and retired identities; Meta-member principal and schema-range bindings |
+| Identity | Data-node certificate principal bindings and retired identities; Meta-member principal bindings |
 | Topology | Groups, membership, owners, epochs, manifests, and slot ranges |
 | Policy | Versioned, content-addressed policy documents and retirement state |
 | Grant | Group terms and authority grants, including fencing and lease parameters |
@@ -37,13 +39,15 @@ index is idempotent and produces the same verdict and audit record;
 correctness does not depend on apply running only once.
 
 All model collections, command fields, snapshots, active operations, archived
-summaries, policy bytes, and the audit window have explicit bounds. The leader
-rejects new privileged proposals with `RESOURCE_EXHAUSTED` before an audit,
-snapshot, or uncompacted-WAL bound can be crossed. Replicated prune commands
-are the escape valves after an operator has durably stored the corresponding
-export. The coordinator reserves audit capacity until each Raft proposal
-actually resolves, including after a local client timeout, and serializes audit
-prunes so overlapping proposals cannot overbook a full window.
+summaries, policy bytes, and the audit window have explicit bounds. Snapshot
+and uncompacted-WAL bounds reject new proposals with `RESOURCE_EXHAUSTED`.
+Audit retention is replicated: the default bounded-rotate mode evicts the
+oldest entry and records durable loss watermarks, disabled mode suppresses
+ordinary records while retaining policy transitions, and strict-export mode
+rejects proposals at capacity until an operator exports and prunes. In strict
+mode the coordinator reserves capacity until each Raft proposal actually
+resolves, including after a local timeout, and serializes prunes so overlapping
+proposals cannot overbook the window.
 
 ## Proposal and observation flows
 
@@ -51,9 +55,12 @@ prunes so overlapping proposals cannot overbook a full window.
 administrative adapter. `Propose` accepts model commands rather than NuRaft
 types. On the leader it takes one atomic committed view, applies fail-safe and
 registered semantic validation, injects the authenticated principal and a
-readable proposal time, encodes with the committed write schema, submits to
-Raft, and returns the committed apply verdict. Followers return a not-leader
-status without appending.
+readable proposal time, encodes the current durable format, submits to
+Raft through the proposal executor, and returns the apply result carried by
+NuRaft's completion. It never re-reads a record that bounded audit rotation may
+already have evicted. Followers return a not-leader status without appending.
+Membership workflows hold one exclusive leader-local lease through completion,
+so NuRaft never receives overlapping configuration changes.
 
 Committed subscribers atomically receive a complete `CommittedView`, its
 cursor, and a bounded ordered subscription. Replay can redeliver an index, so
@@ -86,8 +93,11 @@ atomic durable publication succeeds. Incoming snapshots are size-bounded,
 decoded completely, and installed synchronously as one replacement state.
 
 WAL v2 uses checksum-protected `log-<first-index>.seg` files. Segments roll at
-a size trigger and compaction removes or rewrites the prefix through a durable
-snapshot boundary. Append batches become durable at NuRaft's flush hooks;
+a size trigger. Compaction writes the complete surviving suffix to a synced
+`compact-<first-index>.ready` intent before replacing the old segment set;
+startup finishes such an intent after a crash. A reported pre-publication
+failure leaves both the live index and old segments authoritative. Append
+batches become durable at NuRaft's flush hooks;
 membership state and vote state use atomic rename plus file and directory
 sync. Recovery retains the intact contiguous prefix and truncates a torn tail.
 The older prototype's `raft_log.dat` and `LSN1` snapshots are intentionally
@@ -101,35 +111,35 @@ Meta plane is unavailable rather than exposing an unconfirmed decision.
 Client timeouts therefore mean an uncertain outcome and must be resolved by
 the operation's stable idempotency key.
 
-## Schema compatibility
+## Format compatibility
 
-Commands and snapshots carry a schema version. A binary reads the current and
-immediately preceding schema, while the committed `active_write_schema`
-selects what leaders emit. A new binary continues to write the old schema
-during a rolling deployment. `SetSchemaVersion` itself remains encoded in the
-oldest readable form and is admitted only when every member descriptor in the
-committed Raft configuration attests support for the target. Before any Raft
-request, peers exchange their binary-compiled schema ranges; the authenticated
-peer range must exactly match its committed descriptor and must contain the
-active write schema. Thus operator-supplied membership data cannot make an old
-process appear compatible. After the switch, a binary that cannot read the
-active schema fails loudly and its transport handshake prevents it from being
-added to membership.
+Commands, records, exports, and snapshots carry one exact format marker.
+Keylane Meta does not negotiate durable formats between mixed binary versions
+and has no in-band schema-switch command. A release that changes an
+incompatible format requires coordinated replacement of the Meta cluster;
+pre-release data from the superseded format is recreated rather than migrated.
+Readers reject unknown markers and trailing bytes so incompatible state fails
+at startup or replay instead of being interpreted approximately. The
+independent segmented-WAL marker follows the same fail-loudly rule.
 
 ## Authentication, membership, and audit
 
 Raft transport requires mutual TLS by default. Every member certificate has
-exactly one canonical `keylane://meta/<server-id>` URI SAN. The NuRaft
-configuration identity descriptor, the CA-authenticated certificate, and the
-committed identity-store binding must all match the claimed source id; neither
-the configuration nor the store binding grants membership alone. A pristine
-joiner temporarily relies on the configuration descriptor and certificate
-until it installs its first state-machine entry or snapshot.
+exactly one canonical `keylane://meta/<server-id>` URI SAN and an IP or DNS SAN
+covering its advertised endpoint. The NuRaft configuration identity
+descriptor, the CA-authenticated certificate, and the committed identity-store
+binding must all match the claimed source id; neither the configuration nor
+the store binding grants membership alone. A pristine joiner temporarily
+relies on the authenticated certificate and invited configuration until it
+installs the leader's configuration and its first state-machine entry or
+snapshot.
 
 Dynamic membership preserves that conjunction. Add commits the member binding
 before `add_srv`; removal commits `remove_srv` before retiring the binding.
-Reactivation of retired principals is rejected. Data-node identities use
-canonical `keylane://node/<node-id>` principals with global one-to-one binding.
+The retired binding also disambiguates the short interval after removal commits
+but before NuRaft publishes its new in-memory configuration. Reactivation of
+retired principals is rejected. Data-node identities use canonical
+`keylane://node/<node-id>` principals with global one-to-one binding.
 
 Local administration uses a mode-0600 Unix socket and derives a canonical
 operator actor from Linux `SO_PEERCRED`, constrained by an explicit UID
@@ -147,6 +157,8 @@ summary, verdict, and a rolling hash linked to the previous record. Exports
 carry the preceding anchor and record hashes so an external archive can verify
 continuity and deduplicate by cluster, log index, and record hash. Pruning
 advances the committed chain anchor only through an explicitly named record.
+`SetAuditPolicy` is itself replicated and always audited, including a
+transition into or out of disabled mode.
 
 ## Source map
 
@@ -156,6 +168,6 @@ advances the committed chain anchor only through an explicitly named record.
 | Exact-cut snapshots and committed state-machine lifecycle | `src/meta/meta_state_machine.*` |
 | Coordinator proposal, subscription, role, and fail-safe behavior | `src/meta/meta_coordinator.*` |
 | Volatile observation admission and freshness | `src/meta/meta_observation_store.*` |
-| TLS identity, RBAC, Unix peer credentials, and administrative protocol | `src/meta/meta_identity_verifier.*`, `src/meta/meta_ctl_server.*`, `src/meta/meta_main.cpp`, `celer/src/net/` |
-| Raft WAL, vote/config state, RPC, scheduler, and Celer bridge | `src/meta/nuraft_log_store.*`, `src/meta/nuraft_state_mgr.*`, `src/meta/nuraft_rpc_*`, `src/meta/nuraft_scheduler.*` |
-| Recovery, upgrade, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |
+| TLS identity, RBAC, Unix peer credentials, and administrative protocol | `src/meta/meta_identity_verifier.*`, `src/meta/meta_ctl_server.*`, `app/keylane_meta.cpp`, `celer/src/net/` |
+| Raft WAL, vote/config state, native Asio hooks, proposal executor, and Celer completion bridge | `src/meta/nuraft_log_store.*`, `src/meta/nuraft_state_mgr.*`, `src/meta/nuraft_asio_transport.*`, `src/meta/meta_proposal_executor.*`, `src/meta/nuraft_scheduler.*`, `third_party/patches/nuraft/` |
+| Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

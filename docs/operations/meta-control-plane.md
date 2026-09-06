@@ -5,9 +5,10 @@
 Run a typical deployment as three separate `keylane_meta` processes with
 independent durable data directories. Provision a shared operator-owned CA and
 a distinct key and certificate for every Meta member. Member `N` must present
-exactly one URI SAN `keylane://meta/N`; do not copy one member certificate to
-another node. Protect the CA key offline and restrict each node key and data
-directory to the service account.
+exactly one URI SAN `keylane://meta/N`, plus an IP or DNS SAN covering the
+advertised address; do not copy one member certificate to another node.
+Protect the CA key offline and restrict each node key and data directory to the
+service account.
 
 Start the first member with its own advertised numeric address and `--bootstrap`:
 
@@ -32,14 +33,16 @@ rejected, including on loopback.
 
 Raft mutual TLS is mandatory in normal startup. The
 `--unsafe-allow-plaintext-raft` escape hatch exists only for isolated tests and
-must not be used in a deployment.
+must not be used in a deployment. `--raft-io-threads` sizes NuRaft's native
+Asio pool (default 2); it does not change the single Celer control-session
+worker or make WAL synchronization asynchronous.
 
 Start additional members without `--bootstrap`, then ask the current leader to
 add each identity and endpoint:
 
 ```text
-addsrv 2 10.0.0.12:7100 keylane://meta/2 1 2
-addsrv 3 10.0.0.13:7100 keylane://meta/3 1 2
+addsrv 2 10.0.0.12:7100 keylane://meta/2
+addsrv 3 10.0.0.13:7100 keylane://meta/3
 ```
 
 The add operation commits the identity binding before changing Raft membership.
@@ -51,8 +54,8 @@ after checking cluster status; never bypass the identity step manually.
 
 Send one LF-terminated command per connection or keep a connection open and
 read exactly one reply line per command. `status` reports whether that member
-is leader, its server id, committed and snapshot indexes, current term, and
-active schema. It is a local view; compare all members when diagnosing lag.
+is leader, its server id, committed and snapshot indexes, and current term. It
+is a local view; compare all members when diagnosing lag.
 
 Automatic snapshots run according to `--snapshot-distance`; `snapshot` asks
 the leader for a commit-serialized capture and returns its cut index. The reply
@@ -81,38 +84,36 @@ The formal WAL/snapshot format does not migrate prototype `raft_log.dat` or
 `LSN1` snapshots. Back up such a directory, then bootstrap a fresh formal
 cluster; startup intentionally refuses to guess at a conversion.
 
-## Rolling schema upgrade
+## Binary replacement and format compatibility
 
-The safe order is binary first, write schema second:
+Meta has one exact durable format and does not support a mixed-version schema
+window or an in-band format switch. For a binary-only change that preserves the
+format, replace one follower at a time, wait for catch-up, and replace the
+leader last. Before any replacement, back up every member and record the
+membership, term, commit index, and snapshot index.
 
-1. Back up every member and record the membership, term, commit index, snapshot
-   index, and active schema.
-2. Replace and restart one follower at a time. Wait for it to catch up before
-   continuing. Upgrade the leader last, allowing a normal election if needed.
-3. Verify every member reports the old active schema and advertises a range
-   containing the target. The Raft transport exchanges each process's compiled
-   range and rejects a mismatch with the committed member descriptor; changing
-   `addsrv` arguments cannot widen an old binary. Do not add a `[1,1]` member
-   before a schema-2 switch.
-4. On the leader, commit `setschema 2 <change-ticket>` and wait for every
-   member's `status` to report `schema=2`.
-5. Take and verify a new snapshot before considering the compatibility window
-   closed.
+For an incompatible pre-release format change, stop the old cluster and create
+fresh data directories with the new binary. Do not add a new-format process to
+an old-format membership or copy old snapshots/WAL into the new directory.
+Unknown format markers intentionally fail loudly rather than attempting an
+implicit conversion.
 
-Before step 4, roll back one binary at a time while retaining schema 1. After a
-schema-2 command has committed, do not start a binary that only reads schema 1;
-restore forward-compatible binaries instead. Reverting the schema number does
-not make already committed newer-format WAL entries readable by an old binary.
-The upgrade gate builds and runs a separate v1-only executable and verifies
-that it cannot re-enter after the schema-2 switch.
+## Configure and export audit history
 
-## Export bounded audit and operation history
+Audit defaults to `bounded-rotate`: service remains available at capacity,
+while `status` exposes `audit_dropped_total` and `audit_dropped_through` so an
+archival gap cannot be mistaken for complete history. The replicated choices
+are `setauditpolicy disabled <attestation>`, `setauditpolicy bounded-rotate
+<attestation>`, and `setauditpolicy strict-export <attestation>`. Policy
+changes always produce an audit record. Use disabled only under an explicit
+operational exception; the missing ordinary records are intentional.
 
-Audit space is a fail-safe bound, not a lossy ring. Choose a record index still
-in the window and request `exportaudit <through-index>`. Decode and verify the
-versioned hash-chain blob in the external archival system, store it durably,
-and deduplicate with the cluster identity, Raft log index, and record hash.
-Only after that acknowledgement should an operator issue
+Strict-export is the fail-safe retention mode. Before selecting it, ensure the
+window has room for the policy-change record. Choose an index still in the
+window and request `exportaudit <through-index>`. Decode and verify the
+versioned hash-chain blob and its drop watermarks in the external archival
+system, store it durably, and deduplicate with cluster identity, Raft log
+index, and record hash. Only after that acknowledgement should an operator issue
 `pruneaudit <through-index>`. The prune is replicated and advances the chain
 anchor; there is no in-process record of the external acknowledgement. At a
 full window, overlapping prune attempts are rejected until the outstanding

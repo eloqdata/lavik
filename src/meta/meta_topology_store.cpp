@@ -415,7 +415,7 @@ bool MetaTopologyStore::GroupExists(const std::string& group_id) const {
 // for the convention and the strictness contract.
 std::string MetaTopologyStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteU64(topology_epoch_);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, group] : groups_) {
@@ -462,8 +462,7 @@ absl::StatusOr<MetaTopologyStore> MetaTopologyStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto topology_epoch = r.ReadU64();

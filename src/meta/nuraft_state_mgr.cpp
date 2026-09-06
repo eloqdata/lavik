@@ -120,8 +120,7 @@ absl::StatusOr<std::unique_ptr<NuraftStateMgr>> NuraftStateMgr::Open(
     // server, and no committed config may ever be rolled back to it.
     config = nuraft::cs_new<nuraft::cluster_config>();
     const MetaMemberIdentity identity{
-        server_id, "keylane://meta/" + std::to_string(server_id),
-        kMetaMinReadableSchemaVersion, kMetaCurrentSchemaVersion};
+        server_id, "keylane://meta/" + std::to_string(server_id)};
     config->get_servers().push_back(nuraft::cs_new<nuraft::srv_config>(
         server_id, /*dc_id=*/0, endpoint, identity.EncodeAux(),
         /*learner=*/false));

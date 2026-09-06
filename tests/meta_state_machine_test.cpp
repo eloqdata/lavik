@@ -6,7 +6,7 @@
 //      machine; kill/reopen recovery (close + reopen stands in for process
 //      restart; fdatasync-before-return is what makes it crash-safe);
 //      snapshot exact cut point; snapshot -> compact -> reopen; logical
-//      snapshot transmission; active_write_schema; audit uniqueness under
+//      snapshot transmission; audit uniqueness under
 //      replay; domain-reject vs fail-stop classification (death test).
 //   2. Core-driven integration: a single-node raft_server running on the
 //      real adapters (NuraftStateMgr + WAL v2 NuraftLogStore +
@@ -48,7 +48,6 @@
 namespace {
 
 using keylane::meta::CreateGroup;
-using keylane::meta::kMetaSchemaVersionV1;
 using keylane::meta::MetaAuditVerdict;
 using keylane::meta::MetaCommand;
 using keylane::meta::MetaRequestId;
@@ -57,7 +56,6 @@ using keylane::meta::MetaStores;
 using keylane::meta::NuraftLogStore;
 using keylane::meta::NuraftStateMgr;
 using keylane::meta::RegisterNode;
-using keylane::meta::SetSchemaVersion;
 using keylane::meta::SubmitOperation;
 
 std::filesystem::path MakeTestDir(const char* suite, const char* name) {
@@ -266,8 +264,6 @@ TEST_F(MetaStateMachineTest, CommitAppliesRealCommands) {
     EXPECT_EQ(stores.audit_.size(), 2u);
   }
   EXPECT_EQ(machine->last_commit_index(), 2u);
-  // The committed write schema defaults to v1.
-  EXPECT_EQ(machine->active_write_schema(), kMetaSchemaVersionV1);
 }
 
 TEST_F(MetaStateMachineTest, DomainRejectConsumesIndexWithoutStateChange) {
@@ -371,7 +367,6 @@ TEST_F(MetaStateMachineTest, SnapshotIsDurableAcrossRestart) {
   EXPECT_EQ(stores.topology_.TopologyEpoch(), 1u);
   EXPECT_EQ(stores.audit_.size(), 3u);
   EXPECT_TRUE(stores.audit_.VerifyChain());
-  EXPECT_EQ(machine->active_write_schema(), kMetaSchemaVersionV1);
 }
 
 TEST_F(MetaStateMachineTest, SnapshotExactCutPoint) {
@@ -507,8 +502,6 @@ TEST_F(MetaStateMachineTest, LogicalSnapshotTransmissionRoundTrip) {
     EXPECT_EQ(follower_stores.audit_.chain_head(),
               leader_stores.audit_.chain_head());
     EXPECT_TRUE(follower_stores.audit_.VerifyChain());
-    EXPECT_EQ(follower_stores.active_write_schema_,
-              leader_stores.active_write_schema_);
   }
   EXPECT_EQ(follower->last_commit_index(), 3u);
 
@@ -585,51 +578,6 @@ TEST_F(MetaStateMachineTest, MidStreamPruneKeepsPinnedSnapshotStreamable) {
               -1);
     EXPECT_EQ(stale_ctx, nullptr);
   }
-}
-
-TEST_F(MetaStateMachineTest, ActiveWriteSchemaFollowsSetSchemaVersion) {
-  auto opened = Open();
-  ASSERT_TRUE(opened.ok()) << opened.status();
-  std::unique_ptr<MetaStateMachine> machine = std::move(*opened);
-  EXPECT_EQ(machine->active_write_schema(), kMetaSchemaVersionV1);
-
-  // SetSchemaVersion goes through the normal command path and
-  // rewrites the committed active_write_schema as an absolute value. It is a
-  // privileged command: the frozen wire layout carries the actor, so the
-  // audit record identifies the entry that proposed it.
-  SetSchemaVersion set;
-  set.request_id_ = MakeRequestId(0x31);
-  set.actor_.principal_ = std::string(kEntryPrincipal);
-  set.actor_.readable_time_ = std::string(kEntryReadableTime);
-  set.new_active_write_schema_ = keylane::meta::kMetaCurrentSchemaVersion;
-  set.attestation_ = "ticket-1: enable current schema";
-  Commit(*machine, 1, set);
-  EXPECT_EQ(machine->active_write_schema(),
-            keylane::meta::kMetaCurrentSchemaVersion);
-  const auto accepted = machine->StoresSnapshot().audit_.Find(1);
-  ASSERT_TRUE(accepted.has_value());
-  EXPECT_EQ(accepted->record_.verdict_, MetaAuditVerdict::kAccepted);
-  EXPECT_EQ(accepted->record_.actor_principal_, kEntryPrincipal);
-  EXPECT_EQ(accepted->record_.readable_time_, kEntryReadableTime);
-
-  // A schema this binary cannot write is a domain rejection, not a crash.
-  SetSchemaVersion too_new = set;
-  too_new.new_active_write_schema_ =
-      keylane::meta::kMetaCurrentSchemaVersion + 1;
-  Commit(*machine, 2, too_new);
-  EXPECT_EQ(machine->active_write_schema(),
-            keylane::meta::kMetaCurrentSchemaVersion);
-  const auto rejected = machine->StoresSnapshot().audit_.Find(2);
-  ASSERT_TRUE(rejected.has_value());
-  EXPECT_EQ(rejected->record_.verdict_, MetaAuditVerdict::kRejected);
-
-  // The committed schema survives the snapshot round trip.
-  CreateSnapshot(*machine, 2, 1);
-  auto reopened = Open();
-  ASSERT_TRUE(reopened.ok()) << reopened.status();
-  machine = std::move(*reopened);
-  EXPECT_EQ(machine->active_write_schema(),
-            keylane::meta::kMetaCurrentSchemaVersion);
 }
 
 TEST_F(MetaStateMachineTest, SubmitOperationSeqEqualsLogIndex) {
@@ -906,7 +854,6 @@ TEST_F(MetaServerIntegrationTest, AutoSnapshotOnCommitThread) {
                machine_->last_snapshot()->get_last_log_idx() > 0;
       },
       std::chrono::seconds(10)));
-  const uint64_t snapshot_index = machine_->last_snapshot()->get_last_log_idx();
   // Compaction follows the durable snapshot (on_snapshot_completed), moving
   // the WAL start forward.
   ASSERT_TRUE(WaitFor([&] { return store->start_index() > 1; },
@@ -917,7 +864,12 @@ TEST_F(MetaServerIntegrationTest, AutoSnapshotOnCommitThread) {
   // Restart recovers the snapshotted prefix from the snapshot file and the
   // post-snapshot tail by replay; the full state must come back.
   OpenStorage();
-  EXPECT_EQ(machine_->last_commit_index(), snapshot_index);
+  ASSERT_NE(machine_->last_snapshot(), nullptr);
+  // A later automatic snapshot may publish while the final appends drain.
+  // Compare recovery with the newest durable cut, not the first cut observed
+  // above.
+  EXPECT_EQ(machine_->last_commit_index(),
+            machine_->last_snapshot()->get_last_log_idx());
   LaunchServer(/*snapshot_distance=*/5);
   AppendAndWait(MakeRegister(0x3c));  // low-nibble pattern "c...", unused above
   ASSERT_TRUE(

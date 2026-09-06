@@ -7,18 +7,20 @@
 //   log-<first_idx>.seg   one segment per index range; <first_idx> is the
 //                         first log index the segment can hold, pinned again
 //                         in the segment header
-//   log-<first_idx>.seg.tmp
-//                         in-flight compact rewrite, never valid data
+//   compact-<first_idx>.ready
+//                         fsynced compact intent; recovery finishes replacing
+//                         the old segment set before scanning the WAL
+//   compact-<first_idx>.ready.tmp
+//                         unpublished compact replacement; safe to discard
 // Segments roll when the active segment reaches the size cap (default
 // 64 MiB, configurable via Open); a segment may exceed the cap by one record
 // (the cap is a roll trigger checked before placing each record, never a
 // hard record-size limit). compact(last_log_index) — always called by the
 // core once the state machine made the snapshot at that index durable —
-// unlinks every segment whose records all lie at or below the boundary and
-// rewrites a partially overlapping segment into a fresh segment named
+// rewrites the complete surviving suffix into a fresh segment named
 // log-<last_log_index+1>.seg, so post-compact segment boundaries coincide
-// with snapshot compact boundaries. A full compaction leaves one header-only
-// floor segment pinning start_index.
+// with snapshot compact boundaries. A full compaction leaves that segment
+// header-only to pin start_index.
 //
 // INCOMPATIBLE WITH THE LEGACY SINGLE-FILE LAYOUT: Open fails clearly when
 // `data_dir` holds `raft_log.dat`. Legacy directories carry no production
@@ -45,12 +47,14 @@
 //     boundary and unlinks every later segment before writing, so a reopened
 //     store never sees the overwritten tail past the last sync point as
 //     anything but a torn tail (see below).
-//   - compact() performs its own durability eagerly (tmp file + fdatasync +
-//     rename + directory fsync) and reports failure as `false`, the error
-//     channel NuRaft designed for it. NuRaft only compacts after the state
-//     machine has made the snapshot durable (on_snapshot_completed runs
-//     after create_snapshot's callback), so a crash cannot leave compacted
-//     logs without a durable snapshot.
+//   - compact() performs its own durability eagerly. It fsyncs a complete
+//     replacement as a non-WAL ready intent before removing the old set;
+//     recovery finishes a published intent after a crash. Failures before
+//     publication return `false` without changing live or durable authority;
+//     an unrecoverable cleanup failure after publication fails stop. NuRaft
+//     only compacts after the state machine has made the snapshot durable
+//     (on_snapshot_completed runs after create_snapshot's callback), so a
+//     crash cannot leave compacted logs without a durable snapshot.
 //
 // On-disk format (all integers little-endian); the record format is
 // byte-identical to v1, the segment header adds the format version:
@@ -64,7 +68,8 @@
 // The segment header pins first_index so a fully compacted (record-less)
 // floor segment still reopens at the right index.
 //
-// Recovery scan: Open scans segments in first_index order and rebuilds the
+// Recovery first completes a synced compact ready intent, if present. It then
+// scans segments in first_index order and rebuilds the
 // in-memory index as an exact mirror of the intact on-disk prefix. Records
 // must be contiguous within and across segments. The first anomaly — a short
 // or checksum-mismatched record, a sequence gap, a bad segment header — is
@@ -112,6 +117,8 @@ enum class NuraftLogFaultPoint {
   kFtruncate,
   kFdatasync,
   kUnlink,
+  kRename,
+  kDirectorySync,
 };
 
 // Test seam for exercising the real NuRaft error policy without depending on

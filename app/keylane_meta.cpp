@@ -8,18 +8,18 @@
 //   - main thread: CLI parse, assembly, startup waits, signal polling, and
 //     the ordered teardown. raft_server construction/teardown happen here;
 //     NuRaft's public API is thread-safe.
-//   - one celer worker thread: the MetaCelerBridge drain loop (NuRaft timer
-//     tasks and RPC transport) plus the authenticated ctl line server (UDS
-//     peer credentials by default, or explicit TCP mutual TLS).
-//   - NuRaft background threads (commit/append): call back into the worker
-//     only through the bridge; durability IO runs on them inside
-//     NuraftLogStore/NuraftStateMgr, while MetaStateMachine hands snapshot
-//     file IO to its own writer thread (meta_state_machine.h).
+//   - one celer Runtime worker: authenticated ctl/Data Node control transport
+//     plus the completion bridge drain loop.
+//   - one bounded proposal-executor thread: synchronous entry into NuRaft's
+//     mutation/snapshot APIs, keeping their locks and WAL IO off Celer.
+//   - NuRaft native Asio workers: peer RPC and timers. NuRaft commit/append
+//     threads perform synchronous durability IO; completion and role events
+//     hop back to Celer through MetaCelerBridge.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
-//   raft_server::shutdown() -> MetaStateMachine::WaitForSnapshotWriterIdle()
-//   -> release local refs -> ctl Shutdown() -> listener shutdown() ->
-//   bridge Stop() -> worker stop + join.
+//   ctl Shutdown() -> proposal executor drain -> raft_launcher::shutdown()
+//   -> MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref ->
+//   bridge Stop() -> Celer Runtime stop + join -> coordinator release.
 // shutdown() joins the commit thread — the only producer of automatic
 // snapshot jobs — and the writer drain lets an in-flight when_done reach the
 // still-alive core before reset (the shutdown contract in
@@ -49,8 +49,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
-#include "celer/runtime/cross_core.h"
-#include "celer/runtime/worker.h"
+#include "celer/runtime/runtime.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
 // NuRaft's headers are not -Wpedantic-clean; see nuraft_scheduler.h.
@@ -61,6 +60,7 @@
 #include "libnuraft/callback.hxx"
 #include "libnuraft/cluster_config.hxx"
 #include "libnuraft/context.hxx"
+#include "libnuraft/launcher.hxx"
 #include "libnuraft/logger.hxx"
 #include "libnuraft/raft_params.hxx"
 #include "libnuraft/raft_server.hxx"
@@ -73,25 +73,24 @@
 #include "meta/meta_ctl_server.h"
 #include "meta/meta_identity_verifier.h"
 #include "meta/meta_observation_store.h"
+#include "meta/meta_proposal_executor.h"
 #include "meta/meta_state_machine.h"
+#include "meta/nuraft_asio_transport.h"
 #include "meta/nuraft_log_store.h"
-#include "meta/nuraft_rpc_client.h"
-#include "meta/nuraft_rpc_listener.h"
 #include "meta/nuraft_scheduler.h"
 #include "meta/nuraft_state_mgr.h"
 
 namespace {
 
+using keylane::meta::MetaAsioTransportConfig;
 using keylane::meta::MetaCelerBridge;
 using keylane::meta::MetaCoordinator;
 using keylane::meta::MetaCoordinatorOptions;
 using keylane::meta::MetaCtlServer;
 using keylane::meta::MetaCtlServerOptions;
+using keylane::meta::MetaMembershipGate;
+using keylane::meta::MetaProposalExecutor;
 using keylane::meta::MetaStateMachine;
-using keylane::meta::MetaTransportConfig;
-using keylane::meta::NuraftDelayedTaskScheduler;
-using keylane::meta::NuraftRpcClientFactory;
-using keylane::meta::NuraftRpcListener;
 using keylane::meta::NuraftStateMgr;
 
 // ---------------------------------------------------------------------------
@@ -125,6 +124,7 @@ struct CliOptions {
   int client_req_timeout_ms_ = 3000;
   int snapshot_sync_timeout_ms_ = 0;  // 0 = NuRaft default
   int raft_log_level_ = 4;            // NuRaft level: 6=trace .. 1=fatal
+  int raft_io_threads_ = 2;
 };
 
 struct EndpointParts {
@@ -146,7 +146,8 @@ void PrintUsage(const char* program) {
       "N]\n"
       "          [--snapshot-distance N] [--reserved-log-items N]\n"
       "          [--client-req-timeout-ms N] [--snapshot-sync-timeout-ms N]\n"
-      "          [--raft-log-level 1..6] [--version] [--help]\n",
+      "          [--raft-io-threads N] [--raft-log-level 1..6] [--version] "
+      "[--help]\n",
       program);
 }
 
@@ -309,6 +310,11 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       if (!ParseInt(value, 1, 6, &options.raft_log_level_)) {
         return absl::Status(absl::StatusCode::kInvalidArgument,
                             "bad --raft-log-level");
+      }
+    } else if (name == "--raft-io-threads") {
+      if (!ParseInt(value, 1, 128, &options.raft_io_threads_)) {
+        return absl::Status(absl::StatusCode::kInvalidArgument,
+                            "bad --raft-io-threads");
       }
     } else {
       return absl::Status(absl::StatusCode::kInvalidArgument,
@@ -594,35 +600,13 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // --- transport adapters (allocation only; no celer objects touched) ---
+  // --- Celer completion ingress (allocation only; no worker touched) ---
   auto bridge_or = MetaCelerBridge::Create();
   if (!bridge_or.ok()) {
     spdlog::critical("bridge create failed: {}", bridge_or.status().message());
     return 1;
   }
   std::shared_ptr<MetaCelerBridge> bridge = *bridge_or;
-
-  MetaTransportConfig transport_config;
-  transport_config.tls_ca_cert_file_ = options.tls_ca_;
-  transport_config.tls_cert_file_ = options.tls_cert_;
-  transport_config.tls_key_file_ = options.tls_key_;
-
-  auto factory_or = NuraftRpcClientFactory::Create(bridge, transport_config);
-  if (!factory_or.ok()) {
-    spdlog::critical("rpc client factory create failed: {}",
-                     factory_or.status().message());
-    return 1;
-  }
-  std::shared_ptr<NuraftRpcClientFactory> factory = *factory_or;
-  auto scheduler = std::make_shared<NuraftDelayedTaskScheduler>(bridge);
-  auto listener_or = NuraftRpcListener::Create(
-      bridge, transport_config, raft_endpoint->host_, raft_endpoint->port_);
-  if (!listener_or.ok()) {
-    spdlog::critical("rpc listener create failed: {}",
-                     listener_or.status().message());
-    return 1;
-  }
-  std::shared_ptr<NuraftRpcListener> listener = *listener_or;
 
   // --- durable state (synchronous file IO, main thread) ---
   auto mgr_or =
@@ -645,128 +629,51 @@ int main(int argc, char** argv) {
   }
   nuraft::ptr<MetaStateMachine> state_machine(std::move(*machine_or));
 
-  factory->SetPeerSchemaVerifier(
-      [state_machine](std::int32_t peer_id,
-                      keylane::meta::wire::SchemaRange peer_schema) {
-        const keylane::meta::MetaStores stores =
-            state_machine->StoresSnapshot();
-        if (stores.active_write_schema_ < peer_schema.min_schema_ ||
-            stores.active_write_schema_ > peer_schema.max_schema_) {
-          return absl::PermissionDeniedError(
-              "Raft target binary cannot read the committed write schema");
-        }
-        const auto binding = stores.identity_.FindMetaMember(
-            static_cast<std::uint32_t>(peer_id));
-        if (!binding.has_value() || binding->retired_ ||
-            binding->min_schema_ != peer_schema.min_schema_ ||
-            binding->max_schema_ != peer_schema.max_schema_) {
-          return absl::PermissionDeniedError(
-              "Raft target handshake schema range differs from its committed "
-              "member binding");
-        }
-        return absl::OkStatus();
-      });
-
-  {
-    const bool tls_enabled = transport_config.TlsEnabled();
-    listener->SetIdentityVerifier([state_mgr, state_machine, tls_enabled](
-                                      std::int32_t claimed_id,
-                                      std::span<const std::string> uri_sans,
-                                      keylane::meta::wire::SchemaRange
-                                          peer_schema) {
-      const keylane::meta::MetaStores committed_stores =
-          state_machine->StoresSnapshot();
-      if (committed_stores.active_write_schema_ < peer_schema.min_schema_ ||
-          committed_stores.active_write_schema_ > peer_schema.max_schema_) {
-        return absl::PermissionDeniedError(
-            "Raft peer binary cannot read the committed write schema");
-      }
-      const nuraft::ptr<nuraft::cluster_config> config =
-          state_mgr->load_config();
-      if (config == nullptr) {
-        return absl::PermissionDeniedError(
-            "Raft peer has no committed cluster configuration");
-      }
-      for (const nuraft::ptr<nuraft::srv_config>& member :
-           config->get_servers()) {
-        if (member != nullptr && member->get_id() == claimed_id) {
-          if (tls_enabled) {
-            const absl::Status certificate =
-                keylane::meta::VerifyRaftPeerIdentity(claimed_id, uri_sans,
-                                                      member->get_aux());
-            if (!certificate.ok()) return certificate;
-          }
-          auto descriptor =
-              keylane::meta::MetaMemberIdentity::DecodeAux(member->get_aux());
-          if (!descriptor.ok()) return descriptor.status();
-          if (descriptor->min_schema_ != peer_schema.min_schema_ ||
-              descriptor->max_schema_ != peer_schema.max_schema_) {
-            return absl::PermissionDeniedError(
-                "Raft peer handshake schema range differs from its committed "
-                "member binding");
-          }
-          const auto committed = committed_stores.identity_.FindMetaMember(
-              static_cast<std::uint32_t>(claimed_id));
-          if (!committed.has_value() &&
-              state_machine->last_commit_index() == 0) {
-            // A joiner installs the leader's cluster config before its
-            // first application entry/snapshot. During that narrow
-            // bootstrap window the config aux plus CA-authenticated
-            // certificate is the only durable identity it can know.
-            return absl::OkStatus();
-          }
-          if (!committed.has_value() || committed->retired_ ||
-              committed->principal_ != descriptor->principal_ ||
-              committed->min_schema_ != descriptor->min_schema_ ||
-              committed->max_schema_ != descriptor->max_schema_) {
-            return absl::PermissionDeniedError(
-                "Raft member lacks matching committed identity binding");
-          }
-          return absl::OkStatus();
-        }
-      }
-      // A pristine joiner has not received the leader's configuration
-      // yet. Admit only the CA-authenticated canonical meta identity for
-      // the claimed id; NuRaft still limits this bootstrap path to join
-      // protocol messages. Once a config containing the peer commits,
-      // the persisted aux binding above becomes mandatory.
-      if (!tls_enabled) return absl::OkStatus();
-      auto bootstrap_identity =
-          keylane::meta::AuthenticateMetaUriSans(uri_sans);
-      if (!bootstrap_identity.ok()) return bootstrap_identity.status();
-      if (bootstrap_identity->role_ !=
-              keylane::meta::MetaPrincipalRole::kMetaMember ||
-          bootstrap_identity->subject_id_ != std::to_string(claimed_id)) {
-        return absl::PermissionDeniedError(
-            "Raft bootstrap certificate does not match request source id");
-      }
-      return absl::OkStatus();
-    });
+  MetaAsioTransportConfig transport_config;
+  transport_config.bind_address_ = raft_endpoint->host_;
+  transport_config.tls_ca_cert_file_ = options.tls_ca_;
+  transport_config.tls_cert_file_ = options.tls_cert_;
+  transport_config.tls_key_file_ = options.tls_key_;
+  transport_config.io_threads_ =
+      static_cast<std::size_t>(options.raft_io_threads_);
+  auto asio_options_or = keylane::meta::BuildMetaAsioOptions(
+      transport_config, state_mgr, state_machine);
+  if (!asio_options_or.ok()) {
+    spdlog::critical("Raft Asio transport setup failed: {}",
+                     asio_options_or.status().message());
+    return 1;
   }
+  nuraft::asio_service::options asio_options = std::move(*asio_options_or);
 
-  // --- celer worker thread: bridge drain loop, raft transport, ctl server ---
-  // A standalone Worker still requires its cross-core mailbox set (the
-  // Runtime normally provides it); a single-slot CrossCore satisfies the
-  // invariant without ever carrying traffic — all foreign-thread ingress
-  // goes through the bridge instead.
-  celer::CrossCore cross_core(1);
-  celer::Worker worker;
-  worker.BindCrossCore(/*id=*/0, &cross_core);
+  // --- Celer runtime ---
+  // One worker owns the bridge and ctl/future Data Node transport. Runtime
+  // owns its thread, CrossCore mailbox, and wake eventfd. NuRaft remains a
+  // foreign-thread producer and enters through MetaCelerBridge, not CrossCore.
+  celer::Runtime celer_runtime;
   std::promise<absl::Status> init_promise;
   std::future<absl::Status> init_future = init_promise.get_future();
-  std::thread worker_thread([&worker, &bridge, &init_promise] {
-    const absl::Status init = worker.Init(celer::WorkerOptions{});
-    init_promise.set_value(init);
-    if (!init.ok()) {
-      return;
-    }
-    worker.Spawn(bridge->Run(worker));
-    worker.Run();
-  });
+  celer_runtime.Start(
+      /*thread_count=*/
+      1,
+      [bridge, &init_promise](unsigned, celer::Worker& worker) {
+        const absl::Status init = worker.Init(celer::WorkerOptions{});
+        init_promise.set_value(init);
+        if (!init.ok()) {
+          return 1;
+        }
+        worker.Spawn(bridge->Run(worker));
+        worker.Run();
+        // With one worker there are no cross-worker frames to coordinate, but
+        // cleanup still belongs on the worker thread for thread-affine state.
+        worker.Shutdown();
+        worker.DestroyDetachedTasks();
+        return 0;
+      },
+      /*pin_workers=*/false);
   const absl::Status worker_init = init_future.get();
   if (!worker_init.ok()) {
     spdlog::critical("worker init failed: {}", worker_init.message());
-    worker_thread.join();
+    celer_runtime.WaitUntilStopped();
     return 1;
   }
 
@@ -781,21 +688,16 @@ int main(int argc, char** argv) {
   if (options.snapshot_sync_timeout_ms_ > 0) {
     params.snapshot_sync_ctx_timeout_ = options.snapshot_sync_timeout_ms_;
   }
-  // The celer listener answers process_req synchronously and has no async-cb
-  // support, so follower-side auto-forwarding must stay off; the ctl surface
-  // rejects non-leader writes instead.
+  // The ctl surface rejects non-leader writes instead of relying on NuRaft's
+  // follower auto-forwarding path.
   params.auto_forwarding_ = false;
   params.return_method_ = nuraft::raft_params::async_handler;
+  params.parallel_log_appending_ = false;
   params.wait_for_sm_catchup_on_becoming_leader_ = true;
 
   auto raft_logger =
       std::make_shared<MetaNuraftLogger>(options.raft_log_level_);
 
-  // raft_server takes ownership of ctx via its std::unique_ptr<context>
-  // member; never delete ctx by hand (double-delete trap).
-  nuraft::context* ctx =
-      new nuraft::context(state_mgr, state_machine, listener, raft_logger,
-                          factory, scheduler, params);
   nuraft::raft_server::init_options init_opts;
   init_opts.skip_initial_election_timeout_ = !options.bootstrap_;
   // Construction necessarily precedes MetaCoordinator assembly because the
@@ -804,7 +706,7 @@ int main(int argc, char** argv) {
   auto coordinator_target =
       std::make_shared<std::atomic<MetaCoordinator*>>(nullptr);
   auto pending_role = std::make_shared<std::atomic<int>>(-1);
-  init_opts.raft_callback_ = [coordinator_target, pending_role](
+  init_opts.raft_callback_ = [bridge, coordinator_target, pending_role](
                                  nuraft::cb_func::Type type,
                                  nuraft::cb_func::Param* param) {
     const nuraft::cb_func::ReturnCode logged = RaftEventCallback(type, param);
@@ -816,24 +718,41 @@ int main(int argc, char** argv) {
     }
     if (role != -1) {
       pending_role->store(role, std::memory_order_release);
-      if (MetaCoordinator* target =
-              coordinator_target->load(std::memory_order_acquire);
-          target != nullptr) {
-        role == 1 ? target->BecomeLeader() : target->BecomeFollower();
-      }
+      // NuRaft/Asio threads never call coordinator/Celer-owned state
+      // directly. Stale queued edges read the latest role when drained.
+      bridge->Post([coordinator_target, pending_role](celer::Worker&) {
+        MetaCoordinator* target =
+            coordinator_target->load(std::memory_order_acquire);
+        if (target == nullptr) return;
+        const int current = pending_role->load(std::memory_order_acquire);
+        current == 1 ? target->BecomeLeader() : target->BecomeFollower();
+      });
     }
     return logged;
   };
+  nuraft::raft_launcher launcher;
   nuraft::ptr<nuraft::raft_server> server =
-      nuraft::cs_new<nuraft::raft_server>(ctx, init_opts);
+      launcher.init(state_machine, state_mgr, raft_logger, raft_endpoint->port_,
+                    asio_options, params, init_opts);
+  if (server == nullptr) {
+    spdlog::critical("failed to start NuRaft Asio listener on {}",
+                     options.raft_addr_);
+    bridge->Stop();
+    celer_runtime.RequestStop();
+    celer_runtime.WaitUntilStopped();
+    return 1;
+  }
 
   int exit_code = 0;
   std::shared_ptr<MetaCtlServer> ctl;
   auto obs_store = std::make_shared<keylane::meta::MetaObservationStore>();
+  auto proposal_executor = std::make_unique<MetaProposalExecutor>();
+  auto membership_gate = std::make_shared<MetaMembershipGate>();
   nuraft::ptr<nuraft::log_store> raft_log_store = state_mgr->load_log_store();
   auto* wal = static_cast<keylane::meta::NuraftLogStore*>(raft_log_store.get());
   MetaCoordinatorOptions coordinator_options;
-  coordinator_options.resume_hook_ =
+  coordinator_options.proposal_executor_ = proposal_executor.get();
+  coordinator_options.schedule_resume_ =
       [bridge](std::coroutine_handle<> continuation) {
         bridge->Post([continuation](celer::Worker& owner) {
           owner.Enqueue(continuation);
@@ -842,47 +761,12 @@ int main(int argc, char** argv) {
   std::shared_ptr<MetaCoordinator> coordinator =
       std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
                                         *obs_store, coordinator_options);
-  coordinator->AddValidateHook([server](
-                                   const keylane::meta::MetaCommand& command,
-                                   const keylane::meta::MetaCommittedView&,
-                                   const keylane::meta::MetaObservationStore&) {
-    const auto* set = std::get_if<keylane::meta::SetSchemaVersion>(&command);
-    if (set == nullptr) return absl::OkStatus();
-    const nuraft::ptr<nuraft::cluster_config> config = server->get_config();
-    if (config == nullptr) {
-      return keylane::meta::MetaDomainRejectError(
-          "cannot attest schema support without a Raft configuration");
-    }
-    for (const nuraft::ptr<nuraft::srv_config>& member :
-         config->get_servers()) {
-      if (member == nullptr) continue;
-      auto identity =
-          keylane::meta::MetaMemberIdentity::DecodeAux(member->get_aux());
-      if (!identity.ok() ||
-          set->new_active_write_schema_ < identity->min_schema_ ||
-          set->new_active_write_schema_ > identity->max_schema_) {
-        return keylane::meta::MetaDomainRejectError(
-            "not every Raft member attests support for the requested "
-            "write schema");
-      }
-    }
-    return absl::OkStatus();
-  });
   coordinator_target->store(coordinator.get(), std::memory_order_release);
   const int role_before_attach = pending_role->load(std::memory_order_acquire);
   if (role_before_attach == 1) {
     coordinator->BecomeLeader();
   } else if (role_before_attach == 0) {
     coordinator->BecomeFollower();
-  }
-
-  nuraft::ptr<nuraft::msg_handler> handler(server);
-  listener->listen(handler);
-  const absl::Status raft_bound =
-      WaitForBound([&listener] { return listener->listen_status(); });
-  if (!raft_bound.ok()) {
-    spdlog::critical("raft listener bind failed: {}", raft_bound.message());
-    exit_code = 1;
   }
 
   if (exit_code == 0) {
@@ -899,9 +783,9 @@ int main(int argc, char** argv) {
       ctl_options.unix_socket_path_ = options.ctl_socket_;
       ctl_options.allowed_uids_ = options.ctl_allowed_uids_;
     }
-    auto ctl_or =
-        MetaCtlServer::Create(bridge, server, state_machine, coordinator,
-                              obs_store, std::move(ctl_options));
+    auto ctl_or = MetaCtlServer::Create(
+        bridge, server, state_machine, coordinator, obs_store,
+        *proposal_executor, membership_gate, std::move(ctl_options));
     if (!ctl_or.ok()) {
       spdlog::critical("ctl server create failed: {}",
                        ctl_or.status().message());
@@ -932,22 +816,30 @@ int main(int argc, char** argv) {
                  static_cast<int>(g_last_shutdown_signal));
   }
 
-  // Ordered teardown; see the file-level comment. The two shutdown posts land
-  // in the bridge inbox before Stop(), so the final drain executes them.
-  server->shutdown();
+  // Stop Celer ingress first, then quiesce NuRaft/Asio while the completion
+  // bridge and snapshot writer remain alive.
+  if (ctl != nullptr) {
+    ctl->Shutdown();
+  }
+  coordinator->BecomeFollower();
   coordinator_target->store(nullptr, std::memory_order_release);
+  // No new Celer ingress or leader work is accepted. Drain queued NuRaft
+  // mutation/snapshot entry before stopping its Asio service; cmd_result
+  // completions can still use the live bridge while shutdown resolves rounds.
+  proposal_executor->Shutdown();
+  if (!launcher.shutdown()) {
+    spdlog::error("NuRaft Asio shutdown did not quiesce within its timeout");
+    exit_code = 1;
+  }
   // Snapshot-writer drain between shutdown() and reset(), per the shutdown
   // contract in meta_state_machine.h: an in-flight when_done must reach the
   // core while it is still alive.
   state_machine->WaitForSnapshotWriterIdle();
   server.reset();
-  if (ctl != nullptr) {
-    ctl->Shutdown();
-  }
-  listener->shutdown();
   bridge->Stop();
-  worker.RequestStop();
-  worker_thread.join();
+  celer_runtime.RequestStop();
+  celer_runtime.WaitUntilStopped();
+  if (celer_runtime.exit_code() != 0) exit_code = 1;
   coordinator.reset();
 
   if (exit_code == 0) {

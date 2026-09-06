@@ -591,36 +591,32 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
       absl::StrCat("ArchiveOperations seqs=", cmd.operation_seqs_.size()));
 }
 
-// ---------------------------------------------------------------------------
-// upgrade. SetSchemaVersion rewrites the committed
-// active_write_schema as an absolute value. The coordinator and transport
-// enforce member attestation and reject too-old binaries; apply's rule is only
-// that this binary must be able to write the new schema.
-// ---------------------------------------------------------------------------
-
-ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
-                      const SetSchemaVersion& cmd) {
-  (void)log_index;
-  std::string summary =
-      absl::StrCat("SetSchemaVersion schema=", cmd.new_active_write_schema_);
-  if (cmd.new_active_write_schema_ == 0 ||
-      cmd.new_active_write_schema_ > kMetaCurrentSchemaVersion) {
-    return Rejected(absl::StrCat("schema ", cmd.new_active_write_schema_,
-                                 " is not writable by this binary (max ",
-                                 kMetaCurrentSchemaVersion, ")"),
-                    std::move(summary));
-  }
-  // Absolute assignment: setting the value already held is the replay no-op.
-  stores.active_write_schema_ = cmd.new_active_write_schema_;
-  return Accepted(std::move(summary));
-}
-
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
                       const PruneAudit& cmd) {
   (void)log_index;
   return FromStatus(
       stores.audit_.PruneThrough(cmd.through_log_index_),
       absl::StrCat("PruneAudit through=", cmd.through_log_index_));
+}
+
+ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
+                      const SetAuditPolicy& cmd) {
+  (void)log_index;
+  const char* name = "unknown";
+  switch (cmd.policy_) {
+    case MetaAuditPolicy::kDisabled:
+      name = "disabled";
+      break;
+    case MetaAuditPolicy::kBoundedRotate:
+      name = "bounded-rotate";
+      break;
+    case MetaAuditPolicy::kStrictExport:
+      name = "strict-export";
+      break;
+  }
+  return FromStatus(stores.audit_.SetPolicy(cmd.policy_),
+                    absl::StrCat("SetAuditPolicy policy=", name,
+                                 " attestation=", cmd.attestation_));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -636,8 +632,7 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
   (void)log_index;
   return FromStatus(stores.identity_.Apply(cmd),
                     absl::StrCat("BindMetaMember id=", cmd.server_id_,
-                                 " principal=", cmd.principal_, " schema=",
-                                 cmd.min_schema_, "..", cmd.max_schema_));
+                                 " principal=", cmd.principal_));
 }
 
 ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
@@ -650,39 +645,22 @@ ApplyOutcome Dispatch(MetaStores& stores, std::uint64_t log_index,
 }  // namespace
 
 absl::StatusOr<std::string> MetaStores::Serialize() const {
-  if (active_write_schema_ < kMetaMinReadableSchemaVersion ||
-      active_write_schema_ > kMetaCurrentSchemaVersion) {
-    return MetaDomainRejectError(
-        "active_write_schema is outside this binary's write window");
-  }
-  // V1 and V2 share a payload layout. Store encoders default to the newest
-  // version for standalone callers; a committed snapshot must instead use
-  // active_write_schema throughout so an N-1 member can read every nested
-  // envelope until the operator commits the schema bump.
-  const auto at_active_schema = [&](std::string blob) {
-    if (blob.size() >= 2) {
-      blob[0] = static_cast<char>(active_write_schema_ & 0xffu);
-      blob[1] = static_cast<char>((active_write_schema_ >> 8) & 0xffu);
-    }
-    return blob;
-  };
   MetaWriter w;
-  w.WriteU16(active_write_schema_);
+  w.WriteU16(kMetaFormatVersion);
   // Each store blob carries its own u16 schema_version envelope; the length
   // prefix bounds each sub-decode.
-  w.WriteString(at_active_schema(identity_.Serialize()));
-  w.WriteString(at_active_schema(topology_.Serialize()));
-  w.WriteString(at_active_schema(policy_.Serialize()));
+  w.WriteString(identity_.Serialize());
+  w.WriteString(topology_.Serialize());
+  w.WriteString(policy_.Serialize());
   const auto grant = grant_.Serialize();
   if (!grant.ok()) return grant.status();
-  w.WriteString(at_active_schema(*grant));
+  w.WriteString(*grant);
   const auto operation = operation_.Serialize();
   if (!operation.ok()) return operation.status();
-  w.WriteString(at_active_schema(*operation));
+  w.WriteString(*operation);
   const auto audit = audit_.Serialize();
   if (!audit.ok()) return audit.status();
-  w.WriteString(at_active_schema(*audit));
-  w.WriteU16(active_write_schema_);
+  w.WriteString(*audit);
   std::string out = w.TakeBuffer();
   if (out.size() > kMaxMetaSnapshotBytes) {
     // Fail-safe: the snapshot byte cap fails the snapshot; it is never
@@ -699,8 +677,7 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   MetaReader r(bytes);
   const auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported meta stores schema version");
   }
   // Loose per-blob cap: the aggregate cap dominates; each store's own
@@ -719,8 +696,6 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   if (!operation.ok()) return operation.status();
   const auto audit = r.ReadString(kBlobCap);
   if (!audit.ok()) return audit.status();
-  const auto schema = r.ReadU16();
-  if (!schema.ok()) return schema.status();
   if (absl::Status status = r.Finish(); !status.ok()) return status;
 
   MetaStores stores;
@@ -742,12 +717,6 @@ absl::StatusOr<MetaStores> MetaStores::Deserialize(std::string_view bytes) {
   auto audit_store = MetaAuditStore::Deserialize(*audit);
   if (!audit_store.ok()) return audit_store.status();
   stores.audit_ = std::move(*audit_store);
-  if (*schema == 0 || *schema > kMetaCurrentSchemaVersion) {
-    // A binary must loudly fail on a committed write schema it
-    // cannot produce (old binary reading new encoding).
-    return MetaFailStopError("snapshot carries an unwritable active schema");
-  }
-  stores.active_write_schema_ = *schema;
   return stores;
 }
 
@@ -815,9 +784,52 @@ MetaApplyResult ApplyCommitted(MetaStores& stores, std::uint64_t log_index,
   }
   // Append's remaining failure modes are the store's wiring-bug fail-stops;
   // with the guards above and correct log-index wiring it cannot fail.
-  const absl::Status audit_status = stores.audit_.Append(record);
+  const bool policy_change = std::holds_alternative<SetAuditPolicy>(command);
+  const absl::Status audit_status =
+      stores.audit_.Append(record, /*force_record=*/policy_change);
   (void)audit_status;
   return result;
+}
+
+std::string EncodeMetaApplyResult(const MetaApplyResult& result) {
+  MetaWriter w;
+  w.WriteU8(1);  // process-local completion payload version
+  w.WriteU8(static_cast<std::uint8_t>(result.verdict_));
+  w.WriteU64(result.log_index_);
+  w.WriteU16(static_cast<std::uint16_t>(result.command_tag_));
+  w.WriteString(result.detail_);
+  return w.TakeBuffer();
+}
+
+absl::StatusOr<MetaApplyResult> DecodeMetaApplyResult(std::string_view bytes) {
+  MetaReader r(bytes);
+  auto version = r.ReadU8();
+  if (!version.ok()) return version.status();
+  if (*version != 1) {
+    return MetaFailStopError("unknown apply-result payload version");
+  }
+  auto verdict = r.ReadU8();
+  if (!verdict.ok()) return verdict.status();
+  if (*verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kAccepted) &&
+      *verdict != static_cast<std::uint8_t>(MetaAuditVerdict::kRejected)) {
+    return MetaFailStopError("unknown apply-result verdict");
+  }
+  auto log_index = r.ReadU64();
+  if (!log_index.ok()) return log_index.status();
+  auto command_tag = r.ReadU16();
+  if (!command_tag.ok()) return command_tag.status();
+  if (*command_tag <
+          static_cast<std::uint16_t>(MetaCommandTag::kRegisterNode) ||
+      *command_tag >
+          static_cast<std::uint16_t>(MetaCommandTag::kSetAuditPolicy)) {
+    return MetaFailStopError("unknown apply-result command tag");
+  }
+  auto detail = r.ReadString(kMaxMetaAuditDetailBytes);
+  if (!detail.ok()) return detail.status();
+  if (absl::Status status = r.Finish(); !status.ok()) return status;
+  return MetaApplyResult{static_cast<MetaAuditVerdict>(*verdict),
+                         std::string(*detail), *log_index,
+                         static_cast<MetaCommandTag>(*command_tag)};
 }
 
 }  // namespace keylane::meta

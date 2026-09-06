@@ -82,18 +82,6 @@ absl::StatusOr<MetaAuditChainEntry> ReadChainEntry(MetaReader& r) {
   return entry;
 }
 
-// Reads the u16 schema-version envelope shared by the snapshot and export
-// blobs.
-absl::Status ReadSchemaVersion(MetaReader& r) {
-  auto version = r.ReadU16();
-  if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
-    return MetaFailStopError("unsupported audit blob schema version");
-  }
-  return absl::OkStatus();
-}
-
 // Apply-layer correspondence bug: the log index <-> record mapping broke.
 // Fail stop rather than dropping or overwriting: never silently lose or
 // rewrite an unexported record. The same input stream aborts every node at the
@@ -110,7 +98,8 @@ absl::Status ReadSchemaVersion(MetaReader& r) {
 
 }  // namespace
 
-absl::Status MetaAuditStore::Append(const MetaAuditRecord& record) {
+absl::Status MetaAuditStore::Append(const MetaAuditRecord& record,
+                                    bool force_record) {
   if (record.actor_principal_.size() > kMaxMetaPrincipalBytes ||
       record.command_summary_.size() > kMaxMetaAuditSummaryBytes ||
       record.verdict_detail_.size() > kMaxMetaAuditDetailBytes ||
@@ -132,15 +121,44 @@ absl::Status MetaAuditStore::Append(const MetaAuditRecord& record) {
     FatalAuditCorruption("index at or below the pruned floor",
                          record.log_index_);
   }
+  if (policy_ == MetaAuditPolicy::kDisabled && !force_record) {
+    return absl::OkStatus();
+  }
   if (window_.size() >= window_capacity_) {
-    // The coordinator's proposal reservation makes this unreachable for
-    // correctly orchestrated proposals; reaching it means the gate was
-    // bypassed.
-    FatalAuditCorruption("window capacity exceeded", record.log_index_);
+    if (policy_ == MetaAuditPolicy::kStrictExport) {
+      // The coordinator's proposal reservation makes this unreachable for
+      // correctly orchestrated proposals; reaching it means the gate was
+      // bypassed.
+      FatalAuditCorruption("strict-export window capacity exceeded",
+                           record.log_index_);
+    }
+    // A forced policy-change record while disabled follows bounded rotation
+    // so the transition itself cannot disappear.
+    const auto oldest = window_.begin();
+    anchor_ = oldest->second.chain_hash_;
+    dropped_through_ = oldest->first;
+    ++dropped_total_;
+    window_.erase(oldest);
   }
   const MetaHash256 hash = ComputeChainHash(chain_head_, record);
   window_.emplace(record.log_index_, MetaAuditChainEntry{record, hash});
   chain_head_ = hash;
+  return absl::OkStatus();
+}
+
+absl::Status MetaAuditStore::SetPolicy(MetaAuditPolicy policy) {
+  if (policy != MetaAuditPolicy::kDisabled &&
+      policy != MetaAuditPolicy::kBoundedRotate &&
+      policy != MetaAuditPolicy::kStrictExport) {
+    return MetaDomainRejectError("unknown audit policy");
+  }
+  if (policy == MetaAuditPolicy::kStrictExport &&
+      policy_ != MetaAuditPolicy::kStrictExport &&
+      window_.size() >= window_capacity_) {
+    return MetaDomainRejectError(
+        "strict-export requires one free slot for its policy-change record");
+  }
+  policy_ = policy;
   return absl::OkStatus();
 }
 
@@ -164,8 +182,10 @@ bool MetaAuditStore::VerifyChain() const {
 absl::StatusOr<std::string> MetaAuditStore::ExportThrough(
     std::uint64_t through) const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   WriteFixedArray(w, anchor_);
+  w.WriteU64(dropped_total_);
+  w.WriteU64(dropped_through_);
   // Count the records at/below the watermark first (the writer is
   // append-only, so the count precedes the entries).
   std::uint32_t count = 0;
@@ -201,9 +221,12 @@ absl::Status MetaAuditStore::PruneThrough(std::uint64_t through) {
 
 absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   WriteFixedArray(w, anchor_);
   w.WriteU64(pruned_floor_);
+  w.WriteU8(static_cast<std::uint8_t>(policy_));
+  w.WriteU64(dropped_total_);
+  w.WriteU64(dropped_through_);
   w.WriteCount(static_cast<std::uint32_t>(window_.size()));
   for (const auto& [index, entry] : window_) {
     WriteChainEntry(w, entry);
@@ -214,13 +237,30 @@ absl::StatusOr<std::string> MetaAuditStore::Serialize() const {
 absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
     std::string_view bytes, std::uint32_t window_capacity) {
   MetaReader r(bytes);
-  if (absl::Status status = ReadSchemaVersion(r); !status.ok()) {
-    return status;
+  auto version = r.ReadU16();
+  if (!version.ok()) return version.status();
+  if (*version != kMetaFormatVersion) {
+    return MetaFailStopError("unsupported audit blob schema version");
   }
   auto anchor = ReadFixedArray<32>(r);
   if (!anchor.ok()) return anchor.status();
   auto floor = r.ReadU64();
   if (!floor.ok()) return floor.status();
+  MetaAuditPolicy policy = MetaAuditPolicy::kBoundedRotate;
+  std::uint64_t dropped_total = 0;
+  std::uint64_t dropped_through = 0;
+  auto policy_tag = r.ReadU8();
+  if (!policy_tag.ok()) return policy_tag.status();
+  if (*policy_tag > static_cast<std::uint8_t>(MetaAuditPolicy::kStrictExport)) {
+    return MetaFailStopError("unknown audit policy tag");
+  }
+  policy = static_cast<MetaAuditPolicy>(*policy_tag);
+  auto dropped_count = r.ReadU64();
+  if (!dropped_count.ok()) return dropped_count.status();
+  dropped_total = *dropped_count;
+  auto dropped_floor = r.ReadU64();
+  if (!dropped_floor.ok()) return dropped_floor.status();
+  dropped_through = *dropped_floor;
   auto entries = r.ReadList<MetaAuditChainEntry>(
       window_capacity, [](MetaReader& rr) { return ReadChainEntry(rr); });
   if (!entries.ok()) return entries.status();
@@ -229,6 +269,9 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
   MetaAuditStore store(window_capacity);
   store.anchor_ = *anchor;
   store.pruned_floor_ = *floor;
+  store.policy_ = policy;
+  store.dropped_total_ = dropped_total;
+  store.dropped_through_ = dropped_through;
   std::uint64_t previous_index = 0;
   for (const auto& entry : *entries) {
     // Strictly increasing indexes above the floor; the map insert would
@@ -252,11 +295,21 @@ absl::StatusOr<MetaAuditStore> MetaAuditStore::Deserialize(
 
 absl::StatusOr<MetaAuditExport> DecodeMetaAuditExport(std::string_view bytes) {
   MetaReader r(bytes);
-  if (absl::Status status = ReadSchemaVersion(r); !status.ok()) {
-    return status;
+  auto version = r.ReadU16();
+  if (!version.ok()) return version.status();
+  if (*version != kMetaFormatVersion) {
+    return MetaFailStopError("unsupported audit export schema version");
   }
   auto anchor = ReadFixedArray<32>(r);
   if (!anchor.ok()) return anchor.status();
+  std::uint64_t dropped_total = 0;
+  std::uint64_t dropped_through = 0;
+  auto count = r.ReadU64();
+  if (!count.ok()) return count.status();
+  dropped_total = *count;
+  auto through = r.ReadU64();
+  if (!through.ok()) return through.status();
+  dropped_through = *through;
   auto entries = r.ReadList<MetaAuditChainEntry>(
       kMaxMetaAuditWindowRecords,
       [](MetaReader& rr) { return ReadChainEntry(rr); });
@@ -265,6 +318,8 @@ absl::StatusOr<MetaAuditExport> DecodeMetaAuditExport(std::string_view bytes) {
 
   MetaAuditExport out;
   out.anchor_before_ = *anchor;
+  out.dropped_total_ = dropped_total;
+  out.dropped_through_ = dropped_through;
   // Verify continuity inside the blob: each entry must chain from the
   // previous one, starting at the anchor.
   MetaHash256 previous = *anchor;

@@ -193,20 +193,14 @@ MetaStores MetaStateMachine::StoresSnapshot() const {
   return stores_;
 }
 
-std::uint16_t MetaStateMachine::active_write_schema() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return stores_.active_write_schema_;
-}
-
 void MetaStateMachine::SetCommitEventSink(MetaCommitEventSink sink) {
   std::lock_guard<std::mutex> lock(sink_mutex_);
   commit_event_sink_ = std::move(sink);
 }
 
 absl::StatusOr<nuraft::ptr<nuraft::buffer>> MetaStateMachine::EncodeCommand(
-    const MetaCommand& command, std::uint16_t write_schema) {
-  absl::StatusOr<std::string> encoded =
-      EncodeMetaCommand(command, write_schema);
+    const MetaCommand& command) {
+  absl::StatusOr<std::string> encoded = EncodeMetaCommand(command);
   if (!encoded.ok()) return encoded.status();
   nuraft::ptr<nuraft::buffer> out = nuraft::buffer::alloc(encoded->size());
   std::memcpy(out->data_begin(), encoded->data(), encoded->size());
@@ -238,10 +232,15 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
   // Unforgeability is enforced at the ctl/coordinator entry layer, not here.
   const ActorContext actor =
       std::visit([](const auto& cmd) { return cmd.actor_; }, *decoded);
+  MetaApplyResult applied;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    const MetaApplyResult applied = ApplyCommitted(
-        stores_, log_idx, *decoded, actor.principal_, actor.readable_time_);
+    applied = ApplyCommitted(stores_, log_idx, *decoded, actor.principal_,
+                             actor.readable_time_);
+    // Publish the cursor while the same state lock still protects the effects
+    // it names. Readers cannot copy stores_ until the cursor and sink event
+    // for this commit are both visible.
+    last_committed_idx_ = log_idx;
     // Coordinator commit-event sink: still under the state mutex, so consumers
     // observe the event atomically with the apply. The sink contract
     // (meta_state_machine.h) keeps this O(1) and non-blocking.
@@ -250,10 +249,11 @@ nuraft::ptr<nuraft::buffer> MetaStateMachine::commit(nuraft::ulong log_idx,
       commit_event_sink_(log_idx, applied);
     }
   }
-  last_committed_idx_ = log_idx;
-
-  nuraft::ptr<nuraft::buffer> result = nuraft::buffer::alloc(sizeof(uint64_t));
-  result->put(log_idx);
+  const std::string completion = EncodeMetaApplyResult(applied);
+  nuraft::ptr<nuraft::buffer> result = nuraft::buffer::alloc(completion.size());
+  if (!completion.empty()) {
+    std::memcpy(result->data_begin(), completion.data(), completion.size());
+  }
   result->pos(0);
   return result;
 }

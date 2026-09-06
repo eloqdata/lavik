@@ -28,17 +28,16 @@
 // trail. The same deterministic input byte stream aborts every node at the
 // same index, so this cannot fork the group.
 //
-// Capacity is fail-safe: never silently drop unexported records. The window
-// holds at most capacity() records (default
-// kMaxMetaAuditWindowRecords). NeedsExport() reports a full window; the
-// coordinator gates privileged proposals on it (RESOURCE_EXHAUSTED until the
-// operator exports). Append beyond capacity FAILS STOP: a committed command's
-// audit write cannot be refused without desynchronizing the state machine, so
-// reaching it means the propose gate was bypassed (it must account for
-// in-flight proposals). Exports (ExportThrough) are pure reads; PruneThrough
-// removes an exported prefix and advances the anchor/floor. The store does
-// not track export acknowledgements — pruning discipline (export durably
-// first, prune deterministically) belongs to the apply/ctl orchestration.
+// Capacity behavior is a replicated policy. Bounded-rotate (the default)
+// advances the chain anchor and drops the oldest record before appending at a
+// full window; durable drop watermarks make archival gaps observable.
+// Strict-export instead makes NeedsExport() gate privileged proposals until
+// an operator archives and prunes a prefix. Disabled suppresses ordinary
+// records, but policy changes are always forced into the chain so disabling
+// or re-enabling audit is visible. Append beyond capacity in strict mode
+// FAILS STOP: a committed command's audit write cannot be refused without
+// desynchronizing the state machine, so reaching it means the proposal gate
+// was bypassed.
 //
 // Apply is a pure in-memory function: no IO, no locks (concurrency control
 // lives in the state machine above), no clock, no observation access. Domain
@@ -103,8 +102,13 @@ class MetaAuditStore {
   // already present with identical content. Returns kDomainReject when a field
   // exceeds its cap. FAILS STOP on: same index with different content, an
   // out-of-order new index, an index at/below the pruned floor, or a full
-  // window (see the file header for the rationale of each).
-  absl::Status Append(const MetaAuditRecord& record);
+  // strict-export window (see the file header for the rationale of each).
+  absl::Status Append(const MetaAuditRecord& record, bool force_record = false);
+
+  // Switching to strict-export while full is rejected because its mandatory
+  // policy-change record would have no safe slot.
+  absl::Status SetPolicy(MetaAuditPolicy policy);
+  MetaAuditPolicy policy() const { return policy_; }
 
   std::optional<MetaAuditChainEntry> Find(std::uint64_t log_index) const;
   std::size_t size() const { return window_.size(); }
@@ -112,7 +116,13 @@ class MetaAuditStore {
 
   // Full-window state gated by the coordinator's Propose layer: privileged
   // proposals return RESOURCE_EXHAUSTED until the operator exports records.
-  bool NeedsExport() const { return window_.size() >= window_capacity_; }
+  bool NeedsExport() const {
+    return policy_ == MetaAuditPolicy::kStrictExport &&
+           window_.size() >= window_capacity_;
+  }
+
+  std::uint64_t dropped_total() const { return dropped_total_; }
+  std::uint64_t dropped_through() const { return dropped_through_; }
 
   // Hash of the newest record, or the prune anchor when the window is empty
   // (all-zero before any append).
@@ -149,6 +159,7 @@ class MetaAuditStore {
 
  private:
   std::uint32_t window_capacity_;
+  MetaAuditPolicy policy_ = MetaAuditPolicy::kBoundedRotate;
   std::map<std::uint64_t, MetaAuditChainEntry> window_;  // keyed by log index
   // Hash the first window record chains from: all-zero genesis, or the chain
   // hash of the last pruned record (prefix truncation keeps the remaining
@@ -156,6 +167,10 @@ class MetaAuditStore {
   MetaHash256 anchor_{};
   MetaHash256 chain_head_{};        // == anchor_ when the window is empty
   std::uint64_t pruned_floor_ = 0;  // highest pruned log index (0 = none)
+  // Automatic bounded-rotate loss is distinct from an operator-confirmed
+  // prune. These fields let status/export surface an archival gap.
+  std::uint64_t dropped_total_ = 0;
+  std::uint64_t dropped_through_ = 0;
 };
 
 // Decoded export blob (see MetaAuditStore::ExportThrough): the chain anchor
@@ -163,6 +178,8 @@ class MetaAuditStore {
 // index order. Decode verifies the chain inside the blob.
 struct MetaAuditExport {
   MetaHash256 anchor_before_{};
+  std::uint64_t dropped_total_ = 0;
+  std::uint64_t dropped_through_ = 0;
   std::vector<MetaAuditChainEntry> records_;
   bool operator==(const MetaAuditExport&) const = default;
 };

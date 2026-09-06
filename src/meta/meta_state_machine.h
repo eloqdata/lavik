@@ -1,12 +1,13 @@
 #pragma once
 
 // MetaStateMachine is the metadata control plane's NuRaft `state_machine`.
-// It owns the committed aggregate `MetaStores` (six stores +
-// committed active_write_schema) and applies every committed entry through
+// It owns the committed aggregate `MetaStores` (six stores) and applies every
+// committed entry through
 // the deterministic pure function ApplyCommitted (see meta_state_apply.h).
 //
 // commit() and failure classification:
-//   - commit() decodes the entry with the committed command codec. A DECODE FAILURE
+//   - commit() decodes the entry with the committed command codec. A DECODE
+//   FAILURE
 //     IS FAIL-STOP (spdlog::critical + abort, the system_exit policy): the
 //     same byte sequence fails identically on every node, so aborting cannot
 //     fork the group. This is strictly separate from a domain rejection,
@@ -104,10 +105,6 @@
 // inline on the core's snapshot-sync thread. Lock order
 // is mutex_ -> io_mutex_; the writer thread never holds both in the reverse
 // order.
-//
-// active_write_schema: ApplyCommitted rewrites
-// stores_.active_write_schema_ via the SetSchemaVersion command path;
-// active_write_schema() exposes it for the coordinator's Propose encoder.
 
 #include <atomic>
 #include <condition_variable>
@@ -154,19 +151,15 @@ class MetaStateMachine : public nuraft::state_machine {
 
   ~MetaStateMachine() override;
 
-  // Command payload encoding for proposers and tests: the committed wire encoding
-  // wrapped in a NuRaft buffer.
+  // Command payload encoding for proposers and tests: the committed wire
+  // encoding wrapped in a NuRaft buffer.
   static absl::StatusOr<nuraft::ptr<nuraft::buffer>> EncodeCommand(
-      const MetaCommand& command,
-      std::uint16_t write_schema = kMetaCurrentSchemaVersion);
+      const MetaCommand& command);
 
   // Atomic copy of the whole committed aggregate (the CommittedView
-  // building block; KB-scale). All six stores plus active_write_schema_ move
-  // together — readers never observe a cross-store tear.
+  // building block; KB-scale). All six stores move together — readers never
+  // observe a cross-store tear.
   MetaStores StoresSnapshot() const;
-  // The committed write format gate: defaults to v1, rewritten by
-  // SetSchemaVersion through the normal command path.
-  std::uint16_t active_write_schema() const;
 
   // Targeted read-only queries of the committed state, for the ctl surface
   // (meta_ctl_server.h getop/getnode/completeop). A full StoresSnapshot()
@@ -265,9 +258,10 @@ class MetaStateMachine : public nuraft::state_machine {
 
   mutable std::mutex mutex_;
   MetaStores stores_;
-  // The coordinator commit-event sink (see MetaCommitEventSink). Own mutex, always
-  // taken AFTER mutex_ (lock order mutex_ -> sink_mutex_), so registration
-  // and teardown never block the commit thread on more than a pointer swap.
+  // The coordinator commit-event sink (see MetaCommitEventSink). Own mutex,
+  // always taken AFTER mutex_ (lock order mutex_ -> sink_mutex_), so
+  // registration and teardown never block the commit thread on more than a
+  // pointer swap.
   std::mutex sink_mutex_;
   MetaCommitEventSink commit_event_sink_;
   // Snapshots keyed by last log index; the latest is retained, plus any

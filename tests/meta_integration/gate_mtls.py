@@ -33,9 +33,8 @@ N5. trusted CA and correct endpoint SAN, but a URI SAN naming another member
 
 Every negative scenario asserts the isolated node is still ALIVE with a
 working ctl surface (a crash would itself be a finding) and that the
-cluster's writes never stop. Handshake-failure evidence is taken from the
-leader's log ("response error: TLS handshake ... failed", surfaced by the
-adapter's FailClient through NuRaft's peer error path).
+cluster's writes never stop. Handshake and URI-binding evidence is taken from
+NuRaft's native Asio and Keylane peer-verification log paths.
 
 Usage: gate_mtls.py /path/to/keylane_meta [workdir]
 """
@@ -150,14 +149,18 @@ commonName = supplied
 
 
 def expect_isolated(leader, joiner, history, seq_start, label,
-                    evidence_pattern):
+                    evidence_patterns):
     """Invite `joiner`, then prove for ISOLATION_WINDOW_S that the quorum
     keeps committing while the joiner makes zero raft progress."""
     invite = leader.ctl(f"addsrv {joiner.id} {joiner.endpoint}")
     H.log(f"{label}: addsrv node {joiner.id} -> {invite}")
     if invite != "OK":
         raise H.Failure(f"{label}: addsrv: {invite}")
-    evidence0 = leader.count_log_lines(evidence_pattern)
+    if isinstance(evidence_patterns, str):
+        evidence_patterns = (evidence_patterns,)
+    evidence_label = "|".join(evidence_patterns)
+    evidence0 = sum(leader.count_log_lines(pattern)
+                    for pattern in evidence_patterns)
     committed0 = leader.committed()
 
     seq = seq_start
@@ -188,13 +191,14 @@ def expect_isolated(leader, joiner, history, seq_start, label,
     if committed1 <= committed0:
         raise H.Failure(f"{label}: quorum committed stalled "
                         f"({committed0} -> {committed1})")
-    evidence1 = leader.count_log_lines(evidence_pattern)
+    evidence1 = sum(leader.count_log_lines(pattern)
+                    for pattern in evidence_patterns)
     if evidence1 <= evidence0:
-        raise H.Failure(f"{label}: no '{evidence_pattern}' evidence in "
+        raise H.Failure(f"{label}: no '{evidence_label}' evidence in "
                         f"leader log")
     H.log(f"{label}: node {joiner.id} isolated (alive, committed=0), "
           f"quorum committed {committed0} -> {committed1}, leader log "
-          f"'{evidence_pattern}' lines {evidence0} -> {evidence1}")
+          f"'{evidence_label}' lines {evidence0} -> {evidence1}")
     return seq
 
 
@@ -239,7 +243,7 @@ def main():
         joiners.append(plain_joiner)
         plain_joiner.start(bootstrap=False)
         expect_isolated(leader, plain_joiner, hist_a, 0, "N1a-plaintext",
-                        "TLS handshake")
+                        "SSL handshake")
 
         # ---- scenario N2: wrong-CA joiner vs TLS cluster ----------------
         wrong_dir = os.path.join(workdir, "wrong_ca")
@@ -253,7 +257,7 @@ def main():
         joiners.append(wrong_joiner)
         wrong_joiner.start(bootstrap=False)
         expect_isolated(leader, wrong_joiner, hist_a, 100,
-                        "N2-wrong-ca", "TLS handshake")
+                        "N2-wrong-ca", "SSL handshake")
 
         # ---- scenario N1b: TLS joiner vs plaintext cluster --------------
         dir_b = os.path.join(workdir, "plain_cluster")
@@ -271,7 +275,7 @@ def main():
         joiners.append(tls_joiner)
         tls_joiner.start(bootstrap=False)
         # The plaintext leader's client fails against the TLS listener; the
-        # adapter surfaces it through NuRaft's join-path error log
+        # native Asio service surfaces it through NuRaft's join-path error log
         # ("rpc error response ... closed: peer EOF").
         expect_isolated(plain_leader, tls_joiner, hist_b, 200,
                         "N1b-tls-joiner", "rpc error response")
@@ -298,7 +302,7 @@ def main():
             joiners.append(expired_joiner)
             expired_joiner.start(bootstrap=False)
             expect_isolated(leader_c, expired_joiner, hist_c, 300,
-                            "N3-expired", "TLS handshake")
+                            "N3-expired", "SSL handshake")
         except H.Failure as exc:
             H.log(f"N3-expired: SKIP ({exc})")
 
@@ -317,7 +321,7 @@ def main():
         joiners.append(badsan_joiner)
         badsan_joiner.start(bootstrap=False)
         expect_isolated(leader_c, badsan_joiner, hist_c, 400,
-                        "N4-wrong-san", "TLS handshake")
+                        "N4-wrong-san", "SSL handshake")
 
         # ---- scenario N5: valid endpoint, wrong member URI binding ------
         wrongid_args = member_tls_args(
@@ -327,7 +331,9 @@ def main():
         joiners.append(wrongid_joiner)
         wrongid_joiner.start(bootstrap=False)
         expect_isolated(leader_c, wrongid_joiner, hist_c, 500,
-                        "N5-wrong-member-id", "TLS peer URI identity")
+                        "N5-wrong-member-id",
+                        ("rejected Raft peer",
+                         "RPC peer verification failed"))
 
         # ---- teardown: members must SIGTERM cleanly; the isolated joiners
         # never joined, so shutting them down cleanly is asserted too.

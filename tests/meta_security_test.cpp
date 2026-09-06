@@ -56,7 +56,7 @@ TEST(MetaIdentitySecurity, CertificateMustCarryExactlyOneKeylanePrincipal) {
 }
 
 TEST(MetaIdentitySecurity, RaftPeerClaimMatchesPersistedMemberBinding) {
-  const keylane::meta::MetaMemberIdentity member{2, "keylane://meta/2", 1, 2};
+  const keylane::meta::MetaMemberIdentity member{2, "keylane://meta/2"};
   const std::vector<std::string> sans{"keylane://meta/2"};
   EXPECT_TRUE(
       keylane::meta::VerifyRaftPeerIdentity(2, sans, member.EncodeAux()).ok());
@@ -70,15 +70,13 @@ TEST(MetaIdentitySecurity, RaftPeerClaimMatchesPersistedMemberBinding) {
       keylane::meta::VerifyRaftPeerIdentity(2, sans, "keylane://meta/2").ok());
 }
 
-TEST(MetaIdentitySecurity, MemberDescriptorRoundTripsSchemaWindow) {
-  const keylane::meta::MetaMemberIdentity member{7, "keylane://meta/7", 1, 2};
+TEST(MetaIdentitySecurity, MemberDescriptorRoundTrips) {
+  const keylane::meta::MetaMemberIdentity member{7, "keylane://meta/7"};
   auto decoded =
       keylane::meta::MetaMemberIdentity::DecodeAux(member.EncodeAux());
   ASSERT_TRUE(decoded.ok()) << decoded.status();
   EXPECT_EQ(decoded->server_id_, 7);
   EXPECT_EQ(decoded->principal_, "keylane://meta/7");
-  EXPECT_EQ(decoded->min_schema_, 1);
-  EXPECT_EQ(decoded->max_schema_, 2);
 }
 
 TEST(MetaIdentitySecurity, RbacKeepsDataNodeAtItsObservationBoundary) {
@@ -159,8 +157,6 @@ TEST(MetaIdentitySecurity,
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
-  bind.min_schema_ = 1;
-  bind.max_schema_ = 2;
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto member = store.FindMetaMember(7);
@@ -188,8 +184,6 @@ TEST(MetaIdentitySecurity, MetaMemberBindingSurvivesSnapshotRoundTrip) {
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 3;
   bind.principal_ = "keylane://meta/3";
-  bind.min_schema_ = 1;
-  bind.max_schema_ = 2;
   ASSERT_TRUE(store.Apply(bind).ok());
 
   auto restored =

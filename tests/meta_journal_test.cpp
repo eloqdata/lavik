@@ -22,6 +22,7 @@
 
 namespace {
 
+using keylane::meta::MetaAuditPolicy;
 using keylane::meta::MetaAuditRecord;
 using keylane::meta::MetaAuditStore;
 using keylane::meta::MetaAuditVerdict;
@@ -134,17 +135,38 @@ TEST(MetaAuditStore, RejectsOverCapFields) {
 // MetaAuditStore: bounded window, export (drain to bytes), prune, snapshots.
 // ---------------------------------------------------------------------------
 
-TEST(MetaAuditStore, FullWindowReportsNeedsExportAndAppendFailsStop) {
+TEST(MetaAuditStore, DefaultBoundedWindowRotatesAndReportsLoss) {
   MetaAuditStore store(/*window_capacity=*/2);
   EXPECT_FALSE(store.NeedsExport());
   ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
   ASSERT_TRUE(store.Append(MakeAuditRecord(2)).ok());
-  // The coordinator's propose layer gates privileged proposals on this signal
-  // (RESOURCE_EXHAUSTED until export); the store only exposes the state.
+  ASSERT_TRUE(store.Append(MakeAuditRecord(3)).ok());
+  EXPECT_FALSE(store.Find(1).has_value());
+  EXPECT_TRUE(store.Find(2).has_value());
+  EXPECT_EQ(store.dropped_total(), 1u);
+  EXPECT_EQ(store.dropped_through(), 1u);
+  EXPECT_TRUE(store.VerifyChain());
+}
+
+TEST(MetaAuditStore, StrictExportFullWindowFailsStopIfGateIsBypassed) {
+  MetaAuditStore store(/*window_capacity=*/2);
+  ASSERT_TRUE(store.SetPolicy(MetaAuditPolicy::kStrictExport).ok());
+  ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
+  ASSERT_TRUE(store.Append(MakeAuditRecord(2)).ok());
   EXPECT_TRUE(store.NeedsExport());
-  // A committed audit write cannot be refused; overflowing the cap means the
-  // propose gate was bypassed: fail-stop, never a silent drop.
   EXPECT_DEATH(store.Append(MakeAuditRecord(3)), "");
+}
+
+TEST(MetaAuditStore, DisabledSuppressesOrdinaryRecordsButForcedRecordRemains) {
+  MetaAuditStore store(/*window_capacity=*/2);
+  ASSERT_TRUE(store.SetPolicy(MetaAuditPolicy::kDisabled).ok());
+  ASSERT_TRUE(store.Append(MakeAuditRecord(1)).ok());
+  EXPECT_EQ(store.size(), 0u);
+  ASSERT_TRUE(store
+                  .Append(MakeAuditRecord(2, "SetAuditPolicy"),
+                          /*force_record=*/true)
+                  .ok());
+  EXPECT_TRUE(store.Find(2).has_value());
 }
 
 TEST(MetaAuditStore, ExportDrainsRecordsWithTheirChainContext) {
@@ -250,6 +272,8 @@ TEST(MetaAuditStore, SerializationRoundTripPreservesWindowAndChain) {
   auto restored = MetaAuditStore::Deserialize(*bytes);
   ASSERT_TRUE(restored.ok()) << restored.status();
   EXPECT_EQ(restored->pruned_floor(), store.pruned_floor());
+  EXPECT_EQ(restored->policy(), store.policy());
+  EXPECT_EQ(restored->dropped_total(), store.dropped_total());
   EXPECT_EQ(restored->chain_head(), store.chain_head());
   EXPECT_EQ(restored->size(), store.size());
   EXPECT_EQ(restored->Find(2), store.Find(2));

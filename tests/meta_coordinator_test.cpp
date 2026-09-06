@@ -16,13 +16,14 @@
 //      injection, verdict from the audit store), NOT_LEADER, the three
 //      fail-safe gates with constructor-injected thresholds, ValidateProposal
 //      hooks, uncertain-outcome semantics (timeout/cancel; reconcile via the
-//      committed view), and the RunAsLeader reconciler lifecycle (mock
-//      reconciler, idempotent continuation across cancel/restart and across a
-//      full server restart with WAL replay).
+//      committed view), the required continuation scheduler, and the
+//      RunAsLeader reconciler lifecycle (mock reconciler, idempotent
+//      continuation across cancel/restart and across a full server restart
+//      with WAL replay).
 //
-// All Propose results are driven through RunTaskSync: the seam's default
-// resume hook resumes inline on the NuRaft completion thread, so the tests
-// need no celer worker.
+// All Propose results are driven through RunTaskSync. The server fixture
+// explicitly injects an inline scheduler because it has no Celer worker;
+// production has no inline fallback and schedules through MetaCelerBridge.
 
 #include "meta/meta_coordinator.h"
 
@@ -38,6 +39,7 @@
 #include <future>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -188,7 +190,7 @@ T RunTaskSync(celer::Task<T> task) {
     handle.destroy();
     return T{};
   }
-  T result = std::move(*handle.promise().value_);
+  T result = std::move(handle.promise().value_);
   handle.destroy();
   return result;
 }
@@ -585,6 +587,14 @@ class MetaCoordinatorServerTest : public ::testing::Test {
   void MakeCoordinator(MetaCoordinatorOptions options = {}) {
     nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
     wal_ = static_cast<NuraftLogStore*>(store.get());
+    // This fixture drives Tasks from an ordinary test thread and has no Celer
+    // worker. Keep that exceptional execution policy explicit rather than
+    // relying on a production-dangerous inline fallback in MetaCoordinator.
+    if (!options.schedule_resume_) {
+      options.schedule_resume_ = [](std::coroutine_handle<> continuation) {
+        continuation.resume();
+      };
+    }
     coordinator_ = std::make_unique<MetaCoordinator>(
         server_, *machine_, *wal_, observations_, std::move(options));
     {
@@ -688,6 +698,20 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
                    .has_value());
 }
 
+TEST_F(MetaCoordinatorServerTest,
+       AttachedCoordinatorRequiresContinuationScheduler) {
+  StartServer();
+  nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
+  wal_ = static_cast<NuraftLogStore*>(store.get());
+
+  EXPECT_THROW(
+      {
+        MetaCoordinator coordinator(server_, *machine_, *wal_, observations_,
+                                    MetaCoordinatorOptions{});
+      },
+      std::invalid_argument);
+}
+
 TEST_F(MetaCoordinatorServerTest, ProposeNotLeaderThenLeader) {
   // A wide election window keeps the first self-election seconds away, so the
   // first Propose deterministically lands while the node is still a follower
@@ -745,14 +769,20 @@ TEST_F(MetaCoordinatorServerTest, FailSafeAuditWindowGate) {
   StartServer({.client_req_timeout_ms_ = 25000});
   WaitLeader();
 
-  // Fill the audit window to capacity with one batched append: every command
-  // (accepted or domain-rejected) writes exactly one audit record keyed by
-  // its log index, so identical re-registers fill the window.
+  // Select strict-export through the replicated command before filling the
+  // window. The setup command is itself audited and counts toward capacity.
   const std::uint64_t before = server_->get_committed_log_idx();
   std::vector<nuraft::ptr<nuraft::buffer>> logs;
   logs.reserve(keylane::meta::kMaxMetaAuditWindowRecords);
+  keylane::meta::SetAuditPolicy policy;
+  policy.request_id_ = MakeRequestId(0x31);
+  policy.policy_ = keylane::meta::MetaAuditPolicy::kStrictExport;
+  policy.attestation_ = "test-strict-export";
+  auto encoded_policy = MetaStateMachine::EncodeCommand(policy);
+  ASSERT_TRUE(encoded_policy.ok()) << encoded_policy.status();
+  logs.push_back(*encoded_policy);
   const MetaCommand filler = MakeRegister(0x33);
-  for (std::uint32_t ii = 0; ii < keylane::meta::kMaxMetaAuditWindowRecords;
+  for (std::uint32_t ii = 1; ii < keylane::meta::kMaxMetaAuditWindowRecords;
        ++ii) {
     auto encoded = MetaStateMachine::EncodeCommand(filler);
     ASSERT_TRUE(encoded.ok()) << encoded.status();
@@ -950,7 +980,7 @@ TEST_F(MetaCoordinatorServerTest,
   ShutdownRaft();
   ASSERT_EQ(signal.wait_for(std::chrono::seconds(15)),
             std::future_status::ready);
-  auto cancelled = std::move(*handle.promise().value_);
+  auto cancelled = std::move(handle.promise().value_);
   handle.destroy();
   ASSERT_FALSE(cancelled.ok());
   EXPECT_EQ(cancelled.status().code(), absl::StatusCode::kCancelled);

@@ -46,20 +46,15 @@
 //                             revision=<n> retired=<0|1>" / "ERR not-found";
 //                             same non-linearizable read semantics as getop.
 //   status                 -> "OK leader=<0|1> id=<n> committed=<idx>
-//                             snapshot_idx=<idx> term=<n> schema=<n>".
-//   addsrv <id> <ip:port> [<keylane://meta/id> <min_schema> <max_schema>]
+//                             snapshot_idx=<idx> term=<n>".
+//   addsrv <id> <ip:port> [<keylane://meta/id>]
 //                          -> first commits the member identity, then returns
 //                             "OK" / "ERR <code>" from NuRaft add_srv. The
-//                             optional fields default to this binary's
-//                             canonical principal and schema range.
+//                             optional principal defaults to the canonical
+//                             identity for that member id.
 //   removesrv <id>         -> "OK" / "ERR <code>" from NuRaft remove_srv.
 //                             A successful removal then retires the committed
 //                             member identity.
-//   setschema <n> <attestation>
-//                          -> commits the active write schema after every
-//                             configured member's identity descriptor attests
-//                             support; the opaque token records operator
-//                             intent.
 //   exportaudit <through>  -> "OK <hex>" versioned, hash-chained export.
 //   pruneaudit <through>   -> replicated prefix prune; callers must durably
 //                             store the matching export first.
@@ -133,16 +128,17 @@
 // a closure through the MetaCelerBridge (see nuraft_scheduler.h for the
 // bridge contract). The accept loop and one session coroutine per connection
 // run on the bridge's worker. Committed model mutations go through
-// MetaCoordinator; membership and snapshot lifecycle calls use NuRaft's
-// asynchronous public API. Background-thread completions hop through the
-// bridge before resuming the parked session coroutine.
+// MetaCoordinator; a bounded proposal executor invokes membership and
+// snapshot lifecycle APIs away from the worker. Background-thread completions
+// hop through the bridge before resuming the parked session coroutine.
 //
 // LIFECYCLE
 //
 // The core keeps its own shared_ptr references to the raft_server and the
 // state machine, so a session in flight always sees live objects; Shutdown()
 // releases them on the worker thread (the adapter teardown order in
-// meta_main.cpp guarantees ~raft_server runs after raft_server::shutdown(),
+// app/keylane_meta.cpp guarantees ~raft_server runs after
+// raft_server::shutdown(),
 // on whichever thread drops the last reference — both are safe).
 
 #include <sys/types.h>
@@ -163,7 +159,7 @@
 #pragma GCC diagnostic pop
 
 namespace celer {
-class Connection;
+struct Connection;
 class TcpStream;
 class Worker;
 }  // namespace celer
@@ -173,6 +169,9 @@ class raft_server;
 }  // namespace nuraft
 
 namespace keylane::meta {
+
+class MetaMembershipGate;
+class MetaProposalExecutor;
 
 class MetaCelerBridge;
 class MetaObservationStore;
@@ -205,6 +204,10 @@ class MetaCtlServer {
       nuraft::ptr<MetaStateMachine> state_machine,
       std::shared_ptr<MetaCoordinator> coordinator,
       std::shared_ptr<MetaObservationStore> obs_store,
+      // Non-owning: process assembly must keep the executor alive until the
+      // Celer worker and all ctl session coroutines have stopped.
+      MetaProposalExecutor& proposal_executor,
+      std::shared_ptr<MetaMembershipGate> membership_gate,
       MetaCtlServerOptions options);
 
   // Posts shutdown() if it never happened, so sessions cannot outlive the

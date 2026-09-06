@@ -214,12 +214,6 @@ class Node:
     def term(self):
         return int(self.status()["term"])
 
-    def schema(self):
-        return int(self.status()["schema"])
-
-    def setschema(self, version, attestation="gate"):
-        return self.ctl(f"setschema {version} {attestation}")
-
     def new_op_id(self):
         """Fresh operation id: 32 lowercase hex chars, unique cluster-wide
         (node-id prefix + per-node monotonic counter)."""

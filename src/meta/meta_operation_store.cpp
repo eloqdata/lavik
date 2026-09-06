@@ -362,8 +362,7 @@ namespace {
 absl::Status ReadStoreSchemaVersion(MetaReader& r) {
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported operation store schema version");
   }
   return absl::OkStatus();
@@ -498,7 +497,7 @@ absl::StatusOr<MetaOperationArchiveSummary> ReadSummary(MetaReader& r) {
 
 absl::StatusOr<std::string> MetaOperationStore::ExportArchive() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(archived_.size()));
   for (const auto& [id, summary] : archived_) {
     WriteSummary(w, summary);
@@ -508,7 +507,7 @@ absl::StatusOr<std::string> MetaOperationStore::ExportArchive() const {
 
 absl::StatusOr<std::string> MetaOperationStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(live_.size()));
   for (const auto& [id, record] : live_) {
     WriteRecord(w, record);

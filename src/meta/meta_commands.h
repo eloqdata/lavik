@@ -30,19 +30,8 @@
 //   - Unknown schema versions and unknown command tags are decode failures
 //     (fail-stop class); domain validation belongs to the apply layer.
 //
-// SetSchemaVersion is part of the permanently frozen v1 layout subset: it is
-// always encoded with schema_version = kMetaSchemaVersionV1 so that any
-// binary within the readable window can decode it. Its frozen
-// layout is tag + request_id + actor_principal + readable_time +
-// new_active_write_schema + attestation — the actor fields are part of the
-// frozen subset because it is a privileged command whose audit record must
-// identify the proposing entry; two bounded strings do not weaken the
-// "decodable by any v2+ binary" promise. This layout NEVER changes.
-//
-// The checked-in v1 fixture freezes the oldest-readable SetSchemaVersion
-// layout used during upgrades. All command layouts are durable contracts;
-// later evolution uses a newer schema version or an append-only command tag
-// whose minimum write schema is explicit.
+// This release supports one command format. Incompatible pre-release bytes
+// are rejected instead of negotiated between mixed Meta binaries.
 
 #include <array>
 #include <cstdint>
@@ -114,6 +103,14 @@ inline constexpr std::uint32_t kMaxMetaAttestationBytes = 4096;
 // NodeDescriptor::is_primary_).
 enum class MetaNodeRole : std::uint8_t { kPrimary = 1, kReplica = 2 };
 
+// Replicated audit retention policy. Bounded rotation is the availability-
+// first default; strict export is an explicit operator choice.
+enum class MetaAuditPolicy : std::uint8_t {
+  kDisabled = 0,
+  kBoundedRotate = 1,
+  kStrictExport = 2,
+};
+
 // Wire tag per command. Tags are append-only and never reused.
 enum class MetaCommandTag : std::uint16_t {
   kRegisterNode = 1,
@@ -135,18 +132,19 @@ enum class MetaCommandTag : std::uint16_t {
   kCompleteOperation = 17,
   kAbortOperation = 18,
   kArchiveOperations = 19,
-  kSetSchemaVersion = 20,
-  kPruneAudit = 21,
-  kPruneOperationArchive = 22,
-  kBindMetaMember = 23,
-  kRetireMetaMember = 24,
-  // Added in schema v2; v1 writers must never emit this tag.
-  kSetGroupReplicationState = 25,
+  kPruneAudit = 20,
+  kPruneOperationArchive = 21,
+  kBindMetaMember = 22,
+  kRetireMetaMember = 23,
+  kSetGroupReplicationState = 24,
+  // Policy changes are themselves always audited.
+  kSetAuditPolicy = 25,
 };
 
 // ---------------------------------------------------------------------------
 // identity/enrollment. RegisterNode binds the certificate principal;
-// UpdateNode must NOT modify it (no principal field; rotation is unimplemented).
+// UpdateNode must NOT modify it (no principal field; rotation is
+// unimplemented).
 // ---------------------------------------------------------------------------
 
 struct RegisterNode {
@@ -456,26 +454,6 @@ struct ArchiveOperations {
   bool operator==(const ArchiveOperations&) const = default;
 };
 
-// ---------------------------------------------------------------------------
-// upgrade. SetSchemaVersion switches the committed
-// active_write_schema. Its encoding is part of the PERMANENTLY FROZEN v1
-// layout subset: it is always written with schema_version =
-// kMetaSchemaVersionV1 so every binary within the readable window can decode
-// it. Fields may never be reordered, removed,
-// or re-typed; extensions go through new command tags. The frozen layout —
-// tag + request_id + actor_principal + readable_time +
-// new_active_write_schema + attestation — carries the actor like every other
-// privileged command, so its audit record identifies the proposing entry.
-// ---------------------------------------------------------------------------
-
-struct SetSchemaVersion {
-  MetaRequestId request_id_{};
-  ActorContext actor_;  // encoded, and part of the frozen layout
-  std::uint16_t new_active_write_schema_ = 0;
-  std::string attestation_;  // operator attestation (ticket, reason)
-  bool operator==(const SetSchemaVersion&) const = default;
-};
-
 // Replicated acknowledgement that an audit prefix has been durably exported.
 // The apply layer prunes through this index before appending this command's own
 // audit record, so the prune remains visible and replay-idempotent.
@@ -484,6 +462,14 @@ struct PruneAudit {
   ActorContext actor_;
   std::uint64_t through_log_index_ = 0;
   bool operator==(const PruneAudit&) const = default;
+};
+
+struct SetAuditPolicy {
+  MetaRequestId request_id_{};
+  ActorContext actor_;
+  MetaAuditPolicy policy_ = MetaAuditPolicy::kBoundedRotate;
+  std::string attestation_;
+  bool operator==(const SetAuditPolicy&) const = default;
 };
 
 // Removes externally archived operation tombstones after their documented
@@ -496,14 +482,12 @@ struct PruneOperationArchive {
 };
 
 // First stage of a dynamic Meta membership add: the canonical certificate
-// identity and schema capability are committed and audited before add_srv.
+// identity is committed and audited before add_srv.
 struct BindMetaMember {
   MetaRequestId request_id_{};
   ActorContext actor_;
   std::uint32_t server_id_ = 0;
   std::string principal_;
-  std::uint16_t min_schema_ = 0;
-  std::uint16_t max_schema_ = 0;
   bool operator==(const BindMetaMember&) const = default;
 };
 
@@ -516,22 +500,18 @@ struct RetireMetaMember {
   bool operator==(const RetireMetaMember&) const = default;
 };
 
-using MetaCommand =
-    std::variant<RegisterNode, UpdateNode, RetireNode, CreateGroup,
-                 AssignNodeToGroup, RemoveNodeFromGroup, SetSlotMap,
-                 BeginGroupTerm, GrantAuthority, ActivateAuthority, RevokeGrant,
-                 FenceGroup, PutPolicy, RetirePolicy, SubmitOperation,
-                 TransitionOperationPhase, CompleteOperation, AbortOperation,
-                 ArchiveOperations, SetSchemaVersion, PruneAudit,
-                 PruneOperationArchive, BindMetaMember, RetireMetaMember,
-                 SetGroupReplicationState>;
+using MetaCommand = std::variant<
+    RegisterNode, UpdateNode, RetireNode, CreateGroup, AssignNodeToGroup,
+    RemoveNodeFromGroup, SetSlotMap, BeginGroupTerm, GrantAuthority,
+    ActivateAuthority, RevokeGrant, FenceGroup, PutPolicy, RetirePolicy,
+    SubmitOperation, TransitionOperationPhase, CompleteOperation,
+    AbortOperation, ArchiveOperations, PruneAudit, PruneOperationArchive,
+    BindMetaMember, RetireMetaMember, SetGroupReplicationState, SetAuditPolicy>;
 
 // Encode produces the full envelope. Fails (kDomainReject class) when a field
 // exceeds its cap or the total exceeds kMaxMetaCommandBytes; the encoding is
 // never silently truncated.
-absl::StatusOr<std::string> EncodeMetaCommand(
-    const MetaCommand& command,
-    std::uint16_t write_schema = kMetaCurrentSchemaVersion);
+absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command);
 
 // Decode is strict: unknown version/tag, truncation, over-cap fields, and
 // trailing bytes all fail with MetaFailureClass::kFailStop.

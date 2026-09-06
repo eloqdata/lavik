@@ -24,7 +24,7 @@ absl::Status CheckCap(std::string_view field, std::size_t size,
 // Writes tag + request_id + actor, the fixed header of every command body.
 // The actor fields are ordinary bounded strings on the wire so a follower's
 // apply can persist the trusted entry's injected ActorContext into
-// audit/journal (see meta_commands.h). SetSchemaVersion is the exception:
+// audit/journal (see meta_commands.h).
 // its frozen layout has its own header below.
 absl::Status WriteCommandHeader(MetaWriter& w, MetaCommandTag tag,
                                 const MetaRequestId& request_id,
@@ -65,45 +65,6 @@ absl::StatusOr<MetaCommandHeader> ReadCommandHeader(MetaReader& r) {
   MetaCommandHeader header;
   header.request_id_ = *request_id;
   header.actor_ = std::move(*actor);
-  return header;
-}
-
-// FROZEN SetSchemaVersion header: tag + request_id + actor_principal +
-// readable_time. Permanently frozen as of v1 (meta_commands.h) — field-for-
-// field identical to the shared command header, but a SEPARATE code path so
-// future evolution of WriteCommandHeader can never leak into this layout.
-absl::Status WriteFrozenSetSchemaVersionHeader(MetaWriter& w,
-                                               const MetaRequestId& request_id,
-                                               const ActorContext& actor) {
-  if (auto st = CheckCap("actor_principal", actor.principal_.size(),
-                         kMaxMetaPrincipalBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st = CheckCap("readable_time", actor.readable_time_.size(),
-                         kMaxMetaActorReadableTimeBytes);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteU16(static_cast<std::uint16_t>(MetaCommandTag::kSetSchemaVersion));
-  WriteFixedArray(w, request_id);
-  w.WriteString(actor.principal_);
-  w.WriteString(actor.readable_time_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<MetaCommandHeader> ReadFrozenSetSchemaVersionHeader(
-    MetaReader& r) {
-  auto request_id = ReadFixedArray<16>(r);
-  if (!request_id.ok()) return request_id.status();
-  auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
-  if (!principal.ok()) return principal.status();
-  auto readable_time = ReadBoundedString(r, kMaxMetaActorReadableTimeBytes);
-  if (!readable_time.ok()) return readable_time.status();
-  MetaCommandHeader header;
-  header.request_id_ = *request_id;
-  header.actor_.principal_ = std::move(*principal);
-  header.actor_.readable_time_ = std::move(*readable_time);
   return header;
 }
 
@@ -1034,43 +995,6 @@ absl::StatusOr<ArchiveOperations> ReadArchiveOperationsBody(MetaReader& r) {
   return cmd;
 }
 
-// ---------------------------------------------------------------------------
-// upgrade codec. FROZEN v1 layout (see meta_commands.h): tag + request_id +
-// actor_principal + readable_time + new_active_write_schema u16 +
-// attestation. Permanently frozen as of v1; never change.
-// ---------------------------------------------------------------------------
-
-absl::Status WriteCommandBody(MetaWriter& w, const SetSchemaVersion& cmd) {
-  if (auto st = CheckCap("attestation", cmd.attestation_.size(),
-                         kMaxMetaAttestationBytes);
-      !st.ok()) {
-    return st;
-  }
-  if (auto st =
-          WriteFrozenSetSchemaVersionHeader(w, cmd.request_id_, cmd.actor_);
-      !st.ok()) {
-    return st;
-  }
-  w.WriteU16(cmd.new_active_write_schema_);
-  w.WriteString(cmd.attestation_);
-  return absl::OkStatus();
-}
-
-absl::StatusOr<SetSchemaVersion> ReadSetSchemaVersionBody(MetaReader& r) {
-  auto header = ReadFrozenSetSchemaVersionHeader(r);
-  if (!header.ok()) return header.status();
-  auto new_schema = r.ReadU16();
-  if (!new_schema.ok()) return new_schema.status();
-  auto attestation = ReadBoundedString(r, kMaxMetaAttestationBytes);
-  if (!attestation.ok()) return attestation.status();
-  SetSchemaVersion cmd;
-  cmd.request_id_ = header->request_id_;
-  cmd.actor_ = std::move(header->actor_);
-  cmd.new_active_write_schema_ = *new_schema;
-  cmd.attestation_ = std::move(*attestation);
-  return cmd;
-}
-
 absl::Status WriteCommandBody(MetaWriter& w, const PruneAudit& cmd) {
   if (auto st = WriteCommandHeader(w, MetaCommandTag::kPruneAudit,
                                    cmd.request_id_, cmd.actor_);
@@ -1090,6 +1014,45 @@ absl::StatusOr<PruneAudit> ReadPruneAuditBody(MetaReader& r) {
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.through_log_index_ = *through;
+  return cmd;
+}
+
+absl::Status WriteCommandBody(MetaWriter& w, const SetAuditPolicy& cmd) {
+  if (auto st = CheckCap("attestation", cmd.attestation_.size(),
+                         kMaxMetaAttestationBytes);
+      !st.ok()) {
+    return st;
+  }
+  if (cmd.policy_ != MetaAuditPolicy::kDisabled &&
+      cmd.policy_ != MetaAuditPolicy::kBoundedRotate &&
+      cmd.policy_ != MetaAuditPolicy::kStrictExport) {
+    return MetaDomainRejectError("unknown audit policy");
+  }
+  if (auto st = WriteCommandHeader(w, MetaCommandTag::kSetAuditPolicy,
+                                   cmd.request_id_, cmd.actor_);
+      !st.ok()) {
+    return st;
+  }
+  w.WriteU8(static_cast<std::uint8_t>(cmd.policy_));
+  w.WriteString(cmd.attestation_);
+  return absl::OkStatus();
+}
+
+absl::StatusOr<SetAuditPolicy> ReadSetAuditPolicyBody(MetaReader& r) {
+  auto header = ReadCommandHeader(r);
+  if (!header.ok()) return header.status();
+  auto policy = r.ReadU8();
+  if (!policy.ok()) return policy.status();
+  if (*policy > static_cast<std::uint8_t>(MetaAuditPolicy::kStrictExport)) {
+    return MetaFailStopError("unknown audit policy tag");
+  }
+  auto attestation = ReadBoundedString(r, kMaxMetaAttestationBytes);
+  if (!attestation.ok()) return attestation.status();
+  SetAuditPolicy cmd;
+  cmd.request_id_ = header->request_id_;
+  cmd.actor_ = std::move(header->actor_);
+  cmd.policy_ = static_cast<MetaAuditPolicy>(*policy);
+  cmd.attestation_ = std::move(*attestation);
   return cmd;
 }
 
@@ -1137,8 +1100,6 @@ absl::Status WriteCommandBody(MetaWriter& w, const BindMetaMember& cmd) {
   }
   w.WriteU32(cmd.server_id_);
   w.WriteString(cmd.principal_);
-  w.WriteU16(cmd.min_schema_);
-  w.WriteU16(cmd.max_schema_);
   return absl::OkStatus();
 }
 
@@ -1149,17 +1110,11 @@ absl::StatusOr<BindMetaMember> ReadBindMetaMemberBody(MetaReader& r) {
   if (!server_id.ok()) return server_id.status();
   auto principal = ReadBoundedString(r, kMaxMetaPrincipalBytes);
   if (!principal.ok()) return principal.status();
-  auto min_schema = r.ReadU16();
-  if (!min_schema.ok()) return min_schema.status();
-  auto max_schema = r.ReadU16();
-  if (!max_schema.ok()) return max_schema.status();
   BindMetaMember cmd;
   cmd.request_id_ = header->request_id_;
   cmd.actor_ = std::move(header->actor_);
   cmd.server_id_ = *server_id;
   cmd.principal_ = std::move(*principal);
-  cmd.min_schema_ = *min_schema;
-  cmd.max_schema_ = *max_schema;
   return cmd;
 }
 
@@ -1187,25 +1142,9 @@ absl::StatusOr<RetireMetaMember> ReadRetireMetaMemberBody(MetaReader& r) {
 
 }  // namespace
 
-absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command,
-                                              std::uint16_t write_schema) {
+absl::StatusOr<std::string> EncodeMetaCommand(const MetaCommand& command) {
   MetaWriter w;
-  // SetSchemaVersion uses the frozen v1 layout so every binary in the readable
-  // compatibility window can decode it. Every other command uses the current
-  // write schema.
-  const std::uint16_t write_version =
-      std::holds_alternative<SetSchemaVersion>(command) ? kMetaSchemaVersionV1
-                                                        : write_schema;
-  if (write_version < kMetaMinReadableSchemaVersion ||
-      write_version > kMetaCurrentSchemaVersion) {
-    return MetaDomainRejectError("requested write schema is not supported");
-  }
-  if (std::holds_alternative<SetGroupReplicationState>(command) &&
-      write_version < kMetaSchemaVersionV2) {
-    return MetaDomainRejectError(
-        "SetGroupReplicationState requires write schema v2");
-  }
-  w.WriteU16(write_version);
+  w.WriteU16(kMetaFormatVersion);
   auto status = std::visit(
       [&w](const auto& cmd) -> absl::Status {
         return WriteCommandBody(w, cmd);
@@ -1225,8 +1164,7 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto tag = r.ReadU16();
@@ -1348,12 +1286,6 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
       command = std::move(*body);
       break;
     }
-    case MetaCommandTag::kSetSchemaVersion: {
-      auto body = ReadSetSchemaVersionBody(r);
-      if (!body.ok()) return body.status();
-      command = std::move(*body);
-      break;
-    }
     case MetaCommandTag::kPruneAudit: {
       auto body = ReadPruneAuditBody(r);
       if (!body.ok()) return body.status();
@@ -1379,11 +1311,13 @@ absl::StatusOr<MetaCommand> DecodeMetaCommand(std::string_view bytes) {
       break;
     }
     case MetaCommandTag::kSetGroupReplicationState: {
-      if (*version < kMetaSchemaVersionV2) {
-        return MetaFailStopError(
-            "SetGroupReplicationState is invalid in schema v1");
-      }
       auto body = ReadSetGroupReplicationStateBody(r);
+      if (!body.ok()) return body.status();
+      command = std::move(*body);
+      break;
+    }
+    case MetaCommandTag::kSetAuditPolicy: {
+      auto body = ReadSetAuditPolicyBody(r);
       if (!body.ok()) return body.status();
       command = std::move(*body);
       break;
@@ -1402,7 +1336,7 @@ absl::StatusOr<std::string> EncodeMetaGroupRecord(
     return st;
   }
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteString(record.owner_);
   w.WriteU64(record.group_term_);
   w.WriteU64(record.authority_version_);
@@ -1415,8 +1349,7 @@ absl::StatusOr<MetaGroupRecord> DecodeMetaGroupRecord(std::string_view bytes) {
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   MetaGroupRecord record;

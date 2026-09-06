@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -212,9 +213,55 @@ absl::StatusOr<std::unique_ptr<NuraftLogStore>> NuraftLogStore::Open(
             "data) instead of migrating it");
   }
 
-  // Collect segment files by first index; drop compact-rewrite leftovers (a
-  // *.seg.tmp never survived its rename, so the pre-rewrite segments are the
-  // authoritative bytes and the leftover is never valid data).
+  // A compact replacement is published under a non-WAL name before any old
+  // segment is removed. If the process died during the cleanup/rename phase,
+  // the fsynced ready file is the authoritative intent and contains the full
+  // surviving suffix (or just its floor header). Finish that transaction
+  // before the normal contiguous-prefix scan.
+  std::optional<std::pair<uint64_t, std::string>> compact_ready;
+  for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("compact-", 0) == 0 && name.size() > 14 &&
+        name.ends_with(".ready")) {
+      const std::string digits = name.substr(8, name.size() - 8 - 6);
+      if (digits.empty() ||
+          digits.find_first_not_of("0123456789") != std::string::npos) {
+        continue;
+      }
+      if (compact_ready.has_value()) {
+        return absl::DataLossError("multiple compact ready intents in " +
+                                   data_dir);
+      }
+      try {
+        compact_ready = {std::stoull(digits), entry.path().string()};
+      } catch (...) {
+        continue;
+      }
+    } else if (name.rfind("compact-", 0) == 0 && name.ends_with(".tmp")) {
+      if (::unlink(entry.path().c_str()) < 0) {
+        return ErrnoStatus("unlink(stale compact tmp)", entry.path().string());
+      }
+    }
+  }
+  if (compact_ready.has_value()) {
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+      const std::string name = entry.path().filename().string();
+      if (name.rfind("log-", 0) == 0 && name.ends_with(".seg") &&
+          ::unlink(entry.path().c_str()) < 0) {
+        return ErrnoStatus("unlink(compact recovery)", entry.path().string());
+      }
+    }
+    const std::string target =
+        data_dir + "/" + SegmentFileName(compact_ready->first);
+    if (::rename(compact_ready->second.c_str(), target.c_str()) < 0) {
+      return ErrnoStatus("rename(compact recovery)", target);
+    }
+    absl::Status status = FsyncDirectory(data_dir);
+    if (!status.ok()) return status;
+  }
+
+  // Collect segment files by first index; also tolerate and discard the
+  // obsolete log-*.seg.tmp spelling from pre-intent builds.
   std::vector<std::pair<uint64_t, std::string>> files;
   for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
     const std::string name = entry.path().filename().string();
@@ -605,152 +652,123 @@ void NuraftLogStore::apply_pack(nuraft::ulong index, nuraft::buffer& pack) {
 
 bool NuraftLogStore::compact(nuraft::ulong last_log_index) {
   std::lock_guard<std::mutex> lock(mutex_);
-  // NuRaft sets start_index to last_log_index + 1 even when nothing was
-  // erased; both behaviors mirror its reference in-memory store.
-  entries_.erase(entries_.begin(), entries_.upper_bound(last_log_index));
-  if (start_index_ <= last_log_index) start_index_ = last_log_index + 1;
+  const uint64_t new_first =
+      start_index_ <= last_log_index ? last_log_index + 1 : start_index_;
+  std::map<uint64_t, Slot> replacement_entries;
+  auto survivor = entries_.upper_bound(last_log_index);
+  const std::string ready_path =
+      data_dir_ + "/compact-" + std::to_string(new_first) + ".ready";
+  const std::string tmp_path = ready_path + ".tmp";
 
-  for (auto it = segments_.begin(); it != segments_.end();) {
-    const uint64_t first = it->first;
-    if (first > last_log_index) break;  // fully surviving tail (sorted map)
-
-    // Surviving entries of this segment, if any, form the prefix run of
-    // entries_ (earlier segments were fully purged and entries_ is
-    // index-ordered).
-    auto survivor = entries_.begin();
-    const bool has_survivors =
-        survivor != entries_.end() && survivor->second.segment_ == first;
-
-    if (!has_survivors) {
-      // Fully purged segment.
-      if (active_fd_ >= 0 && segments_.rbegin()->first == first) {
-        ::close(active_fd_);
-        active_fd_ = -1;
-      }
-      if (auto injected = MaybeFailLocked(NuraftLogFaultPoint::kUnlink);
-          !injected.ok()) {
-        spdlog::error("nuraft log store: compact unlink injected failure: {}",
-                      injected.message());
-        return false;
-      }
-      if (::unlink(SegmentPath(first).c_str()) < 0) {
-        spdlog::error("nuraft log store: compact unlink failed on {}: {}",
-                      SegmentPath(first), std::strerror(errno));
-        return false;
-      }
-      dir_dirty_ = true;
-      it = segments_.erase(it);
-      continue;
-    }
-
-    // Partially overlapping segment: rewrite the surviving records into a
-    // fresh segment whose boundary is the compact point, so post-compact
-    // segment boundaries coincide with snapshot compact boundaries.
-    const uint64_t new_first = survivor->first;
-    const std::string new_path = SegmentPath(new_first);
-    const std::string tmp_path = new_path + ".tmp";
-    int tmp_fd = ::open(tmp_path.c_str(),
-                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (tmp_fd < 0) {
-      spdlog::error("nuraft log store: compact open(tmp) failed on {}: {}",
-                    tmp_path, std::strerror(errno));
+  // Preflight the only destructive operation while the old segment set is
+  // still completely authoritative. Once the durable intent is published,
+  // cleanup failures cannot truthfully be returned as a non-mutating false.
+  if (!segments_.empty()) {
+    if (auto injected = MaybeFailLocked(NuraftLogFaultPoint::kUnlink);
+        !injected.ok()) {
+      spdlog::error("nuraft log store: compact unlink injected failure: {}",
+                    injected.message());
       return false;
     }
-    uint64_t offset = 0;
-    absl::Status status = absl::OkStatus();
-    {
-      std::vector<uint8_t> header = EncodeSegmentHeader(new_first);
-      status = PwriteAll(tmp_fd, header.data(), header.size(), 0);
-      offset = header.size();
-    }
-    while (status.ok() && survivor != entries_.end() &&
-           survivor->second.segment_ == first) {
-      std::vector<uint8_t> record =
-          EncodeRecord(survivor->first, *survivor->second.entry_);
-      status = PwriteAll(tmp_fd, record.data(), record.size(), offset);
-      if (!status.ok()) break;
-      survivor->second.offset_ = offset;
-      survivor->second.segment_ = new_first;
-      offset += record.size();
-      ++survivor;
-    }
-    if (status.ok() && ::fdatasync(tmp_fd) < 0) {
-      status = ErrnoStatus("fdatasync(tmp)", tmp_path);
-    }
-    if (::close(tmp_fd) < 0 && status.ok()) {
-      status = ErrnoStatus("close(tmp)", tmp_path);
-    }
-    if (!status.ok()) {
-      // In-memory state already reflects the compaction and stays coherent
-      // for this process; on disk the purged prefix survives as dead records
-      // a later retry removes. Replay never reaches them because the state
-      // machine's durable commit index is at or past the snapshot point.
-      spdlog::error("nuraft log store: compact rewrite failed on {}: {}",
-                    new_path, status.message());
-      return false;
-    }
-
-    const bool was_active = active_fd_ >= 0 && !segments_.empty() &&
-                            segments_.rbegin()->first == first;
-    if (was_active) {
-      ::close(active_fd_);
-      active_fd_ = -1;
-    }
-    if (::unlink(SegmentPath(first).c_str()) < 0) {
-      spdlog::error("nuraft log store: compact unlink failed on {}: {}",
-                    SegmentPath(first), std::strerror(errno));
-      return false;
-    }
-    if (::rename(tmp_path.c_str(), new_path.c_str()) < 0) {
-      spdlog::error("nuraft log store: compact rename failed on {}: {}",
-                    new_path, std::strerror(errno));
-      return false;
-    }
-    dir_dirty_ = true;
-    if (was_active) {
-      active_fd_ = ::open(new_path.c_str(), O_RDWR | O_CLOEXEC);
-      if (active_fd_ < 0) {
-        // The rename already replaced the file; continuing with no descriptor
-        // would strand later appends.
-        FatalStoreError("compact(reopen)", new_path,
-                        ErrnoStatus("open", new_path));
-      }
-    }
-    segments_[new_first] = Segment{new_first, offset};
-    it = segments_.erase(it);  // `it` names the old `first` key
   }
 
-  if (segments_.empty()) {
-    // Full compaction: leave a header-only floor segment pinning start_index
-    // so a reopen starts at the compacted point.
-    const std::string path = SegmentPath(start_index_);
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0) {
-      spdlog::error("nuraft log store: compact floor segment failed on {}: {}",
-                    path, std::strerror(errno));
-      return false;
-    }
-    std::vector<uint8_t> header = EncodeSegmentHeader(start_index_);
-    absl::Status status = PwriteAll(fd, header.data(), header.size(), 0);
-    if (!status.ok()) {
-      ::close(fd);
-      spdlog::error("nuraft log store: compact floor segment failed on {}: {}",
-                    path, status.message());
-      return false;
-    }
-    segments_[start_index_] =
-        Segment{start_index_, static_cast<uint64_t>(header.size())};
-    active_fd_ = fd;
-    dir_dirty_ = true;
-  }
-
-  RecomputeLiveBytesLocked();
-  absl::Status status = SyncLocked();
-  if (!status.ok()) {
-    spdlog::error("nuraft log store: compact sync failed in {}: {}", data_dir_,
-                  status.message());
+  int tmp_fd =
+      ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (tmp_fd < 0) {
+    spdlog::error("nuraft log store: compact open intent failed on {}: {}",
+                  tmp_path, std::strerror(errno));
     return false;
   }
+  uint64_t offset = 0;
+  absl::Status status = absl::OkStatus();
+  {
+    std::vector<uint8_t> header = EncodeSegmentHeader(new_first);
+    status = MaybeFailLocked(NuraftLogFaultPoint::kPwrite);
+    if (status.ok()) {
+      status = PwriteAll(tmp_fd, header.data(), header.size(), 0);
+    }
+    offset = header.size();
+  }
+  while (status.ok() && survivor != entries_.end()) {
+    std::vector<uint8_t> record =
+        EncodeRecord(survivor->first, *survivor->second.entry_);
+    status = MaybeFailLocked(NuraftLogFaultPoint::kPwrite);
+    if (status.ok()) {
+      status = PwriteAll(tmp_fd, record.data(), record.size(), offset);
+    }
+    if (!status.ok()) break;
+    Slot slot = survivor->second;
+    slot.offset_ = offset;
+    slot.segment_ = new_first;
+    replacement_entries.emplace(survivor->first, std::move(slot));
+    offset += record.size();
+    ++survivor;
+  }
+  if (status.ok()) {
+    status = MaybeFailLocked(NuraftLogFaultPoint::kFdatasync);
+  }
+  if (status.ok() && ::fdatasync(tmp_fd) < 0) {
+    status = ErrnoStatus("fdatasync(compact intent)", tmp_path);
+  }
+  if (::close(tmp_fd) < 0 && status.ok()) {
+    status = ErrnoStatus("close(tmp)", tmp_path);
+  }
+  if (!status.ok()) {
+    (void)::unlink(tmp_path.c_str());
+    spdlog::error("nuraft log store: compact intent write failed on {}: {}",
+                  tmp_path, status.message());
+    return false;
+  }
+  status = MaybeFailLocked(NuraftLogFaultPoint::kRename);
+  if (status.ok()) {
+    status = MaybeFailLocked(NuraftLogFaultPoint::kDirectorySync);
+  }
+  if (!status.ok() || ::rename(tmp_path.c_str(), ready_path.c_str()) < 0) {
+    if (status.ok()) status = ErrnoStatus("rename(compact intent)", ready_path);
+    (void)::unlink(tmp_path.c_str());
+    spdlog::error("nuraft log store: compact publish failed on {}: {}",
+                  ready_path, status.message());
+    return false;
+  }
+  status = FsyncDirectory(data_dir_);
+  if (!status.ok()) {
+    FatalStoreError("compact(sync intent)", data_dir_, status);
+  }
+
+  // The durable ready file is now a recovery transaction. Complete it
+  // fail-stop: returning false after this point would promise NuRaft that the
+  // old log remained authoritative when a restart would finish compaction.
+  if (active_fd_ >= 0) {
+    ::close(active_fd_);
+    active_fd_ = -1;
+  }
+  for (const auto& [first, segment] : segments_) {
+    (void)segment;
+    if (::unlink(SegmentPath(first).c_str()) < 0) {
+      FatalStoreError("compact(unlink committed intent)", SegmentPath(first),
+                      ErrnoStatus("unlink", SegmentPath(first)));
+    }
+  }
+  status = FsyncDirectory(data_dir_);
+  if (!status.ok())
+    FatalStoreError("compact(sync removals)", data_dir_, status);
+  const std::string new_path = SegmentPath(new_first);
+  if (::rename(ready_path.c_str(), new_path.c_str()) < 0) {
+    FatalStoreError("compact(install intent)", new_path,
+                    ErrnoStatus("rename", new_path));
+  }
+  status = FsyncDirectory(data_dir_);
+  if (!status.ok()) FatalStoreError("compact(sync install)", data_dir_, status);
+  active_fd_ = ::open(new_path.c_str(), O_RDWR | O_CLOEXEC);
+  if (active_fd_ < 0) {
+    FatalStoreError("compact(reopen)", new_path, ErrnoStatus("open", new_path));
+  }
+  start_index_ = new_first;
+  entries_ = std::move(replacement_entries);
+  segments_.clear();
+  segments_[new_first] = Segment{new_first, offset};
+  dir_dirty_ = false;
+  RecomputeLiveBytesLocked();
   return true;
 }
 

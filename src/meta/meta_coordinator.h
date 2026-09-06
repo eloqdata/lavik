@@ -15,33 +15,37 @@
 // leader-local MetaObservationStore. Those three references MUST outlive the
 // coordinator. Destruction contract (mirrors the state machine's shutdown
 // contract in meta_state_machine.h):
-//   raft_server::shutdown()  ->  MetaStateMachine::WaitForSnapshotWriterIdle()
-//   ->  destroy MetaCoordinator  ->  destroy state machine / log store.
-// raft shutdown resolves every pending cmd_result (CANCELLED), and the
+//   stop ingress -> proposal_executor::Shutdown() -> raft_launcher::shutdown()
+//   -> MetaStateMachine::WaitForSnapshotWriterIdle() -> destroy coordinator
+//   -> destroy state machine / log store.
+// Executor shutdown first submits every accepted mutation to NuRaft; launcher
+// shutdown then resolves pending cmd_results (normally CANCELLED). The
 // coordinator destructor drains in-flight proposals, cancels and joins all
 // registered reconcilers, detaches the commit-event sink, and cancels every
-// live subscription before it returns. A coordinator destroyed while its raft
-// server is still running still terminates: NuRaft completes or cancels every
-// pending cmd_result during the drain, and a Propose task dropped by its
-// caller detaches (below). The commit-event sink is detached under the state
-// machine's sink mutex, so the commit thread never calls into a
-// half-destroyed coordinator.
+// live subscription before it returns. A Propose task dropped by its caller
+// detaches (below). The commit-event sink is detached under the state machine's
+// sink mutex, so the commit thread never calls into a half-destroyed
+// coordinator.
 //
 // THREAD MODEL
 //
 //   - Propose is a celer::Task coroutine. Everything before the first
 //     suspension — leader check, fail-safe gates, ValidateProposal hooks,
-//     schema gate, actor injection, encoding — runs SYNCHRONOUSLY on the
+//     actor injection, encoding — runs SYNCHRONOUSLY on the
 //     caller's thread. Hooks that read the observation store therefore
 //     require the caller to run on the coordinator's owner thread (the celer
 //     worker in production). The observation store is internally serialized
 //     because commit-driven revalidation runs on the dispatch thread.
-//   - The commit round trip suspends. Resumption goes through the injected
-//     options.resume_hook_ — production wires the MetaCelerBridge hop so the
-//     continuation (and the awaiting reconciler) lands back on the celer
-//     worker; the DEFAULT resumes inline on the NuRaft completion thread,
-//     which keeps the seam worker-agnostic and lets plain-thread consumers
-//     (tests, tools) drive the task manually. A Propose task destroyed while
+//   - The commit round trip suspends. Submission goes through the injected
+//     proposal executor before entering NuRaft's mutation path, so WAL work
+//     never blocks the production Celer worker. Short read-only role/config
+//     checks remain on the caller. Completion then goes through the injected
+//     options.schedule_resume_ — production wires the MetaCelerBridge hop so
+//     the continuation (and the awaiting reconciler) lands back on the celer
+//     worker. There is deliberately no implicit inline fallback: a coordinator
+//     attached to Raft requires this scheduler, preventing a NuRaft or timeout
+//     thread from accidentally running Celer-owned code. Plain-thread tests
+//     inject an explicit inline scheduler. A Propose task destroyed while
 //     suspended is SAFE: the awaiter detaches, and the late NuRaft completion
 //     fills a shared waiter and resumes nothing.
 //   - Commit events: the MetaStateMachine invokes the coordinator's sink from
@@ -99,6 +103,7 @@
 #include "celer/runtime/task.h"
 #include "meta/meta_commands.h"
 #include "meta/meta_observation_store.h"
+#include "meta/meta_proposal_executor.h"
 #include "meta/meta_state_apply.h"
 // NuRaft's headers are not -Wpedantic-clean; see nuraft_scheduler.h.
 #pragma GCC diagnostic push
@@ -173,9 +178,6 @@ class MetaCommittedView {
   const MetaGrantStore& grant() const { return stores_.grant_; }
   const MetaOperationStore& operation() const { return stores_.operation_; }
   const MetaAuditStore& audit() const { return stores_.audit_; }
-  std::uint16_t active_write_schema() const {
-    return stores_.active_write_schema_;
-  }
 
  private:
   MetaStores stores_;
@@ -344,9 +346,13 @@ class MetaReconciler {
 // MetaCoordinator
 // ---------------------------------------------------------------------------
 
-// How a suspended Propose continuation is resumed (see the file header's
-// thread model). Empty = resume inline on the NuRaft completion thread.
-using MetaProposeResumeHook = std::function<void(std::coroutine_handle<>)>;
+// Schedules a suspended Propose continuation on its owning execution context
+// (see the file header's thread model). Production implementations must enqueue
+// instead of resuming inline; plain-thread tests may inject an inline
+// scheduler. A copy is retained by every in-flight proposal because a late
+// NuRaft completion can outlive both the caller-side timeout and the
+// coordinator.
+using MetaProposeScheduler = std::function<void(std::coroutine_handle<>)>;
 
 struct MetaCoordinatorOptions {
   // Fail-safe gates are constructor-injected so tests exercise them
@@ -369,7 +375,14 @@ struct MetaCoordinatorOptions {
   std::uint64_t propose_timeout_ms_ = 5000;
   // Principal the LeaderContext mints for reconciler proposals.
   std::string coordinator_principal_ = "keylane://meta/coordinator";
-  MetaProposeResumeHook resume_hook_{};
+  // Non-owning executor shared with ctl membership/snapshot operations in
+  // production. The caller must keep it alive until coordinator destruction.
+  // When omitted, the coordinator owns a private executor for component tests.
+  MetaProposalExecutor* proposal_executor_ = nullptr;
+  // Required whenever the coordinator is attached to a raft_server. Keeping
+  // this as an injected scheduler isolates MetaCoordinator from the concrete
+  // Celer bridge while making continuation affinity an assembly invariant.
+  MetaProposeScheduler schedule_resume_{};
 };
 
 class MetaCoordinator {
@@ -378,7 +391,9 @@ class MetaCoordinator {
   // needed (assembly ordering, component tests); Propose then fails fast with
   // kFailedPrecondition. See the file header for the ownership and teardown
   // contract. The constructor attaches the commit-event sink to the state
-  // machine and starts the dispatch, leadership, and propose-timer threads.
+  // machine and starts the dispatch, leadership, and propose-timer threads. It
+  // throws std::invalid_argument when a non-null server has no continuation
+  // scheduler.
   MetaCoordinator(nuraft::ptr<nuraft::raft_server> server,
                   MetaStateMachine& state_machine, NuraftLogStore& log_store,
                   MetaObservationStore& observations,
@@ -387,14 +402,14 @@ class MetaCoordinator {
   MetaCoordinator(const MetaCoordinator&) = delete;
   MetaCoordinator& operator=(const MetaCoordinator&) = delete;
 
-  // The one write path. Returns the committed apply outcome —
-  // verdict read back from the audit record at the command's log index — or a
+  // The one write path. Returns the committed apply outcome carried directly
+  // by the state-machine completion (independent of audit retention) — or a
   // status:
   //   - kFailedPrecondition: not the leader (the message carries the known
   //     leader id/endpoint when Raft knows one), no server attached, or a
   //     ValidateProposal hook rejection (hook status propagated verbatim).
-  //   - kResourceExhausted: a fail-safe gate (audit window full, uncompacted
-  //     WAL over the cap, consecutive snapshot failures at the limit).
+  //   - kResourceExhausted: executor/full strict-audit or durability gates
+  //     (uncompacted WAL, consecutive snapshot failures).
   //   - kDeadlineExceeded / kCancelled / kInternal: the raft round timed out,
   //     was cancelled (shutdown/leadership loss), or failed. These are
   //     UNCERTAIN OUTCOMES: the command may still have committed.
@@ -462,6 +477,9 @@ class MetaCoordinator {
   NuraftLogStore& log_store_;
   MetaObservationStore& observations_;
   const MetaCoordinatorOptions options_;
+  // Declared before the observing pointer so the fallback owner outlives it.
+  std::unique_ptr<MetaProposalExecutor> owned_proposal_executor_;
+  MetaProposalExecutor* proposal_executor_;
 
   std::vector<MetaValidateHook> hooks_;  // assembly-time only
 

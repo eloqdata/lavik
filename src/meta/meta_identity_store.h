@@ -73,8 +73,6 @@ struct MetaNodeRecord {
 struct MetaMemberRecord {
   std::uint32_t server_id_ = 0;
   std::string principal_;
-  std::uint16_t min_schema_ = 0;
-  std::uint16_t max_schema_ = 0;
   bool retired_ = false;
   bool operator==(const MetaMemberRecord&) const = default;
 };

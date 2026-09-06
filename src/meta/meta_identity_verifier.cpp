@@ -50,18 +50,6 @@ absl::StatusOr<std::uint32_t> ParseCanonicalDecimal(std::string_view text) {
   return value;
 }
 
-absl::StatusOr<std::uint16_t> ParseSchema(std::string_view text) {
-  std::uint32_t value = 0;
-  const auto parsed =
-      std::from_chars(text.data(), text.data() + text.size(), value);
-  if (text.empty() || parsed.ec != std::errc() ||
-      parsed.ptr != text.data() + text.size() || value == 0 ||
-      value > std::numeric_limits<std::uint16_t>::max()) {
-    return absl::InvalidArgumentError("invalid schema version in member aux");
-  }
-  return static_cast<std::uint16_t>(value);
-}
-
 }  // namespace
 
 absl::StatusOr<MetaPrincipalIdentity> ParseMetaPrincipal(
@@ -145,8 +133,7 @@ absl::Status ValidateDataNodePrincipal(std::string_view node_id,
 }
 
 std::string MetaMemberIdentity::EncodeAux() const {
-  return absl::StrCat(kAuxPrefix, server_id_, "|", min_schema_, "|",
-                      max_schema_, "|", principal_);
+  return absl::StrCat(kAuxPrefix, server_id_, "|", principal_);
 }
 
 absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
@@ -155,35 +142,24 @@ absl::StatusOr<MetaMemberIdentity> MetaMemberIdentity::DecodeAux(
     return absl::InvalidArgumentError("missing KMI1 member identity prefix");
   }
   aux.remove_prefix(kAuxPrefix.size());
-  std::string_view parts[4];
-  for (int ii = 0; ii < 3; ++ii) {
-    const std::size_t separator = aux.find('|');
-    if (separator == std::string_view::npos) {
-      return absl::InvalidArgumentError("truncated KMI1 member identity");
-    }
-    parts[ii] = aux.substr(0, separator);
-    aux.remove_prefix(separator + 1);
+  const std::size_t separator = aux.find('|');
+  if (separator == std::string_view::npos) {
+    return absl::InvalidArgumentError("truncated KMI1 member identity");
   }
-  parts[3] = aux;
+  const std::string_view server_id_text = aux.substr(0, separator);
+  const std::string_view principal_text = aux.substr(separator + 1);
 
-  auto server_id = ParseCanonicalDecimal(parts[0]);
+  auto server_id = ParseCanonicalDecimal(server_id_text);
   if (!server_id.ok()) return server_id.status();
-  auto min_schema = ParseSchema(parts[1]);
-  if (!min_schema.ok()) return min_schema.status();
-  auto max_schema = ParseSchema(parts[2]);
-  if (!max_schema.ok()) return max_schema.status();
-  if (*min_schema > *max_schema) {
-    return absl::InvalidArgumentError("member schema interval is inverted");
-  }
-  auto principal = ParseMetaPrincipal(parts[3]);
+  auto principal = ParseMetaPrincipal(principal_text);
   if (!principal.ok()) return principal.status();
   if (principal->role_ != MetaPrincipalRole::kMetaMember ||
-      principal->subject_id_ != parts[0]) {
+      principal->subject_id_ != server_id_text) {
     return absl::InvalidArgumentError(
         "member principal does not match its server id");
   }
   return MetaMemberIdentity{static_cast<std::int32_t>(*server_id),
-                            std::string(parts[3]), *min_schema, *max_schema};
+                            std::string(principal_text)};
 }
 
 absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,

@@ -557,7 +557,40 @@ TEST_F(LogStoreTest, CompactUnlinkFailureReturnsFalse) {
   std::unique_ptr<NuraftLogStore> store = std::move(*opened);
   nuraft::ptr<nuraft::log_entry> entry = MakeEntry(1, "committed");
   store->append(entry);
+  ASSERT_TRUE(store->flush());
   EXPECT_FALSE(store->compact(1));
+  // A reported failure is atomic to both the live object and recovery: the
+  // old floor and record remain authoritative and a retry can succeed.
+  EXPECT_EQ(store->start_index(), 1u);
+  EXPECT_EQ(store->next_slot(), 2u);
+  EXPECT_EQ(EntryPayload(store->entry_at(1)), "committed");
+  store.reset();
+  auto reopened = OpenWithCap(NuraftLogStore::kDefaultMaxSegmentBytes);
+  ASSERT_TRUE(reopened.ok()) << reopened.status();
+  store = std::move(*reopened);
+  EXPECT_EQ(store->start_index(), 1u);
+  EXPECT_EQ(EntryPayload(store->entry_at(1)), "committed");
+  EXPECT_TRUE(store->compact(1));
+}
+
+TEST_F(LogStoreTest, CompactRenameFailureLeavesStateUnchanged) {
+  {
+    auto opened = OpenWithCap(NuraftLogStore::kDefaultMaxSegmentBytes);
+    ASSERT_TRUE(opened.ok()) << opened.status();
+    std::unique_ptr<NuraftLogStore> store = std::move(*opened);
+    nuraft::ptr<nuraft::log_entry> entry = MakeEntry(1, "committed");
+    store->append(entry);
+    ASSERT_TRUE(store->flush());
+  }
+  auto fault = std::make_shared<OneShotLogFault>(NuraftLogFaultPoint::kRename);
+  auto opened = NuraftLogStore::Open(
+      dir_, NuraftLogStore::kDefaultMaxSegmentBytes, fault);
+  ASSERT_TRUE(opened.ok()) << opened.status();
+  std::unique_ptr<NuraftLogStore> store = std::move(*opened);
+  EXPECT_FALSE(store->compact(1));
+  EXPECT_EQ(store->start_index(), 1u);
+  EXPECT_EQ(store->next_slot(), 2u);
+  EXPECT_EQ(EntryPayload(store->entry_at(1)), "committed");
 }
 
 // ---------------------------------------------------------------------------

@@ -144,8 +144,7 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
     return MetaDomainRejectError("meta server_id must be a positive int");
   }
   const MetaMemberIdentity descriptor{static_cast<int>(cmd.server_id_),
-                                      cmd.principal_, cmd.min_schema_,
-                                      cmd.max_schema_};
+                                      cmd.principal_};
   if (auto checked = MetaMemberIdentity::DecodeAux(descriptor.EncodeAux());
       !checked.ok()) {
     return MetaDomainRejectError(checked.status().message());
@@ -153,9 +152,7 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   if (const auto existing = meta_members_.find(cmd.server_id_);
       existing != meta_members_.end()) {
     const MetaMemberRecord& record = existing->second;
-    if (!record.retired_ && record.principal_ == cmd.principal_ &&
-        record.min_schema_ == cmd.min_schema_ &&
-        record.max_schema_ == cmd.max_schema_) {
+    if (!record.retired_ && record.principal_ == cmd.principal_) {
       return absl::OkStatus();
     }
     return MetaDomainRejectError("meta server_id already bound");
@@ -170,8 +167,6 @@ absl::Status MetaIdentityStore::Apply(const BindMetaMember& cmd) {
   MetaMemberRecord record;
   record.server_id_ = cmd.server_id_;
   record.principal_ = cmd.principal_;
-  record.min_schema_ = cmd.min_schema_;
-  record.max_schema_ = cmd.max_schema_;
   meta_members_.emplace(cmd.server_id_, record);
   meta_server_id_by_principal_.emplace(cmd.principal_, cmd.server_id_);
   return absl::OkStatus();
@@ -224,7 +219,7 @@ bool MetaIdentityStore::IsActiveMetaMember(std::uint32_t server_id,
 // header for the convention and the strictness contract.
 std::string MetaIdentityStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(nodes_.size()));
   for (const auto& [node_id, record] : nodes_) {
     w.WriteString(node_id);
@@ -241,8 +236,6 @@ std::string MetaIdentityStore::Serialize() const {
   for (const auto& [server_id, record] : meta_members_) {
     w.WriteU32(server_id);
     w.WriteString(record.principal_);
-    w.WriteU16(record.min_schema_);
-    w.WriteU16(record.max_schema_);
     w.WriteBool(record.retired_);
   }
   return w.TakeBuffer();
@@ -253,8 +246,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   auto count = r.ReadCount(kMaxMetaNodes);
@@ -327,10 +319,6 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
     if (!server_id.ok()) return server_id.status();
     auto principal = r.ReadString(kMaxMetaPrincipalBytes);
     if (!principal.ok()) return principal.status();
-    auto min_schema = r.ReadU16();
-    if (!min_schema.ok()) return min_schema.status();
-    auto max_schema = r.ReadU16();
-    if (!max_schema.ok()) return max_schema.status();
     auto retired = r.ReadBool("invalid meta member in snapshot");
     if (!retired.ok()) return retired.status();
     if (*server_id == 0 || *server_id > static_cast<std::uint32_t>(
@@ -338,8 +326,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
       return MetaFailStopError("invalid meta member in snapshot");
     }
     const MetaMemberIdentity descriptor{static_cast<int>(*server_id),
-                                        std::string(*principal), *min_schema,
-                                        *max_schema};
+                                        std::string(*principal)};
     if (!MetaMemberIdentity::DecodeAux(descriptor.EncodeAux()).ok()) {
       return MetaFailStopError("invalid meta member descriptor in snapshot");
     }
@@ -348,8 +335,7 @@ absl::StatusOr<MetaIdentityStore> MetaIdentityStore::Deserialize(
         store.meta_server_id_by_principal_.contains(std::string(*principal))) {
       return MetaFailStopError("duplicate meta member binding in snapshot");
     }
-    MetaMemberRecord record{*server_id, std::string(*principal), *min_schema,
-                            *max_schema, *retired};
+    MetaMemberRecord record{*server_id, std::string(*principal), *retired};
     store.meta_server_id_by_principal_.emplace(record.principal_,
                                                record.server_id_);
     store.meta_members_.emplace(record.server_id_, std::move(record));

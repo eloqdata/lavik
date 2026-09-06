@@ -221,7 +221,7 @@ bool MetaGrantStore::PolicyInUse(std::string_view policy_id,
 
 absl::StatusOr<std::string> MetaGrantStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(groups_.size()));
   for (const auto& [group_id, entry] : groups_) {
     w.WriteString(group_id);
@@ -245,8 +245,7 @@ absl::StatusOr<MetaGrantStore> MetaGrantStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unsupported grant store schema version");
   }
   auto count = r.ReadCount(max_groups);

@@ -57,21 +57,18 @@ absl::StatusOr<MetaPrincipalIdentity> AuthenticateLocalOperator(
 absl::Status ValidateDataNodePrincipal(std::string_view node_id,
                                        std::string_view principal);
 
-// NuRaft persists this descriptor in srv_config::aux. Keeping the supported
-// schema interval beside the certificate binding lets the leader reject an
-// old member before changing configuration or advancing active_write_schema.
+// NuRaft persists this descriptor in srv_config::aux so an authenticated
+// certificate can be bound to the Raft source id before message processing.
 struct MetaMemberIdentity {
   std::int32_t server_id_ = 0;
   std::string principal_;
-  std::uint16_t min_schema_ = 0;
-  std::uint16_t max_schema_ = 0;
 
   std::string EncodeAux() const;
   static absl::StatusOr<MetaMemberIdentity> DecodeAux(std::string_view aux);
 };
 
 // Validates the authenticated certificate identity against the source id and
-// persisted member descriptor on the first request of a Raft connection.
+// persisted member descriptor on every Raft connection.
 absl::Status VerifyRaftPeerIdentity(std::int32_t claimed_server_id,
                                     std::span<const std::string> uri_sans,
                                     std::string_view expected_member_aux);

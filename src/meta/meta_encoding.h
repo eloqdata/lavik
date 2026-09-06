@@ -5,9 +5,8 @@
 //
 // Wire conventions:
 //   - Fixed-width integers (u8/u16/u32/u64) are little-endian.
-//   - Every committed blob (command or record) starts with a u16
-//     schema_version; readers reject versions outside
-//     [kMetaMinReadableSchemaVersion, kMetaCurrentSchemaVersion].
+//   - Every committed blob (command or record) starts with a u16 format
+//     version; readers accept exactly kMetaFormatVersion.
 //   - Variable-length byte strings carry a u32 length prefix; readers always
 //     enforce a caller-supplied cap, and the cap check precedes the bounds
 //     check so an over-cap prefix fails even on a truncated buffer.
@@ -83,26 +82,12 @@ inline constexpr std::uint64_t kMaxMetaUncompactedWalBytes = 1ull
                                                              << 30;  // 1 GiB
 
 // ---------------------------------------------------------------------------
-// Schema versioning.
+// Durable format versioning. Keylane does not negotiate mixed Meta binary
+// schemas: a release reads and writes exactly this format. Incompatible
+// pre-release data directories must be recreated instead of migrated.
 // ---------------------------------------------------------------------------
 
-inline constexpr std::uint16_t kMetaSchemaVersionV1 = 1;
-inline constexpr std::uint16_t kMetaSchemaVersionV2 = 2;
-#ifndef KEYLANE_META_BINARY_SCHEMA_MAX
-#define KEYLANE_META_BINARY_SCHEMA_MAX 2
-#endif
-static_assert(KEYLANE_META_BINARY_SCHEMA_MAX == 1 ||
-                  KEYLANE_META_BINARY_SCHEMA_MAX == 2,
-              "test fixture binary schema must be v1 or v2");
-// Oldest format this binary can read. The state machine reads N and N-1.
-// V2 deliberately keeps the v1 field layout so negotiation and rolling
-// compatibility can be exercised independently of structural migration.
-inline constexpr std::uint16_t kMetaMinReadableSchemaVersion =
-    kMetaSchemaVersionV1;
-// Format this binary writes, except where a command's layout belongs to the
-// permanently frozen oldest-readable subset (see SetSchemaVersion).
-inline constexpr std::uint16_t kMetaCurrentSchemaVersion =
-    KEYLANE_META_BINARY_SCHEMA_MAX;
+inline constexpr std::uint16_t kMetaFormatVersion = 1;
 
 // ---------------------------------------------------------------------------
 // Failure classification. See the file header for the two classes.

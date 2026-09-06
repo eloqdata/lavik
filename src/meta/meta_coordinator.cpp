@@ -7,6 +7,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <system_error>
 #include <type_traits>
 #include <utility>
@@ -171,19 +172,19 @@ using CmdResult = nuraft::cmd_result<nuraft::ptr<nuraft::buffer>>;
 // Shared wait state for one Propose round trip. The NuRaft completion handler
 // (any NuRaft thread, or inline on the caller for an already-completed
 // result) fills the raw outcome and resumes the suspended coroutine through
-// the resume hook; if the Propose task was destroyed while suspended, the
-// awaiter detached the handle and the completion just drops. Shared ownership
-// is what makes the drop-safe path possible (same pattern as the ctl
-// server's AsyncReply).
+// the injected scheduler. If the Propose task was destroyed while suspended,
+// the awaiter detached the handle and the completion just drops. Shared
+// ownership is what makes the drop-safe path possible (same pattern as the
+// ctl server's AsyncReply).
 struct ProposeWaiter {
   std::mutex mu_;
   std::coroutine_handle<> awaiting_{};
   bool ready_ = false;
   bool detached_ = false;
   nuraft::cmd_result_code code_ = nuraft::cmd_result_code::CANCELLED;
-  std::uint64_t log_index_ = 0;
+  std::optional<MetaApplyResult> apply_result_;
   bool has_exception_ = false;
-  MetaProposeResumeHook resume_hook_;
+  MetaProposeScheduler schedule_resume_;
   // Released only when NuRaft resolves the append, not when the caller's
   // local deadline wins. That distinction closes the uncertain-tail audit
   // overflow race.
@@ -209,7 +210,7 @@ class ProposeAwaiter {
     return true;
   }
   // The waiter fields are read by the coroutine body after resumption; both
-  // completion paths (inline during when_ready, or through the resume hook)
+  // completion paths (inline during when_ready, or through the scheduler)
   // establish the happens-before edge, so no relock is needed there.
   void await_resume() noexcept {}
 
@@ -223,15 +224,13 @@ class ProposeAwaiter {
   std::shared_ptr<ProposeWaiter> waiter_;
 };
 
-// Shared resume step for both completion paths (raft callback, timeout).
-void ResumePropose(const ProposeWaiter& waiter,
-                   std::coroutine_handle<> to_resume) {
+// Shared scheduling step for both completion paths (raft callback, timeout).
+// Construction guarantees the scheduler exists for every waiter, so neither
+// foreign thread has an accidental inline-resume path.
+void ScheduleProposeResume(const ProposeWaiter& waiter,
+                           std::coroutine_handle<> to_resume) {
   if (!to_resume) return;
-  if (waiter.resume_hook_) {
-    waiter.resume_hook_(to_resume);
-  } else {
-    to_resume.resume();
-  }
+  waiter.schedule_resume_(to_resume);
 }
 
 void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
@@ -251,11 +250,15 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
     // exception — the code is the signal, the exception only colour.
     waiter->has_exception_ = (err != nullptr);
     if (waiter->code_ == nuraft::cmd_result_code::OK) {
-      // The state machine's commit() return carries the applied log index.
+      // The state machine's commit() return carries the exact apply outcome;
+      // do not re-read the rotating/prunable audit window after resumption.
       nuraft::ptr<nuraft::buffer>& payload = result.get();
-      if (payload != nullptr && payload->size() >= sizeof(std::uint64_t)) {
-        payload->pos(0);
-        waiter->log_index_ = payload->get_ulong();
+      if (payload != nullptr) {
+        const std::string_view bytes(
+            reinterpret_cast<const char*>(payload->data_begin()),
+            payload->size());
+        auto decoded = DecodeMetaApplyResult(bytes);
+        if (decoded.ok()) waiter->apply_result_ = std::move(*decoded);
       }
     }
     waiter->ready_ = true;
@@ -264,19 +267,37 @@ void CompletePropose(const std::shared_ptr<ProposeWaiter>& waiter,
     }
     waiter->audit_reservation_.reset();
   }
-  ResumePropose(*waiter, to_resume);
+  ScheduleProposeResume(*waiter, to_resume);
+}
+
+void FailProposeDispatch(const std::shared_ptr<ProposeWaiter>& waiter) {
+  std::coroutine_handle<> to_resume;
+  {
+    std::lock_guard<std::mutex> lock(waiter->mu_);
+    if (waiter->ready_) {
+      waiter->audit_reservation_.reset();
+      return;
+    }
+    waiter->code_ = nuraft::cmd_result_code::FAILED;
+    waiter->ready_ = true;
+    if (!waiter->detached_ && waiter->awaiting_) {
+      to_resume = waiter->awaiting_;
+    }
+    waiter->audit_reservation_.reset();
+  }
+  ScheduleProposeResume(*waiter, to_resume);
 }
 
 MetaCommandTag CommandTagOf(const MetaCommand& command) {
   // The MetaCommand variant is declared in tag order (meta_commands.h:
-  // kRegisterNode=1 .. kSetGroupReplicationState=25); pin both ends and the
+  // kRegisterNode=1 .. kSetAuditPolicy=25); pin both ends and the
   // size so a
   // future reorder breaks the build here instead of mislabeling results.
   static_assert(std::variant_size_v<MetaCommand> == 25);
   static_assert(
       std::is_same_v<std::variant_alternative_t<0, MetaCommand>, RegisterNode>);
   static_assert(std::is_same_v<std::variant_alternative_t<24, MetaCommand>,
-                               SetGroupReplicationState>);
+                               SetAuditPolicy>);
   return static_cast<MetaCommandTag>(command.index() + 1);
 }
 
@@ -387,7 +408,7 @@ class MetaProposeTimer {
         to_resume = waiter->awaiting_;
       }
     }
-    ResumePropose(*waiter, to_resume);
+    ScheduleProposeResume(*waiter, to_resume);
   }
 
   std::mutex mu_;
@@ -430,12 +451,22 @@ MetaCoordinator::MetaCoordinator(nuraft::ptr<nuraft::raft_server> server,
       log_store_(log_store),
       observations_(observations),
       options_(std::move(options)),
+      owned_proposal_executor_(options_.proposal_executor_ == nullptr
+                                   ? std::make_unique<MetaProposalExecutor>()
+                                   : nullptr),
+      proposal_executor_(options_.proposal_executor_ != nullptr
+                             ? options_.proposal_executor_
+                             : owned_proposal_executor_.get()),
       audit_gate_(std::make_shared<MetaAuditProposalGate>()),
       propose_timer_(std::make_unique<MetaProposeTimer>()),
       sub_core_(std::make_shared<MetaSubscriptionCore>()),
       leader_context_(*this,
                       AuthenticatedPrincipal(options_.coordinator_principal_,
                                              MetaPrincipalPasskey{})) {
+  if (server_ != nullptr && !options_.schedule_resume_) {
+    throw std::invalid_argument(
+        "MetaCoordinator requires schedule_resume when attached to Raft");
+  }
   // A coordinator assembled onto already-committed state (recovery,
   // assembly ordering) starts its coverage mark at the durable watermark:
   // everything at or below it is covered by the initial view, never by
@@ -805,13 +836,13 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
   MetaCommittedView view(AtomicStoresSnapshot(applied_index, high_water),
                          applied_index);
 
-  // Reserve audit headroom before validation/encoding. Regular proposals may
-  // share the remaining capacity; prune is exclusive because its net effect
-  // depends on the exact committed prefix. The reservation moves to the Raft
-  // waiter below, so an uncertain client timeout cannot free space while its
-  // append is still unresolved.
+  // Strict-export reserves audit headroom before validation/encoding. The
+  // default bounded-rotate policy needs no reservation because deterministic
+  // apply evicts exactly one oldest record when required; disabled creates no
+  // ordinary records. A strict reservation moves to the Raft waiter so an
+  // uncertain client timeout cannot free space while its append is unresolved.
   std::unique_ptr<AuditReservation> audit_reservation;
-  {
+  if (view.stores().audit_.policy() == MetaAuditPolicy::kStrictExport) {
     std::lock_guard<std::mutex> lock(audit_gate_->mu_);
     const MetaAuditStore& audit = view.stores().audit_;
     const auto* prune = std::get_if<PruneAudit>(&command);
@@ -874,18 +905,6 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
     if (!status.ok()) co_return status;
   }
 
-  // Proposals use the committed active write schema. The
-  // codec emits the current or immediately preceding version; anything else
-  // means the binary/format window moved, so fail before writing a format
-  // peers cannot read.
-  if (view.active_write_schema() < kMetaMinReadableSchemaVersion ||
-      view.active_write_schema() > kMetaCurrentSchemaVersion) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "meta: committed active_write_schema " +
-                               std::to_string(view.active_write_schema()) +
-                               " is outside this binary's write window");
-  }
-
   // Actor injection: the trusted entry's principal plus a
   // propose-time readable timestamp. The clock read is legal HERE — the
   // proposal entry point; apply only copies the text into the audit record.
@@ -897,31 +916,43 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
       },
       command);
 
-  auto encoded =
-      MetaStateMachine::EncodeCommand(command, view.active_write_schema());
+  auto encoded = MetaStateMachine::EncodeCommand(command);
   if (!encoded.ok()) co_return encoded.status();
 
+  auto waiter = std::make_shared<ProposeWaiter>();
+  // The copy owns any captured bridge until NuRaft resolves the append, even
+  // if the caller timed out and the coordinator has already been destroyed.
+  waiter->schedule_resume_ = options_.schedule_resume_;
+  waiter->audit_reservation_ = std::move(audit_reservation);
   std::vector<nuraft::ptr<nuraft::buffer>> logs;
   logs.push_back(*encoded);
-  nuraft::ptr<CmdResult> result = server_->append_entries(logs);
-  if (result == nullptr) {
-    co_return absl::Status(absl::StatusCode::kInternal,
-                           "meta: raft append returned no result handle");
-  }
-
-  auto waiter = std::make_shared<ProposeWaiter>();
-  waiter->resume_hook_ = options_.resume_hook_;
-  waiter->audit_reservation_ = std::move(audit_reservation);
+  const absl::Status submitted = proposal_executor_->Submit(
+      [server = server_, logs = std::move(logs), waiter]() mutable {
+        try {
+          nuraft::ptr<CmdResult> result = server->append_entries(logs);
+          if (result == nullptr) {
+            FailProposeDispatch(waiter);
+            return;
+          }
+          // Registration belongs inside the task's exception boundary too:
+          // without a handler, neither NuRaft nor the executor can resolve
+          // the waiter for this dispatch.
+          result->when_ready(
+              [waiter](CmdResult& completed, nuraft::ptr<std::exception>& err) {
+                CompletePropose(waiter, completed, err);
+              });
+        } catch (...) {
+          FailProposeDispatch(waiter);
+        }
+      });
+  if (!submitted.ok()) co_return submitted;
   // The seam's own round-trip bound (NuRaft's async_handler mode has no
-  // client-side timeout). First-wins against the raft completion.
+  // client-side timeout). It includes executor queueing time and first-wins
+  // against the raft completion.
   propose_timer_->Arm(
       std::chrono::steady_clock::now() +
           std::chrono::milliseconds(options_.propose_timeout_ms_),
       waiter);
-  result->when_ready(
-      [waiter](CmdResult& completed, nuraft::ptr<std::exception>& err) {
-        CompletePropose(waiter, completed, err);
-      });
   co_await ProposeAwaiter(waiter);
 
   // The waiter is filled (see ProposeAwaiter for the happens-before).
@@ -943,26 +974,16 @@ celer::Task<absl::StatusOr<MetaApplyResult>> MetaCoordinator::Propose(
               std::to_string(static_cast<int>(waiter->code_)) +
               (waiter->has_exception_ ? " (exception attached)" : ""));
   }
-  if (waiter->log_index_ == 0) {
+  if (!waiter->apply_result_.has_value()) {
     co_return UncertainOutcome(absl::StatusCode::kInternal,
-                               "committed without a log index");
+                               "committed without an apply result");
   }
-
-  // OK means the entry committed AND this leader's SM applied it (the commit
-  // result payload is commit()'s return). The verdict comes from the audit
-  // record at the command's log index — the same record the operator audit
-  // trail persists, so propose-time reporting can never drift from it.
-  const auto audit =
-      state_machine_.StoresSnapshot().audit_.Find(waiter->log_index_);
-  if (!audit.has_value()) {
+  if (waiter->apply_result_->command_tag_ != CommandTagOf(command)) {
     co_return absl::Status(
         absl::StatusCode::kInternal,
-        "meta: committed at log index " + std::to_string(waiter->log_index_) +
-            " but its audit record is missing (concurrent export/prune?)");
+        "meta: committed apply result has a mismatched command tag");
   }
-  co_return MetaApplyResult{audit->record_.verdict_,
-                            audit->record_.verdict_detail_, waiter->log_index_,
-                            CommandTagOf(command)};
+  co_return *waiter->apply_result_;
 }
 
 celer::Task<absl::StatusOr<MetaApplyResult>> MetaLeaderContext::Propose(

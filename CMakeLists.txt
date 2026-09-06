@@ -150,30 +150,66 @@ set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
 
 option(KEYLANE_BUILD_META
-  "Build the keylane_meta Raft control plane (requires the nuraft and asio submodules)"
+  "Build the keylane_meta Raft control plane (requires the recursive nuraft submodule)"
   ON)
 if (KEYLANE_BUILD_META)
   if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/CMakeLists.txt)
     message(FATAL_ERROR
       "nuraft submodule not found; run git submodule update --init --recursive")
   endif()
-  if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio/asio/include/asio.hpp)
+  if (NOT EXISTS
+      ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/asio/asio/include/asio.hpp)
     message(FATAL_ERROR
-      "asio submodule not found; run git submodule update --init --recursive")
+      "nuraft/asio submodule not found; run git submodule update --init --recursive")
   endif()
-  # NuRaft's non-Conan configure path requires ASIO_INCLUDE_DIR to be set even
-  # when DISABLE_ASIO is on (upstream configure-time behavior), so point it at
-  # the vendored header-only asio. Keylane uses only NuRaft's Raft core; the
-  # asio-based network service stays disabled because keylane_meta will serve
-  # transport through celer.
-  set(DISABLE_ASIO ON)
-  set(ASIO_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/asio/asio/include)
+  # Apply the pinned Keylane patch set to an isolated build-tree copy. The
+  # third-party checkout stays pristine, configure is repeatable, and a patch
+  # that no longer applies fails before compilation instead of drifting.
+  set(KEYLANE_NURAFT_SOURCE_DIR
+      ${CMAKE_CURRENT_BINARY_DIR}/_keylane_nuraft_source)
+  file(REMOVE_RECURSE ${KEYLANE_NURAFT_SOURCE_DIR})
+  file(MAKE_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR})
+  file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/
+       DESTINATION ${KEYLANE_NURAFT_SOURCE_DIR}
+       PATTERN ".git" EXCLUDE)
+  find_program(KEYLANE_GIT_EXECUTABLE git REQUIRED)
+  file(GLOB KEYLANE_NURAFT_PATCHES CONFIGURE_DEPENDS
+       ${CMAKE_CURRENT_SOURCE_DIR}/third_party/patches/nuraft/*.patch)
+  list(SORT KEYLANE_NURAFT_PATCHES)
+  foreach(KEYLANE_NURAFT_PATCH IN LISTS KEYLANE_NURAFT_PATCHES)
+    execute_process(
+      # The isolated copy may live underneath Keylane's own worktree. Stop
+      # repository discovery at the build root so git applies paths relative
+      # to WORKING_DIRECTORY instead of silently skipping every path outside
+      # the generated directory's prefix in the parent repository.
+      COMMAND ${CMAKE_COMMAND} -E env
+              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+              ${KEYLANE_GIT_EXECUTABLE} apply --check ${KEYLANE_NURAFT_PATCH}
+      WORKING_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR}
+      RESULT_VARIABLE KEYLANE_NURAFT_PATCH_CHECK)
+    if (NOT KEYLANE_NURAFT_PATCH_CHECK EQUAL 0)
+      message(FATAL_ERROR "NuRaft patch no longer applies: ${KEYLANE_NURAFT_PATCH}")
+    endif()
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E env
+              GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}
+              ${KEYLANE_GIT_EXECUTABLE} apply ${KEYLANE_NURAFT_PATCH}
+      WORKING_DIRECTORY ${KEYLANE_NURAFT_SOURCE_DIR}
+      COMMAND_ERROR_IS_FATAL ANY)
+  endforeach()
+  unset(KEYLANE_NURAFT_PATCH)
+  unset(KEYLANE_NURAFT_PATCHES)
+  set(DISABLE_ASIO OFF)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(ASIO_INCLUDE_DIR
+      ${KEYLANE_NURAFT_SOURCE_DIR}/asio/asio/include CACHE PATH "" FORCE)
   # NuRaft's tests subdirectory builds its asio-based harness whenever
   # BUILD_TESTING is on. Shadow keylane's global test enablement for this
   # subdirectory only, then restore it for keylane's own test targets.
   set(KEYLANE_SAVED_BUILD_TESTING ${BUILD_TESTING})
   set(BUILD_TESTING OFF)
-  add_subdirectory(third_party/nuraft)
+  add_subdirectory(${KEYLANE_NURAFT_SOURCE_DIR}
+                   ${CMAKE_CURRENT_BINARY_DIR}/_keylane_nuraft_build)
   set(BUILD_TESTING ${KEYLANE_SAVED_BUILD_TESTING})
   unset(KEYLANE_SAVED_BUILD_TESTING)
   # NuRaft's headers are not warning-clean under -Wpedantic/-Wunused-parameter;
@@ -421,8 +457,8 @@ if (KEYLANE_BUILD_META)
   # only into keylane_meta; keylane, keylane_module, and the test binaries
   # must stay Raft-free so the data plane never sees consensus code.
   #
-  # keylane_meta_core carries the NuRaft adapter (transport/timer injection)
-  # and the durability glue; keylane_meta is the thin executable on top.
+  # keylane_meta_core carries durability, the completion bridge, and control
+  # logic; NuRaft's native Asio service owns peer transport and timers.
   set(KEYLANE_META_CORE_SOURCES
     src/meta/meta_audit_store.cpp
     src/meta/meta_commands.cpp
@@ -435,13 +471,13 @@ if (KEYLANE_BUILD_META)
     src/meta/meta_observation_store.cpp
     src/meta/meta_operation_store.cpp
     src/meta/meta_policy_store.cpp
+    src/meta/meta_proposal_executor.cpp
     src/meta/meta_state_apply.cpp
     src/meta/meta_state_machine.cpp
     src/meta/meta_topology_store.cpp
     src/meta/meta_value_codec.cpp
+    src/meta/nuraft_asio_transport.cpp
     src/meta/nuraft_log_store.cpp
-    src/meta/nuraft_rpc_client.cpp
-    src/meta/nuraft_rpc_listener.cpp
     src/meta/nuraft_scheduler.cpp
     src/meta/nuraft_state_mgr.cpp
   )
@@ -458,7 +494,7 @@ if (KEYLANE_BUILD_META)
   endif()
 
   add_executable(keylane_meta
-    src/meta/meta_main.cpp
+    app/keylane_meta.cpp
   )
   target_include_directories(keylane_meta PRIVATE
     ${KEYLANE_GENERATED_INCLUDE_DIR}
@@ -473,37 +509,6 @@ if (KEYLANE_BUILD_META)
     target_compile_options(keylane_meta PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
-  if (BUILD_TESTING)
-    # A genuine N-1 executable for the rolling-upgrade gate. It runs the same
-    # production entry/transport but is compiled with a v1-only codec window,
-    # so the schema handshake and old-binary re-entry behavior cannot be faked
-    # by operator-supplied member aux data.
-    add_library(keylane_meta_v1_core STATIC ${KEYLANE_META_CORE_SOURCES})
-    target_include_directories(keylane_meta_v1_core PUBLIC
-      ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
-    target_compile_definitions(keylane_meta_v1_core PUBLIC
-      KEYLANE_META_BINARY_SCHEMA_MAX=1
-    )
-    target_link_libraries(keylane_meta_v1_core PUBLIC
-      NuRaft::static_lib
-      celer::core
-    )
-    add_executable(keylane_meta_v1_fixture src/meta/meta_main.cpp)
-    target_include_directories(keylane_meta_v1_fixture PRIVATE
-      ${KEYLANE_GENERATED_INCLUDE_DIR}
-    )
-    target_compile_definitions(keylane_meta_v1_fixture PRIVATE
-      KEYLANE_NURAFT_PINNED_COMMIT="0b01b185b46b8e482f6c384b636c35605121a41e"
-    )
-    target_link_libraries(keylane_meta_v1_fixture PRIVATE keylane_meta_v1_core)
-    if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-      target_compile_options(keylane_meta_v1_core PRIVATE
-        -Wall -Wextra -Wpedantic)
-      target_compile_options(keylane_meta_v1_fixture PRIVATE
-        -Wall -Wextra -Wpedantic)
-    endif()
-  endif()
   # Negative guard for the layering rule above: fail at configure time if
   # nuraft ever leaks into the data-plane module's link interface.
   get_target_property(KEYLANE_MODULE_IFACE_LIBS keylane_module
@@ -634,8 +639,8 @@ if (BUILD_TESTING)
       # Metadata process gates: leader-change safety, WAL/snapshot
       # recovery matrix, membership-change semantics, transport
       # connect/cancel/timeout, slow-peer backpressure, mTLS, the observation
-      # stale-evidence/observation-lifecycle gate, rolling schema/tail
-      # recovery, and Meta partition safety. Each spins up its own
+      # stale-evidence/observation-lifecycle gate, and Meta partition safety.
+      # Each spins up its own
       # multi-node keylane_meta clusters; RUN_SERIAL keeps port allocation
       # and timing margins deterministic.
       foreach(gate leader_change recovery membership transport backpressure
@@ -652,18 +657,6 @@ if (BUILD_TESTING)
           RUN_SERIAL TRUE
         )
       endforeach()
-      add_test(
-        NAME meta_integration.gate_meta_upgrade
-        COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
-                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_meta_upgrade.py
-                $<TARGET_FILE:keylane_meta>
-                $<TARGET_FILE:keylane_meta_v1_fixture>
-      )
-      set_tests_properties(meta_integration.gate_meta_upgrade PROPERTIES
-        LABELS meta-integration
-        TIMEOUT 180
-        RUN_SERIAL TRUE
-      )
     else()
       message(STATUS "python3 not found; meta integration tests are disabled")
     endif()

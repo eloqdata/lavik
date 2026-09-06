@@ -5,9 +5,8 @@ Single 3-node cluster on the proxy mesh, continuous propose load
 throughout:
 
 1. Half-open peer, 3 rounds: the follower's inbound proxy accepts but
-   blackholes every byte. The adapter contract under test: the leader's
-   sends to that peer must fail inside the adapter's timeouts (connect
-   2s / request 3s, single-use client then recreated by NuRaft), never
+   blackholes every byte. The native NuRaft Asio contract under test: the
+   leader's sends to that peer must fail inside bounded RPC timeouts, never
    hang forever. Observable evidence: (a) the quorum keeps committing
    while the follower's committed index stays frozen, (b) the leader's
    logs gain either an adapter "response error" or NuRaft's bounded
@@ -32,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness as H  # noqa: E402
 
-DROP_WINDOW_S = 4.0     # > adapter request_timeout_ (3s)
+DROP_WINDOW_S = 4.0     # Longer than the configured Raft request timeout.
 REFUSE_WINDOW_S = 2.0
 CATCHUP_ASSERT_S = 15.0
 FLAP_CYCLES = 20
@@ -103,7 +102,7 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
     if evidence1 <= evidence0:
         raise H.Failure(
             f"{round_name}: no peer RPC failure evidence in cluster logs; "
-            f"adapter may be hanging instead of timing out")
+            f"Raft transport may be hanging instead of timing out")
     H.log(f"{round_name}: quorum committed {c0} -> {c1}, node "
           f"{follower.id} frozen at {f1}; cluster RPC failure/reconnect "
           f"signals {evidence0} -> {evidence1}")
@@ -116,7 +115,7 @@ def fault_round(nodes, mesh, history, mode, window_s, round_name):
 
 def flap_stress(nodes, mesh, history, follower_id):
     """Rapid drop/heal flapping: every flap cuts established connections
-    and forces client recreation, hammering the adapter's connect/cancel
+    and forces client recreation, hammering the Asio client's connect/cancel
     and exactly-once drain paths."""
     proxy = mesh.proxy(follower_id)
     H.log(f"flap: {FLAP_CYCLES} drop/heal cycles on node {follower_id} "

@@ -129,7 +129,7 @@ std::optional<std::uint64_t> MetaPolicyStore::LatestVersion(
 // content, hash). See the header for the strictness contract.
 std::string MetaPolicyStore::Serialize() const {
   MetaWriter w;
-  w.WriteU16(kMetaCurrentSchemaVersion);
+  w.WriteU16(kMetaFormatVersion);
   w.WriteCount(static_cast<std::uint32_t>(policies_.size()));
   for (const auto& [policy_id, versions] : policies_) {
     w.WriteString(policy_id);
@@ -149,8 +149,7 @@ absl::StatusOr<MetaPolicyStore> MetaPolicyStore::Deserialize(
   MetaReader r(bytes);
   auto version = r.ReadU16();
   if (!version.ok()) return version.status();
-  if (*version < kMetaMinReadableSchemaVersion ||
-      *version > kMetaCurrentSchemaVersion) {
+  if (*version != kMetaFormatVersion) {
     return MetaFailStopError("unknown schema_version");
   }
   // Every policy holds at least one non-empty content byte, so the total

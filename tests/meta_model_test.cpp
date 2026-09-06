@@ -9,8 +9,6 @@
 // distinguishable.
 
 #include <cstdint>
-#include <fstream>
-#include <iterator>
 #include <string>
 #include <vector>
 
@@ -352,18 +350,18 @@ TEST(MetaModelCommands, RegisterNodeRoundTrip) {
   EXPECT_EQ(std::get<keylane::meta::RegisterNode>(*decoded), cmd);
 }
 
-TEST(MetaModelCommands, EnvelopeStartsWithSchemaVersionThenTag) {
+TEST(MetaModelCommands, EnvelopeStartsWithFormatVersionThenTag) {
   const std::string bytes = MustEncode(MakeRegisterNode());
   ASSERT_GE(bytes.size(), 4u);
   const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
   const std::uint16_t version = static_cast<std::uint16_t>(p[0] | (p[1] << 8));
   const std::uint16_t tag = static_cast<std::uint16_t>(p[2] | (p[3] << 8));
-  EXPECT_EQ(version, keylane::meta::kMetaCurrentSchemaVersion);
+  EXPECT_EQ(version, keylane::meta::kMetaFormatVersion);
   EXPECT_EQ(tag, static_cast<std::uint16_t>(
                      keylane::meta::MetaCommandTag::kRegisterNode));
 }
 
-TEST(MetaModelCommands, UnknownSchemaVersionFails) {
+TEST(MetaModelCommands, UnknownFormatVersionFails) {
   const std::string bytes = MustEncode(MakeRegisterNode());
   for (const std::uint16_t bad_version : {0, 0x7FFF, 0xFFFF}) {
     std::string corrupt = bytes;
@@ -424,7 +422,7 @@ TEST(MetaModelCommands, ActorFieldCapsEnforced) {
   // Hand-built RegisterNode header: version | tag | request_id | actor...
   {
     keylane::meta::MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaSchemaVersionV1);
+    w.WriteU16(keylane::meta::kMetaFormatVersion);
     w.WriteU16(static_cast<std::uint16_t>(
         keylane::meta::MetaCommandTag::kRegisterNode));
     w.WriteRaw(std::string(16, '\0'));                      // request_id
@@ -433,7 +431,7 @@ TEST(MetaModelCommands, ActorFieldCapsEnforced) {
   }
   {
     keylane::meta::MetaWriter w;
-    w.WriteU16(keylane::meta::kMetaSchemaVersionV1);
+    w.WriteU16(keylane::meta::kMetaFormatVersion);
     w.WriteU16(static_cast<std::uint16_t>(
         keylane::meta::MetaCommandTag::kRegisterNode));
     w.WriteRaw(std::string(16, '\0'));
@@ -445,13 +443,13 @@ TEST(MetaModelCommands, ActorFieldCapsEnforced) {
 }
 
 TEST(MetaModelCommands, DecodeRejectsMissingActorFields) {
-  // Bytes shaped like the pre-actor v1 layout (request_id immediately
+  // Bytes shaped like the obsolete pre-actor layout (request_id immediately
   // followed by node_id) are truncated input under the current layout: the
   // node_id length prefix is consumed as the actor principal prefix and the
   // decode runs out of bytes. (Every proper prefix already fails via
   // TruncatedCommandFails; this names the actor-position case explicitly.)
   keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaSchemaVersionV1);
+  w.WriteU16(keylane::meta::kMetaFormatVersion);
   w.WriteU16(
       static_cast<std::uint16_t>(keylane::meta::MetaCommandTag::kRegisterNode));
   w.WriteRaw(std::string(16, '\0'));  // request_id
@@ -554,11 +552,11 @@ TEST(MetaModelCommands, GroupRecordRoundTrip) {
 
   const auto encoded = keylane::meta::EncodeMetaGroupRecord(record);
   ASSERT_TRUE(encoded.ok()) << encoded.status();
-  // Records carry the same u16 schema_version envelope convention.
+  // Records carry the same u16 format-version envelope convention.
   ASSERT_GE(encoded->size(), 2u);
   const auto* p = reinterpret_cast<const unsigned char*>(encoded->data());
   EXPECT_EQ(static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
-            keylane::meta::kMetaCurrentSchemaVersion);
+            keylane::meta::kMetaFormatVersion);
 
   const auto decoded = keylane::meta::DecodeMetaGroupRecord(*encoded);
   ASSERT_TRUE(decoded.ok()) << decoded.status();
@@ -749,88 +747,6 @@ TEST(MetaModelCommands, ArchiveOperationsRoundTrip) {
   ExpectRoundTrip(cmd);
 }
 
-// ---------------------------------------------------------------------------
-// upgrade.
-// ---------------------------------------------------------------------------
-
-TEST(MetaModelCommands, ReadsNMinusOneAndWritesRequestedActiveSchema) {
-  const keylane::meta::RegisterNode cmd = MakeRegisterNode();
-  for (const std::uint16_t schema :
-       {keylane::meta::kMetaSchemaVersionV1,
-        keylane::meta::kMetaCurrentSchemaVersion}) {
-    auto encoded = EncodeMetaCommand(cmd, schema);
-    ASSERT_TRUE(encoded.ok()) << encoded.status();
-    ASSERT_GE(encoded->size(), 2u);
-    const auto* bytes = reinterpret_cast<const unsigned char*>(encoded->data());
-    EXPECT_EQ(static_cast<std::uint16_t>(bytes[0] | (bytes[1] << 8)), schema);
-    auto decoded = DecodeMetaCommand(*encoded);
-    ASSERT_TRUE(decoded.ok()) << decoded.status();
-    EXPECT_EQ(std::get<keylane::meta::RegisterNode>(*decoded), cmd);
-  }
-}
-
-TEST(MetaModelCommands, SetSchemaVersionRoundTrip) {
-  keylane::meta::SetSchemaVersion cmd;
-  cmd.request_id_ = MakeRequestId(0x70);
-  // It is a privileged command: the audit must carry the identity, so the
-  // frozen layout includes the actor fields.
-  cmd.actor_.principal_ = "keylane://operator/alice";
-  cmd.actor_.readable_time_ = "2026-09-04T02:03:04Z";
-  cmd.new_active_write_schema_ = 2;
-  cmd.attestation_ = "operator: alice; ticket: OPS-1234; canary drained";
-  ExpectRoundTrip(cmd);
-}
-
-TEST(MetaModelCommands, SetSchemaVersionUsesFrozenV1Layout) {
-  // SetSchemaVersion must stay decodable by the oldest binary in the
-  // readable window, so its envelope pins
-  // schema_version to v1 regardless of the current write schema, and its
-  // body layout is part of the permanently frozen v1 subset.
-  keylane::meta::SetSchemaVersion cmd;
-  cmd.request_id_ = MakeRequestId(0x71);
-  cmd.new_active_write_schema_ = 2;
-  cmd.attestation_ = "ticket OPS-1234";
-  const std::string bytes = MustEncode(cmd);
-  ASSERT_GE(bytes.size(), 2u);
-  const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
-  EXPECT_EQ(static_cast<std::uint16_t>(p[0] | (p[1] << 8)),
-            keylane::meta::kMetaSchemaVersionV1);
-}
-
-TEST(MetaModelCommands, LoadsFrozenNMinusOneFixture) {
-  std::ifstream input(std::string(KEYLANE_SOURCE_DIR) +
-                      "/tests/fixtures/meta-v1-set-schema.hex");
-  ASSERT_TRUE(input) << "missing frozen v1 fixture";
-  std::string hex((std::istreambuf_iterator<char>(input)),
-                  std::istreambuf_iterator<char>());
-  std::string bytes;
-  int high = -1;
-  for (const char ch : hex) {
-    if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
-    const int nybble = ch >= '0' && ch <= '9'   ? ch - '0'
-                       : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10
-                                                : -1;
-    ASSERT_GE(nybble, 0) << "non-hex byte in fixture";
-    if (high < 0) {
-      high = nybble;
-    } else {
-      bytes.push_back(static_cast<char>((high << 4) | nybble));
-      high = -1;
-    }
-  }
-  ASSERT_EQ(high, -1) << "odd-length hex fixture";
-  auto decoded = DecodeMetaCommand(bytes);
-  ASSERT_TRUE(decoded.ok()) << decoded.status();
-  const auto& command = std::get<keylane::meta::SetSchemaVersion>(*decoded);
-  EXPECT_EQ(command.new_active_write_schema_,
-            keylane::meta::kMetaSchemaVersionV1);
-  EXPECT_TRUE(command.attestation_.empty());
-  auto encoded =
-      EncodeMetaCommand(*decoded, keylane::meta::kMetaCurrentSchemaVersion);
-  ASSERT_TRUE(encoded.ok()) << encoded.status();
-  EXPECT_EQ(*encoded, bytes);
-}
-
 TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   keylane::meta::PruneAudit audit;
   audit.through_log_index_ = 42;
@@ -843,8 +759,6 @@ TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   keylane::meta::BindMetaMember bind;
   bind.server_id_ = 7;
   bind.principal_ = "keylane://meta/7";
-  bind.min_schema_ = 1;
-  bind.max_schema_ = 2;
   ExpectRoundTrip(bind);
 
   keylane::meta::RetireMetaMember retire;
@@ -852,7 +766,15 @@ TEST(MetaModelCommands, AdministrativeCommandsRoundTrip) {
   ExpectRoundTrip(retire);
 }
 
-TEST(MetaModelCommands, SetGroupReplicationStateRoundTripAndRequiresV2) {
+TEST(MetaModelCommands, SetAuditPolicyRoundTrips) {
+  keylane::meta::SetAuditPolicy command;
+  command.request_id_ = MakeRequestId(0x74);
+  command.policy_ = keylane::meta::MetaAuditPolicy::kStrictExport;
+  command.attestation_ = "ticket OPS-4321";
+  ExpectRoundTrip(command);
+}
+
+TEST(MetaModelCommands, SetGroupReplicationStateRoundTrip) {
   keylane::meta::SetGroupReplicationState command;
   command.request_id_ = MakeRequestId(0x75);
   command.group_id_ = "g1";
@@ -862,24 +784,6 @@ TEST(MetaModelCommands, SetGroupReplicationStateRoundTripAndRequiresV2) {
   command.new_partition_replication_epoch_ = 11;
   command.new_topology_epoch_ = 12;
   ExpectRoundTrip(command);
-  EXPECT_FALSE(
-      EncodeMetaCommand(command, keylane::meta::kMetaSchemaVersionV1).ok());
-}
-
-TEST(MetaModelCommands, SetSchemaVersionFrozenLayoutRejectsPreActorBytes) {
-  // The frozen layout is tag + request_id + actor_principal + readable_time +
-  // new_active_write_schema + attestation. Bytes in the short-lived pre-actor
-  // shape (request_id immediately followed by new_active_write_schema) are
-  // corrupt under it: here the u16 schema value 2 and the attestation length
-  // 15 combine into an actor_principal prefix of 0x000F0002, way over cap.
-  keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaSchemaVersionV1);
-  w.WriteU16(static_cast<std::uint16_t>(
-      keylane::meta::MetaCommandTag::kSetSchemaVersion));
-  w.WriteRaw(std::string(16, '\0'));  // request_id
-  w.WriteU16(2);                      // new_active_write_schema (old position)
-  w.WriteString("ticket OPS-1234");
-  ExpectDecodeFailStop(w.buffer());
 }
 
 // ---------------------------------------------------------------------------
@@ -940,7 +844,7 @@ TEST(MetaModelCommands, DecodeRejectsOverCapLengthPrefix) {
   // Hand-build a PutPolicy whose content length prefix exceeds the payload
   // cap; the reader must reject on the cap before even looking for the body.
   keylane::meta::MetaWriter w;
-  w.WriteU16(keylane::meta::kMetaSchemaVersionV1);
+  w.WriteU16(keylane::meta::kMetaFormatVersion);
   w.WriteU16(
       static_cast<std::uint16_t>(keylane::meta::MetaCommandTag::kPutPolicy));
   w.WriteRaw(std::string(16, '\0'));  // request_id
@@ -1052,7 +956,6 @@ std::string DomainStateBytes(const MetaStores& stores) {
   out += stores.policy_.Serialize();
   out += stores.grant_.Serialize().value_or("!");
   out += stores.operation_.Serialize().value_or("!");
-  out += std::string(1, static_cast<char>(stores.active_write_schema_));
   return out;
 }
 
@@ -1212,11 +1115,9 @@ TEST(MetaStateApply, MetaStoresSnapshotRoundTrip) {
   EXPECT_TRUE(restored->grant_.GroupState("g1").has_value());
   EXPECT_EQ(restored->audit_.size(), 2u);
   EXPECT_TRUE(restored->audit_.VerifyChain());
-  EXPECT_EQ(restored->active_write_schema_,
-            keylane::meta::kMetaSchemaVersionV1);
   const auto* envelope = reinterpret_cast<const unsigned char*>(bytes.data());
   EXPECT_EQ(static_cast<std::uint16_t>(envelope[0] | (envelope[1] << 8)),
-            keylane::meta::kMetaSchemaVersionV1);
+            keylane::meta::kMetaFormatVersion);
 }
 
 TEST(MetaStateApply, MetaStoresDeserializeRejectsCorruption) {
@@ -1902,35 +1803,6 @@ TEST(MetaStateApply, ArchiveOperationsRejectsNonTerminal) {
   ApplyRejected(stores, 3, MetaCommand{archive});
 }
 
-TEST(MetaStateApply, SetSchemaVersionThroughDispatcher) {
-  MetaStores stores;
-  keylane::meta::SetSchemaVersion cmd;
-  cmd.request_id_ = MakeRequestId(0x70);
-  cmd.attestation_ = "ticket OPS-1234";
-
-  // Absolute value within this binary's write capability: accepted.
-  cmd.new_active_write_schema_ = keylane::meta::kMetaCurrentSchemaVersion;
-  ApplyOk(stores, 1, MetaCommand{cmd});
-  EXPECT_EQ(stores.active_write_schema_,
-            keylane::meta::kMetaCurrentSchemaVersion);
-
-  // 0 is not a schema version; beyond-current is a schema this binary cannot
-  // write. Binaries must be upgraded first; the leader gate keeps such
-  // commands off the log in a correct deployment.
-  cmd.new_active_write_schema_ = 0;
-  ApplyRejected(stores, 2, MetaCommand{cmd});
-  cmd.new_active_write_schema_ = keylane::meta::kMetaCurrentSchemaVersion + 1;
-  ApplyRejected(stores, 3, MetaCommand{cmd});
-  EXPECT_EQ(stores.active_write_schema_,
-            keylane::meta::kMetaCurrentSchemaVersion);
-
-  // The committed schema survives the snapshot envelope.
-  const auto restored = MetaStores::Deserialize(MustSerialize(stores));
-  ASSERT_TRUE(restored.ok()) << restored.status();
-  EXPECT_EQ(restored->active_write_schema_,
-            keylane::meta::kMetaCurrentSchemaVersion);
-}
-
 TEST(MetaStateApply, AuditPruneIsReplicatedAndAudited) {
   keylane::meta::MetaStores stores;
   auto create = MakeCreateGroup("g-prune", 1);
@@ -2124,20 +1996,6 @@ std::vector<ScriptedCommand> MakeCommandScript() {
     fence.group_id_ = "g1";
     fence.expected_term_ = 1;
     push(fence, accept);
-  }
-  // upgrade
-  {
-    keylane::meta::SetSchemaVersion schema;
-    schema.request_id_ = MakeRequestId(0x70);
-    schema.new_active_write_schema_ = keylane::meta::kMetaCurrentSchemaVersion;
-    push(schema, accept);
-    schema.request_id_ = MakeRequestId(0x71);
-    schema.new_active_write_schema_ = 0;
-    push(schema, reject);
-    schema.request_id_ = MakeRequestId(0x72);
-    schema.new_active_write_schema_ =
-        keylane::meta::kMetaCurrentSchemaVersion + 1;
-    push(schema, reject);
   }
   return script;
 }
