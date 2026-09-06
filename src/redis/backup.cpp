@@ -205,9 +205,9 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     fence_request.serving_generation_ = serving_generation_;
     fence_request.serving_generation_valid_ = serving_generation_valid_;
     fence_request.replication_origin_ = replication_origin_;
-    if (const auto error = CommandServingGenerationError(fence_request);
-        error.has_value()) {
-      cut_error_ = std::string(*error);
+    if (const char* error = CommandServingGenerationError(fence_request);
+        error != nullptr) [[unlikely]] {
+      cut_error_ = error;
       co_return absl::FailedPreconditionError(cut_error_);
     }
 

@@ -1018,9 +1018,9 @@ Task<CommandReply> ExecuteRead(
       co_return Built(builder.AppendError(
           "TRYAGAIN replication role changed; retry command"));
     }
-    if (const auto error = CommandServingGenerationError(request);
-        error.has_value()) {
-      co_return Built(builder.AppendError(*error));
+    if (const char* error = CommandServingGenerationError(request);
+        error != nullptr) [[unlikely]] {
+      co_return Built(builder.AppendError(error));
     }
     std::vector<std::pair<std::string, std::vector<ReadOneResult::Item>>> found;
     for (std::size_t k = 0; k < key_count; ++k) {

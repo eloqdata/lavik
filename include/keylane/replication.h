@@ -284,6 +284,10 @@ class ReplicationManager {
 
  private:
   class ReplicationGroup;
+  // Data-command admission reads this twice per command. Keep the packed
+  // token directly in the public manager rather than behind ReplicationGroup's
+  // pImpl pointer; transitions remain cold and receive this atomic by address.
+  std::atomic<std::uint64_t> serving_generation_{3};
   std::unique_ptr<ReplicationGroup> group_;
   ReplicationOptions options_;
 };

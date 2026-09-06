@@ -460,9 +460,11 @@ Task<CommandReply> DispatchCommand(ConnectionContext& ctx,
 // Revalidates an external data command after it obtains ordinary database
 // admission or drains a self-managed exclusive database cut.
 // Replication-origin and internally nested requests are intentionally
-// unscoped. A mismatch returns a Redis wire error body (without RESP framing)
-// so every execution path reports the same LOADING/TRYAGAIN outcome.
-std::optional<std::string_view> CommandServingGenerationError(
+// unscoped. A mismatch returns a pointer to a static Redis wire error body
+// (without RESP framing), while the common success path returns nullptr. The
+// pointer representation keeps this check cheap enough for every data command;
+// callers must not take ownership of the returned string.
+const char* CommandServingGenerationError(
     const CommandRequest& request) noexcept;
 
 // Unregisters every WATCH this connection holds (connection close, UNWATCH,

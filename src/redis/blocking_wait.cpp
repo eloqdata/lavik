@@ -909,10 +909,10 @@ Task<CommandReply> ExecuteBlockingWaitLoop(
       co_return status_reply(
           absl::AbortedError("replication role changed; retry command"));
     }
-    if (const auto error = CommandServingGenerationError(request);
-        error.has_value()) {
+    if (const char* error = CommandServingGenerationError(request);
+        error != nullptr) [[unlikely]] {
       CommandReply reply;
-      reply.encoded_ = reply_builder.AppendError(*error);
+      reply.encoded_ = reply_builder.AppendError(error);
       co_return reply;
     }
 

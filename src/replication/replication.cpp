@@ -2823,8 +2823,10 @@ class ReplicationManager::ReplicationGroup {
  public:
   ReplicationGroup(storage::StorageEngine* storage,
                    std::optional<ReplicaOfConfig> initial_upstream,
-                   const ReplicationOptions& options)
+                   const ReplicationOptions& options,
+                   std::atomic<std::uint64_t>* serving_generation)
       : storage_(storage),
+        serving_generation_(serving_generation),
         cluster_enabled_(options.cluster_enabled_),
         upstream_(cluster_enabled_ ? std::nullopt
                                    : std::move(initial_upstream)),
@@ -3972,11 +3974,12 @@ class ReplicationManager::ReplicationGroup {
     const bool will_serve = serves_dataset(next);
     if (was_serving) {
       const std::uint64_t current =
-          serving_generation_.load(std::memory_order_relaxed);
+          serving_generation_->load(std::memory_order_relaxed);
       std::uint64_t generation = (current & ~kServingOpen) + 2;
       if (generation == 0) generation = 2;  // Reserve zero for closed capture.
-      serving_generation_.store(generation | (will_serve ? kServingOpen : 0),
-                                std::memory_order_release);
+      serving_generation_->store(
+          generation | (will_serve ? kServingOpen : 0),
+          std::memory_order_release);
       // Blocking commands own no DB gate while asleep. Wake all of them so
       // they can observe the new generation before examining replacement
       // data; baseline population is not required to emit key notifications.
@@ -3989,9 +3992,9 @@ class ReplicationManager::ReplicationGroup {
     role_.store(next, order);
     if (!was_serving && will_serve) {
       const std::uint64_t current =
-          serving_generation_.load(std::memory_order_relaxed);
-      serving_generation_.store(current | kServingOpen,
-                                std::memory_order_release);
+          serving_generation_->load(std::memory_order_relaxed);
+      serving_generation_->store(current | kServingOpen,
+                                 std::memory_order_release);
     }
     if (next == ReplicationRole::kOnline ||
         previous == ReplicationRole::kOnline ||
@@ -4025,18 +4028,6 @@ class ReplicationManager::ReplicationGroup {
     return storage_->ReplicaRecoveryFenced() ||
            role == ReplicationRole::kConnecting ||
            role == ReplicationRole::kSyncing;
-  }
-
-  std::uint64_t CaptureServingGeneration() const noexcept {
-    constexpr std::uint64_t kServingOpen = 1;
-    const std::uint64_t generation =
-        serving_generation_.load(std::memory_order_acquire);
-    return (generation & kServingOpen) != 0 ? generation : 0;
-  }
-
-  bool ServingGenerationMatches(std::uint64_t generation) const noexcept {
-    return generation != 0 &&
-           serving_generation_.load(std::memory_order_acquire) == generation;
   }
 
   absl::Status SetSnapshotReadConcurrency(unsigned concurrency) noexcept {
@@ -9786,6 +9777,10 @@ class ReplicationManager::ReplicationGroup {
   }
 
   storage::StorageEngine* storage_;
+  // The packed atomic is owned by the enclosing manager so external commands
+  // reach it without following this pImpl. Bit zero is serving-open and the
+  // remaining bits are a monotonic dataset generation.
+  std::atomic<std::uint64_t>* const serving_generation_;
   const bool cluster_enabled_;
   mutable std::mutex state_mutex_;
   std::optional<ReplicaOfConfig> upstream_;
@@ -9799,11 +9794,8 @@ class ReplicationManager::ReplicationGroup {
   // state_mutex_. A revoke uses the same order, while this count keeps grants
   // closed across the asynchronous flow join that follows registry removal.
   unsigned cluster_source_revocations_in_flight_ = 0;
-  // The mutex is transition-only. External commands use the packed atomic:
-  // bit zero is serving-open and the remaining bits are a monotonic dataset
-  // generation, avoiding a role lock on every data-command hot path.
+  // Role changes are rare; command admission never takes this mutex.
   mutable std::mutex serving_transition_mutex_;
-  std::atomic<std::uint64_t> serving_generation_{3};
   std::atomic<ReplicationRole> role_{ReplicationRole::kMaster};
   std::atomic<std::uint64_t> link_state_changed_nanos_{SteadyNanos()};
   std::atomic<std::uint64_t> role_epoch_{0};
@@ -9899,7 +9891,8 @@ ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
     : group_(std::make_unique<ReplicationGroup>(
-          storage, std::move(initial_upstream), options)),
+          storage, std::move(initial_upstream), options,
+          &serving_generation_)),
       options_(std::move(options)) {}
 
 ReplicationManager::~ReplicationManager() = default;
@@ -10047,12 +10040,16 @@ std::uint64_t ReplicationManager::role_epoch() const noexcept {
 }
 
 std::uint64_t ReplicationManager::CaptureServingGeneration() const noexcept {
-  return group_->CaptureServingGeneration();
+  constexpr std::uint64_t kServingOpen = 1;
+  const std::uint64_t generation =
+      serving_generation_.load(std::memory_order_acquire);
+  return (generation & kServingOpen) != 0 ? generation : 0;
 }
 
 bool ReplicationManager::ServingGenerationMatches(
     std::uint64_t generation) const noexcept {
-  return group_->ServingGenerationMatches(generation);
+  return generation != 0 &&
+         serving_generation_.load(std::memory_order_acquire) == generation;
 }
 
 bool ReplicationManager::redirects_clients_to_upstream() const noexcept {
