@@ -1,0 +1,232 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "10亿条 1 KiB 数据的高连接数性能对比",
+    "description": "Keylane raw io_uring、Dragonfly v1.40.2 和 Garnet v2.1.5 的 GET/SET 连接数阶梯测试。",
+    "generatedAt": "2026-09-06T10:57:44Z",
+    "charts": [
+      {
+        "id": "get_qps",
+        "title": "GET QPS 与连接数",
+        "subtitle": "每档 60 秒，16 个 memtier 线程，pipeline=1，10 亿条 1 KiB 数据",
+        "type": "bar",
+        "intent": "comparison",
+        "question": "三个系统的随机 GET 吞吐如何随并发连接数变化？",
+        "rationale": "分组柱状图适合在六个有序连接档位上直接比较三个系统的绝对吞吐。",
+        "comparisonContext": {
+          "grain": "每个系统、每个连接档位的一次 60 秒运行",
+          "unit": "每秒完成的 GET 请求",
+          "baseline": "同一连接档位下的其他系统"
+        },
+        "dataset": "get_results",
+        "sourceId": "memtier_logs",
+        "palette": { "kind": "categorical" },
+        "legend": { "position": "bottom", "interactive": true, "sort": "spec", "title": "系统" },
+        "labels": { "values": "none" },
+        "encodings": {
+          "x": { "field": "connections", "type": "ordinal", "label": "连接数" },
+          "y": { "field": "qps", "type": "quantitative", "label": "QPS", "format": "number" },
+          "color": { "field": "product", "type": "nominal", "label": "系统" },
+          "tooltip": [
+            { "field": "p50_ms", "type": "quantitative", "label": "p50 (ms)" },
+            { "field": "p99_ms", "type": "quantitative", "label": "p99 (ms)" },
+            { "field": "p999_ms", "type": "quantitative", "label": "p99.9 (ms)" }
+          ]
+        },
+        "yAxisTitle": "QPS",
+        "valueFormat": "number",
+        "layout": "full"
+      },
+      {
+        "id": "set_qps",
+        "title": "SET QPS 与连接数",
+        "subtitle": "随机覆盖已有 key；每档 60 秒，16 个 memtier 线程，pipeline=1",
+        "type": "bar",
+        "intent": "comparison",
+        "question": "三个系统的随机覆盖 SET 吞吐如何随并发连接数变化？",
+        "rationale": "分组柱状图保留绝对 QPS 和连接数顺序，并能直接看出饱和与过载回落。",
+        "comparisonContext": {
+          "grain": "每个系统、每个连接档位的一次 60 秒运行",
+          "unit": "每秒完成的 SET 请求",
+          "baseline": "同一连接档位下的其他系统"
+        },
+        "dataset": "set_results",
+        "sourceId": "memtier_logs",
+        "palette": { "kind": "categorical" },
+        "legend": { "position": "bottom", "interactive": true, "sort": "spec", "title": "系统" },
+        "labels": { "values": "none" },
+        "encodings": {
+          "x": { "field": "connections", "type": "ordinal", "label": "连接数" },
+          "y": { "field": "qps", "type": "quantitative", "label": "QPS", "format": "number" },
+          "color": { "field": "product", "type": "nominal", "label": "系统" },
+          "tooltip": [
+            { "field": "p50_ms", "type": "quantitative", "label": "p50 (ms)" },
+            { "field": "p99_ms", "type": "quantitative", "label": "p99 (ms)" },
+            { "field": "p999_ms", "type": "quantitative", "label": "p99.9 (ms)" }
+          ]
+        },
+        "yAxisTitle": "QPS",
+        "valueFormat": "number",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "get_detail",
+        "title": "GET 精确结果",
+        "subtitle": "QPS 与客户端观测的延迟百分位；每行是一档 60 秒运行",
+        "dataset": "get_results",
+        "sourceId": "memtier_logs",
+        "defaultSort": { "field": "connections", "direction": "asc" },
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          { "field": "product", "label": "系统", "type": "text" },
+          { "field": "connections", "label": "连接数", "format": "number" },
+          { "field": "qps", "label": "QPS", "format": "number" },
+          { "field": "avg_latency_ms", "label": "平均延迟 (ms)", "format": "number" },
+          { "field": "p50_ms", "label": "p50 (ms)", "format": "number" },
+          { "field": "p99_ms", "label": "p99 (ms)", "format": "number" },
+          { "field": "p999_ms", "label": "p99.9 (ms)", "format": "number" }
+        ]
+      },
+      {
+        "id": "set_detail",
+        "title": "SET 精确结果",
+        "subtitle": "随机覆盖已有 key；QPS 与客户端观测的延迟百分位",
+        "dataset": "set_results",
+        "sourceId": "memtier_logs",
+        "defaultSort": { "field": "connections", "direction": "asc" },
+        "density": "dense",
+        "layout": "full",
+        "columns": [
+          { "field": "product", "label": "系统", "type": "text" },
+          { "field": "connections", "label": "连接数", "format": "number" },
+          { "field": "qps", "label": "QPS", "format": "number" },
+          { "field": "avg_latency_ms", "label": "平均延迟 (ms)", "format": "number" },
+          { "field": "p50_ms", "label": "p50 (ms)", "format": "number" },
+          { "field": "p99_ms", "label": "p99 (ms)", "format": "number" },
+          { "field": "p999_ms", "label": "p99.9 (ms)", "format": "number" }
+        ]
+      }
+    ],
+    "sources": [
+      { "id": "memtier_logs", "label": "memtier 连接数阶梯原始结果", "path": "connection-sweep.csv" }
+    ],
+    "blocks": [
+      { "id": "title", "type": "markdown", "body": "# 10亿条 1 KiB 数据的高连接数性能对比" },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "memtier_logs",
+        "body": "## Keylane 在高连接下达到最高 GET 和 SET 吞吐\n\nKeylane raw io_uring 的 GET 峰值为 **784,179 QPS**，SET 峰值为 **856,523 QPS**，均出现在 1,280 连接。GET 峰值分别比 Dragonfly 和 Garnet 高 **106.99%**、**135.73%**；SET 峰值分别高 **43.97%**、**11.98%**。三个系统到 2,560 连接时吞吐都下降，因此继续增加连接不会提高本机单客户端下的吞吐。"
+      },
+      {
+        "id": "get_finding",
+        "type": "markdown",
+        "sourceId": "memtier_logs",
+        "body": "## GET：Keylane 扩展到 1,280 连接后才饱和\n\nKeylane 从 80 连接的 253k QPS 扩展到 1,280 连接的 784k QPS；Dragonfly 在 1,280 连接达到 379k，Garnet 则在 640 连接达到 333k。高连接虽然提高吞吐，但同时推高长尾：各系统的峰值吞吐点不等于最佳延迟点。"
+      },
+      { "id": "get_chart", "type": "chart", "chartId": "get_qps", "layout": "full" },
+      { "id": "get_table", "type": "table", "tableId": "get_detail", "layout": "full" },
+      {
+        "id": "set_finding",
+        "type": "markdown",
+        "sourceId": "memtier_logs",
+        "body": "## SET：Keylane 峰值 857k，Garnet 在中等连接数接近\n\n320 连接时 Keylane 和 Garnet 分别为 672k 和 669k QPS，几乎持平；到 1,280 连接时 Keylane 达到 857k，Garnet 为 765k，Dragonfly 为 595k。三者在 2,560 连接都回落，并伴随明显的 p99 上升。"
+      },
+      { "id": "set_chart", "type": "chart", "chartId": "set_qps", "layout": "full" },
+      { "id": "set_table", "type": "table", "tableId": "set_detail", "layout": "full" },
+      {
+        "id": "scope",
+        "type": "markdown",
+        "body": "## 比较口径\n\n三套系统都使用 10 亿个 key、固定 1,024-byte value。客户端为 172.16.0.5，固定 16 个 memtier 2.5.1 线程；连接数依次为 80、160、320、640、1,280、2,560，pipeline=1，每档 60 秒。GET 均匀随机访问完整 key 范围；SET 均匀随机覆盖已有 key。QPS 是窗口内完成请求数除以墙钟，延迟为客户端观测值。"
+      },
+      {
+        "id": "method",
+        "type": "markdown",
+        "body": "## 存储与执行方法\n\nKeylane 使用当前 main（29dc8e6b）、16 workers、Clang 18 Release、六个独立 raw io_uring NVMe 块设备，并暂停 defrag。Dragonfly v1.40.2 使用 16 proactors、96 GiB maxmemory，以及六盘 RAID0/XFS 上的 buffered-I/O tier。Garnet v2.1.5 使用 64 GiB hybrid log、32 GiB read cache、16 GiB index 和同一 RAID0/XFS 上的 Native libaio。每套系统都清空并重新灌入 10 亿条；Dragonfly 和 Garnet 在正式 GET 前各预热 180 秒。测试顺序固定为 GET 从低到高六档，再 SET 从低到高六档。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 单轮曲线适合定位饱和区，不代表置信区间\n\n每个点只运行一次 60 秒，没有三轮均值或误差条；小于约 3% 的差异不应解释为稳定优势。Keylane 直接使用六个块设备，Dragonfly/Garnet 使用 RAID0/XFS，内存预算和持久化语义也不同，因此这是明确配置下的系统级吞吐比较，不是等内存、等后端或等故障语义的单变量实验。SET 按连接数递增执行，后面的点建立在更多覆盖写历史上。单客户端在高连接下也可能成为限制的一部分。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 建议把 640 和 1,280 连接作为复测重点\n\n若要用于容量规划，下一步应对 640 和 1,280 连接各跑三轮 300 秒，并同时记录服务端 CPU、盘 IOPS/带宽和客户端 CPU。生产取值还应按延迟 SLO 选择：追求最低长尾时不应直接采用峰值吞吐对应的连接数。"
+      },
+      {
+        "id": "questions",
+        "type": "markdown",
+        "body": "## 仍需回答的问题\n\n- 两台客户端同时施压时，Keylane raw io_uring 是否能突破当前 857k SET / 784k GET 峰值？\n- 开启 Keylane defrag、Dragonfly/Garnet 的生产持久化选项后，高连接曲线如何变化？\n- 在固定 p99 或 p99.9 SLO 下，三套系统各自可持续的最大 QPS 是多少？"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-09-06T10:57:44Z",
+    "status": "ready",
+    "datasets": {
+      "get_results": [
+        { "product": "Keylane raw io_uring", "connections": 80, "qps": 253250.96, "avg_latency_ms": 0.31568, "p50_ms": 0.311, "p99_ms": 0.447, "p999_ms": 0.791 },
+        { "product": "Dragonfly v1.40.2", "connections": 80, "qps": 199548.43, "avg_latency_ms": 0.40069, "p50_ms": 0.343, "p99_ms": 2.591, "p999_ms": 7.359 },
+        { "product": "Garnet v2.1.5", "connections": 80, "qps": 177015.67, "avg_latency_ms": 0.45174, "p50_ms": 0.359, "p99_ms": 2.335, "p999_ms": 3.887 },
+        { "product": "Keylane raw io_uring", "connections": 160, "qps": 444807.97, "avg_latency_ms": 0.35923, "p50_ms": 0.359, "p99_ms": 0.511, "p999_ms": 1.031 },
+        { "product": "Dragonfly v1.40.2", "connections": 160, "qps": 297608.96, "avg_latency_ms": 0.53718, "p50_ms": 0.407, "p99_ms": 4.415, "p999_ms": 13.055 },
+        { "product": "Garnet v2.1.5", "connections": 160, "qps": 247875.06, "avg_latency_ms": 0.64504, "p50_ms": 0.519, "p99_ms": 3.503, "p999_ms": 5.919 },
+        { "product": "Keylane raw io_uring", "connections": 320, "qps": 661401.05, "avg_latency_ms": 0.48343, "p50_ms": 0.463, "p99_ms": 0.871, "p999_ms": 1.479 },
+        { "product": "Dragonfly v1.40.2", "connections": 320, "qps": 347583.54, "avg_latency_ms": 0.92006, "p50_ms": 0.567, "p99_ms": 12.415, "p999_ms": 24.063 },
+        { "product": "Garnet v2.1.5", "connections": 320, "qps": 306276.87, "avg_latency_ms": 1.04423, "p50_ms": 0.903, "p99_ms": 3.951, "p999_ms": 6.751 },
+        { "product": "Keylane raw io_uring", "connections": 640, "qps": 771496.27, "avg_latency_ms": 0.82918, "p50_ms": 0.783, "p99_ms": 1.919, "p999_ms": 4.047 },
+        { "product": "Dragonfly v1.40.2", "connections": 640, "qps": 367956.16, "avg_latency_ms": 1.73854, "p50_ms": 0.919, "p99_ms": 25.343, "p999_ms": 45.823 },
+        { "product": "Garnet v2.1.5", "connections": 640, "qps": 332665.16, "avg_latency_ms": 1.92321, "p50_ms": 1.735, "p99_ms": 3.743, "p999_ms": 5.503 },
+        { "product": "Keylane raw io_uring", "connections": 1280, "qps": 784179.39, "avg_latency_ms": 1.63157, "p50_ms": 1.527, "p99_ms": 4.095, "p999_ms": 8.895 },
+        { "product": "Dragonfly v1.40.2", "connections": 1280, "qps": 378851.32, "avg_latency_ms": 3.37761, "p50_ms": 1.439, "p99_ms": 47.615, "p999_ms": 77.823 },
+        { "product": "Garnet v2.1.5", "connections": 1280, "qps": 318165.27, "avg_latency_ms": 4.02201, "p50_ms": 3.647, "p99_ms": 5.951, "p999_ms": 11.711 },
+        { "product": "Keylane raw io_uring", "connections": 2560, "qps": 690259.48, "avg_latency_ms": 3.70729, "p50_ms": 3.551, "p99_ms": 7.679, "p999_ms": 21.503 },
+        { "product": "Dragonfly v1.40.2", "connections": 2560, "qps": 371890.46, "avg_latency_ms": 6.88397, "p50_ms": 2.687, "p99_ms": 92.159, "p999_ms": 152.575 },
+        { "product": "Garnet v2.1.5", "connections": 2560, "qps": 292481.50, "avg_latency_ms": 8.75040, "p50_ms": 9.087, "p99_ms": 13.247, "p999_ms": 25.599 }
+      ],
+      "set_results": [
+        { "product": "Keylane raw io_uring", "connections": 80, "qps": 320359.53, "avg_latency_ms": 0.24941, "p50_ms": 0.223, "p99_ms": 0.535, "p999_ms": 4.511 },
+        { "product": "Dragonfly v1.40.2", "connections": 80, "qps": 268251.36, "avg_latency_ms": 0.29798, "p50_ms": 0.263, "p99_ms": 1.519, "p999_ms": 4.831 },
+        { "product": "Garnet v2.1.5", "connections": 80, "qps": 365630.02, "avg_latency_ms": 0.21855, "p50_ms": 0.207, "p99_ms": 0.647, "p999_ms": 1.839 },
+        { "product": "Keylane raw io_uring", "connections": 160, "qps": 513385.01, "avg_latency_ms": 0.31130, "p50_ms": 0.263, "p99_ms": 2.367, "p999_ms": 5.407 },
+        { "product": "Dragonfly v1.40.2", "connections": 160, "qps": 378335.10, "avg_latency_ms": 0.42250, "p50_ms": 0.303, "p99_ms": 3.679, "p999_ms": 12.415 },
+        { "product": "Garnet v2.1.5", "connections": 160, "qps": 490332.22, "avg_latency_ms": 0.32596, "p50_ms": 0.255, "p99_ms": 1.823, "p999_ms": 3.567 },
+        { "product": "Keylane raw io_uring", "connections": 320, "qps": 671864.60, "avg_latency_ms": 0.47599, "p50_ms": 0.359, "p99_ms": 4.447, "p999_ms": 6.559 },
+        { "product": "Dragonfly v1.40.2", "connections": 320, "qps": 440721.79, "avg_latency_ms": 0.72565, "p50_ms": 0.423, "p99_ms": 9.023, "p999_ms": 22.399 },
+        { "product": "Garnet v2.1.5", "connections": 320, "qps": 669057.36, "avg_latency_ms": 0.47799, "p50_ms": 0.375, "p99_ms": 2.079, "p999_ms": 4.287 },
+        { "product": "Keylane raw io_uring", "connections": 640, "qps": 811734.07, "avg_latency_ms": 0.78812, "p50_ms": 0.527, "p99_ms": 6.207, "p999_ms": 9.087 },
+        { "product": "Dragonfly v1.40.2", "connections": 640, "qps": 474878.91, "avg_latency_ms": 1.34711, "p50_ms": 0.719, "p99_ms": 17.023, "p999_ms": 39.423 },
+        { "product": "Garnet v2.1.5", "connections": 640, "qps": 757441.83, "avg_latency_ms": 0.84455, "p50_ms": 0.615, "p99_ms": 3.855, "p999_ms": 7.007 },
+        { "product": "Keylane raw io_uring", "connections": 1280, "qps": 856523.03, "avg_latency_ms": 1.49382, "p50_ms": 1.015, "p99_ms": 8.511, "p999_ms": 12.799 },
+        { "product": "Dragonfly v1.40.2", "connections": 1280, "qps": 594940.53, "avg_latency_ms": 2.15081, "p50_ms": 1.551, "p99_ms": 21.375, "p999_ms": 51.199 },
+        { "product": "Garnet v2.1.5", "connections": 1280, "qps": 764916.80, "avg_latency_ms": 1.67274, "p50_ms": 1.399, "p99_ms": 5.183, "p999_ms": 11.263 },
+        { "product": "Keylane raw io_uring", "connections": 2560, "qps": 790186.11, "avg_latency_ms": 3.23862, "p50_ms": 2.559, "p99_ms": 13.439, "p999_ms": 23.295 },
+        { "product": "Dragonfly v1.40.2", "connections": 2560, "qps": 537193.25, "avg_latency_ms": 4.76436, "p50_ms": 3.823, "p99_ms": 38.911, "p999_ms": 86.527 },
+        { "product": "Garnet v2.1.5", "connections": 2560, "qps": 720261.55, "avg_latency_ms": 3.55302, "p50_ms": 3.311, "p99_ms": 8.831, "p999_ms": 21.375 }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "memtier_logs",
+      "label": "memtier 连接数阶梯原始结果",
+      "path": "connection-sweep.csv",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "sql": "SELECT product, workload, connections, qps, avg_latency_ms, p50_ms, p99_ms, p999_ms FROM read_csv_auto('connection-sweep.csv') ORDER BY workload, connections, product",
+        "description": "读取三套系统的 36 个已复核 memtier 连接数阶梯结果。",
+        "executed_at": "2026-09-06T10:57:44Z",
+        "tables_used": ["connection-sweep.csv"],
+        "filters": ["workload IN ('GET', 'SET')", "connections IN (80, 160, 320, 640, 1280, 2560)"]
+      }
+    }
+  ]
+}
