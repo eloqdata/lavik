@@ -49,8 +49,7 @@ cap alone explains the whole delta.
 
 ### Server
 
-- Host: `eloqkv-benchmark-chenzhao-v4` (`135.149.112.147`, private
-  `172.16.0.4`).
+- Azure VM size: `Standard_L16aos_v4`.
 - CPU: AMD EPYC 9V74, 16 logical CPUs: one socket, eight cores, two hardware
   threads per core.
 - RAM: 135,066,603,520 bytes (125.79 GiB).
@@ -65,7 +64,7 @@ cap alone explains the whole delta.
 
 ### Client
 
-- Host: `eloqkv-benchmark-chenzhao-client1` (`20.40.96.254`).
+- Azure VM size: `Standard_F16als_v7`.
 - CPU: AMD EPYC 9V45, 16 logical CPUs: one socket, 16 cores, one hardware
   thread per core.
 - Client: Dragonfly `dfly_bench` v1.40.1 x86_64 release binary, SHA-256
