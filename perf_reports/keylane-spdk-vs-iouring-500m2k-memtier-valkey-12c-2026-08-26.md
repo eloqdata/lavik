@@ -191,4 +191,3 @@ Client versions and hashes:
 
 - Compact reviewed results are included in the headline tables above.
 - Raw run root: `perf_runs/keylane-500m2k-spdk-vs-iouring-memtier-valkey-12c-20260826/`
-- CPU/IRQ method: `perf_reports/keylane-cpu-irq-affinity-2026-08-26.md`
