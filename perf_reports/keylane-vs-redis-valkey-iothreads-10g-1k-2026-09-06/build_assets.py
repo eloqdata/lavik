@@ -9,13 +9,20 @@ from pathlib import Path
 
 
 REPORT_ROOT = Path(__file__).resolve().parent
-RAW_ROOT = Path("/mnt/dev/peer-bench/results-2026-09-06/redis-valkey-iothreads-10g-1k")
-CONNECTIONS = (80, 160, 320, 640, 1280)
+MEMORY_RAW_ROOT = Path("/mnt/dev/peer-bench/results-2026-09-06/redis-valkey-iothreads-10g-1k")
+STORAGE_RAW_ROOT = Path("/mnt/dev/peer-bench/results-2026-09-06/connection-sweep")
+MEMORY_CONNECTIONS = (80, 160, 320, 640, 1280)
+STORAGE_CONNECTIONS = (80, 160, 320, 640, 1280, 2560)
 IO_THREADS = (1, 2, 4, 8, 16)
-PRODUCTS = {
+MEMORY_PRODUCTS = {
     "redis": "Redis 8.8.0",
     "valkey": "Valkey 9.1.0",
     "keylane": "Keylane raw io_uring",
+}
+STORAGE_PRODUCTS = {
+    "keylane-raw": "Keylane raw io_uring",
+    "dragonfly": "Dragonfly v1.40.2",
+    "garnet": "Garnet v2.1.5",
 }
 
 
@@ -35,7 +42,7 @@ def parse_log(path: Path, product: str, server_threads: int, thread_role: str, w
     if not cpu:
         raise RuntimeError(f"missing client CPU summary: {path}")
     return {
-        "product": PRODUCTS[product],
+        "product": MEMORY_PRODUCTS[product],
         "server_threads": server_threads,
         "thread_role": thread_role,
         "workload": workload,
@@ -54,19 +61,19 @@ rows = []
 source_files = []
 for product in ("redis", "valkey"):
     for thread_count in IO_THREADS:
-        config = RAW_ROOT / product / f"io{thread_count}-config.txt"
+        config = MEMORY_RAW_ROOT / product / f"io{thread_count}-config.txt"
         if config.read_text().splitlines() != ["io-threads", str(thread_count)]:
             raise RuntimeError(f"server config mismatch: {config}")
         source_files.append(config)
         for workload in ("GET", "SET"):
-            for connections in CONNECTIONS:
-                path = RAW_ROOT / product / f"io{thread_count}-{workload.lower()}-c{connections}.txt"
+            for connections in MEMORY_CONNECTIONS:
+                path = MEMORY_RAW_ROOT / product / f"io{thread_count}-{workload.lower()}-c{connections}.txt"
                 rows.append(parse_log(path, product, thread_count, "io-threads", workload, connections))
                 source_files.append(path)
 
 for workload in ("GET", "SET"):
-    for connections in CONNECTIONS:
-        path = RAW_ROOT / "keylane" / f"{workload.lower()}-c{connections}.txt"
+    for connections in MEMORY_CONNECTIONS:
+        path = MEMORY_RAW_ROOT / "keylane" / f"{workload.lower()}-c{connections}.txt"
         rows.append(parse_log(path, "keylane", 16, "workers", workload, connections))
         source_files.append(path)
 
@@ -88,7 +95,76 @@ with (REPORT_ROOT / "results.csv").open("w", newline="", encoding="utf-8") as ou
 with (REPORT_ROOT / "raw-SHA256SUMS").open("w", encoding="utf-8") as output:
     for path in sorted(source_files):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        output.write(f"{digest}  {path.relative_to(RAW_ROOT)}\n")
+        output.write(f"{digest}  {path.relative_to(MEMORY_RAW_ROOT)}\n")
+
+
+def parse_storage_log(path: Path, product: str, workload: str, connections: int):
+    body = path.read_text(encoding="utf-8", errors="replace")
+    totals = [line.split() for line in body.splitlines() if line.startswith("Totals")]
+    if len(totals) != 1 or len(totals[0]) != 9:
+        raise RuntimeError(f"incomplete storage-sweep Totals row: {path}")
+    if "16        Threads" not in body or "60        Seconds" not in body:
+        raise RuntimeError(f"storage-sweep client configuration mismatch: {path}")
+    if workload == "GET":
+        gets = [line.split() for line in body.splitlines() if line.startswith("Gets")]
+        if len(gets) != 1 or float(gets[0][3]) != 0.0:
+            raise RuntimeError(f"storage-sweep GET miss or malformed row: {path}")
+        if abs(float(gets[0][1]) - float(gets[0][2])) > 0.01:
+            raise RuntimeError(f"storage-sweep GET QPS does not equal hit rate: {path}")
+    cpu = re.search(r"Cores used:\s+([0-9.]+)", body)
+    if not cpu:
+        raise RuntimeError(f"missing storage-sweep client CPU summary: {path}")
+    row = totals[0]
+    return {
+        "product": STORAGE_PRODUCTS[product],
+        "backend": "six raw NVMe" if product == "keylane-raw" else "RAID0/XFS storage tier",
+        "workload": workload,
+        "connections": connections,
+        "qps": float(row[1]),
+        "avg_latency_ms": float(row[4]),
+        "p50_ms": float(row[5]),
+        "p99_ms": float(row[6]),
+        "p999_ms": float(row[7]),
+        "client_cores": float(cpu.group(1)),
+    }
+
+
+storage_rows = []
+for product in STORAGE_PRODUCTS:
+    for workload in ("GET", "SET"):
+        for connections in STORAGE_CONNECTIONS:
+            path = (
+                STORAGE_RAW_ROOT / product
+                / f"sweep-{product}-{workload.lower()}-c{connections}.txt"
+            )
+            storage_rows.append(parse_storage_log(path, product, workload, connections))
+
+if len(storage_rows) != 36:
+    raise RuntimeError(f"expected 36 storage-sweep rows, got {len(storage_rows)}")
+
+storage_columns = (
+    "product", "backend", "workload", "connections", "qps",
+    "avg_latency_ms", "p50_ms", "p99_ms", "p999_ms", "client_cores",
+)
+with (REPORT_ROOT / "storage-results.csv").open("w", newline="", encoding="utf-8") as output:
+    writer = csv.DictWriter(output, fieldnames=storage_columns, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(storage_rows)
+
+# Preserve every file covered by the per-product acquisition manifests. This
+# includes fill/prewarm/config evidence as well as the 36 formal result logs.
+with (REPORT_ROOT / "storage-raw-SHA256SUMS").open("w", encoding="utf-8") as output:
+    for product in STORAGE_PRODUCTS:
+        product_root = STORAGE_RAW_ROOT / product
+        for manifest_line in (product_root / "SHA256SUMS").read_text().splitlines():
+            expected, source_name = manifest_line.split(maxsplit=1)
+            source = Path(source_name.strip())
+            if source.parent != product_root or not source.is_file():
+                raise RuntimeError(f"storage manifest escaped its result directory: {source}")
+            actual = hashlib.sha256(source.read_bytes()).hexdigest()
+            if actual != expected:
+                raise RuntimeError(f"storage source hash mismatch: {source}")
+            output.write(f"{actual}  {source.relative_to(STORAGE_RAW_ROOT)}\n")
 
 
 def svg_text(x, y, value, *, size=20, anchor="start", weight=400, fill="#17202A"):
@@ -107,6 +183,17 @@ def value(workload, product, connections, threads):
     ]
     if len(matches) != 1:
         raise RuntimeError((workload, product, connections, threads, len(matches)))
+    return matches[0]["qps"]
+
+
+def storage_value(workload, product, connections):
+    matches = [
+        row for row in storage_rows
+        if row["workload"] == workload and row["product"] == product
+        and row["connections"] == connections
+    ]
+    if len(matches) != 1:
+        raise RuntimeError((workload, product, connections, len(matches)))
     return matches[0]["qps"]
 
 
@@ -143,13 +230,13 @@ def render_iothread_scaling():
             svg.append(svg_text(left - 15, y + 6, f"{tick//1000}k", size=17, anchor="end", fill="#566573"))
         svg.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
         svg.append(f'<line x1="{left}" y1="{bottom}" x2="{left+panel_width}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
-        for group_index, connections in enumerate(CONNECTIONS):
-            x = left + panel_width * group_index / (len(CONNECTIONS) - 1)
+        for group_index, connections in enumerate(MEMORY_CONNECTIONS):
+            x = left + panel_width * group_index / (len(MEMORY_CONNECTIONS) - 1)
             svg.append(svg_text(x, bottom + 31, f"{connections:,}", size=17, anchor="middle", fill="#34495E"))
         for thread_count in IO_THREADS:
             points = []
-            for group_index, connections in enumerate(CONNECTIONS):
-                x = left + panel_width * group_index / (len(CONNECTIONS) - 1)
+            for group_index, connections in enumerate(MEMORY_CONNECTIONS):
+                x = left + panel_width * group_index / (len(MEMORY_CONNECTIONS) - 1)
                 y = bottom - panel_height * value(workload, product, connections, thread_count) / maximum
                 points.append((x, y))
             encoded = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
@@ -175,7 +262,7 @@ def render_best_comparison():
     left, right = 145, 55
     chart_width, panel_height = width - left - right, 340
     panel_tops = {"GET": 250, "SET": 690}
-    group_width, bar_width, bar_gap = chart_width / len(CONNECTIONS), 58, 7
+    group_width, bar_width, bar_gap = chart_width / len(MEMORY_CONNECTIONS), 58, 7
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#FFFFFF"/>',
@@ -208,7 +295,7 @@ def render_best_comparison():
         svg.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
         svg.append(f'<line x1="{left}" y1="{bottom}" x2="{width-right}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
         specs = product_specs + (("Valkey 9.1.0", "Valkey", valkey_threads[workload], "#C84C8A", "cross"),)
-        for group_index, connections in enumerate(CONNECTIONS):
+        for group_index, connections in enumerate(MEMORY_CONNECTIONS):
             center = left + group_width * (group_index + 0.5)
             total = len(specs) * bar_width + (len(specs) - 1) * bar_gap
             start = center - total / 2
@@ -226,6 +313,66 @@ def render_best_comparison():
     (REPORT_ROOT / "best-memory-vs-keylane-qps.svg").write_text("\n".join(svg) + "\n", encoding="utf-8")
 
 
+def render_storage_comparison():
+    width, height = 1800, 1170
+    product_specs = (
+        ("Keylane raw io_uring", "Keylane · raw NVMe", "#1473E6", "diag"),
+        ("Dragonfly v1.40.2", "Dragonfly · Tiered Storage", "#E97827", "dots"),
+        ("Garnet v2.1.5", "Garnet · Storage Tier", "#C84C8A", "cross"),
+    )
+    maximum = 900_000
+    left, right = 145, 55
+    chart_width, panel_height = width - left - right, 340
+    panel_tops = {"GET": 250, "SET": 690}
+    group_width, bar_width, bar_gap = chart_width / len(STORAGE_CONNECTIONS), 65, 8
+    svg = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#FFFFFF"/>',
+        '<defs>',
+        '<pattern id="diag" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M-2,10 L10,-2 M4,12 L12,4" stroke="#FFFFFF" stroke-width="2" opacity="0.45"/></pattern>',
+        '<pattern id="dots" width="10" height="10" patternUnits="userSpaceOnUse"><circle cx="3" cy="3" r="1.6" fill="#FFFFFF" opacity="0.55"/></pattern>',
+        '<pattern id="cross" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M2,2 L10,10 M10,2 L2,10" stroke="#FFFFFF" stroke-width="1.5" opacity="0.45"/></pattern>',
+        '</defs>',
+        svg_text(70, 65, "Keylane, Dragonfly, and Garnet storage-tier throughput", size=35, weight=700),
+        svg_text(70, 105, "1B keys × 1 KiB · 60 s/run · 16 memtier threads · pipeline 1", size=21, fill="#566573"),
+    ]
+    for index, (_, label, color, pattern) in enumerate(product_specs):
+        x = 380 + index * 455
+        svg.append(f'<rect x="{x}" y="145" width="48" height="26" rx="3" fill="{color}"/>')
+        svg.append(f'<rect x="{x}" y="145" width="48" height="26" rx="3" fill="url(#{pattern})"/>')
+        svg.append(svg_text(x + 60, 166, label, size=18))
+
+    for workload, top in panel_tops.items():
+        bottom = top + panel_height
+        svg.append(svg_text(left, top - 25, f"{workload} throughput", size=25, weight=700))
+        for tick in range(0, maximum + 1, 150_000):
+            y = bottom - panel_height * tick / maximum
+            svg.append(f'<line x1="{left}" y1="{y:.2f}" x2="{width-right}" y2="{y:.2f}" stroke="#DDE3E8"/>')
+            svg.append(svg_text(left - 15, y + 6, f"{tick//1000}k", size=17, anchor="end", fill="#566573"))
+        svg.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
+        svg.append(f'<line x1="{left}" y1="{bottom}" x2="{width-right}" y2="{bottom}" stroke="#7B8794" stroke-width="1.5"/>')
+        for group_index, connections in enumerate(STORAGE_CONNECTIONS):
+            center = left + group_width * (group_index + 0.5)
+            total = len(product_specs) * bar_width + (len(product_specs) - 1) * bar_gap
+            start = center - total / 2
+            for product_index, (product, _, color, pattern) in enumerate(product_specs):
+                qps = storage_value(workload, product, connections)
+                bar_height = panel_height * qps / maximum
+                x = start + product_index * (bar_width + bar_gap)
+                y = bottom - bar_height
+                svg.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" height="{bar_height:.2f}" rx="2" fill="{color}"/>')
+                svg.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{bar_width}" height="{bar_height:.2f}" rx="2" fill="url(#{pattern})"/>')
+            svg.append(svg_text(center, bottom + 31, f"{connections:,}", size=18, anchor="middle", fill="#34495E"))
+        svg.append(svg_text(left + chart_width / 2, bottom + 67, "Concurrent connections", size=18, anchor="middle", weight=700))
+    svg.append(svg_text(70, 1145, "Keylane uses six raw NVMe devices; Dragonfly and Garnet use tier files on the same six-device RAID0/XFS.", size=17, fill="#566573"))
+    svg.append("</svg>")
+    (REPORT_ROOT / "storage-tier-comparison-qps.svg").write_text("\n".join(svg) + "\n", encoding="utf-8")
+
+
 render_iothread_scaling()
 render_best_comparison()
-print("validated 110 formal rows; wrote results.csv, raw-SHA256SUMS, and two SVG charts")
+render_storage_comparison()
+print(
+    "validated 110 memory rows and 36 storage-tier rows; wrote two CSVs, "
+    "two hash manifests, and three SVG charts"
+)

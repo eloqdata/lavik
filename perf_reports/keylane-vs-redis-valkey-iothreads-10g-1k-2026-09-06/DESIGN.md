@@ -25,3 +25,16 @@
 - Scale: zero-based, shared 0–1.05M QPS scale.
 - Identity: stable blue/orange/pink product colors plus distinct fill textures.
 - Delivery: `best-memory-vs-keylane-qps.svg` and its inspected PNG rendering.
+
+## One-terabyte storage-tier comparison
+
+- Question: how do Keylane raw io_uring, Dragonfly Tiered Storage, and Garnet
+  Storage Tier scale from 80 to 2,560 concurrent connections on a 1B-key
+  working set?
+- Takeaway: Keylane has the highest GET and SET peak throughput; every product
+  regresses at 2,560 connections, while Garnet leads SET at 80 connections.
+- Form: two vertically stacked grouped-bar charts for GET and SET.
+- Data: 36 reviewed rows; six connection counts, two workloads, three products.
+- Scale: zero-based, shared 0–900k QPS scale.
+- Identity: stable blue/orange/pink product colors plus distinct fill textures.
+- Delivery: `storage-tier-comparison-qps.svg` and its inspected PNG rendering.
