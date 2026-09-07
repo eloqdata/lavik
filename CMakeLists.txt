@@ -694,13 +694,23 @@ if (BUILD_TESTING)
 
       # Metadata process gates: leader-change safety, WAL/snapshot
       # recovery matrix, membership-change semantics, transport
-      # connect/cancel/timeout, slow-peer backpressure, mTLS, the observation
+      # connect/cancel/timeout, mTLS, the observation
       # stale-evidence/observation-lifecycle gate, and Meta partition safety.
+      # The backpressure gate enforces a production RSS budget, so sanitizer
+      # allocator quarantine would turn it into a measurement of ASan retention
+      # instead of the bounded live Raft queues it is intended to cover.
+      set(KEYLANE_META_INTEGRATION_GATES
+        leader_change recovery membership transport mtls stale_evidence
+        partition
+      )
+      if (NOT KEYLANE_ASAN_BUILD)
+        list(APPEND KEYLANE_META_INTEGRATION_GATES backpressure)
+      endif()
+
       # Each spins up its own
       # multi-node keylane-meta clusters; RUN_SERIAL keeps port allocation
       # and timing margins deterministic.
-      foreach(gate leader_change recovery membership transport backpressure
-              mtls stale_evidence partition)
+      foreach(gate IN LISTS KEYLANE_META_INTEGRATION_GATES)
         add_test(
           NAME meta_integration.gate_${gate}
           COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
