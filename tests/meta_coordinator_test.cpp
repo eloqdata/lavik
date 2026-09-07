@@ -16,16 +16,14 @@
 //      injection, verdict from the audit store), NOT_LEADER, the three
 //      fail-safe gates with constructor-injected thresholds, ValidateProposal
 //      hooks, uncertain-outcome semantics (timeout/cancel; reconcile via the
-//      committed view), the required continuation scheduler, and the
+//      committed view), the required continuation executor, and the
 //      RunAsLeader reconciler lifecycle (mock reconciler, idempotent
 //      continuation across cancel/restart and across a full server restart
 //      with WAL replay).
 //
 // All Propose results are driven through RunTaskSync. The server fixture
-// explicitly injects an inline scheduler because it has no Celer worker;
-// production has no inline fallback and schedules through MetaCelerBridge.
-
-#include "meta/meta_coordinator.h"
+// explicitly opts into inline resume because it has no Celer worker;
+// production has no inline fallback and schedules through ForeignExecutor.
 
 #include <unistd.h>
 
@@ -46,13 +44,14 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/coordinator.h"
+#include "keylane/meta/hash.h"
+#include "keylane/meta/nuraft_log_store.h"
+#include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/observation_store.h"
+#include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
-#include "meta/meta_commands.h"
-#include "meta/meta_hash.h"
-#include "meta/meta_observation_store.h"
-#include "meta/meta_state_machine.h"
-#include "meta/nuraft_log_store.h"
-#include "meta/nuraft_state_mgr.h"
 
 // Trusted test peer for the passkey-protected principal boundary. Tests use
 // the same privileged construction path as ctl and authenticated sessions.
@@ -590,10 +589,8 @@ class MetaCoordinatorServerTest : public ::testing::Test {
     // This fixture drives Tasks from an ordinary test thread and has no Celer
     // worker. Keep that exceptional execution policy explicit rather than
     // relying on a production-dangerous inline fallback in MetaCoordinator.
-    if (!options.schedule_resume_) {
-      options.schedule_resume_ = [](std::coroutine_handle<> continuation) {
-        continuation.resume();
-      };
+    if (!options.foreign_executor_.valid()) {
+      options.inline_resume_for_testing_ = true;
     }
     coordinator_ = std::make_unique<MetaCoordinator>(
         server_, *machine_, *wal_, observations_, std::move(options));
@@ -608,7 +605,7 @@ class MetaCoordinatorServerTest : public ::testing::Test {
       std::lock_guard<std::mutex> lock(role_mu_);
       forward_target_ = nullptr;
     }
-    // Teardown contract (meta_coordinator.h): the coordinator dies before the
+    // Teardown contract (coordinator.h): the coordinator dies before the
     // state machine it references; raft shutdown resolves in-flight proposes
     // as CANCELLED, which the coordinator destructor drains.
     coordinator_.reset();
@@ -699,7 +696,7 @@ TEST_F(MetaCoordinatorServerTest, ProposeInjectsActorAndReturnsAuditVerdict) {
 }
 
 TEST_F(MetaCoordinatorServerTest,
-       AttachedCoordinatorRequiresContinuationScheduler) {
+       AttachedCoordinatorRequiresContinuationExecutor) {
   StartServer();
   nuraft::ptr<nuraft::log_store> store = mgr_->load_log_store();
   wal_ = static_cast<NuraftLogStore*>(store.get());

@@ -6,10 +6,16 @@
 embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
 and TLS. One Celer worker owns the administrative and future data-node control
 sessions; a bounded proposal executor keeps synchronous NuRaft API entry and
-WAL I/O off that worker, and a mailbox returns completions to it. The main
+WAL I/O off that worker. NuRaft and proposal-executor threads return typed
+notifications or coroutine handles through Celer's foreign MPSC mailbox,
+which reuses the worker's normal wake sequence and eventfd. The main
 Keylane data-plane executable remains Raft-free. The future
 authenticated data-node control session belongs to issue #20; this module
 exposes the in-process coordinator and observation seams that session will use.
+Shutdown first quiesces all NuRaft and proposal-executor producers, waits for
+the foreign executor's accepted prefix to reach the Meta worker, and only then
+stops the generic Celer runtime; no Meta-specific drain policy runs in the
+data-plane worker loop.
 
 The state machine owns one `MetaStores` value containing six committed stores:
 
@@ -54,7 +60,7 @@ proposals cannot overbook the window.
 `MetaCoordinator` is the in-process API used by reconcilers and the current
 administrative adapter. `Propose` accepts model commands rather than NuRaft
 types. On the leader it takes one atomic committed view, applies fail-safe and
-registered semantic validation, injects the authenticated principal and a
+registered semantic validation, injects the transport-authorized actor and a
 readable proposal time, encodes the current durable format, submits to
 Raft through the proposal executor, and returns the apply result carried by
 NuRaft's completion. It never re-reads a record that bounded audit rotation may
@@ -151,14 +157,20 @@ Local administration uses a mode-0600 Unix socket and derives a canonical
 operator actor from Linux `SO_PEERCRED`, constrained by an explicit UID
 allowlist. Its parent directory must not be group- or world-writable, and the
 listener records the bound inode so shutdown never unlinks a replacement path.
-Remote administration requires mutual TLS even on loopback and uses the peer's
-canonical URI SAN. Role-based authorization separates operators, Meta members,
-and data-node self-reporting; actor fields on the wire are never trusted.
+Remote administration is plaintext when no control TLS identity is configured,
+matching the Raft transport default. A plaintext listener grants operator
+authority to every reachable peer and records the fixed
+`keylane://operator/plaintext` actor, so trusted network reachability is its
+security boundary. Deployments requiring authenticated peer identity configure
+mutual TLS and use the peer's canonical URI SAN. Role-based authorization then
+separates operators, Meta members, and data-node self-reporting; actor fields on
+the wire are never trusted.
 Certificate validity is enforced by TLS, but online issuance, rotation, CRL,
 and OCSP integration are outside this module.
 The one-shot `keylane-meta-ctl` operator client speaks the same ordered line
-protocol over either transport, verifies the remote server certificate, and
-keeps RESP and NuRaft dependencies out of the client.
+protocol over Unix, plaintext TCP, or mTLS TCP; in mTLS mode it verifies the
+remote server certificate. It keeps RESP and NuRaft dependencies out of the
+client.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -173,10 +185,9 @@ transition into or out of disabled mode.
 
 | Claim | Repository source |
 |---|---|
-| Commands, encoding, store composition, deterministic apply, and bounds | `src/meta/meta_commands.*`, `src/meta/meta_encoding.*`, `src/meta/meta_*_store.*`, `src/meta/meta_state_apply.*` |
-| Exact-cut snapshots and committed state-machine lifecycle | `src/meta/meta_state_machine.*` |
-| Coordinator proposal, subscription, role, and fail-safe behavior | `src/meta/meta_coordinator.*` |
-| Volatile observation admission and freshness | `src/meta/meta_observation_store.*` |
-| TLS identity, RBAC, Unix peer credentials, and administrative protocol | `src/meta/meta_identity_verifier.*`, `src/meta/meta_ctl_server.*`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
-| Raft WAL, vote/config state, native Asio hooks, proposal executor, and Celer completion bridge | `src/meta/nuraft_log_store.*`, `src/meta/nuraft_state_mgr.*`, `src/meta/nuraft_asio_transport.*`, `src/meta/meta_proposal_executor.*`, `src/meta/nuraft_scheduler.*`, `third_party/patches/nuraft/` |
+| Public Meta boundaries, commands, store composition, and correctness contracts | `include/keylane/meta/` |
+| Deterministic apply, stores, coordinator, observations, and administrative protocol implementations | `src/meta/` |
+| Raft WAL, vote/config state, native Asio hooks, and proposal executor | `include/keylane/meta/nuraft_*`, `src/meta/nuraft_*`, `src/meta/proposal_executor.cpp`, `third_party/patches/nuraft/` |
+| Foreign-thread typed completion ingress and worker wakeup | `celer/include/celer/runtime/foreign_executor.h`, `celer/src/runtime/foreign_executor.cpp`, `celer/include/celer/runtime/cross_core.h`, `celer/src/runtime/worker.cpp` |
+| TLS identity, RBAC, Unix peer credentials, and administrative clients | `include/keylane/meta/identity_verifier.h`, `include/keylane/meta/ctl_server.h`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

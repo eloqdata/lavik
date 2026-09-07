@@ -16,12 +16,10 @@
 //
 // ACTOR ON THE WIRE: the command codec encodes the trusted-entry-injected
 // ActorContext (actor_principal, readable_time) as ordinary bounded fields of
-// every command body (meta_commands.h), so a committed command decodes with
+// every command body (commands.h), so a committed command decodes with
 // the same actor the entry injected and the audit/journal records below
 // carry it verbatim. Unforgeability is enforced at the ctl/coordinator entry
 // server, not by this internal encoding.
-
-#include "meta/meta_state_machine.h"
 
 #include <unistd.h>
 
@@ -38,12 +36,13 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
+#include "keylane/meta/nuraft_log_store.h"
+#include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/state_apply.h"
+#include "keylane/meta/state_machine.h"
 #include "libnuraft/nuraft.hxx"
-#include "meta/meta_commands.h"
-#include "meta/meta_encoding.h"
-#include "meta/meta_state_apply.h"
-#include "meta/nuraft_log_store.h"
-#include "meta/nuraft_state_mgr.h"
 
 namespace {
 
@@ -721,7 +720,7 @@ class MetaServerIntegrationTest : public ::testing::Test {
       server_->shutdown();
     }
     if (machine_) {
-      // Shutdown contract (meta_state_machine.h): shutdown() joins the commit
+      // Shutdown contract (state_machine.h): shutdown() joins the commit
       // thread, so no new snapshot jobs arrive; drain the SM writer so an
       // in-flight when_done lands on the still-alive core before reset().
       machine_->WaitForSnapshotWriterIdle();

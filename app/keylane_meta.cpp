@@ -8,23 +8,24 @@
 //   - main thread: CLI parse, assembly, startup waits, signal polling, and
 //     the ordered teardown. raft_server construction/teardown happen here;
 //     NuRaft's public API is thread-safe.
-//   - one celer Runtime worker: authenticated ctl/Data Node control transport
-//     plus the completion bridge drain loop.
+//   - one celer Runtime worker: ctl/future Data Node control transport, with
+//     authentication determined by the selected listener mode.
 //   - one bounded proposal-executor thread: synchronous entry into NuRaft's
 //     mutation/snapshot APIs, keeping their locks and WAL IO off Celer.
 //   - NuRaft native Asio workers: peer RPC and timers. NuRaft commit/append
 //     threads perform synchronous durability IO; completion and role events
-//     hop back to Celer through MetaCelerBridge.
+//     return to Celer through the Runtime's foreign executor mailbox.
 //
 // Teardown order (main thread, on SIGTERM/SIGINT):
 //   ctl Shutdown() -> proposal executor drain -> raft_launcher::shutdown()
 //   -> MetaStateMachine::WaitForSnapshotWriterIdle() -> release Raft ref ->
-//   bridge Stop() -> Celer Runtime stop + join -> coordinator release.
+//   Celer Runtime stop + join -> coordinator release.
 // shutdown() joins the commit thread — the only producer of automatic
 // snapshot jobs — and the writer drain lets an in-flight when_done reach the
 // still-alive core before reset (the shutdown contract in
-// meta_state_machine.h). The bridge's FIFO inbox drains the posted shutdown
-// closures before the drain loop exits, and raft_server owns the
+// state_machine.h). Once those producers quiesce, ForeignExecutor drains its
+// accepted notifications before the generic Celer Runtime is stopped, and
+// raft_server owns the
 // nuraft::context through a unique_ptr member — the caller must never delete
 // the context itself.
 
@@ -34,10 +35,10 @@
 
 #include <atomic>
 #include <chrono>
-#include <coroutine>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -52,7 +53,7 @@
 #include "celer/runtime/runtime.h"
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/spdlog.h"
-// NuRaft's headers are not -Wpedantic-clean; see nuraft_scheduler.h.
+// NuRaft's headers are not -Wpedantic-clean.
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -68,22 +69,20 @@
 #include "libnuraft/srv_config.hxx"
 #pragma GCC diagnostic pop
 
+#include "keylane/meta/coordinator.h"
+#include "keylane/meta/ctl_server.h"
+#include "keylane/meta/identity_verifier.h"
+#include "keylane/meta/nuraft_asio_transport.h"
+#include "keylane/meta/nuraft_log_store.h"
+#include "keylane/meta/nuraft_state_mgr.h"
+#include "keylane/meta/observation_store.h"
+#include "keylane/meta/proposal_executor.h"
+#include "keylane/meta/state_machine.h"
 #include "keylane/version.h"
-#include "meta/meta_coordinator.h"
-#include "meta/meta_ctl_server.h"
-#include "meta/meta_identity_verifier.h"
-#include "meta/meta_observation_store.h"
-#include "meta/meta_proposal_executor.h"
-#include "meta/meta_state_machine.h"
-#include "meta/nuraft_asio_transport.h"
-#include "meta/nuraft_log_store.h"
-#include "meta/nuraft_scheduler.h"
-#include "meta/nuraft_state_mgr.h"
 
 namespace {
 
 using keylane::meta::MetaAsioTransportConfig;
-using keylane::meta::MetaCelerBridge;
 using keylane::meta::MetaCoordinator;
 using keylane::meta::MetaCoordinatorOptions;
 using keylane::meta::MetaCtlServer;
@@ -102,7 +101,7 @@ struct CliOptions {
   bool has_id_ = false;
   std::string raft_addr_;  // "ip:port": raft bind AND advertised endpoint
   std::string data_dir_;
-  std::string ctl_addr_;    // optional remote "ip:port" mTLS control surface
+  std::string ctl_addr_;    // optional remote "ip:port" control surface
   std::string ctl_socket_;  // default: <data-dir>/meta-admin.sock
   std::vector<uid_t> ctl_allowed_uids_;
   std::string ctl_tls_ca_;
@@ -360,11 +359,6 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
         "--ctl-tls-ca, --ctl-tls-cert and --ctl-tls-key must be given "
         "together");
   }
-  if (!options.ctl_addr_.empty() && !ctl_tls_all) {
-    return absl::InvalidArgumentError(
-        "--ctl-addr requires complete ctl mTLS options; plaintext TCP admin "
-        "is forbidden");
-  }
   if (!options.ctl_socket_.empty() && ctl_tls_any) {
     return absl::InvalidArgumentError(
         "ctl TLS options apply only to --ctl-addr");
@@ -591,14 +585,6 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  // --- Celer completion ingress (allocation only; no worker touched) ---
-  auto bridge_or = MetaCelerBridge::Create();
-  if (!bridge_or.ok()) {
-    spdlog::critical("bridge create failed: {}", bridge_or.status().message());
-    return 1;
-  }
-  std::shared_ptr<MetaCelerBridge> bridge = *bridge_or;
-
   // --- durable state (synchronous file IO, main thread) ---
   auto mgr_or =
       NuraftStateMgr::Open(options.data_dir_, options.id_, options.raft_addr_);
@@ -637,22 +623,21 @@ int main(int argc, char** argv) {
   nuraft::asio_service::options asio_options = std::move(*asio_options_or);
 
   // --- Celer runtime ---
-  // One worker owns the bridge and ctl/future Data Node transport. Runtime
-  // owns its thread, CrossCore mailbox, and wake eventfd. NuRaft remains a
-  // foreign-thread producer and enters through MetaCelerBridge, not CrossCore.
+  // One worker owns ctl/future Data Node transport. Runtime owns its thread,
+  // MPSC mailbox, and wake eventfd. NuRaft posts typed notifications directly
+  // through the worker's foreign executor without touching Celer TLS.
   celer::Runtime celer_runtime;
   std::promise<absl::Status> init_promise;
   std::future<absl::Status> init_future = init_promise.get_future();
   celer_runtime.Start(
       /*thread_count=*/
       1,
-      [bridge, &init_promise](unsigned, celer::Worker& worker) {
+      [&init_promise](unsigned, celer::Worker& worker) {
         const absl::Status init = worker.Init(celer::WorkerOptions{});
         init_promise.set_value(init);
         if (!init.ok()) {
           return 1;
         }
-        worker.Spawn(bridge->Run(worker));
         worker.Run();
         // With one worker there are no cross-worker frames to coordinate, but
         // cleanup still belongs on the worker thread for thread-affine state.
@@ -661,6 +646,8 @@ int main(int argc, char** argv) {
         return 0;
       },
       /*pin_workers=*/false);
+  const celer::ForeignExecutor foreign_executor =
+      celer_runtime.GetForeignExecutor(/*worker_id=*/0);
   const absl::Status worker_init = init_future.get();
   if (!worker_init.ok()) {
     spdlog::critical("worker init failed: {}", worker_init.message());
@@ -697,9 +684,9 @@ int main(int argc, char** argv) {
   auto coordinator_target =
       std::make_shared<std::atomic<MetaCoordinator*>>(nullptr);
   auto pending_role = std::make_shared<std::atomic<int>>(-1);
-  init_opts.raft_callback_ = [bridge, coordinator_target, pending_role](
-                                 nuraft::cb_func::Type type,
-                                 nuraft::cb_func::Param* param) {
+  init_opts.raft_callback_ = [foreign_executor, coordinator_target,
+                              pending_role](nuraft::cb_func::Type type,
+                                            nuraft::cb_func::Param* param) {
     const nuraft::cb_func::ReturnCode logged = RaftEventCallback(type, param);
     int role = -1;
     if (type == nuraft::cb_func::BecomeLeader) {
@@ -711,13 +698,19 @@ int main(int argc, char** argv) {
       pending_role->store(role, std::memory_order_release);
       // NuRaft/Asio threads never call coordinator/Celer-owned state
       // directly. Stale queued edges read the latest role when drained.
-      bridge->Post([coordinator_target, pending_role](celer::Worker&) {
-        MetaCoordinator* target =
-            coordinator_target->load(std::memory_order_acquire);
-        if (target == nullptr) return;
-        const int current = pending_role->load(std::memory_order_acquire);
-        current == 1 ? target->BecomeLeader() : target->BecomeFollower();
-      });
+      const bool accepted = foreign_executor.Notify(
+          [coordinator_target, pending_role]() noexcept {
+            MetaCoordinator* target =
+                coordinator_target->load(std::memory_order_acquire);
+            if (target == nullptr) return;
+            const int current = pending_role->load(std::memory_order_acquire);
+            current == 1 ? target->BecomeLeader() : target->BecomeFollower();
+          });
+      if (!accepted) {
+        // This path is quiesced before Runtime shutdown. Losing a role edge
+        // here would leave leader-only control logic in the wrong state.
+        std::terminate();
+      }
     }
     return logged;
   };
@@ -728,7 +721,7 @@ int main(int argc, char** argv) {
   if (server == nullptr) {
     spdlog::critical("failed to start NuRaft Asio listener on {}",
                      options.raft_addr_);
-    bridge->Stop();
+    foreign_executor.WaitUntilIdle();
     celer_runtime.RequestStop();
     celer_runtime.WaitUntilStopped();
     return 1;
@@ -743,12 +736,7 @@ int main(int argc, char** argv) {
   auto* wal = static_cast<keylane::meta::NuraftLogStore*>(raft_log_store.get());
   MetaCoordinatorOptions coordinator_options;
   coordinator_options.proposal_executor_ = proposal_executor.get();
-  coordinator_options.schedule_resume_ =
-      [bridge](std::coroutine_handle<> continuation) {
-        bridge->Post([continuation](celer::Worker& owner) {
-          owner.Enqueue(continuation);
-        });
-      };
+  coordinator_options.foreign_executor_ = foreign_executor;
   std::shared_ptr<MetaCoordinator> coordinator =
       std::make_shared<MetaCoordinator>(server, *state_machine, *wal,
                                         *obs_store, coordinator_options);
@@ -763,7 +751,10 @@ int main(int argc, char** argv) {
   if (exit_code == 0) {
     MetaCtlServerOptions ctl_options;
     if (ctl_endpoint.has_value()) {
-      ctl_options.transport_ = MetaCtlServerOptions::Transport::kTcpMtls;
+      ctl_options.transport_ =
+          options.ctl_tls_ca_.empty()
+              ? MetaCtlServerOptions::Transport::kTcpPlaintext
+              : MetaCtlServerOptions::Transport::kTcpMtls;
       ctl_options.bind_host_ = ctl_endpoint->host_;
       ctl_options.port_ = ctl_endpoint->port_;
       ctl_options.tls_ca_cert_file_ = options.ctl_tls_ca_;
@@ -775,7 +766,7 @@ int main(int argc, char** argv) {
       ctl_options.allowed_uids_ = options.ctl_allowed_uids_;
     }
     auto ctl_or = MetaCtlServer::Create(
-        bridge, server, state_machine, coordinator, obs_store,
+        foreign_executor, server, state_machine, coordinator, obs_store,
         *proposal_executor, membership_gate, std::move(ctl_options));
     if (!ctl_or.ok()) {
       spdlog::critical("ctl server create failed: {}",
@@ -807,8 +798,8 @@ int main(int argc, char** argv) {
                  static_cast<int>(g_last_shutdown_signal));
   }
 
-  // Stop Celer ingress first, then quiesce NuRaft/Asio while the completion
-  // bridge and snapshot writer remain alive.
+  // Stop ctl ingress first, then quiesce NuRaft/Asio while the Celer worker
+  // mailbox and snapshot writer remain alive.
   if (ctl != nullptr) {
     ctl->Shutdown();
   }
@@ -816,18 +807,22 @@ int main(int argc, char** argv) {
   coordinator_target->store(nullptr, std::memory_order_release);
   // No new Celer ingress or leader work is accepted. Drain queued NuRaft
   // mutation/snapshot entry before stopping its Asio service; cmd_result
-  // completions can still use the live bridge while shutdown resolves rounds.
+  // completions can still use the live foreign executor while shutdown
+  // resolves rounds.
   proposal_executor->Shutdown();
   if (!launcher.shutdown()) {
     spdlog::error("NuRaft Asio shutdown did not quiesce within its timeout");
     exit_code = 1;
   }
   // Snapshot-writer drain between shutdown() and reset(), per the shutdown
-  // contract in meta_state_machine.h: an in-flight when_done must reach the
+  // contract in state_machine.h: an in-flight when_done must reach the
   // core while it is still alive.
   state_machine->WaitForSnapshotWriterIdle();
   server.reset();
-  bridge->Stop();
+  // Every foreign producer is now quiescent. Drain its accepted mailbox
+  // prefix before stopping the generic Runtime, keeping this lifecycle policy
+  // out of Celer's data-plane Worker loop.
+  foreign_executor.WaitUntilIdle();
   celer_runtime.RequestStop();
   celer_runtime.WaitUntilStopped();
   if (celer_runtime.exit_code() != 0) exit_code = 1;

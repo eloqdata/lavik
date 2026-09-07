@@ -209,7 +209,7 @@ those deployment boundaries remain unknown here.
 | Claim | Repository source |
 |---|---|
 | Language level, targets, dependencies, source units, and test entry points | `CMakeLists.txt` |
-| Meta control-plane composition and the NuRaft layering boundary | `CMakeLists.txt`, `app/keylane_meta.cpp`, `src/meta/`, `.gitmodules` |
+| Meta control-plane composition and the NuRaft layering boundary | `CMakeLists.txt`, `app/keylane_meta.cpp`, `include/keylane/meta/`, `src/meta/`, `.gitmodules` |
 | CLI/config parsing and top-level process entry | `app/keylane.cpp`, `include/keylane/config.h`, `src/config.cpp` |
 | Module construction, worker startup barriers, readiness, and shutdown ordering | `include/keylane/server.h`, `src/redis/server.cpp` |
 | Celer runtime and service dependency | `.gitmodules`, `celer/include/celer/runtime/`, `celer/include/celer/net/`, `celer/src/` |

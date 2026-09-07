@@ -1,6 +1,6 @@
 // Model-layer tests for encoding
-// primitives (src/meta/meta_encoding) and the committed command schema
-// (src/meta/meta_commands).
+// primitives (src/meta/encoding.cpp) and the committed command schema
+// (src/meta/commands.cpp).
 //
 // The tests exercise only the public surface: encode/decode round-trips and
 // rejection behavior (truncation, corruption, unknown version/command,
@@ -15,10 +15,10 @@
 #include "absl/status/status.h"
 #include "absl/strings/str_cat.h"
 #include "gtest/gtest.h"
-#include "meta/meta_commands.h"
-#include "meta/meta_encoding.h"
-#include "meta/meta_hash.h"
-#include "meta/meta_state_apply.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
+#include "keylane/meta/hash.h"
+#include "keylane/meta/state_apply.h"
 
 namespace {
 
@@ -886,7 +886,7 @@ TEST(MetaModelCommands, DecodeRejectsBufferOverCommandCap) {
 }
 
 // ---------------------------------------------------------------------------
-// Apply layer (src/meta/meta_state_apply): the ApplyCommitted dispatcher.
+// Apply layer (src/meta/state_apply.cpp): the ApplyCommitted dispatcher.
 // Tests drive the public surface only: MetaStores + ApplyCommitted with
 // caller-injected actor fields, plus the whole-aggregate snapshot codec.
 // ---------------------------------------------------------------------------

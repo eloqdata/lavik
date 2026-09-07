@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end gate for keylane-meta-ctl over Unix sockets and TCP mTLS.
+"""End-to-end gate for keylane-meta-ctl over Unix and TCP transports.
 
 Usage: ctl_client.py /path/to/keylane-meta /path/to/keylane-meta-ctl [workdir]
 """
@@ -68,6 +68,60 @@ def unix_gate(workdir):
         H.log("keylane-meta-ctl Unix transport and exit statuses — OK")
     finally:
         node.terminate()
+
+
+def plaintext_gate(workdir):
+    directory = os.path.join(workdir, "plaintext")
+    data_dir = os.path.join(directory, "node1")
+    os.makedirs(data_dir, mode=0o700, exist_ok=True)
+    raft_port = H.free_port()
+    ctl_port = H.free_port()
+    log_path = os.path.join(directory, "node1.log")
+    log_file = open(log_path, "wb")
+    server = subprocess.Popen(
+        [META, "--id", "1", "--addr", f"127.0.0.1:{raft_port}",
+         "--data-dir", data_dir, "--bootstrap",
+         "--ctl-addr", f"127.0.0.1:{ctl_port}"] + H.raft_args(),
+        stdout=log_file, stderr=subprocess.STDOUT)
+    client_args = ["--addr", f"127.0.0.1:{ctl_port}"]
+    try:
+        def ready():
+            if server.poll() is not None:
+                raise H.Failure(
+                    f"plaintext server exited with {server.returncode}")
+            result = subprocess.run(
+                [CTL] + client_args + ["status"], capture_output=True,
+                text=True, timeout=3)
+            return (result.returncode == 0 and
+                    result.stdout.startswith("OK leader=1 "))
+
+        H.wait_until("plaintext ctl listener", 15, ready)
+        status = run(client_args + ["status"])
+        if not status.startswith("OK leader="):
+            raise H.Failure(f"unexpected plaintext status: {status}")
+
+        op_id = "00000002000000000000000000000001"
+        reply = run(client_args + ["submitop", op_id, "ctl-gate", "plain"])
+        if not reply.startswith("OK "):
+            raise H.Failure(f"plaintext submitop: {reply}")
+        export = run(client_args + ["exportaudit", reply.split()[1]])
+        if not export.startswith("OK "):
+            raise H.Failure(f"plaintext exportaudit: {export}")
+        if b"keylane://operator/plaintext" not in bytes.fromhex(export[3:]):
+            raise H.Failure("plaintext audit actor was not persisted")
+        H.log("keylane-meta-ctl remote plaintext transport — OK")
+    finally:
+        if server.poll() is None:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait(timeout=5)
+        log_file.close()
+        if server.returncode not in (0, -15):
+            with open(log_path, errors="replace") as handle:
+                H.log(handle.read()[-4000:])
 
 
 def mtls_gate(workdir):
@@ -147,6 +201,7 @@ def main():
     workdir, keep = H.make_workdir(harness_argv, "meta_ctl_client_")
     try:
         unix_gate(workdir)
+        plaintext_gate(workdir)
         mtls_gate(workdir)
     except Exception:
         H.log(f"FAIL; artifacts kept at {workdir}")

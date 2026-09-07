@@ -1,7 +1,7 @@
 // Journal-side tests for the audit
-// store (src/meta/meta_audit_store), the term/grant store
-// (src/meta/meta_grant_store), and the operation journal store
-// (src/meta/meta_operation_store).
+// store (src/meta/audit_store.cpp), the term/grant store
+// (src/meta/grant_store.cpp), and the operation journal store
+// (src/meta/operation_store.cpp).
 //
 // The tests exercise only the public surface: state queryable after applying
 // commands, rejection behavior, idempotent replay acceptance vs conflict
@@ -14,11 +14,11 @@
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
-#include "meta/meta_audit_store.h"
-#include "meta/meta_commands.h"
-#include "meta/meta_encoding.h"
-#include "meta/meta_grant_store.h"
-#include "meta/meta_operation_store.h"
+#include "keylane/meta/audit_store.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/encoding.h"
+#include "keylane/meta/grant_store.h"
+#include "keylane/meta/operation_store.h"
 
 namespace {
 

@@ -144,7 +144,7 @@ void PrintUsage(const char* program) {
       stderr,
       "Usage:\n"
       "  %s --socket PATH [--timeout-ms N] COMMAND [ARG...]\n"
-      "  %s --addr IP:PORT --tls-ca FILE --tls-cert FILE --tls-key FILE\n"
+      "  %s --addr IP:PORT [--tls-ca FILE --tls-cert FILE --tls-key FILE]\n"
       "     [--tls-server-name NAME] [--timeout-ms N] COMMAND [ARG...]\n"
       "\n"
       "The command is sent as one LF-terminated Meta control-protocol line.\n"
@@ -235,8 +235,11 @@ Options ParseOptions(int argc, char** argv, bool* early_exit) {
                        !options.tls_key_.empty();
   const bool tls_all = !options.tls_ca_.empty() && !options.tls_cert_.empty() &&
                        !options.tls_key_.empty();
-  if (!options.address_.empty() && !tls_all) {
-    Fail("--addr requires --tls-ca, --tls-cert, and --tls-key");
+  if (!options.address_.empty() && tls_any != tls_all) {
+    Fail("--tls-ca, --tls-cert, and --tls-key must be given together");
+  }
+  if (!options.tls_server_name_.empty() && !tls_all) {
+    Fail("--tls-server-name requires TLS options");
   }
   if (!options.socket_path_.empty() &&
       (tls_any || !options.tls_server_name_.empty())) {
@@ -531,12 +534,17 @@ int Run(const Options& options) {
     FileDescriptor fd = Connect(
         endpoint.family_, reinterpret_cast<const sockaddr*>(&endpoint.address_),
         endpoint.length_, deadline);
-    SslContext context = MakeTlsContext(options);
-    SslSession ssl = StartTls(context.get(), fd.get(), endpoint,
-                              options.tls_server_name_, deadline);
-    TlsWriteAll(ssl.get(), command, deadline);
-    reply = TlsReadLine(ssl.get(), deadline);
-    (void)SSL_shutdown(ssl.get());
+    if (options.tls_ca_.empty()) {
+      PlainWriteAll(fd.get(), command, deadline);
+      reply = PlainReadLine(fd.get(), deadline);
+    } else {
+      SslContext context = MakeTlsContext(options);
+      SslSession ssl = StartTls(context.get(), fd.get(), endpoint,
+                                options.tls_server_name_, deadline);
+      TlsWriteAll(ssl.get(), command, deadline);
+      reply = TlsReadLine(ssl.get(), deadline);
+      (void)SSL_shutdown(ssl.get());
+    }
   }
 
   std::cout << reply << '\n';

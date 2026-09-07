@@ -19,8 +19,8 @@
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
-#include "meta/meta_encoding.h"
-#include "meta/meta_observation_store.h"
+#include "keylane/meta/encoding.h"
+#include "keylane/meta/observation_store.h"
 
 namespace {
 

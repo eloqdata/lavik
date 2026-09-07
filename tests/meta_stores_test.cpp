@@ -18,10 +18,10 @@
 
 #include "absl/status/status.h"
 #include "gtest/gtest.h"
-#include "meta/meta_encoding.h"
-#include "meta/meta_identity_store.h"
-#include "meta/meta_policy_store.h"
-#include "meta/meta_topology_store.h"
+#include "keylane/meta/encoding.h"
+#include "keylane/meta/identity_store.h"
+#include "keylane/meta/policy_store.h"
+#include "keylane/meta/topology_store.h"
 
 namespace {
 

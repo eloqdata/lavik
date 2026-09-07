@@ -4,10 +4,10 @@
 #include <vector>
 
 #include "gtest/gtest.h"
-#include "meta/meta_commands.h"
-#include "meta/meta_ctl_server.h"
-#include "meta/meta_identity_store.h"
-#include "meta/meta_identity_verifier.h"
+#include "keylane/meta/commands.h"
+#include "keylane/meta/ctl_server.h"
+#include "keylane/meta/identity_store.h"
+#include "keylane/meta/identity_verifier.h"
 
 namespace {
 
@@ -116,20 +116,21 @@ TEST(MetaIdentitySecurity, UnixPeerMustBeOnTheExplicitUidAllowlist) {
   EXPECT_EQ(rejected.status().code(), absl::StatusCode::kPermissionDenied);
 }
 
-TEST(MetaIdentitySecurity, PlaintextTcpAdminConfigurationFailsFast) {
+TEST(MetaIdentitySecurity, TcpAdminSupportsPlaintextOrCompleteMtls) {
   keylane::meta::MetaCtlServerOptions options;
-  options.transport_ = keylane::meta::MetaCtlServerOptions::Transport::kTcpMtls;
+  options.transport_ =
+      keylane::meta::MetaCtlServerOptions::Transport::kTcpPlaintext;
   options.bind_host_ = "127.0.0.1";
   options.port_ = 9000;
-  const absl::Status rejected =
-      keylane::meta::MetaCtlServer::ValidateOptions(options);
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_NE(rejected.message().find("plaintext TCP administration"),
-            std::string_view::npos);
+  EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
 
   options.tls_ca_cert_file_ = "ca.pem";
+  EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
   options.tls_cert_file_ = "server.pem";
   options.tls_key_file_ = "server.key";
+  EXPECT_FALSE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
+
+  options.transport_ = keylane::meta::MetaCtlServerOptions::Transport::kTcpMtls;
   EXPECT_TRUE(keylane::meta::MetaCtlServer::ValidateOptions(options).ok());
 }
 

@@ -23,8 +23,10 @@ socket itself is mode 0600 and authenticates the caller with Linux
 `SO_PEERCRED`. By default only the process uid is allowed; repeat
 `--ctl-allow-uid N` to replace that default with an explicit uid allowlist.
 The socket parent must not be group- or world-writable. Remote administration
-is a separate option: `--ctl-addr` requires all three `--ctl-tls-*` arguments,
-and plaintext TCP administration is rejected even on loopback.
+is a separate option: `--ctl-addr` uses plaintext TCP unless all three
+`--ctl-tls-*` arguments are supplied. Partial TLS configuration fails startup
+instead of silently downgrading. A plaintext listener grants operator access to
+any reachable peer, so expose it only on loopback or a trusted private network.
 
 Only the first process of a new cluster is started with `--bootstrap`. A fresh
 process without `--bootstrap` opens its listener and waits to be invited; merely
@@ -48,6 +50,23 @@ is five seconds and `--timeout-ms` changes the whole connect/send/receive
 deadline. Query every live member when locating the leader; the leader's reply
 contains `leader=1`, while mutation requests sent to a follower return
 `ERR not-leader`.
+
+For plaintext remote administration, configure a listener and connect without
+TLS arguments:
+
+```sh
+keylane-meta --id 1 --addr 10.0.0.11:7100 \
+  --data-dir /var/lib/keylane/meta-1 --bootstrap \
+  --ctl-addr 10.0.0.11:7200
+
+keylane-meta-ctl --addr 10.0.0.11:7200 status
+```
+
+All plaintext peers share the audit actor
+`keylane://operator/plaintext`; source IP addresses are not treated as
+authenticated identities. Use the mTLS configuration below when distinct,
+cryptographically authenticated operators or data nodes need the remote
+surface.
 
 ## Run a local plaintext cluster
 

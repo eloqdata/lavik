@@ -21,9 +21,9 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "keylane/meta/nuraft_log_store.h"
+#include "keylane/meta/nuraft_state_mgr.h"
 #include "libnuraft/nuraft.hxx"
-#include "meta/nuraft_log_store.h"
-#include "meta/nuraft_state_mgr.h"
 
 namespace {
 

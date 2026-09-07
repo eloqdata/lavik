@@ -483,33 +483,33 @@ if (KEYLANE_BUILD_META)
   # only into keylane-meta; keylane, keylane_module, and the test binaries
   # must stay Raft-free so the data plane never sees consensus code.
   #
-  # keylane_meta_core carries durability, the completion bridge, and control
-  # logic; NuRaft's native Asio service owns peer transport and timers.
+  # keylane_meta_core carries durability and control logic; Celer owns
+  # foreign-thread completion ingress while NuRaft's native Asio service owns
+  # peer transport and timers.
   set(KEYLANE_META_CORE_SOURCES
-    src/meta/meta_audit_store.cpp
-    src/meta/meta_commands.cpp
-    src/meta/meta_coordinator.cpp
-    src/meta/meta_ctl_server.cpp
-    src/meta/meta_encoding.cpp
-    src/meta/meta_grant_store.cpp
-    src/meta/meta_identity_verifier.cpp
-    src/meta/meta_identity_store.cpp
-    src/meta/meta_observation_store.cpp
-    src/meta/meta_operation_store.cpp
-    src/meta/meta_policy_store.cpp
-    src/meta/meta_proposal_executor.cpp
-    src/meta/meta_state_apply.cpp
-    src/meta/meta_state_machine.cpp
-    src/meta/meta_topology_store.cpp
-    src/meta/meta_value_codec.cpp
+    src/meta/audit_store.cpp
+    src/meta/commands.cpp
+    src/meta/coordinator.cpp
+    src/meta/ctl_server.cpp
+    src/meta/encoding.cpp
+    src/meta/grant_store.cpp
+    src/meta/identity_verifier.cpp
+    src/meta/identity_store.cpp
+    src/meta/observation_store.cpp
+    src/meta/operation_store.cpp
+    src/meta/policy_store.cpp
+    src/meta/proposal_executor.cpp
+    src/meta/state_apply.cpp
+    src/meta/state_machine.cpp
+    src/meta/topology_store.cpp
+    src/meta/value_codec.cpp
     src/meta/nuraft_asio_transport.cpp
     src/meta/nuraft_log_store.cpp
-    src/meta/nuraft_scheduler.cpp
     src/meta/nuraft_state_mgr.cpp
   )
   add_library(keylane_meta_core STATIC ${KEYLANE_META_CORE_SOURCES})
   target_include_directories(keylane_meta_core PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(keylane_meta_core PUBLIC
     NuRaft::static_lib
@@ -905,6 +905,7 @@ if (BUILD_TESTING)
     tests/cross_core_active_sender_test.cpp
     tests/cross_worker_mutex_test.cpp
     tests/device_affinity_test.cpp
+    tests/foreign_executor_test.cpp
     tests/logging_test.cpp
     tests/lua_eval_test.cpp
     tests/memory_test.cpp
