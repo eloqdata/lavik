@@ -2,17 +2,17 @@
 
 ## Process and storage prerequisites
 
-Build the separate Meta executable with:
+Build the separate Meta executable and its operator client with:
 
 ```sh
-cmake --build <build-dir> --target keylane_meta
+cmake --build <build-dir> --target keylane-meta keylane-meta-ctl
 ```
 
-A cluster normally has three `keylane_meta` processes. Every process needs:
+A cluster normally has three `keylane-meta` processes. Every process needs:
 
 - A positive, cluster-unique `--id` that never changes for that member.
 - A numeric IPv4 or IPv6 `--addr` used both as its Raft listener and advertised
-  endpoint. For IPv6, use the form accepted by `keylane_meta --help`.
+  endpoint. For IPv6, use the form accepted by `keylane-meta --help`.
 - A private `--data-dir`. Never share a directory between members or reuse it
   with another id.
 - A local administrative Unix socket, defaulting to
@@ -34,35 +34,20 @@ member.
 
 ## Send administrative commands
 
-This shell helper uses Python's standard library to send one LF-terminated
-command over the Unix socket. Run it as an allowed uid:
+`keylane-meta-ctl` sends one LF-terminated command and prints the one-line
+reply. Run it as an allowed uid when using the local Unix socket:
 
 ```sh
-meta_ctl() {
-  python3 - "$1" "$2" <<'PY'
-import socket
-import sys
-
-with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-    sock.connect(sys.argv[1])
-    sock.sendall((sys.argv[2] + "\n").encode())
-    reply = bytearray()
-    while not reply.endswith(b"\n"):
-        chunk = sock.recv(65536)
-        if not chunk:
-            break
-        reply.extend(chunk)
-print(reply.decode().rstrip("\n"))
-PY
-}
-
-meta_ctl /var/lib/keylane/meta-1/meta-admin.sock status
+keylane-meta-ctl \
+  --socket /var/lib/keylane/meta-1/meta-admin.sock status
 ```
 
-The connection may also remain open for multiple commands, with exactly one
-reply line per command. Query every live member when locating the leader; the
-leader's reply contains `leader=1`, while mutation requests sent to a follower
-return `ERR not-leader`.
+The client exits 0 for an `OK` reply, 2 for an `ERR` reply, and 1 for local,
+connection, TLS, timeout, or malformed-protocol failures. Its default timeout
+is five seconds and `--timeout-ms` changes the whole connect/send/receive
+deadline. Query every live member when locating the leader; the leader's reply
+contains `leader=1`, while mutation requests sent to a follower return
+`ERR not-leader`.
 
 ## Run a local plaintext cluster
 
@@ -72,7 +57,7 @@ addresses and durable directories should be managed by the service manager
 instead of background shell jobs:
 
 ```sh
-META_BIN=./build-clang/keylane_meta
+META_BIN=./build-clang/keylane-meta
 META_ROOT=/tmp/keylane-meta-demo
 install -d -m 0700 "$META_ROOT" \
   "$META_ROOT/node1" "$META_ROOT/node2" "$META_ROOT/node3"
@@ -93,16 +78,16 @@ install -d -m 0700 "$META_ROOT" \
 Wait until node 1 reports `leader=1`, then add one waiting member at a time:
 
 ```sh
-meta_ctl "$META_ROOT/node1/meta-admin.sock" status
-meta_ctl "$META_ROOT/node1/meta-admin.sock" \
-  "addsrv 2 127.0.0.1:7102"
+keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" status
+keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
+  addsrv 2 127.0.0.1:7102
 
-meta_ctl "$META_ROOT/node2/meta-admin.sock" status
+keylane-meta-ctl --socket "$META_ROOT/node2/meta-admin.sock" status
 
-meta_ctl "$META_ROOT/node1/meta-admin.sock" \
-  "addsrv 3 127.0.0.1:7103"
+keylane-meta-ctl --socket "$META_ROOT/node1/meta-admin.sock" \
+  addsrv 3 127.0.0.1:7103
 
-meta_ctl "$META_ROOT/node3/meta-admin.sock" status
+keylane-meta-ctl --socket "$META_ROOT/node3/meta-admin.sock" status
 ```
 
 Do not treat `addsrv` returning `OK` as proof that catch-up finished: NuRaft
@@ -167,7 +152,7 @@ the matching member leaf/key to each host. Start each process with its own leaf
 and the shared CA, for example member 1:
 
 ```sh
-keylane_meta \
+keylane-meta \
   --id 1 --addr 10.0.0.11:7100 --data-dir /var/lib/keylane/meta-1 \
   --bootstrap \
   --tls-ca /etc/keylane/meta/ca.crt \
@@ -187,6 +172,46 @@ change the WAL or snapshot format. `--raft-io-threads` sizes NuRaft's native
 Asio pool (default 2); it does not change the single Celer control-session
 worker or make WAL synchronization asynchronous.
 
+Remote administration configures its server certificate independently with
+`--ctl-tls-ca`, `--ctl-tls-cert`, and `--ctl-tls-key`. It may reuse that Meta
+member's Raft certificate when the control listener uses an IP or DNS already
+covered by the certificate and the leaf permits `serverAuth`; otherwise issue
+a dedicated server leaf with a SAN covering `--ctl-addr`. The client can select
+a DNS SAN instead of the numeric control address with `--tls-server-name`.
+
+Every client certificate must carry exactly one canonical operator URI SAN.
+The following development example uses the CA created above to issue
+`keylane://operator/admin`; production deployments should use their managed
+certificate issuer and normal lifetime/rotation policy:
+
+```sh
+umask 077
+
+openssl req -newkey rsa:2048 -nodes -sha256 \
+  -subj '/CN=keylane-meta-operator-admin' \
+  -addext 'subjectAltName=URI:keylane://operator/admin' \
+  -addext 'extendedKeyUsage=clientAuth' \
+  -addext 'keyUsage=critical,digitalSignature' \
+  -keyout "$TLS_ROOT/operator-admin.key" \
+  -out "$TLS_ROOT/operator-admin.csr"
+
+openssl x509 -req -sha256 -days 30 \
+  -in "$TLS_ROOT/operator-admin.csr" \
+  -CA "$TLS_ROOT/ca.crt" -CAkey "$TLS_ROOT/ca.key" \
+  -CAcreateserial -copy_extensions copy \
+  -out "$TLS_ROOT/operator-admin.crt"
+```
+
+Use that operator identity with the control client:
+
+```sh
+keylane-meta-ctl --addr 10.0.0.11:7200 \
+  --tls-ca /etc/keylane/meta/ca.crt \
+  --tls-cert /etc/keylane/meta/operator-admin.crt \
+  --tls-key /etc/keylane/meta/operator-admin.key \
+  status
+```
+
 ## Add and remove peers
 
 Membership commands are accepted only by the current leader and only one
@@ -194,7 +219,7 @@ change may be active at a time. To add a peer:
 
 1. Allocate a never-before-used positive id, private data directory, and Raft
    endpoint. With mTLS, issue its matching certificate first.
-2. Start the new `keylane_meta` process without `--bootstrap`.
+2. Start the new `keylane-meta` process without `--bootstrap`.
 3. On the current leader, run `addsrv <id> <endpoint>`. A third principal
    argument is accepted but may only be the matching canonical
    `keylane://meta/<id>`; omitting it selects that value automatically.
@@ -204,8 +229,8 @@ change may be active at a time. To add a peer:
 For example:
 
 ```sh
-meta_ctl /var/lib/keylane/meta-1/meta-admin.sock \
-  "addsrv 4 10.0.0.14:7100"
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock \
+  addsrv 4 10.0.0.14:7100
 ```
 
 The leader first commits and audits the member identity binding, then invokes
@@ -217,7 +242,7 @@ rather than creating a different identity.
 To remove a peer, select a follower and run this on the leader:
 
 ```sh
-meta_ctl /var/lib/keylane/meta-1/meta-admin.sock "removesrv 4"
+keylane-meta-ctl --socket /var/lib/keylane/meta-1/meta-admin.sock removesrv 4
 ```
 
 On success, Keylane first completes NuRaft `remove_srv`, then commits and

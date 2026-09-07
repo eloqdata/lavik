@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: WAL / snapshot recovery matrix for keylane_meta.
+"""Integration gate: WAL / snapshot recovery matrix for keylane-meta.
 
 Four serial scenarios, each on a fresh 3-node cluster with plain direct
 connections (faults are process-level: SIGKILL / SIGSTOP / SIGTERM):
@@ -20,7 +20,7 @@ C. install-snapshot: SIGSTOP a follower, write 100 keys, take a manual
 D. clean-restart: SIGTERM-restart every node in turn; committed never
    regresses and data stays complete.
 
-Usage: gate_recovery.py /path/to/keylane_meta [workdir]
+Usage: gate_recovery.py /path/to/keylane-meta [workdir]
 """
 
 import os

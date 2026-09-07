@@ -25,7 +25,7 @@ One 3-node cluster; serial phases:
    fresh session on the new leader. Committed history is verified
    unaffected by all observation traffic.
 
-Usage: gate_stale_evidence.py /path/to/keylane_meta [workdir]
+Usage: gate_stale_evidence.py /path/to/keylane-meta [workdir]
 """
 
 import os

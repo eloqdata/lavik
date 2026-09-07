@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Shared harness for the keylane_meta process gates.
+"""Shared harness for the keylane-meta process gates.
 
-Stdlib-only building blocks for driving multi-node keylane_meta clusters:
+Stdlib-only building blocks for driving multi-node keylane-meta clusters:
 
 - `Node`: process lifecycle (start on dynamic free ports with a mktemp
   data dir, clean SIGTERM stop, SIGKILL, SIGSTOP/SIGCONT pause/resume,
@@ -975,7 +975,7 @@ def dump_node_logs(nodes, lines=40):
 
 
 def make_workdir(argv, prefix):
-    """argv[1] is the keylane_meta binary; optional argv[2] pins (and keeps)
+    """argv[1] is the keylane-meta binary; optional argv[2] pins (and keeps)
     the workdir for debugging, mirroring smoke_3node.py."""
     if len(argv) > 2:
         workdir = argv[2]
@@ -990,7 +990,7 @@ def cleanup(workdir, keep):
 
 
 def tls_args(ca_cert, cert, key):
-    """mTLS flag triple for keylane_meta; all raft traffic then requires
+    """mTLS flag triple for keylane-meta; all raft traffic then requires
     client certs signed by ca_cert (the ctl surface remains a peer-credential
     authenticated Unix socket unless explicit ctl mTLS flags are supplied)."""
     return ["--tls-ca", ca_cert, "--tls-cert", cert, "--tls-key", key]

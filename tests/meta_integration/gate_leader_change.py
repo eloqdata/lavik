@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: leader-change safety for keylane_meta.
+"""Integration gate: leader-change safety for keylane-meta.
 
 Single 3-node cluster with ALL raft traffic flowing through the proxy
 mesh (bootstrap_meshed_cluster), continuous propose load throughout:
@@ -13,7 +13,7 @@ mesh (bootstrap_meshed_cluster), continuous propose load throughout:
 2. Round 2: kill -9 the NEW leader and repeat. Every write that ever
    returned OK must survive both failovers.
    Both rounds additionally assert the raft_callback_ trail directly (the
-   [raft-cb] lines emitted by keylane_meta): the new leader logs
+   [raft-cb] lines emitted by keylane-meta): the new leader logs
    BecomeLeader at a term above the victim's, timestamped at the moment
    its committed index observably caught up; the surviving follower logs
    BecomeFollower at the new term; the victim's pre-kill log shows its own
@@ -30,7 +30,7 @@ mesh (bootstrap_meshed_cluster), continuous propose load throughout:
 4. Stop the load, run the full committed-history check, and shut all
    nodes down cleanly.
 
-Usage: gate_leader_change.py /path/to/keylane_meta [workdir]
+Usage: gate_leader_change.py /path/to/keylane-meta [workdir]
 """
 
 from datetime import datetime

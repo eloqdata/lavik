@@ -2,7 +2,7 @@
 
 ## Boundary and state model
 
-`keylane_meta` is a separate C++ process for durable cluster metadata. It
+`keylane-meta` is a separate C++ process for durable cluster metadata. It
 embeds NuRaft and uses its native Asio service for Raft peer sockets, timers,
 and TLS. One Celer worker owns the administrative and future data-node control
 sessions; a bounded proposal executor keeps synchronous NuRaft API entry and
@@ -156,6 +156,9 @@ canonical URI SAN. Role-based authorization separates operators, Meta members,
 and data-node self-reporting; actor fields on the wire are never trusted.
 Certificate validity is enforced by TLS, but online issuance, rotation, CRL,
 and OCSP integration are outside this module.
+The one-shot `keylane-meta-ctl` operator client speaks the same ordered line
+protocol over either transport, verifies the remote server certificate, and
+keeps RESP and NuRaft dependencies out of the client.
 
 Every privileged committed command creates a deterministic audit record keyed
 by Raft log index. Records include the injected actor, proposal time, command
@@ -174,6 +177,6 @@ transition into or out of disabled mode.
 | Exact-cut snapshots and committed state-machine lifecycle | `src/meta/meta_state_machine.*` |
 | Coordinator proposal, subscription, role, and fail-safe behavior | `src/meta/meta_coordinator.*` |
 | Volatile observation admission and freshness | `src/meta/meta_observation_store.*` |
-| TLS identity, RBAC, Unix peer credentials, and administrative protocol | `src/meta/meta_identity_verifier.*`, `src/meta/meta_ctl_server.*`, `app/keylane_meta.cpp`, `celer/src/net/` |
+| TLS identity, RBAC, Unix peer credentials, and administrative protocol | `src/meta/meta_identity_verifier.*`, `src/meta/meta_ctl_server.*`, `app/keylane_meta.cpp`, `app/keylane_meta_ctl.cpp`, `celer/src/net/` |
 | Raft WAL, vote/config state, native Asio hooks, proposal executor, and Celer completion bridge | `src/meta/nuraft_log_store.*`, `src/meta/nuraft_state_mgr.*`, `src/meta/nuraft_asio_transport.*`, `src/meta/meta_proposal_executor.*`, `src/meta/nuraft_scheduler.*`, `third_party/patches/nuraft/` |
 | Recovery, partition, membership, and security gates | `tests/meta_*`, `tests/meta_integration/` |

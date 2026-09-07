@@ -14,13 +14,13 @@ of networked services. Redis serving, metrics, replication, transaction
 coordination, the cluster data plane, and storage are composed in `RunServer`;
 Celer owns the worker and socket lifecycle underneath those Keylane modules.
 
-A separate `keylane_meta` executable runs the [Raft-backed meta control
+A separate `keylane-meta` executable runs the [Raft-backed meta control
 plane](08-meta-control-plane.md). It owns committed cluster metadata,
 leader-local observations, authenticated administration, and coordination
 seams for future data-node control sessions. It links the pinned NuRaft
 submodule, whose native Asio service owns Raft peer communication; Celer owns
 the separate administrative and future data-node sessions. NuRaft is linked
-only into `keylane_meta`: the data-plane executable, library, and tests never
+only into `keylane-meta`: the data-plane executable, library, and tests never
 see consensus code, and the build enforces that boundary at configure time.
 
 ```text
@@ -191,7 +191,7 @@ state explicitly.
 |---|---|
 | Celer | Pinned git submodule compiled into Keylane for runtime, network, TLS, cross-core, HTTP, io_uring, and optional SPDK support |
 | mimalloc | Pinned allocator submodule; the official global new/delete override serves ordinary C++ allocations, while retained storage calls mimalloc through explicitly accounted domains |
-| NuRaft | Pinned Raft consensus submodule linked only by `keylane_meta`; its native Asio service owns Raft peer sockets, timers, and TLS and uses the Asio headers shipped in the NuRaft source tree |
+| NuRaft | Pinned Raft consensus submodule linked only by `keylane-meta`; its native Asio service owns Raft peer sockets, timers, and TLS and uses the Asio headers shipped in the NuRaft source tree |
 | OpenSSL | TLS server/client contexts; release builds can link it statically |
 | Redis/Valkey clients | RESP2 by default; `HELLO 2`/`HELLO 3` selects connection-level reply semantics, including RESP3 maps, sets, booleans, doubles, nulls, and push frames where handlers expose them |
 | Redis Sentinel | Discovers topology through Redis-compatible `INFO`, `ROLE`, client metadata, and Pub/Sub connections; drives failover with `REPLICAOF`, `CONFIG REWRITE`, and client eviction, using `replica-priority` for candidate preference |

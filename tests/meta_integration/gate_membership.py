@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration gate: membership-change semantics for keylane_meta.
+"""Integration gate: membership-change semantics for keylane-meta.
 
 One cluster under a continuous propose load; serial phases:
 
@@ -25,7 +25,7 @@ One cluster under a continuous propose load; serial phases:
    the gate follows the new behavior and still requires no data loss.
 6. Full committed-history check on the surviving members, clean teardown.
 
-Usage: gate_membership.py /path/to/keylane_meta [workdir]
+Usage: gate_membership.py /path/to/keylane-meta [workdir]
 """
 
 import os

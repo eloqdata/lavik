@@ -1,5 +1,5 @@
 // Entry point of the Raft-backed meta control plane.
-// keylane_meta is the only keylane artifact that links NuRaft: cluster
+// keylane-meta is the only keylane artifact that links NuRaft: cluster
 // membership and other control-plane metadata live on the meta plane, while
 // the data-plane binary (keylane) and its tests stay Raft-free by
 // construction (guarded in the root CMakeLists.txt).
@@ -212,7 +212,7 @@ absl::StatusOr<CliOptions> ParseCli(int argc, char** argv, const char* program,
       return options;
     }
     if (name == "--version") {
-      std::printf("keylane_meta %.*s (nuraft %s)\n",
+      std::printf("keylane-meta %.*s (nuraft %s)\n",
                   static_cast<int>(keylane::kVersion.size()),
                   keylane::kVersion.data(), KEYLANE_NURAFT_PINNED_COMMIT);
       *early_exit = true;
@@ -555,7 +555,7 @@ int main(int argc, char** argv) {
     return early_exit_code;
   }
   if (!parsed.ok()) {
-    std::fprintf(stderr, "keylane_meta: %s\n",
+    std::fprintf(stderr, "keylane-meta: %s\n",
                  std::string(parsed.status().message()).c_str());
     PrintUsage(argv[0]);
     return 1;
@@ -563,7 +563,7 @@ int main(int argc, char** argv) {
   const CliOptions options = *parsed;
   auto raft_endpoint = ParseEndpointArg(options.raft_addr_);
   if (!raft_endpoint.ok()) {
-    std::fprintf(stderr, "keylane_meta: --addr: %s\n",
+    std::fprintf(stderr, "keylane-meta: --addr: %s\n",
                  std::string(raft_endpoint.status().message()).c_str());
     return 1;
   }
@@ -571,7 +571,7 @@ int main(int argc, char** argv) {
   if (!options.ctl_addr_.empty()) {
     auto parsed_ctl = ParseEndpointArg(options.ctl_addr_);
     if (!parsed_ctl.ok()) {
-      std::fprintf(stderr, "keylane_meta: --ctl-addr: %s\n",
+      std::fprintf(stderr, "keylane-meta: --ctl-addr: %s\n",
                    std::string(parsed_ctl.status().message()).c_str());
       return 1;
     }

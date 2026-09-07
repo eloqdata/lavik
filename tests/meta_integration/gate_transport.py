@@ -21,7 +21,7 @@ throughout:
    filtering never wedge a peer's busy flag — and no node may have
    crashed or hung its ctl surface.
 
-Usage: gate_transport.py /path/to/keylane_meta [workdir]
+Usage: gate_transport.py /path/to/keylane-meta [workdir]
 """
 
 import os

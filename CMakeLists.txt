@@ -150,7 +150,7 @@ set(MI_EXTRA_CPPDEFS "MI_DEFAULT_ARENA_EAGER_COMMIT=1" CACHE STRING "" FORCE)
 add_subdirectory(third_party/mimalloc)
 
 option(KEYLANE_BUILD_META
-  "Build the keylane_meta Raft control plane (requires the recursive nuraft submodule)"
+  "Build the keylane-meta Raft control plane (requires the recursive nuraft submodule)"
   ON)
 if (KEYLANE_BUILD_META)
   if (NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nuraft/CMakeLists.txt)
@@ -454,7 +454,7 @@ endif()
 
 if (KEYLANE_BUILD_META)
   # Architecture layering: Raft is a meta-plane concern. NuRaft is linked
-  # only into keylane_meta; keylane, keylane_module, and the test binaries
+  # only into keylane-meta; keylane, keylane_module, and the test binaries
   # must stay Raft-free so the data plane never sees consensus code.
   #
   # keylane_meta_core carries durability, the completion bridge, and control
@@ -493,20 +493,37 @@ if (KEYLANE_BUILD_META)
     target_compile_options(keylane_meta_core PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
-  add_executable(keylane_meta
+  add_executable(keylane-meta
     app/keylane_meta.cpp
   )
-  target_include_directories(keylane_meta PRIVATE
+  target_include_directories(keylane-meta PRIVATE
     ${KEYLANE_GENERATED_INCLUDE_DIR}
   )
-  target_compile_definitions(keylane_meta PRIVATE
+  target_compile_definitions(keylane-meta PRIVATE
     KEYLANE_NURAFT_PINNED_COMMIT=\"0b01b185b46b8e482f6c384b636c35605121a41e\"
   )
-  target_link_libraries(keylane_meta PRIVATE
+  target_link_libraries(keylane-meta PRIVATE
     keylane_meta_core
   )
   if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(keylane_meta PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(keylane-meta PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+
+  # The operator client intentionally does not link keylane_meta_core (and
+  # therefore NuRaft). It only needs OpenSSL for the optional remote mTLS
+  # transport; local administration uses a Unix domain socket.
+  add_executable(keylane-meta-ctl
+    app/keylane_meta_ctl.cpp
+  )
+  target_include_directories(keylane-meta-ctl PRIVATE
+    ${KEYLANE_GENERATED_INCLUDE_DIR}
+  )
+  target_link_libraries(keylane-meta-ctl PRIVATE
+    OpenSSL::SSL
+    OpenSSL::Crypto
+  )
+  if (CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(keylane-meta-ctl PRIVATE -Wall -Wextra -Wpedantic)
   endif()
 
   # Negative guard for the layering rule above: fail at configure time if
@@ -628,11 +645,24 @@ if (BUILD_TESTING)
         NAME meta_integration.smoke_3node
         COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/smoke_3node.py
-                $<TARGET_FILE:keylane_meta>
+                $<TARGET_FILE:keylane-meta>
       )
       set_tests_properties(meta_integration.smoke_3node PROPERTIES
         LABELS meta-integration
         TIMEOUT 120
+        RUN_SERIAL TRUE
+      )
+
+      add_test(
+        NAME meta_integration.ctl_client
+        COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/ctl_client.py
+                $<TARGET_FILE:keylane-meta>
+                $<TARGET_FILE:keylane-meta-ctl>
+      )
+      set_tests_properties(meta_integration.ctl_client PROPERTIES
+        LABELS meta-integration
+        TIMEOUT 60
         RUN_SERIAL TRUE
       )
 
@@ -641,7 +671,7 @@ if (BUILD_TESTING)
       # connect/cancel/timeout, slow-peer backpressure, mTLS, the observation
       # stale-evidence/observation-lifecycle gate, and Meta partition safety.
       # Each spins up its own
-      # multi-node keylane_meta clusters; RUN_SERIAL keeps port allocation
+      # multi-node keylane-meta clusters; RUN_SERIAL keeps port allocation
       # and timing margins deterministic.
       foreach(gate leader_change recovery membership transport backpressure
               mtls stale_evidence partition)
@@ -649,7 +679,7 @@ if (BUILD_TESTING)
           NAME meta_integration.gate_${gate}
           COMMAND ${KEYLANE_PYTHON3_EXECUTABLE}
                   ${CMAKE_CURRENT_SOURCE_DIR}/tests/meta_integration/gate_${gate}.py
-                  $<TARGET_FILE:keylane_meta>
+                  $<TARGET_FILE:keylane-meta>
         )
         set_tests_properties(meta_integration.gate_${gate} PROPERTIES
           LABELS meta-integration

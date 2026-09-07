@@ -1,7 +1,7 @@
 #pragma once
 
 // MetaCtlServer: authenticated line-protocol administration and observation
-// surface of keylane_meta, served on the celer worker that also drives the
+// surface of keylane-meta, served on the celer worker that also drives the
 // meta Raft transport.
 //
 // Local administration defaults to a mode-0600 AF_UNIX socket and derives
