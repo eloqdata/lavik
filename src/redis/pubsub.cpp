@@ -35,8 +35,7 @@ std::atomic<std::uint64_t> g_resp2_subscribers{0};
 std::atomic<std::uint64_t> g_resp3_subscribers{0};
 
 std::atomic<std::uint64_t>& SubscriberCount(RespVersion version) {
-  return version == RespVersion::k3 ? g_resp3_subscribers
-                                    : g_resp2_subscribers;
+  return version == RespVersion::k3 ? g_resp3_subscribers : g_resp2_subscribers;
 }
 
 struct WorkerPubSubRegistry;

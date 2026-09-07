@@ -37,9 +37,9 @@
 #include "celer/runtime/cycle_clock.h"
 #include "celer/runtime/worker.h"
 #include "client_limit.h"
-#include "function_catalog.h"
 #include "cluster_command.h"
 #include "cluster_gate.h"
+#include "function_catalog.h"
 #include "hash_command.h"
 #include "keylane/cluster/authority.h"
 #include "keylane/cluster/runtime.h"
@@ -901,8 +901,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
       request.ClusterSlots().empty() || !ClusterRequestIsWrite(request)) {
     return std::nullopt;
   }
-  cluster::TopologyCache& cache =
-      cluster::GetClusterRuntime()->topology_cache_;
+  cluster::TopologyCache& cache = cluster::GetClusterRuntime()->topology_cache_;
   for (;;) {
     // The snapshot arrives with a completed publication sequence; that
     // pairing is what makes the handshake below airtight.
@@ -912,8 +911,7 @@ std::optional<CommandReply> RecheckClusterWriteAuthority(
         cluster::CurrentCachedWithVersion(cache, &version_before,
                                           &publication_before);
     if (!cluster::AuthorityUnchanged(*request.cluster_admitted_state_,
-                                     current.get(),
-                                     request.ClusterSlots())) {
+                                     current.get(), request.ClusterSlots())) {
       // Nothing has executed yet, so the request can safely be re-admitted
       // against the current snapshot. Writes are never on the loading
       // whitelist, so a current snapshot that lost readiness answers LOADING
@@ -1641,8 +1639,7 @@ Task<CommandReply> ExecuteConfig(const CommandRequest& request,
       } else {
         configured =
             co_await g_replication->ApplyDirective(ReplicationDirective{
-                .kind_ =
-                    ReplicationDirective::Kind::kBacklogBackpressure,
+                .kind_ = ReplicationDirective::Kind::kBacklogBackpressure,
                 .upstream_ = std::nullopt,
                 .value_ = *enabled ? 1ULL : 0ULL,
             });
@@ -2576,7 +2573,7 @@ AcquireReplicationPublisherAdmission(std::size_t logical_bytes,
                     ReplicationPublisherAdmission::WorkerToken{
                         .worker_ = scope.worker_,
                         .token_ = std::move(*token),
-                    };
+                };
                 co_return absl::OkStatus();
               }};
         });
@@ -3841,8 +3838,8 @@ Task<CommandReply> ExecuteStorageCommand(const CommandRequest& request,
       }
       PreparedDumpReply prepared = PrepareDumpReply(std::move(*payload));
       reply.encoded_ = reply_builder.AppendRaw(prepared.header_);
-      reply.chunks_ = std::make_unique<ReplyChunkSource>(
-          std::move(prepared.chunks_));
+      reply.chunks_ =
+          std::make_unique<ReplyChunkSource>(std::move(prepared.chunks_));
       co_return reply;
     }
 
@@ -7297,8 +7294,8 @@ PrepareFunctionMutationPublication(const CommandRequest& request) {
   co_return co_await SubmitTaskTo(
       0,
       [admission = std::move(admission), args = std::move(args)]() mutable
-      -> Task<
-          absl::StatusOr<std::optional<PreparedFunctionMutationPublication>>> {
+          -> Task<absl::StatusOr<
+              std::optional<PreparedFunctionMutationPublication>>> {
         auto publication = g_storage->PrepareAdmittedReplicationCommand(
             admission, storage::ReplicationEventKind::kCatalogMutation, 0,
             std::move(args), std::vector<std::string>{});
@@ -8972,8 +8969,8 @@ Task<CommandReply> ExecuteExecBody(
   for (const std::uint8_t db : gate_dbs) {
     if (!db_guard.Add(db)) {
       co_await DropWatches(ctx);
-      co_return finalize_exec_reply(BuiltReply(AppendTryAgainError(
-          reply_builder, "database flush is in progress")));
+      co_return finalize_exec_reply(BuiltReply(
+          AppendTryAgainError(reply_builder, "database flush is in progress")));
     }
   }
   if (source_write && write_admission_role_epoch.has_value() &&
@@ -11658,10 +11655,9 @@ Task<CommandReply> ExecuteCommandBody(
         // cluster reads learned the same route during admission. Deriving the
         // worker from the retained slot is cheaper than hashing args[1] again.
         const bool routed = request.HasRoutedPartitionFor(1);
-        const unsigned target = routed
-                                    ? request.RoutedPartitionId() %
-                                          g_storage->worker_count()
-                                    : ShardForKey(args[1]);
+        const unsigned target =
+            routed ? request.RoutedPartitionId() % g_storage->worker_count()
+                   : ShardForKey(args[1]);
 #if KEYLANE_ENABLE_READ_LATENCY_TRACE
         if (request.kind_ == CommandKind::kGet) {
           ReadLatencyTrace trace;
@@ -11798,9 +11794,10 @@ std::optional<unsigned> SingleKeyWriteOwner(CommandRequest& request) {
 // Admission suspends on the publish-queue capacity of the worker it runs on,
 // and holding that same worker's DB gate across the wait would stall every
 // FLUSHDB and FULLSYNC_CUT drain waiting for the gate counts to reach zero.
-Task<CommandReply> ExecuteAdmittedWriteCommand(
-    CommandRequest& request, ReplyBuilder& reply_builder,
-    std::uint64_t client_id, ConnectionContext* connection) {
+Task<CommandReply> ExecuteAdmittedWriteCommand(CommandRequest& request,
+                                               ReplyBuilder& reply_builder,
+                                               std::uint64_t client_id,
+                                               ConnectionContext* connection) {
   if (ReplicationEventExceedsBacklog(ReplicationEventAdmissionBytes(request))) {
     co_return BuiltReply(reply_builder.AppendError(
         "ERR replication publisher admission failed: canonical event exceeds "
@@ -11877,16 +11874,18 @@ bool CommandWriteAdmissionIsCurrent(const CommandRequest& request) noexcept {
 
 namespace {
 
-Task<CommandReply> ExecuteCommandOnOwner(
-    unsigned owner, CommandRequest& request, ReplyBuilder& reply_builder,
-    std::uint64_t client_id, ConnectionContext* connection) {
-  co_return co_await SubmitTaskTo(
-      owner,
-      [&request, &reply_builder, client_id,
-       connection]() -> Task<CommandReply> {
-        co_return co_await ExecuteAdmittedCommand(request, reply_builder,
-                                                  client_id, connection);
-      });
+Task<CommandReply> ExecuteCommandOnOwner(unsigned owner,
+                                         CommandRequest& request,
+                                         ReplyBuilder& reply_builder,
+                                         std::uint64_t client_id,
+                                         ConnectionContext* connection) {
+  co_return co_await SubmitTaskTo(owner,
+                                  [&request, &reply_builder, client_id,
+                                   connection]() -> Task<CommandReply> {
+                                    co_return co_await ExecuteAdmittedCommand(
+                                        request, reply_builder, client_id,
+                                        connection);
+                                  });
 }
 
 }  // namespace

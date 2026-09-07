@@ -472,15 +472,13 @@ int main(int argc, char** argv) {
       Expect(client.Command(
                  {"CONFIG", "SET", "defrag-max-active-per-device", "1"}),
              "+OK", "CONFIG defrag max active");
-      Expect(client.Command({"CONFIG", "SET", "defrag-sleep-ms", "25"}),
-             "+OK", "CONFIG defrag block sleep");
-      Expect(
-          client.Command({"CONFIG", "SET", "defrag-record-sleep-us", "7"}),
-          "+OK", "CONFIG defrag record sleep");
-      Expect(client.Command({"CONFIG", "SET", "defrag-paused", "yes"}),
-             "+OK", "CONFIG defrag paused");
-      const std::string defrag_status =
-          client.Command({"DEFRAG", "STATUS"});
+      Expect(client.Command({"CONFIG", "SET", "defrag-sleep-ms", "25"}), "+OK",
+             "CONFIG defrag block sleep");
+      Expect(client.Command({"CONFIG", "SET", "defrag-record-sleep-us", "7"}),
+             "+OK", "CONFIG defrag record sleep");
+      Expect(client.Command({"CONFIG", "SET", "defrag-paused", "yes"}), "+OK",
+             "CONFIG defrag paused");
+      const std::string defrag_status = client.Command({"DEFRAG", "STATUS"});
       if (defrag_status.find("paused=1") == std::string::npos ||
           defrag_status.find("max_active_per_device=1") == std::string::npos ||
           defrag_status.find("block_sleep_ms=25") == std::string::npos ||
@@ -493,13 +491,12 @@ int main(int argc, char** argv) {
           StatField(client, "defrag_record_sleep_us") != 7) {
         Fail("INFO stats did not report defrag runtime settings");
       }
-      Expect(client.Command({"DEFRAG", "RESUME"}), "+OK",
-             "DEFRAG RESUME");
+      Expect(client.Command({"DEFRAG", "RESUME"}), "+OK", "DEFRAG RESUME");
       Expect(client.Command({"DEFRAG", "MAX-ACTIVE", "0"}),
              "-ERR value is not an integer or out of range",
              "DEFRAG zero concurrency");
-      Expect(client.Command({"DEFRAG", "INVALID", "1"}),
-             "-ERR syntax error", "DEFRAG invalid setting");
+      Expect(client.Command({"DEFRAG", "INVALID", "1"}), "-ERR syntax error",
+             "DEFRAG invalid setting");
       Expect(client.Command({"DEFRAG", "BLOCK-SLEEP-MS", "0"}), "+OK",
              "DEFRAG reset block sleep");
       Expect(client.Command({"DEFRAG", "RECORD-SLEEP-US", "0"}), "+OK",
@@ -523,16 +520,14 @@ int main(int argc, char** argv) {
       Expect(client.Command({"TOMBRAIDER", "INTERVAL", "0"}),
              "-ERR value is not an integer or out of range",
              "TOMBRAIDER zero interval");
-      Expect(client.Command(
-                 {"CONFIG", "SET", "tomb-raider-sleep-ms", "0"}),
+      Expect(client.Command({"CONFIG", "SET", "tomb-raider-sleep-ms", "0"}),
              "+OK", "CONFIG tomb raider block sleep");
       if (StatField(client, "tomb_raider_block_sleep_ms") != 0) {
         Fail("tomb raider did not update block sleep");
       }
 
       const std::string daily = LocalTimeAfter(2s);
-      Expect(client.Command(
-                 {"CONFIG", "SET", "tomb-raider-daily-time", daily}),
+      Expect(client.Command({"CONFIG", "SET", "tomb-raider-daily-time", daily}),
              "+OK", "CONFIG tomb raider daily");
       if (client.Command({"TOMBRAIDER", "STATUS"}).find("mode=daily") ==
           std::string::npos) {
@@ -550,9 +545,9 @@ int main(int argc, char** argv) {
           std::string::npos) {
         Fail("TOMBRAIDER ON did not restore daily mode");
       }
-      Expect(client.Command(
-                 {"CONFIG", "SET", "tomb-raider-interval-ms", "500"}),
-             "+OK", "CONFIG tomb raider interval");
+      Expect(
+          client.Command({"CONFIG", "SET", "tomb-raider-interval-ms", "500"}),
+          "+OK", "CONFIG tomb raider interval");
       if (StatField(client, "tomb_raider_enabled") != 1) {
         Fail("tomb raider did not report enabled");
       }

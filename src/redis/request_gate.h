@@ -28,9 +28,9 @@ class RequestGate {
     Counter& counter = counters_[worker_id];
     std::uint64_t state = counter.state_.load(std::memory_order_acquire);
     while ((state & kClosed) == 0) {
-      if (counter.state_.compare_exchange_weak(
-              state, state + 1, std::memory_order_acq_rel,
-              std::memory_order_acquire)) {
+      if (counter.state_.compare_exchange_weak(state, state + 1,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire)) {
         return true;
       }
     }
@@ -48,8 +48,7 @@ class RequestGate {
     // begin WaitUntilEmpty. Each shard's closed bit and count share one atomic,
     // so an entry racing Close is either rejected or included in the count.
     for (unsigned worker_id = 0; worker_id < worker_count_; ++worker_id) {
-      counters_[worker_id].state_.fetch_or(kClosed,
-                                           std::memory_order_acq_rel);
+      counters_[worker_id].state_.fetch_or(kClosed, std::memory_order_acq_rel);
     }
   }
 

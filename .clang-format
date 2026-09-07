@@ -1,4 +1,4 @@
 ---
 BasedOnStyle: Google
-Standard: c++20
+Standard: c++23
 ...

@@ -912,13 +912,13 @@ TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
   // keeping (safe) or accidentally skipping (unsafe) the replication
   // transaction order gate.
   const std::set<std::string_view> known_incomplete = {
-      "sort",        // BY/GET patterns expand participants from row data
-      "georadius",   // STORE/STOREDIST destination is outside the view
+      "sort",               // BY/GET patterns expand participants from row data
+      "georadius",          // STORE/STOREDIST destination is outside the view
       "georadiusbymember",  // same STORE/STOREDIST shape as georadius
-      "zdiffstore",  // destination arg1 is outside the source-only view
+      "zdiffstore",         // destination arg1 is outside the source-only view
       "zinterstore",        // same aggregate-store shape as zdiffstore
       "zunionstore",        // same aggregate-store shape as zdiffstore
-      "function",    // kCmdNoKeys: library mutations are process-global
+      "function",           // kCmdNoKeys: library mutations are process-global
   };
   std::size_t eligible_count = 0;
   for (const CommandSpec& spec : keylane::CommandSpecs()) {
@@ -928,7 +928,8 @@ TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
         (spec.flags_ & keylane::kCmdMayBlock) == 0;
     if (!eligible) {
       EXPECT_EQ(spec.flags_ & keylane::kCmdKeyViewComplete, 0u)
-          << spec.name_ << " carries kCmdKeyViewComplete without being "
+          << spec.name_
+          << " carries kCmdKeyViewComplete without being "
              "gate-eligible; the flag is meaningless there";
       continue;
     }
@@ -940,7 +941,8 @@ TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
                                "must not carry kCmdKeyViewComplete";
     } else {
       EXPECT_TRUE(flagged)
-          << spec.name_ << " is gate-eligible but neither carries "
+          << spec.name_
+          << " is gate-eligible but neither carries "
              "kCmdKeyViewComplete nor is classified as key-view-incomplete; "
              "audit its execution path and classify it";
     }
@@ -954,8 +956,8 @@ TEST(CommandTableTest, ReplicationGateCandidatesAreClassified) {
     const CommandSpec* spec = FindCommand(name);
     ASSERT_NE(spec, nullptr) << name;
     EXPECT_NE(spec->flags_ & keylane::kCmdMultiShard, 0u) << name;
-    EXPECT_NE(
-        spec->flags_ & (keylane::kCmdWrite | keylane::kCmdDynamicWrite), 0u)
+    EXPECT_NE(spec->flags_ & (keylane::kCmdWrite | keylane::kCmdDynamicWrite),
+              0u)
         << name << " is no longer gate-eligible; drop its list entry";
     EXPECT_EQ(spec->flags_ & keylane::kCmdMayBlock, 0u) << name;
   }
@@ -1072,10 +1074,10 @@ TEST(CommandTableTest, RequestSpansMultipleShardsDecision) {
                       "BYRADIUS", "1", "km"}));
   // Scripts are confined to their declared keys, so their participant set is
   // exactly the view.
-  EXPECT_FALSE(spans({"eval", "return redis.call('set', KEYS[1], '1')", "2",
-                      same_a, same_b}));
-  EXPECT_TRUE(spans({"eval", "return redis.call('set', KEYS[1], '1')", "2",
-                     same_a, cross}));
+  EXPECT_FALSE(spans(
+      {"eval", "return redis.call('set', KEYS[1], '1')", "2", same_a, same_b}));
+  EXPECT_TRUE(spans(
+      {"eval", "return redis.call('set', KEYS[1], '1')", "2", same_a, cross}));
   EXPECT_FALSE(spans({"fcall", "fn", "2", same_a, same_b}));
   EXPECT_TRUE(spans({"fcall", "fn", "2", same_a, cross}));
 }

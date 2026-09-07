@@ -385,9 +385,9 @@ int main(int argc, char** argv) {
         "redis.register_function{FUNCTION_NAME='named_arg_case', "
         "CALLBACK=function(keys, args) return args[1] end, "
         "FLAGS={'NO-WRITES'}}";
-    Expect(client.Command(
-               {"FUNCTION", "LOAD", case_insensitive_function_library}),
-           Bulk("named_arg_case"), "FUNCTION LOAD named argument case");
+    Expect(
+        client.Command({"FUNCTION", "LOAD", case_insensitive_function_library}),
+        Bulk("named_arg_case"), "FUNCTION LOAD named argument case");
     Expect(client.Command({"FCALL_RO", "named_arg_case", "0", "works"}),
            Bulk("works"), "FCALL case-insensitive named arguments");
     Expect(client.Command({"FUNCTION", "DELETE", "named_arg_case"}), "+OK",
@@ -468,8 +468,7 @@ int main(int argc, char** argv) {
     ExpectContains(
         client.Command({"FCALL", "keylane_get", "1", "function:key"}),
         "Function not found", "FCALL after FUNCTION FLUSH");
-    Expect(client.Command(
-               {"FUNCTION", "RESTORE", function_dump, "FLUSH"}),
+    Expect(client.Command({"FUNCTION", "RESTORE", function_dump, "FLUSH"}),
            "+OK", "FUNCTION RESTORE FLUSH");
     ExpectContains(client.Command({"FUNCTION", "RESTORE", "broken"}),
                    "DUMP payload version or checksum are wrong",
@@ -480,11 +479,10 @@ int main(int argc, char** argv) {
         "redis.register_function('transaction_set', function(keys, args) "
         "return redis.call('SET', keys[1], args[1]) end)";
     Expect(client.Command({"MULTI"}), "+OK", "MULTI FUNCTION LOAD");
-    Expect(client.Command({"FUNCTION", "LOAD", transaction_library}),
-           "+QUEUED", "queue FUNCTION LOAD");
-    Expect(client.Command(
-               {"FCALL", "transaction_set", "1", "function:transaction",
-                "loaded-in-exec"}),
+    Expect(client.Command({"FUNCTION", "LOAD", transaction_library}), "+QUEUED",
+           "queue FUNCTION LOAD");
+    Expect(client.Command({"FCALL", "transaction_set", "1",
+                           "function:transaction", "loaded-in-exec"}),
            "+QUEUED", "queue FCALL after FUNCTION LOAD");
     Expect(client.Command({"EXEC"}),
            "*2\r\n" + Bulk("transaction_library") + "\r\n+OK",
@@ -496,12 +494,10 @@ int main(int argc, char** argv) {
            "WATCH before FCALL");
     RespClient function_writer = Connect(port);
     Expect(function_writer.Command({"SET", "function:watched", "changed"}),
-           "+OK",
-           "invalidate FCALL watch");
+           "+OK", "invalidate FCALL watch");
     Expect(client.Command({"MULTI"}), "+OK", "MULTI watched FCALL");
-    Expect(client.Command(
-               {"FCALL", "transaction_set", "1", "function:watched",
-                "must-not-run"}),
+    Expect(client.Command({"FCALL", "transaction_set", "1", "function:watched",
+                           "must-not-run"}),
            "+QUEUED", "queue watched FCALL");
     Expect(client.Command({"EXEC"}), "*-1", "WATCH aborts FCALL");
     Expect(client.Command({"GET", "function:watched"}), Bulk("changed"),
@@ -521,10 +517,9 @@ int main(int argc, char** argv) {
     // redis.call yields to the worker scheduler, allowing another connection
     // to request termination. The instruction hook then stops the script.
     RespClient looping_script = Connect(port);
-    looping_script.SendCommand(
-        {"EVAL",
-         "while true do redis.call('GET',KEYS[1]) end",
-         "1", "lua:kill-loop"});
+    looping_script.SendCommand({"EVAL",
+                                "while true do redis.call('GET',KEYS[1]) end",
+                                "1", "lua:kill-loop"});
     std::this_thread::sleep_for(100ms);
     RespClient script_killer = Connect(port);
     ExpectContains(client.Command({"PING"}),
@@ -537,8 +532,8 @@ int main(int argc, char** argv) {
     Expect(script_killer.Command({"SCRIPT", "KILL"}),
            "-NOTBUSY No scripts in execution right now.",
            "SCRIPT KILL after termination");
-    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}),
-           "+OK", "CONFIG SET lua-time-limit");
+    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}), "+OK",
+           "CONFIG SET lua-time-limit");
     ExpectContains(ReadFile(log_path), "Slow script detected",
                    "busy script warning log");
 
@@ -553,8 +548,7 @@ int main(int argc, char** argv) {
     ExpectContains(script_killer.Command({"SCRIPT", "KILL"}),
                    "You can only call FUNCTION KILL",
                    "SCRIPT KILL cannot kill function");
-    Expect(script_killer.Command({"FUNCTION", "KILL"}), "+OK",
-           "FUNCTION KILL");
+    Expect(script_killer.Command({"FUNCTION", "KILL"}), "+OK", "FUNCTION KILL");
     ExpectContains(looping_function.ReadPush(),
                    "Script killed by user with FUNCTION KILL",
                    "killed function reply");
@@ -592,8 +586,8 @@ int main(int argc, char** argv) {
     ExpectContains(pcall_function.ReadPush(),
                    "Script killed by user with FUNCTION KILL",
                    "pcall cannot swallow FUNCTION KILL");
-    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}),
-           "+OK", "restore Lua time limit after pcall kill");
+    Expect(client.Command({"CONFIG", "SET", "lua-time-limit", "5000"}), "+OK",
+           "restore Lua time limit after pcall kill");
 
     RespClient dirty_script = Connect(port);
     dirty_script.SendCommand(
@@ -833,11 +827,10 @@ int main(int argc, char** argv) {
         client.Command({"EVAL", "keylane_persistent_global=1; return 1", "0"}),
         "Attempt to modify a readonly table", "Lua global table is readonly");
 
-    Expect(client.Command(
-               {"EVAL",
-                "redis.call('SET',KEYS[1],9007199254740991); "
-                "return redis.call('GET',KEYS[1])",
-                "1", "lua:number-precision"}),
+    Expect(client.Command({"EVAL",
+                           "redis.call('SET',KEYS[1],9007199254740991); "
+                           "return redis.call('GET',KEYS[1])",
+                           "1", "lua:number-precision"}),
            Bulk("9007199254740991"), "Lua numeric command argument precision");
 
     Expect(client.Command({"SET", "lua:ro", "seed"}), "+OK", "EVAL_RO seed");
@@ -863,11 +856,11 @@ int main(int argc, char** argv) {
                            "098e0f0d1448c0a81dafe820f66d460eb09263da", "0",
                            "readonly-cache"}),
            Bulk("readonly-cache"), "EVALSHA_RO shared compiled cache");
-    Expect(client.Command(
-               {"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])", "1",
-                "lua:ro", "changed"}),
-           "-ERR Write commands are not allowed from read-only scripts.",
-           "EVAL_RO returns the direct read-only write error");
+    Expect(
+        client.Command({"EVAL_RO", "return redis.call('SET',KEYS[1],ARGV[1])",
+                        "1", "lua:ro", "changed"}),
+        "-ERR Write commands are not allowed from read-only scripts.",
+        "EVAL_RO returns the direct read-only write error");
     Expect(client.Command({"GET", "lua:ro"}), Bulk("seed"),
            "EVAL_RO write made no change");
     Expect(client.Command(

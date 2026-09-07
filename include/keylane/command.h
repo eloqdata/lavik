@@ -366,8 +366,7 @@ struct alignas(std::max_align_t) CommandRequest {
   std::uint16_t RoutedPartitionId() const noexcept {
     return cluster_slot_samples_[0];
   }
-  void SetRoutedPartition(std::uint16_t slot,
-                          std::uint16_t argument) noexcept {
+  void SetRoutedPartition(std::uint16_t slot, std::uint16_t argument) noexcept {
     assert(argument != 0);
     cluster_slot_samples_[0] = slot;
     routed_key_argument_ = argument;

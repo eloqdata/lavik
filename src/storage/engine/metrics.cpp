@@ -80,7 +80,7 @@ Task<StorageMetricsSnapshot> StorageEngine::Impl::CollectMetrics() const {
         .filesystem_available_bytes_ = std::nullopt,
     };
     if (!device.is_block_device_) {
-      struct statvfs filesystem {};
+      struct statvfs filesystem{};
       if (::statvfs(device.path_.c_str(), &filesystem) == 0) {
         metrics.filesystem_available_bytes_ =
             static_cast<std::uint64_t>(filesystem.f_bavail) *

@@ -329,8 +329,8 @@ Task<absl::Status> StorageEngine::Impl::SetReplicationLogCapacity(
   co_return absl::OkStatus();
 }
 
-Task<absl::Status>
-StorageEngine::Impl::SetReplicationBacklogBackpressure(bool enabled) {
+Task<absl::Status> StorageEngine::Impl::SetReplicationBacklogBackpressure(
+    bool enabled) {
   replication_backlog_backpressure_.store(enabled, std::memory_order_release);
   WorkerStore& store = CurrentStore();
   auto& log = store.replication_log_;

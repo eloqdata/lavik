@@ -37,7 +37,7 @@ bool GrowFile(const std::string& path, std::uint64_t bytes) {
 }
 
 std::uint64_t FileSize(const std::string& path) {
-  struct stat info {};
+  struct stat info{};
   return ::stat(path.c_str(), &info) == 0
              ? static_cast<std::uint64_t>(info.st_size)
              : 0;

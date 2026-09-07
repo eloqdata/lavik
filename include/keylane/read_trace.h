@@ -1,7 +1,7 @@
 #pragma once
 
-#include <cstddef>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 #ifndef KEYLANE_ENABLE_READ_LATENCY_TRACE

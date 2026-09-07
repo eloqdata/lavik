@@ -3977,9 +3977,8 @@ class ReplicationManager::ReplicationGroup {
           serving_generation_->load(std::memory_order_relaxed);
       std::uint64_t generation = (current & ~kServingOpen) + 2;
       if (generation == 0) generation = 2;  // Reserve zero for closed capture.
-      serving_generation_->store(
-          generation | (will_serve ? kServingOpen : 0),
-          std::memory_order_release);
+      serving_generation_->store(generation | (will_serve ? kServingOpen : 0),
+                                 std::memory_order_release);
       // Blocking commands own no DB gate while asleep. Wake all of them so
       // they can observe the new generation before examining replacement
       // data; baseline population is not required to emit key notifications.
@@ -9902,8 +9901,7 @@ ReplicationManager::ReplicationManager(
     storage::StorageEngine* storage, ReplicationOptions options,
     std::optional<ReplicaOfConfig> initial_upstream)
     : group_(std::make_unique<ReplicationGroup>(
-          storage, std::move(initial_upstream), options,
-          &serving_generation_)),
+          storage, std::move(initial_upstream), options, &serving_generation_)),
       options_(std::move(options)) {}
 
 ReplicationManager::~ReplicationManager() = default;

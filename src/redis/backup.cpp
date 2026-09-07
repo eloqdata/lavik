@@ -19,8 +19,8 @@
 #include "celer/runtime/cross_core.h"
 #include "celer/runtime/sync.h"
 #include "celer/runtime/worker.h"
-#include "keylane/rdb.h"
 #include "keylane/metrics.h"
+#include "keylane/rdb.h"
 #include "keylane/resp.h"
 #include "lua_eval.h"
 #include "spdlog/spdlog.h"
@@ -220,12 +220,11 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
     saved_change_cuts_.reserve(storage_->worker_count());
     unsigned begun = 0;
     for (; begun < storage_->worker_count(); ++begun) {
-      auto cut = co_await celer::SubmitTo(
-          begun, [this, snapshot_time_ms] {
-            absl::Status status =
-                storage_->BeginRdbSnapshot(session_id_, snapshot_time_ms);
-            return std::pair{std::move(status), LocalDatasetChangesTotal()};
-          });
+      auto cut = co_await celer::SubmitTo(begun, [this, snapshot_time_ms] {
+        absl::Status status =
+            storage_->BeginRdbSnapshot(session_id_, snapshot_time_ms);
+        return std::pair{std::move(status), LocalDatasetChangesTotal()};
+      });
       if (!cut.first.ok()) {
         for (unsigned worker = 0; worker < begun; ++worker) {
           (void)co_await celer::SubmitTaskTo(
@@ -235,8 +234,7 @@ class BackupJob : public std::enable_shared_from_this<BackupJob> {
       }
       saved_change_cuts_.push_back(cut.second);
     }
-    for (const LuaFunctionLibrary& library :
-         SnapshotLuaFunctionLibraries()) {
+    for (const LuaFunctionLibrary& library : SnapshotLuaFunctionLibraries()) {
       std::string fragment = rdb::EncodeFunctionLibraryEntry(library.code_);
       while (!output_.TryPush(&fragment)) {
         if (output_.failed()) {

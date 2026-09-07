@@ -509,10 +509,9 @@ class RecordIndexValue {
     assert(block_owner < kMaxMemoryWorkers);
 
     constexpr std::uint64_t kPhysicalMask =
-        ((std::uint64_t{1} << (kOffsetBits + kLengthBits)) - 1)
-        << kOffsetShift;
-    constexpr std::uint64_t kStateMask =
-        ((std::uint64_t{1} << kStateBits) - 1) << kInMemoryShift;
+        ((std::uint64_t{1} << (kOffsetBits + kLengthBits)) - 1) << kOffsetShift;
+    constexpr std::uint64_t kStateMask = ((std::uint64_t{1} << kStateBits) - 1)
+                                         << kInMemoryShift;
     const std::uint64_t runtime_bits =
         ((metadata_ & kPhysicalMask) >> kOffsetShift) |
         (static_cast<std::uint64_t>(block_owner) << Runtime::kOwnerShift) |
@@ -1155,8 +1154,7 @@ struct TxUndoLog {
         handle_by_address_.contains(reinterpret_cast<std::uintptr_t>(entry))) {
       return true;
     }
-    return current_entries_.size() <
-           std::numeric_limits<std::uint32_t>::max();
+    return current_entries_.size() < std::numeric_limits<std::uint32_t>::max();
   }
 
   // Null means the 32-bit handle namespace is full. Physical allocation
@@ -1634,7 +1632,7 @@ inline absl::StatusOr<StoragePathInfo> ProbeStoragePath(
                            .controller_id_ = device->controller_id_,
                            .io_queue_count_ = device->io_queue_count_};
   }
-  struct stat file_info {};
+  struct stat file_info{};
   if (::stat(path.c_str(), &file_info) != 0) {
     return absl::Status(
         absl::StatusCode::kInternal,
@@ -1709,8 +1707,7 @@ class StorageEngine::Impl {
     replication_publish_queue_bytes_.store(
         options_.replication_publish_queue_bytes_, std::memory_order_relaxed);
     replication_backlog_backpressure_.store(
-        options_.replication_backlog_backpressure_,
-        std::memory_order_relaxed);
+        options_.replication_backlog_backpressure_, std::memory_order_relaxed);
     expiration_authority_.store(options_.expiration_authority_,
                                 std::memory_order_relaxed);
     const TombRaiderMode mode =
@@ -2190,28 +2187,23 @@ class StorageEngine::Impl {
     return StorageShardForKey(key) % worker_count_;
   }
 
-  Task<absl::StatusOr<DiskValue>> Get(std::uint8_t db_id, std::string_view key,
-                                      ReadLatencyTrace* trace,
-                                      std::optional<std::uint16_t>
-                                          routed_partition_id);
+  Task<absl::StatusOr<DiskValue>> Get(
+      std::uint8_t db_id, std::string_view key, ReadLatencyTrace* trace,
+      std::optional<std::uint16_t> routed_partition_id);
 
   // Caller holds this worker's key lock for `digest` (shared) and runs on
   // OwnerForKey(key). `digest` must equal ComputeDigest(key).
-  Task<absl::StatusOr<DiskValue>> GetLocked(std::uint8_t db_id,
-                                            std::string_view key,
-                                            const Digest& digest,
-                                            ReadLatencyTrace* trace,
-                                            std::optional<std::uint16_t>
-                                                routed_partition_id =
-                                                    std::nullopt);
+  Task<absl::StatusOr<DiskValue>> GetLocked(
+      std::uint8_t db_id, std::string_view key, const Digest& digest,
+      ReadLatencyTrace* trace,
+      std::optional<std::uint16_t> routed_partition_id = std::nullopt);
 
   // Shared implementation for ordinary and transaction-owned reads. Keeping
   // conditional lock acquisition in this coroutine avoids a nested Task frame
   // on every standalone GET while preserving the pre-locked public contract.
   Task<absl::StatusOr<DiskValue>> GetWithLockState(
       std::uint8_t db_id, std::string_view key, Digest digest,
-      ReadLatencyTrace* trace,
-      std::optional<std::uint16_t> routed_partition_id,
+      ReadLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
       bool acquire_key_lock, bool optimistic_read = false);
 
   Task<std::vector<BatchGetValue>> BatchGetLocked(
@@ -3066,8 +3058,8 @@ class StorageEngine::Impl {
     if (local < lookup.local_begin_ || local >= lookup.local_end_) {
       return kUnownedBlock;
     }
-    return lookup.states_[local - lookup.local_begin_]
-        .owner_.load(std::memory_order_acquire);
+    return lookup.states_[local - lookup.local_begin_].owner_.load(
+        std::memory_order_acquire);
   }
 
   // Materialize the self-contained identity only while the entry is known to
@@ -3106,9 +3098,9 @@ class StorageEngine::Impl {
 
   absl::Status ApplyRecoveredRecord(WorkerStore& store,
                                     const RecoveryRecord& record);
-  absl::Status ApplyRecoveredRecord(
-      WorkerStore& store, WorkerStore::PartitionStore& partition,
-      const RecoveryRecordView& record);
+  absl::Status ApplyRecoveredRecord(WorkerStore& store,
+                                    WorkerStore::PartitionStore& partition,
+                                    const RecoveryRecordView& record);
 
   static ExtentManifest ExtentsFor(const WorkerStore& store,
                                    const RecordIndex::Entry* entry) {

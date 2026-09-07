@@ -138,13 +138,11 @@ Task<absl::StatusOr<SetResult>> StorageEngine::Impl::SetLocked(
     }
     found = *resolved;
   }
-  bool exists = found != nullptr &&
-                found->value_.kind() == RecordKind::kValue;
+  bool exists = found != nullptr && found->value_.kind() == RecordKind::kValue;
   // Expiry metadata is out-of-line and uncommon in the no-TTL workload. Do
   // not read wall time for the ordinary overwrite path; it is irrelevant when
   // the index entry cannot expire.
-  if (exists && found->value_.has_expiry() &&
-      IsExpiredNow(*found)) {
+  if (exists && found->value_.has_expiry() && IsExpiredNow(*found)) {
     exists = false;
   }
   if (trace != nullptr) trace->lookup_done_ns_ = SetTraceNowNanos();
@@ -1836,8 +1834,7 @@ Task<absl::Status> StorageEngine::Impl::WriteRecordLocked(
     TxShardWrites* tx,
     std::unique_ptr<std::vector<RetiredRecord>> commit_retirements,
     SetLatencyTrace* trace, const ExplicitWriteRoot* explicit_root,
-    TxUndoLog* replacement_undo,
-    WorkerStore::PartitionStore* known_partition) {
+    TxUndoLog* replacement_undo, WorkerStore::PartitionStore* known_partition) {
   if (store.write_failed_ ||
       epoch_metadata_failed_.load(std::memory_order_acquire)) {
     co_return absl::Status(absl::StatusCode::kFailedPrecondition,
@@ -2426,11 +2423,11 @@ acquire_active_stream:
                                   !previous->key_external()
                               ? retired_value_extents
                               : nullptr,
-      .retired_record_ = (!for_defrag || defer_defrag_retirement) &&
-                                 !route_to_commit && previous.has_value()
-                             ? StagedRetiredRecordOf(
-                                   *previous, previous_dependent_extents)
-                             : StagedRetiredRecord{},
+      .retired_record_ =
+          (!for_defrag || defer_defrag_retirement) && !route_to_commit &&
+                  previous.has_value()
+              ? StagedRetiredRecordOf(*previous, previous_dependent_extents)
+              : StagedRetiredRecord{},
       .tx_retirements_ = std::move(commit_retirements),
       .index_generation_ = store.index_generations_[db_id],
       .entry_hash_ =

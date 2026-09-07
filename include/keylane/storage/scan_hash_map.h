@@ -124,8 +124,8 @@ class RetainedAllocator {
     if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
       std::terminate();
     }
-    T* pointer = static_cast<T*>(TryAllocateRetainedBytes(
-        domain_, count * sizeof(T), alignof(T)));
+    T* pointer = static_cast<T*>(
+        TryAllocateRetainedBytes(domain_, count * sizeof(T), alignof(T)));
     // std::allocator_traits has no error-return channel. Retained containers
     // therefore require their owners to complete deterministic admission
     // before calling into the allocator; violating that invariant is fatal.
@@ -166,8 +166,8 @@ template <typename T, typename... Args>
 std::unique_ptr<T, RetainedObjectDeleter<T>> TryMakeRetainedUnique(
     RetainedAllocationDomain domain, Args&&... args) {
   RetainedAllocator<T> allocator(domain);
-  T* pointer = static_cast<T*>(
-      TryAllocateRetainedBytes(domain, sizeof(T), alignof(T)));
+  T* pointer =
+      static_cast<T*>(TryAllocateRetainedBytes(domain, sizeof(T), alignof(T)));
   if (pointer == nullptr) {
     return {nullptr, RetainedObjectDeleter<T>{allocator}};
   }
@@ -702,8 +702,8 @@ inline ScanHashMapEntryArena::PageHeader* ScanHashMapEntryArena::AllocatePage(
         static_cast<std::uint16_t>(~(std::uint32_t{1} << span_slot));
     ++small_span->live_pages_;
     if (small_span->free_page_mask_ == 0) RemoveAvailableSpan(small_span);
-    storage = static_cast<std::byte*>(small_span->storage_) +
-              span_slot * kPageBytes;
+    storage =
+        static_cast<std::byte*>(small_span->storage_) + span_slot * kPageBytes;
   }
   if (storage == nullptr) {
     ReleasePageId(page_id);
@@ -870,8 +870,8 @@ inline void* ScanHashMapEntryArena::Resolve(Handle handle) const noexcept {
   const std::uint64_t marker = descriptor & std::uint64_t{0xffff};
   assert(descriptor != 0 && marker != kFreePageMarker);
 
-  const auto* page = reinterpret_cast<const PageHeader*>(
-      descriptor & ~std::uint64_t{0xffff});
+  const auto* page =
+      reinterpret_cast<const PageHeader*>(descriptor & ~std::uint64_t{0xffff});
   const std::uint16_t slot = static_cast<std::uint16_t>(handle & kSlotMask);
   if (marker == kLargeClassMarker) {
     assert(slot < page->capacity_);
@@ -887,7 +887,7 @@ inline void* ScanHashMapEntryArena::Resolve(Handle handle) const noexcept {
          block_size <= kClassSizes.back() && block_size % 8 == 0);
   assert(slot < (kPageBytes - kPageHeaderBytes) / block_size);
   return const_cast<std::byte*>(reinterpret_cast<const std::byte*>(page) +
-                               kPageHeaderBytes + slot * block_size);
+                                kPageHeaderBytes + slot * block_size);
 }
 
 inline ScanHashMapEntryArena::Handle ScanHashMapEntryArena::HandleOf(
@@ -1049,8 +1049,7 @@ class ScanHashMap {
           std::memcpy(&sought_head, key.data(), sizeof(sought_head));
           const std::size_t tail_offset =
               metadata.logical_size_ - sizeof(std::uint64_t);
-          std::memcpy(&stored_tail, payload + tail_offset,
-                      sizeof(stored_tail));
+          std::memcpy(&stored_tail, payload + tail_offset, sizeof(stored_tail));
           std::memcpy(&sought_tail, key.data() + tail_offset,
                       sizeof(sought_tail));
           return stored_head == sought_head && stored_tail == sought_tail;
@@ -1263,9 +1262,7 @@ class ScanHashMap {
         expected_entries / kTargetEntriesPerBucket +
         (expected_entries % kTargetEntriesPerBucket != 0);
     const std::size_t exponent =
-        required_buckets <= 1
-            ? 0
-            : std::bit_width(required_buckets - 1);
+        required_buckets <= 1 ? 0 : std::bit_width(required_buckets - 1);
     if (exponent > MaxBucketExponent ||
         exponent >= std::numeric_limits<std::size_t>::digits) {
       return false;
@@ -1421,8 +1418,8 @@ class ScanHashMap {
         Entry::Create(EnsureArena(), digest, key, value, key_complete);
     if (allocation.entry_ == nullptr) return {nullptr, false, true};
     try {
-      if (!AddToTable(Rehashing() ? tables_[1] : tables_[0],
-                      allocation.handle_, Hash(digest))) {
+      if (!AddToTable(Rehashing() ? tables_[1] : tables_[0], allocation.handle_,
+                      Hash(digest))) {
         DestroyEntry(allocation.entry_, allocation.handle_);
         return {nullptr, false, true};
       }
@@ -1442,8 +1439,8 @@ class ScanHashMap {
         Entry::Create(EnsureArena(), digest, key, value, key_complete);
     if (allocation.entry_ == nullptr) return nullptr;
     try {
-      if (!AddToTable(Rehashing() ? tables_[1] : tables_[0],
-                      allocation.handle_, Hash(digest))) {
+      if (!AddToTable(Rehashing() ? tables_[1] : tables_[0], allocation.handle_,
+                      Hash(digest))) {
         DestroyEntry(allocation.entry_, allocation.handle_);
         return nullptr;
       }
@@ -2268,8 +2265,9 @@ class ScanHashMap {
     return FindInTable(tables_[1], digest, key, hash);
   }
 
-  [[gnu::noinline]] const Entry* FindInRehashTable(
-      const Digest& digest, std::string_view key, std::uint64_t hash) const {
+  [[gnu::noinline]] const Entry* FindInRehashTable(const Digest& digest,
+                                                   std::string_view key,
+                                                   std::uint64_t hash) const {
     return FindInTable(tables_[1], digest, key, hash);
   }
 

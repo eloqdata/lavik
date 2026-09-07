@@ -341,11 +341,10 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
-  auto parsed_client_limit =
-      keylane::ParseClientBufferLimit(maxmemory_clients);
+  auto parsed_client_limit = keylane::ParseClientBufferLimit(maxmemory_clients);
   if (!parsed_client_limit.ok()) {
-    std::cerr << "Configuration error: " << parsed_client_limit.status().message()
-              << '\n';
+    std::cerr << "Configuration error: "
+              << parsed_client_limit.status().message() << '\n';
     return 2;
   }
   options.maxmemory_clients_ = *parsed_client_limit;

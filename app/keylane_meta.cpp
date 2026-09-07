@@ -518,7 +518,7 @@ void ShutdownSignalHandler(int signal) {
 }
 
 absl::Status InstallShutdownSignalHandlers() {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (::sigaction(SIGINT, &action, nullptr) != 0 ||

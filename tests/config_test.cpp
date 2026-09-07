@@ -113,9 +113,9 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
       ApplyRedisConfigDirective({"maxclients", "12000"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"maxmemory-clients", "7%"}, &options).ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"client-query-buffer-limit", "64mb"}, &options)
-                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"client-query-buffer-limit", "64mb"}, &options)
+          .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"replicaof", "redis.internal", "6379"},
                                         &options)
                   .ok());
@@ -151,23 +151,21 @@ TEST(RedisConfigTest, AppliesSupportedDirectives) {
           .ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"load-rdb-replace", "yes"}, &options).ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective({"shutdown-checkpoint", "yes"},
-                                        &options)
-                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"shutdown-checkpoint", "yes"}, &options).ok());
   ASSERT_TRUE(ApplyRedisConfigDirective({"dir", "/backup"}, &options).ok());
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"dbfilename", "snapshot.rdb"}, &options).ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective({"foreground-budget-us", "250"},
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"foreground-budget-us", "250"}, &options)
+          .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"background-budget-us", "20"}, &options).ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective({"background-warrant-percent", "7"}, &options)
+          .ok());
+  ASSERT_TRUE(ApplyRedisConfigDirective({"spdk-max-completions-per-poll", "4"},
                                         &options)
-                  .ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective({"background-budget-us", "20"},
-                                        &options)
-                  .ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"background-warrant-percent", "7"}, &options)
-                  .ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"spdk-max-completions-per-poll", "4"}, &options)
                   .ok());
   ASSERT_TRUE(ApplyRedisConfigDirective(
                   {"replication-snapshot-batch-size", "32"}, &options)
@@ -310,9 +308,9 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
       ApplyRedisConfigDirective({"foreground-budget-us", "0"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"background-budget-us", "0"}, &options).ok());
-  EXPECT_FALSE(ApplyRedisConfigDirective(
-                   {"background-warrant-percent", "101"}, &options)
-                   .ok());
+  EXPECT_FALSE(
+      ApplyRedisConfigDirective({"background-warrant-percent", "101"}, &options)
+          .ok());
   EXPECT_FALSE(ApplyRedisConfigDirective(
                    {"replication-snapshot-batch-size", "0"}, &options)
                    .ok());
@@ -327,8 +325,8 @@ TEST(RedisConfigTest, RejectsInvalidAndUnsupportedDirectives) {
   EXPECT_FALSE(ApplyRedisConfigDirective({"maxclients", "0"}, &options).ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"maxmemory-clients", "101%"}, &options).ok());
-  EXPECT_FALSE(ApplyRedisConfigDirective(
-                   {"client-query-buffer-limit", "512kb"}, &options)
+  EXPECT_FALSE(ApplyRedisConfigDirective({"client-query-buffer-limit", "512kb"},
+                                         &options)
                    .ok());
   EXPECT_FALSE(
       ApplyRedisConfigDirective({"maxclients", "many"}, &options).ok());
@@ -358,10 +356,10 @@ TEST(RedisConfigTest, ClusterModeRejectsStandalonePopulationSources) {
   ServerOptions options;
   ASSERT_TRUE(
       ApplyRedisConfigDirective({"cluster-enabled", "yes"}, &options).ok());
-  ASSERT_TRUE(ApplyRedisConfigDirective(
-                  {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"},
-                  &options)
-                  .ok());
+  ASSERT_TRUE(
+      ApplyRedisConfigDirective(
+          {"cluster-static-nodes-file", "/etc/keylane/nodes.conf"}, &options)
+          .ok());
   EXPECT_TRUE(ValidateServerOptions(options).ok());
 
   options.replicaof_ = keylane::ReplicaOfConfig{"keylane.local", 6379};
@@ -496,21 +494,20 @@ TEST(RedisConfigTest, AtomicallyRewritesFailoverManagedDirectives) {
       "replica-priority 80\n");
 
   absl::Status rewritten = RewriteRedisConfigFile(
-      config.path().string(),
-      keylane::ReplicaOfConfig{"new upstream#1", 6380}, false, 20);
+      config.path().string(), keylane::ReplicaOfConfig{"new upstream#1", 6380},
+      false, 20);
   ASSERT_TRUE(rewritten.ok()) << rewritten;
 
   ServerOptions following;
   ASSERT_TRUE(LoadRedisConfigFile(config.path().string(), &following).ok());
-  EXPECT_EQ(following.bind_addresses_,
-            (std::vector<std::string>{"127.0.0.1"}));
+  EXPECT_EQ(following.bind_addresses_, (std::vector<std::string>{"127.0.0.1"}));
   ASSERT_TRUE(following.replicaof_.has_value());
   EXPECT_EQ(following.replicaof_->host_, "new upstream#1");
   EXPECT_EQ(following.replicaof_->port_, 6380);
   EXPECT_EQ(following.replication_options_.replica_priority_, 20u);
 
-  rewritten = RewriteRedisConfigFile(config.path().string(), std::nullopt,
-                                     false, 0);
+  rewritten =
+      RewriteRedisConfigFile(config.path().string(), std::nullopt, false, 0);
   ASSERT_TRUE(rewritten.ok()) << rewritten;
   ServerOptions promoted;
   ASSERT_TRUE(LoadRedisConfigFile(config.path().string(), &promoted).ok());

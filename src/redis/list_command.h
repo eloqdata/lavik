@@ -1,7 +1,7 @@
 #pragma once
 
-#include "keylane/command.h"
 #include "blocking_wait.h"
+#include "keylane/command.h"
 
 namespace keylane {
 

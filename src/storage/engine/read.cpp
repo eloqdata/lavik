@@ -220,16 +220,14 @@ StorageEngine::Impl::RandomKeyLocal(std::uint8_t db_id) {
     std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
-  const bool optimistic =
-      tx::CurrentTxShard().CanReadOptimistically(db_id);
+  const bool optimistic = tx::CurrentTxShard().CanReadOptimistically(db_id);
   return GetWithLockState(db_id, key, digest, trace, routed_partition_id,
                           !optimistic, optimistic);
 }
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
     std::uint8_t db_id, std::string_view key, const Digest& digest,
-    ReadLatencyTrace* trace,
-    std::optional<std::uint16_t> routed_partition_id) {
+    ReadLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id) {
   assert(db_id < kLogicalDatabaseCount);
   return GetWithLockState(db_id, key, digest, trace, routed_partition_id,
                           false);
@@ -237,9 +235,8 @@ Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetLocked(
 
 Task<absl::StatusOr<DiskValue>> StorageEngine::Impl::GetWithLockState(
     std::uint8_t db_id, std::string_view key, Digest digest,
-    ReadLatencyTrace* trace,
-    std::optional<std::uint16_t> routed_partition_id, bool acquire_key_lock,
-    bool optimistic_read) {
+    ReadLatencyTrace* trace, std::optional<std::uint16_t> routed_partition_id,
+    bool acquire_key_lock, bool optimistic_read) {
   assert(db_id < kLogicalDatabaseCount);
   assert(!routed_partition_id.has_value() ||
          *routed_partition_id == RedisSlot(key));

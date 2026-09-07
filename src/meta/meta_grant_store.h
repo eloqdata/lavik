@@ -87,8 +87,8 @@ class MetaGrantStore {
       : max_groups_(max_groups) {}
 
   // Group lifecycle primitives; the apply dispatcher orchestrates them with
-  // the topology store's CreateGroup/group-removal path. AddGroup is idempotent.
-  // RemoveGroup rejects while a grant exists (the group must be
+  // the topology store's CreateGroup/group-removal path. AddGroup is
+  // idempotent. RemoveGroup rejects while a grant exists (the group must be
   // revoked/fenced first) and is an idempotent no-op once the group is gone.
   absl::Status AddGroup(std::string_view group_id);
   absl::Status RemoveGroup(std::string_view group_id);

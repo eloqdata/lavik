@@ -174,25 +174,24 @@ Task<CommandReply> ExecuteHashCommandImpl(const CommandRequest& request,
   // Both locked and ordinary dispatch assign this placeholder. A non-empty
   // diagnostic here only allocates a StatusRep that is discarded immediately.
   absl::StatusOr<storage::HashResult> result;
-  auto replication = tx == nullptr ? PrepareReplicationCommand(request)
-                                   : std::nullopt;
+  auto replication =
+      tx == nullptr ? PrepareReplicationCommand(request) : std::nullopt;
   if (digest == nullptr) {
-    result = co_await g_storage->ExecuteHash(
-        request.db_id_, args[1], operation,
-        replication ? &*replication : nullptr);
+    result =
+        co_await g_storage->ExecuteHash(request.db_id_, args[1], operation,
+                                        replication ? &*replication : nullptr);
   } else {
-    result = co_await g_storage->ExecuteHashLocked(request.db_id_, args[1],
-                                                   *digest, operation, tx,
-                                                   replication ? &*replication
-                                                               : nullptr);
+    result = co_await g_storage->ExecuteHashLocked(
+        request.db_id_, args[1], *digest, operation, tx,
+        replication ? &*replication : nullptr);
   }
   if (!result.ok()) {
     co_return BuiltReply(AppendStorageError(reply_builder, result.status()));
   }
   if (request.kind_ == CommandKind::kHIncrBy) {
     CaptureReplicationCommand(
-        request, {"HSET", args[1], args[2],
-                  std::to_string(result->signed_integer_)});
+        request,
+        {"HSET", args[1], args[2], std::to_string(result->signed_integer_)});
   } else if (request.kind_ == CommandKind::kHIncrByFloat) {
     CaptureReplicationCommand(request,
                               {"HSET", args[1], args[2], result->scalar_});

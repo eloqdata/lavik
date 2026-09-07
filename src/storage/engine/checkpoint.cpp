@@ -168,15 +168,15 @@ constexpr std::uint64_t EncodeCheckpointLocationMetadata(
 
 constexpr std::uint32_t CheckpointRecordOffset(
     std::uint64_t metadata) noexcept {
-  return static_cast<std::uint32_t>(
-             (metadata >> kCheckpointOffsetShift) & kCheckpointOffsetMask) *
+  return static_cast<std::uint32_t>((metadata >> kCheckpointOffsetShift) &
+                                    kCheckpointOffsetMask) *
          kRecordAlignment;
 }
 
 constexpr std::uint32_t CheckpointTotalDiskBytes(
     std::uint64_t metadata) noexcept {
-  return static_cast<std::uint32_t>(
-             (metadata >> kCheckpointLengthShift) & kCheckpointLengthMask) *
+  return static_cast<std::uint32_t>((metadata >> kCheckpointLengthShift) &
+                                    kCheckpointLengthMask) *
          kRecordAlignment;
 }
 
@@ -226,15 +226,14 @@ constexpr std::uint32_t CheckpointKeyBytes(std::uint64_t packed) noexcept {
   return static_cast<std::uint32_t>(packed & kCheckpointKeyBytesMask);
 }
 
-constexpr std::uint32_t CheckpointExtentCount(
-    std::uint64_t packed) noexcept {
-  return static_cast<std::uint32_t>(
-      (packed >> kCheckpointExtentCountShift) & kCheckpointExtentCountMask);
+constexpr std::uint32_t CheckpointExtentCount(std::uint64_t packed) noexcept {
+  return static_cast<std::uint32_t>((packed >> kCheckpointExtentCountShift) &
+                                    kCheckpointExtentCountMask);
 }
 
 constexpr std::uint16_t CheckpointPartition(std::uint64_t packed) noexcept {
-  return static_cast<std::uint16_t>(
-      (packed >> kCheckpointPartitionShift) & kCheckpointPartitionMask);
+  return static_cast<std::uint16_t>((packed >> kCheckpointPartitionShift) &
+                                    kCheckpointPartitionMask);
 }
 
 constexpr std::uint64_t kCheckpointPackedFieldTest =
@@ -311,8 +310,8 @@ class CheckpointWriteSlot {
     assert(state_ != nullptr);
     assert(!state_->active_);
     std::byte* const data = state_->data_;
-    const auto payload = std::span<const std::byte>(
-        data + kBlockHeaderBytes, state_->payload_bytes_);
+    const auto payload = std::span<const std::byte>(data + kBlockHeaderBytes,
+                                                    state_->payload_bytes_);
     BlockHeader header{
         .magic_ = kBlockMagic,
         .block_id_ = block_id,
@@ -321,8 +320,8 @@ class CheckpointWriteSlot {
         .block_bytes_ = kStorageBlockBytes,
         .writer_id_ = shard_id,
         .allocation_epoch_ = allocation_epoch,
-        .committed_bytes_ = static_cast<std::uint32_t>(
-            kBlockHeaderBytes + state_->payload_bytes_),
+        .committed_bytes_ = static_cast<std::uint32_t>(kBlockHeaderBytes +
+                                                       state_->payload_bytes_),
         .record_count_ = record_count,
         .max_lsn_ = 0,
         .header_sequence_ = 1,
@@ -497,8 +496,8 @@ absl::StatusOr<CheckpointChunkHeader> ValidateCheckpointChunk(
           kBlockHeaderBytes + block.extent_payload_bytes_) {
     return absl::InternalError("invalid checkpoint block bounds");
   }
-  const auto payload = std::span<const std::byte>(
-      data + kBlockHeaderBytes, block.extent_payload_bytes_);
+  const auto payload = std::span<const std::byte>(data + kBlockHeaderBytes,
+                                                  block.extent_payload_bytes_);
   if (validate_payload && Crc32c(payload) != block.extent_payload_checksum_) {
     return absl::InternalError("checkpoint payload checksum mismatch");
   }
@@ -596,9 +595,7 @@ class CheckpointPrefetchSlot {
               celer::AllocateStorageBuffer(kStorageBlockBytes, alignment))),
           alignment_(alignment) {}
 
-    ~State() override {
-      celer::FreeStorageBuffer(data_, alignment_);
-    }
+    ~State() override { celer::FreeStorageBuffer(data_, alignment_); }
 
     void Start(Worker& worker, FixedFile file, std::uint64_t offset,
                std::uint64_t block_id, std::uint64_t generation,
@@ -643,10 +640,9 @@ class CheckpointPrefetchSlot {
       }
 
       BlockHeader header{};
-      if (!DecodeBlockHeaderPages(
-              std::span<const std::byte, kBlockHeaderBytes>(
-                  data_, kBlockHeaderBytes),
-              &header) ||
+      if (!DecodeBlockHeaderPages(std::span<const std::byte, kBlockHeaderBytes>(
+                                      data_, kBlockHeaderBytes),
+                                  &header) ||
           header.block_id_ != block_id_ ||
           header.kind_ != BlockKind::kCheckpointIndex ||
           header.tx_generation_ != generation_ ||
@@ -670,8 +666,8 @@ class CheckpointPrefetchSlot {
     }
 
     absl::Status Submit(std::size_t bytes) {
-      return worker_->SubmitRead(
-          file_, std::span<std::byte>(data_, bytes), offset_, this);
+      return worker_->SubmitRead(file_, std::span<std::byte>(data_, bytes),
+                                 offset_, this);
     }
 
     void Finish(Result result) {
@@ -830,8 +826,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   result = {};
   std::array<CheckpointWriteSlot, 2> write_slots;
   for (CheckpointWriteSlot& slot : write_slots) {
-    absl::Status initialized =
-        slot.Initialize(options_.buffers_.alignment_);
+    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
     if (!initialized.ok()) co_return initialized;
   }
   std::size_t payload_slot = 0;
@@ -896,8 +891,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
       .digest_seed_ = CurrentDigestSeed()};
   payload->AppendPod(chunk);
   std::uint32_t chunk_entries = 0;
-  absl::flat_hash_map<std::uint64_t, RecoveryLiveReference>
-      extent_identities;
+  absl::flat_hash_map<std::uint64_t, RecoveryLiveReference> extent_identities;
 
   auto flush_chunk = [&store, generation, &payload, &chunk_entries,
                       &submit_payload]() -> Task<absl::Status> {
@@ -976,10 +970,9 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
             .digest_ = ComputeDigest(key),
             .mutation_sequence_ = location.mutation_sequence_,
             .block_and_epoch_low_ =
-                location.block_id() |
-                ((location.allocation_epoch() &
-                  kCheckpointAllocationEpochLowMask)
-                 << RecordLocation::kBlockIdBits),
+                location.block_id() | ((location.allocation_epoch() &
+                                        kCheckpointAllocationEpochLowMask)
+                                       << RecordLocation::kBlockIdBits),
             .location_metadata_ = EncodeCheckpointLocationMetadata(
                 location.record_offset(), location.total_disk_bytes(),
                 location.block_owner(), db_id, location.kind(),
@@ -1000,8 +993,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
         if (extents != nullptr) {
           payload->AppendBytes(extents->data(),
                                extents->size() * sizeof(ExtentRef));
-          for (std::size_t extent_index = 0;
-               extent_index < extents->size(); ++extent_index) {
+          for (std::size_t extent_index = 0; extent_index < extents->size();
+               ++extent_index) {
             const ExtentRef& extent = extents->at(extent_index);
             RecoveryLiveReference identity{
                 .block_id_ = extent.block_id_,
@@ -1012,8 +1005,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
                 .extent_index_ = static_cast<std::uint32_t>(extent_index),
                 .extent_payload_checksum_ = extent.payload_checksum_,
             };
-            auto [position, inserted] = extent_identities.try_emplace(
-                extent.block_id_, identity);
+            auto [position, inserted] =
+                extent_identities.try_emplace(extent.block_id_, identity);
             if (!inserted) {
               const RecoveryLiveReference& existing = position->second;
               if (existing.allocation_epoch_ != identity.allocation_epoch_ ||
@@ -1022,9 +1015,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
                   existing.extent_index_ != identity.extent_index_ ||
                   existing.extent_payload_checksum_ !=
                       identity.extent_payload_checksum_ ||
-                  identity.bytes_ >
-                      std::numeric_limits<std::uint32_t>::max() -
-                          position->second.bytes_) {
+                  identity.bytes_ > std::numeric_limits<std::uint32_t>::max() -
+                                        position->second.bytes_) {
                 co_return absl::InternalError(
                     "checkpoint has inconsistent extent identities");
               }
@@ -1049,9 +1041,8 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
   };
   payload->AppendPod(accounting_chunk);
   chunk_entries = 0;
-  auto flush_accounting_chunk =
-      [&store, generation, &payload, &chunk_entries,
-       &submit_payload]() -> Task<absl::Status> {
+  auto flush_accounting_chunk = [&store, generation, &payload, &chunk_entries,
+                                 &submit_payload]() -> Task<absl::Status> {
     auto* header =
         reinterpret_cast<CheckpointChunkHeader*>(payload->payload().data());
     header->entry_count_ = chunk_entries;
@@ -1068,8 +1059,7 @@ Task<absl::Status> StorageEngine::Impl::BuildShutdownCheckpointShard(
     co_return absl::OkStatus();
   };
 
-  const std::uint16_t owner =
-      static_cast<std::uint16_t>(store.worker_->id());
+  const std::uint16_t owner = static_cast<std::uint16_t>(store.worker_->id());
   for (std::size_t device_index = 0; device_index < devices_.size();
        ++device_index) {
     const StorageDevice& device = devices_[device_index];
@@ -1312,10 +1302,9 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
             ? device.data_block_count_
             : static_cast<std::uint64_t>(owner - owners.begin());
 #else
-    next_device_offsets[device_index] =
-        (store.worker_->id() + worker_count_ -
-         device_linear_begin % worker_count_) %
-        worker_count_;
+    next_device_offsets[device_index] = (store.worker_->id() + worker_count_ -
+                                         device_linear_begin % worker_count_) %
+                                        worker_count_;
 #endif
     device_linear_begin += device.data_block_count_;
   }
@@ -1336,8 +1325,8 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
       next_device_offset += worker_count_;
 #endif
       scanned_block = true;
-      const std::uint32_t local = static_cast<std::uint32_t>(
-          device.data_block_begin_ + device_offset);
+      const std::uint32_t local =
+          static_cast<std::uint32_t>(device.data_block_begin_ + device_offset);
       if ((std::to_integer<unsigned>(allocator.checkpoint_bitmap_[local / 8]) &
            (1U << (local % 8))) == 0) {
         continue;
@@ -1410,9 +1399,9 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
           "checkpoint capacity header changed after discovery");
     }
     const BlockHeader& block = **candidate;
-    auto chunk = ValidateCheckpointChunk(
-        capacity_blocks[index], current.data(), block,
-        checkpoint_root_.generation_, worker_count_, true);
+    auto chunk = ValidateCheckpointChunk(capacity_blocks[index], current.data(),
+                                         block, checkpoint_root_.generation_,
+                                         worker_count_, true);
     if (!chunk.ok()) co_return chunk.status();
     if (chunk->kind_ != CheckpointChunkKind::kIndexCapacity) {
       co_return absl::InternalError(
@@ -1431,8 +1420,8 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
     }
     const std::byte* cursor =
         current.data() + kBlockHeaderBytes + sizeof(CheckpointChunkHeader);
-    for (std::uint32_t entry_index = 0;
-         entry_index < chunk->entry_count_; ++entry_index) {
+    for (std::uint32_t entry_index = 0; entry_index < chunk->entry_count_;
+         ++entry_index) {
       CheckpointCapacityEntry entry{};
       std::memcpy(&entry, cursor, sizeof(entry));
       cursor += sizeof(entry);
@@ -1456,11 +1445,9 @@ Task<absl::Status> StorageEngine::Impl::DiscoverCheckpoint(
 
 Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
   assert(celer::ThisWorker().id_ == 0);
-  constexpr std::uint64_t kMissing =
-      std::numeric_limits<std::uint64_t>::max();
+  constexpr std::uint64_t kMissing = std::numeric_limits<std::uint64_t>::max();
   std::vector<std::uint64_t> expected(
-      static_cast<std::size_t>(kLogicalStorageShards) *
-          kLogicalDatabaseCount,
+      static_cast<std::size_t>(kLogicalStorageShards) * kLogicalDatabaseCount,
       kMissing);
   std::vector<std::uint32_t> capacity_chunks(worker_count_, 0);
   std::vector<std::vector<std::uint64_t>> body_blocks_by_owner(worker_count_);
@@ -1483,8 +1470,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
       co_return absl::InternalError("checkpoint block total overflows");
     }
     discovered_blocks += loaded.blocks_.size();
-    for (const CheckpointBodyBlock& body :
-         loaded.discovered_body_blocks_) {
+    for (const CheckpointBodyBlock& body : loaded.discovered_body_blocks_) {
       if (body.shard_id_ >= worker_count_) {
         co_return absl::InternalError(
             "checkpoint body block has an invalid owner");
@@ -1510,8 +1496,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
       }
       capacity_chunks[shard] += loaded.capacity_chunks_by_shard_[shard];
     }
-    for (const CheckpointIndexCapacity& capacity :
-         loaded.index_capacities_) {
+    for (const CheckpointIndexCapacity& capacity : loaded.index_capacities_) {
       if (capacity.partition_id_ >= kLogicalStorageShards ||
           capacity.db_id_ >= kLogicalDatabaseCount ||
           capacity.partition_id_ % worker_count_ != capacity.shard_id_) {
@@ -1545,8 +1530,7 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
         "checkpoint must contain one capacity chunk per worker");
   }
   if (std::find(expected.begin(), expected.end(), kMissing) != expected.end()) {
-    co_return absl::InternalError(
-        "checkpoint omits an index capacity entry");
+    co_return absl::InternalError("checkpoint omits an index capacity entry");
   }
   if (declared_entries != checkpoint_root_.entry_count_) {
     co_return absl::InternalError("checkpoint capacity entry count mismatch");
@@ -1559,10 +1543,10 @@ Task<absl::Status> StorageEngine::Impl::PrepareCheckpointIndexes() {
   for (unsigned owner = 0; owner < worker_count_; ++owner) {
     std::vector<std::array<std::uint64_t, kLogicalDatabaseCount>> capacities(
         stores_[owner]->partitions_.size());
-    for (std::size_t partition_index = 0;
-         partition_index < capacities.size(); ++partition_index) {
-      const std::uint16_t partition_id = static_cast<std::uint16_t>(
-          owner + partition_index * worker_count_);
+    for (std::size_t partition_index = 0; partition_index < capacities.size();
+         ++partition_index) {
+      const std::uint16_t partition_id =
+          static_cast<std::uint16_t>(owner + partition_index * worker_count_);
       for (std::uint8_t db_id = 0; db_id < kLogicalDatabaseCount; ++db_id) {
         capacities[partition_index][db_id] =
             expected[static_cast<std::size_t>(partition_id) *
@@ -1628,17 +1612,16 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
   }
   std::array<CheckpointPrefetchSlot, 2> prefetch;
   for (CheckpointPrefetchSlot& slot : prefetch) {
-    absl::Status initialized =
-        slot.Initialize(options_.buffers_.alignment_);
+    absl::Status initialized = slot.Initialize(options_.buffers_.alignment_);
     if (!initialized.ok()) co_return initialized;
   }
 
   auto decode_block = [this, &store, result](
                           std::uint64_t block_id, const std::byte* data,
                           BlockHeader block) -> Task<absl::Status> {
-    auto decoded_chunk = ValidateCheckpointChunk(
-        block_id, data, block, checkpoint_root_.generation_, worker_count_,
-        true);
+    auto decoded_chunk = ValidateCheckpointChunk(block_id, data, block,
+                                                 checkpoint_root_.generation_,
+                                                 worker_count_, true);
     if (!decoded_chunk.ok()) co_return decoded_chunk.status();
     if (decoded_chunk->digest_seed_ != CurrentDigestSeed()) {
       co_return absl::InternalError(
@@ -1672,11 +1655,9 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         if (entry.live_bytes_ == 0 || entry.allocation_epoch_ == 0 ||
             entry.extent_ > 1 ||
             (entry.extent_ && entry.owner_ != kUnownedBlock) ||
-            (!entry.extent_ &&
-             (entry.owner_ != block.extent_index_ ||
-              entry.owner_ >= worker_count_)) ||
-            entry.reserved_ != 0 ||
-            entry.reserved_tail_ != 0 ||
+            (!entry.extent_ && (entry.owner_ != block.extent_index_ ||
+                                entry.owner_ >= worker_count_)) ||
+            entry.reserved_ != 0 || entry.reserved_tail_ != 0 ||
             !RecordLocation::CanEncodeBlockIdentity(entry.block_id_,
                                                     entry.allocation_epoch_) ||
             (entry.extent_ &&
@@ -1685,8 +1666,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             (!entry.extent_ &&
              (entry.extent_payload_bytes_ != 0 || entry.extent_index_ != 0 ||
               entry.extent_payload_checksum_ != 0))) {
-          co_return absl::InternalError(
-              "invalid checkpoint accounting entry");
+          co_return absl::InternalError("invalid checkpoint accounting entry");
         }
         RecoveryLiveReference reference{
             .block_id_ = entry.block_id_,
@@ -1699,8 +1679,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             .extent_index_ = entry.extent_index_,
             .extent_payload_checksum_ = entry.extent_payload_checksum_,
         };
-        if (!result->live_by_block_
-                 .try_emplace(entry.block_id_, reference)
+        if (!result->live_by_block_.try_emplace(entry.block_id_, reference)
                  .second) {
           co_return absl::InternalError(
               "checkpoint accounting repeats a physical block");
@@ -1759,9 +1738,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             (kind != RecordKind::kValue && kind != RecordKind::kTombstone) ||
             (kind == RecordKind::kTombstone &&
              value_type != ValueType::kNone) ||
-            (kind == RecordKind::kValue &&
-             (value_type < ValueType::kString ||
-              value_type > ValueType::kStream)) ||
+            (kind == RecordKind::kValue && (value_type < ValueType::kString ||
+                                            value_type > ValueType::kStream)) ||
             entry.logical_size_ > RecordIndexValue::kLogicalSizeMask ||
             record_offset < kBlockHeaderBytes || total_disk_bytes == 0 ||
             static_cast<std::uint64_t>(record_offset) + total_disk_bytes >
@@ -1771,10 +1749,9 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
             fixed_bytes > static_cast<std::size_t>(end - entry_cursor) ||
             key_bytes >
                 static_cast<std::size_t>(end - entry_cursor) - fixed_bytes ||
-            extent_count >
-                (static_cast<std::size_t>(end - entry_cursor) - fixed_bytes -
-                 key_bytes) /
-                    sizeof(ExtentRef)) {
+            extent_count > (static_cast<std::size_t>(end - entry_cursor) -
+                            fixed_bytes - key_bytes) /
+                               sizeof(ExtentRef)) {
           return absl::InternalError("invalid checkpoint entry");
         }
         const std::size_t entry_bytes =
@@ -1785,8 +1762,7 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
           std::memcpy(&expire_at_ms, entry_cursor + sizeof(entry),
                       sizeof(expire_at_ms));
           if (expire_at_ms == 0) {
-            return absl::InternalError(
-                "checkpoint expiry extension is zero");
+            return absl::InternalError("checkpoint expiry extension is zero");
           }
         }
         const char* key_data =
@@ -1826,12 +1802,12 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
         // A frozen checkpoint has exactly one final winner per key. Direct
         // insertion skips cold-scan version arbitration while publishing the
         // same owner-local accounting as ordinary recovery insertion.
-        partition.mutation_sequence_ = std::max(
-            partition.mutation_sequence_, location.mutation_sequence_);
+        partition.mutation_sequence_ =
+            std::max(partition.mutation_sequence_, location.mutation_sequence_);
         AddFullSyncCoverageEntry(partition, db_id, key.size());
         if (location.external()) {
           store.external_manifests_.insert_or_assign(installed,
-                                                      std::move(extents));
+                                                     std::move(extents));
         }
         if (location.key_external()) [[unlikely]] {
           // The complete key is needed through expiry and any fallback merge;
@@ -1885,9 +1861,8 @@ Task<absl::Status> StorageEngine::Impl::LoadCheckpoint(
       co_return absl::InternalError(
           "checkpoint body header changed after discovery");
     }
-    absl::Status decoded =
-        co_await decode_block(result->body_blocks_[index], current.data(),
-                              **candidate);
+    absl::Status decoded = co_await decode_block(result->body_blocks_[index],
+                                                 current.data(), **candidate);
     if (!decoded.ok()) co_return decoded;
   }
   co_return absl::OkStatus();

@@ -18,8 +18,8 @@ struct StringExecKey {
 
 void InitStringCommandStorage(storage::StorageEngine* engine);
 
-celer::Task<CommandReply> ExecuteStringCommand(
-    const CommandRequest& request, ReplyBuilder& reply_builder);
+celer::Task<CommandReply> ExecuteStringCommand(const CommandRequest& request,
+                                               ReplyBuilder& reply_builder);
 
 celer::Task<CommandReply> ExecuteStringCommandLocked(
     const CommandRequest& request, const storage::Digest& digest,

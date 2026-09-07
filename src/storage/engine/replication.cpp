@@ -1787,26 +1787,26 @@ Task<absl::Status> StorageEngine::Impl::ApplyReplicaRecords(
             "budget");
       }
       partition.replica_value_stage_ = ReplicaValueStage{
-            .db_id_ = record.db_id_,
-            .db_epoch_ = record.db_epoch_,
-            .mutation_sequence_ = record.mutation_sequence_,
-            .expire_at_ms_ = record.expire_at_ms_,
-            .logical_size_ = value_logical_size,
-            .encoded_size_ = record.logical_size_,
-            .next_chunk_ = 0,
-            .chunk_count_ = record.chunk_count_,
-            .value_type_ = record.value_type_,
-            .key_ = record.key_,
-            .value_ = {},
-            .memory_charge_ = {},
-        };
-        // Reserve once while the memory permit is live. Chunks append within
-        // this capacity, so a peer cannot create an unaccounted allocation at
-        // an arbitrary point later in the stream.
-        partition.replica_value_stage_->value_.reserve(
-            static_cast<std::size_t>(record.logical_size_));
-      partition.replica_value_stage_->memory_charge_.Adopt(
-          &*stage_reservation, stage_bytes);
+          .db_id_ = record.db_id_,
+          .db_epoch_ = record.db_epoch_,
+          .mutation_sequence_ = record.mutation_sequence_,
+          .expire_at_ms_ = record.expire_at_ms_,
+          .logical_size_ = value_logical_size,
+          .encoded_size_ = record.logical_size_,
+          .next_chunk_ = 0,
+          .chunk_count_ = record.chunk_count_,
+          .value_type_ = record.value_type_,
+          .key_ = record.key_,
+          .value_ = {},
+          .memory_charge_ = {},
+      };
+      // Reserve once while the memory permit is live. Chunks append within
+      // this capacity, so a peer cannot create an unaccounted allocation at
+      // an arbitrary point later in the stream.
+      partition.replica_value_stage_->value_.reserve(
+          static_cast<std::size_t>(record.logical_size_));
+      partition.replica_value_stage_->memory_charge_.Adopt(&*stage_reservation,
+                                                           stage_bytes);
       continue;
     }
     if (record.kind_ == SnapshotRecord::Kind::kValueChunk) {

@@ -67,9 +67,9 @@ Decision Admit(const ServingState* state, const RequestView& request);
 // admission), the executing worker compares per-group authority tokens for
 // the request's slots between the admitted and the current snapshot.
 enum class RecheckResult : std::uint8_t {
-  kOk,        // authority unchanged; proceed
-  kReject,    // nothing executed yet; safe to answer with redirect/error
-  kUncertain, // a revoking change raced an irreversible step; close connection
+  kOk,         // authority unchanged; proceed
+  kReject,     // nothing executed yet; safe to answer with redirect/error
+  kUncertain,  // a revoking change raced an irreversible step; close connection
 };
 
 // Compares per-group authority (owner identity, term, grant, readiness —

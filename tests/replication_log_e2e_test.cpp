@@ -396,8 +396,8 @@ class ReplicationLogService final : public celer::Service {
               }),
           "canonical tail command was not enqueued");
 
-    std::vector<std::string> final_command{
-        "SET", "canonical-head", std::string(2 * kMiB, 'c')};
+    std::vector<std::string> final_command{"SET", "canonical-head",
+                                           std::string(2 * kMiB, 'c')};
     const auto final_bytes =
         keylane::storage::ReplicationTransactionAllocationBytes(
             transaction->participants_.capacity(),
@@ -1573,8 +1573,7 @@ class ReplicationLogService final : public celer::Service {
     if (!append_status.ok()) co_return append_status;
 
     const auto info = storage_->LocalReplicationLogInfo();
-    Check(info.backpressure_waits_ >= 2 &&
-              info.coverage_revocations_ == 1 &&
+    Check(info.backpressure_waits_ >= 2 && info.coverage_revocations_ == 1 &&
               info.retained_cursor_count_ == 0,
           "runtime policy change did not wake and revoke lagging coverage");
     status = co_await storage_->DisableReplicationLog();

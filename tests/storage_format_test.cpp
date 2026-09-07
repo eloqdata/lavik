@@ -329,10 +329,10 @@ TEST(StorageFormatTest, EncodesAndValidatesPersistentMetadata) {
   ASSERT_TRUE(EncodeRecordHeader(
       record, key,
       std::span<std::byte>(record_page.data(), record_header_bytes)));
-  EXPECT_TRUE(std::all_of(
-      record_page.begin() + sizeof(RecordHeader) + key.size(),
-      record_page.begin() + record_header_bytes,
-      [](std::byte byte) { return byte == std::byte{0}; }));
+  EXPECT_TRUE(
+      std::all_of(record_page.begin() + sizeof(RecordHeader) + key.size(),
+                  record_page.begin() + record_header_bytes,
+                  [](std::byte byte) { return byte == std::byte{0}; }));
   RecordHeader decoded_record{};
   std::string_view decoded_key;
   ASSERT_TRUE(DecodeRecordHeader(

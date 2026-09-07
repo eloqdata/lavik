@@ -21,9 +21,10 @@ class PubSubSession;
 // Everything here must be cleaned up through the single cleanup point at the
 // end of RedisService::Serve.
 struct ConnectionContext {
-  using HelloHandler = std::string_view (*)(
-      const void*, void*, ConnectionContext&, std::span<const std::string>,
-      ReplyBuilder&);
+  using HelloHandler = std::string_view (*)(const void*, void*,
+                                            ConnectionContext&,
+                                            std::span<const std::string>,
+                                            ReplyBuilder&);
   std::uint8_t selected_db_ = 0;
   bool authenticated_ = true;
   bool authentication_required_ = false;

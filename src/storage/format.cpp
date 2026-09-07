@@ -679,8 +679,7 @@ bool DecodeRecordHeader(std::span<const std::byte> input, RecordHeader* header,
       RecordFixedHeaderBytes(has_txid, has_expiry);
   const std::size_t header_bytes =
       RecordHeaderBytes(key_bytes, key_external, has_txid, has_expiry);
-  if (!ValidRecordKeySize(key_bytes) ||
-      header_bytes > kMaxRecordHeaderBytes ||
+  if (!ValidRecordKeySize(key_bytes) || header_bytes > kMaxRecordHeaderBytes ||
       header_bytes > input.size()) {
     return false;
   }

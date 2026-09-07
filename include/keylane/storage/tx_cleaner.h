@@ -14,8 +14,8 @@ struct TxGenerationReadiness {
 constexpr bool CanReclaimTxGeneration(
     const TxGenerationReadiness& readiness) noexcept {
   return readiness.active_transactions_ == 0 &&
-         readiness.live_tagged_bytes_ == 0 &&
-         readiness.dependency_pins_ == 0 && readiness.sealed_and_durable_;
+         readiness.live_tagged_bytes_ == 0 && readiness.dependency_pins_ == 0 &&
+         readiness.sealed_and_durable_;
 }
 
 }  // namespace keylane::storage::internal

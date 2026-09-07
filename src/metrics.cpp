@@ -175,17 +175,15 @@ void RecordCommandMetric(CommandKind kind,
   WorkerMetricsShard& shard = g_worker_metrics[worker];
   std::size_t bucket = shard.last_latency_buckets_[command_index];
   const bool above_lower =
-      bucket == 0 ||
-      elapsed_ticks > g_latency_bucket_upper_ticks[bucket - 1];
+      bucket == 0 || elapsed_ticks > g_latency_bucket_upper_ticks[bucket - 1];
   const bool below_upper =
       bucket == g_latency_bucket_upper_ticks.size() ||
       elapsed_ticks <= g_latency_bucket_upper_ticks[bucket];
   if (!above_lower || !below_upper) {
-    bucket = static_cast<std::size_t>(std::lower_bound(
-                                         g_latency_bucket_upper_ticks.begin(),
-                                         g_latency_bucket_upper_ticks.end(),
-                                         elapsed_ticks) -
-                                     g_latency_bucket_upper_ticks.begin());
+    bucket = static_cast<std::size_t>(
+        std::lower_bound(g_latency_bucket_upper_ticks.begin(),
+                         g_latency_bucket_upper_ticks.end(), elapsed_ticks) -
+        g_latency_bucket_upper_ticks.begin());
     shard.last_latency_buckets_[command_index] =
         static_cast<std::uint8_t>(bucket);
   }

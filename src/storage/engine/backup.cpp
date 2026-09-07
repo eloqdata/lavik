@@ -240,13 +240,12 @@ Task<absl::Status> StorageEngine::Impl::CaptureRdbSnapshotBeforeWriteLocked(
           store.rdb_snapshot_->invalidated_ = true;
         }
       } else {
-        if (capture->dirty_keys_.InsertNew(
-                map_digest, map_key,
-                SnapshotValue{
-                    .location_ = {},
-                    .extents_ = nullptr,
-                    .phase_ = Phase::kAbsent,
-                }) == nullptr) {
+        if (capture->dirty_keys_.InsertNew(map_digest, map_key,
+                                           SnapshotValue{
+                                               .location_ = {},
+                                               .extents_ = nullptr,
+                                               .phase_ = Phase::kAbsent,
+                                           }) == nullptr) {
           store.rdb_snapshot_->invalidated_ = true;
         }
         reservation->Release();
@@ -409,13 +408,12 @@ StorageEngine::Impl::MaterializeRdbSnapshotKey(
           co_return absl::ResourceExhaustedError(
               "RDB snapshot dirty-key allocation failed");
         }
-        if (capture->dirty_keys_.InsertNew(
-                map_digest, map_key,
-                SavedValue{
-                    .location_ = {},
-                    .extents_ = nullptr,
-                    .phase_ = Phase::kDone,
-                }) == nullptr) {
+        if (capture->dirty_keys_.InsertNew(map_digest, map_key,
+                                           SavedValue{
+                                               .location_ = {},
+                                               .extents_ = nullptr,
+                                               .phase_ = Phase::kDone,
+                                           }) == nullptr) {
           store.rdb_snapshot_->invalidated_ = true;
           co_return absl::ResourceExhaustedError(
               "RDB snapshot dirty-key capacity exhausted");

@@ -1,12 +1,12 @@
 #pragma once
 
+#include <cctype>
 #include <cerrno>
 #include <charconv>
-#include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -85,8 +85,7 @@ inline bool ParseRedisDouble(std::string_view input, double* value,
 
 // Redis string2ld grammar. ERANGE is accepted only for a non-zero finite
 // subnormal value, matching Valkey 7.2's handling of strtold().
-inline bool ParseRedisLongDouble(std::string_view input,
-                                 long double* value) {
+inline bool ParseRedisLongDouble(std::string_view input, long double* value) {
   constexpr std::size_t kMaxLongDoubleChars = 5 * 1024;
   if (value == nullptr || input.empty() ||
       input.size() >= kMaxLongDoubleChars ||

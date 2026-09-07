@@ -1,0 +1,8 @@
+repos:
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v23.1.0
+    hooks:
+      - id: clang-format
+        name: clang-format 23.1.0
+        files: '^(app/|include/keylane/|src/|tests/).*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$'
+        exclude: '^include/keylane/CLI11\.hpp$'

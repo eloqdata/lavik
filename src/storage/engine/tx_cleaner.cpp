@@ -584,9 +584,9 @@ Task<absl::Status> StorageEngine::Impl::DrainTxCleanerForShutdown() {
   // and an invariant violation must degrade to cold recovery instead of racing
   // two generation coordinators.
   bool expected = false;
-  if (!tx_cleaner_running_.compare_exchange_strong(
-          expected, true, std::memory_order_acq_rel,
-          std::memory_order_acquire)) {
+  if (!tx_cleaner_running_.compare_exchange_strong(expected, true,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
     co_return absl::FailedPreconditionError(
         "transaction cleaner is still running at shutdown");
   }

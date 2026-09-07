@@ -96,8 +96,8 @@ CommandRequest BuildParsedCommandRequest(RespCommand command,
   assert(!command.args_.empty());
   CommandRequest request;
   request.spec_ = FindCommand(command.args_.front());
-  request.kind_ = request.spec_ != nullptr ? request.spec_->kind_
-                                           : CommandKind::kUnknown;
+  request.kind_ =
+      request.spec_ != nullptr ? request.spec_->kind_ : CommandKind::kUnknown;
   request.db_id_ = db_id;
   request.args_ = std::move(command.args_);
   return request;
@@ -473,7 +473,7 @@ absl::Status InstallShutdownSignalHandler() {
     return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
   }
 
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ShutdownSignalHandler;
   if (sigaction(SIGINT, &action, nullptr) != 0 ||
@@ -486,7 +486,7 @@ absl::Status InstallShutdownSignalHandler() {
 }
 
 void CleanupShutdownSignalHandler() noexcept {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = SIG_DFL;
   (void)sigaction(SIGINT, &action, nullptr);
@@ -520,7 +520,7 @@ absl::Status InstallClusterReloadSignalHandler() {
     return absl::Status(absl::StatusCode::kInternal, "eventfd setup failed");
   }
 
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = ClusterReloadSignalHandler;
   if (sigaction(SIGHUP, &action, nullptr) != 0) {
@@ -532,7 +532,7 @@ absl::Status InstallClusterReloadSignalHandler() {
 }
 
 void CleanupClusterReloadSignalHandler() noexcept {
-  struct sigaction action {};
+  struct sigaction action{};
   sigemptyset(&action.sa_mask);
   action.sa_handler = SIG_DFL;
   (void)sigaction(SIGHUP, &action, nullptr);
@@ -922,9 +922,7 @@ void RedisService::Prepare(unsigned thread_count) {
   rdb_import_barrier_ = std::make_unique<CoroutineBarrier>(thread_count);
 }
 
-void RedisService::StopAcceptingRequests() noexcept {
-  request_gate_.Close();
-}
+void RedisService::StopAcceptingRequests() noexcept { request_gate_.Close(); }
 
 void RedisService::WaitForRequestsDrained() const noexcept {
   request_gate_.WaitUntilEmpty();
@@ -1646,8 +1644,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
     if (kind == CommandKind::kQuit || kind == CommandKind::kReset) {
       const std::size_t queued_before = ctx.queued_.size();
-      CommandReply reply =
-          co_await DispatchCommand(ctx, request, builder);
+      CommandReply reply = co_await DispatchCommand(ctx, request, builder);
       if (ctx.queued_.size() > queued_before) {
         *multi_input_bytes += command_memory.Detach();
       } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1702,8 +1699,7 @@ Task<absl::Status> RedisService::ReadSubscribedCommands(
     }
 
     const std::size_t queued_before = ctx.queued_.size();
-    CommandReply reply =
-        co_await DispatchCommand(ctx, request, builder);
+    CommandReply reply = co_await DispatchCommand(ctx, request, builder);
     if (ctx.queued_.size() > queued_before) {
       *multi_input_bytes += command_memory.Detach();
     } else if (queued_before != 0 && ctx.queued_.empty()) {
@@ -1956,9 +1952,8 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
       // already completed remain invisible to the client indefinitely.
       // Blocking commands queued by MULTI execute non-blocking at EXEC time,
       // so preserve batching while they are only being queued.
-      const bool may_block =
-          !ctx.in_multi_ && request.spec_ != nullptr &&
-          (request.spec_->flags_ & kCmdMayBlock) != 0;
+      const bool may_block = !ctx.in_multi_ && request.spec_ != nullptr &&
+                             (request.spec_->flags_ & kCmdMayBlock) != 0;
       if (may_block && !pending_replies.empty()) {
         absl::Status flushed =
             co_await FlushReplyBatch(stream, &pending_replies);
@@ -1976,17 +1971,15 @@ Task<absl::Status> RedisService::Serve(TcpStream& stream,
             kind != CommandKind::kDiscard && kind != CommandKind::kMulti &&
             kind != CommandKind::kWatch;
         if (!defer_to_exec) {
-          monitor_message =
-              PrepareMonitorMessage(request.db_id_, ctx.peer_address_,
-                                    request.args_, &request);
+          monitor_message = PrepareMonitorMessage(
+              request.db_id_, ctx.peer_address_, request.args_, &request);
         }
       }
       if (monitor_message != nullptr && !publish_monitor_after_dispatch)
           [[unlikely]] {
         PublishMonitorMessage(std::move(monitor_message));
       }
-      reply =
-          co_await DispatchCommand(ctx, request, ctx.reply_builder_);
+      reply = co_await DispatchCommand(ctx, request, ctx.reply_builder_);
     }
     if (ctx.queued_.size() > queued_before) {
       multi_input_bytes += command_memory.Detach();
@@ -2196,7 +2189,7 @@ int RunServer(ServerOptions options) {
         ++skipped;
       }
     }
-    struct stat rdb_info {};
+    struct stat rdb_info{};
     if (::stat(options.load_rdb_file_.c_str(), &rdb_info) != 0) {
       spdlog::error("cannot identify replacement RDB '{}': {}",
                     options.load_rdb_file_, std::strerror(errno));
@@ -2216,7 +2209,7 @@ int RunServer(ServerOptions options) {
         }
         continue;
       }
-      struct stat info {};
+      struct stat info{};
       if (::stat(path.c_str(), &info) != 0) {
         spdlog::error("cannot identify replacement storage path '{}': {}", path,
                       std::strerror(errno));
@@ -2327,12 +2320,11 @@ int RunServer(ServerOptions options) {
       options.storage_write_buffer_count_, options.storage_read_buffer_bytes_,
       options.replication_publish_queue_bytes_, options.max_memory_bytes_,
       FormatClientBufferLimit(options.maxmemory_clients_),
-      options.client_query_buffer_limit_bytes_,
-      options.flush_max_ms_, options.flush_size_bytes_,
-      options.inline_key_max_bytes_,
-      options.defrag_max_active_per_device_,
-      options.defrag_sleep_ms_, options.defrag_record_sleep_us_,
-      options.defrag_paused_, options.shutdown_checkpoint_,
+      options.client_query_buffer_limit_bytes_, options.flush_max_ms_,
+      options.flush_size_bytes_, options.inline_key_max_bytes_,
+      options.defrag_max_active_per_device_, options.defrag_sleep_ms_,
+      options.defrag_record_sleep_us_, options.defrag_paused_,
+      options.shutdown_checkpoint_,
       options.replication_options_.backlog_backpressure_);
 
   const absl::Status memory_status =

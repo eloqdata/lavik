@@ -58,6 +58,32 @@ determinism boundary, invariant matrix, trace/replay commands, and hardware
 allowlist rules. The CTest labels are `cluster-model`,
 `cluster-integration`, `cluster-soak`, and `cluster-hardware`.
 
+## Source formatting
+
+Keylane and its Celer submodule use the Google style, parse source as C++23,
+and pin clang-format 23.1.0. Install `pre-commit` once and enable the repository
+hook:
+
+```bash
+sudo apt-get install pre-commit
+pre-commit install
+```
+
+The first run creates an isolated hook environment and downloads the pinned
+formatter; clang-format is not a Keylane runtime or build dependency. Commits
+then format staged first-party C and C++ files. When formatting changes a file,
+the commit stops so the result can be reviewed and staged before retrying. To
+format every maintained source file explicitly, run:
+
+```bash
+pre-commit run clang-format --all-files
+```
+
+The CMake `format` and `format-check` targets use a system installation only
+when it reports exactly version 23.1.0. This exact check prevents a local tool
+upgrade from silently rewriting unrelated code. The pre-commit hook is the
+portable path when that system binary is unavailable.
+
 ## Downloadable release package
 
 ```bash

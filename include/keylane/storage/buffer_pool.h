@@ -69,9 +69,7 @@ class ReadBufferLease {
   // Aligned region intended as the destination of READ_FIXED.
   celer::FixedBuffer io_buffer() const noexcept;
 
-  std::span<std::byte> bytes() const noexcept {
-    return {data_, size_};
-  }
+  std::span<std::byte> bytes() const noexcept { return {data_, size_}; }
   std::size_t headroom_bytes() const noexcept { return headroom_bytes_; }
   std::size_t tailroom_bytes() const noexcept { return tailroom_bytes_; }
 
@@ -83,8 +81,8 @@ class ReadBufferLease {
                   std::size_t headroom_bytes,
                   std::size_t tailroom_bytes) noexcept;
   ReadBufferLease(RegisteredBufferPool* pool, celer::FixedBuffer buffer,
-                  std::size_t headroom_bytes,
-                  std::size_t tailroom_bytes, std::size_t overflow_id) noexcept;
+                  std::size_t headroom_bytes, std::size_t tailroom_bytes,
+                  std::size_t overflow_id) noexcept;
 
   // A lease releases either a fixed slot or an overflow slot, never both. The
   // high bit distinguishes the latter so their mutually exclusive ids occupy

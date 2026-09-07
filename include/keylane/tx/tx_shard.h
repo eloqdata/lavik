@@ -272,8 +272,8 @@ class TxShard {
   bool TryFastPath(std::span<const KeyRef> keys) {
     if (keys.size() == 1) {
       const KeyRef& key = keys.front();
-      const bool granted = locks_[key.db_].AcquireIntentAndHoldIfGranted(
-          key.fp_, key.mode_);
+      const bool granted =
+          locks_[key.db_].AcquireIntentAndHoldIfGranted(key.fp_, key.mode_);
       if (granted) {
         ++fastpath_runs_;
       }

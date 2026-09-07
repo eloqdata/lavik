@@ -405,8 +405,8 @@ bool WaitForInfoStat(RespClient& client, std::string_view marker,
 }
 
 bool WaitForCleanerRetirement(RespClient& client, std::uint64_t baseline) {
-  return WaitForCleanerStat(client, "tx_cleaner_retired_generations:",
-                            baseline);
+  return WaitForCleanerStat(client,
+                            "tx_cleaner_retired_generations:", baseline);
 }
 
 }  // namespace
@@ -605,11 +605,9 @@ int main(int argc, char** argv) {
           InfoStat(client, "tx_commit_batch_transactions:") -
           transactions_before;
       const std::uint64_t input_fences =
-          InfoStat(client, "tx_commit_input_fences:") -
-          input_fences_before;
+          InfoStat(client, "tx_commit_input_fences:") - input_fences_before;
       const std::uint64_t merged_fences =
-          InfoStat(client, "tx_commit_merged_fences:") -
-          merged_fences_before;
+          InfoStat(client, "tx_commit_merged_fences:") - merged_fences_before;
       if (transactions != kWriters * kRounds) {
         Fail("commit coordinator lost a concurrent MSET receipt");
       }
@@ -690,8 +688,8 @@ int main(int argc, char** argv) {
            "*2\r\n" + Bulk(large) + "\r\n" + Bulk("s"), "MGET large");
     const auto streamed_pipeline = client.Pipeline(
         {{"GET", "large"}, {"PING"}, {"GET", "large"}, {"PING"}});
-    if (streamed_pipeline != std::vector<std::string>{
-                                 Bulk(large), "+PONG", Bulk(large), "+PONG"}) {
+    if (streamed_pipeline !=
+        std::vector<std::string>{Bulk(large), "+PONG", Bulk(large), "+PONG"}) {
       Fail("mixed streamed/encoded pipeline reordered replies");
     }
     Expect(client.Command({"DEL", "large", "small"}), ":2", "DEL large");
@@ -814,20 +812,19 @@ int main(int argc, char** argv) {
           (std::uint64_t{1} << (64 - 14)) - 1;
       // Standard Redis slots for b, c, d, and a are 3300, 7365, 11298, and
       // 15495 respectively, selecting owners 0 through 3 modulo four.
-      constexpr std::array<std::string_view, 4> kWorkerTags{
-          "{b}", "{c}", "{d}", "{a}"};
+      constexpr std::array<std::string_view, 4> kWorkerTags{"{b}", "{c}", "{d}",
+                                                            "{a}"};
       std::vector<std::string> packed_cursor_keys;
       packed_cursor_keys.reserve(kPackedCursorKeysPerWorker *
                                  kWorkerTags.size());
       for (std::string_view tag : kWorkerTags) {
         for (std::size_t i = 0; i < kPackedCursorKeysPerWorker; ++i) {
-          packed_cursor_keys.push_back("scan-packed:" + std::string(tag) +
-                                       ":" + std::to_string(i));
+          packed_cursor_keys.push_back("scan-packed:" + std::string(tag) + ":" +
+                                       std::to_string(i));
         }
       }
       for (const std::string& key : packed_cursor_keys) {
-        Expect(client.Command({"SET", key, "v"}), "+OK",
-               "packed-cursor seed");
+        Expect(client.Command({"SET", key, "v"}), "+OK", "packed-cursor seed");
       }
 
       std::string collected;
@@ -863,9 +860,10 @@ int main(int argc, char** argv) {
 
       for (std::size_t worker = 0; worker < saw_local_cursor.size(); ++worker) {
         if (!saw_local_cursor[worker]) {
-          Fail("packed-cursor SCAN never returned local bucket state for "
-               "worker " +
-               std::to_string(worker));
+          Fail(
+              "packed-cursor SCAN never returned local bucket state for "
+              "worker " +
+              std::to_string(worker));
         }
       }
       for (const std::string& key : packed_cursor_keys) {
@@ -912,19 +910,18 @@ int main(int argc, char** argv) {
     Expect(client.Command({"CONFIG", "GET", "tx-cleaner-cooldown-ms"}),
            "*2\r\n" + Bulk("tx-cleaner-cooldown-ms") + "\r\n" + Bulk("20"),
            "read tx cleaner cooldown");
-    const std::uint64_t cleaner_baseline =
-        TxCleanerRetiredGenerations(client);
-    Expect(client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b",
-                           "after-b", "cleaner-c", "after-c", "cleaner-d",
-                           "after-d"}),
-           "+OK", "tx cleaner seed");
+    const std::uint64_t cleaner_baseline = TxCleanerRetiredGenerations(client);
+    Expect(
+        client.Command({"MSET", "cleaner-a", "after-a", "cleaner-b", "after-b",
+                        "cleaner-c", "after-c", "cleaner-d", "after-d"}),
+        "+OK", "tx cleaner seed");
     if (!WaitForCleanerRetirement(client, cleaner_baseline)) {
       Fail("transaction cleaner did not retire a generation");
     }
-    Expect(client.Command({"MGET", "cleaner-d", "cleaner-a", "cleaner-c",
-                           "cleaner-b"}),
-           "*4\r\n" + Bulk("after-d") + "\r\n" + Bulk("after-a") +
-               "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-b"),
+    Expect(client.Command(
+               {"MGET", "cleaner-d", "cleaner-a", "cleaner-c", "cleaner-b"}),
+           "*4\r\n" + Bulk("after-d") + "\r\n" + Bulk("after-a") + "\r\n" +
+               Bulk("after-c") + "\r\n" + Bulk("after-b"),
            "values after tx cleaner retirement");
     Expect(client.Command({"MSET", "{disk-batch}a", "batch-a", "{disk-batch}b",
                            "batch-b", "{disk-batch}c", "batch-c",
@@ -952,10 +949,10 @@ int main(int argc, char** argv) {
            "startup checkpoint setting initializes runtime state");
     Expect(recovered.Command({"CONFIG", "SET", "shutdown-checkpoint", "no"}),
            "+OK", "disable the recovered server's next checkpoint");
-    Expect(recovered.Command({"MGET", "cleaner-a", "cleaner-b", "cleaner-c",
-                              "cleaner-d"}),
-           "*4\r\n" + Bulk("after-a") + "\r\n" + Bulk("after-b") +
-               "\r\n" + Bulk("after-c") + "\r\n" + Bulk("after-d"),
+    Expect(recovered.Command(
+               {"MGET", "cleaner-a", "cleaner-b", "cleaner-c", "cleaner-d"}),
+           "*4\r\n" + Bulk("after-a") + "\r\n" + Bulk("after-b") + "\r\n" +
+               Bulk("after-c") + "\r\n" + Bulk("after-d"),
            "promoted values after restart");
     Expect(recovered.Command({"MGET", "{disk-batch}d", "{disk-batch}b",
                               "{disk-batch}a", "{disk-batch}c"}),
@@ -965,20 +962,21 @@ int main(int argc, char** argv) {
     // Recovered values exercise disk-backed replies. Encoded replies preceding
     // them must flush first, and an empty batch must not suppress a disk reply.
     for (int repeat = 0; repeat < 3; ++repeat) {
-      const auto replies = recovered.Pipeline(
-          {{"GET", "{disk-batch}a"}, {"PING"},
-           {"GET", "{disk-batch}b"}, {"GET", "{disk-batch}c"},
-           {"GET", "pipeline-missing-key"}, {"GET", "{disk-batch}d"},
-           {"PING"}});
+      const auto replies = recovered.Pipeline({{"GET", "{disk-batch}a"},
+                                               {"PING"},
+                                               {"GET", "{disk-batch}b"},
+                                               {"GET", "{disk-batch}c"},
+                                               {"GET", "pipeline-missing-key"},
+                                               {"GET", "{disk-batch}d"},
+                                               {"PING"}});
       const std::vector<std::string> expected{
-          Bulk("batch-a"), "+PONG", Bulk("batch-b"), Bulk("batch-c"),
-          "$-1", Bulk("batch-d"), "+PONG"};
+          Bulk("batch-a"), "+PONG",         Bulk("batch-b"), Bulk("batch-c"),
+          "$-1",           Bulk("batch-d"), "+PONG"};
       if (replies != expected) {
         Fail("mixed disk/encoded pipeline reordered replies");
       }
     }
-    Expect(recovered.Command(
-               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
+    Expect(recovered.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "disable tx cleaner before recovery fixture");
     Expect(recovered.Command({"MSET", "cleaner-recovery-a", "disk-a",
                               "cleaner-recovery-b", "disk-b"}),
@@ -1009,9 +1007,8 @@ int main(int argc, char** argv) {
     Expect(generation_recovery.Command(
                {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "0"}),
            "+OK", "disable tx cleaner before FLUSHDB fixture");
-    Expect(generation_recovery.Command(
-               {"MSET", "cleaner-flush-a", "old-a", "cleaner-flush-b",
-                "old-b"}),
+    Expect(generation_recovery.Command({"MSET", "cleaner-flush-a", "old-a",
+                                        "cleaner-flush-b", "old-b"}),
            "+OK", "persist tagged values before FLUSHDB");
     Expect(generation_recovery.Command({"FLUSHDB", "SYNC"}), "+OK",
            "flush tagged transaction generation");
@@ -1036,8 +1033,7 @@ int main(int argc, char** argv) {
     ServerProcess rollback_server(argv[1], port, data_path, log_path,
                                   "cleaner-undo-d");
     RespClient rollback = Connect(port);
-    Expect(rollback.Command(
-               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+    Expect(rollback.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable tx cleaner during rollback");
     for (std::string_view key : {"cleaner-undo-a", "cleaner-undo-b",
                                  "cleaner-undo-c", "cleaner-undo-d"}) {
@@ -1064,15 +1060,14 @@ int main(int argc, char** argv) {
     }
     rollback_server.Stop();
 
-    ServerProcess rollback_recovered_server(argv[1], port, data_path,
-                                            log_path);
+    ServerProcess rollback_recovered_server(argv[1], port, data_path, log_path);
     RespClient rollback_recovered = Connect(port);
-    Expect(rollback_recovered.Command(
-               {"MGET", "cleaner-undo-a", "cleaner-undo-b",
-                "cleaner-undo-c", "cleaner-undo-d"}),
-           "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" +
-               Bulk("old") + "\r\n" + Bulk("old"),
-           "UNDO values after cleaner restart");
+    Expect(
+        rollback_recovered.Command({"MGET", "cleaner-undo-a", "cleaner-undo-b",
+                                    "cleaner-undo-c", "cleaner-undo-d"}),
+        "*4\r\n" + Bulk("old") + "\r\n" + Bulk("old") + "\r\n" + Bulk("old") +
+            "\r\n" + Bulk("old"),
+        "UNDO values after cleaner restart");
     Expect(
         rollback_recovered.Command({"EXPIRE", "cleaner-undo-a", "600", "NX"}),
         ":0", "UNDO TTL survives recovery");
@@ -1187,28 +1182,27 @@ int main(int argc, char** argv) {
     const std::uint64_t retry_retired_baseline =
         TxCleanerRetiredGenerations(retry);
     Expect(retry.Command({"MSET", "cleaner-retry-a{tx}", "durable-a",
-                          "cleaner-retry-b{tx}", "durable-b"}), "+OK",
-           "seed retryable cleaner failure");
-    Expect(retry.Command(
-               {"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
+                          "cleaner-retry-b{tx}", "durable-b"}),
+           "+OK", "seed retryable cleaner failure");
+    Expect(retry.Command({"CONFIG", "SET", "tx-cleaner-cooldown-ms", "20"}),
            "+OK", "enable retryable cleaner fixture");
-    if (!WaitForCleanerStat(retry, "tx_cleaner_failures:",
-                            failure_baseline, 10s)) {
+    if (!WaitForCleanerStat(retry, "tx_cleaner_failures:", failure_baseline,
+                            10s)) {
       Fail("injected cleaner failure was not recorded");
     }
     if (!WaitForCleanerRetirement(retry, retry_retired_baseline)) {
       Fail("periodic flush stopped after a retryable cleaner failure");
     }
-    Expect(retry.Command({"MGET", "cleaner-retry-a{tx}",
-                          "cleaner-retry-b{tx}"}),
-           "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),
-           "value after cleaner retry");
+    Expect(
+        retry.Command({"MGET", "cleaner-retry-a{tx}", "cleaner-retry-b{tx}"}),
+        "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),
+        "value after cleaner retry");
     retry_server.Stop();
 
     ServerProcess retry_recovered_server(argv[1], port, data_path, log_path);
     RespClient retry_recovered = Connect(port);
-    Expect(retry_recovered.Command({"MGET", "cleaner-retry-a{tx}",
-                                    "cleaner-retry-b{tx}"}),
+    Expect(retry_recovered.Command(
+               {"MGET", "cleaner-retry-a{tx}", "cleaner-retry-b{tx}"}),
            "*2\r\n" + Bulk("durable-a") + "\r\n" + Bulk("durable-b"),
            "cleaner retry value after graceful shutdown");
     retry_recovered_server.Stop();
@@ -1410,32 +1404,28 @@ int main(int argc, char** argv) {
       writers.clear();
       writers.reserve(kVariedWriters);
       for (int writer = 0; writer < kVariedWriters; ++writer) {
-        writers.push_back(std::async(
-            std::launch::async,
-            [source_port, writer, &varied_payload]() {
-              RespClient client = Connect(source_port);
-              for (int round = 0; round < kVariedRounds; ++round) {
-                const int key_count = 2 + (writer * 5 + round * 3) % 7;
-                std::vector<std::string> keys;
-                keys.reserve(key_count);
-                std::vector<std::string_view> command{"MSET"};
-                command.reserve(1 + 2 * key_count);
-                for (int key = 0; key < key_count; ++key) {
-                  keys.push_back("duplex-multikey:" +
-                                 std::to_string(writer) + ":" +
-                                 std::to_string(round) + ":" +
-                                 std::to_string(key));
-                  command.push_back(keys.back());
-                  command.push_back(varied_payload);
-                }
-                Expect(client.Command(command), "+OK",
-                       "varied-participant replicated MSET");
-              }
-            }));
+        writers.push_back(std::async(std::launch::async, [source_port, writer,
+                                                          &varied_payload]() {
+          RespClient client = Connect(source_port);
+          for (int round = 0; round < kVariedRounds; ++round) {
+            const int key_count = 2 + (writer * 5 + round * 3) % 7;
+            std::vector<std::string> keys;
+            keys.reserve(key_count);
+            std::vector<std::string_view> command{"MSET"};
+            command.reserve(1 + 2 * key_count);
+            for (int key = 0; key < key_count; ++key) {
+              keys.push_back("duplex-multikey:" + std::to_string(writer) + ":" +
+                             std::to_string(round) + ":" + std::to_string(key));
+              command.push_back(keys.back());
+              command.push_back(varied_payload);
+            }
+            Expect(client.Command(command), "+OK",
+                   "varied-participant replicated MSET");
+          }
+        }));
       }
       for (auto& writer : writers) writer.get();
-      const std::string varied_source_size =
-          source_client.Command({"DBSIZE"});
+      const std::string varied_source_size = source_client.Command({"DBSIZE"});
       const auto varied_deadline = std::chrono::steady_clock::now() + 30s;
       std::string varied_replica_size;
       do {
@@ -1552,8 +1542,7 @@ int main(int argc, char** argv) {
       Expect(gate_replica_client.Command(
                  {"REPLICAOF", "127.0.0.1", std::to_string(gate_source_port)}),
              "+OK", "attach replica for order-gate regression");
-      const auto gate_online_deadline =
-          std::chrono::steady_clock::now() + 120s;
+      const auto gate_online_deadline = std::chrono::steady_clock::now() + 120s;
       bool gate_online = false;
       while (!gate_online &&
              std::chrono::steady_clock::now() < gate_online_deadline) {
@@ -1581,10 +1570,9 @@ int main(int argc, char** argv) {
       bool marker_seen = false;
       while (!marker_seen &&
              std::chrono::steady_clock::now() < marker_deadline) {
-        marker_seen =
-            ReadFile(gate_log_path)
-                .find("KEYLANE_REPLICATION_ORDER_HOLD_MS holding") !=
-            std::string::npos;
+        marker_seen = ReadFile(gate_log_path)
+                          .find("KEYLANE_REPLICATION_ORDER_HOLD_MS holding") !=
+                      std::string::npos;
         if (!marker_seen) std::this_thread::sleep_for(20ms);
       }
       if (!marker_seen) Fail("order-gate hold did not engage for the MSET");
@@ -1619,15 +1607,15 @@ int main(int argc, char** argv) {
 
       const std::string gate_expected =
           "*6\r\n" + Bulk("paused-1") + "\r\n" + Bulk("paused-2") + "\r\n" +
-          Bulk("fast-1") + "\r\n" + Bulk("fast-2") + "\r\n" +
-          Bulk("late-1") + "\r\n" + Bulk("late-2");
+          Bulk("fast-1") + "\r\n" + Bulk("fast-2") + "\r\n" + Bulk("late-1") +
+          "\r\n" + Bulk("late-2");
       const auto gate_converge_deadline =
           std::chrono::steady_clock::now() + 60s;
       std::string gate_replicated;
       while (std::chrono::steady_clock::now() < gate_converge_deadline) {
-        gate_replicated = gate_replica_client.Command(
-            {"MGET", "order-a", "order-b", "{og}a", "{og}b", "order-c",
-             "order-d"});
+        gate_replicated =
+            gate_replica_client.Command({"MGET", "order-a", "order-b", "{og}a",
+                                         "{og}b", "order-c", "order-d"});
         if (gate_replicated == gate_expected) break;
         std::this_thread::sleep_for(20ms);
       }

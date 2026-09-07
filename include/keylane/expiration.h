@@ -38,15 +38,13 @@ inline absl::StatusOr<std::uint64_t> ParseRedisExpirationDeadline(
   if (past_policy == PastExpirationPolicy::kRejectNonPositive && value <= 0) {
     return invalid();
   }
-  if (seconds &&
-      (value > std::numeric_limits<std::int64_t>::max() / 1000 ||
-       value < std::numeric_limits<std::int64_t>::min() / 1000)) {
+  if (seconds && (value > std::numeric_limits<std::int64_t>::max() / 1000 ||
+                  value < std::numeric_limits<std::int64_t>::min() / 1000)) {
     return invalid();
   }
   if (seconds) value *= 1000;
 
-  const std::int64_t now =
-      static_cast<std::int64_t>(RedisUnixTimeMillis());
+  const std::int64_t now = static_cast<std::int64_t>(RedisUnixTimeMillis());
   if (!absolute) {
     if (value > std::numeric_limits<std::int64_t>::max() - now) {
       return invalid();

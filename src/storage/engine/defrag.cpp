@@ -797,7 +797,8 @@ Task<absl::Status> StorageEngine::Impl::SalvageBlockRecords(
           key_owner,
           [this, key_owner, key, value, record, source_location,
            promote = committed_txids != nullptr]() mutable
-          -> Task<absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
+              -> Task<
+                  absl::StatusOr<std::optional<RelocationDurabilityFence>>> {
             co_return co_await RelocateIfCurrent(key_owner, key, value, record,
                                                  source_location, promote);
           });

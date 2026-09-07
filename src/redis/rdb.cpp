@@ -771,8 +771,8 @@ void SynthesizeStreamNodes(Stream* stream) {
   stream->node_entries.clear();
   std::size_t remaining = stream->entries.size();
   while (remaining != 0) {
-    const auto count = static_cast<std::uint32_t>(std::min<std::size_t>(
-        remaining, kDefaultStreamNodeMaxEntries));
+    const auto count = static_cast<std::uint32_t>(
+        std::min<std::size_t>(remaining, kDefaultStreamNodeMaxEntries));
     stream->node_entries.push_back(count);
     remaining -= count;
   }
@@ -1304,8 +1304,7 @@ absl::StatusOr<LogicalValue> DecodeRaw(const storage::RawValue& raw) {
       stream.node_entries.reserve(nodes);
       for (std::uint32_t i = 0; i < nodes; ++i) {
         std::uint32_t count = 0;
-        if (!reader.Le32(&count))
-          return Bad("truncated Keylane Stream nodes");
+        if (!reader.Le32(&count)) return Bad("truncated Keylane Stream nodes");
         stream.node_entries.push_back(count);
       }
       if (!ValidStreamNodes(stream))
@@ -1688,7 +1687,7 @@ absl::StatusOr<FileReader> FileReader::Open(const std::string& path) {
                            : absl::InternalError(message);
   }
 
-  struct stat info {};
+  struct stat info{};
   if (::fstat(fd, &info) != 0) {
     const int error = errno;
     ::close(fd);
@@ -1981,7 +1980,7 @@ absl::StatusOr<FileWriter> FileWriter::Open(std::string target_path) {
   if (basename.empty() || basename == "." || basename == "..") {
     return absl::InvalidArgumentError("invalid RDB target filename");
   }
-  struct stat directory_info {};
+  struct stat directory_info{};
   if (::stat(directory.c_str(), &directory_info) != 0 ||
       !S_ISDIR(directory_info.st_mode)) {
     return absl::InvalidArgumentError(

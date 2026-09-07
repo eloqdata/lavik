@@ -36,8 +36,7 @@ TEST(ScanHashMapTest, SharedArenaReusesSlotsAndRejectsPageIdExhaustion) {
   }
   EXPECT_EQ(arena->allocated_pages(), 1);
   EXPECT_FALSE(first.CanAllocateEntry("overflow", true, false));
-  EXPECT_EQ(first.InsertNew(ComputeDigest("overflow"), "overflow", 1),
-            nullptr);
+  EXPECT_EQ(first.InsertNew(ComputeDigest("overflow"), "overflow", 1), nullptr);
 
   EXPECT_TRUE(first.Erase(ComputeDigest("k0"), "k0"));
   EXPECT_TRUE(first.CanAllocateEntry("replacement", true, false));

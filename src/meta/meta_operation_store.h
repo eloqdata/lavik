@@ -98,7 +98,7 @@ struct MetaOperationRecord {
   MetaOperationLifecycle lifecycle_ = MetaOperationLifecycle::kSubmitted;
   // Opaque to committed apply; operation-specific coordinators own the schema.
   std::string kind_phase_blob_;
-  std::uint64_t revision_ = 0;   // CAS token; bumps on every accepted mutation
+  std::uint64_t revision_ = 0;  // CAS token; bumps on every accepted mutation
   std::vector<MetaEvidenceSummary> evidence_;  // persisted summaries, in order
   std::string terminal_result_;  // Completed: result; Aborted: reason
   bool data_loss_possible_ = false;

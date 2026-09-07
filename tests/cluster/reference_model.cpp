@@ -150,7 +150,7 @@ constexpr std::array<ExplorationActionDescriptor, 26>
                                     "reset-old-replica"},
         ExplorationActionDescriptor{ExplorationAction::kRecordClientSuccess,
                                     "record-client-success"},
-    };
+};
 
 std::string_view ExplorationActionName(ExplorationAction kind) {
   const auto found =

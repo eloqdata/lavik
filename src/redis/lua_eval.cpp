@@ -5,9 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -94,8 +94,7 @@ thread_local std::uint64_t g_lua_random_state = 0x1234abcd330eULL;
 std::string FoldFunctionName(std::string_view name) {
   std::string folded(name);
   for (char& byte : folded) {
-    byte = static_cast<char>(
-        std::tolower(static_cast<unsigned char>(byte)));
+    byte = static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
   }
   return folded;
 }
@@ -158,8 +157,7 @@ void RawGetFieldCaseInsensitive(lua_State* state, int table,
 int RedisRegisterFunction(lua_State* state) {
   lua_pushlightuserdata(state, &g_function_load_registry_key);
   lua_rawget(state, LUA_REGISTRYINDEX);
-  auto* context =
-      static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
+  auto* context = static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
   lua_pop(state, 1);
   if (context == nullptr || context->library_ == nullptr) {
     return luaL_error(
@@ -196,8 +194,8 @@ int RedisRegisterFunction(lua_State* state) {
       if (folded != "function_name" && folded != "description" &&
           folded != "flags" && folded != "callback") {
         lua_pop(state, 2);
-        return luaL_error(
-            state, "unknown argument given to redis.register_function");
+        return luaL_error(state,
+                          "unknown argument given to redis.register_function");
       }
       lua_pop(state, 1);
     }
@@ -259,7 +257,8 @@ int RedisRegisterFunction(lua_State* state) {
     }
     callback_index = lua_gettop(state);
   } else {
-    return luaL_error(state, "wrong number of arguments to redis.register_function");
+    return luaL_error(state,
+                      "wrong number of arguments to redis.register_function");
   }
 
   if (!ValidFunctionName(info.name_)) {
@@ -290,8 +289,7 @@ int RedisRegisterFunction(lua_State* state) {
 
 std::int32_t NextLuaRandom() {
   constexpr std::uint64_t kMask = (1ULL << 48) - 1;
-  g_lua_random_state =
-      (g_lua_random_state * 0x5deece66dULL + 0xbULL) & kMask;
+  g_lua_random_state = (g_lua_random_state * 0x5deece66dULL + 0xbULL) & kMask;
   return static_cast<std::int32_t>(g_lua_random_state >> 17);
 }
 
@@ -314,8 +312,7 @@ int RedisMathRandom(lua_State* state) {
       const int lower = luaL_checkint(state, 1);
       const int upper = luaL_checkint(state, 2);
       luaL_argcheck(state, lower <= upper, 2, "interval is empty");
-      lua_pushnumber(state,
-                     std::floor(random * (upper - lower + 1.0)) + lower);
+      lua_pushnumber(state, std::floor(random * (upper - lower + 1.0)) + lower);
       return 1;
     }
     default:
@@ -351,10 +348,10 @@ int RedisSetResp(lua_State* state) {
   auto* control = static_cast<LuaRunControl*>(lua_touserdata(state, -1));
   lua_pop(state, 1);
   if (control == nullptr) {
-    return luaL_error(state, "redis.setresp() is only available while running a script.");
+    return luaL_error(
+        state, "redis.setresp() is only available while running a script.");
   }
-  control->resp_version_ =
-      version == 3 ? RespVersion::k3 : RespVersion::k2;
+  control->resp_version_ = version == 3 ? RespVersion::k3 : RespVersion::k2;
   return 0;
 }
 
@@ -401,8 +398,8 @@ void RegisterActiveScript(LuaRunControl* run) {
 
 void UnregisterActiveScript(LuaRunControl* run) {
   std::lock_guard lock(g_active_scripts_mutex);
-  const auto found = std::find(g_active_scripts.begin(), g_active_scripts.end(),
-                               run);
+  const auto found =
+      std::find(g_active_scripts.begin(), g_active_scripts.end(), run);
   if (found != g_active_scripts.end()) g_active_scripts.erase(found);
 }
 
@@ -419,10 +416,9 @@ void ScriptInstructionHook(lua_State* state, lua_Debug*) {
     // and return to an outer loop indefinitely. Backward jumps also generate
     // line-hook events, which covers single-line loops used by Redis clients.
     lua_sethook(state, ScriptInstructionHook, LUA_MASKLINE, 0);
-    (void)luaL_error(
-        state, control->is_function_
-                   ? "Script killed by user with FUNCTION KILL..."
-                   : "Script killed by user with SCRIPT KILL...");
+    (void)luaL_error(state, control->is_function_
+                                ? "Script killed by user with FUNCTION KILL..."
+                                : "Script killed by user with SCRIPT KILL...");
     return;
   }
   if (std::chrono::steady_clock::now() < control->deadline_) return;
@@ -640,9 +636,8 @@ absl::StatusOr<std::pair<std::string, std::string>> ParseLibraryMetadata(
     return absl::InvalidArgumentError(
         absl::StrCat("Engine '", engine, "' not found"));
   }
-  header = engine_end == std::string_view::npos
-               ? std::string_view{}
-               : header.substr(engine_end);
+  header = engine_end == std::string_view::npos ? std::string_view{}
+                                                : header.substr(engine_end);
   std::optional<std::string> name;
   while (!header.empty()) {
     while (!header.empty() &&
@@ -657,8 +652,8 @@ absl::StatusOr<std::pair<std::string, std::string>> ParseLibraryMetadata(
           absl::StrCat("Invalid metadata value given: ", token));
     }
     name.emplace(token.substr(5));
-    header = end == std::string_view::npos ? std::string_view{}
-                                           : header.substr(end);
+    header =
+        end == std::string_view::npos ? std::string_view{} : header.substr(end);
   }
   if (!name.has_value()) {
     return absl::InvalidArgumentError("Library name was not given");
@@ -673,12 +668,12 @@ absl::StatusOr<std::pair<std::string, std::string>> ParseLibraryMetadata(
 void FunctionLoadInstructionHook(lua_State* state, lua_Debug*) {
   lua_pushlightuserdata(state, &g_function_load_registry_key);
   lua_rawget(state, LUA_REGISTRYINDEX);
-  auto* context =
-      static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
+  auto* context = static_cast<FunctionLoadContext*>(lua_touserdata(state, -1));
   lua_pop(state, 1);
   if (context != nullptr && context->library_ != nullptr &&
       std::chrono::steady_clock::now() >= context->deadline_) {
-    (void)luaL_error(state, "FUNCTION LOAD exceeded the maximum execution time");
+    (void)luaL_error(state,
+                     "FUNCTION LOAD exceeded the maximum execution time");
   }
 }
 
@@ -841,8 +836,8 @@ class LuaWorkerRuntime {
     const int base = lua_gettop(root_);
     FunctionLoadContext context{
         .library_ = staged.get(),
-        .deadline_ = std::chrono::steady_clock::now() +
-                     std::chrono::milliseconds(500),
+        .deadline_ =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500),
     };
     lua_pushlightuserdata(root_, &g_function_load_registry_key);
     lua_pushlightuserdata(root_, &context);
@@ -851,8 +846,8 @@ class LuaWorkerRuntime {
     const std::string chunk_name = absl::StrCat("@", library_name);
     const std::size_t body_offset = code.find('\n');
     const std::string_view body = code.substr(body_offset);
-    const int loaded = luaL_loadbuffer(root_, body.data(), body.size(),
-                                       chunk_name.c_str());
+    const int loaded =
+        luaL_loadbuffer(root_, body.data(), body.size(), chunk_name.c_str());
     const int executed = loaded == 0 ? lua_pcall(root_, 0, 0, 0) : loaded;
     lua_sethook(root_, nullptr, 0, 0);
     lua_pushlightuserdata(root_, &g_function_load_registry_key);
@@ -867,7 +862,8 @@ class LuaWorkerRuntime {
     lua_settop(root_, base);
 
     for (const StagedLuaFunction& function : staged->functions_) {
-      const auto collision = functions_.find(FoldFunctionName(function.info_.name_));
+      const auto collision =
+          functions_.find(FoldFunctionName(function.info_.name_));
       if (collision != functions_.end()) {
         const std::string name = function.info_.name_;
         ReleaseStaged(staged.get());
@@ -890,16 +886,16 @@ class LuaWorkerRuntime {
     for (StagedLuaFunction& staged : staged_library_->functions_) {
       const std::string folded = FoldFunctionName(staged.info_.name_);
       library->functions_.emplace(
-          folded, LocalLuaFunction{std::move(staged.info_),
-                                   std::exchange(staged.registry_ref_,
-                                                 LUA_NOREF)});
+          folded,
+          LocalLuaFunction{std::move(staged.info_),
+                           std::exchange(staged.registry_ref_, LUA_NOREF)});
     }
     LocalLuaLibrary* library_ptr = library.get();
     auto [entry, inserted] = libraries_.emplace(name, std::move(library));
     if (!inserted) return;
     for (auto& [folded, function] : entry->second->functions_) {
-      functions_.emplace(
-          folded, LocalLuaFunctionLookup{library_ptr, &function});
+      functions_.emplace(folded,
+                         LocalLuaFunctionLookup{library_ptr, &function});
     }
     staged_library_.reset();
   }
@@ -1321,9 +1317,8 @@ void AppendLuaValue(lua_State* state, int index, ReplyBuilder* builder,
           const char* format = lua_tolstring(state, -2, &format_size);
           const char* value = lua_tolstring(state, -1, &value_size);
           if (format_size == 3) {
-            builder->AppendVerbatimString(
-                std::string_view(format, format_size),
-                std::string_view(value, value_size));
+            builder->AppendVerbatimString(std::string_view(format, format_size),
+                                          std::string_view(value, value_size));
             lua_pop(state, 3);
             return;
           }
@@ -1392,8 +1387,7 @@ LuaExecutionStep RuntimeErrorStep(lua_State* state) {
   // envelope.
   if (error.starts_with("ERR Lua redis lib command arguments ") ||
       error.starts_with("ERR Please specify at least one argument ") ||
-      error ==
-          "ERR Write commands are not allowed from read-only scripts.") {
+      error == "ERR Write commands are not allowed from read-only scripts.") {
     return LuaExecutionStep{.call_ = std::nullopt,
                             .reply_ = EncodeError(error)};
   }
@@ -1591,10 +1585,9 @@ absl::StatusOr<std::unique_ptr<LuaExecution>> LuaExecution::CreateFunction(
 
 std::string_view LuaExecution::bytecode() const { return impl_->bytecode_; }
 
-LuaExecutionStep LuaExecution::Start(bool replication_origin,
-                                     std::string_view script_name,
-                                     std::span<const std::string>
-                                         invocation_command) {
+LuaExecutionStep LuaExecution::Start(
+    bool replication_origin, std::string_view script_name,
+    std::span<const std::string> invocation_command) {
   const auto now = std::chrono::steady_clock::now();
   const std::uint64_t threshold =
       g_script_busy_threshold_ms.load(std::memory_order_acquire);
@@ -1774,11 +1767,11 @@ std::vector<LuaFunctionLibrary> SnapshotLuaFunctionLibraries() {
     (void)name;
     libraries.push_back(library);
   }
-  std::sort(libraries.begin(), libraries.end(),
-            [](const LuaFunctionLibrary& left,
-               const LuaFunctionLibrary& right) {
-              return left.name_ < right.name_;
-            });
+  std::sort(
+      libraries.begin(), libraries.end(),
+      [](const LuaFunctionLibrary& left, const LuaFunctionLibrary& right) {
+        return left.name_ < right.name_;
+      });
   return libraries;
 }
 

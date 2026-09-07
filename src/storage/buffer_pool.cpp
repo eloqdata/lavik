@@ -182,8 +182,7 @@ absl::Status RegisteredBufferPool::Init(
     return absl::Status(absl::StatusCode::kInvalidArgument,
                         "registered buffer sizes must be positive");
   }
-  if (options.read_payload_bytes_ >
-          std::numeric_limits<std::uint32_t>::max() ||
+  if (options.read_payload_bytes_ > std::numeric_limits<std::uint32_t>::max() ||
       options.read_headroom_bytes_ >
           std::numeric_limits<std::uint32_t>::max() ||
       options.read_tailroom_bytes_ >

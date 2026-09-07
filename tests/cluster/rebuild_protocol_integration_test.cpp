@@ -266,11 +266,10 @@ TEST(RebuildProtocolIntegrationTest,
   const std::uint16_t source_port = source_reservation.ReleaseForSpawn();
   const std::uint16_t target_port = target_reservation.ReleaseForSpawn();
   const std::filesystem::path nodes = directory.path() / "nodes.conf";
-  WriteFile(nodes,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
-                std::to_string(target_port) +
-                "@0 master - 0 0 1 connected 0-16383\n"
-                "vars currentEpoch 1 lastVoteEpoch 0\n");
+  WriteFile(nodes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
+                       std::to_string(target_port) +
+                       "@0 master - 0 0 1 connected 0-16383\n"
+                       "vars currentEpoch 1 lastVoteEpoch 0\n");
   ChildProcess source(
       ServerArguments(source_port, source_data), source_log,
       {{"KEYLANE_REPLICATION_PAUSE_FULLSYNC_AFTER_HANDOFF_MS", "5000"}});

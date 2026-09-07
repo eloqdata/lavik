@@ -82,7 +82,28 @@ if (KEYLANE_ASAN_BUILD AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     "AddressSanitizer builds require Clang. GCC does not preserve coroutine "
     "symmetric transfers under ASan and can overflow the native stack.")
 endif()
-find_program(KEYLANE_CLANG_FORMAT NAMES clang-format-18 clang-format)
+set(KEYLANE_CLANG_FORMAT_REQUIRED_VERSION "23.1.0")
+string(REPLACE "." "\\." KEYLANE_CLANG_FORMAT_VERSION_REGEX
+  "${KEYLANE_CLANG_FORMAT_REQUIRED_VERSION}")
+find_program(KEYLANE_CLANG_FORMAT NAMES clang-format-23 clang-format)
+if (KEYLANE_CLANG_FORMAT)
+  execute_process(
+    COMMAND ${KEYLANE_CLANG_FORMAT} --version
+    RESULT_VARIABLE KEYLANE_CLANG_FORMAT_VERSION_RESULT
+    OUTPUT_VARIABLE KEYLANE_CLANG_FORMAT_VERSION_OUTPUT
+    ERROR_VARIABLE KEYLANE_CLANG_FORMAT_VERSION_OUTPUT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE
+  )
+  # Formatting is repository-wide, so silently accepting another formatter
+  # version would create unrelated churn in otherwise valid changes.
+  if (NOT KEYLANE_CLANG_FORMAT_VERSION_RESULT EQUAL 0 OR
+      NOT KEYLANE_CLANG_FORMAT_VERSION_OUTPUT MATCHES
+        "clang-format version ${KEYLANE_CLANG_FORMAT_VERSION_REGEX}([^0-9.]|$)")
+    unset(KEYLANE_CLANG_FORMAT CACHE)
+    set(KEYLANE_CLANG_FORMAT "")
+  endif()
+endif()
 file(GLOB_RECURSE KEYLANE_FORMAT_FILES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/app/*.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/include/keylane/*.h
@@ -90,6 +111,9 @@ file(GLOB_RECURSE KEYLANE_FORMAT_FILES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/*.h
   ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp
 )
+# CLI11.hpp is an upstream-generated single header; rewriting it makes local
+# formatting depend on the generated artifact instead of its upstream source.
+list(FILTER KEYLANE_FORMAT_FILES EXCLUDE REGEX "/keylane/CLI11\\.hpp$")
 if (KEYLANE_CLANG_FORMAT)
   add_custom_target(format
     COMMAND ${KEYLANE_CLANG_FORMAT} -i ${KEYLANE_FORMAT_FILES}
@@ -102,7 +126,9 @@ if (KEYLANE_CLANG_FORMAT)
     VERBATIM
   )
 else()
-  message(STATUS "clang-format not found; format targets are disabled")
+  message(STATUS
+    "clang-format ${KEYLANE_CLANG_FORMAT_REQUIRED_VERSION} not found; "
+    "format targets are disabled")
 endif()
 
 set(CELER_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)

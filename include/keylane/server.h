@@ -54,8 +54,7 @@ struct ServerOptions {
   std::size_t replication_publish_queue_bytes_ = 16ULL * 1024 * 1024;
   std::uint64_t max_memory_bytes_ = 0;
   ClientBufferLimit maxmemory_clients_;
-  std::size_t client_query_buffer_limit_bytes_ =
-      kDefaultClientQueryBufferLimit;
+  std::size_t client_query_buffer_limit_bytes_ = kDefaultClientQueryBufferLimit;
   std::size_t inline_key_max_bytes_ = storage::kDefaultInlineKeyBytes;
   std::uint32_t flush_max_ms_ = 1000;
   std::size_t flush_size_bytes_ = 128ULL * 1024;

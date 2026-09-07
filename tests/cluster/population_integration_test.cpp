@@ -31,16 +31,15 @@ TEST(PopulationIntegrationTest,
   PortReservation reservation;
   const std::uint16_t port = reservation.ReleaseForSpawn();
   const std::filesystem::path nodes = directory.path() / "nodes.conf";
-  WriteFile(nodes,
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
-                std::to_string(port) +
-                "@0 master - 0 0 1 connected 0-16383\n"
-                "vars currentEpoch 1 lastVoteEpoch 0\n");
+  WriteFile(nodes, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 127.0.0.1:" +
+                       std::to_string(port) +
+                       "@0 master - 0 0 1 connected 0-16383\n"
+                       "vars currentEpoch 1 lastVoteEpoch 0\n");
   ChildProcess process(
       {g_keylane_binary, "--cluster-enabled", "--port", std::to_string(port),
-       "--cluster-static-nodes-file", nodes.string(),
-       "--threads", "1", "--no-pin-workers", "--logtostderr",
-       "--recv-buffers-per-worker", "0", "--data-file", data.string()},
+       "--cluster-static-nodes-file", nodes.string(), "--threads", "1",
+       "--no-pin-workers", "--logtostderr", "--recv-buffers-per-worker", "0",
+       "--data-file", data.string()},
       log);
 
   WaitUntil("cluster node startup", 20s, [&] {

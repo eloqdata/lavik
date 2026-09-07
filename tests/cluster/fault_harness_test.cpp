@@ -88,7 +88,7 @@ PopulationObservation ProvenPopulation() {
 
 struct PopulationFlag {
   std::string_view name_;
-  bool PopulationObservation::*member_;
+  bool PopulationObservation::* member_;
 };
 
 constexpr std::array<PopulationFlag, 3> kReadinessExposures{{

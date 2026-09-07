@@ -2549,8 +2549,8 @@ TEST(ListE2eTest, EstablishesNativeReplicationFlowsAndChangesRole) {
                 {"CONFIG", "GET", "replication-backlog-backpressure"}),
             BulkArray({"replication-backlog-backpressure", "no"}));
   EXPECT_TRUE(source_client
-                  .Command({"CONFIG", "SET",
-                            "replication-backlog-backpressure", "maybe"})
+                  .Command({"CONFIG", "SET", "replication-backlog-backpressure",
+                            "maybe"})
                   .starts_with("-ERR"));
   ASSERT_EQ(source_client.Command(
                 {"CONFIG", "SET", "replication-backlog-backpressure", "yes"}),

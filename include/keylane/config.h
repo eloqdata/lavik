@@ -18,8 +18,7 @@ absl::StatusOr<std::size_t> ParseMemorySize(std::string_view text);
 
 // Parses Valkey-compatible maxmemory-clients values: an ordinary memory size,
 // a percentage from 0% through 100%, or zero to disable the limit.
-absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
-    std::string_view text);
+absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(std::string_view text);
 std::string FormatClientBufferLimit(ClientBufferLimit limit);
 
 // Parses Redis-compatible client-query-buffer-limit values. Redis constrains
@@ -45,9 +44,10 @@ absl::Status LoadRedisConfigFile(const std::string& path,
 // Replaces the failover-managed directives in an existing configuration file
 // and durably installs the result with a same-directory atomic rename. Other
 // directives and comments are preserved verbatim.
-absl::Status RewriteRedisConfigFile(
-    const std::string& path, std::optional<ReplicaOfConfig> upstream,
-    bool redis_upstream, unsigned replica_priority);
+absl::Status RewriteRedisConfigFile(const std::string& path,
+                                    std::optional<ReplicaOfConfig> upstream,
+                                    bool redis_upstream,
+                                    unsigned replica_priority);
 
 // Validates cross-field startup constraints after config-file and CLI values
 // have both been applied.

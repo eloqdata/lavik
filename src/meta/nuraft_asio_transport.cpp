@@ -49,10 +49,11 @@ std::string OpenSslError(std::string_view operation) {
 
 absl::StatusOr<SSL_CTX*> MakeSslContext(const MetaAsioTransportConfig& config,
                                         bool server) {
-  SSL_CTX* ctx = SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
+  SSL_CTX* ctx =
+      SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
   if (ctx == nullptr) return absl::InternalError(OpenSslError("SSL_CTX_new"));
-  const auto fail = [&](std::string_view operation)
-      -> absl::StatusOr<SSL_CTX*> {
+  const auto fail =
+      [&](std::string_view operation) -> absl::StatusOr<SSL_CTX*> {
     const std::string message = OpenSslError(operation);
     SSL_CTX_free(ctx);
     return absl::InvalidArgumentError(message);
@@ -65,7 +66,7 @@ absl::StatusOr<SSL_CTX*> MakeSslContext(const MetaAsioTransportConfig& config,
     return fail("load TLS certificate chain");
   }
   if (SSL_CTX_use_PrivateKey_file(ctx, config.tls_key_file_.c_str(),
-                                 SSL_FILETYPE_PEM) != 1) {
+                                  SSL_FILETYPE_PEM) != 1) {
     return fail("load TLS private key");
   }
   if (SSL_CTX_check_private_key(ctx) != 1) {
@@ -75,9 +76,9 @@ absl::StatusOr<SSL_CTX*> MakeSslContext(const MetaAsioTransportConfig& config,
                                     nullptr) != 1) {
     return fail("load TLS CA");
   }
-  SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER |
-                              (server ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0),
-                     nullptr);
+  SSL_CTX_set_verify(
+      ctx, SSL_VERIFY_PEER | (server ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0),
+      nullptr);
   return ctx;
 }
 
@@ -94,13 +95,14 @@ std::optional<MetaMemberIdentity> FindConfiguredMember(
   return std::nullopt;
 }
 
-absl::Status VerifyPeer(
-    const nuraft::asio_service::meta_cb_params& params,
-    std::span<const std::string> uri_sans,
-    const nuraft::ptr<NuraftStateMgr>& state_mgr,
-    const nuraft::ptr<MetaStateMachine>& state_machine, bool tls_enabled) {
+absl::Status VerifyPeer(const nuraft::asio_service::meta_cb_params& params,
+                        std::span<const std::string> uri_sans,
+                        const nuraft::ptr<NuraftStateMgr>& state_mgr,
+                        const nuraft::ptr<MetaStateMachine>& state_machine,
+                        bool tls_enabled) {
   if (params.src_id_ <= 0 || params.dst_id_ != state_mgr->server_id()) {
-    return absl::PermissionDeniedError("Raft RPC source/destination is invalid");
+    return absl::PermissionDeniedError(
+        "Raft RPC source/destination is invalid");
   }
   const auto configured = FindConfiguredMember(state_mgr, params.src_id_);
   if (!configured.has_value()) {
@@ -140,8 +142,8 @@ absl::Status VerifyPeer(
     if (!certificate.ok()) return certificate;
   }
   const MetaStores stores = state_machine->StoresSnapshot();
-  const auto committed =
-      stores.identity_.FindMetaMember(static_cast<std::uint32_t>(params.src_id_));
+  const auto committed = stores.identity_.FindMetaMember(
+      static_cast<std::uint32_t>(params.src_id_));
   if (!committed.has_value()) {
     // After the join request installs configuration but before the first
     // snapshot/entry, the durable config descriptor is the joiner's only
@@ -149,8 +151,7 @@ absl::Status VerifyPeer(
     if (state_machine->last_commit_index() == 0) return absl::OkStatus();
     return absl::PermissionDeniedError("Raft member has no committed binding");
   }
-  if (committed->retired_ ||
-      committed->principal_ != configured->principal_) {
+  if (committed->retired_ || committed->principal_ != configured->principal_) {
     return absl::PermissionDeniedError(
         "Raft member binding is retired or differs from configuration");
   }
@@ -193,8 +194,8 @@ absl::StatusOr<nuraft::asio_service::options> BuildMetaAsioOptions(
   options.verify_rpc_peer_ =
       [state_mgr, state_machine, tls_enabled = config.TlsEnabled()](
           const auto& params, const std::vector<std::string>& uri_sans) {
-        const absl::Status status = VerifyPeer(
-            params, uri_sans, state_mgr, state_machine, tls_enabled);
+        const absl::Status status =
+            VerifyPeer(params, uri_sans, state_mgr, state_machine, tls_enabled);
         if (!status.ok()) {
           spdlog::warn("rejected Raft peer: {}", status.ToString());
         }

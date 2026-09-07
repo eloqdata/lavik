@@ -1,19 +1,20 @@
 #include "keylane/config.h"
 
-#include <cerrno>
-#include <cctype>
-#include <charconv>
-#include <cstring>
-#include <cstdint>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cctype>
+#include <cerrno>
+#include <charconv>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <mutex>
 #include <string>
 #include <string_view>
-#include <sys/stat.h>
 #include <type_traits>
-#include <unistd.h>
 #include <vector>
 
 #include "absl/status/status.h"
@@ -121,9 +122,9 @@ absl::Status WriteAll(int fd, std::string_view contents,
     const ssize_t written = ::write(fd, contents.data(), contents.size());
     if (written < 0) {
       if (errno == EINTR) continue;
-      return absl::InternalError(absl::StrCat(
-          "cannot write configuration temporary file for '", path,
-          "': ", std::strerror(errno)));
+      return absl::InternalError(
+          absl::StrCat("cannot write configuration temporary file for '", path,
+                       "': ", std::strerror(errno)));
     }
     if (written == 0) {
       return absl::InternalError(absl::StrCat(
@@ -194,11 +195,10 @@ absl::StatusOr<ClientBufferLimit> ParseClientBufferLimit(
           "maxmemory-clients percentage must not be empty");
     }
     std::uint64_t percentage = 0;
-    const auto parsed =
-        std::from_chars(number.data(), number.data() + number.size(),
-                        percentage);
-    if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() ||
-        percentage > 100) {
+    const auto parsed = std::from_chars(
+        number.data(), number.data() + number.size(), percentage);
+    if (parsed.ec != std::errc{} ||
+        parsed.ptr != number.data() + number.size() || percentage > 100) {
       return absl::InvalidArgumentError(
           "maxmemory-clients percentage must be between 0% and 100%");
     }
@@ -216,8 +216,7 @@ std::string FormatClientBufferLimit(ClientBufferLimit limit) {
   return result;
 }
 
-absl::StatusOr<std::size_t> ParseClientQueryBufferLimit(
-    std::string_view text) {
+absl::StatusOr<std::size_t> ParseClientQueryBufferLimit(std::string_view text) {
   auto bytes = ParseMemorySize(text);
   if (!bytes.ok()) return bytes.status();
   if (*bytes < kMinimumClientQueryBufferLimit ||
@@ -460,8 +459,7 @@ absl::Status ApplyRedisConfigDirective(
   if (name == "replica-priority") {
     if (directive.size() != 2) return WrongArgumentCount(name);
     unsigned priority = 0;
-    absl::Status parsed =
-        ParseUnsigned(directive[1], name, &priority, true);
+    absl::Status parsed = ParseUnsigned(directive[1], name, &priority, true);
     if (!parsed.ok()) return parsed;
     options->replication_options_.replica_priority_ = priority;
     return absl::OkStatus();
@@ -506,8 +504,7 @@ absl::Status ApplyRedisConfigDirective(
     if (directive.size() != 2) return WrongArgumentCount(name);
     unsigned value = 0;
     const bool allow_zero = name == "spdk-max-completions-per-poll";
-    absl::Status parsed =
-        ParseUnsigned(directive[1], name, &value, allow_zero);
+    absl::Status parsed = ParseUnsigned(directive[1], name, &value, allow_zero);
     if (!parsed.ok()) return parsed;
     if (name == "background-warrant-percent" && value > 100) {
       return absl::InvalidArgumentError(
@@ -586,7 +583,8 @@ absl::Status ApplyRedisConfigDirective(
   }
   if (name == "lua-time-limit" || name == "busy-reply-threshold") {
     if (directive.size() != 2) return WrongArgumentCount(name);
-    return ParseUnsigned(directive[1], name, &options->lua_time_limit_ms_, true);
+    return ParseUnsigned(directive[1], name, &options->lua_time_limit_ms_,
+                         true);
   }
   return absl::InvalidArgumentError(
       absl::StrCat("unsupported configuration directive '", name, "'"));
@@ -759,9 +757,10 @@ absl::Status LoadRedisConfigFile(const std::string& path,
   return absl::OkStatus();
 }
 
-absl::Status RewriteRedisConfigFile(
-    const std::string& path, std::optional<ReplicaOfConfig> upstream,
-    bool redis_upstream, unsigned replica_priority) {
+absl::Status RewriteRedisConfigFile(const std::string& path,
+                                    std::optional<ReplicaOfConfig> upstream,
+                                    bool redis_upstream,
+                                    unsigned replica_priority) {
   if (path.empty()) {
     return absl::FailedPreconditionError(
         "The server is running without a config file");
@@ -772,16 +771,14 @@ absl::Status RewriteRedisConfigFile(
   static std::mutex rewrite_mutex;
   const std::lock_guard lock(rewrite_mutex);
 
-  struct stat metadata {};
+  struct stat metadata{};
   if (::stat(path.c_str(), &metadata) != 0) {
-    return absl::NotFoundError(absl::StrCat(
-        "cannot stat configuration file '", path, "': ",
-        std::strerror(errno)));
+    return absl::NotFoundError(absl::StrCat("cannot stat configuration file '",
+                                            path, "': ", std::strerror(errno)));
   }
   if (!S_ISREG(metadata.st_mode)) {
     return absl::FailedPreconditionError(
-        absl::StrCat("configuration file is not a regular file: '", path,
-                     "'"));
+        absl::StrCat("configuration file is not a regular file: '", path, "'"));
   }
 
   std::ifstream input(path);
@@ -838,9 +835,9 @@ absl::Status RewriteRedisConfigFile(
   temporary_path.push_back('\0');
   const int fd = ::mkstemp(temporary_path.data());
   if (fd < 0) {
-    return absl::InternalError(absl::StrCat(
-        "cannot create configuration temporary file for '", path,
-        "': ", std::strerror(errno)));
+    return absl::InternalError(
+        absl::StrCat("cannot create configuration temporary file for '", path,
+                     "': ", std::strerror(errno)));
   }
   const std::string temporary_name(temporary_path.data());
   bool renamed = false;
@@ -850,9 +847,9 @@ absl::Status RewriteRedisConfigFile(
 
   absl::Status result;
   if (::fchmod(fd, metadata.st_mode & 07777) != 0) {
-    result = absl::InternalError(absl::StrCat(
-        "cannot set configuration temporary file mode: ",
-        std::strerror(errno)));
+    result = absl::InternalError(
+        absl::StrCat("cannot set configuration temporary file mode: ",
+                     std::strerror(errno)));
   }
   if (result.ok()) result = WriteAll(fd, rewritten, path);
   if (result.ok() && ::fdatasync(fd) != 0) {
@@ -868,9 +865,9 @@ absl::Status RewriteRedisConfigFile(
     return result;
   }
   if (::rename(temporary_name.c_str(), path.c_str()) != 0) {
-    result = absl::InternalError(absl::StrCat(
-        "cannot replace configuration file '", path, "': ",
-        std::strerror(errno)));
+    result =
+        absl::InternalError(absl::StrCat("cannot replace configuration file '",
+                                         path, "': ", std::strerror(errno)));
     cleanup();
     return result;
   }
@@ -880,22 +877,22 @@ absl::Status RewriteRedisConfigFile(
   const int directory_fd =
       ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (directory_fd < 0) {
-    return absl::InternalError(absl::StrCat(
-        "cannot open configuration directory '", directory,
-        "': ", std::strerror(errno)));
+    return absl::InternalError(
+        absl::StrCat("cannot open configuration directory '", directory,
+                     "': ", std::strerror(errno)));
   }
   const int sync_result = ::fsync(directory_fd);
   const int sync_error = errno;
   const int close_result = ::close(directory_fd);
   if (sync_result != 0) {
-    return absl::InternalError(absl::StrCat(
-        "cannot sync configuration directory '", directory,
-        "': ", std::strerror(sync_error)));
+    return absl::InternalError(
+        absl::StrCat("cannot sync configuration directory '", directory,
+                     "': ", std::strerror(sync_error)));
   }
   if (close_result != 0) {
-    return absl::InternalError(absl::StrCat(
-        "cannot close configuration directory '", directory,
-        "': ", std::strerror(errno)));
+    return absl::InternalError(
+        absl::StrCat("cannot close configuration directory '", directory,
+                     "': ", std::strerror(errno)));
   }
   return absl::OkStatus();
 }

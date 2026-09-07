@@ -19,8 +19,7 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
     std::span<const std::string_view> values, TxShardWrites* tx,
     ReplicationCommandAppend* replication) {
   if (values.empty()) {
-    co_return absl::InvalidArgumentError(
-        "LPUSH requires at least one element");
+    co_return absl::InvalidArgumentError("LPUSH requires at least one element");
   }
   ListOperation operation;
   operation.kind_ = ListOperationKind::kPushLeft;
@@ -32,8 +31,8 @@ Task<absl::StatusOr<std::uint64_t>> StorageEngine::Impl::ListPushLocked(
 }
 
 Task<absl::StatusOr<ListResult>> StorageEngine::Impl::ExecuteList(
-    std::uint8_t db_id, std::string_view key,
-    const ListOperation& operation, ReplicationCommandAppend* replication) {
+    std::uint8_t db_id, std::string_view key, const ListOperation& operation,
+    ReplicationCommandAppend* replication) {
   assert(db_id < kLogicalDatabaseCount);
   const Digest digest = ComputeDigest(key);
   const bool read_only = operation.kind_ == ListOperationKind::kLength ||
